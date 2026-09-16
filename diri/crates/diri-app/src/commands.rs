@@ -360,8 +360,8 @@ pub const COMMANDS: &[CommandSpec] = &[
     spec!(
         NewCodexSession,
         "new-codex",
-        Some("cmd-shift-n"),
-        Some("⇧⌘N"),
+        Some("cmd-alt-shift-n"),
+        Some("⌥⇧⌘N"),
         Some(APP_CONTEXT)
     ),
     spec!(
@@ -728,8 +728,8 @@ pub const COMMANDS: &[CommandSpec] = &[
     spec!(
         ArchiveSelectedSession,
         "archive-selected-session",
-        Some("cmd-shift-w"),
-        Some("⇧⌘W"),
+        Some("cmd-alt-shift-w"),
+        Some("⌥⇧⌘W"),
         Some(APP_CONTEXT)
     ),
     spec!(
@@ -1916,6 +1916,59 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn application_and_global_defaults_are_unique_across_product_actions() {
+        let defaults = ShortcutOverrides::new();
+        let commands: Vec<_> = COMMANDS
+            .iter()
+            .filter(|command| command.context.is_none() || command.context == Some(APP_CONTEXT))
+            .collect();
+        for (index, command) in commands.iter().enumerate() {
+            for key in command.effective_keystrokes(&defaults) {
+                let parsed = Keystroke::parse(&key).unwrap();
+                for other in &commands[index + 1..] {
+                    for other_key in other.effective_keystrokes(&defaults) {
+                        let other_parsed = Keystroke::parse(&other_key).unwrap();
+                        assert!(
+                            parsed.key != other_parsed.key
+                                || parsed.modifiers != other_parsed.modifiers,
+                            "{:?} and {:?} share application chord {}",
+                            command.id,
+                            other.id,
+                            key
+                        );
+                    }
+                }
+            }
+        }
+        // More specific editor/browser contexts may intentionally reuse keys.
+        let overrides = ShortcutOverrides::from([
+            ("new-codex".into(), Some(test_chords("cmd-shift-n"))),
+            (
+                "archive-selected-session".into(),
+                Some(test_chords("cmd-shift-w")),
+            ),
+        ]);
+        assert_eq!(
+            command(CommandId::NewCodexSession).effective_keystrokes(&overrides),
+            vec![test_chords("cmd-shift-n")]
+        );
+        assert_eq!(
+            command(CommandId::ArchiveSelectedSession).effective_keystrokes(&overrides),
+            vec![test_chords("cmd-shift-w")]
+        );
+        assert!(
+            command(CommandId::NewWindow)
+                .effective_keystrokes(&overrides)
+                .is_empty()
+        );
+        assert!(
+            command(CommandId::CloseWindow)
+                .effective_keystrokes(&overrides)
+                .is_empty()
+        );
     }
 
     #[test]

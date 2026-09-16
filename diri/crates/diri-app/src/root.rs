@@ -4,6 +4,8 @@ mod peek_profile;
 #[cfg(all(test, target_os = "macos"))]
 mod window_navigation_tests;
 mod workspace_launches;
+#[cfg(all(test, target_os = "macos"))]
+mod workspace_palette_tests;
 
 use std::collections::HashSet;
 use std::sync::Arc;
@@ -314,6 +316,22 @@ impl RootView {
         Self::new_with_workspace(services, preview, preview_scenario, None, window, cx)
     }
 
+    pub(crate) fn native_window_context(
+        &self,
+        window: &Window,
+        cx: &App,
+    ) -> crate::NativeWindowContext {
+        let mut placement = crate::current_window_placement(window, cx);
+        placement.x += 28.0;
+        placement.y += 28.0;
+        placement.mode = crate::store::WindowMode::Windowed;
+        crate::NativeWindowContext {
+            workspace: self.window_workspace(),
+            selected: self.window_session(),
+            placement,
+        }
+    }
+
     pub(crate) fn window_workspace(&self) -> Option<diri_proto::workspace::WorkspaceId> {
         self.active_workspace.clone()
     }
@@ -465,6 +483,24 @@ impl RootView {
                 }
             })
             .detach();
+        }
+        if let Some(navigation) = &navigation {
+            cx.subscribe_in(
+                navigation,
+                window,
+                |this, _, command: &crate::palette_workspace::WorkspaceCommand, window, cx| {
+                    let handled = this.sidebar.update(cx, |sidebar, cx| {
+                        sidebar.run_workspace_palette(command.clone(), window, cx)
+                    });
+                    if !handled {
+                        this.show_quote_feedback(
+                            "Workspace changed",
+                            "The selected target is no longer available. Open the command palette to choose again.",
+                            cx,
+                        );
+                    }
+                },
+            ).detach();
         }
         cx.subscribe_in(&sidebar, window, |this, _, event, window, cx| {
             if let SidebarEvent::WorkspaceActivated(id) = event {
@@ -1325,6 +1361,9 @@ impl RootView {
                 let tokio = self.services.tokio.clone();
                 let workbench = cx.new(|cx| {
                     crate::workspace_workbench::WorkspaceWorkbench::new(runtime, tokio, window, cx)
+                });
+                workbench.update(cx, |workbench, cx| {
+                    workbench.set_window_store(self.window_store.clone(), cx);
                 });
                 cx.subscribe_in(
                     &workbench,
@@ -2280,6 +2319,9 @@ impl RootView {
             let id = session.id.clone();
             let terminal =
                 cx.new(|cx| TerminalPane::new_fixed(runtime, tokio, id.clone(), window, cx));
+            terminal.update(cx, |terminal, _| {
+                terminal.set_window_store(self.window_store.clone())
+            });
             if let (Some(navigation), Some(utility_surfaces)) =
                 (&self.navigation, &self.utility_surfaces)
             {
@@ -4091,6 +4133,25 @@ impl Render for RootView {
             .capture_key_down(cx.listener(Self::on_key_down))
             .capture_key_up(cx.listener(Self::on_key_up))
             .on_action(cx.listener(Self::close_selected_session))
+            .on_action(
+                cx.listener(|this, _: &crate::commands::NewWindow, window, cx| {
+                    let context = this.native_window_context(window, cx);
+                    crate::open_main_window_with_context(
+                        cx,
+                        this.services.clone(),
+                        this.preview,
+                        this.preview_scenario,
+                        Some(context),
+                    );
+                }),
+            )
+            .on_action(
+                cx.listener(|_, _: &crate::commands::CloseWindow, window, _| {
+                    // Dispatch already identifies the originating window. Closing
+                    // it must not consult whichever platform window is active later.
+                    window.remove_window();
+                }),
+            )
             .on_action(cx.listener(Self::reopen_last_session))
             .on_action(cx.listener(Self::toggle_launcher))
             .on_action(cx.listener(|this, _: &NewDefaultSession, window, cx| {

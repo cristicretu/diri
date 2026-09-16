@@ -6373,7 +6373,7 @@ impl Sidebar {
         true
     }
 
-    /// ⌘⇧W: archive the selected session, where ⌘W removes it from the
+    /// ⌥⇧⌘W: archive the selected session, where ⌘W removes it from the
     /// sidebar. Returns false when nothing is selected.
     pub fn archive_selected(&mut self, cx: &mut Context<Self>) -> bool {
         if self.workspace_nav.active.is_some() {

@@ -31,6 +31,7 @@ mod notification_feed;
 pub mod notifications;
 pub mod palette;
 mod palette_chrome;
+mod palette_workspace;
 mod peek_settle;
 mod phone_access;
 mod platform;
@@ -393,17 +394,9 @@ fn main() {
             let context = cx.active_window().and_then(|handle| {
                 handle
                     .update(cx, |root, window, cx| {
-                        root.downcast::<RootView>().ok().map(|root| {
-                            let mut placement = current_window_placement(window, cx);
-                            placement.x += 28.0;
-                            placement.y += 28.0;
-                            placement.mode = WindowMode::Windowed;
-                            NativeWindowContext {
-                                workspace: root.read(cx).window_workspace(),
-                                selected: root.read(cx).window_session(),
-                                placement,
-                            }
-                        })
+                        root.downcast::<RootView>()
+                            .ok()
+                            .map(|root| root.read(cx).native_window_context(window, cx))
                     })
                     .ok()
                     .flatten()

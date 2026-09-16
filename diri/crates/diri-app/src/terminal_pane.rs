@@ -661,6 +661,10 @@ impl TerminalPane {
         )
     }
 
+    pub(crate) fn set_window_store(&mut self, store: crate::store::WindowStore) {
+        self.window_store = Some(store);
+    }
+
     fn new_with_source(
         runtime: Arc<StoreRuntime>,
         tokio_owner: Arc<tokio::runtime::Runtime>,
@@ -2212,7 +2216,23 @@ impl TerminalPane {
         self.qol.hover = None;
         self.qol.hit = None;
         let switcher_key = switcher_key(event);
-        let switcher_handled = {
+        let switcher_handled = if let Some(window_store) = &self.window_store {
+            let mut store = window_store.write().expect("session store lock poisoned");
+            let was_visible = store.switcher_state().is_visible();
+            let handled = if was_visible
+                || matches!(
+                    switcher_key,
+                    crate::switcher::SwitcherKey::Tab { control: true, .. }
+                ) {
+                store.handle_switcher_key(switcher_key)
+            } else {
+                false
+            };
+            if handled && !was_visible && store.switcher_state().is_visible() {
+                store.dismiss_overview();
+            }
+            handled
+        } else {
             let mut store = self
                 .runtime
                 .store
@@ -2324,13 +2344,28 @@ impl TerminalPane {
         }
     }
 
-    fn handle_key_up(&mut self, event: &KeyUpEvent, _window: &mut Window, cx: &mut Context<Self>) {
-        if matches!(event.keystroke.key.as_str(), "control" | "ctrl") {
-            self.runtime
+    fn finish_switcher_modifiers(&self, control: bool) -> bool {
+        if let Some(window_store) = &self.window_store {
+            let mut store = window_store.write().expect("session store lock poisoned");
+            let was_visible = store.switcher_state().is_visible();
+            store.handle_switcher_modifiers_changed(control);
+            was_visible != store.switcher_state().is_visible()
+        } else {
+            let mut store = self
+                .runtime
                 .store
                 .write()
-                .expect("session store lock poisoned")
-                .handle_switcher_modifiers_changed(false);
+                .expect("session store lock poisoned");
+            let was_visible = store.switcher_state().is_visible();
+            store.handle_switcher_modifiers_changed(control);
+            was_visible != store.switcher_state().is_visible()
+        }
+    }
+
+    fn handle_key_up(&mut self, event: &KeyUpEvent, _window: &mut Window, cx: &mut Context<Self>) {
+        if matches!(event.keystroke.key.as_str(), "control" | "ctrl")
+            && self.finish_switcher_modifiers(false)
+        {
             cx.notify();
         }
     }
@@ -2341,14 +2376,7 @@ impl TerminalPane {
         _window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let mut store = self
-            .runtime
-            .store
-            .write()
-            .expect("session store lock poisoned");
-        let was_visible = store.switcher_state().is_visible();
-        store.handle_switcher_modifiers_changed(event.modifiers.control);
-        if was_visible != store.switcher_state().is_visible() {
+        if self.finish_switcher_modifiers(event.modifiers.control) {
             cx.notify();
         }
     }
@@ -4744,6 +4772,135 @@ mod tests {
         cx.update_window(window.into(), |_, window, _| window.remove_window())
             .unwrap();
         cx.run_until_parked();
+    }
+
+    #[gpui::test]
+    fn split_terminal_switcher_events_keep_the_originating_window(cx: &mut TestAppContext) {
+        use crate::store::WindowStore;
+        use crate::workspace_workbench::WorkspaceWorkbench;
+        use diri_proto::workspace::{LayoutAxis, LayoutNode, PaneId, SplitId, TabId, WorkspaceTab};
+        let runtime = Arc::new(StoreRuntime::inert());
+        let tokio = Arc::new(
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap(),
+        );
+        let first = fixture_session();
+        let first_id = first.id.clone();
+        let mut second = first.clone();
+        second.id = SessionId::new("switcher-second");
+        let second_id = second.id.clone();
+        {
+            let mut store = runtime.store.write().unwrap();
+            store.upsert_session(first);
+            store.upsert_session(second);
+            store.select(first_id.clone());
+        }
+        let origin = WindowStore::new(runtime.store.clone(), Some(first_id.clone()));
+        let other = WindowStore::new(runtime.store.clone(), Some(second_id.clone()));
+        let tab = WorkspaceTab {
+            id: TabId::new("saved-tab"),
+            title: Some("Saved split".into()),
+            focused_pane: PaneId::new("first"),
+            zoomed_pane: None,
+            layout: LayoutNode::Split {
+                id: SplitId::new("divider"),
+                axis: LayoutAxis::Horizontal,
+                fraction: 0.5,
+                first: Box::new(LayoutNode::Pane {
+                    id: PaneId::new("first"),
+                    session_id: first_id.clone(),
+                }),
+                second: Box::new(LayoutNode::Pane {
+                    id: PaneId::new("second"),
+                    session_id: second_id.clone(),
+                }),
+            },
+        };
+        let workbench = cx.add_window(|window, cx| {
+            let mut workbench = WorkspaceWorkbench::new(runtime.clone(), tokio.clone(), window, cx);
+            workbench.set_window_store(origin.clone(), cx);
+            workbench.set_tab(
+                tab,
+                TerminalViewport {
+                    width: 900.0,
+                    height: 600.0,
+                    ..Default::default()
+                },
+                window,
+                cx,
+            );
+            workbench
+        });
+        let other_window = cx.add_window(|window, cx| {
+            TerminalPane::new_for_window(runtime.clone(), tokio.clone(), other.clone(), window, cx)
+        });
+        // Another window is focused after mounting; the fixed split must still
+        // route terminal-local events to the window that owns that saved tab.
+        other.write().unwrap().set_active(true);
+        for release_with_key_up in [true, false] {
+            origin.write().unwrap().select(first_id.clone());
+            other.write().unwrap().select(second_id.clone());
+            workbench
+                .update(cx, |workbench, window, cx| {
+                    let terminal = workbench.focused_terminal().unwrap();
+                    terminal.update(cx, |pane, cx| {
+                        assert_eq!(pane.window_store.as_ref().unwrap().owner(), origin.owner());
+                        pane.handle_key_down(
+                            &KeyDownEvent {
+                                keystroke: Keystroke::parse("ctrl-tab").unwrap(),
+                                is_held: false,
+                                prefer_character_input: false,
+                            },
+                            window,
+                            cx,
+                        );
+                        assert!(origin.read().unwrap().switcher_state().is_visible());
+                        assert!(!other.read().unwrap().switcher_state().is_visible());
+                        assert!(!runtime.store.read().unwrap().switcher_state().is_visible());
+                        assert_eq!(
+                            origin.read().unwrap().switcher_state().highlighted(),
+                            Some(&second_id)
+                        );
+                        if release_with_key_up {
+                            pane.handle_key_up(
+                                &KeyUpEvent {
+                                    keystroke: Keystroke::parse("control").unwrap(),
+                                },
+                                window,
+                                cx,
+                            );
+                        } else {
+                            pane.handle_modifiers_changed(
+                                &ModifiersChangedEvent::default(),
+                                window,
+                                cx,
+                            );
+                        }
+                    });
+                })
+                .unwrap();
+            assert_eq!(
+                origin.read().unwrap().selected_session_id(),
+                Some(&second_id)
+            );
+            assert_eq!(
+                other.read().unwrap().selected_session_id(),
+                Some(&second_id)
+            );
+            assert_eq!(
+                runtime.store.read().unwrap().selected_session_id(),
+                Some(&first_id)
+            );
+            assert!(!origin.read().unwrap().switcher_state().is_visible());
+        }
+        other_window
+            .update(cx, |_, window, _| window.remove_window())
+            .unwrap();
+        workbench
+            .update(cx, |_, window, _| window.remove_window())
+            .unwrap();
     }
 
     #[gpui::test]

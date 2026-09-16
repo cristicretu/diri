@@ -44,8 +44,9 @@ pub(super) struct WorkspaceNavigation {
     destination: Option<SessionDestination>,
     query: query_editor::QueryEditor,
     pub(super) focus: FocusHandle,
-    awaiting_create: bool,
+    awaiting_create: Option<u64>,
     highlighted_session: Option<SessionId>,
+    highlighted_workspace: Option<Option<WorkspaceId>>,
     cursor: Option<WorkspaceRowKey>,
     pending_activation: Option<(WorkspaceId, TabId, u64)>,
     menu_scroll: ScrollHandle,
@@ -63,8 +64,9 @@ impl WorkspaceNavigation {
             destination: None,
             query: Default::default(),
             focus: cx.focus_handle(),
-            awaiting_create: false,
+            awaiting_create: None,
             highlighted_session: None,
+            highlighted_workspace: None,
             cursor: None,
             pending_activation: None,
             menu_scroll: ScrollHandle::new(),
@@ -116,7 +118,138 @@ fn tab_title(tab: &diri_proto::workspace::WorkspaceTab, store: &SessionStore) ->
         .unwrap_or_else(|| "Unavailable session".into())
 }
 
+fn workspace_menu_targets(
+    snapshot: Option<&diri_proto::workspace::WorkspaceSnapshot>,
+    query: &str,
+) -> Vec<Option<WorkspaceId>> {
+    let query = query.trim().to_lowercase();
+    let mut targets = Vec::new();
+    if "all sessions".contains(&query) {
+        targets.push(None);
+    }
+    if let Some(snapshot) = snapshot {
+        targets.extend(
+            snapshot
+                .workspaces
+                .iter()
+                .filter(|workspace| workspace.name.to_lowercase().contains(&query))
+                .map(|workspace| Some(workspace.id.clone())),
+        );
+    }
+    targets
+}
+
 impl Sidebar {
+    pub(crate) fn run_workspace_palette(
+        &mut self,
+        command: crate::palette_workspace::WorkspaceCommand,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        use crate::palette_workspace::WorkspaceCommand;
+        if matches!(
+            &command,
+            WorkspaceCommand::Create
+                | WorkspaceCommand::Browse
+                | WorkspaceCommand::Rename(_)
+                | WorkspaceCommand::RenameTab(_)
+                | WorkspaceCommand::RenameSession(_)
+        ) {
+            self.peek(window, cx);
+        }
+        match command {
+            WorkspaceCommand::Create => {
+                self.begin_workspace_editor(WorkspaceEditor::Create, "", window, cx);
+            }
+            WorkspaceCommand::Browse => {
+                self.workspace_nav.editor = None;
+                self.workspace_nav.destination = None;
+                self.workspace_nav.highlighted_workspace = Some(self.workspace_nav.active.clone());
+                self.workspace_nav.query.clear();
+                self.workspace_nav.menu = true;
+                self.workspace_nav.focus.focus(window, cx);
+                cx.notify();
+            }
+            WorkspaceCommand::Switch(id) => {
+                if id.as_ref().is_some_and(|id| {
+                    !self
+                        .store
+                        .read()
+                        .expect("store")
+                        .workspace_catalog()
+                        .snapshot()
+                        .is_some_and(|snapshot| {
+                            snapshot
+                                .workspaces
+                                .iter()
+                                .any(|workspace| &workspace.id == id)
+                        })
+                }) {
+                    return false;
+                }
+                self.activate_workspace(id, cx);
+            }
+            WorkspaceCommand::Rename(id) => {
+                let name = self
+                    .store
+                    .read()
+                    .expect("store")
+                    .workspace_catalog()
+                    .snapshot()
+                    .and_then(|snapshot| {
+                        snapshot
+                            .workspaces
+                            .iter()
+                            .find(|workspace| workspace.id == id)
+                    })
+                    .map(|workspace| workspace.name.clone());
+                let Some(name) = name else { return false };
+                self.begin_workspace_editor(WorkspaceEditor::Rename(id), &name, window, cx);
+            }
+            WorkspaceCommand::RenameTab(id) => {
+                let title = {
+                    let store = self.store.read().expect("store");
+                    store
+                        .workspace_catalog()
+                        .snapshot()
+                        .and_then(|snapshot| {
+                            snapshot
+                                .workspaces
+                                .iter()
+                                .flat_map(|workspace| &workspace.tabs)
+                                .find(|tab| tab.id == id)
+                        })
+                        .map(|tab| tab_title(tab, &store))
+                };
+                let Some(title) = title else { return false };
+                self.begin_workspace_editor(WorkspaceEditor::RenameTab(id), &title, window, cx);
+            }
+            WorkspaceCommand::CloseTab(id) => {
+                return self
+                    .store
+                    .write()
+                    .expect("store")
+                    .edit_workspace(WorkspaceMutation::RemoveTab { tab_id: id });
+            }
+            WorkspaceCommand::RenameSession(id) => {
+                let session = self
+                    .store
+                    .read()
+                    .expect("store")
+                    .sessions()
+                    .get(&id)
+                    .cloned();
+                let Some(session) = session else { return false };
+                self.begin_rename(&session, window, cx);
+            }
+            WorkspaceCommand::CloseSession(id) => {
+                self.store.write().expect("store").request_close(vec![id]);
+                cx.notify();
+            }
+        }
+        true
+    }
+
     pub(crate) fn workspace_menu_is_open(&self) -> bool {
         self.workspace_nav.menu
     }
@@ -160,7 +293,7 @@ impl Sidebar {
         {
             eprintln!("diri: could not remember workspace selection: {error}");
         }
-        self.workspace_nav.awaiting_create = false;
+        self.workspace_nav.awaiting_create = None;
         self.workspace_nav.pending_activation = None;
         self.workspace_nav.menu = false;
         self.workspace_nav.destination = None;
@@ -203,11 +336,15 @@ impl Sidebar {
                 catalog.can_edit(),
             )
         };
-        if self.workspace_nav.awaiting_create
-            && let Some(created) = created
+        if let Some(expected) = self.workspace_nav.awaiting_create
+            && let Some((request, created)) = created
+            && expected == request
         {
-            self.workspace_nav.awaiting_create = false;
+            self.workspace_nav.awaiting_create = None;
             self.activate_workspace(Some(created), cx);
+        } else if ready && self.workspace_nav.awaiting_create.is_some() {
+            // A failed or superseded request must never select a later creation.
+            self.workspace_nav.awaiting_create = None;
         } else if ready && !active_exists {
             self.activate_workspace(None, cx);
         }
@@ -234,6 +371,41 @@ impl Sidebar {
     ) -> bool {
         if !self.workspace_nav.menu || !self.workspace_nav.focus.is_focused(window) {
             return false;
+        }
+        if self.workspace_nav.destination.is_none()
+            && self.workspace_nav.editor.is_none()
+            && matches!(event.keystroke.key.as_str(), "up" | "down" | "enter")
+        {
+            let targets = workspace_menu_targets(
+                self.store
+                    .read()
+                    .expect("store")
+                    .workspace_catalog()
+                    .snapshot(),
+                self.workspace_nav.query.text(),
+            );
+            if !targets.is_empty() {
+                let current = self
+                    .workspace_nav
+                    .highlighted_workspace
+                    .as_ref()
+                    .and_then(|id| targets.iter().position(|target| target == id))
+                    .unwrap_or(0);
+                let next = match event.keystroke.key.as_str() {
+                    "up" => current.saturating_sub(1),
+                    "down" => (current + 1).min(targets.len() - 1),
+                    _ => current,
+                };
+                let target = targets[next].clone();
+                self.workspace_nav.highlighted_workspace = Some(target.clone());
+                self.workspace_nav.menu_scroll.scroll_to_item(next);
+                if event.keystroke.key == "enter" {
+                    self.activate_workspace(target, cx);
+                }
+            }
+            cx.stop_propagation();
+            cx.notify();
+            return true;
         }
         if self.workspace_nav.destination.is_some()
             && self.workspace_nav.editor.is_none()
@@ -296,7 +468,13 @@ impl Sidebar {
                 };
                 if self.store.write().expect("store").edit_workspace(mutation) {
                     self.workspace_nav.editor = None;
-                    self.workspace_nav.awaiting_create = creating;
+                    self.workspace_nav.awaiting_create = creating.then(|| {
+                        self.store
+                            .read()
+                            .expect("store")
+                            .workspace_catalog()
+                            .create_request_id
+                    });
                     self.workspace_nav.query.clear();
                 }
             }
@@ -305,6 +483,7 @@ impl Sidebar {
                     return false;
                 };
                 self.workspace_nav.highlighted_session = None;
+                self.workspace_nav.highlighted_workspace = None;
                 match edit {
                     Edit::Local(edit) => {
                         self.workspace_nav.query.apply(edit);
@@ -978,22 +1157,38 @@ impl Sidebar {
                 );
             }
         } else {
-            choices = choices.child(
-                div()
-                    .id("workspace-all-sessions")
-                    .role(Role::Button)
-                    .aria_label("Browse all sessions")
-                    .h(px(30.0))
-                    .px(px(7.0))
-                    .flex()
-                    .items_center()
-                    .text_size(px(12.0))
-                    .rounded(px(6.0))
-                    .cursor_pointer()
-                    .hover(move |row| row.bg(colors.primary.alpha(0.06)))
-                    .child("All sessions")
-                    .on_click(cx.listener(|this, _, _, cx| this.activate_workspace(None, cx))),
-            );
+            let targets = workspace_menu_targets(catalog.snapshot(), &query);
+            if self
+                .workspace_nav
+                .highlighted_workspace
+                .as_ref()
+                .is_none_or(|id| !targets.contains(id))
+            {
+                self.workspace_nav.highlighted_workspace = targets.first().cloned();
+            }
+            if targets.contains(&None) {
+                choices = choices.child(
+                    div()
+                        .id("workspace-all-sessions")
+                        .role(Role::Button)
+                        .aria_label("Browse all sessions")
+                        .bg(if self.workspace_nav.highlighted_workspace == Some(None) {
+                            colors.primary.alpha(0.10)
+                        } else {
+                            colors.primary.alpha(0.0)
+                        })
+                        .h(px(30.0))
+                        .px(px(7.0))
+                        .flex()
+                        .items_center()
+                        .text_size(px(12.0))
+                        .rounded(px(6.0))
+                        .cursor_pointer()
+                        .hover(move |row| row.bg(colors.primary.alpha(0.06)))
+                        .child("All sessions")
+                        .on_click(cx.listener(|this, _, _, cx| this.activate_workspace(None, cx))),
+                );
+            }
             if let Some(snapshot) = catalog.snapshot() {
                 for workspace in &snapshot.workspaces {
                     if !workspace.name.to_lowercase().contains(&query) {
@@ -1008,6 +1203,15 @@ impl Sidebar {
                             .id(SharedString::from(format!("choose-workspace-{}", id.0)))
                             .role(Role::Button)
                             .aria_label(name.clone())
+                            .bg(
+                                if self.workspace_nav.highlighted_workspace
+                                    == Some(Some(id.clone()))
+                                {
+                                    colors.primary.alpha(0.10)
+                                } else {
+                                    colors.primary.alpha(0.0)
+                                },
+                            )
                             .h(px(32.0))
                             .px(px(7.0))
                             .flex()

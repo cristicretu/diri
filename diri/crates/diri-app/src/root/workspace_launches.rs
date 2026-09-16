@@ -26,8 +26,9 @@ impl RootView {
             launcher.set_workspace_spawn_target(target.clone())
         });
         if let Some(navigation) = &self.navigation {
-            navigation.update(cx, |navigation, _| {
-                navigation.set_workspace_spawn_target(target)
+            navigation.update(cx, |navigation, cx| {
+                navigation.set_workspace_spawn_target(target);
+                navigation.set_workspace_palette_context(self.active_workspace.clone(), cx)
             });
         }
     }

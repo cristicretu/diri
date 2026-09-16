@@ -18,6 +18,7 @@ use crate::fuzzy::{FuzzyMatcher, FuzzyQuery, PreparedText, Score};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum PaletteCommand {
+    Workspace(crate::palette_workspace::WorkspaceCommand),
     Themes,
     /// A static application command. The palette dispatches the same typed
     /// action used by key bindings, menus, and toolbar controls.
