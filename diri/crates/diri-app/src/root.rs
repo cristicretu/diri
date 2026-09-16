@@ -1,6 +1,7 @@
 #[cfg(all(test, target_os = "macos"))]
 #[path = "root/peek_profile.rs"]
 mod peek_profile;
+mod workspace_launches;
 
 use std::collections::HashSet;
 use std::sync::Arc;
@@ -200,6 +201,11 @@ fn advance_seam(slide: &mut Option<SeamSlide>, settled: f32, now: Instant, windo
 }
 
 pub struct RootView {
+    spawn_owner: crate::store::SpawnOwner,
+    launches_expanded: bool,
+    launches_focus: FocusHandle,
+    launch_cursor: Option<u64>,
+    launch_scroll: gpui::ScrollHandle,
     active_workspace: Option<diri_proto::workspace::WorkspaceId>,
     workspace_error: Option<String>,
     workspace_workbench: Option<Entity<crate::workspace_workbench::WorkspaceWorkbench>>,
@@ -923,6 +929,7 @@ impl RootView {
                                         inspector.sync_workspace_session(cx)
                                     });
                                 }
+                                this.sync_workspace_spawn_context(cx);
                                 this.sync_inspector_context(cx);
                                 this.sync_auxiliary_terminal(window, cx);
                                 let error = this
@@ -1109,6 +1116,11 @@ impl RootView {
             (None, None)
         };
         let mut root = Self {
+            spawn_owner: crate::store::SpawnOwner::default(),
+            launches_expanded: false,
+            launches_focus: cx.focus_handle(),
+            launch_cursor: None,
+            launch_scroll: gpui::ScrollHandle::new(),
             active_workspace: None,
             workspace_error: None,
             workspace_workbench: None,
@@ -1250,6 +1262,7 @@ impl RootView {
         cx: &mut Context<Self>,
     ) {
         self.active_workspace = id;
+        self.sync_workspace_spawn_context(cx);
         if let Some(workbench) = &self.workspace_workbench {
             workbench.update(cx, |workbench, cx| workbench.deactivate(cx));
         }
@@ -1827,6 +1840,7 @@ impl RootView {
                     .session_surfaces
                     .as_ref()
                     .is_some_and(|view| view.read(cx).tab_peek_visible())
+                || (self.launches_expanded && self.launches_focus.contains_focused(window, cx))
                 || self.quote_target_picker.is_some()
             {
                 return;
@@ -1864,6 +1878,7 @@ impl RootView {
                 }
             }
             CommandId::ToggleCommandPalette => {
+                self.sync_workspace_spawn_context(cx);
                 self.remember_quote_surface(window, cx);
                 if let Some(navigation) = &self.navigation {
                     navigation.update(cx, |navigation, cx| {
@@ -1872,6 +1887,7 @@ impl RootView {
                 }
             }
             CommandId::ToggleQuickOpen => {
+                self.sync_workspace_spawn_context(cx);
                 if let Some(navigation) = &self.navigation {
                     navigation.update(cx, |navigation, cx| {
                         navigation.toggle_quick_open(&ToggleQuickOpen, window, cx);
@@ -1884,6 +1900,11 @@ impl RootView {
                         navigation.toggle_history(&ToggleHistory, window, cx)
                     });
                 }
+            }
+            CommandId::ReviewLaunches => {
+                self.launches_expanded = true;
+                window.focus(&self.launches_focus, cx);
+                cx.notify();
             }
             CommandId::ToggleTabPeek => self.toggle_tab_peek(window, cx),
             CommandId::ToggleOverview => {
@@ -2029,6 +2050,7 @@ impl RootView {
     /// bypassing the sidebar's picker. No-ops in preview, which has no daemon
     /// to spawn into. Reports whether the spawn was dispatched.
     fn spawn(&self, agent: Option<AgentKind>) -> bool {
+        let workspace_target = self.workspace_spawn_target();
         if self.preview {
             return false;
         }
@@ -2051,17 +2073,22 @@ impl RootView {
                 store.spawn_kind(
                     agent,
                     SpawnOptions {
+                        workspace_target,
                         host,
                         ..SpawnOptions::default()
                     },
                 );
             }
-            None => store.spawn_shell(SpawnOptions::default()),
+            None => store.spawn_shell(SpawnOptions {
+                workspace_target,
+                ..SpawnOptions::default()
+            }),
         }
         true
     }
 
     fn spawn_default(&self) -> bool {
+        let workspace_target = self.workspace_spawn_target();
         if self.preview {
             return false;
         }
@@ -2073,6 +2100,7 @@ impl RootView {
             .expect("session store lock poisoned");
         let host = store.default_spawn_host();
         store.spawn_default(SpawnOptions {
+            workspace_target,
             host,
             ..SpawnOptions::default()
         })
@@ -2323,6 +2351,7 @@ impl RootView {
     }
 
     fn open_launcher(&mut self, _: &OpenLauncher, window: &mut Window, cx: &mut Context<Self>) {
+        self.sync_workspace_spawn_context(cx);
         self.launcher
             .update(cx, |launcher, cx| launcher.open(window, cx));
         // Opening changes which main-pane branch RootView renders.
@@ -2336,6 +2365,7 @@ impl RootView {
     }
 
     fn toggle_launcher(&mut self, _: &OpenLauncher, window: &mut Window, cx: &mut Context<Self>) {
+        self.sync_workspace_spawn_context(cx);
         let opens = self
             .launcher
             .update(cx, |launcher, cx| launcher.toggle(window, cx));
@@ -4179,6 +4209,11 @@ impl Render for RootView {
                     this.run_command(CommandId::MovePaneDown, window, cx);
                 }),
             )
+            .on_action(
+                cx.listener(|this, _: &crate::commands::ReviewLaunches, window, cx| {
+                    this.run_command(CommandId::ReviewLaunches, window, cx);
+                }),
+            )
             .on_action(cx.listener(|this, _: &ToggleTabPeek, window, cx| {
                 this.toggle_tab_peek(window, cx);
             }))
@@ -4406,6 +4441,9 @@ impl Render for RootView {
             || self.inspector_resize_origin.is_some()
         {
             root = root.child(self.resize_shield(cx));
+        }
+        if let Some(launches) = self.workspace_launches(colors, cx) {
+            root = root.child(launches);
         }
         if let Some(confirmation) = self.close_confirmation(colors, cx) {
             root = root.child(confirmation);
@@ -5390,6 +5428,101 @@ mod tests {
     }
 
     #[gpui::test]
+    fn launch_review_keyboard_opens_exact_session_retries_only_placement_and_dismisses(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        use crate::store::{SpawnOwner, WorkspaceSpawnState, WorkspaceSpawnTarget};
+        use diri_proto::workspace::WorkspaceId;
+        let services = test_services();
+        let runtime = services.store.clone();
+        runtime
+            .store
+            .write()
+            .unwrap()
+            .hydrate(SidebarPreviewFixture::make(PreviewScenario::Typical).list);
+        let (root, cx) = cx.add_window_view(move |window, cx| {
+            RootView::new(services, true, PreviewScenario::Typical, window, cx)
+        });
+        let target = WorkspaceSpawnTarget {
+            owner: SpawnOwner::default(),
+            workspace: WorkspaceId::new("removed"),
+            selected_tab: None,
+        };
+        let retry_id = runtime
+            .store
+            .write()
+            .unwrap()
+            .seed_workspace_spawn_for_test(
+                target.clone(),
+                WorkspaceSpawnState::Unplaced {
+                    session: SessionId::new("preview-codex"),
+                    detail: "The workspace was removed. Your session remains available.".into(),
+                },
+            );
+        let dismiss_id = runtime
+            .store
+            .write()
+            .unwrap()
+            .seed_workspace_spawn_for_test(
+                target,
+                WorkspaceSpawnState::Unconfirmed(
+                    "Check All sessions before creating another session.".into(),
+                ),
+            );
+        root.update(cx, |root, cx| {
+            root.launches_expanded = true;
+            cx.notify();
+        });
+        cx.run_until_parked();
+        let button = cx
+            .debug_bounds("workspace-launches-toggle")
+            .unwrap()
+            .center();
+        cx.simulate_click(button, Modifiers::default());
+        cx.simulate_click(button, Modifiers::default());
+        cx.simulate_keystrokes("backspace");
+        assert!(
+            !runtime
+                .store
+                .read()
+                .unwrap()
+                .workspace_spawn_receipts()
+                .any(|r| r.id == dismiss_id)
+        );
+        cx.simulate_keystrokes("enter");
+        assert_eq!(
+            runtime.store.read().unwrap().selected_session_id(),
+            Some(&SessionId::new("preview-codex"))
+        );
+        assert!(!root.read_with(cx, |root, _| root.launches_expanded));
+        cx.simulate_click(button, Modifiers::default());
+        cx.simulate_keystrokes("r");
+        assert_eq!(
+            runtime
+                .store
+                .read()
+                .unwrap()
+                .workspace_spawn_receipts()
+                .find(|r| r.id == retry_id)
+                .unwrap()
+                .state,
+            WorkspaceSpawnState::Placing(SessionId::new("preview-codex"))
+        );
+        cx.simulate_keystrokes("backspace");
+        assert!(
+            runtime
+                .store
+                .read()
+                .unwrap()
+                .workspace_spawn_receipts()
+                .any(|r| r.id == retry_id),
+            "pending placement cannot be cancelled by dismiss"
+        );
+        cx.simulate_keystrokes("escape");
+        assert!(!root.read_with(cx, |root, _| root.launches_expanded));
+    }
+
+    #[gpui::test]
     fn workspace_filter_and_group_collapse_preserve_terminal_and_restore_rows(
         cx: &mut gpui::TestAppContext,
     ) {
@@ -5854,6 +5987,101 @@ mod tests {
 
     #[cfg(target_os = "macos")]
     #[test]
+    #[ignore = "native window lifetime and disposable real Engine PTYs"]
+    fn workspace_launch_finishes_after_initiating_window_closes() {
+        use crate::store::WorkspaceSpawnState;
+        use gpui::HeadlessAppContext;
+        let fixture = crate::workspace_fixture::LiveWorkspace::start();
+        let held = fixture.held_spawn();
+        let platform = gpui_platform::current_platform(true);
+        let mut cx = HeadlessAppContext::with_platform(
+            platform.text_system(),
+            Arc::new(diri_ui::IconAssets),
+            gpui_platform::current_headless_renderer,
+        );
+        cx.update(|cx| {
+            crate::fonts::init(cx);
+            cx.set_reduce_motion(true);
+        });
+        let services = fixture.services.clone();
+        let window = cx
+            .open_window(size(px(1000.0), px(700.0)), |window, cx| {
+                cx.new(|cx| RootView::new(services, false, PreviewScenario::Empty, window, cx))
+            })
+            .unwrap();
+        cx.run_until_parked();
+        let id = cx
+            .update_window(window.into(), |root, _, cx| {
+                let root = root.downcast::<RootView>().unwrap();
+                let root = root.read(cx);
+                let target = root
+                    .workspace_spawn_target()
+                    .expect("window captures its workspace");
+                root.services
+                    .store
+                    .store
+                    .write()
+                    .unwrap()
+                    .request_workspace_spawn(target, held.params.clone())
+                    .unwrap()
+            })
+            .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !held.entered.exists() {
+            assert!(Instant::now() < deadline);
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        cx.update_window(window.into(), |_, window, _| window.remove_window())
+            .unwrap();
+        cx.run_until_parked();
+        held.release();
+        let state = loop {
+            let state = fixture
+                .services
+                .store
+                .store
+                .read()
+                .unwrap()
+                .workspace_spawn_receipts()
+                .find(|r| r.id == id)
+                .unwrap()
+                .state
+                .clone();
+            if !state.pending() {
+                break state;
+            }
+            assert!(Instant::now() < deadline);
+            std::thread::sleep(Duration::from_millis(5));
+        };
+        let WorkspaceSpawnState::Placed { session, tab } = state else {
+            panic!("{state:?}");
+        };
+        let snapshot = fixture
+            .services
+            .tokio
+            .block_on(fixture.services.store.client().workspaces())
+            .unwrap();
+        assert!(
+            snapshot
+                .workspaces
+                .iter()
+                .find(|w| w.id == fixture.workspace)
+                .unwrap()
+                .tabs
+                .iter()
+                .any(|t| t.id == tab)
+        );
+        let sessions = fixture
+            .services
+            .tokio
+            .block_on(fixture.services.store.client().sessions())
+            .unwrap();
+        assert!(sessions.sessions.iter().any(|s| s.id == session));
+        fixture.verify_process_identity();
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
     #[ignore = "writes synthetic saved workspace UI to DIRI_WORKSPACE_SCREENSHOT"]
     fn render_workspace_workbench_screenshot() {
         use diri_proto::workspace::*;
@@ -5991,7 +6219,13 @@ mod tests {
         let window = cx
             .open_window(size(px(width), px(800.0)), |window, cx| {
                 cx.new(|cx| {
-                    let root = RootView::new(services, false, PreviewScenario::Empty, window, cx);
+                    let mut root = RootView::new(services, false, PreviewScenario::Empty, window, cx);
+                    if let Ok(mode) = std::env::var("DIRI_WORKSPACE_LAUNCHES") {
+                        let target = crate::store::WorkspaceSpawnTarget { owner: root.spawn_owner, workspace: workspace.clone(), selected_tab: Some(TabId::new("release-tab")) };
+                        let state = if mode == "pending" { crate::store::WorkspaceSpawnState::Creating } else { crate::store::WorkspaceSpawnState::Unplaced { session: SessionId::new("preview-codex"), detail: "The workspace changed while this session was starting. Your session is ready in All sessions. Retry placement to use the current layout.".into() } };
+                        root.services.store.store.write().unwrap().seed_workspace_spawn_for_test(target, state);
+                        root.launches_expanded = mode != "pending";
+                    }
                     root.sidebar.update(cx, |sidebar, cx| {
                         if std::env::var("DIRI_WORKSPACE_GROUPS").as_deref() == Ok("filter") {
                             sidebar.seed_workspace_filter_for_test("review", cx);

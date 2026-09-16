@@ -329,6 +329,7 @@ impl Sidebar {
     ) {
         let mutation = match destination {
             SessionDestination::Tab(workspace_id) => WorkspaceMutation::CreateTab {
+                select: true,
                 workspace_id,
                 session_id: id,
                 title: None,
