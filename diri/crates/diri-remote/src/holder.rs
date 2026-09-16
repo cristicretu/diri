@@ -929,7 +929,18 @@ impl Holder {
         }
         match message {
             RemoteMessage::Terminal(frame) => match frame.frame_type {
-                FrameType::Input | FrameType::Mouse => self.write_input(&frame.payload),
+                FrameType::Input => {
+                    let keyboard = self.screen.input_keyboard_state();
+                    ensure_keyboard_controller(keyboard, connection.enhanced_keyboard)?;
+                    if keyboard.is_none() {
+                        return Err(io::Error::new(
+                            io::ErrorKind::Unsupported,
+                            "enhanced keyboard state is unknown",
+                        ));
+                    }
+                    self.write_input(&frame.payload)
+                }
+                FrameType::Mouse => self.write_input(&frame.payload),
                 FrameType::Resize => {
                     let Some((cols, rows)) = frame.resize_payload() else {
                         return Err(io::Error::new(
@@ -1085,6 +1096,19 @@ impl Holder {
                 format!("required capability {missing:?} is unavailable"),
             ));
         }
+        let enhanced_requested = hello
+            .required_capabilities
+            .contains(&diri_proto::remote_pty::RemoteCapability::EnhancedKeyboard);
+        let enhanced_keyboard = enhanced_requested
+            && hello.protocol.minor >= diri_proto::remote_pty::ENHANCED_KEYBOARD_PROTOCOL_MINOR;
+        if enhanced_requested && !enhanced_keyboard {
+            return Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "enhanced-keyboard-v1 requires protocol minor 14",
+            ));
+        }
+        ensure_keyboard_controller(self.screen.input_keyboard_state(), enhanced_keyboard)?;
+        connection.enhanced_keyboard = enhanced_keyboard;
         self.state.controller_epoch = self.state.controller_epoch.saturating_add(1);
         let epoch = self.state.controller_epoch;
         connection.epoch = Some(epoch);
@@ -1288,7 +1312,16 @@ impl Holder {
         let Some(mut connection) = self.connection.take() else {
             return Ok(());
         };
-        connection.keyboard = self.screen.keyboard_state();
+        connection.keyboard = self.screen.input_keyboard_state();
+        if ensure_keyboard_controller(connection.keyboard, connection.enhanced_keyboard).is_err() {
+            // An output mode change invalidates only this controller. The
+            // Holder and Agent continue, and a capable client can reseed.
+            connection.send_fatal(
+                "enhanced_keyboard_required",
+                "active enhanced keyboard modes require enhanced-keyboard-v1",
+            );
+            return Ok(());
+        }
         connection.queue(message)?;
         if connection.outbound.len() > MAX_OUTBOUND_BYTES {
             if connection.sent != 0 {
@@ -1313,7 +1346,7 @@ impl Holder {
     }
 
     fn queue_snapshot(&self, connection: &mut Connection) -> io::Result<()> {
-        connection.keyboard = self.screen.keyboard_state();
+        connection.keyboard = self.screen.input_keyboard_state();
         connection.queue(RemoteMessage::FullSnapshot(FullSnapshot {
             sequence: self.state.snapshot_sequence,
             alt_screen: self.screen.is_alt_screen(),
@@ -1465,9 +1498,23 @@ fn resolve_remote_executable(
     ))
 }
 
+fn ensure_keyboard_controller(
+    keyboard: Option<diri_proto::terminal_input::KeyboardState>,
+    capable: bool,
+) -> io::Result<()> {
+    if keyboard.is_none_or(|state| state.requires_enhanced_controller()) && !capable {
+        return Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "active enhanced keyboard modes require enhanced-keyboard-v1",
+        ));
+    }
+    Ok(())
+}
+
 struct Connection {
+    enhanced_keyboard: bool,
     protocol_minor: u16,
-    keyboard: diri_proto::terminal_input::KeyboardState,
+    keyboard: Option<diri_proto::terminal_input::KeyboardState>,
     stream: UnixStream,
     codec: RemoteCodec,
     epoch: Option<u64>,
@@ -1478,8 +1525,9 @@ struct Connection {
 impl Connection {
     fn new(stream: UnixStream) -> Self {
         Self {
+            enhanced_keyboard: false,
             protocol_minor: 0,
-            keyboard: Default::default(),
+            keyboard: Some(Default::default()),
             stream,
             codec: RemoteCodec::new(),
             epoch: None,
@@ -1515,6 +1563,19 @@ impl Connection {
                 *capability != diri_proto::remote_pty::RemoteCapability::InputModes
             });
         }
+        if !self.enhanced_keyboard
+            && let RemoteMessage::HelloAck(value) = &mut message
+        {
+            value.capabilities.retain(|capability| {
+                *capability != diri_proto::remote_pty::RemoteCapability::EnhancedKeyboard
+            });
+        }
+        if matches!(
+            &message,
+            RemoteMessage::FullSnapshot(_) | RemoteMessage::GridDelta(_)
+        ) {
+            ensure_keyboard_controller(self.keyboard, self.enhanced_keyboard)?;
+        }
         // Mode state and its grid are admitted as one publication. The Holder's
         // overflow/reseed decision must never run between these two frames.
         let start = self.outbound.len();
@@ -1529,7 +1590,11 @@ impl Connection {
                     RemoteCodec::encode_into(
                         &RemoteMessage::InputModes(diri_proto::remote_pty::InputModes {
                             sequence,
-                            keyboard: self.keyboard,
+                            keyboard: if self.enhanced_keyboard {
+                                self.keyboard
+                            } else {
+                                self.keyboard.map(|state| state.legacy_projection())
+                            },
                         }),
                         &mut self.outbound,
                     )?;
@@ -1678,16 +1743,62 @@ fn terminate_process_group(pid: u32) {
 #[cfg(test)]
 mod tests {
     #[test]
+    fn enhanced_modes_require_explicit_opt_in_and_legacy_payload_is_exact() {
+        let screen = HeadlessScreen::new(4, 2);
+        let snapshot = || {
+            RemoteMessage::FullSnapshot(FullSnapshot {
+                sequence: 7,
+                alt_screen: false,
+                bracketed_paste: false,
+                mouse: Default::default(),
+                grid: screen.full_snapshot(),
+            })
+        };
+        for capable in [false, true] {
+            for flags in 0..32 {
+                let (stream, _peer) = UnixStream::pair().unwrap();
+                let mut connection = Connection::new(stream);
+                connection.protocol_minor =
+                    diri_proto::remote_pty::ENHANCED_KEYBOARD_PROTOCOL_MINOR;
+                connection.enhanced_keyboard = capable;
+                connection.keyboard.as_mut().unwrap().enhancements =
+                    Some(flags.try_into().unwrap());
+                let result = connection.queue(snapshot());
+                if !capable && flags != 0 {
+                    assert_eq!(result.unwrap_err().kind(), io::ErrorKind::Unsupported);
+                    assert!(connection.outbound.is_empty());
+                    continue;
+                }
+                result.unwrap();
+                let messages = RemoteCodec::new().feed(&connection.outbound).unwrap();
+                let RemoteMessage::InputModes(modes) = &messages[0] else {
+                    panic!("mode prefix")
+                };
+                let json = serde_json::to_value(modes).unwrap();
+                if capable {
+                    assert_eq!(modes.keyboard.unwrap().enhancements.unwrap().bits(), flags);
+                } else {
+                    assert_eq!(
+                        json,
+                        serde_json::json!({"sequence":7,"keyboard":{"applicationCursorKeys":false,"applicationKeypad":false}})
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
     fn input_modes_and_grid_are_one_negotiated_publication() {
         use diri_proto::terminal_input::KeyboardState;
         for minor in [8, 9] {
             let (stream, _peer) = UnixStream::pair().unwrap();
             let mut connection = Connection::new(stream);
             connection.protocol_minor = minor;
-            connection.keyboard = KeyboardState {
+            connection.keyboard = Some(KeyboardState {
+                enhancements: None,
                 application_cursor_keys: true,
                 application_keypad: true,
-            };
+            });
             let screen = diri_terminal_state::HeadlessScreen::new(4, 2);
             let snapshot = FullSnapshot {
                 sequence: 42,
@@ -1793,8 +1904,7 @@ mod tests {
         assert_eq!(pending.remaining(), b"two");
     }
 
-    #[test]
-    fn reaped_child_rejects_signal_before_tail_checkpoint_says_exited() {
+    fn waiting_holder() -> (tempfile::TempDir, Holder, LaunchRequest) {
         let temp = tempfile::tempdir().unwrap();
         let roots = StatePaths::from_root(temp.path().join("state")).unwrap();
         let request = LaunchRequest {
@@ -1842,7 +1952,7 @@ mod tests {
             })
             .unwrap();
         let socket = paths.socket.clone();
-        let mut holder = Holder {
+        let holder = Holder {
             // The fixture has no descendants; guard behavior is covered by the
             // real Helper e2e. This test controls the exact reap→tail interval.
             process_guard: ProcessGuard {
@@ -1875,6 +1985,122 @@ mod tests {
             last_foreground_pid: None,
             foreground_probe_deadline: None,
         };
+        (temp, holder, request)
+    }
+
+    #[test]
+    fn enhanced_admission_precedes_epoch_change_and_late_activation_only_closes_bridge() {
+        let (_temp, mut holder, request) = waiting_holder();
+        initialize_auth(&holder.paths, &request.session_token).unwrap();
+        holder.screen = HeadlessScreen::new_with_keyboard_enhancements(80, 24);
+        holder.screen.feed(b"\x1b[=5u");
+        let before_epoch = holder.state.controller_epoch;
+        let before_pid = holder.pty.pid();
+        let hello = |capable| Hello {
+            protocol: diri_proto::remote_pty::ProtocolVersion::CURRENT,
+            local_build_id: "fixture".into(),
+            session_id: request.session_id.clone(),
+            session_token: request.session_token.clone(),
+            expected_incarnation: Some(holder.state.session_incarnation.clone()),
+            requested_role: diri_proto::remote_pty::RemoteRole::Controller,
+            client_nonce: "fixture-nonce".into(),
+            required_capabilities: if capable {
+                vec![diri_proto::remote_pty::RemoteCapability::EnhancedKeyboard]
+            } else {
+                vec![]
+            },
+            last_acknowledged_output_offset: None,
+            last_acknowledged_grid_sequence: None,
+        };
+        let legacy = hello(false);
+        let capable = hello(true);
+        let (stream, _peer) = UnixStream::pair().unwrap();
+        let mut connection = Connection::new(stream);
+        assert_eq!(
+            holder
+                .handshake(&mut connection, legacy)
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::Unsupported
+        );
+        assert_eq!(holder.state.controller_epoch, before_epoch);
+        assert!(connection.epoch.is_none());
+        holder.handshake(&mut connection, capable).unwrap();
+        assert_eq!(holder.state.controller_epoch, before_epoch + 1);
+        assert!(connection.enhanced_keyboard);
+        connection.outbound.clear();
+        holder.screen.grid_update(false);
+        holder.screen.feed(b"\x1b[=7u");
+        holder.connection = Some(connection);
+        holder.emit_grid_delta().unwrap();
+        let mut connection = holder.connection.take().unwrap();
+        let published = RemoteCodec::new().feed(&connection.outbound).unwrap();
+        let RemoteMessage::InputModes(modes) = &published[0] else {
+            panic!("mode prefix")
+        };
+        assert_eq!(modes.keyboard.unwrap().enhancements.unwrap().bits(), 7);
+        let RemoteMessage::GridDelta(grid) = &published[1] else {
+            panic!("matching delta")
+        };
+        assert_eq!(modes.sequence, grid.sequence);
+        assert!(
+            grid.grid.changed_rows.is_empty(),
+            "mode-only change needs no cell payload"
+        );
+        let full_keyboard = holder.screen.keyboard_snapshot().unwrap();
+        holder.screen.restore_keyboard_state(Default::default());
+        assert_eq!(holder.screen.input_keyboard_state(), None);
+        assert_eq!(
+            holder
+                .handle_message(
+                    &mut connection,
+                    RemoteMessage::Terminal(Frame::input(b"unknown-input".to_vec()))
+                )
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::Unsupported
+        );
+        assert!(holder.pending_input.is_empty());
+        assert!(holder.screen.restore_keyboard_snapshot(&full_keyboard));
+        // Simulate an already admitted legacy controller before a later mode
+        // activation; input must fail before queueing or reaching the PTY.
+        connection.enhanced_keyboard = false;
+        assert_eq!(
+            holder
+                .handle_message(
+                    &mut connection,
+                    RemoteMessage::Terminal(Frame::input(b"must-not-reach-child".to_vec()))
+                )
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::Unsupported
+        );
+        assert!(holder.pending_input.is_empty());
+        holder.connection = Some(connection);
+        holder.emit_grid_delta().unwrap();
+        assert!(holder.connection.is_none());
+        assert_eq!(holder.pty.pid(), before_pid);
+        assert!(matches!(
+            holder.state.process_state,
+            RemoteProcessState::Running { .. }
+        ));
+        assert!(holder.pty.try_wait().unwrap().is_none());
+        holder.pty_writer.write_all(b"go\n").unwrap();
+        let deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            holder.drain_pty().unwrap();
+            if holder.pty.try_wait().unwrap().is_some() {
+                break;
+            }
+            assert!(Instant::now() < deadline);
+            std::thread::sleep(Duration::from_millis(1));
+        }
+    }
+
+    #[test]
+    fn reaped_child_rejects_signal_before_tail_checkpoint_says_exited() {
+        let (_temp, mut holder, _request) = waiting_holder();
+        let socket = holder.paths.socket.clone();
         let (stream, _peer) = UnixStream::pair().unwrap();
         let mut connection = Connection::new(stream);
         connection.epoch = Some(1);

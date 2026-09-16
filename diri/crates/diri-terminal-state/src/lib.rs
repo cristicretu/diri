@@ -305,7 +305,13 @@ impl EventListener for Collector {
     }
 }
 
+pub use alacritty_terminal::term::keyboard::KeyboardSnapshot;
+
 pub struct HeadlessScreen {
+    // False after an old/partial cache restore. Capability negotiation never
+    // changes this observation or enables parser support. Exact parking must
+    // preserve it independently of Term flags.
+    keyboard_enhancements_known: bool,
     term: Term<Collector>,
     parser: Processor,
     events: Receiver<Event>,
@@ -352,17 +358,29 @@ pub struct HeadlessScreen {
 
 impl HeadlessScreen {
     pub fn new(cols: usize, rows: usize) -> Self {
+        Self::new_with_keyboard_config(cols, rows, false)
+    }
+
+    /// Explicit parser opt-in. Only a fully capable input owner may choose
+    /// this constructor; a peer capability or restored cache never enables it.
+    pub fn new_with_keyboard_enhancements(cols: usize, rows: usize) -> Self {
+        Self::new_with_keyboard_config(cols, rows, true)
+    }
+
+    fn new_with_keyboard_config(cols: usize, rows: usize, kitty_keyboard: bool) -> Self {
         let geometry = Geometry {
             cols: cols.max(1),
             rows: rows.max(1),
         };
         let (sender, events) = mpsc::sync_channel(EVENT_QUEUE_CAPACITY);
         let config = Config {
+            kitty_keyboard,
             scrolling_history: history_line_limit(geometry.cols),
             ..Config::default()
         };
         let term = Term::new(config, &geometry, Collector(sender));
         let mut screen = Self {
+            keyboard_enhancements_known: true,
             term,
             parser: Processor::new(),
             events,
@@ -586,17 +604,60 @@ impl HeadlessScreen {
         (self.geometry.cols, self.geometry.rows)
     }
 
+    pub fn invalidate_keyboard_enhancements(&mut self) {
+        self.keyboard_enhancements_known = false;
+    }
+
+    pub fn keyboard_enhancements_enabled(&self) -> bool {
+        self.term.keyboard_enhancements_enabled()
+    }
+
+    /// Unknown enhanced state may never masquerade as legacy-only input.
+    /// A disabled legacy parser can retain its old cursor/keypad projection.
+    pub fn input_keyboard_state(&self) -> Option<diri_proto::terminal_input::KeyboardState> {
+        (self.keyboard_enhancements_known || !self.keyboard_enhancements_enabled())
+            .then(|| self.keyboard_state())
+    }
+
     /// Keyboard modes from the same parser that owns the visible terminal.
     pub fn keyboard_state(&self) -> diri_proto::terminal_input::KeyboardState {
         let mode = self.term.mode();
         diri_proto::terminal_input::KeyboardState {
+            enhancements: self.keyboard_enhancements_known.then(|| {
+                diri_proto::terminal_input::enhanced::KeyboardEnhancements::try_from(
+                    alacritty_terminal::vte::ansi::KeyboardModes::from(*mode).bits(),
+                )
+                .expect("parser keyboard flags are bounded")
+            }),
             application_cursor_keys: mode.contains(TermMode::APP_CURSOR),
             application_keypad: mode.contains(TermMode::APP_KEYPAD),
         }
     }
 
+    /// A bounded projection of both keyboard stacks; unknown historical state
+    /// must remain absent rather than becoming a fabricated known zero.
+    pub fn keyboard_snapshot(&self) -> Option<KeyboardSnapshot> {
+        self.keyboard_enhancements_known
+            .then(|| self.term.keyboard_snapshot())
+    }
+
+    pub fn can_restore_keyboard_snapshot(&self, snapshot: &KeyboardSnapshot) -> bool {
+        self.term.can_restore_keyboard_snapshot(snapshot)
+    }
+
+    pub fn restore_keyboard_snapshot(&mut self, snapshot: &KeyboardSnapshot) -> bool {
+        if !self.term.restore_keyboard_snapshot(snapshot) {
+            return false;
+        }
+        self.keyboard_enhancements_known = true;
+        true
+    }
+
     /// Restore checkpointed modes through the existing parser after grid restore.
     pub fn restore_keyboard_state(&mut self, state: diri_proto::terminal_input::KeyboardState) {
+        // Current flags alone cannot reconstruct the saved inactive/pop state.
+        // Only restore_keyboard_snapshot can establish enhanced state as known.
+        self.keyboard_enhancements_known = false;
         self.feed(if state.application_cursor_keys {
             b"\x1b[?1h"
         } else {
@@ -814,6 +875,9 @@ impl HeadlessScreen {
         {
             return false;
         }
+
+        // Visible cells cannot prove the child's negotiated keyboard state.
+        self.keyboard_enhancements_known = false;
 
         // Allocate scrollback in the emulator, then replace those rows with
         // the persisted cells. The visible grid is painted below; CSI 2 J
@@ -1489,7 +1553,10 @@ mod tests {
         let cells = screen.lines();
         assert_eq!(
             screen.keyboard_state(),
-            diri_proto::terminal_input::KeyboardState::default()
+            diri_proto::terminal_input::KeyboardState {
+                enhancements: Some(0.try_into().unwrap()),
+                ..Default::default()
+            }
         );
         screen.feed(b"\x1b[?1h\x1b=");
         assert_eq!(screen.lines(), cells);
@@ -1501,7 +1568,10 @@ mod tests {
         screen.feed(b"\x1b>");
         assert_eq!(
             screen.keyboard_state(),
-            diri_proto::terminal_input::KeyboardState::default()
+            diri_proto::terminal_input::KeyboardState {
+                enhancements: Some(0.try_into().unwrap()),
+                ..Default::default()
+            }
         );
     }
 
@@ -1511,6 +1581,44 @@ mod tests {
         let mut screen = HeadlessScreen::new(80, 24);
         screen.feed(input);
         screen
+    }
+
+    #[test]
+    fn enabled_parser_old_visible_cache_keeps_enhancements_unknown() {
+        let mut original = HeadlessScreen::new_with_keyboard_enhancements(20, 3);
+        original.feed(b"\x1b[>5u");
+        let grid = original.full_snapshot();
+        let complete = original.keyboard_snapshot().unwrap();
+        let mut restored = HeadlessScreen::new_with_keyboard_enhancements(20, 3);
+        assert!(restored.restore(&[], &grid, false, false, MouseModes::OFF));
+        restored.restore_keyboard_state(Default::default());
+        assert_eq!(restored.keyboard_state().enhancements, None);
+        assert_eq!(restored.input_keyboard_state(), None);
+        restored.feed(b"\x1b[<u");
+        assert_eq!(restored.keyboard_state().enhancements, None);
+        assert!(restored.restore_keyboard_snapshot(&complete));
+        assert_eq!(restored.keyboard_state().enhancements.unwrap().bits(), 5);
+        restored.feed(b"\x1b[<u");
+        assert_eq!(restored.keyboard_state().enhancements.unwrap().bits(), 0);
+    }
+
+    #[test]
+    fn keyboard_cache_knownness_does_not_enable_negotiation() {
+        let mut screen = HeadlessScreen::new(20, 3);
+        let snapshot = screen.keyboard_snapshot().unwrap();
+        assert_eq!(screen.keyboard_state().enhancements.unwrap().bits(), 0);
+        screen.restore_keyboard_state(Default::default());
+        assert_eq!(screen.keyboard_state().enhancements, None);
+        assert_eq!(screen.keyboard_snapshot(), None);
+        screen.feed(b"\x1b[=31u\x1b[?u");
+        assert!(screen.take_replies().is_empty());
+        assert!(screen.restore_keyboard_snapshot(&snapshot));
+        assert_eq!(screen.keyboard_state().enhancements.unwrap().bits(), 0);
+        let active = KeyboardSnapshot::decode(&[1, 1, 1, 0, 0, 0, 1]).unwrap();
+        assert!(!screen.restore_keyboard_snapshot(&active));
+        let inactive = KeyboardSnapshot::decode(&[1, 0, 0, 0, 1, 0, 1]).unwrap();
+        assert!(!screen.restore_keyboard_snapshot(&inactive));
+        assert_eq!(screen.keyboard_state().enhancements.unwrap().bits(), 0);
     }
 
     #[test]

@@ -18,7 +18,8 @@ use crate::grid::{GridCodecError, GridUpdate};
 use crate::terminal::MouseModes;
 
 pub const PROTOCOL_MAJOR: u16 = 1;
-pub const PROTOCOL_MINOR: u16 = 13;
+pub const PROTOCOL_MINOR: u16 = 14;
+pub const ENHANCED_KEYBOARD_PROTOCOL_MINOR: u16 = 14;
 pub const PROCESS_FACTS_PROTOCOL_MINOR: u16 = 13;
 pub const STOP_SESSION_PROTOCOL_MINOR: u16 = 12;
 pub const PROCESS_IDENTITY_PROTOCOL_MINOR: u16 = 10;
@@ -86,6 +87,8 @@ pub enum RemoteCapability {
     TerminalAnnotations,
     #[serde(rename = "terminal-input-modes-v1")]
     InputModes,
+    #[serde(rename = "enhanced-keyboard-v1")]
+    EnhancedKeyboard,
     #[serde(rename = "process-identity-v1")]
     ProcessIdentity,
     #[serde(rename = "process-facts-v1")]
@@ -130,6 +133,7 @@ impl RemoteCapability {
         match self {
             Self::TerminalAnnotations => "terminal-annotations-v1",
             Self::InputModes => "terminal-input-modes-v1",
+            Self::EnhancedKeyboard => "enhanced-keyboard-v1",
             Self::ProcessIdentity => "process-identity-v1",
             Self::ProcessFacts => "process-facts-v1",
             Self::StopSession => "stop-session-v1",
@@ -196,6 +200,7 @@ pub const ANNOTATED_HOLDER_CAPABILITIES: &[RemoteCapability] = &[
     RemoteCapability::Scrollback,
     RemoteCapability::TerminalAnnotations,
     RemoteCapability::InputModes,
+    RemoteCapability::EnhancedKeyboard,
     RemoteCapability::ProcessIdentity,
     RemoteCapability::StopSession,
 ];
@@ -216,6 +221,7 @@ pub const ANNOTATED_HELPER_CAPABILITIES: &[RemoteCapability] = &[
     RemoteCapability::AtomicActivation,
     RemoteCapability::TerminalAnnotations,
     RemoteCapability::InputModes,
+    RemoteCapability::EnhancedKeyboard,
     RemoteCapability::ProcessIdentity,
     RemoteCapability::StopSession,
 ];
@@ -349,7 +355,9 @@ impl HelloAck {
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct InputModes {
     pub sequence: u64,
-    pub keyboard: crate::terminal_input::KeyboardState,
+    /// Null is allowed only after explicit enhanced-keyboard-v1 negotiation.
+    /// Some retains the exact legacy object representation.
+    pub keyboard: Option<crate::terminal_input::KeyboardState>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]

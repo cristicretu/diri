@@ -5,6 +5,8 @@
 
 use serde::{Deserialize, Serialize};
 
+pub mod enhanced;
+
 const ESC: u8 = 0x1b;
 
 /// A keyboard event's logical key.
@@ -205,11 +207,24 @@ impl Default for TermInputModes {
 #[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct KeyboardState {
+    /// Absent from older peers and caches. Unknown is distinct from observed zero.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub enhancements: Option<enhanced::KeyboardEnhancements>,
     pub application_cursor_keys: bool,
     pub application_keypad: bool,
 }
 
 impl KeyboardState {
+    /// Exact historical JSON shape for an unnegotiated consumer.
+    pub fn legacy_projection(mut self) -> Self {
+        self.enhancements = None;
+        self
+    }
+
+    pub fn requires_enhanced_controller(self) -> bool {
+        self.enhancements.is_some_and(|flags| flags.bits() != 0)
+    }
+
     pub fn encoding_modes(self, bracketed_paste: bool) -> TermInputModes {
         TermInputModes {
             application_cursor_keys: self.application_cursor_keys,
@@ -512,9 +527,40 @@ mod tests {
     use super::*;
 
     #[test]
+    fn keyboard_enhancement_json_distinguishes_unknown_zero_and_legacy_projection() {
+        let legacy = r#"{"applicationCursorKeys":false,"applicationKeypad":false}"#;
+        let old: KeyboardState = serde_json::from_str(legacy).unwrap();
+        assert_eq!(old.enhancements, None);
+        assert_eq!(serde_json::to_string(&old).unwrap(), legacy);
+        for bits in 0..=31 {
+            let state = KeyboardState {
+                enhancements: Some(bits.try_into().unwrap()),
+                ..Default::default()
+            };
+            assert_eq!(
+                serde_json::from_str::<KeyboardState>(&serde_json::to_string(&state).unwrap())
+                    .unwrap(),
+                state
+            );
+            assert_eq!(
+                serde_json::to_string(&state.legacy_projection()).unwrap(),
+                legacy
+            );
+            assert_eq!(state.requires_enhanced_controller(), bits != 0);
+        }
+        assert!(
+            serde_json::from_str::<KeyboardState>(
+                r#"{"applicationCursorKeys":false,"applicationKeypad":false,"enhancements":32}"#
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
     fn authoritative_cursor_and_keypad_modes_change_only_their_keys() {
         let normal = Some(KeyboardState::default());
         let application = Some(KeyboardState {
+            enhancements: None,
             application_cursor_keys: true,
             application_keypad: true,
         });

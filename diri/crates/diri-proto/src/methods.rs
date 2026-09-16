@@ -1028,6 +1028,8 @@ pub type DaemonShutdownResult = EmptyResult;
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct AttachRequest {
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub enhanced_keyboard: bool,
     pub attach: SessionId,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub from_offset: Option<u64>,

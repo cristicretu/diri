@@ -28,6 +28,7 @@ use crate::vte::ansi::{
 
 pub mod cell;
 pub mod color;
+pub mod keyboard;
 pub mod search;
 
 /// Minimum number of columns.
@@ -107,6 +108,31 @@ impl From<KeyboardModes> for TermMode {
         mode.set(TermMode::REPORT_ASSOCIATED_TEXT, report_associated_text);
 
         mode
+    }
+}
+
+impl From<TermMode> for KeyboardModes {
+    fn from(value: TermMode) -> Self {
+        let mut flags = Self::NO_MODE;
+        for (terminal, keyboard) in [
+            (
+                TermMode::DISAMBIGUATE_ESC_CODES,
+                Self::DISAMBIGUATE_ESC_CODES,
+            ),
+            (TermMode::REPORT_EVENT_TYPES, Self::REPORT_EVENT_TYPES),
+            (TermMode::REPORT_ALTERNATE_KEYS, Self::REPORT_ALTERNATE_KEYS),
+            (
+                TermMode::REPORT_ALL_KEYS_AS_ESC,
+                Self::REPORT_ALL_KEYS_AS_ESC,
+            ),
+            (
+                TermMode::REPORT_ASSOCIATED_TEXT,
+                Self::REPORT_ASSOCIATED_TEXT,
+            ),
+        ] {
+            flags.set(keyboard, value.contains(terminal));
+        }
+        flags
     }
 }
 
@@ -1382,11 +1408,7 @@ impl<T: EventListener> Handler for Term<T> {
         }
 
         trace!("Reporting active keyboard mode");
-        let current_mode = self
-            .keyboard_mode_stack
-            .last()
-            .unwrap_or(&KeyboardModes::NO_MODE)
-            .bits();
+        let current_mode = KeyboardModes::from(self.mode).bits();
         let text = format!("\x1b[?{current_mode}u");
         self.event_proxy.send_event(Event::PtyWrite(text));
     }
@@ -1400,7 +1422,7 @@ impl<T: EventListener> Handler for Term<T> {
         trace!("Pushing `{mode:?}` keyboard mode into the stack");
 
         if self.keyboard_mode_stack.len() >= KEYBOARD_MODE_STACK_MAX_DEPTH {
-            let removed = self.title_stack.remove(0);
+            let removed = self.keyboard_mode_stack.remove(0);
             trace!(
                 "Removing '{removed:?}' from bottom of keyboard mode stack that exceeds its \
                  maximum depth"
@@ -1440,6 +1462,14 @@ impl<T: EventListener> Handler for Term<T> {
         }
 
         self.set_keyboard_mode(mode.into(), apply);
+        // CSI = changes the current stack entry. Keep the saved screen state
+        // consistent with the mode used to encode input and answer CSI ? u.
+        let current = KeyboardModes::from(self.mode);
+        if let Some(top) = self.keyboard_mode_stack.last_mut() {
+            *top = current;
+        } else {
+            self.keyboard_mode_stack.push(current);
+        }
     }
 
     #[inline]
@@ -2690,6 +2720,44 @@ mod tests {
     use crate::vte::ansi::{self, CharsetIndex, Handler, StandardCharset};
 
     #[test]
+    fn keyboard_query_and_screen_switch_preserve_directly_set_flags() {
+        #[derive(Clone)]
+        struct Replies(std::sync::Arc<std::sync::Mutex<Vec<String>>>);
+        impl EventListener for Replies {
+            fn send_event(&self, event: Event) {
+                if let Event::PtyWrite(reply) = event {
+                    self.0.lock().unwrap().push(reply);
+                }
+            }
+        }
+        let replies = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let mut term = Term::new(
+            Config {
+                kitty_keyboard: true,
+                ..Config::default()
+            },
+            &TermSize::new(5, 10),
+            Replies(replies.clone()),
+        );
+        let mut parser: ansi::Processor = ansi::Processor::new();
+        parser.advance(&mut term, b"\x1b[=5u\x1b[?u");
+        assert_eq!(*replies.lock().unwrap(), vec!["\x1b[?5u"]);
+        parser.advance(&mut term, b"\x1b[?1049h\x1b[=3u\x1b[?u\x1b[?1049l\x1b[?u");
+        assert_eq!(
+            *replies.lock().unwrap(),
+            vec!["\x1b[?5u", "\x1b[?3u", "\x1b[?5u"]
+        );
+        parser.advance(&mut term, b"\x1b[>1u\x1b[=2;2u\x1b[>8u\x1b[<u\x1b[?u");
+        assert_eq!(replies.lock().unwrap().last().unwrap(), "\x1b[?3u");
+        parser.advance(&mut term, b"\x1b[=1;3u\x1b[?u");
+        assert_eq!(replies.lock().unwrap().last().unwrap(), "\x1b[?2u");
+        parser.advance(&mut term, b"\x1b[<u\x1b[?u");
+        assert_eq!(replies.lock().unwrap().last().unwrap(), "\x1b[?5u");
+        parser.advance(&mut term, b"\x1bc\x1b[?u");
+        assert_eq!(replies.lock().unwrap().last().unwrap(), "\x1b[?0u");
+    }
+
+    #[test]
     fn scroll_display_page_up() {
         let size = TermSize::new(5, 10);
         let mut term = Term::new(Config::default(), &size, VoidListener);
@@ -3716,6 +3784,45 @@ mod tests {
         term.title = Some("Test".into());
         term.set_title(None);
         assert_eq!(term.title, None);
+    }
+
+    #[test]
+    fn keyboard_stack_overflow_preserves_titles_and_evicts_only_oldest_modes() {
+        let size = TermSize::new(7, 17);
+        let mut term = Term::new(
+            Config {
+                kitty_keyboard: true,
+                ..Config::default()
+            },
+            &size,
+            VoidListener,
+        );
+        term.push_keyboard_mode(KeyboardModes::DISAMBIGUATE_ESC_CODES);
+        // An empty title stack must not make the 4,097th keyboard push panic.
+        for _ in 0..KEYBOARD_MODE_STACK_MAX_DEPTH {
+            term.push_keyboard_mode(KeyboardModes::REPORT_EVENT_TYPES);
+        }
+        assert_eq!(
+            term.keyboard_mode_stack.len(),
+            KEYBOARD_MODE_STACK_MAX_DEPTH
+        );
+        assert!(term.title_stack.is_empty());
+        assert!(
+            term.keyboard_mode_stack
+                .iter()
+                .all(|mode| *mode == KeyboardModes::REPORT_EVENT_TYPES)
+        );
+        term.set_title(Some("saved window title".into()));
+        term.push_title();
+        term.push_keyboard_mode(KeyboardModes::REPORT_ALL_KEYS_AS_ESC);
+        assert_eq!(term.title_stack, vec![Some("saved window title".into())]);
+        assert_eq!(
+            term.keyboard_mode_stack.len(),
+            KEYBOARD_MODE_STACK_MAX_DEPTH
+        );
+        term.pop_keyboard_modes(1);
+        assert!(term.mode.contains(TermMode::REPORT_EVENT_TYPES));
+        assert!(!term.mode.contains(TermMode::REPORT_ALL_KEYS_AS_ESC));
     }
 
     #[test]

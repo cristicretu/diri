@@ -491,6 +491,11 @@ impl ControlServer {
                     // its immediate pass seeing a foreground/recent session
                     // even if registration has not completed yet.
                     if let Ok(mut registry) = self.registry.lock() {
+                        if registry.get(&attach.attach.0).is_some_and(|session| {
+                            !session.allows_keyboard_controller(attach.enhanced_keyboard)
+                        }) {
+                            return Ok(());
+                        }
                         let _ = registry.ensure_session_awake(&attach.attach.0);
                         let _ = registry.mark_seen(&attach.attach.0);
                         let _ = registry.persist();
@@ -500,9 +505,10 @@ impl ControlServer {
                     // Bytes the line reader buffered past the attach line are
                     // already binary frames; hand them over.
                     let buffered = reader.buffer().to_vec();
-                    self.attach.serve(
+                    self.attach.serve_with_keyboard(
                         &self.registry,
                         &attach.attach.0,
+                        attach.enhanced_keyboard,
                         reader.into_inner(),
                         buffered,
                         writer,
@@ -1933,6 +1939,12 @@ impl ControlServer {
         let session = registry
             .get(&p.session_id.0)
             .ok_or_else(|| ControlError::not_found(p.session_id.0.clone()))?;
+        if !session.accepts_keyboard_input(true) {
+            return Err(ControlError::new(
+                "input_modes_unavailable",
+                "enhanced keyboard state is unavailable; input was not sent",
+            ));
+        }
         let bytes = encode_action(&event, p.modifiers, session.keyboard_state(), p.action)
             .map_err(|error| {
                 ControlError::new(
@@ -3631,6 +3643,12 @@ fn migrate_control_error(error: crate::migrate::MigrateError) -> ControlError {
 }
 
 fn io_control_error(error: std::io::Error) -> ControlError {
+    if error
+        .get_ref()
+        .is_some_and(|cause| cause.is::<crate::session::InputModesUnavailable>())
+    {
+        return ControlError::new("input_modes_unavailable", error.to_string());
+    }
     if error
         .get_ref()
         .is_some_and(|cause| cause.is::<crate::remote::client::RemoteTransportFailed>())

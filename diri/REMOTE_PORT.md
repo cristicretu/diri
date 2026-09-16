@@ -1562,3 +1562,48 @@ foreground group; it is distinct from unavailable. Observations are identity-bou
 not simultaneous: a live child may change cwd, executable or effective UID between
 field reads. Account name/home come from the observed effective UID's native
 account record, not environment variables. No command arguments are collected.
+
+## Enhanced keyboard state compatibility (protocol minor 14)
+
+`enhanced-keyboard-v1` is an optional, explicit controller capability. It does
+not enable parser negotiation: shipping `HeadlessScreen::new` remains disabled.
+Only an explicitly configured capable input owner may use the opt-in parser
+constructor. Five validated flag bits come from the shared parser; there is no
+second escape parser. Direct set, query, push/pop and screen swaps share the
+same bounded stack state.
+
+New Engines request the capability only from exact installed Helpers with
+minor 14 or newer and require its acknowledgement. Input modes remain staged
+with the matching snapshot/delta sequence and committed only after grid
+validation. A legacy connection receives the exact prior InputModes JSON
+object. An enhanced connection may receive the optional five-bit flags, or
+`keyboard: null` when an enhanced-capable parser lost state during old cache
+recovery. Null is rejected on an unnegotiated connection. Supported, authenticated
+pre-14 Holders retain the legacy input contract; arbitrary omitted capability
+fields are not evidence that a new owner is legacy-only.
+
+An old controller cannot attach when enhanced flags are active or enhanced
+state is unknown; rejection precedes controller-epoch mutation. A later mode
+activation closes only its bridge, preserving the Holder/Agent. Input is checked
+against current authoritative state before PTY admission. Even a capable client
+cannot send input while enhanced state is unknown. A capable read connection
+may show the retained grid until validated state becomes available.
+
+Local `AttachRequest.enhancedKeyboard` and client `AttachmentOptions` default
+to false and omit the false wire field. Opted-in consumers receive the version-2
+Modes tail when flags are known; old consumers retain exact version-1 bytes.
+Read-only previews remain version 1 because they never encode input. The Engine
+encodes at most two tiny Modes frames and shares the grid allocation. Local
+control admission checks happen before wake/visibility changes and input is
+checked again before writing. Lost enhanced state is a wholly unknown keyboard
+projection, distinct from a known legacy cursor/keypad projection.
+
+Visible-grid cache version 6 is required for known enhancement state, including
+known zero. It includes both bounded active/inactive keyboard stacks (at most
+4,096 entries each; at most 8,198 encoded bytes), with version, length, bit and
+current/top consistency validation before allocation. Older cache versions
+remain unknown for enhancements. A disabled parser rejects a cache containing
+nonzero flags on either screen rather than enabling negotiation. Cache flags
+and snapshot stacks must agree before writing; missing or malformed v6 state
+uses the existing cache-miss recovery. Whole-parser parking must retain the
+wrapper's knowledge bit as well as the parser's exact flags/stacks.

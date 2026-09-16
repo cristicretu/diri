@@ -3130,7 +3130,7 @@ mod tests {
                         vec![
                             "/bin/sh".into(),
                             "-c".into(),
-                            "read -r prompt; read -r done".into(),
+                            "read -r prompt; read -r done; printf fixture-exit; exit 0".into(),
                         ],
                         "/tmp",
                     ),
@@ -3153,6 +3153,20 @@ mod tests {
         let record = registry.record("terminal-input-title").unwrap();
         assert_eq!(record.title, "Fix chat naming");
         assert_eq!(record.title_source, TitleSource::FirstPrompt);
+        // Do not leave a live shell for Session::drop: Drop stops its reader
+        // before kill/wait, which can strand a macOS exiting child with unread
+        // PTY bytes. Ask this fixture to finish while its normal pump still
+        // drains output and reaps concurrently, then drop only after observed exit.
+        let session = &registry.sessions["terminal-input-title"];
+        session.write_input(b"fixture complete\r").unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+        while !session.view().exited {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "title fixture did not drain and exit"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
     }
 
     #[test]
