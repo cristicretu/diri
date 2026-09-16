@@ -232,6 +232,26 @@ impl Sidebar {
             .child(rows)
             .child(
                 div()
+                    .id("horizontal-peek-tabs")
+                    .debug_selector(|| "horizontal-peek-tabs".into())
+                    .role(Role::Button)
+                    .aria_label("Peek tabs")
+                    .size(px(28.0))
+                    .flex_none()
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .rounded(px(7.0))
+                    .cursor_pointer()
+                    .hover(move |button| button.bg(colors.primary.alpha(0.06)))
+                    .child(sf_symbol("square.grid.2x2", 12.0, colors.secondary))
+                    .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                    .on_click(|_, window, cx| {
+                        window.dispatch_action(Box::new(crate::commands::ToggleTabPeek), cx)
+                    }),
+            )
+            .child(
+                div()
                     .id("horizontal-new-tab")
                     .role(Role::Button)
                     .aria_label("New session")

@@ -35,6 +35,7 @@ actions!(
         ToggleHistory,
         ToggleNotifications,
         ToggleOverview,
+        ToggleTabPeek,
         OpenWorktrees,
         OpenSettings,
         // Palette destination: open Settings even when it is already visible.
@@ -110,6 +111,7 @@ pub enum CommandId {
     ToggleHistory,
     ToggleNotifications,
     ToggleOverview,
+    ToggleTabPeek,
     OpenWorktrees,
     OpenSettings,
     ToggleSidebar,
@@ -336,6 +338,16 @@ pub const COMMANDS: &[CommandSpec] = &[
         "Session Overview",
         "square.grid.2x2",
         "board grid switcher all sessions"
+    ),
+    spec!(
+        ToggleTabPeek,
+        "tab-peek",
+        Some("ctrl-shift-space"),
+        Some("⌃⇧Space"),
+        Some(APP_CONTEXT),
+        "Peek Tabs",
+        "rectangle.stack",
+        "preview overview gesture three finger swipe"
     ),
     spec!(
         OpenWorktrees,
@@ -820,6 +832,7 @@ impl CommandSpec {
             CommandId::ToggleHistory => KeyBinding::new(key, ToggleHistory, context),
             CommandId::ToggleNotifications => KeyBinding::new(key, ToggleNotifications, context),
             CommandId::ToggleOverview => KeyBinding::new(key, ToggleOverview, context),
+            CommandId::ToggleTabPeek => KeyBinding::new(key, ToggleTabPeek, context),
             CommandId::OpenWorktrees => KeyBinding::new(key, OpenWorktrees, context),
             CommandId::OpenSettings => KeyBinding::new(key, OpenSettings, context),
             CommandId::ToggleSidebar => KeyBinding::new(key, ToggleSidebar, context),
@@ -1123,6 +1136,11 @@ impl CommandId {
                 description: "Open or close the session overview",
                 category: Navigation,
             },
+            Self::ToggleTabPeek => ShortcutMetadata {
+                title: "Peek tabs",
+                description: "Preview tabs in the selected project without changing work",
+                category: Navigation,
+            },
             Self::OpenWorktrees => ShortcutMetadata {
                 title: "Worktrees overview",
                 description: "Open the Git worktrees overview",
@@ -1331,6 +1349,7 @@ impl CommandId {
             Self::ToggleHistory => Box::new(ToggleHistory),
             Self::ToggleNotifications => Box::new(ToggleNotifications),
             Self::ToggleOverview => Box::new(ToggleOverview),
+            Self::ToggleTabPeek => Box::new(ToggleTabPeek),
             Self::OpenWorktrees => Box::new(OpenWorktrees),
             Self::OpenSettings => Box::new(OpenSettings),
             Self::ToggleSidebar => Box::new(ToggleSidebar),

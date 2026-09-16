@@ -145,6 +145,7 @@ pub fn actions_for_catalogs(
         registered_action_with_title(CommandId::NewTerminal, terminal_title),
         registered_action(CommandId::ToggleQuickOpen),
         registered_action(CommandId::ToggleOverview),
+        registered_action(CommandId::ToggleTabPeek),
     ]);
 
     for target in projects {
@@ -348,6 +349,7 @@ pub fn actions_for_default_host(
         registered_action_with_title(CommandId::NewTerminal, terminal_title),
         registered_action(CommandId::ToggleQuickOpen),
         registered_action(CommandId::ToggleOverview),
+        registered_action(CommandId::ToggleTabPeek),
     ]);
 
     let default_name = display_name(&default_agent, catalog);
@@ -734,6 +736,35 @@ mod tests {
     }
 
     #[test]
+    fn peek_tabs_is_registered_once_in_live_and_fixture_palettes() {
+        let live = actions_for_catalogs(AgentKind::SHELL, &[], &[], None, None, &HashMap::new());
+        let fixture = actions(
+            AgentKind::SHELL,
+            &AgentReadinessResult::default(),
+            &[],
+            &[],
+            None,
+        );
+        for actions in [live, fixture] {
+            let peeks: Vec<_> = actions
+                .iter()
+                .filter(|action| {
+                    matches!(
+                        action.command,
+                        PaletteCommand::Action(CommandId::ToggleTabPeek)
+                    )
+                })
+                .collect();
+            assert_eq!(peeks.len(), 1);
+            assert_eq!(peeks[0].title, "Peek Tabs");
+            assert_eq!(
+                peeks[0].shortcut,
+                commands::command(CommandId::ToggleTabPeek).shortcut_label()
+            );
+        }
+    }
+
+    #[test]
     fn manifest_only_agents_get_typed_default_and_contextual_remote_actions() {
         let catalog = AgentReadinessResult {
             agents: vec![catalog_item("amp", "Amp", true, None, None)],
@@ -980,6 +1011,7 @@ mod tests {
                 "new-terminal",
                 "quick-open",
                 "session-overview",
+                "tab-peek",
                 "new-default-in-/work/diri",
                 "worktrees",
                 "toggle-sidebar",
@@ -998,7 +1030,14 @@ mod tests {
             commands::command(CommandId::NewDefaultSession).shortcut_label()
         );
         assert_eq!(result[1].title, "New Claude Code Session");
-        assert_eq!(result[7].title, "New Codex in diri");
+        assert_eq!(
+            result
+                .iter()
+                .find(|action| action.id == "new-default-in-/work/diri")
+                .unwrap()
+                .title,
+            "New Codex in diri"
+        );
     }
 
     #[test]

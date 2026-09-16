@@ -50,6 +50,7 @@ mod status_debug;
 mod surface_shell;
 pub mod switcher;
 mod tab_navigation;
+mod tab_peek;
 pub mod terminal_pane;
 pub mod transcript;
 pub mod updates;
