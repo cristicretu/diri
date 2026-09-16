@@ -4083,6 +4083,7 @@ mod grid_wake_tests {
         use diri_proto::remote_pty::InputModes;
         use diri_proto::terminal_input::KeyboardState;
         let state = KeyboardState {
+            enhancements: None,
             application_cursor_keys: true,
             application_keypad: false,
         };
@@ -4390,6 +4391,7 @@ mod remote_connection_tests {
                     RemoteMessage::InputModes(diri_proto::remote_pty::InputModes {
                         sequence: 1,
                         keyboard: diri_proto::terminal_input::KeyboardState {
+                            enhancements: None,
                             application_cursor_keys: true,
                             application_keypad: true,
                         },
@@ -4522,6 +4524,7 @@ fi
                 session.view().remote_connection.unwrap().state == State::Connected
             });
             let keyboard = Some(diri_proto::terminal_input::KeyboardState {
+                enhancements: None,
                 application_cursor_keys: true,
                 application_keypad: true,
             });

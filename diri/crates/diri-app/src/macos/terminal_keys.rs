@@ -88,6 +88,7 @@ mod tests {
                 let key = keypad_event(&event).unwrap();
                 for (enabled, expected) in [(false, numeric), (true, application)] {
                     let modes = KeyboardState {
+                        enhancements: None,
                         application_cursor_keys: false,
                         application_keypad: enabled,
                     };

@@ -166,6 +166,7 @@ fn an_attach_is_seeded_then_streams_diffs_and_answers_input() {
     assert_eq!(
         modes.keyboard_state_payload().unwrap(),
         Some(diri_proto::terminal_input::KeyboardState {
+            enhancements: None,
             application_cursor_keys: true,
             application_keypad: true
         })

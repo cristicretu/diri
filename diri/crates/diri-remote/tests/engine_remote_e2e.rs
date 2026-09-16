@@ -549,6 +549,7 @@ fn engine_bootstraps_detaches_and_adopts_the_same_remote_process() {
     assert_eq!(
         session.keyboard_state(),
         Some(diri_proto::terminal_input::KeyboardState {
+            enhancements: None,
             application_cursor_keys: true,
             application_keypad: true
         })
@@ -558,6 +559,7 @@ fn engine_bootstraps_detaches_and_adopts_the_same_remote_process() {
     assert_eq!(
         session.keyboard_state(),
         Some(diri_proto::terminal_input::KeyboardState {
+            enhancements: None,
             application_cursor_keys: false,
             application_keypad: true
         })
@@ -628,6 +630,7 @@ fn engine_bootstraps_detaches_and_adopts_the_same_remote_process() {
     assert_eq!(
         session.keyboard_state(),
         Some(diri_proto::terminal_input::KeyboardState {
+            enhancements: None,
             application_cursor_keys: false,
             application_keypad: true
         })

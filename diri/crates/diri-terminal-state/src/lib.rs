@@ -590,6 +590,7 @@ impl HeadlessScreen {
     pub fn keyboard_state(&self) -> diri_proto::terminal_input::KeyboardState {
         let mode = self.term.mode();
         diri_proto::terminal_input::KeyboardState {
+            enhancements: None,
             application_cursor_keys: mode.contains(TermMode::APP_CURSOR),
             application_keypad: mode.contains(TermMode::APP_KEYPAD),
         }

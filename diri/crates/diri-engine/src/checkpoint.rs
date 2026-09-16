@@ -121,6 +121,7 @@ impl ScreenCheckpoint {
                     return None;
                 }
                 Some(diri_proto::terminal_input::KeyboardState {
+                    enhancements: None,
                     application_cursor_keys: state.get("applicationCursorKeys")?.as_boolean()?,
                     application_keypad: state.get("applicationKeypad")?.as_boolean()?,
                 })
@@ -248,6 +249,7 @@ mod tests {
         let cells = vec![GridCell::BLANK; 4];
         ScreenCheckpoint {
             keyboard: Some(diri_proto::terminal_input::KeyboardState {
+                enhancements: None,
                 application_cursor_keys: true,
                 application_keypad: true,
             }),

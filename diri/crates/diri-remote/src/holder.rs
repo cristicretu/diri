@@ -1685,6 +1685,7 @@ mod tests {
             let mut connection = Connection::new(stream);
             connection.protocol_minor = minor;
             connection.keyboard = KeyboardState {
+                enhancements: None,
                 application_cursor_keys: true,
                 application_keypad: true,
             };
