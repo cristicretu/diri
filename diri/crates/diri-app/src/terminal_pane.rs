@@ -2845,7 +2845,6 @@ impl TerminalPane {
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let glyph = self.glyphs.get(&session.id).cloned();
-        let kind = ui_agent_kind(session.effective_kind());
         let identity_selector = format!("terminal-session-identity-{}", session.id.0);
         let shell_controls = matches!(self.session_source, SessionSource::FollowSelection);
         let show_sidebar = self.shows_navigation_control();
@@ -2880,6 +2879,16 @@ impl TerminalPane {
                     .gap(px(Metrics::TOOLBAR_ITEM_GAP))
                     .overflow_hidden()
                     .when_some(sidebar_reveal, |title, control| title.child(control))
+                    .when_some(glyph.filter(|_| header_width >= 280.0), |title, glyph| {
+                        title.child(
+                            div()
+                                .debug_selector(move || identity_selector.clone())
+                                .flex_none()
+                                .flex()
+                                .items_center()
+                                .child(glyph),
+                        )
+                    })
                     .child(
                         div()
                             .min_w(px(0.0))
@@ -2903,25 +2912,6 @@ impl TerminalPane {
                     .flex()
                     .items_center()
                     .gap(px(Metrics::TOOLBAR_ITEM_GAP))
-                    .child(
-                        div()
-                            .debug_selector(move || identity_selector.clone())
-                            .flex()
-                            .items_center()
-                            .gap(px(Metrics::TOOLBAR_COMPACT_GAP))
-                            .when_some(
-                                glyph.filter(|_| header_width >= 280.0),
-                                |identity, glyph| identity.child(glyph),
-                            )
-                            .when(header_width >= 420.0, |identity| {
-                                identity.child(
-                                    div()
-                                        .text_size(px(Typo::META.size))
-                                        .text_color(colors.tertiary)
-                                        .child(kind.label()),
-                                )
-                            }),
-                    )
                     .when(shell_controls, |trailing| {
                         trailing.child(
                             div()

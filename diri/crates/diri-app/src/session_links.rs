@@ -434,11 +434,10 @@ impl TerminalPane {
         colors: SemanticColors,
         cx: &mut Context<Self>,
     ) -> AnyElement {
-        let compact = self.viewport.is_some_and(|viewport| viewport.width < 360.0);
         let count = link_count(session);
         let attention = active_check_attention(session);
         let help = attention.as_ref().map_or_else(
-            || "Links and session details".to_owned(),
+            || format!("Links and session details · {count} links"),
             |(_, help)| help.clone(),
         );
         let open = self.session_links.open;
@@ -456,11 +455,11 @@ impl TerminalPane {
             .id("session-links-trigger")
             .debug_selector(|| "session-links-trigger".into())
             .h(px(Metrics::TOOLBAR_CONTROL_SIZE))
-            .px(px(if compact { 2.0 } else { 8.0 }))
+            .px(px(6.0))
             .flex_none()
             .flex()
             .items_center()
-            .gap(px(6.0))
+            .gap(px(4.0))
             .rounded(px(Radius::ROW))
             .when(open, |el| el.bg(Fill::selected(colors, true)))
             .hover(move |el| el.bg(Fill::subtle(colors)))
@@ -470,8 +469,8 @@ impl TerminalPane {
             .when_some(attention, |el, (tone, _)| {
                 el.child(div().size(px(5.0)).flex_none().rounded_full().bg(tone))
             })
-            .when(!compact, |el| el.child("Links"))
-            .when(count > 0 && !compact, |el| {
+            .child(Icon::new(IconName::ExternalLink, 14.0, colors.secondary))
+            .when(count > 0, |el| {
                 el.child(
                     div()
                         .text_size(px(Typo::META.size))
@@ -479,15 +478,6 @@ impl TerminalPane {
                         .child(count.to_string()),
                 )
             })
-            .child(Icon::new(
-                if compact {
-                    IconName::ExternalLink
-                } else {
-                    IconName::ChevronDown
-                },
-                14.0,
-                colors.tertiary,
-            ))
             .tooltip(move |_, cx| cx.new(|_| PaletteTooltip(help.clone(), colors)).into())
             .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
             .on_click(cx.listener(|this, _, window, cx| {
