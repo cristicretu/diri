@@ -400,7 +400,7 @@ impl GridWake {
         }
     }
 
-    fn notify(&self) {
+    pub(crate) fn notify(&self) {
         let mut state = self.inner.state.lock().expect("grid wake");
         state.generation = state.generation.saturating_add(1);
         self.inner.changed.notify_all();
@@ -430,22 +430,6 @@ impl GridWake {
             .inner
             .changed
             .wait_timeout_while(state, timeout, |state| state.generation == observed)
-            .expect("grid wake");
-        grid_wake_event(&state, observed)
-    }
-
-    pub(crate) fn wait_for_priority_or_timeout(
-        &self,
-        observed: u64,
-        timeout: Duration,
-    ) -> GridWakeEvent {
-        let state = self.inner.state.lock().expect("grid wake");
-        let (state, _) = self
-            .inner
-            .changed
-            .wait_timeout_while(state, timeout, |state| {
-                state.interactive_budget == 0 || state.generation == observed
-            })
             .expect("grid wake");
         grid_wake_event(&state, observed)
     }
@@ -1300,6 +1284,11 @@ impl Session {
     /// where output lands between the seed and pump registration.
     pub(crate) fn attachment_seed(&self) -> AttachmentSeed {
         self.shared.note_hot();
+        self.preview_seed()
+    }
+
+    /// Observe the current mirror without changing activity or process state.
+    pub(crate) fn preview_seed(&self) -> AttachmentSeed {
         let wake = self.shared.grid_wake.clone();
         loop {
             let wake_generation = wake.generation();
@@ -3857,12 +3846,12 @@ mod grid_wake_tests {
         let observed = wake.generation();
         wake.prioritize_interactive_changes();
 
-        let unchanged = wake.wait_for_priority_or_timeout(observed, Duration::from_millis(1));
+        let unchanged = wake.wait_for_change(observed, Duration::from_millis(1));
         assert_eq!(unchanged.generation, observed);
         assert!(!unchanged.interactive);
 
         wake.notify();
-        let changed = wake.wait_for_priority_or_timeout(observed, Duration::from_secs(1));
+        let changed = wake.wait_for_change(observed, Duration::from_secs(1));
         assert!(changed.generation > observed);
         assert!(changed.interactive);
 
@@ -3910,5 +3899,46 @@ mod notification_tests {
         apply_remote_output(&shared, &engine, "shell", &mut seq, end, bytes, false).unwrap();
         assert!(!shared.screen.lock().unwrap().has_notifications());
         assert_eq!(*shared.status.lock().unwrap(), SessionStatus::Idle);
+    }
+}
+
+#[cfg(test)]
+mod preview_tests {
+    use super::*;
+
+    #[test]
+    fn observing_a_deferred_grid_does_not_refresh_activity_or_launch() {
+        let temp = tempfile::tempdir().unwrap();
+        let (engine, _) = ManifestEngine::load_dir(&crate::detect::bundled_manifest_dir()).unwrap();
+        let spec = SessionSpec {
+            id: "preview-cold".into(),
+            pty: PtySpec::new(vec!["/bin/sh".into()], "/tmp"),
+            manifest_id: "generic".into(),
+            authority: Authority::ProcessOnly,
+            logs_dir: temp.path().to_path_buf(),
+            holder: None,
+            remote: None,
+            defer_launch: true,
+        };
+        let session = Session {
+            shared: new_shared(
+                &spec,
+                OutputLog::writer(temp.path(), &spec.id).unwrap(),
+                &engine,
+                true,
+            ),
+            transport: Transport::Held(HolderClient::new(temp.path().join("unused.sock"))),
+            pump: None,
+            manifest_id: spec.manifest_id.clone(),
+            deferred: Some(Arc::new(DeferredLaunch::new())),
+        };
+        session.shared.last_hot.store(0, Ordering::Relaxed);
+        session.shared.screen.lock().unwrap().feed(b"last received");
+        let seed = session.preview_seed();
+        assert!(seed.grid.is_full_snapshot);
+        assert_eq!(session.shared.last_hot.load(Ordering::Relaxed), 0);
+        assert_eq!(session.shared.last_interaction.load(Ordering::Relaxed), 0);
+        assert!(session.deferred.is_some());
+        assert!(session.pump.is_none());
     }
 }

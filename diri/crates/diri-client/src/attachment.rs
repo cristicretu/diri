@@ -121,6 +121,97 @@ pub struct SessionAttachment {
     pub chunks: AttachmentChunks,
 }
 
+/// Receive-only observation of an Engine-owned grid. Opening or dropping this
+/// channel never attaches to the remote Holder or changes terminal authority.
+/// A slow consumer backpressures the bounded socket queue; reconnect is explicit.
+pub struct SessionPreview {
+    session_id: SessionId,
+    // Keep the connection's command receiver alive, but expose no writer.
+    _commands: mpsc::UnboundedSender<Command>,
+    task: Option<JoinHandle<()>>,
+    pub chunks: AttachmentChunks,
+}
+
+impl SessionPreview {
+    pub async fn connect(
+        socket_path: impl AsRef<Path>,
+        session_id: SessionId,
+    ) -> Result<Self, AttachmentError> {
+        let stream = UnixStream::connect(socket_path).await?;
+        Self::adopt(stream, session_id).await
+    }
+
+    async fn adopt(mut stream: UnixStream, session_id: SessionId) -> Result<Self, AttachmentError> {
+        use diri_proto::preview::{PREVIEW_VERSION, PreviewReady, PreviewRequest};
+        let request = PreviewRequest {
+            preview: session_id.clone(),
+            version: PREVIEW_VERSION,
+        };
+        let mut line = serde_json::to_vec(&request)?;
+        line.push(b'\n');
+        // Bounded acknowledgement makes old engines, unknown sessions and the
+        // admission limit fail closed before a preview is exposed to the UI.
+        tokio::time::timeout(Duration::from_secs(2), async {
+            stream.write_all(&line).await?;
+            let mut response = Vec::new();
+            loop {
+                let byte = stream.read_u8().await?;
+                if byte == b'\n' {
+                    break;
+                }
+                if response.len() >= 512 {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "oversized preview acknowledgement",
+                    ));
+                }
+                response.push(byte);
+            }
+            let ready: PreviewReady = serde_json::from_slice(&response)
+                .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+            if ready.version != PREVIEW_VERSION || ready.preview != session_id {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "preview identity/version mismatch",
+                ));
+            }
+            Ok(())
+        })
+        .await
+        .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "preview handshake timed out"))??;
+        let (commands, command_rx) = mpsc::unbounded_channel();
+        let (chunk_tx, receiver) = mpsc::channel(1);
+        let task = tokio::spawn(run_connection(stream, command_rx, chunk_tx, false));
+        Ok(Self {
+            session_id,
+            _commands: commands,
+            task: Some(task),
+            chunks: AttachmentChunks { receiver },
+        })
+    }
+
+    pub fn session_id(&self) -> &SessionId {
+        &self.session_id
+    }
+
+    /// Cancellation remains prompt even if the UI stopped draining a full queue.
+    pub async fn close(&mut self) {
+        if let Some(task) = self.task.take() {
+            task.abort();
+            let _ = task.await;
+        }
+        self.chunks.receiver.close();
+    }
+}
+
+impl Drop for SessionPreview {
+    fn drop(&mut self) {
+        if let Some(task) = self.task.take() {
+            task.abort();
+        }
+    }
+}
+
 /// Cloneable write half for a live, resident attachment.
 ///
 /// The app keeps this handle beside its resident terminal model while the
@@ -195,7 +286,7 @@ impl SessionAttachment {
         // backpressure only the attach writer instead of growing client memory
         // without limit.
         let (chunk_tx, chunk_rx) = mpsc::channel(CHUNK_QUEUE_CAPACITY);
-        let task = tokio::spawn(run_connection(stream, command_rx, chunk_tx));
+        let task = tokio::spawn(run_connection(stream, command_rx, chunk_tx, true));
 
         Ok(Self {
             commands: command_tx,
@@ -265,13 +356,19 @@ async fn run_connection(
     mut stream: UnixStream,
     mut commands: mpsc::UnboundedReceiver<Command>,
     chunks: mpsc::Sender<TerminalChunk>,
+    keepalive_enabled: bool,
 ) {
     let mut codec = FrameCodec::new();
     let mut read_buffer = vec![0_u8; READ_BUFFER_BYTES];
     let mut last_received = Instant::now();
-    let start = Instant::now() + KEEPALIVE_CHECK_EVERY;
-    let mut keepalive = tokio::time::interval_at(start, KEEPALIVE_CHECK_EVERY);
-    keepalive.set_missed_tick_behavior(MissedTickBehavior::Delay);
+    // Local receive-only previews need no idle timer: Unix socket EOF reports
+    // peer closure, and remote freshness is an Engine control fact.
+    let mut keepalive = keepalive_enabled.then(|| {
+        let start = Instant::now() + KEEPALIVE_CHECK_EVERY;
+        let mut timer = tokio::time::interval_at(start, KEEPALIVE_CHECK_EVERY);
+        timer.set_missed_tick_behavior(MissedTickBehavior::Delay);
+        timer
+    });
 
     loop {
         tokio::select! {
@@ -298,7 +395,12 @@ async fn run_connection(
                     Some(Command::Close) | None => return,
                 }
             }
-            _ = keepalive.tick() => {
+            _ = async {
+                match &mut keepalive {
+                    Some(timer) => { timer.tick().await; }
+                    None => std::future::pending::<()>().await,
+                }
+            } => {
                 let idle = Instant::now().duration_since(last_received);
                 if idle >= DEAD_AFTER {
                     return;
@@ -397,6 +499,125 @@ mod tests {
                 mouse,
             })
         );
+    }
+
+    #[tokio::test]
+    async fn preview_decodes_ordered_chunks_and_cancels_with_a_full_queue() {
+        use super::SessionPreview;
+        use diri_proto::grid::{ChangedRow, GridUpdate};
+        use tokio::io::AsyncReadExt;
+        let (client, server) = UnixStream::pair().unwrap();
+        let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
+        let peer = tokio::spawn(async move {
+            let mut server = BufReader::new(server);
+            let mut line = String::new();
+            server.read_line(&mut line).await.unwrap();
+            let request: diri_proto::preview::PreviewRequest = serde_json::from_str(&line).unwrap();
+            assert_eq!(request.preview.0, "fixture");
+            server.get_mut().write_all(line.as_bytes()).await.unwrap();
+            for index in 0..4 {
+                let update = GridUpdate {
+                    cols: 1,
+                    rows: 1,
+                    cursor_col: 0,
+                    cursor_row: 0,
+                    cursor_visible: true,
+                    is_full_snapshot: index == 0,
+                    changed_rows: vec![ChangedRow::new(
+                        0,
+                        vec![GridCell {
+                            scalar: u32::from(b'A' + index),
+                            ..GridCell::BLANK
+                        }],
+                    )],
+                };
+                super::write_frame(server.get_mut(), &Frame::grid(&update).unwrap())
+                    .await
+                    .unwrap();
+            }
+            ready_tx.send(()).unwrap();
+            assert_eq!(
+                server.read(&mut [0]).await.unwrap(),
+                0,
+                "close releases socket"
+            );
+        });
+        let mut preview = SessionPreview::adopt(client, SessionId("fixture".into()))
+            .await
+            .unwrap();
+        ready_rx.await.unwrap();
+        for scalar in *b"AB" {
+            let Some(TerminalChunk::Grid(grid)) = preview.chunks.recv().await else {
+                panic!("grid");
+            };
+            assert_eq!(grid.changed_rows[0].cells[0].scalar, u32::from(scalar));
+        }
+        // Leave the remaining patches unread. Closing must not await a sender
+        // blocked on the capacity-one queue, nor splice/drop patches to continue.
+        timeout(Duration::from_secs(1), preview.close())
+            .await
+            .unwrap();
+        timeout(Duration::from_secs(1), peer)
+            .await
+            .unwrap()
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_silent_preview_has_no_idle_ping_or_deadline() {
+        use super::SessionPreview;
+        let (client, mut server) = UnixStream::pair().unwrap();
+        let peer = tokio::spawn(async move {
+            let mut reader = BufReader::new(server);
+            let mut line = String::new();
+            reader.read_line(&mut line).await.unwrap();
+            reader.get_mut().write_all(line.as_bytes()).await.unwrap();
+            reader.into_inner()
+        });
+        let mut preview = SessionPreview::adopt(client, SessionId("silent".into()))
+            .await
+            .unwrap();
+        server = peer.await.unwrap();
+        tokio::time::pause();
+        tokio::time::advance(Duration::from_secs(120)).await;
+        tokio::task::yield_now().await;
+        assert!(
+            !preview.task.as_ref().unwrap().is_finished(),
+            "silent preview stays open"
+        );
+        assert_eq!(
+            server.try_read(&mut [0]).unwrap_err().kind(),
+            std::io::ErrorKind::WouldBlock,
+            "preview emits no idle ping"
+        );
+        preview.close().await;
+    }
+
+    #[tokio::test]
+    async fn preview_rejects_wrong_identity_and_legacy_control_reply() {
+        use super::SessionPreview;
+        for response in [
+            r#"{"preview":"other","version":1}"#,
+            r#"{"id":0,"error":"unknown request"}"#,
+        ] {
+            let (client, server) = UnixStream::pair().unwrap();
+            let peer = tokio::spawn(async move {
+                let mut server = BufReader::new(server);
+                let mut line = String::new();
+                server.read_line(&mut line).await.unwrap();
+                server
+                    .get_mut()
+                    .write_all(format!("{response}\n").as_bytes())
+                    .await
+                    .unwrap();
+            });
+            assert!(
+                SessionPreview::adopt(client, SessionId("fixture".into()))
+                    .await
+                    .is_err()
+            );
+            peer.await.unwrap();
+        }
     }
 
     struct TestControl {

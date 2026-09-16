@@ -12,6 +12,7 @@ pub mod model;
 pub mod net;
 pub mod node;
 pub mod paths;
+pub mod preview;
 pub mod recovery;
 pub mod remote_pty;
 pub mod tasks;

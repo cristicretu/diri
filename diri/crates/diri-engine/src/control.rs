@@ -449,6 +449,26 @@ impl ControlServer {
             }
             if first {
                 first = false;
+                // Route by the distinct key before normal attach decoding. Mixed
+                // or unsupported requests fail closed without visibility effects.
+                if serde_json::from_slice::<serde_json::Value>(&line)
+                    .is_ok_and(|value| value.get("preview").is_some())
+                {
+                    if let Ok(request) =
+                        serde_json::from_slice::<diri_proto::preview::PreviewRequest>(&line)
+                        && request.version == diri_proto::preview::PREVIEW_VERSION
+                    {
+                        let buffered = reader.buffer().to_vec();
+                        self.attach.serve_preview(
+                            &self.registry,
+                            &request.preview.0,
+                            reader.into_inner(),
+                            buffered,
+                            writer,
+                        );
+                    }
+                    return Ok(());
+                }
                 if let Ok(attach) = serde_json::from_slice::<diri_proto::AttachRequest>(&line) {
                     // Attaching means this session is visible. Reconcile the
                     // actual process first: an adopted holder can be stopped
@@ -821,19 +841,10 @@ impl ControlServer {
         reserved_id: Option<String>,
     ) -> Result<JsonValue, ControlError> {
         let raw = params.ok_or_else(|| ControlError::bad_request("params are required"))?;
-        // Tests and scripts may pass a raw argv; the app never does. Read it
-        // before the typed decode consumes the value.
-        let argv: Vec<String> = raw
-            .get("argv")
-            .and_then(Value::as_array)
-            .map(|values| {
-                values
-                    .iter()
-                    .filter_map(Value::as_str)
-                    .map(str::to_string)
-                    .collect()
-            })
-            .unwrap_or_default();
+        // Validate before any account, worktree, or remote side effect. Missing
+        // argv keeps manifest launch behavior; an explicit malformed argv must
+        // never silently drop arguments or fall back to a login shell.
+        let argv = decode_launch_argv(&raw)?;
         let p: diri_proto::SessionSpawnParams = decode(Some(raw))?;
         let mut account_profile = self.accounts.lock().map_err(poisoned)?.resolve(
             p.account_profile_id.as_deref(),
@@ -3225,6 +3236,30 @@ impl Drop for ControlServer {
     }
 }
 
+fn decode_launch_argv(params: &JsonValue) -> Result<Vec<String>, ControlError> {
+    let Some(value) = params.get("argv") else {
+        return Ok(Vec::new());
+    };
+    let argv: Vec<String> = serde_json::from_value(value.clone())
+        .map_err(|_| ControlError::bad_request("argv must be an array of strings"))?;
+    if argv.is_empty() || argv.len() > diri_proto::remote_pty::MAX_ARGUMENTS {
+        return Err(ControlError::bad_request(
+            "argv must contain 1..=512 entries",
+        ));
+    }
+    if argv[0].is_empty() || argv.iter().any(|argument| argument.contains('\0')) {
+        return Err(ControlError::bad_request(
+            "argv needs a nonempty executable and NUL-free arguments",
+        ));
+    }
+    if argv.iter().map(String::len).sum::<usize>() > diri_proto::remote_pty::MAX_LAUNCH_BYTES {
+        return Err(ControlError::bad_request(
+            "argv exceeds the launch byte limit",
+        ));
+    }
+    Ok(argv)
+}
+
 /// Content identity of the running Engine. It is computed once, then reused by
 /// every heartbeat so version coordination has no steady-state hashing cost.
 fn process_executable_hash() -> Option<&'static str> {
@@ -3888,6 +3923,31 @@ const MAX_PROBE_CHARS: usize = 20;
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn explicit_launch_argv_is_literal_and_never_silently_repaired() {
+        assert!(decode_launch_argv(&json!({})).unwrap().is_empty());
+        let arguments = vec!["/bin/echo", "", "a b", "$(touch nope)", "--host", "界"];
+        assert_eq!(
+            decode_launch_argv(&json!({"argv": arguments})).unwrap(),
+            arguments
+        );
+        for argv in [
+            json!(null),
+            json!("echo"),
+            json!([]),
+            json!([""]),
+            json!(["echo", 3]),
+            json!(["echo", "x\0y"]),
+            json!(vec!["x"; diri_proto::remote_pty::MAX_ARGUMENTS + 1]),
+            json!(["x".repeat(diri_proto::remote_pty::MAX_LAUNCH_BYTES + 1)]),
+        ] {
+            assert_eq!(
+                decode_launch_argv(&json!({"argv": argv})).unwrap_err().code,
+                "bad_request"
+            );
+        }
+    }
 
     #[test]
     fn oversized_control_line_is_rejected_before_unbounded_buffering() {

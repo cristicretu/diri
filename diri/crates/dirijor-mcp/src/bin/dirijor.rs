@@ -89,7 +89,7 @@ fn run(arguments: &[String]) -> Result<(), CliError> {
 fn print_help() {
     println!(
         "dirijor — Diri automation CLI\n\n\
-         Usage:\n  dirijor status [--json]\n  dirijor activity [--limit N] [--json]\n  dirijor session <list|get|read|send|wait|spawn|fork|release|archive> ...\n  \
+         Usage:\n  dirijor status [--json]\n  dirijor activity [--limit N] [--json]\n  dirijor session <list|get|read|send|wait|spawn|run|fork|release|archive> ...\n  \
          dirijor worktree <list|create|remove> ...\n  dirijor artifacts <session> [--json]\n  \
          dirijor events <subscribe|wait> ...\n  dirijor ports [--json]\n  dirijor doctor\n  \
          dirijor hook <event>\n  dirijor notify <json>\n  dirijor notify --title TEXT --body TEXT\n  dirijor mcp-tools\n  \
@@ -372,6 +372,7 @@ fn session(arguments: &[String]) -> Result<(), CliError> {
         "send" => session_send(rest),
         "wait" => session_wait(rest),
         "spawn" => session_spawn(rest),
+        "run" => session_run(rest),
         "fork" => session_fork(rest),
         "release" => session_release(rest),
         "archive" => session_archive(rest),
@@ -632,6 +633,85 @@ fn session_spawn(arguments: &[String]) -> Result<(), CliError> {
         print_json(&result);
     } else if let Some(id) = result.get("id").and_then(Value::as_str) {
         println!("spawned {id}");
+    } else {
+        print_json(&result);
+    }
+    Ok(())
+}
+
+/// Everything after `--` is an argv element, never a shell command string.
+fn session_run_params(arguments: &[String]) -> Result<(Value, bool), CliError> {
+    let usage = "session run [--cwd PATH] [--host ID] [--title TEXT] [--json] -- PROGRAM [ARG ...]";
+    let Some(separator) = arguments.iter().position(|argument| argument == "--") else {
+        return Err(CliError::failure(usage));
+    };
+    let (options, command) = arguments.split_at(separator);
+    let argv = &command[1..];
+    if argv.first().is_none_or(String::is_empty) {
+        return Err(CliError::failure(
+            "session run requires a nonempty PROGRAM after --",
+        ));
+    }
+    let mut params = json!({"kind": diri_proto::AgentKind::new("generic"), "argv": argv});
+    let mut json_output = false;
+    let mut options = options.iter();
+    while let Some(option) = options.next() {
+        let field = match option.as_str() {
+            "--json" => {
+                json_output = true;
+                continue;
+            }
+            "--cwd" => "cwd",
+            "--host" => "host",
+            "--title" | "--name" => "title",
+            _ => {
+                return Err(CliError::failure(format!(
+                    "unknown session run option {option:?}; {usage}"
+                )));
+            }
+        };
+        let value = options
+            .next()
+            .filter(|value| !value.is_empty())
+            .ok_or_else(|| CliError::failure(format!("{option} requires a value")))?;
+        if params.get(field).is_some() {
+            return Err(CliError::failure(format!(
+                "{option} was supplied more than once"
+            )));
+        }
+        params[field] = json!(value);
+    }
+    if params.get("cwd").is_none() {
+        if params.get("host").is_some() {
+            return Err(CliError::failure(
+                "remote session run requires --cwd with an absolute path on that host",
+            ));
+        }
+        params["cwd"] = json!(std::env::current_dir().map_err(|error| CliError::failure(
+            format!("could not determine working directory: {error}")
+        ))?);
+    }
+    if !Path::new(params["cwd"].as_str().unwrap()).is_absolute() {
+        return Err(CliError::failure(
+            "--cwd must be an absolute path on the execution host",
+        ));
+    }
+    Ok((params, json_output))
+}
+
+fn session_run(arguments: &[String]) -> Result<(), CliError> {
+    if matches!(arguments, [help] if matches!(help.as_str(), "--help" | "-h")) {
+        println!(
+            "Usage: dirijor session run [--cwd PATH] [--host ID] [--title TEXT] [--json] -- PROGRAM [ARG ...]\n\nArguments after -- are passed literally. Completed commands retain their terminal output.\nWait for completion: dirijor session wait ID --until exited --json\nClose retained work: dirijor session release ID --remove"
+        );
+        return Ok(());
+    }
+    let (params, json_output) = session_run_params(arguments)?;
+    let result = request(Method::SESSION_SPAWN, params, Duration::from_secs(120))?;
+    if json_output {
+        print_json(&result);
+    } else if let Some(id) = result.get("id").and_then(Value::as_str) {
+        println!("started {id}");
     } else {
         print_json(&result);
     }
@@ -1363,6 +1443,63 @@ fn stdin_json(cap: usize, timeout: Duration) -> Value {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn run_keeps_every_argument_after_separator_literal() {
+        let args = [
+            "--cwd",
+            "/tmp",
+            "--title",
+            "finite work",
+            "--json",
+            "--",
+            "/bin/echo",
+            "",
+            "a b",
+            "$(touch nope)",
+            "--host",
+            "--json",
+            "--",
+            "界",
+        ]
+        .map(str::to_owned);
+        let (params, json_output) = session_run_params(&args).unwrap();
+        assert!(json_output);
+        assert_eq!(params["argv"], json!(&args[6..]));
+        assert_eq!(params["title"], "finite work");
+        assert!(params.get("host").is_none());
+    }
+
+    #[test]
+    fn run_output_flags_do_not_scan_option_values() {
+        let args = ["--title", "--json", "--", "echo"].map(str::to_owned);
+        let (params, json_output) = session_run_params(&args).unwrap();
+        assert_eq!(params["title"], "--json");
+        assert!(!json_output);
+    }
+
+    #[test]
+    fn run_rejects_incomplete_options_and_remote_local_cwd_confusion() {
+        for args in [
+            vec![],
+            vec!["echo"],
+            vec!["--"],
+            vec!["--", ""],
+            vec!["--typo", "--", "echo"],
+            vec!["--cwd", "--", "echo"],
+            vec!["--cwd", "relative", "--", "echo"],
+            vec!["--host", "server", "--", "echo"],
+            vec!["--cwd", "/tmp", "--cwd", "/var", "--", "echo"],
+        ] {
+            assert!(
+                session_run_params(&args.into_iter().map(str::to_owned).collect::<Vec<_>>())
+                    .is_err()
+            );
+        }
+        let args = ["--host", "server", "--cwd", "/srv/work", "--", "echo"].map(str::to_owned);
+        assert_eq!(session_run_params(&args).unwrap().0["host"], "server");
+    }
+
     use diri_proto::{
         AgentDescriptor, AgentKind, AgentReadinessItem, DateMillis, ProjectId, Resumability,
         SessionId, TitleSource,
