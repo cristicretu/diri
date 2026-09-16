@@ -48,7 +48,10 @@ fn project_agent_open_is_lazy_identity_bound_and_repeatable_after_restart() {
     assert_eq!(first.tabs[0].title, None);
     f.store = WorkspaceStore::new(&f.path);
     open(&mut f, &inventory(0, "local"), None);
-    assert_eq!(f.snapshot.workspaces, [first.clone()]);
+    assert_eq!(
+        f.snapshot.workspaces.as_slice(),
+        std::slice::from_ref(&first)
+    );
     open(&mut f, &inventory(1, "remote"), None);
     assert_eq!(f.snapshot.workspaces.len(), 2);
     assert_eq!(f.snapshot.workspaces[0], first);
