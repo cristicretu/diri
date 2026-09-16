@@ -370,16 +370,30 @@ fn detach_reconnect_preserves_pid_snapshot_and_input() {
         })
         .max()
         .unwrap_or(0);
-    std::thread::sleep(Duration::from_millis(100));
-    let inspection: SessionInspection = run_json(
-        "inspect",
-        &state_dir,
-        Some(&SessionSelector {
-            session_id: launch.session_id.clone(),
-            session_token: token(),
-            expected_incarnation: Some(launch.session_incarnation.clone()),
-        }),
-    );
+    // Inspection reads the asynchronous metadata checkpoint. Wait for the
+    // existing attach epoch to persist; elapsed wall time is not its receipt.
+    let selector = SessionSelector {
+        session_id: launch.session_id.clone(),
+        session_token: token(),
+        expected_incarnation: Some(launch.session_incarnation.clone()),
+    };
+    let checkpoint_deadline = Instant::now() + Duration::from_secs(2);
+    loop {
+        let checkpoint: SessionInspection = run_json("inspect", &state_dir, Some(&selector));
+        assert!(
+            checkpoint.controller_epoch <= first_epoch,
+            "inspection acquired control"
+        );
+        if checkpoint.controller_epoch == first_epoch {
+            break;
+        }
+        assert!(
+            Instant::now() < checkpoint_deadline,
+            "attach epoch was not checkpointed"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    let inspection: SessionInspection = run_json("inspect", &state_dir, Some(&selector));
     assert_eq!(
         inspection.process_state,
         RemoteProcessState::Running {
