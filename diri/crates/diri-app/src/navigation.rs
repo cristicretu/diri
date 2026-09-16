@@ -80,7 +80,7 @@ enum Overlay {
     Themes,
 }
 
-#[derive(Clone)]
+#[derive(Clone, Debug, PartialEq)]
 enum CommandSelection {
     Action(PaletteCommand),
     Session(SessionId),
@@ -110,10 +110,9 @@ pub struct NavigationOverlay {
     directory_index: DirectoryIndex,
     quick_snapshot: QuickOpenSnapshot,
     ranked_items: Vec<RankedFolder>,
-    /// Identity of the readiness facts `ranked_actions` was built from, so a
-    /// store change that cannot have altered the Agent rows does not rebuild
-    /// them. See `agent_actions_fingerprint`.
-    agent_actions_fingerprint: u64,
+    /// Readiness and displayed preference identity. Terminal output does not
+    /// rebuild ranked rows; orientation and shortcut changes do.
+    palette_context_fingerprint: u64,
     list_scroll: UniformListScrollHandle,
     tokio: Arc<tokio::runtime::Runtime>,
     history: Vec<diri_proto::HistoryEntry>,
@@ -191,7 +190,7 @@ impl NavigationOverlay {
             directory_index: DirectoryIndex::default(),
             quick_snapshot: QuickOpenSnapshot::default(),
             ranked_items: Vec::new(),
-            agent_actions_fingerprint: 0,
+            palette_context_fingerprint: 0,
             list_scroll: UniformListScrollHandle::new(),
             tokio,
             history: Vec::new(),
@@ -245,7 +244,7 @@ impl NavigationOverlay {
             directory_index: DirectoryIndex::default(),
             quick_snapshot: QuickOpenSnapshot::default(),
             ranked_items: Vec::new(),
-            agent_actions_fingerprint: 0,
+            palette_context_fingerprint: 0,
             list_scroll: UniformListScrollHandle::new(),
             tokio,
             history: Vec::new(),
@@ -278,8 +277,8 @@ impl NavigationOverlay {
     /// one of these several times a second while any session is producing
     /// output. Rebuilding on each would take a write lock, clone every project
     /// and session record, and re-rank the whole list — reordering rows under a
-    /// highlight index that is not re-anchored. Only readiness can change the
-    /// Agent rows this handler exists for, so gate on exactly that.
+    /// highlight index that is not re-anchored. Rebuild only when readiness or
+    /// displayed preference values change, retaining the highlighted command.
     fn handle_store_change(&mut self, cx: &mut Context<Self>) {
         let mut changed = {
             let store = self.store.read().expect("session store lock poisoned");
@@ -293,9 +292,9 @@ impl NavigationOverlay {
         if self.overlay == Some(Overlay::CommandPalette) {
             let fingerprint = {
                 let store = self.store.read().expect("session store lock poisoned");
-                agent_actions_fingerprint(&store)
+                palette_context_fingerprint(&store)
             };
-            if fingerprint != self.agent_actions_fingerprint {
+            if fingerprint != self.palette_context_fingerprint {
                 let highlighted = self.highlighted_command();
                 self.refresh_command_items();
                 self.restore_highlight(highlighted.as_ref());
@@ -868,10 +867,10 @@ impl NavigationOverlay {
                     }
                 }
             }
-            let fingerprint = agent_actions_fingerprint(&store);
+            let fingerprint = palette_context_fingerprint(&store);
             (actions, store.ordered_sessions(), fingerprint)
         };
-        self.agent_actions_fingerprint = fingerprint;
+        self.palette_context_fingerprint = fingerprint;
         let query = FuzzyQuery::new(self.query.text());
         let searching = !self.query.text().trim().is_empty();
         let mut ranked_actions = palette::rank_actions(actions, &query, &mut self.matcher);
@@ -1813,8 +1812,10 @@ fn shortcut_hint(text: impl Into<gpui::SharedString>, colors: SemanticColors) ->
         .into_any_element()
 }
 
-fn agent_actions_fingerprint(store: &SessionStore) -> u64 {
+fn palette_context_fingerprint(store: &SessionStore) -> u64 {
     let mut hasher = DefaultHasher::new();
+    std::mem::discriminant(&store.preferences().tab_orientation).hash(&mut hasher);
+    store.preferences().shortcut_overrides.hash(&mut hasher);
     store.preferences().default_agent.id().hash(&mut hasher);
     store.default_spawn_host().hash(&mut hasher);
     let mut targets: Vec<_> = store.agent_catalogs().iter().collect();
@@ -1921,6 +1922,81 @@ mod tests {
             assert!(layout.top_inset + px(SEARCH_HEIGHT + 13.0) + layout.list_height <= px(height));
             assert!(layout.list_height <= px(LIST_HEIGHT));
         }
+    }
+
+    #[gpui::test]
+    fn open_palette_refreshes_orientation_and_shortcuts_without_moving_highlight(
+        cx: &mut TestAppContext,
+    ) {
+        let runtime = Arc::new(StoreRuntime::inert());
+        let for_view = runtime.clone();
+        let (overlay, cx) = cx.add_window_view(move |_, cx| {
+            let mut view = NavigationOverlay::opened_for_test(for_view, cx);
+            view.query.insert("tabs");
+            view.refresh_command_items();
+            view.highlight = view
+                .ranked_actions
+                .iter()
+                .position(|r| r.item.command == PaletteCommand::Action(CommandId::HorizontalTabs))
+                .unwrap();
+            view
+        });
+        let highlighted = overlay.read_with(cx, |view, _| view.highlighted_command());
+        assert!(
+            overlay.read_with(cx, |view, _| view.ranked_actions.iter().any(|r| r
+                .item
+                .command
+                == PaletteCommand::Action(CommandId::VerticalTabs)
+                && r.item.detail.as_deref() == Some("Current")))
+        );
+        runtime
+            .store
+            .write()
+            .unwrap()
+            .update_preferences(|prefs| {
+                prefs.tab_orientation = crate::store::TabOrientation::Horizontal
+            })
+            .unwrap();
+        overlay.update(cx, |view, cx| view.handle_store_change(cx));
+        assert_eq!(
+            overlay.read_with(cx, |view, _| view.highlighted_command()),
+            highlighted
+        );
+        assert!(
+            overlay.read_with(cx, |view, _| view.ranked_actions.iter().any(|r| r
+                .item
+                .command
+                == PaletteCommand::Action(CommandId::HorizontalTabs)
+                && r.item.detail.as_deref() == Some("Current")))
+        );
+        assert!(
+            !overlay.read_with(cx, |view, _| view.ranked_actions.iter().any(|r| r
+                .item
+                .command
+                == PaletteCommand::Action(CommandId::VerticalTabs)
+                && r.item.detail.as_deref() == Some("Current")))
+        );
+        let before = overlay.read_with(cx, |view, _| view.palette_context_fingerprint);
+        runtime
+            .store
+            .write()
+            .unwrap()
+            .update_preferences(|prefs| {
+                prefs.shortcut_overrides.insert(
+                    "toggle-tab-orientation".into(),
+                    Some(crate::commands::test_chords("cmd-alt-shift-t")),
+                );
+            })
+            .unwrap();
+        overlay.update(cx, |view, cx| view.handle_store_change(cx));
+        assert_ne!(
+            overlay.read_with(cx, |view, _| view.palette_context_fingerprint),
+            before
+        );
+        assert_eq!(
+            overlay.read_with(cx, |view, _| view.highlighted_command()),
+            highlighted
+        );
     }
 
     #[gpui::test]
@@ -2046,6 +2122,16 @@ mod tests {
                             })
                             .unwrap();
                     }
+                    if std::env::var_os("DIRI_VISUAL_HORIZONTAL").is_some() {
+                        overlay
+                            .store
+                            .write()
+                            .unwrap()
+                            .update_preferences(|prefs| {
+                                prefs.tab_orientation = crate::store::TabOrientation::Horizontal
+                            })
+                            .unwrap();
+                    }
                     overlay.refresh_command_items();
                     match std::env::var("DIRI_VISUAL_PAGE").as_deref() {
                         Ok("history") => super::page_tests::seed_history(&mut overlay),
@@ -2150,14 +2236,14 @@ mod tests {
         // A store change that cannot have moved readiness must not rebuild the
         // list: these arrive on the UI tick, and re-ranking under a fixed
         // highlight index moves rows out from under the user's selection.
-        let before = overlay.read_with(cx, |overlay, _| overlay.agent_actions_fingerprint);
+        let before = overlay.read_with(cx, |overlay, _| overlay.palette_context_fingerprint);
         overlay.update(cx, |overlay, cx| {
             overlay.highlight = 1;
             overlay.handle_store_change(cx);
         });
         assert_eq!(
             overlay.read_with(cx, |overlay, _| (
-                overlay.agent_actions_fingerprint,
+                overlay.palette_context_fingerprint,
                 overlay.highlight
             )),
             (before, 1)

@@ -19,7 +19,7 @@ pub type ShortcutOverrides = BTreeMap<String, Option<String>>;
 
 static ACTIVE_SHORTCUT_OVERRIDES: OnceLock<RwLock<ShortcutOverrides>> = OnceLock::new();
 
-actions!(diri_app, [Quit, HideApp, CloseWindow]);
+actions!(diri_app, [Quit, HideApp, NewWindow, CloseWindow]);
 
 actions!(
     diri,
@@ -121,6 +121,7 @@ pub enum CommandId {
     Quit,
     HideApp,
     CloseWindow,
+    NewWindow,
     CloseSession,
     ReopenSession,
     OpenLauncher,
@@ -298,7 +299,26 @@ macro_rules! spec_with_alternates {
 pub const COMMANDS: &[CommandSpec] = &[
     spec!(Quit, "quit", Some("cmd-q"), Some("⌘Q"), None),
     spec!(HideApp, "hide-app", Some("cmd-h"), Some("⌘H"), None),
-    spec!(CloseWindow, "close-window", None, None, None),
+    spec!(
+        NewWindow,
+        "new-window",
+        Some("cmd-shift-n"),
+        Some("⇧⌘N"),
+        None,
+        "New Window",
+        "macwindow.badge.plus",
+        "window open independent view"
+    ),
+    spec!(
+        CloseWindow,
+        "close-window",
+        Some("cmd-shift-w"),
+        Some("⇧⌘W"),
+        None,
+        "Close Window",
+        "macwindow",
+        "window close keep sessions running"
+    ),
     spec!(
         CloseSession,
         "close-session",
@@ -1032,6 +1052,9 @@ impl CommandSpec {
     }
 
     pub fn shortcut_label_for(&self, overrides: &ShortcutOverrides) -> Option<String> {
+        if self.window_default_is_claimed(overrides) {
+            return None;
+        }
         match overrides.get(self.stable_id) {
             Some(None) => None,
             Some(Some(binding)) if Keystroke::parse(binding).is_ok() => Keystroke::parse(binding)
@@ -1063,6 +1086,9 @@ impl CommandSpec {
     }
 
     pub fn effective_keystrokes(&self, overrides: &ShortcutOverrides) -> Vec<String> {
+        if self.window_default_is_claimed(overrides) {
+            return Vec::new();
+        }
         match overrides.get(self.stable_id) {
             Some(None) => Vec::new(),
             Some(Some(binding)) if Keystroke::parse(binding).is_ok() => vec![binding.clone()],
@@ -1075,12 +1101,40 @@ impl CommandSpec {
         }
     }
 
+    /// These defaults are new. A binding already saved by the user wins when
+    /// upgrading; the window action remains available in menus and palette.
+    fn window_default_is_claimed(&self, overrides: &ShortcutOverrides) -> bool {
+        if !matches!(self.id, CommandId::NewWindow | CommandId::CloseWindow)
+            || overrides.contains_key(self.stable_id)
+        {
+            return false;
+        }
+        let Some(candidate) = self
+            .keystroke
+            .and_then(|key| platform_keystroke(self.id, key))
+            .and_then(|key| Keystroke::parse(&key).ok())
+        else {
+            return false;
+        };
+        overrides.iter().any(|(id, key)| {
+            id != self.stable_id
+                && COMMANDS.iter().any(|command| command.stable_id == id)
+                && key
+                    .as_ref()
+                    .and_then(|key| Keystroke::parse(key).ok())
+                    .is_some_and(|key| {
+                        key.key == candidate.key && key.modifiers == candidate.modifiers
+                    })
+        })
+    }
+
     fn key_binding(&self, key: &str) -> KeyBinding {
         let context = self.context;
         match self.id {
             CommandId::Quit => KeyBinding::new(key, Quit, context),
             CommandId::HideApp => KeyBinding::new(key, HideApp, context),
             CommandId::CloseWindow => KeyBinding::new(key, CloseWindow, context),
+            CommandId::NewWindow => KeyBinding::new(key, NewWindow, context),
             CommandId::CloseSession => KeyBinding::new(key, CloseSession, context),
             CommandId::ReopenSession => KeyBinding::new(key, ReopenSession, context),
             CommandId::OpenLauncher => KeyBinding::new(key, OpenLauncher, context),
@@ -1699,6 +1753,11 @@ impl CommandId {
                 description: "Look for a newer version of Diri",
                 category: Application,
             },
+            Self::NewWindow => ShortcutMetadata {
+                title: "New window",
+                description: "Open another window for the current workspace",
+                category: Application,
+            },
             Self::CloseWindow => ShortcutMetadata {
                 title: "Close window",
                 description: "Close the current Diri window",
@@ -1732,6 +1791,7 @@ impl CommandId {
             Self::Quit => Box::new(Quit),
             Self::HideApp => Box::new(HideApp),
             Self::CloseWindow => Box::new(CloseWindow),
+            Self::NewWindow => Box::new(NewWindow),
             Self::CloseSession => Box::new(CloseSession),
             Self::ReopenSession => Box::new(ReopenSession),
             Self::OpenLauncher => Box::new(OpenLauncher),
@@ -1856,6 +1916,40 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn new_window_defaults_preserve_existing_custom_bindings() {
+        let overrides = ShortcutOverrides::from([
+            ("open-launcher".into(), Some(test_chords("cmd-shift-n"))),
+            ("new-default".into(), Some(test_chords("cmd-shift-w"))),
+        ]);
+        for id in [CommandId::NewWindow, CommandId::CloseWindow] {
+            assert!(command(id).effective_keystrokes(&overrides).is_empty());
+            assert_eq!(command(id).shortcut_label_for(&overrides), None);
+        }
+        assert_eq!(
+            command(CommandId::OpenLauncher).effective_keystrokes(&overrides),
+            vec![test_chords("cmd-shift-n")]
+        );
+        assert_eq!(
+            shortcut_conflict(
+                CommandId::NewWindow,
+                &test_chords("cmd-shift-n"),
+                &overrides
+            )
+            .unwrap()
+            .id,
+            CommandId::OpenLauncher
+        );
+        assert_eq!(
+            command(CommandId::OpenLauncher).effective_keystrokes(&ShortcutOverrides::new()),
+            vec![test_chords("cmd-n")]
+        );
+        assert_eq!(
+            command(CommandId::CloseSession).effective_keystrokes(&ShortcutOverrides::new()),
+            vec![test_chords("cmd-w")]
+        );
     }
 
     #[test]
