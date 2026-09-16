@@ -234,7 +234,19 @@ impl SessionSurfaces {
                 )
             };
             let id = tab.id.clone();
-            let title = tab.title.unwrap_or_else(|| "Untitled tab".into());
+            let session = self
+                .store
+                .read()
+                .expect("store")
+                .sessions()
+                .get(&geometry.focused.session)
+                .cloned();
+            let title = tab
+                .title
+                .filter(|title| !title.trim().is_empty())
+                .or_else(|| session.as_ref().map(|session| display_title(session)))
+                .unwrap_or_else(|| "Unavailable agent".into());
+            let icon = Self::peek_agent_icon(session.as_deref(), colors);
             let preview = crate::workspace_preview::render_workspace_preview(
                 geometry,
                 (bounds.width - 12.0).max(1.0),
@@ -280,6 +292,7 @@ impl SessionSurfaces {
                             .bg(colors.floating_surface())
                             .text_size(px(11.0))
                             .text_color(colors.primary)
+                            .child(icon)
                             .child(div().flex_1().min_w(px(0.0)).text_ellipsis().child(title))
                             .child(
                                 div()

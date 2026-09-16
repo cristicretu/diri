@@ -39,6 +39,20 @@ fn preview_caption(
 }
 
 impl SessionSurfaces {
+    pub(super) fn peek_agent_icon(
+        session: Option<&SessionRecord>,
+        colors: SemanticColors,
+    ) -> AnyElement {
+        let mark = session.and_then(|session| ui_agent_kind(session.effective_kind()).brand_mark());
+        let icon = match mark {
+            Some(mark) => diri_ui::BrandMark::solid(mark, 14.0, colors.secondary)
+                .inset(0.08)
+                .into_any_element(),
+            None => sf_symbol("terminal", 14.0, colors.secondary),
+        };
+        div().flex_none().size(px(14.0)).child(icon).into_any_element()
+    }
+
     #[cfg(all(test, target_os = "macos"))]
     pub(crate) fn peek_state_for_test(&self) -> (bool, f32, Option<String>, usize, bool) {
         (
@@ -489,6 +503,8 @@ impl SessionSurfaces {
                             .text_color(colors.primary)
                             .overflow_hidden()
                             .whitespace_nowrap()
+                            .gap(px(6.0))
+                            .child(Self::peek_agent_icon(Some(session), colors))
                             .child(div().flex_1().min_w(px(0.0)).truncate().child(title))
                             .when_some(status, |row, status| {
                                 row.child(

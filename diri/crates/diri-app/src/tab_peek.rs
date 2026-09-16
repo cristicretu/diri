@@ -17,6 +17,69 @@ pub(crate) enum GestureFrame {
     Released(f32),
 }
 
+/// Native magnification drives the same continuous reveal as keyboard peek.
+#[derive(Default)]
+pub(crate) struct TabPinch {
+    distance: f32,
+    tracking: bool,
+    blocked: bool,
+}
+
+impl TabPinch {
+    fn reveal_distance(&self) -> f32 {
+        // Rest at the small previews before letting a deliberate deeper pinch
+        // expand the overview. Spreading back out stays direct and responsive.
+        if self.distance <= PEEK_DISTANCE {
+            self.distance
+        } else if self.distance <= 360.0 {
+            PEEK_DISTANCE + (self.distance - PEEK_DISTANCE) * 0.12
+        } else {
+            PEEK_DISTANCE + (360.0 - PEEK_DISTANCE) * 0.12
+                + (self.distance - 360.0) * 2.0
+        }
+    }
+
+    pub(crate) fn cancel(&mut self) {
+        *self = Self { blocked: true, ..Self::default() };
+    }
+
+    pub(crate) fn sample(
+        &mut self,
+        event: &gpui::PinchEvent,
+        revealed: bool,
+    ) -> Option<GestureFrame> {
+        if event.phase == gpui::TouchPhase::Started {
+            *self = Self::default();
+        }
+        if event.phase == gpui::TouchPhase::Cancelled || !event.delta.is_finite() {
+            let frame = self.tracking.then_some(GestureFrame::Cancelled);
+            self.cancel();
+            return frame;
+        }
+        if self.blocked {
+            return None;
+        }
+        // A normal pinch reaches the strip; continuing meets a resistant band.
+        self.distance -= event.delta * 1000.0;
+        if event.phase == gpui::TouchPhase::Ended {
+            let frame = self.tracking.then_some(GestureFrame::Released(self.reveal_distance()));
+            *self = Self::default();
+            return frame;
+        }
+        if !self.tracking {
+            if !revealed && self.distance < -10.0 {
+                self.cancel();
+                return None;
+            }
+            if self.distance.abs() < 10.0 {
+                return None;
+            }
+            self.tracking = true;
+        }
+        Some(GestureFrame::Tracking(self.reveal_distance()))
+    }
+}
+
 pub(crate) struct TabPeek<T = SessionId> {
     pub(crate) sessions: Vec<T>,
     pub(crate) focused: usize,
@@ -289,7 +352,7 @@ pub(crate) fn visible_card_indices<T: Clone + PartialEq>(
 
 /// Recognizes only a stable set of three contacts. Coordinates are normalized
 /// trackpad coordinates with Y up; changing finger count cancels until lifted.
-#[cfg(any(target_os = "macos", test))]
+#[cfg(test)]
 #[derive(Default)]
 pub(crate) struct ThreeFingerGesture {
     origin: Option<([u64; 3], f32, f32)>,
@@ -297,7 +360,7 @@ pub(crate) struct ThreeFingerGesture {
     recognized: bool,
     blocked: bool,
 }
-#[cfg(any(target_os = "macos", test))]
+#[cfg(test)]
 impl ThreeFingerGesture {
     pub(crate) fn sample(
         &mut self,

@@ -16,7 +16,7 @@ mod empty_workbench;
 mod external_drop;
 pub mod fonts;
 pub mod fuzzy;
-#[cfg(any(target_os = "macos", test))]
+#[cfg(test)]
 mod gesture_delivery;
 mod git_review;
 pub mod history;

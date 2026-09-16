@@ -232,10 +232,7 @@ pub struct RootView {
     terminal: Option<Entity<TerminalPane>>,
     navigation: Option<Entity<NavigationOverlay>>,
     session_surfaces: Option<Entity<SessionSurfaces>>,
-    #[cfg(target_os = "macos")]
-    _tab_gesture: Option<crate::macos::tab_gesture::TabGestureBridge>,
-    #[cfg(target_os = "macos")]
-    _tab_gesture_task: Option<Task<()>>,
+    tab_pinch: crate::tab_peek::TabPinch,
     utility_surfaces: Option<Entity<UtilitySurfaces>>,
     launcher: Entity<LauncherOverlay>,
     inspector: Option<Entity<WorkbenchInspector>>,
@@ -845,10 +842,7 @@ impl RootView {
 
         let activation = cx.observe_window_activation(window, move |this, window, cx| {
             if !window.is_window_active() {
-                #[cfg(target_os = "macos")]
-                if let Some(bridge) = &this._tab_gesture {
-                    bridge.cancel();
-                }
+                this.tab_pinch.cancel();
                 if let Some(surfaces) = &this.session_surfaces {
                     surfaces.update(cx, |s, cx| s.cancel_tab_peek_immediately(cx));
                 }
@@ -1163,15 +1157,8 @@ impl RootView {
             cx.observe(surfaces, move |_this, surfaces, cx| {
                 let visible = surfaces.read(cx).tab_peek_visible();
                 let offset = surfaces.read(cx).tab_peek_offset(cx);
-                #[cfg(target_os = "macos")]
-                if let Some(bridge) = &_this._tab_gesture {
-                    bridge.set_revealed(visible);
-                }
                 if was_visible && !visible {
-                    #[cfg(target_os = "macos")]
-                    if let Some(bridge) = &_this._tab_gesture {
-                        bridge.cancel();
-                    }
+                    _this.tab_pinch.cancel();
                 }
                 // Output only repaints the preview entity. Root layout needs
                 // invalidation solely when terminal placement changes.
@@ -1198,55 +1185,6 @@ impl RootView {
                         }
                     })
                 });
-        #[cfg(target_os = "macos")]
-        let (tab_gesture, tab_gesture_task) = if !preview
-            && let Some((bridge, mut frames)) =
-                crate::macos::tab_gesture::TabGestureBridge::install(window)
-        {
-            let task = cx.spawn_in(window, async move |this, cx| {
-                while let Some(batch) = frames.recv().await {
-                    if this
-                        .update_in(cx, |this, window, cx| {
-                            if window.is_window_active()
-                                && !this.launcher.read(cx).is_open()
-                                && !this
-                                    .navigation
-                                    .as_ref()
-                                    .is_some_and(|v| v.read(cx).is_open())
-                                && !this
-                                    .utility_surfaces
-                                    .as_ref()
-                                    .is_some_and(|v| v.read(cx).is_open())
-                                && !this.notification_panel_open
-                                && this.sidebar.read(cx).pending_close_copy().is_none()
-                                && this.quote_target_picker.is_none()
-                                && this.resize_origin.is_none()
-                                && this.terminal_resize_origin.is_none()
-                                && this.inspector_resize_origin.is_none()
-                                && let Some(surfaces) = &this.session_surfaces
-                            {
-                                surfaces.update(cx, |surfaces, cx| {
-                                    for sample in batch.iter() {
-                                        surfaces.tab_gesture_at(
-                                            sample.frame,
-                                            sample.observed_at,
-                                            cx,
-                                        );
-                                    }
-                                    surfaces.sync_tab_peek_focus(window, cx);
-                                });
-                            }
-                        })
-                        .is_err()
-                    {
-                        break;
-                    }
-                }
-            });
-            (Some(bridge), Some(task))
-        } else {
-            (None, None)
-        };
         let mut root = Self {
             spawn_owner: window_store.owner(),
             window_store,
@@ -1261,10 +1199,7 @@ impl RootView {
             terminal,
             navigation,
             session_surfaces,
-            #[cfg(target_os = "macos")]
-            _tab_gesture: tab_gesture,
-            #[cfg(target_os = "macos")]
-            _tab_gesture_task: tab_gesture_task,
+            tab_pinch: Default::default(),
             utility_surfaces,
             launcher,
             inspector,
@@ -4020,6 +3955,41 @@ impl RootView {
     }
 }
 
+impl RootView {
+    fn handle_tab_pinch(
+        &mut self,
+        event: &gpui::PinchEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let allowed = window.is_window_active()
+            && !self.launcher.read(cx).is_open()
+            && !self.navigation.as_ref().is_some_and(|v| v.read(cx).is_open())
+            && !self.utility_surfaces.as_ref().is_some_and(|v| v.read(cx).is_open())
+            && !self.notification_panel_open
+            && self.sidebar.read(cx).pending_close_copy().is_none()
+            && self.quote_target_picker.is_none()
+            && self.resize_origin.is_none()
+            && self.terminal_resize_origin.is_none()
+            && self.inspector_resize_origin.is_none();
+        let Some(surfaces) = self.session_surfaces.clone() else {
+            return;
+        };
+        if !allowed {
+            self.tab_pinch.cancel();
+            return;
+        }
+        let revealed = surfaces.read(cx).tab_peek_visible();
+        if let Some(frame) = self.tab_pinch.sample(event, revealed) {
+            surfaces.update(cx, |surfaces, cx| {
+                surfaces.tab_gesture(frame, cx);
+                surfaces.sync_tab_peek_focus(window, cx);
+            });
+            cx.stop_propagation();
+        }
+    }
+}
+
 impl Render for RootView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         if self.pending_notification_open.is_some()
@@ -4216,6 +4186,7 @@ impl Render for RootView {
         let mut root = div()
             .id("root")
             .key_context(key_context)
+            .capture_pinch(cx.listener(Self::handle_tab_pinch))
             .relative()
             .size_full()
             // Real SF Pro (registered from SFNS.ttf at startup) for every UI

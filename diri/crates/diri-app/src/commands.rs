@@ -409,7 +409,7 @@ pub const COMMANDS: &[CommandSpec] = &[
         Some(APP_CONTEXT),
         "Peek Tabs",
         "rectangle.stack",
-        "preview overview gesture three finger swipe"
+        "preview overview gesture two finger pinch"
     ),
     spec!(
         ReviewLaunches,
