@@ -4,7 +4,9 @@ use std::io::{self, Read, Write};
 use std::os::fd::AsRawFd;
 use std::path::Path;
 use std::process::{Child, Command, Stdio};
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, LazyLock};
+mod reap;
+use reap::{Budget, Permit};
 use std::time::{Duration, Instant};
 
 use diri_proto::process_facts::{
@@ -15,8 +17,7 @@ use diri_proto::process_facts::{
 pub const WORKER_FLAG: &str = "--account-facts";
 const TIMEOUT: Duration = Duration::from_millis(250);
 const MAX_TIMEOUT: Duration = Duration::from_secs(1);
-static ACTIVE: AtomicUsize = AtomicUsize::new(0);
-const MAX_ACTIVE: usize = 4;
+static BUDGET: LazyLock<Arc<Budget>> = LazyLock::new(|| Arc::new(Budget::default()));
 
 pub fn parse_uid(raw: &str) -> io::Result<u32> {
     if raw.is_empty() || !raw.bytes().all(|byte| byte.is_ascii_digit()) {
@@ -33,27 +34,13 @@ pub fn parse_uid(raw: &str) -> io::Result<u32> {
     })
 }
 
-struct Permit<'a>(&'a AtomicUsize);
-impl<'a> Permit<'a> {
-    fn acquire(counter: &'a AtomicUsize) -> Option<Self> {
-        counter
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |active| {
-                (active < MAX_ACTIVE).then_some(active + 1)
-            })
-            .ok()
-            .map(|_| Self(counter))
-    }
-}
-impl Drop for Permit<'_> {
-    fn drop(&mut self) {
-        self.0.fetch_sub(1, Ordering::AcqRel);
-    }
-}
-
 /// Called by the narrow hidden mode in the existing Rust helper binaries.
 /// This function may block; never call it inside an Engine or Holder loop.
 pub fn run_worker(uid: u32, output: &mut (impl Write + ?Sized)) -> io::Result<()> {
-    output.write_all(&encode_account_reply(super::value(native_account(uid)))?)
+    let encoded = encode_account_reply(super::value(native_account(uid))).or_else(|_| {
+        encode_account_reply(ProcessValue::unavailable(UnavailableReason::InvalidData))
+    })?;
+    output.write_all(&encoded)
 }
 
 pub fn lookup(executable: &Path, uid: u32) -> ProcessValue<ProcessAccount> {
@@ -67,42 +54,39 @@ pub fn lookup_until(
     uid: u32,
     deadline: Instant,
 ) -> ProcessValue<ProcessAccount> {
-    let Some(permit) = Permit::acquire(&ACTIVE) else {
+    let Some(permit) = BUDGET.acquire() else {
         return ProcessValue::unavailable(UnavailableReason::Busy);
     };
     let mut command = Command::new(executable);
     command.arg(WORKER_FLAG).arg(uid.to_string()).env_clear();
-    // The permit remains held until lookup_command has killed/reaped any
-    // timed-out worker. Repeated requests cannot accumulate abandoned threads.
+    // A timed-out worker keeps this permit through asynchronous reap. New
+    // requests cannot accumulate unbounded workers behind stalled cleanup.
     match lookup_command_admitted(
         command,
         uid,
         deadline.min(Instant::now() + MAX_TIMEOUT),
-        Some(permit),
+        permit,
     ) {
         Ok(result) => result,
         Err(error) => super::value::<ProcessAccount>(Err(error)),
     }
 }
 
-struct OwnedWorker<'a> {
-    child: Child,
-    permit: Option<Permit<'a>>,
+struct OwnedWorker {
+    child: Option<Child>,
+    permit: Option<Permit>,
 }
-impl Drop for OwnedWorker<'_> {
+impl Drop for OwnedWorker {
     fn drop(&mut self) {
-        let reaped = if matches!(self.child.try_wait(), Ok(Some(_))) {
-            true
-        } else {
-            let _ = self.child.kill();
-            self.child.wait().is_ok()
-        };
-        if !reaped && let Some(permit) = self.permit.take() {
-            // An OS-level failure to verify reaping must not admit another
-            // worker over this slot. This bounded capacity stays unavailable
-            // until process restart, rather than accumulating uncertain work.
-            std::mem::forget(permit);
+        let mut child = self.child.take().expect("owned worker");
+        if matches!(child.try_wait(), Ok(Some(_))) {
+            return;
         }
+        let _ = child.kill();
+        if matches!(child.try_wait(), Ok(Some(_))) {
+            return;
+        }
+        self.permit.take().expect("worker admission").reap(child);
     }
 }
 
@@ -112,14 +96,19 @@ fn lookup_command(
     uid: u32,
     deadline: Instant,
 ) -> io::Result<ProcessValue<ProcessAccount>> {
-    lookup_command_admitted(command, uid, deadline, None)
+    lookup_command_admitted(
+        command,
+        uid,
+        deadline,
+        Arc::new(Budget::default()).acquire().unwrap(),
+    )
 }
 
 fn lookup_command_admitted(
     mut command: Command,
     uid: u32,
     deadline: Instant,
-    permit: Option<Permit<'_>>,
+    permit: Permit,
 ) -> io::Result<ProcessValue<ProcessAccount>> {
     let check_deadline = || {
         if Instant::now() >= deadline {
@@ -137,11 +126,13 @@ fn lookup_command_admitted(
         .stdout(Stdio::piped())
         .stderr(Stdio::null());
     let mut child = OwnedWorker {
-        child: command.spawn()?,
-        permit,
+        child: Some(command.spawn()?),
+        permit: Some(permit),
     };
     let mut output = child
         .child
+        .as_mut()
+        .expect("owned worker")
         .stdout
         .take()
         .ok_or_else(|| io::Error::other("account worker stdout missing"))?;
@@ -174,7 +165,7 @@ fn lookup_command_admitted(
                 Err(error) => return Err(error),
             }
         }
-        if let Some(status) = child.child.try_wait()? {
+        if let Some(status) = child.child.as_mut().expect("owned worker").try_wait()? {
             check_deadline()?;
             if !status.success() {
                 return Err(io::Error::new(
@@ -276,21 +267,6 @@ mod tests {
         let mut command = Command::new("/bin/sh");
         command.arg("-c").arg(script);
         command
-    }
-
-    #[test]
-    fn account_worker_admission_is_capped_and_released_by_ownership() {
-        let counter = AtomicUsize::new(0);
-        let mut permits: Vec<_> = (0..MAX_ACTIVE)
-            .map(|_| Permit::acquire(&counter).unwrap())
-            .collect();
-        assert!(Permit::acquire(&counter).is_none());
-        permits.pop();
-        let last = Permit::acquire(&counter).unwrap();
-        assert_eq!(counter.load(Ordering::Acquire), MAX_ACTIVE);
-        drop(last);
-        drop(permits);
-        assert_eq!(counter.load(Ordering::Acquire), 0);
     }
 
     #[test]
