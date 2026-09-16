@@ -18,7 +18,8 @@ use crate::grid::{GridCodecError, GridUpdate};
 use crate::terminal::MouseModes;
 
 pub const PROTOCOL_MAJOR: u16 = 1;
-pub const PROTOCOL_MINOR: u16 = 10;
+pub const PROTOCOL_MINOR: u16 = 12;
+pub const STOP_SESSION_PROTOCOL_MINOR: u16 = 12;
 pub const PROCESS_IDENTITY_PROTOCOL_MINOR: u16 = 10;
 pub const INPUT_MODES_PROTOCOL_MINOR: u16 = 9;
 pub const TERMINAL_ANNOTATIONS_PROTOCOL_MINOR: u16 = 6;
@@ -54,6 +55,7 @@ const KIND_SCROLLBACK_REQUEST: u8 = 43;
 const KIND_SCROLLBACK_RESPONSE: u8 = 44;
 const KIND_FOREGROUND_PROCESS: u8 = 45;
 const KIND_INPUT_MODES: u8 = 46;
+const KIND_STOP_SESSION: u8 = 47;
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -85,6 +87,8 @@ pub enum RemoteCapability {
     InputModes,
     #[serde(rename = "process-identity-v1")]
     ProcessIdentity,
+    #[serde(rename = "stop-session-v1")]
+    StopSession,
     IncrementalGrid,
     ProcessExit,
     Signal,
@@ -124,6 +128,7 @@ impl RemoteCapability {
             Self::TerminalAnnotations => "terminal-annotations-v1",
             Self::InputModes => "terminal-input-modes-v1",
             Self::ProcessIdentity => "process-identity-v1",
+            Self::StopSession => "stop-session-v1",
             Self::FullSnapshot => "full-snapshot",
             Self::IncrementalGrid => "incremental-grid",
             Self::ProcessExit => "process-exit",
@@ -188,6 +193,7 @@ pub const ANNOTATED_HOLDER_CAPABILITIES: &[RemoteCapability] = &[
     RemoteCapability::TerminalAnnotations,
     RemoteCapability::InputModes,
     RemoteCapability::ProcessIdentity,
+    RemoteCapability::StopSession,
 ];
 pub const ANNOTATED_HELPER_CAPABILITIES: &[RemoteCapability] = &[
     RemoteCapability::FullSnapshot,
@@ -206,6 +212,7 @@ pub const ANNOTATED_HELPER_CAPABILITIES: &[RemoteCapability] = &[
     RemoteCapability::TerminalAnnotations,
     RemoteCapability::InputModes,
     RemoteCapability::ProcessIdentity,
+    RemoteCapability::StopSession,
 ];
 
 /// Authentication bearer shared only by the local Engine and one Holder.
@@ -765,6 +772,13 @@ pub struct Signal {
     pub signal: i32,
 }
 
+/// Explicit destructive lifecycle request, admitted by the current Holder owner.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct StopSession {
+    pub controller_epoch: u64,
+}
+
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct AcquireControl {
@@ -805,11 +819,23 @@ pub struct RemoteError {
 pub enum RemoteManagementFailure {
     HolderUnavailable,
     ProcessIdentityUnavailable,
+    StopUnsupported,
+    StopPending,
+    StopIdentityMismatch,
 }
 
 impl std::fmt::Display for RemoteManagementFailure {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            Self::StopUnsupported => {
+                formatter.write_str("remote Holder does not support identity-safe stop")
+            }
+            Self::StopPending => {
+                formatter.write_str("remote stop has not completed; no Agent exit is asserted")
+            }
+            Self::StopIdentityMismatch => {
+                formatter.write_str("remote session identity changed while stopping")
+            }
             Self::HolderUnavailable => {
                 formatter.write_str("remote Holder owner is unavailable; Agent exit is unknown")
             }
@@ -826,6 +852,9 @@ impl RemoteManagementFailure {
         let kind = match self {
             Self::HolderUnavailable => std::io::ErrorKind::NotConnected,
             Self::ProcessIdentityUnavailable => std::io::ErrorKind::NotFound,
+            Self::StopUnsupported => std::io::ErrorKind::Unsupported,
+            Self::StopPending => std::io::ErrorKind::TimedOut,
+            Self::StopIdentityMismatch => std::io::ErrorKind::InvalidData,
         };
         std::io::Error::new(kind, self)
     }
@@ -868,6 +897,7 @@ pub enum RemoteMessage {
     GridDelta(GridDelta),
     ProcessExit(ProcessExit),
     Signal(Signal),
+    StopSession(StopSession),
     AcquireControl(AcquireControl),
     ControlGranted(ControlGranted),
     ControlRevoked(ControlRevoked),
@@ -1041,6 +1071,9 @@ impl RemoteCodec {
                 append_json(KIND_PROCESS_EXIT, value, output, start)
             }
             RemoteMessage::Signal(value) => append_json(KIND_SIGNAL, value, output, start),
+            RemoteMessage::StopSession(value) => {
+                append_json(KIND_STOP_SESSION, value, output, start)
+            }
             RemoteMessage::AcquireControl(value) => {
                 validate_identifier("client nonce", &value.client_nonce)?;
                 append_json(KIND_ACQUIRE_CONTROL, value, output, start)
@@ -1248,6 +1281,7 @@ fn decode_message(kind: u8, payload: &[u8]) -> Result<RemoteMessage, RemoteCodec
         }
         KIND_PROCESS_EXIT => Ok(RemoteMessage::ProcessExit(decode_json(kind, payload)?)),
         KIND_SIGNAL => Ok(RemoteMessage::Signal(decode_json(kind, payload)?)),
+        KIND_STOP_SESSION => Ok(RemoteMessage::StopSession(decode_json(kind, payload)?)),
         KIND_ACQUIRE_CONTROL => {
             let value: AcquireControl = decode_json(kind, payload)?;
             validate_identifier("client nonce", &value.client_nonce)?;
@@ -1275,7 +1309,7 @@ fn decode_message(kind: u8, payload: &[u8]) -> Result<RemoteMessage, RemoteCodec
 
 fn validate_kind(kind: u8) -> Result<(), RemoteCodecError> {
     if (1..=FrameType::Mouse as u8).contains(&kind)
-        || (KIND_HELLO..=KIND_INPUT_MODES).contains(&kind)
+        || (KIND_HELLO..=KIND_STOP_SESSION).contains(&kind)
     {
         Ok(())
     } else {
@@ -1451,6 +1485,21 @@ mod tests {
                 vec![message.clone()]
             );
             assert_eq!(codec.buffered_len(), 0);
+        }
+    }
+
+    #[test]
+    fn stop_session_round_trips_its_controller_epoch() {
+        let message = RemoteMessage::StopSession(StopSession {
+            controller_epoch: 42,
+        });
+        let encoded = RemoteCodec::encode(&message).unwrap();
+        assert_eq!(encoded[0], KIND_STOP_SESSION);
+        for split in 0..=encoded.len() {
+            let mut codec = RemoteCodec::new();
+            let mut decoded = codec.feed(&encoded[..split]).unwrap();
+            decoded.extend(codec.feed(&encoded[split..]).unwrap());
+            assert_eq!(decoded, vec![message.clone()]);
         }
     }
 

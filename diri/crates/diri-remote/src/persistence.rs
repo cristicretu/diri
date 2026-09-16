@@ -212,6 +212,49 @@ pub fn cleanup_holder(session_id: &str) {
     cleanup_supervisor_label(&supervisor_label("holder", session_id));
 }
 
+/// Stop cleanup is bounded by the management request. The spawned utility is
+/// owned and unreaped until this function completes; it never targets a stored
+/// Holder or Agent PID.
+pub(crate) fn cleanup_holder_until(session_id: &str, deadline: Instant) -> io::Result<()> {
+    wait_cleanup_command(
+        cleanup_command(&supervisor_label("holder", session_id)),
+        deadline,
+    )
+}
+
+fn wait_cleanup_command(mut command: Command, deadline: Instant) -> io::Result<()> {
+    let expired = || {
+        io::Error::new(
+            io::ErrorKind::TimedOut,
+            "transient supervisor cleanup timed out",
+        )
+    };
+    if Instant::now() >= deadline {
+        return Err(expired());
+    }
+    let mut child = command
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()?;
+    loop {
+        match child.try_wait()? {
+            Some(_) if Instant::now() < deadline => return Ok(()),
+            Some(_) => return Err(expired()),
+            None if Instant::now() >= deadline => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(expired());
+            }
+            None => std::thread::sleep(
+                deadline
+                    .saturating_duration_since(Instant::now())
+                    .min(Duration::from_millis(10)),
+            ),
+        }
+    }
+}
+
 fn wait_for_witness(path: &Path, expected_pid: Option<u32>) -> io::Result<PersistenceProbeResult> {
     let deadline = Instant::now() + STARTUP_TIMEOUT;
     while Instant::now() < deadline {
@@ -270,20 +313,26 @@ fn cleanup_supervisor(nonce: &str) {
 }
 
 fn cleanup_supervisor_label(label: &str) {
+    let _ = cleanup_command(label)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status();
+}
+
+fn cleanup_command(label: &str) -> Command {
     #[cfg(target_os = "linux")]
-    let _ = Command::new("systemctl")
-        .args(["--user", "stop", label])
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status();
+    {
+        let mut command = Command::new("systemctl");
+        command.args(["--user", "stop", label]);
+        command
+    }
     #[cfg(target_os = "macos")]
-    let _ = Command::new("launchctl")
-        .args(["remove", label])
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status();
+    {
+        let mut command = Command::new("launchctl");
+        command.args(["remove", label]);
+        command
+    }
 }
 
 fn supervisor_label(kind: &str, id: &str) -> String {
@@ -307,4 +356,35 @@ fn read_state(path: &Path) -> io::Result<WitnessState> {
     let bytes = fs::read(path)?;
     serde_json::from_slice(&bytes)
         .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))
+}
+
+#[cfg(test)]
+mod stop_cleanup_tests {
+    use super::*;
+    #[test]
+    fn cleanup_rejects_expired_deadline_and_reaps_owned_utility() {
+        assert_eq!(
+            wait_cleanup_command(Command::new("/usr/bin/true"), Instant::now())
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::TimedOut
+        );
+        assert!(
+            wait_cleanup_command(
+                Command::new("/usr/bin/true"),
+                Instant::now() + Duration::from_secs(1)
+            )
+            .is_ok()
+        );
+        let mut sleep = Command::new("/bin/sleep");
+        sleep.arg("1");
+        let start = Instant::now();
+        assert_eq!(
+            wait_cleanup_command(sleep, start + Duration::from_millis(20))
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::TimedOut
+        );
+        assert!(start.elapsed() < Duration::from_millis(500));
+    }
 }

@@ -1150,6 +1150,31 @@ execution in the client. A HelloAck birth is captured origin metadata, not an
 independent liveness assertion; mode/grid readiness still uses the existing
 validated snapshot boundary. Foreground identifiers remain process-group IDs.
 
+### Identity-safe explicit stop (protocol minor 12)
+
+`stop-session-v1` adds StopSession (frame 47) to the existing authenticated
+controller channel. Explicit `kill` may revoke the previous controller, validates
+captured birth/build/incarnation again in HelloAck, and asks the Holder owner loop
+to stop. Only the unreaped owned child may receive TERM, followed after 500 ms by
+KILL if needed. The timer exists only while a stop is active. New attaches cannot
+replace a stopping controller. The Holder persists actual exit facts and drained
+PTY tail before releasing ownership; it gives queued final frames a bounded
+500 ms drain before closing. No management process signals a numeric Agent or
+Holder PID. Missing capabilities fail closed; no raw-signal fallback is allowed.
+
+The management request releases the launch lock while waiting, so the Holder's
+existing checkpoint worker can publish exit facts. A five-second request bound
+includes lock acquisition and protocol reads. Success requires a recorded exit
+and released ownership for the same authenticated incarnation/build/birth;
+EOF, signal acceptance, timeout, and lock loss are never invented exit facts.
+Pending/unavailable outcomes are structured failures and never replay uncertain
+input. Already-recorded exits with no owner remain idempotent successes.
+
+A controller Signal is rejected after the Holder has reaped its child, including
+the interval where trailing PTY output still delays the final ProcessExit
+publication. The exit-watcher ownership boundary is authoritative here; a
+presentation state that still says Running does not protect a reusable PGID.
+
 Remote `inspect` treats a missing Holder ownership lock as an unavailable owner,
 not as evidence that the Agent exited. If the last persisted fact is Running,
 it returns nonzero with the additive JSON management error
@@ -1216,6 +1241,13 @@ An inherited `DIRIJOR_SOCKET` equal to the app's ordinary socket does not bypass
 this startup verification: Agents launched by Diri inherit that path, and an
 app started from their environment must still refresh an outdated Engine.
 Only a different, explicitly supplied socket skips app-owned supervision.
+
+The Engine preserves the validated stop response through RemoteSessionClient and
+both terminate paths. It rejects Helpers older than minor 12 and responses with
+a different session/build/incarnation or ambiguous exit fields. Controller
+revocation can prevent the old attach from receiving ProcessExit, so its missing
+event is never replaced with a synthetic SIGKILL. A cleanup failure can preserve
+only an already-observed exit.
 
 ## Tailscale, iPhone Companion, and `diri-node`
 
