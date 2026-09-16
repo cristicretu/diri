@@ -7,6 +7,11 @@ mod workspace_launches;
 #[cfg(all(test, target_os = "macos"))]
 mod workspace_palette_tests;
 
+#[cfg(all(test, target_os = "macos"))]
+mod gesture_acceptance_tests;
+#[cfg(all(test, target_os = "macos"))]
+mod gesture_schedule_profile;
+
 use std::collections::HashSet;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -1758,9 +1763,13 @@ impl RootView {
         if let Some(surfaces) = &self.session_surfaces
             && surfaces.read(cx).tab_peek_visible()
         {
-            surfaces.update(cx, |surfaces, cx| {
-                surfaces.handle_key_down(event, window, cx)
-            });
+            if commands::matches_keystroke(CommandId::ToggleTabOrientation, &event.keystroke) {
+                self.run_command(CommandId::ToggleTabOrientation, window, cx);
+            } else {
+                surfaces.update(cx, |surfaces, cx| {
+                    surfaces.handle_key_down(event, window, cx)
+                });
+            }
             cx.stop_propagation();
             return;
         }

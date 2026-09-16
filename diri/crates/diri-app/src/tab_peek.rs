@@ -89,10 +89,6 @@ impl<T: Clone + PartialEq> TabPeek<T> {
         now: Instant,
         reduced_motion: bool,
     ) {
-        if reduced_motion {
-            self.update(frame);
-            return;
-        }
         self.advance_motion(now);
         match frame {
             GestureFrame::Tracking(distance) if distance.is_finite() => {
@@ -120,11 +116,11 @@ impl<T: Clone + PartialEq> TabPeek<T> {
                 } else {
                     OVERVIEW_DISTANCE
                 };
-                self.animate_to(target, now, false);
+                self.animate_to(target, now, reduced_motion);
             }
             _ => {
                 if !self.closing {
-                    self.animate_to(0.0, now, false);
+                    self.animate_to(0.0, now, reduced_motion);
                 }
             }
         }
@@ -135,6 +131,7 @@ impl<T: Clone + PartialEq> TabPeek<T> {
             .unwrap_or(0);
         self.sessions = sessions;
     }
+    #[cfg(test)]
     pub(crate) fn update(&mut self, frame: GestureFrame) {
         self.settle = None;
         self.closing = false;
@@ -389,6 +386,30 @@ mod tests {
     fn touches(x: f32, y: f32) -> Vec<(u64, f32, f32)> {
         (1..=3).map(|id| (id, x, y)).collect()
     }
+    #[test]
+    fn reduced_motion_preserves_relative_strokes_and_release_thresholds() {
+        let now = Instant::now();
+        let mut peek = TabPeek::default();
+        let sessions = vec![SessionId::new("a"), SessionId::new("b")];
+        peek.begin(sessions.clone(), sessions.first());
+        peek.animate_to(OVERVIEW_DISTANCE, now, true);
+        peek.update_animated(GestureFrame::Tracking(-100.0), now, true);
+        assert_eq!(peek.distance, 280.0);
+        assert!(peek.visible());
+        peek.update_animated(GestureFrame::Tracking(-200.0), now, true);
+        assert_eq!(peek.distance, 180.0);
+        peek.update_animated(GestureFrame::Released(-200.0), now, true);
+        assert_eq!(peek.distance, PEEK_DISTANCE);
+        assert!(!peek.is_settling());
+        assert_eq!(peek.sessions, sessions);
+        assert_eq!(peek.selected(), sessions.first().cloned());
+        peek.update_animated(GestureFrame::Tracking(-120.0), now, true);
+        assert_eq!(peek.distance, 20.0);
+        peek.update_animated(GestureFrame::Released(-120.0), now, true);
+        assert!(!peek.paint_visible());
+        assert!(peek.sessions.is_empty());
+    }
+
     #[test]
     fn ordinary_scroll_and_upward_or_horizontal_swipes_do_not_reveal() {
         let mut gesture = ThreeFingerGesture::default();

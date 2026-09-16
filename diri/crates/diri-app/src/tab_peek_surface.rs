@@ -5,6 +5,41 @@ use crate::tab_peek::{
 use gpui::App;
 
 impl SessionSurfaces {
+    #[cfg(all(test, target_os = "macos"))]
+    pub(crate) fn peek_state_for_test(&self) -> (bool, f32, Option<String>, usize, bool) {
+        (
+            self.peek.visible(),
+            self.peek.overview(),
+            self.peek.selected().map(|item| match item {
+                PeekItem::Session(id) => id.0,
+                PeekItem::Tab(id) => id.0,
+            }),
+            self.peek.sessions.len(),
+            self.peek.is_settling(),
+        )
+    }
+
+    #[cfg(all(test, target_os = "macos"))]
+    pub(crate) fn peek_card_center_for_test(
+        &self,
+        index: usize,
+        window: &Window,
+        cx: &App,
+    ) -> gpui::Point<gpui::Pixels> {
+        let bounds = card_rect(
+            index,
+            self.peek.sessions.len(),
+            self.peek_width,
+            (f32::from(window.viewport_size().height) - self.peek_top).max(0.0),
+            &self.peek,
+            cx.reduce_motion(),
+        );
+        point(
+            px(self.peek_left + bounds.x + bounds.width / 2.0),
+            px(self.peek_top + bounds.y + bounds.height / 2.0) + self.peek_scroll.offset().y,
+        )
+    }
+
     pub(super) fn dismiss_tab_peek(&mut self, cx: &mut Context<Self>) {
         if self.peek.is_closing() {
             return;

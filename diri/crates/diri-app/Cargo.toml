@@ -9,6 +9,11 @@ license.workspace = true
 name = "diri"
 path = "src/main.rs"
 
+[[test]]
+name = "tab_gesture_appkit"
+path = "tests/tab_gesture_appkit.rs"
+harness = false
+
 [features]
 default = ["audio-playback"]
 audio-playback = []
@@ -57,7 +62,7 @@ url.workspace = true
 
 [dev-dependencies]
 diri-engine.workspace = true
-gpui = { workspace = true, features = ["test-support"] }
+gpui = { workspace = true, features = ["test-support", "bench"] }
 gpui_platform = { workspace = true, features = ["test-support"] }
 # Pauses the clock so the notification settle window is exercised without
 # spending its wall-clock duration in the test suite.
