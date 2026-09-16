@@ -984,8 +984,11 @@ Ordinary queued frames retain at most 1 MiB and 64 frame references per sink.
 One larger valid frame (up to the existing 16 MiB protocol payload limit) may be
 queued with 64 bytes of mode/control overhead. Already-written prefixes still
 count toward retained allocation until their complete frame is released. The
-pump services each sink for at most 256 KiB or 1 ms per turn; it retries at 1 ms
-only while data remains pending. Empty queues use the existing GridWake sleep.
+pump services each sink for at most 256 KiB or 1 ms per turn. While bytes remain
+pending it waits for socket writability, bounded to 1 ms so new grid activity and
+shutdown remain responsive. Publication coalescing retains dirty state while
+queued bytes continue draining; it cannot suspend output behind its 8 ms timer.
+Empty queues use the existing GridWake sleep. No locks are held during poll.
 A sink that exceeds its bound or makes no write progress for two seconds closes;
 the client reconnects and receives a FullSnapshot. Partial frames are never
 spliced with a replacement. Queueing seeds moves all socket I/O outside the
@@ -997,6 +1000,11 @@ p90 below 150 ms, validates fragmented input, and reconnects to a FullSnapshot
 with the same process identity. Queue tests verify exact partial-frame bytes,
 retained-byte bounds, overflow closure and the no-progress timeout. These are
 Engine-local tests, separate from the Helper/UDS and real SSH release gates.
+A second real-PTY regression streams 120 dense colored frames into both 80×24
+and 160×50 receive-only previews with an 8 KiB socket send buffer. The producer
+and Engine must reach the final frame, and the drained preview must remain
+connected and show progress throughout the run. This catches artificial write
+retry delays that otherwise overflow a healthy reader on large grids.
 
 
 ### Receive-only desktop previews

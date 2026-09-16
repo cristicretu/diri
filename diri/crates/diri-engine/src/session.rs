@@ -436,22 +436,6 @@ impl GridWake {
         grid_wake_event(&state, observed)
     }
 
-    pub(crate) fn wait_for_priority_or_timeout(
-        &self,
-        observed: u64,
-        timeout: Duration,
-    ) -> GridWakeEvent {
-        let state = self.inner.state.lock().expect("grid wake");
-        let (state, _) = self
-            .inner
-            .changed
-            .wait_timeout_while(state, timeout, |state| {
-                state.interactive_budget == 0 || state.generation == observed
-            })
-            .expect("grid wake");
-        grid_wake_event(&state, observed)
-    }
-
     pub(crate) fn same_source(&self, other: &Self) -> bool {
         Arc::ptr_eq(&self.inner, &other.inner)
     }
@@ -3907,12 +3891,12 @@ mod grid_wake_tests {
         let observed = wake.generation();
         wake.prioritize_interactive_changes();
 
-        let unchanged = wake.wait_for_priority_or_timeout(observed, Duration::from_millis(1));
+        let unchanged = wake.wait_for_change(observed, Duration::from_millis(1));
         assert_eq!(unchanged.generation, observed);
         assert!(!unchanged.interactive);
 
         wake.notify();
-        let changed = wake.wait_for_priority_or_timeout(observed, Duration::from_secs(1));
+        let changed = wake.wait_for_change(observed, Duration::from_secs(1));
         assert!(changed.generation > observed);
         assert!(changed.interactive);
 
