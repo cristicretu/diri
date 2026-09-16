@@ -1311,8 +1311,13 @@ impl Sidebar {
             }))
             .pr(px(10.0))
             .child(
-                div().absolute().left(px(0.0)).right(px(0.0)).bottom(px(0.0))
-                    .h(px(1.0)).bg(colors.primary.alpha(0.07)),
+                div()
+                    .absolute()
+                    .left(px(0.0))
+                    .right(px(0.0))
+                    .bottom(px(0.0))
+                    .h(px(1.0))
+                    .bg(colors.primary.alpha(0.07)),
             )
             .bg(colors.sidebar_surface())
             .child(self.project_control(colors, cx))

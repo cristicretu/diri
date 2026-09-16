@@ -3,7 +3,7 @@ mod project_picker;
 mod tabs;
 mod workspaces;
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
 use std::sync::{Arc, RwLock};
@@ -23,8 +23,8 @@ use gpui::{
     Anchor, Animation, AnimationExt, AnyElement, App, AppContext as _, Bounds, Context,
     CursorStyle, Entity, EventEmitter, ExternalPaths, FocusHandle, Focusable, FontWeight, Hsla,
     IntoElement, MouseButton, PathPromptOptions, Pixels, Point, Render, Rgba, Role, ScrollHandle,
-    SharedString, Task, Window, anchored, deferred, div, linear_color_stop, linear_gradient, point,
-    prelude::*, px,
+    SharedString, Task, WeakEntity, Window, anchored, deferred, div, linear_color_stop,
+    linear_gradient, point, prelude::*, px,
 };
 use tokio::sync::mpsc;
 
@@ -262,6 +262,16 @@ pub struct Sidebar {
     /// Window-space row bounds from the latest prepaint. Keyboard navigation
     /// uses these to reveal only rows that actually crossed the viewport edge.
     row_bounds: Rc<RefCell<HashMap<SessionId, Bounds<Pixels>>>>,
+    /// Window-space bounds of rows that are not sessions (project headers)
+    /// from the latest prepaint, so they can take part in the edge fade.
+    fade_bounds: Rc<RefCell<HashMap<SharedString, Bounds<Pixels>>>>,
+    /// The session list's viewport from the latest prepaint.
+    fade_viewport: Rc<Cell<Option<Bounds<Pixels>>>>,
+    /// Whether rows fade themselves at the list edges. On a glass window a
+    /// gradient painted over the rows only adds coverage, so each row lowers
+    /// its own opacity instead; opaque windows keep the painted masks.
+    fade_glass: bool,
+    weak_self: WeakEntity<Self>,
     /// The ghost following the pointer during a drag, kept so a cancel can
     /// hide it before GPUI lets go of the gesture.
     drag_preview: Option<Entity<DragPreview>>,
@@ -416,6 +426,10 @@ impl Sidebar {
             filter_focus: cx.focus_handle(),
             filter_generation: 0,
             row_bounds: Rc::new(RefCell::new(HashMap::new())),
+            fade_bounds: Rc::new(RefCell::new(HashMap::new())),
+            fade_viewport: Rc::new(Cell::new(None)),
+            fade_glass: false,
+            weak_self: cx.entity().downgrade(),
             drag_preview: None,
             directory_scroll: ScrollHandle::new(),
             glyphs: HashMap::new(),
@@ -2104,6 +2118,15 @@ impl Sidebar {
                     move || format!("PROJECT_{}", id.0)
                 })
                 .relative()
+                .opacity(
+                    self.edge_fade_alpha(
+                        self.fade_bounds
+                            .borrow()
+                            .get(&SharedString::from(format!("project:{}", id.0)))
+                            .copied(),
+                    ),
+                )
+                .child(self.fade_probe(SharedString::from(format!("project:{}", id.0))))
                 .px(px(Space::ROW_H))
                 .h(px(SIDEBAR_NAV_ROW_HEIGHT))
                 .flex()
@@ -2602,13 +2625,19 @@ impl Sidebar {
         insertion: Option<(DropZone, u16)>,
     ) -> AnyElement {
         let bounds = Rc::clone(&self.row_bounds);
+        let alpha = self.edge_fade_alpha(bounds.borrow().get(&id).copied());
+        let weak = self.weak_self.clone();
         div()
             .w_full()
             .flex_none()
             .relative()
-            .on_children_prepainted(move |children, _, _| {
+            .opacity(alpha)
+            .on_children_prepainted(move |children, window, _| {
                 if let Some(row) = children.first().copied() {
-                    bounds.borrow_mut().insert(id.clone(), row);
+                    let changed = bounds.borrow_mut().insert(id.clone(), row) != Some(row);
+                    if changed {
+                        Self::refresh_on_next_frame(&weak, window);
+                    }
                 }
             })
             .child(row)
@@ -2616,6 +2645,63 @@ impl Sidebar {
                 element.child(insertion_marker(zone, depth))
             })
             .into_any_element()
+    }
+
+    /// Height of the band in which rows dissolve at either list edge.
+    const EDGE_FADE_HEIGHT: f32 = 28.0;
+    /// Scroll distance over which an edge fade reaches full strength, so a
+    /// list at rest shows its first and last rows whole.
+    const EDGE_FADE_RAMP: f32 = 14.0;
+
+    /// Opacity for a row whose window-space `bounds` came from the previous
+    /// prepaint. Rows near a scrolled edge dissolve over
+    /// [`Self::EDGE_FADE_HEIGHT`]; everything else paints in full.
+    fn edge_fade_alpha(&self, bounds: Option<Bounds<Pixels>>) -> f32 {
+        if !self.fade_glass {
+            return 1.0;
+        }
+        let (Some(viewport), Some(row)) = (self.fade_viewport.get(), bounds) else {
+            return 1.0;
+        };
+        let scrolled = f32::from(self.list_scroll.offset().y).min(0.0).abs();
+        let remaining = (f32::from(self.list_scroll.max_offset().y) - scrolled).max(0.0);
+        let top_strength = (scrolled / Self::EDGE_FADE_RAMP).min(1.0);
+        let bottom_strength = (remaining / Self::EDGE_FADE_RAMP).min(1.0);
+        let center = f32::from(row.origin.y) + f32::from(row.size.height) / 2.0;
+        let top = f32::from(viewport.origin.y);
+        let bottom = top + f32::from(viewport.size.height);
+        let top_t = ((center - top) / Self::EDGE_FADE_HEIGHT).clamp(0.0, 1.0);
+        let bottom_t = ((bottom - center) / Self::EDGE_FADE_HEIGHT).clamp(0.0, 1.0);
+        let top_alpha = 1.0 - top_strength * (1.0 - top_t);
+        let bottom_alpha = 1.0 - bottom_strength * (1.0 - bottom_t);
+        top_alpha.min(bottom_alpha)
+    }
+
+    /// Row opacities come from the previous frame's bounds, so a frame whose
+    /// prepaint moved a row schedules one more render to settle them.
+    fn refresh_on_next_frame(weak: &WeakEntity<Self>, window: &mut Window) {
+        let weak = weak.clone();
+        window.on_next_frame(move |_, cx| {
+            let _ = weak.update(cx, |_, cx| cx.notify());
+        });
+    }
+
+    /// An invisible probe that records the bounds of the row it is absolutely
+    /// positioned inside, for rows that are not tracked as sessions.
+    fn fade_probe(&self, key: SharedString) -> impl IntoElement {
+        let bounds = Rc::clone(&self.fade_bounds);
+        let weak = self.weak_self.clone();
+        gpui::canvas(
+            move |row, window, _| {
+                let changed = bounds.borrow_mut().insert(key.clone(), row) != Some(row);
+                if changed {
+                    Self::refresh_on_next_frame(&weak, window);
+                }
+            },
+            |_, _, _, _| (),
+        )
+        .absolute()
+        .inset_0()
     }
 
     /// Decides what a release over `row` would do right now. Only the row
@@ -5410,6 +5496,10 @@ impl Sidebar {
     /// Top/bottom gradient masks over the session list, each fading in over the
     /// first few pixels of travel so a list that fits shows neither.
     fn scroll_fades(&self, colors: SemanticColors) -> Vec<AnyElement> {
+        if self.fade_glass {
+            // Rows lower their own opacity at the edges (`edge_fade_alpha`).
+            return Vec::new();
+        }
         const HEIGHT: f32 = 28.0;
         /// Scroll distance over which a mask reaches full strength.
         const RAMP: f32 = 14.0;
@@ -6694,6 +6784,7 @@ fn reveal_tracked_row(
 impl Render for Sidebar {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         self.reconcile_workspace_navigation(cx);
+        self.fade_glass = self.colors().material() == diri_ui::Material::Glass;
         self.working_row_rendered = false;
         self.disclosure_animating = false;
         if cx.reduce_motion() {
@@ -6934,6 +7025,8 @@ impl Render for Sidebar {
             } else {
                 // Rows dissolve into the chrome at both ends of the scroll
                 // instead of being sliced off by the container edge.
+                let viewport = Rc::clone(&self.fade_viewport);
+                let weak = self.weak_self.clone();
                 body = body.child(
                     div()
                         .relative()
@@ -6941,6 +7034,14 @@ impl Render for Sidebar {
                         .min_h(px(0.0))
                         .flex()
                         .flex_col()
+                        .on_children_prepainted(move |children, window, _| {
+                            if let Some(list) = children.first().copied()
+                                && viewport.get() != Some(list)
+                            {
+                                viewport.set(Some(list));
+                                Self::refresh_on_next_frame(&weak, window);
+                            }
+                        })
                         .children(list)
                         .children(self.scroll_fades(colors)),
                 );
