@@ -308,6 +308,7 @@ fn mutate(
             state.workspaces.insert(index, record);
         }
         CreateTab {
+            select,
             workspace_id,
             session_id,
             title,
@@ -326,7 +327,9 @@ fn mutate(
                 focused_pane: pane_id,
                 zoomed_pane: None,
             });
-            workspace.selected_tab = Some(tab_id);
+            if select || workspace.selected_tab.is_none() {
+                workspace.selected_tab = Some(tab_id);
+            }
         }
         RenameTab { tab_id, title } => {
             tab(state, &tab_id)?.title = title;
@@ -525,6 +528,7 @@ mod tests {
         }
         fn create_tab(&mut self, workspace_id: WorkspaceId, session: usize) -> (TabId, PaneId) {
             self.apply(CreateTab {
+                select: true,
                 workspace_id: workspace_id.clone(),
                 session_id: SessionId::new(format!("session_{session}")),
                 title: None,
@@ -791,6 +795,30 @@ mod tests {
     }
 
     #[test]
+    fn background_tab_creation_preserves_selection_and_old_wire_defaults_to_select() {
+        let mut f = Fixture::new();
+        let workspace = f.create_workspace("Work");
+        let (original, _) = f.create_tab(workspace.clone(), 0);
+        f.apply(CreateTab {
+            select: false,
+            workspace_id: workspace.clone(),
+            session_id: SessionId::new("session_1"),
+            title: None,
+        });
+        assert_eq!(f.snapshot.workspaces[0].selected_tab, Some(original));
+        assert_eq!(f.snapshot.workspaces[0].tabs.len(), 2);
+        assert_eq!(f.store.snapshot().unwrap(), f.snapshot);
+        let old_wire = serde_json::json!({"type":"createTab", "workspaceId":workspace, "sessionId":"session_2", "title":null});
+        let mutation = serde_json::from_value(old_wire).unwrap();
+        assert!(matches!(mutation, CreateTab { select: true, .. }));
+        f.apply(mutation);
+        assert_eq!(
+            f.snapshot.workspaces[0].selected_tab.as_ref(),
+            Some(&f.snapshot.workspaces[0].tabs[2].id)
+        );
+    }
+
+    #[test]
     fn removal_race_keeps_unavailable_reference_and_never_recreates_session() {
         let mut f = Fixture::new();
         let workspace = f.create_workspace("Work");
@@ -803,6 +831,7 @@ mod tests {
                 WorkspaceMutationParams {
                     expected_revision: f.snapshot.revision,
                     mutation: CreateTab {
+                        select: true,
                         workspace_id: workspace.clone(),
                         session_id: SessionId::new("session_0"),
                         title: None,
@@ -818,6 +847,7 @@ mod tests {
         });
         f.reject(
             CreateTab {
+                select: true,
                 workspace_id: workspace,
                 session_id: SessionId::new("session_0"),
                 title: None,

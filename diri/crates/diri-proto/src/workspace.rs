@@ -130,6 +130,9 @@ pub enum WorkspaceMutation {
         index: usize,
     },
     CreateTab {
+        /// Existing clients select by default; delayed launches may append in the background.
+        #[serde(default = "select_created_tab")]
+        select: bool,
         workspace_id: WorkspaceId,
         session_id: SessionId,
         title: Option<String>,
@@ -193,4 +196,8 @@ pub enum WorkspaceMutation {
 pub struct WorkspaceMutationParams {
     pub expected_revision: u64,
     pub mutation: WorkspaceMutation,
+}
+
+fn select_created_tab() -> bool {
+    true
 }

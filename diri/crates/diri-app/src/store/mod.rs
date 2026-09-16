@@ -3,6 +3,7 @@
 mod prefs;
 mod projection;
 mod residency;
+mod workspace_spawn;
 mod workspaces;
 
 use std::collections::{HashMap, HashSet};
@@ -37,6 +38,9 @@ pub use prefs::{
 };
 pub use projection::{SidebarProject, SidebarProjection, SidebarRow};
 pub use residency::{ResidencyUpdate, TerminalResidency};
+pub use workspace_spawn::{
+    SpawnOwner, WorkspaceSpawnReceipt, WorkspaceSpawnState, WorkspaceSpawnTarget,
+};
 pub use workspaces::{WorkspaceCatalog, WorkspaceCatalogStatus};
 
 pub const AUXILIARY_TERMINAL_TITLE: &str = "Terminal";
@@ -123,6 +127,10 @@ pub enum StoreEffect {
         title: String,
     },
     Spawn(SessionSpawnParams),
+    WorkspaceSpawn {
+        id: u64,
+        params: Option<SessionSpawnParams>,
+    },
     /// A shell owned by a workbench pane. Unlike a top-level spawn, its
     /// response must not replace the selected sidebar session.
     SpawnAuxiliary {
@@ -251,6 +259,7 @@ pub struct WorktreeSpawn {
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct SpawnOptions {
+    pub workspace_target: Option<WorkspaceSpawnTarget>,
     pub account_profile_id: Option<String>,
     pub cwd: Option<String>,
     pub worktree: Option<WorktreeSpawn>,
@@ -306,6 +315,7 @@ fn repo_target_key(host: Option<&str>) -> String {
 /// Pure application model. Side effects are emitted onto a channel for the daemon adapter.
 pub struct SessionStore {
     workspaces: WorkspaceCatalog,
+    workspace_spawns: workspace_spawn::WorkspaceSpawns,
     daemon_state: DaemonState,
     session_list_hydrated: bool,
     daemon_identity: Option<HelloResult>,
@@ -412,6 +422,7 @@ impl SessionStore {
         (
             Self {
                 workspaces: WorkspaceCatalog::default(),
+                workspace_spawns: workspace_spawn::WorkspaceSpawns::default(),
                 daemon_state: DaemonState::Connecting,
                 session_list_hydrated: false,
                 daemon_identity: None,
@@ -2337,7 +2348,13 @@ impl SessionStore {
     }
 
     pub fn spawn_kind(&mut self, kind: AgentKind, options: SpawnOptions) {
-        self.emit(StoreEffect::Spawn(self.spawn_params(kind, options)));
+        let target = options.workspace_target.clone();
+        let params = self.spawn_params(kind, options);
+        if let Some(target) = target {
+            self.request_workspace_spawn(target, params);
+        } else {
+            self.emit(StoreEffect::Spawn(params));
+        }
     }
 
     /// Shared launch resolution for queued actions and acknowledged composers.
@@ -2346,6 +2363,17 @@ impl SessionStore {
         kind: AgentKind,
         options: SpawnOptions,
     ) -> SessionSpawnParams {
+        let local_context = options
+            .workspace_target
+            .as_ref()
+            .and_then(|target| self.workspace_spawn_source(target))
+            .map(|session| {
+                if session.host.is_none() {
+                    session.cwd.clone()
+                } else {
+                    self.local_fallback_directory()
+                }
+            });
         let host = options.host;
         let cwd = if let Some(host_id) = &host {
             // Remote spawn: local directories are meaningless — use the
@@ -2355,7 +2383,10 @@ impl SessionStore {
                 .or_else(|| self.host(host_id).and_then(|host| host.default_cwd.clone()))
                 .unwrap_or_else(|| "~".to_owned())
         } else {
-            options.cwd.unwrap_or_else(|| self.active_directory())
+            options
+                .cwd
+                .or(local_context)
+                .unwrap_or_else(|| self.active_directory())
         };
         // Worktrees are a local-git feature; drop them for remote spawns (the
         // daemon rejects the combination outright).
@@ -3130,7 +3161,15 @@ async fn run_effects(
     snapshot_tx: tokio::sync::watch::Sender<StoreSnapshot>,
     status_tx: broadcast::Sender<StatusTransition>,
 ) {
-    while let Some(effect) = effects.recv().await {
+    let mut workspace_tasks = tokio::task::JoinSet::new();
+    loop {
+        // Reap completed handles before admitting another effect, so a burst
+        // of fast launches cannot retain an unbounded completed task set.
+        while workspace_tasks.try_join_next().is_some() {}
+        let effect = tokio::select! {
+            effect = effects.recv() => match effect { Some(effect) => effect, None => break },
+            _ = workspace_tasks.join_next(), if !workspace_tasks.is_empty() => continue,
+        };
         let action_context = action_context(&effect);
         let force_snapshot = matches!(
             &effect,
@@ -3183,6 +3222,16 @@ async fn run_effects(
             StoreEffect::Archive(id) => client.archive(&id).await,
             StoreEffect::Unarchive(id) => client.unarchive(&id).await,
             StoreEffect::Rename { id, title } => client.rename(&id, title).await,
+            StoreEffect::WorkspaceSpawn { id, params } => {
+                workspace_tasks.spawn(workspace_spawn::run(
+                    id,
+                    params,
+                    client.clone(),
+                    store.clone(),
+                    change_tx.clone(),
+                ));
+                Ok(())
+            }
             StoreEffect::Spawn(params) => match client.spawn(params).await {
                 Ok(id) => {
                     // The authoritative record still arrives through session.updated.
@@ -3448,6 +3497,7 @@ fn action_context(effect: &StoreEffect) -> Option<ActionContext> {
         ),
         StoreEffect::ReopenLast => ("Reopen session failed", None),
         StoreEffect::UiChanged
+        | StoreEffect::WorkspaceSpawn { .. }
         | StoreEffect::RefreshWorkspaces { .. }
         | StoreEffect::MutateWorkspace { .. }
         | StoreEffect::PublishSnapshot

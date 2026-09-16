@@ -94,6 +94,7 @@ struct PageState {
 }
 
 pub struct NavigationOverlay {
+    workspace_spawn_target: Option<crate::store::WorkspaceSpawnTarget>,
     focus_handle: FocusHandle,
     previous_focus_handle: Option<FocusHandle>,
     store: Arc<RwLock<SessionStore>>,
@@ -142,6 +143,13 @@ pub struct NavigationOverlay {
 }
 
 impl NavigationOverlay {
+    pub(crate) fn set_workspace_spawn_target(
+        &mut self,
+        target: Option<crate::store::WorkspaceSpawnTarget>,
+    ) {
+        self.workspace_spawn_target = target;
+    }
+
     pub fn new(
         runtime: Arc<StoreRuntime>,
         tokio: Arc<tokio::runtime::Runtime>,
@@ -169,6 +177,7 @@ impl NavigationOverlay {
             }
         });
         let mut overlay = Self {
+            workspace_spawn_target: None,
             focus_handle,
             previous_focus_handle: None,
             store: Arc::clone(&runtime.store),
@@ -222,6 +231,7 @@ impl NavigationOverlay {
                 .unwrap(),
         );
         Self {
+            workspace_spawn_target: None,
             focus_handle: cx.focus_handle(),
             previous_focus_handle: None,
             store: Arc::clone(&runtime.store),
@@ -678,6 +688,7 @@ impl NavigationOverlay {
                     let launched = {
                         let mut store = self.store.write().expect("session store lock poisoned");
                         let options = SpawnOptions {
+                            workspace_target: self.workspace_spawn_target.clone(),
                             cwd: Some(cwd),
                             ..SpawnOptions::default()
                         };
@@ -762,6 +773,7 @@ impl NavigationOverlay {
                 {
                     let mut store = self.store.write().expect("session store lock poisoned");
                     let mut options = SpawnOptions {
+                        workspace_target: self.workspace_spawn_target.clone(),
                         cwd: cwd.map(|path| path.to_string_lossy().into_owned()),
                         host: host.clone(),
                         ..SpawnOptions::default()
@@ -770,7 +782,10 @@ impl NavigationOverlay {
                     // chosen and the spawn targets a remote host (or the
                     // active session lives on one), keep the active REPO —
                     // the daemon resolves its checkout on the target host.
-                    let selected = store.selected_session();
+                    let selected = self.workspace_spawn_target.as_ref().map_or_else(
+                        || store.selected_session(),
+                        |target| store.workspace_spawn_source(target),
+                    );
                     let active_host = selected.and_then(|session| session.host.clone());
                     if options.cwd.is_none() && (host.is_some() || active_host.is_some()) {
                         options.same_repo_as = selected.map(|session| session.id.clone());

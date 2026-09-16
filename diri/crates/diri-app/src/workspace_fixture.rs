@@ -92,6 +92,7 @@ impl LiveWorkspace {
         });
         let workspace = snapshot.workspaces[0].id.clone();
         let snapshot = apply(WorkspaceMutation::CreateTab {
+            select: true,
             workspace_id: workspace.clone(),
             session_id: SessionId::new("build"),
             title: Some("Build and review".into()),
@@ -203,6 +204,69 @@ impl LiveWorkspace {
             _resources: resources,
         }
     }
+    pub(crate) fn held_spawn(&self) -> HeldLaunch {
+        use std::os::unix::fs::PermissionsExt;
+        let repo = self.directory.path().join("held-repo");
+        std::fs::create_dir(&repo).unwrap();
+        for args in [
+            vec!["init", "--initial-branch=main"],
+            vec![
+                "-c",
+                "user.name=Test",
+                "-c",
+                "user.email=test@example.invalid",
+                "-c",
+                "commit.gpgsign=false",
+                "commit",
+                "--allow-empty",
+                "-m",
+                "fixture",
+            ],
+        ] {
+            assert!(
+                std::process::Command::new("git")
+                    .args(args)
+                    .current_dir(&repo)
+                    .output()
+                    .unwrap()
+                    .status
+                    .success()
+            );
+        }
+        let entered = self.directory.path().join("held-entered");
+        let release = self.directory.path().join("held-release");
+        let quote = |path: &std::path::Path| {
+            format!("'{}'", path.to_string_lossy().replace('\'', "'\"'\"'"))
+        };
+        let hook = repo.join(".git/hooks/post-checkout");
+        std::fs::write(
+            &hook,
+            format!(
+                "#!/bin/sh\ntouch {}\nwhile [ ! -f {} ]; do sleep 0.01; done\n",
+                quote(&entered),
+                quote(&release)
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&hook, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let params = self.services.store.store.read().unwrap().spawn_params(
+            diri_proto::AgentKind::SHELL,
+            crate::store::SpawnOptions {
+                cwd: Some(repo.to_string_lossy().into_owned()),
+                worktree: Some(crate::store::WorktreeSpawn {
+                    create: true,
+                    branch: Some("held-spawn".into()),
+                }),
+                ..Default::default()
+            },
+        );
+        HeldLaunch {
+            params,
+            entered,
+            release,
+        }
+    }
+
     pub(crate) fn verify_geometry(&self, expected: &[(SessionId, u16, u16)]) {
         for (id, cols, rows) in expected {
             assert_eq!(
@@ -247,11 +311,39 @@ impl Drop for ServerResources {
         for socket in self.sockets.lock().unwrap().iter() {
             let _ = socket.shutdown(std::net::Shutdown::Both);
         }
-        for id in ["build", "review"] {
-            let _ = self.registry.lock().unwrap().terminate(id, Duration::ZERO);
+        let ids: Vec<_> = self
+            .registry
+            .lock()
+            .unwrap()
+            .records()
+            .into_iter()
+            .map(|record| record.id)
+            .collect();
+        for id in ids {
+            let _ = self
+                .registry
+                .lock()
+                .unwrap()
+                .terminate(&id.0, Duration::ZERO);
         }
         if let Some(server) = self.server.take() {
             let _ = server.join();
         }
+    }
+}
+
+pub(crate) struct HeldLaunch {
+    pub params: diri_proto::SessionSpawnParams,
+    pub entered: std::path::PathBuf,
+    release: std::path::PathBuf,
+}
+impl HeldLaunch {
+    pub fn release(&self) {
+        std::fs::write(&self.release, "release").unwrap();
+    }
+}
+impl Drop for HeldLaunch {
+    fn drop(&mut self) {
+        let _ = std::fs::write(&self.release, "release");
     }
 }
