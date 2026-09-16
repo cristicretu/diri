@@ -1541,7 +1541,7 @@ dependencies = [
 
 [[package]]
 name = "diri-app"
-version = "0.7.4"
+version = "0.8.0"
 dependencies = [
  "base64 0.23.1",
  "block2 0.6.2",
