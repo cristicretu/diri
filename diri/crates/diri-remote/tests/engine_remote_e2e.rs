@@ -19,6 +19,13 @@ use diri_proto::remote_pty::{
 };
 use diri_proto::{HostEntry, SessionStatus};
 
+fn unique_stop_session_id(label: &str) -> String {
+    let mut nonce = [0u8; 16];
+    getrandom::fill(&mut nonce).expect("fixture nonce");
+    let suffix: String = nonce.iter().map(|byte| format!("{byte:02x}")).collect();
+    format!("{label}-{suffix}")
+}
+
 fn helper() -> &'static str {
     env!("CARGO_BIN_EXE_diri-remote")
 }
@@ -955,7 +962,7 @@ fn engine_terminate_uses_stop_result_after_controller_revocation() {
     };
     let installed = manager.ensure_helper(&host).unwrap();
     let request = LaunchRequest {
-        session_id: "stop-facts".into(),
+        session_id: unique_stop_session_id("stop-facts"),
         session_token: token_for_retry(),
         argv: vec![
             "/bin/sh".into(),
