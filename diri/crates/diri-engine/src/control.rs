@@ -2198,6 +2198,14 @@ impl ControlServer {
                 .into_iter()
                 .find(|record| record.id.0 == p.session_id.0)
                 .ok_or_else(|| ControlError::not_found(p.session_id.0.clone()))?;
+            if record.remote_connection.is_some_and(|connection| {
+                connection.state == diri_proto::RemoteConnectionState::Failed
+            }) {
+                return Err(ControlError::new(
+                    "remote_transport_failed",
+                    "Remote transport failed; the Agent's last state is preserved.",
+                ));
+            }
             // Presence in the registry is not liveness: only an explicit kill
             // removes a session, so an agent that died on its own is still in
             // the map. Returning here on presence alone would hand back the
@@ -3331,6 +3339,7 @@ pub(crate) fn new_record(id: &str, kind: &str, cwd: &str) -> diri_proto::Session
         archived_at: None,
         host: None,
         remote_persistence: None,
+        remote_connection: None,
         hibernation: None,
         memory_bytes: None,
         artifacts: None,
@@ -3468,6 +3477,15 @@ fn migrate_control_error(error: crate::migrate::MigrateError) -> ControlError {
 }
 
 fn io_control_error(error: std::io::Error) -> ControlError {
+    if error
+        .get_ref()
+        .is_some_and(|cause| cause.is::<crate::remote::client::RemoteTransportFailed>())
+    {
+        return ControlError::new(
+            "remote_transport_failed",
+            "Remote transport failed; the Agent's last state is preserved.",
+        );
+    }
     match error.kind() {
         std::io::ErrorKind::NotFound => ControlError::not_found(error.to_string()),
         _ => ControlError::internal(error.to_string()),
@@ -3918,6 +3936,37 @@ mod tests {
     use super::*;
 
     #[test]
+    fn failed_remote_state_times_out_exit_wait_and_returns_a_structured_resume_error() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut registry = Registry::new(engine(), temp.path().join("state.json"));
+        let mut record = test_record("failed-remote");
+        record.host = Some("fixture".into());
+        record.status = diri_proto::SessionStatus::Unknown;
+        record.remote_connection = Some(diri_proto::RemoteConnection {
+            state: diri_proto::RemoteConnectionState::Failed,
+            since: diri_proto::DateMillis(123.0),
+        });
+        registry.insert_record(record);
+        let server = ControlServer::new(Arc::new(Mutex::new(registry)), temp.path().join("socket"));
+        let result = server
+            .events_wait(Some(serde_json::json!({
+                "sessionID":"failed-remote", "until":["exited"], "timeoutMs":0,
+            })))
+            .unwrap();
+        assert_eq!(result["timedOut"], true);
+        assert_eq!(result["session"]["remoteConnection"]["state"], "failed");
+        let error = server
+            .session_resume(Some(serde_json::json!({"sessionID":"failed-remote"})))
+            .unwrap_err();
+        assert_eq!(error.code, "remote_transport_failed");
+        let error = io_control_error(std::io::Error::new(
+            std::io::ErrorKind::NotConnected,
+            crate::remote::client::RemoteTransportFailed,
+        ));
+        assert_eq!(error.code, "remote_transport_failed");
+    }
+
+    #[test]
     fn explicit_launch_argv_is_literal_and_never_silently_repaired() {
         assert!(decode_launch_argv(&json!({})).unwrap().is_empty());
         let arguments = vec!["/bin/echo", "", "a b", "$(touch nope)", "--host", "界"];
@@ -4009,6 +4058,7 @@ mod tests {
             archived_at: None,
             host: None,
             remote_persistence: None,
+            remote_connection: None,
             hibernation: None,
             memory_bytes: None,
             artifacts: None,
