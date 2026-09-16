@@ -152,8 +152,7 @@ fn validate(state: &WorkspaceSnapshot) -> Result<(), ControlError> {
             if let Some(title) = &tab.title {
                 name(title)?;
             }
-            let mut sessions = HashSet::new();
-            validate_node(&tab.layout, 0, &mut seen, &mut sessions)?;
+            validate_node(&tab.layout, 0, &mut seen)?;
             let ids = tree::panes(&tab.layout);
             if ids.len() > MAX_TAB_PANES
                 || tab
@@ -173,7 +172,6 @@ fn validate_node(
     node: &LayoutNode,
     depth: usize,
     seen: &mut HashSet<String>,
-    sessions: &mut HashSet<SessionId>,
 ) -> Result<(), ControlError> {
     if depth >= MAX_LAYOUT_DEPTH {
         return Err(invalid("layout tree is too deep"));
@@ -181,11 +179,10 @@ fn validate_node(
     match node {
         LayoutNode::Pane { id, session_id } => {
             identity(&id.0, seen)?;
-            if session_id.0.is_empty()
-                || session_id.0.len() > 128
-                || !sessions.insert(session_id.clone())
-            {
-                return Err(invalid("a session may appear only once within a tab"));
+            // Pane identity is unique; a saved pane is a reference to a session.
+            // Repeated references share one controller and do not spawn another PTY.
+            if session_id.0.is_empty() || session_id.0.len() > 128 {
+                return Err(invalid("invalid session reference"));
             }
         }
         LayoutNode::Split {
@@ -199,8 +196,8 @@ fn validate_node(
             if !fraction.is_finite() || !(0.1..=0.9).contains(fraction) {
                 return Err(invalid("split fraction must be between 0.1 and 0.9"));
             }
-            validate_node(first, depth + 1, seen, sessions)?;
-            validate_node(second, depth + 1, seen, sessions)?;
+            validate_node(first, depth + 1, seen)?;
+            validate_node(second, depth + 1, seen)?;
         }
     }
     Ok(())
@@ -666,19 +663,23 @@ mod tests {
     }
 
     #[test]
-    fn invalid_moves_and_duplicate_sessions_are_atomic() {
+    fn repeated_session_references_keep_unique_panes_and_invalid_moves_are_atomic() {
         let mut f = Fixture::new();
         let workspace = f.create_workspace("Work");
         let (tab, pane) = f.create_tab(workspace, 0);
-        f.reject(
-            SplitPane {
-                tab_id: tab.clone(),
-                target: pane.clone(),
-                session_id: SessionId::new("session_0"),
-                edge: DockEdge::Right,
-            },
-            "invalid_workspace",
-        );
+        f.apply(SplitPane {
+            tab_id: tab.clone(),
+            target: pane.clone(),
+            session_id: SessionId::new("session_0"),
+            edge: DockEdge::Right,
+        });
+        let saved = &f.snapshot.workspaces[0].tabs[0];
+        let panes = tree::panes(&saved.layout);
+        assert_eq!(panes.len(), 2);
+        assert_ne!(panes[0], panes[1]);
+        assert_eq!(f.store.snapshot().unwrap(), f.snapshot);
+        assert_eq!(f.sessions.len(), 12);
+
         f.reject(
             MoveNode {
                 source_tab: tab.clone(),
