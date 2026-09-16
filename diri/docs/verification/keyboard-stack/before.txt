@@ -1,0 +1,18 @@
+running 1 test
+test term::tests::keyboard_stack_overflow_preserves_titles_and_evicts_only_oldest_modes ... FAILED
+
+failures:
+
+---- term::tests::keyboard_stack_overflow_preserves_titles_and_evicts_only_oldest_modes stdout ----
+
+thread 'term::tests::keyboard_stack_overflow_preserves_titles_and_evicts_only_oldest_modes' (3258950) panicked at src/term/mod.rs:1430:44:
+removal index (is 0) should be < len (is 0)
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+
+failures:
+    term::tests::keyboard_stack_overflow_preserves_titles_and_evicts_only_oldest_modes
+
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 143 filtered out; finished in 0.00s
+
+error: test failed, to rerun pass `--lib`

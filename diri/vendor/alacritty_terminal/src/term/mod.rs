@@ -1427,7 +1427,7 @@ impl<T: EventListener> Handler for Term<T> {
         trace!("Pushing `{mode:?}` keyboard mode into the stack");
 
         if self.keyboard_mode_stack.len() >= KEYBOARD_MODE_STACK_MAX_DEPTH {
-            let removed = self.title_stack.remove(0);
+            let removed = self.keyboard_mode_stack.remove(0);
             trace!(
                 "Removing '{removed:?}' from bottom of keyboard mode stack that exceeds its \
                  maximum depth"
@@ -3750,6 +3750,45 @@ mod tests {
         term.title = Some("Test".into());
         term.set_title(None);
         assert_eq!(term.title, None);
+    }
+
+    #[test]
+    fn keyboard_stack_overflow_preserves_titles_and_evicts_only_oldest_modes() {
+        let size = TermSize::new(7, 17);
+        let mut term = Term::new(
+            Config {
+                kitty_keyboard: true,
+                ..Config::default()
+            },
+            &size,
+            VoidListener,
+        );
+        term.push_keyboard_mode(KeyboardModes::DISAMBIGUATE_ESC_CODES);
+        // An empty title stack must not make the 4,097th keyboard push panic.
+        for _ in 0..KEYBOARD_MODE_STACK_MAX_DEPTH {
+            term.push_keyboard_mode(KeyboardModes::REPORT_EVENT_TYPES);
+        }
+        assert_eq!(
+            term.keyboard_mode_stack.len(),
+            KEYBOARD_MODE_STACK_MAX_DEPTH
+        );
+        assert!(term.title_stack.is_empty());
+        assert!(
+            term.keyboard_mode_stack
+                .iter()
+                .all(|mode| *mode == KeyboardModes::REPORT_EVENT_TYPES)
+        );
+        term.set_title(Some("saved window title".into()));
+        term.push_title();
+        term.push_keyboard_mode(KeyboardModes::REPORT_ALL_KEYS_AS_ESC);
+        assert_eq!(term.title_stack, vec![Some("saved window title".into())]);
+        assert_eq!(
+            term.keyboard_mode_stack.len(),
+            KEYBOARD_MODE_STACK_MAX_DEPTH
+        );
+        term.pop_keyboard_modes(1);
+        assert!(term.mode.contains(TermMode::REPORT_EVENT_TYPES));
+        assert!(!term.mode.contains(TermMode::REPORT_ALL_KEYS_AS_ESC));
     }
 
     #[test]
