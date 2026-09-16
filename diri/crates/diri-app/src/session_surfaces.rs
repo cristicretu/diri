@@ -34,6 +34,8 @@ pub struct SessionSurfaces {
     peek_width: f32,
     peek_scroll: ScrollHandle,
     peek_previous_focus: Option<FocusHandle>,
+    peek_frame_pending: bool,
+    closing_previews: HashMap<SessionId, TerminalElement>,
     live_previews: crate::tab_preview::PreviewSet<crate::tab_preview::LivePreview>,
     store: Arc<RwLock<SessionStore>>,
     focus_handle: FocusHandle,
@@ -137,6 +139,8 @@ impl SessionSurfaces {
             peek_width: 0.0,
             peek_scroll: ScrollHandle::new(),
             peek_previous_focus: None,
+            peek_frame_pending: false,
+            closing_previews: HashMap::new(),
             live_previews: Default::default(),
             store: Arc::clone(&runtime.store),
             focus_handle: cx.focus_handle(),
@@ -203,7 +207,7 @@ impl SessionSurfaces {
     }
 
     pub(crate) fn dismiss(&mut self, cx: &mut Context<Self>) {
-        self.dismiss_tab_peek();
+        self.cancel_tab_peek_immediately(cx);
         let mut store = self.store.write().expect("session store lock poisoned");
         store.cancel_switcher();
         store.dismiss_overview();
@@ -215,8 +219,22 @@ impl SessionSurfaces {
 impl Render for SessionSurfaces {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         self.sync_tab_peek_focus(window, cx);
-        if !self.peek.visible() {
+        if !self.peek.paint_visible() {
             self.live_previews.clear();
+            self.closing_previews.clear();
+        }
+        if self.peek.is_settling() && !self.peek_frame_pending {
+            self.peek_frame_pending = true;
+            let entity = cx.entity().downgrade();
+            window.on_next_frame(move |_, cx| {
+                let _ = entity.update(cx, |this, cx| {
+                    this.peek_frame_pending = false;
+                    if this.peek.is_settling() {
+                        this.peek.advance_motion(cx.background_executor().now());
+                        cx.notify();
+                    }
+                });
+            });
         }
         let (overview_visible, switcher_visible) = {
             let store = self.store.read().expect("session store lock poisoned");
@@ -255,7 +273,7 @@ impl Render for SessionSurfaces {
             .capture_key_down(cx.listener(Self::handle_key_down))
             .capture_key_up(cx.listener(Self::handle_key_up))
             .on_modifiers_changed(cx.listener(Self::handle_modifiers_changed));
-        if self.peek.visible() {
+        if self.peek.paint_visible() {
             root.inset_0().child(self.render_tab_peek(window, cx))
         } else if overview_visible {
             root.inset_0().child(self.render_overview(window, cx))
@@ -1974,6 +1992,102 @@ mod tests {
     }
 
     #[gpui::test]
+    fn closing_peek_returns_scroll_without_waiting_for_animation(cx: &mut TestAppContext) {
+        use crate::tab_peek::GestureFrame;
+        let runtime = Arc::new(StoreRuntime::inert());
+        runtime.store.write().unwrap().hydrate(SessionListResult {
+            sessions: vec![session(0)],
+            projects: vec![],
+        });
+        runtime.store.write().unwrap().select(session(0).id);
+        let scrolls = Arc::new(AtomicUsize::new(0));
+        let probe = scrolls.clone();
+        let (view, cx) = cx.add_window_view(move |_, cx| OverviewHarness {
+            surfaces: cx.new(|cx| {
+                let mut surface = SessionSurfaces::new(runtime, None, cx);
+                surface.tab_gesture(GestureFrame::Tracking(140.0), cx);
+                surface
+            }),
+            background_scrolls: probe,
+        });
+        cx.simulate_resize(size(px(1000.0), px(700.0)));
+        let event = ScrollWheelEvent {
+            position: point(px(100.0), px(100.0)),
+            delta: ScrollDelta::Pixels(point(px(0.0), px(-80.0))),
+            ..ScrollWheelEvent::default()
+        };
+        cx.simulate_event(event.clone());
+        assert_eq!(scrolls.load(Ordering::Relaxed), 0);
+        let surfaces = view.read_with(cx, |view, _| view.surfaces.clone());
+        surfaces.update(cx, |surface, cx| {
+            surface.dismiss_tab_peek(cx);
+            cx.notify();
+        });
+        cx.run_until_parked();
+        assert!(surfaces.read_with(cx, |surface, _| surface.peek.paint_visible()));
+        cx.simulate_event(event);
+        assert_eq!(scrolls.load(Ordering::Relaxed), 1);
+    }
+
+    #[gpui::test]
+    fn tab_peek_settling_requests_frames_only_until_settled_or_cancelled(cx: &mut TestAppContext) {
+        use crate::tab_peek::GestureFrame;
+        let runtime = Arc::new(StoreRuntime::inert());
+        runtime.store.write().unwrap().hydrate(SessionListResult {
+            sessions: vec![session(0)],
+            projects: vec![],
+        });
+        runtime.store.write().unwrap().select(session(0).id);
+        let (view, cx) = cx.add_window_view(move |_, cx| {
+            let surfaces = cx.new(|cx| {
+                let mut s = SessionSurfaces::new(runtime, None, cx);
+                s.tab_gesture(GestureFrame::Tracking(100.0), cx);
+                s.tab_gesture(GestureFrame::Released(100.0), cx);
+                s
+            });
+            OverviewHarness {
+                surfaces,
+                background_scrolls: Arc::new(AtomicUsize::new(0)),
+            }
+        });
+        cx.simulate_resize(size(px(1000.0), px(700.0)));
+        let surfaces = view.read_with(cx, |view, _| view.surfaces.clone());
+        let first = surfaces.read_with(cx, |s, cx| s.tab_peek_offset(cx));
+        cx.executor()
+            .advance_clock(std::time::Duration::from_millis(100));
+        view.update_in(cx, |_, window, cx| {
+            assert_eq!(window.simulate_next_frame(cx), 1);
+        });
+        cx.run_until_parked();
+        let halfway = surfaces.read_with(cx, |s, cx| s.tab_peek_offset(cx));
+        assert!(halfway > first);
+        cx.executor()
+            .advance_clock(std::time::Duration::from_millis(200));
+        view.update_in(cx, |_, window, cx| {
+            window.simulate_next_frame(cx);
+        });
+        cx.run_until_parked();
+        assert!(!surfaces.read_with(cx, |s, _| s.peek.is_settling()));
+        view.update_in(cx, |_, window, cx| {
+            assert_eq!(window.simulate_next_frame(cx), 0);
+        });
+        surfaces.update(cx, |s, cx| {
+            s.dismiss_tab_peek(cx);
+            cx.notify();
+        });
+        cx.run_until_parked();
+        surfaces.update(cx, |s, cx| s.cancel_tab_peek_immediately(cx));
+        view.update_in(cx, |_, window, cx| {
+            window.simulate_next_frame(cx);
+        });
+        cx.run_until_parked();
+        assert!(!surfaces.read_with(cx, |s, _| s.peek.paint_visible()));
+        view.update_in(cx, |_, window, cx| {
+            assert_eq!(window.simulate_next_frame(cx), 0);
+        });
+    }
+
+    #[gpui::test]
     fn tab_peek_streams_inactive_cards_with_one_resident_and_drops_on_escape(
         cx: &mut TestAppContext,
     ) {
@@ -1986,13 +2100,21 @@ mod tests {
         use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
         let directory = tempfile::tempdir().unwrap();
         let socket = directory.path().join("preview.sock");
-        let executor = tokio::runtime::Runtime::new().unwrap();
+        // GPUI's deterministic executor rejects wakes from foreign threads.
+        // Drive real socket tasks on this test thread while waiting for I/O.
+        let executor = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
         let listener = {
             let _entered = executor.enter();
             tokio::net::UnixListener::bind(&socket).unwrap()
         };
         let opened = Arc::new(AtomicUsize::new(0));
         let closed = Arc::new(AtomicUsize::new(0));
+        let began = std::time::Instant::now();
+        let events = Arc::new(std::sync::Mutex::new(Vec::<(String, u128)>::new()));
+        let server_events = events.clone();
         let server_opened = opened.clone();
         let server_closed = closed.clone();
         let server = executor.spawn(async move {
@@ -2000,6 +2122,7 @@ mod tests {
                 let (stream, _) = listener.accept().await.unwrap();
                 let opened = server_opened.clone();
                 let closed = server_closed.clone();
+                let events = server_events.clone();
                 tokio::spawn(async move {
                     let mut stream = BufReader::new(stream);
                     let mut line = String::new();
@@ -2024,10 +2147,18 @@ mod tests {
                         .write_all(&FrameCodec::encode(&Frame::grid(&update).unwrap()).unwrap())
                         .await
                         .unwrap();
+                    events.lock().unwrap().push((
+                        format!("opened {}", request["preview"]),
+                        began.elapsed().as_micros(),
+                    ));
                     opened.fetch_add(1, Ordering::SeqCst);
                     let mut effects = Vec::new();
                     stream.read_to_end(&mut effects).await.unwrap();
                     assert!(effects.is_empty());
+                    events.lock().unwrap().push((
+                        format!("EOF {}", request["preview"]),
+                        began.elapsed().as_micros(),
+                    ));
                     closed.fetch_add(1, Ordering::SeqCst);
                 });
             }
@@ -2056,6 +2187,16 @@ mod tests {
             }
         });
         cx.simulate_resize(size(px(1100.0), px(700.0)));
+        assert!(cx.debug_bounds("TAB_PEEK_CARD_0").is_none());
+        assert_eq!(
+            opened.load(Ordering::SeqCst),
+            0,
+            "offscreen reveal must not open streams"
+        );
+        cx.executor()
+            .advance_clock(std::time::Duration::from_millis(250));
+        view.update_in(cx, |_, window, cx| window.simulate_next_frame(cx));
+        cx.run_until_parked();
         assert!(cx.debug_bounds("TAB_PEEK_CARD_0").is_some());
         let surfaces = view.read_with(cx, |h, _| h.surfaces.clone());
         let mut states: Vec<_> = surfaces.read_with(cx, |s, _| {
@@ -2094,9 +2235,22 @@ mod tests {
             (100, 40)
         );
         // Moving two cards offscreen drops their sockets before dismissal.
+        events
+            .lock()
+            .unwrap()
+            .push(("resize begins".into(), began.elapsed().as_micros()));
         cx.simulate_resize(size(px(250.0), px(700.0)));
         assert!(cx.debug_bounds("TAB_PEEK_CARD_1").is_some());
         assert!(cx.debug_bounds("TAB_PEEK_CARD_2").is_none());
+        surfaces.read_with(cx, |s, _| {
+            assert!(s.live_previews.get(&session(1).id).is_some());
+            assert!(s.live_previews.get(&session(2).id).is_none());
+            assert!(s.live_previews.get(&session(3).id).is_none());
+        });
+        events.lock().unwrap().push((
+            "slots retained running-01; dropped running-02/running-03".into(),
+            began.elapsed().as_micros(),
+        ));
         executor.block_on(async {
             tokio::time::timeout(std::time::Duration::from_secs(2), async {
                 while closed.load(Ordering::SeqCst) != 2 {
@@ -2104,7 +2258,14 @@ mod tests {
                 }
             })
             .await
-            .unwrap();
+            .unwrap_or_else(|error| {
+                panic!(
+                    "{error}: opened {}, closed {}; events (microseconds): {:?}",
+                    opened.load(Ordering::SeqCst),
+                    closed.load(Ordering::SeqCst),
+                    events.lock().unwrap()
+                )
+            });
         });
         cx.simulate_keystrokes("escape");
         assert!(!surfaces.read_with(cx, |s, _| s.peek.visible()));
@@ -2117,6 +2278,10 @@ mod tests {
             .await
             .unwrap();
         });
+        eprintln!(
+            "preview lifecycle (microseconds): {:?}",
+            events.lock().unwrap()
+        );
         server.abort();
     }
 
