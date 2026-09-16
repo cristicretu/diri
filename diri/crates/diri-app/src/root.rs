@@ -1488,9 +1488,7 @@ impl RootView {
         if self.applied_material == Some(material) {
             return;
         }
-        if self.applied_material.is_some() {
-            window.set_background_appearance(window_background(material));
-        }
+        window.set_background_appearance(window_background(material));
         self.applied_material = Some(material);
     }
 
@@ -3072,7 +3070,7 @@ impl RootView {
                 card.rounded_tr(px(Radius::CARD))
             })
             .rounded_bl(px(Radius::CARD))
-            .bg(terminal.work_surface())
+            .bg(terminal.work_surface_nested())
             .overflow_hidden()
             .text_color(terminal.primary);
 
@@ -3139,7 +3137,7 @@ impl RootView {
             .w_full()
             .h(px(card_height))
             .min_h(px(0.0))
-            .bg(terminal.work_surface());
+            .bg(terminal.work_surface_nested());
         if self.active_workspace.is_some() {
             let tab = {
                 let store = self.window_store.read().expect("store");

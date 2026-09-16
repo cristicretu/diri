@@ -1,4 +1,4 @@
-use gpui::{BoxShadow, FontWeight, Rgba, WindowAppearance, point, px};
+use gpui::{BoxShadow, FontWeight, Rgba, WindowAppearance};
 
 /// Constructs a GPUI color from normalized channel values.
 pub const fn rgba_f32(r: f32, g: f32, b: f32, a: f32) -> Rgba {
@@ -239,7 +239,7 @@ impl SemanticColors {
     pub fn window_fill(self) -> Rgba {
         match self.material {
             Material::Opaque => self.background,
-            Material::Glass => self.background.alpha(self.glass_alpha(0.60, 0.70)),
+            Material::Glass => self.background.alpha(self.glass_alpha(0.40, 0.55)),
         }
     }
 
@@ -248,7 +248,18 @@ impl SemanticColors {
     pub fn work_surface(self) -> Rgba {
         match self.material {
             Material::Opaque => self.background,
-            Material::Glass => self.background.alpha(self.glass_alpha(0.70, 0.80)),
+            Material::Glass => self.background.alpha(self.glass_alpha(0.55, 0.70)),
+        }
+    }
+
+    /// Fill for containers nested inside a work surface. Opaque windows keep
+    /// painting the theme background there; under glass the tint is painted
+    /// exactly once (by the innermost pane), because stacked translucent
+    /// fills compound into a solid.
+    pub fn work_surface_nested(self) -> Rgba {
+        match self.material {
+            Material::Opaque => self.background,
+            Material::Glass => self.background.alpha(0.0),
         }
     }
 
@@ -298,7 +309,7 @@ impl SemanticColors {
     pub fn sidebar_surface(self) -> Rgba {
         match self.material {
             Material::Opaque => self.sidebar_surface,
-            Material::Glass => self.sidebar_surface.alpha(self.glass_alpha(0.50, 0.60)),
+            Material::Glass => self.sidebar_surface.alpha(self.glass_alpha(0.35, 0.48)),
         }
     }
 }
@@ -367,49 +378,31 @@ impl Fill {
     }
 }
 
-/// The lifted, translucent pill behind a selected tab-like control: sidebar
-/// session rows, settings pages, workspace tabs. A hairline stroke, a
-/// one-point highlight along the top edge, and a soft drop shadow make the
-/// pill read as a slab of glass sitting on the chrome rather than a flat
-/// tint painted into it.
+/// The translucent pill behind a selected tab-like control: sidebar session
+/// rows, settings pages, workspace tabs. A slightly lighter fill and a faint
+/// hairline are all it takes on glass; highlights and drop shadows read as
+/// artifacts over a blurred backdrop.
 pub struct Glass;
 
 impl Glass {
     pub fn fill(colors: SemanticColors) -> Rgba {
         match colors.appearance {
-            Appearance::Dark => rgba_f32(1.0, 1.0, 1.0, 0.115),
-            Appearance::Light => rgba_f32(1.0, 1.0, 1.0, 0.62),
+            Appearance::Dark => rgba_f32(1.0, 1.0, 1.0, 0.10),
+            Appearance::Light => rgba_f32(1.0, 1.0, 1.0, 0.55),
         }
     }
 
     pub fn stroke(colors: SemanticColors) -> Rgba {
         match colors.appearance {
-            Appearance::Dark => rgba_f32(1.0, 1.0, 1.0, 0.13),
-            Appearance::Light => rgba_f32(0.0, 0.0, 0.0, 0.09),
+            Appearance::Dark => rgba_f32(1.0, 1.0, 1.0, 0.06),
+            Appearance::Light => rgba_f32(0.0, 0.0, 0.0, 0.06),
         }
     }
 
-    pub fn shadows(colors: SemanticColors) -> Vec<BoxShadow> {
-        let (highlight, shadow) = match colors.appearance {
-            Appearance::Dark => (rgba_f32(1.0, 1.0, 1.0, 0.09), rgba_f32(0.0, 0.0, 0.0, 0.28)),
-            Appearance::Light => (rgba_f32(1.0, 1.0, 1.0, 0.70), rgba_f32(0.0, 0.0, 0.0, 0.10)),
-        };
-        vec![
-            BoxShadow {
-                color: highlight.into(),
-                offset: point(px(0.0), px(1.0)),
-                blur_radius: px(0.0),
-                spread_radius: px(0.0),
-                inset: true,
-            },
-            BoxShadow {
-                color: shadow.into(),
-                offset: point(px(0.0), px(1.0)),
-                blur_radius: px(3.0),
-                spread_radius: px(0.0),
-                inset: false,
-            },
-        ]
+    /// No shadows: on a blurred backdrop they read as smudges. Kept as the
+    /// single place a future lift would live.
+    pub fn shadows(_colors: SemanticColors) -> Vec<BoxShadow> {
+        Vec::new()
     }
 }
 

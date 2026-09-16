@@ -694,7 +694,7 @@ impl Render for WorkspaceWorkbench {
             .relative()
             .size_full()
             .overflow_hidden()
-            .bg(colors.work_surface())
+            .bg(colors.work_surface_nested())
             .on_drag_move(cx.listener(
                 |this, event: &DragMoveEvent<DraggedWorkspaceDivider>, _, cx| {
                     this.drag_resize(

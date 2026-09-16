@@ -424,8 +424,10 @@ mod tests {
             assert!(Glass::fill(colors).a > RowFill::MultiSelected.color(colors).a);
             assert!(Glass::stroke(colors).a > 0.0);
             let shadows = Glass::shadows(colors);
-            assert!(shadows.iter().any(|shadow| shadow.inset));
-            assert!(shadows.iter().any(|shadow| !shadow.inset));
+            assert!(
+                shadows.is_empty(),
+                "glass pills carry no shadows on a blurred backdrop"
+            );
         }
     }
 

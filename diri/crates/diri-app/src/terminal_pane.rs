@@ -2833,7 +2833,7 @@ impl TerminalPane {
             .flex()
             .items_center()
             .justify_between()
-            .bg(colors.work_surface())
+            .bg(colors.work_surface_nested())
             .child(
                 div()
                     .min_w(px(0.0))
@@ -3557,7 +3557,7 @@ impl Render for TerminalPane {
                 .rounded_tl(px(Radius::CARD))
                 .rounded_tr(px(Radius::CARD))
                 .overflow_hidden()
-                .bg(colors.work_surface())
+                .bg(colors.work_surface_nested())
                 .child(
                     self.render_grid_and_overlays(&session, theme, colors, font_size, window, cx),
                 );
@@ -3588,7 +3588,7 @@ impl Render for TerminalPane {
                             .px(px(Metrics::TOOLBAR_EDGE_INSET))
                             .flex()
                             .items_center()
-                            .bg(colors.work_surface())
+                            .bg(colors.work_surface_nested())
                             .child(control),
                     )
                 })
