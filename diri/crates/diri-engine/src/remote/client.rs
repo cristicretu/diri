@@ -455,8 +455,8 @@ impl RemoteSessionClient {
         )
     }
 
-    pub fn kill(&self) -> io::Result<()> {
-        self.manager.kill(
+    pub fn kill(&self) -> io::Result<diri_proto::remote_pty::ProcessExit> {
+        let inspection = self.manager.kill(
             &self.helper,
             &SessionSelector {
                 session_id: self.session_id.clone(),
@@ -464,7 +464,13 @@ impl RemoteSessionClient {
                 expected_incarnation: Some(self.incarnation.clone()),
             },
         )?;
-        Ok(())
+        let RemoteProcessState::Exited { code, signal } = inspection.process_state else {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "stop did not observe an Agent exit",
+            ));
+        };
+        Ok(diri_proto::remote_pty::ProcessExit { code, signal })
     }
 
     pub fn inspect(&self) -> io::Result<SessionInspection> {

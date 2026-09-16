@@ -401,6 +401,11 @@ impl Drop for ProcessGuard {
     }
 }
 
+struct StopState {
+    grace_deadline: Option<Instant>,
+    flush_deadline: Option<Instant>,
+}
+
 struct Holder {
     // Cleanup the Agent before joining metadata persistence, and retain the
     // session lock until both are finished, including on unwinding.
@@ -414,6 +419,7 @@ struct Holder {
     pty_writer: PtyStream,
     exit_watcher: Option<ExitWatcher>,
     pending_exit: Option<Exit>,
+    stop: Option<StopState>,
     screen: HeadlessScreen,
     log: OutputLog,
     state: SessionState,
@@ -507,6 +513,7 @@ impl Holder {
             pty_writer,
             exit_watcher: Some(exit_watcher),
             pending_exit: None,
+            stop: None,
             screen,
             log,
             state,
@@ -668,7 +675,59 @@ impl Holder {
                 self.finish_exit(exit)?;
             }
             self.emit_foreground_process()?;
+            if self.advance_stop()? {
+                return Ok(());
+            }
         }
+    }
+
+    fn begin_stop(&mut self) -> io::Result<()> {
+        if self.stop.is_some() {
+            return Ok(());
+        }
+        let grace_deadline = if self.exit_watcher.is_some() {
+            self.pty.kill_group(libc::SIGTERM)?;
+            Some(Instant::now() + Duration::from_millis(500))
+        } else {
+            None
+        };
+        self.stop = Some(StopState {
+            grace_deadline,
+            flush_deadline: None,
+        });
+        Ok(())
+    }
+
+    fn advance_stop(&mut self) -> io::Result<bool> {
+        let Some(stop) = self.stop.as_mut() else {
+            return Ok(false);
+        };
+        if self.exit_watcher.is_none() {
+            stop.grace_deadline = None;
+        } else if stop
+            .grace_deadline
+            .is_some_and(|deadline| Instant::now() >= deadline)
+        {
+            // The owner has not reaped the child; its PGID cannot be reused.
+            self.pty.kill_group(libc::SIGKILL)?;
+            stop.grace_deadline = None;
+        }
+        if matches!(self.state.process_state, RemoteProcessState::Exited { .. })
+            && self.pending_exit.is_none()
+            && self.pty_reader.is_none()
+        {
+            // finish_exit has already flushed tail and genuine facts to disk.
+            let deadline = *stop
+                .flush_deadline
+                .get_or_insert_with(|| Instant::now() + Duration::from_millis(500));
+            self.flush_connection()?;
+            let drained = self
+                .connection
+                .as_ref()
+                .is_none_or(|connection| connection.sent == connection.outbound.len());
+            return Ok(drained || Instant::now() >= deadline);
+        }
+        Ok(false)
     }
 
     fn accept_connection(&mut self) -> io::Result<()> {
@@ -814,7 +873,14 @@ impl Holder {
                     };
                     for message in messages {
                         if let Err(error) = self.handle_message(connection, message) {
-                            connection.send_fatal("protocol_error", &error.to_string());
+                            let code = if self.stop.is_some()
+                                && error.kind() == io::ErrorKind::NotConnected
+                            {
+                                "session_stopping"
+                            } else {
+                                "protocol_error"
+                            };
+                            connection.send_fatal(code, &error.to_string());
                             closed = true;
                             break;
                         }
@@ -853,6 +919,12 @@ impl Holder {
             return Err(io::Error::new(
                 io::ErrorKind::PermissionDenied,
                 "controller epoch was revoked",
+            ));
+        }
+        if self.stop.is_some() && !matches!(&message, RemoteMessage::StopSession(_)) {
+            return Err(io::Error::new(
+                io::ErrorKind::NotConnected,
+                "session is stopping",
             ));
         }
         match message {
@@ -908,7 +980,27 @@ impl Holder {
                         "signal or controller epoch is invalid",
                     ));
                 }
+                // A zombie protects the process-group id only until this
+                // owner reaps it. ProcessState stays Running while PTY tail
+                // drains, so use actual ownership rather than presentation.
+                if self.exit_watcher.is_none() {
+                    return Err(io::Error::new(
+                        io::ErrorKind::NotConnected,
+                        "Agent has already been reaped; process group is no longer owned",
+                    ));
+                }
                 self.pty.kill_group(signal.signal)
+            }
+            RemoteMessage::StopSession(request) => {
+                if connection.protocol_minor < diri_proto::remote_pty::STOP_SESSION_PROTOCOL_MINOR
+                    || request.controller_epoch != epoch
+                {
+                    return Err(io::Error::new(
+                        io::ErrorKind::PermissionDenied,
+                        "stop capability or controller epoch is invalid",
+                    ));
+                }
+                self.begin_stop()
             }
             RemoteMessage::AcquireControl(_) => {
                 connection.queue(RemoteMessage::ControlGranted(ControlGranted {
@@ -965,6 +1057,22 @@ impl Holder {
             return Err(io::Error::new(
                 io::ErrorKind::PermissionDenied,
                 "session authentication failed",
+            ));
+        }
+        if self.stop.is_some() {
+            return Err(io::Error::new(
+                io::ErrorKind::NotConnected,
+                "session is stopping",
+            ));
+        }
+        if hello.protocol.minor < diri_proto::remote_pty::STOP_SESSION_PROTOCOL_MINOR
+            && hello
+                .required_capabilities
+                .contains(&diri_proto::remote_pty::RemoteCapability::StopSession)
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "stop-session-v1 requires protocol minor 12",
             ));
         }
         if let Some(missing) = hello
@@ -1093,12 +1201,16 @@ impl Holder {
             .dirty_since
             .map(|since| poll_timeout(since + DIFF_COALESCE));
         let probe = self.foreground_probe_deadline.map(poll_timeout);
-        match (grid, probe) {
-            (Some(a), Some(b)) => a.min(b),
-            (Some(a), None) => a,
-            (None, Some(b)) => b,
-            (None, None) => -1,
-        }
+        let stop = self
+            .stop
+            .as_ref()
+            .and_then(|stop| stop.grace_deadline.or(stop.flush_deadline))
+            .map(poll_timeout);
+        [grid, probe, stop]
+            .into_iter()
+            .flatten()
+            .min()
+            .unwrap_or(-1)
     }
 
     fn emit_foreground_process(&mut self) -> io::Result<()> {
@@ -1679,6 +1791,166 @@ mod tests {
         assert!(pending.is_empty());
         pending.push(b"two");
         assert_eq!(pending.remaining(), b"two");
+    }
+
+    #[test]
+    fn reaped_child_rejects_signal_before_tail_checkpoint_says_exited() {
+        let temp = tempfile::tempdir().unwrap();
+        let roots = StatePaths::from_root(temp.path().join("state")).unwrap();
+        let request = LaunchRequest {
+            session_id: format!("tail-{}", random_hex(8).unwrap()),
+            session_token: diri_proto::remote_pty::SessionToken::new(
+                "0123456789abcdef0123456789abcdef",
+            )
+            .unwrap(),
+            argv: vec![
+                "/bin/sh".into(),
+                "-c".into(),
+                "read -r go; printf final-tail; exit 42".into(),
+            ],
+            cwd: "/".into(),
+            environment: vec![],
+            cols: 80,
+            rows: 24,
+            persistence: diri_proto::remote_pty::PersistenceCapability::NonPersistent,
+        };
+        let paths = roots.session(&request.session_id).unwrap();
+        paths.ensure().unwrap();
+        let pty = Pty::spawn(&PtySpec {
+            argv: request.argv.clone(),
+            env: vec![],
+            cwd: "/".into(),
+            cols: 80,
+            rows: 24,
+        })
+        .unwrap();
+        let watcher = ExitWatcher::new(pty.pid()).unwrap();
+        let reader = pty.reader().unwrap();
+        reader.set_nonblocking(true).unwrap();
+        let writer = pty.writer().unwrap();
+        let mut state = SessionState::new(
+            &request,
+            "incarnation".into(),
+            pty.pid(),
+            pty.child_identity(),
+        );
+        state.controller_epoch = 1;
+        let state_path = paths.state.clone();
+        let checkpoint =
+            diri_pty::checkpoint::CheckpointWriter::new("tail-exit-test", move |state| {
+                write_state(&state_path, &state)
+            })
+            .unwrap();
+        let socket = paths.socket.clone();
+        let mut holder = Holder {
+            // The fixture has no descendants; guard behavior is covered by the
+            // real Helper e2e. This test controls the exact reap→tail interval.
+            process_guard: ProcessGuard {
+                lifetime: None,
+                child: None,
+                watcher: None,
+            },
+            checkpoint,
+            _lock: acquire_lock(&paths.lock).unwrap(),
+            listener: UnixListener::bind(&socket).unwrap(),
+            log: OutputLog::open(&paths.output).unwrap(),
+            paths,
+            pty,
+            pty_reader: Some(reader),
+            pty_writer: writer,
+            exit_watcher: Some(watcher),
+            pending_exit: None,
+            stop: None,
+            screen: HeadlessScreen::new(80, 24),
+            state,
+            connection: None,
+            pending_connection: None,
+            pending_input: PendingBytes::default(),
+            dirty_since: None,
+            pending_output: Vec::new(),
+            pending_output_offset: 0,
+            interactive_grid_budget: 0,
+            last_persisted_offset: 0,
+            controller_protocol_minor: 0,
+            last_foreground_pid: None,
+            foreground_probe_deadline: None,
+        };
+        let (stream, _peer) = UnixStream::pair().unwrap();
+        let mut connection = Connection::new(stream);
+        connection.epoch = Some(1);
+        connection.protocol_minor = diri_proto::remote_pty::STOP_SESSION_PROTOCOL_MINOR;
+        let stale = holder
+            .handle_message(
+                &mut connection,
+                RemoteMessage::StopSession(diri_proto::remote_pty::StopSession {
+                    controller_epoch: 2,
+                }),
+            )
+            .unwrap_err();
+        assert_eq!(stale.kind(), io::ErrorKind::PermissionDenied);
+        connection.protocol_minor = diri_proto::remote_pty::STOP_SESSION_PROTOCOL_MINOR - 1;
+        let old = holder
+            .handle_message(
+                &mut connection,
+                RemoteMessage::StopSession(diri_proto::remote_pty::StopSession {
+                    controller_epoch: 1,
+                }),
+            )
+            .unwrap_err();
+        assert_eq!(old.kind(), io::ErrorKind::PermissionDenied);
+        assert!(holder.stop.is_none());
+        holder.pty_writer.write_all(b"go\n").unwrap();
+        // Keep draining as the real owner loop does; waiting before draining a
+        // PTY can stall child exit on macOS. Stop before committing exit facts.
+        let deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            holder.drain_pty().unwrap();
+            if holder.pty.try_wait().unwrap().is_some() {
+                break;
+            }
+            assert!(Instant::now() < deadline, "fixture child did not exit");
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        holder.record_exit().unwrap();
+        assert!(holder.exit_watcher.is_none());
+        assert!(holder.pending_exit.is_some());
+        assert!(matches!(
+            holder.state.process_state,
+            RemoteProcessState::Running { .. }
+        ));
+        let error = holder
+            .handle_message(
+                &mut connection,
+                RemoteMessage::Signal(diri_proto::remote_pty::Signal {
+                    controller_epoch: 1,
+                    signal: libc::SIGTERM,
+                }),
+            )
+            .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::NotConnected);
+        holder.begin_stop().unwrap();
+        assert!(
+            holder.stop.as_ref().unwrap().grace_deadline.is_none(),
+            "no escalation after reap"
+        );
+        assert!(
+            !holder.advance_stop().unwrap(),
+            "tail must precede completed stop"
+        );
+        holder.drain_pty().unwrap();
+        assert!(holder.pty_reader.is_none());
+        let exit = holder.pending_exit.take().unwrap();
+        holder.finish_exit(exit).unwrap();
+        assert_eq!(
+            holder.state.process_state,
+            RemoteProcessState::Exited {
+                code: Some(42),
+                signal: None
+            }
+        );
+        assert!(holder.advance_stop().unwrap());
+        drop(holder);
+        let _ = fs::remove_file(socket);
     }
 
     #[test]

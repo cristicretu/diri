@@ -929,6 +929,78 @@ fn attach_ssh_disconnect_reconnects_and_flushes_queued_input() {
         .expect("cleanup Holder");
 }
 
+#[test]
+fn engine_terminate_uses_stop_result_after_controller_revocation() {
+    let temporary = tempfile::tempdir().unwrap();
+    let remote_home = temporary.path().join("remote-home");
+    fs::create_dir(&remote_home).unwrap();
+    let manager = Arc::new(
+        RemoteManager::new(
+            ProcessExecutor::new(write_fake_ssh(
+                temporary.path(),
+                &remote_home,
+                &temporary.path().join("remote-state"),
+            )),
+            ArtifactCatalog::from_native_helper(Path::new(helper())).unwrap(),
+            temporary.path().join("ssh-control"),
+        )
+        .unwrap(),
+    );
+    let host = HostEntry {
+        id: "stop-fixture".into(),
+        name: None,
+        ssh: "fixture-host".into(),
+        default_cwd: Some("/".into()),
+        node: None,
+    };
+    let installed = manager.ensure_helper(&host).unwrap();
+    let request = LaunchRequest {
+        session_id: "stop-facts".into(),
+        session_token: token_for_retry(),
+        argv: vec![
+            "/bin/sh".into(),
+            "-c".into(),
+            "trap 'sleep 0.1; exit 42' TERM; printf ready; while :; do sleep 1; done".into(),
+        ],
+        cwd: "/".into(),
+        environment: vec![],
+        cols: 80,
+        rows: 24,
+        persistence: PersistenceCapability::NonPersistent,
+    };
+    let mut session = Session::spawn(
+        SessionSpec {
+            id: request.session_id.clone(),
+            pty: PtySpec::new(request.argv.clone(), "/").size(80, 24),
+            manifest_id: "shell".into(),
+            authority: Authority::ProcessOnly,
+            logs_dir: temporary.path().join("logs"),
+            holder: None,
+            defer_launch: false,
+            remote: Some(RemoteSessionSpec {
+                manager,
+                helper: installed,
+                launch: request,
+                host_id: host.id,
+                binding_store: RemoteBindingStore::new(temporary.path().join("bindings")).unwrap(),
+            }),
+        },
+        Arc::new(ManifestEngine::new(Vec::new())),
+    )
+    .unwrap();
+    wait_for_grid(&session, "ready");
+    let exit = session.terminate(Duration::ZERO).unwrap();
+    assert_eq!(
+        exit,
+        diri_engine::Exit::Code(42),
+        "the old controller cannot supply the stop channel's exit"
+    );
+    assert!(
+        session.view().exited,
+        "actual stop fact reaches the shared session projection"
+    );
+}
+
 fn wait_for_grid(session: &Session, needle: &str) {
     wait_until(needle, Duration::from_secs(5), || {
         session.screen_lines().join("\n").contains(needle)

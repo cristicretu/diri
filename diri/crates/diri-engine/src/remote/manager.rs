@@ -800,7 +800,17 @@ impl RemoteManager {
         helper: &InstalledHelper,
         selector: &SessionSelector,
     ) -> io::Result<SessionInspection> {
-        self.rpc(helper, HelperCommand::Kill, selector, RPC_TIMEOUT)
+        if helper.protocol.major != ProtocolVersion::CURRENT.major
+            || helper.protocol.minor < diri_proto::remote_pty::STOP_SESSION_PROTOCOL_MINOR
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "remote Helper does not support observed stop facts",
+            ));
+        }
+        let inspection = self.rpc(helper, HelperCommand::Kill, selector, RPC_TIMEOUT)?;
+        validate_stop_inspection(&helper.build_id, selector, &inspection)?;
+        Ok(inspection)
     }
 
     pub fn gc(&self, helper: &InstalledHelper) -> io::Result<GcResult> {
@@ -872,6 +882,40 @@ impl RemoteManager {
         SshTransport::new(host, self.control_dir.join(name))
             .with_executable(self.executor.ssh_executable().to_os_string())
             .with_batch_mode(self.batch_mode)
+    }
+}
+
+fn validate_stop_inspection(
+    build: &str,
+    selector: &SessionSelector,
+    inspection: &SessionInspection,
+) -> io::Result<()> {
+    use diri_proto::remote_pty::RemoteProcessState;
+    if inspection.session_id != selector.session_id
+        || inspection.holder_build_id != build
+        || selector
+            .expected_incarnation
+            .as_ref()
+            .is_some_and(|expected| expected != &inspection.session_incarnation)
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "stop returned a different remote session identity",
+        ));
+    }
+    match inspection.process_state {
+        RemoteProcessState::Exited {
+            code: Some(_),
+            signal: None,
+        }
+        | RemoteProcessState::Exited {
+            code: None,
+            signal: Some(1..),
+        } => Ok(()),
+        _ => Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "stop did not return unambiguous observed exit facts",
+        )),
     }
 }
 
@@ -1287,6 +1331,52 @@ mod tests {
                 "rejected signals must not reach SSH"
             );
         }
+    }
+
+    #[test]
+    fn stop_result_requires_bound_identity_and_actual_exit_facts() {
+        use diri_proto::remote_pty::{RemoteProcessState, SessionToken};
+        let selector = SessionSelector {
+            session_id: "session".into(),
+            session_token: SessionToken::new("0123456789abcdef0123456789abcdef").unwrap(),
+            expected_incarnation: Some("incarnation".into()),
+        };
+        let mut inspection: SessionInspection = serde_json::from_value(serde_json::json!({
+            "sessionId":"session", "sessionIncarnation":"incarnation", "holderBuildId":"build", "holderPid":1,
+            "processState":{"state":"exited", "code":42, "signal":null}, "cols":80, "rows":24,
+            "outputOffset":0, "snapshotSequence":0, "controllerEpoch":0, "persistence":"non-persistent"
+        })).unwrap();
+        assert!(validate_stop_inspection("build", &selector, &inspection).is_ok());
+        assert!(validate_stop_inspection("wrong", &selector, &inspection).is_err());
+        for (session, incarnation) in [("other", "incarnation"), ("session", "other")] {
+            let mut wrong = inspection.clone();
+            wrong.session_id = session.into();
+            wrong.session_incarnation = incarnation.into();
+            assert!(validate_stop_inspection("build", &selector, &wrong).is_err());
+        }
+        for state in [
+            RemoteProcessState::Running { pid: 42 },
+            RemoteProcessState::Exited {
+                code: None,
+                signal: None,
+            },
+            RemoteProcessState::Exited {
+                code: Some(42),
+                signal: Some(15),
+            },
+            RemoteProcessState::Exited {
+                code: None,
+                signal: Some(0),
+            },
+        ] {
+            inspection.process_state = state;
+            assert!(validate_stop_inspection("build", &selector, &inspection).is_err());
+        }
+        inspection.process_state = RemoteProcessState::Exited {
+            code: None,
+            signal: Some(9),
+        };
+        assert!(validate_stop_inspection("build", &selector, &inspection).is_ok());
     }
 
     #[test]

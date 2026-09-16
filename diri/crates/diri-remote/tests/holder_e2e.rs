@@ -249,6 +249,7 @@ fn message_kinds(messages: &[RemoteMessage]) -> String {
             RemoteMessage::GridDelta(_) => "GridDelta",
             RemoteMessage::ProcessExit(_) => "ProcessExit",
             RemoteMessage::Signal(_) => "Signal",
+            RemoteMessage::StopSession(_) => "StopSession",
             RemoteMessage::AcquireControl(_) => "AcquireControl",
             RemoteMessage::ControlGranted(_) => "ControlGranted",
             RemoteMessage::ControlRevoked(_) => "ControlRevoked",
@@ -768,6 +769,131 @@ fn incompatible_protocol_and_wrong_incarnation_fail_with_structured_errors() {
 }
 
 #[test]
+fn explicit_stop_records_real_term_trap_and_forced_exit_facts() {
+    for (name, script, expected) in [
+        (
+            "stop-trap",
+            "trap 'printf final-tail; exit 42' TERM; printf stop-ready; while :; do read -r line; done",
+            RemoteProcessState::Exited {
+                code: Some(42),
+                signal: None,
+            },
+        ),
+        (
+            "stop-force",
+            "trap '' TERM; printf stop-ready; while :; do read -r line; done",
+            RemoteProcessState::Exited {
+                code: None,
+                signal: Some(libc::SIGKILL),
+            },
+        ),
+    ] {
+        let temporary = tempfile::tempdir().unwrap();
+        let state_dir = temporary.path().join("state");
+        let request = LaunchRequest {
+            session_id: name.into(),
+            session_token: token(),
+            argv: vec!["/bin/sh".into(), "-c".into(), script.into()],
+            cwd: "/".into(),
+            environment: vec![],
+            cols: 80,
+            rows: 24,
+            persistence: PersistenceCapability::NonPersistent,
+        };
+        let launch: LaunchResult = run_json("launch", &state_dir, Some(&request));
+        let selector = SessionSelector {
+            session_id: launch.session_id.clone(),
+            session_token: token(),
+            expected_incarnation: Some(launch.session_incarnation.clone()),
+        };
+        let mut attach = Attach::open(&state_dir, hello(&launch, None, "ready-client"));
+        attach.receive_until(Duration::from_secs(2), |message| match message {
+            RemoteMessage::FullSnapshot(snapshot) => {
+                grid_text(&snapshot.grid).contains("stop-ready")
+            }
+            RemoteMessage::GridDelta(delta) => grid_text(&delta.grid).contains("stop-ready"),
+            _ => false,
+        });
+        let started = Instant::now();
+        let stopped: SessionInspection = run_json("kill", &state_dir, Some(&selector));
+        assert_eq!(
+            stopped.process_state, expected,
+            "requesting TERM must not invent TERM as the exit"
+        );
+        assert!(started.elapsed() < Duration::from_secs(5));
+        let again: SessionInspection = run_json("kill", &state_dir, Some(&selector));
+        assert_eq!(
+            again.process_state, expected,
+            "completed stop is idempotent"
+        );
+        if name == "stop-trap" {
+            assert!(
+                log_tail(&state_dir.join("sessions").join(name).join("output.log"))
+                    >= b"stop-readyfinal-tail".len() as u64
+            );
+        }
+        let gc: TestGcResult = run_json::<SessionSelector, _>("gc", &state_dir, None);
+        assert_eq!(
+            gc.removed_sessions, 1,
+            "completed stop released Holder ownership"
+        );
+    }
+}
+
+#[test]
+fn concurrent_explicit_stops_complete_one_owned_lifecycle() {
+    let temporary = tempfile::tempdir().unwrap();
+    let state_dir = temporary.path().join("state");
+    let request = LaunchRequest {
+        session_id: "stop-concurrent".into(),
+        session_token: token(),
+        argv: vec![
+            "/bin/sh".into(),
+            "-c".into(),
+            "trap 'sleep 0.1; exit 42' TERM; printf ready; while :; do read -r line; done".into(),
+        ],
+        cwd: "/".into(),
+        environment: vec![],
+        cols: 80,
+        rows: 24,
+        persistence: PersistenceCapability::NonPersistent,
+    };
+    let launch: LaunchResult = run_json("launch", &state_dir, Some(&request));
+    let selector = SessionSelector {
+        session_id: launch.session_id.clone(),
+        session_token: token(),
+        expected_incarnation: Some(launch.session_incarnation.clone()),
+    };
+    let mut attach = Attach::open(&state_dir, hello(&launch, None, "ready-client"));
+    attach.receive_until(Duration::from_secs(2), |message| match message {
+        RemoteMessage::FullSnapshot(snapshot) => grid_text(&snapshot.grid).contains("ready"),
+        RemoteMessage::GridDelta(delta) => grid_text(&delta.grid).contains("ready"),
+        _ => false,
+    });
+    let barrier = Arc::new(std::sync::Barrier::new(2));
+    let jobs = (0..2)
+        .map(|_| {
+            let state_dir = state_dir.clone();
+            let selector = selector.clone();
+            let barrier = barrier.clone();
+            std::thread::spawn(move || {
+                barrier.wait();
+                run_json::<_, SessionInspection>("kill", &state_dir, Some(&selector))
+            })
+        })
+        .collect::<Vec<_>>();
+    for job in jobs {
+        assert_eq!(
+            job.join().unwrap().process_state,
+            RemoteProcessState::Exited {
+                code: Some(42),
+                signal: None
+            }
+        );
+    }
+}
+
+#[test]
 fn signal_exit_and_holder_failure_are_reported_without_orphaning_the_agent() {
     let temporary = tempfile::tempdir().expect("temp");
     let state_dir = temporary.path().join("state");
@@ -810,6 +936,21 @@ fn signal_exit_and_holder_failure_are_reported_without_orphaning_the_agent() {
     assert!(exited.iter().any(|message| {
         matches!(message, RemoteMessage::ProcessExit(exit) if exit.signal == Some(libc::SIGTERM))
     }));
+    attach.send(RemoteMessage::Signal(diri_proto::remote_pty::Signal {
+        controller_epoch: epoch,
+        signal: libc::SIGTERM,
+    }));
+    let deadline = Instant::now() + Duration::from_secs(2);
+    let after_reap = loop {
+        match attach
+            .messages
+            .recv_timeout(deadline.saturating_duration_since(Instant::now()))
+        {
+            Ok(Ok(RemoteMessage::Error(error))) => break Some(error),
+            Ok(Ok(_)) if Instant::now() < deadline => {}
+            _ => break None,
+        }
+    };
     let _: SessionInspection = run_json(
         "kill",
         &state_dir,
@@ -818,6 +959,12 @@ fn signal_exit_and_holder_failure_are_reported_without_orphaning_the_agent() {
             session_token: token(),
             expected_incarnation: Some(launch.session_incarnation),
         }),
+    );
+
+    assert!(
+        after_reap
+            .is_some_and(|error| error.fatal && error.message.contains("already been reaped")),
+        "signals after reap must be explicitly rejected, never sent to a reusable PGID"
     );
 
     let mut failure_request = request;

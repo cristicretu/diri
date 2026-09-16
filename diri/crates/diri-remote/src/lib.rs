@@ -9,13 +9,13 @@ mod output_log;
 mod paths;
 mod persistence;
 mod state;
+mod stop;
 mod usage;
 
 use std::collections::HashSet;
 use std::fs;
 use std::io::{self, Read, Write};
 use std::path::Path;
-use std::time::{Duration, Instant};
 
 use diri_proto::remote_pty::{
     ANNOTATED_HELPER_CAPABILITIES, EnvironmentCaptureRequest, GcResult, HelperProbe, LaunchRequest,
@@ -450,75 +450,7 @@ fn list() -> io::Result<Vec<SessionInspection>> {
 }
 
 fn kill(selector: &SessionSelector) -> io::Result<SessionInspection> {
-    let roots = paths::StatePaths::resolve()?;
-    let paths = roots.session(&selector.session_id)?;
-    let _launch_lock = state::acquire_launch_lock_wait(&paths.launch_lock)?;
-    if !state::authenticate(&paths, &selector.session_token)? {
-        return Err(io::Error::new(
-            io::ErrorKind::PermissionDenied,
-            "session authentication failed",
-        ));
-    }
-    let mut session = state::read_state(&paths.state)?;
-    validate_incarnation(selector, &session)?;
-    if !state::holder_lock_held(&paths.lock)? {
-        return Err(io::Error::new(
-            io::ErrorKind::NotConnected,
-            "Holder is not running",
-        ));
-    }
-
-    if let RemoteProcessState::Running { pid } = session.process_state {
-        signal_group(pid, libc::SIGTERM);
-        let deadline = Instant::now() + Duration::from_millis(500);
-        while Instant::now() < deadline && state::process_alive(pid) {
-            std::thread::sleep(Duration::from_millis(20));
-        }
-        if state::process_alive(pid) {
-            signal_group(pid, libc::SIGKILL);
-        }
-        session.process_state = RemoteProcessState::Exited {
-            code: None,
-            signal: Some(libc::SIGTERM),
-        };
-    }
-    signal_pid(session.holder_pid, libc::SIGTERM);
-    if session.persistence == diri_proto::remote_pty::PersistenceCapability::UserSupervisor {
-        persistence::cleanup_holder(&session.session_id);
-    }
-    let holder_deadline = Instant::now() + Duration::from_millis(500);
-    while Instant::now() < holder_deadline && state::holder_lock_held(&paths.lock)? {
-        std::thread::sleep(Duration::from_millis(10));
-    }
-    if state::holder_lock_held(&paths.lock)? {
-        signal_pid(session.holder_pid, libc::SIGKILL);
-        let killed_deadline = Instant::now() + Duration::from_millis(500);
-        while Instant::now() < killed_deadline && state::holder_lock_held(&paths.lock)? {
-            std::thread::sleep(Duration::from_millis(10));
-        }
-        if state::holder_lock_held(&paths.lock)? {
-            return Err(io::Error::new(
-                io::ErrorKind::TimedOut,
-                "Holder did not release its session lock after SIGKILL",
-            ));
-        }
-    }
-    // Fence the dead Holder's asynchronous checkpoints before publishing the
-    // management exit. Also retain the Holder lock through this final write.
-    let _lock = state::acquire_lock(&paths.lock)?;
-    let latest = state::read_state(&paths.state)?;
-    validate_incarnation(selector, &latest)?;
-    if latest.session_incarnation != session.session_incarnation {
-        return Err(io::Error::other("session changed while stopping Holder"));
-    }
-    let fallback_exit = session.process_state;
-    session = latest;
-    if matches!(session.process_state, RemoteProcessState::Running { .. }) {
-        session.process_state = fallback_exit;
-    }
-    session.output_offset = output_log::OutputLog::open(&paths.output)?.tail_offset();
-    state::write_state(&paths.state, &session)?;
-    Ok(session.inspection())
+    stop::kill(selector)
 }
 
 fn gc() -> io::Result<GcResult> {
@@ -778,26 +710,6 @@ fn validate_activation_path(path: &Path) -> io::Result<()> {
         ));
     }
     Ok(())
-}
-
-fn signal_group(pid: u32, signal: i32) {
-    if let Ok(pid) = libc::pid_t::try_from(pid) {
-        // SAFETY: the Agent process created its own process group via
-        // `setsid`; kill(2) receives integers only. Errors mean it exited.
-        unsafe {
-            libc::kill(-pid, signal);
-        }
-    }
-}
-
-fn signal_pid(pid: u32, signal: i32) {
-    if let Ok(pid) = libc::pid_t::try_from(pid) {
-        // SAFETY: lock ownership and authenticated state were verified before
-        // selecting this Holder pid; kill(2) receives integers only.
-        unsafe {
-            libc::kill(pid, signal);
-        }
-    }
 }
 
 fn sha256_file(path: &Path) -> io::Result<String> {
