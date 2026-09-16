@@ -1,0 +1,10 @@
+terminal-fleet: 20 cores; requested heap, excluding processes/renderer
+fresh 80x50: 2119500 live heap bytes (2.02 MiB)
+full history 80x50: 6549580 live heap bytes (6.25 MiB)
+20 resizes 80->320: 6.002708ms
+full history 320x50: 17163340 live heap bytes (16.37 MiB)
+same-size resize: 1 ns/op
+cursor-only fleet: 1737 ns/op, 0 allocations / 2000 updates
+resize churn: 40 us/op
+after resize churn: 12187020 live heap bytes (11.62 MiB)
+after drop: 0 live heap bytes (0.00 MiB)

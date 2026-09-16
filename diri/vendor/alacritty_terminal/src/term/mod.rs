@@ -404,6 +404,18 @@ pub enum Osc52 {
 }
 
 impl<T> Term<T> {
+    #[cfg(feature = "compact-history")]
+    pub fn bound_primary_history_storage(&mut self, budget: usize) {
+        if self.mode.contains(TermMode::ALT_SCREEN) {
+            self.inactive_grid
+                .as_mut()
+                .expect("primary grid")
+                .bound_history_storage(budget);
+        } else {
+            self.grid.bound_history_storage(budget);
+        }
+    }
+
     #[inline]
     pub fn scroll_display(&mut self, scroll: Scroll)
     where
