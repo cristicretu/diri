@@ -85,8 +85,8 @@ use diri_client::DaemonClient;
 #[cfg(target_os = "macos")]
 use gpui::SystemMenuType;
 use gpui::{
-    App, AppContext as _, Bounds, Menu, MenuItem, OsAction, TitlebarOptions, Window,
-    WindowBackgroundAppearance, WindowBounds, WindowOptions, point, px, size,
+    App, AppContext as _, Bounds, Menu, MenuItem, OsAction, TitlebarOptions, Window, WindowBounds,
+    WindowOptions, point, px, size,
 };
 use gpui_platform::application;
 use root::RootView;
@@ -679,15 +679,22 @@ fn open_main_window_with_context(
         .dev_build
         .as_ref()
         .map(|build| build.window_title().into());
+    let window_material = services
+        .store
+        .store
+        .read()
+        .expect("session store lock poisoned")
+        .preferences()
+        .window_material;
     cx.open_window(
         WindowOptions {
             window_bounds: Some(window_bounds),
             display_id,
             window_min_size: Some(size(px(MIN_WINDOW_WIDTH), px(MIN_WINDOW_HEIGHT))),
-            // The terminal is an opaque work surface. Marking the whole window
-            // blurred forces WindowServer/Metal to retain full-size backdrop
-            // surfaces even though only the sidebar used that material.
-            window_background: WindowBackgroundAppearance::Opaque,
+            // Glass blurs the desktop behind the whole window, which makes
+            // WindowServer retain a backdrop for it; the Appearance settings
+            // offer an opaque window for anyone who would rather not pay that.
+            window_background: crate::root::window_background(window_material),
             app_id: Some(app_id),
             // Diri paints the whole titlebar. Keep AppKit from turning presses on
             // its controls into window drags; RootView explicitly moves the

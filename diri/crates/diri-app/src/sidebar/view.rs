@@ -14,9 +14,9 @@ use diri_proto::{
     SessionRecord,
 };
 use diri_ui::{
-    AgentLogo, AlertChip, AttentionDot, AttentionLevel, Fill, FloatingSurface, HairlineDivider,
-    HoverMarquee, Ink, LoadingIndicator, Metrics, Motion, Palette, Radius, RowFill, SemanticColors,
-    Space, StateChip, StatusGlyph, StatusState, Typo,
+    AgentLogo, AlertChip, AttentionDot, AttentionLevel, Fill, FloatingSurface, Glass, GlassPill,
+    HairlineDivider, HoverMarquee, Ink, LoadingIndicator, Metrics, Motion, Palette, Radius,
+    RowFill, SemanticColors, Space, StateChip, StatusGlyph, StatusState, Typo,
 };
 use gpui::{
     Anchor, Animation, AnimationExt, AnyElement, App, AppContext as _, Bounds, Context,
@@ -978,7 +978,7 @@ impl Sidebar {
 
     fn colors(&self) -> SemanticColors {
         let store = self.store.read().expect("session store lock poisoned");
-        crate::app_theme::sidebar_colors(store.theme_id())
+        crate::app_theme::sidebar_colors_for(store.preferences())
     }
 
     fn begin_rename(
@@ -1726,14 +1726,22 @@ impl Sidebar {
             .flex()
             .items_center()
             .gap(px(8.0))
-            .bg(Fill::selected(colors, selected))
+            .border_1()
+            .border_color(colors.primary.alpha(0.0))
+            .glass_pill(colors, selected)
             .text_color(if selected {
                 colors.primary
             } else {
                 colors.secondary
             })
             .cursor_pointer()
-            .hover(move |style| style.bg(Fill::hover(colors, true)))
+            .hover(move |style| {
+                if selected {
+                    style
+                } else {
+                    style.bg(Fill::hover(colors, true))
+                }
+            })
             .on_click(cx.listener(move |_, _, _, cx| {
                 cx.emit(SidebarEvent::SettingsTabSelected(tab));
             }))
@@ -2843,9 +2851,12 @@ impl Sidebar {
             .border_1()
             .border_color(if marked {
                 Palette::CLAY.alpha(0.78)
+            } else if selected {
+                Glass::stroke(colors)
             } else {
                 colors.primary.alpha(0.0)
             })
+            .when(selected, |row| row.shadow(Glass::shadows(colors)))
             .opacity(if archived {
                 0.58
             } else if hibernated {
@@ -5405,12 +5416,11 @@ impl Sidebar {
 
         let scrolled = f32::from(self.list_scroll.offset().y).min(0.0).abs();
         let remaining = (f32::from(self.list_scroll.max_offset().y) - scrolled).max(0.0);
-        // Opaque at the edge: the sidebar's own fill is translucent, and
-        // fading to it would leave a legible ghost of the clipped row.
-        let fill = Hsla {
-            a: 1.0,
-            ..Self::surface_fill(colors).into()
-        };
+        // The fade lands on exactly the color the panel settles to over the
+        // window fill, so the mask is invisible where the list is at rest.
+        // On an opaque window that edge is solid; on glass it keeps the
+        // panel's own coverage rather than hardening into a dark band.
+        let fill: Hsla = colors.sidebar_surface_settled().into();
         let mut fades = Vec::new();
         for (strength, angle, edge) in [
             ((scrolled / RAMP).min(1.0), 180.0, true),

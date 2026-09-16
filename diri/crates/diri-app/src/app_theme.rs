@@ -1,6 +1,8 @@
 use diri_term::theme::{TermTheme, ThemeAppearance};
-use diri_ui::{Appearance, SemanticColors};
+use diri_ui::{Appearance, Material, SemanticColors};
 use gpui::Rgba;
+
+use crate::store::{Prefs, SessionStore};
 
 /// Resolves persisted theme ids in one place for both terminal and app chrome.
 pub(crate) fn terminal_theme(id: &str) -> TermTheme {
@@ -10,12 +12,48 @@ pub(crate) fn terminal_theme(id: &str) -> TermTheme {
         .unwrap_or_default()
 }
 
+/// Opaque application palette for a theme id. Previews, tests, and surfaces
+/// that never sit on the blurred window use this; live chrome goes through
+/// [`colors_for`] so the window material travels with the palette.
 pub(crate) fn colors(id: &str) -> SemanticColors {
     semantic_colors(terminal_theme(id), false)
 }
 
 pub(crate) fn sidebar_colors(id: &str) -> SemanticColors {
     semantic_colors(terminal_theme(id), true)
+}
+
+pub(crate) fn colors_with(id: &str, material: Material) -> SemanticColors {
+    colors(id).with_material(material)
+}
+
+pub(crate) fn sidebar_colors_with(id: &str, material: Material) -> SemanticColors {
+    sidebar_colors(id).with_material(material)
+}
+
+/// Application palette carrying the user's window material.
+pub(crate) fn colors_for(prefs: &Prefs) -> SemanticColors {
+    colors_with(&prefs.terminal_theme, prefs.window_material.to_ui())
+}
+
+pub(crate) fn sidebar_colors_for(prefs: &Prefs) -> SemanticColors {
+    sidebar_colors_with(&prefs.terminal_theme, prefs.window_material.to_ui())
+}
+
+/// Live palette for a store: the previewed theme, if any, under the user's
+/// window material.
+pub(crate) fn colors_in(store: &SessionStore) -> SemanticColors {
+    colors_with(
+        store.theme_id(),
+        store.preferences().window_material.to_ui(),
+    )
+}
+
+pub(crate) fn sidebar_colors_in(store: &SessionStore) -> SemanticColors {
+    sidebar_colors_with(
+        store.theme_id(),
+        store.preferences().window_material.to_ui(),
+    )
 }
 
 fn semantic_colors(theme: TermTheme, sidebar_tones: bool) -> SemanticColors {

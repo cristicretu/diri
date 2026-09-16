@@ -20,6 +20,35 @@ pub enum WindowMode {
     Fullscreen,
 }
 
+/// How the main window sits over the desktop. Stored as its own enum so the
+/// preferences file never depends on `diri-ui` types.
+#[derive(Clone, Copy, Debug, Default, Deserialize, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub enum WindowMaterial {
+    /// Blur the desktop behind the window and paint chrome as translucent
+    /// tints over it.
+    #[default]
+    Glass,
+    /// A solid window. Cheaper for the compositor: no backdrop is retained.
+    Opaque,
+}
+
+impl WindowMaterial {
+    pub const fn to_ui(self) -> diri_ui::Material {
+        match self {
+            Self::Glass => diri_ui::Material::Glass,
+            Self::Opaque => diri_ui::Material::Opaque,
+        }
+    }
+
+    pub const fn toggled(self) -> Self {
+        match self {
+            Self::Glass => Self::Opaque,
+            Self::Opaque => Self::Glass,
+        }
+    }
+}
+
 /// The last desktop window placement, stored without GPUI types so the
 /// preferences file stays a plain, forwards-compatible JSON document.
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
@@ -153,6 +182,10 @@ pub struct Prefs {
     pub terminal_copy_on_select: bool,
     pub terminal_hide_pointer: bool,
     pub terminal_paste_protection: bool,
+    /// Whether the window blurs the desktop behind it. Field-level default so
+    /// files written before it existed pick up glass.
+    #[serde(default)]
+    pub window_material: WindowMaterial,
     /// Last size, position, and presentation mode of the main window.
     pub window_placement: Option<WindowPlacement>,
     /// Whether the leading sidebar was mounted when the app last ran.
@@ -221,6 +254,7 @@ impl Default for Prefs {
             terminal_copy_on_select: false,
             terminal_hide_pointer: true,
             terminal_paste_protection: false,
+            window_material: WindowMaterial::Glass,
             window_placement: None,
             sidebar_visible: false,
             sidebar_width: 248.0,

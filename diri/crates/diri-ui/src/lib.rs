@@ -19,7 +19,8 @@ pub use brand::{
     MarkRasterizer, OPENAI_PATH, set_mark_rasterizer,
 };
 pub use components::{
-    AlertChip, FloatingSurface, HairlineDivider, HoverMarquee, LoadingIndicator, RowFill, StateChip,
+    AlertChip, FloatingSurface, GlassPill, HairlineDivider, HoverMarquee, LoadingIndicator,
+    RowFill, StateChip,
 };
 pub use icon::{Icon, IconAssets, IconName, IconSize, icon_from_system_name};
 pub use status::{
@@ -27,6 +28,6 @@ pub use status::{
 };
 pub use svg::{PathCommand, SvgPath, SvgPathError};
 pub use tokens::{
-    Appearance, Chip, Fill, Ink, MemoryFormat, Metrics, Motion, Palette, Radius, SemanticColors,
-    Space, Spring, TextRole, TextTone, TypeStyle, Typo, rgba_f32,
+    Appearance, Chip, Fill, Glass, Ink, Material, MemoryFormat, Metrics, Motion, Palette, Radius,
+    SemanticColors, Space, Spring, TextRole, TextTone, TypeStyle, Typo, composite, rgba_f32,
 };

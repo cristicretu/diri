@@ -685,7 +685,7 @@ impl Render for WorkspaceWorkbench {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let colors = {
             let store = self.runtime.store.read().expect("store");
-            crate::app_theme::colors(store.theme_id())
+            crate::app_theme::colors_in(&store)
         };
         let mut root = div()
             .id("workspace-workbench")

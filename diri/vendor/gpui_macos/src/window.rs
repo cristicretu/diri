@@ -1551,6 +1551,13 @@ impl PlatformWindow for MacWindow {
     fn set_app_id(&mut self, _app_id: &str) {}
 
     fn set_background_appearance(&self, background_appearance: WindowBackgroundAppearance) {
+        // diri: blur through WindowServer's window-level filter (what Terminal.app
+        // and Ghostty use) rather than an `NSVisualEffectView` backdrop layer. On
+        // macOS 26+ the effect view resolves to a Liquid Glass material whose
+        // per-frame lensing made a 60 fps terminal window stutter; the plain
+        // WindowServer blur is a fixed-cost gaussian on the retained backdrop.
+        const USE_VISUAL_EFFECT_BACKDROP: bool = false;
+        const WINDOW_BLUR_RADIUS: i64 = 28;
         let mut this = self.0.as_ref().lock();
         this.background_appearance = background_appearance;
 
@@ -1567,12 +1574,12 @@ impl PlatformWindow for MacWindow {
             };
             this.native_window.setBackgroundColor_(background_color);
 
-            if NSAppKitVersionNumber < NSAppKitVersionNumber12_0 {
+            if NSAppKitVersionNumber < NSAppKitVersionNumber12_0 || !USE_VISUAL_EFFECT_BACKDROP {
                 // Whether `-[NSVisualEffectView respondsToSelector:@selector(_updateProxyLayer)]`.
                 // On macOS Catalina/Big Sur `NSVisualEffectView` doesn’t own concrete sublayers
                 // but uses a `CAProxyLayer`. Use the legacy WindowServer API.
                 let blur_radius = if background_appearance == WindowBackgroundAppearance::Blurred {
-                    80
+                    WINDOW_BLUR_RADIUS
                 } else {
                     0
                 };

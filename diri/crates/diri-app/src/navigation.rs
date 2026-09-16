@@ -1142,11 +1142,8 @@ impl NavigationOverlay {
     }
 
     fn colors(&self) -> SemanticColors {
-        crate::app_theme::sidebar_colors(
-            self.store
-                .read()
-                .expect("session store lock poisoned")
-                .theme_id(),
+        crate::app_theme::sidebar_colors_in(
+            &self.store.read().expect("session store lock poisoned"),
         )
     }
 

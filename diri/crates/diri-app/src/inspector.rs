@@ -15,8 +15,8 @@ use diri_proto::{
     SessionArtifact, SessionDiffBase, SessionId, SessionRecord, SessionStatus,
 };
 use diri_ui::{
-    AgentKind, AgentLogo, Appearance, Fill, FloatingSurface, Ink, LoadingIndicator, Metrics,
-    Radius, SemanticColors, Typo,
+    AgentKind, AgentLogo, Appearance, Fill, FloatingSurface, GlassPill, Ink, LoadingIndicator,
+    Metrics, Radius, SemanticColors, Typo,
 };
 use gpui::{
     Animation, AnimationExt, AnyElement, App, Context, DragMoveEvent, Entity, EventEmitter,
@@ -366,7 +366,7 @@ impl WorkbenchInspector {
             let store = runtime.store.read().expect("session store lock poisoned");
             (
                 store.preferences().inspector_tab,
-                crate::app_theme::sidebar_colors(store.theme_id()),
+                crate::app_theme::sidebar_colors_for(store.preferences()),
                 store.selected_session_id().cloned(),
             )
         };
@@ -760,7 +760,7 @@ impl WorkbenchInspector {
                 .store
                 .read()
                 .expect("session store lock poisoned");
-            crate::app_theme::sidebar_colors(store.theme_id())
+            crate::app_theme::sidebar_colors_for(store.preferences())
         };
         self.code_viewer
             .update(cx, |viewer, cx| viewer.set_colors(colors, cx));
@@ -988,14 +988,8 @@ impl WorkbenchInspector {
         self.next_workspace_id += 1;
         let mut tab = WorkspaceTab::new(id, surface);
         if surface == WorkspaceSurface::Files {
-            let colors = self
-                .runtime
-                .store
-                .read()
-                .expect("store")
-                .theme_id()
-                .to_owned();
-            let colors = crate::app_theme::sidebar_colors(&colors);
+            let colors =
+                crate::app_theme::sidebar_colors_in(&self.runtime.store.read().expect("store"));
             let viewer = cx.new(|cx| CodeViewer::new(self.tokio.clone(), colors, cx));
             cx.observe(&viewer, |_, _, cx| cx.notify()).detach();
             let cwd = self
@@ -1825,11 +1819,9 @@ impl WorkbenchInspector {
                     .items_center()
                     .gap(px(5.0))
                     .rounded(px(Radius::BADGE))
-                    .bg(if active {
-                        colors.primary.alpha(0.09)
-                    } else {
-                        colors.primary.alpha(0.0)
-                    })
+                    .border_1()
+                    .border_color(colors.primary.alpha(0.0))
+                    .glass_pill(colors, active)
                     .text_color(if active {
                         colors.primary
                     } else {
@@ -1837,7 +1829,11 @@ impl WorkbenchInspector {
                     })
                     .cursor_pointer()
                     .hover(move |tab| {
-                        tab.bg(colors.primary.alpha(if active { 0.12 } else { 0.055 }))
+                        if active {
+                            tab
+                        } else {
+                            tab.bg(colors.primary.alpha(0.055))
+                        }
                     })
                     .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
                     .child({
@@ -4504,7 +4500,7 @@ impl Render for WorkbenchInspector {
                 .store
                 .read()
                 .expect("session store lock poisoned");
-            crate::app_theme::sidebar_colors(store.theme_id())
+            crate::app_theme::sidebar_colors_for(store.preferences())
         };
         let session = self.selected_session();
         let body = match self.workspace_selected {

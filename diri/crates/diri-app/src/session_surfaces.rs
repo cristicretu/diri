@@ -188,7 +188,7 @@ impl SessionSurfaces {
 
     fn colors(&self) -> SemanticColors {
         let store = self.store.read().expect("session store lock poisoned");
-        crate::app_theme::colors(store.theme_id())
+        crate::app_theme::colors_for(store.preferences())
     }
 
     /// T11 supplies the same resident buffer used by the mounted terminal. A

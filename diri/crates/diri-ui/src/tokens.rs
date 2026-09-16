@@ -1,4 +1,4 @@
-use gpui::{FontWeight, Rgba, WindowAppearance};
+use gpui::{BoxShadow, FontWeight, Rgba, WindowAppearance, point, px};
 
 /// Constructs a GPUI color from normalized channel values.
 pub const fn rgba_f32(r: f32, g: f32, b: f32, a: f32) -> Rgba {
@@ -86,6 +86,34 @@ impl Appearance {
     }
 }
 
+/// How the application window sits over the desktop.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Material {
+    /// A solid window: every surface paints its full color.
+    #[default]
+    Opaque,
+    /// The desktop shows through a blur and chrome paints translucent tints
+    /// over it. The work surface stays denser than the sidebars so terminal
+    /// text keeps its contrast while the panels read as lighter glass.
+    Glass,
+}
+
+/// Straight-alpha compositing of `top` over `under`, keeping the combined
+/// coverage so a translucent result stays translucent.
+pub fn composite(top: Rgba, under: Rgba) -> Rgba {
+    let a = top.a + under.a * (1.0 - top.a);
+    if a <= f32::EPSILON {
+        return rgba_f32(under.r, under.g, under.b, 0.0);
+    }
+    let blend = |t: f32, u: f32| (t * top.a + u * under.a * (1.0 - top.a)) / a;
+    rgba_f32(
+        blend(top.r, under.r),
+        blend(top.g, under.g),
+        blend(top.b, under.b),
+        a,
+    )
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum TextTone {
     Selected,
@@ -103,6 +131,7 @@ pub struct SemanticColors {
     pub background: Rgba,
     sidebar_surface: Rgba,
     floating_surface: Rgba,
+    material: Material,
 }
 
 impl SemanticColors {
@@ -116,6 +145,7 @@ impl SemanticColors {
             background: rgba_f32(1.0, 1.0, 1.0, 1.0),
             sidebar_surface: rgba_f32(0.949, 0.953, 0.941, 0.89),
             floating_surface: rgba_f32(0.949, 0.953, 0.941, 1.0),
+            material: Material::Opaque,
         }
     }
 
@@ -129,6 +159,7 @@ impl SemanticColors {
             background: rgba_f32(0.071, 0.075, 0.094, 1.0),
             sidebar_surface: rgba_f32(0.141, 0.161, 0.196, 0.89),
             floating_surface: rgba_f32(0.141, 0.161, 0.196, 1.0),
+            material: Material::Opaque,
         }
     }
 
@@ -180,7 +211,51 @@ impl SemanticColors {
             background,
             sidebar_surface,
             floating_surface,
+            material: Material::Opaque,
         }
+    }
+
+    /// Chooses how translucent every surface paints. Glass only changes the
+    /// alphas: hues stay with the selected theme.
+    pub const fn with_material(mut self, material: Material) -> Self {
+        self.material = material;
+        self
+    }
+
+    pub const fn material(self) -> Material {
+        self.material
+    }
+
+    fn glass_alpha(self, dark: f32, light: f32) -> f32 {
+        match self.appearance {
+            Appearance::Dark => dark,
+            Appearance::Light => light,
+        }
+    }
+
+    /// The window's own fill: the base every panel composes over. Under glass
+    /// it is a tint of the theme background so the blurred desktop reads in
+    /// the theme's hue everywhere, including behind the rounded card corners.
+    pub fn window_fill(self) -> Rgba {
+        match self.material {
+            Material::Opaque => self.background,
+            Material::Glass => self.background.alpha(self.glass_alpha(0.66, 0.74)),
+        }
+    }
+
+    /// Fill for the work surface (terminal grid, editors). This is the
+    /// densest glass tint: running output must never fight the wallpaper.
+    pub fn work_surface(self) -> Rgba {
+        match self.material {
+            Material::Opaque => self.background,
+            Material::Glass => self.background.alpha(self.glass_alpha(0.78, 0.84)),
+        }
+    }
+
+    /// The sidebar material as it settles over the window fill, for edge
+    /// masks and fades that must match the painted panel exactly.
+    pub fn sidebar_surface_settled(self) -> Rgba {
+        composite(self.sidebar_surface(), self.window_fill())
     }
 
     pub fn text(self, tone: TextTone) -> Rgba {
@@ -218,8 +293,13 @@ impl SemanticColors {
     }
 
     /// Shared translucent material for the leading and trailing sidebars.
-    pub const fn sidebar_surface(self) -> Rgba {
-        self.sidebar_surface
+    /// Under glass the panels are the lightest layer, so they carry the
+    /// least coverage and let the most desktop through.
+    pub fn sidebar_surface(self) -> Rgba {
+        match self.material {
+            Material::Opaque => self.sidebar_surface,
+            Material::Glass => self.sidebar_surface.alpha(self.glass_alpha(0.62, 0.68)),
+        }
     }
 }
 
@@ -284,6 +364,52 @@ impl Fill {
 
     pub fn subtle(colors: SemanticColors) -> Rgba {
         colors.primary.alpha(Self::SUBTLE_OPACITY)
+    }
+}
+
+/// The lifted, translucent pill behind a selected tab-like control: sidebar
+/// session rows, settings pages, workspace tabs. A hairline stroke, a
+/// one-point highlight along the top edge, and a soft drop shadow make the
+/// pill read as a slab of glass sitting on the chrome rather than a flat
+/// tint painted into it.
+pub struct Glass;
+
+impl Glass {
+    pub fn fill(colors: SemanticColors) -> Rgba {
+        match colors.appearance {
+            Appearance::Dark => rgba_f32(1.0, 1.0, 1.0, 0.115),
+            Appearance::Light => rgba_f32(1.0, 1.0, 1.0, 0.62),
+        }
+    }
+
+    pub fn stroke(colors: SemanticColors) -> Rgba {
+        match colors.appearance {
+            Appearance::Dark => rgba_f32(1.0, 1.0, 1.0, 0.13),
+            Appearance::Light => rgba_f32(0.0, 0.0, 0.0, 0.09),
+        }
+    }
+
+    pub fn shadows(colors: SemanticColors) -> Vec<BoxShadow> {
+        let (highlight, shadow) = match colors.appearance {
+            Appearance::Dark => (rgba_f32(1.0, 1.0, 1.0, 0.09), rgba_f32(0.0, 0.0, 0.0, 0.28)),
+            Appearance::Light => (rgba_f32(1.0, 1.0, 1.0, 0.70), rgba_f32(0.0, 0.0, 0.0, 0.10)),
+        };
+        vec![
+            BoxShadow {
+                color: highlight.into(),
+                offset: point(px(0.0), px(1.0)),
+                blur_radius: px(0.0),
+                spread_radius: px(0.0),
+                inset: true,
+            },
+            BoxShadow {
+                color: shadow.into(),
+                offset: point(px(0.0), px(1.0)),
+                blur_radius: px(3.0),
+                spread_radius: px(0.0),
+                inset: false,
+            },
+        ]
     }
 }
 

@@ -24,7 +24,7 @@ impl Render for NotificationWheelHarness {
             .store
             .store
             .read()
-            .map(|store| crate::app_theme::sidebar_colors(store.theme_id()))
+            .map(|store| crate::app_theme::sidebar_colors_in(&store))
             .unwrap();
         div()
             .size_full()

@@ -22,7 +22,7 @@ use gpui::{
     Animation, AnimationExt, AnyElement, App, BoxShadow, Context, CursorStyle, DragMoveEvent,
     Entity, FocusHandle, Focusable, FontWeight, KeyContext, KeyDownEvent, KeyUpEvent,
     ModifiersChangedEvent, MouseButton, Render, StyleRefinement, Subscription, Task, Window,
-    deferred, div, ease_out_quint, prelude::*, px, rgba,
+    WindowBackgroundAppearance, deferred, div, ease_out_quint, prelude::*, px, rgba,
 };
 
 use crate::AppServices;
@@ -50,7 +50,7 @@ use crate::recovery::{RecoveryAction, RecoveryKind, RecoveryNotice};
 use crate::seam::{SeamSlide, toggle_has_settled};
 use crate::session_surfaces::SessionSurfaces;
 use crate::sidebar::{PreviewScenario, Sidebar, SidebarEvent};
-use crate::store::SpawnOptions;
+use crate::store::{SpawnOptions, WindowMaterial};
 use crate::surface_shell::UtilitySurfaces;
 use crate::terminal_pane::{TerminalPane, TerminalPaneEvent, TerminalViewport};
 use crate::updates::UpdatePhase;
@@ -194,6 +194,14 @@ enum QuoteSurface {
 ///
 /// Takes the slide by `&mut Option<_>` rather than hanging off `RootView` so
 /// both seams can be advanced in one pass without borrowing all of `self`.
+/// The platform window background that realizes a preferred material.
+pub(crate) fn window_background(material: WindowMaterial) -> WindowBackgroundAppearance {
+    match material {
+        WindowMaterial::Glass => WindowBackgroundAppearance::Blurred,
+        WindowMaterial::Opaque => WindowBackgroundAppearance::Opaque,
+    }
+}
+
 fn advance_seam(slide: &mut Option<SeamSlide>, settled: f32, now: Instant, window: &Window) -> f32 {
     match *slide {
         Some(active) if !active.is_done(now) => {
@@ -252,6 +260,9 @@ pub struct RootView {
     sidebar_float: f32,
     sidebar_floating: bool,
     sidebar_peek_dwell: Option<Task<()>>,
+    /// The window material last pushed to the platform window, so a
+    /// preference change re-applies it exactly once.
+    applied_material: Option<WindowMaterial>,
     auxiliary_terminal: Option<Entity<TerminalPane>>,
     auxiliary_id: Option<SessionId>,
     auxiliary_parent: Option<SessionId>,
@@ -1237,6 +1248,7 @@ impl RootView {
             sidebar_floating: false,
             sidebar_peek_dwell: None,
             sidebar_seam,
+            applied_material: None,
             auxiliary_terminal: None,
             auxiliary_id: None,
             auxiliary_parent: None,
@@ -1458,7 +1470,28 @@ impl RootView {
             .window_store
             .read()
             .expect("session store lock poisoned");
-        crate::app_theme::colors(store.theme_id())
+        crate::app_theme::colors_for(store.preferences())
+    }
+
+    /// Pushes the preferred window material to the platform window when it
+    /// changes. The window opens with the right material already; this only
+    /// follows the settings toggle afterwards.
+    fn sync_window_material(&mut self, window: &Window) {
+        let material = self
+            .services
+            .store
+            .store
+            .read()
+            .expect("session store lock poisoned")
+            .preferences()
+            .window_material;
+        if self.applied_material == Some(material) {
+            return;
+        }
+        if self.applied_material.is_some() {
+            window.set_background_appearance(window_background(material));
+        }
+        self.applied_material = Some(material);
     }
 
     fn show_quote_feedback(
@@ -3039,7 +3072,7 @@ impl RootView {
                 card.rounded_tr(px(Radius::CARD))
             })
             .rounded_bl(px(Radius::CARD))
-            .bg(terminal.background)
+            .bg(terminal.work_surface())
             .overflow_hidden()
             .text_color(terminal.primary);
 
@@ -3213,7 +3246,7 @@ impl RootView {
                         .flex()
                         .items_center()
                         .justify_center()
-                        .bg(terminal.background)
+                        .bg(terminal.work_surface())
                         .text_size(px(12.0))
                         .text_color(terminal.secondary)
                         .child("Opening terminal…"),
@@ -3926,6 +3959,7 @@ impl Render for RootView {
             self.open_notification(session, event, window, cx);
         }
         let colors = self.colors();
+        self.sync_window_material(window);
         let launcher_open = self.launcher.read(cx).is_open();
         let recovery_notice = if self.preview {
             None
@@ -4114,10 +4148,10 @@ impl Render for RootView {
             // surface; the terminal grid sets its own mono font.
             .font_family(crate::fonts::ui_family())
             .flex()
-            // Match the opaque platform window so content behind diri never
-            // participates in compositing. The sidebar keeps its own surface
-            // treatment above this base.
-            .bg(colors.background)
+            // The window's base tint. Opaque matches the solid platform
+            // window; glass leaves the blurred desktop showing through it.
+            // Every panel keeps its own surface treatment above this base.
+            .bg(colors.window_fill())
             .track_focus(&self.focus)
             .on_mouse_down(
                 MouseButton::Left,

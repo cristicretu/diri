@@ -373,7 +373,7 @@ impl RootView {
         let (colors, sounds, alerts) = {
             let store = self.window_store.read().expect("store");
             (
-                crate::app_theme::sidebar_colors(store.theme_id()),
+                crate::app_theme::sidebar_colors_in(&store),
                 store.preferences().status_sounds,
                 store.preferences().status_notifications,
             )

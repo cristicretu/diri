@@ -3972,15 +3972,15 @@ impl Render for LauncherOverlay {
             window,
         );
 
-        let theme_id = self
-            .services
-            .store
-            .store
-            .read()
-            .expect("session store lock poisoned")
-            .theme_id()
-            .to_owned();
-        let colors = launcher_colors_for_theme(&theme_id);
+        let colors = {
+            let store = self
+                .services
+                .store
+                .store
+                .read()
+                .expect("session store lock poisoned");
+            crate::app_theme::colors_in(&store)
+        };
         let focused = self.focus.is_focused(window);
         root.size_full()
             .relative()

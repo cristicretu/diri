@@ -83,6 +83,10 @@ pub struct TerminalElement {
     buffer: SharedGridBuffer,
     shared: Arc<ElementSharedState>,
     theme: TermTheme,
+    /// Coverage of the default-background fill under the grid. Cells with
+    /// their own background keep painting opaque; only the theme background
+    /// lets a translucent host surface show through.
+    background_opacity: f32,
     font: Font,
     font_size: Pixels,
     focus_handle: Option<FocusHandle>,
@@ -476,6 +480,7 @@ impl TerminalElement {
                 metrics: Mutex::new(None),
             }),
             theme: TermTheme::default(),
+            background_opacity: 1.0,
             font: terminal_font,
             font_size: px(13.0),
             focus_handle: None,
@@ -521,6 +526,15 @@ impl TerminalElement {
     #[must_use]
     pub fn theme(mut self, theme: TermTheme) -> Self {
         self.theme = theme;
+        self
+    }
+
+    /// Sets how much of the theme background the grid paints itself. Pass
+    /// `0.0` when the surface underneath already supplies a (translucent)
+    /// fill so the desktop can show through default-background cells.
+    #[must_use]
+    pub fn background_opacity(mut self, opacity: f32) -> Self {
+        self.background_opacity = opacity.clamp(0.0, 1.0);
         self
     }
 
@@ -1216,7 +1230,10 @@ impl Element for TerminalElement {
         // it: every party that touches these mutexes runs on the main thread,
         // and the clone copied the entire fetched-history cell cache per frame.
         let viewport = mutex_lock(&self.shared.viewport);
-        let mut background_quads = vec![fill(bounds, self.theme.background)];
+        let mut background_quads = vec![fill(
+            bounds,
+            self.theme.background.alpha(self.background_opacity),
+        )];
         let mut decoration_quads = Vec::new();
         let mut overlay_quads = Vec::new();
         let mut lines = Vec::with_capacity(visible_rows);

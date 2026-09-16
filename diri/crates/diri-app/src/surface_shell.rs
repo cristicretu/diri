@@ -16,7 +16,7 @@ use crate::query_editor::{self, ClipboardEdit, Edit, QueryEditor};
 use crate::settings::{HostDraft, SettingsNav, SettingsTab, theme};
 mod account_settings;
 use crate::sidebar::DraggedSidebarItem;
-use crate::store::{Prefs, SessionStore, StoreRuntime};
+use crate::store::{Prefs, SessionStore, StoreRuntime, WindowMaterial};
 use crate::updates::{UpdateCommand, UpdateHandle, UpdatePhase};
 use crate::worktrees::WorktreesSheet;
 use account_settings::AccountsState;
@@ -469,22 +469,24 @@ impl UtilitySurfaces {
     }
 
     fn colors(&self) -> SemanticColors {
-        crate::app_theme::colors(
+        crate::app_theme::colors_with(
             self.store
                 .read()
                 .expect("session store lock poisoned")
                 .preview_theme_id()
                 .unwrap_or(&self.prefs.terminal_theme),
+            self.prefs.window_material.to_ui(),
         )
     }
 
     fn settings_colors(&self) -> SemanticColors {
-        crate::app_theme::sidebar_colors(
+        crate::app_theme::sidebar_colors_with(
             self.store
                 .read()
                 .expect("session store lock poisoned")
                 .preview_theme_id()
                 .unwrap_or(&self.prefs.terminal_theme),
+            self.prefs.window_material.to_ui(),
         )
     }
 
@@ -3354,6 +3356,16 @@ impl UtilitySurfaces {
                         ))
                         .child(appearance_divider(colors))
                         .child(appearance_setting_row(
+                            "Glass window",
+                            window_material_switch(
+                                self.prefs.window_material == WindowMaterial::Glass,
+                                colors,
+                                cx,
+                            ),
+                            colors,
+                        ))
+                        .child(appearance_divider(colors))
+                        .child(appearance_setting_row(
                             "Background",
                             swatch(selected.background),
                             colors,
@@ -5409,6 +5421,37 @@ fn appearance_setting_row(
                 .child(label),
         )
         .child(control)
+}
+
+/// Blur the desktop behind the window, or paint it solid. Solid is cheaper
+/// for the compositor, so the choice stays one click away from the theme.
+fn window_material_switch(
+    enabled: bool,
+    colors: SemanticColors,
+    cx: &mut Context<UtilitySurfaces>,
+) -> impl IntoElement {
+    div()
+        .id("window-material")
+        .flex_none()
+        .w(px(30.0))
+        .h(px(18.0))
+        .p(px(2.0))
+        .rounded(px(9.0))
+        .bg(if enabled {
+            Ink::FRESH.alpha(0.72)
+        } else {
+            colors.primary.alpha(0.14)
+        })
+        .flex()
+        .justify_end()
+        .when(!enabled, |toggle| toggle.justify_start())
+        .cursor_pointer()
+        .on_click(cx.listener(|this, _, _, cx| {
+            this.prefs.window_material = this.prefs.window_material.toggled();
+            this.persist_prefs();
+            cx.notify();
+        }))
+        .child(div().size(px(14.0)).rounded(px(7.0)).bg(colors.primary))
 }
 
 fn appearance_divider(colors: SemanticColors) -> impl IntoElement {

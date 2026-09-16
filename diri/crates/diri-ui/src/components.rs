@@ -6,7 +6,7 @@ use gpui::{
     prelude::*, px, svg,
 };
 
-use crate::{Chip, Fill, IconName, Ink, Radius, SemanticColors, Typo, rgba_f32};
+use crate::{Chip, Fill, Glass, IconName, Ink, Radius, SemanticColors, Typo, rgba_f32};
 
 /// Shared, platform-independent activity mark for bounded asynchronous work.
 /// Repeating GPUI animations automatically become static when Reduce Motion
@@ -238,10 +238,28 @@ impl RowFill {
             Self::Clear => colors.primary.alpha(0.0),
             Self::Hover => colors.primary.alpha(Fill::HOVER_OPACITY),
             Self::MultiSelected => colors.primary.alpha(Fill::MULTI_SELECTED_OPACITY),
-            Self::Selected => colors.primary.alpha(Fill::SELECTED_OPACITY),
+            Self::Selected => Glass::fill(colors),
         }
     }
 }
+
+/// Styles a tab-like control as a lifted glass pill while `on` (see
+/// [`Glass`]). Callers keep a transparent `border_1` on the off state so
+/// toggling never shifts layout.
+pub trait GlassPill: Styled + Sized {
+    fn glass_pill(self, colors: SemanticColors, on: bool) -> Self {
+        if on {
+            self.bg(Glass::fill(colors))
+                .border_1()
+                .border_color(Glass::stroke(colors))
+                .shadow(Glass::shadows(colors))
+        } else {
+            self
+        }
+    }
+}
+
+impl<T: Styled> GlassPill for T {}
 
 /// Shared panel recipe for palettes, popovers, and find surfaces.
 #[derive(IntoElement)]
@@ -396,8 +414,19 @@ mod tests {
         let colors = SemanticColors::dark();
         assert_eq!(RowFill::Hover.color(colors).a, 0.06);
         assert_eq!(RowFill::MultiSelected.color(colors).a, 0.08);
-        assert_eq!(RowFill::Selected.color(colors).a, 0.10);
+        assert_eq!(RowFill::Selected.color(colors), Glass::fill(colors));
         assert_eq!(RowFill::Clear.color(colors).a, 0.0);
+    }
+
+    #[test]
+    fn glass_pill_lifts_the_selected_row_above_hover_and_multi_select() {
+        for colors in [SemanticColors::dark(), SemanticColors::light()] {
+            assert!(Glass::fill(colors).a > RowFill::MultiSelected.color(colors).a);
+            assert!(Glass::stroke(colors).a > 0.0);
+            let shadows = Glass::shadows(colors);
+            assert!(shadows.iter().any(|shadow| shadow.inset));
+            assert!(shadows.iter().any(|shadow| !shadow.inset));
+        }
     }
 
     #[test]

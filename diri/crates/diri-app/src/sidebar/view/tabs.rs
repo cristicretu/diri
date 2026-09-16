@@ -126,13 +126,15 @@ impl Sidebar {
                     .items_center()
                     .gap(px(7.0))
                     .cursor_pointer()
-                    .bg(if active {
-                        colors.primary.alpha(0.10)
-                    } else {
-                        colors.primary.alpha(0.0)
-                    })
+                    .border_1()
+                    .border_color(colors.primary.alpha(0.0))
+                    .glass_pill(colors, active)
                     .hover(move |row| {
-                        row.bg(colors.primary.alpha(if active { 0.13 } else { 0.06 }))
+                        if active {
+                            row
+                        } else {
+                            row.bg(colors.primary.alpha(0.06))
+                        }
                     })
                     .child(sf_symbol(
                         crate::agent_catalog::system_image(&session.kind),
