@@ -1032,13 +1032,44 @@ attach/preview fields and unsupported versions before normal attach dispatch.
 A matching versioned acknowledgement precedes the existing binary full grid,
 modes, and pushed diff frames. There is no fallback to a normal attachment.
 
-At most 16 preview connections are admitted per Engine. They share the bounded
+At most 16 preview subscriptions are admitted per Engine, shared between single-session and multiplexed connections. They share the bounded
 publisher above and do not count as governor visibility. Opening a preview does
 not wake, mark seen, persist, trigger the PR monitor, or refresh activity clocks.
 Input, mouse, resize, and scroll frames close the preview before session lookup;
 only Ping/Pong is accepted. Observing a remote mirror never opens another Helper
 channel or changes its controller lease. The deferred multiple-observer feature
 of the Remote Helper protocol remains deferred.
+
+A second strict, versioned local handshake,
+`{"preview_set":true,"version":1}`, carries a changing bounded membership on one
+receive-only connection. Each member has a session ID and generation; remove and
+re-add requires a fresh generation and full seed. The client coalesces desired
+membership through a latest-value channel, filters stale generations, and keeps
+its decoded event queue at capacity one. A missing or admission-limited member
+gets an individual unavailable event. Connection loss requires reseeding every
+remaining member. The maximum request contains 64 unique IDs; it does not raise
+the shared Engine admission limit.
+
+The existing per-session AttachHub publisher remains the only diff owner. Its
+encoded frame allocations are shared with multiplexed sinks; the multiplexed
+connection has one membership reader and one socket writer, with no additional
+parser, polling publisher, remote channel, or controller. Its queue retains at
+most 8 MiB and 512 frame/header references, plus a separate bounded control
+reserve. One protocol-valid oversized full seed may occupy the empty queue;
+its full allocation stays counted through partial writes. Overflow or a stalled
+writer closes the connection instead of splicing or discarding terminal patches.
+These queue sizes are subject to the same capacity measurements as the admission
+limit.
+
+Seed capture, queue admission, and publisher registration share the Registry
+sequencing boundary. When queue capacity is unavailable, admission releases
+Registry and retries with a newly captured seed; no old snapshot survives the
+wait. Admission has a two-second bound for a complete membership update, and
+connection closure cancels it. Socket I/O takes place outside Registry and queue
+locks. Empty writers sleep until a publication or cancellation, with no idle
+timer. Tests cover fresh seeds after capacity waits, retained partial-frame
+allocation, continuous large-grid progress, stale-generation rejection, and
+closing a backpressured receiver.
 
 The Rust client exposes `SessionPreview` with decoded receive-only chunks, a
 capacity-one queue, and cancellation on close/drop. Previews create no idle

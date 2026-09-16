@@ -35,7 +35,31 @@ const GRID_FLUSH_INTERVAL: Duration = Duration::from_millis(8);
 struct Sink {
     id: u64,
     preview: bool,
-    output: Arc<Mutex<SinkOutput>>,
+    output: PublicationOutput,
+}
+
+#[derive(Clone)]
+enum PublicationOutput {
+    Socket(Arc<Mutex<SinkOutput>>),
+    Mux(crate::preview_mux::MuxSink),
+}
+impl From<Arc<Mutex<SinkOutput>>> for PublicationOutput {
+    fn from(output: Arc<Mutex<SinkOutput>>) -> Self {
+        Self::Socket(output)
+    }
+}
+impl PublicationOutput {
+    fn close(&self) {
+        match self {
+            Self::Socket(output) => {
+                if let Ok(mut output) = output.lock() {
+                    output.close();
+                }
+            }
+            Self::Mux(output) => output
+                .unavailable(diri_proto::preview_set::PreviewUnavailable::PublisherUnavailable),
+        }
+    }
 }
 
 // Queues own only Arc references: a publication is encoded once for all sinks.
@@ -170,6 +194,78 @@ impl AttachHub {
         Self::default()
     }
 
+    pub fn serve_preview_set(
+        &self,
+        registry: &Arc<Mutex<Registry>>,
+        reader: UnixStream,
+        buffered: Vec<u8>,
+    ) -> std::io::Result<()> {
+        crate::preview_mux::serve(self, registry, reader, buffered)
+    }
+
+    pub(crate) fn add_mux(
+        &self,
+        registry: &Arc<Mutex<Registry>>,
+        sink: crate::preview_mux::MuxSink,
+    ) -> crate::preview_mux::Admission {
+        use crate::preview_mux::{Admission, QueueError};
+        let Ok(guard) = registry.lock() else {
+            return Admission::Unavailable;
+        };
+        let id = &sink.member.session_id.0;
+        let Some(session) = guard.get(id) else {
+            return Admission::Missing;
+        };
+        let count = self
+            .sessions
+            .lock()
+            .expect("attach hub")
+            .values()
+            .flat_map(|entry| &entry.sinks)
+            .filter(|sink| sink.preview)
+            .count();
+        if count >= diri_proto::preview::MAX_PREVIEWS {
+            return Admission::Limit;
+        }
+        let seed = session.preview_seed();
+        let Ok(grid) = Frame::grid(&seed.grid)
+            .map_err(std::io::Error::other)
+            .and_then(|frame| encoded(&frame))
+        else {
+            return Admission::Unavailable;
+        };
+        let Ok(modes) = encoded(&Frame::modes_with_bracketed_paste(
+            seed.modes.0,
+            seed.modes.1,
+            seed.modes.2,
+        )) else {
+            return Admission::Unavailable;
+        };
+        match sink.seed(&[grid, modes]) {
+            Ok(()) => {}
+            Err(QueueError::Full(needed)) => return Admission::Retry(needed),
+            Err(_) => return Admission::Unavailable,
+        }
+        let sink_id = self.next_sink.fetch_add(1, Ordering::SeqCst);
+        let wake = seed.wake.clone();
+        self.register(
+            registry,
+            id,
+            sink_id,
+            PublicationOutput::Mux(sink.clone()),
+            seed,
+            true,
+        );
+        // Seed and registration share the same Registry sequencing boundary as
+        // normal publications. Neither queue admission nor registration writes.
+        wake.notify();
+        Admission::Added(sink_id)
+    }
+
+    pub(crate) fn remove_mux(&self, session_id: &str, sink_id: u64) {
+        self.deregister(session_id, sink_id);
+    }
+
     /// Runs one attach connection to completion: seeds the sink, registers it
     /// with the session's pump, then loops on incoming frames until the peer
     /// leaves. `reader` may hold bytes buffered past the attach line; they are
@@ -294,7 +390,7 @@ impl AttachHub {
                 registry,
                 session_id,
                 sink_id,
-                Arc::clone(&output),
+                Arc::clone(&output).into(),
                 seed,
                 preview,
             );
@@ -398,7 +494,7 @@ impl AttachHub {
         registry: &Arc<Mutex<Registry>>,
         session_id: &str,
         sink_id: u64,
-        output: Arc<Mutex<SinkOutput>>,
+        output: PublicationOutput,
         seed: AttachmentSeed,
         preview: bool,
     ) {
@@ -435,9 +531,7 @@ impl AttachHub {
         if let Some(entry) = sessions.get_mut(session_id) {
             entry.sinks.retain(|sink| {
                 if sink.id == sink_id {
-                    if let Ok(mut output) = sink.output.lock() {
-                        output.close();
-                    }
+                    sink.output.close();
                     false
                 } else {
                     true
@@ -446,7 +540,7 @@ impl AttachHub {
         }
     }
 
-    fn sink_outputs(&self, session_id: &str) -> Vec<(u64, Arc<Mutex<SinkOutput>>)> {
+    fn sink_outputs(&self, session_id: &str) -> Vec<(u64, PublicationOutput)> {
         self.sessions
             .lock()
             .expect("attach hub")
@@ -455,7 +549,7 @@ impl AttachHub {
                 entry
                     .sinks
                     .iter()
-                    .map(|sink| (sink.id, Arc::clone(&sink.output)))
+                    .map(|sink| (sink.id, sink.output.clone()))
                     .collect()
             })
             .unwrap_or_default()
@@ -466,13 +560,16 @@ impl AttachHub {
     fn enqueue_publication(
         &self,
         session_id: &str,
-        sinks: Vec<(u64, Arc<Mutex<SinkOutput>>)>,
+        sinks: Vec<(u64, PublicationOutput)>,
         frames: &[Arc<[u8]>],
     ) {
         for (sink_id, output) in sinks {
-            let accepted = output.lock().is_ok_and(|mut output| {
-                frames.iter().all(|frame| output.enqueue(Arc::clone(frame)))
-            });
+            let accepted = match output {
+                PublicationOutput::Socket(output) => output.lock().is_ok_and(|mut output| {
+                    frames.iter().all(|frame| output.enqueue(Arc::clone(frame)))
+                }),
+                PublicationOutput::Mux(output) => output.publish(frames),
+            };
             if !accepted {
                 self.deregister(session_id, sink_id);
             }
@@ -482,11 +579,14 @@ impl AttachHub {
     fn flush_sinks(&self, session_id: &str) -> bool {
         let mut pending = false;
         for (id, output) in self.sink_outputs(session_id) {
-            let keep = output.lock().is_ok_and(|mut output| {
-                let keep = output.flush();
-                pending |= !output.frames.is_empty();
-                keep
-            });
+            let keep = match output {
+                PublicationOutput::Socket(output) => output.lock().is_ok_and(|mut output| {
+                    let keep = output.flush();
+                    pending |= !output.frames.is_empty();
+                    keep
+                }),
+                PublicationOutput::Mux(output) => !output.is_closed(),
+            };
             if !keep {
                 self.deregister(session_id, id);
             }
@@ -502,6 +602,9 @@ impl AttachHub {
         let mut descriptors: Vec<_> = outputs
             .iter()
             .filter_map(|(_, output)| {
+                let PublicationOutput::Socket(output) = output else {
+                    return None;
+                };
                 let output = output.lock().ok()?;
                 (!output.closed && !output.frames.is_empty()).then(|| libc::pollfd {
                     fd: output.stream.as_raw_fd(),
@@ -643,9 +746,7 @@ impl AttachHub {
                     let entry = self.sessions.lock().expect("attach hub").remove(session_id);
                     if let Some(entry) = entry {
                         for sink in entry.sinks {
-                            if let Ok(mut output) = sink.output.lock() {
-                                output.close();
-                            }
+                            sink.output.close();
                         }
                     }
                     return;
@@ -725,7 +826,7 @@ mod tests {
                 sinks: vec![Sink {
                     id: 1,
                     preview: false,
-                    output: Arc::clone(&old),
+                    output: Arc::clone(&old).into(),
                 }],
                 pump_running: true,
             },
@@ -746,7 +847,7 @@ mod tests {
             .push(Sink {
                 id: 2,
                 preview: false,
-                output: Arc::clone(&new),
+                output: Arc::clone(&new).into(),
             });
         hub.enqueue_publication(
             "s",

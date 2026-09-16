@@ -5,6 +5,7 @@ use diri_engine::registry::Registry;
 use diri_engine::session::SessionSpec;
 use diri_engine::{Authority, ManifestEngine, PtySpec};
 use diri_proto::frames::FrameCodec;
+use diri_proto::preview_set::*;
 use serde_json::json;
 use std::collections::HashSet;
 use std::io::{BufRead, BufReader, Read, Write};
@@ -73,7 +74,12 @@ impl Drop for Cleanup {
 
 #[test]
 fn continuous_preview_drains_large_frames_while_publications_coalesce() {
-    for (cols, rows) in [(80, 24), (160, 50)] {
+    for (cols, rows, multiplex) in [
+        (80, 24, false),
+        (160, 50, false),
+        (80, 24, true),
+        (160, 50, true),
+    ] {
         let temp = tempfile::tempdir().unwrap();
         let (engine, _) =
             ManifestEngine::load_dir(&diri_engine::detect::bundled_manifest_dir()).unwrap();
@@ -139,19 +145,37 @@ fn continuous_preview_drains_large_frames_while_publications_coalesce() {
         let server_registry = Arc::clone(&registry);
         let server_hub = hub.clone();
         let worker = std::thread::spawn(move || {
-            let writer = Arc::new(Mutex::new(server.try_clone().unwrap()));
-            server_hub.serve_preview(&server_registry, "fixture", server, Vec::new(), writer);
+            if multiplex {
+                let _ = server_hub.serve_preview_set(&server_registry, server, Vec::new());
+            } else {
+                let writer = Arc::new(Mutex::new(server.try_clone().unwrap()));
+                server_hub.serve_preview(&server_registry, "fixture", server, Vec::new(), writer);
+            }
         });
         let mut client = BufReader::new(client);
         let mut ready = String::new();
         client.read_line(&mut ready).unwrap();
-        let _: diri_proto::preview::PreviewReady = serde_json::from_str(&ready).unwrap();
+        if multiplex {
+            let _: PreviewSetReady = serde_json::from_str(&ready).unwrap();
+            let mut request = serde_json::to_vec(&PreviewSetMembership {
+                members: vec![PreviewMember {
+                    session_id: diri_proto::SessionId::new("fixture"),
+                    generation: 1,
+                }],
+            })
+            .unwrap();
+            request.push(b'\n');
+            client.get_mut().write_all(&request).unwrap();
+        } else {
+            let _: diri_proto::preview::PreviewReady = serde_json::from_str(&ready).unwrap();
+        }
         assert!(
             !hub.has_sinks("fixture"),
             "preview must not confer normal attachment visibility"
         );
         std::fs::write(temp.path().join("start"), b"").unwrap();
         let mut codec = FrameCodec::new();
+        let mut mux_codec = PreviewSetDecoder::default();
         let mut bytes = [0; 65536];
         let mut seen = HashSet::new();
         let mut complete = false;
@@ -161,7 +185,22 @@ fn continuous_preview_drains_large_frames_while_publications_coalesce() {
             if count == 0 {
                 break;
             }
-            for frame in codec.feed(&bytes[..count]).unwrap() {
+            let frames = if multiplex {
+                mux_codec
+                    .feed(&bytes[..count])
+                    .unwrap()
+                    .into_iter()
+                    .map(|packet| match packet {
+                        PreviewSetPacket::Chunk { frame, .. } => frame,
+                        PreviewSetPacket::Unavailable { reason, .. } => {
+                            panic!("preview unavailable: {reason:?}")
+                        }
+                    })
+                    .collect()
+            } else {
+                codec.feed(&bytes[..count]).unwrap()
+            };
+            for frame in frames {
                 if let Some(grid) = frame.grid_payload().unwrap() {
                     for row in grid.changed_rows.iter().filter(|row| row.y == 0) {
                         let text: String = row
@@ -213,7 +252,7 @@ fn continuous_preview_drains_large_frames_while_publications_coalesce() {
         worker.join().unwrap();
         assert!(
             complete,
-            "{cols}x{rows} preview disconnected before final frame; {} distinct images received while producer and Engine completed 120",
+            "{cols}x{rows} preview (multiplex={multiplex}) disconnected before final frame; {} distinct images received while producer and Engine completed 120",
             seen.len()
         );
         // Coalescing legitimately combines intermediate images, especially in
@@ -223,7 +262,7 @@ fn continuous_preview_drains_large_frames_while_publications_coalesce() {
             .map(|phase| phase.filter(|sequence| seen.contains(sequence)).count());
         assert!(
             phases.iter().all(|count| *count > 0),
-            "{cols}x{rows} preview must progress in early/middle/late output, received {phases:?} images"
+            "{cols}x{rows} preview (multiplex={multiplex}) must progress in early/middle/late output, received {phases:?} images"
         );
     }
 }
