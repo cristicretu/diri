@@ -444,6 +444,43 @@ impl ControlServer {
             }
             if first {
                 first = false;
+                if serde_json::from_slice::<serde_json::Value>(&line)
+                    .is_ok_and(|value| value.get("preview_set").is_some())
+                {
+                    if let Ok(request) =
+                        serde_json::from_slice::<diri_proto::preview_set::PreviewSetRequest>(&line)
+                        && request.preview_set
+                        && request.version == diri_proto::preview_set::PREVIEW_SET_VERSION
+                    {
+                        let buffered = reader.buffer().to_vec();
+                        return self.attach.serve_preview_set(
+                            &self.registry,
+                            reader.into_inner(),
+                            buffered,
+                        );
+                    }
+                    return Ok(());
+                }
+                // Route by the distinct key before normal attach decoding. Mixed
+                // or unsupported requests fail closed without visibility effects.
+                if serde_json::from_slice::<serde_json::Value>(&line)
+                    .is_ok_and(|value| value.get("preview").is_some())
+                {
+                    if let Ok(request) =
+                        serde_json::from_slice::<diri_proto::preview::PreviewRequest>(&line)
+                        && request.version == diri_proto::preview::PREVIEW_VERSION
+                    {
+                        let buffered = reader.buffer().to_vec();
+                        self.attach.serve_preview(
+                            &self.registry,
+                            &request.preview.0,
+                            reader.into_inner(),
+                            buffered,
+                            writer,
+                        );
+                    }
+                    return Ok(());
+                }
                 if let Ok(attach) = serde_json::from_slice::<diri_proto::AttachRequest>(&line) {
                     // Attaching means this session is visible. Reconcile the
                     // actual process first: an adopted holder can be stopped
@@ -524,6 +561,7 @@ impl ControlServer {
                         | Method::SESSION_REMOVE
                         | Method::SESSION_ARCHIVE
                         | Method::SESSION_RESUME
+                        | Method::SESSION_RECONNECT
                         | Method::SESSION_FORK
                         | Method::SESSION_MIGRATE
                         | Method::WORKTREE_OVERVIEW
@@ -719,6 +757,7 @@ impl ControlServer {
             Method::TASK_REPORT => self.task_report(params),
             Method::SESSION_LIST | Method::STATE_SNAPSHOT => self.session_list(),
             Method::SESSION_DELIVER_MESSAGE => self.session_deliver_message(params),
+            Method::SESSION_SEND_KEY => self.session_send_key(params),
             Method::SESSION_SEND_TEXT => self.session_send_text(params),
             Method::SESSION_RESIZE => self.session_resize(params),
             Method::SESSION_READ_SCREEN => self.session_read_screen(params),
@@ -756,6 +795,7 @@ impl ControlServer {
             Method::HOST_LOCATE_REPO => self.host_locate_repo(params),
             Method::HOOK_REPORT => self.hook_report(params),
             Method::SESSION_RESUME => self.session_resume(params),
+            Method::SESSION_RECONNECT => self.session_reconnect(params),
             Method::SESSION_FORK => self.session_fork(params),
             Method::SESSION_RESUME_FROM_HISTORY => self.session_resume_from_history(params),
             Method::SESSION_REOPEN_LAST => self.session_reopen_last(),
@@ -1883,6 +1923,37 @@ impl ControlServer {
         )
     }
 
+    fn session_send_key(&self, params: Option<JsonValue>) -> Result<JsonValue, ControlError> {
+        use diri_proto::terminal_input::{KeyEncodingError, encode_action};
+        let p: diri_proto::SendKeyParams = decode(params)?;
+        let event = p.event().map_err(ControlError::bad_request)?;
+        let mut registry = self.registry.lock().map_err(poisoned)?;
+        let session = registry
+            .get(&p.session_id.0)
+            .ok_or_else(|| ControlError::not_found(p.session_id.0.clone()))?;
+        let bytes = encode_action(&event, p.modifiers, session.keyboard_state(), p.action)
+            .map_err(|error| {
+                ControlError::new(
+                    match error {
+                        KeyEncodingError::UnknownModes => "input_modes_unavailable",
+                        _ => "unsupported_key_action",
+                    },
+                    error.to_string(),
+                )
+            })?;
+        registry
+            .wake_session(&p.session_id.0)
+            .map_err(io_control_error)?;
+        let session = registry
+            .get(&p.session_id.0)
+            .ok_or_else(|| ControlError::not_found(p.session_id.0.clone()))?;
+        session.write_input(&bytes).map_err(io_control_error)?;
+        self.publish_updated(&registry, &p.session_id.0);
+        encode(&diri_proto::SendKeyResult {
+            bytes_accepted: bytes.len(),
+        })
+    }
+
     fn session_send_text(&self, params: Option<JsonValue>) -> Result<JsonValue, ControlError> {
         let p: diri_proto::SendTextParams = decode(params)?;
         let mut registry = self.registry.lock().map_err(poisoned)?;
@@ -2178,6 +2249,65 @@ impl ControlServer {
     }
 
     /// Revives an exited session's conversation under the SAME record id.
+    fn session_reconnect(&self, params: Option<JsonValue>) -> Result<JsonValue, ControlError> {
+        let p: diri_proto::SessionReconnectParams = decode(params)?;
+        let owner = {
+            let registry = self.registry.lock().map_err(poisoned)?;
+            let record = registry
+                .record(&p.session_id.0)
+                .ok_or_else(|| ControlError::not_found(p.session_id.0.clone()))?;
+            if record.host.is_none() {
+                return Err(ControlError::bad_request(
+                    "Reconnect requires a remote session",
+                ));
+            }
+            if !matches!(record.status, diri_proto::SessionStatus::Exited(_))
+                && registry.get(&p.session_id.0).is_none()
+            {
+                return Err(ControlError::new(
+                    "remote_owner_unavailable",
+                    "The remote session has no live Engine binding to reconnect",
+                ));
+            }
+            if !record.remote_connection.is_some_and(|connection| {
+                connection.state == diri_proto::RemoteConnectionState::Failed
+            }) {
+                return encode(&diri_proto::SessionReconnectResult {
+                    session: record,
+                    started: false,
+                    uncertain_input_discarded: false,
+                });
+            }
+            registry
+                .get(&p.session_id.0)
+                .and_then(|session| session.remote_reconnect_handle())
+                .ok_or_else(|| {
+                    ControlError::new(
+                        "remote_owner_unavailable",
+                        "The remote session has no live Engine binding to reconnect",
+                    )
+                })?
+        };
+        // Inspect can wait on SSH. The lifecycle reservation pins this identity,
+        // while Registry remains available to unrelated sessions and UI reads.
+        let inspection = owner
+            .inspect()
+            .map_err(|error| ControlError::new("remote_reconnect_failed", error.to_string()))?;
+        let mut registry = self.registry.lock().map_err(poisoned)?;
+        let (started, uncertain_input_discarded) = registry
+            .reconnect_remote(&p.session_id.0, &owner, inspection.process_state)
+            .map_err(io_control_error)?;
+        self.publish_updated(&registry, &p.session_id.0);
+        let session = registry
+            .record(&p.session_id.0)
+            .ok_or_else(|| ControlError::not_found(p.session_id.0.clone()))?;
+        encode(&diri_proto::SessionReconnectResult {
+            session,
+            started,
+            uncertain_input_discarded,
+        })
+    }
+
     fn session_resume(&self, params: Option<JsonValue>) -> Result<JsonValue, ControlError> {
         let p: diri_proto::SessionIdParams = decode(params)?;
         let record = {
@@ -2187,6 +2317,14 @@ impl ControlServer {
                 .into_iter()
                 .find(|record| record.id.0 == p.session_id.0)
                 .ok_or_else(|| ControlError::not_found(p.session_id.0.clone()))?;
+            if record.remote_connection.is_some_and(|connection| {
+                connection.state == diri_proto::RemoteConnectionState::Failed
+            }) {
+                return Err(ControlError::new(
+                    "remote_transport_failed",
+                    "Remote transport failed; the Agent's last state is preserved.",
+                ));
+            }
             // Presence in the registry is not liveness: only an explicit kill
             // removes a session, so an agent that died on its own is still in
             // the map. Returning here on presence alone would hand back the
@@ -3296,6 +3434,7 @@ pub(crate) fn new_record(id: &str, kind: &str, cwd: &str) -> diri_proto::Session
         archived_at: None,
         host: None,
         remote_persistence: None,
+        remote_connection: None,
         hibernation: None,
         memory_bytes: None,
         artifacts: None,
@@ -3433,6 +3572,15 @@ fn migrate_control_error(error: crate::migrate::MigrateError) -> ControlError {
 }
 
 fn io_control_error(error: std::io::Error) -> ControlError {
+    if error
+        .get_ref()
+        .is_some_and(|cause| cause.is::<crate::remote::client::RemoteTransportFailed>())
+    {
+        return ControlError::new(
+            "remote_transport_failed",
+            "Remote transport failed; the Agent's last state is preserved.",
+        );
+    }
     match error.kind() {
         std::io::ErrorKind::NotFound => ControlError::not_found(error.to_string()),
         _ => ControlError::internal(error.to_string()),
@@ -3882,6 +4030,40 @@ const MAX_PROBE_CHARS: usize = 20;
 mod tests {
     use super::*;
 
+    mod reconnect_tests;
+    mod send_key_tests;
+
+    #[test]
+    fn failed_remote_state_times_out_exit_wait_and_returns_a_structured_resume_error() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut registry = Registry::new(engine(), temp.path().join("state.json"));
+        let mut record = test_record("failed-remote");
+        record.host = Some("fixture".into());
+        record.status = diri_proto::SessionStatus::Unknown;
+        record.remote_connection = Some(diri_proto::RemoteConnection {
+            state: diri_proto::RemoteConnectionState::Failed,
+            since: diri_proto::DateMillis(123.0),
+        });
+        registry.insert_record(record);
+        let server = ControlServer::new(Arc::new(Mutex::new(registry)), temp.path().join("socket"));
+        let result = server
+            .events_wait(Some(serde_json::json!({
+                "sessionID":"failed-remote", "until":["exited"], "timeoutMs":0,
+            })))
+            .unwrap();
+        assert_eq!(result["timedOut"], true);
+        assert_eq!(result["session"]["remoteConnection"]["state"], "failed");
+        let error = server
+            .session_resume(Some(serde_json::json!({"sessionID":"failed-remote"})))
+            .unwrap_err();
+        assert_eq!(error.code, "remote_transport_failed");
+        let error = io_control_error(std::io::Error::new(
+            std::io::ErrorKind::NotConnected,
+            crate::remote::client::RemoteTransportFailed,
+        ));
+        assert_eq!(error.code, "remote_transport_failed");
+    }
+
     #[test]
     fn oversized_control_line_is_rejected_before_unbounded_buffering() {
         let bytes = vec![b'x'; MAX_CONTROL_LINE_BYTES + 1];
@@ -3949,6 +4131,7 @@ mod tests {
             archived_at: None,
             host: None,
             remote_persistence: None,
+            remote_connection: None,
             hibernation: None,
             memory_bytes: None,
             artifacts: None,

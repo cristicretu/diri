@@ -26,9 +26,11 @@ impl Method {
     pub const SESSION_KILL: &'static str = "session.kill";
     pub const SESSION_REMOVE: &'static str = "session.remove";
     pub const SESSION_RENAME: &'static str = "session.rename";
+    pub const SESSION_RECONNECT: &'static str = "session.reconnect";
     pub const SESSION_RESUME: &'static str = "session.resume";
     pub const SESSION_FORK: &'static str = "session.fork";
     pub const SESSION_DELIVER_MESSAGE: &'static str = "session.deliver_message";
+    pub const SESSION_SEND_KEY: &'static str = "session.send_key";
     pub const SESSION_SEND_TEXT: &'static str = "session.send_text";
     pub const SESSION_RESIZE: &'static str = "session.resize";
     pub const SESSION_READ_SCREEN: &'static str = "session.read_screen";
@@ -430,6 +432,7 @@ pub use SessionIdParams as SessionIDParams;
 pub type SessionKillParams = SessionIdParams;
 pub type SessionRemoveParams = SessionIdParams;
 pub type SessionResumeParams = SessionIdParams;
+pub type SessionReconnectParams = SessionIdParams;
 pub type SessionReadScreenParams = SessionIdParams;
 pub type SessionReadScrollbackParams = SessionIdParams;
 pub type SessionMarkSeenParams = SessionIdParams;
@@ -441,6 +444,15 @@ pub type SessionRefParams = SessionIdParams;
 
 pub type SessionKillResult = EmptyResult;
 pub type SessionRemoveResult = EmptyResult;
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SessionReconnectResult {
+    pub session: SessionRecord,
+    pub started: bool,
+    /// Previous uncertain input was discarded, never confirmed or replayed.
+    pub uncertain_input_discarded: bool,
+}
+
 pub type SessionResumeResult = SessionRecord;
 pub type SessionMarkSeenResult = EmptyResult;
 pub type SessionHibernateResult = EmptyResult;
@@ -528,6 +540,53 @@ pub struct SendTextParams {
     pub session_id: SessionId,
     pub text: String,
     pub submit: bool,
+}
+
+/// One key event; ordinary Enter is a carriage return, never pasted text.
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct SendKeyParams {
+    #[serde(rename = "sessionID")]
+    pub session_id: SessionId,
+    pub key: crate::terminal_input::Key,
+    #[serde(default)]
+    pub modifiers: crate::terminal_input::Modifiers,
+    #[serde(default)]
+    pub action: crate::terminal_input::KeyAction,
+}
+
+impl SendKeyParams {
+    pub fn event(&self) -> Result<crate::terminal_input::KeyEvent, &'static str> {
+        use crate::terminal_input::{Key, KeyEvent};
+        match &self.key {
+            Key::Character(value) => {
+                let mut chars = value.chars();
+                let ch = chars
+                    .next()
+                    .ok_or("a character key must contain one scalar")?;
+                if chars.next().is_some() || ch.is_control() {
+                    return Err("use one printable character or a named key");
+                }
+                // Character keys are layout independent. Only ASCII letters
+                // have an unambiguous Shift mapping; punctuation is literal.
+                let text = if self.modifiers.shift && ch.is_ascii_lowercase() {
+                    ch.to_ascii_uppercase().to_string()
+                } else {
+                    value.clone()
+                };
+                Ok(KeyEvent::composed(value, text))
+            }
+            Key::Named(key) => Ok(KeyEvent::named(*key)),
+            Key::Keypad(key) => Ok(KeyEvent::keypad(*key)),
+        }
+    }
+}
+
+/// Admission to the existing input path is not a child-process delivery receipt.
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SendKeyResult {
+    pub bytes_accepted: usize,
 }
 
 /// Idempotent orchestration input. The identity is scoped to sender and target

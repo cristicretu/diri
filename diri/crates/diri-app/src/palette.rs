@@ -1120,6 +1120,7 @@ mod tests {
             archived_at: None,
             host: host.map(str::to_owned),
             remote_persistence: None,
+            remote_connection: None,
             hibernation: None,
             memory_bytes: None,
             artifacts: None,

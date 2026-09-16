@@ -192,6 +192,7 @@ impl Registry {
                     .collect::<HashMap<_, _>>();
                 let mut locations = Vec::with_capacity(state.sessions.len());
                 for mut record in state.sessions {
+                    record.remote_connection = None;
                     repair_persisted_agent_title(&mut record);
                     // Resolve the owning project before repairing its
                     // location namespace. In particular, a linked worktree's
@@ -627,6 +628,21 @@ impl Registry {
     /// The manifest engine these sessions were started with.
     pub fn engine(&self) -> Arc<ManifestEngine> {
         Arc::clone(&self.engine)
+    }
+
+    pub(crate) fn reconnect_remote(
+        &mut self,
+        id: &str,
+        owner: &crate::session::RemoteReconnect,
+        inspected: diri_proto::remote_pty::RemoteProcessState,
+    ) -> std::io::Result<(bool, bool)> {
+        let session = self.sessions.get_mut(id).ok_or_else(|| not_found(id))?;
+        if !owner.matches(session) {
+            return Err(std::io::Error::other(
+                "session owner changed during reconnect",
+            ));
+        }
+        session.restart_failed_remote(Arc::clone(&self.engine), inspected)
     }
 
     pub fn get(&self, id: &str) -> Option<&Session> {
@@ -1661,6 +1677,7 @@ fn is_local_cursor_record(record: &SessionRecord) -> bool {
 }
 
 fn fold_session_view(record: &mut SessionRecord, view: &SessionView) {
+    record.remote_connection = view.remote_connection;
     fold_session_status(record, view);
     // cursor-agent (and similar) stamp a brand/status OSC title as soon as
     // they are idle. That must not freeze the record as AgentProvided, or
@@ -1948,6 +1965,7 @@ fn recovered_record(capsule: diri_proto::recovery::SessionRecoveryCapsule) -> Se
         archived_at: None,
         host: None,
         remote_persistence: None,
+        remote_connection: None,
         hibernation: None,
         memory_bytes: None,
         artifacts: None,
@@ -2063,6 +2081,7 @@ mod tests {
             archived_at: None,
             host: None,
             remote_persistence: None,
+            remote_connection: None,
             hibernation: None,
             memory_bytes: None,
             artifacts: None,
@@ -2094,6 +2113,24 @@ mod tests {
         assert!(registry.reserve_launch("s_1", false).is_err());
         registry.release_launch("s_1");
         registry.reserve_launch("s_1", false).unwrap();
+    }
+
+    #[test]
+    fn restart_does_not_restore_a_persisted_connected_transport_claim() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("state.json");
+        let mut registry = Registry::new(engine(), &path);
+        let mut session = record("remote");
+        session.host = Some("fixture".into());
+        session.remote_connection = Some(diri_proto::RemoteConnection {
+            state: diri_proto::RemoteConnectionState::Connected,
+            since: DateMillis(123.0),
+        });
+        registry.insert_record(session);
+        registry.persist().unwrap();
+        let mut restarted = Registry::new(engine(), path);
+        restarted.load().unwrap();
+        assert_eq!(restarted.records()[0].remote_connection, None);
     }
 
     #[test]
@@ -2755,6 +2792,7 @@ mod tests {
     #[test]
     fn pty_titles_are_filtered_fallbacks_and_never_override_user_renames() {
         let view = SessionView {
+            remote_connection: None,
             attention_state: None,
             terminal_title: None,
             id: "claude".to_owned(),
@@ -2791,6 +2829,7 @@ mod tests {
         let mut captured_prompt = record("captured-prompt");
         captured_prompt.kind = AgentKind::CODEX;
         let prompt_view = SessionView {
+            remote_connection: None,
             title: Some("Implement terminal IME".to_owned()),
             title_source: Some(TitleSource::FirstPrompt),
             ..view.clone()
@@ -2803,6 +2842,7 @@ mod tests {
         generic.kind = AgentKind::CODEX;
         generic.cwd = "/work/diri".to_owned();
         let generic_view = SessionView {
+            remote_connection: None,
             title: Some("diri".to_owned()),
             ..view
         };
@@ -2812,6 +2852,7 @@ mod tests {
         let mut decorated = record("decorated");
         decorated.kind = AgentKind::CLAUDE_CODE;
         let decorated_view = SessionView {
+            remote_connection: None,
             title: Some("✳ Claude Code".to_owned()),
             ..generic_view.clone()
         };
@@ -2838,6 +2879,7 @@ mod tests {
         let mut cursor = record("cursor");
         cursor.kind = AgentKind::CURSOR;
         let cursor_ready = SessionView {
+            remote_connection: None,
             title: Some("Cursor Agent - \u{2705} Ready".to_owned()),
             title_source: Some(TitleSource::AgentProvided),
             ..generic_view
@@ -2848,6 +2890,7 @@ mod tests {
         cursor.title = "Cursor Agent - \u{2705} Ready".to_owned();
         cursor.title_source = TitleSource::AgentProvided;
         let cursor_prompt = SessionView {
+            remote_connection: None,
             title: Some("Fix the cursor session title".to_owned()),
             title_source: Some(TitleSource::FirstPrompt),
             ..cursor_ready.clone()
@@ -2859,6 +2902,7 @@ mod tests {
         cursor.title = "Fix the cursor session title".to_owned();
         cursor.title_source = TitleSource::FirstPrompt;
         let named_working = SessionView {
+            remote_connection: None,
             title: Some("Cursor Integration Fix - \u{23f3} Working ...".to_owned()),
             title_source: Some(TitleSource::AgentProvided),
             ..cursor_ready
@@ -2878,6 +2922,7 @@ mod tests {
         // A newly attached Session has no captured prompt. Its first input can
         // be a follow-up to the conversation whose title was already saved.
         let view = SessionView {
+            remote_connection: None,
             attention_state: None,
             id: session.id.to_string(),
             status: SessionStatus::Working,
@@ -2991,6 +3036,7 @@ mod tests {
             session.title = "Fix chat naming".into();
             session.title_source = TitleSource::FirstPrompt;
             let view = SessionView {
+                remote_connection: None,
                 attention_state: None,
                 terminal_title: None,
                 id: session.id.to_string(),
@@ -3014,6 +3060,7 @@ mod tests {
         session.kind = AgentKind::CODEX;
         session.cwd = "/work/anara".into();
         let mut view = SessionView {
+            remote_connection: None,
             attention_state: None,
             id: session.id.to_string(),
             status: SessionStatus::Working,
@@ -3443,6 +3490,7 @@ mod tests {
         session.kind = AgentKind::CLAUDE_CODE;
         session.status = SessionStatus::Working;
         let view = SessionView {
+            remote_connection: None,
             attention_state: None,
             terminal_title: None,
             id: "completed".to_owned(),

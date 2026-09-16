@@ -68,6 +68,13 @@ pub struct ArtifactCatalog {
 }
 
 impl ArtifactCatalog {
+    #[cfg(test)]
+    pub(crate) fn without_artifacts_for_test() -> Self {
+        Self {
+            artifacts: HashMap::new(),
+        }
+    }
+
     pub fn from_manifest(path: &Path) -> io::Result<Self> {
         let bytes = fs::read(path)?;
         let manifest: ArtifactManifest = serde_json::from_slice(&bytes)
@@ -744,6 +751,19 @@ impl RemoteManager {
         selector: &SessionSelector,
     ) -> io::Result<SessionInspection> {
         self.rpc(helper, HelperCommand::Inspect, selector, RPC_TIMEOUT)
+    }
+
+    pub(crate) fn inspect_for_reconnect(
+        &self,
+        helper: &InstalledHelper,
+        selector: &SessionSelector,
+    ) -> io::Result<SessionInspection> {
+        self.rpc(
+            helper,
+            HelperCommand::Inspect,
+            selector,
+            Duration::from_secs(15),
+        )
     }
 
     pub fn list(&self, helper: &InstalledHelper) -> io::Result<Vec<SessionInspection>> {

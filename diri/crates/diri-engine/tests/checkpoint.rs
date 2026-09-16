@@ -87,6 +87,7 @@ fn record(id: &str) -> diri_proto::SessionRecord {
         archived_at: None,
         host: None,
         remote_persistence: None,
+        remote_connection: None,
         hibernation: None,
         memory_bytes: None,
         artifacts: None,
@@ -246,6 +247,10 @@ fn adoption_seeds_from_the_checkpoint_not_the_raw_tail() {
     // log has never seen.
     let planted_offset = log_tail(&logs, "s_ad");
     ScreenCheckpoint {
+        keyboard: Some(diri_proto::terminal_input::KeyboardState {
+            application_cursor_keys: true,
+            application_keypad: true,
+        }),
         log_offset: planted_offset,
         history: Vec::new(),
         history_metadata: Vec::new(),
@@ -275,6 +280,13 @@ fn adoption_seeds_from_the_checkpoint_not_the_raw_tail() {
         .expect("adopted")
         .screen_lines()
         .join("\n");
+    assert_eq!(
+        registry.get("s_ad").unwrap().keyboard_state(),
+        Some(diri_proto::terminal_input::KeyboardState {
+            application_cursor_keys: true,
+            application_keypad: true
+        })
+    );
     let final_tail = log_tail(&logs, "s_ad");
     assert_eq!(
         final_tail, planted_offset,
@@ -325,6 +337,7 @@ fn a_stale_checkpoint_falls_back_to_tail_replay() {
         row.cells.truncate(40);
     }
     ScreenCheckpoint {
+        keyboard: None,
         log_offset: log_tail(&logs, "s_fb"),
         history: Vec::new(),
         history_metadata: Vec::new(),

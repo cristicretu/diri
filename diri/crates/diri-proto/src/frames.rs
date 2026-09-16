@@ -204,6 +204,42 @@ impl Frame {
         ))
     }
 
+    /// Add keyboard state to the historical Modes payload. Older readers use
+    /// only byte zero; absence of the versioned tail means unknown state.
+    #[must_use]
+    pub fn modes_with_keyboard(
+        alt_screen: bool,
+        bracketed_paste: bool,
+        mouse: MouseModes,
+        keyboard: Option<crate::terminal_input::KeyboardState>,
+    ) -> Self {
+        let mut frame = Self::modes_with_bracketed_paste(alt_screen, bracketed_paste, mouse);
+        if let Some(keyboard) = keyboard {
+            frame.payload.extend_from_slice(&[
+                1, // keyboard-state extension version
+                u8::from(keyboard.application_cursor_keys)
+                    | (u8::from(keyboard.application_keypad) << 1),
+            ]);
+        }
+        frame
+    }
+
+    pub fn keyboard_state_payload(
+        &self,
+    ) -> Result<Option<crate::terminal_input::KeyboardState>, &'static str> {
+        if self.frame_type != FrameType::Modes || self.payload.is_empty() {
+            return Err("not a valid Modes frame");
+        }
+        match self.payload.as_slice() {
+            [_] => Ok(None),
+            [_, 1, bits] if bits & !3 == 0 => Ok(Some(crate::terminal_input::KeyboardState {
+                application_cursor_keys: bits & 1 != 0,
+                application_keypad: bits & 2 != 0,
+            })),
+            _ => Err("unsupported keyboard-state extension"),
+        }
+    }
+
     #[must_use]
     pub fn modes_payload(&self) -> Option<(bool, MouseModes)> {
         self.terminal_modes_payload()
@@ -351,6 +387,35 @@ fn read_u16(bytes: &[u8], offset: usize) -> u16 {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn keyboard_modes_tail_preserves_old_decoder_and_distinguishes_unknown() {
+        use crate::terminal_input::KeyboardState;
+        let legacy =
+            super::Frame::modes_with_bracketed_paste(true, true, crate::terminal::MouseModes::OFF);
+        assert_eq!(legacy.keyboard_state_payload().unwrap(), None);
+        let known = super::Frame::modes_with_keyboard(
+            true,
+            true,
+            crate::terminal::MouseModes::OFF,
+            Some(KeyboardState::default()),
+        );
+        assert_eq!(
+            known.terminal_modes_payload(),
+            legacy.terminal_modes_payload()
+        );
+        assert_eq!(
+            known.keyboard_state_payload().unwrap(),
+            Some(KeyboardState::default())
+        );
+        for payload in [vec![0, 1], vec![0, 2, 0], vec![0, 1, 4], vec![]] {
+            assert!(
+                super::Frame::new(super::FrameType::Modes, payload)
+                    .keyboard_state_payload()
+                    .is_err()
+            );
+        }
+    }
+
     use super::*;
 
     #[test]

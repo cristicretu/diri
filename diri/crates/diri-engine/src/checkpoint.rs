@@ -27,6 +27,8 @@ const CURRENT_VERSION: u64 = 4;
 
 /// A decoded checkpoint, grid already validated.
 pub struct ScreenCheckpoint {
+    /// Versioned optional input-state extension; absent historical state is unknown.
+    pub keyboard: Option<diri_proto::terminal_input::KeyboardState>,
     pub log_offset: u64,
     /// Rows above the visible grid, oldest first.
     pub history: Vec<Vec<GridCell>>,
@@ -111,7 +113,21 @@ impl ScreenCheckpoint {
                 )?,
             )
         };
+        let keyboard = match dict.get("keyboardState") {
+            None => None,
+            Some(value) => {
+                let state = value.as_dictionary()?;
+                if state.get("version")?.as_unsigned_integer()? != 1 {
+                    return None;
+                }
+                Some(diri_proto::terminal_input::KeyboardState {
+                    application_cursor_keys: state.get("applicationCursorKeys")?.as_boolean()?,
+                    application_keypad: state.get("applicationKeypad")?.as_boolean()?,
+                })
+            }
+        };
         Some(Self {
+            keyboard,
             log_offset: dict.get("logOffset")?.as_unsigned_integer()?,
             history,
             history_metadata,
@@ -126,6 +142,19 @@ impl ScreenCheckpoint {
     /// Writes atomically (temp file + rename) as a binary plist.
     pub fn write_atomically(&self, path: &Path) -> std::io::Result<()> {
         let mut dict = plist::Dictionary::new();
+        if let Some(keyboard) = self.keyboard {
+            let mut state = plist::Dictionary::new();
+            state.insert("version".into(), plist::Value::Integer(1u64.into()));
+            state.insert(
+                "applicationCursorKeys".into(),
+                plist::Value::Boolean(keyboard.application_cursor_keys),
+            );
+            state.insert(
+                "applicationKeypad".into(),
+                plist::Value::Boolean(keyboard.application_keypad),
+            );
+            dict.insert("keyboardState".into(), plist::Value::Dictionary(state));
+        }
         let metadata = serde_json::to_vec(&self.history_metadata).map_err(std::io::Error::other)?;
         if metadata.len() > diri_proto::grid::MAX_GRID_METADATA_BYTES {
             return Err(std::io::Error::other("checkpoint annotations exceed limit"));
@@ -196,12 +225,32 @@ fn as_data(value: &plist::Value) -> Option<&[u8]> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn keyboard_checkpoint_extension_preserves_known_state_and_old_absence() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("screen.plist");
+        let checkpoint = sample();
+        checkpoint.write_atomically(&path).unwrap();
+        assert_eq!(
+            super::ScreenCheckpoint::load(&path).unwrap().keyboard,
+            checkpoint.keyboard
+        );
+        let mut value = plist::Value::from_file(&path).unwrap();
+        value.as_dictionary_mut().unwrap().remove("keyboardState");
+        value.to_file_binary(&path).unwrap();
+        assert_eq!(super::ScreenCheckpoint::load(&path).unwrap().keyboard, None);
+    }
+
     use super::*;
     use diri_proto::grid::{ChangedRow, GridCell};
 
     fn sample() -> ScreenCheckpoint {
         let cells = vec![GridCell::BLANK; 4];
         ScreenCheckpoint {
+            keyboard: Some(diri_proto::terminal_input::KeyboardState {
+                application_cursor_keys: true,
+                application_keypad: true,
+            }),
             log_offset: 12345,
             history_metadata: Vec::new(),
             history: vec![vec![GridCell::BLANK; 4]],

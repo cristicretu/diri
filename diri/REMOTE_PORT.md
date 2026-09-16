@@ -73,6 +73,23 @@ The current baseline:
   capability-compatible Helper is available;
 - retains orchestration and user-facing state in the local Rust Engine.
 
+## Terminal input-mode projection
+
+Protocol minor 9 adds optional `terminal-input-modes-v1`. A capable Holder
+publishes a bounded `InputModes` record immediately before the snapshot/delta
+with the same sequence, admitting both frames as one queue transaction. The
+Engine commits modes only after validating that grid; a new Hello clears the
+pending projection. Mode-only changes use the same publication path. Older
+controllers receive neither the capability nor new messages, and old Holders
+remain usable with unknown input-mode state. Mode-dependent typed input fails
+explicitly when that state is unavailable.
+
+Local app/client `Modes` frames retain their existing first byte and gain an
+optional versioned tail. GUI and CLI share one pure key encoder; there is no new
+Holder attachment or terminal owner. Local restart checkpoints carry optional
+versioned keyboard state. Missing state and truncated replay are unknown, not
+an observed default. See [terminal key input](docs/terminal-key-input.md).
+
 ## Account-profile enhancement
 
 The local Engine owns the account-profile catalog and durable per-session
@@ -961,6 +978,155 @@ same remote Agent after the pause. This checks Engine contention separately
 from the Helper/UDS gates and does not claim to measure real WAN latency.
 
 ## Desktop integration
+
+The Engine's local binary attachment hub encodes each publication once and
+shares it among bounded per-client output queues. Its existing one pump per
+Session owns nonblocking writes; the existing connection thread handles input
+with a readiness wait and preserves partial frame headers/bodies. No writer
+worker, remote attachment, or Helper protocol change is added. PTY draining
+remains independent of every local client.
+
+Ordinary queued frames retain at most 1 MiB and 64 frame references per sink.
+One larger valid frame (up to the existing 16 MiB protocol payload limit) may be
+queued with 64 bytes of mode/control overhead. Already-written prefixes still
+count toward retained allocation until their complete frame is released. The
+pump services each sink for at most 256 KiB or 1 ms per turn. While bytes remain
+pending it waits for socket writability, bounded to 1 ms so new grid activity and
+shutdown remain responsive. Publication coalescing retains dirty state while
+queued bytes continue draining; it cannot suspend output behind its 8 ms timer.
+Empty queues use the existing GridWake sleep. No locks are held during poll.
+A sink that exceeds its bound or makes no write progress for two seconds closes;
+the client reconnects and receives a FullSnapshot. Partial frames are never
+spliced with a replacement. Queueing seeds moves all socket I/O outside the
+Registry lock; pongs use the same ordered writer.
+
+The deterministic local regression stalls one client with a 1 KiB socket send
+buffer while another receives 40 interactive redraws. It requires active-reader
+p90 below 150 ms, validates fragmented input, and reconnects to a FullSnapshot
+with the same process identity. Queue tests verify exact partial-frame bytes,
+retained-byte bounds, overflow closure and the no-progress timeout. These are
+Engine-local tests, separate from the Helper/UDS and real SSH release gates.
+A second real-PTY regression streams 120 dense colored frames into both 80×24
+and 160×50 receive-only previews with an 8 KiB socket send buffer. The producer
+and Engine must reach the final frame, and the drained preview must remain
+connected and show progress throughout the run. This catches artificial write
+retry delays that otherwise overflow a healthy reader on large grids.
+
+
+### Receive-only desktop previews
+
+A separate Engine-local first-line handshake, `{"preview":"SESSION","version":1}`,
+observes the Engine's existing terminal mirror. The strict request rejects mixed
+attach/preview fields and unsupported versions before normal attach dispatch.
+A matching versioned acknowledgement precedes the existing binary full grid,
+modes, and pushed diff frames. There is no fallback to a normal attachment.
+
+At most 16 preview subscriptions are admitted per Engine, shared between single-session and multiplexed connections. They share the bounded
+publisher above and do not count as governor visibility. Opening a preview does
+not wake, mark seen, persist, trigger the PR monitor, or refresh activity clocks.
+Input, mouse, resize, and scroll frames close the preview before session lookup;
+only Ping/Pong is accepted. Observing a remote mirror never opens another Helper
+channel or changes its controller lease. The deferred multiple-observer feature
+of the Remote Helper protocol remains deferred.
+
+A second strict, versioned local handshake,
+`{"preview_set":true,"version":1}`, carries a changing bounded membership on one
+receive-only connection. Each member has a session ID and generation; remove and
+re-add requires a fresh generation and full seed. The client coalesces desired
+membership through a latest-value channel, filters stale generations, and keeps
+its decoded event queue at capacity one. A missing or admission-limited member
+gets an individual unavailable event. Connection loss requires reseeding every
+remaining member. The maximum request contains 64 unique IDs; it does not raise
+the shared Engine admission limit.
+
+The existing per-session AttachHub publisher remains the only diff owner. Its
+encoded frame allocations are shared with multiplexed sinks; the multiplexed
+connection has one membership reader and one socket writer, with no additional
+parser, polling publisher, remote channel, or controller. Its queue retains at
+most 8 MiB and 512 frame/header references, plus a separate bounded control
+reserve. One protocol-valid oversized full seed may occupy the empty queue;
+its full allocation stays counted through partial writes. Overflow or a stalled
+writer closes the connection instead of splicing or discarding terminal patches.
+These queue sizes are subject to the same capacity measurements as the admission
+limit.
+
+Seed capture, queue admission, and publisher registration share the Registry
+sequencing boundary. When queue capacity is unavailable, admission releases
+Registry and retries with a newly captured seed; no old snapshot survives the
+wait. Admission has a two-second bound for a complete membership update, and
+connection closure cancels it. Socket I/O takes place outside Registry and queue
+locks. Empty writers sleep until a publication or cancellation, with no idle
+timer. Tests cover fresh seeds after capacity waits, retained partial-frame
+allocation, continuous large-grid progress, stale-generation rejection, and
+closing a backpressured receiver.
+
+The Rust client exposes `SessionPreview` with decoded receive-only chunks, a
+capacity-one queue, and cancellation on close/drop. Previews create no idle
+keepalive timer or deadline; local socket EOF reports peer closure. Backpressure never discards
+patches: a slow server queue closes and the caller must explicitly reconnect to
+a new full seed. Session exit and Engine-observed remote connection state are projected through
+the control stream. A preview socket itself is not proof the remote process is
+currently reachable; absent or unknown connection state means last received. UI consumers subscribe only while their cards are visible
+and render every grid at its existing dimensions without resizing the PTY.
+
+Private-socket tests verify pushed updates without a desktop attach, the 16-client
+limit, rejected mutation and mixed handshakes, unchanged stopped process identity,
+geometry/hibernation/last-seen state, and prompt client cancellation with a full
+queue. These local observation checks do not replace real SSH release gates.
+
+
+### Remote connection facts and fatal transport failures
+
+`SessionRecord.remoteConnection` is an optional Engine observation with a state
+and `since` transition timestamp. It moves from Connecting to Connected only
+after a validated FullSnapshot; an open SSH pipe or HelloAck is insufficient.
+Bridge EOF/recoverable errors publish Reconnecting immediately and retain the
+last grid, PID and incarnation. A new validated snapshot restores Connected.
+Silent sessions remain connected without an added heartbeat or output timer.
+Unknown future values decode as Unknown; absence is never treated as Connected.
+Engine restart clears persisted connection observations before Holder adoption.
+The existing session state-version/event path publishes transitions only; the
+timestamp describes when the transition was observed, not last-output age.
+
+A fatal protocol failure or uncertain write permanently closes that Engine
+client, clears queued input/resize, and publishes Failed plus Unknown Agent
+status. It preserves the last grid and identity but does not invent an exit code
+or complete `wait --until exited`. Subsequent writes return structured
+`remote_transport_failed`; ordinary status signals cannot revive that failed
+reducer. Only an actual ProcessExit can establish Agent exit, including code126.
+Explicit kill still uses the existing management RPC; automatic replay or a
+second Holder controller is never introduced. A failed resident `session.resume`
+returns the structured error instead of falsely succeeding as a live no-op.
+`session.reconnect` is the explicit recovery boundary for a failed resident
+remote transport. It reserves the session identity against concurrent lifecycle
+operations and inspects the same Holder outside Registry, with a 15-second
+deadline. The inspection must match the session ID, incarnation, Helper build,
+and last known Agent PID. An actual exited inspection records that exit without
+reattaching or inventing a replacement Agent.
+
+For a running Agent, recovery retains the existing Session, mirror, process ID,
+output offsets, and incarnation. A replacement pump joins the failed pump outside
+Registry, discards all previous pending/uncertain input and resize operations,
+and requests the existing single-controller attachment. HelloAck must again
+match build/incarnation/PID and advance the previous controller epoch; only a
+validated FullSnapshot restores Connected. A race where the Agent exits between
+inspection and attachment records the genuine exit. Input after exit is rejected
+instead of accumulating in a disconnected transport queue.
+
+The result includes the latest SessionRecord, whether recovery started, and
+whether previous input delivery was uncertain and discarded. That flag never
+means the input was confirmed. Connected or already reconnecting sessions return
+their current state without creating another attachment. Missing Engine owners
+return `remote_owner_unavailable`; reconnect does not silently invoke Agent
+resume/relaunch or replace a persisted session. The Rust client and CLI expose
+the same operation (`dirijor session reconnect ID [--json]`).
+
+Deterministic fake-SSH fixtures preserve one live child across bridge loss and
+validated reconnect, reject a fatal protocol frame without declaring that child
+dead, and distinguish its genuine exit126. Separate tests cover permanent write
+rejection/queue clearing, status reduction, restart clearing, and forward-compatible
+state decoding. These fixtures do not replace actual-host SSH release gates.
+
 
 While the desktop terminal is scrolled back, its renderer retains one local
 screen snapshot and preserves already fetched rows in its bounded 512-row
