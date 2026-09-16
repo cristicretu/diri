@@ -22,9 +22,16 @@ impl SessionSurfaces {
     pub(crate) fn tab_peek_offset(&self, cx: &App) -> f32 {
         terminal_offset(&self.peek, cx.reduce_motion())
     }
-    pub(crate) fn set_tab_peek_region(&mut self, left: f32, width: f32, cx: &mut Context<Self>) {
-        if self.peek_left != left || self.peek_width != width {
+    pub(crate) fn set_tab_peek_region(
+        &mut self,
+        left: f32,
+        top: f32,
+        width: f32,
+        cx: &mut Context<Self>,
+    ) {
+        if self.peek_left != left || self.peek_top != top || self.peek_width != width {
             self.peek_left = left;
+            self.peek_top = top;
             self.peek_width = width;
             if self.peek.visible() {
                 cx.notify();
@@ -43,29 +50,11 @@ impl SessionSurfaces {
                 return;
             }
             let selected = store.selected_session_id().cloned();
-            let project = selected
-                .as_ref()
-                .and_then(|id| store.sessions().get(id))
-                .map(|s| s.project_id.clone());
-            let projection = store.sidebar_projection();
-            let sessions = projection
-                .projects
+            let sessions = crate::tab_navigation::selected_project_tabs(&mut store)
+                .sessions
                 .iter()
-                .find(|group| Some(&group.project.id) == project.as_ref())
-                .map(|group| {
-                    group
-                        .active
-                        .iter()
-                        .chain(
-                            group
-                                .archived
-                                .iter()
-                                .filter(|session| Some(&session.id) == selected.as_ref()),
-                        )
-                        .map(|session| session.id.clone())
-                        .collect()
-                })
-                .unwrap_or_default();
+                .map(|session| session.id.clone())
+                .collect();
             self.peek.begin(sessions, selected.as_ref());
             self.peek_scroll.set_offset(point(px(0.0), px(0.0)));
         }
@@ -129,7 +118,7 @@ impl SessionSurfaces {
             _ => {}
         }
         if self.peek.visible() && self.peek.overview() > 0.5 {
-            let height = f32::from(window.viewport_size().height);
+            let height = (f32::from(window.viewport_size().height) - self.peek_top).max(0.0);
             let bounds = card_rect(
                 self.peek.focused,
                 self.peek.sessions.len(),
@@ -165,7 +154,7 @@ impl SessionSurfaces {
         } else {
             f32::from(window.viewport_size().width)
         };
-        let height = f32::from(window.viewport_size().height);
+        let height = (f32::from(window.viewport_size().height) - self.peek_top).max(0.0);
         let blend = self.peek.overview();
         let mut body = div().id("tab-peek-cards").relative().w_full().min_h_full();
         let sessions: Vec<_> = {
@@ -271,9 +260,9 @@ impl SessionSurfaces {
             .debug_selector(|| "TAB_PEEK".into())
             .absolute()
             .left(px(self.peek_left))
-            .top_0()
+            .top(px(self.peek_top))
             .w(px(width))
-            .h_full()
+            .h(px(height))
             .occlude()
             .overflow_hidden()
             .bg(colors

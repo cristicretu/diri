@@ -1,3 +1,6 @@
+mod filter;
+mod tabs;
+
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
@@ -240,6 +243,13 @@ pub struct Sidebar {
     /// Session list scroll position, read back each frame to size the top and
     /// bottom fades.
     list_scroll: ScrollHandle,
+    tab_scroll: ScrollHandle,
+    last_tab_selection: Option<SessionId>,
+    last_tab_available_width: f32,
+    filter_query: crate::query_editor::QueryEditor,
+    filter_open: bool,
+    filter_focus: FocusHandle,
+    filter_generation: u64,
     /// Window-space row bounds from the latest prepaint. Keyboard navigation
     /// uses these to reveal only rows that actually crossed the viewport edge.
     row_bounds: Rc<RefCell<HashMap<SessionId, Bounds<Pixels>>>>,
@@ -374,6 +384,13 @@ impl Sidebar {
             surface_in_parent: false,
             peek_close: None,
             list_scroll: ScrollHandle::new(),
+            tab_scroll: ScrollHandle::new(),
+            last_tab_selection: None,
+            last_tab_available_width: 0.0,
+            filter_query: Default::default(),
+            filter_open: false,
+            filter_focus: cx.focus_handle(),
+            filter_generation: 0,
             row_bounds: Rc::new(RefCell::new(HashMap::new())),
             drag_preview: None,
             directory_scroll: ScrollHandle::new(),
@@ -495,6 +512,7 @@ impl Sidebar {
             || self.peek_hovered
             || self.peek_region_hovered
             || self.peek_interaction_active()
+            || self.is_focused(window)
             || self.peek_close.is_some()
         {
             return;
@@ -509,6 +527,7 @@ impl Sidebar {
                     && !this.peek_hovered
                     && !this.peek_region_hovered
                     && !this.peek_interaction_active()
+                    && !this.is_focused(window)
                 {
                     this.peek_open = false;
                     this.dismiss_hover_card(cx);
@@ -968,7 +987,7 @@ impl Sidebar {
     }
 
     pub fn is_focused(&self, window: &Window) -> bool {
-        self.focus_handle.is_focused(window)
+        self.focus_handle.is_focused(window) || self.filter_focus.is_focused(window)
     }
 
     /// Enters keyboard-navigation mode from any other surface. An active row
@@ -1010,20 +1029,33 @@ impl Sidebar {
 
     fn focus_rows_snapshot(&self) -> (Vec<FocusRow>, Option<SessionId>) {
         let mut store = self.store.write().expect("session store lock poisoned");
-        let expanded_archives = store.preferences().sidebar_expanded_archives.clone();
+        let selected = store.selected_session_id().cloned();
+        (self.focus_rows_for_store(&mut store), selected)
+    }
+
+    fn focus_rows_for_store(&self, store: &mut SessionStore) -> Vec<FocusRow> {
+        let mut expanded_archives = store.preferences().sidebar_expanded_archives.clone();
         let grouping = store.preferences().sidebar_grouping;
         let ordering = store.preferences().sidebar_ordering;
-        let recency_archives_expanded = store.preferences().sidebar_recency_archives_expanded;
+        let recency_archives_expanded = store.preferences().sidebar_recency_archives_expanded
+            || !self.filter_query.text().trim().is_empty();
         let pinned = store
             .preferences()
             .sidebar_pinned_sessions
             .iter()
             .cloned()
             .collect();
-        let selected = store.selected_session_id().cloned();
-        let projection = store.sidebar_projection();
+        let projection =
+            super::filter::filter_projection(store.sidebar_projection(), self.filter_query.text());
+        if !self.filter_query.text().trim().is_empty() {
+            expanded_archives = projection
+                .projects
+                .iter()
+                .map(|group| group.project.id.clone())
+                .collect();
+        }
         let today = local_day_ordinal(wall_clock_millis()).unwrap_or(0);
-        let rows = match grouping {
+        match grouping {
             SidebarGrouping::Project => focus_rows(&projection, &expanded_archives),
             SidebarGrouping::Recency => recency_focus_rows(
                 &projection,
@@ -1032,8 +1064,7 @@ impl Sidebar {
                 &pinned,
                 today,
             ),
-        };
-        (rows, selected)
+        }
     }
 
     fn move_focus_cursor(
@@ -1125,6 +1156,9 @@ impl Sidebar {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if self.filter_focus.is_focused(window) && self.handle_filter_key(event, window, cx) {
+            return;
+        }
         if self.ui.renaming.is_some() {
             // Rename remains a modal editor for every editing keystroke. A
             // non-editing application shortcut may continue through GPUI's
@@ -1249,6 +1283,12 @@ impl Sidebar {
             "left" => self.move_focus_horizontally(false, window, cx),
             "right" => self.move_focus_horizontally(true, window, cx),
             "enter" => self.activate_focus_cursor(cx),
+            "/" => {
+                self.filter_generation += 1;
+                self.filter_open = true;
+                self.filter_focus.focus(window, cx);
+                true
+            }
             "g" => {
                 self.open_sidebar_layout_popover();
                 cx.notify();
@@ -2005,7 +2045,8 @@ impl Sidebar {
             .expect("session store lock poisoned")
             .preferences()
             .sidebar_collapsed_projects
-            .contains(&id);
+            .contains(&id)
+            && self.filter_query.text().trim().is_empty();
         let project_for_click = group.project.clone();
         let project_root = group.project.root.clone();
         let project_host = group.host.clone();
@@ -2433,7 +2474,8 @@ impl Sidebar {
             .read()
             .expect("session store lock poisoned")
             .preferences()
-            .sidebar_recency_archives_expanded;
+            .sidebar_recency_archives_expanded
+            || !self.filter_query.text().trim().is_empty();
         let count = archived.len();
         let mut section = div().flex_none().flex().flex_col().child(
             div()
@@ -2915,15 +2957,33 @@ impl Sidebar {
             // Hover keeps activity visible and swaps identity for the close action.
             .child(activity_mark(activity_state, self.activity_frame, colors))
             .child(
-                HoverMarquee::new(
-                    title_marquee_id,
-                    title,
-                    hovered,
-                    title_available_width,
-                    Typo::ROW.size,
-                    colors.primary.alpha(if selected { 1.0 } else { 0.82 }),
-                )
-                .font_weight(Typo::ROW.weight),
+                if let Some(range) = super::filter::label_match(&title, self.filter_query.text()) {
+                    div()
+                        .w(px(title_available_width))
+                        .overflow_hidden()
+                        .text_ellipsis()
+                        .text_size(px(Typo::ROW.size))
+                        .child(gpui::StyledText::new(title.clone()).with_highlights([(
+                            range,
+                            gpui::HighlightStyle {
+                                color: Some(Palette::CLAY.into()),
+                                font_weight: Some(FontWeight::SEMIBOLD),
+                                ..Default::default()
+                            },
+                        )]))
+                        .into_any_element()
+                } else {
+                    HoverMarquee::new(
+                        title_marquee_id,
+                        title,
+                        hovered,
+                        title_available_width,
+                        Typo::ROW.size,
+                        colors.primary.alpha(if selected { 1.0 } else { 0.82 }),
+                    )
+                    .font_weight(Typo::ROW.weight)
+                    .into_any_element()
+                },
             )
             .when(row.pinned, |element| element.child(pin_mark(colors)))
             .when(marked, |element| {
@@ -3104,7 +3164,8 @@ impl Sidebar {
             .expect("session store lock poisoned")
             .preferences()
             .sidebar_expanded_archives
-            .contains(&project_id);
+            .contains(&project_id)
+            || !self.filter_query.text().trim().is_empty();
         let targeted =
             self.ui.drag_target.as_deref() == Some(format!("archive:{}", project_id.0).as_str());
         let mut bucket = div()
@@ -6076,8 +6137,8 @@ impl Sidebar {
         self.commit_rename();
         let id = {
             let mut store = self.store.write().expect("session store lock poisoned");
-            let id = store
-                .ordered_sessions()
+            let id = self
+                .navigation_sessions(&mut store)
                 .get(index)
                 .map(|session| session.id.clone());
             if let Some(id) = &id {
@@ -6097,10 +6158,7 @@ impl Sidebar {
     /// convention where the last digit jumps to the final tab).
     pub fn select_last(&mut self, cx: &mut Context<Self>) -> bool {
         let count = self
-            .store
-            .write()
-            .expect("session store lock poisoned")
-            .ordered_sessions()
+            .navigation_sessions(&mut self.store.write().expect("store"))
             .len();
         if count == 0 {
             return false;
@@ -6115,7 +6173,7 @@ impl Sidebar {
         self.commit_rename();
         {
             let mut store = self.store.write().expect("session store lock poisoned");
-            let sessions = store.ordered_sessions();
+            let sessions = self.navigation_sessions(&mut store);
             if sessions.is_empty() {
                 return false;
             }
@@ -6613,7 +6671,7 @@ impl Render for Sidebar {
         let colors = self.colors();
         let (
             projection,
-            expanded_archives,
+            mut expanded_archives,
             selected,
             grouping,
             ordering,
@@ -6631,9 +6689,13 @@ impl Render for Sidebar {
                 .iter()
                 .cloned()
                 .collect();
-            let recency_archives_expanded = store.preferences().sidebar_recency_archives_expanded;
+            let recency_archives_expanded = store.preferences().sidebar_recency_archives_expanded
+                || !self.filter_query.text().trim().is_empty();
             (
-                store.sidebar_projection(),
+                super::filter::filter_projection(
+                    store.sidebar_projection(),
+                    self.filter_query.text(),
+                ),
                 expanded,
                 selected,
                 grouping,
@@ -6642,6 +6704,13 @@ impl Render for Sidebar {
                 recency_archives_expanded,
             )
         };
+        if !self.filter_query.text().trim().is_empty() {
+            expanded_archives = projection
+                .projects
+                .iter()
+                .map(|group| group.project.id.clone())
+                .collect();
+        }
         self.project_disclosures.retain(|id, _| {
             grouping == SidebarGrouping::Project
                 && projection
@@ -6805,7 +6874,19 @@ impl Render for Sidebar {
                 .flex()
                 .flex_col()
                 .child(self.new_agent_row(colors, cx));
-            if projection.projects.is_empty() {
+            if projection.projects.is_empty() && !self.filter_query.text().trim().is_empty() {
+                body = body.child(
+                    div()
+                        .id("sidebar-filter-empty")
+                        .debug_selector(|| "sidebar-filter-empty".into())
+                        .flex_1()
+                        .px(px(20.0))
+                        .pt(px(18.0))
+                        .text_size(px(Typo::META.size))
+                        .text_color(colors.tertiary)
+                        .child("No sessions match this filter"),
+                );
+            } else if projection.projects.is_empty() {
                 body = body.child(self.empty_state(colors, cx));
             } else {
                 // Rows dissolve into the chrome at both ends of the scroll
@@ -6832,6 +6913,9 @@ impl Render for Sidebar {
         }
         if let Some(feedback) = self.external_drop_feedback(colors, cx) {
             root = root.child(feedback);
+        }
+        if self.settings_nav.is_none() {
+            root = root.child(self.filter_control(colors, window, cx));
         }
         root = root.child(self.account_footer(colors, cx));
         // Paint the edge without reducing the shared sidebar content width.
@@ -8474,6 +8558,46 @@ mod tests {
     }
 
     #[gpui::test]
+    fn sidebar_filter_typing_and_clear_preserve_active_work(cx: &mut TestAppContext) {
+        cx.update(|cx| cx.set_reduce_motion(true));
+        let (view, cx) = cx.add_window_view(|_, cx| {
+            let sidebar = cx.new(|cx| Sidebar::new(None, true, PreviewScenario::Typical, cx));
+            SidebarPopoverHarness { sidebar }
+        });
+        let sidebar = view.read_with(cx, |harness, _| harness.sidebar.clone());
+        let (selected, prefs, records) = sidebar.read_with(cx, |sidebar, _| {
+            let store = sidebar.store.read().unwrap();
+            (
+                store.selected_session_id().cloned(),
+                store.preferences().clone(),
+                store.sessions().clone(),
+            )
+        });
+        let filter = cx.debug_bounds("sidebar-filter").unwrap();
+        cx.simulate_click(filter.center(), Modifiers::default());
+        cx.simulate_keystrokes("x x x x");
+        assert!(cx.debug_bounds("sidebar-filter-empty").is_some());
+        sidebar.read_with(cx, |sidebar, _| {
+            assert_eq!(sidebar.filter_query.text(), "xxxx");
+            assert!(sidebar.focus_rows_snapshot().0.is_empty());
+            assert_eq!(
+                sidebar.store.read().unwrap().selected_session_id(),
+                selected.as_ref()
+            );
+        });
+        let clear = cx.debug_bounds("clear-sidebar-filter").unwrap();
+        cx.simulate_click(clear.center(), Modifiers::default());
+        sidebar.read_with(cx, |sidebar, _| {
+            assert!(sidebar.filter_query.is_empty());
+            assert!(!sidebar.filter_open);
+            let store = sidebar.store.read().unwrap();
+            assert_eq!(store.selected_session_id(), selected.as_ref());
+            assert_eq!(store.preferences(), &prefs);
+            assert_eq!(store.sessions(), &records);
+        });
+    }
+
+    #[gpui::test]
     fn pointer_selection_does_not_enter_keyboard_navigation(cx: &mut TestAppContext) {
         let (view, cx) = cx.add_window_view(|_, cx| {
             let sidebar = cx.new(|cx| Sidebar::new(None, true, PreviewScenario::Typical, cx));
@@ -9174,6 +9298,11 @@ mod tests {
                 let sidebar = cx.new(|cx| {
                     let mut sidebar = Sidebar::new(None, true, scenario, cx);
                     sidebar.ui.width = width;
+                    if let Ok(query) = std::env::var("DIRI_VISUAL_FILTER") {
+                        sidebar.filter_open = true;
+                        sidebar.filter_query.insert(&query);
+                    }
+
                     if std::env::var_os("DIRI_VISUAL_HOVER").is_some() {
                         sidebar.ui.hovered_session = Some(SessionId::new("preview-codex"));
                     }
@@ -9371,6 +9500,39 @@ mod tests {
             "project actions must open below their trigger"
         );
         assert_eq!(popover.size.width, px(184.0));
+    }
+
+    #[gpui::test]
+    fn filtered_shortcuts_follow_visible_rows_including_archives(cx: &mut TestAppContext) {
+        let (view, cx) = cx.add_window_view(|_, cx| {
+            let sidebar = cx.new(|cx| Sidebar::new(None, true, PreviewScenario::Typical, cx));
+            SidebarPopoverHarness { sidebar }
+        });
+        let sidebar = view.read_with(cx, |harness, _| harness.sidebar.clone());
+        sidebar.update(cx, |sidebar, cx| {
+            sidebar.filter_query.insert("i");
+            for grouping in [SidebarGrouping::Project, SidebarGrouping::Recency] {
+                let expected = {
+                    let mut store = sidebar.store.write().unwrap();
+                    store
+                        .update_preferences(|prefs| prefs.sidebar_grouping = grouping)
+                        .unwrap();
+                    let rows = sidebar.focus_rows_for_store(&mut store);
+                    assert!(
+                        rows.iter()
+                            .any(|row| store.sessions()[&row.id].archived_at.is_some())
+                    );
+                    rows.into_iter().map(|row| row.id).collect::<Vec<_>>()
+                };
+                for (index, id) in expected.iter().enumerate() {
+                    assert!(sidebar.select_shortcut(index, cx));
+                    assert_eq!(
+                        sidebar.store.read().unwrap().selected_session_id(),
+                        Some(id)
+                    );
+                }
+            }
+        });
     }
 
     #[gpui::test]

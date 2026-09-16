@@ -400,7 +400,7 @@ impl GridWake {
         }
     }
 
-    fn notify(&self) {
+    pub(crate) fn notify(&self) {
         let mut state = self.inner.state.lock().expect("grid wake");
         state.generation = state.generation.saturating_add(1);
         self.inner.changed.notify_all();
@@ -1300,6 +1300,11 @@ impl Session {
     /// where output lands between the seed and pump registration.
     pub(crate) fn attachment_seed(&self) -> AttachmentSeed {
         self.shared.note_hot();
+        self.preview_seed()
+    }
+
+    /// Observe the current mirror without changing activity or process state.
+    pub(crate) fn preview_seed(&self) -> AttachmentSeed {
         let wake = self.shared.grid_wake.clone();
         loop {
             let wake_generation = wake.generation();
@@ -1600,10 +1605,13 @@ impl Session {
     /// Titling happens here rather than at submit, so a prompt the injector
     /// types names its session the same way one the user types does. It is
     /// idempotent; delivery itself must never be replayed based on screen echo.
+    ///
+    /// Bracketed text is sanitized first so it cannot embed its own
+    /// end-of-paste marker (#275).
     pub fn paste_text(&self, text: &str) -> std::io::Result<()> {
         self.capture_prompt_title(text);
         let framed = if self.bracketed_paste() {
-            format!("\x1b[200~{text}\x1b[201~")
+            format!("\x1b[200~{}\x1b[201~", sanitize_paste_text(text))
         } else {
             text.to_owned()
         };
@@ -1998,6 +2006,65 @@ fn wait_for_holder(
 
 fn holder_io_error(error: crate::holder::HolderError) -> std::io::Error {
     std::io::Error::other(error.to_string())
+}
+
+/// Replaces control characters other than `\n`, `\r` and `\t` with a space,
+/// so text framed in `ESC[200~ ... ESC[201~` cannot close the envelope early
+/// (#275). Replacing one-for-one never deletes, so no marker can reassemble.
+/// Mirrors `diri_term::keys::paste`; kept local since this crate does not
+/// depend on `diri-term`.
+fn sanitize_paste_text(text: &str) -> String {
+    text.chars()
+        .map(|ch| {
+            if ch.is_control() && !matches!(ch, '\n' | '\r' | '\t') {
+                ' '
+            } else {
+                ch
+            }
+        })
+        .collect()
+}
+
+#[cfg(test)]
+mod paste_text_sanitize_tests {
+    use super::sanitize_paste_text;
+
+    /// Issue #275, audited for `Session::paste_text`: an injected prompt
+    /// that opens with the paste end-marker must not be able to close the
+    /// envelope early and let the rest submit ahead of the real, separate
+    /// Enter that `send_text` sends afterwards.
+    #[test]
+    fn embedded_end_marker_cannot_survive_sanitizing() {
+        let framed = format!(
+            "\x1b[200~{}\x1b[201~",
+            sanitize_paste_text("\x1b[201~printf x\r")
+        );
+        let bytes = framed.as_bytes();
+        let end_marker_positions: Vec<usize> = bytes
+            .windows(6)
+            .enumerate()
+            .filter(|(_, window)| *window == b"\x1b[201~")
+            .map(|(index, _)| index)
+            .collect();
+        assert_eq!(end_marker_positions, vec![bytes.len() - 6]);
+        assert!(!bytes[6..bytes.len() - 6].contains(&0x1b));
+    }
+
+    /// Split-marker bytes must not reassemble once the embedded ESC is gone.
+    #[test]
+    fn nested_partial_markers_cannot_reassemble_after_sanitizing() {
+        let sanitized = sanitize_paste_text("\x1b[20\x1b[201~1~");
+        assert!(!sanitized.contains('\x1b'));
+    }
+
+    #[test]
+    fn ordinary_text_and_newlines_are_untouched() {
+        assert_eq!(
+            sanitize_paste_text("one\ntwo\r\nthree\tfour"),
+            "one\ntwo\r\nthree\tfour"
+        );
+        assert_eq!(sanitize_paste_text("café 🎉"), "café 🎉");
+    }
 }
 
 /// Applies a reducer outcome to the shared state, bumping the state version
@@ -3848,5 +3915,46 @@ mod notification_tests {
         apply_remote_output(&shared, &engine, "shell", &mut seq, end, bytes, false).unwrap();
         assert!(!shared.screen.lock().unwrap().has_notifications());
         assert_eq!(*shared.status.lock().unwrap(), SessionStatus::Idle);
+    }
+}
+
+#[cfg(test)]
+mod preview_tests {
+    use super::*;
+
+    #[test]
+    fn observing_a_deferred_grid_does_not_refresh_activity_or_launch() {
+        let temp = tempfile::tempdir().unwrap();
+        let (engine, _) = ManifestEngine::load_dir(&crate::detect::bundled_manifest_dir()).unwrap();
+        let spec = SessionSpec {
+            id: "preview-cold".into(),
+            pty: PtySpec::new(vec!["/bin/sh".into()], "/tmp"),
+            manifest_id: "generic".into(),
+            authority: Authority::ProcessOnly,
+            logs_dir: temp.path().to_path_buf(),
+            holder: None,
+            remote: None,
+            defer_launch: true,
+        };
+        let session = Session {
+            shared: new_shared(
+                &spec,
+                OutputLog::writer(temp.path(), &spec.id).unwrap(),
+                &engine,
+                true,
+            ),
+            transport: Transport::Held(HolderClient::new(temp.path().join("unused.sock"))),
+            pump: None,
+            manifest_id: spec.manifest_id.clone(),
+            deferred: Some(Arc::new(DeferredLaunch::new())),
+        };
+        session.shared.last_hot.store(0, Ordering::Relaxed);
+        session.shared.screen.lock().unwrap().feed(b"last received");
+        let seed = session.preview_seed();
+        assert!(seed.grid.is_full_snapshot);
+        assert_eq!(session.shared.last_hot.load(Ordering::Relaxed), 0);
+        assert_eq!(session.shared.last_interaction.load(Ordering::Relaxed), 0);
+        assert!(session.deferred.is_some());
+        assert!(session.pump.is_none());
     }
 }
