@@ -631,8 +631,16 @@ impl Registry {
                             || seed.occurred_at_ms as f64 >= record_updated_at)
                         && let Some((signal, metadata)) = crate::hooks::parse_activity_seed(&seed)
                     {
-                        let _ = self.apply_hook_metadata(&session_id, &metadata);
-                        if let Some(session) = self.sessions.get(&session_id)
+                        let home = std::env::var("HOME").ok();
+                        let accepted = self
+                            .accept_hook_metadata(
+                                &session_id,
+                                &metadata,
+                                home.as_deref().map(Path::new),
+                            )
+                            .is_some();
+                        if accepted
+                            && let Some(session) = self.sessions.get(&session_id)
                             && session
                                 .view()
                                 .attention_state
@@ -1065,6 +1073,25 @@ impl Registry {
         Ok(())
     }
 
+    /// Accept identity and status together: an inherited child callback must
+    /// never complete the owning conversation, even when its metadata is ignored.
+    pub fn apply_hook_report(
+        &mut self,
+        id: &str,
+        signal: StatusSignal,
+        meta: &crate::hooks::HookMetadata,
+    ) -> bool {
+        let home = std::env::var("HOME").ok();
+        let Some(changed) = self.accept_hook_metadata(id, meta, home.as_deref().map(Path::new))
+        else {
+            return false;
+        };
+        if let Some(session) = self.sessions.get(id) {
+            session.feed_identified_signal(signal, meta.identity.clone());
+        }
+        changed
+    }
+
     /// Folds identity a hook payload carried into the record: the agent-side
     /// conversation id (what makes resume possible), the live transcript path
     /// (it MOVES when the agent enters a worktree), a first-prompt fallback,
@@ -1083,6 +1110,16 @@ impl Registry {
         meta: &crate::hooks::HookMetadata,
         home: Option<&Path>,
     ) -> bool {
+        self.accept_hook_metadata(id, meta, home).unwrap_or(false)
+    }
+
+    /// None means rejected, distinct from accepted metadata that did not change.
+    fn accept_hook_metadata(
+        &mut self,
+        id: &str,
+        meta: &crate::hooks::HookMetadata,
+        home: Option<&Path>,
+    ) -> Option<bool> {
         let claimed = self.claimed_agent_ids(Some(id));
         let mut transcript = self.records.get(id).and_then(|record| {
             if record.host.is_some() {
@@ -1130,7 +1167,7 @@ impl Registry {
                 .as_mut()
                 .is_none_or(|transcript| transcript.is_codex_subagent())
         {
-            return false;
+            return None;
         }
         let native_title = self.records.get(id).and_then(|record| {
             if record.host.is_some() || !accepts_native_title(record.title_source) {
@@ -1172,9 +1209,7 @@ impl Registry {
                 &claimed,
             )
         });
-        let Some(record) = self.records.get_mut(id) else {
-            return false;
-        };
+        let record = self.records.get_mut(id)?;
         let mut changed = false;
         if let Some(agent_id) = &meta.agent_session_id
             && record.agent_session_id.as_ref() != Some(agent_id)
@@ -1213,7 +1248,7 @@ impl Registry {
         if let Some(record) = recovery_snapshot.as_ref() {
             let _ = self.write_recovery_capsule(record);
         }
-        changed
+        Some(changed)
     }
 
     /// SIGSTOPs a session's whole tree and records it as hibernated. The PTY
@@ -2749,6 +2784,18 @@ mod tests {
         assert_eq!(updated.agent_session_id.as_deref(), Some("parent"));
         assert_eq!(updated.transcript_path.as_deref(), parent.to_str());
         assert_ne!(updated.title, "child task");
+
+        // A child can finish before the parent's first notify establishes its
+        // identity. Transcript evidence must reject that callback as well.
+        let mut unbound = updated.clone();
+        unbound.agent_session_id = None;
+        unbound.transcript_path = None;
+        registry.insert_record(unbound);
+        assert_eq!(
+            registry.accept_hook_metadata("codex", &metadata, Some(temp.path())),
+            None
+        );
+        assert!(registry.record("codex").unwrap().agent_session_id.is_none());
 
         // An older Engine may already have persisted the child identity.
         let mut damaged = updated;

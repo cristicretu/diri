@@ -2263,10 +2263,7 @@ impl ControlServer {
             return Ok(json!({}));
         };
         let mut registry = self.registry.lock().map_err(poisoned)?;
-        let changed = registry.apply_hook_metadata(&session_id.0, &meta);
-        if let Some(session) = registry.get(&session_id.0) {
-            session.feed_identified_signal(signal, meta.identity.clone());
-        }
+        let changed = registry.apply_hook_report(&session_id.0, signal, &meta);
         if changed {
             let _ = registry.persist();
         }
@@ -5113,6 +5110,108 @@ mod tests {
         ));
         let list = ok_of(call(&server, "session.list", None));
         assert_eq!(list["sessions"].as_array().map(Vec::len), Some(0));
+    }
+
+    #[test]
+    fn codex_subagent_completion_does_not_finish_the_parent_turn() {
+        let temp = tempfile::tempdir().unwrap();
+        let config = temp.path().join("codex");
+        let root = config.join("sessions/2026/09/16");
+        std::fs::create_dir_all(&root).unwrap();
+        for (id, source) in [
+            ("parent", json!("cli")),
+            ("new-parent", json!("cli")),
+            (
+                "child",
+                json!({"subagent": {"thread_spawn": {"parent_thread_id": "parent", "depth": 1}}}),
+            ),
+        ] {
+            std::fs::write(
+                root.join(format!("rollout-now-{id}.jsonl")),
+                json!({
+                    "type": "session_meta", "payload": {"id": id, "cwd": "/tmp", "source": source}
+                })
+                .to_string(),
+            )
+            .unwrap();
+        }
+        let server = server(temp.path());
+        {
+            let mut registry = server.registry.lock().unwrap();
+            let mut record = test_record("s_codex");
+            record.kind = diri_proto::AgentKind::CODEX;
+            record.agent_session_id = Some("parent".into());
+            record.account_profile = Some(diri_proto::AgentAccountProfile {
+                id: "test".into(),
+                label: "Test".into(),
+                agent: "codex".into(),
+                host: None,
+                config_home: config.to_string_lossy().into_owned(),
+                is_default: false,
+            });
+            registry
+                .spawn(
+                    crate::session::SessionSpec {
+                        id: "s_codex".into(),
+                        pty: crate::pty::PtySpec::new(
+                            vec!["/bin/sh".into(), "-c".into(), "read line".into()],
+                            "/tmp",
+                        ),
+                        manifest_id: "codex".into(),
+                        authority: crate::status::Authority::ScreenPrimary,
+                        logs_dir: temp.path().join("logs"),
+                        holder: None,
+                        remote: None,
+                        defer_launch: false,
+                    },
+                    record,
+                )
+                .unwrap();
+        }
+        for thread in [
+            "child",
+            "unavailable-child",
+            "parent",
+            "parent",
+            "new-parent",
+        ] {
+            {
+                let registry = server.registry.lock().unwrap();
+                registry
+                    .get("s_codex")
+                    .unwrap()
+                    .feed_signal(crate::status::StatusSignal::Screen(
+                        crate::detect::ScreenObservation {
+                            state: crate::detect::ManifestState::Working,
+                            matched_rule_id: "working-spinner".into(),
+                            priority: 900,
+                            content_seq: 1,
+                            prompt_excerpt: None,
+                            options: None,
+                        },
+                    ));
+            }
+            ok_of(call(
+                &server,
+                "hook.report",
+                Some(json!({
+                    "kind": "codex-notify", "dirijorSessionID": "s_codex",
+                    "payload": {"type": "agent-turn-complete", "thread-id": thread}
+                })),
+            ));
+            let registry = server.registry.lock().unwrap();
+            let session = registry.get("s_codex").unwrap();
+            session.feed_signal(crate::status::StatusSignal::Tick);
+            assert_eq!(
+                session.status(),
+                if thread.contains("child") {
+                    diri_proto::SessionStatus::Working
+                } else {
+                    diri_proto::SessionStatus::Idle
+                },
+                "callback from {thread}"
+            );
+        }
     }
 
     #[test]

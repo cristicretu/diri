@@ -64,6 +64,9 @@ printf '\033]9;Review is ready\007'
 ```
 
 The existing `dirijor notify '<Codex JSON>'` completion callback is preserved.
+Codex subagents inherit this callback, but their completion does not finish the
+parent session or produce its completion alert. The Engine checks conversation
+identity before applying either metadata or completion, including during recovery.
 The Engine accepts OSC 9, OSC 777 and plain-text OSC 99 title/body notifications,
 including BEL/ST terminators and fragmented writes. OSC 9;4 remains progress.
 Kitty queries, icons, encoded payloads and callback actions are ignored.
