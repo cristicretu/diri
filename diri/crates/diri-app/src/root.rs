@@ -640,10 +640,32 @@ impl RootView {
             {
                 surfaces.update(cx, |surfaces, cx| surfaces.open_whats_new(cx));
             }
-            if matches!(event, SidebarEvent::VisibilityChanged) {
+            if matches!(
+                event,
+                SidebarEvent::VisibilityChanged | SidebarEvent::TabOrientationChanged
+            ) {
                 this.sidebar_peek_dwell = None;
                 this.sidebar_floating = false;
-                this.begin_sidebar_slide(cx);
+                if matches!(event, SidebarEvent::TabOrientationChanged) {
+                    // A terminal receives its final viewport immediately. Switching
+                    // axes must commit the chrome in the same frame, otherwise a
+                    // full-width workspace is clipped by the old sidebar width.
+                    this.sidebar_slide = None;
+                    this.sidebar_panel_slide = None;
+                    this.sidebar_float_slide = None;
+                    this.sidebar_seam = this.settled_sidebar_seam(cx);
+                    this.sidebar_panel_width = this.sidebar_seam;
+                    this.sidebar_float = 0.0;
+                    this.tabs_slide = None;
+                    this.tabs_target = if this.sidebar.read(cx).horizontal_tabs_visible() {
+                        crate::tab_navigation::TAB_STRIP_HEIGHT
+                    } else {
+                        0.0
+                    };
+                    this.tabs_seam = this.tabs_target;
+                } else {
+                    this.begin_sidebar_slide(cx);
+                }
                 // Settings navigation lives in the sidebar, so hiding the
                 // sidebar is also the way out of settings.
                 if !this.sidebar.read(cx).is_visible()
@@ -4844,6 +4866,105 @@ mod tests {
     }
 
     #[gpui::test]
+    fn horizontal_tabs_fill_window_on_orientation_switch(cx: &mut gpui::TestAppContext) {
+        cx.update(|cx| {
+            cx.set_reduce_motion(false);
+            commands::bind_keys(cx, &Default::default());
+        });
+        let services = test_services();
+        let fixture = SidebarPreviewFixture::make(PreviewScenario::Typical);
+        {
+            let mut store = services.store.store.write().unwrap();
+            store.hydrate(fixture.list);
+            let selected = fixture.selected_session_id.unwrap();
+            store.select(selected.clone());
+            use diri_proto::workspace::*;
+            let workspace = WorkspaceId::new("test-workspace");
+            let tab = TabId::new("test-tab");
+            let pane = PaneId::new("test-pane");
+            store.seed_workspace_snapshot_for_test(WorkspaceSnapshot {
+                revision: 1,
+                workspaces: vec![WorkspaceRecord {
+                    project_id: None,
+                    id: workspace.clone(),
+                    name: "Test".into(),
+                    selected_tab: Some(tab.clone()),
+                    tabs: vec![WorkspaceTab {
+                        id: tab,
+                        title: None,
+                        focused_pane: pane.clone(),
+                        zoomed_pane: None,
+                        layout: LayoutNode::Pane {
+                            id: pane,
+                            session_id: selected,
+                        },
+                    }],
+                }],
+                ..Default::default()
+            });
+            store
+                .update_preferences(|prefs| {
+                    prefs.active_workspace = Some(workspace);
+                    prefs.sidebar_visible = true;
+                })
+                .unwrap();
+        }
+        let (root, cx) = cx.add_window_view(move |window, cx| {
+            RootView::new(services, false, PreviewScenario::Empty, window, cx)
+        });
+        let terminal = root.read_with(cx, |root, cx| root.active_terminal(cx).unwrap());
+        for reduced_motion in [false, true] {
+            cx.update(|_, cx| cx.set_reduce_motion(reduced_motion));
+            for width in [640.0, 1000.0, 1942.0] {
+                cx.simulate_resize(size(px(width), px(700.0)));
+                cx.run_until_parked();
+                let vertical = cx.debug_bounds("terminal-card-body").unwrap();
+                assert!(vertical.left() > px(0.0));
+                for horizontal in [true, false, true, false] {
+                    root.update_in(cx, |root, window, cx| window.focus(&root.focus, cx));
+                    cx.simulate_keystrokes(&commands::test_chords("cmd-shift-s"));
+                    cx.run_until_parked();
+                    // Check the first layout, without a resize, frame tick or a
+                    // terminal-output notification to repair stale geometry.
+                    let body = cx.debug_bounds("terminal-card-body").unwrap();
+                    let grid = cx.debug_bounds("terminal-grid-surface").unwrap();
+                    assert_eq!(body.right(), px(width));
+                    assert_eq!(
+                        grid.right(),
+                        body.right(),
+                        "terminal exceeds its card after switching tabs"
+                    );
+                    assert_eq!(
+                        body.left(),
+                        if horizontal { px(0.0) } else { vertical.left() }
+                    );
+                    assert_eq!(
+                        body.top(),
+                        px(if horizontal {
+                            crate::tab_navigation::TAB_STRIP_HEIGHT
+                        } else {
+                            0.0
+                        })
+                    );
+                    assert_eq!(body.bottom(), px(700.0));
+                    root.read_with(cx, |root, cx| {
+                        assert_eq!(root.active_terminal(cx), Some(terminal.clone()));
+                        let viewport = terminal.read(cx).geometry_for_test().0.unwrap();
+                        assert_eq!(px(viewport.x), body.left());
+                        assert_eq!(px(viewport.width), body.size.width);
+                    });
+                    if horizontal {
+                        let project = cx.debug_bounds("horizontal-tab-project").unwrap();
+                        if cfg!(target_os = "macos") {
+                            assert!(project.left() >= px(92.0), "tabs overlap traffic lights");
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[gpui::test]
     fn horizontal_tabs_reveal_selection_after_first_layout_and_resize(
         cx: &mut gpui::TestAppContext,
     ) {
@@ -6825,7 +6946,7 @@ mod tests {
         );
         cx.update(|cx| {
             crate::fonts::init(cx);
-            cx.set_reduce_motion(true);
+            cx.set_reduce_motion(false);
         });
         for (name, orientation, light, width) in [
             (
@@ -6861,6 +6982,7 @@ mod tests {
                 store.select(fixture.selected_session_id.unwrap());
                 store
                     .update_preferences(|prefs| {
+                        prefs.sidebar_visible = true;
                         prefs.terminal_theme = if light {
                             "dirijor-light"
                         } else {
@@ -6872,18 +6994,24 @@ mod tests {
             }
             let window = cx
                 .open_window(size(px(width), px(700.0)), |window, cx| {
-                    cx.new(|cx| {
-                        let root =
-                            RootView::new(services, false, PreviewScenario::Empty, window, cx);
-                        root.sidebar
-                            .update(cx, |sidebar, cx| {
-                                sidebar.set_tab_orientation(orientation, cx)
-                            })
-                            .unwrap();
-                        root
-                    })
+                    cx.new(|cx| RootView::new(services, false, PreviewScenario::Empty, window, cx))
                 })
                 .unwrap();
+            cx.run_until_parked();
+            cx.update_window(window.into(), |view, window, cx| {
+                view.downcast::<RootView>().unwrap().update(cx, |root, cx| {
+                    root.run_command(
+                        if orientation == crate::store::TabOrientation::Horizontal {
+                            CommandId::HorizontalTabs
+                        } else {
+                            CommandId::VerticalTabs
+                        },
+                        window,
+                        cx,
+                    );
+                });
+            })
+            .unwrap();
             cx.run_until_parked();
             cx.capture_screenshot(window.into())
                 .unwrap()

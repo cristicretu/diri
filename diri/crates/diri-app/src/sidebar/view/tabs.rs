@@ -94,7 +94,7 @@ impl Sidebar {
         self.peek_open = false;
         self.peek_close = None;
         self.dismiss_hover_card(cx);
-        cx.emit(SidebarEvent::VisibilityChanged);
+        cx.emit(SidebarEvent::TabOrientationChanged);
         cx.notify();
         Ok(())
     }

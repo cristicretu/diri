@@ -135,6 +135,8 @@ pub(crate) enum SidebarEvent {
     RefreshUsageLimits,
     ContinueAccount(SessionId),
     VisibilityChanged,
+    /// The sidebar and top strip must adopt the new layout together.
+    TabOrientationChanged,
     /// Transient overlay visibility; never changes the saved sidebar layout.
     PeekChanged,
     WidthChanged,
