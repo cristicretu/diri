@@ -8,7 +8,6 @@ use objc2::rc::Retained;
 use objc2::{ClassType, DefinedClass, MainThreadMarker, MainThreadOnly, define_class, msg_send};
 use objc2_app_kit::{NSEvent, NSResponder, NSTouchPhase, NSTouchTypeMask, NSView};
 use objc2_foundation::NSObjectProtocol;
-use raw_window_handle::{HasWindowHandle, RawWindowHandle};
 use std::cell::{Cell, RefCell};
 
 struct GestureIvars {
@@ -131,18 +130,6 @@ impl TabGestureBridge {
             .ivars()
             .suppress_until_lift
             .set(contacts_present);
-    }
-
-    pub(crate) fn install(window: &impl HasWindowHandle) -> Option<(Self, GestureReceiver)> {
-        let marker = MainThreadMarker::new()?;
-        let handle = window.window_handle().ok()?;
-        let RawWindowHandle::AppKit(handle) = handle.as_raw() else {
-            return None;
-        };
-        // GPUI guarantees this NSView remains valid for the window lifetime;
-        // retain it so teardown remains safe even during window destruction.
-        let view = unsafe { Retained::retain(handle.ns_view.as_ptr().cast::<NSView>()) }?;
-        Some(Self::install_view(marker, view))
     }
 
     fn install_view(marker: MainThreadMarker, view: Retained<NSView>) -> (Self, GestureReceiver) {

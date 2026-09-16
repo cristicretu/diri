@@ -90,6 +90,7 @@ struct LauncherSurfaceFills {
     composer: gpui::Rgba,
 }
 
+#[cfg(test)]
 fn launcher_colors_for_theme(theme_id: &str) -> SemanticColors {
     crate::app_theme::colors(theme_id)
 }
