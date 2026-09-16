@@ -300,6 +300,9 @@ pub struct UtilitySurfaces {
     store_runtime: Arc<StoreRuntime>,
     runtime: Arc<Runtime>,
     updates: UpdateHandle,
+    /// Hidden version picker under Software updates, revealed by
+    /// Option-clicking the update button. Not persisted.
+    show_version_picker: bool,
     activity: String,
     diagnostics_report: Option<String>,
     _update_changes: Task<()>,
@@ -461,6 +464,7 @@ impl UtilitySurfaces {
             store_runtime,
             runtime,
             updates,
+            show_version_picker: false,
             activity: "Connected client · shared daemon remains untouched".to_owned(),
             diagnostics_report,
             _update_changes: update_changes,
@@ -3140,14 +3144,21 @@ impl UtilitySurfaces {
         } else {
             state.summary()
         };
+        // Option-click on the update button reveals the version picker; it is
+        // deliberately not advertised, since walking back to an older build is
+        // a recovery tool rather than a feature most people should reach for.
         let action_control = div().when_some(action, |control, (label, command)| {
-            control.child(surface_button(
+            control.child(surface_button_with_event(
                 label,
                 "update-action",
                 colors,
                 cx,
-                move |this, _| {
-                    this.updates.send(command.clone());
+                move |this, event, cx| {
+                    if event.modifiers().alt {
+                        this.toggle_version_picker(cx);
+                    } else {
+                        this.updates.send(command.clone());
+                    }
                 },
             ))
         });
@@ -3174,6 +3185,11 @@ impl UtilitySurfaces {
                 colors,
             ));
         }
+        if self.show_version_picker && !unsupported {
+            rows = rows
+                .child(setting_divider(colors))
+                .child(self.version_picker_rows(&state, colors, cx));
+        }
         if !unsupported {
             rows = rows.child(setting_divider(colors)).child(toggle_row(
                 "Update automatically",
@@ -3192,6 +3208,93 @@ impl UtilitySurfaces {
             ));
         }
         setting_section("Software updates", rows, colors)
+    }
+
+    fn toggle_version_picker(&mut self, cx: &mut Context<Self>) {
+        self.show_version_picker = !self.show_version_picker;
+        if self.show_version_picker {
+            self.updates.send(UpdateCommand::ListReleases);
+        }
+        cx.notify();
+    }
+
+    /// One row per installable release from the feed. Choosing one installs
+    /// exactly that build and relaunches; automatic updates are switched off
+    /// first so the chosen version is not immediately replaced, and the build
+    /// being left is marked skipped so an older diri's own manual check does
+    /// not nag about it either.
+    fn version_picker_rows(
+        &self,
+        state: &crate::updates::UpdateState,
+        colors: SemanticColors,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        let busy = matches!(
+            state.phase,
+            UpdatePhase::Checking | UpdatePhase::Downloading { .. } | UpdatePhase::Installing
+        );
+        let mut list = div()
+            .debug_selector(|| "version-picker".into())
+            .flex()
+            .flex_col();
+        list = list.child(setting_row(
+            "Switch version",
+            if state.releases.is_empty() {
+                "Loading releases from GitHub…".to_owned()
+            } else {
+                "Install a specific signed release. Automatic updates turn off so it stays put."
+                    .to_owned()
+            },
+            div(),
+            colors,
+        ));
+        for release in &state.releases {
+            let version = release.version.clone();
+            let current = version == crate::updates::CURRENT_VERSION;
+            let detail = match (&release.published, state.is_downgrade(&version)) {
+                (Some(published), true) => {
+                    format!("Released {published} · older than this build")
+                }
+                (Some(published), false) => format!("Released {published}"),
+                (None, true) => "Older than this build".to_owned(),
+                (None, false) => String::new(),
+            };
+            let control: gpui::AnyElement = if current {
+                div()
+                    .text_size(px(11.0))
+                    .text_color(colors.tertiary)
+                    .child("Current")
+                    .into_any_element()
+            } else if busy {
+                div().into_any_element()
+            } else {
+                let target = version.clone();
+                surface_button(
+                    "Install",
+                    SharedString::from(format!("install-version-{version}")),
+                    colors,
+                    cx,
+                    move |this, cx| {
+                        this.prefs.automatic_updates = false;
+                        this.prefs.skipped_update_version =
+                            crate::updates::CURRENT_VERSION.to_owned();
+                        this.persist_prefs();
+                        this.updates.send(UpdateCommand::SetAutomatic(false));
+                        this.updates
+                            .send(UpdateCommand::InstallVersion(target.clone()));
+                        cx.notify();
+                    },
+                )
+                .into_any_element()
+            };
+            list = list.child(setting_row(
+                format!("diri {version}"),
+                detail,
+                control,
+                colors,
+            ));
+        }
+        list
     }
 
     fn terminal_settings(&self, cx: &mut Context<Self>) -> impl IntoElement {
@@ -4675,6 +4778,32 @@ fn surface_button(
         .cursor_pointer()
         .hover(move |style| style.bg(colors.primary.alpha(0.09)))
         .on_click(cx.listener(move |this, _, _, cx| handler(this, cx)))
+        .child(label.into())
+}
+
+/// Like [`surface_button`] but hands the click to the handler, for controls
+/// with a modifier-gated alternate action.
+fn surface_button_with_event(
+    label: impl Into<SharedString>,
+    id: impl Into<SharedString>,
+    colors: SemanticColors,
+    cx: &mut Context<UtilitySurfaces>,
+    handler: impl Fn(&mut UtilitySurfaces, &gpui::ClickEvent, &mut Context<UtilitySurfaces>) + 'static,
+) -> impl IntoElement {
+    div()
+        .id(id.into())
+        .h(px(26.0))
+        .px(px(9.0))
+        .rounded(px(Radius::BADGE))
+        .border_1()
+        .border_color(colors.primary.alpha(0.10))
+        .bg(colors.primary.alpha(0.04))
+        .flex()
+        .items_center()
+        .text_size(px(11.0))
+        .cursor_pointer()
+        .hover(move |style| style.bg(colors.primary.alpha(0.09)))
+        .on_click(cx.listener(move |this, event, _, cx| handler(this, event, cx)))
         .child(label.into())
 }
 

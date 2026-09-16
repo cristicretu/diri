@@ -162,6 +162,29 @@ Gatekeeper would need an online check to assess it — and the updater assesses
 offline. Notarizing a zip of the app first lets the ticket be stapled to the
 bundle itself, which then goes into both the DMG and the update zip.
 
+### Switching to a specific version
+
+Settings → General → Software updates only ever offers something newer. To
+move to an exact release, including an older one, **Option-click** the update
+button ("Check Now" / "Download" / "Restart"). A "Switch version" list appears
+with every release the feed still carries (the release script keeps the newest
+five) and an **Install** button next to each one that is not running.
+
+Installing from that list:
+
+- turns **Update automatically** off and marks the build you are leaving as
+  skipped, so the chosen version is not replaced on the next check and an older
+  diri's own manual check does not nag about the exact build you left;
+- goes through the same download, checksum, code-signature and
+  promised-version checks as a normal update, then swaps and relaunches
+  immediately;
+- is the only path that installs a version older than the running one. The
+  automatic feed selection keeps its strictly-newer rule, so a tampered feed
+  still cannot walk anyone backwards.
+
+Turn **Update automatically** back on (or press Check Now) to return to the
+latest release.
+
 ### Env overrides
 
 - `DIRI_SIGN_IDENTITY` — Developer ID identity (default: auto-detected).

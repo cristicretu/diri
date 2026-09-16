@@ -124,6 +124,39 @@ impl Feed {
             })
             .max_by_key(|release| release.parsed_version().unwrap_or_default())
     }
+
+    /// Every release this machine could install, newest first, regardless of
+    /// whether it is newer than the running build. This backs the explicit
+    /// version picker; the automatic offer keeps going through
+    /// [`Feed::newest_eligible`], whose newer-only rule still protects users
+    /// who never asked to move.
+    ///
+    /// The same integrity requirements apply: a row without a bounded size and
+    /// checksum, or one needing a newer macOS, is not an installable choice.
+    pub fn installable(&self, system: Version) -> Vec<&Release> {
+        let mut releases: Vec<(&Release, Version)> = self
+            .releases
+            .iter()
+            .filter_map(|release| release.parsed_version().map(|version| (release, version)))
+            .filter(|(release, _)| {
+                !release.url.is_empty()
+                    && release.has_bounded_integrity_metadata()
+                    && !release
+                        .minimum_system()
+                        .is_some_and(|minimum| minimum > system)
+            })
+            .collect();
+        releases.sort_by_key(|(_, version)| std::cmp::Reverse(*version));
+        releases.dedup_by(|a, b| a.1 == b.1);
+        releases.into_iter().map(|(release, _)| release).collect()
+    }
+
+    /// The installable release with exactly this version, if the feed has one.
+    pub fn find(&self, version: Version, system: Version) -> Option<&Release> {
+        self.installable(system)
+            .into_iter()
+            .find(|release| release.parsed_version() == Some(version))
+    }
 }
 
 #[cfg(test)]
@@ -306,5 +339,64 @@ mod tests {
             releases: vec![missing_size, huge, bad_digest],
         };
         assert!(feed.newest_eligible(eligibility()).is_none());
+    }
+
+    #[test]
+    fn installable_lists_older_and_current_builds_newest_first() {
+        let feed = Feed {
+            feed_version: 1,
+            releases: vec![
+                release("0.4.0"),
+                release("0.4.2"),
+                release("0.5.0"),
+                release("0.4.1"),
+            ],
+        };
+        let versions: Vec<&str> = feed
+            .installable(SYSTEM)
+            .iter()
+            .map(|release| release.version.as_str())
+            .collect();
+        assert_eq!(versions, ["0.5.0", "0.4.2", "0.4.1", "0.4.0"]);
+        // The automatic offer is unchanged by the picker's broader view.
+        assert_eq!(
+            feed.newest_eligible(eligibility())
+                .map(|r| r.version.as_str()),
+            Some("0.5.0")
+        );
+    }
+
+    #[test]
+    fn installable_keeps_the_integrity_and_macos_rules() {
+        let mut unbounded = release("0.4.0");
+        unbounded.sha256 = None;
+        let mut too_new = release("0.4.1");
+        too_new.minimum_system_version = Some("99.0".into());
+        let mut unparseable = release("nightly");
+        unparseable.version = "nightly".into();
+        let feed = Feed {
+            feed_version: 1,
+            releases: vec![unbounded, too_new, unparseable, release("0.3.9")],
+        };
+        let versions: Vec<&str> = feed
+            .installable(SYSTEM)
+            .iter()
+            .map(|release| release.version.as_str())
+            .collect();
+        assert_eq!(versions, ["0.3.9"]);
+    }
+
+    #[test]
+    fn find_matches_an_exact_version_only() {
+        let feed = Feed {
+            feed_version: 1,
+            releases: vec![release("0.4.0"), release("0.4.2")],
+        };
+        assert_eq!(
+            feed.find(Version::new(0, 4, 0), SYSTEM)
+                .map(|r| r.version.as_str()),
+            Some("0.4.0")
+        );
+        assert!(feed.find(Version::new(0, 4, 1), SYSTEM).is_none());
     }
 }

@@ -177,6 +177,31 @@ impl Updater {
             .cloned())
     }
 
+    /// Every release the feed offers that this machine could install, newest
+    /// first, including the running version and older ones. Powers the
+    /// explicit version picker; [`Updater::check`] stays newer-only.
+    pub fn available_releases(&self) -> Result<Vec<Release>> {
+        let body = self.http.fetch_text(&self.config.feed_url)?;
+        let feed = Feed::parse(&body).map_err(|error| UpdateError::Feed(error.to_string()))?;
+        Ok(feed
+            .installable(bundle::system_version())
+            .into_iter()
+            .cloned()
+            .collect())
+    }
+
+    /// The feed's installable release with exactly `version`, if any. The
+    /// version is re-read from the feed rather than trusted from the caller so
+    /// the download URL and checksum always come from the pinned host.
+    pub fn release(&self, version: &str) -> Result<Option<Release>> {
+        let Some(wanted) = Version::parse(version) else {
+            return Ok(None);
+        };
+        let body = self.http.fetch_text(&self.config.feed_url)?;
+        let feed = Feed::parse(&body).map_err(|error| UpdateError::Feed(error.to_string()))?;
+        Ok(feed.find(wanted, bundle::system_version()).cloned())
+    }
+
     /// Downloads the release archive, verifying size and checksum.
     ///
     /// Checks the install location *first*: discovering that `/Applications`

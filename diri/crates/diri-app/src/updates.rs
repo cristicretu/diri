@@ -39,6 +39,10 @@ pub const CURRENT_VERSION: &str = env!("CARGO_PKG_VERSION");
 trait UpdateBackend: Send + Sync {
     fn clean_cache(&self);
     fn check(&self, skipped: Option<&str>) -> UpdateResult<Option<Release>>;
+    /// Everything installable, newest first, including older builds.
+    fn available_releases(&self) -> UpdateResult<Vec<Release>>;
+    /// The installable release with exactly this version, re-read from the feed.
+    fn release(&self, version: &str) -> UpdateResult<Option<Release>>;
     fn download_and_stage(
         &self,
         release: &Release,
@@ -55,6 +59,14 @@ impl UpdateBackend for Updater {
 
     fn check(&self, skipped: Option<&str>) -> UpdateResult<Option<Release>> {
         Updater::check(self, skipped)
+    }
+
+    fn available_releases(&self) -> UpdateResult<Vec<Release>> {
+        Updater::available_releases(self)
+    }
+
+    fn release(&self, version: &str) -> UpdateResult<Option<Release>> {
+        Updater::release(self, version)
     }
 
     fn download_and_stage(
@@ -107,6 +119,9 @@ pub struct UpdateState {
     /// True when this work should surface transient progress or failure. A
     /// background check stays quiet until it finds a release to download.
     pub user_initiated: bool,
+    /// Releases the version picker can install, newest first. Empty until the
+    /// picker asks; never drives the automatic offer.
+    pub releases: Vec<Release>,
 }
 
 impl UpdateState {
@@ -135,6 +150,18 @@ impl UpdateState {
         }
     }
 
+    /// Whether `version` is older than the running build, so the wording can
+    /// say "switch" instead of "update" when the user picked an earlier one.
+    pub fn is_downgrade(&self, version: &str) -> bool {
+        match (
+            diri_updater::Version::parse(version),
+            diri_updater::Version::parse(&self.current_version),
+        ) {
+            (Some(target), Some(current)) => target < current,
+            _ => false,
+        }
+    }
+
     /// One line for the account footer and the Settings row.
     pub fn summary(&self) -> String {
         match &self.phase {
@@ -142,9 +169,15 @@ impl UpdateState {
             UpdatePhase::Idle => format!("diri {}", self.current_version),
             UpdatePhase::Checking => "Checking for updates…".to_owned(),
             UpdatePhase::UpToDate => format!("diri {} is up to date", self.current_version),
+            UpdatePhase::Available(release) if self.is_downgrade(&release.version) => {
+                format!("Switch to {}", release.version)
+            }
             UpdatePhase::Available(release) => format!("Update to {}", release.version),
             UpdatePhase::Downloading { progress, .. } => {
                 format!("Downloading… {}%", (progress * 100.0).round() as u32)
+            }
+            UpdatePhase::Ready(release) if self.is_downgrade(&release.version) => {
+                format!("Restart to switch to {}", release.version)
             }
             UpdatePhase::Ready(release) => format!("Restart to update to {}", release.version),
             UpdatePhase::Installing => "Restarting…".to_owned(),
@@ -165,6 +198,12 @@ pub enum UpdateCommand {
     /// Clear a finished check's transient state (up to date / failed).
     Dismiss,
     SetAutomatic(bool),
+    /// Refresh [`UpdateState::releases`] for the version picker.
+    ListReleases,
+    /// Download, verify and install exactly this version, then relaunch.
+    /// Unlike a regular update the target may be older than the running build;
+    /// the same signature and checksum checks apply.
+    InstallVersion(String),
 }
 
 /// UI-side handle: a state stream plus a command sink.
@@ -412,6 +451,76 @@ impl Service {
                     self.download(true).await;
                 }
             }
+            UpdateCommand::ListReleases => self.list_releases().await,
+            UpdateCommand::InstallVersion(version) => self.install_version(version).await,
+        }
+    }
+
+    async fn list_releases(&mut self) {
+        let updater = Arc::clone(&self.updater);
+        let found = tokio::task::spawn_blocking(move || updater.available_releases()).await;
+        match found {
+            Ok(Ok(releases)) => {
+                let previous = self.state.borrow().clone();
+                self.state.send_replace(UpdateState {
+                    releases,
+                    ..previous
+                });
+            }
+            Ok(Err(error)) => self.fail(&error, true),
+            Err(_) => self.publish(
+                UpdatePhase::Failed("The release list stopped unexpectedly".to_owned()),
+                true,
+            ),
+        }
+    }
+
+    /// The explicit picker path: resolve the version against the feed (never
+    /// trusting a caller-supplied URL), stage it through the ordinary verified
+    /// download, then swap and relaunch right away. Anything already staged
+    /// for the automatic path is discarded so quit cannot install the wrong
+    /// build.
+    async fn install_version(&mut self, version: String) {
+        if self.busy {
+            return;
+        }
+        self.busy = true;
+        self.publish(UpdatePhase::Checking, true);
+        let updater = Arc::clone(&self.updater);
+        let wanted = version.clone();
+        let found = tokio::task::spawn_blocking(move || updater.release(&wanted)).await;
+        self.busy = false;
+        let release = match found {
+            Ok(Ok(Some(release))) => release,
+            Ok(Ok(None)) => {
+                self.publish(
+                    UpdatePhase::Failed(format!("diri {version} is not available to install")),
+                    true,
+                );
+                return;
+            }
+            Ok(Err(error)) => {
+                self.fail(&error, true);
+                return;
+            }
+            Err(_) => {
+                self.publish(
+                    UpdatePhase::Failed("The version lookup stopped unexpectedly".to_owned()),
+                    true,
+                );
+                return;
+            }
+        };
+        self.staged = None;
+        self.ready_install.lock().expect("ready update").take();
+        self.pending = Some(release.clone());
+        self.download(true).await;
+        if self
+            .staged
+            .as_ref()
+            .is_some_and(|staged| staged.release.version == release.version)
+        {
+            self.install(true);
         }
     }
 
@@ -583,6 +692,21 @@ mod tests {
             Ok(Some(self.offered.clone()))
         }
 
+        fn available_releases(&self) -> UpdateResult<Vec<Release>> {
+            Ok(vec![
+                self.offered.clone(),
+                release("0.4.2"),
+                release("0.4.1"),
+            ])
+        }
+
+        fn release(&self, version: &str) -> UpdateResult<Option<Release>> {
+            Ok(self
+                .available_releases()?
+                .into_iter()
+                .find(|release| release.version == version))
+        }
+
         fn download_and_stage(
             &self,
             release: &Release,
@@ -616,7 +740,22 @@ mod tests {
             current_version: "0.4.2".to_owned(),
             last_checked_unix: None,
             user_initiated,
+            releases: Vec::new(),
         }
+    }
+
+    #[test]
+    fn switching_to_an_older_build_reads_as_a_switch_not_an_update() {
+        assert_eq!(
+            state(UpdatePhase::Ready(release("0.4.1")), true).summary(),
+            "Restart to switch to 0.4.1"
+        );
+        assert_eq!(
+            state(UpdatePhase::Ready(release("0.5.0")), true).summary(),
+            "Restart to update to 0.5.0"
+        );
+        assert!(state(UpdatePhase::Idle, false).is_downgrade("0.4.1"));
+        assert!(!state(UpdatePhase::Idle, false).is_downgrade("0.4.2"));
     }
 
     #[test]
@@ -667,6 +806,117 @@ mod tests {
             state(UpdatePhase::Ready(release("0.5.0")), true).summary(),
             "Restart to update to 0.5.0"
         );
+    }
+
+    #[test]
+    fn installing_a_specific_older_version_stages_it_and_relaunches() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_time()
+            .build()
+            .expect("test runtime");
+        runtime.block_on(async {
+            let updater = Arc::new(FakeUpdater {
+                offered: release("0.5.0"),
+                downloads: AtomicUsize::new(0),
+                installs: Mutex::new(Vec::new()),
+            });
+            let backend: Arc<dyn UpdateBackend> = updater.clone();
+            let (state_tx, mut state_rx) = watch::channel(UpdateState::default());
+            let (command_tx, command_rx) = mpsc::unbounded_channel();
+            let ready_install = Arc::new(Mutex::new(None));
+            let task = tokio::spawn(service(
+                Some(backend),
+                false,
+                None,
+                state_tx,
+                command_rx,
+                Arc::clone(&ready_install),
+            ));
+
+            command_tx
+                .send(UpdateCommand::InstallVersion("0.4.1".to_owned()))
+                .expect("send install version");
+            let installing = tokio::time::timeout(Duration::from_secs(1), async {
+                loop {
+                    if state_rx.borrow().phase == UpdatePhase::Installing {
+                        return;
+                    }
+                    state_rx.changed().await.expect("service remains alive");
+                }
+            })
+            .await;
+
+            drop(command_tx);
+            task.abort();
+            assert!(installing.is_ok(), "a picked version installs right away");
+            assert_eq!(updater.downloads.load(Ordering::SeqCst), 1);
+            assert_eq!(
+                *updater.installs.lock().expect("installs"),
+                vec![true],
+                "switching versions relaunches into the chosen build"
+            );
+            assert!(
+                ready_install.lock().expect("ready update").is_none(),
+                "nothing is left for the quit hook to install a second time"
+            );
+        });
+    }
+
+    #[test]
+    fn a_version_the_feed_does_not_offer_fails_without_downloading() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_time()
+            .build()
+            .expect("test runtime");
+        runtime.block_on(async {
+            let updater = Arc::new(FakeUpdater {
+                offered: release("0.5.0"),
+                downloads: AtomicUsize::new(0),
+                installs: Mutex::new(Vec::new()),
+            });
+            let backend: Arc<dyn UpdateBackend> = updater.clone();
+            let (state_tx, mut state_rx) = watch::channel(UpdateState::default());
+            let (command_tx, command_rx) = mpsc::unbounded_channel();
+            let task = tokio::spawn(service(
+                Some(backend),
+                false,
+                None,
+                state_tx,
+                command_rx,
+                Arc::new(Mutex::new(None)),
+            ));
+
+            command_tx
+                .send(UpdateCommand::ListReleases)
+                .expect("send list");
+            command_tx
+                .send(UpdateCommand::InstallVersion("0.3.0".to_owned()))
+                .expect("send install version");
+            let failed = tokio::time::timeout(Duration::from_secs(1), async {
+                loop {
+                    if let UpdatePhase::Failed(reason) = &state_rx.borrow().phase {
+                        return reason.clone();
+                    }
+                    state_rx.changed().await.expect("service remains alive");
+                }
+            })
+            .await;
+
+            drop(command_tx);
+            task.abort();
+            assert_eq!(
+                failed.as_deref().ok(),
+                Some("diri 0.3.0 is not available to install")
+            );
+            assert_eq!(updater.downloads.load(Ordering::SeqCst), 0);
+            let listed: Vec<String> = state_rx
+                .borrow()
+                .releases
+                .iter()
+                .map(|release| release.version.clone())
+                .collect();
+            assert_eq!(listed, ["0.5.0", "0.4.2", "0.4.1"]);
+        });
     }
 
     #[test]
