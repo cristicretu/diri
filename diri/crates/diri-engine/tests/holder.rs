@@ -104,6 +104,14 @@ fn a_holder_owns_a_session_end_to_end() {
     let stat = client.stat().expect("stat");
     assert!(stat.alive);
     assert!(stat.child_pid > 1);
+    let identity = stat
+        .verified_child_identity()
+        .expect("new Holder reports exact owned-child birth");
+    assert_eq!(identity.pid(), stat.child_pid as u32);
+    assert_eq!(
+        diri_pty::process_identity::observe(identity.pid()).unwrap(),
+        identity
+    );
     assert_eq!(
         stat.epoch_offset,
         Some(0),
@@ -125,6 +133,7 @@ fn a_holder_owns_a_session_end_to_end() {
 
     client.resize(132, 43).expect("resize");
     let resized = client.stat().expect("stat after resize");
+    assert_eq!(resized.verified_child_identity(), Some(identity));
     assert_eq!((resized.cols, resized.rows), (Some(132), Some(43)));
 
     // The tree is visible and killable through the protocol alone.
@@ -337,9 +346,15 @@ fn the_manager_hosts_launches_and_idles_out() {
     });
 
     // Launching the same spec again adopts the live holder, no second child.
-    let first_child = client.stat().expect("stat").child_pid;
+    let first_stat = client.stat().expect("stat");
+    let first_child = first_stat.child_pid;
+    let first_identity = first_stat
+        .verified_child_identity()
+        .expect("owned child birth");
     manager.launch(&launch).expect("re-launch");
-    assert_eq!(client.stat().expect("stat").child_pid, first_child);
+    let adopted_stat = client.stat().expect("stat");
+    assert_eq!(adopted_stat.child_pid, first_child);
+    assert_eq!(adopted_stat.verified_child_identity(), Some(first_identity));
 
     // A spec whose control files point elsewhere is rejected.
     let mut foreign = launch.clone();

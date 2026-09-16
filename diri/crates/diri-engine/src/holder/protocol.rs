@@ -70,6 +70,14 @@ pub struct HolderProcessSample {
 /// A holder's answer to `stat`: the child, its liveness, and the log tail.
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 pub struct HolderStat {
+    /// Immutable owned-child birth, verified around this observation. Old
+    /// Holders omit it; consumers must not invent it from childPID/startSec.
+    #[serde(
+        rename = "childIdentity",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub child_identity: Option<diri_proto::process::ProcessIdentity>,
     #[serde(rename = "childPID")]
     pub child_pid: i32,
     pub alive: bool,
@@ -80,6 +88,7 @@ pub struct HolderStat {
         default,
         skip_serializing_if = "Option::is_none"
     )]
+    /// Historical wire spelling; this value is the PTY foreground PGID.
     pub foreground_pid: Option<i32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cols: Option<u16>,
@@ -96,6 +105,16 @@ pub struct HolderStat {
         skip_serializing_if = "Option::is_none"
     )]
     pub epoch_offset: Option<u64>,
+}
+
+impl HolderStat {
+    /// Reject absent/unsupported identity and inconsistent sibling PID fields.
+    /// Presence is evidence supplied by the owning Holder, not permission to
+    /// inspect or signal an arbitrary numeric PID on another host.
+    pub fn verified_child_identity(&self) -> Option<diri_proto::process::ProcessIdentity> {
+        self.child_identity
+            .filter(|identity| Some(identity.pid()) == u32::try_from(self.child_pid).ok())
+    }
 }
 
 /// How the held child ended.
@@ -480,6 +499,32 @@ mod tests {
         let sparse: HolderStat =
             serde_json::from_str(r#"{"childPID":9,"alive":false,"logOffset":0}"#).expect("sparse");
         assert_eq!(sparse.foreground_pid, None);
+        assert_eq!(sparse.child_identity, None);
+        assert_eq!(sparse.verified_child_identity(), None);
+        let mut inconsistent = sparse.clone();
+        inconsistent.child_identity = Some(
+            diri_proto::process::ProcessIdentity::new(
+                10,
+                diri_proto::process::ProcessBirth::Linux {
+                    boot_id: diri_proto::process::BootId::parse(
+                        "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee",
+                    )
+                    .unwrap(),
+                    start_ticks: 42,
+                    clock_ticks_per_second: 100,
+                },
+            )
+            .unwrap(),
+        );
+        assert_eq!(inconsistent.verified_child_identity(), None);
+        inconsistent.child_pid = 10;
+        assert!(inconsistent.verified_child_identity().is_some());
+        let round_trip: HolderStat =
+            serde_json::from_str(&serde_json::to_string(&inconsistent).unwrap()).unwrap();
+        assert_eq!(
+            round_trip.verified_child_identity(),
+            inconsistent.child_identity
+        );
         assert_eq!(sparse.epoch_offset, None);
     }
 

@@ -68,6 +68,7 @@ pub struct HolderServer;
 struct Shared {
     spec: HolderLaunchSpec,
     child_pid: i32,
+    child_identity: Option<diri_proto::process::ProcessIdentity>,
     /// The PTY, kept for write/resize/stat access. The master stays open for
     /// the holder's whole life; closing happens when `run` returns.
     pty: Mutex<Pty>,
@@ -171,6 +172,7 @@ impl HolderServer {
 
         let shared = Arc::new(Shared {
             child_pid,
+            child_identity: pty.child_identity(),
             pty: Mutex::new(pty),
             log: Mutex::new(log),
             epoch_offset,
@@ -763,12 +765,25 @@ fn write_pty(shared: &Shared, data: &[u8]) -> HolderResult<()> {
 }
 
 fn current_stat(shared: &Shared) -> HolderStat {
+    if let Some(expected) = shared.child_identity
+        && let Ok(mut stat) = diri_pty::process_identity::inspect_verified(&expected, || {
+            Ok(current_stat_without_identity(shared))
+        })
+    {
+        stat.child_identity = Some(expected);
+        return stat;
+    }
+    current_stat_without_identity(shared)
+}
+
+fn current_stat_without_identity(shared: &Shared) -> HolderStat {
     let finished = shared.finished.load(Ordering::SeqCst);
     let pty = shared.pty.lock().expect("pty");
     // SAFETY: kill with signal 0 only checks existence.
     let child_alive = unsafe { libc::kill(shared.child_pid, 0) } == 0;
     let size = pty.size().ok();
     HolderStat {
+        child_identity: None,
         child_pid: shared.child_pid,
         alive: !finished && child_alive,
         log_offset: shared.log.lock().expect("log").tail_offset(),

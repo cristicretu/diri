@@ -1638,6 +1638,7 @@ dependencies = [
 name = "diri-pty"
 version = "0.1.0"
 dependencies = [
+ "diri-proto",
  "libc",
 ]
 
