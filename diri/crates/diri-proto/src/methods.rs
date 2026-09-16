@@ -16,6 +16,8 @@ pub const RUST_ENGINE_KIND: &str = "diri-rust-engine";
 pub struct Method;
 
 impl Method {
+    pub const WORKSPACE_SNAPSHOT: &'static str = "workspace.snapshot";
+    pub const WORKSPACE_MUTATE: &'static str = "workspace.mutate";
     pub const HELLO: &'static str = "hello";
     pub const SESSION_SPAWN_TRACKED: &'static str = "session.spawn_tracked";
     pub const TASK_SUBMIT: &'static str = "task.submit";
@@ -81,6 +83,7 @@ impl Method {
 pub struct EventName;
 
 impl EventName {
+    pub const WORKSPACE_UPDATED: &'static str = "workspace.updated";
     pub const SESSION_NOTIFICATION: &'static str = "session.notification";
     pub const SESSION_UPDATED: &'static str = "session.updated";
     pub const SESSION_RESOURCES: &'static str = "session.resources";
@@ -616,12 +619,44 @@ pub struct SessionReadDiffResult {
 #[serde(rename_all = "camelCase")]
 pub struct ReadScrollbackResult {
     pub lines: Vec<String>,
+    /// Sparse row-indexed mappings from Unicode scalar indices to half-open
+    /// terminal cell ranges. An omitted row uses one cell per scalar. Older
+    /// Engines omit the field and retain their original cell-aligned text.
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub text_cells: std::collections::BTreeMap<usize, Vec<[u16; 2]>>,
     pub first_row: i64,
     pub visible_start_row: i64,
     pub cols: i64,
     pub rows: i64,
     pub content_seq: u64,
     pub is_alt_screen: bool,
+}
+
+#[cfg(test)]
+mod scrollback_text_tests {
+    use super::ReadScrollbackResult;
+
+    #[test]
+    fn text_cell_ranges_are_additive_and_round_trip_without_ascii_overhead() {
+        let old = serde_json::json!({
+            "lines": ["plain"], "firstRow": 0, "visibleStartRow": 0,
+            "cols": 8, "rows": 1, "contentSeq": 7, "isAltScreen": false
+        });
+        let mut result: ReadScrollbackResult = serde_json::from_value(old.clone()).unwrap();
+        assert!(result.text_cells.is_empty());
+        assert_eq!(serde_json::to_value(&result).unwrap(), old);
+        result.lines[0] = "界e\u{301}".into();
+        result.text_cells.insert(0, vec![[0, 2], [2, 3], [2, 3]]);
+        let encoded = serde_json::to_value(&result).unwrap();
+        assert_eq!(
+            encoded["textCells"]["0"],
+            serde_json::json!([[0, 2], [2, 3], [2, 3]])
+        );
+        assert_eq!(
+            serde_json::from_value::<ReadScrollbackResult>(encoded).unwrap(),
+            result
+        );
+    }
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]

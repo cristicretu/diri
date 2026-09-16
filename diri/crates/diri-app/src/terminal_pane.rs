@@ -3,6 +3,9 @@
 //! The daemon remains authoritative: this module only composes
 //! `diri-client::SessionAttachment`, `diri-term`, and the T9 session store.
 
+mod controller;
+use controller::{AttachmentControl, ControllerLease};
+mod find_overlay;
 mod qol;
 use qol::QolState;
 
@@ -262,57 +265,14 @@ enum AttachmentCommand {
         col: u16,
         row: u16,
     },
-    Close,
 }
 
 #[cfg(test)]
 type InputObserver = mpsc::UnboundedSender<(SessionId, Vec<u8>)>;
 
-#[derive(Clone)]
-struct AttachmentControl {
-    tx: mpsc::UnboundedSender<AttachmentCommand>,
-    #[cfg(test)]
-    input_observer: Option<(SessionId, InputObserver)>,
-}
-
-impl AttachmentControl {
-    fn input(&self, bytes: Vec<u8>) {
-        if bytes.is_empty() {
-            return;
-        }
-        #[cfg(test)]
-        if let Some((id, observer)) = &self.input_observer {
-            let _ = observer.send((id.clone(), bytes.clone()));
-        }
-        let _ = self.tx.send(AttachmentCommand::Input(bytes));
-    }
-
-    fn resize(&self, cols: u16, rows: u16) {
-        let _ = self.tx.send(AttachmentCommand::Resize(cols, rows));
-    }
-
-    fn mouse(&self, bytes: Vec<u8>) {
-        if bytes.is_empty() {
-            return;
-        }
-        let _ = self.tx.send(AttachmentCommand::Mouse(bytes));
-    }
-
-    fn scroll(&self, direction: u8, lines: u16, col: u16, row: u16) {
-        let _ = self.tx.send(AttachmentCommand::Scroll {
-            direction,
-            lines,
-            col,
-            row,
-        });
-    }
-
-    fn close(&self) {
-        let _ = self.tx.send(AttachmentCommand::Close);
-    }
-}
-
 enum PaneEvent {
+    ControllerDamage(SessionId, AttachmentGeneration, bool),
+    InputFeedback(SessionId, String),
     AttachmentState(SessionId, AttachmentGeneration, AttachmentState),
     Chunk(SessionId, AttachmentGeneration, TerminalChunk),
     GridBatch(SessionId, AttachmentGeneration, Vec<GridUpdate>),
@@ -331,8 +291,8 @@ enum PaneEvent {
     DroppedFilesUploaded(SessionId, Result<Vec<String>, String>),
 }
 
-/// Identifies one attachment task, not the durable session it reads. A session
-/// receives a new generation whenever residency replaces its attachment.
+/// Identifies one view residency, not the durable session or shared transport.
+/// Replacing a view invalidates its pending search and UI completion events.
 type AttachmentGeneration = u64;
 
 /// Bounded, grid-aware handoff from transport tasks to the GPUI thread.
@@ -526,6 +486,7 @@ impl PaneMailboxState {
 }
 
 struct ResidentTerminal {
+    controller: ControllerLease,
     element: TerminalElement,
     attachment: AttachmentControl,
     /// Rejects events that finished crossing to GPUI after this resident's
@@ -593,12 +554,6 @@ pub struct TerminalViewport {
     pub height: f32,
 }
 
-impl Drop for ResidentTerminal {
-    fn drop(&mut self) {
-        self.attachment.close();
-    }
-}
-
 pub struct TerminalPane {
     qol: QolState,
     runtime: Arc<StoreRuntime>,
@@ -612,8 +567,8 @@ pub struct TerminalPane {
     /// switching read as instant with a residency of one.
     parked_grids: Vec<(SessionId, SharedGridBuffer)>,
     pane_tx: PaneEventSender,
-    /// Monotonic within this pane; enough to distinguish replacement tasks
-    /// because every attachment event returns through this pane's mailbox.
+    /// Monotonic within this pane so replaced view residencies cannot receive
+    /// stale UI/search completions from their predecessor.
     next_attachment_generation: AttachmentGeneration,
     focus: FocusHandle,
     glyphs: HashMap<SessionId, Entity<StatusGlyph>>,
@@ -621,17 +576,12 @@ pub struct TerminalPane {
     /// Paced PTY resizes: window and sidebar drags relayout every frame, but
     /// sustained grid frames leave the daemon at up to 120 Hz, so intermediate
     /// sizes coalesce onto that cadence (see [`RESIZE_CADENCE`]).
-    pending_resizes: HashMap<SessionId, (u16, u16)>,
+    pending_resizes: HashMap<SessionId, ((u16, u16), u64)>,
     resize_flush: Option<Task<()>>,
     /// A cadence tick is already armed; further changes fold into it instead of
     /// rescheduling (which is what used to starve the flush during a drag).
     resize_flush_armed: bool,
     last_resize_sent: Option<Instant>,
-    /// Grids held still while a column change round-trips. Keyed by session id
-    /// so a hold follows the session rather than the pane: selection can move
-    /// on mid-hold, and the parked frames still belong to the session that was
-    /// resized.
-    reflow_holds: HashMap<SessionId, ReflowHold>,
     started_at: Instant,
     session_source: SessionSource,
     /// Last selection observed by the primary pane. Spawn responses select the
@@ -649,6 +599,8 @@ pub struct TerminalPane {
     navigation: Option<Entity<NavigationOverlay>>,
     utility_surfaces: Option<Entity<UtilitySurfaces>>,
     local_clipboard_images: Vec<StagedClipboardImage>,
+    _focus_owner: gpui::Subscription,
+    _window_owner: gpui::Subscription,
     _pane_events: Task<()>,
     _store_changes: Task<()>,
 }
@@ -698,6 +650,18 @@ impl TerminalPane {
         if matches!(session_source, SessionSource::FollowSelection) {
             window.focus(&focus, cx);
         }
+        let focus_owner = cx.on_focus(&focus, window, |this, window, cx| {
+            if window.is_window_active() {
+                this.claim_selected_control();
+            }
+            cx.notify();
+        });
+        let window_owner = cx.observe_window_activation(window, |this, window, cx| {
+            if window.is_window_active() && this.focus.is_focused(window) {
+                this.claim_selected_control();
+                cx.notify();
+            }
+        });
         let (pane_tx, mut pane_rx) = pane_event_channel();
         let pane_events = cx.spawn_in(window, async move |this, cx| {
             let mut batch = Vec::new();
@@ -761,7 +725,6 @@ impl TerminalPane {
             resize_flush: None,
             resize_flush_armed: false,
             last_resize_sent: None,
-            reflow_holds: HashMap::new(),
             started_at: Instant::now(),
             session_source,
             observed_selected_id,
@@ -774,15 +737,17 @@ impl TerminalPane {
             navigation: None,
             utility_surfaces: None,
             local_clipboard_images: Vec::new(),
+            _focus_owner: focus_owner,
+            _window_owner: window_owner,
             _pane_events: pane_events,
             _store_changes: store_changes,
         };
-        pane.reconcile_residency();
+        pane.reconcile_residency(cx);
         pane.sync_status_glyphs(pane.current_colors(), window, cx);
         pane
     }
 
-    fn reconcile_residency(&mut self) {
+    fn reconcile_residency(&mut self, cx: &mut Context<Self>) {
         let store = self
             .runtime
             .store
@@ -819,12 +784,6 @@ impl TerminalPane {
             self.parked_grids.drain(..excess);
         }
         self.residents.retain(|id, _| resident_ids.contains(id));
-        // A hold outliving its resident would park frames belonging to a
-        // session id that has been re-attached since, and paint them into a
-        // grid that never asked for them.
-        let residents = &self.residents;
-        self.reflow_holds.retain(|id, _| residents.contains_key(id));
-
         let socket = self.runtime.client().socket_path().to_path_buf();
         for id in resident_ids {
             if self.residents.contains_key(&id) {
@@ -838,32 +797,31 @@ impl TerminalPane {
                 .iter()
                 .position(|(parked, _)| parked == &id)
                 .map(|index| self.parked_grids.remove(index).1);
-            let attachment = spawn_attachment(
-                &self.tokio,
+            let (controller, attachment, buffer) = ControllerLease::mount(
                 socket.clone(),
                 id.clone(),
-                generation,
+                &self.tokio,
                 self.pane_tx.clone(),
+                generation,
+                parked,
+                cx,
             );
             #[cfg(test)]
-            let attachment = AttachmentControl {
-                input_observer: self.input_observer.clone().map(|tx| (id.clone(), tx)),
-                ..attachment
+            let attachment = {
+                let mut attachment = attachment;
+                attachment.input_observer = self.input_observer.clone().map(|tx| (id.clone(), tx));
+                attachment
             };
             let ime_attachment = attachment.clone();
-            let element = match parked {
-                // The parked cells paint on the first frame; the attach's
-                // full snapshot overwrites the same shared buffer moments
-                // later, so stale content lives for one round-trip at most.
-                Some(buffer) => TerminalElement::new(buffer),
-                None => TerminalElement::with_buffer(GridBuffer::default()),
-            }
-            .font(mono)
-            .focus_handle(self.focus.clone())
-            .on_text_input(move |text| ime_attachment.input(text.as_bytes().to_vec()));
+            let element = TerminalElement::new(buffer)
+                .font(mono)
+                .focus_handle(self.focus.clone())
+                .on_text_input(move |text| ime_attachment.input(text.as_bytes().to_vec()));
+            controller.observe(&element);
             self.residents.insert(
                 id,
                 ResidentTerminal {
+                    controller,
                     element,
                     attachment,
                     attachment_generation: generation,
@@ -892,10 +850,19 @@ impl TerminalPane {
             })
             .flatten();
         let selection_changed = selected_id != self.observed_selected_id;
+        if selection_changed {
+            if let Some(previous) = &self.observed_selected_id
+                && let Some(resident) = self.residents.get(previous)
+            {
+                resident.attachment.release();
+            }
+            self.pending_resizes.clear();
+        }
         self.observed_selected_id = selected_id.clone();
 
-        self.reconcile_residency();
+        self.reconcile_residency(cx);
         if selection_changed {
+            self.qol.clear_feedback();
             self.session_links.close();
             for resident in self.residents.values_mut() {
                 resident.pointer_owner = None;
@@ -909,13 +876,24 @@ impl TerminalPane {
         // path. Following the selection here covers both RPC/event orderings
         // and avoids trying to focus a terminal before its id exists.
         if selection_changed && selected_id.is_some() {
-            window.focus(&self.focus, cx);
+            self.focus(window, cx);
         }
         cx.notify();
     }
 
-    pub fn resident_buffers(&mut self) -> HashMap<SessionId, SharedGridBuffer> {
-        self.reconcile_residency();
+    /// Paint-only previews must not reconcile residency or acquire a controller.
+    pub fn resident_preview_buffers(&self) -> HashMap<SessionId, SharedGridBuffer> {
+        self.residents
+            .iter()
+            .map(|(id, resident)| (id.clone(), resident.element.buffer()))
+            .collect()
+    }
+
+    pub fn resident_buffers(
+        &mut self,
+        cx: &mut Context<Self>,
+    ) -> HashMap<SessionId, SharedGridBuffer> {
+        self.reconcile_residency(cx);
         self.residents
             .iter()
             .map(|(id, resident)| (id.clone(), resident.element.buffer()))
@@ -932,7 +910,18 @@ impl TerminalPane {
     }
 
     pub fn focus(&self, window: &mut Window, cx: &mut Context<Self>) {
+        if window.is_window_active() {
+            self.claim_selected_control();
+        }
         window.focus(&self.focus, cx);
+    }
+
+    fn claim_selected_control(&self) {
+        if let Some(id) = self.selected_id()
+            && let Some(resident) = self.residents.get(&id)
+        {
+            resident.attachment.claim();
+        }
     }
 
     pub fn set_viewport(&mut self, viewport: TerminalViewport, cx: &mut Context<Self>) {
@@ -941,6 +930,18 @@ impl TerminalPane {
         }
         self.viewport = Some(viewport);
         cx.notify();
+    }
+
+    #[cfg(all(test, target_os = "macos"))]
+    pub(crate) fn seed_preview_grid_for_test(&mut self, grid: GridBuffer, cx: &mut Context<Self>) {
+        self.reconcile_residency(cx);
+        if let Some(id) = self.selected_id()
+            && let Some(resident) = self.residents.get_mut(&id)
+        {
+            *resident.element.buffer().write().unwrap() = grid;
+            resident.attachment_state = AttachmentState::Live;
+            resident.controller.seed_live_for_test();
+        }
     }
 
     #[cfg(test)]
@@ -1056,6 +1057,28 @@ impl TerminalPane {
 
     fn handle_pane_event(&mut self, event: PaneEvent, window: &mut Window, cx: &mut Context<Self>) {
         match event {
+            PaneEvent::ControllerDamage(id, generation, changed) => {
+                if !self.attachment_is_current(&id, generation) {
+                    return;
+                }
+                let now = self.started_at.elapsed();
+                let schedule = self
+                    .residents
+                    .get_mut(&id)
+                    .and_then(|resident| resident.find.as_mut())
+                    .is_some_and(|find| find.on_output(now));
+                if schedule {
+                    self.schedule_find(id.clone(), Duration::from_millis(100), window, cx);
+                }
+                if terminal_damage_should_repaint(self.selected_id().as_ref(), &id, changed) {
+                    self.request_terminal_repaint(window, cx);
+                }
+            }
+            PaneEvent::InputFeedback(id, message) => {
+                if self.selected_id().as_ref() == Some(&id) {
+                    self.show_terminal_feedback(message, window, cx);
+                }
+            }
             PaneEvent::AttachmentState(id, generation, state) => {
                 if !self.attachment_is_current(&id, generation) {
                     return;
@@ -1077,28 +1100,10 @@ impl TerminalPane {
                 if !self.attachment_is_current(&id, generation) {
                     return;
                 }
-                if let Some(hold) = self.reflow_holds.get_mut(&id) {
-                    if hold.park(update) {
-                        self.release_reflow_hold(&id, window, cx);
-                    }
-                    return;
-                }
                 self.apply_grid_updates(id, [update], window, cx);
             }
             PaneEvent::GridBatch(id, generation, updates) => {
                 if !self.attachment_is_current(&id, generation) {
-                    return;
-                }
-                if self.reflow_holds.contains_key(&id) {
-                    for update in updates {
-                        let release = self
-                            .reflow_holds
-                            .get_mut(&id)
-                            .is_some_and(|hold| hold.park(update));
-                        if release {
-                            self.release_reflow_hold(&id, window, cx);
-                        }
-                    }
                     return;
                 }
                 self.apply_grid_updates(id, updates, window, cx);
@@ -1403,34 +1408,10 @@ impl TerminalPane {
     /// its frames carry over, because a daemon that never answers the second
     /// resize (a hibernated tree, a session the phone owns) would otherwise
     /// leave the pane painting whatever was on screen before the first one.
-    fn hold_reflow(&mut self, id: SessionId, window: &mut Window, cx: &mut Context<Self>) {
-        let held = id.clone();
-        let release = cx.spawn_in(window, async move |this, cx| {
-            cx.background_executor().timer(REFLOW_HOLD).await;
-            let _ = this.update_in(cx, |this, window, cx| {
-                this.release_reflow_hold(&held, window, cx);
-            });
-        });
-        let parked = self
-            .reflow_holds
-            .remove(&id)
-            .map_or_else(Vec::new, |hold| hold.parked);
-        self.reflow_holds.insert(
-            id,
-            ReflowHold {
-                parked,
-                saw_snapshot: false,
-                _release: release,
-            },
-        );
-    }
-
-    /// Ends a hold and paints everything it parked as a single frame.
-    fn release_reflow_hold(&mut self, id: &SessionId, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(hold) = self.reflow_holds.remove(id) else {
-            return;
-        };
-        self.apply_grid_updates(id.clone(), hold.parked, window, cx);
+    fn hold_reflow(&mut self, id: SessionId, _window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(resident) = self.residents.get(&id) {
+            resident.controller.hold_reflow(cx);
+        }
     }
 
     fn request_terminal_repaint(&mut self, _window: &mut Window, cx: &mut Context<Self>) {
@@ -2398,7 +2379,8 @@ impl TerminalPane {
         );
         let size = estimated_grid_size(viewport.width, viewport.height, 0.0, metrics);
         if let Some(resident) = self.residents.get_mut(&session.id)
-            && resident.last_size != size
+            && resident.attachment.is_controller()
+            && (resident.last_size != size || resident.attachment.needs_resize(size))
         {
             // Leading edge: an isolated change (first measure after attach, a
             // session switch, a window snap, the first frame of a drag) reaches
@@ -2424,12 +2406,18 @@ impl TerminalPane {
                 // continuous drag keeps the PTY reflowing at ~20Hz instead of
                 // waiting for the mouse to stop.
                 ResizePlan::Fold => {
-                    self.pending_resizes.insert(session.id.clone(), size);
+                    self.pending_resizes.insert(
+                        session.id.clone(),
+                        (size, resident.attachment.ownership_revision()),
+                    );
                     return;
                 }
                 ResizePlan::Arm(delay) => delay,
             };
-            self.pending_resizes.insert(session.id.clone(), size);
+            self.pending_resizes.insert(
+                session.id.clone(),
+                (size, resident.attachment.ownership_revision()),
+            );
             self.resize_flush_armed = true;
             let timer = cx.background_executor().timer(delay);
             self.resize_flush = Some(cx.spawn(async move |this, cx| {
@@ -2438,9 +2426,9 @@ impl TerminalPane {
                     this.resize_flush_armed = false;
                     this.last_resize_sent = Some(Instant::now());
                     let pending = std::mem::take(&mut this.pending_resizes);
-                    for (id, size) in pending {
+                    for (id, (size, revision)) in pending {
                         if let Some(resident) = this.residents.get(&id) {
-                            resident.attachment.resize(size.0, size.1);
+                            resident.attachment.resize_if_current(size, revision);
                         }
                     }
                 });
@@ -2719,7 +2707,7 @@ impl TerminalPane {
             .on_mouse_down(
                 MouseButton::Left,
                 cx.listener(move |this, event: &gpui::MouseDownEvent, window, cx| {
-                    window.focus(&this.focus, cx);
+                    this.focus(window, cx);
                     if follows_selection {
                         this.runtime
                             .store
@@ -2914,13 +2902,12 @@ impl TerminalPane {
             query_label(&resident.find_query)
         };
         let alt_screen = find.is_alt_screen();
-        Some(
+        Some(find_overlay::render(
+            resident.element.clone(),
             div()
                 .id("find-bar")
-                .absolute()
-                .top(px(Metrics::TITLE_BAR + 6.0))
-                .right(px(16.0))
-                .w(px(360.0))
+                .debug_selector(|| "find-bar".into())
+                .w_full()
                 .child(FloatingSurface::new(
                     colors,
                     div()
@@ -2937,7 +2924,7 @@ impl TerminalPane {
                                 .text_size(px(Typo::ROW.size))
                                 .text_color(colors.primary)
                                 .child(sf_symbol("magnifyingglass", 12.0, colors.tertiary))
-                                .child(div().flex_1().child(query))
+                                .child(div().flex_1().min_w(px(0.0)).overflow_hidden().child(query))
                                 .child(
                                     div()
                                         .text_size(px(Typo::META.size))
@@ -3000,7 +2987,7 @@ impl TerminalPane {
                         }),
                 ))
                 .into_any_element(),
-        )
+        ))
     }
 
     /// The pane-filling card for an exited session, or `None` when the terminal
@@ -3118,7 +3105,7 @@ impl TerminalPane {
                         .write()
                         .expect("session store lock poisoned")
                         .revive_sessions(vec![id.clone()]);
-                    this.reconcile_residency();
+                    this.reconcile_residency(cx);
                     cx.notify();
                 },
             ))
@@ -3140,7 +3127,10 @@ fn quote_from_terminal_element(session_id: SessionId, element: &TerminalElement)
 
 impl Render for TerminalPane {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        self.reconcile_residency();
+        self.reconcile_residency(cx);
+        if window.is_window_active() && self.focus.is_focused(window) {
+            self.claim_selected_control();
+        }
         let (theme, colors, sidebar_colors, font_size) = {
             let store = self
                 .runtime
@@ -3172,7 +3162,7 @@ impl Render for TerminalPane {
                 .border_color(sidebar_colors.primary.alpha(0.08))
                 .bg(theme.background)
                 .child(self.render_header(&session, sidebar_colors, cx));
-            let terminal_surface = div()
+            let mut terminal_surface = div()
                 .relative()
                 .min_h(px(0.0))
                 .flex_1()
@@ -3185,10 +3175,10 @@ impl Render for TerminalPane {
                 .child(
                     self.render_grid_and_overlays(&session, theme, colors, font_size, window, cx),
                 );
-            pane = pane.child(terminal_surface);
             if let Some(find) = self.render_find_bar(&session, colors, cx) {
-                pane = pane.child(find);
+                terminal_surface = terminal_surface.child(find);
             }
+            pane = pane.child(terminal_surface);
             if let Some(summary) = self.render_session_links(&session, sidebar_colors, window, cx) {
                 pane = pane.child(summary);
             }
@@ -3555,121 +3545,6 @@ fn terminal_key_event(event: &KeyDownEvent) -> Option<TermKeyEvent> {
     })
 }
 
-fn spawn_attachment(
-    runtime: &Handle,
-    socket: std::path::PathBuf,
-    id: SessionId,
-    generation: AttachmentGeneration,
-    pane_tx: PaneEventSender,
-) -> AttachmentControl {
-    let (command_tx, mut commands) = mpsc::unbounded_channel();
-    let control = AttachmentControl {
-        tx: command_tx,
-        #[cfg(test)]
-        input_observer: None,
-    };
-    runtime.spawn(async move {
-        // The first resize must be the measured pane geometry: deferred agent
-        // launch waits for it. Do not seed an arbitrary 80×24 size.
-        let mut last_resize = None;
-        loop {
-            let _ = pane_tx.send(PaneEvent::AttachmentState(
-                id.clone(),
-                generation,
-                AttachmentState::Attaching,
-            ));
-            let mut attachment = match SessionAttachment::connect(&socket, id.clone()).await {
-                Ok(attachment) => attachment,
-                Err(_) => {
-                    let _ = pane_tx.send(PaneEvent::AttachmentState(
-                        id.clone(),
-                        generation,
-                        AttachmentState::Reconnecting,
-                    ));
-                    if wait_for_retry(&mut commands, &mut last_resize).await {
-                        return;
-                    }
-                    continue;
-                }
-            };
-            let writer = attachment.handle();
-            if let Some((cols, rows)) = last_resize {
-                let _ = writer.resize(cols, rows);
-            }
-            let _ = pane_tx.send(PaneEvent::AttachmentState(
-                id.clone(),
-                generation,
-                AttachmentState::Live,
-            ));
-
-            let should_close = loop {
-                tokio::select! {
-                    chunk = attachment.chunks.recv() => {
-                        let Some(chunk) = chunk else { break false };
-                        if pane_tx
-                            .send(PaneEvent::Chunk(id.clone(), generation, chunk))
-                            .is_err()
-                        {
-                            break true;
-                        }
-                    }
-                    command = commands.recv() => {
-                        match command {
-                            Some(AttachmentCommand::Input(bytes)) => {
-                                let _ = writer.send_input(bytes);
-                            }
-                            Some(AttachmentCommand::Mouse(bytes)) => {
-                                let _ = writer.send_mouse(bytes);
-                            }
-                            Some(AttachmentCommand::Resize(cols, rows)) => {
-                                last_resize = Some((cols, rows));
-                                let _ = writer.resize(cols, rows);
-                            }
-                            Some(AttachmentCommand::Scroll { direction, lines, col, row }) => {
-                                let _ = writer.scroll(direction, lines, col, row);
-                            }
-                            Some(AttachmentCommand::Close) | None => break true,
-                        }
-                    }
-                }
-            };
-            attachment.close().await;
-            if should_close {
-                return;
-            }
-            let _ = pane_tx.send(PaneEvent::AttachmentState(
-                id.clone(),
-                generation,
-                AttachmentState::Reconnecting,
-            ));
-            if wait_for_retry(&mut commands, &mut last_resize).await {
-                return;
-            }
-        }
-    });
-    control
-}
-
-async fn wait_for_retry(
-    commands: &mut mpsc::UnboundedReceiver<AttachmentCommand>,
-    last_resize: &mut Option<(u16, u16)>,
-) -> bool {
-    let delay = tokio::time::sleep(REATTACH_DELAY);
-    tokio::pin!(delay);
-    loop {
-        tokio::select! {
-            () = &mut delay => return false,
-            command = commands.recv() => match command {
-                Some(AttachmentCommand::Resize(cols, rows)) => *last_resize = Some((cols, rows)),
-                Some(AttachmentCommand::Close) | None => return true,
-                Some(AttachmentCommand::Input(_))
-                | Some(AttachmentCommand::Mouse(_))
-                | Some(AttachmentCommand::Scroll { .. }) => {}
-            }
-        }
-    }
-}
-
 fn ui_agent_kind(kind: &ProtoAgentKind) -> UiAgentKind {
     // Brand vocabulary, not a protocol type: a manifest agent the client has
     // no hand-drawn mark for falls back to the generic terminal treatment.
@@ -3828,6 +3703,7 @@ mod tests {
 
     fn find_snapshot(content_seq: u64) -> FindSnapshot {
         FindSnapshot {
+            text_cells: Default::default(),
             lines: Vec::new(),
             first_row: 0,
             visible_start_row: 0,
@@ -4678,10 +4554,51 @@ mod tests {
                         }
                         grid.changed_rows.push(row);
                     }
+                    let find_fixture = if scene == "find-unicode" {
+                        let mut screen = diri_engine::HeadlessScreen::new(80, 28);
+                        screen.feed("$ printf 'Unicode terminal output'\r\n\r\n1  <界> cafe\u{301}\r\n2  A🙂B  cafe\u{301}\r\n\r\nSearch keeps wide glyphs and combining marks aligned with their cells.".as_bytes());
+                        grid = screen.full_snapshot();
+                        let query = std::env::var("DIRI_QOL_QUERY").unwrap_or_else(|_| "e\u{301}".into());
+                        Some((query, FindSnapshot::from(screen.scrollback())))
+                    } else if scene.starts_with("find") {
+                        for row in [0, 15] {
+                            let mut cells = vec![GridCell::BLANK; 80];
+                            for (cell, ch) in cells[(width as usize / 12).clamp(4, 60)..]
+                                .iter_mut()
+                                .zip("needle".chars())
+                            {
+                                cell.scalar = ch as u32;
+                            }
+                            grid.changed_rows.retain(|changed| changed.y != row);
+                            grid.changed_rows.push(ChangedRow::new(row, cells));
+                        }
+                        Some(("needle".into(), FindSnapshot {
+                            cols: 80,
+                            rows: 28,
+                            is_alt_screen: scene == "find-alt",
+                            ..find_snapshot(1)
+                        }))
+                    } else {
+                        None
+                    };
                     let resident = pane.residents.get_mut(&id).unwrap();
                     resident.element.apply_damage(grid);
+                    if let Some((query, snapshot)) = find_fixture {
+                        let mut find = TerminalFindModel::default();
+                        let request = due_find_request(&mut find, &query, Duration::ZERO);
+                        let result = resident.element.prepare_find_search(&find, &request, snapshot).unwrap().run();
+                        resident.element.apply_find_result(&mut find, result);
+                        assert!(!find.matches().is_empty());
+                        if scene == "find-clear" {
+                            resident.element.find_next(&mut find);
+                        }
+                        resident.find_query.insert(&query);
+                        resident.element.sync_find_highlights(&find);
+                        resident.find = Some(find);
+                    }
                     resident.last_size = (80, 28);
                     resident.attachment_state = AttachmentState::Live;
+                    resident.controller.seed_live_for_test();
                     pane.focus(window, cx);
                     pane.reset_qol_session(&id);
                     pane.qol.hover = Some((2, 1));
@@ -4702,6 +4619,8 @@ mod tests {
                                 cx,
                             );
                         }
+                        "controller-feedback" => pane.handle_pane_event(
+                            PaneEvent::InputFeedback(id.clone(), "Terminal input queue is full. The latest input was not accepted.".into()), window, cx),
                         "copy" => pane.enter_copy_mode(window, cx),
                         _ => (),
                     }
@@ -4717,6 +4636,160 @@ mod tests {
         cx.update_window(window.into(), |_, window, _| window.remove_window())
             .unwrap();
         cx.run_until_parked();
+    }
+
+    #[gpui::test]
+    fn two_windows_transfer_control_without_replacing_grid_or_passive_resize(
+        cx: &mut TestAppContext,
+    ) {
+        let runtime = Arc::new(StoreRuntime::inert());
+        let tokio = Arc::new(
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap(),
+        );
+        let session = fixture_session();
+        let id = session.id.clone();
+        {
+            let mut store = runtime.store.write().unwrap();
+            store.upsert_session(session);
+            store.select(id.clone());
+        }
+        let first = cx
+            .add_window(|window, cx| TerminalPane::new(runtime.clone(), tokio.clone(), window, cx));
+        let second = cx.add_window(|window, cx| {
+            TerminalPane::new_fixed(runtime.clone(), tokio.clone(), id.clone(), window, cx)
+        });
+        // Both windows hydrate before either is active. In particular the
+        // first session reference must not acquire control just by mounting.
+        first
+            .update(cx, |pane, window, cx| {
+                assert!(!pane.residents[&id].attachment.is_controller());
+                pane.focus(window, cx);
+                pane.set_viewport(
+                    TerminalViewport {
+                        width: 400.0,
+                        height: 300.0,
+                        ..Default::default()
+                    },
+                    cx,
+                );
+                pane.update_selected_geometry(window, cx);
+                assert_eq!(pane.residents[&id].last_size, (0, 0));
+                assert!(!pane.residents[&id].attachment.is_controller());
+                window.activate_window();
+            })
+            .unwrap();
+        cx.run_until_parked();
+        let first_grid = first
+            .update(cx, |pane, window, cx| {
+                pane.focus(window, cx);
+                pane.set_viewport(
+                    TerminalViewport {
+                        width: 900.0,
+                        height: 600.0,
+                        ..Default::default()
+                    },
+                    cx,
+                );
+                pane.update_selected_geometry(window, cx);
+                pane.residents[&id].element.buffer()
+            })
+            .unwrap();
+        second
+            .update(cx, |pane, window, cx| {
+                assert!(Arc::ptr_eq(
+                    &first_grid,
+                    &pane.residents[&id].element.buffer()
+                ));
+                assert!(!pane.residents[&id].attachment.is_controller());
+                pane.set_viewport(
+                    TerminalViewport {
+                        width: 300.0,
+                        height: 200.0,
+                        ..Default::default()
+                    },
+                    cx,
+                );
+                pane.update_selected_geometry(window, cx);
+                assert_eq!(
+                    pane.residents[&id].last_size,
+                    (0, 0),
+                    "passive layout cannot resize"
+                );
+                pane.focus(window, cx);
+                assert!(
+                    !pane.residents[&id].attachment.is_controller(),
+                    "inactive hydration/focus cannot steal control"
+                );
+            })
+            .unwrap();
+        second
+            .update(cx, |_, window, _| window.activate_window())
+            .unwrap();
+        cx.run_until_parked();
+        second
+            .update(cx, |pane, window, cx| {
+                assert!(
+                    pane.residents[&id].attachment.is_controller(),
+                    "activation claims the already-focused pane without another click"
+                );
+                pane.update_selected_geometry(window, cx);
+                assert_ne!(pane.residents[&id].last_size, (0, 0));
+                pane.handle_pane_event(
+                    PaneEvent::InputFeedback(id.clone(), "Input rejected".into()),
+                    window,
+                    cx,
+                );
+                assert_eq!(pane.qol.feedback.as_deref(), Some("Input rejected"));
+                let generation = pane.qol.feedback_generation;
+                for _ in 0..100 {
+                    pane.handle_pane_event(
+                        PaneEvent::InputFeedback(id.clone(), "Input rejected".into()),
+                        window,
+                        cx,
+                    );
+                }
+                assert_eq!(
+                    pane.qol.feedback_generation, generation,
+                    "identical rejection does not create another timer or repaint"
+                );
+            })
+            .unwrap();
+        first
+            .update(cx, |pane, window, cx| {
+                assert!(!pane.residents[&id].attachment.is_controller());
+                pane.observed_selected_id = None;
+                pane.reconcile_store_change(window, cx);
+                assert!(
+                    !pane.residents[&id].attachment.is_controller(),
+                    "inactive selection hydration cannot take ownership"
+                );
+                let size = pane.residents[&id].last_size;
+                pane.set_viewport(
+                    TerminalViewport {
+                        width: 700.0,
+                        height: 500.0,
+                        ..Default::default()
+                    },
+                    cx,
+                );
+                pane.update_selected_geometry(window, cx);
+                assert_eq!(pane.residents[&id].last_size, size);
+                window.remove_window();
+            })
+            .unwrap();
+        second
+            .update(cx, |pane, window, _| {
+                assert!(pane.residents[&id].attachment.is_controller());
+                assert!(Arc::ptr_eq(
+                    &first_grid,
+                    &pane.residents[&id].element.buffer()
+                ));
+                window.remove_window();
+            })
+            .unwrap();
     }
 
     #[gpui::test]
@@ -4886,6 +4959,95 @@ mod tests {
     }
 
     #[gpui::test]
+    fn find_overlay_tracks_painted_match_without_resizing_terminal(cx: &mut TestAppContext) {
+        let runtime = Arc::new(StoreRuntime::inert());
+        let tokio = Arc::new(
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap(),
+        );
+        let session = fixture_session();
+        let id = session.id.clone();
+        {
+            let mut store = runtime.store.write().unwrap();
+            store.upsert_session(session);
+            store.select(id.clone());
+        }
+        let (pane, cx) =
+            cx.add_window_view(move |window, cx| TerminalPane::new(runtime, tokio, window, cx));
+        pane.update_in(cx, |pane, window, cx| {
+            pane.reconcile_store_change(window, cx);
+            let resident = pane.residents.get_mut(&id).unwrap();
+            resident.attachment_state = AttachmentState::Live;
+            resident.element.apply_damage(grid_frame(200, true));
+            cx.notify();
+        });
+        let surface = cx.debug_bounds("terminal-grid-surface").unwrap();
+        let original_size = pane.read_with(cx, |pane, _| pane.residents[&id].last_size);
+        pane.update_in(cx, |pane, window, cx| pane.open_find(&OpenFind, window, cx));
+        let anchor = cx
+            .debug_bounds("find-bar")
+            .expect("find opens over terminal");
+        let span = |row| diri_term::find::FindSpan {
+            row,
+            start_col: 0,
+            end_col_exclusive: 200,
+            is_current: true,
+        };
+        pane.update_in(cx, |pane, _, cx| {
+            pane.residents[&id]
+                .element
+                .set_find_highlights(vec![span(0)]);
+            cx.notify();
+        });
+        let moved = cx.debug_bounds("find-bar").unwrap();
+        let current = pane.read_with(cx, |pane, _| {
+            pane.residents[&id]
+                .element
+                .current_find_match_bounds()
+                .unwrap()
+        });
+        assert!(
+            moved.top() > anchor.top(),
+            "bar must move in the frame with the match"
+        );
+        assert!(
+            !moved.intersects(&current),
+            "active result must remain readable"
+        );
+        assert_eq!(cx.debug_bounds("terminal-grid-surface").unwrap(), surface);
+        pane.read_with(cx, |pane, _| {
+            assert_eq!(pane.residents[&id].last_size, original_size)
+        });
+        pane.update_in(cx, |pane, _, cx| {
+            pane.residents[&id]
+                .element
+                .set_find_highlights(vec![span(15)]);
+            cx.notify();
+        });
+        assert_eq!(
+            cx.debug_bounds("find-bar").unwrap(),
+            anchor,
+            "bar returns when result moves clear"
+        );
+        let close = gpui::point(anchor.right() - px(22.0), anchor.center().y);
+        cx.simulate_mouse_down(close, MouseButton::Left, Modifiers::default());
+        cx.simulate_mouse_up(close, MouseButton::Left, Modifiers::default());
+        assert!(cx.debug_bounds("find-bar").is_none());
+        pane.read_with(cx, |pane, _| {
+            assert!(pane.residents[&id].find.is_none());
+            assert!(
+                pane.residents[&id]
+                    .element
+                    .current_find_match_bounds()
+                    .is_none()
+            );
+            assert_eq!(pane.residents[&id].last_size, original_size);
+        });
+    }
+
+    #[gpui::test]
     fn terminal_selection_drag_reaches_outside_and_context_menu_dismisses(cx: &mut TestAppContext) {
         let runtime = Arc::new(StoreRuntime::inert());
         let tokio = Arc::new(
@@ -4936,6 +5098,54 @@ mod tests {
         assert!(cx.debug_bounds("terminal-context-menu").is_some());
         cx.simulate_mouse_down(outside, MouseButton::Left, Modifiers::default());
         pane.read_with(cx, |pane, _| assert!(pane.qol.menu.is_none()));
+    }
+
+    #[gpui::test]
+    fn changing_sessions_clears_feedback_and_rearms_identical_later_errors(
+        cx: &mut TestAppContext,
+    ) {
+        let runtime = Arc::new(StoreRuntime::inert());
+        let tokio = Arc::new(
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap(),
+        );
+        let first = fixture_session();
+        let mut second = first.clone();
+        second.id = SessionId::new("feedback-next");
+        {
+            let mut store = runtime.store.write().unwrap();
+            store.upsert_session(first.clone());
+            store.upsert_session(second.clone());
+            store.select(first.id);
+        }
+        let runtime_for_view = runtime.clone();
+        let (pane, cx) = cx.add_window_view(move |window, cx| {
+            TerminalPane::new(runtime_for_view, tokio, window, cx)
+        });
+        pane.update_in(cx, |pane, window, cx| {
+            pane.show_terminal_feedback("Input rejected", window, cx)
+        });
+        runtime.store.write().unwrap().select(second.id);
+        pane.update_in(cx, |pane, window, cx| {
+            pane.reconcile_store_change(window, cx);
+            assert!(
+                pane.qol.feedback.is_none(),
+                "previous session's feedback must not linger"
+            );
+            pane.show_terminal_feedback("Input rejected", window, cx);
+            assert_eq!(pane.qol.feedback.as_deref(), Some("Input rejected"));
+        });
+        cx.run_until_parked();
+        cx.executor().advance_clock(Duration::from_secs(3));
+        cx.run_until_parked();
+        pane.read_with(cx, |pane, _| {
+            assert!(
+                pane.qol.feedback.is_none(),
+                "identical later error has its own expiry"
+            )
+        });
     }
 
     #[gpui::test]
@@ -5092,6 +5302,7 @@ mod tests {
             .take_due_search(Duration::from_millis(200))
             .expect("find request");
         let snapshot = FindSnapshot {
+            text_cells: Default::default(),
             lines: Vec::new(),
             first_row: 0,
             visible_start_row: 0,

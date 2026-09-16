@@ -649,6 +649,23 @@ source and workspace dependency configuration participate in the default
 Helper Build ID. This adds no parser implementation or runtime dependency.
 See `vendor/vte/DIRI-PATCH.md` and the 2026-09-06 measurements in `PERF.md`.
 
+The vendored terminal parser allocates its pristine alternate grid on first
+screen entry, at the current dimensions. It retains that grid for subsequent
+switches and applies the existing cursor, erase, resize, reset and history rules.
+For a new 80×24 core this removes 46,848 requested heap bytes; first alternate
+entry pays that allocation instead. The 4 MiB history-cell budget and snapshot
+format are unchanged. This parser source already participates in Helper Build
+IDs; existing Holders retain their original allocations until they exit.
+
+Spare parser history rows are allocated in batches sized by row bytes, capped at
+1,000 rows and approximately 64 KiB of new cell/row storage (at least one row).
+Required visible/history rows are always allocated. This bounds the eager reserve
+at first scroll without changing the 4 MiB retained-history cell allowance or
+serialized grid representation. Existing vector capacity and reflow-retained rows
+remain separate from this reserve target. Smaller batches trade more occasional
+growth operations for lower memory; the resource and throughput harnesses verify
+that tradeoff. Parser source participates in the Helper Build ID as above.
+
 ### Local Holder input compatibility
 
 The durable local Holder is outside the remote Helper wire protocol, but it
@@ -706,6 +723,17 @@ Terminal quality-of-life interactions remain desktop-owned: link discovery and
 activation, selection, copying, menus, paste review, export, and keyboard modes
 run in `diri-app` / `diri-term`. They do not execute SSH or change controller
 ownership. The existing local Engine RPC serves retained terminal rows.
+
+The local `session.read_scrollback` response includes optional sparse `textCells`
+row mappings from Unicode scalar indices to half-open terminal cell ranges.
+Text omits wide-glyph filler cells and retains combining marks; the mappings
+keep find highlights aligned with the original cells. Ordinary one-cell text
+omits this field. Clients accept an absent field using the older cell-aligned
+text contract. This is an additive local control response, with no Helper
+protocol, controller, snapshot, or history-budget change. Live-grid search uses
+the existing annotations and the same `unicode-width` 0.2.2 width rules as the
+shared parser; making that existing transitive dependency direct in `diri-term`
+avoids a separate, inconsistent width table.
 
 The shared terminal parser additionally retains OSC 8 targets, soft-wrap facts,
 wide-cell continuation facts, combining characters, and OSC 133 A prompt-start

@@ -947,17 +947,50 @@ impl HeadlessScreen {
         let cols = self.geometry.cols;
         let total = history + rows;
         let mut lines = Vec::with_capacity(total);
+        let mut text_cells = std::collections::BTreeMap::new();
+        let mut ranges = Vec::with_capacity(cols);
         for index in 0..total {
             let line = Line(index as i32 - history as i32);
             let mut text = String::with_capacity(cols);
+            ranges.clear();
             for x in 0..cols {
-                let c = grid[line][Column(x)].c;
+                let cell = &grid[line][Column(x)];
+                if cell
+                    .flags
+                    .intersects(Flags::WIDE_CHAR_SPACER | Flags::LEADING_WIDE_CHAR_SPACER)
+                {
+                    continue;
+                }
+                let c = cell.c;
+                let width = if cell.flags.contains(Flags::WIDE_CHAR) {
+                    2
+                } else {
+                    1
+                };
+                let range = [x as u16, (x + width).min(cols) as u16];
                 text.push(if c < ' ' && c != '\t' { ' ' } else { c });
+                ranges.push(range);
+                if let Some(combining) = cell.zerowidth() {
+                    for &ch in combining {
+                        text.push(ch);
+                        ranges.push(range);
+                    }
+                }
             }
-            lines.push(text.trim_end().to_string());
+            text.truncate(text.trim_end().len());
+            ranges.truncate(text.chars().count());
+            if ranges
+                .iter()
+                .enumerate()
+                .any(|(i, range)| usize::from(range[0]) != i || usize::from(range[1]) != i + 1)
+            {
+                text_cells.insert(index, ranges.clone());
+            }
+            lines.push(text);
         }
         diri_proto::ReadScrollbackResult {
             lines,
+            text_cells,
             first_row: 0,
             visible_start_row: history as i64,
             cols: cols as i64,
@@ -1067,7 +1100,18 @@ impl HeadlessScreen {
             let line = Line(row as i32);
             let mut text = String::with_capacity(self.geometry.cols);
             for column in 0..self.geometry.cols {
-                text.push(grid[line][Column(column)].c);
+                let cell = &grid[line][Column(column)];
+                // These occupy terminal columns but are not textual spaces.
+                if cell
+                    .flags
+                    .intersects(Flags::WIDE_CHAR_SPACER | Flags::LEADING_WIDE_CHAR_SPACER)
+                {
+                    continue;
+                }
+                text.push(cell.c);
+                if let Some(combining) = cell.zerowidth() {
+                    text.extend(combining.iter().copied());
+                }
             }
             lines.push(text.trim_end().to_string());
         }
@@ -1662,6 +1706,38 @@ mod tests {
     }
 
     #[test]
+    fn first_alternate_screen_matches_a_previously_initialized_screen() {
+        for mode in [47, 1047, 1049] {
+            let mut fresh = HeadlessScreen::new(80, 24);
+            let mut initialized = HeadlessScreen::new(80, 24);
+            initialized.feed(b"\x1b[?1049h\x1b[?1049l");
+            for size in [(40, 10), (120, 30), (12, 3)] {
+                fresh.resize(size.0, size.1);
+                initialized.resize(size.0, size.1);
+                let enter = format!("\x1b[?{mode}h");
+                let leave = format!("\x1b[?{mode}l");
+                for bytes in [
+                    b"primary\r\n\x1b[31mstyled\x1b[0m\x1b7".as_slice(),
+                    enter.as_bytes(),
+                    "alternate: 界e\u{301}\r\nnext".as_bytes(),
+                    leave.as_bytes(),
+                    b"\x1b8!",
+                    enter.as_bytes(),
+                    b"\x1bc", // RIS while the alternate screen is active.
+                    b"after reset",
+                    leave.as_bytes(),
+                ] {
+                    fresh.feed(bytes);
+                    initialized.feed(bytes);
+                    assert_eq!(fresh.full_snapshot(), initialized.full_snapshot());
+                    assert_eq!(fresh.lines(), initialized.lines());
+                    assert_eq!(fresh.is_alt_screen(), initialized.is_alt_screen());
+                }
+            }
+        }
+    }
+
+    #[test]
     fn incremental_grid_matches_fresh_snapshots_through_damage_and_resize() {
         let mut screen = HeadlessScreen::new(24, 8);
         let mut mirror = Vec::new();
@@ -1929,6 +2005,55 @@ mod qol_tests {
                 .any(|c| c.style.contains(TermStyle::PROMPT_START))
         );
     }
+    #[test]
+    fn visible_text_preserves_unicode_without_terminal_filler_cells() {
+        let mut screen = HeadlessScreen::new(20, 4);
+        screen.feed("<界> e\u{301}\r\nA🙂B".as_bytes());
+        assert_eq!(screen.lines(), vec!["<界> e\u{301}", "A🙂B"]);
+        assert_eq!(screen.snapshot().lines, screen.lines());
+
+        let mut restored = HeadlessScreen::new(20, 4);
+        assert!(restored.restore(&[], &screen.full_snapshot(), false, false, MouseModes::OFF));
+        assert_eq!(restored.lines(), screen.lines());
+
+        screen.feed("\x1b[?1049h\x1b[H<界> e\u{301}".as_bytes());
+        assert_eq!(screen.lines(), vec!["<界> e\u{301}"]);
+        screen.feed(b"\x1b[?1049l");
+        assert_eq!(screen.lines(), vec!["<界> e\u{301}", "A🙂B"]);
+    }
+
+    #[test]
+    fn visible_text_keeps_real_spaces_after_overwriting_a_wide_glyph() {
+        let mut screen = HeadlessScreen::new(8, 2);
+        screen.feed("界X\rA".as_bytes());
+        assert_eq!(screen.lines(), vec!["A X"]);
+    }
+
+    #[test]
+    fn history_text_maps_unicode_scalars_to_their_original_cells() {
+        let mut screen = HeadlessScreen::new(12, 2);
+        screen.feed("<界> e\u{301}\r\nA🙂B\r\nplain\r\nend".as_bytes());
+        let history = screen.scrollback();
+        assert_eq!(
+            &history.lines[..4],
+            &["<界> e\u{301}", "A🙂B", "plain", "end"]
+        );
+        assert_eq!(history.visible_start_row, 2);
+        assert_eq!(
+            history.text_cells[&0],
+            vec![[0, 1], [1, 3], [3, 4], [4, 5], [5, 6], [5, 6]]
+        );
+        assert_eq!(history.text_cells[&1], vec![[0, 1], [1, 3], [3, 4]]);
+        assert!(!history.text_cells.contains_key(&2));
+        assert!(!history.text_cells.contains_key(&3));
+        screen.feed(b"\x1b[?1049h\x1b[H");
+        screen.feed("e\u{301}".as_bytes());
+        let alternate = screen.scrollback();
+        assert!(alternate.is_alt_screen);
+        assert_eq!(alternate.lines[0], "e\u{301}");
+        assert_eq!(alternate.text_cells[&0], vec![[0, 1], [0, 1]]);
+    }
+
     #[test]
     fn wrap_wide_glyph_and_combining_metadata_survive_restore() {
         let mut screen = HeadlessScreen::new(6, 3);
