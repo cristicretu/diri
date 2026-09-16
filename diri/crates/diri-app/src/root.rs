@@ -312,6 +312,21 @@ impl RootView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
+        Self::new_with_workspace(services, preview, preview_scenario, None, window, cx)
+    }
+
+    pub(crate) fn window_workspace(&self) -> Option<diri_proto::workspace::WorkspaceId> {
+        self.active_workspace.clone()
+    }
+
+    pub(crate) fn new_with_workspace(
+        services: Arc<AppServices>,
+        preview: bool,
+        preview_scenario: PreviewScenario,
+        workspace_override: Option<Option<diri_proto::workspace::WorkspaceId>>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Self {
         if !preview {
             sync_system_theme(&services.store, window.appearance());
         }
@@ -324,6 +339,9 @@ impl RootView {
         let sidebar_runtime = (!preview).then(|| Arc::clone(&services.store));
         let sidebar = cx.new(|cx| {
             let mut sidebar = Sidebar::new(sidebar_runtime, preview, preview_scenario, cx);
+            if let Some(workspace) = &workspace_override {
+                sidebar.set_initial_workspace(workspace.clone());
+            }
             sidebar.set_surface_in_parent();
             sidebar
         });
@@ -1202,15 +1220,16 @@ impl RootView {
             _browser_state_sync: browser_state_sync,
         };
         root.sync_auxiliary_terminal(window, cx);
-        let saved_workspace = root
-            .services
-            .store
-            .store
-            .read()
-            .expect("store")
-            .preferences()
-            .active_workspace
-            .clone();
+        let saved_workspace = workspace_override.unwrap_or_else(|| {
+            root.services
+                .store
+                .store
+                .read()
+                .expect("store")
+                .preferences()
+                .active_workspace
+                .clone()
+        });
         if saved_workspace.is_some() && !preview {
             root.activate_saved_workspace(saved_workspace, window, cx);
         }
@@ -5983,6 +6002,159 @@ mod tests {
                 .unwrap();
             cx.run_until_parked();
         }
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    #[ignore = "native multiwindow views backed by disposable Engine PTYs"]
+    fn new_window_copies_workspace_and_reuses_controllers_without_spawning_or_closing_sessions() {
+        use gpui::HeadlessAppContext;
+        let fixture = crate::workspace_fixture::LiveWorkspace::start();
+        let platform = gpui_platform::current_platform(true);
+        let mut cx = HeadlessAppContext::with_platform(
+            platform.text_system(),
+            Arc::new(diri_ui::IconAssets),
+            gpui_platform::current_headless_renderer,
+        );
+        cx.update(|cx| {
+            crate::fonts::init(cx);
+            cx.set_reduce_motion(true);
+        });
+        let services = fixture.services.clone();
+        let first = cx
+            .open_window(size(px(1000.0), px(700.0)), |window, cx| {
+                cx.new(|cx| RootView::new(services, false, PreviewScenario::Empty, window, cx))
+            })
+            .unwrap();
+        cx.run_until_parked();
+        let controllers_before = cx.update(|cx| TerminalPane::controller_counts_for_test(cx));
+        assert_eq!(controllers_before.0, 2);
+        let sessions_before = fixture
+            .services
+            .tokio
+            .block_on(fixture.services.store.client().sessions())
+            .unwrap();
+        // Preferences can reflect another window. Copy this window's context,
+        // including explicit All sessions, instead of consulting them again.
+        fixture
+            .services
+            .store
+            .store
+            .write()
+            .unwrap()
+            .update_preferences(|prefs| {
+                prefs.active_workspace =
+                    Some(diri_proto::workspace::WorkspaceId::new("another-window"))
+            })
+            .unwrap();
+        let captured = cx
+            .update_window(first.into(), |root, _, cx| {
+                root.downcast::<RootView>()
+                    .unwrap()
+                    .read(cx)
+                    .window_workspace()
+            })
+            .unwrap();
+        let services = fixture.services.clone();
+        let second = cx
+            .open_window(size(px(1000.0), px(700.0)), |window, cx| {
+                cx.new(|cx| {
+                    RootView::new_with_workspace(
+                        services,
+                        false,
+                        PreviewScenario::Empty,
+                        Some(captured.clone()),
+                        window,
+                        cx,
+                    )
+                })
+            })
+            .unwrap();
+        cx.run_until_parked();
+        assert_eq!(
+            cx.update_window(second.into(), |root, _, cx| root
+                .downcast::<RootView>()
+                .unwrap()
+                .read(cx)
+                .window_workspace())
+                .unwrap(),
+            captured
+        );
+        let controllers_after = cx.update(|cx| TerminalPane::controller_counts_for_test(cx));
+        assert_eq!(
+            controllers_after.0, controllers_before.0,
+            "one shared attachment/controller per SessionId"
+        );
+        assert!(
+            controllers_after.1 > controllers_before.1,
+            "second window adds views only"
+        );
+        let services = fixture.services.clone();
+        let all_sessions = cx
+            .open_window(size(px(1000.0), px(700.0)), |window, cx| {
+                cx.new(|cx| {
+                    RootView::new_with_workspace(
+                        services,
+                        false,
+                        PreviewScenario::Empty,
+                        Some(None),
+                        window,
+                        cx,
+                    )
+                })
+            })
+            .unwrap();
+        cx.run_until_parked();
+        assert_eq!(
+            cx.update_window(all_sessions.into(), |root, _, cx| root
+                .downcast::<RootView>()
+                .unwrap()
+                .read(cx)
+                .window_workspace())
+                .unwrap(),
+            None
+        );
+        assert_eq!(
+            cx.update_window(first.into(), |root, _, cx| root
+                .downcast::<RootView>()
+                .unwrap()
+                .read(cx)
+                .window_workspace())
+                .unwrap(),
+            captured
+        );
+        for handle in [all_sessions, second] {
+            cx.update_window(handle.into(), |_, window, _| window.remove_window())
+                .unwrap();
+        }
+        cx.run_until_parked();
+        assert_eq!(
+            cx.update(|cx| TerminalPane::controller_counts_for_test(cx))
+                .0,
+            controllers_before.0
+        );
+        let sessions_after = fixture
+            .services
+            .tokio
+            .block_on(fixture.services.store.client().sessions())
+            .unwrap();
+        assert_eq!(
+            sessions_before
+                .sessions
+                .iter()
+                .map(|r| &r.id)
+                .collect::<HashSet<_>>(),
+            sessions_after
+                .sessions
+                .iter()
+                .map(|r| &r.id)
+                .collect::<HashSet<_>>()
+        );
+        fixture.verify_process_identity();
+        cx.update_window(first.into(), |_, window, _| window.remove_window())
+            .unwrap();
+        cx.run_until_parked();
+        fixture.verify_process_identity();
     }
 
     #[cfg(target_os = "macos")]

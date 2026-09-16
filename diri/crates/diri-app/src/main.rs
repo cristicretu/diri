@@ -142,7 +142,10 @@ pub(crate) fn refresh_app_menus(cx: &mut App) {
             MenuItem::separator(),
             MenuItem::action("Quit diri", Quit),
         ]),
-        Menu::new("File").items([MenuItem::action("New Session", OpenLauncher)]),
+        Menu::new("File").items([
+            MenuItem::action("New Session", OpenLauncher),
+            MenuItem::action("New Window", commands::NewWindow),
+        ]),
         Menu::new("Edit").items([
             MenuItem::os_action("Copy", CopySelection, OsAction::Copy),
             MenuItem::os_action("Paste", Paste, OsAction::Paste),
@@ -157,6 +160,7 @@ pub(crate) fn refresh_app_menus(cx: &mut App) {
     cx.set_menus([
         Menu::new("File").items([
             MenuItem::action("New Session", OpenLauncher),
+            MenuItem::action("New Window", commands::NewWindow),
             MenuItem::separator(),
             MenuItem::action("Quit diri", Quit),
         ]),
@@ -383,6 +387,27 @@ fn main() {
             .clone();
         commands::bind_keys(cx, &shortcut_overrides);
         install_app_menus(cx);
+        let window_services = services.clone();
+        cx.on_action(move |_: &commands::NewWindow, cx| {
+            let context = cx.active_window().and_then(|handle| {
+                handle
+                    .update(cx, |root, window, cx| {
+                        root.downcast::<RootView>().ok().map(|root| {
+                            let mut placement = current_window_placement(window, cx);
+                            placement.x += 28.0;
+                            placement.y += 28.0;
+                            placement.mode = WindowMode::Windowed;
+                            NativeWindowContext {
+                                workspace: root.read(cx).window_workspace(),
+                                placement,
+                            }
+                        })
+                    })
+                    .ok()
+                    .flatten()
+            });
+            open_main_window_with_context(cx, window_services.clone(), preview, scenario, context);
+        });
         let quit_services = Arc::clone(&services);
         let quit_updates = services.updates.clone();
         let release_owned_daemon =
@@ -588,11 +613,26 @@ async fn publish_usage_refresh(
     Some(store)
 }
 
+struct NativeWindowContext {
+    workspace: Option<diri_proto::workspace::WorkspaceId>,
+    placement: WindowPlacement,
+}
+
 fn open_main_window(
     cx: &mut App,
     services: Arc<AppServices>,
     preview: bool,
     scenario: PreviewScenario,
+) {
+    open_main_window_with_context(cx, services, preview, scenario, None);
+}
+
+fn open_main_window_with_context(
+    cx: &mut App,
+    services: Arc<AppServices>,
+    preview: bool,
+    scenario: PreviewScenario,
+    context: Option<NativeWindowContext>,
 ) {
     let perf_large_window = std::env::var_os("DIRI_PERF_LARGE_WINDOW").is_some();
     let initial_size = if perf_large_window {
@@ -612,6 +652,11 @@ fn open_main_window(
                 .clone()
         })
         .flatten();
+    let saved_placement = context
+        .as_ref()
+        .map(|context| context.placement.clone())
+        .or(saved_placement);
+    let workspace_override = context.map(|context| context.workspace);
     let (window_bounds, display_id) = saved_placement
         .map(|placement| restore_window_bounds(placement, cx))
         .unwrap_or_else(|| {
@@ -652,7 +697,22 @@ fn open_main_window(
             }),
             ..Default::default()
         },
-        move |window, cx| cx.new(|cx| RootView::new(services, preview, scenario, window, cx)),
+        move |window, cx| {
+            cx.new(|cx| {
+                if workspace_override.is_some() {
+                    RootView::new_with_workspace(
+                        services,
+                        preview,
+                        scenario,
+                        workspace_override,
+                        window,
+                        cx,
+                    )
+                } else {
+                    RootView::new(services, preview, scenario, window, cx)
+                }
+            })
+        },
     )
     .expect("failed to open the diri window");
 }
