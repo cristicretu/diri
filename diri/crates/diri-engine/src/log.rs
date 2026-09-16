@@ -85,7 +85,9 @@ impl OutputLog {
         disk_capacity: usize,
         read_only: bool,
     ) -> io::Result<Self> {
-        fs::create_dir_all(dir)?;
+        if !read_only {
+            fs::create_dir_all(dir)?;
+        }
         let mut log = Self {
             ring_capacity,
             disk_capacity,
@@ -357,19 +359,29 @@ impl OutputLog {
     // MARK: Disk spill
 
     fn open_or_recover(&mut self) -> io::Result<()> {
-        let existing = File::open(&self.path).ok().and_then(|mut handle| {
+        let existing = (|| -> io::Result<_> {
+            let mut handle = File::open(&self.path)?;
             let mut header = [0u8; HEADER_SIZE];
-            handle.read_exact(&mut header).ok()?;
+            handle.read_exact(&mut header)?;
             if read_u32_be(&header, 0) != MAGIC {
-                return None;
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "invalid output log magic",
+                ));
+            }
+            if self.read_only && read_u32_be(&header, 4) != VERSION {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "unsupported output log version",
+                ));
             }
             let base = read_u64_be(&header, 8);
-            let size = handle.seek(SeekFrom::End(0)).ok()?;
-            Some((handle, base, (size as usize).saturating_sub(HEADER_SIZE)))
-        });
+            let size = handle.seek(SeekFrom::End(0))?;
+            Ok((handle, base, (size as usize).saturating_sub(HEADER_SIZE)))
+        })();
 
         match existing {
-            Some((handle, base, bytes)) => {
+            Ok((handle, base, bytes)) => {
                 self.file_base_offset = base;
                 self.file_bytes = bytes;
                 self.tail_offset = base + bytes as u64;
@@ -382,7 +394,10 @@ impl OutputLog {
                 }
                 Ok(())
             }
-            None => self.create_file(0),
+            // A reader never owns recovery. In particular, it may observe a
+            // writer between creating its file and completing the header.
+            Err(error) if self.read_only => Err(error),
+            Err(_) => self.create_file(0),
         }
     }
 
@@ -554,6 +569,88 @@ mod tests {
 
     fn dir() -> tempfile::TempDir {
         tempfile::tempdir().expect("temp dir")
+    }
+
+    #[test]
+    fn read_only_open_never_creates_directories_or_missing_files() {
+        let root = dir();
+        let missing_dir = root.path().join("missing");
+        assert_eq!(
+            OutputLog::reader(&missing_dir, "s").err().unwrap().kind(),
+            io::ErrorKind::NotFound
+        );
+        assert!(!missing_dir.exists());
+        assert_eq!(
+            OutputLog::reader(root.path(), "s").err().unwrap().kind(),
+            io::ErrorKind::NotFound
+        );
+        assert!(!root.path().join("s.bin").exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn read_only_open_preserves_every_partial_or_invalid_header_byte_and_inode() {
+        use std::os::unix::fs::MetadataExt;
+        let root = dir();
+        let path = root.path().join("s.bin");
+        let mut header = Vec::new();
+        header.extend_from_slice(&MAGIC.to_be_bytes());
+        header.extend_from_slice(&VERSION.to_be_bytes());
+        header.extend_from_slice(&123_u64.to_be_bytes());
+        let mut cases = (0..HEADER_SIZE)
+            .map(|len| header[..len].to_vec())
+            .collect::<Vec<_>>();
+        cases.push(b"not a log header; retained output".to_vec());
+        let mut future = header.clone();
+        future[4..8].copy_from_slice(&2_u32.to_be_bytes());
+        future.extend_from_slice(b"future payload");
+        cases.push(future);
+        for bytes in cases {
+            fs::write(&path, &bytes).unwrap();
+            let inode = fs::metadata(&path).unwrap().ino();
+            assert!(OutputLog::reader(root.path(), "s").is_err());
+            assert_eq!(fs::read(&path).unwrap(), bytes);
+            assert_eq!(fs::metadata(&path).unwrap().ino(), inode);
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn reader_racing_incomplete_writer_header_cannot_reset_the_log() {
+        use std::os::unix::fs::MetadataExt;
+        let root = dir();
+        let path = root.path().join("s.bin");
+        let (ready_tx, ready) = std::sync::mpsc::sync_channel(0);
+        let (resume, resume_rx) = std::sync::mpsc::sync_channel(0);
+        let writer_path = path.clone();
+        let writer = std::thread::spawn(move || {
+            let mut file = create_private(&writer_path).unwrap();
+            file.write_all(&MAGIC.to_be_bytes()).unwrap();
+            ready_tx.send(()).unwrap();
+            resume_rx.recv().unwrap();
+            file.write_all(&VERSION.to_be_bytes()).unwrap();
+            file.write_all(&91_u64.to_be_bytes()).unwrap();
+            file.write_all(b"READY and retained output").unwrap();
+            file.flush().unwrap();
+        });
+        ready.recv().unwrap();
+        let inode = fs::metadata(&path).unwrap().ino();
+        for _ in 0..32 {
+            assert_eq!(
+                OutputLog::reader(root.path(), "s").err().unwrap().kind(),
+                io::ErrorKind::UnexpectedEof
+            );
+            assert_eq!(fs::read(&path).unwrap(), MAGIC.to_be_bytes());
+            assert_eq!(fs::metadata(&path).unwrap().ino(), inode);
+        }
+        resume.send(()).unwrap();
+        writer.join().unwrap();
+        let mut reader = OutputLog::reader(root.path(), "s").unwrap();
+        assert_eq!(
+            reader.read(91, 100),
+            (91, b"READY and retained output".to_vec())
+        );
+        assert_eq!(fs::metadata(&path).unwrap().ino(), inode);
     }
 
     #[test]

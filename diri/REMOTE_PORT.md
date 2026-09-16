@@ -1677,3 +1677,12 @@ nonzero flags on either screen rather than enabling negotiation. Cache flags
 and snapshot stacks must agree before writing; missing or malformed v6 state
 uses the existing cache-miss recovery. Whole-parser parking must retain the
 wrapper's knowledge bit as well as the parser's exact flags/stacks.
+
+## Read-only output log ownership
+
+Opening a raw output log as a reader never creates directories, creates a missing
+log, or recovers/truncates an invalid header. Missing files, incomplete headers
+(including a concurrent writer still creating one), bad magic and unsupported
+versions return an error without changing bytes or inode. Only the existing log
+writer owns creation/recovery. The Engine may retry a transient incomplete read;
+it must not rewrite a live Holder's log to manufacture an empty baseline.
