@@ -57,6 +57,20 @@ fn run_json<T: serde::Serialize, R: serde::de::DeserializeOwned>(
     state_dir: &std::path::Path,
     request: Option<&T>,
 ) -> R {
+    let output = run_output(command, state_dir, request);
+    assert!(
+        output.status.success(),
+        "{command} failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    serde_json::from_slice(&output.stdout).expect("JSON response")
+}
+
+fn run_output<T: serde::Serialize>(
+    command: &str,
+    state_dir: &std::path::Path,
+    request: Option<&T>,
+) -> std::process::Output {
     let fixture_home = state_dir
         .parent()
         .expect("state parent")
@@ -76,13 +90,7 @@ fn run_json<T: serde::Serialize, R: serde::de::DeserializeOwned>(
             .expect("write request");
     }
     drop(child.stdin.take());
-    let output = child.wait_with_output().expect("wait helper command");
-    assert!(
-        output.status.success(),
-        "{command} failed: {}",
-        String::from_utf8_lossy(&output.stderr)
-    );
-    serde_json::from_slice(&output.stdout).expect("JSON response")
+    child.wait_with_output().expect("wait helper command")
 }
 
 #[derive(Debug, serde::Deserialize)]
@@ -818,7 +826,7 @@ fn signal_exit_and_holder_failure_are_reported_without_orphaning_the_agent() {
         }
         panic!("Agent process survived an abnormal Holder exit");
     }
-    let inspection: SessionInspection = run_json(
+    let inspection = run_output(
         "inspect",
         &state_dir,
         Some(&SessionSelector {
@@ -827,12 +835,13 @@ fn signal_exit_and_holder_failure_are_reported_without_orphaning_the_agent() {
             expected_incarnation: Some(failed.session_incarnation),
         }),
     );
+    assert_eq!(inspection.status.code(), Some(1));
     assert_eq!(
-        inspection.process_state,
-        RemoteProcessState::Exited {
-            code: None,
-            signal: None
-        }
+        serde_json::from_slice::<diri_proto::remote_pty::RemoteManagementFailure>(
+            &inspection.stdout
+        )
+        .unwrap(),
+        diri_proto::remote_pty::RemoteManagementFailure::HolderUnavailable,
     );
 }
 
