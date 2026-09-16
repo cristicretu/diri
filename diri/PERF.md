@@ -1,5 +1,92 @@
 # diri performance record
 
+## Large preview frames keep draining (2026-09-16)
+
+A 160×50 receive-only preview could disconnect despite continuously reading.
+The default macOS Unix socket send buffer is 8 KiB; the output loop waited a
+fixed millisecond between partial writes and could also suspend draining during
+its 8 ms publication coalescing window. The resulting backlog overflowed even
+though the producer and terminal parser kept up. A real-PTY release regression
+received only 18 of 120 images before EOF, while the producer and Engine reached
+the final frame. The same 80×24 workload stayed connected.
+
+Queued output now waits for `POLLOUT` readiness, bounded to one millisecond, and
+resumes immediately when the reader frees capacity. The publisher remembers a
+pending grid change while servicing partial writes. Existing frame offsets,
+recipient ordering, queue limits, fairness budgets, and the single writer owner
+remain intact. Empty queues retain the existing GridWake sleep. No new remote
+Holder attachment or preview visibility/activity side effect is introduced.
+
+### Verification
+
+`cargo test -p diri-engine --release --test preview_progress` exercises both
+sizes with an 8 KiB send buffer. Each fixture produces 120 dense colored redraws;
+the preview must stay connected, show progress, and receive the final frame.
+The full Engine suite passed 526 tests with 6 ignored; strict all-target Engine
+Clippy, formatting, and the release build passed. Existing slow-reader,
+partial-frame, registration-order, and interactive-input tests also passed.
+
+A quiet reference-machine run used 16 previews (one deliberately stalled), plus
+one normal active attachment. All 15 drained previews survived each complete
+three-second sample; the stalled preview disconnected and reconnect seeded the
+same child PID. The production cap remains 16.
+
+| Requested rate | 80×24 updates/s | 160×50 updates/s | Output p90, small / large | Input p95 | Combined CPU cores | Loaded RSS |
+| --- | ---: | ---: | --- | ---: | ---: | ---: |
+| Idle | 0 | 0 | — | — | 0.0036 | 20.5 MiB |
+| 10 Hz | 10.01 | 10.01 | 4.91 / 6.21 ms | 0.917 ms | 0.241 | 33.9 MiB |
+| 60 Hz | 58.95 | 58.10 | 4.47 / 5.83 ms | 1.745 ms | 1.082 | 58.5 MiB |
+
+Updates/s counts distinct producer timestamps reaching decoded client grids,
+not monitor presentation. At the 60 Hz target, producers completed 173–180 frames
+in the sample; the large-grid maximum observed latency was 19.74 ms. These are
+local Engine/socket results, excluding GUI, SSH, and producer CPU. The benchmark
+combines Engine and blocking decoder threads: 19 threads before attachment,
+68 after. The 49-thread increase includes one benchmark reader per drained
+preview; actual desktop preview clients use Tokio tasks. Idle CPU includes the
+benchmark readers’ 100 ms deadline checks, so it is not an Engine-only idle cost.
+
+[Raw samples and commands](docs/perf/preview-progress-2026-09-16.json) include
+per-size connection lifetimes, producer/PTY counters, memory, and input samples.
+Run `cargo run -p diri-engine --release --example previewbench -- 16 60 3 diagnose`
+to reproduce using disposable local PTYs. The optional `diagnose` argument
+records synthetic child write progress; all fixture processes and files are
+cleaned up. The harness fails on any unexpected drained-reader EOF. Earlier
+48/64-preview loaded samples ended connections early and cannot justify a cap
+increase; larger demand requires a fresh measurement of the corrected path.
+
+## A stalled desktop client cannot block another client (2026-09-15)
+
+The Engine-local AttachHub wrote each client's socket synchronously. A client
+that stopped reading could block the shared publisher indefinitely. A new
+private-socket test reproduces the baseline failure at its fourth redraw:
+the active reader times out after 750 ms, even while the PTY keeps draining.
+
+The existing one pump per Session now owns bounded nonblocking output queues.
+It encodes each frame once and shares it across sinks, preserves partial-frame
+offsets, and disconnects only an overflowing or stalled sink. There is no new
+writer thread. The initial seed is queued outside the Registry lock; pongs use
+the same ordered output. Normal drained connections keep the existing idle wait.
+
+Run `cargo test -p diri-engine --release --test attach -- --nocapture`. On a
+Mac16,5 with 36 GiB RAM, macOS 27.0 and Rust 1.97.1, the 80×24 fixture deliberately
+requests a 1 KiB socket send buffer and stalls the first reader. Forty redraws
+still reach the other reader: p50 32.98 ms, p90 51.43 ms, maximum 61.84 ms. The
+separate ordinary-input test has a 72 µs median across 101 turns. These measure
+arrival at the local client socket, not display presentation, SSH or an Agent's
+application latency. [Raw fixture samples](docs/perf/attach-output-2026-09-15.json)
+include the machine, command and sample values.
+
+Queue tests retain a 2 MiB frame through partial writes and verify exact bytes,
+mode-frame ordering and complete allocation release. Already-written prefixes
+remain included in the retained-byte count. Ordinary backlog is bounded to
+1 MiB/64 references; one larger valid frame permits only 64 additional bytes for
+modes/control until it drains. Overflow closes the stream instead of splicing a
+new frame into a partially transmitted one. A reconnect receives a FullSnapshot
+from the unchanged process. These are explicit queue-allocation bounds, not RSS
+or whole-application memory measurements.
+
+
 ## Stable reading during streaming redraws (2026-09-10)
 
 An absolute scroll anchor did not protect text still backed by the live grid.
@@ -666,3 +753,50 @@ controlled before/after network-speed comparison. Workspace validation passed
 **1,612 tests** (34 intentionally ignored), formatting, clippy, and release build;
 Linux-specific remote clippy, local Holder latency/load/slow-attach gates, and
 the signed three-platform app bundle/catalog verification also passed.
+
+
+## Multiplexed local preview capacity — 2026-09-16
+
+The same `previewbench` release binary compares separate preview sockets with a
+single receive-only connection for the active preview set. This experiment
+compiled the admission constant at 64 in a disposable build; production remains
+at 16. Each run lasts three seconds after a one-second unattached idle sample,
+uses alternating 80×24 and 160×50 grids, and retains one deliberately stalled
+single-session preview plus one normal interactive attachment in both modes.
+The shared queue's overflow/partial-frame and reseed behavior has separate tests.
+
+| Previews / Hz | CPU cores separate → mux | RSS MiB separate → mux | Input p95 ms separate → mux |
+|---|---:|---:|---:|
+| 48 / idle | 0.010 → 0.005 | 43.6 → 35.6 | — |
+| 48 / 10 | 0.720 → 0.671 | 77.8 → 65.6 | 7.866 → 6.326 |
+| 48 / 60 | 2.241 → 1.671 | 122.7 → 116.3 | 3.456 → 1.000 |
+| 64 / idle | 0.013 → 0.006 | 54.6 → 44.2 | — |
+| 64 / 10 | 0.938 → 0.840 | 96.1 → 83.6 | 9.106 → 6.615 |
+| 64 / 60 | 3.299 → 2.194 | 167.3 → 148.2 | 2.256 → 1.224 |
+
+All continuously drained readers survived all twelve runs; the stalled legacy
+preview disconnected and reseeded without changing its process identity. At
+64/60, small/large grids delivered 54.4/53.1 distinct producer images per second
+with multiplexing, versus 53.2/52.0 separately. Producers completed 159–170 frames
+in the multiplexed interval, so this is not evidence of sustained 60fps output.
+At 64/10, multiplexed output p90 was 20.2/19.9 ms versus 16.8/17.3 ms separately;
+lower aggregate cost does not imply lower latency for every workload.
+
+The boundary includes Engine and blocking benchmark decoder threads, not GUI,
+SSH, or producer CPU. With 64 previews, unconnected baseline was 67 threads;
+separate connections reached 260, multiplexing 137. Of the 123-thread reduction,
+62 are benchmark decoder threads (the production client already uses Tokio),
+and 61 are Engine connection threads. Existing per-session publishers remain.
+Idle decoder deadline checks also contribute to the reported CPU, so idle values
+are not Engine-only wakeup measurements. Runs were paired while other builds
+were held on Mac16,5 / 36 GiB / macOS 27.0 / Rust 1.97.1.
+
+Full per-dimension timing, producer progress, reader survival, and allocation
+samples are in `docs/perf/preview-multiplex-2026-09-16.json`. Reproduce the checked-in
+16-subscription configuration from `diri/`:
+
+```sh
+cargo build --release -p diri-engine --example previewbench
+./target/release/examples/previewbench 16 60 3 diagnose
+./target/release/examples/previewbench 16 60 3 diagnose mux
+```

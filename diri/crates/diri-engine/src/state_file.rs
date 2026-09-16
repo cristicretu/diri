@@ -51,13 +51,30 @@ impl JsonStateFile {
         &self,
         mutate: impl FnOnce(&mut Map<String, Value>) -> io::Result<()>,
     ) -> io::Result<()> {
+        self.update_inner(mutate, false)
+    }
+
+    /// Also sync the renamed directory entry before acknowledging the edit.
+    /// A sync error after rename is indeterminate: callers must reload state.
+    pub(crate) fn update_durable(
+        &self,
+        mutate: impl FnOnce(&mut Map<String, Value>) -> io::Result<()>,
+    ) -> io::Result<()> {
+        self.update_inner(mutate, true)
+    }
+
+    fn update_inner(
+        &self,
+        mutate: impl FnOnce(&mut Map<String, Value>) -> io::Result<()>,
+        sync_directory: bool,
+    ) -> io::Result<()> {
         if let Some(parent) = self.path.parent() {
             std::fs::create_dir_all(parent)?;
         }
         let _lock = FileLock::exclusive(&self.path)?;
         let mut document = read_object(&self.path)?.unwrap_or_default();
         mutate(&mut document)?;
-        write_object(&self.path, &document)
+        write_object(&self.path, &document, sync_directory)
     }
 }
 
@@ -77,7 +94,11 @@ fn read_object(path: &Path) -> io::Result<Option<Map<String, Value>>> {
     })
 }
 
-fn write_object(path: &Path, document: &Map<String, Value>) -> io::Result<()> {
+fn write_object(
+    path: &Path,
+    document: &Map<String, Value>,
+    sync_directory: bool,
+) -> io::Result<()> {
     static NEXT_TEMPORARY: AtomicU64 = AtomicU64::new(0);
 
     let body = serde_json::to_vec(&Value::Object(document.clone()))?;
@@ -107,6 +128,15 @@ fn write_object(path: &Path, document: &Map<String, Value>) -> io::Result<()> {
     if let Err(error) = std::fs::rename(&temporary, path) {
         let _ = std::fs::remove_file(temporary);
         return Err(error);
+    }
+    // Persist the rename itself before acknowledging an organization edit.
+    // A file fsync alone does not guarantee its directory entry after a crash.
+    if sync_directory {
+        let parent = path
+            .parent()
+            .filter(|parent| !parent.as_os_str().is_empty())
+            .unwrap_or_else(|| Path::new("."));
+        File::open(parent)?.sync_all()?;
     }
     Ok(())
 }
@@ -140,6 +170,40 @@ mod tests {
     use std::sync::{Arc, Barrier};
 
     use super::*;
+
+    #[test]
+    fn durable_updates_sync_successfully_and_measure_directory_sync_cost() {
+        let directory = tempfile::tempdir().unwrap();
+        let file = JsonStateFile::new(directory.path().join("state.json"));
+        let mut samples = [Vec::new(), Vec::new()];
+        for i in 0..32 {
+            for durable in [false, true] {
+                let start = std::time::Instant::now();
+                file.update_inner(
+                    |document| {
+                        document.insert(
+                            if durable { "workspace" } else { "sessions" }.into(),
+                            Value::from(i),
+                        );
+                        Ok(())
+                    },
+                    durable,
+                )
+                .unwrap();
+                samples[usize::from(durable)].push(start.elapsed());
+            }
+        }
+        for sample in &mut samples {
+            sample.sort();
+        }
+        eprintln!(
+            "state writes: file-sync median {:?}, p95 {:?}; file+directory-sync median {:?}, p95 {:?}",
+            samples[0][16], samples[0][30], samples[1][16], samples[1][30]
+        );
+        let document = file.read().unwrap().unwrap();
+        assert_eq!(document["workspace"], 31);
+        assert_eq!(document["sessions"], 31);
+    }
 
     #[test]
     fn update_refuses_to_clobber_an_unparseable_document() {

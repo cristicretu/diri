@@ -28,6 +28,7 @@ mod account_handoff;
 mod message_delivery;
 mod operations;
 mod tasks;
+mod workspaces;
 
 /// Identifies this engine in the handshake, so a client can tell which
 /// implementation it reached.
@@ -64,6 +65,7 @@ pub struct ControlServer {
     active_connections: Arc<AtomicUsize>,
     background_requests: Arc<AtomicUsize>,
     worktree_scan: crate::worktree_scan::ScanStore,
+    workspaces: crate::workspace::WorkspaceStore,
     agent_catalog: Arc<Mutex<crate::agent_catalog::AgentCatalogStore>>,
     accounts: Mutex<crate::accounts::AccountStore>,
     session_operations: Mutex<std::collections::HashSet<String>>,
@@ -116,6 +118,8 @@ impl ControlServer {
         // updater can replace the bundle path underneath the live daemon.
         let _ = process_executable_hash();
         let socket_path = socket_path.into();
+        let workspaces =
+            crate::workspace::WorkspaceStore::new(registry.lock().expect("registry").state_file());
         let logs_dir = socket_path
             .parent()
             .map(|parent| parent.join("logs"))
@@ -159,6 +163,7 @@ impl ControlServer {
             active_connections: Arc::new(AtomicUsize::new(0)),
             background_requests: Arc::new(AtomicUsize::new(0)),
             worktree_scan: Default::default(),
+            workspaces,
             agent_catalog: Arc::new(Mutex::new(agent_catalog)),
             accounts,
             session_operations: Mutex::new(std::collections::HashSet::new()),
@@ -444,6 +449,43 @@ impl ControlServer {
             }
             if first {
                 first = false;
+                if serde_json::from_slice::<serde_json::Value>(&line)
+                    .is_ok_and(|value| value.get("preview_set").is_some())
+                {
+                    if let Ok(request) =
+                        serde_json::from_slice::<diri_proto::preview_set::PreviewSetRequest>(&line)
+                        && request.preview_set
+                        && request.version == diri_proto::preview_set::PREVIEW_SET_VERSION
+                    {
+                        let buffered = reader.buffer().to_vec();
+                        return self.attach.serve_preview_set(
+                            &self.registry,
+                            reader.into_inner(),
+                            buffered,
+                        );
+                    }
+                    return Ok(());
+                }
+                // Route by the distinct key before normal attach decoding. Mixed
+                // or unsupported requests fail closed without visibility effects.
+                if serde_json::from_slice::<serde_json::Value>(&line)
+                    .is_ok_and(|value| value.get("preview").is_some())
+                {
+                    if let Ok(request) =
+                        serde_json::from_slice::<diri_proto::preview::PreviewRequest>(&line)
+                        && request.version == diri_proto::preview::PREVIEW_VERSION
+                    {
+                        let buffered = reader.buffer().to_vec();
+                        self.attach.serve_preview(
+                            &self.registry,
+                            &request.preview.0,
+                            reader.into_inner(),
+                            buffered,
+                            writer,
+                        );
+                    }
+                    return Ok(());
+                }
                 if let Ok(attach) = serde_json::from_slice::<diri_proto::AttachRequest>(&line) {
                     // Attaching means this session is visible. Reconcile the
                     // actual process first: an adopted holder can be stopped
@@ -711,6 +753,8 @@ impl ControlServer {
                 let params: diri_proto::AgentAccountId = decode(params)?;
                 encode(&self.accounts.lock().map_err(poisoned)?.remove(&params.id)?)
             }
+            Method::WORKSPACE_SNAPSHOT => encode(&self.workspaces.snapshot()?),
+            Method::WORKSPACE_MUTATE => self.workspace_mutate(params),
             Method::HELLO => self.hello(params),
             Method::SESSION_SPAWN => self.session_spawn(params),
             Method::SESSION_SPAWN_TRACKED => self.session_spawn_tracked(params),
@@ -814,19 +858,10 @@ impl ControlServer {
         reserved_id: Option<String>,
     ) -> Result<JsonValue, ControlError> {
         let raw = params.ok_or_else(|| ControlError::bad_request("params are required"))?;
-        // Tests and scripts may pass a raw argv; the app never does. Read it
-        // before the typed decode consumes the value.
-        let argv: Vec<String> = raw
-            .get("argv")
-            .and_then(Value::as_array)
-            .map(|values| {
-                values
-                    .iter()
-                    .filter_map(Value::as_str)
-                    .map(str::to_string)
-                    .collect()
-            })
-            .unwrap_or_default();
+        // Validate before any account, worktree, or remote side effect. Missing
+        // argv keeps manifest launch behavior; an explicit malformed argv must
+        // never silently drop arguments or fall back to a login shell.
+        let argv = decode_launch_argv(&raw)?;
         let p: diri_proto::SessionSpawnParams = decode(Some(raw))?;
         let mut account_profile = self.accounts.lock().map_err(poisoned)?.resolve(
             p.account_profile_id.as_deref(),
@@ -2187,6 +2222,14 @@ impl ControlServer {
                 .into_iter()
                 .find(|record| record.id.0 == p.session_id.0)
                 .ok_or_else(|| ControlError::not_found(p.session_id.0.clone()))?;
+            if record.remote_connection.is_some_and(|connection| {
+                connection.state == diri_proto::RemoteConnectionState::Failed
+            }) {
+                return Err(ControlError::new(
+                    "remote_transport_failed",
+                    "Remote transport failed; the Agent's last state is preserved.",
+                ));
+            }
             // Presence in the registry is not liveness: only an explicit kill
             // removes a session, so an agent that died on its own is still in
             // the map. Returning here on presence alone would hand back the
@@ -3218,6 +3261,30 @@ impl Drop for ControlServer {
     }
 }
 
+fn decode_launch_argv(params: &JsonValue) -> Result<Vec<String>, ControlError> {
+    let Some(value) = params.get("argv") else {
+        return Ok(Vec::new());
+    };
+    let argv: Vec<String> = serde_json::from_value(value.clone())
+        .map_err(|_| ControlError::bad_request("argv must be an array of strings"))?;
+    if argv.is_empty() || argv.len() > diri_proto::remote_pty::MAX_ARGUMENTS {
+        return Err(ControlError::bad_request(
+            "argv must contain 1..=512 entries",
+        ));
+    }
+    if argv[0].is_empty() || argv.iter().any(|argument| argument.contains('\0')) {
+        return Err(ControlError::bad_request(
+            "argv needs a nonempty executable and NUL-free arguments",
+        ));
+    }
+    if argv.iter().map(String::len).sum::<usize>() > diri_proto::remote_pty::MAX_LAUNCH_BYTES {
+        return Err(ControlError::bad_request(
+            "argv exceeds the launch byte limit",
+        ));
+    }
+    Ok(argv)
+}
+
 /// Content identity of the running Engine. It is computed once, then reused by
 /// every heartbeat so version coordination has no steady-state hashing cost.
 fn process_executable_hash() -> Option<&'static str> {
@@ -3296,6 +3363,7 @@ pub(crate) fn new_record(id: &str, kind: &str, cwd: &str) -> diri_proto::Session
         archived_at: None,
         host: None,
         remote_persistence: None,
+        remote_connection: None,
         hibernation: None,
         memory_bytes: None,
         artifacts: None,
@@ -3433,6 +3501,15 @@ fn migrate_control_error(error: crate::migrate::MigrateError) -> ControlError {
 }
 
 fn io_control_error(error: std::io::Error) -> ControlError {
+    if error
+        .get_ref()
+        .is_some_and(|cause| cause.is::<crate::remote::client::RemoteTransportFailed>())
+    {
+        return ControlError::new(
+            "remote_transport_failed",
+            "Remote transport failed; the Agent's last state is preserved.",
+        );
+    }
     match error.kind() {
         std::io::ErrorKind::NotFound => ControlError::not_found(error.to_string()),
         _ => ControlError::internal(error.to_string()),
@@ -3883,6 +3960,62 @@ mod tests {
     use super::*;
 
     #[test]
+    fn explicit_launch_argv_is_literal_and_never_silently_repaired() {
+        assert!(decode_launch_argv(&json!({})).unwrap().is_empty());
+        let arguments = vec!["/bin/echo", "", "a b", "$(touch nope)", "--host", "界"];
+        assert_eq!(
+            decode_launch_argv(&json!({"argv": arguments})).unwrap(),
+            arguments
+        );
+        for argv in [
+            json!(null),
+            json!("echo"),
+            json!([]),
+            json!([""]),
+            json!(["echo", 3]),
+            json!(["echo", "x\0y"]),
+            json!(vec!["x"; diri_proto::remote_pty::MAX_ARGUMENTS + 1]),
+            json!(["x".repeat(diri_proto::remote_pty::MAX_LAUNCH_BYTES + 1)]),
+        ] {
+            assert_eq!(
+                decode_launch_argv(&json!({"argv": argv})).unwrap_err().code,
+                "bad_request"
+            );
+        }
+    }
+
+    #[test]
+    fn failed_remote_state_times_out_exit_wait_and_returns_a_structured_resume_error() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut registry = Registry::new(engine(), temp.path().join("state.json"));
+        let mut record = test_record("failed-remote");
+        record.host = Some("fixture".into());
+        record.status = diri_proto::SessionStatus::Unknown;
+        record.remote_connection = Some(diri_proto::RemoteConnection {
+            state: diri_proto::RemoteConnectionState::Failed,
+            since: diri_proto::DateMillis(123.0),
+        });
+        registry.insert_record(record);
+        let server = ControlServer::new(Arc::new(Mutex::new(registry)), temp.path().join("socket"));
+        let result = server
+            .events_wait(Some(serde_json::json!({
+                "sessionID":"failed-remote", "until":["exited"], "timeoutMs":0,
+            })))
+            .unwrap();
+        assert_eq!(result["timedOut"], true);
+        assert_eq!(result["session"]["remoteConnection"]["state"], "failed");
+        let error = server
+            .session_resume(Some(serde_json::json!({"sessionID":"failed-remote"})))
+            .unwrap_err();
+        assert_eq!(error.code, "remote_transport_failed");
+        let error = io_control_error(std::io::Error::new(
+            std::io::ErrorKind::NotConnected,
+            crate::remote::client::RemoteTransportFailed,
+        ));
+        assert_eq!(error.code, "remote_transport_failed");
+    }
+
+    #[test]
     fn oversized_control_line_is_rejected_before_unbounded_buffering() {
         let bytes = vec![b'x'; MAX_CONTROL_LINE_BYTES + 1];
         let mut reader = std::io::BufReader::new(bytes.as_slice());
@@ -3949,6 +4082,7 @@ mod tests {
             archived_at: None,
             host: None,
             remote_persistence: None,
+            remote_connection: None,
             hibernation: None,
             memory_bytes: None,
             artifacts: None,

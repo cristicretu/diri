@@ -30,6 +30,7 @@ mod notification_feed;
 pub mod notifications;
 pub mod palette;
 mod palette_chrome;
+mod peek_settle;
 mod phone_access;
 mod platform;
 pub mod query_editor;
@@ -49,11 +50,22 @@ pub mod sounds;
 mod status_debug;
 mod surface_shell;
 pub mod switcher;
+mod tab_navigation;
+mod tab_peek;
+mod tab_preview;
 pub mod terminal_pane;
 pub mod transcript;
 pub mod updates;
 pub mod usage;
 mod workbench;
+#[cfg(all(test, target_os = "macos"))]
+mod workspace_fixture;
+#[cfg_attr(not(test), allow(dead_code))]
+mod workspace_geometry;
+#[cfg_attr(not(test), allow(dead_code))]
+mod workspace_preview;
+mod workspace_preview_source;
+mod workspace_workbench;
 pub mod worktrees;
 
 #[cfg(target_os = "macos")]

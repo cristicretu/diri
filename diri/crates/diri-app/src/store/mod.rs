@@ -3,6 +3,7 @@
 mod prefs;
 mod projection;
 mod residency;
+mod workspaces;
 
 use std::collections::{HashMap, HashSet};
 use std::io;
@@ -31,10 +32,12 @@ use crate::switcher::{
 };
 
 pub use prefs::{
-    InspectorTab, Prefs, SidebarGrouping, SidebarOrdering, WindowMode, WindowPlacement,
+    InspectorTab, Prefs, SidebarGrouping, SidebarOrdering, TabOrientation, WindowMode,
+    WindowPlacement,
 };
 pub use projection::{SidebarProject, SidebarProjection, SidebarRow};
 pub use residency::{ResidencyUpdate, TerminalResidency};
+pub use workspaces::{WorkspaceCatalog, WorkspaceCatalogStatus};
 
 pub const AUXILIARY_TERMINAL_TITLE: &str = "Terminal";
 
@@ -97,6 +100,13 @@ pub enum DaemonState {
 pub enum StoreEffect {
     /// Repaint subscribers after a purely local navigation change.
     UiChanged,
+    RefreshWorkspaces {
+        generation: u64,
+    },
+    MutateWorkspace {
+        generation: u64,
+        params: diri_proto::workspace::WorkspaceMutationParams,
+    },
     /// Push one fresh snapshot to watch subscribers. The menu-bar panel skips
     /// rebuilds while hidden, so opening it asks for a current snapshot.
     PublishSnapshot,
@@ -295,6 +305,7 @@ fn repo_target_key(host: Option<&str>) -> String {
 
 /// Pure application model. Side effects are emitted onto a channel for the daemon adapter.
 pub struct SessionStore {
+    workspaces: WorkspaceCatalog,
     daemon_state: DaemonState,
     session_list_hydrated: bool,
     daemon_identity: Option<HelloResult>,
@@ -400,6 +411,7 @@ impl SessionStore {
             .unwrap_or_default();
         (
             Self {
+                workspaces: WorkspaceCatalog::default(),
                 daemon_state: DaemonState::Connecting,
                 session_list_hydrated: false,
                 daemon_identity: None,
@@ -1461,6 +1473,17 @@ impl SessionStore {
 
     fn handle_event_change(&mut self, event: EventEnvelope) -> StoreEventChange {
         match event.name.as_str() {
+            EventName::WORKSPACE_UPDATED => {
+                if let Some(revision) = event
+                    .params
+                    .get("revision")
+                    .and_then(|value| value.as_u64())
+                {
+                    self.workspace_announced(revision);
+                } else {
+                    self.refresh_workspaces();
+                }
+            }
             EventName::SESSION_NOTIFICATION => {
                 if let Ok(mut event) =
                     serde_json::from_value::<diri_proto::SessionNotificationEvent>(event.params)
@@ -2838,7 +2861,12 @@ impl StoreRuntime {
                             let _ = event_publish_tx.try_send(changed);
                         }
                     }
-                    Err(broadcast::error::RecvError::Lagged(_)) => continue,
+                    Err(broadcast::error::RecvError::Lagged(_)) => {
+                        event_store
+                            .write()
+                            .expect("session store lock poisoned")
+                            .refresh_workspaces();
+                    }
                     Err(broadcast::error::RecvError::Closed) => break,
                 }
             }
@@ -2867,15 +2895,15 @@ impl StoreRuntime {
                 waiting_for_deferred_start = false;
                 match state {
                     ConnectionState::Connecting => {
-                        state_store
-                            .write()
-                            .expect("session store lock poisoned")
-                            .daemon_state = DaemonState::Connecting;
+                        let mut store = state_store.write().expect("session store lock poisoned");
+                        store.daemon_state = DaemonState::Connecting;
+                        store.workspace_connection_changed(false);
                     }
                     ConnectionState::Disconnected(error) => {
                         let mut store = state_store.write().expect("session store lock poisoned");
                         store.daemon_state = DaemonState::Unreachable(error);
                         store.daemon_identity = None;
+                        store.workspace_connection_changed(false);
                     }
                     ConnectionState::Connected(identity) => {
                         {
@@ -2884,6 +2912,7 @@ impl StoreRuntime {
                             store.daemon_state = DaemonState::Connected;
                             store.daemon_identity = Some(identity);
                             store.last_action_failure = None;
+                            store.workspace_connection_changed(true);
                         }
                         // The agent catalog first: `hydrate` runs the notification
                         // policy for every arriving session, and that policy reads
@@ -3109,6 +3138,36 @@ async fn run_effects(
         );
         let result: Result<(), ClientError> = match effect {
             StoreEffect::UiChanged | StoreEffect::PublishSnapshot => Ok(()),
+            StoreEffect::RefreshWorkspaces { generation } => {
+                if !store
+                    .read()
+                    .expect("store")
+                    .workspace_request_is_current(generation)
+                {
+                    continue;
+                }
+                let result = client.workspaces().await;
+                store
+                    .write()
+                    .expect("store")
+                    .finish_workspace_request(generation, false, result);
+                Ok(())
+            }
+            StoreEffect::MutateWorkspace { generation, params } => {
+                if !store
+                    .read()
+                    .expect("store")
+                    .workspace_request_is_current(generation)
+                {
+                    continue;
+                }
+                let result = client.mutate_workspace(&params).await;
+                store
+                    .write()
+                    .expect("store")
+                    .finish_workspace_request(generation, true, result);
+                Ok(())
+            }
             StoreEffect::MarkSeen(id) => client.mark_seen(&id).await,
             StoreEffect::Remove(id) => client.remove(&id).await,
             StoreEffect::Resume { id, automatic } => {
@@ -3389,6 +3448,8 @@ fn action_context(effect: &StoreEffect) -> Option<ActionContext> {
         ),
         StoreEffect::ReopenLast => ("Reopen session failed", None),
         StoreEffect::UiChanged
+        | StoreEffect::RefreshWorkspaces { .. }
+        | StoreEffect::MutateWorkspace { .. }
         | StoreEffect::PublishSnapshot
         | StoreEffect::MarkSeen(_)
         | StoreEffect::RetryConnection

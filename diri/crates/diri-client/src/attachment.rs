@@ -8,6 +8,7 @@ use std::fmt;
 use std::io;
 use std::path::Path;
 use std::pin::Pin;
+use std::sync::Arc;
 use std::task::{Context, Poll};
 use std::time::Duration;
 
@@ -19,7 +20,7 @@ use diri_proto::terminal::MouseModes;
 use futures_core::Stream;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::UnixStream;
-use tokio::sync::mpsc;
+use tokio::sync::{OwnedSemaphorePermit, Semaphore, mpsc};
 use tokio::task::JoinHandle;
 use tokio::time::{Instant, MissedTickBehavior};
 
@@ -28,6 +29,8 @@ const KEEPALIVE_CHECK_EVERY: Duration = Duration::from_secs(5);
 const PING_AFTER: Duration = Duration::from_secs(20);
 const DEAD_AFTER: Duration = Duration::from_secs(30);
 const CHUNK_QUEUE_CAPACITY: usize = 256;
+const COMMAND_QUEUE_CAPACITY: usize = 256;
+const COMMAND_QUEUE_BYTES: usize = 1024 * 1024;
 
 /// A decoded event from the daemon's authoritative terminal data channel.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -102,13 +105,20 @@ impl From<serde_json::Error> for AttachmentError {
     }
 }
 
-/// Returned when an outgoing frame is queued after the data channel has ended.
+/// An outgoing frame was rejected because the channel ended or its bounded
+/// queue has no capacity. No rejected frame is retained or replayed.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct AttachmentClosed;
+pub enum AttachmentClosed {
+    Closed,
+    Backpressure,
+}
 
 impl fmt::Display for AttachmentClosed {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter.write_str("session attachment is closed")
+        formatter.write_str(match self {
+            Self::Closed => "session attachment is closed",
+            Self::Backpressure => "terminal input queue is full; input was not accepted",
+        })
     }
 }
 
@@ -116,9 +126,102 @@ impl std::error::Error for AttachmentClosed {}
 
 /// A separate binary data connection attached to one daemon session.
 pub struct SessionAttachment {
-    commands: mpsc::UnboundedSender<Command>,
-    task: Option<JoinHandle<()>>,
+    commands: mpsc::Sender<Command>,
+    budget: Arc<Semaphore>,
+    writer_drained: Option<bool>,
+    task: Option<JoinHandle<bool>>,
     pub chunks: AttachmentChunks,
+}
+
+/// Receive-only observation of an Engine-owned grid. Opening or dropping this
+/// channel never attaches to the remote Holder or changes terminal authority.
+/// A slow consumer backpressures the bounded socket queue; reconnect is explicit.
+pub struct SessionPreview {
+    session_id: SessionId,
+    // Keep the connection's command receiver alive, but expose no writer.
+    _commands: mpsc::Sender<Command>,
+    task: Option<JoinHandle<bool>>,
+    pub chunks: AttachmentChunks,
+}
+
+impl SessionPreview {
+    pub async fn connect(
+        socket_path: impl AsRef<Path>,
+        session_id: SessionId,
+    ) -> Result<Self, AttachmentError> {
+        let stream = UnixStream::connect(socket_path).await?;
+        Self::adopt(stream, session_id).await
+    }
+
+    async fn adopt(mut stream: UnixStream, session_id: SessionId) -> Result<Self, AttachmentError> {
+        use diri_proto::preview::{PREVIEW_VERSION, PreviewReady, PreviewRequest};
+        let request = PreviewRequest {
+            preview: session_id.clone(),
+            version: PREVIEW_VERSION,
+        };
+        let mut line = serde_json::to_vec(&request)?;
+        line.push(b'\n');
+        // Bounded acknowledgement makes old engines, unknown sessions and the
+        // admission limit fail closed before a preview is exposed to the UI.
+        tokio::time::timeout(Duration::from_secs(2), async {
+            stream.write_all(&line).await?;
+            let mut response = Vec::new();
+            loop {
+                let byte = stream.read_u8().await?;
+                if byte == b'\n' {
+                    break;
+                }
+                if response.len() >= 512 {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "oversized preview acknowledgement",
+                    ));
+                }
+                response.push(byte);
+            }
+            let ready: PreviewReady = serde_json::from_slice(&response)
+                .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+            if ready.version != PREVIEW_VERSION || ready.preview != session_id {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "preview identity/version mismatch",
+                ));
+            }
+            Ok(())
+        })
+        .await
+        .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "preview handshake timed out"))??;
+        let (commands, command_rx) = mpsc::channel(COMMAND_QUEUE_CAPACITY);
+        let (chunk_tx, receiver) = mpsc::channel(1);
+        let task = tokio::spawn(run_connection(stream, command_rx, chunk_tx, false));
+        Ok(Self {
+            session_id,
+            _commands: commands,
+            task: Some(task),
+            chunks: AttachmentChunks { receiver },
+        })
+    }
+
+    pub fn session_id(&self) -> &SessionId {
+        &self.session_id
+    }
+
+    /// Cancellation remains prompt even if the UI stopped draining a full queue.
+    pub async fn close(&mut self) {
+        if let Some(task) = self.task.take() {
+            task.abort();
+            let _ = task.await;
+        }
+        self.chunks.receiver.close();
+    }
+}
+
+impl Drop for SessionPreview {
+    fn drop(&mut self) {
+        if let Some(task) = self.task.take() {
+            task.abort();
+        }
+    }
 }
 
 /// Cloneable write half for a live, resident attachment.
@@ -129,10 +232,44 @@ pub struct SessionAttachment {
 /// with the caller, as in `SessionAttachment.swift`.
 #[derive(Clone)]
 pub struct SessionAttachmentHandle {
-    commands: mpsc::UnboundedSender<Command>,
+    commands: mpsc::Sender<Command>,
+    budget: Arc<Semaphore>,
+}
+
+/// One reserved resize frame in the existing ordered writer queue. The caller
+/// decides the latest still-authorized geometry only after capacity is ready.
+/// Dropping a reservation releases both budgets without enqueueing a frame.
+pub struct ResizeReservation {
+    queue: mpsc::OwnedPermit<Command>,
+    bytes: OwnedSemaphorePermit,
+}
+
+impl ResizeReservation {
+    pub fn send(self, cols: u16, rows: u16) {
+        self.queue
+            .send(Command::Frame(Frame::resize(cols, rows), self.bytes));
+    }
 }
 
 impl SessionAttachmentHandle {
+    /// Wait for capacity without repeatedly rejecting a coalescible resize.
+    /// Holding this reservation never takes a terminal or app-state lock.
+    pub async fn reserve_resize(&self) -> Result<ResizeReservation, AttachmentClosed> {
+        let queue = self
+            .commands
+            .clone()
+            .reserve_owned()
+            .await
+            .map_err(|_| AttachmentClosed::Closed)?;
+        let bytes = self
+            .budget
+            .clone()
+            .acquire_many_owned(4)
+            .await
+            .map_err(|_| AttachmentClosed::Closed)?;
+        Ok(ResizeReservation { queue, bytes })
+    }
+
     pub fn send_input(&self, bytes: impl Into<Vec<u8>>) -> Result<(), AttachmentClosed> {
         self.send(Frame::input(bytes))
     }
@@ -157,14 +294,28 @@ impl SessionAttachmentHandle {
 
     pub fn close(&self) -> Result<(), AttachmentClosed> {
         self.commands
-            .send(Command::Close)
-            .map_err(|_| AttachmentClosed)
+            .try_send(Command::Close)
+            .map_err(admission_error)
     }
 
     fn send(&self, frame: Frame) -> Result<(), AttachmentClosed> {
+        let bytes = u32::try_from(frame.payload.len().max(1))
+            .map_err(|_| AttachmentClosed::Backpressure)?;
+        let permit = self
+            .budget
+            .clone()
+            .try_acquire_many_owned(bytes)
+            .map_err(|_| AttachmentClosed::Backpressure)?;
         self.commands
-            .send(Command::Frame(frame))
-            .map_err(|_| AttachmentClosed)
+            .try_send(Command::Frame(frame, permit))
+            .map_err(admission_error)
+    }
+}
+
+fn admission_error(error: mpsc::error::TrySendError<Command>) -> AttachmentClosed {
+    match error {
+        mpsc::error::TrySendError::Full(_) => AttachmentClosed::Backpressure,
+        mpsc::error::TrySendError::Closed(_) => AttachmentClosed::Closed,
     }
 }
 
@@ -189,16 +340,18 @@ impl SessionAttachment {
         line.push(b'\n');
         stream.write_all(&line).await?;
 
-        let (command_tx, command_rx) = mpsc::unbounded_channel();
+        let (command_tx, command_rx) = mpsc::channel(COMMAND_QUEUE_CAPACITY);
         // Bound decoded terminal work between the socket and UI. The daemon's
         // PTY drain is independent of this connection, so brief UI stalls
         // backpressure only the attach writer instead of growing client memory
         // without limit.
         let (chunk_tx, chunk_rx) = mpsc::channel(CHUNK_QUEUE_CAPACITY);
-        let task = tokio::spawn(run_connection(stream, command_rx, chunk_tx));
+        let task = tokio::spawn(run_connection(stream, command_rx, chunk_tx, true));
 
         Ok(Self {
             commands: command_tx,
+            budget: Arc::new(Semaphore::new(COMMAND_QUEUE_BYTES)),
+            writer_drained: None,
             task: Some(task),
             chunks: AttachmentChunks { receiver: chunk_rx },
         })
@@ -236,14 +389,48 @@ impl SessionAttachment {
     pub fn handle(&self) -> SessionAttachmentHandle {
         SessionAttachmentHandle {
             commands: self.commands.clone(),
+            budget: self.budget.clone(),
         }
     }
 
-    /// Detaches and cleanly finishes the chunk stream. Idempotent.
+    /// Drains accepted commands before detaching. Incoming chunks are consumed
+    /// while closing so a full display queue cannot strand the ordered writer.
+    /// Cancellation keeps the task owned here: dropping the attachment still
+    /// aborts it if the caller's bounded drain deadline expires.
     pub async fn close(&mut self) {
-        let _ = self.commands.send(Command::Close);
-        if let Some(task) = self.task.take() {
-            let _ = task.await;
+        let _ = self.close_checked().await;
+    }
+
+    /// Reports whether the ordered socket writer reached the queued close.
+    /// Success confirms neither Engine receipt nor delivery to the PTY. EOF,
+    /// write failure or task failure leaves recent input uncertain. Repeated
+    /// calls preserve that terminal outcome; closing again cannot turn an
+    /// interrupted writer into a successful drain.
+    pub async fn close_checked(&mut self) -> Result<(), AttachmentClosed> {
+        let close = self.commands.send(Command::Close);
+        tokio::pin!(close);
+        loop {
+            tokio::select! {
+                _ = &mut close => break,
+                Some(_) = self.chunks.recv() => {}
+            }
+        }
+        let drained = if let Some(task) = self.task.as_mut() {
+            loop {
+                tokio::select! {
+                    result = &mut *task => break result.unwrap_or(false),
+                    Some(_) = self.chunks.recv() => {}
+                }
+            }
+        } else {
+            self.writer_drained.unwrap_or(false)
+        };
+        self.task.take();
+        self.writer_drained = Some(drained);
+        if drained {
+            Ok(())
+        } else {
+            Err(AttachmentClosed::Closed)
         }
     }
 }
@@ -257,54 +444,66 @@ impl Drop for SessionAttachment {
 }
 
 enum Command {
-    Frame(Frame),
+    Frame(Frame, OwnedSemaphorePermit),
     Close,
 }
 
 async fn run_connection(
     mut stream: UnixStream,
-    mut commands: mpsc::UnboundedReceiver<Command>,
+    mut commands: mpsc::Receiver<Command>,
     chunks: mpsc::Sender<TerminalChunk>,
-) {
+    keepalive_enabled: bool,
+) -> bool {
     let mut codec = FrameCodec::new();
     let mut read_buffer = vec![0_u8; READ_BUFFER_BYTES];
     let mut last_received = Instant::now();
-    let start = Instant::now() + KEEPALIVE_CHECK_EVERY;
-    let mut keepalive = tokio::time::interval_at(start, KEEPALIVE_CHECK_EVERY);
-    keepalive.set_missed_tick_behavior(MissedTickBehavior::Delay);
+    // Local receive-only previews need no idle timer: Unix socket EOF reports
+    // peer closure, and remote freshness is an Engine control fact.
+    let mut keepalive = keepalive_enabled.then(|| {
+        let start = Instant::now() + KEEPALIVE_CHECK_EVERY;
+        let mut timer = tokio::time::interval_at(start, KEEPALIVE_CHECK_EVERY);
+        timer.set_missed_tick_behavior(MissedTickBehavior::Delay);
+        timer
+    });
 
     loop {
         tokio::select! {
             read = stream.read(&mut read_buffer) => {
-                let Ok(read) = read else { return };
+                let Ok(read) = read else { return false };
                 if read == 0 {
-                    return;
+                    return false;
                 }
                 last_received = Instant::now();
-                let Ok(frames) = codec.feed(&read_buffer[..read]) else { return };
+                let Ok(frames) = codec.feed(&read_buffer[..read]) else { return false };
                 for frame in frames {
                     if process_incoming(frame, &mut stream, &chunks).await.is_err() {
-                        return;
+                        return false;
                     }
                 }
             }
             command = commands.recv() => {
                 match command {
-                    Some(Command::Frame(frame)) => {
+                    Some(Command::Frame(frame, _permit)) => {
                         if write_frame(&mut stream, &frame).await.is_err() {
-                            return;
+                            return false;
                         }
                     }
-                    Some(Command::Close) | None => return,
+                    Some(Command::Close) => return true,
+                    None => return false,
                 }
             }
-            _ = keepalive.tick() => {
+            _ = async {
+                match &mut keepalive {
+                    Some(timer) => { timer.tick().await; }
+                    None => std::future::pending::<()>().await,
+                }
+            } => {
                 let idle = Instant::now().duration_since(last_received);
                 if idle >= DEAD_AFTER {
-                    return;
+                    return false;
                 }
                 if idle >= PING_AFTER && write_frame(&mut stream, &Frame::ping()).await.is_err() {
-                    return;
+                    return false;
                 }
             }
         }
@@ -358,7 +557,7 @@ mod tests {
     use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
     use diri_proto::control::{ControlMessage, decode_line, encode_line};
-    use diri_proto::frames::Frame;
+    use diri_proto::frames::{Frame, FrameCodec, FrameType};
     use diri_proto::grid::GridCell;
     use diri_proto::methods::{
         HelloParams, HelloResult, Method, SessionIdParams, SessionSpawnParams,
@@ -368,12 +567,200 @@ mod tests {
     use diri_proto::terminal::{MouseEncoding, MouseModes, MouseTrackingMode};
     use serde::Serialize;
     use serde::de::DeserializeOwned;
-    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+    use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
     use tokio::net::UnixStream;
     use tokio::net::unix::{OwnedReadHalf, OwnedWriteHalf};
     use tokio::time::timeout;
 
     use super::{SessionAttachment, TerminalChunk, process_incoming};
+
+    #[tokio::test]
+    async fn checked_close_reports_peer_loss_instead_of_claiming_a_drained_writer() {
+        let (client, server) = tokio::net::UnixStream::pair().unwrap();
+        let mut attachment = SessionAttachment::adopt(client, SessionId("lost-peer".into()))
+            .await
+            .unwrap();
+        attachment.send_input(b"uncertain".to_vec()).unwrap();
+        drop(server);
+        assert!(
+            tokio::time::timeout(Duration::from_secs(1), attachment.chunks.recv())
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(
+            attachment.close_checked().await,
+            Err(super::AttachmentClosed::Closed)
+        );
+        attachment.close().await;
+        assert_eq!(
+            attachment.close_checked().await,
+            Err(super::AttachmentClosed::Closed),
+            "repeat close cannot invent successful completion"
+        );
+    }
+
+    #[tokio::test]
+    async fn cancelled_close_keeps_the_task_owned_until_drop() {
+        let (commands, _receiver) = tokio::sync::mpsc::channel(super::COMMAND_QUEUE_CAPACITY);
+        let (_chunks_tx, chunks_rx) = tokio::sync::mpsc::channel(1);
+        let task = tokio::spawn(std::future::pending::<bool>());
+        let abort = task.abort_handle();
+        let mut attachment = SessionAttachment {
+            commands,
+            budget: std::sync::Arc::new(tokio::sync::Semaphore::new(super::COMMAND_QUEUE_BYTES)),
+            writer_drained: None,
+            task: Some(task),
+            chunks: super::AttachmentChunks {
+                receiver: chunks_rx,
+            },
+        };
+        assert!(
+            tokio::time::timeout(Duration::from_millis(1), attachment.close())
+                .await
+                .is_err()
+        );
+        assert!(
+            attachment.task.is_some(),
+            "timeout cannot detach the owner task"
+        );
+        drop(attachment);
+        tokio::task::yield_now().await;
+        assert!(
+            abort.is_finished(),
+            "dropping a timed-out attachment aborts its task"
+        );
+    }
+
+    #[tokio::test]
+    async fn close_drains_a_full_display_queue_and_keeps_accepted_input_ordered() {
+        use tokio::io::{AsyncBufReadExt, BufReader};
+        let (client, server) = tokio::net::UnixStream::pair().unwrap();
+        let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
+        let peer = tokio::spawn(async move {
+            let mut server = BufReader::new(server);
+            let mut hello = String::new();
+            server.read_line(&mut hello).await.unwrap();
+            for index in 0..(super::CHUNK_QUEUE_CAPACITY + 8) {
+                let grid = diri_proto::grid::GridUpdate {
+                    cols: 1,
+                    rows: 1,
+                    cursor_col: 0,
+                    cursor_row: 0,
+                    cursor_visible: true,
+                    is_full_snapshot: index == 0,
+                    changed_rows: Vec::new(),
+                };
+                super::write_frame(server.get_mut(), &Frame::grid(&grid).unwrap())
+                    .await
+                    .unwrap();
+            }
+            ready_tx.send(()).unwrap();
+            let mut codec = FrameCodec::new();
+            let mut buffer = [0; 8192];
+            let mut inputs = Vec::new();
+            loop {
+                let length = server.read(&mut buffer).await.unwrap();
+                if length == 0 {
+                    break;
+                }
+                for frame in codec.feed(&buffer[..length]).unwrap() {
+                    if frame.frame_type == FrameType::Input {
+                        inputs.push(frame.payload);
+                    }
+                }
+            }
+            inputs
+        });
+        let mut attachment = SessionAttachment::adopt(client, SessionId("closing-fixture".into()))
+            .await
+            .unwrap();
+        attachment.send_input(b"first".to_vec()).unwrap();
+        attachment.send_input(b"second".to_vec()).unwrap();
+        ready_rx.await.unwrap();
+        tokio::time::timeout(Duration::from_secs(2), attachment.close_checked())
+            .await
+            .unwrap()
+            .unwrap();
+        attachment.close().await;
+        assert_eq!(
+            attachment.close_checked().await,
+            Ok(()),
+            "successful close remains idempotent"
+        );
+        assert_eq!(peer.await.unwrap(), [b"first".to_vec(), b"second".to_vec()]);
+    }
+
+    #[tokio::test]
+    async fn cancelled_resize_reservation_releases_capacity_and_sends_only_on_commit() {
+        let (tx, mut rx) = tokio::sync::mpsc::channel(super::COMMAND_QUEUE_CAPACITY);
+        let handle = super::SessionAttachmentHandle {
+            commands: tx,
+            budget: std::sync::Arc::new(tokio::sync::Semaphore::new(super::COMMAND_QUEUE_BYTES)),
+        };
+        handle
+            .send_input(vec![b'x'; super::COMMAND_QUEUE_BYTES])
+            .unwrap();
+        assert!(
+            tokio::time::timeout(Duration::from_millis(1), handle.reserve_resize())
+                .await
+                .is_err()
+        );
+        drop(rx.try_recv().unwrap());
+        assert!(
+            rx.try_recv().is_err(),
+            "cancelled reservation emitted no geometry"
+        );
+        let reservation = handle.reserve_resize().await.unwrap();
+        reservation.send(90, 30);
+        let super::Command::Frame(frame, _bytes) = rx.try_recv().unwrap() else {
+            panic!("resize frame");
+        };
+        assert_eq!(frame.resize_payload(), Some((90, 30)));
+        for _ in 0..super::COMMAND_QUEUE_CAPACITY {
+            handle.send_input(b"x".to_vec()).unwrap();
+        }
+        assert_eq!(
+            handle.send_input(b"full".to_vec()),
+            Err(super::AttachmentClosed::Backpressure)
+        );
+    }
+
+    #[test]
+    fn command_admission_bounds_frame_count_bytes_and_reports_closed() {
+        let (tx, mut rx) = tokio::sync::mpsc::channel(super::COMMAND_QUEUE_CAPACITY);
+        let handle = super::SessionAttachmentHandle {
+            commands: tx,
+            budget: std::sync::Arc::new(tokio::sync::Semaphore::new(super::COMMAND_QUEUE_BYTES)),
+        };
+        for _ in 0..super::COMMAND_QUEUE_CAPACITY {
+            handle.send_input(b"a".to_vec()).unwrap();
+        }
+        assert_eq!(
+            handle.send_input(b"b".to_vec()),
+            Err(super::AttachmentClosed::Backpressure)
+        );
+        // Both budgets are released only when the queued command is retired.
+        while rx.try_recv().is_ok() {}
+        handle
+            .send_input(vec![b'x'; super::COMMAND_QUEUE_BYTES])
+            .unwrap();
+        assert_eq!(
+            handle.send_input(b"b".to_vec()),
+            Err(super::AttachmentClosed::Backpressure)
+        );
+        drop(rx.try_recv().unwrap());
+        handle.send_input(b"recovered".to_vec()).unwrap();
+        assert_eq!(
+            handle.send_input(vec![b'x'; super::COMMAND_QUEUE_BYTES + 1]),
+            Err(super::AttachmentClosed::Backpressure)
+        );
+        drop(rx);
+        assert_eq!(
+            handle.send_input(b"closed".to_vec()),
+            Err(super::AttachmentClosed::Closed)
+        );
+    }
 
     #[tokio::test]
     async fn mode_frames_keep_bracketed_paste_state() {
@@ -397,6 +784,125 @@ mod tests {
                 mouse,
             })
         );
+    }
+
+    #[tokio::test]
+    async fn preview_decodes_ordered_chunks_and_cancels_with_a_full_queue() {
+        use super::SessionPreview;
+        use diri_proto::grid::{ChangedRow, GridUpdate};
+        use tokio::io::AsyncReadExt;
+        let (client, server) = UnixStream::pair().unwrap();
+        let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
+        let peer = tokio::spawn(async move {
+            let mut server = BufReader::new(server);
+            let mut line = String::new();
+            server.read_line(&mut line).await.unwrap();
+            let request: diri_proto::preview::PreviewRequest = serde_json::from_str(&line).unwrap();
+            assert_eq!(request.preview.0, "fixture");
+            server.get_mut().write_all(line.as_bytes()).await.unwrap();
+            for index in 0..4 {
+                let update = GridUpdate {
+                    cols: 1,
+                    rows: 1,
+                    cursor_col: 0,
+                    cursor_row: 0,
+                    cursor_visible: true,
+                    is_full_snapshot: index == 0,
+                    changed_rows: vec![ChangedRow::new(
+                        0,
+                        vec![GridCell {
+                            scalar: u32::from(b'A' + index),
+                            ..GridCell::BLANK
+                        }],
+                    )],
+                };
+                super::write_frame(server.get_mut(), &Frame::grid(&update).unwrap())
+                    .await
+                    .unwrap();
+            }
+            ready_tx.send(()).unwrap();
+            assert_eq!(
+                server.read(&mut [0]).await.unwrap(),
+                0,
+                "close releases socket"
+            );
+        });
+        let mut preview = SessionPreview::adopt(client, SessionId("fixture".into()))
+            .await
+            .unwrap();
+        ready_rx.await.unwrap();
+        for scalar in *b"AB" {
+            let Some(TerminalChunk::Grid(grid)) = preview.chunks.recv().await else {
+                panic!("grid");
+            };
+            assert_eq!(grid.changed_rows[0].cells[0].scalar, u32::from(scalar));
+        }
+        // Leave the remaining patches unread. Closing must not await a sender
+        // blocked on the capacity-one queue, nor splice/drop patches to continue.
+        timeout(Duration::from_secs(1), preview.close())
+            .await
+            .unwrap();
+        timeout(Duration::from_secs(1), peer)
+            .await
+            .unwrap()
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_silent_preview_has_no_idle_ping_or_deadline() {
+        use super::SessionPreview;
+        let (client, mut server) = UnixStream::pair().unwrap();
+        let peer = tokio::spawn(async move {
+            let mut reader = BufReader::new(server);
+            let mut line = String::new();
+            reader.read_line(&mut line).await.unwrap();
+            reader.get_mut().write_all(line.as_bytes()).await.unwrap();
+            reader.into_inner()
+        });
+        let mut preview = SessionPreview::adopt(client, SessionId("silent".into()))
+            .await
+            .unwrap();
+        server = peer.await.unwrap();
+        tokio::time::pause();
+        tokio::time::advance(Duration::from_secs(120)).await;
+        tokio::task::yield_now().await;
+        assert!(
+            !preview.task.as_ref().unwrap().is_finished(),
+            "silent preview stays open"
+        );
+        assert_eq!(
+            server.try_read(&mut [0]).unwrap_err().kind(),
+            std::io::ErrorKind::WouldBlock,
+            "preview emits no idle ping"
+        );
+        preview.close().await;
+    }
+
+    #[tokio::test]
+    async fn preview_rejects_wrong_identity_and_legacy_control_reply() {
+        use super::SessionPreview;
+        for response in [
+            r#"{"preview":"other","version":1}"#,
+            r#"{"id":0,"error":"unknown request"}"#,
+        ] {
+            let (client, server) = UnixStream::pair().unwrap();
+            let peer = tokio::spawn(async move {
+                let mut server = BufReader::new(server);
+                let mut line = String::new();
+                server.read_line(&mut line).await.unwrap();
+                server
+                    .get_mut()
+                    .write_all(format!("{response}\n").as_bytes())
+                    .await
+                    .unwrap();
+            });
+            assert!(
+                SessionPreview::adopt(client, SessionId("fixture".into()))
+                    .await
+                    .is_err()
+            );
+            peer.await.unwrap();
+        }
     }
 
     struct TestControl {

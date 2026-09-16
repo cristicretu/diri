@@ -55,6 +55,25 @@ pub enum SidebarGrouping {
     Recency,
 }
 
+/// Navigation placement is local presentation only. Both orientations use
+/// the same project/session identities and saved ordering.
+#[derive(Clone, Copy, Debug, Default, Deserialize, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub enum TabOrientation {
+    #[default]
+    Vertical,
+    Horizontal,
+}
+
+impl TabOrientation {
+    pub fn toggled(self) -> Self {
+        match self {
+            Self::Vertical => Self::Horizontal,
+            Self::Horizontal => Self::Vertical,
+        }
+    }
+}
+
 /// Sort policy for sidebar sessions. `Custom` preserves the long-standing
 /// drag order; the chronological choices never overwrite that saved order.
 #[derive(Clone, Copy, Debug, Default, Deserialize, PartialEq, Eq, Serialize)]
@@ -140,6 +159,9 @@ pub struct Prefs {
     pub sidebar_visible: bool,
     pub sidebar_width: f32,
     pub sidebar_grouping: SidebarGrouping,
+    pub tab_orientation: TabOrientation,
+    /// Initial workspace for new windows; each open window keeps its own selection.
+    pub active_workspace: Option<diri_proto::workspace::WorkspaceId>,
     pub sidebar_ordering: SidebarOrdering,
     /// The projectless recency view has one shared archive disclosure rather
     /// than one disclosure per hidden project header.
@@ -201,6 +223,8 @@ impl Default for Prefs {
             sidebar_visible: false,
             sidebar_width: 248.0,
             sidebar_grouping: SidebarGrouping::Project,
+            tab_orientation: TabOrientation::Vertical,
+            active_workspace: None,
             sidebar_ordering: SidebarOrdering::Custom,
             sidebar_recency_archives_expanded: false,
             inspector_open: false,
@@ -380,6 +404,20 @@ mod tests {
         restored.follow_system_theme = false;
         assert!(!restored.apply_system_theme(false));
         assert_eq!(restored.terminal_theme, "dirijor-dark");
+    }
+
+    #[test]
+    fn tab_orientation_defaults_migrates_and_round_trips_without_changing_order() {
+        let legacy: Prefs = serde_json::from_str(r#"{"sidebarVisible":true}"#).unwrap();
+        assert_eq!(legacy.tab_orientation, TabOrientation::Vertical);
+        let prefs = Prefs {
+            tab_orientation: TabOrientation::Horizontal,
+            sidebar_session_order: vec![SessionId::new("second"), SessionId::new("first")],
+            last_selected_session: Some(SessionId::new("first")),
+            ..legacy
+        };
+        let restored: Prefs = serde_json::from_slice(&serde_json::to_vec(&prefs).unwrap()).unwrap();
+        assert_eq!(restored, prefs);
     }
 
     fn prefs_with_hibernation(minutes: u32, gb: u64, revision: Option<u32>) -> Prefs {

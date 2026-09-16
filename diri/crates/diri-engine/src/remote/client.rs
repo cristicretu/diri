@@ -36,6 +36,7 @@ struct PendingFrame {
 
 #[derive(Default)]
 struct WriterState {
+    failed: bool,
     child: Option<Child>,
     input: Option<ChildStdin>,
     generation: u64,
@@ -106,11 +107,22 @@ impl RemoteSessionClient {
         })
     }
 
+    /// Permanently rejects further transport writes until explicit re-adoption.
+    /// Clearing queues ensures an uncertain operation can never be replayed.
+    pub(crate) fn fail_closed(&self) {
+        fail_writer(&mut self.writer.lock().expect("remote writer"));
+        self.scrollback_requests
+            .lock()
+            .expect("scrollback requests")
+            .clear();
+    }
+
     pub fn connect(
         &self,
         output_offset: u64,
         grid_sequence: Option<u64>,
     ) -> io::Result<(u64, ChildStdout)> {
+        ensure_available(&self.writer.lock().expect("remote writer"))?;
         let mut channel = self.manager.attach(&self.helper)?;
         let setup = (|| {
             let hello = RemoteMessage::Hello(Hello {
@@ -151,6 +163,10 @@ impl RemoteSessionClient {
             }
         };
         let mut writer = self.writer.lock().expect("remote writer");
+        if let Err(error) = ensure_available(&writer) {
+            super::executor::terminate_process_group(&mut channel.child);
+            return Err(error);
+        }
         terminate_current(&mut writer);
         writer.wake = Some(wake);
         writer.wake_reader = Some(wake_reader);
@@ -286,6 +302,7 @@ impl RemoteSessionClient {
             return Ok(());
         }
         let mut writer = self.writer.lock().expect("remote writer");
+        ensure_available(&writer)?;
         if !writer.control_granted || writer.input.is_none() {
             // Wheel/motion is ephemeral. Replaying it after a reconnect would
             // target a screen that may already have changed.
@@ -309,6 +326,7 @@ impl RemoteSessionClient {
             return Ok(());
         }
         let mut writer = self.writer.lock().expect("remote writer");
+        ensure_available(&writer)?;
         if !writer.control_granted || writer.input.is_none() {
             return queue_input(&mut writer, bytes);
         }
@@ -336,6 +354,7 @@ impl RemoteSessionClient {
         validate_terminal_dimensions(cols, rows)
             .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error))?;
         let mut writer = self.writer.lock().expect("remote writer");
+        ensure_available(&writer)?;
         if !writer.control_granted || writer.input.is_none() {
             writer.queued_resize = Some((cols, rows));
             return Ok(());
@@ -507,6 +526,7 @@ impl RemoteSessionClient {
 }
 
 fn write_message(writer: &mut WriterState, message: &RemoteMessage) -> io::Result<()> {
+    ensure_available(writer)?;
     if writer.input.is_none() {
         return Err(io::Error::new(
             io::ErrorKind::NotConnected,
@@ -593,6 +613,7 @@ fn terminal_input_frame(protocol: ProtocolVersion, bytes: &[u8], mouse: bool) ->
 }
 
 fn queue_input(writer: &mut WriterState, bytes: &[u8]) -> io::Result<()> {
+    ensure_available(writer)?;
     if writer.uncertain_effect {
         return Err(io::Error::other("remote input delivery is uncertain"));
     }
@@ -638,6 +659,34 @@ fn remote_signal(target: RemoteTarget, signal: i32) -> io::Result<i32> {
             "unsupported remote signal",
         )),
     }
+}
+
+#[derive(Debug)]
+pub(crate) struct RemoteTransportFailed;
+impl std::fmt::Display for RemoteTransportFailed {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("remote_transport_failed")
+    }
+}
+impl std::error::Error for RemoteTransportFailed {}
+
+fn ensure_available(writer: &WriterState) -> io::Result<()> {
+    if writer.failed {
+        Err(io::Error::new(
+            io::ErrorKind::NotConnected,
+            RemoteTransportFailed,
+        ))
+    } else {
+        Ok(())
+    }
+}
+
+fn fail_writer(writer: &mut WriterState) {
+    writer.failed = true;
+    terminate_current(writer);
+    writer.queued_input.clear();
+    writer.queued_resize = None;
+    writer.controller_epoch = None;
 }
 
 fn terminate_current(writer: &mut WriterState) {
@@ -770,6 +819,29 @@ mod tests {
             },
             output,
         )
+    }
+
+    #[test]
+    fn fatal_transport_discards_queued_effects_and_rejects_future_writes() {
+        let (mut writer, _peer) = pipe_writer();
+        writer.queued_input.extend_from_slice(b"uncertain input");
+        writer.queued_resize = Some((132, 42));
+        writer.uncertain_effect = true;
+        fail_writer(&mut writer);
+        assert!(writer.failed);
+        assert!(writer.uncertain_effect);
+        assert!(writer.queued_input.is_empty());
+        assert!(writer.pending.is_empty());
+        assert!(writer.queued_resize.is_none());
+        assert!(writer.input.is_none());
+        assert!(queue_input(&mut writer, b"new input").is_err());
+        assert!(
+            write_message(&mut writer, &RemoteMessage::Terminal(Frame::resize(80, 24))).is_err()
+        );
+        assert_eq!(
+            ensure_available(&writer).unwrap_err().to_string(),
+            "remote_transport_failed"
+        );
     }
 
     #[test]

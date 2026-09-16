@@ -93,6 +93,54 @@ pub struct TerminalElement {
     hovered_reference: Option<ReferenceHit>,
 }
 
+/// Selection and reading state only: deliberately does not retain an input
+/// callback, focus handle or IME composition when a session registers a view.
+#[derive(Clone)]
+pub struct TerminalDamageObserver {
+    buffer: SharedGridBuffer,
+    shared: Arc<ElementSharedState>,
+}
+
+impl TerminalDamageObserver {
+    pub fn prepare(&self, update: &GridUpdate) {
+        // Absolute rows keep a selection attached while the viewport moves,
+        // but not when the daemon replaces cells at those rows. Damage is
+        // row-granular, so unrelated live output and history remain selected.
+        let mut viewport = mutex_lock(&self.shared.viewport);
+        let live_start_row = viewport.live_start_row();
+        let buffer = read_lock(&self.buffer);
+        viewport.hold_reading_view(&buffer);
+        let reading_held = viewport.is_reading();
+        drop(viewport);
+        let replaces_grid =
+            update.is_full_snapshot || buffer.cols != update.cols || buffer.rows != update.rows;
+        let damaged_cols = usize::from(if replaces_grid {
+            buffer.cols.max(update.cols)
+        } else {
+            update.cols
+        });
+        let mut selection = mutex_lock(&self.shared.selection);
+        let selection_overlaps_damage = if reading_held || selection.range().is_none() {
+            false
+        } else if replaces_grid {
+            (0..buffer.rows.max(update.rows)).any(|row| {
+                selection.overlaps_row(live_start_row.saturating_add(i64::from(row)), damaged_cols)
+            })
+        } else {
+            update.changed_rows.iter().any(|changed| {
+                changed.y < update.rows
+                    && selection.overlaps_row(
+                        live_start_row.saturating_add(i64::from(changed.y)),
+                        damaged_cols,
+                    )
+            })
+        };
+        if selection_overlaps_damage {
+            selection.clear();
+        }
+    }
+}
+
 #[derive(Default)]
 struct TerminalImeState {
     marked_text: String,
@@ -218,21 +266,27 @@ struct ElementSharedState {
     stats: Mutex<RendererStats>,
     viewport: Mutex<ScrollbackViewport>,
     selection: Mutex<TerminalSelection>,
-    find_spans: Mutex<Vec<FindSpan>>,
+    find_highlights: Mutex<FindHighlights>,
     modes: Mutex<TerminalModes>,
     scroll_router: Mutex<ScrollRouter>,
     history_lines: Mutex<HistoryLineCache>,
     metrics: Mutex<Option<(Font, u32, CellMetrics)>>,
 }
 
+#[derive(Default)]
+struct FindHighlights {
+    spans: Vec<FindSpan>,
+    current_bounds: Option<Bounds<Pixels>>,
+}
+
 /// Shaped lines for history rows, keyed by absolute row and content-addressed
-/// by a digest of the row's cells, so shaping survives across scrolled frames
+/// by a digest of the row's cells and combining text, so shaping survives across scrolled frames
 /// instead of being redone per frame.
 ///
 /// The digest replaces following the viewport's `content_seq`: that sequence
 /// advances on *any* visible change — a spinner in the live grid was enough —
 /// which dumped the shaping of history rows that had not moved a pixel.
-/// Comparing the cells cannot go stale, and costs a hash against a reshape.
+/// Comparing the complete painted content costs a hash against a reshape.
 #[derive(Default)]
 struct HistoryLineCache {
     key: Option<HistoryShapeKey>,
@@ -287,16 +341,23 @@ impl HistoryLineCache {
     }
 }
 
+#[cfg(test)]
 fn digest_cells(cells: &[GridCell]) -> u64 {
+    digest_row(cells, &[])
+}
+
+fn digest_row(cells: &[GridCell], graphemes: &[(u16, String)]) -> u64 {
     use std::hash::{Hash, Hasher};
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
     cells.hash(&mut hasher);
+    graphemes.hash(&mut hasher);
     hasher.finish()
 }
 
 #[derive(Clone)]
 struct CachedRow {
     cells: Vec<GridCell>,
+    graphemes: Vec<(u16, String)>,
     background_quads: Vec<PaintQuad>,
     decoration_quads: Vec<PaintQuad>,
     line: ShapedLine,
@@ -322,10 +383,11 @@ fn align_scrolled_rows(cache: &mut [Option<CachedRow>], damage: &[ChangedRenderR
         return 0;
     }
     for changed in [damage.first().unwrap(), damage.last().unwrap()] {
-        if let Some(previous) = cache
-            .iter()
-            .position(|entry| entry.as_ref().is_some_and(|row| row.cells == changed.cells))
-        {
+        if let Some(previous) = cache.iter().position(|entry| {
+            entry
+                .as_ref()
+                .is_some_and(|row| row.cells == changed.cells && row.graphemes == changed.graphemes)
+        }) {
             let offset = (previous + cache.len() - changed.row) % cache.len();
             if offset != 0 {
                 cache.rotate_left(offset);
@@ -386,7 +448,7 @@ impl TerminalElement {
                 stats: Mutex::new(RendererStats::default()),
                 viewport: Mutex::new(ScrollbackViewport::default()),
                 selection: Mutex::new(TerminalSelection::default()),
-                find_spans: Mutex::new(Vec::new()),
+                find_highlights: Mutex::new(FindHighlights::default()),
                 modes: Mutex::new(TerminalModes::default()),
                 scroll_router: Mutex::new(ScrollRouter::default()),
                 history_lines: Mutex::new(HistoryLineCache::default()),
@@ -499,43 +561,18 @@ impl TerminalElement {
     /// Terminal hosts use this to keep the authoritative buffer current while
     /// coalescing bursts and suppressing paints for offscreen residents.
     pub fn apply_damage(&self, update: GridUpdate) -> ApplySummary {
-        // Absolute rows keep a selection attached while the viewport moves,
-        // but not when the daemon replaces cells at those rows. Damage is
-        // row-granular, so unrelated live output and history remain selected.
-        let mut viewport = mutex_lock(&self.shared.viewport);
-        let live_start_row = viewport.live_start_row();
-        let mut buffer = write_lock(&self.buffer);
-        viewport.hold_reading_view(&buffer);
-        let reading_held = viewport.is_reading();
-        drop(viewport);
-        let replaces_grid =
-            update.is_full_snapshot || buffer.cols != update.cols || buffer.rows != update.rows;
-        let damaged_cols = usize::from(if replaces_grid {
-            buffer.cols.max(update.cols)
-        } else {
-            update.cols
-        });
-        let mut selection = mutex_lock(&self.shared.selection);
-        let selection_overlaps_damage = if reading_held || selection.range().is_none() {
-            false
-        } else if replaces_grid {
-            (0..buffer.rows.max(update.rows)).any(|row| {
-                selection.overlaps_row(live_start_row.saturating_add(i64::from(row)), damaged_cols)
-            })
-        } else {
-            update.changed_rows.iter().any(|changed| {
-                changed.y < update.rows
-                    && selection.overlaps_row(
-                        live_start_row.saturating_add(i64::from(changed.y)),
-                        damaged_cols,
-                    )
-            })
-        };
-        let summary = buffer.apply(update);
-        if selection_overlaps_damage {
-            selection.clear();
+        self.damage_observer().prepare(&update);
+        write_lock(&self.buffer).apply(update)
+    }
+
+    /// View-local damage bookkeeping for a session-owned live buffer. Hosts
+    /// prepare every mounted view before applying the frame once to that buffer.
+    #[must_use]
+    pub fn damage_observer(&self) -> TerminalDamageObserver {
+        TerminalDamageObserver {
+            buffer: self.buffer.clone(),
+            shared: self.shared.clone(),
         }
-        summary
     }
 
     #[must_use]
@@ -797,7 +834,18 @@ impl TerminalElement {
     }
 
     pub fn set_find_highlights(&self, spans: Vec<FindSpan>) {
-        *mutex_lock(&self.shared.find_spans) = spans;
+        *mutex_lock(&self.shared.find_highlights) = FindHighlights {
+            spans,
+            current_bounds: None,
+        };
+    }
+
+    /// Window-space bounds of the active highlight from this element's latest
+    /// prepaint. Overlay siblings must read this after the terminal prepaints,
+    /// so font, clipping, and viewport changes use the same geometry as paint.
+    #[must_use]
+    pub fn current_find_match_bounds(&self) -> Option<Bounds<Pixels>> {
+        mutex_lock(&self.shared.find_highlights).current_bounds
     }
 
     /// Captures the small live grid and packages it with daemon history for a
@@ -839,8 +887,14 @@ impl TerminalElement {
         })
     }
 
-    fn shape_row(&self, row: &[GridCell], metrics: CellMetrics, window: &mut Window) -> ShapedLine {
-        let (text, runs) = self.row_text_and_runs(row);
+    fn shape_row(
+        &self,
+        row: &[GridCell],
+        graphemes: &[(u16, String)],
+        metrics: CellMetrics,
+        window: &mut Window,
+    ) -> ShapedLine {
+        let (text, runs) = self.row_text_and_runs(row, graphemes);
         window.text_system().shape_line(
             SharedString::from(text),
             self.font_size,
@@ -852,6 +906,7 @@ impl TerminalElement {
     fn prepare_row(
         &self,
         cells: Vec<GridCell>,
+        graphemes: Vec<(u16, String)>,
         row: u16,
         origin: Point<Pixels>,
         metrics: CellMetrics,
@@ -868,24 +923,43 @@ impl TerminalElement {
             &mut background_quads,
             &mut decoration_quads,
         );
-        let line = self.shape_row(&cells, metrics, window);
+        let line = self.shape_row(&cells, &graphemes, metrics, window);
         CachedRow {
             cells,
+            graphemes,
             background_quads,
             decoration_quads,
             line,
         }
     }
 
-    fn row_text_and_runs(&self, row: &[GridCell]) -> (String, Vec<TextRun>) {
+    fn row_text_and_runs(
+        &self,
+        row: &[GridCell],
+        graphemes: &[(u16, String)],
+    ) -> (String, Vec<TextRun>) {
         let mut text = String::with_capacity(row.len());
         let mut runs = Vec::<TextRun>::new();
 
-        for cell in row {
+        let mut graphemes = graphemes.iter().peekable();
+        for (column, cell) in row.iter().enumerate() {
             let resolved = self.theme.resolve_cell(*cell);
             let ch = render_char(*cell, resolved.visible);
-            let byte_len = ch.len_utf8();
+            let mut byte_len = ch.len_utf8();
             text.push(ch);
+            while graphemes
+                .peek()
+                .is_some_and(|(col, _)| usize::from(*col) < column)
+            {
+                graphemes.next();
+            }
+            if let Some((_, combining)) = graphemes.next_if(|(col, _)| usize::from(*col) == column)
+                && resolved.visible
+                && cell.scalar != 0
+            {
+                text.push_str(combining);
+                byte_len += combining.len();
+            }
 
             let run_font = styled_font(&self.font, resolved);
             let color = resolved.foreground.into();
@@ -911,15 +985,16 @@ impl TerminalElement {
     fn shape_cursor_glyph(
         &self,
         cell: GridCell,
+        combining: &str,
         metrics: CellMetrics,
         window: &mut Window,
     ) -> Option<ShapedLine> {
         let resolved = self.theme.resolve_cell(cell);
         let ch = render_char(cell, resolved.visible);
-        if ch == ' ' {
+        if !resolved.visible || (ch == ' ' && combining.is_empty()) {
             return None;
         }
-        let text = SharedString::from(ch.to_string());
+        let text = SharedString::from(format!("{ch}{combining}"));
         let run = TextRun {
             len: text.len(),
             font: styled_font(&self.font, resolved),
@@ -1018,6 +1093,7 @@ impl Element for TerminalElement {
         _cx: &mut App,
     ) -> Self::PrepaintState {
         if self.suspended {
+            mutex_lock(&self.shared.find_highlights).current_bounds = None;
             mutex_lock(&self.shared.row_cache).clear();
             mutex_lock(&self.shared.render_generations).clear();
             *mutex_lock(&self.shared.render_context) = None;
@@ -1042,6 +1118,7 @@ impl Element for TerminalElement {
         let focused = self.is_focused(window);
 
         if grid_is_empty {
+            mutex_lock(&self.shared.find_highlights).current_bounds = None;
             return TerminalPrepaintState {
                 started_at: None,
                 background_quads: Vec::new(),
@@ -1122,14 +1199,15 @@ impl Element for TerminalElement {
                     &mut decoration_quads,
                 );
                 let is_history = absolute < viewport.live_start_row();
-                let digest = digest_cells(&cells);
+                let graphemes = viewport.row_graphemes(&buffer, absolute);
+                let digest = digest_row(&cells, graphemes);
                 let line = if let Some(line) =
                     is_history.then(|| history.get(absolute, digest)).flatten()
                 {
                     hits += 1;
                     line.clone()
                 } else {
-                    let line = self.shape_row(&cells, metrics, window);
+                    let line = self.shape_row(&cells, graphemes, metrics, window);
                     // A row the viewport has not fetched yet composes as
                     // blank. Caching it is safe now that entries are content
                     // addressed: the blank's digest stops matching the moment
@@ -1184,6 +1262,7 @@ impl Element for TerminalElement {
                 if !force
                     && let Some(prepared) = cache[changed.row].as_mut()
                     && prepared.cells == changed.cells
+                    && prepared.graphemes == changed.graphemes
                 {
                     // Shapes are independent of row position. Backgrounds and
                     // decorations carry absolute bounds and must move with it.
@@ -1196,6 +1275,7 @@ impl Element for TerminalElement {
                 misses += 1;
                 cache[changed.row] = Some(self.prepare_row(
                     changed.cells,
+                    changed.graphemes,
                     changed.row as u16,
                     bounds.origin,
                     metrics,
@@ -1246,7 +1326,27 @@ impl Element for TerminalElement {
                 ));
             }
         }
-        for span in mutex_lock(&self.shared.find_spans).iter().copied() {
+        let mut highlights = mutex_lock(&self.shared.find_highlights);
+        highlights.current_bounds = highlights.spans.iter().find_map(|span| {
+            if !span.is_current || span.row >= visible_rows {
+                return None;
+            }
+            let start = span.start_col.min(visible_cols);
+            let end = span.end_col_exclusive.min(visible_cols);
+            (end > start).then(|| {
+                Bounds::new(
+                    point(
+                        bounds.left() + metrics.cell_width * start as f32,
+                        bounds.top() + metrics.line_height * span.row as f32,
+                    ),
+                    size(
+                        metrics.cell_width * (end - start) as f32,
+                        metrics.line_height,
+                    ),
+                )
+            })
+        });
+        for span in highlights.spans.iter().copied() {
             append_overlay_quad(
                 span.row,
                 span.start_col,
@@ -1261,6 +1361,8 @@ impl Element for TerminalElement {
                 &mut overlay_quads,
             );
         }
+
+        drop(highlights);
 
         let cursor_visible = cursor_should_render(focused, cursor.visible);
         let cursor = if cursor_visible
@@ -1285,7 +1387,15 @@ impl Element for TerminalElement {
                     Bounds::new(origin, size(metrics.cell_width, metrics.line_height)),
                     self.theme.cursor,
                 ),
-                glyph: self.shape_cursor_glyph(cell, metrics, window),
+                glyph: self.shape_cursor_glyph(
+                    cell,
+                    cache[usize::from(cursor.row)]
+                        .as_ref()
+                        .and_then(|row| row.graphemes.iter().find(|(col, _)| *col == cursor.col))
+                        .map_or("", |(_, text)| text.as_str()),
+                    metrics,
+                    window,
+                ),
                 block: self
                     .theme
                     .resolve_cell(cell)
@@ -2006,10 +2116,13 @@ mod block_tests {
                 Bounds::new(point(px(2.0), px(20.0 + top)), size(px(8.5), px(height)))
             );
             let terminal = TerminalElement::with_buffer(GridBuffer::default());
-            let (text, _) = terminal.row_text_and_runs(&[
-                cell,
-                GridCell::new('A' as u32, cell.fg, cell.bg, cell.style),
-            ]);
+            let (text, _) = terminal.row_text_and_runs(
+                &[
+                    cell,
+                    GridCell::new('A' as u32, cell.fg, cell.bg, cell.style),
+                ],
+                &[],
+            );
             assert_eq!(
                 text, " A",
                 "the block must reserve one text column without painting a second glyph"
@@ -2367,7 +2480,23 @@ mod history_cache_tests {
     use diri_proto::grid::{GridCell, TermColor, TermStyle};
     use gpui::{FontId, ShapedLine};
 
-    use super::{HistoryLineCache, HistoryShapeKey, digest_cells};
+    use super::{HistoryLineCache, HistoryShapeKey, digest_cells, digest_row};
+
+    #[test]
+    fn combining_only_changes_invalidate_history_shapes() {
+        let cells = row("e");
+        let mut cache = HistoryLineCache::default();
+        cache.validate(key(), 0);
+        let original = digest_row(&cells, &[(0, "\u{301}".into())]);
+        cache.insert(3, original, ShapedLine::default());
+        assert!(cache.get(3, original).is_some());
+        assert!(
+            cache
+                .get(3, digest_row(&cells, &[(0, "\u{308}".into())]))
+                .is_none()
+        );
+        assert!(cache.get(3, digest_row(&cells, &[])).is_none());
+    }
 
     fn key() -> HistoryShapeKey {
         HistoryShapeKey {
@@ -2818,6 +2947,7 @@ mod live_scroll_cache_tests {
             .map(|(row, ch)| {
                 Some(CachedRow {
                     cells: cells(ch),
+                    graphemes: Vec::new(),
                     background_quads: vec![fill(
                         Bounds::new(point(px(3.), px(row as f32 * 20.)), size(px(80.), px(20.))),
                         gpui::black(),
@@ -2842,6 +2972,7 @@ mod live_scroll_cache_tests {
                 row,
                 generation: 1,
                 cells: cells(ch),
+                graphemes: Vec::new(),
             })
             .collect()
     }
@@ -2891,5 +3022,61 @@ mod live_scroll_cache_tests {
         damage[1].cells[0].bg = diri_proto::grid::TermColor::Ansi(1);
         assert_eq!(align_scrolled_rows(&mut cache, &damage), 1);
         assert_ne!(cache[1].as_ref().unwrap().cells, damage[1].cells);
+    }
+}
+
+#[cfg(test)]
+mod grapheme_paint_tests {
+    use super::*;
+    use diri_proto::grid::TermStyle;
+
+    #[test]
+    fn parser_combining_text_reaches_shaping_and_invisible_cells_stay_hidden() {
+        let mut parser = diri_terminal_state::HeadlessScreen::new(12, 2);
+        parser.feed("e\u{301} A🙂B".as_bytes());
+        let mut grid = GridBuffer::default();
+        grid.apply(parser.full_snapshot());
+        let terminal = TerminalElement::with_buffer(grid.clone());
+        let (text, runs) =
+            terminal.row_text_and_runs(grid.row(0).unwrap(), &grid.annotations[0].graphemes);
+        assert!(text.starts_with("e\u{301} A🙂 B"));
+        assert_eq!(runs.iter().map(|run| run.len).sum::<usize>(), text.len());
+        grid.cells[0].style = TermStyle::INVISIBLE;
+        let (hidden, _) =
+            terminal.row_text_and_runs(grid.row(0).unwrap(), &grid.annotations[0].graphemes);
+        assert!(!hidden.contains('\u{301}'));
+        assert!(hidden.starts_with(' '));
+    }
+
+    #[test]
+    fn combining_only_output_damages_the_row_and_preserves_cell_identity() {
+        let mut parser = diri_terminal_state::HeadlessScreen::new(8, 2);
+        parser.feed(b"e");
+        let mut grid = GridBuffer::default();
+        grid.apply(parser.full_snapshot());
+        let before = grid.cells.clone();
+        let mut known = Vec::new();
+        assert_eq!(
+            grid.snapshot_damage(&mut known, 2, 8, true)
+                .changed_rows
+                .len(),
+            2
+        );
+        parser.feed("\u{301}".as_bytes());
+        grid.apply(parser.full_snapshot());
+        assert_eq!(grid.cells, before);
+        let damage = grid.snapshot_damage(&mut known, 2, 8, false);
+        assert_eq!(
+            damage.changed_rows[0].graphemes,
+            vec![(0, "\u{301}".into())]
+        );
+        let terminal = TerminalElement::with_buffer(grid);
+        let changed = &damage.changed_rows[0];
+        assert!(
+            terminal
+                .row_text_and_runs(&changed.cells, &changed.graphemes)
+                .0
+                .starts_with("e\u{301}")
+        );
     }
 }

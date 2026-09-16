@@ -1,3 +1,7 @@
+#[cfg(all(test, target_os = "macos"))]
+#[path = "root/peek_profile.rs"]
+mod peek_profile;
+
 use std::collections::HashSet;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -21,7 +25,7 @@ use crate::commands::{
     SelectPreviousSession, SelectSession1, SelectSession2, SelectSession3, SelectSession4,
     SelectSession5, SelectSession6, SelectSession7, SelectSession8, ToggleAuxiliaryTerminal,
     ToggleCommandPalette, ToggleHistory, ToggleInspector, ToggleOverview, ToggleQuickOpen,
-    ToggleSidebar,
+    ToggleSidebar, ToggleTabPeek,
 };
 use crate::external_drop::ExternalDropAction;
 use crate::icons::{SymbolWeight, sf_symbol, sf_symbol_weighted};
@@ -196,10 +200,17 @@ fn advance_seam(slide: &mut Option<SeamSlide>, settled: f32, now: Instant, windo
 }
 
 pub struct RootView {
+    active_workspace: Option<diri_proto::workspace::WorkspaceId>,
+    workspace_error: Option<String>,
+    workspace_workbench: Option<Entity<crate::workspace_workbench::WorkspaceWorkbench>>,
     sidebar: Entity<Sidebar>,
     terminal: Option<Entity<TerminalPane>>,
     navigation: Option<Entity<NavigationOverlay>>,
     session_surfaces: Option<Entity<SessionSurfaces>>,
+    #[cfg(target_os = "macos")]
+    _tab_gesture: Option<crate::macos::tab_gesture::TabGestureBridge>,
+    #[cfg(target_os = "macos")]
+    _tab_gesture_task: Option<Task<()>>,
     utility_surfaces: Option<Entity<UtilitySurfaces>>,
     launcher: Entity<LauncherOverlay>,
     inspector: Option<Entity<WorkbenchInspector>>,
@@ -375,6 +386,15 @@ impl RootView {
             .detach();
         }
         cx.subscribe_in(&sidebar, window, |this, _, event, window, cx| {
+            if let SidebarEvent::WorkspaceActivated(id) = event {
+                this.activate_saved_workspace(id.clone(), window, cx);
+            }
+            if matches!(event, SidebarEvent::WorkspaceTabActivated) {
+                if let Some(workbench) = &this.workspace_workbench {
+                    workbench.update(cx, |workbench, cx| workbench.focus(window, cx));
+                }
+                cx.notify();
+            }
             if matches!(event, SidebarEvent::RefreshUsageLimits) {
                 let _ = this.services.usage_limits_refresh.try_send(());
             }
@@ -424,6 +444,11 @@ impl RootView {
                 });
             }
             if matches!(event, SidebarEvent::SessionActivated) {
+                if this.active_workspace.is_some() {
+                    this.sidebar
+                        .update(cx, |sidebar, cx| sidebar.activate_workspace(None, cx));
+                    this.activate_saved_workspace(None, window, cx);
+                }
                 if this.launcher.read(cx).is_open() {
                     this.launcher
                         .update(cx, |launcher, cx| launcher.dismiss(cx));
@@ -434,7 +459,7 @@ impl RootView {
                 }
             }
             if matches!(event, SidebarEvent::FocusTerminal) {
-                if let Some(terminal) = &this.terminal {
+                if let Some(terminal) = this.active_terminal(cx) {
                     terminal.update(cx, |terminal, cx| terminal.focus(window, cx));
                     this.sync_auxiliary_terminal(window, cx);
                 } else {
@@ -703,7 +728,16 @@ impl RootView {
         });
 
         let activation_services = Arc::clone(&services);
-        let activation = cx.observe_window_activation(window, move |_this, window, _cx| {
+        let activation = cx.observe_window_activation(window, move |this, window, cx| {
+            if !window.is_window_active() {
+                #[cfg(target_os = "macos")]
+                if let Some(bridge) = &this._tab_gesture {
+                    bridge.cancel();
+                }
+                if let Some(surfaces) = &this.session_surfaces {
+                    surfaces.update(cx, |s, cx| s.cancel_tab_peek_immediately(cx));
+                }
+            }
             activation_services
                 .store
                 .store
@@ -822,16 +856,25 @@ impl RootView {
                     let terminal = terminal.clone();
                     let surfaces = surfaces.clone();
                     let mut changes = services.store.changes();
-                    cx.spawn(async move |_this, cx| {
+                    cx.spawn(async move |this, cx| {
                         loop {
                             match changes.recv().await {
                                 Ok(())
                                 | Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
-                                    let buffers = terminal
-                                        .update(cx, |terminal, _| terminal.resident_buffers());
-                                    surfaces.update(cx, |surfaces, _| {
-                                        surfaces.sync_resident_buffers(buffers);
+                                    terminal.update(cx, |terminal, cx| {
+                                        terminal.resident_buffers(cx);
                                     });
+                                    if this
+                                        .update(cx, |this, cx| {
+                                            let buffers = this.preview_buffers(cx);
+                                            surfaces.update(cx, |surfaces, _| {
+                                                surfaces.sync_resident_buffers(buffers)
+                                            });
+                                        })
+                                        .is_err()
+                                    {
+                                        return;
+                                    }
                                 }
                                 Err(tokio::sync::broadcast::error::RecvError::Closed) => return,
                             }
@@ -880,7 +923,27 @@ impl RootView {
                                         inspector.sync_workspace_session(cx)
                                     });
                                 }
+                                this.sync_inspector_context(cx);
                                 this.sync_auxiliary_terminal(window, cx);
+                                let error = this
+                                    .services
+                                    .store
+                                    .store
+                                    .read()
+                                    .expect("store")
+                                    .workspace_catalog()
+                                    .error
+                                    .clone();
+                                if error != this.workspace_error {
+                                    this.workspace_error = error.clone();
+                                    if let Some(error) = error {
+                                        this.show_quote_feedback(
+                                            "Workspace change was not saved",
+                                            error,
+                                            cx,
+                                        );
+                                    }
+                                }
                                 cx.notify();
                             })
                             .is_err()
@@ -947,11 +1010,116 @@ impl RootView {
                 }
             }
         });
+        if let Some(surfaces) = &session_surfaces {
+            cx.subscribe_in(
+                surfaces,
+                window,
+                |this, _, _: &crate::session_surfaces::TabPeekActivated, window, cx| {
+                    if let Some(terminal) = this.active_terminal(cx) {
+                        terminal.update(cx, |terminal, cx| terminal.focus(window, cx));
+                    }
+                    this.sync_auxiliary_terminal(window, cx);
+                },
+            )
+            .detach();
+        }
+        let peek_observer = session_surfaces.as_ref().map(|surfaces| {
+            let mut was_visible = false;
+            let mut previous_offset = 0.0;
+            cx.observe(surfaces, move |_this, surfaces, cx| {
+                let visible = surfaces.read(cx).tab_peek_visible();
+                let offset = surfaces.read(cx).tab_peek_offset(cx);
+                #[cfg(target_os = "macos")]
+                if let Some(bridge) = &_this._tab_gesture {
+                    bridge.set_revealed(visible);
+                }
+                if was_visible && !visible {
+                    #[cfg(target_os = "macos")]
+                    if let Some(bridge) = &_this._tab_gesture {
+                        bridge.cancel();
+                    }
+                }
+                // Output only repaints the preview entity. Root layout needs
+                // invalidation solely when terminal placement changes.
+                if was_visible != visible || previous_offset != offset {
+                    cx.notify();
+                }
+                was_visible = visible;
+                previous_offset = offset;
+            })
+        });
+        let peek_output =
+            terminal
+                .as_ref()
+                .zip(session_surfaces.as_ref())
+                .map(|(terminal, surfaces)| {
+                    let surfaces = surfaces.clone();
+                    cx.observe(terminal, move |this, _, cx| {
+                        if surfaces.read(cx).tab_peek_visible() {
+                            let buffers = this.preview_buffers(cx);
+                            surfaces.update(cx, |surface, cx| {
+                                surface.sync_resident_buffers(buffers);
+                                cx.notify();
+                            });
+                        }
+                    })
+                });
+        #[cfg(target_os = "macos")]
+        let (tab_gesture, tab_gesture_task) = if !preview
+            && let Some((bridge, mut frames)) =
+                crate::macos::tab_gesture::TabGestureBridge::install(window)
+        {
+            let task = cx.spawn_in(window, async move |this, cx| {
+                while frames.changed().await.is_ok() {
+                    let frame = *frames.borrow_and_update();
+                    if this
+                        .update_in(cx, |this, window, cx| {
+                            if window.is_window_active()
+                                && !this.launcher.read(cx).is_open()
+                                && !this
+                                    .navigation
+                                    .as_ref()
+                                    .is_some_and(|v| v.read(cx).is_open())
+                                && !this
+                                    .utility_surfaces
+                                    .as_ref()
+                                    .is_some_and(|v| v.read(cx).is_open())
+                                && !this.notification_panel_open
+                                && this.sidebar.read(cx).pending_close_copy().is_none()
+                                && this.quote_target_picker.is_none()
+                                && this.resize_origin.is_none()
+                                && this.terminal_resize_origin.is_none()
+                                && this.inspector_resize_origin.is_none()
+                                && let Some(surfaces) = &this.session_surfaces
+                            {
+                                surfaces.update(cx, |surfaces, cx| {
+                                    surfaces.tab_gesture(frame, cx);
+                                    surfaces.sync_tab_peek_focus(window, cx);
+                                });
+                            }
+                        })
+                        .is_err()
+                    {
+                        break;
+                    }
+                }
+            });
+            (Some(bridge), Some(task))
+        } else {
+            (None, None)
+        };
         let mut root = Self {
+            active_workspace: None,
+            workspace_error: None,
+            workspace_workbench: None,
             sidebar,
             terminal,
             navigation,
             session_surfaces,
+            #[cfg(target_os = "macos")]
+            _tab_gesture: tab_gesture,
+            #[cfg(target_os = "macos")]
+            _tab_gesture_task: tab_gesture_task,
             utility_surfaces,
             launcher,
             inspector,
@@ -1012,6 +1180,8 @@ impl RootView {
             _subscriptions: std::iter::once(activation)
                 .chain(bounds_observer)
                 .chain(appearance_observer)
+                .chain(peek_observer)
+                .chain(peek_output)
                 .collect(),
             _service_events: service_events,
             _surface_sync: surface_sync,
@@ -1020,6 +1190,18 @@ impl RootView {
             _browser_state_sync: browser_state_sync,
         };
         root.sync_auxiliary_terminal(window, cx);
+        let saved_workspace = root
+            .services
+            .store
+            .store
+            .read()
+            .expect("store")
+            .preferences()
+            .active_workspace
+            .clone();
+        if saved_workspace.is_some() && !preview {
+            root.activate_saved_workspace(saved_workspace, window, cx);
+        }
         if !preview {
             // Do not rely on AppKit emitting a move/resize after the observer
             // is installed: even an untouched first launch should become the
@@ -1061,6 +1243,100 @@ impl RootView {
         }));
     }
 
+    fn activate_saved_workspace(
+        &mut self,
+        id: Option<diri_proto::workspace::WorkspaceId>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.active_workspace = id;
+        if let Some(workbench) = &self.workspace_workbench {
+            workbench.update(cx, |workbench, cx| workbench.deactivate(cx));
+        }
+        if self.active_workspace.is_some() {
+            if let Some(auxiliary) = &self.auxiliary_terminal {
+                auxiliary.update(cx, |terminal, _| terminal.release_layout_control());
+            }
+            if let Some(terminal) = &self.terminal {
+                terminal.update(cx, |terminal, _| terminal.release_layout_control());
+            }
+            if self.workspace_workbench.is_none() {
+                let runtime = self.services.store.clone();
+                let tokio = self.services.tokio.clone();
+                let workbench = cx.new(|cx| {
+                    crate::workspace_workbench::WorkspaceWorkbench::new(runtime, tokio, window, cx)
+                });
+                cx.subscribe_in(
+                    &workbench,
+                    window,
+                    |this, _, event, window, cx| match event {
+                        crate::workspace_workbench::WorkspaceWorkbenchEvent::Notice(message) => {
+                            this.show_quote_feedback("Workspace", message.clone(), cx)
+                        }
+                        crate::workspace_workbench::WorkspaceWorkbenchEvent::RequestSplit {
+                            tab,
+                            pane,
+                        } => this.sidebar.update(cx, |sidebar, cx| {
+                            sidebar.choose_split_session(tab.clone(), pane.clone(), window, cx)
+                        }),
+                        crate::workspace_workbench::WorkspaceWorkbenchEvent::Terminal(
+                            TerminalPaneEvent::OpenFileReference { reference, cwd, .. },
+                        ) => {
+                            this.reveal_inspector(cx);
+                            if let Some(inspector) = &this.inspector {
+                                inspector.update(cx, |inspector, cx| {
+                                    inspector.open_file_reference(
+                                        cwd.clone(),
+                                        reference.clone(),
+                                        cx,
+                                    )
+                                });
+                            }
+                        }
+                        crate::workspace_workbench::WorkspaceWorkbenchEvent::Terminal(
+                            TerminalPaneEvent::ExternalDropFeedback { message },
+                        ) => this.show_quote_feedback("Dropped files", message.clone(), cx),
+                        crate::workspace_workbench::WorkspaceWorkbenchEvent::Terminal(
+                            TerminalPaneEvent::ContinueAccount(id),
+                        ) => {
+                            if let Some(surfaces) = &this.utility_surfaces {
+                                surfaces.update(cx, |surfaces, cx| {
+                                    surfaces.open_account_continuation(id.clone(), window, cx)
+                                });
+                            }
+                        }
+                    },
+                )
+                .detach();
+                cx.observe_in(&workbench, window, |this, _, window, cx| {
+                    this.sync_inspector_context(cx);
+                    this.sync_auxiliary_terminal(window, cx);
+                    if let Some(surfaces) = &this.session_surfaces
+                        && surfaces.read(cx).tab_peek_visible()
+                    {
+                        let buffers = this.preview_buffers(cx);
+                        surfaces.update(cx, |surfaces, cx| {
+                            surfaces.sync_resident_buffers(buffers);
+                            cx.notify();
+                        });
+                    }
+                })
+                .detach();
+                self.workspace_workbench = Some(workbench);
+            }
+        } else {
+            if let Some(workbench) = &self.workspace_workbench {
+                workbench.update(cx, |workbench, cx| workbench.deactivate(cx));
+            }
+            if let Some(terminal) = &self.terminal {
+                terminal.update(cx, |terminal, cx| terminal.focus(window, cx));
+            }
+        }
+        self.sync_inspector_context(cx);
+        self.sync_auxiliary_terminal(window, cx);
+        cx.notify();
+    }
+
     fn colors(&self) -> SemanticColors {
         let store = self
             .services
@@ -1096,6 +1372,58 @@ impl RootView {
         .detach();
     }
 
+    fn preview_buffers(
+        &self,
+        cx: &App,
+    ) -> std::collections::HashMap<SessionId, diri_term::element::SharedGridBuffer> {
+        let mut buffers = self
+            .terminal
+            .as_ref()
+            .map(|terminal| terminal.read(cx).resident_preview_buffers())
+            .unwrap_or_default();
+        if let Some(workbench) = &self.workspace_workbench {
+            buffers.extend(workbench.read(cx).resident_preview_buffers(cx));
+        }
+        buffers
+    }
+    fn active_session_id(&self, cx: &App) -> Option<SessionId> {
+        if self.active_workspace.is_some() {
+            self.workspace_workbench
+                .as_ref()
+                .and_then(|workbench| workbench.read(cx).focused_session_id())
+        } else {
+            self.services
+                .store
+                .store
+                .read()
+                .expect("store")
+                .selected_session_id()
+                .cloned()
+        }
+    }
+
+    fn sync_inspector_context(&mut self, cx: &mut Context<Self>) {
+        let context = self
+            .active_workspace
+            .as_ref()
+            .map(|_| self.active_session_id(cx));
+        if let Some(inspector) = &self.inspector {
+            inspector.update(cx, |inspector, cx| {
+                inspector.set_session_context(context, cx)
+            });
+        }
+    }
+
+    fn active_terminal(&self, cx: &App) -> Option<Entity<TerminalPane>> {
+        if self.active_workspace.is_some() {
+            self.workspace_workbench
+                .as_ref()
+                .and_then(|workbench| workbench.read(cx).focused_terminal())
+        } else {
+            self.terminal.clone()
+        }
+    }
+
     fn focused_quote_surface(&self, window: &Window, cx: &App) -> Option<QuoteSurface> {
         if let Some(auxiliary) = &self.auxiliary_terminal
             && auxiliary.read(cx).is_focused(window)
@@ -1107,7 +1435,7 @@ impl RootView {
         {
             return Some(QuoteSurface::Inspector);
         }
-        if let Some(terminal) = &self.terminal
+        if let Some(terminal) = self.active_terminal(cx)
             && terminal.read(cx).is_focused(window)
         {
             return Some(QuoteSurface::PrimaryTerminal);
@@ -1118,7 +1446,7 @@ impl RootView {
     fn quote_from_surface(&self, surface: QuoteSurface, cx: &App) -> Option<Quote> {
         match surface {
             QuoteSurface::PrimaryTerminal => self
-                .terminal
+                .active_terminal(cx)
                 .as_ref()
                 .and_then(|terminal| terminal.read(cx).quote_selection()),
             QuoteSurface::AuxiliaryTerminal => self
@@ -1146,7 +1474,7 @@ impl RootView {
     ) {
         let handle = match surface {
             QuoteSurface::PrimaryTerminal => self
-                .terminal
+                .active_terminal(cx)
                 .as_ref()
                 .map(|terminal| terminal.read(cx).quote_focus_handle()),
             QuoteSurface::AuxiliaryTerminal => self
@@ -1171,7 +1499,7 @@ impl RootView {
         // source surface rather than making Quote Selection palette-only fail.
         self.quote_from_surface(self.last_quote_surface, cx)
             .or_else(|| {
-                self.terminal
+                self.active_terminal(cx)
                     .as_ref()
                     .and_then(|terminal| terminal.read(cx).quote_selection())
             })
@@ -1211,14 +1539,7 @@ impl RootView {
                 );
                 return;
             }
-            let active = self
-                .services
-                .store
-                .store
-                .read()
-                .expect("session store lock poisoned")
-                .selected_session_id()
-                .cloned();
+            let active = self.active_session_id(cx);
             let highlighted = active
                 .as_ref()
                 .and_then(|id| targets.iter().position(|session| &session.id == id))
@@ -1234,14 +1555,7 @@ impl RootView {
             cx.notify();
             return;
         }
-        let target = self
-            .services
-            .store
-            .store
-            .read()
-            .expect("session store lock poisoned")
-            .selected_session_id()
-            .cloned();
+        let target = self.active_session_id(cx);
         let Some(target) = target else {
             self.show_quote_feedback(
                 "No active session",
@@ -1318,7 +1632,38 @@ impl RootView {
         self.open_quote_draft(target, picker.quote, window, cx);
     }
 
+    pub(crate) fn toggle_tab_peek(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.launcher.read(cx).is_open()
+            || self
+                .utility_surfaces
+                .as_ref()
+                .is_some_and(|view| view.read(cx).is_open())
+            || self.notification_panel_open
+            || self.sidebar.read(cx).pending_close_copy().is_some()
+            || self.quote_target_picker.is_some()
+        {
+            return;
+        }
+        if let Some(surfaces) = &self.session_surfaces {
+            let buffers = self.preview_buffers(cx);
+            surfaces.update(cx, |surfaces, cx| {
+                surfaces.sync_resident_buffers(buffers);
+                surfaces.toggle_tab_peek(cx);
+                surfaces.sync_tab_peek_focus(window, cx);
+            });
+        }
+    }
+
     fn on_key_down(&mut self, event: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(surfaces) = &self.session_surfaces
+            && surfaces.read(cx).tab_peek_visible()
+        {
+            surfaces.update(cx, |surfaces, cx| {
+                surfaces.handle_key_down(event, window, cx)
+            });
+            cx.stop_propagation();
+            return;
+        }
         // The close dialog overlays the focused surface without taking its
         // focus. Handle its keys first so they cannot reach the terminal or
         // sidebar beneath it, and focus is preserved when closing is canceled.
@@ -1499,6 +1844,7 @@ impl RootView {
                     });
                 }
             }
+            CommandId::ToggleTabPeek => self.toggle_tab_peek(window, cx),
             CommandId::ToggleOverview => {
                 if let Some(surfaces) = &self.session_surfaces {
                     surfaces.update(cx, |surfaces, cx| surfaces.toggle_overview(cx));
@@ -1519,6 +1865,34 @@ impl RootView {
                 if let Some(surfaces) = &self.utility_surfaces {
                     surfaces.update(cx, |surfaces, cx| surfaces.toggle_settings(cx));
                 }
+            }
+            CommandId::ToggleTabOrientation
+            | CommandId::HorizontalTabs
+            | CommandId::VerticalTabs => {
+                let orientation = match command {
+                    CommandId::HorizontalTabs => crate::store::TabOrientation::Horizontal,
+                    CommandId::VerticalTabs => crate::store::TabOrientation::Vertical,
+                    _ => self.sidebar.read(cx).tab_orientation().toggled(),
+                };
+                let navigation_focused = self.sidebar.read(cx).is_focused(window);
+                if let Err(error) = self.sidebar.update(cx, |sidebar, cx| {
+                    sidebar.set_tab_orientation(orientation, cx)
+                }) {
+                    self.show_quote_feedback(
+                        "Tab orientation",
+                        format!("Could not save tab orientation: {error}"),
+                        cx,
+                    );
+                    return;
+                }
+                if orientation == crate::store::TabOrientation::Horizontal
+                    && navigation_focused
+                    && !self.sidebar.read(cx).is_visible()
+                    && let Some(terminal) = &self.terminal
+                {
+                    terminal.update(cx, |terminal, cx| terminal.focus(window, cx));
+                }
+                cx.notify();
             }
             CommandId::ToggleSidebar => {
                 self.sidebar.update(cx, |sidebar, cx| sidebar.toggle(cx));
@@ -1667,8 +2041,9 @@ impl RootView {
         if self.preview {
             return false;
         }
+        self.sync_inspector_context(cx);
         if let Some(inspector) = &self.inspector
-            && inspector.read(cx).workspace_needs_terminal()
+            && (self.active_workspace.is_some() || inspector.read(cx).workspace_needs_terminal())
         {
             inspector.update(cx, |inspector, cx| {
                 inspector.select_workspace(crate::inspector::WorkspaceSurface::Terminal, cx);
@@ -1690,14 +2065,7 @@ impl RootView {
         if self.preview {
             return false;
         }
-        let selected = self
-            .services
-            .store
-            .store
-            .read()
-            .expect("session store lock poisoned")
-            .selected_session_id()
-            .cloned();
+        let selected = self.active_session_id(cx);
         let Some(parent) = selected else {
             return false;
         };
@@ -1733,15 +2101,7 @@ impl RootView {
 
     /// Hide the pane without starting or stopping the Engine-owned child shell.
     fn hide_auxiliary_terminal(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if let Some(parent) = self
-            .services
-            .store
-            .store
-            .read()
-            .expect("session store lock poisoned")
-            .selected_session_id()
-            .cloned()
-        {
+        if let Some(parent) = self.active_session_id(cx) {
             self.collapsed_auxiliary_parents.insert(parent);
         }
         self.auxiliary_terminal = None;
@@ -1751,7 +2111,7 @@ impl RootView {
         if let Some(inspector) = &self.inspector {
             inspector.update(cx, |inspector, cx| inspector.set_terminal_surface(None, cx));
         }
-        if let Some(primary) = &self.terminal {
+        if let Some(primary) = self.active_terminal(cx) {
             primary.update(cx, |terminal, cx| terminal.focus(window, cx));
         }
         cx.notify();
@@ -1768,6 +2128,7 @@ impl RootView {
             .inspector
             .as_ref()
             .map_or(0, |inspector| inspector.read(cx).terminal_slot());
+        let selected = self.active_session_id(cx);
         let (selected, auxiliary, spawn_pending) = {
             let mut store = self
                 .services
@@ -1775,7 +2136,7 @@ impl RootView {
                 .store
                 .write()
                 .expect("session store lock poisoned");
-            let selected = store.selected_session_id().cloned();
+
             let auxiliary = selected
                 .as_ref()
                 .and_then(|parent| store.auxiliary_terminal_for_slot(parent, slot));
@@ -1824,6 +2185,7 @@ impl RootView {
                     terminal.set_shell_entities(navigation.clone(), utility_surfaces.clone());
                 });
             }
+            cx.observe(&terminal, |_, _, cx| cx.notify()).detach();
             let should_focus = self.auxiliary_spawn_parent.as_ref() == Some(&parent);
             self.auxiliary_id = Some(session.id.clone());
             self.auxiliary_parent = Some(parent);
@@ -1947,6 +2309,14 @@ impl RootView {
     }
 
     fn on_key_up(&mut self, event: &KeyUpEvent, window: &mut Window, cx: &mut Context<Self>) {
+        if self
+            .session_surfaces
+            .as_ref()
+            .is_some_and(|s| s.read(cx).tab_peek_visible())
+        {
+            cx.stop_propagation();
+            return;
+        }
         if let Some(surfaces) = &self.session_surfaces {
             surfaces.update(cx, |surfaces, cx| {
                 surfaces.handle_key_up(event, window, cx);
@@ -2459,7 +2829,14 @@ impl RootView {
         };
         let card_width =
             (f32::from(viewport_size.width) - sidebar_width - inspector_width).max(0.0);
-        let card_height = f32::from(viewport_size.height).max(0.0);
+        let tabs_height = if self.sidebar.read(cx).tab_orientation()
+            == crate::store::TabOrientation::Horizontal
+        {
+            crate::tab_navigation::TAB_STRIP_HEIGHT
+        } else {
+            0.0
+        };
+        let card_height = (f32::from(viewport_size.height) - tabs_height).max(0.0);
         let selected = self
             .services
             .store
@@ -2482,6 +2859,26 @@ impl RootView {
                 || selected
                     .as_ref()
                     .is_some_and(|id| self.auxiliary_spawn_parent.as_ref() == Some(id)));
+        let peek_offset = self
+            .session_surfaces
+            .as_ref()
+            .map_or(0.0, |surfaces| surfaces.read(cx).tab_peek_offset(cx));
+        if let Some(surfaces) = &self.session_surfaces {
+            let buffers = self.preview_buffers(cx);
+            surfaces.update(cx, |surfaces, cx| {
+                surfaces.sync_resident_buffers(buffers);
+                surfaces.set_tab_peek_region(sidebar_width, tabs_height, card_width, cx);
+                surfaces.set_workspace_peek(
+                    self.active_workspace.clone(),
+                    crate::workspace_geometry::Rect {
+                        width: card_width,
+                        height: card_height,
+                        ..Default::default()
+                    },
+                    cx,
+                );
+            });
+        }
         let mut card = div()
             .relative()
             .flex_1()
@@ -2512,6 +2909,21 @@ impl RootView {
             .border_1()
             .border_color(terminal.primary.alpha(0.10));
 
+        if let Some(workbench) = &self.workspace_workbench {
+            let external_owner = if terminal_in_workspace_panel
+                && self
+                    .auxiliary_terminal
+                    .as_ref()
+                    .is_some_and(|terminal| terminal.read(cx).is_focused(window))
+            {
+                self.auxiliary_id.clone()
+            } else {
+                None
+            };
+            workbench.update(cx, |workbench, _| {
+                workbench.set_external_owner(external_owner)
+            });
+        }
         if terminal_in_workspace_panel && let Some(auxiliary) = &self.auxiliary_terminal {
             auxiliary.update(cx, |terminal, cx| {
                 terminal.set_shell_chrome(visible_sidebar, true, cx);
@@ -2521,15 +2933,81 @@ impl RootView {
                         x: sidebar_width + card_width,
                         y: Metrics::TITLE_BAR,
                         width: inspector_width,
-                        height: card_height.max(0.0),
+                        height: f32::from(viewport_size.height).max(0.0),
                     },
                     cx,
                 );
             });
         }
 
-        if self.preview && self.preview_scenario != PreviewScenario::Empty {
-            card = card.child(self.preview_workbench(terminal));
+        if tabs_height > 0.0 {
+            card = card.child(self.sidebar.update(cx, |sidebar, cx| {
+                sidebar.render_horizontal_tabs(card_width, cx)
+            }));
+        }
+        // Translation changes only paint placement. The stationary tab strip
+        // and settled PTY viewport never participate in the gesture layout.
+        let mut body = div()
+            .id("terminal-card-body")
+            .debug_selector(|| "terminal-card-body".into())
+            .relative()
+            .top(px(peek_offset))
+            .flex_none()
+            .flex()
+            .flex_col()
+            .w_full()
+            .h(px(card_height))
+            .min_h(px(0.0))
+            .bg(terminal.background);
+        if self.active_workspace.is_some() {
+            let tab = {
+                let store = self.services.store.store.read().expect("store");
+                store
+                    .workspace_catalog()
+                    .snapshot()
+                    .and_then(|snapshot| {
+                        snapshot
+                            .workspaces
+                            .iter()
+                            .find(|workspace| Some(&workspace.id) == self.active_workspace.as_ref())
+                    })
+                    .and_then(|workspace| {
+                        workspace
+                            .tabs
+                            .iter()
+                            .find(|tab| Some(&tab.id) == workspace.selected_tab.as_ref())
+                    })
+                    .cloned()
+            };
+            if let (Some(tab), Some(workbench)) = (tab, &self.workspace_workbench) {
+                workbench.update(cx, |workbench, cx| {
+                    workbench.set_tab(
+                        tab,
+                        TerminalViewport {
+                            x: sidebar_width,
+                            y: tabs_height,
+                            width: card_width,
+                            height: card_height,
+                        },
+                        window,
+                        cx,
+                    )
+                });
+                body = body.child(workbench.clone());
+                self.sync_inspector_context(cx);
+            } else {
+                if let Some(workbench) = &self.workspace_workbench {
+                    workbench.update(cx, |workbench, cx| workbench.deactivate(cx));
+                }
+                body = body.child(
+                    div()
+                        .p(px(28.0))
+                        .text_color(terminal.secondary)
+                        .child("Add a session to this workspace"),
+                );
+            }
+        } else if self.preview && self.preview_scenario != PreviewScenario::Empty {
+            body = body.child(self.preview_workbench(terminal));
         } else if split_open {
             let available_height = (card_height - 1.0).max(0.0);
             self.terminal_available_height = available_height;
@@ -2540,14 +3018,14 @@ impl RootView {
                     terminal.set_viewport(
                         TerminalViewport {
                             x: sidebar_width,
-                            y: 0.0,
+                            y: tabs_height,
                             width: card_width,
                             height: heights.primary,
                         },
                         cx,
                     );
                 });
-                card = card.child(
+                body = body.child(
                     div()
                         .flex_none()
                         .w_full()
@@ -2557,7 +3035,7 @@ impl RootView {
                         .child(primary.clone()),
                 );
             }
-            card = card.child(self.terminal_resize_handle(cx));
+            body = body.child(self.terminal_resize_handle(cx));
 
             let mut auxiliary = div()
                 .relative()
@@ -2572,7 +3050,7 @@ impl RootView {
                     terminal.set_viewport(
                         TerminalViewport {
                             x: sidebar_width,
-                            y: heights.primary + 1.0,
+                            y: tabs_height + heights.primary + 1.0,
                             width: card_width,
                             height: heights.auxiliary,
                         },
@@ -2625,7 +3103,7 @@ impl RootView {
                         }),
                 );
             }
-            card = card.child(auxiliary);
+            body = body.child(auxiliary);
         } else if let Some(primary) = &self.terminal {
             self.terminal_available_height = card_height;
             primary.update(cx, |terminal, cx| {
@@ -2633,17 +3111,34 @@ impl RootView {
                 terminal.set_viewport(
                     TerminalViewport {
                         x: sidebar_width,
-                        y: 0.0,
+                        y: tabs_height,
                         width: card_width,
                         height: card_height,
                     },
                     cx,
                 );
             });
-            card = card.child(primary.clone());
+            body = body.child(primary.clone());
         }
 
-        card.child(card_outline).into_any_element()
+        if let Some(auxiliary) = &self.auxiliary_terminal {
+            let duplicate = self.active_workspace.is_some()
+                && self.auxiliary_id.as_ref().is_some_and(|id| {
+                    self.workspace_workbench
+                        .as_ref()
+                        .is_some_and(|workbench| workbench.read(cx).visible_session(id))
+                });
+            let visible =
+                terminal_in_workspace_panel || (self.active_workspace.is_none() && split_open);
+            auxiliary.update(cx, |terminal, _| {
+                if visible && (!duplicate || terminal.is_focused(window)) {
+                    terminal.claim_layout_control(window);
+                } else {
+                    terminal.release_layout_control();
+                }
+            });
+        }
+        card.child(body).child(card_outline).into_any_element()
     }
 
     fn preview_workbench(&self, colors: SemanticColors) -> AnyElement {
@@ -3543,6 +4038,9 @@ impl Render for RootView {
             .on_action(cx.listener(|this, _: &ToggleHistory, window, cx| {
                 this.run_command(CommandId::ToggleHistory, window, cx);
             }))
+            .on_action(cx.listener(|this, _: &ToggleTabPeek, window, cx| {
+                this.toggle_tab_peek(window, cx);
+            }))
             .on_action(cx.listener(|this, _: &ToggleOverview, window, cx| {
                 this.run_command(CommandId::ToggleOverview, window, cx);
             }))
@@ -3563,6 +4061,19 @@ impl Render for RootView {
             }))
             .on_action(cx.listener(|this, _: &ToggleSidebar, window, cx| {
                 this.run_command(CommandId::ToggleSidebar, window, cx);
+            }))
+            .on_action(
+                cx.listener(|this, _: &commands::ToggleTabOrientation, window, cx| {
+                    this.run_command(CommandId::ToggleTabOrientation, window, cx);
+                }),
+            )
+            .on_action(
+                cx.listener(|this, _: &commands::HorizontalTabs, window, cx| {
+                    this.run_command(CommandId::HorizontalTabs, window, cx);
+                }),
+            )
+            .on_action(cx.listener(|this, _: &commands::VerticalTabs, window, cx| {
+                this.run_command(CommandId::VerticalTabs, window, cx);
             }))
             .on_action(cx.listener(|this, _: &FocusSidebar, window, cx| {
                 this.run_command(CommandId::FocusSidebar, window, cx);
@@ -3984,6 +4495,354 @@ mod tests {
     }
 
     #[gpui::test]
+    fn horizontal_tabs_reveal_selection_after_first_layout_and_resize(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let services = test_services();
+        let fixture = SidebarPreviewFixture::make(PreviewScenario::Typical);
+        let selected = fixture.selected_session_id.clone().unwrap();
+        {
+            let mut store = services.store.store.write().unwrap();
+            store.hydrate(fixture.list);
+            store.select(selected.clone());
+        }
+        let (root, cx) = cx.add_window_view(move |window, cx| {
+            RootView::new(services, false, PreviewScenario::Empty, window, cx)
+        });
+        root.update_in(cx, |root, window, cx| {
+            root.run_command(CommandId::HorizontalTabs, window, cx)
+        });
+        for width in [1000.0, 640.0] {
+            cx.simulate_resize(size(px(width), px(700.0)));
+            cx.run_until_parked();
+            let tab = cx.debug_bounds("horizontal-tab-preview-codex").unwrap();
+            let project = cx.debug_bounds("horizontal-tab-project").unwrap();
+            assert!(
+                tab.left() >= project.right(),
+                "selected tab hidden to the left"
+            );
+            assert!(
+                tab.right() <= px(width - 40.0),
+                "selected tab hidden to the right at {width}: {tab:?}"
+            );
+        }
+    }
+
+    #[gpui::test]
+    fn tab_orientation_preserves_terminal_identity_selection_and_restores_geometry(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        cx.update(|cx| {
+            cx.set_reduce_motion(true);
+            commands::bind_keys(cx, &Default::default());
+        });
+        let services = test_services();
+        let fixture = SidebarPreviewFixture::make(PreviewScenario::Typical);
+        let selected = fixture.selected_session_id.unwrap();
+        {
+            let mut store = services.store.store.write().unwrap();
+            store.hydrate(fixture.list);
+            store.select(selected.clone());
+        }
+        let store = services.store.clone();
+        let (root, cx) = cx.add_window_view(move |window, cx| {
+            RootView::new(services, false, PreviewScenario::Empty, window, cx)
+        });
+        cx.simulate_resize(size(px(1000.0), px(700.0)));
+        root.update_in(cx, |root, window, cx| {
+            root.run_command(CommandId::VerticalTabs, window, cx)
+        });
+        cx.run_until_parked();
+        let (entity, before, records) = root.read_with(cx, |root, cx| {
+            let terminal = root.terminal.as_ref().unwrap();
+            (
+                terminal.clone(),
+                terminal.read(cx).geometry_for_test().0.unwrap(),
+                store.store.read().unwrap().sessions().clone(),
+            )
+        });
+        cx.simulate_keystrokes(&commands::test_chords("cmd-k"));
+        cx.run_until_parked();
+        assert!(
+            root.read_with(cx, |root, cx| root
+                .navigation
+                .as_ref()
+                .unwrap()
+                .read(cx)
+                .is_open()),
+            "palette opens from terminal"
+        );
+        cx.simulate_keystrokes("h o r i z o n t a l");
+        cx.run_until_parked();
+        assert!(
+            cx.debug_bounds("palette-row-0").is_some(),
+            "orientation is searchable"
+        );
+        cx.simulate_keystrokes("enter");
+        cx.run_until_parked();
+        assert_eq!(
+            store.store.read().unwrap().preferences().tab_orientation,
+            crate::store::TabOrientation::Horizontal
+        );
+        assert!(cx.debug_bounds("horizontal-tabs").is_some());
+        let horizontal = root.read_with(cx, |root, cx| {
+            assert_eq!(root.terminal.as_ref(), Some(&entity));
+            entity.read(cx).geometry_for_test().0.unwrap()
+        });
+        assert_eq!(
+            horizontal.height,
+            before.height - crate::tab_navigation::TAB_STRIP_HEIGHT
+        );
+        assert!(horizontal.width > before.width);
+        assert_eq!(horizontal.y, crate::tab_navigation::TAB_STRIP_HEIGHT);
+        let picker = cx.debug_bounds("horizontal-tab-project").unwrap();
+        cx.simulate_click(picker.center(), Modifiers::default());
+        cx.executor().advance_clock(Duration::from_millis(300));
+        cx.run_until_parked();
+        root.read_with(cx, |root, cx| {
+            assert!(
+                root.sidebar.read(cx).is_peeking(),
+                "keyboard project picker remains open"
+            );
+            assert_eq!(
+                entity.read(cx).geometry_for_test().0.unwrap(),
+                horizontal,
+                "project picker overlays work without resizing"
+            );
+        });
+        cx.simulate_keystrokes("escape");
+        cx.executor().advance_clock(Duration::from_millis(300));
+        cx.run_until_parked();
+        cx.simulate_keystrokes(&commands::test_chords("cmd-shift-s"));
+        cx.run_until_parked();
+        root.read_with(cx, |root, cx| {
+            assert_eq!(root.terminal.as_ref(), Some(&entity));
+            assert_eq!(entity.read(cx).geometry_for_test().0.unwrap(), before);
+        });
+        let store = store.store.read().unwrap();
+        assert_eq!(store.selected_session_id(), Some(&selected));
+        assert_eq!(
+            store.sessions(),
+            &records,
+            "presentation must not mutate workload records"
+        );
+    }
+
+    #[gpui::test]
+    fn tab_peek_commit_focuses_same_terminal_while_cancel_restores_prior_focus(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let services = test_services();
+        let fixture = SidebarPreviewFixture::make(PreviewScenario::Typical);
+        {
+            let mut store = services.store.store.write().unwrap();
+            store.hydrate(fixture.list);
+            store.select(fixture.selected_session_id.unwrap());
+        }
+        let (root, cx) = cx.add_window_view(move |window, cx| {
+            RootView::new(services, false, PreviewScenario::Empty, window, cx)
+        });
+        cx.simulate_resize(size(px(1000.0), px(700.0)));
+        cx.run_until_parked();
+        let (original, terminal_focus) = root.read_with(cx, |root, cx| {
+            (
+                root.terminal.as_ref().unwrap().clone(),
+                root.terminal
+                    .as_ref()
+                    .unwrap()
+                    .read(cx)
+                    .quote_focus_handle(),
+            )
+        });
+        for key in ["escape", "enter"] {
+            root.update_in(cx, |root, window, cx| {
+                window.focus(&root.focus, cx);
+                root.toggle_tab_peek(window, cx);
+            });
+            cx.simulate_keystrokes(key);
+            cx.run_until_parked();
+            root.update_in(cx, |root, window, cx| {
+                assert_eq!(root.terminal.as_ref(), Some(&original));
+                assert!(if key == "escape" {
+                    root.focus.is_focused(window)
+                } else {
+                    terminal_focus.is_focused(window)
+                });
+                assert!(
+                    !root
+                        .session_surfaces
+                        .as_ref()
+                        .unwrap()
+                        .read(cx)
+                        .tab_peek_visible()
+                );
+            });
+        }
+    }
+
+    #[gpui::test]
+    fn tab_peek_translation_does_not_resize_the_terminal(cx: &mut gpui::TestAppContext) {
+        use crate::tab_peek::GestureFrame;
+        let services = test_services();
+        let fixture = SidebarPreviewFixture::make(PreviewScenario::Typical);
+        {
+            let mut store = services.store.store.write().unwrap();
+            store.hydrate(fixture.list);
+            store.select(fixture.selected_session_id.unwrap());
+        }
+        let (root, cx) = cx.add_window_view(move |window, cx| {
+            RootView::new(services, false, PreviewScenario::Empty, window, cx)
+        });
+        cx.simulate_resize(size(px(1000.0), px(700.0)));
+        cx.run_until_parked();
+        let original = root.read_with(cx, |root, cx| {
+            root.terminal.as_ref().unwrap().read(cx).geometry_for_test()
+        });
+        let selected = root.read_with(cx, |root, _| {
+            root.services
+                .store
+                .store
+                .read()
+                .unwrap()
+                .selected_session_id()
+                .cloned()
+        });
+        for distance in [10.0, 50.0, 140.0, 240.0, 380.0, 180.0, 40.0] {
+            root.update(cx, |root, cx| {
+                root.session_surfaces.as_ref().unwrap().update(cx, |s, cx| {
+                    s.tab_gesture(GestureFrame::Tracking(distance), cx)
+                })
+            });
+            cx.run_until_parked();
+            let current = root.read_with(cx, |root, cx| {
+                root.terminal.as_ref().unwrap().read(cx).geometry_for_test()
+            });
+            assert_eq!(
+                current, original,
+                "peek at {distance} changed terminal geometry"
+            );
+            assert_eq!(
+                root.read_with(cx, |root, _| root
+                    .services
+                    .store
+                    .store
+                    .read()
+                    .unwrap()
+                    .selected_session_id()
+                    .cloned()),
+                selected
+            );
+        }
+        cx.simulate_keystrokes("escape");
+        cx.run_until_parked();
+        assert_eq!(
+            root.read_with(cx, |root, cx| root
+                .terminal
+                .as_ref()
+                .unwrap()
+                .read(cx)
+                .geometry_for_test()),
+            original
+        );
+    }
+
+    #[gpui::test]
+    fn horizontal_peek_keeps_tabs_stationary_and_terminal_identity(cx: &mut gpui::TestAppContext) {
+        use crate::tab_peek::GestureFrame;
+        let services = test_services();
+        let fixture = SidebarPreviewFixture::make(PreviewScenario::Typical);
+        {
+            let mut store = services.store.store.write().unwrap();
+            store.hydrate(fixture.list);
+            store.select(fixture.selected_session_id.unwrap());
+        }
+        let (root, cx) = cx.add_window_view(move |window, cx| {
+            RootView::new(services, false, PreviewScenario::Empty, window, cx)
+        });
+        cx.simulate_resize(size(px(1000.0), px(700.0)));
+        root.update_in(cx, |root, window, cx| {
+            root.run_command(CommandId::HorizontalTabs, window, cx)
+        });
+        cx.run_until_parked();
+        let heading = cx.debug_bounds("horizontal-tabs").unwrap();
+        let body = cx.debug_bounds("terminal-card-body").unwrap();
+        let entity = root.read_with(cx, |root, _| root.terminal.clone().unwrap());
+        let original = root.read_with(cx, |root, cx| {
+            root.terminal.as_ref().unwrap().read(cx).geometry_for_test()
+        });
+        let selected = root.read_with(cx, |root, _| {
+            root.services
+                .store
+                .store
+                .read()
+                .unwrap()
+                .selected_session_id()
+                .cloned()
+        });
+        for distance in [10.0, 50.0, 140.0, 240.0, 380.0, 180.0, 40.0] {
+            root.update(cx, |root, cx| {
+                root.session_surfaces.as_ref().unwrap().update(cx, |s, cx| {
+                    s.tab_gesture(GestureFrame::Tracking(distance), cx)
+                })
+            });
+            cx.run_until_parked();
+            assert_eq!(cx.debug_bounds("horizontal-tabs").unwrap(), heading);
+            let moved = cx.debug_bounds("terminal-card-body").unwrap();
+            assert_eq!(moved.size, body.size);
+            let overlay = cx.debug_bounds("TAB_PEEK").unwrap();
+            assert_eq!(overlay.top(), heading.bottom());
+            let current = root.read_with(cx, |root, cx| {
+                assert_eq!(root.terminal.as_ref(), Some(&entity));
+                root.terminal.as_ref().unwrap().read(cx).geometry_for_test()
+            });
+            assert_eq!(
+                current, original,
+                "peek at {distance} changed terminal geometry"
+            );
+            assert_eq!(
+                root.read_with(cx, |root, _| root
+                    .services
+                    .store
+                    .store
+                    .read()
+                    .unwrap()
+                    .selected_session_id()
+                    .cloned()),
+                selected
+            );
+        }
+        cx.simulate_keystrokes("escape");
+        cx.run_until_parked();
+        assert_eq!(cx.debug_bounds("horizontal-tabs").unwrap(), heading);
+        assert!(cx.debug_bounds("terminal-card-body").unwrap().top() > body.top());
+        cx.executor()
+            .advance_clock(std::time::Duration::from_millis(250));
+        root.update_in(cx, |_, window, cx| window.simulate_next_frame(cx));
+        cx.run_until_parked();
+        assert_eq!(cx.debug_bounds("terminal-card-body").unwrap(), body);
+        let trigger = cx.debug_bounds("horizontal-peek-tabs").unwrap();
+        cx.simulate_click(trigger.center(), Modifiers::default());
+        cx.run_until_parked();
+        assert!(cx.debug_bounds("TAB_PEEK").is_some());
+        cx.simulate_keystrokes("escape");
+        cx.run_until_parked();
+        cx.executor()
+            .advance_clock(std::time::Duration::from_millis(250));
+        root.update_in(cx, |_, window, cx| window.simulate_next_frame(cx));
+        cx.run_until_parked();
+        assert!(cx.debug_bounds("TAB_PEEK").is_none());
+        assert_eq!(
+            root.read_with(cx, |root, cx| root
+                .terminal
+                .as_ref()
+                .unwrap()
+                .read(cx)
+                .geometry_for_test()),
+            original
+        );
+    }
+
+    #[gpui::test]
     fn fullscreen_terminal_tracks_drawable_size_with_windowed_restore_bounds(
         cx: &mut gpui::TestAppContext,
     ) {
@@ -3998,6 +4857,8 @@ mod tests {
         let (root, cx) = cx.add_window_view(move |window, cx| {
             RootView::new(services, false, PreviewScenario::Empty, window, cx)
         });
+        root.update_in(cx, |_, window, _| window.activate_window());
+        cx.run_until_parked();
         let windowed = size(px(1000.0), px(700.0));
         cx.simulate_resize(windowed);
         cx.run_until_parked();
@@ -4068,6 +4929,8 @@ mod tests {
         let (root, cx) = cx.add_window_view(move |window, cx| {
             RootView::new(services, false, PreviewScenario::Empty, window, cx)
         });
+        root.update_in(cx, |_, window, _| window.activate_window());
+        cx.run_until_parked();
         let mut input = root.update(cx, |root, cx| {
             root.terminal
                 .as_ref()
@@ -4387,6 +5250,421 @@ mod tests {
 
     #[cfg(target_os = "macos")]
     #[test]
+    #[ignore = "real disposable PTYs and native screenshot to DIRI_WORKSPACE_LIVE_SCREENSHOT"]
+    fn render_workspace_real_pty_geometry_screenshot() {
+        use gpui::HeadlessAppContext;
+        let output = std::env::var("DIRI_WORKSPACE_LIVE_SCREENSHOT").unwrap();
+        let fixture = crate::workspace_fixture::LiveWorkspace::start();
+        let platform = gpui_platform::current_platform(true);
+        let mut cx = HeadlessAppContext::with_platform(
+            platform.text_system(),
+            Arc::new(diri_ui::IconAssets),
+            gpui_platform::current_headless_renderer,
+        );
+        cx.update(|cx| {
+            crate::fonts::init(cx);
+            cx.set_reduce_motion(true);
+        });
+        let mut previous_cols = None;
+        for width in [1100.0, 720.0] {
+            let window = cx
+                .open_window(size(px(width), px(700.0)), |window, cx| {
+                    cx.new(|cx| {
+                        RootView::new(
+                            fixture.services.clone(),
+                            false,
+                            PreviewScenario::Empty,
+                            window,
+                            cx,
+                        )
+                    })
+                })
+                .unwrap();
+            cx.update_window(window.into(), |_, window, _| window.activate_window())
+                .unwrap();
+            cx.run_until_parked();
+            let deadline = std::time::Instant::now() + Duration::from_secs(6);
+            let expected = loop {
+                cx.run_until_parked();
+                let expected = cx
+                    .update_window(window.into(), |root, window, cx| {
+                        let root = root.downcast::<RootView>().unwrap();
+                        assert_eq!(
+                            root.read(cx).active_workspace.as_ref(),
+                            Some(&fixture.workspace)
+                        );
+                        assert!(window.is_window_active());
+                        root.read(cx)
+                            .workspace_workbench
+                            .as_ref()
+                            .unwrap()
+                            .read(cx)
+                            .send_owned_fixture_input(cx)
+                    })
+                    .unwrap();
+                if expected.len() == 2 {
+                    break expected;
+                }
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "both visible session owners resize"
+                );
+                std::thread::sleep(Duration::from_millis(5));
+            };
+            assert!(
+                expected
+                    .iter()
+                    .all(|(_, cols, rows)| *cols < 120 && *rows > 0)
+            );
+            loop {
+                cx.run_until_parked();
+                let complete = cx
+                    .update_window(window.into(), |root, _, cx| {
+                        let root = root.downcast::<RootView>().unwrap();
+                        let buffers = root
+                            .read(cx)
+                            .workspace_workbench
+                            .as_ref()
+                            .unwrap()
+                            .read(cx)
+                            .resident_preview_buffers(cx);
+                        expected.iter().all(|(id, cols, rows)| {
+                            let grid = buffers[id].read().unwrap();
+                            let text = (0..grid.rows)
+                                .filter_map(|row| grid.row_text_with_columns(row as usize))
+                                .map(|(text, _)| text)
+                                .collect::<String>();
+                            let compact = text
+                                .chars()
+                                .filter(|ch| !ch.is_whitespace())
+                                .collect::<String>();
+                            grid.cols == *cols
+                                && grid.rows == *rows
+                                && compact.contains("Nofixedscreenshotgridisusedhere.")
+                                && compact.contains(&format!("columns:{rows}{cols}"))
+                        })
+                    })
+                    .unwrap();
+                if complete {
+                    break;
+                }
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "PTY output wraps completely at actual owned geometry"
+                );
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            fixture.verify_geometry(&expected);
+            cx.update_window(window.into(), |root, window, cx| {
+                root.downcast::<RootView>()
+                    .unwrap()
+                    .update(cx, |root, cx| root.toggle_tab_peek(window, cx));
+            })
+            .unwrap();
+            for _ in 0..10 {
+                cx.run_until_parked();
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            fixture.verify_geometry(&expected);
+            cx.update_window(window.into(), |root, window, cx| {
+                root.downcast::<RootView>()
+                    .unwrap()
+                    .update(cx, |root, cx| root.toggle_tab_peek(window, cx));
+            })
+            .unwrap();
+            cx.run_until_parked();
+            fixture.verify_geometry(&expected);
+            eprintln!("window={width}, actual PTY geometry={expected:?}");
+            let cols = expected.iter().map(|(_, cols, _)| *cols).sum::<u16>();
+            if let Some(previous) = previous_cols {
+                assert!(cols < previous, "narrower window changes actual PTY widths");
+            }
+            previous_cols = Some(cols);
+            cx.capture_screenshot(window.into())
+                .unwrap()
+                .save(&output)
+                .unwrap();
+            cx.update_window(window.into(), |_, window, _| window.remove_window())
+                .unwrap();
+            cx.run_until_parked();
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    #[ignore = "writes synthetic saved workspace UI to DIRI_WORKSPACE_SCREENSHOT"]
+    fn render_workspace_workbench_screenshot() {
+        use diri_proto::workspace::*;
+        use gpui::HeadlessAppContext;
+        let output = std::env::var("DIRI_WORKSPACE_SCREENSHOT").unwrap();
+        let platform = gpui_platform::current_platform(true);
+        let mut cx = HeadlessAppContext::with_platform(
+            platform.text_system(),
+            Arc::new(diri_ui::IconAssets),
+            gpui_platform::current_headless_renderer,
+        );
+        cx.update(|cx| {
+            crate::fonts::init(cx);
+            cx.set_reduce_motion(std::env::var_os("DIRI_WORKSPACE_PEEK").is_none());
+        });
+        let services = test_services();
+        let fixture = SidebarPreviewFixture::make(PreviewScenario::Typical);
+        let workspace = WorkspaceId::new("release-workspace");
+        let tab = TabId::new("release-tab");
+        let first = PaneId::new("coding");
+        {
+            let mut store = services.store.store.write().unwrap();
+            store.hydrate(fixture.list);
+            store
+                .update_preferences(|prefs| {
+                    prefs.terminal_theme = if std::env::var_os("DIRI_VISUAL_LIGHT").is_some() {
+                        "dirijor-light"
+                    } else {
+                        "dirijor-dark"
+                    }
+                    .into();
+                })
+                .unwrap();
+            store.seed_workspace_snapshot_for_test(WorkspaceSnapshot {
+                revision: 7,
+                workspaces: vec![WorkspaceRecord {
+                    id: workspace.clone(),
+                    name: "Release room".into(),
+                    selected_tab: Some(tab.clone()),
+                    tabs: vec![
+                        WorkspaceTab {
+                            id: tab,
+                            title: Some("Implement and verify".into()),
+                            focused_pane: first.clone(),
+                            zoomed_pane: None,
+                            layout: LayoutNode::Split {
+                                id: SplitId::new("split-main"),
+                                axis: LayoutAxis::Horizontal,
+                                fraction: 0.58,
+                                first: Box::new(LayoutNode::Pane {
+                                    id: first,
+                                    session_id: SessionId::new("preview-claude"),
+                                }),
+                                second: Box::new(LayoutNode::Pane {
+                                    id: PaneId::new("verification"),
+                                    session_id: SessionId::new("preview-codex"),
+                                }),
+                            },
+                        },
+                        WorkspaceTab {
+                            id: TabId::new("notes-tab"),
+                            title: Some("Review notes".into()),
+                            focused_pane: PaneId::new("notes"),
+                            zoomed_pane: None,
+                            layout: LayoutNode::Pane {
+                                id: PaneId::new("notes"),
+                                session_id: SessionId::new("preview-claude"),
+                            },
+                        },
+                    ],
+                }],
+                ..Default::default()
+            });
+        }
+        {
+            let mut store = services.store.store.write().unwrap();
+            let mut snapshot = store.workspace_catalog().snapshot().unwrap().clone();
+            let tab = &mut snapshot.workspaces[0].tabs[0];
+            if std::env::var_os("DIRI_WORKSPACE_NESTED").is_some()
+                && let LayoutNode::Split { second, .. } = &mut tab.layout
+            {
+                **second = LayoutNode::Split {
+                    id: SplitId::new("split-detail"),
+                    axis: LayoutAxis::Vertical,
+                    fraction: 0.6,
+                    first: second.clone(),
+                    second: Box::new(LayoutNode::Pane {
+                        id: PaneId::new("notes-duplicate"),
+                        session_id: SessionId::new("preview-claude"),
+                    }),
+                };
+            }
+            if std::env::var_os("DIRI_WORKSPACE_ZOOM").is_some() {
+                tab.focused_pane = PaneId::new("verification");
+                tab.zoomed_pane = Some(tab.focused_pane.clone());
+            }
+            store.seed_workspace_snapshot_for_test(snapshot);
+        }
+        let width = if std::env::var_os("DIRI_WORKSPACE_NARROW").is_some() {
+            720.0
+        } else {
+            1200.0
+        };
+        let window = cx
+            .open_window(size(px(width), px(800.0)), |window, cx| {
+                cx.new(|cx| {
+                    let root = RootView::new(services, false, PreviewScenario::Empty, window, cx);
+                    root.sidebar.update(cx, |sidebar, cx| {
+                        sidebar
+                            .set_tab_orientation(
+                                if std::env::var_os("DIRI_WORKSPACE_HORIZONTAL").is_some() {
+                                    crate::store::TabOrientation::Horizontal
+                                } else {
+                                    crate::store::TabOrientation::Vertical
+                                },
+                                cx,
+                            )
+                            .unwrap();
+                        sidebar.activate_workspace(Some(workspace), cx);
+                    });
+                    root
+                })
+            })
+            .unwrap();
+        cx.run_until_parked();
+        cx.update_window(window.into(), |root, _, cx| {
+            let root = root.downcast::<RootView>().unwrap();
+            let workbench = root.read(cx).workspace_workbench.clone().unwrap();
+            workbench.update(cx, |workbench, cx| workbench.seed_panes_for_test(cx));
+        })
+        .unwrap();
+        cx.run_until_parked();
+        if let Ok(mode) = std::env::var("DIRI_WORKSPACE_PEEK") {
+            cx.update_window(window.into(), |root, window, cx| {
+                let root = root.downcast::<RootView>().unwrap();
+                root.update(cx, |root, cx| {
+                    root.toggle_tab_peek(window, cx);
+                    root.session_surfaces
+                        .as_ref()
+                        .unwrap()
+                        .update(cx, |surface, cx| {
+                            let distance = if mode == "overview" { 380.0 } else { 140.0 };
+                            surface
+                                .tab_gesture(crate::tab_peek::GestureFrame::Tracking(distance), cx);
+                            surface
+                                .tab_gesture(crate::tab_peek::GestureFrame::Released(distance), cx);
+                        });
+                });
+            })
+            .unwrap();
+            cx.run_until_parked();
+        }
+        let image = cx.capture_screenshot(window.into()).unwrap();
+        image.save(&output).unwrap();
+        cx.update_window(window.into(), |_, window, _| window.remove_window())
+            .unwrap();
+        cx.run_until_parked();
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    #[ignore = "writes the complete tab peek workbench to DIRI_PEEK_ROOT_SCREENSHOT"]
+    fn render_tab_peek_workbench_screenshot() {
+        use diri_term::buffer::GridBuffer;
+        use gpui::HeadlessAppContext;
+        let output = std::env::var("DIRI_PEEK_ROOT_SCREENSHOT").expect("output path");
+        let distance = std::env::var("DIRI_PEEK_DISTANCE")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(140.0);
+        let platform = gpui_platform::current_platform(true);
+        let mut cx = HeadlessAppContext::with_platform(
+            platform.text_system(),
+            Arc::new(diri_ui::IconAssets),
+            gpui_platform::current_headless_renderer,
+        );
+        cx.update(|cx| crate::fonts::init(cx));
+        let services = test_services();
+        let live_source = std::env::var_os("DIRI_PEEK_LIVE")
+            .map(|_| crate::tab_preview::screenshot_fixture::Source::new());
+        let mut fixture = SidebarPreviewFixture::make(PreviewScenario::Typical);
+        let selected = fixture.selected_session_id.clone().unwrap();
+        let project = fixture
+            .list
+            .sessions
+            .iter()
+            .find(|s| s.id == selected)
+            .unwrap()
+            .project_id
+            .clone();
+        fixture.list.sessions.retain(|s| s.project_id == project);
+        {
+            let mut store = services.store.store.write().unwrap();
+            store.hydrate(fixture.list);
+            store.select(selected.clone());
+            store
+                .update_preferences(|p| {
+                    p.terminal_theme = if std::env::var_os("DIRI_VISUAL_LIGHT").is_some() {
+                        "dirijor-light"
+                    } else {
+                        "dirijor-dark"
+                    }
+                    .into()
+                })
+                .unwrap();
+        }
+        let width = if std::env::var_os("DIRI_PEEK_NARROW").is_some() {
+            640.0
+        } else {
+            1200.0
+        };
+        let window = cx.open_window(size(px(width), px(800.0)), |window, cx| {
+            cx.new(|cx| {
+                let root = RootView::new(services, false, PreviewScenario::Empty, window, cx);
+                if std::env::var_os("DIRI_PEEK_HORIZONTAL").is_some() {
+                    root.sidebar.update(cx, |sidebar, cx| {
+                        sidebar.set_tab_orientation(crate::store::TabOrientation::Horizontal, cx)
+                    }).unwrap();
+                }
+                let mut grid = GridBuffer::new(100, 36);
+            let sample = "$ pwd\n/Users/you/work/diri\n\n$ cargo test --workspace\n\nrunning 4 tests\ntest session_identity_survives ... ok\ntest preview_does_not_resize ... ok\ntest controller_stays_attached ... ok\ntest input_returns_to_terminal ... ok\n\ntest result: ok. 4 passed; 0 failed\n\n$ git status --short\n M crates/diri-app/src/tab_peek.rs\n M crates/diri-app/src/root.rs\n\n$ ";
+                for (y, line) in sample.lines().enumerate() {
+                    for (x, ch) in line.chars().enumerate() {
+                        grid.cells[y * 100 + x].scalar = ch as u32;
+                    }
+                }
+                let terminal = root.terminal.as_ref().unwrap();
+                terminal.update(cx, |terminal, cx| {
+                    terminal.seed_preview_grid_for_test(grid, cx);
+                    cx.notify();
+                });
+                let buffers = terminal.read(cx).resident_preview_buffers();
+                root.session_surfaces.as_ref().unwrap().update(cx, |surface, cx| {
+                    if let Some(source) = &live_source {
+                        surface.configure_preview_fixture(source);
+                    }
+                    surface.sync_resident_buffers(buffers);
+                    surface.tab_gesture(crate::tab_peek::GestureFrame::Tracking(distance), cx);
+                });
+                root
+            })
+        }).unwrap();
+        cx.run_until_parked();
+        if let Some(source) = &live_source {
+            let states = cx
+                .update_window(window.into(), |root, _, cx| {
+                    root.downcast::<RootView>()
+                        .unwrap()
+                        .read(cx)
+                        .session_surfaces
+                        .as_ref()
+                        .unwrap()
+                        .read(cx)
+                        .preview_fixture_states()
+                })
+                .unwrap();
+            source.settle(states);
+            cx.run_until_parked();
+        }
+        if let Some(profile) = std::env::var_os("DIRI_PEEK_PROFILE") {
+            super::peek_profile::run(&mut cx, window, std::path::Path::new(&profile));
+        }
+        cx.capture_screenshot(window.into())
+            .unwrap()
+            .save(output)
+            .unwrap();
+        cx.update_window(window.into(), |_, window, _| window.remove_window())
+            .unwrap();
+        cx.run_until_parked();
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
     #[ignore = "writes a visual preview to DIRI_RECOVERY_SCREENSHOT"]
     fn render_recovery_notice_screenshot() {
         use gpui::{AppContext as _, HeadlessAppContext};
@@ -4433,6 +5711,91 @@ mod tests {
         cx.update_window(window.into(), |_, window, _| window.remove_window())
             .unwrap();
         cx.run_until_parked();
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    #[ignore = "writes deterministic tab orientation screenshots to DIRI_TABS_SCREENSHOTS"]
+    fn render_tab_orientation_screenshots() {
+        use gpui::{AppContext as _, HeadlessAppContext};
+        let output = std::env::var("DIRI_TABS_SCREENSHOTS").expect("DIRI_TABS_SCREENSHOTS");
+        std::fs::create_dir_all(&output).unwrap();
+        let platform = gpui_platform::current_platform(true);
+        let mut cx = HeadlessAppContext::with_platform(
+            platform.text_system(),
+            Arc::new(diri_ui::IconAssets),
+            gpui_platform::current_headless_renderer,
+        );
+        cx.update(|cx| {
+            crate::fonts::init(cx);
+            cx.set_reduce_motion(true);
+        });
+        for (name, orientation, light, width) in [
+            (
+                "horizontal-dark",
+                crate::store::TabOrientation::Horizontal,
+                false,
+                1000.0,
+            ),
+            (
+                "horizontal-light",
+                crate::store::TabOrientation::Horizontal,
+                true,
+                1000.0,
+            ),
+            (
+                "horizontal-narrow",
+                crate::store::TabOrientation::Horizontal,
+                false,
+                640.0,
+            ),
+            (
+                "vertical-light",
+                crate::store::TabOrientation::Vertical,
+                true,
+                1000.0,
+            ),
+        ] {
+            let services = test_services();
+            let fixture = SidebarPreviewFixture::make(PreviewScenario::Typical);
+            {
+                let mut store = services.store.store.write().unwrap();
+                store.hydrate(fixture.list);
+                store.select(fixture.selected_session_id.unwrap());
+                store
+                    .update_preferences(|prefs| {
+                        prefs.terminal_theme = if light {
+                            "dirijor-light"
+                        } else {
+                            "dirijor-dark"
+                        }
+                        .into()
+                    })
+                    .unwrap();
+            }
+            let window = cx
+                .open_window(size(px(width), px(700.0)), |window, cx| {
+                    cx.new(|cx| {
+                        let root =
+                            RootView::new(services, false, PreviewScenario::Empty, window, cx);
+                        root.sidebar
+                            .update(cx, |sidebar, cx| {
+                                sidebar.set_tab_orientation(orientation, cx)
+                            })
+                            .unwrap();
+                        root
+                    })
+                })
+                .unwrap();
+            cx.run_until_parked();
+            cx.capture_screenshot(window.into())
+                .unwrap()
+                .save(std::path::Path::new(&output).join(format!("{name}.png")))
+                .unwrap();
+            cx.update_window(window.into(), |_, window, _| window.remove_window())
+                .unwrap();
+            cx.run_until_parked();
+        }
     }
 
     #[cfg(target_os = "macos")]
@@ -4717,6 +6080,85 @@ mod tests {
             cfg!(target_os = "macos"),
             "macOS arms window move on empty chrome; Linux leaves it to the compositor"
         );
+    }
+
+    #[gpui::test]
+    fn saved_workspace_auxiliary_uses_focused_parent_without_global_selection(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        use diri_proto::workspace::*;
+        let services = test_services();
+        let fixture = SidebarPreviewFixture::make(PreviewScenario::Typical);
+        let parent = fixture.list.sessions[0].id.clone();
+        let other = fixture.list.sessions[1].id.clone();
+        let mut child = fixture.list.sessions[0].clone();
+        child.id = SessionId::new("saved-pane-shell");
+        child.parent = Some(parent.clone());
+        child.kind = AgentKind::SHELL;
+        child.title = crate::store::AUXILIARY_TERMINAL_TITLE.into();
+        let child_id = child.id.clone();
+        let workspace = WorkspaceId::new("focused-context");
+        let tab = TabId::new("focused-context-tab");
+        let pane = PaneId::new("focused-context-pane");
+        {
+            let mut store = services.store.store.write().unwrap();
+            store.hydrate(fixture.list);
+            store.upsert_session(child);
+            store.select(other.clone());
+            store.seed_workspace_snapshot_for_test(WorkspaceSnapshot {
+                revision: 1,
+                workspaces: vec![WorkspaceRecord {
+                    id: workspace.clone(),
+                    name: "Window context".into(),
+                    selected_tab: Some(tab.clone()),
+                    tabs: vec![WorkspaceTab {
+                        id: tab,
+                        title: None,
+                        focused_pane: pane.clone(),
+                        zoomed_pane: None,
+                        layout: LayoutNode::Pane {
+                            id: pane,
+                            session_id: parent.clone(),
+                        },
+                    }],
+                }],
+                ..Default::default()
+            });
+        }
+        let runtime = services.store.clone();
+        let (root, cx) = cx.add_window_view(move |window, cx| {
+            RootView::new(services, false, PreviewScenario::Empty, window, cx)
+        });
+        root.update_in(cx, |root, window, cx| {
+            root.activate_saved_workspace(Some(workspace), window, cx)
+        });
+        cx.simulate_resize(size(px(1100.0), px(800.0)));
+        cx.run_until_parked();
+        root.update_in(cx, |root, window, cx| {
+            assert_eq!(root.active_session_id(cx), Some(parent.clone()));
+            assert!(root.open_auxiliary_terminal(window, cx));
+            assert_eq!(root.auxiliary_parent, Some(parent.clone()));
+            assert_eq!(root.auxiliary_id, Some(child_id));
+            assert!(root.inspector_open);
+            assert!(root.inspector.as_ref().unwrap().read(cx).is_terminal_tab());
+        });
+        assert_eq!(
+            runtime.store.read().unwrap().selected_session_id(),
+            Some(&other)
+        );
+        cx.run_until_parked();
+        root.update_in(cx, |root, window, cx| {
+            root.hide_auxiliary_terminal(window, cx);
+            assert!(root.auxiliary_terminal.is_none());
+            assert!(
+                runtime
+                    .store
+                    .read()
+                    .unwrap()
+                    .auxiliary_terminal_for(&parent)
+                    .is_some()
+            );
+        });
     }
 
     #[gpui::test]

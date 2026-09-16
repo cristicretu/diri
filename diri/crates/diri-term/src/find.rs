@@ -36,6 +36,7 @@ pub struct FindSpan {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct FindSnapshot {
     pub lines: Vec<String>,
+    pub text_cells: std::collections::BTreeMap<usize, Vec<[u16; 2]>>,
     pub first_row: i64,
     pub visible_start_row: i64,
     pub cols: i64,
@@ -48,6 +49,7 @@ impl From<ReadScrollbackResult> for FindSnapshot {
     fn from(result: ReadScrollbackResult) -> Self {
         Self {
             lines: result.lines,
+            text_cells: result.text_cells,
             first_row: result.first_row,
             visible_start_row: result.visible_start_row,
             cols: result.cols,
@@ -268,10 +270,8 @@ impl TerminalFindModel {
         if self.matches.is_empty() {
             return None;
         }
-        self.current_index = self
-            .current_index
-            .wrapping_add_signed(direction)
-            .rem_euclid(self.matches.len());
+        self.current_index = (self.current_index as isize + direction)
+            .rem_euclid(self.matches.len() as isize) as usize;
         let item = &self.matches[self.current_index];
         let visible_start = self.cached_visible_start_row?;
         let target = if item.absolute_row >= visible_start {
@@ -315,6 +315,7 @@ mod tests {
 
     fn snapshot(lines: Vec<String>, alt: bool) -> FindSnapshot {
         FindSnapshot {
+            text_cells: Default::default(),
             lines,
             first_row: 0,
             visible_start_row: 10,
@@ -387,6 +388,28 @@ mod tests {
         assert!(model.matches().is_empty());
         assert_eq!(model.current_index(), 0);
         assert!(!model.set_query("absent", Duration::from_secs(3)));
+    }
+
+    #[test]
+    fn previous_wraps_from_first_to_last_for_three_matches() {
+        let mut viewport = ScrollbackViewport::default();
+        let live = live_buffer(&["a a a", "", ""], 6);
+        let mut model = TerminalFindModel::default();
+        search(
+            &mut model,
+            "a",
+            snapshot(Vec::new(), false),
+            &live,
+            &mut viewport,
+        );
+        assert_eq!(model.matches().len(), 3);
+        assert_eq!(model.current_index(), 0);
+        for expected in [2, 1, 0, 2] {
+            model.previous(&mut viewport);
+            assert_eq!(model.current_index(), expected);
+        }
+        model.next(&mut viewport);
+        assert_eq!(model.current_index(), 0);
     }
 
     #[test]

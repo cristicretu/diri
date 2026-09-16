@@ -45,6 +45,7 @@ pub mod local_path;
 pub mod log;
 pub mod migrate;
 pub mod pr_monitor;
+mod preview_mux;
 pub mod pty;
 pub mod registry;
 pub mod remote;
@@ -52,6 +53,7 @@ pub mod screen;
 pub mod session;
 mod state_file;
 pub mod status;
+pub mod workspace;
 mod worktree_health;
 mod worktree_scan;
 
