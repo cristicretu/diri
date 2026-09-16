@@ -764,6 +764,32 @@ pub struct RemoteError {
     pub fatal: bool,
 }
 
+/// Additive failure body for a nonzero management RPC. Successful responses
+/// retain their existing shape; old Engines fail closed on the exit status.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(tag = "error", rename_all = "snake_case", deny_unknown_fields)]
+pub enum RemoteManagementFailure {
+    HolderUnavailable,
+}
+
+impl std::fmt::Display for RemoteManagementFailure {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::HolderUnavailable => {
+                formatter.write_str("remote Holder owner is unavailable; Agent exit is unknown")
+            }
+        }
+    }
+}
+
+impl std::error::Error for RemoteManagementFailure {}
+
+impl RemoteManagementFailure {
+    pub fn into_io_error(self) -> std::io::Error {
+        std::io::Error::new(std::io::ErrorKind::NotConnected, self)
+    }
+}
+
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ScrollbackRequest {

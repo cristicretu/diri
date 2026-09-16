@@ -1130,6 +1130,15 @@ deadline. The inspection must match the session ID, incarnation, Helper build,
 and last known Agent PID. An actual exited inspection records that exit without
 reattaching or inventing a replacement Agent.
 
+Remote `inspect` treats a missing Holder ownership lock as an unavailable owner,
+not as evidence that the Agent exited. If the last persisted fact is Running,
+it returns nonzero with the additive JSON management error
+`{"error":"holder_unavailable"}` and leaves that state untouched. New Engines
+preserve this category as NotConnected; older Engines already reject a nonzero
+RPC. Only a recorded exit remains a successful exited inspection. Lock loss does
+not authorize signaling a reusable numeric PID, fabricating an exit, or completing
+`wait --until exited`. This cold management check creates no attachment or lease.
+
 For a running Agent, recovery retains the existing Session, mirror, process ID,
 output offsets, and incarnation. A replacement pump joins the failed pump outside
 Registry, discards all previous pending/uncertain input and resize operations,
