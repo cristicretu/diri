@@ -3087,7 +3087,6 @@ impl RootView {
             .when(inspector_seam <= 0.0, |card| {
                 card.rounded_tr(px(Radius::CARD))
             })
-            .rounded_bl(px(Radius::CARD))
             .bg(terminal.work_surface_nested())
             .overflow_hidden()
             .text_color(terminal.primary);
@@ -3111,6 +3110,8 @@ impl RootView {
         // Paint the frame independently from layout. A normal border shrinks
         // the content box, putting this title bar one pixel below the
         // borderless sidebar title bar even though both are 42 points tall.
+        // The sidebar owns the shared divider; only draw our left edge when
+        // it is hidden. Bottom corners stay square against the window edge.
         let card_outline = div()
             .absolute()
             .inset_0()
@@ -3118,8 +3119,10 @@ impl RootView {
             .when(inspector_seam <= 0.0, |outline| {
                 outline.rounded_tr(px(Radius::CARD))
             })
-            .rounded_bl(px(Radius::CARD))
-            .border_1()
+            .border_t_1()
+            .border_r_1()
+            .border_b_1()
+            .when(seam <= 0.0, |outline| outline.border_l_1())
             .border_color(terminal.primary.alpha(0.10));
 
         if let Some(workbench) = &self.workspace_workbench {
