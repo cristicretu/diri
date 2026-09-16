@@ -5,5 +5,8 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 
+[dependencies]
+diri-proto.workspace = true
+
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"

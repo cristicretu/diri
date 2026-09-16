@@ -452,6 +452,32 @@ precedence over PATH; an invalid override is reported while a valid PATH result
 remains usable. Executable preferences and quick-create visibility are stored
 in an owner-only, additive Engine configuration file.
 
+## Owned child process birth identity
+
+Process facts and durable terminal-state bindings must not identify a child by
+numeric PID or rounded start seconds alone. The shared `ProcessIdentity` records
+PID in the execution host's PID namespace plus explicit platform-native units:
+Linux boot UUID, `/proc/PID/stat` start ticks and clock tick rate; macOS boot
+session UUID and the full libproc start-time seconds/microseconds. Stable v1
+canonical bytes bind those fields without depending on JSON field order.
+
+The existing PTY owner captures birth once after spawn and before any reaper can
+release that PID. It never learns a replacement identity lazily during adoption.
+Local `HolderStat` adds optional `childIdentity`, returned only when host-local
+observations before and after the stat facts match the captured birth. Missing,
+unreadable, inconsistent or old-Holder identity means unsupported identity-backed
+facts; consumers fail closed instead of inventing a birth from `childPID` or
+`startSec`. The legacy `foregroundPID` value remains a foreground **process group**
+ID and must not be exposed as an individual process PID.
+
+OS observation lives in the existing minimal `diri-pty` crate, with a direct edge
+to the already-used `diri-proto` identity model; no new package, polling loop,
+controller, observer or Holder attachment is introduced. Observations are bounded
+and made on the execution host. This first additive slice covers local Holder
+facts; remote identity projection and process-detail inspection need their own
+capability boundary before they can claim support. Identity is not authorization
+to inspect or signal an unrelated process.
+
 ## Holder and process lifecycle
 
 The Holder owns the PTY master, the Agent child/process group, terminal state,

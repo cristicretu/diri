@@ -56,6 +56,7 @@ fn exercise_old_holder(fail_first: bool) {
     let listener = UnixListener::bind(paths.socket()).unwrap();
     listener.set_nonblocking(true).unwrap();
     let stat = HolderStat {
+        child_identity: None,
         child_pid: std::process::id() as i32,
         alive: true,
         log_offset: 0,
