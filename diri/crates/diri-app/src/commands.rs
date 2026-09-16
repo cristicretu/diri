@@ -36,6 +36,7 @@ actions!(
         ToggleNotifications,
         ToggleOverview,
         ToggleTabPeek,
+        ReviewLaunches,
         FocusPaneLeft,
         FocusPaneRight,
         FocusPaneUp,
@@ -132,6 +133,7 @@ pub enum CommandId {
     ToggleNotifications,
     ToggleOverview,
     ToggleTabPeek,
+    ReviewLaunches,
     FocusPaneLeft,
     FocusPaneRight,
     FocusPaneUp,
@@ -388,6 +390,16 @@ pub const COMMANDS: &[CommandSpec] = &[
         "Peek Tabs",
         "rectangle.stack",
         "preview overview gesture three finger swipe"
+    ),
+    spec!(
+        ReviewLaunches,
+        "review-launches",
+        None,
+        None,
+        Some(APP_CONTEXT),
+        "Review session launches",
+        "tray",
+        "workspace create pending retry placement receipts"
     ),
     spec!(
         FocusPaneLeft,
@@ -1080,6 +1092,7 @@ impl CommandSpec {
             CommandId::ToggleHistory => KeyBinding::new(key, ToggleHistory, context),
             CommandId::ToggleNotifications => KeyBinding::new(key, ToggleNotifications, context),
             CommandId::ToggleOverview => KeyBinding::new(key, ToggleOverview, context),
+            CommandId::ReviewLaunches => KeyBinding::new(key, ReviewLaunches, context),
             CommandId::ToggleTabPeek => KeyBinding::new(key, ToggleTabPeek, context),
             CommandId::FocusPaneLeft => KeyBinding::new(key, FocusPaneLeft, context),
             CommandId::FocusPaneRight => KeyBinding::new(key, FocusPaneRight, context),
@@ -1412,6 +1425,11 @@ impl CommandId {
                 description: "Open or close the session overview",
                 category: Navigation,
             },
+            Self::ReviewLaunches => ShortcutMetadata {
+                title: "Review session launches",
+                description: "Review pending creation and retry workspace placement",
+                category: Workspace,
+            },
             Self::FocusPaneLeft => ShortcutMetadata {
                 title: "Focus pane left",
                 description: "Move focus to the nearest pane in this direction",
@@ -1726,6 +1744,7 @@ impl CommandId {
             Self::ToggleNotifications => Box::new(ToggleNotifications),
             Self::ToggleOverview => Box::new(ToggleOverview),
             Self::ToggleTabPeek => Box::new(ToggleTabPeek),
+            Self::ReviewLaunches => Box::new(ReviewLaunches),
             Self::FocusPaneLeft => Box::new(FocusPaneLeft),
             Self::FocusPaneRight => Box::new(FocusPaneRight),
             Self::FocusPaneUp => Box::new(FocusPaneUp),

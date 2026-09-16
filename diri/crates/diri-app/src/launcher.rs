@@ -124,6 +124,8 @@ pub(crate) enum LauncherEvent {
 }
 
 pub(crate) struct LauncherOverlay {
+    workspace_spawn_target: Option<crate::store::WorkspaceSpawnTarget>,
+    workspace_submission: Option<(u64, u64, LauncherTarget)>,
     accounts: diri_proto::AgentAccountCatalog,
     accounts_loading: bool,
     accounts_error: Option<String>,
@@ -325,6 +327,7 @@ impl LauncherOverlay {
                     Ok(()) | Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
                         if this
                             .update(cx, |this, cx| {
+                                this.finish_workspace_submission(cx);
                                 this.resume_pending_recipe_activation(cx);
                                 if this.open
                                     && !this.delivery.is_sending()
@@ -347,6 +350,8 @@ impl LauncherOverlay {
         });
 
         Self {
+            workspace_spawn_target: None,
+            workspace_submission: None,
             accounts: diri_proto::AgentAccountCatalog::default(),
             accounts_loading: false,
             accounts_error: None,
@@ -387,6 +392,43 @@ impl LauncherOverlay {
         self.open
     }
 
+    pub(crate) fn set_workspace_spawn_target(
+        &mut self,
+        target: Option<crate::store::WorkspaceSpawnTarget>,
+    ) {
+        self.workspace_spawn_target = target;
+    }
+
+    fn finish_workspace_submission(&mut self, cx: &mut Context<Self>) {
+        let Some((receipt_id, ticket, target)) = self.workspace_submission.clone() else {
+            return;
+        };
+        let state = self
+            .services
+            .store
+            .store
+            .read()
+            .expect("store")
+            .workspace_spawn_receipts()
+            .find(|r| r.id == receipt_id)
+            .map(|r| r.state.clone());
+        let result = match state {
+            Some(
+                crate::store::WorkspaceSpawnState::Placed { .. }
+                | crate::store::WorkspaceSpawnState::Unplaced { .. },
+            ) => Ok(None),
+            Some(crate::store::WorkspaceSpawnState::Unconfirmed(error)) => Err(error),
+            // A placed receipt can be evicted only after 32 newer requests.
+            None => Err(
+                "Launch receipt is no longer available. Check All sessions before sending again."
+                    .into(),
+            ),
+            _ => return,
+        };
+        self.workspace_submission = None;
+        self.finish_submission(ticket, target, result, cx);
+    }
+
     pub(crate) fn open(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if self.delivery.is_sending() {
             self.open = true;
@@ -403,7 +445,8 @@ impl LauncherOverlay {
         // cleared on submit, and only there.
         if self.prompt.is_empty() {
             self.selected_account = None;
-            let (harness, root, host) = initial_target(&self.services);
+            let (harness, root, host) =
+                initial_target_for_workspace(&self.services, self.workspace_spawn_target.as_ref());
             self.selected_harness = harness;
             self.selected_root = root;
             self.selected_host = host;
@@ -1515,6 +1558,29 @@ impl LauncherOverlay {
         let Some(ticket) = self.delivery.begin() else {
             return false;
         };
+        if let (Some(params), Some(workspace_target)) =
+            (spawn.as_ref(), self.workspace_spawn_target.clone())
+        {
+            let receipt = self
+                .services
+                .store
+                .store
+                .write()
+                .expect("store")
+                .request_workspace_spawn(workspace_target, params.clone());
+            if let Some(receipt) = receipt {
+                self.workspace_submission = Some((receipt, ticket, target));
+                self.fallback_notice = None;
+                self.picker = None;
+                cx.notify();
+                return true;
+            }
+            self.delivery.settle(ticket);
+            self.fallback_notice =
+                Some("Launch was not requested. Review pending launches and try again.".into());
+            cx.notify();
+            return false;
+        }
         self.services
             .store
             .store
@@ -3964,13 +4030,23 @@ impl Render for LauncherOverlay {
 }
 
 fn initial_target(services: &AppServices) -> (AgentKind, String, Option<String>) {
+    initial_target_for_workspace(services, None)
+}
+
+fn initial_target_for_workspace(
+    services: &AppServices,
+    target: Option<&crate::store::WorkspaceSpawnTarget>,
+) -> (AgentKind, String, Option<String>) {
     let store = services
         .store
         .store
         .read()
         .expect("session store lock poisoned");
-    let selected = store
-        .selected_session()
+    let selected = target
+        .map_or_else(
+            || store.selected_session(),
+            |target| store.workspace_spawn_source(target),
+        )
         .and_then(|session| {
             store
                 .projects()

@@ -105,6 +105,7 @@ fn parse(scope: &str, words: &[String]) -> Result<WorkspaceMutation, CliError> {
             index: index(destination)?,
         }),
         ("tab", ["create", id, session]) => Ok(CreateTab {
+            select: true,
             workspace_id: workspace(id),
             session_id: SessionId::new(*session),
             title: None,
