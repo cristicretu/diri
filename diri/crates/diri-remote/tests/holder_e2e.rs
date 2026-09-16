@@ -1600,8 +1600,12 @@ fn bounded_drain_preserves_output_and_grid_before_process_exit() {
         persistence: PersistenceCapability::NonPersistent,
     }));
     let mut attach = Attach::open(&state_dir, hello(&launch, Some(0), "exit-tail-client"));
-    attach.receive_until(Duration::from_secs(5), |message| {
-        matches!(message, RemoteMessage::ControlGranted(_))
+    // A controller lease can arrive before the shell disables echo. Wait for
+    // the shell's readiness marker so the trigger is not counted as PTY output.
+    attach.receive_until(Duration::from_secs(5), |message| match message {
+        RemoteMessage::FullSnapshot(snapshot) => grid_text(&snapshot.grid).contains("ready"),
+        RemoteMessage::GridDelta(delta) => grid_text(&delta.grid).contains("ready"),
+        _ => false,
     });
     attach.send(RemoteMessage::Terminal(Frame::input(b"start\n".to_vec())));
     let started = Instant::now();
