@@ -2518,6 +2518,11 @@ impl TerminalPane {
         }
 
         if event.keystroke.modifiers.platform && event.keystroke.key != "backspace" {
+            if let Some(bytes) = terminal_command_navigation(&event.keystroke) {
+                resident.attachment.input(bytes.to_vec());
+                cx.stop_propagation();
+                return;
+            }
             cx.propagate();
             return;
         }
@@ -2531,7 +2536,7 @@ impl TerminalPane {
             alt: event.keystroke.modifiers.alt,
             cmd: event.keystroke.modifiers.platform,
         };
-        let bytes = match diri_term::keys::encode_action(
+        let bytes = match diri_term::keys::encode_interactive_action(
             &term_event,
             modifiers,
             resident.keyboard,
@@ -3911,6 +3916,20 @@ fn centered_symbol_message(
                     .child(message.to_owned()),
             )
         })
+}
+
+/// Readline-compatible line navigation. Other Command chords continue to the
+/// app keymap; in particular, Ctrl-A is not a substitute for Select All.
+fn terminal_command_navigation(key: &gpui::Keystroke) -> Option<&'static [u8]> {
+    let modifiers = key.modifiers;
+    if !modifiers.platform || modifiers.control || modifiers.alt || modifiers.shift {
+        return None;
+    }
+    match key.key.as_str() {
+        "left" => Some(b"\x01"),
+        "right" => Some(b"\x05"),
+        _ => None,
+    }
 }
 
 fn terminal_key_event(event: &KeyDownEvent) -> Option<TermKeyEvent> {
@@ -5429,6 +5448,66 @@ mod tests {
     }
 
     #[gpui::test]
+    fn terminal_navigation_survives_missing_keyboard_metadata(cx: &mut TestAppContext) {
+        let runtime = Arc::new(StoreRuntime::inert());
+        let tokio = Arc::new(
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap(),
+        );
+        let session = fixture_session();
+        let id = session.id.clone();
+        {
+            let mut store = runtime.store.write().unwrap();
+            store.upsert_session(session);
+            store.select(id.clone());
+        }
+        let (pane, cx) =
+            cx.add_window_view(move |window, cx| TerminalPane::new(runtime, tokio, window, cx));
+        pane.update_in(cx, |pane, window, cx| {
+            pane.reconcile_store_change(window, cx);
+            let (tx, mut input) = mpsc::unbounded_channel();
+            let resident = pane.residents.get_mut(&id).unwrap();
+            resident.attachment.claim();
+            resident.attachment.input_observer = Some((id.clone(), tx));
+            resident.keyboard = None;
+            for (key, expected) in [
+                ("up", b"\x1b[A".as_slice()),
+                ("down", b"\x1b[B"),
+                ("right", b"\x1b[C"),
+                ("left", b"\x1b[D"),
+                ("home", b"\x1b[H"),
+                ("end", b"\x1b[F"),
+                ("alt-left", b"\x1b[1;3D"),
+                ("shift-right", b"\x1b[1;2C"),
+                ("cmd-left", b"\x01"),
+                ("cmd-right", b"\x05"),
+                ("cmd-backspace", b"\x15"),
+            ] {
+                pane.handle_key_down(
+                    &KeyDownEvent {
+                        keystroke: Keystroke::parse(key).unwrap(),
+                        is_held: false,
+                        prefer_character_input: false,
+                    },
+                    window,
+                    cx,
+                );
+                assert_eq!(
+                    pane.qol.feedback, None,
+                    "{key} must not be blocked by missing metadata"
+                );
+                assert_eq!(input.try_recv().unwrap(), (id.clone(), expected.to_vec()));
+                assert_eq!(
+                    pane.residents[&id].keyboard, None,
+                    "compatibility must not invent observed state"
+                );
+            }
+        });
+    }
+
+    #[gpui::test]
     fn terminal_copy_mode_and_paste_review_keep_input_local(cx: &mut TestAppContext) {
         let runtime = Arc::new(StoreRuntime::inert());
         let tokio = Arc::new(
@@ -5989,6 +6068,26 @@ mod tests {
             exit_description(&session),
             "Session ended when the daemon restarted"
         );
+    }
+
+    #[test]
+    fn terminal_command_navigation_preserves_app_and_modified_shortcuts() {
+        for key in [
+            "cmd-a",
+            "cmd-c",
+            "cmd-v",
+            "cmd-f",
+            "cmd-alt-left",
+            "cmd-shift-left",
+            "cmd-ctrl-right",
+            "left",
+        ] {
+            assert_eq!(
+                terminal_command_navigation(&Keystroke::parse(key).unwrap()),
+                None,
+                "{key}"
+            );
+        }
     }
 
     #[test]

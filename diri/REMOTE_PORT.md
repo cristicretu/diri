@@ -81,8 +81,13 @@ with the same sequence, admitting both frames as one queue transaction. The
 Engine commits modes only after validating that grid; a new Hello clears the
 pending projection. Mode-only changes use the same publication path. Older
 controllers receive neither the capability nor new messages, and old Holders
-remain usable with unknown input-mode state. Mode-dependent typed input fails
-explicitly when that state is unavailable.
+remain usable with unknown input-mode state. Mode-dependent automated key
+requests fail explicitly when that state is unavailable. Desktop arrows and
+Home/End retain their historical normal-cursor CSI encoding for these legacy
+sessions instead of disabling navigation after an upgrade. This compatibility
+choice does not claim or persist known modes; observed application-cursor modes
+always override it. Keypad input still requires observed modes. Controller and
+enhanced-keyboard admission checks remain enforced by the Engine.
 
 Local app/client `Modes` frames retain their existing first byte and gain an
 optional versioned tail. GUI and CLI share one pure key encoder; there is no new
