@@ -324,7 +324,8 @@ pub struct Term<T> {
     ///
     /// Opposite of the active grid. While the alternate screen buffer is active, this will be the
     /// primary grid. Otherwise it is the alternate screen buffer.
-    inactive_grid: Grid<Cell>,
+    /// None is the pristine alternate screen, allocated on first entry.
+    inactive_grid: Option<Grid<Cell>>,
 
     /// Index into `charsets`, pointing to what ASCII is currently being mapped to.
     active_charset: CharsetIndex,
@@ -429,6 +430,18 @@ pub enum Osc52 {
 }
 
 impl<T> Term<T> {
+    #[cfg(feature = "compact-history")]
+    pub fn bound_primary_history_storage(&mut self, budget: usize) {
+        if self.mode.contains(TermMode::ALT_SCREEN) {
+            self.inactive_grid
+                .as_mut()
+                .expect("primary grid")
+                .bound_history_storage(budget);
+        } else {
+            self.grid.bound_history_storage(budget);
+        }
+    }
+
     #[inline]
     pub fn scroll_display(&mut self, scroll: Scroll)
     where
@@ -457,7 +470,7 @@ impl<T> Term<T> {
 
         let history_size = config.scrolling_history;
         let grid = Grid::new(num_lines, num_cols, history_size);
-        let inactive_grid = Grid::new(num_lines, num_cols, 0);
+        let inactive_grid = None;
 
         let tabs = TabStops::new(grid.columns());
 
@@ -555,6 +568,8 @@ impl<T> Term<T> {
 
         if self.mode.contains(TermMode::ALT_SCREEN) {
             self.inactive_grid
+                .as_mut()
+                .expect("alternate screen retains the primary grid")
                 .update_history(self.config.scrolling_history);
         } else {
             self.grid.update_history(self.config.scrolling_history);
@@ -746,7 +761,9 @@ impl<T> Term<T> {
 
         let is_alt = self.mode.contains(TermMode::ALT_SCREEN);
         self.grid.resize(!is_alt, num_lines, num_cols);
-        self.inactive_grid.resize(is_alt, num_lines, num_cols);
+        if let Some(inactive_grid) = self.inactive_grid.as_mut() {
+            inactive_grid.resize(is_alt, num_lines, num_cols);
+        }
 
         // Invalidate selection and tabs only when necessary.
         if old_cols != num_cols {
@@ -783,15 +800,20 @@ impl<T> Term<T> {
 
     /// Swap primary and alternate screen buffer.
     pub fn swap_alt(&mut self) {
+        let num_lines = self.grid.screen_lines();
+        let num_cols = self.grid.columns();
+        let inactive_grid = self
+            .inactive_grid
+            .get_or_insert_with(|| Grid::new(num_lines, num_cols, 0));
         if !self.mode.contains(TermMode::ALT_SCREEN) {
             // Set alt screen cursor to the current primary screen cursor.
-            self.inactive_grid.cursor = self.grid.cursor.clone();
+            inactive_grid.cursor = self.grid.cursor.clone();
 
             // Drop information about the primary screens saved cursor.
             self.grid.saved_cursor = self.grid.cursor.clone();
 
             // Reset alternate screen contents.
-            self.inactive_grid.reset_region(..);
+            inactive_grid.reset_region(..);
         }
 
         mem::swap(
@@ -806,7 +828,12 @@ impl<T> Term<T> {
             .into();
         self.set_keyboard_mode(keyboard_mode, KeyboardModesApplyBehavior::Replace);
 
-        mem::swap(&mut self.grid, &mut self.inactive_grid);
+        mem::swap(
+            &mut self.grid,
+            self.inactive_grid
+                .as_mut()
+                .expect("alternate screen initialized before swap"),
+        );
         self.mode ^= TermMode::ALT_SCREEN;
         self.selection = None;
         self.mark_fully_damaged();
@@ -1993,12 +2020,19 @@ impl<T: EventListener> Handler for Term<T> {
     #[inline]
     fn reset_state(&mut self) {
         if self.mode.contains(TermMode::ALT_SCREEN) {
-            mem::swap(&mut self.grid, &mut self.inactive_grid);
+            mem::swap(
+                &mut self.grid,
+                self.inactive_grid
+                    .as_mut()
+                    .expect("alternate screen initialized before swap"),
+            );
         }
         self.active_charset = Default::default();
         self.cursor_style = None;
         self.grid.reset();
-        self.inactive_grid.reset();
+        if let Some(inactive_grid) = self.inactive_grid.as_mut() {
+            inactive_grid.reset();
+        }
         self.scroll_region = Line(0)..Line(self.screen_lines() as i32);
         self.tabs = TabStops::new(self.columns());
         self.title_stack = Vec::new();

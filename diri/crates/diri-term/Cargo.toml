@@ -8,8 +8,10 @@ license.workspace = true
 [dependencies]
 diri-proto.workspace = true
 gpui.workspace = true
+unicode-width = "0.2.2"
 
 [dev-dependencies]
+diri-terminal-state.workspace = true
 criterion = "0.5.1"
 gpui = { workspace = true, features = ["bench"] }
 gpui_platform = { workspace = true, features = ["test-support"] }

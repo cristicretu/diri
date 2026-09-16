@@ -107,7 +107,8 @@ impl<T: GridCell + Default + PartialEq> Grid<T> {
 
         self.columns = columns;
 
-        let mut reversed: Vec<Row<T>> = Vec::with_capacity(self.raw.len());
+        let reflow_rows = self.raw.prepare_reflow(columns);
+        let mut reversed: Vec<Row<T>> = Vec::with_capacity(reflow_rows);
         let mut cursor_line_delta = 0;
 
         // Remove the linewrap special case, by moving the cursor outside of the grid.
@@ -253,7 +254,8 @@ impl<T: GridCell + Default + PartialEq> Grid<T> {
             self.cursor.point.column += 1;
         }
 
-        let mut new_raw = Vec::with_capacity(self.raw.len());
+        let reflow_rows = self.raw.prepare_reflow(columns);
+        let mut new_raw = Vec::with_capacity(reflow_rows);
         let mut buffered: Option<Vec<T>> = None;
 
         let mut rows = self.raw.take_all();
@@ -373,6 +375,9 @@ impl<T: GridCell + Default + PartialEq> Grid<T> {
         let mut reversed: Vec<Row<T>> = new_raw.drain(..).rev().collect();
         reversed.truncate(self.max_scroll_limit + self.lines);
         self.raw.replace_inner(reversed);
+        // A compact resize may retain an untouched cold suffix outside the
+        // reflow work list. Apply the same history cap to the combined result.
+        self.update_history(self.max_scroll_limit);
 
         // Clamp display offset in case some lines went off.
         self.display_offset = min(self.display_offset, self.history_size());

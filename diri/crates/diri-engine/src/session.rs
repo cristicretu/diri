@@ -3934,7 +3934,7 @@ fn persist_checkpoint(
         keyboard,
         keyboard_snapshot,
     ) = {
-        let screen = shared.screen.lock().expect("screen");
+        let mut screen = shared.screen.lock().expect("screen");
         (
             screen.history_snapshot(),
             screen.history_metadata(),

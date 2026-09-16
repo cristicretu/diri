@@ -1,4 +1,5 @@
 use diri_proto::grid::{GridCell, GridUpdate, RowMetadata};
+use unicode_width::UnicodeWidthChar;
 
 /// Cursor state carried by every daemon grid update.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -23,6 +24,7 @@ pub struct ChangedRenderRow {
     pub row: usize,
     pub generation: u64,
     pub cells: Vec<GridCell>,
+    pub graphemes: Vec<(u16, String)>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -92,19 +94,56 @@ impl GridBuffer {
     /// skipped, preserving exact find-highlight columns.
     #[must_use]
     pub fn row_text_with_columns(&self, row: usize) -> Option<(String, Vec<usize>)> {
+        self.row_text_with_cell_ranges(row).map(|(text, ranges)| {
+            (
+                text,
+                ranges
+                    .into_iter()
+                    .map(|range| usize::from(range[0]))
+                    .collect(),
+            )
+        })
+    }
+
+    /// Each scalar maps to its complete source cell span. Combining marks share
+    /// their base's span, so searching either part still highlights that cell.
+    #[must_use]
+    pub fn row_text_with_cell_ranges(&self, row: usize) -> Option<(String, Vec<[u16; 2]>)> {
         let cells = self.row(row)?;
         let mut text = String::with_capacity(cells.len());
         let mut columns = Vec::with_capacity(cells.len());
+        let mut graphemes = self
+            .annotations
+            .get(row)
+            .into_iter()
+            .flat_map(|metadata| &metadata.graphemes)
+            .peekable();
         for (column, cell) in cells.iter().enumerate() {
             if cell.scalar == 0 {
                 continue;
             }
-            text.push(
-                char::from_u32(cell.scalar)
-                    .filter(|ch| *ch != '\n' && *ch != '\r')
-                    .unwrap_or(' '),
-            );
-            columns.push(column);
+            let ch = char::from_u32(cell.scalar)
+                .filter(|ch| *ch != '\n' && *ch != '\r')
+                .unwrap_or(' ');
+            // Match the shared parser's width rules, including older Helpers
+            // whose wire cells do not distinguish wide bases from other glyphs.
+            let width = ch.width().unwrap_or(1).max(1);
+            let range = [column as u16, (column + width).min(cells.len()) as u16];
+            text.push(ch);
+            columns.push(range);
+            while graphemes
+                .peek()
+                .is_some_and(|(col, _)| usize::from(*col) < column)
+            {
+                graphemes.next();
+            }
+            if let Some((_, combining)) = graphemes.next_if(|(col, _)| usize::from(*col) == column)
+            {
+                for ch in combining.chars() {
+                    text.push(ch);
+                    columns.push(range);
+                }
+            }
         }
         Some((text, columns))
     }
@@ -150,6 +189,14 @@ impl GridBuffer {
                     row,
                     generation,
                     cells,
+                    graphemes: self.annotations.get(row).map_or_else(Vec::new, |metadata| {
+                        metadata
+                            .graphemes
+                            .iter()
+                            .take_while(|(col, _)| usize::from(*col) < col_count)
+                            .cloned()
+                            .collect()
+                    }),
                 });
                 *known = generation;
             }
@@ -399,6 +446,27 @@ mod tests {
         assert_eq!(
             buffer.row_text_with_columns(0),
             Some(("界x".to_owned(), vec![0, 2]))
+        );
+    }
+
+    #[test]
+    fn row_text_maps_combining_marks_and_wide_cells_without_absorbing_wrap_padding() {
+        let mut buffer = GridBuffer::new(6, 1);
+        buffer.cells = vec![
+            cell('界'),
+            cell('\0'),
+            cell('e'),
+            cell('x'),
+            cell(' '),
+            cell('\0'),
+        ];
+        buffer.annotations[0].graphemes.push((2, "\u{301}".into()));
+        assert_eq!(
+            buffer.row_text_with_cell_ranges(0),
+            Some((
+                "界e\u{301}x ".into(),
+                vec![[0, 2], [2, 3], [2, 3], [3, 4], [4, 5]]
+            ))
         );
     }
 }

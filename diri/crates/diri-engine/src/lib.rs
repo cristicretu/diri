@@ -53,6 +53,7 @@ pub mod screen;
 pub mod session;
 mod state_file;
 pub mod status;
+pub mod workspace;
 mod worktree_health;
 mod worktree_scan;
 
