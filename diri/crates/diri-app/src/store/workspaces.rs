@@ -342,6 +342,7 @@ mod tests {
         state
             .workspaces
             .push(diri_proto::workspace::WorkspaceRecord {
+                project_id: None,
                 id: diri_proto::workspace::WorkspaceId::new("first"),
                 name: "First".into(),
                 tabs: vec![],
@@ -366,6 +367,7 @@ mod tests {
         state
             .workspaces
             .push(diri_proto::workspace::WorkspaceRecord {
+                project_id: None,
                 id: diri_proto::workspace::WorkspaceId::new("second"),
                 name: "Second".into(),
                 tabs: vec![],

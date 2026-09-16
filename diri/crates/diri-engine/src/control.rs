@@ -4254,7 +4254,7 @@ mod tests {
         ))
     }
 
-    fn test_record(id: &str) -> diri_proto::SessionRecord {
+    pub(super) fn test_record(id: &str) -> diri_proto::SessionRecord {
         use diri_proto::*;
         SessionRecord {
             attention_state: None,

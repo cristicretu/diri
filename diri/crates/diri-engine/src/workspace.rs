@@ -1,17 +1,27 @@
 //! Durable organization intent behind one revisioned interface. This module
 //! never launches, resizes, attaches to, or terminates a session.
+#[cfg(test)]
+mod project_agent_tests;
 mod tree;
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 
 use diri_proto::workspace::*;
-use diri_proto::{ControlError, SessionId};
+use diri_proto::{ControlError, Project, ProjectId, SessionId};
 use serde_json::{Map, Value};
 
 use crate::state_file::JsonStateFile;
 
 const KEY: &str = "workspaceState";
+
+/// Resolved under Registry once, before the workspace file transaction. The
+/// client supplies only a session identity, never a project name or location.
+pub(crate) struct ProjectAgentInventory {
+    pub session_id: SessionId,
+    pub project: Project,
+    pub session_projects: HashMap<SessionId, ProjectId>,
+}
 pub struct WorkspaceStore {
     file: JsonStateFile,
 }
@@ -35,6 +45,15 @@ impl WorkspaceStore {
         params: WorkspaceMutationParams,
         sessions: &HashSet<SessionId>,
     ) -> Result<WorkspaceSnapshot, ControlError> {
+        self.apply_with_project_agent(params, sessions, None)
+    }
+
+    pub(crate) fn apply_with_project_agent(
+        &self,
+        params: WorkspaceMutationParams,
+        sessions: &HashSet<SessionId>,
+        project_agent: Option<&ProjectAgentInventory>,
+    ) -> Result<WorkspaceSnapshot, ControlError> {
         let mut outcome = None;
         let written = self.file.update_durable(|document| {
             let result = (|| {
@@ -48,7 +67,7 @@ impl WorkspaceStore {
                         ),
                     ));
                 }
-                mutate(&mut next, params.mutation, sessions)?;
+                mutate(&mut next, params.mutation, sessions, project_agent)?;
                 tree::repair(&mut next);
                 validate(&next)?;
                 next.revision = next
@@ -136,7 +155,13 @@ fn validate(state: &WorkspaceSnapshot) -> Result<(), ControlError> {
         return Err(invalid("workspace or tab count exceeds the limit"));
     }
     let mut seen = HashSet::new();
+    let mut project_ids = HashSet::new();
     for workspace in &state.workspaces {
+        if let Some(project) = &workspace.project_id
+            && (project.0.is_empty() || project.0.len() > 128 || !project_ids.insert(project))
+        {
+            return Err(invalid("invalid or duplicate project workspace binding"));
+        }
         identity(&workspace.id.0, &mut seen)?;
         name(&workspace.name)?;
         if workspace.tabs.is_empty() != workspace.selected_tab.is_none()
@@ -261,16 +286,172 @@ fn require_pane(tab: &WorkspaceTab, id: &PaneId) -> Result<(), ControlError> {
     }
 }
 
+fn matching_pane(tab: &WorkspaceTab, session: &SessionId) -> Option<PaneId> {
+    fn find(node: &LayoutNode, session: &SessionId) -> Option<PaneId> {
+        match node {
+            LayoutNode::Pane { id, session_id } => (session_id == session).then(|| id.clone()),
+            LayoutNode::Split { first, second, .. } => {
+                find(first, session).or_else(|| find(second, session))
+            }
+        }
+    }
+    // Duplicate references are valid: retain the already focused occurrence.
+    if let Some(LayoutNode::Pane { session_id, .. }) =
+        tree::find(&tab.layout, &LayoutNodeId::Pane(tab.focused_pane.clone()))
+        && session_id == session
+    {
+        return Some(tab.focused_pane.clone());
+    }
+    find(&tab.layout, session)
+}
+
+fn select_agent(workspace: &mut WorkspaceRecord, session: &SessionId) -> bool {
+    let index = workspace
+        .tabs
+        .iter()
+        .position(|tab| {
+            Some(&tab.id) == workspace.selected_tab.as_ref()
+                && matching_pane(tab, session).is_some()
+        })
+        .or_else(|| {
+            workspace
+                .tabs
+                .iter()
+                .position(|tab| matching_pane(tab, session).is_some())
+        });
+    let Some(index) = index else { return false };
+    let tab = &mut workspace.tabs[index];
+    let pane = matching_pane(tab, session).expect("matched agent pane");
+    if tab
+        .zoomed_pane
+        .as_ref()
+        .is_some_and(|zoomed| zoomed != &pane)
+    {
+        tab.zoomed_pane = None;
+    }
+    tab.focused_pane = pane;
+    workspace.selected_tab = Some(tab.id.clone());
+    true
+}
+
+fn belongs_to_project(node: &LayoutNode, inventory: &ProjectAgentInventory) -> bool {
+    match node {
+        LayoutNode::Pane { session_id, .. } => {
+            inventory.session_projects.get(session_id) == Some(&inventory.project.id)
+        }
+        LayoutNode::Split { first, second, .. } => {
+            belongs_to_project(first, inventory) && belongs_to_project(second, inventory)
+        }
+    }
+}
+
+fn open_project_agent(
+    state: &mut WorkspaceSnapshot,
+    session: &SessionId,
+    preferred: Option<&WorkspaceId>,
+    inventory: &ProjectAgentInventory,
+) -> Result<(), ControlError> {
+    // A preferred layout is a view, not evidence of project membership. Mixed
+    // layouts remain intact and unbound, with only the requested focus changed.
+    if let Some(preferred) = preferred
+        && let Some(workspace) = state
+            .workspaces
+            .iter_mut()
+            .find(|workspace| &workspace.id == preferred)
+        && select_agent(workspace, session)
+    {
+        return Ok(());
+    }
+    let bound = state
+        .workspaces
+        .iter()
+        .position(|workspace| workspace.project_id.as_ref() == Some(&inventory.project.id));
+    let adopted = if bound.is_none() {
+        let mut candidates = state
+            .workspaces
+            .iter()
+            .enumerate()
+            .filter(|(_, workspace)| {
+                workspace.project_id.is_none()
+                    && workspace
+                        .tabs
+                        .iter()
+                        .any(|tab| matching_pane(tab, session).is_some())
+                    && workspace
+                        .tabs
+                        .iter()
+                        .all(|tab| belongs_to_project(&tab.layout, inventory))
+            });
+        let first = candidates.next().map(|(index, _)| index);
+        if candidates.next().is_none() {
+            first
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+    let index = if let Some(index) = bound.or(adopted) {
+        // Preserve legacy names and every existing layout identity on adoption.
+        state.workspaces[index].project_id = Some(inventory.project.id.clone());
+        index
+    } else {
+        name(&inventory.project.name)?;
+        state.workspaces.push(WorkspaceRecord {
+            project_id: Some(inventory.project.id.clone()),
+            id: WorkspaceId(new_id("workspace")?),
+            name: inventory.project.name.clone(),
+            tabs: Vec::new(),
+            selected_tab: None,
+        });
+        state.workspaces.len() - 1
+    };
+    let workspace = &mut state.workspaces[index];
+    if !select_agent(workspace, session) {
+        let pane = PaneId(new_id("pane")?);
+        let tab = TabId(new_id("tab")?);
+        workspace.tabs.push(WorkspaceTab {
+            id: tab.clone(),
+            title: None,
+            layout: LayoutNode::Pane {
+                id: pane.clone(),
+                session_id: session.clone(),
+            },
+            focused_pane: pane,
+            zoomed_pane: None,
+        });
+        workspace.selected_tab = Some(tab);
+    }
+    Ok(())
+}
+
 fn mutate(
     state: &mut WorkspaceSnapshot,
     mutation: WorkspaceMutation,
     sessions: &HashSet<SessionId>,
+    project_agent: Option<&ProjectAgentInventory>,
 ) -> Result<(), ControlError> {
     use WorkspaceMutation::*;
     match mutation {
+        OpenProjectAgent {
+            session_id,
+            preferred_workspace,
+        } => {
+            existing(&session_id, sessions)?;
+            let inventory = project_agent
+                .filter(|inventory| inventory.session_id == session_id)
+                .ok_or_else(|| {
+                    ControlError::new(
+                        "workspace_project_unavailable",
+                        "the agent project is absent from the Engine inventory",
+                    )
+                })?;
+            open_project_agent(state, &session_id, preferred_workspace.as_ref(), inventory)?;
+        }
         CreateWorkspace { name: title } => {
             name(&title)?;
             state.workspaces.push(WorkspaceRecord {
+                project_id: None,
                 id: WorkspaceId(new_id("workspace")?),
                 name: title,
                 tabs: Vec::new(),
@@ -484,15 +665,15 @@ mod tests {
     use super::*;
     use WorkspaceMutation::*;
 
-    struct Fixture {
+    pub(super) struct Fixture {
         _temp: tempfile::TempDir,
-        path: PathBuf,
-        store: WorkspaceStore,
-        sessions: HashSet<SessionId>,
-        snapshot: WorkspaceSnapshot,
+        pub(super) path: PathBuf,
+        pub(super) store: WorkspaceStore,
+        pub(super) sessions: HashSet<SessionId>,
+        pub(super) snapshot: WorkspaceSnapshot,
     }
     impl Fixture {
-        fn new() -> Self {
+        pub(super) fn new() -> Self {
             let temp = tempfile::tempdir().unwrap();
             let path = temp.path().join("state.json");
             std::fs::write(
@@ -510,7 +691,7 @@ mod tests {
                 snapshot: WorkspaceSnapshot::default(),
             }
         }
-        fn apply(&mut self, mutation: WorkspaceMutation) {
+        pub(super) fn apply(&mut self, mutation: WorkspaceMutation) {
             self.snapshot = self
                 .store
                 .apply(
@@ -522,11 +703,15 @@ mod tests {
                 )
                 .unwrap();
         }
-        fn create_workspace(&mut self, name: &str) -> WorkspaceId {
+        pub(super) fn create_workspace(&mut self, name: &str) -> WorkspaceId {
             self.apply(CreateWorkspace { name: name.into() });
             self.snapshot.workspaces.last().unwrap().id.clone()
         }
-        fn create_tab(&mut self, workspace_id: WorkspaceId, session: usize) -> (TabId, PaneId) {
+        pub(super) fn create_tab(
+            &mut self,
+            workspace_id: WorkspaceId,
+            session: usize,
+        ) -> (TabId, PaneId) {
             self.apply(CreateTab {
                 select: true,
                 workspace_id: workspace_id.clone(),

@@ -5653,6 +5653,7 @@ mod tests {
                 revision: 7,
                 workspaces: vec![
                     WorkspaceRecord {
+                        project_id: None,
                         id: WorkspaceId::new("release"),
                         name: "Release".into(),
                         selected_tab: Some(TabId::new("build")),
@@ -5662,6 +5663,7 @@ mod tests {
                         ],
                     },
                     WorkspaceRecord {
+                        project_id: None,
                         id: WorkspaceId::new("remote"),
                         name: "Remote".into(),
                         selected_tab: Some(TabId::new("logs")),
@@ -6384,6 +6386,7 @@ mod tests {
             store.seed_workspace_snapshot_for_test(WorkspaceSnapshot {
                 revision: 7,
                 workspaces: vec![WorkspaceRecord {
+                    project_id: None,
                     id: workspace.clone(),
                     name: "Release room".into(),
                     selected_tab: Some(tab.clone()),
@@ -6446,6 +6449,7 @@ mod tests {
             }
             if let Ok(mode) = std::env::var("DIRI_WORKSPACE_GROUPS") {
                 snapshot.workspaces.push(WorkspaceRecord {
+                    project_id: None,
                     id: WorkspaceId::new("operations-workspace"),
                     name: "Operations".into(),
                     selected_tab: Some(TabId::new("deployment-tab")),
@@ -7124,6 +7128,7 @@ mod tests {
             store.seed_workspace_snapshot_for_test(WorkspaceSnapshot {
                 revision: 1,
                 workspaces: vec![WorkspaceRecord {
+                    project_id: None,
                     id: workspace.clone(),
                     name: "Window context".into(),
                     selected_tab: Some(tab.clone()),

@@ -999,6 +999,7 @@ mod tests {
         store.seed_workspace_snapshot_for_test(WorkspaceSnapshot {
             revision,
             workspaces: vec![WorkspaceRecord {
+                project_id: None,
                 id: WorkspaceId::new("workspace"),
                 name: "Release".into(),
                 selected_tab: tabs.first().map(|tab| tab.id.clone()),

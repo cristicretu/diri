@@ -330,12 +330,14 @@ mod tests {
         WorkspaceSnapshot {
             workspaces: vec![
                 WorkspaceRecord {
+                    project_id: None,
                     id: WorkspaceId::new("release"),
                     name: "Release".into(),
                     selected_tab: Some(TabId::new("build")),
                     tabs: vec![tab("build", "Build frontend"), tab("ship", "Ship café")],
                 },
                 WorkspaceRecord {
+                    project_id: None,
                     id: WorkspaceId::new("remote"),
                     name: "Remote review".into(),
                     selected_tab: Some(TabId::new("logs")),
