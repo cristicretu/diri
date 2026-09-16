@@ -484,6 +484,21 @@ impl RemoteSessionClient {
         )
     }
 
+    pub(crate) fn process_facts(
+        &self,
+        deadline: std::time::Instant,
+    ) -> io::Result<diri_proto::process_facts::ProcessFacts> {
+        self.manager.inspect_process_facts(
+            &self.helper,
+            &SessionSelector {
+                session_id: self.session_id.clone(),
+                session_token: self.token.clone(),
+                expected_incarnation: Some(self.incarnation.clone()),
+            },
+            deadline,
+        )
+    }
+
     pub fn read_scrollback_cells(
         &self,
         first_row: i64,

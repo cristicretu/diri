@@ -407,6 +407,41 @@ fn detach_reconnect_preserves_pid_snapshot_and_input() {
         "inspection must not acquire control"
     );
 
+    let with_facts: SessionInspection = run_json(
+        "inspect",
+        &state_dir,
+        Some(&diri_proto::remote_pty::ProcessInspectionRequest {
+            selector: selector.clone(),
+            include_process_facts: true,
+            timeout_ms: 1000,
+        }),
+    );
+    assert_eq!(
+        with_facts.controller_epoch, first_epoch,
+        "process facts must not acquire control"
+    );
+    let facts = with_facts
+        .process_facts
+        .expect("capable actual-host process facts");
+    assert_eq!(facts.identity, first_birth);
+    facts.validate().unwrap();
+    assert!(matches!(
+        facts.executable,
+        diri_proto::process_facts::ProcessValue::Available { .. }
+    ));
+    assert!(matches!(
+        facts.working_directory,
+        diri_proto::process_facts::ProcessValue::Available { .. }
+    ));
+    assert!(matches!(
+        facts.user_ids,
+        diri_proto::process_facts::ProcessValue::Available { .. }
+    ));
+    assert!(
+        inspection.process_facts.is_none(),
+        "ordinary inspection remains cheap"
+    );
+
     let mut second = Attach::open(&state_dir, hello(&launch, Some(acknowledged), "client-two"));
     let reconnected = second.receive_until(Duration::from_secs(2), |message| {
         matches!(message, RemoteMessage::FullSnapshot(_))

@@ -25,8 +25,25 @@ pub fn inspect(
             },
             ProcessValue::Unavailable { reason } => ProcessValue::unavailable(*reason),
         };
+        let (process_group, foreground_process_group) = match groups(identity.pid()) {
+            Ok((group, foreground)) => (
+                ProcessValue::available(group),
+                ProcessValue::available(foreground),
+            ),
+            Err(error) => {
+                let ProcessValue::Unavailable { reason } = value::<()>(Err(error)) else {
+                    unreachable!()
+                };
+                (
+                    ProcessValue::unavailable(reason),
+                    ProcessValue::unavailable(reason),
+                )
+            }
+        };
         Ok(ProcessFacts {
             identity: *identity,
+            process_group,
+            foreground_process_group,
             executable: value(executable(identity.pid())),
             working_directory: value(working_directory(identity.pid())),
             user_ids,
@@ -129,6 +146,80 @@ fn parse_linux_user_ids(bytes: &[u8]) -> io::Result<ProcessUserIds> {
     })
 }
 
+#[cfg(target_os = "linux")]
+fn groups(pid: u32) -> io::Result<(u32, Option<u32>)> {
+    use std::io::Read;
+    let mut bytes = Vec::new();
+    std::fs::File::open(format!("/proc/{pid}/stat"))?
+        .take(4097)
+        .read_to_end(&mut bytes)?;
+    if bytes.len() > 4096 {
+        return Err(invalid("oversized process stat"));
+    }
+    parse_linux_groups(pid, &bytes)
+}
+
+#[cfg(any(target_os = "linux", test))]
+fn parse_linux_groups(pid: u32, bytes: &[u8]) -> io::Result<(u32, Option<u32>)> {
+    let text = std::str::from_utf8(bytes).map_err(|_| invalid("invalid process stat encoding"))?;
+    let open = text
+        .find('(')
+        .ok_or_else(|| invalid("missing process comm"))?;
+    let close = text
+        .rfind(')')
+        .filter(|close| *close > open)
+        .ok_or_else(|| invalid("invalid process comm"))?;
+    if text[..open].trim().parse::<u32>().ok() != Some(pid) {
+        return Err(invalid("process stat PID mismatch"));
+    }
+    let fields: Vec<_> = text[close + 1..].split_whitespace().take(6).collect();
+    if fields.len() != 6 {
+        return Err(invalid("process group fields missing"));
+    }
+    let group = fields[2]
+        .parse::<u32>()
+        .ok()
+        .filter(|group| *group > 0 && *group <= i32::MAX as u32)
+        .ok_or_else(|| invalid("invalid process group"))?;
+    let foreground = fields[5]
+        .parse::<i32>()
+        .map_err(|_| invalid("invalid foreground process group"))?;
+    let foreground = match foreground {
+        -1 | 0 => None,
+        1.. => Some(foreground as u32),
+        _ => return Err(invalid("invalid foreground process group")),
+    };
+    Ok((group, foreground))
+}
+
+#[cfg(target_os = "macos")]
+fn groups(pid: u32) -> io::Result<(u32, Option<u32>)> {
+    // SAFETY: initialized SDK storage of precisely the size passed below.
+    let mut info: libc::proc_bsdinfo = unsafe { std::mem::zeroed() };
+    let size = std::mem::size_of_val(&info) as i32;
+    let filled = unsafe {
+        libc::proc_pidinfo(
+            pid as i32,
+            libc::PROC_PIDTBSDINFO,
+            0,
+            (&raw mut info).cast(),
+            size,
+        )
+    };
+    if filled != size {
+        return Err(io::Error::last_os_error());
+    }
+    if info.pbi_pid != pid || info.pbi_pgid == 0 || info.pbi_pgid > i32::MAX as u32 {
+        return Err(invalid("invalid native process group"));
+    }
+    let foreground = match info.e_tpgid {
+        0 | u32::MAX => None,
+        value if value <= i32::MAX as u32 => Some(value),
+        _ => return Err(invalid("invalid foreground process group")),
+    };
+    Ok((info.pbi_pgid, foreground))
+}
+
 #[cfg(target_os = "macos")]
 fn executable(pid: u32) -> io::Result<String> {
     let mut buffer = [0u8; libc::PROC_PIDPATHINFO_MAXSIZE as usize];
@@ -215,9 +306,27 @@ fn user_ids(_: u32) -> io::Result<ProcessUserIds> {
     Err(io::ErrorKind::Unsupported.into())
 }
 
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+fn groups(_: u32) -> io::Result<(u32, Option<u32>)> {
+    Err(io::ErrorKind::Unsupported.into())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn foreground_group_is_distinct_from_child_and_own_group() {
+        assert_eq!(
+            parse_linux_groups(42, b"42 (name ) with spaces) S 1 43 44 0 55 rest").unwrap(),
+            (43, Some(55))
+        );
+        assert_eq!(
+            parse_linux_groups(42, b"42 (name) S 1 43 44 0 -1").unwrap(),
+            (43, None)
+        );
+        assert!(parse_linux_groups(43, b"42 (name) S 1 43 44 0 55").is_err());
+    }
 
     #[test]
     fn linux_ids_keep_real_and_effective_distinct() {

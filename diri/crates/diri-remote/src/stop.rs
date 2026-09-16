@@ -3,8 +3,7 @@
 //! while waiting for the Holder to record its child's actual exit.
 use std::fs::File;
 use std::io::{self, Read, Write};
-use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
-use std::os::unix::ffi::OsStrExt;
+use std::os::fd::AsRawFd;
 use std::os::unix::net::UnixStream;
 use std::path::Path;
 use std::time::{Duration, Instant};
@@ -235,96 +234,14 @@ fn read_authenticated(
     Ok(current)
 }
 
-/// The management deadline includes socket admission. A blocking connect can
-/// otherwise wait indefinitely behind a full local listen backlog.
 fn connect_until(path: &Path, deadline: Instant) -> io::Result<UnixStream> {
-    remaining(deadline)?;
-    // SAFETY: all-zero sockaddr_un is valid storage before initializing fields.
-    let mut address: libc::sockaddr_un = unsafe { std::mem::zeroed() };
-    let bytes = path.as_os_str().as_bytes();
-    if bytes.len() >= address.sun_path.len() || bytes.contains(&0) {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            "invalid Holder socket path",
-        ));
-    }
-    address.sun_family = libc::AF_UNIX as _;
-    for (destination, source) in address.sun_path.iter_mut().zip(bytes) {
-        *destination = *source as libc::c_char;
-    }
-    let length =
-        (std::mem::offset_of!(libc::sockaddr_un, sun_path) + bytes.len() + 1) as libc::socklen_t;
-    #[cfg(target_os = "macos")]
-    {
-        address.sun_len = length as u8;
-    }
-    // SAFETY: socket takes only integer constants and returns an owned fd.
-    let raw = unsafe { libc::socket(libc::AF_UNIX, libc::SOCK_STREAM, 0) };
-    if raw < 0 {
-        return Err(io::Error::last_os_error());
-    }
-    // SAFETY: the successful socket call returned a new owned descriptor.
-    let owned = unsafe { OwnedFd::from_raw_fd(raw) };
-    // SAFETY: owned holds a live fd; these commands take integer flag values.
-    if unsafe { libc::fcntl(raw, libc::F_SETFD, libc::FD_CLOEXEC) } < 0 {
-        return Err(io::Error::last_os_error());
-    }
-    let stream = UnixStream::from(owned);
-    stream.set_nonblocking(true)?;
-    loop {
-        remaining(deadline)?;
-        // SAFETY: address is initialized, with a valid bounded length, and
-        // stream owns raw throughout this synchronous connect attempt.
-        if unsafe { libc::connect(raw, (&raw const address).cast(), length) } == 0 {
-            break;
+    diri_pty::unix_socket::connect_until(path, deadline).map_err(|error| {
+        if error.kind() == io::ErrorKind::TimedOut {
+            Failure::StopPending.into_io_error()
+        } else {
+            error
         }
-        let error = io::Error::last_os_error();
-        match error.raw_os_error() {
-            Some(libc::EISCONN) => break,
-            Some(libc::EINTR) => continue,
-            Some(code) if code == libc::EAGAIN || code == libc::EWOULDBLOCK => {
-                pause_until(deadline);
-            }
-            Some(libc::EINPROGRESS) | Some(libc::EALREADY) => {
-                let mut descriptor = libc::pollfd {
-                    fd: raw,
-                    events: libc::POLLOUT,
-                    revents: 0,
-                };
-                let timeout = remaining(deadline)?
-                    .as_millis()
-                    .max(1)
-                    .min(i32::MAX as u128) as i32;
-                // SAFETY: descriptor is live initialized storage for one entry.
-                let ready = unsafe { libc::poll(&mut descriptor, 1, timeout) };
-                if ready < 0 {
-                    let error = io::Error::last_os_error();
-                    if error.kind() == io::ErrorKind::Interrupted {
-                        continue;
-                    }
-                    return Err(error);
-                }
-                remaining(deadline)?;
-                if ready == 0 {
-                    continue;
-                }
-                if let Some(error) = stream.take_error()? {
-                    return Err(error);
-                }
-                if descriptor.revents & libc::POLLOUT != 0 {
-                    break;
-                }
-                return Err(io::Error::new(
-                    io::ErrorKind::ConnectionAborted,
-                    "Holder socket closed during connect",
-                ));
-            }
-            _ => return Err(error),
-        }
-    }
-    remaining(deadline)?;
-    stream.set_nonblocking(false)?;
-    Ok(stream)
+    })
 }
 
 fn write_message(

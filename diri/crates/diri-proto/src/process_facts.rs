@@ -60,6 +60,45 @@ pub struct ProcessFacts {
     pub working_directory: ProcessValue<String>,
     pub user_ids: ProcessValue<ProcessUserIds>,
     pub account: ProcessValue<ProcessAccount>,
+    /// Native process-group ID; never labeled as an individual PID.
+    pub process_group: ProcessValue<u32>,
+    /// Available(None) means the kernel reports no controlling foreground group.
+    pub foreground_process_group: ProcessValue<Option<u32>>,
+}
+
+impl ProcessFacts {
+    pub fn validate(&self) -> Result<(), &'static str> {
+        for field in [&self.executable, &self.working_directory] {
+            if let ProcessValue::Available { value } = field
+                && (!value.starts_with('/') || value.len() > 16 * 1024 || value.contains('\0'))
+            {
+                return Err("invalid native process path");
+            }
+        }
+        if matches!(self.process_group, ProcessValue::Available { value } if value == 0 || value > i32::MAX as u32)
+            || matches!(self.foreground_process_group, ProcessValue::Available { value: Some(value) } if value == 0 || value > i32::MAX as u32)
+        {
+            return Err("invalid native process group");
+        }
+        validate_account(&self.account).map_err(|_| "invalid process account")?;
+        if let ProcessValue::Available { value: account } = &self.account
+            && !matches!(&self.user_ids, ProcessValue::Available { value: ids } if ids.effective == account.uid)
+        {
+            return Err("process account does not match effective UID");
+        }
+        Ok(())
+    }
+}
+
+/// A read-only observation of the currently bound session child.
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SessionProcessInfo {
+    #[serde(rename = "sessionID")]
+    pub session_id: crate::SessionId,
+    pub host: Option<String>,
+    pub observed_at: crate::DateMillis,
+    pub process: ProcessFacts,
 }
 
 pub const MAX_ACCOUNT_REPLY_BYTES: usize = 8192;

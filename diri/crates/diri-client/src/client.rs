@@ -471,6 +471,14 @@ impl DaemonClient {
         .await
     }
 
+    pub async fn process_info(
+        &self,
+        session_id: &SessionId,
+    ) -> Result<diri_proto::process_facts::SessionProcessInfo, ClientError> {
+        self.typed(Method::SESSION_PROCESS_INFO, &session_params(session_id))
+            .await
+    }
+
     pub async fn reconnect(
         &self,
         session_id: &SessionId,

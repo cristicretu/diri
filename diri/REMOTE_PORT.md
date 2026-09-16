@@ -1516,10 +1516,37 @@ Account database calls may block in directory services. The existing Rust
 runs before detachment or manager logic. It owns no PTY, socket, lease or service.
 Its parent clears the worker environment, bounds the reply to 8 KiB, defaults to
 a 250 ms deadline (one-second ceiling for an explicitly supplied caller deadline),
-and kills/reaps timed-out workers. Admission allows at most four workers per
-caller process and retains each permit until that worker is reaped. No lookup
-runs in a Holder owner loop, and no idle worker or timer remains afterward.
+and kills timed-out workers. Admission allows at most four workers per caller
+process and retains each permit until that worker is reaped. A killed child that
+is not yet reapable transfers to an on-demand reaper rather than extending the
+caller deadline. Failed cleanup-thread creation retains the child and permit in
+a bounded tracked queue, retried on the next request; no idle poller is added.
+The worker is one directly spawned Rust process, not a shell or process tree.
+No lookup runs in a Holder owner loop. The Engine additionally caps whole
+inspections at four; this is not a host-wide cross-process worker limit.
 
-The stronger public process-inspection request and remote minor-13 capability
-are the next additive projection of this foundation; this worker alone does not
-claim a complete process-inspection API.
+`session.process_info` and `dirijor session process ID [--json]` expose these
+observations on demand. The Engine captures a session handle under Registry,
+then releases Registry before native or remote work, and checks the same handle
+and host again before returning. At most four requests run concurrently. One
+one-second deadline spans connection, bounded stat replies, native/account
+observations and identity verification; the account phase is additionally capped
+at 250 ms. The local stat reader uses nonblocking I/O and a 16 KiB reply limit;
+partial replies do not renew the deadline, and peer closure drains queued bytes.
+
+Local held sessions retain the owned-child birth and log epoch captured during
+launch/adoption. Both stat observations must match that binding; old Holders or
+missing captured identity return unsupported, never lazy PID adoption. Remote
+protocol minor 13 advertises `process-facts-v1` on the existing authenticated
+Helper `inspect` command. The Helper brackets observations with actual-host
+birth checks and authenticated state/incarnation/build/owner-lock verification.
+Old Helpers omit optional facts and fail closed for the stronger operation.
+Ordinary inspect/list requests do not collect these facts. There is no new frame,
+controller attach, observer, wake, activity update, or Holder owner-loop lookup.
+
+The result distinguishes child PID, own process-group ID and controlling-terminal
+foreground process-group ID. Available-null foreground means the OS reports no
+foreground group; it is distinct from unavailable. Observations are identity-bound,
+not simultaneous: a live child may change cwd, executable or effective UID between
+field reads. Account name/home come from the observed effective UID's native
+account record, not environment variables. No command arguments are collected.

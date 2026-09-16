@@ -83,7 +83,7 @@ fn run(arguments: &[String]) -> Result<(), CliError> {
 fn print_help() {
     println!(
         "dirijor — Diri automation CLI\n\n\
-         Usage:\n  dirijor status [--json]\n  dirijor activity [--limit N] [--json]\n  dirijor session <list|get|read|send|key|wait|spawn|fork|reconnect|release|archive> ...\n  \
+         Usage:\n  dirijor status [--json]\n  dirijor activity [--limit N] [--json]\n  dirijor session <list|get|process|read|send|key|wait|spawn|fork|reconnect|release|archive> ...\n  \
          dirijor worktree <list|create|remove> ...\n  dirijor artifacts <session> [--json]\n  \
          dirijor events <subscribe|wait> ...\n  dirijor ports [--json]\n  dirijor doctor\n  \
          dirijor hook <event>\n  dirijor notify <json>\n  dirijor notify --title TEXT --body TEXT\n  dirijor mcp-tools\n  \
@@ -355,6 +355,7 @@ fn session(arguments: &[String]) -> Result<(), CliError> {
     match action {
         "list" => session_list(rest, false),
         "get" => session_get(rest),
+        "process" => session_process(rest),
         "read" => session_read(rest),
         "send" => session_send(rest),
         "key" => session_key(rest),
@@ -368,6 +369,63 @@ fn session(arguments: &[String]) -> Result<(), CliError> {
             "unknown session action: {other}"
         ))),
     }
+}
+
+fn session_process(arguments: &[String]) -> Result<(), CliError> {
+    let Some(id) = arguments.first().filter(|id| !id.starts_with('-')) else {
+        return Err(CliError::failure("session process requires a session ID"));
+    };
+    if arguments[1..].iter().any(|arg| arg != "--json") {
+        return Err(CliError::failure("usage: session process ID [--json]"));
+    }
+    let result = request(
+        Method::SESSION_PROCESS_INFO,
+        json!({"sessionID": id}),
+        Duration::from_secs(3),
+    )?;
+    let parsed: diri_proto::process_facts::SessionProcessInfo =
+        serde_json::from_value(result.clone())
+            .map_err(|_| CliError::failure("invalid process inspection response"))?;
+    parsed.process.validate().map_err(CliError::failure)?;
+    if has_flag(&arguments[1..], "--json") {
+        print_json(&result);
+    } else {
+        print!("{}", format_process_info(&parsed));
+    }
+    Ok(())
+}
+
+fn format_process_info(info: &diri_proto::process_facts::SessionProcessInfo) -> String {
+    use diri_proto::process_facts::ProcessValue;
+    fn field<T: serde::Serialize>(value: &ProcessValue<T>) -> String {
+        match value {
+            ProcessValue::Available { value } => {
+                serde_json::to_string(value).expect("process field")
+            }
+            ProcessValue::Unavailable { reason } => format!(
+                "unavailable ({})",
+                serde_json::to_value(reason)
+                    .expect("reason")
+                    .as_str()
+                    .expect("reason string")
+            ),
+        }
+    }
+    let p = &info.process;
+    format!(
+        "Session: {:?}\nHost: {}\nChild PID: {}\nProcess PGID: {}\nForeground PGID: {}\nExecutable: {}\nWorking directory: {}\nReal/effective UIDs: {}\nEffective account: {}\n",
+        info.session_id.0,
+        info.host
+            .as_ref()
+            .map_or_else(|| "local".into(), |host| format!("{host:?}")),
+        p.identity.pid(),
+        field(&p.process_group),
+        field(&p.foreground_process_group),
+        field(&p.executable),
+        field(&p.working_directory),
+        field(&p.user_ids),
+        field(&p.account)
+    )
 }
 
 fn session_reconnect(arguments: &[String]) -> Result<(), CliError> {

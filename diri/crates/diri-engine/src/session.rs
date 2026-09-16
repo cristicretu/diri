@@ -16,6 +16,8 @@
 //! PTY read is a blocking syscall — the same reasoning that moved the test
 //! servers off the cooperative pool earlier tonight.
 
+mod process_facts;
+
 use std::io::Read;
 use std::os::fd::AsRawFd;
 use std::path::{Path, PathBuf};
@@ -260,6 +262,7 @@ impl PromptInputState {
 
 /// The state the pump thread and the outside world share.
 struct Shared {
+    holder_identity: std::sync::OnceLock<(diri_proto::process::ProcessIdentity, u64)>,
     keyboard_known: AtomicBool,
     id: String,
     status: Mutex<SessionStatus>,
@@ -1112,9 +1115,9 @@ impl Session {
         HolderLauncher::launch(&holder.executable, &paths, &launch).map_err(holder_io_error)?;
 
         let client = HolderClient::new(paths.socket());
-        let floor = wait_for_holder(&client, &spec.logs_dir, &spec.id, pre_spawn_tail)
+        let (floor, stat) = wait_for_holder(&client, &spec.logs_dir, &spec.id, pre_spawn_tail)
             .map_err(holder_io_error)?;
-        Self::attach(spec, client, floor, engine, true)
+        Self::attach(spec, client, floor, engine, true, stat.as_ref())
     }
 
     /// Spawns through a holder, but not yet: the exec waits for the first
@@ -1182,12 +1185,20 @@ impl Session {
                         mark_launch_failed(&shared);
                         return;
                     }
-                    let Ok(floor) = wait_for_holder(&client, &logs_dir, &id, pre_spawn_tail) else {
+                    let Ok((floor, stat)) =
+                        wait_for_holder(&client, &logs_dir, &id, pre_spawn_tail)
+                    else {
                         mark_launch_failed(&shared);
                         return;
                     };
-                    if let Ok(stat) = client.stat() {
-                        shared.child_pid.store(stat.child_pid, Ordering::SeqCst);
+                    let stat = stat.or_else(|| {
+                        client
+                            .stat()
+                            .ok()
+                            .filter(|stat| stat.epoch_offset == Some(floor))
+                    });
+                    if let Some(stat) = stat {
+                        process_facts::capture_holder(&shared, &stat);
                     }
                     let Some(handoff) = deferred.finish_launch((cols, rows)) else {
                         // A terminate raced the launch and believes there is
@@ -1254,7 +1265,7 @@ impl Session {
             spec.pty.cols = cols;
             spec.pty.rows = rows;
         }
-        let session = Self::attach(spec, client, floor, engine, false)?;
+        let session = Self::attach(spec, client, floor, engine, false, Some(stat))?;
         if let Some((status, needs_input)) = initial_status
             && session
                 .shared
@@ -1278,11 +1289,23 @@ impl Session {
         exit_marker_floor: u64,
         engine: Arc<ManifestEngine>,
         fresh: bool,
+        stat: Option<&HolderStat>,
     ) -> std::io::Result<Self> {
         let log = OutputLog::reader(&spec.logs_dir, &spec.id)?;
         let shared = new_shared(&spec, log, &engine, fresh);
-        if let Ok(stat) = client.stat() {
-            shared.child_pid.store(stat.child_pid, Ordering::SeqCst);
+        // Log progress can establish short-lived launch readiness before the
+        // first stat succeeds. Preserve the existing one-time launch probe,
+        // but never bind a later Holder epoch to that log boundary.
+        let fallback = if stat.is_none() {
+            client
+                .stat()
+                .ok()
+                .filter(|stat| stat.epoch_offset == Some(exit_marker_floor))
+        } else {
+            None
+        };
+        if let Some(stat) = stat.or(fallback.as_ref()) {
+            process_facts::capture_holder(&shared, stat);
         }
 
         let pump = {
@@ -2141,6 +2164,7 @@ fn new_shared(
         })
         .map(|event| event.occurred_at);
     Arc::new(Shared {
+        holder_identity: std::sync::OnceLock::new(),
         keyboard_known: AtomicBool::new(true),
         id: spec.id.clone(),
         status: Mutex::new(initial_status),
@@ -2184,15 +2208,15 @@ fn wait_for_holder(
     logs_dir: &Path,
     session_id: &str,
     pre_spawn_tail: u64,
-) -> Result<u64, crate::holder::HolderError> {
+) -> Result<(u64, Option<HolderStat>), crate::holder::HolderError> {
     for delay in crate::holder::readiness_delays().take(300) {
         if let Ok(stat) = client.stat() {
-            return Ok(stat.epoch_offset.unwrap_or(pre_spawn_tail));
+            return Ok((stat.epoch_offset.unwrap_or(pre_spawn_tail), Some(stat)));
         }
         if let Ok(mut log) = OutputLog::reader(logs_dir, session_id) {
             log.refresh_from_disk();
             if log.tail_offset() > pre_spawn_tail {
-                return Ok(pre_spawn_tail);
+                return Ok((pre_spawn_tail, None));
             }
         }
         std::thread::sleep(delay);
