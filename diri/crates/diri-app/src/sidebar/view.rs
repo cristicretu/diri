@@ -996,7 +996,9 @@ impl Sidebar {
     }
 
     pub fn is_focused(&self, window: &Window) -> bool {
-        self.focus_handle.is_focused(window) || self.filter_focus.is_focused(window)
+        self.focus_handle.is_focused(window)
+            || self.filter_focus.is_focused(window)
+            || self.workspace_nav.focus.is_focused(window)
     }
 
     /// Enters keyboard-navigation mode from any other surface. An active row

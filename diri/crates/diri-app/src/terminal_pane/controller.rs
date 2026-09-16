@@ -594,6 +594,22 @@ fn spawn_transport(
     });
 }
 
+#[cfg(all(test, target_os = "macos"))]
+impl super::TerminalPane {
+    pub(crate) fn controller_counts_for_test(cx: &App) -> (usize, usize) {
+        if !cx.has_global::<Controllers>() {
+            return (0, 0);
+        }
+        cx.global::<Controllers>()
+            .0
+            .values()
+            .filter_map(|entry| entry.session.upgrade())
+            .fold((0, 0), |(controllers, views), session| {
+                (controllers + 1, views + session.borrow().views.len())
+            })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use diri_proto::frames::{Frame, FrameCodec, FrameType};

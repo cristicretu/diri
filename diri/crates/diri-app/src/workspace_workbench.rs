@@ -1,5 +1,7 @@
 //! Mounted layout views. Saved panes reference sessions; one explicit visible
 //! view per session owns geometry in the active window.
+mod commands;
+pub(crate) use commands::PaneCommand;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Arc;
 
@@ -25,7 +27,11 @@ use gpui::{
 pub(crate) enum WorkspaceWorkbenchEvent {
     Terminal(TerminalPaneEvent),
     Notice(String),
-    RequestSplit { tab: TabId, pane: PaneId },
+    RequestSplit {
+        tab: TabId,
+        pane: PaneId,
+        edge: DockEdge,
+    },
 }
 #[derive(Clone)]
 struct DraggedWorkspacePane {
@@ -107,6 +113,7 @@ pub(crate) struct WorkspaceWorkbench {
     tokio: Arc<tokio::runtime::Runtime>,
     tab: Option<WorkspaceTab>,
     enabled: bool,
+    placeholder_focus: gpui::FocusHandle,
     external_owner: Option<SessionId>,
     mounted: HashMap<PaneId, MountedPane>,
     recent: VecDeque<PaneId>,
@@ -167,6 +174,7 @@ impl WorkspaceWorkbench {
             tokio,
             tab: None,
             enabled: false,
+            placeholder_focus: cx.focus_handle(),
             external_owner: None,
             mounted: HashMap::new(),
             recent: VecDeque::new(),
@@ -393,7 +401,11 @@ impl WorkspaceWorkbench {
     fn focused_id(&self) -> Option<&PaneId> {
         self.pending_focus
             .as_ref()
-            .filter(|id| self.mounted.contains_key(*id))
+            .filter(|id| {
+                self.tab
+                    .as_ref()
+                    .is_some_and(|tab| commands::contains_pane(&tab.layout, id))
+            })
             .or_else(|| self.tab.as_ref().map(|tab| &tab.focused_pane))
     }
     pub(crate) fn resident_preview_buffers(
@@ -436,6 +448,8 @@ impl WorkspaceWorkbench {
     pub(crate) fn focus(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if let Some(terminal) = self.focused_terminal() {
             terminal.update(cx, |terminal, cx| terminal.focus(window, cx));
+        } else {
+            window.focus(&self.placeholder_focus, cx);
         }
         self.assign_visible_owners(window, cx);
     }
@@ -611,7 +625,7 @@ impl WorkspaceWorkbench {
         let mut tab = self.tab.clone()?;
         if let Some(focused) = self.focused_id() {
             if tab.focused_pane != *focused {
-                tab.zoomed_pane = None;
+                tab.zoomed_pane = tab.zoomed_pane.as_ref().map(|_| focused.clone());
             }
             tab.focused_pane = focused.clone();
         }
@@ -659,6 +673,7 @@ impl Render for WorkspaceWorkbench {
         let mut root = div()
             .id("workspace-workbench")
             .debug_selector(|| "workspace-workbench".into())
+            .track_focus(&self.placeholder_focus)
             .relative()
             .size_full()
             .overflow_hidden()
@@ -856,6 +871,7 @@ impl Render for WorkspaceWorkbench {
                                 cx.emit(WorkspaceWorkbenchEvent::RequestSplit {
                                     tab: split_tab.clone(),
                                     pane: split_pane.clone(),
+                                    edge: DockEdge::Right,
                                 });
                             }
                         })),
@@ -1013,6 +1029,51 @@ mod tests {
         owners.sort_by(|a, b| a.0.cmp(&b.0));
         owners
     }
+    #[gpui::test]
+    fn keyboard_focus_on_unavailable_reference_leaves_live_terminal_input(cx: &mut TestAppContext) {
+        let (runtime, tokio, mut tab) = fixture(false);
+        if let LayoutNode::Split { second, .. } = &mut tab.layout
+            && let LayoutNode::Pane { session_id, .. } = second.as_mut()
+        {
+            *session_id = SessionId::new("unavailable");
+        }
+        seed(&runtime, vec![tab.clone()], 2);
+        let window =
+            cx.add_window(|window, cx| WorkspaceWorkbench::new(runtime, tokio, window, cx));
+        window
+            .update(cx, |workbench, window, cx| {
+                window.activate_window();
+                workbench.set_tab(tab, viewport(), window, cx);
+                workbench.execute_command(PaneCommand::Focus(DockEdge::Right), window, cx);
+                assert_eq!(workbench.focused_id(), Some(&PaneId::new("b")));
+                assert!(workbench.focused_terminal().is_none());
+                assert!(workbench.placeholder_focus.is_focused(window));
+            })
+            .unwrap();
+    }
+
+    #[gpui::test]
+    fn keyboard_focus_keeps_zoom_and_shared_session_identity(cx: &mut TestAppContext) {
+        let (runtime, tokio, mut tab) = fixture(true);
+        tab.zoomed_pane = Some(PaneId::new("a"));
+        seed(&runtime, vec![tab.clone()], 2);
+        let window =
+            cx.add_window(|window, cx| WorkspaceWorkbench::new(runtime, tokio, window, cx));
+        window
+            .update(cx, |workbench, window, cx| {
+                window.activate_window();
+                workbench.set_tab(tab, viewport(), window, cx);
+                let before = workbench.mounted[&PaneId::new("a")].terminal.clone();
+                workbench.execute_command(PaneCommand::Focus(DockEdge::Right), window, cx);
+                let geometry = workbench.geometry().unwrap();
+                assert_eq!(geometry.panes.len(), 1);
+                assert_eq!(geometry.focused.pane, PaneId::new("b"));
+                assert_eq!(geometry.focused.session, SessionId::new("preview-claude"));
+                assert_eq!(workbench.mounted[&PaneId::new("a")].terminal, before);
+            })
+            .unwrap();
+    }
+
     #[test]
     fn visible_owner_is_stable_and_focused_duplicate_wins() {
         let panes = vec![
