@@ -19,6 +19,13 @@ use diri_proto::remote_pty::{
 };
 use diri_proto::{HostEntry, SessionStatus};
 
+fn unique_stop_session_id(label: &str) -> String {
+    let mut nonce = [0u8; 16];
+    getrandom::fill(&mut nonce).expect("fixture nonce");
+    let suffix: String = nonce.iter().map(|byte| format!("{byte:02x}")).collect();
+    format!("{label}-{suffix}")
+}
+
 fn helper() -> &'static str {
     env!("CARGO_BIN_EXE_diri-remote")
 }
@@ -499,7 +506,7 @@ fn engine_bootstraps_detaches_and_adopts_the_same_remote_process() {
         argv: vec![
             "/bin/sh".into(),
             "-c".into(),
-            "printf 'ready>'; IFS= read -r first; printf 'first:%s\\nnext>' \"$first\"; IFS= read -r second; printf 'second:%s\\n' \"$second\"".into(),
+            "printf '\\033[?1h\\033=ready>'; IFS= read -r first; printf '\\033[?1lfirst:%s\\nnext>' \"$first\"; IFS= read -r second; printf 'second:%s\\n' \"$second\"".into(),
         ],
         cwd: "/".into(),
         environment: vec![
@@ -539,8 +546,24 @@ fn engine_bootstraps_detaches_and_adopts_the_same_remote_process() {
     )
     .expect("spawn remote Session");
     wait_for_grid(&session, "ready>");
+    assert_eq!(
+        session.keyboard_state(),
+        Some(diri_proto::terminal_input::KeyboardState {
+            enhancements: Some(0.try_into().unwrap()),
+            application_cursor_keys: true,
+            application_keypad: true
+        })
+    );
     session.write_input(b"alpha\n").expect("first input");
     wait_for_grid(&session, "next>");
+    assert_eq!(
+        session.keyboard_state(),
+        Some(diri_proto::terminal_input::KeyboardState {
+            enhancements: Some(0.try_into().unwrap()),
+            application_cursor_keys: false,
+            application_keypad: true
+        })
+    );
 
     let binding = bindings
         .load_all()
@@ -604,6 +627,14 @@ fn engine_bootstraps_detaches_and_adopts_the_same_remote_process() {
         "reattaching an existing remote Agent must not look like a new launch"
     );
     wait_for_grid(&session, "next>");
+    assert_eq!(
+        session.keyboard_state(),
+        Some(diri_proto::terminal_input::KeyboardState {
+            enhancements: Some(0.try_into().unwrap()),
+            application_cursor_keys: false,
+            application_keypad: true
+        })
+    );
     let after = manager
         .inspect(
             &installed,
@@ -618,7 +649,24 @@ fn engine_bootstraps_detaches_and_adopts_the_same_remote_process() {
         after.process_state,
         diri_proto::remote_pty::RemoteProcessState::Running { pid } if pid == process_pid
     ));
-    session.write_input(b"omega\n").expect("second input");
+    for key in "omega"
+        .chars()
+        .map(|ch| diri_proto::terminal_input::KeyEvent::character(ch.to_string()))
+        .chain([diri_proto::terminal_input::KeyEvent::named(
+            diri_proto::terminal_input::NamedKey::Enter,
+        )])
+    {
+        let bytes = diri_proto::terminal_input::encode_action(
+            &key,
+            Default::default(),
+            session.keyboard_state(),
+            diri_proto::terminal_input::KeyAction::Press,
+        )
+        .unwrap();
+        session
+            .write_input(&bytes)
+            .expect("mode-aware input after reconnect");
+    }
     wait_until("remote exit", Duration::from_secs(5), || {
         session.view().exited
     });
@@ -680,6 +728,19 @@ fn launch_response_disconnect_recovers_the_existing_holder_idempotently() {
         expected_incarnation: Some(launched.session_incarnation.clone()),
     };
     let inspection = manager.inspect(&installed, &selector).expect("inspect");
+    let birth = manager
+        .inspect_process_identity(&installed, &selector)
+        .expect("host-verified birth");
+    assert_eq!(birth.pid(), launched.process_pid);
+    assert_eq!(inspection.verified_child_identity(), Some(birth));
+    assert_eq!(
+        manager
+            .inspect(&installed, &selector)
+            .unwrap()
+            .controller_epoch,
+        inspection.controller_epoch,
+        "lease-free facts cannot change control ownership"
+    );
     assert_eq!(
         inspection.process_state,
         diri_proto::remote_pty::RemoteProcessState::Running {
@@ -778,7 +839,7 @@ fn interrupted_upload_cleans_only_its_nonce_and_is_retryable() {
 }
 
 #[test]
-fn attach_ssh_disconnect_reconnects_and_flushes_queued_input() {
+fn attach_ssh_disconnect_reconnects_without_replaying_unavailable_input() {
     let temporary = tempfile::tempdir().expect("temp");
     let remote_home = temporary.path().join("remote-home");
     let remote_state = temporary.path().join("remote-state");
@@ -846,20 +907,39 @@ fn attach_ssh_disconnect_reconnects_and_flushes_queued_input() {
     )
     .expect("spawn remote Session");
     wait_until("first attach interruption", Duration::from_secs(5), || {
-        disconnect_marker.is_file()
+        temporary
+            .path()
+            .join("attach-interrupted.disconnected")
+            .is_file()
+            && session.view().remote_connection.is_some_and(|connection| {
+                connection.state == diri_proto::RemoteConnectionState::Reconnecting
+            })
     });
-    // Input during the reconnect window is bounded and delivered after the
-    // replacement controller receives ControlGranted.
+    // The child may have changed modes while disconnected. Reject without
+    // queueing until a matching authoritative seed restores mode knowledge.
+    assert_eq!(
+        session
+            .write_input(b"must-not-replay\n")
+            .unwrap_err()
+            .kind(),
+        std::io::ErrorKind::Unsupported
+    );
+    fs::write(temporary.path().join("attach-interrupted.resume"), b"").unwrap();
+    wait_until("validated reconnect seed", Duration::from_secs(5), || {
+        session.view().remote_connection.is_some_and(|connection| {
+            connection.state == diri_proto::RemoteConnectionState::Connected
+        })
+    });
     session
         .write_input(b"after-ssh-reconnect\n")
-        .expect("queued input");
+        .expect("input after validated seed");
     // Wait for the echo itself, not for the exit. `exited` flips when the
     // remote process is reaped, which can beat the last of its output through
     // the Holder, the frame queue and the terminal parser — so asserting the
     // screen right after it raced the flush and failed on a loaded CI runner
     // while passing locally.
     wait_until(
-        "the queued input to echo after reconnect",
+        "the newly admitted input to echo after reconnect",
         Duration::from_secs(10),
         || {
             session
@@ -876,6 +956,78 @@ fn attach_ssh_disconnect_reconnects_and_flushes_queued_input() {
     session
         .terminate(Duration::from_millis(200))
         .expect("cleanup Holder");
+}
+
+#[test]
+fn engine_terminate_uses_stop_result_after_controller_revocation() {
+    let temporary = tempfile::tempdir().unwrap();
+    let remote_home = temporary.path().join("remote-home");
+    fs::create_dir(&remote_home).unwrap();
+    let manager = Arc::new(
+        RemoteManager::new(
+            ProcessExecutor::new(write_fake_ssh(
+                temporary.path(),
+                &remote_home,
+                &temporary.path().join("remote-state"),
+            )),
+            ArtifactCatalog::from_native_helper(Path::new(helper())).unwrap(),
+            temporary.path().join("ssh-control"),
+        )
+        .unwrap(),
+    );
+    let host = HostEntry {
+        id: "stop-fixture".into(),
+        name: None,
+        ssh: "fixture-host".into(),
+        default_cwd: Some("/".into()),
+        node: None,
+    };
+    let installed = manager.ensure_helper(&host).unwrap();
+    let request = LaunchRequest {
+        session_id: unique_stop_session_id("stop-facts"),
+        session_token: token_for_retry(),
+        argv: vec![
+            "/bin/sh".into(),
+            "-c".into(),
+            "trap 'sleep 0.1; exit 42' TERM; printf ready; while :; do sleep 1; done".into(),
+        ],
+        cwd: "/".into(),
+        environment: vec![],
+        cols: 80,
+        rows: 24,
+        persistence: PersistenceCapability::NonPersistent,
+    };
+    let mut session = Session::spawn(
+        SessionSpec {
+            id: request.session_id.clone(),
+            pty: PtySpec::new(request.argv.clone(), "/").size(80, 24),
+            manifest_id: "shell".into(),
+            authority: Authority::ProcessOnly,
+            logs_dir: temporary.path().join("logs"),
+            holder: None,
+            defer_launch: false,
+            remote: Some(RemoteSessionSpec {
+                manager,
+                helper: installed,
+                launch: request,
+                host_id: host.id,
+                binding_store: RemoteBindingStore::new(temporary.path().join("bindings")).unwrap(),
+            }),
+        },
+        Arc::new(ManifestEngine::new(Vec::new())),
+    )
+    .unwrap();
+    wait_for_grid(&session, "ready");
+    let exit = session.terminate(Duration::ZERO).unwrap();
+    assert_eq!(
+        exit,
+        diri_engine::Exit::Code(42),
+        "the old controller cannot supply the stop channel's exit"
+    );
+    assert!(
+        session.view().exited,
+        "actual stop fact reaches the shared session projection"
+    );
 }
 
 fn wait_for_grid(session: &Session, needle: &str) {
@@ -990,9 +1142,11 @@ fn write_fake_ssh_with_attach_disconnect(
     write_executable_script(
         &path,
         &format!(
-            "#!/bin/sh\nexport HOME='{}'\nexport DIRI_REMOTE_STATE_DIR='{}'\nfor last; do :; done\ncase \"$last\" in\n  *' attach'*)\n    if [ ! -e '{}' ]; then\n      : > '{}'\n      /bin/sh -c \"$last\" <&0 & bridge=$!\n      (sleep 0.2; kill \"$bridge\" 2>/dev/null || true) & killer=$!\n      wait \"$bridge\" || true\n      kill \"$killer\" 2>/dev/null || true\n      wait \"$killer\" 2>/dev/null || true\n      printf 'simulated interrupted attach\\n' >&2\n      exit 255\n    fi\n    ;;\nesac\nexec /bin/sh -c \"$last\"",
+            "#!/bin/sh\nexport HOME='{}'\nexport DIRI_REMOTE_STATE_DIR='{}'\nfor last; do :; done\ncase \"$last\" in\n  *' attach'*)\n    if [ ! -e '{}' ]; then\n      : > '{}'\n      /bin/sh -c \"$last\" <&0 & bridge=$!\n      (sleep 0.2; kill \"$bridge\" 2>/dev/null || true) & killer=$!\n      wait \"$bridge\" || true\n      kill \"$killer\" 2>/dev/null || true\n      wait \"$killer\" 2>/dev/null || true\n      printf 'simulated interrupted attach\\n' >&2\n      : > '{}.disconnected'\n      exit 255\n    fi\n    while [ ! -e '{}.resume' ]; do sleep 0.01; done\n    ;;\nesac\nexec /bin/sh -c \"$last\"",
             home.display(),
             state.display(),
+            marker.display(),
+            marker.display(),
             marker.display(),
             marker.display(),
         ),

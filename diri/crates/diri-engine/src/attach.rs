@@ -71,6 +71,8 @@ const WRITE_RETRY: Duration = Duration::from_millis(1);
 const STALLED_SINK_TIMEOUT: Duration = Duration::from_secs(2);
 
 struct SinkOutput {
+    enhanced_keyboard: bool,
+    preview: bool,
     stream: UnixStream,
     frames: VecDeque<Arc<[u8]>>,
     offset: usize,
@@ -85,6 +87,8 @@ impl SinkOutput {
     fn new(stream: UnixStream) -> std::io::Result<Self> {
         stream.set_nonblocking(true)?;
         Ok(Self {
+            enhanced_keyboard: false,
+            preview: false,
             stream,
             frames: VecDeque::new(),
             offset: 0,
@@ -234,10 +238,11 @@ impl AttachHub {
         else {
             return Admission::Unavailable;
         };
-        let Ok(modes) = encoded(&Frame::modes_with_bracketed_paste(
+        let Ok(modes) = encoded(&Frame::modes_with_keyboard(
             seed.modes.0,
             seed.modes.1,
             seed.modes.2,
+            seed.signature.keyboard,
         )) else {
             return Admission::Unavailable;
         };
@@ -278,7 +283,26 @@ impl AttachHub {
         buffered: Vec<u8>,
         writer: Arc<Mutex<UnixStream>>,
     ) {
-        self.serve_kind(registry, session_id, reader, buffered, writer, false);
+        self.serve_with_keyboard(registry, session_id, false, reader, buffered, writer);
+    }
+
+    pub fn serve_with_keyboard(
+        &self,
+        registry: &Arc<Mutex<Registry>>,
+        session_id: &str,
+        enhanced_keyboard: bool,
+        reader: UnixStream,
+        buffered: Vec<u8>,
+        writer: Arc<Mutex<UnixStream>>,
+    ) {
+        self.serve_kind(
+            registry,
+            session_id,
+            reader,
+            buffered,
+            writer,
+            (false, enhanced_keyboard),
+        );
     }
 
     pub fn serve_preview(
@@ -289,7 +313,14 @@ impl AttachHub {
         buffered: Vec<u8>,
         writer: Arc<Mutex<UnixStream>>,
     ) {
-        self.serve_kind(registry, session_id, reader, buffered, writer, true);
+        self.serve_kind(
+            registry,
+            session_id,
+            reader,
+            buffered,
+            writer,
+            (true, false),
+        );
     }
 
     fn serve_kind(
@@ -299,7 +330,7 @@ impl AttachHub {
         mut reader: UnixStream,
         buffered: Vec<u8>,
         writer: Arc<Mutex<UnixStream>>,
-        preview: bool,
+        (preview, enhanced_keyboard): (bool, bool),
     ) {
         // Selecting a hibernated session revives it: the seed below paints
         // instantly from the emulator, and the live program resumes
@@ -308,6 +339,12 @@ impl AttachHub {
             let Ok(mut guard) = registry.lock() else {
                 return;
             };
+            if guard
+                .get(session_id)
+                .is_some_and(|session| !session.allows_keyboard_controller(enhanced_keyboard))
+            {
+                return;
+            }
             let _ = guard.wake_session(session_id);
         }
         let mut output = {
@@ -322,6 +359,8 @@ impl AttachHub {
             };
             output
         };
+        output.enhanced_keyboard = enhanced_keyboard;
+        output.preview = preview;
         // Snapshot, seed queueing and registration share the publisher's
         // Registry sequencing boundary. No update can slip between a new
         // sink's snapshot and admission, and no socket write holds this lock.
@@ -343,6 +382,9 @@ impl AttachHub {
                     .count()
                     >= diri_proto::preview::MAX_PREVIEWS
             {
+                return;
+            }
+            if !preview && !session.allows_keyboard_controller(enhanced_keyboard) {
                 return;
             }
             let seed = if preview {
@@ -375,10 +417,12 @@ impl AttachHub {
                 grid
             };
             output.enqueue(Arc::from(grid));
-            let Ok(modes) = encoded(&Frame::modes_with_bracketed_paste(
+            let Ok(modes) = encoded(&Frame::modes_with_keyboard_capability(
                 seed.modes.0,
                 seed.modes.1,
                 seed.modes.2,
+                seed.signature.keyboard,
+                enhanced_keyboard,
             )) else {
                 return;
             };
@@ -410,7 +454,14 @@ impl AttachHub {
                 if preview && !matches!(frame.frame_type, FrameType::Ping | FrameType::Pong) {
                     break 'serve;
                 }
-                if !self.handle_frame(registry, session_id, &output, &wake, &frame) {
+                if !self.handle_frame(
+                    registry,
+                    session_id,
+                    &output,
+                    &wake,
+                    &frame,
+                    enhanced_keyboard,
+                ) {
                     break 'serve;
                 }
             }
@@ -439,6 +490,7 @@ impl AttachHub {
         output: &Arc<Mutex<SinkOutput>>,
         wake: &crate::session::GridWake,
         frame: &Frame,
+        enhanced_keyboard: bool,
     ) -> bool {
         if frame.frame_type == FrameType::Ping {
             let Ok(pong) = encoded(&Frame::pong()) else {
@@ -454,6 +506,13 @@ impl AttachHub {
         let Ok(mut guard) = registry.lock() else {
             return false;
         };
+        if frame.frame_type == FrameType::Input
+            && guard
+                .get(session_id)
+                .is_some_and(|session| !session.accepts_keyboard_input(enhanced_keyboard))
+        {
+            return false;
+        }
         if matches!(frame.frame_type, FrameType::Input | FrameType::Mouse) {
             // Input to a frozen session wakes it; write_input's queue covers
             // the race where the governor froze it mid-keystroke.
@@ -557,16 +616,40 @@ impl AttachHub {
 
     /// Recipients were captured with the grid under Registry. Looking them
     /// up after encoding could send an older diff behind a newer client's seed.
+    #[cfg(test)]
     fn enqueue_publication(
         &self,
         session_id: &str,
         sinks: Vec<(u64, PublicationOutput)>,
         frames: &[Arc<[u8]>],
     ) {
+        self.enqueue_with_keyboard(session_id, sinks, frames, None, false);
+    }
+
+    fn enqueue_with_keyboard(
+        &self,
+        session_id: &str,
+        sinks: Vec<(u64, PublicationOutput)>,
+        frames: &[Arc<[u8]>],
+        enhanced_modes: Option<&Arc<[u8]>>,
+        requires_enhanced: bool,
+    ) {
         for (sink_id, output) in sinks {
             let accepted = match output {
                 PublicationOutput::Socket(output) => output.lock().is_ok_and(|mut output| {
-                    frames.iter().all(|frame| output.enqueue(Arc::clone(frame)))
+                    if !output.preview && !output.enhanced_keyboard && requires_enhanced {
+                        output.close();
+                        return false;
+                    }
+                    let enhanced = output.enhanced_keyboard;
+                    frames.iter().enumerate().all(|(index, frame)| {
+                        let frame = if enhanced && index + 1 == frames.len() {
+                            enhanced_modes.unwrap_or(frame)
+                        } else {
+                            frame
+                        };
+                        output.enqueue(Arc::clone(frame))
+                    })
                 }),
                 PublicationOutput::Mux(output) => output.publish(frames),
             };
@@ -640,7 +723,7 @@ impl AttachHub {
     /// one bounded wait after the last sink.
     fn pump(&self, registry: &Arc<Mutex<Registry>>, session_id: &str, seed: AttachmentSeed) {
         let mut signature = seed.signature;
-        let mut last_modes = Some(seed.modes);
+        let mut last_modes = Some((seed.modes, seed.signature.keyboard));
         let mut wake = seed.wake;
         let mut wake_generation = seed.wake_generation;
         let mut last_emission = Instant::now()
@@ -700,9 +783,9 @@ impl AttachHub {
                 let Ok(guard) = registry.lock() else { break };
                 guard.get(session_id).map(|session| {
                     (
-                        session.grid_update_if_changed(&mut signature),
-                        session.modes(),
+                        session.terminal_publication(&mut signature),
                         self.sink_outputs(session_id),
+                        !session.allows_keyboard_controller(false),
                     )
                 })
             } else {
@@ -710,20 +793,28 @@ impl AttachHub {
             };
 
             let mut frames: Vec<Frame> = Vec::with_capacity(2);
+            let mut enhanced_modes = None;
+            let mut requires_enhanced = false;
             let mut eligible_sinks = Vec::new();
-            if let Some((grid, modes, sinks)) = observed {
+            if let Some((publication, sinks, requires_capability)) = observed {
                 eligible_sinks = sinks;
-                if let Some(update) = grid
+                let modes = (publication.modes, publication.keyboard);
+                requires_enhanced = requires_capability;
+                if let Some(update) = publication.grid
                     && let Ok(frame) = Frame::grid(&update)
                 {
                     frames.push(frame);
                 }
                 // Fresh sinks get their initial modes at seed time; the pump
                 // only broadcasts changes.
-                if let Some(previous) = last_modes
-                    && previous != modes
-                {
-                    frames.push(Frame::modes_with_bracketed_paste(modes.0, modes.1, modes.2));
+                if last_modes != Some(modes) {
+                    enhanced_modes = encoded(&Frame::modes_with_keyboard_capability(
+                        modes.0.0, modes.0.1, modes.0.2, modes.1, true,
+                    ))
+                    .ok();
+                    frames.push(Frame::modes_with_keyboard(
+                        modes.0.0, modes.0.1, modes.0.2, modes.1,
+                    ));
                 }
                 last_modes = Some(modes);
             }
@@ -751,7 +842,13 @@ impl AttachHub {
                     }
                     return;
                 };
-                self.enqueue_publication(session_id, eligible_sinks, &encoded_frames);
+                self.enqueue_with_keyboard(
+                    session_id,
+                    eligible_sinks,
+                    &encoded_frames,
+                    enhanced_modes.as_ref(),
+                    requires_enhanced,
+                );
             }
 
             {
@@ -813,6 +910,80 @@ mod tests {
         );
         reader.set_nonblocking(true).unwrap();
         (SinkOutput::new(writer).unwrap(), reader)
+    }
+
+    #[test]
+    fn keyboard_publication_preserves_legacy_bytes_and_shares_grid() {
+        let hub = AttachHub::new();
+        let (legacy, _legacy_reader) = constrained_output();
+        let (mut capable, _capable_reader) = constrained_output();
+        let (mut preview, _preview_reader) = constrained_output();
+        capable.enhanced_keyboard = true;
+        preview.preview = true;
+        let legacy = Arc::new(Mutex::new(legacy));
+        let capable = Arc::new(Mutex::new(capable));
+        let preview = Arc::new(Mutex::new(preview));
+        let sinks = || {
+            vec![
+                (1, Arc::clone(&legacy).into()),
+                (2, Arc::clone(&capable).into()),
+                (3, Arc::clone(&preview).into()),
+            ]
+        };
+        let keyboard = Some(diri_proto::terminal_input::KeyboardState {
+            enhancements: Some(0.try_into().unwrap()),
+            ..Default::default()
+        });
+        let grid = encoded(
+            &Frame::grid(&diri_terminal_state::HeadlessScreen::new(4, 2).full_snapshot()).unwrap(),
+        )
+        .unwrap();
+        let v1 = encoded(&Frame::modes_with_keyboard(
+            false,
+            false,
+            Default::default(),
+            keyboard,
+        ))
+        .unwrap();
+        let v2 = encoded(&Frame::modes_with_keyboard_capability(
+            false,
+            false,
+            Default::default(),
+            keyboard,
+            true,
+        ))
+        .unwrap();
+        hub.enqueue_with_keyboard(
+            "fixture",
+            sinks(),
+            &[Arc::clone(&grid), Arc::clone(&v1)],
+            Some(&v2),
+            false,
+        );
+        assert!(Arc::ptr_eq(
+            legacy.lock().unwrap().frames.front().unwrap(),
+            &grid
+        ));
+        assert!(Arc::ptr_eq(
+            capable.lock().unwrap().frames.front().unwrap(),
+            &grid
+        ));
+        assert!(Arc::ptr_eq(
+            legacy.lock().unwrap().frames.back().unwrap(),
+            &v1
+        ));
+        assert!(Arc::ptr_eq(
+            capable.lock().unwrap().frames.back().unwrap(),
+            &v2
+        ));
+        assert!(Arc::ptr_eq(
+            preview.lock().unwrap().frames.back().unwrap(),
+            &v1
+        ));
+        hub.enqueue_with_keyboard("fixture", sinks(), &[v1], Some(&v2), true);
+        assert!(legacy.lock().unwrap().closed);
+        assert!(!capable.lock().unwrap().closed);
+        assert!(!preview.lock().unwrap().closed);
     }
 
     #[test]

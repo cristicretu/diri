@@ -18,8 +18,11 @@ pub mod recovery;
 pub mod remote_connection;
 pub mod remote_pty;
 pub use remote_connection::{RemoteConnection, RemoteConnectionState};
+pub mod process;
+pub mod process_facts;
 pub mod tasks;
 pub mod terminal;
+pub mod terminal_input;
 pub mod workspace;
 
 pub use control::{ControlError, ControlMessage, JsonValue, WIRE_VERSION};

@@ -401,6 +401,11 @@ impl Drop for ProcessGuard {
     }
 }
 
+struct StopState {
+    grace_deadline: Option<Instant>,
+    flush_deadline: Option<Instant>,
+}
+
 struct Holder {
     // Cleanup the Agent before joining metadata persistence, and retain the
     // session lock until both are finished, including on unwinding.
@@ -414,6 +419,7 @@ struct Holder {
     pty_writer: PtyStream,
     exit_watcher: Option<ExitWatcher>,
     pending_exit: Option<Exit>,
+    stop: Option<StopState>,
     screen: HeadlessScreen,
     log: OutputLog,
     state: SessionState,
@@ -480,7 +486,12 @@ impl Holder {
             usize::from(start.request.rows),
         );
         let log = OutputLog::open(&paths.output)?;
-        let mut state = SessionState::new(&start.request, start.incarnation, process_pid);
+        let mut state = SessionState::new(
+            &start.request,
+            start.incarnation,
+            process_pid,
+            pty.child_identity(),
+        );
         state.output_offset = log.tail_offset();
         write_state(&paths.state, &state)?;
         let state_path = paths.state.clone();
@@ -502,6 +513,7 @@ impl Holder {
             pty_writer,
             exit_watcher: Some(exit_watcher),
             pending_exit: None,
+            stop: None,
             screen,
             log,
             state,
@@ -663,7 +675,59 @@ impl Holder {
                 self.finish_exit(exit)?;
             }
             self.emit_foreground_process()?;
+            if self.advance_stop()? {
+                return Ok(());
+            }
         }
+    }
+
+    fn begin_stop(&mut self) -> io::Result<()> {
+        if self.stop.is_some() {
+            return Ok(());
+        }
+        let grace_deadline = if self.exit_watcher.is_some() {
+            self.pty.kill_group(libc::SIGTERM)?;
+            Some(Instant::now() + Duration::from_millis(500))
+        } else {
+            None
+        };
+        self.stop = Some(StopState {
+            grace_deadline,
+            flush_deadline: None,
+        });
+        Ok(())
+    }
+
+    fn advance_stop(&mut self) -> io::Result<bool> {
+        let Some(stop) = self.stop.as_mut() else {
+            return Ok(false);
+        };
+        if self.exit_watcher.is_none() {
+            stop.grace_deadline = None;
+        } else if stop
+            .grace_deadline
+            .is_some_and(|deadline| Instant::now() >= deadline)
+        {
+            // The owner has not reaped the child; its PGID cannot be reused.
+            self.pty.kill_group(libc::SIGKILL)?;
+            stop.grace_deadline = None;
+        }
+        if matches!(self.state.process_state, RemoteProcessState::Exited { .. })
+            && self.pending_exit.is_none()
+            && self.pty_reader.is_none()
+        {
+            // finish_exit has already flushed tail and genuine facts to disk.
+            let deadline = *stop
+                .flush_deadline
+                .get_or_insert_with(|| Instant::now() + Duration::from_millis(500));
+            self.flush_connection()?;
+            let drained = self
+                .connection
+                .as_ref()
+                .is_none_or(|connection| connection.sent == connection.outbound.len());
+            return Ok(drained || Instant::now() >= deadline);
+        }
+        Ok(false)
     }
 
     fn accept_connection(&mut self) -> io::Result<()> {
@@ -809,7 +873,14 @@ impl Holder {
                     };
                     for message in messages {
                         if let Err(error) = self.handle_message(connection, message) {
-                            connection.send_fatal("protocol_error", &error.to_string());
+                            let code = if self.stop.is_some()
+                                && error.kind() == io::ErrorKind::NotConnected
+                            {
+                                "session_stopping"
+                            } else {
+                                "protocol_error"
+                            };
+                            connection.send_fatal(code, &error.to_string());
                             closed = true;
                             break;
                         }
@@ -850,9 +921,26 @@ impl Holder {
                 "controller epoch was revoked",
             ));
         }
+        if self.stop.is_some() && !matches!(&message, RemoteMessage::StopSession(_)) {
+            return Err(io::Error::new(
+                io::ErrorKind::NotConnected,
+                "session is stopping",
+            ));
+        }
         match message {
             RemoteMessage::Terminal(frame) => match frame.frame_type {
-                FrameType::Input | FrameType::Mouse => self.write_input(&frame.payload),
+                FrameType::Input => {
+                    let keyboard = self.screen.input_keyboard_state();
+                    ensure_keyboard_controller(keyboard, connection.enhanced_keyboard)?;
+                    if keyboard.is_none() {
+                        return Err(io::Error::new(
+                            io::ErrorKind::Unsupported,
+                            "enhanced keyboard state is unknown",
+                        ));
+                    }
+                    self.write_input(&frame.payload)
+                }
+                FrameType::Mouse => self.write_input(&frame.payload),
                 FrameType::Resize => {
                     let Some((cols, rows)) = frame.resize_payload() else {
                         return Err(io::Error::new(
@@ -903,7 +991,27 @@ impl Holder {
                         "signal or controller epoch is invalid",
                     ));
                 }
+                // A zombie protects the process-group id only until this
+                // owner reaps it. ProcessState stays Running while PTY tail
+                // drains, so use actual ownership rather than presentation.
+                if self.exit_watcher.is_none() {
+                    return Err(io::Error::new(
+                        io::ErrorKind::NotConnected,
+                        "Agent has already been reaped; process group is no longer owned",
+                    ));
+                }
                 self.pty.kill_group(signal.signal)
+            }
+            RemoteMessage::StopSession(request) => {
+                if connection.protocol_minor < diri_proto::remote_pty::STOP_SESSION_PROTOCOL_MINOR
+                    || request.controller_epoch != epoch
+                {
+                    return Err(io::Error::new(
+                        io::ErrorKind::PermissionDenied,
+                        "stop capability or controller epoch is invalid",
+                    ));
+                }
+                self.begin_stop()
             }
             RemoteMessage::AcquireControl(_) => {
                 connection.queue(RemoteMessage::ControlGranted(ControlGranted {
@@ -962,6 +1070,22 @@ impl Holder {
                 "session authentication failed",
             ));
         }
+        if self.stop.is_some() {
+            return Err(io::Error::new(
+                io::ErrorKind::NotConnected,
+                "session is stopping",
+            ));
+        }
+        if hello.protocol.minor < diri_proto::remote_pty::STOP_SESSION_PROTOCOL_MINOR
+            && hello
+                .required_capabilities
+                .contains(&diri_proto::remote_pty::RemoteCapability::StopSession)
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "stop-session-v1 requires protocol minor 12",
+            ));
+        }
         if let Some(missing) = hello
             .required_capabilities
             .iter()
@@ -972,6 +1096,19 @@ impl Holder {
                 format!("required capability {missing:?} is unavailable"),
             ));
         }
+        let enhanced_requested = hello
+            .required_capabilities
+            .contains(&diri_proto::remote_pty::RemoteCapability::EnhancedKeyboard);
+        let enhanced_keyboard = enhanced_requested
+            && hello.protocol.minor >= diri_proto::remote_pty::ENHANCED_KEYBOARD_PROTOCOL_MINOR;
+        if enhanced_requested && !enhanced_keyboard {
+            return Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "enhanced-keyboard-v1 requires protocol minor 14",
+            ));
+        }
+        ensure_keyboard_controller(self.screen.input_keyboard_state(), enhanced_keyboard)?;
+        connection.enhanced_keyboard = enhanced_keyboard;
         self.state.controller_epoch = self.state.controller_epoch.saturating_add(1);
         let epoch = self.state.controller_epoch;
         connection.epoch = Some(epoch);
@@ -986,6 +1123,10 @@ impl Holder {
             capabilities: PHASE_ONE_CAPABILITIES.to_vec(),
             controller_epoch: epoch,
             process_state: self.state.process_state.clone(),
+            child_identity: (hello.protocol.minor
+                >= diri_proto::remote_pty::PROCESS_IDENTITY_PROTOCOL_MINOR)
+                .then_some(self.state.child_identity)
+                .flatten(),
             output_offset: self.state.output_offset,
             snapshot_sequence: self.state.snapshot_sequence,
             foreground_pid,
@@ -1084,12 +1225,16 @@ impl Holder {
             .dirty_since
             .map(|since| poll_timeout(since + DIFF_COALESCE));
         let probe = self.foreground_probe_deadline.map(poll_timeout);
-        match (grid, probe) {
-            (Some(a), Some(b)) => a.min(b),
-            (Some(a), None) => a,
-            (None, Some(b)) => b,
-            (None, None) => -1,
-        }
+        let stop = self
+            .stop
+            .as_ref()
+            .and_then(|stop| stop.grace_deadline.or(stop.flush_deadline))
+            .map(poll_timeout);
+        [grid, probe, stop]
+            .into_iter()
+            .flatten()
+            .min()
+            .unwrap_or(-1)
     }
 
     fn emit_foreground_process(&mut self) -> io::Result<()> {
@@ -1167,6 +1312,16 @@ impl Holder {
         let Some(mut connection) = self.connection.take() else {
             return Ok(());
         };
+        connection.keyboard = self.screen.input_keyboard_state();
+        if ensure_keyboard_controller(connection.keyboard, connection.enhanced_keyboard).is_err() {
+            // An output mode change invalidates only this controller. The
+            // Holder and Agent continue, and a capable client can reseed.
+            connection.send_fatal(
+                "enhanced_keyboard_required",
+                "active enhanced keyboard modes require enhanced-keyboard-v1",
+            );
+            return Ok(());
+        }
         connection.queue(message)?;
         if connection.outbound.len() > MAX_OUTBOUND_BYTES {
             if connection.sent != 0 {
@@ -1191,6 +1346,7 @@ impl Holder {
     }
 
     fn queue_snapshot(&self, connection: &mut Connection) -> io::Result<()> {
+        connection.keyboard = self.screen.input_keyboard_state();
         connection.queue(RemoteMessage::FullSnapshot(FullSnapshot {
             sequence: self.state.snapshot_sequence,
             alt_screen: self.screen.is_alt_screen(),
@@ -1342,8 +1498,23 @@ fn resolve_remote_executable(
     ))
 }
 
+fn ensure_keyboard_controller(
+    keyboard: Option<diri_proto::terminal_input::KeyboardState>,
+    capable: bool,
+) -> io::Result<()> {
+    if keyboard.is_none_or(|state| state.requires_enhanced_controller()) && !capable {
+        return Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "active enhanced keyboard modes require enhanced-keyboard-v1",
+        ));
+    }
+    Ok(())
+}
+
 struct Connection {
+    enhanced_keyboard: bool,
     protocol_minor: u16,
+    keyboard: Option<diri_proto::terminal_input::KeyboardState>,
     stream: UnixStream,
     codec: RemoteCodec,
     epoch: Option<u64>,
@@ -1354,7 +1525,9 @@ struct Connection {
 impl Connection {
     fn new(stream: UnixStream) -> Self {
         Self {
+            enhanced_keyboard: false,
             protocol_minor: 0,
+            keyboard: Some(Default::default()),
             stream,
             codec: RemoteCodec::new(),
             epoch: None,
@@ -1383,7 +1556,56 @@ impl Connection {
                 _ => {}
             }
         }
-        RemoteCodec::encode_into(&message, &mut self.outbound).map_err(io::Error::other)
+        if self.protocol_minor < diri_proto::remote_pty::INPUT_MODES_PROTOCOL_MINOR
+            && let RemoteMessage::HelloAck(value) = &mut message
+        {
+            value.capabilities.retain(|capability| {
+                *capability != diri_proto::remote_pty::RemoteCapability::InputModes
+            });
+        }
+        if !self.enhanced_keyboard
+            && let RemoteMessage::HelloAck(value) = &mut message
+        {
+            value.capabilities.retain(|capability| {
+                *capability != diri_proto::remote_pty::RemoteCapability::EnhancedKeyboard
+            });
+        }
+        if matches!(
+            &message,
+            RemoteMessage::FullSnapshot(_) | RemoteMessage::GridDelta(_)
+        ) {
+            ensure_keyboard_controller(self.keyboard, self.enhanced_keyboard)?;
+        }
+        // Mode state and its grid are admitted as one publication. The Holder's
+        // overflow/reseed decision must never run between these two frames.
+        let start = self.outbound.len();
+        let result = (|| {
+            if self.protocol_minor >= diri_proto::remote_pty::INPUT_MODES_PROTOCOL_MINOR {
+                let sequence = match &message {
+                    RemoteMessage::FullSnapshot(value) => Some(value.sequence),
+                    RemoteMessage::GridDelta(value) => Some(value.sequence),
+                    _ => None,
+                };
+                if let Some(sequence) = sequence {
+                    RemoteCodec::encode_into(
+                        &RemoteMessage::InputModes(diri_proto::remote_pty::InputModes {
+                            sequence,
+                            keyboard: if self.enhanced_keyboard {
+                                self.keyboard
+                            } else {
+                                self.keyboard.map(|state| state.legacy_projection())
+                            },
+                        }),
+                        &mut self.outbound,
+                    )?;
+                }
+            }
+            RemoteCodec::encode_into(&message, &mut self.outbound)
+        })();
+        if result.is_err() {
+            self.outbound.truncate(start);
+        }
+        result.map_err(io::Error::other)
     }
 
     fn queue_error(&mut self, code: &str, message: &str, fatal: bool) -> io::Result<()> {
@@ -1520,6 +1742,105 @@ fn terminate_process_group(pid: u32) {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn enhanced_modes_require_explicit_opt_in_and_legacy_payload_is_exact() {
+        let screen = HeadlessScreen::new(4, 2);
+        let snapshot = || {
+            RemoteMessage::FullSnapshot(FullSnapshot {
+                sequence: 7,
+                alt_screen: false,
+                bracketed_paste: false,
+                mouse: Default::default(),
+                grid: screen.full_snapshot(),
+            })
+        };
+        for capable in [false, true] {
+            for flags in 0..32 {
+                let (stream, _peer) = UnixStream::pair().unwrap();
+                let mut connection = Connection::new(stream);
+                connection.protocol_minor =
+                    diri_proto::remote_pty::ENHANCED_KEYBOARD_PROTOCOL_MINOR;
+                connection.enhanced_keyboard = capable;
+                connection.keyboard.as_mut().unwrap().enhancements =
+                    Some(flags.try_into().unwrap());
+                let result = connection.queue(snapshot());
+                if !capable && flags != 0 {
+                    assert_eq!(result.unwrap_err().kind(), io::ErrorKind::Unsupported);
+                    assert!(connection.outbound.is_empty());
+                    continue;
+                }
+                result.unwrap();
+                let messages = RemoteCodec::new().feed(&connection.outbound).unwrap();
+                let RemoteMessage::InputModes(modes) = &messages[0] else {
+                    panic!("mode prefix")
+                };
+                let json = serde_json::to_value(modes).unwrap();
+                if capable {
+                    assert_eq!(modes.keyboard.unwrap().enhancements.unwrap().bits(), flags);
+                } else {
+                    assert_eq!(
+                        json,
+                        serde_json::json!({"sequence":7,"keyboard":{"applicationCursorKeys":false,"applicationKeypad":false}})
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn input_modes_and_grid_are_one_negotiated_publication() {
+        use diri_proto::terminal_input::KeyboardState;
+        for minor in [8, 9] {
+            let (stream, _peer) = UnixStream::pair().unwrap();
+            let mut connection = Connection::new(stream);
+            connection.protocol_minor = minor;
+            connection.keyboard = Some(KeyboardState {
+                enhancements: None,
+                application_cursor_keys: true,
+                application_keypad: true,
+            });
+            let screen = diri_terminal_state::HeadlessScreen::new(4, 2);
+            let snapshot = FullSnapshot {
+                sequence: 42,
+                alt_screen: false,
+                bracketed_paste: false,
+                mouse: Default::default(),
+                grid: screen.full_snapshot(),
+            };
+            connection
+                .queue(RemoteMessage::FullSnapshot(snapshot))
+                .unwrap();
+            let frames = RemoteCodec::new().feed(&connection.outbound).unwrap();
+            assert_eq!(frames.len(), if minor == 9 { 2 } else { 1 });
+            if minor == 9 {
+                assert!(
+                    matches!(&frames[0], RemoteMessage::InputModes(state) if state.sequence == 42 && state.keyboard == connection.keyboard)
+                );
+            }
+            assert!(
+                matches!(frames.last(), Some(RemoteMessage::FullSnapshot(state)) if state.sequence == 42)
+            );
+            let before = connection.outbound.clone();
+            let mut invalid = screen.full_snapshot();
+            invalid.cols = 0;
+            assert!(
+                connection
+                    .queue(RemoteMessage::FullSnapshot(FullSnapshot {
+                        sequence: 43,
+                        alt_screen: false,
+                        bracketed_paste: false,
+                        mouse: Default::default(),
+                        grid: invalid
+                    }))
+                    .is_err()
+            );
+            assert_eq!(
+                connection.outbound, before,
+                "failed grid must roll back its mode prefix"
+            );
+        }
+    }
+
     use super::*;
 
     #[test]
@@ -1581,6 +1902,281 @@ mod tests {
         assert!(pending.is_empty());
         pending.push(b"two");
         assert_eq!(pending.remaining(), b"two");
+    }
+
+    fn waiting_holder() -> (tempfile::TempDir, Holder, LaunchRequest) {
+        let temp = tempfile::tempdir().unwrap();
+        let roots = StatePaths::from_root(temp.path().join("state")).unwrap();
+        let request = LaunchRequest {
+            session_id: format!("tail-{}", random_hex(8).unwrap()),
+            session_token: diri_proto::remote_pty::SessionToken::new(
+                "0123456789abcdef0123456789abcdef",
+            )
+            .unwrap(),
+            argv: vec![
+                "/bin/sh".into(),
+                "-c".into(),
+                "read -r go; printf final-tail; exit 42".into(),
+            ],
+            cwd: "/".into(),
+            environment: vec![],
+            cols: 80,
+            rows: 24,
+            persistence: diri_proto::remote_pty::PersistenceCapability::NonPersistent,
+        };
+        let paths = roots.session(&request.session_id).unwrap();
+        paths.ensure().unwrap();
+        let pty = Pty::spawn(&PtySpec {
+            argv: request.argv.clone(),
+            env: vec![],
+            cwd: "/".into(),
+            cols: 80,
+            rows: 24,
+        })
+        .unwrap();
+        let watcher = ExitWatcher::new(pty.pid()).unwrap();
+        let reader = pty.reader().unwrap();
+        reader.set_nonblocking(true).unwrap();
+        let writer = pty.writer().unwrap();
+        let mut state = SessionState::new(
+            &request,
+            "incarnation".into(),
+            pty.pid(),
+            pty.child_identity(),
+        );
+        state.controller_epoch = 1;
+        let state_path = paths.state.clone();
+        let checkpoint =
+            diri_pty::checkpoint::CheckpointWriter::new("tail-exit-test", move |state| {
+                write_state(&state_path, &state)
+            })
+            .unwrap();
+        let socket = paths.socket.clone();
+        let holder = Holder {
+            // The fixture has no descendants; guard behavior is covered by the
+            // real Helper e2e. This test controls the exact reap→tail interval.
+            process_guard: ProcessGuard {
+                lifetime: None,
+                child: None,
+                watcher: None,
+            },
+            checkpoint,
+            _lock: acquire_lock(&paths.lock).unwrap(),
+            listener: UnixListener::bind(&socket).unwrap(),
+            log: OutputLog::open(&paths.output).unwrap(),
+            paths,
+            pty,
+            pty_reader: Some(reader),
+            pty_writer: writer,
+            exit_watcher: Some(watcher),
+            pending_exit: None,
+            stop: None,
+            screen: HeadlessScreen::new(80, 24),
+            state,
+            connection: None,
+            pending_connection: None,
+            pending_input: PendingBytes::default(),
+            dirty_since: None,
+            pending_output: Vec::new(),
+            pending_output_offset: 0,
+            interactive_grid_budget: 0,
+            last_persisted_offset: 0,
+            controller_protocol_minor: 0,
+            last_foreground_pid: None,
+            foreground_probe_deadline: None,
+        };
+        (temp, holder, request)
+    }
+
+    #[test]
+    fn enhanced_admission_precedes_epoch_change_and_late_activation_only_closes_bridge() {
+        let (_temp, mut holder, request) = waiting_holder();
+        initialize_auth(&holder.paths, &request.session_token).unwrap();
+        holder.screen = HeadlessScreen::new_with_keyboard_enhancements(80, 24);
+        holder.screen.feed(b"\x1b[=5u");
+        let before_epoch = holder.state.controller_epoch;
+        let before_pid = holder.pty.pid();
+        let hello = |capable| Hello {
+            protocol: diri_proto::remote_pty::ProtocolVersion::CURRENT,
+            local_build_id: "fixture".into(),
+            session_id: request.session_id.clone(),
+            session_token: request.session_token.clone(),
+            expected_incarnation: Some(holder.state.session_incarnation.clone()),
+            requested_role: diri_proto::remote_pty::RemoteRole::Controller,
+            client_nonce: "fixture-nonce".into(),
+            required_capabilities: if capable {
+                vec![diri_proto::remote_pty::RemoteCapability::EnhancedKeyboard]
+            } else {
+                vec![]
+            },
+            last_acknowledged_output_offset: None,
+            last_acknowledged_grid_sequence: None,
+        };
+        let legacy = hello(false);
+        let capable = hello(true);
+        let (stream, _peer) = UnixStream::pair().unwrap();
+        let mut connection = Connection::new(stream);
+        assert_eq!(
+            holder
+                .handshake(&mut connection, legacy)
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::Unsupported
+        );
+        assert_eq!(holder.state.controller_epoch, before_epoch);
+        assert!(connection.epoch.is_none());
+        holder.handshake(&mut connection, capable).unwrap();
+        assert_eq!(holder.state.controller_epoch, before_epoch + 1);
+        assert!(connection.enhanced_keyboard);
+        connection.outbound.clear();
+        holder.screen.grid_update(false);
+        holder.screen.feed(b"\x1b[=7u");
+        holder.connection = Some(connection);
+        holder.emit_grid_delta().unwrap();
+        let mut connection = holder.connection.take().unwrap();
+        let published = RemoteCodec::new().feed(&connection.outbound).unwrap();
+        let RemoteMessage::InputModes(modes) = &published[0] else {
+            panic!("mode prefix")
+        };
+        assert_eq!(modes.keyboard.unwrap().enhancements.unwrap().bits(), 7);
+        let RemoteMessage::GridDelta(grid) = &published[1] else {
+            panic!("matching delta")
+        };
+        assert_eq!(modes.sequence, grid.sequence);
+        assert!(
+            grid.grid.changed_rows.is_empty(),
+            "mode-only change needs no cell payload"
+        );
+        let full_keyboard = holder.screen.keyboard_snapshot().unwrap();
+        holder.screen.restore_keyboard_state(Default::default());
+        assert_eq!(holder.screen.input_keyboard_state(), None);
+        assert_eq!(
+            holder
+                .handle_message(
+                    &mut connection,
+                    RemoteMessage::Terminal(Frame::input(b"unknown-input".to_vec()))
+                )
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::Unsupported
+        );
+        assert!(holder.pending_input.is_empty());
+        assert!(holder.screen.restore_keyboard_snapshot(&full_keyboard));
+        // Simulate an already admitted legacy controller before a later mode
+        // activation; input must fail before queueing or reaching the PTY.
+        connection.enhanced_keyboard = false;
+        assert_eq!(
+            holder
+                .handle_message(
+                    &mut connection,
+                    RemoteMessage::Terminal(Frame::input(b"must-not-reach-child".to_vec()))
+                )
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::Unsupported
+        );
+        assert!(holder.pending_input.is_empty());
+        holder.connection = Some(connection);
+        holder.emit_grid_delta().unwrap();
+        assert!(holder.connection.is_none());
+        assert_eq!(holder.pty.pid(), before_pid);
+        assert!(matches!(
+            holder.state.process_state,
+            RemoteProcessState::Running { .. }
+        ));
+        assert!(holder.pty.try_wait().unwrap().is_none());
+        holder.pty_writer.write_all(b"go\n").unwrap();
+        let deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            holder.drain_pty().unwrap();
+            if holder.pty.try_wait().unwrap().is_some() {
+                break;
+            }
+            assert!(Instant::now() < deadline);
+            std::thread::sleep(Duration::from_millis(1));
+        }
+    }
+
+    #[test]
+    fn reaped_child_rejects_signal_before_tail_checkpoint_says_exited() {
+        let (_temp, mut holder, _request) = waiting_holder();
+        let socket = holder.paths.socket.clone();
+        let (stream, _peer) = UnixStream::pair().unwrap();
+        let mut connection = Connection::new(stream);
+        connection.epoch = Some(1);
+        connection.protocol_minor = diri_proto::remote_pty::STOP_SESSION_PROTOCOL_MINOR;
+        let stale = holder
+            .handle_message(
+                &mut connection,
+                RemoteMessage::StopSession(diri_proto::remote_pty::StopSession {
+                    controller_epoch: 2,
+                }),
+            )
+            .unwrap_err();
+        assert_eq!(stale.kind(), io::ErrorKind::PermissionDenied);
+        connection.protocol_minor = diri_proto::remote_pty::STOP_SESSION_PROTOCOL_MINOR - 1;
+        let old = holder
+            .handle_message(
+                &mut connection,
+                RemoteMessage::StopSession(diri_proto::remote_pty::StopSession {
+                    controller_epoch: 1,
+                }),
+            )
+            .unwrap_err();
+        assert_eq!(old.kind(), io::ErrorKind::PermissionDenied);
+        assert!(holder.stop.is_none());
+        holder.pty_writer.write_all(b"go\n").unwrap();
+        // Keep draining as the real owner loop does; waiting before draining a
+        // PTY can stall child exit on macOS. Stop before committing exit facts.
+        let deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            holder.drain_pty().unwrap();
+            if holder.pty.try_wait().unwrap().is_some() {
+                break;
+            }
+            assert!(Instant::now() < deadline, "fixture child did not exit");
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        holder.record_exit().unwrap();
+        assert!(holder.exit_watcher.is_none());
+        assert!(holder.pending_exit.is_some());
+        assert!(matches!(
+            holder.state.process_state,
+            RemoteProcessState::Running { .. }
+        ));
+        let error = holder
+            .handle_message(
+                &mut connection,
+                RemoteMessage::Signal(diri_proto::remote_pty::Signal {
+                    controller_epoch: 1,
+                    signal: libc::SIGTERM,
+                }),
+            )
+            .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::NotConnected);
+        holder.begin_stop().unwrap();
+        assert!(
+            holder.stop.as_ref().unwrap().grace_deadline.is_none(),
+            "no escalation after reap"
+        );
+        assert!(
+            !holder.advance_stop().unwrap(),
+            "tail must precede completed stop"
+        );
+        holder.drain_pty().unwrap();
+        assert!(holder.pty_reader.is_none());
+        let exit = holder.pending_exit.take().unwrap();
+        holder.finish_exit(exit).unwrap();
+        assert_eq!(
+            holder.state.process_state,
+            RemoteProcessState::Exited {
+                code: Some(42),
+                signal: None
+            }
+        );
+        assert!(holder.advance_stop().unwrap());
+        drop(holder);
+        let _ = fs::remove_file(socket);
     }
 
     #[test]

@@ -5,6 +5,12 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 
+[features]
+# Enabled for both the Engine and Remote Helper. The dense configuration is
+# retained only for storage differential tests and allocation comparisons.
+default = ["compact-history"]
+compact-history = ["alacritty_terminal/compact-history"]
+
 [dependencies]
 alacritty_terminal.workspace = true
 diri-proto.workspace = true

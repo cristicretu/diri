@@ -68,6 +68,8 @@ jobs:
       # every pull request.
       - name: Test
         run: cargo test --workspace
+      - name: Test native keypad dispatch boundary
+        run: cargo test --locked -p gpui_macos native_key::tests
 
   ios:
     name: iPhone app

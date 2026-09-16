@@ -7,6 +7,8 @@ use std::ops::{Index, IndexMut};
 use serde::{Deserialize, Serialize};
 
 use super::Row;
+#[cfg(feature = "compact-history")]
+use super::compact::{CompactRows, RowCodec};
 use crate::index::Line;
 
 /// Maximum number of buffered lines outside of the grid for performance optimization.
@@ -39,9 +41,16 @@ fn cache_rows<T>(columns: usize) -> usize {
 /// [`Deref`]: std::ops::Deref
 /// [`zero`]: #structfield.zero
 #[derive(Clone, Debug)]
-#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
+#[cfg_attr(feature = "serde", derive(Deserialize))]
+#[cfg_attr(
+    all(feature = "serde", not(feature = "compact-history")),
+    derive(Serialize)
+)]
 pub struct Storage<T> {
     inner: Vec<Row<T>>,
+    #[cfg(feature = "compact-history")]
+    #[serde(skip)]
+    compact: Option<CompactRows<T>>,
 
     /// Starting point for the storage of rows.
     ///
@@ -68,11 +77,53 @@ impl<T: PartialEq> PartialEq for Storage<T> {
         assert_eq!(self.zero, 0);
         assert_eq!(other.zero, 0);
 
+        #[cfg(feature = "compact-history")]
+        if self.compact.is_some() || other.compact.is_some() {
+            return self.len == other.len
+                && (0..self.len).all(|i| {
+                    self[Line(self.visible_lines as i32 - 1 - i as i32)]
+                        == other[Line(other.visible_lines as i32 - 1 - i as i32)]
+                });
+        }
         self.inner == other.inner && self.len == other.len
     }
 }
 
 impl<T> Storage<T> {
+    #[cfg(feature = "compact-history")]
+    pub fn enable_compact(&mut self, codec: RowCodec<T>) {
+        if self.compact.is_some() {
+            return;
+        }
+        let columns = self.inner.first().map_or(0, Row::len);
+        let rows = self.take_all();
+        self.len = rows.len();
+        self.zero = 0;
+        self.compact = Some(CompactRows::new(rows, self.visible_lines, columns, codec));
+    }
+
+    #[cfg(feature = "compact-history")]
+    pub fn release_read_cache(&mut self) {
+        if let Some(compact) = &mut self.compact {
+            compact.release_read_cache();
+        }
+    }
+
+    #[cfg(feature = "compact-history")]
+    pub fn bound_history_bytes(&mut self, budget: usize) {
+        if let Some(compact) = &mut self.compact {
+            compact.bound_history_bytes(budget);
+            self.len = compact.len();
+        }
+    }
+
+    #[cfg(feature = "compact-history")]
+    pub fn history_storage_bytes(&self) -> usize {
+        self.compact
+            .as_ref()
+            .map_or(0, CompactRows::history_storage_bytes)
+    }
+
     #[inline]
     pub fn with_capacity(visible_lines: usize, columns: usize) -> Storage<T>
     where
@@ -84,6 +135,8 @@ impl<T> Storage<T> {
 
         Storage {
             inner,
+            #[cfg(feature = "compact-history")]
+            compact: None,
             zero: 0,
             visible_lines,
             len: visible_lines,
@@ -104,6 +157,10 @@ impl<T> Storage<T> {
 
         // Update visible lines.
         self.visible_lines = next;
+        #[cfg(feature = "compact-history")]
+        if let Some(compact) = &mut self.compact {
+            compact.set_visible(next);
+        }
     }
 
     /// Decrease the number of lines in the buffer.
@@ -115,12 +172,21 @@ impl<T> Storage<T> {
 
         // Update visible lines.
         self.visible_lines = next;
+        #[cfg(feature = "compact-history")]
+        if let Some(compact) = &mut self.compact {
+            compact.set_visible(next);
+        }
     }
 
     /// Shrink the number of lines in the buffer.
     #[inline]
     pub fn shrink_lines(&mut self, shrinkage: usize) {
         self.len -= shrinkage;
+        #[cfg(feature = "compact-history")]
+        if let Some(compact) = &mut self.compact {
+            compact.truncate(self.len);
+            return;
+        }
 
         // Free memory.
         let columns = self.inner.first().map_or(0, Row::len);
@@ -132,6 +198,11 @@ impl<T> Storage<T> {
     /// Truncate the invisible elements from the raw buffer.
     #[inline]
     pub fn truncate(&mut self) {
+        #[cfg(feature = "compact-history")]
+        if let Some(compact) = &mut self.compact {
+            compact.release_read_cache();
+            return;
+        }
         self.rezero();
 
         self.inner.truncate(self.len);
@@ -143,6 +214,12 @@ impl<T> Storage<T> {
     where
         T: Default,
     {
+        #[cfg(feature = "compact-history")]
+        if let Some(compact) = &mut self.compact {
+            compact.initialize(additional_rows, columns);
+            self.len += additional_rows;
+            return;
+        }
         if self.len + additional_rows > self.inner.len() {
             self.rezero();
 
@@ -167,6 +244,13 @@ impl<T> Storage<T> {
     /// instructions. This implementation achieves the swap in only 8 movups
     /// instructions.
     pub fn swap(&mut self, a: Line, b: Line) {
+        #[cfg(feature = "compact-history")]
+        if let Some(compact) = &mut self.compact {
+            let a = (self.visible_lines as i32 - 1 - a.0) as usize;
+            let b = (self.visible_lines as i32 - 1 - b.0) as usize;
+            compact.swap(a, b);
+            return;
+        }
         debug_assert_eq!(mem::size_of::<Row<T>>(), mem::size_of::<usize>() * 4);
 
         let a = self.compute_index(a);
@@ -194,6 +278,11 @@ impl<T> Storage<T> {
     /// Rotate the grid, moving all lines up/down in history.
     #[inline]
     pub fn rotate(&mut self, count: isize) {
+        #[cfg(feature = "compact-history")]
+        if let Some(compact) = &mut self.compact {
+            compact.rotate(count);
+            return;
+        }
         debug_assert!(count.unsigned_abs() <= self.inner.len());
 
         let len = self.inner.len();
@@ -207,12 +296,24 @@ impl<T> Storage<T> {
     /// [`rotate_left`]: https://doc.rust-lang.org/std/vec/struct.Vec.html#method.rotate_left
     #[inline]
     pub fn rotate_down(&mut self, count: usize) {
+        #[cfg(feature = "compact-history")]
+        if let Some(compact) = &mut self.compact {
+            compact.rotate(count as isize);
+            return;
+        }
         self.zero = (self.zero + count) % self.inner.len();
     }
 
     /// Update the raw storage buffer.
     #[inline]
     pub fn replace_inner(&mut self, vec: Vec<Row<T>>) {
+        #[cfg(feature = "compact-history")]
+        if let Some(compact) = &mut self.compact {
+            let columns = vec.first().map_or(0, Row::len);
+            compact.replace_rows(vec, self.visible_lines, columns);
+            self.len = compact.len();
+            return;
+        }
         self.len = vec.len();
         self.inner = vec;
         self.zero = 0;
@@ -221,6 +322,12 @@ impl<T> Storage<T> {
     /// Remove all rows from storage.
     #[inline]
     pub fn take_all(&mut self) -> Vec<Row<T>> {
+        #[cfg(feature = "compact-history")]
+        if let Some(compact) = &mut self.compact {
+            let rows = compact.drain_rows();
+            self.len = compact.len();
+            return rows;
+        }
         self.truncate();
 
         let mut buffer = Vec::new();
@@ -231,23 +338,49 @@ impl<T> Storage<T> {
         buffer
     }
 
+    pub fn prepare_reflow(&mut self, columns: usize) -> usize {
+        #[cfg(feature = "compact-history")]
+        if let Some(compact) = &mut self.compact {
+            return compact.prepare_reflow(columns);
+        }
+        let _ = columns;
+        self.len
+    }
+
     /// Compute actual index in underlying storage given the requested index.
     #[inline]
     fn compute_index(&self, requested: Line) -> usize {
-        debug_assert!(requested.0 < self.visible_lines as i32);
+        Self::ring_index(
+            self.visible_lines,
+            self.zero,
+            self.len,
+            self.inner.len(),
+            requested,
+        )
+    }
 
-        let positive = -(requested - self.visible_lines).0 as usize - 1;
+    #[inline]
+    fn ring_index(
+        visible_lines: usize,
+        zero: usize,
+        len: usize,
+        capacity: usize,
+        requested: Line,
+    ) -> usize {
+        debug_assert!(requested.0 < visible_lines as i32);
 
-        debug_assert!(positive < self.len);
+        let positive = -(requested - visible_lines).0 as usize - 1;
 
-        let zeroed = self.zero + positive;
+        debug_assert!(positive < len);
+
+        let zeroed = zero + positive;
 
         // Use if/else instead of remainder here to improve performance.
         //
-        // Requires `zeroed` to be smaller than `self.inner.len() * 2`,
-        // but both `self.zero` and `requested` are always smaller than `self.inner.len()`.
-        if zeroed >= self.inner.len() {
-            zeroed - self.inner.len()
+        // Requires `zeroed` to be smaller than `capacity * 2`,
+        // but both `zero` and `requested` are always smaller than `capacity`.
+        if zeroed >= capacity {
+            zeroed - capacity
         } else {
             zeroed
         }
@@ -265,11 +398,44 @@ impl<T> Storage<T> {
     }
 }
 
+#[cfg(feature = "compact-history")]
+impl<T: Serialize> Serialize for Storage<T> {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        use serde::ser::{SerializeSeq, SerializeStruct};
+
+        struct Rows<'a, T>(&'a CompactRows<T>);
+        impl<T: Serialize> Serialize for Rows<'_, T> {
+            fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+                let mut rows = serializer.serialize_seq(Some(self.0.len()))?;
+                for index in 0..self.0.len() {
+                    rows.serialize_element(self.0.row(index))?;
+                }
+                rows.end()
+            }
+        }
+
+        let mut state = serializer.serialize_struct("Storage", 4)?;
+        if let Some(compact) = &self.compact {
+            state.serialize_field("inner", &Rows(compact))?;
+        } else {
+            state.serialize_field("inner", &self.inner)?;
+        }
+        state.serialize_field("zero", &self.zero)?;
+        state.serialize_field("visible_lines", &self.visible_lines)?;
+        state.serialize_field("len", &self.len)?;
+        state.end()
+    }
+}
+
 impl<T> Index<Line> for Storage<T> {
     type Output = Row<T>;
 
     #[inline]
     fn index(&self, index: Line) -> &Self::Output {
+        #[cfg(feature = "compact-history")]
+        if let Some(compact) = &self.compact {
+            return compact.row((self.visible_lines as i32 - 1 - index.0) as usize);
+        }
         let index = self.compute_index(index);
         &self.inner[index]
     }
@@ -278,7 +444,17 @@ impl<T> Index<Line> for Storage<T> {
 impl<T> IndexMut<Line> for Storage<T> {
     #[inline]
     fn index_mut(&mut self, index: Line) -> &mut Self::Output {
-        let index = self.compute_index(index);
+        #[cfg(feature = "compact-history")]
+        if let Some(compact) = &mut self.compact {
+            return compact.row_mut((self.visible_lines as i32 - 1 - index.0) as usize);
+        }
+        let index = Self::ring_index(
+            self.visible_lines,
+            self.zero,
+            self.len,
+            self.inner.len(),
+            index,
+        );
         &mut self.inner[index]
     }
 }
@@ -387,6 +563,8 @@ mod tests {
     fn grow_after_zero() {
         // Setup storage area.
         let mut storage: Storage<char> = Storage {
+            #[cfg(feature = "compact-history")]
+            compact: None,
             inner: vec![filled_row('0'), filled_row('1'), filled_row('-')],
             zero: 0,
             visible_lines: 3,
@@ -398,6 +576,8 @@ mod tests {
 
         // Make sure the result is correct.
         let mut expected = Storage {
+            #[cfg(feature = "compact-history")]
+            compact: None,
             inner: vec![filled_row('0'), filled_row('1'), filled_row('-')],
             zero: 0,
             visible_lines: 4,
@@ -430,6 +610,8 @@ mod tests {
     fn grow_before_zero() {
         // Setup storage area.
         let mut storage: Storage<char> = Storage {
+            #[cfg(feature = "compact-history")]
+            compact: None,
             inner: vec![filled_row('-'), filled_row('0'), filled_row('1')],
             zero: 1,
             visible_lines: 3,
@@ -441,6 +623,8 @@ mod tests {
 
         // Make sure the result is correct.
         let mut expected = Storage {
+            #[cfg(feature = "compact-history")]
+            compact: None,
             inner: vec![filled_row('0'), filled_row('1'), filled_row('-')],
             zero: 0,
             visible_lines: 4,
@@ -470,6 +654,8 @@ mod tests {
     fn shrink_before_zero() {
         // Setup storage area.
         let mut storage: Storage<char> = Storage {
+            #[cfg(feature = "compact-history")]
+            compact: None,
             inner: vec![filled_row('2'), filled_row('0'), filled_row('1')],
             zero: 1,
             visible_lines: 3,
@@ -481,6 +667,8 @@ mod tests {
 
         // Make sure the result is correct.
         let expected = Storage {
+            #[cfg(feature = "compact-history")]
+            compact: None,
             inner: vec![filled_row('2'), filled_row('0'), filled_row('1')],
             zero: 1,
             visible_lines: 2,
@@ -506,6 +694,8 @@ mod tests {
     fn shrink_after_zero() {
         // Setup storage area.
         let mut storage: Storage<char> = Storage {
+            #[cfg(feature = "compact-history")]
+            compact: None,
             inner: vec![filled_row('0'), filled_row('1'), filled_row('2')],
             zero: 0,
             visible_lines: 3,
@@ -517,6 +707,8 @@ mod tests {
 
         // Make sure the result is correct.
         let expected = Storage {
+            #[cfg(feature = "compact-history")]
+            compact: None,
             inner: vec![filled_row('0'), filled_row('1'), filled_row('2')],
             zero: 0,
             visible_lines: 2,
@@ -548,6 +740,8 @@ mod tests {
     fn shrink_before_and_after_zero() {
         // Setup storage area.
         let mut storage: Storage<char> = Storage {
+            #[cfg(feature = "compact-history")]
+            compact: None,
             inner: vec![
                 filled_row('4'),
                 filled_row('5'),
@@ -566,6 +760,8 @@ mod tests {
 
         // Make sure the result is correct.
         let expected = Storage {
+            #[cfg(feature = "compact-history")]
+            compact: None,
             inner: vec![
                 filled_row('4'),
                 filled_row('5'),
@@ -600,6 +796,8 @@ mod tests {
     fn truncate_invisible_lines() {
         // Setup storage area.
         let mut storage: Storage<char> = Storage {
+            #[cfg(feature = "compact-history")]
+            compact: None,
             inner: vec![
                 filled_row('4'),
                 filled_row('5'),
@@ -618,6 +816,8 @@ mod tests {
 
         // Make sure the result is correct.
         let expected = Storage {
+            #[cfg(feature = "compact-history")]
+            compact: None,
             inner: vec![filled_row('0'), filled_row('1')],
             zero: 0,
             visible_lines: 1,
@@ -642,6 +842,8 @@ mod tests {
     fn truncate_invisible_lines_beginning() {
         // Setup storage area.
         let mut storage: Storage<char> = Storage {
+            #[cfg(feature = "compact-history")]
+            compact: None,
             inner: vec![filled_row('1'), filled_row('2'), filled_row('0')],
             zero: 2,
             visible_lines: 1,
@@ -653,6 +855,8 @@ mod tests {
 
         // Make sure the result is correct.
         let expected = Storage {
+            #[cfg(feature = "compact-history")]
+            compact: None,
             inner: vec![filled_row('0'), filled_row('1')],
             zero: 0,
             visible_lines: 1,
@@ -692,6 +896,8 @@ mod tests {
     fn shrink_then_grow() {
         // Setup storage area.
         let mut storage: Storage<char> = Storage {
+            #[cfg(feature = "compact-history")]
+            compact: None,
             inner: vec![
                 filled_row('4'),
                 filled_row('5'),
@@ -710,6 +916,8 @@ mod tests {
 
         // Make sure the result after shrinking is correct.
         let shrinking_expected = Storage {
+            #[cfg(feature = "compact-history")]
+            compact: None,
             inner: vec![
                 filled_row('4'),
                 filled_row('5'),
@@ -731,6 +939,8 @@ mod tests {
 
         // Make sure the previously freed elements are reused.
         let growing_expected = Storage {
+            #[cfg(feature = "compact-history")]
+            compact: None,
             inner: vec![
                 filled_row('4'),
                 filled_row('5'),
@@ -753,6 +963,8 @@ mod tests {
     fn initialize() {
         // Setup storage area.
         let mut storage: Storage<char> = Storage {
+            #[cfg(feature = "compact-history")]
+            compact: None,
             inner: vec![
                 filled_row('4'),
                 filled_row('5'),
@@ -782,6 +994,8 @@ mod tests {
         let expected_init_size = std::cmp::max(init_size, MAX_CACHE_SIZE);
         expected_inner.append(&mut vec![filled_row('\0'); expected_init_size]);
         let expected_storage = Storage {
+            #[cfg(feature = "compact-history")]
+            compact: None,
             inner: expected_inner,
             zero: 0,
             visible_lines: 0,
@@ -796,6 +1010,8 @@ mod tests {
     #[test]
     fn rotate_wrap_zero() {
         let mut storage: Storage<char> = Storage {
+            #[cfg(feature = "compact-history")]
+            compact: None,
             inner: vec![filled_row('-'), filled_row('-'), filled_row('-')],
             zero: 2,
             visible_lines: 0,

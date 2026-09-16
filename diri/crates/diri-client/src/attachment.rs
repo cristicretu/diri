@@ -37,6 +37,7 @@ const COMMAND_QUEUE_BYTES: usize = 1024 * 1024;
 pub enum TerminalChunk {
     Grid(GridUpdate),
     Modes {
+        keyboard: Option<diri_proto::terminal_input::KeyboardState>,
         alt_screen: bool,
         bracketed_paste: bool,
         mouse: MouseModes,
@@ -319,18 +320,36 @@ fn admission_error(error: mpsc::error::TrySendError<Command>) -> AttachmentClose
     }
 }
 
+#[derive(Clone, Copy, Debug, Default)]
+pub struct AttachmentOptions {
+    pub enhanced_keyboard: bool,
+}
+
 impl SessionAttachment {
     /// Opens a fresh local Unix socket and adopts it as a desktop data channel.
     pub async fn connect(
         socket_path: impl AsRef<Path>,
         session_id: SessionId,
     ) -> Result<Self, AttachmentError> {
-        let stream = UnixStream::connect(socket_path).await?;
-        Self::adopt(stream, session_id).await
+        Self::connect_with_options(socket_path, session_id, AttachmentOptions::default()).await
     }
 
-    async fn adopt(mut stream: UnixStream, session_id: SessionId) -> Result<Self, AttachmentError> {
+    pub async fn connect_with_options(
+        socket_path: impl AsRef<Path>,
+        session_id: SessionId,
+        options: AttachmentOptions,
+    ) -> Result<Self, AttachmentError> {
+        let stream = UnixStream::connect(socket_path).await?;
+        Self::adopt_with_options(stream, session_id, options).await
+    }
+
+    async fn adopt_with_options(
+        mut stream: UnixStream,
+        session_id: SessionId,
+        options: AttachmentOptions,
+    ) -> Result<Self, AttachmentError> {
         let request = AttachRequest {
+            enhanced_keyboard: options.enhanced_keyboard,
             attach: session_id,
             from_offset: None,
             token: None,
@@ -527,6 +546,7 @@ async fn process_incoming(
             let (alt_screen, bracketed_paste, mouse) = frame.terminal_modes_payload().ok_or(())?;
             chunks
                 .send(TerminalChunk::Modes {
+                    keyboard: frame.keyboard_state_payload().map_err(|_| ())?,
                     alt_screen,
                     bracketed_paste,
                     mouse,
@@ -552,6 +572,58 @@ async fn write_frame(stream: &mut UnixStream, frame: &Frame) -> io::Result<()> {
 
 #[cfg(test)]
 mod tests {
+    #[tokio::test]
+    async fn enhanced_attach_is_explicit_and_decodes_negotiated_modes() {
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+        for capable in [false, true] {
+            let (client, server) = tokio::net::UnixStream::pair().unwrap();
+            let peer = tokio::spawn(async move {
+                let mut server = BufReader::new(server);
+                let mut line = String::new();
+                server.read_line(&mut line).await.unwrap();
+                let value: serde_json::Value = serde_json::from_str(&line).unwrap();
+                assert_eq!(
+                    value.get("enhancedKeyboard"),
+                    capable.then_some(&serde_json::Value::Bool(true))
+                );
+                let keyboard = Some(diri_proto::terminal_input::KeyboardState {
+                    enhancements: Some(5.try_into().unwrap()),
+                    ..Default::default()
+                });
+                let frame = diri_proto::frames::Frame::modes_with_keyboard_capability(
+                    false,
+                    false,
+                    Default::default(),
+                    keyboard,
+                    capable,
+                );
+                server
+                    .get_mut()
+                    .write_all(&diri_proto::frames::FrameCodec::encode(&frame).unwrap())
+                    .await
+                    .unwrap();
+            });
+            let mut attached = super::SessionAttachment::adopt_with_options(
+                client,
+                diri_proto::SessionId("fixture".into()),
+                super::AttachmentOptions {
+                    enhanced_keyboard: capable,
+                },
+            )
+            .await
+            .unwrap();
+            let chunk = attached.chunks.recv().await.unwrap();
+            let super::TerminalChunk::Modes { keyboard, .. } = chunk else {
+                panic!("modes")
+            };
+            assert_eq!(
+                keyboard.unwrap().enhancements.map(|flags| flags.bits()),
+                capable.then_some(5)
+            );
+            peer.await.unwrap();
+        }
+    }
+
     use std::error::Error;
     use std::path::{Path, PathBuf};
     use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -577,9 +649,13 @@ mod tests {
     #[tokio::test]
     async fn checked_close_reports_peer_loss_instead_of_claiming_a_drained_writer() {
         let (client, server) = tokio::net::UnixStream::pair().unwrap();
-        let mut attachment = SessionAttachment::adopt(client, SessionId("lost-peer".into()))
-            .await
-            .unwrap();
+        let mut attachment = SessionAttachment::adopt_with_options(
+            client,
+            SessionId("lost-peer".into()),
+            super::AttachmentOptions::default(),
+        )
+        .await
+        .unwrap();
         attachment.send_input(b"uncertain".to_vec()).unwrap();
         drop(server);
         assert!(
@@ -672,9 +748,13 @@ mod tests {
             }
             inputs
         });
-        let mut attachment = SessionAttachment::adopt(client, SessionId("closing-fixture".into()))
-            .await
-            .unwrap();
+        let mut attachment = SessionAttachment::adopt_with_options(
+            client,
+            SessionId("closing-fixture".into()),
+            super::AttachmentOptions::default(),
+        )
+        .await
+        .unwrap();
         attachment.send_input(b"first".to_vec()).unwrap();
         attachment.send_input(b"second".to_vec()).unwrap();
         ready_rx.await.unwrap();
@@ -779,6 +859,7 @@ mod tests {
         assert_eq!(
             rx.recv().await,
             Some(TerminalChunk::Modes {
+                keyboard: None,
                 alt_screen: true,
                 bracketed_paste: true,
                 mouse,

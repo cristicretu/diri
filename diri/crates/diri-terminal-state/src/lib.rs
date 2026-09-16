@@ -253,18 +253,23 @@ impl ScreenSnapshot {
     }
 }
 
-/// Scrollback is byte-budgeted: enough history for a client's scrollback view
-/// without letting a build log grow daemon memory unboundedly. Divided by the
-/// per-line cell cost at construction.
-///
-/// 4 MiB works out to ~2,180 history rows at 80 columns (~870 at 200) per
-/// session. The original 1 MiB kept only 546 rows at 80 columns — shallower
-/// than one long compile's output, and users hit the floor scrolling back.
-const HISTORY_CELL_BUDGET_BYTES: usize = 4 << 20;
+/// Retain up to 10,000 physical history rows within 4 MiB of stored row
+/// representation. Cold rows are losslessly compressed; visible cells and
+/// temporary caller-owned responses are separate. Dense differential builds
+/// translate this allowance into a width-dependent row count.
+const HISTORY_STORAGE_BUDGET_BYTES: usize = 4 << 20;
 
 fn history_line_limit(cols: usize) -> usize {
-    let bytes_per_line = cols.max(1).saturating_mul(std::mem::size_of::<Cell>());
-    HISTORY_CELL_BUDGET_BYTES / bytes_per_line
+    #[cfg(feature = "compact-history")]
+    {
+        let _ = cols;
+        10_000
+    }
+    #[cfg(not(feature = "compact-history"))]
+    {
+        let bytes_per_line = cols.max(1).saturating_mul(std::mem::size_of::<Cell>());
+        HISTORY_STORAGE_BUDGET_BYTES / bytes_per_line
+    }
 }
 
 /// Fixed screen geometry handed to the emulator.
@@ -305,7 +310,13 @@ impl EventListener for Collector {
     }
 }
 
+pub use alacritty_terminal::term::keyboard::KeyboardSnapshot;
+
 pub struct HeadlessScreen {
+    // False after an old/partial cache restore. Capability negotiation never
+    // changes this observation or enables parser support. Exact parking must
+    // preserve it independently of Term flags.
+    keyboard_enhancements_known: bool,
     term: Term<Collector>,
     parser: Processor,
     events: Receiver<Event>,
@@ -352,17 +363,35 @@ pub struct HeadlessScreen {
 
 impl HeadlessScreen {
     pub fn new(cols: usize, rows: usize) -> Self {
+        Self::new_with_keyboard_config(cols, rows, false)
+    }
+
+    /// Explicit parser opt-in. Only a fully capable input owner may choose
+    /// this constructor; a peer capability or restored cache never enables it.
+    pub fn new_with_keyboard_enhancements(cols: usize, rows: usize) -> Self {
+        Self::new_with_keyboard_config(cols, rows, true)
+    }
+
+    fn new_with_keyboard_config(cols: usize, rows: usize, kitty_keyboard: bool) -> Self {
         let geometry = Geometry {
             cols: cols.max(1),
             rows: rows.max(1),
         };
         let (sender, events) = mpsc::sync_channel(EVENT_QUEUE_CAPACITY);
         let config = Config {
+            kitty_keyboard,
             scrolling_history: history_line_limit(geometry.cols),
             ..Config::default()
         };
         let term = Term::new(config, &geometry, Collector(sender));
+        #[cfg(feature = "compact-history")]
+        let term = {
+            let mut term = term;
+            term.grid_mut().enable_compact_history();
+            term
+        };
         let mut screen = Self {
+            keyboard_enhancements_known: true,
             term,
             parser: Processor::new(),
             events,
@@ -466,6 +495,9 @@ impl HeadlessScreen {
     /// the next wire diff. Cursor-only damage hashes at most the touched rows;
     /// a one-line echo never scans the rest of the viewport.
     fn settle(&mut self) {
+        #[cfg(feature = "compact-history")]
+        self.term
+            .bound_primary_history_storage(HISTORY_STORAGE_BUDGET_BYTES);
         self.drain_events();
         let rows = self.geometry.rows;
         self.current_damage_rows.resize(rows, false);
@@ -586,6 +618,72 @@ impl HeadlessScreen {
         (self.geometry.cols, self.geometry.rows)
     }
 
+    pub fn invalidate_keyboard_enhancements(&mut self) {
+        self.keyboard_enhancements_known = false;
+    }
+
+    pub fn keyboard_enhancements_enabled(&self) -> bool {
+        self.term.keyboard_enhancements_enabled()
+    }
+
+    /// Unknown enhanced state may never masquerade as legacy-only input.
+    /// A disabled legacy parser can retain its old cursor/keypad projection.
+    pub fn input_keyboard_state(&self) -> Option<diri_proto::terminal_input::KeyboardState> {
+        (self.keyboard_enhancements_known || !self.keyboard_enhancements_enabled())
+            .then(|| self.keyboard_state())
+    }
+
+    /// Keyboard modes from the same parser that owns the visible terminal.
+    pub fn keyboard_state(&self) -> diri_proto::terminal_input::KeyboardState {
+        let mode = self.term.mode();
+        diri_proto::terminal_input::KeyboardState {
+            enhancements: self.keyboard_enhancements_known.then(|| {
+                diri_proto::terminal_input::enhanced::KeyboardEnhancements::try_from(
+                    alacritty_terminal::vte::ansi::KeyboardModes::from(*mode).bits(),
+                )
+                .expect("parser keyboard flags are bounded")
+            }),
+            application_cursor_keys: mode.contains(TermMode::APP_CURSOR),
+            application_keypad: mode.contains(TermMode::APP_KEYPAD),
+        }
+    }
+
+    /// A bounded projection of both keyboard stacks; unknown historical state
+    /// must remain absent rather than becoming a fabricated known zero.
+    pub fn keyboard_snapshot(&self) -> Option<KeyboardSnapshot> {
+        self.keyboard_enhancements_known
+            .then(|| self.term.keyboard_snapshot())
+    }
+
+    pub fn can_restore_keyboard_snapshot(&self, snapshot: &KeyboardSnapshot) -> bool {
+        self.term.can_restore_keyboard_snapshot(snapshot)
+    }
+
+    pub fn restore_keyboard_snapshot(&mut self, snapshot: &KeyboardSnapshot) -> bool {
+        if !self.term.restore_keyboard_snapshot(snapshot) {
+            return false;
+        }
+        self.keyboard_enhancements_known = true;
+        true
+    }
+
+    /// Restore checkpointed modes through the existing parser after grid restore.
+    pub fn restore_keyboard_state(&mut self, state: diri_proto::terminal_input::KeyboardState) {
+        // Current flags alone cannot reconstruct the saved inactive/pop state.
+        // Only restore_keyboard_snapshot can establish enhanced state as known.
+        self.keyboard_enhancements_known = false;
+        self.feed(if state.application_cursor_keys {
+            b"\x1b[?1h"
+        } else {
+            b"\x1b[?1l"
+        });
+        self.feed(if state.application_keypad {
+            b"\x1b="
+        } else {
+            b"\x1b>"
+        });
+    }
+
     /// The independent tracking and encoding modes requested by the child.
     pub fn mouse_modes(&self) -> MouseModes {
         let mode = self.term.mode();
@@ -656,8 +754,9 @@ impl HeadlessScreen {
             let metadata = self.row_metadata(line);
             let row = &mut self.last_cells[base..base + cols];
             let mut row_changed = force_full || self.last_annotations[y] != metadata;
+            let source = &grid[line];
             for (x, previous) in row.iter_mut().enumerate() {
-                let cell = wire_cell(&grid[line][Column(x)]);
+                let cell = wire_cell(&source[Column(x)]);
                 row_changed |= *previous != cell;
                 *previous = cell;
             }
@@ -697,8 +796,9 @@ impl HeadlessScreen {
         for y in 0..rows {
             let line = Line(y as i32);
             let mut row = Vec::with_capacity(cols);
+            let source = &grid[line];
             for x in 0..cols {
-                row.push(wire_cell(&grid[line][Column(x)]));
+                row.push(wire_cell(&source[Column(x)]));
             }
             let mut changed = ChangedRow::new(y as u16, row);
             changed.metadata = self.row_metadata(line);
@@ -724,27 +824,49 @@ impl HeadlessScreen {
     /// Styled rows above the visible grid, oldest first. Checkpoints persist
     /// these alongside the visible snapshot so adoption does not collapse a
     /// long session to a single scrollback row.
-    pub fn history_snapshot(&self) -> Vec<Vec<GridCell>> {
-        let grid = self.term.grid();
-        let history = grid.history_size();
+    pub fn history_snapshot(&mut self) -> Vec<Vec<GridCell>> {
+        let history = self.term.grid().history_size();
         let cols = self.geometry.cols;
         let mut rows = Vec::with_capacity(history);
         for index in 0..history {
             let line = Line(index as i32 - history as i32);
             let mut row = Vec::with_capacity(cols);
+            let source = &self.term.grid()[line];
             for x in 0..cols {
-                row.push(wire_cell(&grid[line][Column(x)]));
+                row.push(wire_cell(&source[Column(x)]));
             }
             rows.push(row);
+            self.finish_history_read_batch(index + 1, index + 1 == history);
         }
         rows
     }
 
-    pub fn history_metadata(&self) -> Vec<RowMetadata> {
+    pub fn history_metadata(&mut self) -> Vec<RowMetadata> {
         let count = self.term.grid().history_size();
-        (0..count)
-            .map(|index| self.row_metadata(Line(index as i32 - count as i32)))
-            .collect()
+        let mut rows = Vec::with_capacity(count);
+        for index in 0..count {
+            rows.push(self.row_metadata(Line(index as i32 - count as i32)));
+            self.finish_history_read_batch(index + 1, index + 1 == count);
+        }
+        rows
+    }
+
+    fn finish_history_read_batch(&mut self, completed: usize, finished: bool) {
+        #[cfg(feature = "compact-history")]
+        {
+            let row_bytes = self
+                .geometry
+                .cols
+                .saturating_mul(std::mem::size_of::<Cell>())
+                .saturating_add(std::mem::size_of::<alacritty_terminal::grid::Row<Cell>>())
+                .max(1);
+            let batch = (128 * 1024 / row_bytes).clamp(1, 64);
+            if finished || completed.is_multiple_of(batch) {
+                self.term.grid_mut().release_history_read_cache();
+            }
+        }
+        #[cfg(not(feature = "compact-history"))]
+        let _ = (completed, finished);
     }
 
     pub fn restore_history_metadata(&mut self, rows: &[RowMetadata]) {
@@ -769,7 +891,11 @@ impl HeadlessScreen {
                     self.term.grid_mut()[line][Column(usize::from(*x))].push_zerowidth(ch);
                 }
             }
+            self.finish_history_read_batch(index + 1, index + 1 == count);
         }
+        #[cfg(feature = "compact-history")]
+        self.term
+            .bound_primary_history_storage(HISTORY_STORAGE_BUDGET_BYTES);
     }
 
     pub fn restore(
@@ -791,6 +917,9 @@ impl HeadlessScreen {
         {
             return false;
         }
+
+        // Visible cells cannot prove the child's negotiated keyboard state.
+        self.keyboard_enhancements_known = false;
 
         // Allocate scrollback in the emulator, then replace those rows with
         // the persisted cells. The visible grid is painted below; CSI 2 J
@@ -940,9 +1069,8 @@ impl HeadlessScreen {
     /// retains. They slide once the history budget evicts, so a client caching
     /// deep scrollback across heavy output may refetch; the visible region and
     /// recent history are exact.
-    pub fn scrollback(&self) -> diri_proto::ReadScrollbackResult {
-        let grid = self.term.grid();
-        let history = grid.history_size();
+    pub fn scrollback(&mut self) -> diri_proto::ReadScrollbackResult {
+        let history = self.term.grid().history_size();
         let rows = self.geometry.rows;
         let cols = self.geometry.cols;
         let total = history + rows;
@@ -953,8 +1081,9 @@ impl HeadlessScreen {
             let line = Line(index as i32 - history as i32);
             let mut text = String::with_capacity(cols);
             ranges.clear();
+            let source = &self.term.grid()[line];
             for x in 0..cols {
-                let cell = &grid[line][Column(x)];
+                let cell = &source[Column(x)];
                 if cell
                     .flags
                     .intersects(Flags::WIDE_CHAR_SPACER | Flags::LEADING_WIDE_CHAR_SPACER)
@@ -987,6 +1116,7 @@ impl HeadlessScreen {
                 text_cells.insert(index, ranges.clone());
             }
             lines.push(text);
+            self.finish_history_read_batch(index + 1, index + 1 == total);
         }
         diri_proto::ReadScrollbackResult {
             lines,
@@ -1002,35 +1132,34 @@ impl HeadlessScreen {
 
     /// A window of scrollback rows as encoded cells, clamped to what exists.
     pub fn scrollback_cells(
-        &self,
+        &mut self,
         first_row: i64,
         max_rows: i64,
     ) -> diri_proto::ReadScrollbackCellsResult {
-        let grid = self.term.grid();
-        let history = grid.history_size();
+        let history = self.term.grid().history_size();
         let cols = self.geometry.cols;
         let total = history + self.geometry.rows;
 
         let start = first_row.max(0).min(total as i64) as usize;
         let end = (start + max_rows.max(0) as usize).min(total);
         let mut rows = Vec::with_capacity(end.saturating_sub(start));
+        let mut metadata = Vec::with_capacity(end.saturating_sub(start));
         for index in start..end {
             let line = Line(index as i32 - history as i32);
             let mut row = Vec::with_capacity(cols);
+            let source = &self.term.grid()[line];
             for x in 0..cols {
-                row.push(wire_cell(&grid[line][Column(x)]));
+                row.push(wire_cell(&source[Column(x)]));
             }
             rows.push(row);
+            metadata.push(self.row_metadata_with_budget(
+                line,
+                (diri_proto::grid::MAX_GRID_METADATA_BYTES / 8) / (end - start).max(1),
+            ));
+            self.finish_history_read_batch(index - start + 1, index + 1 == end);
         }
         diri_proto::ReadScrollbackCellsResult {
-            metadata: (start..end)
-                .map(|index| {
-                    self.row_metadata_with_budget(
-                        Line(index as i32 - history as i32),
-                        (diri_proto::grid::MAX_GRID_METADATA_BYTES / 8) / rows.len().max(1),
-                    )
-                })
-                .collect(),
+            metadata,
             payload: GridRowCodec::encode_rows(&rows).unwrap_or_default(),
             first_row: start as i64,
             row_count: rows.len() as i64,
@@ -1117,8 +1246,9 @@ impl HeadlessScreen {
         // Account for framing as well as text before allocating. Retained Find
         // uses complete mode; existing live/page exports keep their old limits.
         let mut used = 0;
+        let source = &grid[line];
         for x in 0..self.geometry.cols {
-            let cell = &grid[line][Column(x)];
+            let cell = &source[Column(x)];
             if let Some(link) = cell.hyperlink() {
                 let uri = link.uri();
                 if let Some(last) = result.links.last_mut()
@@ -1175,8 +1305,9 @@ impl HeadlessScreen {
         for row in 0..self.geometry.rows {
             let line = Line(row as i32);
             let mut text = String::with_capacity(self.geometry.cols);
+            let source = &grid[line];
             for column in 0..self.geometry.cols {
-                let cell = &grid[line][Column(column)];
+                let cell = &source[Column(column)];
                 // These occupy terminal columns but are not textual spaces.
                 if cell
                     .flags
@@ -1266,8 +1397,9 @@ impl HeadlessScreen {
         let mut previous_link = None;
         let grid = self.term.grid();
         let line = Line(row as i32);
+        let source = &grid[line];
         for column in 0..self.geometry.cols {
-            let cell = &grid[line][Column(column)];
+            let cell = &source[Column(column)];
             let link = cell.hyperlink();
             if link != previous_link {
                 for byte in link.as_ref().map_or(&b""[..], |link| link.uri().as_bytes()) {
@@ -1579,12 +1711,79 @@ fn emulator_color(color: TermColor) -> Color {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn keyboard_mode_only_changes_leave_cells_unchanged_and_reset_independently() {
+        let mut screen = super::HeadlessScreen::new(20, 3);
+        screen.feed(b"unchanged");
+        let cells = screen.lines();
+        assert_eq!(
+            screen.keyboard_state(),
+            diri_proto::terminal_input::KeyboardState {
+                enhancements: Some(0.try_into().unwrap()),
+                ..Default::default()
+            }
+        );
+        screen.feed(b"\x1b[?1h\x1b=");
+        assert_eq!(screen.lines(), cells);
+        assert!(screen.keyboard_state().application_cursor_keys);
+        assert!(screen.keyboard_state().application_keypad);
+        screen.feed(b"\x1b[?1l");
+        assert!(!screen.keyboard_state().application_cursor_keys);
+        assert!(screen.keyboard_state().application_keypad);
+        screen.feed(b"\x1b>");
+        assert_eq!(
+            screen.keyboard_state(),
+            diri_proto::terminal_input::KeyboardState {
+                enhancements: Some(0.try_into().unwrap()),
+                ..Default::default()
+            }
+        );
+    }
+
     use super::*;
 
     fn screen_with(input: &[u8]) -> HeadlessScreen {
         let mut screen = HeadlessScreen::new(80, 24);
         screen.feed(input);
         screen
+    }
+
+    #[test]
+    fn enabled_parser_old_visible_cache_keeps_enhancements_unknown() {
+        let mut original = HeadlessScreen::new_with_keyboard_enhancements(20, 3);
+        original.feed(b"\x1b[>5u");
+        let grid = original.full_snapshot();
+        let complete = original.keyboard_snapshot().unwrap();
+        let mut restored = HeadlessScreen::new_with_keyboard_enhancements(20, 3);
+        assert!(restored.restore(&[], &grid, false, false, MouseModes::OFF));
+        restored.restore_keyboard_state(Default::default());
+        assert_eq!(restored.keyboard_state().enhancements, None);
+        assert_eq!(restored.input_keyboard_state(), None);
+        restored.feed(b"\x1b[<u");
+        assert_eq!(restored.keyboard_state().enhancements, None);
+        assert!(restored.restore_keyboard_snapshot(&complete));
+        assert_eq!(restored.keyboard_state().enhancements.unwrap().bits(), 5);
+        restored.feed(b"\x1b[<u");
+        assert_eq!(restored.keyboard_state().enhancements.unwrap().bits(), 0);
+    }
+
+    #[test]
+    fn keyboard_cache_knownness_does_not_enable_negotiation() {
+        let mut screen = HeadlessScreen::new(20, 3);
+        let snapshot = screen.keyboard_snapshot().unwrap();
+        assert_eq!(screen.keyboard_state().enhancements.unwrap().bits(), 0);
+        screen.restore_keyboard_state(Default::default());
+        assert_eq!(screen.keyboard_state().enhancements, None);
+        assert_eq!(screen.keyboard_snapshot(), None);
+        screen.feed(b"\x1b[=31u\x1b[?u");
+        assert!(screen.take_replies().is_empty());
+        assert!(screen.restore_keyboard_snapshot(&snapshot));
+        assert_eq!(screen.keyboard_state().enhancements.unwrap().bits(), 0);
+        let active = KeyboardSnapshot::decode(&[1, 1, 1, 0, 0, 0, 1]).unwrap();
+        assert!(!screen.restore_keyboard_snapshot(&active));
+        let inactive = KeyboardSnapshot::decode(&[1, 0, 0, 0, 1, 0, 1]).unwrap();
+        assert!(!screen.restore_keyboard_snapshot(&inactive));
+        assert_eq!(screen.keyboard_state().enhancements.unwrap().bits(), 0);
     }
 
     #[test]
@@ -1764,21 +1963,34 @@ mod tests {
                 "{history} rows after widening (alternate={alternate})"
             );
             assert!(screen.lines().iter().any(|line| line == "retained history"));
+            #[cfg(feature = "compact-history")]
+            assert!(screen.term.grid().history_storage_bytes() <= HISTORY_STORAGE_BUDGET_BYTES);
 
             // Narrowing permits more rows again, including after an app reset.
             screen.resize(80, 24);
             screen.feed(b"\x1bc");
             screen.feed("new history\r\n".repeat(6000).as_bytes());
-            assert_eq!(screen.term.grid().history_size(), history_line_limit(80));
+            assert_eq!(
+                screen.term.grid().history_size(),
+                history_line_limit(80).min(6000 + 1 - 24)
+            );
         }
     }
 
     #[test]
     fn history_budget_does_not_have_a_wide_terminal_exception() {
+        #[cfg(not(feature = "compact-history"))]
         assert!(
             history_line_limit(4096) * 4096 * std::mem::size_of::<Cell>()
-                <= HISTORY_CELL_BUDGET_BYTES
+                <= HISTORY_STORAGE_BUDGET_BYTES
         );
+        #[cfg(feature = "compact-history")]
+        {
+            let mut screen = HeadlessScreen::new(4096, 24);
+            screen.feed("wide retained history\r\n".repeat(1000).as_bytes());
+            assert!(screen.term.grid().history_storage_bytes() <= HISTORY_STORAGE_BUDGET_BYTES);
+            assert_eq!(screen.term.grid().history_size(), 1000 + 1 - 24);
+        }
     }
 
     #[test]
@@ -1921,6 +2133,26 @@ mod tests {
             "restorable"
         );
         assert_eq!(restored.scrollback(), original.scrollback());
+    }
+
+    #[cfg(feature = "compact-history")]
+    #[test]
+    fn compact_history_checkpoint_restores_cold_rows_and_annotations() {
+        let mut original = HeadlessScreen::new(80, 24);
+        for index in 0..3000 {
+            original.feed(format!("\x1b]8;id={index};https://example.invalid/{index}\x07{index:06} 界 e\u{301}\x1b]8;;\x07\r\n").as_bytes());
+        }
+        let history = original.history_snapshot();
+        let metadata = original.history_metadata();
+        let snapshot = original.full_snapshot();
+        assert_eq!(history.len(), 3000 + 1 - 24);
+        let mut restored = HeadlessScreen::new(80, 24);
+        assert!(restored.restore(&history, &snapshot, false, false, MouseModes::OFF));
+        restored.restore_history_metadata(&metadata);
+        assert_eq!(restored.scrollback().lines, original.scrollback().lines);
+        assert_eq!(restored.history_metadata(), metadata);
+        assert_eq!(restored.history_snapshot(), history);
+        assert!(restored.term.grid().history_storage_bytes() <= HISTORY_STORAGE_BUDGET_BYTES);
     }
 
     #[test]

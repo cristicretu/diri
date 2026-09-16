@@ -70,6 +70,14 @@ pub struct HolderProcessSample {
 /// A holder's answer to `stat`: the child, its liveness, and the log tail.
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 pub struct HolderStat {
+    /// Immutable owned-child birth, verified around this observation. Old
+    /// Holders omit it; consumers must not invent it from childPID/startSec.
+    #[serde(
+        rename = "childIdentity",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub child_identity: Option<diri_proto::process::ProcessIdentity>,
     #[serde(rename = "childPID")]
     pub child_pid: i32,
     pub alive: bool,
@@ -80,6 +88,7 @@ pub struct HolderStat {
         default,
         skip_serializing_if = "Option::is_none"
     )]
+    /// Historical wire spelling; this value is the PTY foreground PGID.
     pub foreground_pid: Option<i32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cols: Option<u16>,
@@ -96,6 +105,16 @@ pub struct HolderStat {
         skip_serializing_if = "Option::is_none"
     )]
     pub epoch_offset: Option<u64>,
+}
+
+impl HolderStat {
+    /// Reject absent/unsupported identity and inconsistent sibling PID fields.
+    /// Presence is evidence supplied by the owning Holder, not permission to
+    /// inspect or signal an arbitrary numeric PID on another host.
+    pub fn verified_child_identity(&self) -> Option<diri_proto::process::ProcessIdentity> {
+        self.child_identity
+            .filter(|identity| Some(identity.pid()) == u32::try_from(self.child_pid).ok())
+    }
 }
 
 /// How the held child ended.
@@ -339,6 +358,13 @@ pub struct HolderExitMarker;
 impl HolderExitMarker {
     pub const PREFIX: &'static [u8] = b"\x1b]777;dirijor-exit=";
     pub const TERMINATOR: u8 = 0x07;
+    // v1 has a reason ("exited"/"signaled") and two optional i32 fields.
+    // 128 JSON bytes cover their compact Rust/Swift encodings, including both
+    // signed extremes, with room for field order/ordinary whitespace. This is
+    // an envelope limit, not permission for unbounded JSON padding/extensions.
+    const MAX_STATUS_JSON_BYTES: usize = 128;
+    pub const MAX_RETAINED_BYTES: usize =
+        Self::PREFIX.len() + Self::MAX_STATUS_JSON_BYTES.div_ceil(3) * 4;
 
     pub fn encode(status: &HolderExitStatus) -> Vec<u8> {
         let Ok(payload) = serde_json::to_vec(status) else {
@@ -372,33 +398,62 @@ impl HolderExitMarker {
         let mut output = Vec::new();
         let mut exit_status = None;
 
-        while !buffer.is_empty() {
-            if let Some(marker_start) = find(buffer, Self::PREFIX) {
+        let mut consumed = 0;
+        while consumed < buffer.len() {
+            let remaining = &buffer[consumed..];
+            if let Some(marker_start) = find(remaining, Self::PREFIX) {
                 if marker_start > 0 {
-                    output.extend_from_slice(&buffer[..marker_start]);
-                    buffer.drain(..marker_start);
+                    output.extend_from_slice(&remaining[..marker_start]);
+                    consumed += marker_start;
                     continue;
                 }
-                let Some(end) = buffer.iter().position(|&byte| byte == Self::TERMINATOR) else {
-                    break; // incomplete marker; wait for more bytes
-                };
-                let payload = &buffer[Self::PREFIX.len()..end];
-                if let Ok(decoded) = base64::engine::general_purpose::STANDARD.decode(payload)
-                    && let Ok(status) = serde_json::from_slice::<HolderExitStatus>(&decoded)
-                {
-                    exit_status = Some(status);
+                let end = remaining
+                    .iter()
+                    .take(Self::MAX_RETAINED_BYTES + 1)
+                    .position(|&byte| byte == Self::TERMINATOR);
+                let payload_end = end.unwrap_or(remaining.len().min(Self::MAX_RETAINED_BYTES + 1));
+                let plausible = remaining[Self::PREFIX.len()..payload_end]
+                    .iter()
+                    .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'+' | b'/' | b'='));
+                if !plausible || (end.is_none() && remaining.len() > Self::MAX_RETAINED_BYTES) {
+                    // This prefix cannot be a bounded marker. Release its first
+                    // byte, then preserve normal prefix detection for the rest.
+                    output.push(remaining[0]);
+                    consumed += 1;
+                    continue;
                 }
-                buffer.drain(..=end);
+                let Some(end) = end else {
+                    break;
+                };
+                let payload = &remaining[Self::PREFIX.len()..end];
+                let status = base64::engine::general_purpose::STANDARD
+                    .decode(payload)
+                    .ok()
+                    .filter(|bytes| bytes.len() <= Self::MAX_STATUS_JSON_BYTES)
+                    .and_then(|bytes| serde_json::from_slice::<HolderExitStatus>(&bytes).ok());
+                if let Some(status) = status {
+                    exit_status = Some(status);
+                } else {
+                    // Malformed metadata is ordinary terminal input, not a
+                    // fabricated process exit and not output we may discard.
+                    output.extend_from_slice(&remaining[..=end]);
+                }
+                consumed += end + 1;
                 continue;
             }
 
-            let keep = longest_suffix_of_prefix(buffer);
-            let emit = buffer.len() - keep;
+            let keep = longest_suffix_of_prefix(remaining);
+            let emit = remaining.len() - keep;
             if emit > 0 {
-                output.extend_from_slice(&buffer[..emit]);
-                buffer.drain(..emit);
+                output.extend_from_slice(&remaining[..emit]);
+                consumed += emit;
             }
             break;
+        }
+        buffer.drain(..consumed);
+        // A previous oversized append must not leave its allocation resident.
+        if buffer.capacity() > Self::MAX_RETAINED_BYTES * 2 {
+            *buffer = buffer.to_vec();
         }
         (output, exit_status)
     }
@@ -480,6 +535,32 @@ mod tests {
         let sparse: HolderStat =
             serde_json::from_str(r#"{"childPID":9,"alive":false,"logOffset":0}"#).expect("sparse");
         assert_eq!(sparse.foreground_pid, None);
+        assert_eq!(sparse.child_identity, None);
+        assert_eq!(sparse.verified_child_identity(), None);
+        let mut inconsistent = sparse.clone();
+        inconsistent.child_identity = Some(
+            diri_proto::process::ProcessIdentity::new(
+                10,
+                diri_proto::process::ProcessBirth::Linux {
+                    boot_id: diri_proto::process::BootId::parse(
+                        "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee",
+                    )
+                    .unwrap(),
+                    start_ticks: 42,
+                    clock_ticks_per_second: 100,
+                },
+            )
+            .unwrap(),
+        );
+        assert_eq!(inconsistent.verified_child_identity(), None);
+        inconsistent.child_pid = 10;
+        assert!(inconsistent.verified_child_identity().is_some());
+        let round_trip: HolderStat =
+            serde_json::from_str(&serde_json::to_string(&inconsistent).unwrap()).unwrap();
+        assert_eq!(
+            round_trip.verified_child_identity(),
+            inconsistent.child_identity
+        );
         assert_eq!(sparse.epoch_offset, None);
     }
 
@@ -574,14 +655,107 @@ mod tests {
     }
 
     #[test]
-    fn a_corrupt_marker_is_consumed_without_a_status() {
+    fn a_corrupt_marker_is_released_without_a_status() {
         let mut buffer = HolderExitMarker::PREFIX.to_vec();
         buffer.extend_from_slice(b"not-base64!!");
         buffer.push(HolderExitMarker::TERMINATOR);
         buffer.extend_from_slice(b"rest");
 
+        let original = buffer.clone();
         let (output, exit) = HolderExitMarker::drain(&mut buffer);
         assert_eq!(exit, None);
-        assert_eq!(output, b"rest", "the broken marker itself is swallowed");
+        assert_eq!(
+            output, original,
+            "malformed marker bytes retain their order"
+        );
+    }
+    #[test]
+    fn every_marker_boundary_preserves_legitimate_status_and_surrounding_output() {
+        for reason in [HolderExitReason::Exited, HolderExitReason::Signaled] {
+            for value in [i32::MIN, 0, i32::MAX] {
+                let status = HolderExitStatus {
+                    reason,
+                    code: Some(value),
+                    signal: Some(value),
+                };
+                let marker = HolderExitMarker::encode(&status);
+                assert!(marker.len() <= HolderExitMarker::MAX_RETAINED_BYTES + 1);
+                let mut input = b"before".to_vec();
+                input.extend(&marker);
+                input.extend(b"after");
+                for split in 0..=input.len() {
+                    let mut buffer = input[..split].to_vec();
+                    let (mut output, first) = HolderExitMarker::drain(&mut buffer);
+                    assert!(buffer.len() <= HolderExitMarker::MAX_RETAINED_BYTES);
+                    buffer.extend(&input[split..]);
+                    let (tail, second) = HolderExitMarker::drain(&mut buffer);
+                    output.extend(tail);
+                    assert_eq!(output, b"beforeafter", "split {split}");
+                    assert_eq!(second.or(first), Some(status));
+                    assert!(buffer.is_empty());
+                }
+            }
+        }
+    }
+    #[test]
+    fn malformed_and_oversized_markers_are_lossless_at_every_boundary() {
+        let mut cases = Vec::new();
+        for payload in [
+            b"not-base64!!".to_vec(),
+            b"e30=".to_vec(),
+            vec![b'A'; HolderExitMarker::MAX_RETAINED_BYTES * 3],
+        ] {
+            let mut input = b"before".to_vec();
+            input.extend(HolderExitMarker::PREFIX);
+            input.extend(payload);
+            input.push(HolderExitMarker::TERMINATOR);
+            input.extend(b"after");
+            cases.push(input);
+        }
+        for input in cases {
+            for split in 0..=input.len() {
+                let mut buffer = input[..split].to_vec();
+                let (mut output, exit) = HolderExitMarker::drain(&mut buffer);
+                assert!(exit.is_none());
+                assert!(buffer.len() <= HolderExitMarker::MAX_RETAINED_BYTES);
+                buffer.extend(&input[split..]);
+                let (tail, exit) = HolderExitMarker::drain(&mut buffer);
+                assert!(exit.is_none());
+                output.extend(tail);
+                assert_eq!(output, input, "split {split}");
+                assert!(buffer.is_empty());
+            }
+        }
+    }
+    #[test]
+    fn unterminated_prefix_stream_retains_bounded_bytes_and_all_output() {
+        let mut buffer = HolderExitMarker::PREFIX.to_vec();
+        let mut expected = buffer.clone();
+        let mut output = Vec::new();
+        let chunk = vec![b'A'; 64 * 1024];
+        for _ in 0..64 {
+            expected.extend(&chunk);
+            buffer.extend(&chunk);
+            let (bytes, exit) = HolderExitMarker::drain(&mut buffer);
+            assert!(exit.is_none());
+            output.extend(bytes);
+            assert!(buffer.len() <= HolderExitMarker::MAX_RETAINED_BYTES);
+            assert!(buffer.capacity() <= HolderExitMarker::MAX_RETAINED_BYTES * 2);
+        }
+        output.extend(&buffer);
+        assert_eq!(output, expected);
+    }
+    #[test]
+    fn repeated_invalid_prefixes_are_drained_in_order_without_retention_growth() {
+        let mut piece = HolderExitMarker::PREFIX.to_vec();
+        piece.extend(b"AAAA");
+        let input = piece.repeat(10_000);
+        let mut buffer = input.clone();
+        let (mut output, exit) = HolderExitMarker::drain(&mut buffer);
+        assert!(exit.is_none());
+        assert!(buffer.len() <= HolderExitMarker::MAX_RETAINED_BYTES);
+        assert!(buffer.capacity() <= HolderExitMarker::MAX_RETAINED_BYTES * 2);
+        output.extend(buffer);
+        assert_eq!(output, input);
     }
 }

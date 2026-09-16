@@ -115,7 +115,7 @@ fn an_attach_is_seeded_then_streams_diffs_and_answers_input() {
             "argv": [
                 "/bin/sh",
                 "-c",
-                "stty -echo; printf '\\033[?2004hseeded-screen\\n'; IFS= read -r _; printf '\\033[?2004l'; stty echo; exec cat"
+                "stty -echo; printf '\\033[?1h\\033=\\033[?2004hseeded-screen\\n'; IFS= read -r _; printf '\\033[?1l\\033>'; IFS= read -r _; printf '\\033[?2004l'; stty echo; exec cat"
             ],
         })),
     });
@@ -163,7 +163,28 @@ fn an_attach_is_seeded_then_streams_diffs_and_answers_input() {
         "the attachment seed carries the child's current paste mode"
     );
 
-    // The setup shell drops bracketed paste after its first input. A mode-only
+    assert_eq!(
+        modes.keyboard_state_payload().unwrap(),
+        Some(diri_proto::terminal_input::KeyboardState {
+            enhancements: None,
+            application_cursor_keys: true,
+            application_keypad: true
+        })
+    );
+    data.write_all(&FrameCodec::encode(&Frame::input(b"finish-keys\n".to_vec())).unwrap())
+        .unwrap();
+    let keyboard_only = frames.until("keyboard-only mode change", |frame| {
+        frame.frame_type == FrameType::Modes
+            && frame.keyboard_state_payload().ok().flatten()
+                == Some(diri_proto::terminal_input::KeyboardState::default())
+    });
+    assert_eq!(
+        keyboard_only.terminal_modes_payload(),
+        Some((false, true, MouseModes::OFF)),
+        "keyboard-only change publishes while cell/cursor/paste/mouse state stays unchanged"
+    );
+
+    // The setup shell drops bracketed paste after its next input. A mode-only
     // terminal change must wake the attachment pump even when no visible cell
     // changes with it.
     data.write_all(&FrameCodec::encode(&Frame::input(b"finish-setup\n".to_vec())).expect("encode"))

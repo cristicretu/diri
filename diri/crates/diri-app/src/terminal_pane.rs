@@ -33,9 +33,10 @@ use diri_term::find::{
     TerminalFindModel,
 };
 use diri_term::keys::{
-    Key as TermKey, KeyEvent as TermKeyEvent, Modifiers as TermModifiers, NamedKey, TermInputModes,
-    encode_key, paste,
+    Key as TermKey, KeyEvent as TermKeyEvent, Modifiers as TermModifiers, NamedKey, paste,
 };
+#[cfg(test)]
+use diri_term::keys::{TermInputModes, encode_key};
 use diri_term::metrics::CellMetrics;
 use diri_term::scrollback::{WheelDelta, WheelEvent, WheelRoute};
 use diri_term::theme::TermTheme;
@@ -491,6 +492,7 @@ impl PaneMailboxState {
 
 struct ResidentTerminal {
     controller: ControllerLease,
+    keyboard: Option<diri_proto::terminal_input::KeyboardState>,
     element: TerminalElement,
     attachment: AttachmentControl,
     /// Rejects events that finished crossing to GPUI after this resident's
@@ -893,6 +895,7 @@ impl TerminalPane {
                 id,
                 ResidentTerminal {
                     controller,
+                    keyboard: None,
                     element,
                     attachment,
                     attachment_generation: generation,
@@ -1200,6 +1203,9 @@ impl TerminalPane {
                         resident.pointer_owner = None;
                         resident.mouse_motion.reset();
                     }
+                    if state != AttachmentState::Live {
+                        resident.keyboard = None;
+                    }
                     resident.attachment_state = state;
                 }
                 if self.selected_id().as_ref() == Some(&id) {
@@ -1222,6 +1228,7 @@ impl TerminalPane {
                 id,
                 generation,
                 TerminalChunk::Modes {
+                    keyboard,
                     alt_screen,
                     bracketed_paste,
                     mouse,
@@ -1235,6 +1242,7 @@ impl TerminalPane {
                         resident.pointer_owner = None;
                         resident.mouse_motion.reset();
                     }
+                    resident.keyboard = keyboard;
                     resident.bracketed_paste = bracketed_paste;
                     resident.element.set_modes(alt_screen, mouse);
                 }
@@ -2523,7 +2531,23 @@ impl TerminalPane {
             alt: event.keystroke.modifiers.alt,
             cmd: event.keystroke.modifiers.platform,
         };
-        let bytes = encode_key(&term_event, modifiers, TermInputModes::default());
+        let bytes = match diri_term::keys::encode_action(
+            &term_event,
+            modifiers,
+            resident.keyboard,
+            if event.is_held {
+                diri_term::keys::KeyAction::Repeat
+            } else {
+                diri_term::keys::KeyAction::Press
+            },
+        ) {
+            Ok(bytes) => bytes,
+            Err(error) => {
+                self.show_terminal_feedback(error.to_string(), window, cx);
+                cx.stop_propagation();
+                return;
+            }
+        };
         if bytes.is_empty() {
             cx.propagate();
         } else {
@@ -3859,6 +3883,10 @@ fn centered_symbol_message(
 }
 
 fn terminal_key_event(event: &KeyDownEvent) -> Option<TermKeyEvent> {
+    #[cfg(target_os = "macos")]
+    if let Some(keypad) = crate::macos::terminal_keys::keypad_event(event) {
+        return Some(keypad);
+    }
     let named = match event.keystroke.key.as_str() {
         "up" => Some(NamedKey::ArrowUp),
         "down" => Some(NamedKey::ArrowDown),

@@ -18,6 +18,28 @@ fn main() {
 
 #[cfg(unix)]
 fn main() {
+    let arguments: Vec<String> = std::env::args().collect();
+    if arguments
+        .get(1)
+        .is_some_and(|value| value == diri_pty::process_facts::account::WORKER_FLAG)
+    {
+        // One-shot directory-service worker: no detachment, manager, PTY or
+        // Holder sockets. Its caller owns the deadline and reaps this process.
+        let result = if arguments.len() == 3 {
+            diri_pty::process_facts::account::parse_uid(&arguments[2]).and_then(|uid| {
+                diri_pty::process_facts::account::run_worker(uid, &mut std::io::stdout())
+            })
+        } else {
+            Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "account worker expects one UID",
+            ))
+        };
+        if result.is_err() {
+            std::process::exit(1);
+        }
+        return;
+    }
     // The daemon detaches us with setsid at spawn. Direct/manual launches
     // detach here as well; parent death never terminates a POSIX child, and
     // ignoring SIGHUP severs the last terminal coupling.
@@ -29,7 +51,6 @@ fn main() {
         libc::signal(libc::SIGHUP, libc::SIG_IGN);
     }
 
-    let arguments: Vec<String> = std::env::args().collect();
     let result = if let Some(directory) = value_after(&arguments, "--manager") {
         // Tests shorten the idle window so managers don't outlive them.
         let idle = std::env::var("DIRI_HOLDER_IDLE_SECONDS")

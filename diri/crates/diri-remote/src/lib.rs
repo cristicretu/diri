@@ -9,18 +9,18 @@ mod output_log;
 mod paths;
 mod persistence;
 mod state;
+mod stop;
 mod usage;
 
 use std::collections::HashSet;
 use std::fs;
 use std::io::{self, Read, Write};
 use std::path::Path;
-use std::time::{Duration, Instant};
 
 use diri_proto::remote_pty::{
     ANNOTATED_HELPER_CAPABILITIES, EnvironmentCaptureRequest, GcResult, HelperProbe, LaunchRequest,
-    PROTOCOL_MAJOR, PROTOCOL_MINOR, ProtocolVersion, RemoteProcessState, SessionInspection,
-    SessionSelector,
+    PROTOCOL_MAJOR, PROTOCOL_MINOR, ProtocolVersion, RemoteManagementFailure, RemoteProcessState,
+    SessionInspection, SessionSelector,
 };
 use serde::Serialize;
 use sha2::{Digest, Sha256};
@@ -100,6 +100,7 @@ enum Invocation {
         process_pid: u32,
     },
     HiddenDumpEnvironment,
+    HiddenAccountFacts(u32),
     HiddenEnvironmentTestShell(std::path::PathBuf),
     HiddenPersistenceWitness,
     HiddenPersistenceWitnessArg {
@@ -148,8 +149,7 @@ pub fn execute<W: Write + Send>(
         // side to a detached thread, so it takes the real stdin rather than
         // the injected reader the other subcommands are tested through.
         Invocation::Attach => bridge::run(io::stdin(), &mut *stdout),
-        Invocation::Inspect => read_selector(stdin)
-            .and_then(|selector| inspect(&selector))
+        Invocation::Inspect => inspect_request(stdin, executable)
             .and_then(|inspection| write_json(stdout, &inspection)),
         Invocation::List => list().and_then(|sessions| write_json(stdout, &sessions)),
         Invocation::Kill => read_selector(stdin)
@@ -204,6 +204,9 @@ pub fn execute<W: Write + Send>(
             holder::run_process_guard(stdin, process_pid)
         }
         Invocation::HiddenDumpEnvironment => environment::dump(stdout),
+        Invocation::HiddenAccountFacts(uid) => {
+            diri_pty::process_facts::account::run_worker(uid, stdout)
+        }
         Invocation::HiddenEnvironmentTestShell(shell) => {
             holder::read_limited_json::<_, EnvironmentCaptureRequest>(stdin, 64 * 1024)
                 .and_then(|request| environment::capture_with_shell(&request, executable, &shell))
@@ -221,6 +224,12 @@ pub fn execute<W: Write + Send>(
             // Errors describe phase and category only. Launch requests,
             // environments, authentication payloads and prompts are never
             // included in Helper diagnostics.
+            if let Some(failure) = error
+                .get_ref()
+                .and_then(|inner| inner.downcast_ref::<RemoteManagementFailure>())
+            {
+                let _ = write_json(stdout, failure).and_then(|()| stdout.flush());
+            }
             let _ = writeln!(stderr, "diri-remote: {error}");
             EXIT_FAILURE
         }
@@ -278,6 +287,15 @@ fn parse(arguments: impl IntoIterator<Item = String>) -> Result<Invocation, Stri
             Ok(Invocation::HiddenProcessGuard { process_pid })
         }
         "__dump-environment" => no_more(arguments, Invocation::HiddenDumpEnvironment),
+        diri_pty::process_facts::account::WORKER_FLAG => {
+            let values: Vec<_> = arguments.collect();
+            let [uid] = values.as_slice() else {
+                return Err("account worker expects one UID".into());
+            };
+            let uid = diri_pty::process_facts::account::parse_uid(uid)
+                .map_err(|error| error.to_string())?;
+            Ok(Invocation::HiddenAccountFacts(uid))
+        }
         "__environment-test-shell" if cfg!(debug_assertions) => {
             let remainder = arguments.collect::<Vec<_>>();
             let [shell] = remainder.as_slice() else {
@@ -336,8 +354,49 @@ fn read_selector(reader: &mut dyn Read) -> io::Result<SessionSelector> {
     Ok(selector)
 }
 
-fn inspect(selector: &SessionSelector) -> io::Result<SessionInspection> {
+fn inspect_request(reader: &mut dyn Read, executable: &Path) -> io::Result<SessionInspection> {
+    let request: diri_proto::remote_pty::ProcessInspectionRequest =
+        holder::read_limited_json(reader, 64 * 1024)?;
+    request
+        .selector
+        .validate()
+        .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error))?;
     let roots = paths::StatePaths::resolve()?;
+    if !request.include_process_facts {
+        return inspect_at(&roots, &request.selector);
+    }
+    if !(1..=1000).contains(&request.timeout_ms) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "process inspection timeout must be 1..1000 ms",
+        ));
+    }
+    let deadline =
+        std::time::Instant::now() + std::time::Duration::from_millis(u64::from(request.timeout_ms));
+    inspect_at_with_facts(&roots, &request.selector, Some((executable, deadline)))
+}
+
+fn inspect_at(
+    roots: &paths::StatePaths,
+    selector: &SessionSelector,
+) -> io::Result<SessionInspection> {
+    inspect_at_with_facts(roots, selector, None)
+}
+
+fn check_facts_deadline(facts: Option<(&Path, std::time::Instant)>) -> io::Result<()> {
+    if facts.is_some_and(|(_, deadline)| std::time::Instant::now() >= deadline) {
+        Err(RemoteManagementFailure::ProcessFactsTimedOut.into_io_error())
+    } else {
+        Ok(())
+    }
+}
+
+fn inspect_at_with_facts(
+    roots: &paths::StatePaths,
+    selector: &SessionSelector,
+    facts: Option<(&Path, std::time::Instant)>,
+) -> io::Result<SessionInspection> {
+    check_facts_deadline(facts)?;
     let paths = roots.session(&selector.session_id)?;
     if !state::authenticate(&paths, &selector.session_token)? {
         return Err(io::Error::new(
@@ -345,22 +404,112 @@ fn inspect(selector: &SessionSelector) -> io::Result<SessionInspection> {
             "session authentication failed",
         ));
     }
-    let mut state = state::read_state(&paths.state)?;
+    let state = state::read_state(&paths.state)?;
     validate_incarnation(selector, &state)?;
     if matches!(state.process_state, RemoteProcessState::Running { .. })
         && !state::holder_lock_held(&paths.lock)?
     {
-        // The Holder lock, not a reusable numeric PID, is the authority for
-        // liveness. Once the lock is gone we report an unknown failure and
-        // deliberately avoid signaling a process that might now own a reused
-        // PID/PGID.
-        state.process_state = RemoteProcessState::Exited {
-            code: None,
-            signal: None,
-        };
-        state::write_state(&paths.state, &state)?;
+        // Lock absence establishes owner loss, never Agent exit. Preserve the
+        // last observed fact and never signal a potentially recycled PID/PGID.
+        return Err(RemoteManagementFailure::HolderUnavailable.into_io_error());
     }
-    Ok(state.inspection())
+    let Some(identity) = state.child_identity else {
+        // Old Holders remain inspectable, but cannot supply identity-bound facts.
+        if facts.is_some() {
+            return Err(RemoteManagementFailure::ProcessFactsUnsupported.into_io_error());
+        }
+        return Ok(state.inspection());
+    };
+    if !matches!(state.process_state, RemoteProcessState::Running { .. }) {
+        if facts.is_some() {
+            return Err(RemoteManagementFailure::ProcessIdentityUnavailable.into_io_error());
+        }
+        return Ok(state.inspection());
+    }
+    if !matches!(state.process_state, RemoteProcessState::Running { pid } if pid == identity.pid())
+    {
+        return Err(RemoteManagementFailure::ProcessIdentityUnavailable.into_io_error());
+    }
+    diri_pty::process_identity::inspect_verified(&identity, || {
+        // This Helper runs on the owning host. Recheck authenticated durable
+        // binding and lock inside the before/after native birth observations.
+        if !state::authenticate(&paths, &selector.session_token)? {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "session authentication changed",
+            ));
+        }
+        let current = state::read_state(&paths.state)?;
+        validate_incarnation(selector, &current)?;
+        validate_process_binding(&state, &current)?;
+        if !state::holder_lock_held(&paths.lock)? {
+            return Err(RemoteManagementFailure::HolderUnavailable.into_io_error());
+        }
+        let mut inspection = current.inspection();
+        inspection.child_identity = Some(identity);
+        if let Some((executable, deadline)) = facts {
+            check_facts_deadline(facts)?;
+            let observed = diri_pty::process_facts::inspect(&identity, |uid| {
+                let account_deadline =
+                    deadline.min(std::time::Instant::now() + std::time::Duration::from_millis(250));
+                diri_pty::process_facts::account::lookup_until(executable, uid, account_deadline)
+            })?;
+            observed
+                .validate()
+                .map_err(|message| io::Error::new(io::ErrorKind::InvalidData, message))?;
+            // Native/account work may outlast an owner replacement. Recheck
+            // the authenticated durable binding and ownership after it too.
+            if !state::authenticate(&paths, &selector.session_token)? {
+                return Err(io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    "session authentication changed",
+                ));
+            }
+            let latest = state::read_state(&paths.state)?;
+            validate_incarnation(selector, &latest)?;
+            validate_process_binding(&state, &latest)?;
+            if !state::holder_lock_held(&paths.lock)? {
+                return Err(RemoteManagementFailure::HolderUnavailable.into_io_error());
+            }
+            inspection = latest.inspection();
+            inspection.child_identity = Some(identity);
+            inspection.process_facts = Some(observed);
+        }
+        check_facts_deadline(facts)?;
+        Ok(inspection)
+    })
+    .and_then(|inspection| {
+        check_facts_deadline(facts)?;
+        Ok(inspection)
+    })
+    .map_err(|error| {
+        if error
+            .get_ref()
+            .is_some_and(|inner| inner.is::<RemoteManagementFailure>())
+            || error.kind() == io::ErrorKind::PermissionDenied
+        {
+            error
+        } else {
+            RemoteManagementFailure::ProcessIdentityUnavailable.into_io_error()
+        }
+    })
+}
+
+fn validate_process_binding(
+    expected: &state::SessionState,
+    current: &state::SessionState,
+) -> io::Result<()> {
+    if expected.session_id != current.session_id
+        || expected.session_incarnation != current.session_incarnation
+        || expected.holder_build_id != current.holder_build_id
+        || expected.holder_pid != current.holder_pid
+        || expected.child_identity != current.child_identity
+        || expected.process_state != current.process_state
+    {
+        Err(RemoteManagementFailure::ProcessIdentityUnavailable.into_io_error())
+    } else {
+        Ok(())
+    }
 }
 
 fn list() -> io::Result<Vec<SessionInspection>> {
@@ -387,75 +536,7 @@ fn list() -> io::Result<Vec<SessionInspection>> {
 }
 
 fn kill(selector: &SessionSelector) -> io::Result<SessionInspection> {
-    let roots = paths::StatePaths::resolve()?;
-    let paths = roots.session(&selector.session_id)?;
-    let _launch_lock = state::acquire_launch_lock_wait(&paths.launch_lock)?;
-    if !state::authenticate(&paths, &selector.session_token)? {
-        return Err(io::Error::new(
-            io::ErrorKind::PermissionDenied,
-            "session authentication failed",
-        ));
-    }
-    let mut session = state::read_state(&paths.state)?;
-    validate_incarnation(selector, &session)?;
-    if !state::holder_lock_held(&paths.lock)? {
-        return Err(io::Error::new(
-            io::ErrorKind::NotConnected,
-            "Holder is not running",
-        ));
-    }
-
-    if let RemoteProcessState::Running { pid } = session.process_state {
-        signal_group(pid, libc::SIGTERM);
-        let deadline = Instant::now() + Duration::from_millis(500);
-        while Instant::now() < deadline && state::process_alive(pid) {
-            std::thread::sleep(Duration::from_millis(20));
-        }
-        if state::process_alive(pid) {
-            signal_group(pid, libc::SIGKILL);
-        }
-        session.process_state = RemoteProcessState::Exited {
-            code: None,
-            signal: Some(libc::SIGTERM),
-        };
-    }
-    signal_pid(session.holder_pid, libc::SIGTERM);
-    if session.persistence == diri_proto::remote_pty::PersistenceCapability::UserSupervisor {
-        persistence::cleanup_holder(&session.session_id);
-    }
-    let holder_deadline = Instant::now() + Duration::from_millis(500);
-    while Instant::now() < holder_deadline && state::holder_lock_held(&paths.lock)? {
-        std::thread::sleep(Duration::from_millis(10));
-    }
-    if state::holder_lock_held(&paths.lock)? {
-        signal_pid(session.holder_pid, libc::SIGKILL);
-        let killed_deadline = Instant::now() + Duration::from_millis(500);
-        while Instant::now() < killed_deadline && state::holder_lock_held(&paths.lock)? {
-            std::thread::sleep(Duration::from_millis(10));
-        }
-        if state::holder_lock_held(&paths.lock)? {
-            return Err(io::Error::new(
-                io::ErrorKind::TimedOut,
-                "Holder did not release its session lock after SIGKILL",
-            ));
-        }
-    }
-    // Fence the dead Holder's asynchronous checkpoints before publishing the
-    // management exit. Also retain the Holder lock through this final write.
-    let _lock = state::acquire_lock(&paths.lock)?;
-    let latest = state::read_state(&paths.state)?;
-    validate_incarnation(selector, &latest)?;
-    if latest.session_incarnation != session.session_incarnation {
-        return Err(io::Error::other("session changed while stopping Holder"));
-    }
-    let fallback_exit = session.process_state;
-    session = latest;
-    if matches!(session.process_state, RemoteProcessState::Running { .. }) {
-        session.process_state = fallback_exit;
-    }
-    session.output_offset = output_log::OutputLog::open(&paths.output)?.tail_offset();
-    state::write_state(&paths.state, &session)?;
-    Ok(session.inspection())
+    stop::kill(selector)
 }
 
 fn gc() -> io::Result<GcResult> {
@@ -717,26 +798,6 @@ fn validate_activation_path(path: &Path) -> io::Result<()> {
     Ok(())
 }
 
-fn signal_group(pid: u32, signal: i32) {
-    if let Ok(pid) = libc::pid_t::try_from(pid) {
-        // SAFETY: the Agent process created its own process group via
-        // `setsid`; kill(2) receives integers only. Errors mean it exited.
-        unsafe {
-            libc::kill(-pid, signal);
-        }
-    }
-}
-
-fn signal_pid(pid: u32, signal: i32) {
-    if let Ok(pid) = libc::pid_t::try_from(pid) {
-        // SAFETY: lock ownership and authenticated state were verified before
-        // selecting this Holder pid; kill(2) receives integers only.
-        unsafe {
-            libc::kill(pid, signal);
-        }
-    }
-}
-
 fn sha256_file(path: &Path) -> io::Result<String> {
     let mut file = fs::File::open(path)?;
     let mut hasher = Sha256::new();
@@ -798,6 +859,182 @@ mod tests {
             String::from_utf8(stdout).expect("stdout utf8"),
             String::from_utf8(stderr).expect("stderr utf8"),
         )
+    }
+
+    #[test]
+    fn inspection_owner_loss_preserves_a_live_child_and_recorded_exit_facts() {
+        use diri_proto::remote_pty::{PersistenceCapability, SessionToken};
+        use std::process::{Command, Stdio};
+
+        struct ChildGuard(std::process::Child);
+        impl Drop for ChildGuard {
+            fn drop(&mut self) {
+                let _ = self.0.kill();
+                let _ = self.0.wait();
+            }
+        }
+        let mut child = ChildGuard(
+            Command::new("/bin/cat")
+                .stdin(Stdio::piped())
+                .stdout(Stdio::null())
+                .spawn()
+                .unwrap(),
+        );
+        let temporary = tempfile::tempdir().unwrap();
+        let roots = paths::StatePaths::from_root(temporary.path().join("state")).unwrap();
+        let request = LaunchRequest {
+            session_id: "owner-loss".into(),
+            session_token: SessionToken::new("0123456789abcdef0123456789abcdef").unwrap(),
+            argv: vec!["/bin/cat".into()],
+            cwd: "/".into(),
+            environment: vec![],
+            cols: 80,
+            rows: 24,
+            persistence: PersistenceCapability::NonPersistent,
+        };
+        let paths = roots.session(&request.session_id).unwrap();
+        paths.ensure().unwrap();
+        state::initialize_auth(&paths, &request.session_token).unwrap();
+        let mut stored =
+            state::SessionState::new(&request, "incarnation".into(), child.0.id(), None);
+        state::write_state(&paths.state, &stored).unwrap();
+        let selector = SessionSelector {
+            session_id: request.session_id,
+            session_token: request.session_token,
+            expected_incarnation: Some(stored.session_incarnation.clone()),
+        };
+        let before = fs::read(&paths.state).unwrap();
+        let error = inspect_at(&roots, &selector).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::NotConnected);
+        assert_eq!(
+            error
+                .get_ref()
+                .unwrap()
+                .downcast_ref::<RemoteManagementFailure>(),
+            Some(&RemoteManagementFailure::HolderUnavailable)
+        );
+        assert_eq!(
+            fs::read(&paths.state).unwrap(),
+            before,
+            "inspection must not invent state"
+        );
+        assert!(
+            child.0.try_wait().unwrap().is_none(),
+            "inspection must not kill the child"
+        );
+
+        let lock = state::acquire_lock(&paths.lock).unwrap();
+        assert_eq!(
+            inspect_at(&roots, &selector).unwrap().process_state,
+            RemoteProcessState::Running { pid: child.0.id() }
+        );
+        // The owned, unreaped child can provide native birth facts while its
+        // Holder lock remains held. Old persisted records stay unsupported.
+        let captured = diri_pty::process_identity::observe(child.0.id()).unwrap();
+        assert_eq!(inspect_at(&roots, &selector).unwrap().child_identity, None);
+        let options = Some((
+            Path::new("/unused-account-worker"),
+            std::time::Instant::now() + std::time::Duration::from_secs(1),
+        ));
+        assert_eq!(
+            inspect_at_with_facts(&roots, &selector, options)
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::Unsupported
+        );
+        assert_eq!(
+            inspect_at_with_facts(
+                &roots,
+                &selector,
+                Some((Path::new("/unused"), std::time::Instant::now()))
+            )
+            .unwrap_err()
+            .kind(),
+            io::ErrorKind::TimedOut
+        );
+        stored.child_identity = Some(captured);
+        state::write_state(&paths.state, &stored).unwrap();
+        assert_eq!(
+            inspect_at(&roots, &selector)
+                .unwrap()
+                .verified_child_identity(),
+            Some(captured)
+        );
+        let changed_birth = match captured.birth() {
+            diri_proto::process::ProcessBirth::Linux {
+                boot_id,
+                start_ticks,
+                clock_ticks_per_second,
+            } => diri_proto::process::ProcessBirth::Linux {
+                boot_id,
+                start_ticks: start_ticks + 1,
+                clock_ticks_per_second,
+            },
+            diri_proto::process::ProcessBirth::Macos {
+                boot_session,
+                start_seconds,
+                start_microseconds,
+            } => diri_proto::process::ProcessBirth::Macos {
+                boot_session,
+                start_seconds: start_seconds + 1,
+                start_microseconds,
+            },
+        };
+        let mut recycled = stored.clone();
+        recycled.child_identity =
+            Some(diri_proto::process::ProcessIdentity::new(child.0.id(), changed_birth).unwrap());
+        state::write_state(&paths.state, &recycled).unwrap();
+        assert_eq!(
+            inspect_at(&roots, &selector)
+                .unwrap_err()
+                .get_ref()
+                .unwrap()
+                .downcast_ref::<RemoteManagementFailure>(),
+            Some(&RemoteManagementFailure::ProcessIdentityUnavailable)
+        );
+        assert!(validate_process_binding(&stored, &recycled).is_err());
+        for change in 0..4 {
+            let mut current = stored.clone();
+            match change {
+                0 => current.session_incarnation.push_str("-changed"),
+                1 => current.holder_build_id.push_str("-changed"),
+                2 => current.holder_pid = current.holder_pid.saturating_add(1),
+                _ => {
+                    current.process_state = RemoteProcessState::Exited {
+                        code: Some(0),
+                        signal: None,
+                    }
+                }
+            }
+            assert!(validate_process_binding(&stored, &current).is_err());
+        }
+        let mut advancing = stored.clone();
+        advancing.output_offset += 1;
+        advancing.snapshot_sequence += 1;
+        assert!(validate_process_binding(&stored, &advancing).is_ok());
+        state::write_state(&paths.state, &stored).unwrap();
+        drop(lock);
+        let mut stale = selector.clone();
+        stale.expected_incarnation = Some("stale".into());
+        assert!(inspect_at(&roots, &stale).is_err());
+
+        // Genuine exit facts remain observable after the owner is gone.
+        for exit in [
+            RemoteProcessState::Exited {
+                code: Some(126),
+                signal: None,
+            },
+            RemoteProcessState::Exited {
+                code: None,
+                signal: Some(15),
+            },
+        ] {
+            stored.process_state = exit.clone();
+            state::write_state(&paths.state, &stored).unwrap();
+            assert_eq!(inspect_at(&roots, &selector).unwrap().process_state, exit);
+        }
+        let bytes = serde_json::to_vec(&RemoteManagementFailure::HolderUnavailable).unwrap();
+        assert_eq!(bytes, br#"{"error":"holder_unavailable"}"#);
     }
 
     #[test]

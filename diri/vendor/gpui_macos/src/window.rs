@@ -2157,6 +2157,11 @@ extern "C" fn handle_key_event(this: &Object, native_event: id, key_equivalent: 
         return NO;
     };
 
+    // Scope physical identity across this synchronous dispatch, including IME
+    // doCommand callbacks; logical GPUI keystrokes are never rewritten.
+    let _native_key =
+        crate::native_key::NativeKeyDispatch::enter(&event, unsafe { native_event.keyCode() });
+
     let run_callback = |event: PlatformInput| -> BOOL {
         let mut callback = window_state.as_ref().lock().event_callback.take();
         let handled: BOOL = if let Some(callback) = callback.as_mut() {

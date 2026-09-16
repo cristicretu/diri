@@ -1,6 +1,6 @@
 # Diri terminal extensions
 
-Pinned alacritty_terminal 0.26.0 (Apache-2.0). The metadata extension adds a
+Pinned alacritty_terminal 0.26.0 (Apache-2.0). The terminal metadata extension adds a
 PROMPT_START cell flag and Handler::mark_prompt implementation, paired with the
 OSC 133 A dispatch in vendored VTE. Markers follow the existing grid erase,
 scroll, and reflow lifecycle and are ignored on the alternate screen.
@@ -39,3 +39,8 @@ terminal dimensions. The change preserves ring indexing, row identity, history
 limits, resize/reflow and serialized formats. It trades smaller growth batches
 for lower retained heap. The short-history resource gate covers both sides of
 the first-scroll boundary; upstream storage tests cover indexing and rotation.
+
+The opt-in enhanced keyboard parser also keeps direct CSI = mode changes in
+the active stack entry. Queries, push/pop, and alternate-screen transitions
+therefore observe the same flags. Its bounded overflow evicts keyboard entries
+without touching window titles. Diri does not enable negotiation by default.

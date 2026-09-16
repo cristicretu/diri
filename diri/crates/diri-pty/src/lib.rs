@@ -5,6 +5,12 @@
 
 #[cfg(unix)]
 pub mod checkpoint;
+#[cfg(unix)]
+pub mod process_facts;
+#[cfg(unix)]
+pub mod process_identity;
+#[cfg(unix)]
+pub mod unix_socket;
 
 use std::path::PathBuf;
 

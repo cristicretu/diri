@@ -25,6 +25,9 @@ pub struct SessionState {
     pub holder_build_id: String,
     pub holder_pid: u32,
     pub process_state: RemoteProcessState,
+    /// Captured once by the owned PTY, never reconstructed from a stored PID.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub child_identity: Option<diri_proto::process::ProcessIdentity>,
     pub cols: u16,
     pub rows: u16,
     pub output_offset: u64,
@@ -35,7 +38,12 @@ pub struct SessionState {
 }
 
 impl SessionState {
-    pub fn new(request: &LaunchRequest, incarnation: String, process_pid: u32) -> Self {
+    pub fn new(
+        request: &LaunchRequest,
+        incarnation: String,
+        process_pid: u32,
+        child_identity: Option<diri_proto::process::ProcessIdentity>,
+    ) -> Self {
         Self {
             schema: STATE_SCHEMA,
             session_id: request.session_id.clone(),
@@ -43,6 +51,7 @@ impl SessionState {
             holder_build_id: BUILD_ID.to_string(),
             holder_pid: std::process::id(),
             process_state: RemoteProcessState::Running { pid: process_pid },
+            child_identity: child_identity.filter(|identity| identity.pid() == process_pid),
             cols: request.cols,
             rows: request.rows,
             output_offset: 0,
@@ -61,6 +70,9 @@ impl SessionState {
             holder_build_id: self.holder_build_id.clone(),
             holder_pid: self.holder_pid,
             process_state: self.process_state.clone(),
+            // Persisted origin alone is not a verified current-host fact.
+            child_identity: None,
+            process_facts: None,
             cols: self.cols,
             rows: self.rows,
             output_offset: self.output_offset,

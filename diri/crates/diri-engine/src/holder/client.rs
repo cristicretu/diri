@@ -95,6 +95,33 @@ impl HolderClient {
             .ok_or_else(|| HolderError::Transport("stat response omitted stat".into()))
     }
 
+    /// On-demand inspection shares one caller deadline across connection,
+    /// write, partial reads and verification. No existing input/stat loop uses
+    /// this stronger request path implicitly.
+    pub fn stat_until(&self, deadline: std::time::Instant) -> std::io::Result<HolderStat> {
+        use diri_pty::unix_socket::{connect_until, read_line_until, remaining};
+        let mut stream = connect_until(&self.socket_path, deadline)?;
+        let mut bytes = serde_json::to_vec(&HolderRequest::op(HolderOperation::Stat))
+            .map_err(std::io::Error::other)?;
+        bytes.push(b'\n');
+        stream.set_write_timeout(Some(remaining(deadline)?))?;
+        stream.write_all(&bytes)?;
+        let bytes = read_line_until(&mut stream, deadline, 16 * 1024)?;
+        let response: HolderResponse = serde_json::from_slice(&bytes).map_err(|_| {
+            std::io::Error::new(std::io::ErrorKind::InvalidData, "invalid Holder stat reply")
+        })?;
+        remaining(deadline)?;
+        if !response.ok {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::NotConnected,
+                "Holder rejected stat",
+            ));
+        }
+        response.stat.ok_or_else(|| {
+            std::io::Error::new(std::io::ErrorKind::InvalidData, "Holder omitted stat")
+        })
+    }
+
     /// Whether a live holder with a live child serves this socket.
     /// Subscribes to PTY output as the holder reads it.
     ///
@@ -427,5 +454,55 @@ impl HolderClient {
     /// Convenience over `Path` without an allocation at every call site.
     pub fn at(path: &Path) -> Self {
         Self::new(path.to_path_buf())
+    }
+}
+
+#[cfg(test)]
+mod deadline_tests {
+    use super::*;
+    use std::io::{BufRead, BufReader};
+    use std::os::unix::net::UnixListener;
+    use std::time::Instant;
+    #[test]
+    fn stat_deadline_is_not_extended_by_partial_replies() {
+        let temp = tempfile::tempdir_in("/tmp").unwrap();
+        let path = temp.path().join("stat.sock");
+        let listener = UnixListener::bind(&path).unwrap();
+        let worker = std::thread::spawn(move || {
+            let (mut socket, _) = listener.accept().unwrap();
+            let mut line = String::new();
+            BufReader::new(&mut socket).read_line(&mut line).unwrap();
+            for _ in 0..100 {
+                if socket.write_all(b" ").is_err() {
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(5));
+            }
+        });
+        let error = HolderClient::at(&path)
+            .stat_until(Instant::now() + Duration::from_millis(30))
+            .unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::TimedOut);
+        worker.join().unwrap();
+    }
+    #[test]
+    fn stat_reply_has_a_byte_bound() {
+        let temp = tempfile::tempdir_in("/tmp").unwrap();
+        let path = temp.path().join("stat.sock");
+        let listener = UnixListener::bind(&path).unwrap();
+        let worker = std::thread::spawn(move || {
+            let (mut socket, _) = listener.accept().unwrap();
+            let mut line = String::new();
+            BufReader::new(&mut socket).read_line(&mut line).unwrap();
+            let _ = socket.write_all(&vec![b'x'; 16 * 1024 + 1]);
+        });
+        assert_eq!(
+            HolderClient::at(&path)
+                .stat_until(Instant::now() + Duration::from_secs(1))
+                .unwrap_err()
+                .kind(),
+            std::io::ErrorKind::InvalidData
+        );
+        worker.join().unwrap();
     }
 }

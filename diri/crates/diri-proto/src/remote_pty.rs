@@ -18,7 +18,12 @@ use crate::grid::{GridCodecError, GridUpdate};
 use crate::terminal::MouseModes;
 
 pub const PROTOCOL_MAJOR: u16 = 1;
-pub const PROTOCOL_MINOR: u16 = 7;
+pub const PROTOCOL_MINOR: u16 = 14;
+pub const ENHANCED_KEYBOARD_PROTOCOL_MINOR: u16 = 14;
+pub const PROCESS_FACTS_PROTOCOL_MINOR: u16 = 13;
+pub const STOP_SESSION_PROTOCOL_MINOR: u16 = 12;
+pub const PROCESS_IDENTITY_PROTOCOL_MINOR: u16 = 10;
+pub const INPUT_MODES_PROTOCOL_MINOR: u16 = 9;
 pub const TERMINAL_ANNOTATIONS_PROTOCOL_MINOR: u16 = 6;
 pub const MOUSE_INPUT_PROTOCOL_MINOR: u16 = 4;
 pub const FOREGROUND_PROCESS_PROTOCOL_MINOR: u16 = 5;
@@ -51,6 +56,8 @@ const KIND_GRID_DELTA: u8 = 42;
 const KIND_SCROLLBACK_REQUEST: u8 = 43;
 const KIND_SCROLLBACK_RESPONSE: u8 = 44;
 const KIND_FOREGROUND_PROCESS: u8 = 45;
+const KIND_INPUT_MODES: u8 = 46;
+const KIND_STOP_SESSION: u8 = 47;
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -78,6 +85,16 @@ pub enum RemoteCapability {
     FullSnapshot,
     #[serde(rename = "terminal-annotations-v1")]
     TerminalAnnotations,
+    #[serde(rename = "terminal-input-modes-v1")]
+    InputModes,
+    #[serde(rename = "enhanced-keyboard-v1")]
+    EnhancedKeyboard,
+    #[serde(rename = "process-identity-v1")]
+    ProcessIdentity,
+    #[serde(rename = "process-facts-v1")]
+    ProcessFacts,
+    #[serde(rename = "stop-session-v1")]
+    StopSession,
     IncrementalGrid,
     ProcessExit,
     Signal,
@@ -115,6 +132,11 @@ impl RemoteCapability {
     pub const fn wire_name(self) -> &'static str {
         match self {
             Self::TerminalAnnotations => "terminal-annotations-v1",
+            Self::InputModes => "terminal-input-modes-v1",
+            Self::EnhancedKeyboard => "enhanced-keyboard-v1",
+            Self::ProcessIdentity => "process-identity-v1",
+            Self::ProcessFacts => "process-facts-v1",
+            Self::StopSession => "stop-session-v1",
             Self::FullSnapshot => "full-snapshot",
             Self::IncrementalGrid => "incremental-grid",
             Self::ProcessExit => "process-exit",
@@ -177,8 +199,13 @@ pub const ANNOTATED_HOLDER_CAPABILITIES: &[RemoteCapability] = &[
     RemoteCapability::ControllerLease,
     RemoteCapability::Scrollback,
     RemoteCapability::TerminalAnnotations,
+    RemoteCapability::InputModes,
+    RemoteCapability::EnhancedKeyboard,
+    RemoteCapability::ProcessIdentity,
+    RemoteCapability::StopSession,
 ];
 pub const ANNOTATED_HELPER_CAPABILITIES: &[RemoteCapability] = &[
+    RemoteCapability::ProcessFacts,
     RemoteCapability::FullSnapshot,
     RemoteCapability::IncrementalGrid,
     RemoteCapability::ProcessExit,
@@ -193,6 +220,10 @@ pub const ANNOTATED_HELPER_CAPABILITIES: &[RemoteCapability] = &[
     RemoteCapability::PersistenceProbe,
     RemoteCapability::AtomicActivation,
     RemoteCapability::TerminalAnnotations,
+    RemoteCapability::InputModes,
+    RemoteCapability::EnhancedKeyboard,
+    RemoteCapability::ProcessIdentity,
+    RemoteCapability::StopSession,
 ];
 
 /// Authentication bearer shared only by the local Engine and one Holder.
@@ -287,6 +318,9 @@ pub struct HelloAck {
     pub capabilities: Vec<RemoteCapability>,
     pub controller_epoch: u64,
     pub process_state: RemoteProcessState,
+    /// Captured owned-child origin; not proof the process is still alive.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub child_identity: Option<crate::process::ProcessIdentity>,
     pub output_offset: u64,
     pub snapshot_sequence: u64,
     /// PTY foreground process group. Absent from protocol 1.4 HelloAck.
@@ -297,8 +331,33 @@ pub struct HelloAck {
 impl HelloAck {
     pub fn validate(&self) -> Result<(), RemoteCodecError> {
         validate_identifier("holder build id", &self.holder_build_id)?;
-        validate_identifier("session incarnation", &self.session_incarnation)
+        validate_identifier("session incarnation", &self.session_incarnation)?;
+        if let Some(identity) = self.child_identity
+            && (self.protocol.minor < PROCESS_IDENTITY_PROTOCOL_MINOR
+                || !self
+                    .capabilities
+                    .contains(&RemoteCapability::ProcessIdentity)
+                || matches!(self.process_state, RemoteProcessState::Running { pid } if identity.pid() != pid))
+        {
+            return Err(RemoteCodecError::InvalidControlPayload {
+                kind: KIND_HELLO_ACK,
+                detail: "child birth identity is inconsistent with Holder capabilities or PID"
+                    .into(),
+            });
+        }
+        Ok(())
     }
+}
+
+/// Input state staged before the grid publication with the exact same sequence.
+/// A receiver commits this state only after accepting that snapshot or delta.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct InputModes {
+    pub sequence: u64,
+    /// Null is allowed only after explicit enhanced-keyboard-v1 negotiation.
+    /// Some retains the exact legacy object representation.
+    pub keyboard: Option<crate::terminal_input::KeyboardState>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -658,12 +717,25 @@ pub struct SessionInspection {
     pub holder_build_id: String,
     pub holder_pid: u32,
     pub process_state: RemoteProcessState,
+    /// Present only after host-local verification of the still-running child.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub child_identity: Option<crate::process::ProcessIdentity>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub process_facts: Option<crate::process_facts::ProcessFacts>,
     pub cols: u16,
     pub rows: u16,
     pub output_offset: u64,
     pub snapshot_sequence: u64,
     pub controller_epoch: u64,
     pub persistence: PersistenceCapability,
+}
+
+impl SessionInspection {
+    pub fn verified_child_identity(&self) -> Option<crate::process::ProcessIdentity> {
+        let identity = self.child_identity?;
+        matches!(self.process_state, RemoteProcessState::Running { pid } if identity.pid() == pid)
+            .then_some(identity)
+    }
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -681,6 +753,23 @@ pub struct SessionSelector {
     pub session_id: String,
     pub session_token: SessionToken,
     pub expected_incarnation: Option<String>,
+}
+
+/// Additive request shape on the existing authenticated `inspect` command.
+/// Older helpers omit facts, which stronger clients reject explicitly.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProcessInspectionRequest {
+    #[serde(flatten)]
+    pub selector: SessionSelector,
+    #[serde(default)]
+    pub include_process_facts: bool,
+    #[serde(default = "default_process_inspection_timeout")]
+    pub timeout_ms: u32,
+}
+
+fn default_process_inspection_timeout() -> u32 {
+    1000
 }
 
 impl SessionSelector {
@@ -715,6 +804,13 @@ pub struct Signal {
     pub signal: i32,
 }
 
+/// Explicit destructive lifecycle request, admitted by the current Holder owner.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct StopSession {
+    pub controller_epoch: u64,
+}
+
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct AcquireControl {
@@ -746,6 +842,64 @@ pub struct RemoteError {
     pub code: String,
     pub message: String,
     pub fatal: bool,
+}
+
+/// Additive failure body for a nonzero management RPC. Successful responses
+/// retain their existing shape; old Engines fail closed on the exit status.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(tag = "error", rename_all = "snake_case", deny_unknown_fields)]
+pub enum RemoteManagementFailure {
+    HolderUnavailable,
+    ProcessIdentityUnavailable,
+    ProcessFactsUnsupported,
+    ProcessFactsTimedOut,
+    StopUnsupported,
+    StopPending,
+    StopIdentityMismatch,
+}
+
+impl std::fmt::Display for RemoteManagementFailure {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::ProcessFactsUnsupported => {
+                formatter.write_str("remote Holder cannot supply identity-bound process facts")
+            }
+            Self::ProcessFactsTimedOut => {
+                formatter.write_str("process inspection deadline expired")
+            }
+            Self::StopUnsupported => {
+                formatter.write_str("remote Holder does not support identity-safe stop")
+            }
+            Self::StopPending => {
+                formatter.write_str("remote stop has not completed; no Agent exit is asserted")
+            }
+            Self::StopIdentityMismatch => {
+                formatter.write_str("remote session identity changed while stopping")
+            }
+            Self::HolderUnavailable => {
+                formatter.write_str("remote Holder owner is unavailable; Agent exit is unknown")
+            }
+            Self::ProcessIdentityUnavailable => formatter
+                .write_str("remote process birth could not be verified; Agent exit is unknown"),
+        }
+    }
+}
+
+impl std::error::Error for RemoteManagementFailure {}
+
+impl RemoteManagementFailure {
+    pub fn into_io_error(self) -> std::io::Error {
+        let kind = match self {
+            Self::HolderUnavailable => std::io::ErrorKind::NotConnected,
+            Self::ProcessIdentityUnavailable => std::io::ErrorKind::NotFound,
+            Self::ProcessFactsUnsupported => std::io::ErrorKind::Unsupported,
+            Self::ProcessFactsTimedOut => std::io::ErrorKind::TimedOut,
+            Self::StopUnsupported => std::io::ErrorKind::Unsupported,
+            Self::StopPending => std::io::ErrorKind::TimedOut,
+            Self::StopIdentityMismatch => std::io::ErrorKind::InvalidData,
+        };
+        std::io::Error::new(kind, self)
+    }
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -785,6 +939,7 @@ pub enum RemoteMessage {
     GridDelta(GridDelta),
     ProcessExit(ProcessExit),
     Signal(Signal),
+    StopSession(StopSession),
     AcquireControl(AcquireControl),
     ControlGranted(ControlGranted),
     ControlRevoked(ControlRevoked),
@@ -793,6 +948,7 @@ pub enum RemoteMessage {
     ScrollbackResponse(ScrollbackResponse),
     Error(RemoteError),
     ForegroundProcess(ForegroundProcess),
+    InputModes(InputModes),
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -957,6 +1113,9 @@ impl RemoteCodec {
                 append_json(KIND_PROCESS_EXIT, value, output, start)
             }
             RemoteMessage::Signal(value) => append_json(KIND_SIGNAL, value, output, start),
+            RemoteMessage::StopSession(value) => {
+                append_json(KIND_STOP_SESSION, value, output, start)
+            }
             RemoteMessage::AcquireControl(value) => {
                 validate_identifier("client nonce", &value.client_nonce)?;
                 append_json(KIND_ACQUIRE_CONTROL, value, output, start)
@@ -978,6 +1137,7 @@ impl RemoteCodec {
                 append_json(KIND_SCROLLBACK_RESPONSE, value, output, start)
             }
             RemoteMessage::Error(value) => append_json(KIND_ERROR, value, output, start),
+            RemoteMessage::InputModes(value) => append_json(KIND_INPUT_MODES, value, output, start),
             RemoteMessage::ForegroundProcess(value) => {
                 append_json(KIND_FOREGROUND_PROCESS, value, output, start)
             }
@@ -1163,6 +1323,7 @@ fn decode_message(kind: u8, payload: &[u8]) -> Result<RemoteMessage, RemoteCodec
         }
         KIND_PROCESS_EXIT => Ok(RemoteMessage::ProcessExit(decode_json(kind, payload)?)),
         KIND_SIGNAL => Ok(RemoteMessage::Signal(decode_json(kind, payload)?)),
+        KIND_STOP_SESSION => Ok(RemoteMessage::StopSession(decode_json(kind, payload)?)),
         KIND_ACQUIRE_CONTROL => {
             let value: AcquireControl = decode_json(kind, payload)?;
             validate_identifier("client nonce", &value.client_nonce)?;
@@ -1180,6 +1341,7 @@ fn decode_message(kind: u8, payload: &[u8]) -> Result<RemoteMessage, RemoteCodec
             kind, payload,
         )?)),
         KIND_ERROR => Ok(RemoteMessage::Error(decode_json(kind, payload)?)),
+        KIND_INPUT_MODES => Ok(RemoteMessage::InputModes(decode_json(kind, payload)?)),
         KIND_FOREGROUND_PROCESS => Ok(RemoteMessage::ForegroundProcess(decode_json(
             kind, payload,
         )?)),
@@ -1189,7 +1351,7 @@ fn decode_message(kind: u8, payload: &[u8]) -> Result<RemoteMessage, RemoteCodec
 
 fn validate_kind(kind: u8) -> Result<(), RemoteCodecError> {
     if (1..=FrameType::Mouse as u8).contains(&kind)
-        || (KIND_HELLO..=KIND_FOREGROUND_PROCESS).contains(&kind)
+        || (KIND_HELLO..=KIND_STOP_SESSION).contains(&kind)
     {
         Ok(())
     } else {
@@ -1259,6 +1421,26 @@ mod tests {
             last_acknowledged_output_offset: Some(6),
             last_acknowledged_grid_sequence: Some(7),
         }
+    }
+
+    #[test]
+    fn process_inspection_is_additive_and_never_a_holder_attach_capability() {
+        let selector = SessionSelector {
+            session_id: "fixture".into(),
+            session_token: SessionToken::new("0123456789abcdef0123456789abcdef").unwrap(),
+            expected_incarnation: Some("incarnation".into()),
+        };
+        let request: ProcessInspectionRequest =
+            serde_json::from_value(serde_json::to_value(&selector).unwrap()).unwrap();
+        assert!(!request.include_process_facts);
+        assert_eq!(request.timeout_ms, 1000);
+        assert_eq!(request.selector, selector);
+        assert!(ANNOTATED_HELPER_CAPABILITIES.contains(&RemoteCapability::ProcessFacts));
+        assert!(!PHASE_ONE_HOLDER_CAPABILITIES.contains(&RemoteCapability::ProcessFacts));
+        assert_eq!(
+            serde_json::to_string(&RemoteCapability::ProcessFacts).unwrap(),
+            "\"process-facts-v1\""
+        );
     }
 
     #[test]
@@ -1369,6 +1551,21 @@ mod tests {
     }
 
     #[test]
+    fn stop_session_round_trips_its_controller_epoch() {
+        let message = RemoteMessage::StopSession(StopSession {
+            controller_epoch: 42,
+        });
+        let encoded = RemoteCodec::encode(&message).unwrap();
+        assert_eq!(encoded[0], KIND_STOP_SESSION);
+        for split in 0..=encoded.len() {
+            let mut codec = RemoteCodec::new();
+            let mut decoded = codec.feed(&encoded[..split]).unwrap();
+            decoded.extend(codec.feed(&encoded[split..]).unwrap());
+            assert_eq!(decoded, vec![message.clone()]);
+        }
+    }
+
+    #[test]
     fn full_snapshot_round_trips_binary_grid_and_modes() {
         let message = RemoteMessage::FullSnapshot(snapshot());
         let encoded = RemoteCodec::encode(&message).expect("encode");
@@ -1450,6 +1647,45 @@ mod tests {
         .expect("legacy hello ack");
         assert_eq!(ack.foreground_pid, None);
         assert_eq!(ack.process_state, RemoteProcessState::Running { pid: 12 });
+    }
+
+    #[test]
+    fn child_identity_metadata_is_optional_and_capability_bound() {
+        use crate::process::{BootId, ProcessBirth, ProcessIdentity};
+        let mut ack: HelloAck = serde_json::from_str(
+            r#"{"protocol":{"major":1,"minor":9},"holderBuildId":"b","sessionIncarnation":"i","capabilities":[],"controllerEpoch":1,"processState":{"state":"running","pid":12},"outputOffset":0,"snapshotSequence":1}"#,
+        ).unwrap();
+        assert_eq!(ack.child_identity, None);
+        assert!(ack.validate().is_ok());
+        let identity = ProcessIdentity::new(
+            12,
+            ProcessBirth::Linux {
+                boot_id: BootId::parse("12345678-1234-5678-9abc-def012345678").unwrap(),
+                start_ticks: 42,
+                clock_ticks_per_second: 100,
+            },
+        )
+        .unwrap();
+        ack.child_identity = Some(identity);
+        assert!(
+            ack.validate().is_err(),
+            "old minor/capability cannot claim identity"
+        );
+        ack.protocol.minor = PROCESS_IDENTITY_PROTOCOL_MINOR;
+        ack.capabilities.push(RemoteCapability::ProcessIdentity);
+        assert!(ack.validate().is_ok());
+        let message = RemoteMessage::HelloAck(ack.clone());
+        assert_eq!(
+            RemoteCodec::new()
+                .feed(&RemoteCodec::encode(&message).unwrap())
+                .unwrap(),
+            vec![message]
+        );
+        ack.process_state = RemoteProcessState::Running { pid: 13 };
+        assert!(
+            ack.validate().is_err(),
+            "birth must match the child PID, never foreground PGID"
+        );
     }
 
     #[test]

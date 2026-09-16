@@ -73,6 +73,23 @@ The current baseline:
   capability-compatible Helper is available;
 - retains orchestration and user-facing state in the local Rust Engine.
 
+## Terminal input-mode projection
+
+Protocol minor 9 adds optional `terminal-input-modes-v1`. A capable Holder
+publishes a bounded `InputModes` record immediately before the snapshot/delta
+with the same sequence, admitting both frames as one queue transaction. The
+Engine commits modes only after validating that grid; a new Hello clears the
+pending projection. Mode-only changes use the same publication path. Older
+controllers receive neither the capability nor new messages, and old Holders
+remain usable with unknown input-mode state. Mode-dependent typed input fails
+explicitly when that state is unavailable.
+
+Local app/client `Modes` frames retain their existing first byte and gain an
+optional versioned tail. GUI and CLI share one pure key encoder; there is no new
+Holder attachment or terminal owner. Local restart checkpoints carry optional
+versioned keyboard state. Missing state and truncated replay are unknown, not
+an observed default. See [terminal key input](docs/terminal-key-input.md).
+
 ## Account-profile enhancement
 
 The local Engine owns the account-profile catalog and durable per-session
@@ -435,6 +452,32 @@ precedence over PATH; an invalid override is reported while a valid PATH result
 remains usable. Executable preferences and quick-create visibility are stored
 in an owner-only, additive Engine configuration file.
 
+## Owned child process birth identity
+
+Process facts and durable terminal-state bindings must not identify a child by
+numeric PID or rounded start seconds alone. The shared `ProcessIdentity` records
+PID in the execution host's PID namespace plus explicit platform-native units:
+Linux boot UUID, `/proc/PID/stat` start ticks and clock tick rate; macOS boot
+session UUID and the full libproc start-time seconds/microseconds. Stable v1
+canonical bytes bind those fields without depending on JSON field order.
+
+The existing PTY owner captures birth once after spawn and before any reaper can
+release that PID. It never learns a replacement identity lazily during adoption.
+Local `HolderStat` adds optional `childIdentity`, returned only when host-local
+observations before and after the stat facts match the captured birth. Missing,
+unreadable, inconsistent or old-Holder identity means unsupported identity-backed
+facts; consumers fail closed instead of inventing a birth from `childPID` or
+`startSec`. The legacy `foregroundPID` value remains a foreground **process group**
+ID and must not be exposed as an individual process PID.
+
+OS observation lives in the existing minimal `diri-pty` crate, with a direct edge
+to the already-used `diri-proto` identity model; no new package, polling loop,
+controller, observer or Holder attachment is introduced. Observations are bounded
+and made on the execution host. This first additive slice covers local Holder
+facts; remote identity projection and process-detail inspection need their own
+capability boundary before they can claim support. Identity is not authorization
+to inspect or signal an unrelated process.
+
 ## Holder and process lifecycle
 
 The Holder owns the PTY master, the Agent child/process group, terminal state,
@@ -653,18 +696,55 @@ The vendored terminal parser allocates its pristine alternate grid on first
 screen entry, at the current dimensions. It retains that grid for subsequent
 switches and applies the existing cursor, erase, resize, reset and history rules.
 For a new 80×24 core this removes 46,848 requested heap bytes; first alternate
-entry pays that allocation instead. The 4 MiB history-cell budget and snapshot
-format are unchanged. This parser source already participates in Helper Build
+entry pays that allocation instead. Snapshot format is unchanged; retained
+history follows the stored-representation policy below. This parser source already participates in Helper Build
 IDs; existing Holders retain their original allocations until they exit.
 
 Spare parser history rows are allocated in batches sized by row bytes, capped at
 1,000 rows and approximately 64 KiB of new cell/row storage (at least one row).
 Required visible/history rows are always allocated. This bounds the eager reserve
-at first scroll without changing the 4 MiB retained-history cell allowance or
-serialized grid representation. Existing vector capacity and reflow-retained rows
+at first scroll in the dense comparison configuration without changing its
+history allowance or serialized grid representation. Existing vector capacity and reflow-retained rows
 remain separate from this reserve target. Smaller batches trade more occasional
 growth operations for lower memory; the resource and throughput harnesses verify
 that tradeoff. Parser source participates in the Helper Build ID as above.
+
+### Lossless compact history
+
+The Engine and Remote Helper enable process-local compressed row blocks in the
+existing parser. Editable recent rows remain directly accessible; cold history
+uses typed Cell style palettes, UTF-8 scalars and style runs followed by DEFLATE.
+Row occupancy, flags, colors, links and combining marks survive exact round trips.
+There is one parser and no background compression task or terminal lock.
+
+Retain up to 10,000 physical history rows under a 4 MiB stored-history allowance:
+compressed payload, allocated block/row indexes, and editable history cells.
+Discard only oldest history when either limit is reached. Visible cells,
+cell-extra heap allocations, temporary codec/read/reflow work and caller-owned
+response buffers are separate from this allowance. Reflow can alter physical row
+count and therefore evict oldest rows at the same cap. History capacity no longer
+shrinks merely because the terminal becomes wider.
+
+History reads decode bounded row blocks and release caches at exclusive borrow
+boundaries. Resizing untouched hard lines retains compressed payloads and pads
+only rows requested by a reader. Wrapped lines and edits retain the existing
+parser reflow algorithm. Shared index ranges split for wide reads and coalesce
+where possible when narrowing; this does not change terminal semantics.
+
+This is not a parking/checkpoint format and does not change a wire codec or
+on-disk state. `flate2`, already present in the lockfile, supplies compression
+instead of a new compressor implementation; serde/serde_json supply the typed
+internal layout. The dense feature configuration remains for differential tests
+and benchmark comparison only. Shipping Engine and Helper builds use the default
+compact configuration. Parser and dependency changes participate in Helper Build
+IDs; live Holders keep their original code and allocations until they exit.
+
+Acceptance covers actual-parser scrolling, partial regions, editing, both screens,
+reset and resize/reflow differentials; bounded history reads; checkpoint/adoption
+and Helper Scroll; high-entropy storage-budget eviction; and paired CPU, latency
+and requested-heap measurements. See `docs/verification/compact-history` for raw
+results and metric boundaries. Existing Helper/UDS latency gates remain unchanged.
+No transport or controller-lease migration is implied.
 
 ### Local Holder input compatibility
 
@@ -1115,6 +1195,60 @@ deadline. The inspection must match the session ID, incarnation, Helper build,
 and last known Agent PID. An actual exited inspection records that exit without
 reattaching or inventing a replacement Agent.
 
+### Remote process birth identity (protocol minor 10)
+
+`process-identity-v1` is additive to the existing Helper and Holder capability
+sets. The Holder captures optional platform-native child identity from the owned
+PTY before exit observation/reaping, persists it in schema-1 state, and exposes
+it in the existing HelloAck for clients speaking minor 10 or later. It never
+adopts the process currently using a stored numeric PID. Missing identity in old
+state/Holder responses remains unsupported for identity-dependent operations.
+
+Lease-free `inspect` verifies the captured identity on the remote host before
+and after reading facts, rechecks authentication, incarnation, Holder build/PID,
+child identity and the ownership lock, and returns the optional verified birth
+only for a still-running matching child. Failed verification discards the facts
+and returns a structured `process_identity_unavailable` failure; it never infers
+Agent exit. `list` remains a listing of persisted facts and does not project a
+verified live identity. This adds no observer, terminal frame, polling or SSH
+execution in the client. A HelloAck birth is captured origin metadata, not an
+independent liveness assertion; mode/grid readiness still uses the existing
+validated snapshot boundary. Foreground identifiers remain process-group IDs.
+
+### Identity-safe explicit stop (protocol minor 12)
+
+`stop-session-v1` adds StopSession (frame 47) to the existing authenticated
+controller channel. Explicit `kill` may revoke the previous controller, validates
+captured birth/build/incarnation again in HelloAck, and asks the Holder owner loop
+to stop. Only the unreaped owned child may receive TERM, followed after 500 ms by
+KILL if needed. The timer exists only while a stop is active. New attaches cannot
+replace a stopping controller. The Holder persists actual exit facts and drained
+PTY tail before releasing ownership; it gives queued final frames a bounded
+500 ms drain before closing. No management process signals a numeric Agent or
+Holder PID. Missing capabilities fail closed; no raw-signal fallback is allowed.
+
+The management request releases the launch lock while waiting, so the Holder's
+existing checkpoint worker can publish exit facts. A five-second request bound
+includes lock acquisition and protocol reads. Success requires a recorded exit
+and released ownership for the same authenticated incarnation/build/birth;
+EOF, signal acceptance, timeout, and lock loss are never invented exit facts.
+Pending/unavailable outcomes are structured failures and never replay uncertain
+input. Already-recorded exits with no owner remain idempotent successes.
+
+A controller Signal is rejected after the Holder has reaped its child, including
+the interval where trailing PTY output still delays the final ProcessExit
+publication. The exit-watcher ownership boundary is authoritative here; a
+presentation state that still says Running does not protect a reusable PGID.
+
+Remote `inspect` treats a missing Holder ownership lock as an unavailable owner,
+not as evidence that the Agent exited. If the last persisted fact is Running,
+it returns nonzero with the additive JSON management error
+`{"error":"holder_unavailable"}` and leaves that state untouched. New Engines
+preserve this category as NotConnected; older Engines already reject a nonzero
+RPC. Only a recorded exit remains a successful exited inspection. Lock loss does
+not authorize signaling a reusable numeric PID, fabricating an exit, or completing
+`wait --until exited`. This cold management check creates no attachment or lease.
+
 For a running Agent, recovery retains the existing Session, mirror, process ID,
 output offsets, and incarnation. A replacement pump joins the failed pump outside
 Registry, discards all previous pending/uncertain input and resize operations,
@@ -1172,6 +1306,13 @@ An inherited `DIRIJOR_SOCKET` equal to the app's ordinary socket does not bypass
 this startup verification: Agents launched by Diri inherit that path, and an
 app started from their environment must still refresh an outdated Engine.
 Only a different, explicitly supplied socket skips app-owned supervision.
+
+The Engine preserves the validated stop response through RemoteSessionClient and
+both terminate paths. It rejects Helpers older than minor 12 and responses with
+a different session/build/incarnation or ambiguous exit fields. Controller
+revocation can prevent the old attach from receiving ProcessExit, so its missing
+event is never replaced with a synthetic SIGKILL. A cleanup failure can preserve
+only an already-observed exit.
 
 ## Tailscale, iPhone Companion, and `diri-node`
 
@@ -1424,3 +1565,110 @@ The current architecture does not attempt to:
 > The remote host keeps only state that cannot remain local: the PTY, Agent
 > process, and current terminal screen. Session orchestration and product logic
 > remain in the local Rust Engine.
+
+## Bounded local Holder exit-marker continuation
+
+The local Holder's version-1 exit envelope has a reason plus optional signed
+32-bit code/signal fields. The Engine retains at most its fixed prefix plus the
+base64 representation of 128 JSON bytes while waiting for BEL. This includes
+existing compact Rust/Swift encodings and both integer extremes. Longer or
+malformed envelopes are passed to terminal parsing byte-for-byte in their
+original order; they neither invent exit facts nor discard output. Oversized
+input allocations are released after draining. Legitimate markers remain valid
+across every chunk boundary. This bounds the pending exit-marker bytes that an
+exact durable checkpoint must preserve at its raw-log offset.
+
+## On-demand process facts: account lookup boundary
+
+Process facts use the captured native child identity on the owning host. Native
+executable, working-directory and real/effective UID observations are bracketed
+by matching birth identities; account records correspond to the observed
+effective UID. They contain no argv or environment and do not infer a PID from
+the PTY foreground PGID. Unsupported, unreadable and timed-out fields remain
+explicitly unavailable.
+
+Account database calls may block in directory services. The existing Rust
+`diri-holder` and `diri-remote` binaries therefore have a narrow one-shot
+`--account-facts <uid>` mode, implemented in shared `diri-pty`. The local mode
+runs before detachment or manager logic. It owns no PTY, socket, lease or service.
+Its parent clears the worker environment, bounds the reply to 8 KiB, defaults to
+a 250 ms deadline (one-second ceiling for an explicitly supplied caller deadline),
+and kills timed-out workers. Admission allows at most four workers per caller
+process and retains each permit until that worker is reaped. A killed child that
+is not yet reapable transfers to an on-demand reaper rather than extending the
+caller deadline. Failed cleanup-thread creation retains the child and permit in
+a bounded tracked queue, retried on the next request; no idle poller is added.
+The worker is one directly spawned Rust process, not a shell or process tree.
+No lookup runs in a Holder owner loop. The Engine additionally caps whole
+inspections at four; this is not a host-wide cross-process worker limit.
+
+`session.process_info` and `dirijor session process ID [--json]` expose these
+observations on demand. The Engine captures a session handle under Registry,
+then releases Registry before native or remote work, and checks the same handle
+and host again before returning. At most four requests run concurrently. One
+one-second deadline spans connection, bounded stat replies, native/account
+observations and identity verification; the account phase is additionally capped
+at 250 ms. The local stat reader uses nonblocking I/O and a 16 KiB reply limit;
+partial replies do not renew the deadline, and peer closure drains queued bytes.
+
+Local held sessions retain the owned-child birth and log epoch captured during
+launch/adoption. Both stat observations must match that binding; old Holders or
+missing captured identity return unsupported, never lazy PID adoption. Remote
+protocol minor 13 advertises `process-facts-v1` on the existing authenticated
+Helper `inspect` command. The Helper brackets observations with actual-host
+birth checks and authenticated state/incarnation/build/owner-lock verification.
+Old Helpers omit optional facts and fail closed for the stronger operation.
+Ordinary inspect/list requests do not collect these facts. There is no new frame,
+controller attach, observer, wake, activity update, or Holder owner-loop lookup.
+
+The result distinguishes child PID, own process-group ID and controlling-terminal
+foreground process-group ID. Available-null foreground means the OS reports no
+foreground group; it is distinct from unavailable. Observations are identity-bound,
+not simultaneous: a live child may change cwd, executable or effective UID between
+field reads. Account name/home come from the observed effective UID's native
+account record, not environment variables. No command arguments are collected.
+
+## Enhanced keyboard state compatibility (protocol minor 14)
+
+`enhanced-keyboard-v1` is an optional, explicit controller capability. It does
+not enable parser negotiation: shipping `HeadlessScreen::new` remains disabled.
+Only an explicitly configured capable input owner may use the opt-in parser
+constructor. Five validated flag bits come from the shared parser; there is no
+second escape parser. Direct set, query, push/pop and screen swaps share the
+same bounded stack state.
+
+New Engines request the capability only from exact installed Helpers with
+minor 14 or newer and require its acknowledgement. Input modes remain staged
+with the matching snapshot/delta sequence and committed only after grid
+validation. A legacy connection receives the exact prior InputModes JSON
+object. An enhanced connection may receive the optional five-bit flags, or
+`keyboard: null` when an enhanced-capable parser lost state during old cache
+recovery. Null is rejected on an unnegotiated connection. Supported, authenticated
+pre-14 Holders retain the legacy input contract; arbitrary omitted capability
+fields are not evidence that a new owner is legacy-only.
+
+An old controller cannot attach when enhanced flags are active or enhanced
+state is unknown; rejection precedes controller-epoch mutation. A later mode
+activation closes only its bridge, preserving the Holder/Agent. Input is checked
+against current authoritative state before PTY admission. Even a capable client
+cannot send input while enhanced state is unknown. A capable read connection
+may show the retained grid until validated state becomes available.
+
+Local `AttachRequest.enhancedKeyboard` and client `AttachmentOptions` default
+to false and omit the false wire field. Opted-in consumers receive the version-2
+Modes tail when flags are known; old consumers retain exact version-1 bytes.
+Read-only previews remain version 1 because they never encode input. The Engine
+encodes at most two tiny Modes frames and shares the grid allocation. Local
+control admission checks happen before wake/visibility changes and input is
+checked again before writing. Lost enhanced state is a wholly unknown keyboard
+projection, distinct from a known legacy cursor/keypad projection.
+
+Visible-grid cache version 6 is required for known enhancement state, including
+known zero. It includes both bounded active/inactive keyboard stacks (at most
+4,096 entries each; at most 8,198 encoded bytes), with version, length, bit and
+current/top consistency validation before allocation. Older cache versions
+remain unknown for enhancements. A disabled parser rejects a cache containing
+nonzero flags on either screen rather than enabling negotiation. Cache flags
+and snapshot stacks must agree before writing; missing or malformed v6 state
+uses the existing cache-miss recovery. Whole-parser parking must retain the
+wrapper's knowledge bit as well as the parser's exact flags/stacks.

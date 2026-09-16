@@ -299,7 +299,9 @@ fn capture_login_path(
     use std::io::{Read, Seek};
     use std::os::unix::process::CommandExt;
     use std::process::{Command, Stdio};
-    use std::time::{Duration, Instant};
+    use std::time::Instant;
+
+    let deadline = Instant::now().checked_add(capture_timeout)?;
 
     // A background process from an rc file can inherit stdout after its shell
     // exits. Capturing into an unlinked regular file means reading stops at the
@@ -323,26 +325,7 @@ fn capture_login_path(
     }
     .ok()?;
 
-    let started = Instant::now();
-    let timed_out = loop {
-        match child.try_wait() {
-            Ok(Some(status)) if status.success() => break false,
-            Ok(Some(_)) => return None,
-            Ok(None) if started.elapsed() < capture_timeout => {
-                std::thread::sleep(Duration::from_millis(50));
-            }
-            Ok(None) | Err(_) => break true,
-        }
-    };
-
-    if timed_out {
-        let pid = child.id() as i32;
-        // SAFETY: pid is this child's id; negative targets its process group.
-        unsafe {
-            let _ = libc::kill(-pid, libc::SIGKILL);
-            let _ = libc::kill(pid, libc::SIGKILL);
-        }
-        let _ = child.wait();
+    if !wait_for_login_capture(&mut child, deadline) {
         return None;
     }
 
@@ -359,6 +342,34 @@ fn capture_login_path(
         .find(|line| line.contains('/'))
         .map(str::to_owned)?;
     Some(path)
+}
+
+#[cfg(unix)]
+fn wait_for_login_capture(child: &mut std::process::Child, deadline: std::time::Instant) -> bool {
+    use std::time::{Duration, Instant};
+    loop {
+        match child.try_wait() {
+            // Observing success after the deadline is still a timeout. Return
+            // directly for a reaped child: its PID must never be signaled.
+            Ok(Some(status)) => return status.success() && Instant::now() < deadline,
+            Ok(None) if Instant::now() < deadline => {
+                std::thread::sleep(
+                    Duration::from_millis(50)
+                        .min(deadline.saturating_duration_since(Instant::now())),
+                );
+            }
+            Ok(None) | Err(_) => break,
+        }
+    }
+
+    let pid = child.id() as i32;
+    // SAFETY: the unreaped child owns this process group; negative targets it.
+    unsafe {
+        let _ = libc::kill(-pid, libc::SIGKILL);
+        let _ = libc::kill(pid, libc::SIGKILL);
+    }
+    let _ = child.wait();
+    false
 }
 
 #[cfg(unix)]
@@ -714,6 +725,39 @@ mod tests {
 
         assert_eq!(path.as_deref(), Some("/fixture:/usr/bin"));
         assert!(started.elapsed() < Duration::from_secs(3));
+    }
+
+    #[test]
+    fn an_expired_capture_deadline_rejects_an_already_successful_child() {
+        use std::process::Command;
+        use std::time::{Duration, Instant};
+
+        // Reap first so the test deterministically represents a delayed owner
+        // observing child success only after its capture deadline has expired.
+        let mut child = Command::new("/bin/sh")
+            .args(["-c", "exit 0"])
+            .spawn()
+            .unwrap();
+        assert!(child.wait().unwrap().success());
+        let expired = Instant::now() - Duration::from_secs(1);
+        assert!(!wait_for_login_capture(&mut child, expired));
+        // Reaped children are never signaled. A timely observation still works.
+        assert!(wait_for_login_capture(
+            &mut child,
+            Instant::now() + Duration::from_secs(1)
+        ));
+    }
+
+    #[test]
+    fn a_zero_capture_budget_never_accepts_shell_output() {
+        assert!(
+            capture_login_path(
+                "/bin/sh",
+                &["-c", "printf '/too-late:/usr/bin\\n'"],
+                std::time::Duration::ZERO,
+            )
+            .is_none()
+        );
     }
 
     #[test]

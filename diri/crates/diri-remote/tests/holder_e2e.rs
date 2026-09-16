@@ -48,6 +48,15 @@ fn log_tail(path: &std::path::Path) -> u64 {
     tail
 }
 
+// Runtime sockets are namespaced by SessionId, not by fixture state directory.
+// Independent worktrees/test binaries must never share a live Holder address.
+fn test_session_id(prefix: &str) -> String {
+    let mut nonce = [0_u8; 16];
+    getrandom::fill(&mut nonce).unwrap();
+    let suffix: String = nonce.iter().map(|byte| format!("{byte:02x}")).collect();
+    format!("{prefix}-{suffix}")
+}
+
 fn token() -> SessionToken {
     SessionToken::new("0123456789abcdef0123456789abcdef").expect("token")
 }
@@ -57,6 +66,20 @@ fn run_json<T: serde::Serialize, R: serde::de::DeserializeOwned>(
     state_dir: &std::path::Path,
     request: Option<&T>,
 ) -> R {
+    let output = run_output(command, state_dir, request);
+    assert!(
+        output.status.success(),
+        "{command} failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    serde_json::from_slice(&output.stdout).expect("JSON response")
+}
+
+fn run_output<T: serde::Serialize>(
+    command: &str,
+    state_dir: &std::path::Path,
+    request: Option<&T>,
+) -> std::process::Output {
     let fixture_home = state_dir
         .parent()
         .expect("state parent")
@@ -76,13 +99,7 @@ fn run_json<T: serde::Serialize, R: serde::de::DeserializeOwned>(
             .expect("write request");
     }
     drop(child.stdin.take());
-    let output = child.wait_with_output().expect("wait helper command");
-    assert!(
-        output.status.success(),
-        "{command} failed: {}",
-        String::from_utf8_lossy(&output.stderr)
-    );
-    serde_json::from_slice(&output.stdout).expect("JSON response")
+    child.wait_with_output().expect("wait helper command")
 }
 
 #[derive(Debug, serde::Deserialize)]
@@ -241,6 +258,7 @@ fn message_kinds(messages: &[RemoteMessage]) -> String {
             RemoteMessage::GridDelta(_) => "GridDelta",
             RemoteMessage::ProcessExit(_) => "ProcessExit",
             RemoteMessage::Signal(_) => "Signal",
+            RemoteMessage::StopSession(_) => "StopSession",
             RemoteMessage::AcquireControl(_) => "AcquireControl",
             RemoteMessage::ControlGranted(_) => "ControlGranted",
             RemoteMessage::ControlRevoked(_) => "ControlRevoked",
@@ -249,6 +267,7 @@ fn message_kinds(messages: &[RemoteMessage]) -> String {
             RemoteMessage::ScrollbackResponse(_) => "ScrollbackResponse",
             RemoteMessage::Error(_) => "Error",
             RemoteMessage::ForegroundProcess(_) => "ForegroundProcess",
+            RemoteMessage::InputModes(_) => "InputModes",
         })
         .collect::<Vec<_>>()
         .join(",")
@@ -285,7 +304,7 @@ fn detach_reconnect_preserves_pid_snapshot_and_input() {
     let temporary = tempfile::tempdir().expect("temp");
     let state_dir = temporary.path().join("state");
     let request = LaunchRequest {
-        session_id: "holder-e2e".into(),
+        session_id: test_session_id("holder-e2e"),
         session_token: token(),
         argv: vec![
             "/bin/sh".into(),
@@ -304,12 +323,29 @@ fn detach_reconnect_preserves_pid_snapshot_and_input() {
     let launch: LaunchResult = run_json("launch", &state_dir, Some(&request));
     assert_ne!(launch.holder_pid, launch.process_pid);
 
+    let mut old_hello = hello(&launch, None, "old-client");
+    old_hello.protocol.minor = 9;
+    let mut old = Attach::open(&state_dir, old_hello);
+    let old_handshake = old.receive_until(Duration::from_secs(2), |message| {
+        matches!(message, RemoteMessage::FullSnapshot(_))
+    });
+    assert!(old_handshake.iter().any(|message| matches!(message,
+        RemoteMessage::HelloAck(ack) if ack.child_identity.is_none())));
+    drop(old);
     let mut first = Attach::open(&state_dir, hello(&launch, Some(0), "client-one"));
     let initial = first.receive_until(Duration::from_secs(2), |message| match message {
         RemoteMessage::FullSnapshot(snapshot) => grid_text(&snapshot.grid).contains("ready>"),
         RemoteMessage::GridDelta(delta) => grid_text(&delta.grid).contains("ready>"),
         _ => false,
     });
+    let first_birth = initial
+        .iter()
+        .find_map(|message| match message {
+            RemoteMessage::HelloAck(ack) => ack.child_identity,
+            _ => None,
+        })
+        .expect("owned-child birth from capable Holder");
+    assert_eq!(first_birth.pid(), launch.process_pid);
     let first_epoch = initial
         .iter()
         .find_map(|message| match message {
@@ -334,21 +370,76 @@ fn detach_reconnect_preserves_pid_snapshot_and_input() {
         })
         .max()
         .unwrap_or(0);
-    std::thread::sleep(Duration::from_millis(100));
-    let inspection: SessionInspection = run_json(
-        "inspect",
-        &state_dir,
-        Some(&SessionSelector {
-            session_id: launch.session_id.clone(),
-            session_token: token(),
-            expected_incarnation: Some(launch.session_incarnation.clone()),
-        }),
-    );
+    // Inspection reads the asynchronous metadata checkpoint. Wait for the
+    // existing attach epoch to persist; elapsed wall time is not its receipt.
+    let selector = SessionSelector {
+        session_id: launch.session_id.clone(),
+        session_token: token(),
+        expected_incarnation: Some(launch.session_incarnation.clone()),
+    };
+    let checkpoint_deadline = Instant::now() + Duration::from_secs(2);
+    loop {
+        let checkpoint: SessionInspection = run_json("inspect", &state_dir, Some(&selector));
+        assert!(
+            checkpoint.controller_epoch <= first_epoch,
+            "inspection acquired control"
+        );
+        if checkpoint.controller_epoch == first_epoch {
+            break;
+        }
+        assert!(
+            Instant::now() < checkpoint_deadline,
+            "attach epoch was not checkpointed"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    let inspection: SessionInspection = run_json("inspect", &state_dir, Some(&selector));
     assert_eq!(
         inspection.process_state,
         RemoteProcessState::Running {
             pid: launch.process_pid
         }
+    );
+
+    assert_eq!(inspection.verified_child_identity(), Some(first_birth));
+    assert_eq!(
+        inspection.controller_epoch, first_epoch,
+        "inspection must not acquire control"
+    );
+
+    let with_facts: SessionInspection = run_json(
+        "inspect",
+        &state_dir,
+        Some(&diri_proto::remote_pty::ProcessInspectionRequest {
+            selector: selector.clone(),
+            include_process_facts: true,
+            timeout_ms: 1000,
+        }),
+    );
+    assert_eq!(
+        with_facts.controller_epoch, first_epoch,
+        "process facts must not acquire control"
+    );
+    let facts = with_facts
+        .process_facts
+        .expect("capable actual-host process facts");
+    assert_eq!(facts.identity, first_birth);
+    facts.validate().unwrap();
+    assert!(matches!(
+        facts.executable,
+        diri_proto::process_facts::ProcessValue::Available { .. }
+    ));
+    assert!(matches!(
+        facts.working_directory,
+        diri_proto::process_facts::ProcessValue::Available { .. }
+    ));
+    assert!(matches!(
+        facts.user_ids,
+        diri_proto::process_facts::ProcessValue::Available { .. }
+    ));
+    assert!(
+        inspection.process_facts.is_none(),
+        "ordinary inspection remains cheap"
     );
 
     let mut second = Attach::open(&state_dir, hello(&launch, Some(acknowledged), "client-two"));
@@ -363,6 +454,7 @@ fn detach_reconnect_preserves_pid_snapshot_and_input() {
         })
         .expect("second HelloAck");
     assert!(second_ack.controller_epoch > first_epoch);
+    assert_eq!(second_ack.child_identity, Some(first_birth));
     assert_eq!(
         second_ack.process_state,
         RemoteProcessState::Running {
@@ -425,7 +517,7 @@ fn detached_foreground_job_does_not_spin_the_holder() {
     let temporary = tempfile::tempdir().expect("temp");
     let state_dir = temporary.path().join("state");
     let request = LaunchRequest {
-        session_id: "foreground-detach".into(),
+        session_id: test_session_id("foreground-detach"),
         session_token: token(),
         argv: vec![
             "/bin/bash".into(),
@@ -497,7 +589,7 @@ fn holder_agent_has_a_real_editable_resizable_terminal() {
     let temporary = tempfile::tempdir().expect("temp");
     let state_dir = temporary.path().join("state");
     let request = LaunchRequest {
-        session_id: "holder-terminal-capabilities".into(),
+        session_id: test_session_id("holder-terminal-capabilities"),
         session_token: token(),
         argv: vec![
             "/bin/sh".into(),
@@ -558,7 +650,7 @@ fn list_kill_and_gc_complete_the_session_lifecycle() {
     let temporary = tempfile::tempdir().expect("temp");
     let state_dir = temporary.path().join("state");
     let request = LaunchRequest {
-        session_id: "holder-gc".into(),
+        session_id: test_session_id("holder-gc"),
         session_token: token(),
         argv: vec![
             "/bin/sh".into(),
@@ -575,7 +667,7 @@ fn list_kill_and_gc_complete_the_session_lifecycle() {
         persistence: PersistenceCapability::NonPersistent,
     };
     let launched: LaunchResult = run_json("launch", &state_dir, Some(&request));
-    let session_root = state_dir.join("sessions/holder-gc");
+    let session_root = state_dir.join("sessions").join(&request.session_id);
     assert_eq!(
         std::fs::metadata(&session_root)
             .expect("session metadata")
@@ -630,7 +722,7 @@ fn killed_session_id_can_launch_a_new_authenticated_incarnation() {
     let temporary = tempfile::tempdir().expect("temp");
     let state_dir = temporary.path().join("state");
     let first_request = LaunchRequest {
-        session_id: "holder-relaunch".into(),
+        session_id: test_session_id("holder-relaunch"),
         session_token: token(),
         argv: vec![
             "/bin/sh".into(),
@@ -671,8 +763,13 @@ fn killed_session_id_can_launch_a_new_authenticated_incarnation() {
         RemoteMessage::GridDelta(delta) => grid_text(&delta.grid).contains("new>"),
         _ => false,
     });
-    let auth = std::fs::read_to_string(state_dir.join("sessions/holder-relaunch/auth.sha256"))
-        .expect("auth hash");
+    let auth = std::fs::read_to_string(
+        state_dir
+            .join("sessions")
+            .join(&second_request.session_id)
+            .join("auth.sha256"),
+    )
+    .expect("auth hash");
     assert!(!auth.contains(second_token.expose_secret()));
     let _: SessionInspection = run_json(
         "kill",
@@ -690,7 +787,7 @@ fn incompatible_protocol_and_wrong_incarnation_fail_with_structured_errors() {
     let temporary = tempfile::tempdir().expect("temp");
     let state_dir = temporary.path().join("state");
     let request = LaunchRequest {
-        session_id: "holder-reject".into(),
+        session_id: test_session_id("holder-reject"),
         session_token: token(),
         argv: vec!["/bin/sh".into(), "-c".into(), "IFS= read -r _".into()],
         cwd: "/".into(),
@@ -735,11 +832,140 @@ fn incompatible_protocol_and_wrong_incarnation_fail_with_structured_errors() {
 }
 
 #[test]
+fn explicit_stop_records_real_term_trap_and_forced_exit_facts() {
+    for (name, script, expected) in [
+        (
+            "stop-trap",
+            "trap 'printf final-tail; exit 42' TERM; printf stop-ready; while :; do read -r line; done",
+            RemoteProcessState::Exited {
+                code: Some(42),
+                signal: None,
+            },
+        ),
+        (
+            "stop-force",
+            "trap '' TERM; printf stop-ready; while :; do read -r line; done",
+            RemoteProcessState::Exited {
+                code: None,
+                signal: Some(libc::SIGKILL),
+            },
+        ),
+    ] {
+        let temporary = tempfile::tempdir().unwrap();
+        let state_dir = temporary.path().join("state");
+        let request = LaunchRequest {
+            session_id: test_session_id(name),
+            session_token: token(),
+            argv: vec!["/bin/sh".into(), "-c".into(), script.into()],
+            cwd: "/".into(),
+            environment: vec![],
+            cols: 80,
+            rows: 24,
+            persistence: PersistenceCapability::NonPersistent,
+        };
+        let launch: LaunchResult = run_json("launch", &state_dir, Some(&request));
+        let selector = SessionSelector {
+            session_id: launch.session_id.clone(),
+            session_token: token(),
+            expected_incarnation: Some(launch.session_incarnation.clone()),
+        };
+        let mut attach = Attach::open(&state_dir, hello(&launch, None, "ready-client"));
+        attach.receive_until(Duration::from_secs(2), |message| match message {
+            RemoteMessage::FullSnapshot(snapshot) => {
+                grid_text(&snapshot.grid).contains("stop-ready")
+            }
+            RemoteMessage::GridDelta(delta) => grid_text(&delta.grid).contains("stop-ready"),
+            _ => false,
+        });
+        let started = Instant::now();
+        let stopped: SessionInspection = run_json("kill", &state_dir, Some(&selector));
+        assert_eq!(
+            stopped.process_state, expected,
+            "requesting TERM must not invent TERM as the exit"
+        );
+        assert!(started.elapsed() < Duration::from_secs(5));
+        let again: SessionInspection = run_json("kill", &state_dir, Some(&selector));
+        assert_eq!(
+            again.process_state, expected,
+            "completed stop is idempotent"
+        );
+        if name == "stop-trap" {
+            assert!(
+                log_tail(
+                    &state_dir
+                        .join("sessions")
+                        .join(&launch.session_id)
+                        .join("output.log")
+                ) >= b"stop-readyfinal-tail".len() as u64
+            );
+        }
+        let gc: TestGcResult = run_json::<SessionSelector, _>("gc", &state_dir, None);
+        assert_eq!(
+            gc.removed_sessions, 1,
+            "completed stop released Holder ownership"
+        );
+    }
+}
+
+#[test]
+fn concurrent_explicit_stops_complete_one_owned_lifecycle() {
+    let temporary = tempfile::tempdir().unwrap();
+    let state_dir = temporary.path().join("state");
+    let request = LaunchRequest {
+        session_id: test_session_id("stop-concurrent"),
+        session_token: token(),
+        argv: vec![
+            "/bin/sh".into(),
+            "-c".into(),
+            "trap 'sleep 0.1; exit 42' TERM; printf ready; while :; do read -r line; done".into(),
+        ],
+        cwd: "/".into(),
+        environment: vec![],
+        cols: 80,
+        rows: 24,
+        persistence: PersistenceCapability::NonPersistent,
+    };
+    let launch: LaunchResult = run_json("launch", &state_dir, Some(&request));
+    let selector = SessionSelector {
+        session_id: launch.session_id.clone(),
+        session_token: token(),
+        expected_incarnation: Some(launch.session_incarnation.clone()),
+    };
+    let mut attach = Attach::open(&state_dir, hello(&launch, None, "ready-client"));
+    attach.receive_until(Duration::from_secs(2), |message| match message {
+        RemoteMessage::FullSnapshot(snapshot) => grid_text(&snapshot.grid).contains("ready"),
+        RemoteMessage::GridDelta(delta) => grid_text(&delta.grid).contains("ready"),
+        _ => false,
+    });
+    let barrier = Arc::new(std::sync::Barrier::new(2));
+    let jobs = (0..2)
+        .map(|_| {
+            let state_dir = state_dir.clone();
+            let selector = selector.clone();
+            let barrier = barrier.clone();
+            std::thread::spawn(move || {
+                barrier.wait();
+                run_json::<_, SessionInspection>("kill", &state_dir, Some(&selector))
+            })
+        })
+        .collect::<Vec<_>>();
+    for job in jobs {
+        assert_eq!(
+            job.join().unwrap().process_state,
+            RemoteProcessState::Exited {
+                code: Some(42),
+                signal: None
+            }
+        );
+    }
+}
+
+#[test]
 fn signal_exit_and_holder_failure_are_reported_without_orphaning_the_agent() {
     let temporary = tempfile::tempdir().expect("temp");
     let state_dir = temporary.path().join("state");
     let request = LaunchRequest {
-        session_id: "holder-signal-exit".into(),
+        session_id: test_session_id("holder-signal-exit"),
         session_token: token(),
         argv: vec![
             "/bin/sh".into(),
@@ -777,6 +1003,21 @@ fn signal_exit_and_holder_failure_are_reported_without_orphaning_the_agent() {
     assert!(exited.iter().any(|message| {
         matches!(message, RemoteMessage::ProcessExit(exit) if exit.signal == Some(libc::SIGTERM))
     }));
+    attach.send(RemoteMessage::Signal(diri_proto::remote_pty::Signal {
+        controller_epoch: epoch,
+        signal: libc::SIGTERM,
+    }));
+    let deadline = Instant::now() + Duration::from_secs(2);
+    let after_reap = loop {
+        match attach
+            .messages
+            .recv_timeout(deadline.saturating_duration_since(Instant::now()))
+        {
+            Ok(Ok(RemoteMessage::Error(error))) => break Some(error),
+            Ok(Ok(_)) if Instant::now() < deadline => {}
+            _ => break None,
+        }
+    };
     let _: SessionInspection = run_json(
         "kill",
         &state_dir,
@@ -785,6 +1026,12 @@ fn signal_exit_and_holder_failure_are_reported_without_orphaning_the_agent() {
             session_token: token(),
             expected_incarnation: Some(launch.session_incarnation),
         }),
+    );
+
+    assert!(
+        after_reap
+            .is_some_and(|error| error.fatal && error.message.contains("already been reaped")),
+        "signals after reap must be explicitly rejected, never sent to a reusable PGID"
     );
 
     let mut failure_request = request;
@@ -817,7 +1064,7 @@ fn signal_exit_and_holder_failure_are_reported_without_orphaning_the_agent() {
         }
         panic!("Agent process survived an abnormal Holder exit");
     }
-    let inspection: SessionInspection = run_json(
+    let inspection = run_output(
         "inspect",
         &state_dir,
         Some(&SessionSelector {
@@ -826,12 +1073,13 @@ fn signal_exit_and_holder_failure_are_reported_without_orphaning_the_agent() {
             expected_incarnation: Some(failed.session_incarnation),
         }),
     );
+    assert_eq!(inspection.status.code(), Some(1));
     assert_eq!(
-        inspection.process_state,
-        RemoteProcessState::Exited {
-            code: None,
-            signal: None
-        }
+        serde_json::from_slice::<diri_proto::remote_pty::RemoteManagementFailure>(
+            &inspection.stdout
+        )
+        .unwrap(),
+        diri_proto::remote_pty::RemoteManagementFailure::HolderUnavailable,
     );
 }
 
@@ -1064,7 +1312,7 @@ fn existing_user_supervisor_can_own_one_holder_without_persistent_configuration(
     let temporary = tempfile::tempdir().expect("temp");
     let state_dir = temporary.path().join("state");
     let request = LaunchRequest {
-        session_id: "holder-supervised".into(),
+        session_id: test_session_id("holder-supervised"),
         session_token: token(),
         argv: vec![
             "/bin/sh".into(),
@@ -1109,7 +1357,7 @@ fn performance_gate_meets_remote_holder_latency_budget() {
     let temporary = tempfile::tempdir().expect("temp");
     let state_dir = temporary.path().join("state");
     let request = LaunchRequest {
-        session_id: "holder-performance".into(),
+        session_id: test_session_id("holder-performance"),
         session_token: token(),
         argv: vec![
             "/bin/sh".into(),
@@ -1235,7 +1483,7 @@ fn slow_attach_never_blocks_pty_and_reconnects_from_full_snapshot() {
     let temporary = tempfile::tempdir().expect("temp");
     let state_dir = temporary.path().join("state");
     let request = LaunchRequest {
-        session_id: "holder-slow-attach".into(),
+        session_id: test_session_id("holder-slow-attach"),
         session_token: token(),
         argv: vec![
             "/bin/sh".into(),
@@ -1288,7 +1536,10 @@ fn slow_attach_never_blocks_pty_and_reconnects_from_full_snapshot() {
         session_token: token(),
         expected_incarnation: Some(launch.session_incarnation.clone()),
     };
-    let output_log = state_dir.join("sessions/holder-slow-attach/output.log");
+    let output_log = state_dir
+        .join("sessions")
+        .join(&request.session_id)
+        .join("output.log");
     let deadline = Instant::now() + Duration::from_secs(20);
     loop {
         if std::fs::read(&output_log).is_ok_and(|bytes| {
@@ -1343,7 +1594,7 @@ fn bounded_drain_preserves_output_and_grid_before_process_exit() {
     let temporary = tempfile::tempdir_in("/tmp").unwrap();
     let state_dir = temporary.path().join("state");
     let launch: LaunchResult = run_json("launch", &state_dir, Some(&LaunchRequest {
-        session_id: "exit-tail".into(), session_token: token(),
+        session_id: test_session_id("exit-tail"), session_token: token(),
         argv: vec!["/bin/sh".into(), "-c".into(), "stty -echo; printf 'ready\\n'; read start; head -c 2097152 /dev/zero | tr '\\000' x; printf 'tail-complete'".into()],
         cwd: "/".into(), environment: vec![], cols: 80, rows: 24,
         persistence: PersistenceCapability::NonPersistent,
@@ -1397,7 +1648,7 @@ fn continuous_output_keeps_controller_responsive() {
     let temporary = tempfile::tempdir_in("/tmp").unwrap();
     let state_dir = temporary.path().join("state");
     let launch: LaunchResult = run_json("launch", &state_dir, Some(&LaunchRequest {
-        session_id: "loaded-input".into(), session_token: token(),
+        session_id: test_session_id("loaded-input"), session_token: token(),
         argv: vec!["/bin/sh".into(), "-c".into(), "stty -echo; printf 'ready\\n'; read start; yes noisy-output & producer=$!; read line; kill $producer; wait $producer 2>/dev/null; printf 'ack:%s\\n' \"$line\"; read end".into()],
         cwd: "/".into(), environment: vec![], cols: 80, rows: 24,
         persistence: PersistenceCapability::NonPersistent,
@@ -1542,7 +1793,7 @@ fn impaired_tcp_preserves_input_history_and_reconnect() {
         let temporary = tempfile::tempdir().unwrap();
         let state_dir = temporary.path().join("state");
         let launch: LaunchResult = run_json("launch", &state_dir, Some(&LaunchRequest {
-            session_id: "netem-fixture".into(), session_token: token(),
+            session_id: test_session_id("netem-fixture"), session_token: token(),
             argv: vec!["/bin/sh".into(), "-c".into(),
                 "i=0; while [ $i -lt 8192 ]; do printf '%080d\\n' $i; i=$((i+1)); done; printf 'ready>'; while IFS= read -r line; do printf 'ack:%s\\n' \"$line\"; done".into()],
             cwd: "/".into(), environment: vec![], cols: 100, rows: 24,

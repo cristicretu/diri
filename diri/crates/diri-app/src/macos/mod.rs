@@ -2,6 +2,7 @@ pub mod brand_raster;
 pub mod browser;
 pub mod menu_bar;
 pub mod notifier;
+pub(crate) mod terminal_keys;
 
 use objc2_foundation::NSBundle;
 
