@@ -14,3 +14,15 @@ pub(crate) fn bundle_identifier() -> Option<String> {
 
 #[cfg(test)]
 pub(crate) mod tab_gesture;
+
+/// AppKit respects the current trackpad and the user's haptic preferences.
+pub(crate) fn pinch_feedback() {
+    use objc2_app_kit::{
+        NSHapticFeedbackManager, NSHapticFeedbackPattern, NSHapticFeedbackPerformanceTime,
+        NSHapticFeedbackPerformer,
+    };
+    NSHapticFeedbackManager::defaultPerformer().performFeedbackPattern_performanceTime(
+        NSHapticFeedbackPattern::Alignment,
+        NSHapticFeedbackPerformanceTime::Now,
+    );
+}

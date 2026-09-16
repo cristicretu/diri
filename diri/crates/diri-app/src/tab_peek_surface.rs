@@ -135,6 +135,9 @@ impl SessionSurfaces {
         }
     }
 
+    pub(crate) fn tab_peek_position(&self) -> f32 {
+        self.peek.position()
+    }
     pub(crate) fn tab_peek_visible(&self) -> bool {
         self.peek.visible()
     }

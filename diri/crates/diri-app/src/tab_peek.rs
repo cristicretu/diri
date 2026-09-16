@@ -17,36 +17,34 @@ pub(crate) enum GestureFrame {
     Released(f32),
 }
 
-/// Native magnification drives the same continuous reveal as keyboard peek.
+/// A physical detent separates the small strip from the full overview.
 #[derive(Default)]
 pub(crate) struct TabPinch {
-    distance: f32,
+    origin: Option<f32>,
+    position: f32,
     tracking: bool,
     blocked: bool,
+    waiting_since: Option<Instant>,
+    push: f32,
+    passed_detent: bool,
+    boundary_feedback_sent: bool,
+    feedback_pending: bool,
 }
 
 impl TabPinch {
-    fn reveal_distance(&self) -> f32 {
-        // Rest at the small previews before letting a deliberate deeper pinch
-        // expand the overview. Spreading back out stays direct and responsive.
-        if self.distance <= PEEK_DISTANCE {
-            self.distance
-        } else if self.distance <= 360.0 {
-            PEEK_DISTANCE + (self.distance - PEEK_DISTANCE) * 0.12
-        } else {
-            PEEK_DISTANCE + (360.0 - PEEK_DISTANCE) * 0.12
-                + (self.distance - 360.0) * 2.0
-        }
-    }
-
     pub(crate) fn cancel(&mut self) {
         *self = Self { blocked: true, ..Self::default() };
+    }
+
+    pub(crate) fn take_feedback(&mut self) -> bool {
+        std::mem::take(&mut self.feedback_pending)
     }
 
     pub(crate) fn sample(
         &mut self,
         event: &gpui::PinchEvent,
-        revealed: bool,
+        current_position: f32,
+        now: Instant,
     ) -> Option<GestureFrame> {
         if event.phase == gpui::TouchPhase::Started {
             *self = Self::default();
@@ -59,24 +57,52 @@ impl TabPinch {
         if self.blocked {
             return None;
         }
-        // A normal pinch reaches the strip; continuing meets a resistant band.
-        self.distance -= event.delta * 1000.0;
+        let origin = *self.origin.get_or_insert_with(|| {
+            self.position = current_position;
+            current_position
+        });
+        let step = -event.delta * 1000.0;
+        if step > 0.0 && origin <= PEEK_DISTANCE && !self.passed_detent {
+            if self.position + step >= PEEK_DISTANCE {
+                self.position = PEEK_DISTANCE;
+                let reached = *self.waiting_since.get_or_insert(now);
+                if !self.boundary_feedback_sent {
+                    self.feedback_pending = true;
+                    self.boundary_feedback_sent = true;
+                }
+                // Discard all overshoot until the user has rested at the strip.
+                // Only fresh movement after that pause can cross the detent.
+                if now.saturating_duration_since(reached).as_millis() >= 400 {
+                    self.push += step;
+                    if self.push >= 180.0 {
+                        self.passed_detent = true;
+                        self.feedback_pending = true;
+                        self.position += (self.push - 180.0).min(40.0);
+                    }
+                }
+            } else {
+                self.position += step;
+            }
+        } else {
+            self.position = (self.position + step).clamp(0.0, OVERVIEW_DISTANCE);
+            if step < 0.0 && self.position < PEEK_DISTANCE {
+                self.waiting_since = None;
+                self.push = 0.0;
+            }
+        }
+        let distance = self.position - origin;
         if event.phase == gpui::TouchPhase::Ended {
-            let frame = self.tracking.then_some(GestureFrame::Released(self.reveal_distance()));
+            let frame = self.tracking.then_some(GestureFrame::Released(distance));
             *self = Self::default();
             return frame;
         }
         if !self.tracking {
-            if !revealed && self.distance < -10.0 {
-                self.cancel();
-                return None;
-            }
-            if self.distance.abs() < 10.0 {
+            if distance.abs() < 10.0 && self.waiting_since.is_none() {
                 return None;
             }
             self.tracking = true;
         }
-        Some(GestureFrame::Tracking(self.reveal_distance()))
+        Some(GestureFrame::Tracking(distance))
     }
 }
 
@@ -232,6 +258,9 @@ impl<T: Clone + PartialEq> TabPeek<T> {
     }
     pub(crate) fn reveal(&self) -> f32 {
         (self.distance / PEEK_DISTANCE).clamp(0.0, 1.0)
+    }
+    pub(crate) fn position(&self) -> f32 {
+        self.distance
     }
     pub(crate) fn overview(&self) -> f32 {
         ((self.distance - PEEK_DISTANCE) / (OVERVIEW_DISTANCE - PEEK_DISTANCE)).clamp(0.0, 1.0)

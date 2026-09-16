@@ -3070,6 +3070,22 @@ impl RootView {
             .overflow_hidden()
             .text_color(terminal.primary);
 
+        // Moving the terminal exposes the parent, whose glass fill is clear.
+        // Give that strip the same single surface tint as the terminal instead
+        // of exposing the much lighter window/desktop backdrop beneath it.
+        if peek_offset > 0.0 {
+            card = card.child(
+                div()
+                    .id("tab-peek-terminal-backdrop")
+                    .absolute()
+                    .top(px(self.tabs_seam))
+                    .left(px(0.0))
+                    .w_full()
+                    .h(px(peek_offset))
+                    .bg(terminal.work_surface()),
+            );
+        }
+
         // Paint the frame independently from layout. A normal border shrinks
         // the content box, putting this title bar one pixel below the
         // borderless sidebar title bar even though both are 42 points tall.
@@ -3979,8 +3995,13 @@ impl RootView {
             self.tab_pinch.cancel();
             return;
         }
-        let revealed = surfaces.read(cx).tab_peek_visible();
-        if let Some(frame) = self.tab_pinch.sample(event, revealed) {
+        let position = surfaces.read(cx).tab_peek_position();
+        let frame = self.tab_pinch.sample(event, position, cx.background_executor().now());
+        if self.tab_pinch.take_feedback() {
+            #[cfg(target_os = "macos")]
+            crate::macos::pinch_feedback();
+        }
+        if let Some(frame) = frame {
             surfaces.update(cx, |surfaces, cx| {
                 surfaces.tab_gesture(frame, cx);
                 surfaces.sync_tab_peek_focus(window, cx);
