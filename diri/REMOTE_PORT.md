@@ -657,6 +657,15 @@ entry pays that allocation instead. The 4 MiB history-cell budget and snapshot
 format are unchanged. This parser source already participates in Helper Build
 IDs; existing Holders retain their original allocations until they exit.
 
+Spare parser history rows are allocated in batches sized by row bytes, capped at
+1,000 rows and approximately 64 KiB of new cell/row storage (at least one row).
+Required visible/history rows are always allocated. This bounds the eager reserve
+at first scroll without changing the 4 MiB retained-history cell allowance or
+serialized grid representation. Existing vector capacity and reflow-retained rows
+remain separate from this reserve target. Smaller batches trade more occasional
+growth operations for lower memory; the resource and throughput harnesses verify
+that tradeoff. Parser source participates in the Helper Build ID as above.
+
 ### Local Holder input compatibility
 
 The durable local Holder is outside the remote Helper wire protocol, but it
