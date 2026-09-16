@@ -2,7 +2,7 @@
 //! management process never signals a numeric PID or holds a metadata lock
 //! while waiting for the Holder to record its child's actual exit.
 use std::fs::File;
-use std::io::{self, Read, Write};
+use std::io::{self, Write};
 use std::os::fd::AsRawFd;
 use std::os::unix::net::UnixStream;
 use std::path::Path;
@@ -93,9 +93,7 @@ pub(crate) fn kill(selector: &SessionSelector) -> io::Result<SessionInspection> 
     let mut buffer = [0u8; 64 * 1024];
     let mut requested = false;
     'connection: loop {
-        let remaining = remaining(deadline)?;
-        stream.set_read_timeout(Some(remaining))?;
-        match stream.read(&mut buffer) {
+        match read_until(&stream, &mut buffer, deadline) {
             Ok(0) => break,
             Ok(count) => {
                 for message in codec.feed(&buffer[..count]).map_err(io::Error::other)? {
@@ -253,6 +251,53 @@ fn write_message(
     stream.write_all(&RemoteCodec::encode(message).map_err(io::Error::other)?)
 }
 
+// macOS can reject SO_RCVTIMEO after peer close while final frames remain
+// queued. Read without changing socket options, preserving the absolute stop
+// deadline and leaving the bounded blocking write path unchanged.
+fn read_until(stream: &UnixStream, buffer: &mut [u8], deadline: Instant) -> io::Result<usize> {
+    loop {
+        remaining(deadline)?;
+        // SAFETY: stream owns a live socket and buffer is writable for its length.
+        let count = unsafe {
+            libc::recv(
+                stream.as_raw_fd(),
+                buffer.as_mut_ptr().cast(),
+                buffer.len(),
+                libc::MSG_DONTWAIT,
+            )
+        };
+        if count >= 0 {
+            return Ok(count as usize);
+        }
+        let error = io::Error::last_os_error();
+        match error.kind() {
+            io::ErrorKind::Interrupted => continue,
+            io::ErrorKind::WouldBlock => {}
+            _ => return Err(error),
+        }
+        let mut descriptor = libc::pollfd {
+            fd: stream.as_raw_fd(),
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        let timeout = remaining(deadline)?.as_millis().clamp(1, i32::MAX as u128) as i32;
+        // SAFETY: one initialized descriptor, live throughout the bounded wait.
+        if unsafe { libc::poll(&mut descriptor, 1, timeout) } < 0 {
+            let error = io::Error::last_os_error();
+            if error.kind() != io::ErrorKind::Interrupted {
+                return Err(error);
+            }
+        }
+        if descriptor.revents & libc::POLLNVAL != 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::NotConnected,
+                "stop socket invalid",
+            ));
+        }
+        // HUP/ERR may still have final bytes to drain before EOF.
+    }
+}
+
 fn remaining(deadline: Instant) -> io::Result<Duration> {
     deadline
         .checked_duration_since(Instant::now())
@@ -290,6 +335,28 @@ mod tests {
     use super::*;
     use diri_proto::process::{BootId, ProcessBirth, ProcessIdentity};
     use diri_proto::remote_pty::{ANNOTATED_HOLDER_CAPABILITIES, SessionToken};
+
+    #[test]
+    fn stop_reads_queued_frames_after_peer_close_and_bounds_silent_reads() {
+        let (reader, mut writer) = UnixStream::pair().unwrap();
+        writer.write_all(b"final").unwrap();
+        drop(writer);
+        let deadline = Instant::now() + Duration::from_secs(1);
+        let mut buffer = [0; 16];
+        let count = read_until(&reader, &mut buffer, deadline).unwrap();
+        assert_eq!(&buffer[..count], b"final");
+        assert_eq!(read_until(&reader, &mut buffer, deadline).unwrap(), 0);
+
+        let (reader, _writer) = UnixStream::pair().unwrap();
+        let started = Instant::now();
+        assert_eq!(
+            read_until(&reader, &mut buffer, started + Duration::from_millis(25))
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::TimedOut
+        );
+        assert!(started.elapsed() < Duration::from_secs(1));
+    }
 
     fn fixture() -> (SessionState, SessionSelector) {
         let identity = ProcessIdentity::new(
