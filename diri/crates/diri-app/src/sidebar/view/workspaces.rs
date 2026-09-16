@@ -41,8 +41,10 @@ pub(super) struct WorkspaceNavigation {
     editor: Option<WorkspaceEditor>,
     destination: Option<SessionDestination>,
     query: query_editor::QueryEditor,
-    focus: FocusHandle,
+    pub(super) focus: FocusHandle,
     awaiting_create: bool,
+    highlighted_session: Option<SessionId>,
+    menu_scroll: ScrollHandle,
     scroll: ScrollHandle,
     vertical_scroll: ScrollHandle,
     last_selection: Option<(WorkspaceId, Option<TabId>, bool, u32)>,
@@ -58,12 +60,37 @@ impl WorkspaceNavigation {
             query: Default::default(),
             focus: cx.focus_handle(),
             awaiting_create: false,
+            highlighted_session: None,
+            menu_scroll: ScrollHandle::new(),
             scroll: ScrollHandle::new(),
             vertical_scroll: ScrollHandle::new(),
             last_selection: None,
             available_width: 0.0,
         }
     }
+}
+
+fn session_choices(store: &SessionStore, query: &str) -> Vec<Arc<SessionRecord>> {
+    let query = query.trim().to_lowercase();
+    let mut sessions = store
+        .sessions()
+        .values()
+        .filter(|session| {
+            query.is_empty()
+                || format!(
+                    "{} {} {}",
+                    session.title,
+                    session.cwd,
+                    session.host.as_deref().unwrap_or("local")
+                )
+                .to_lowercase()
+                .contains(&query)
+        })
+        .cloned()
+        .collect::<Vec<_>>();
+    sessions.sort_by(|a, b| a.title.cmp(&b.title).then_with(|| a.id.0.cmp(&b.id.0)));
+    sessions.truncate(100);
+    sessions
 }
 
 fn tab_title(tab: &diri_proto::workspace::WorkspaceTab, store: &SessionStore) -> String {
@@ -84,6 +111,9 @@ fn tab_title(tab: &diri_proto::workspace::WorkspaceTab, store: &SessionStore) ->
 }
 
 impl Sidebar {
+    pub(crate) fn workspace_menu_is_open(&self) -> bool {
+        self.workspace_nav.menu
+    }
     fn move_workspace_tab(
         &mut self,
         dragged: &DraggedWorkspaceTab,
@@ -129,14 +159,13 @@ impl Sidebar {
         &mut self,
         tab: TabId,
         pane: PaneId,
+        edge: DockEdge,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        self.workspace_nav.destination = Some(SessionDestination::Split {
-            tab,
-            pane,
-            edge: DockEdge::Right,
-        });
+        self.workspace_nav.editor = None;
+        self.workspace_nav.destination = Some(SessionDestination::Split { tab, pane, edge });
+        self.workspace_nav.highlighted_session = None;
         self.workspace_nav.menu = true;
         self.workspace_nav.query.clear();
         self.workspace_nav.focus.focus(window, cx);
@@ -192,6 +221,41 @@ impl Sidebar {
         if !self.workspace_nav.menu || !self.workspace_nav.focus.is_focused(window) {
             return false;
         }
+        if self.workspace_nav.destination.is_some()
+            && self.workspace_nav.editor.is_none()
+            && matches!(event.keystroke.key.as_str(), "up" | "down" | "enter")
+        {
+            let choices = session_choices(
+                &self.store.read().expect("store"),
+                self.workspace_nav.query.text(),
+            );
+            if !choices.is_empty() {
+                let current = self
+                    .workspace_nav
+                    .highlighted_session
+                    .as_ref()
+                    .and_then(|id| choices.iter().position(|session| &session.id == id))
+                    .unwrap_or(0);
+                let next = match event.keystroke.key.as_str() {
+                    "up" => current.saturating_sub(1),
+                    "down" => (current + 1).min(choices.len() - 1),
+                    _ => current,
+                };
+                let id = choices[next].id.clone();
+                self.workspace_nav.highlighted_session = Some(id.clone());
+                self.workspace_nav.menu_scroll.scroll_to_item(next);
+                if event.keystroke.key == "enter" {
+                    self.place_workspace_session(
+                        self.workspace_nav.destination.clone().unwrap(),
+                        id,
+                        cx,
+                    );
+                }
+            }
+            cx.stop_propagation();
+            cx.notify();
+            return true;
+        }
         match event.keystroke.key.as_str() {
             "escape" => {
                 self.workspace_nav.menu = false;
@@ -226,6 +290,7 @@ impl Sidebar {
                 let Some(edit) = query_editor::edit_for(&event.keystroke) else {
                     return false;
                 };
+                self.workspace_nav.highlighted_session = None;
                 match edit {
                     Edit::Local(edit) => {
                         self.workspace_nav.query.apply(edit);
@@ -248,6 +313,33 @@ impl Sidebar {
         cx.notify();
         true
     }
+    fn place_workspace_session(
+        &mut self,
+        destination: SessionDestination,
+        id: SessionId,
+        cx: &mut Context<Self>,
+    ) {
+        let mutation = match destination {
+            SessionDestination::Tab(workspace_id) => WorkspaceMutation::CreateTab {
+                workspace_id,
+                session_id: id,
+                title: None,
+            },
+            SessionDestination::Split { tab, pane, edge } => WorkspaceMutation::SplitPane {
+                tab_id: tab,
+                target: pane,
+                session_id: id,
+                edge,
+            },
+        };
+        if self.store.write().expect("store").edit_workspace(mutation) {
+            self.workspace_nav.menu = false;
+            self.workspace_nav.destination = None;
+            cx.emit(SidebarEvent::WorkspaceTabActivated);
+        }
+        cx.notify();
+    }
+
     pub(super) fn workspace_control(
         &self,
         colors: SemanticColors,
@@ -540,7 +632,7 @@ impl Sidebar {
 
 impl Sidebar {
     pub(super) fn workspace_popup(
-        &self,
+        &mut self,
         colors: SemanticColors,
         cx: &mut Context<Self>,
     ) -> Option<AnyElement> {
@@ -665,8 +757,18 @@ impl Sidebar {
             return Some(panel.into_any_element());
         }
         let query = self.workspace_nav.query.text().trim().to_lowercase();
+        if self.workspace_nav.destination.is_some() {
+            panel = panel.child(
+                div()
+                    .px(px(5.0))
+                    .text_size(px(10.0))
+                    .text_color(colors.tertiary)
+                    .child("↑ ↓ to choose · Return to add"),
+            );
+        }
         let mut choices = div()
             .id("workspace-menu-choices")
+            .track_scroll(&self.workspace_nav.menu_scroll)
             .flex()
             .flex_col()
             .min_h(px(0.0))
@@ -704,24 +806,27 @@ impl Sidebar {
                         })),
                 );
             }
-            let mut sessions = store
-                .sessions()
-                .values()
-                .filter(|session| {
-                    query.is_empty()
-                        || format!(
-                            "{} {} {}",
-                            session.title,
-                            session.cwd,
-                            session.host.as_deref().unwrap_or("local")
-                        )
-                        .to_lowercase()
-                        .contains(&query)
-                })
-                .cloned()
-                .collect::<Vec<_>>();
-            sessions.sort_by(|a, b| a.title.cmp(&b.title).then_with(|| a.id.0.cmp(&b.id.0)));
-            for session in sessions.into_iter().take(100) {
+            let sessions = session_choices(&store, &query);
+            if self
+                .workspace_nav
+                .highlighted_session
+                .as_ref()
+                .is_none_or(|id| !sessions.iter().any(|session| &session.id == id))
+            {
+                self.workspace_nav.highlighted_session =
+                    sessions.first().map(|session| session.id.clone());
+            }
+            if sessions.is_empty() {
+                choices = choices.child(
+                    div()
+                        .p(px(7.0))
+                        .text_size(px(12.0))
+                        .text_color(colors.secondary)
+                        .child("No matching sessions"),
+                );
+            }
+            for session in sessions {
+                let selected = self.workspace_nav.highlighted_session.as_ref() == Some(&session.id);
                 let destination = destination.clone();
                 let id = session.id.clone();
                 let title = display_title(&session);
@@ -735,6 +840,8 @@ impl Sidebar {
                         .id(SharedString::from(format!("workspace-session-{}", id.0)))
                         .role(Role::Button)
                         .aria_label(format!("Add {title}"))
+                        .aria_selected(selected)
+                        .when(selected, |row| row.bg(colors.primary.alpha(0.08)))
                         .px(px(7.0))
                         .py(px(6.0))
                         .rounded(px(6.0))
@@ -756,29 +863,7 @@ impl Sidebar {
                                 .child(detail),
                         )
                         .on_click(cx.listener(move |this, _, _, cx| {
-                            let mutation = match &destination {
-                                SessionDestination::Tab(workspace_id) => {
-                                    WorkspaceMutation::CreateTab {
-                                        workspace_id: workspace_id.clone(),
-                                        session_id: id.clone(),
-                                        title: None,
-                                    }
-                                }
-                                SessionDestination::Split { tab, pane, edge } => {
-                                    WorkspaceMutation::SplitPane {
-                                        tab_id: tab.clone(),
-                                        target: pane.clone(),
-                                        session_id: id.clone(),
-                                        edge: *edge,
-                                    }
-                                }
-                            };
-                            if this.store.write().expect("store").edit_workspace(mutation) {
-                                this.workspace_nav.menu = false;
-                                this.workspace_nav.destination = None;
-                            }
-                            cx.emit(SidebarEvent::WorkspaceTabActivated);
-                            cx.notify();
+                            this.place_workspace_session(destination.clone(), id.clone(), cx);
                         })),
                 );
             }

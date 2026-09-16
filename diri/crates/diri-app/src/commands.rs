@@ -36,6 +36,26 @@ actions!(
         ToggleNotifications,
         ToggleOverview,
         ToggleTabPeek,
+        FocusPaneLeft,
+        FocusPaneRight,
+        FocusPaneUp,
+        FocusPaneDown,
+        SplitPaneRight,
+        SplitPaneBelow,
+        TogglePaneZoom,
+        RemoveFocusedPane,
+        PaneGrowWidth,
+        PaneShrinkWidth,
+        PaneGrowHeight,
+        PaneShrinkHeight,
+        SwapPaneLeft,
+        SwapPaneRight,
+        SwapPaneUp,
+        SwapPaneDown,
+        MovePaneLeft,
+        MovePaneRight,
+        MovePaneUp,
+        MovePaneDown,
         OpenWorktrees,
         OpenSettings,
         // Palette destination: open Settings even when it is already visible.
@@ -112,6 +132,26 @@ pub enum CommandId {
     ToggleNotifications,
     ToggleOverview,
     ToggleTabPeek,
+    FocusPaneLeft,
+    FocusPaneRight,
+    FocusPaneUp,
+    FocusPaneDown,
+    SplitPaneRight,
+    SplitPaneBelow,
+    TogglePaneZoom,
+    RemoveFocusedPane,
+    PaneGrowWidth,
+    PaneShrinkWidth,
+    PaneGrowHeight,
+    PaneShrinkHeight,
+    SwapPaneLeft,
+    SwapPaneRight,
+    SwapPaneUp,
+    SwapPaneDown,
+    MovePaneLeft,
+    MovePaneRight,
+    MovePaneUp,
+    MovePaneDown,
     OpenWorktrees,
     OpenSettings,
     ToggleSidebar,
@@ -348,6 +388,206 @@ pub const COMMANDS: &[CommandSpec] = &[
         "Peek Tabs",
         "rectangle.stack",
         "preview overview gesture three finger swipe"
+    ),
+    spec!(
+        FocusPaneLeft,
+        "focus-pane-left",
+        Some("ctrl-alt-left"),
+        Some("⌃⌥←"),
+        Some(APP_CONTEXT),
+        "Focus pane left",
+        "rectangle.split.2x1",
+        "workspace focus pane left"
+    ),
+    spec!(
+        FocusPaneRight,
+        "focus-pane-right",
+        Some("ctrl-alt-right"),
+        Some("⌃⌥→"),
+        Some(APP_CONTEXT),
+        "Focus pane right",
+        "rectangle.split.2x1",
+        "workspace focus pane right"
+    ),
+    spec!(
+        FocusPaneUp,
+        "focus-pane-up",
+        Some("ctrl-alt-up"),
+        Some("⌃⌥↑"),
+        Some(APP_CONTEXT),
+        "Focus pane up",
+        "rectangle.split.2x1",
+        "workspace focus pane up"
+    ),
+    spec!(
+        FocusPaneDown,
+        "focus-pane-down",
+        Some("ctrl-alt-down"),
+        Some("⌃⌥↓"),
+        Some(APP_CONTEXT),
+        "Focus pane down",
+        "rectangle.split.2x1",
+        "workspace focus pane down"
+    ),
+    spec!(
+        SplitPaneRight,
+        "split-pane-right",
+        Some("cmd-d"),
+        Some("⌘D"),
+        Some(APP_CONTEXT),
+        "Split pane right…",
+        "rectangle.split.2x1",
+        "workspace split pane right add layout"
+    ),
+    spec!(
+        SplitPaneBelow,
+        "split-pane-below",
+        Some("cmd-alt-shift-d"),
+        Some("⇧⌥⌘D"),
+        Some(APP_CONTEXT),
+        "Split pane below…",
+        "rectangle.split.2x1",
+        "workspace split pane below add layout"
+    ),
+    spec!(
+        TogglePaneZoom,
+        "toggle-pane-zoom",
+        Some("cmd-shift-enter"),
+        Some("⇧⌘Return"),
+        Some(APP_CONTEXT),
+        "Toggle pane zoom",
+        "rectangle.split.2x1",
+        "workspace toggle pane zoom maximize restore"
+    ),
+    spec!(
+        RemoveFocusedPane,
+        "remove-focused-pane",
+        None,
+        None,
+        Some(APP_CONTEXT),
+        "Remove focused pane",
+        "rectangle.split.2x1",
+        "workspace remove focused pane close"
+    ),
+    spec!(
+        PaneGrowWidth,
+        "pane-grow-width",
+        Some("cmd-alt-shift-right"),
+        Some("⌥⇧⌘→"),
+        Some(APP_CONTEXT),
+        "Grow pane width",
+        "rectangle.split.2x1",
+        "workspace pane grow width resize divider"
+    ),
+    spec!(
+        PaneShrinkWidth,
+        "pane-shrink-width",
+        Some("cmd-alt-shift-left"),
+        Some("⌥⇧⌘←"),
+        Some(APP_CONTEXT),
+        "Shrink pane width",
+        "rectangle.split.2x1",
+        "workspace pane shrink width resize divider"
+    ),
+    spec!(
+        PaneGrowHeight,
+        "pane-grow-height",
+        Some("cmd-alt-shift-down"),
+        Some("⌥⇧⌘↓"),
+        Some(APP_CONTEXT),
+        "Grow pane height",
+        "rectangle.split.2x1",
+        "workspace pane grow height resize divider"
+    ),
+    spec!(
+        PaneShrinkHeight,
+        "pane-shrink-height",
+        Some("cmd-alt-shift-up"),
+        Some("⌥⇧⌘↑"),
+        Some(APP_CONTEXT),
+        "Shrink pane height",
+        "rectangle.split.2x1",
+        "workspace pane shrink height resize divider"
+    ),
+    spec!(
+        SwapPaneLeft,
+        "swap-pane-left",
+        None,
+        None,
+        Some(APP_CONTEXT),
+        "Swap pane left",
+        "rectangle.split.2x1",
+        "workspace swap pane left exchange"
+    ),
+    spec!(
+        SwapPaneRight,
+        "swap-pane-right",
+        None,
+        None,
+        Some(APP_CONTEXT),
+        "Swap pane right",
+        "rectangle.split.2x1",
+        "workspace swap pane right exchange"
+    ),
+    spec!(
+        SwapPaneUp,
+        "swap-pane-up",
+        None,
+        None,
+        Some(APP_CONTEXT),
+        "Swap pane up",
+        "rectangle.split.2x1",
+        "workspace swap pane up exchange"
+    ),
+    spec!(
+        SwapPaneDown,
+        "swap-pane-down",
+        None,
+        None,
+        Some(APP_CONTEXT),
+        "Swap pane down",
+        "rectangle.split.2x1",
+        "workspace swap pane down exchange"
+    ),
+    spec!(
+        MovePaneLeft,
+        "move-pane-left",
+        None,
+        None,
+        Some(APP_CONTEXT),
+        "Move pane left",
+        "rectangle.split.2x1",
+        "workspace move pane left dock"
+    ),
+    spec!(
+        MovePaneRight,
+        "move-pane-right",
+        None,
+        None,
+        Some(APP_CONTEXT),
+        "Move pane right",
+        "rectangle.split.2x1",
+        "workspace move pane right dock"
+    ),
+    spec!(
+        MovePaneUp,
+        "move-pane-up",
+        None,
+        None,
+        Some(APP_CONTEXT),
+        "Move pane up",
+        "rectangle.split.2x1",
+        "workspace move pane up dock"
+    ),
+    spec!(
+        MovePaneDown,
+        "move-pane-down",
+        None,
+        None,
+        Some(APP_CONTEXT),
+        "Move pane down",
+        "rectangle.split.2x1",
+        "workspace move pane down dock"
     ),
     spec!(
         OpenWorktrees,
@@ -786,7 +1026,15 @@ impl CommandSpec {
                 .ok()
                 .map(|key| shortcut_label_for_keystroke(&key)),
             #[cfg(not(target_os = "macos"))]
-            _ if self.id == CommandId::DelegateSelectedSession => {
+            _ if matches!(
+                self.id,
+                CommandId::DelegateSelectedSession
+                    | CommandId::FocusPaneLeft
+                    | CommandId::FocusPaneRight
+                    | CommandId::FocusPaneUp
+                    | CommandId::FocusPaneDown
+            ) =>
+            {
                 linux_keystroke(self.id, self.keystroke?)
                     .and_then(|key| Keystroke::parse(&key).ok())
                     .map(|key| shortcut_label_for_keystroke(&key))
@@ -833,6 +1081,27 @@ impl CommandSpec {
             CommandId::ToggleNotifications => KeyBinding::new(key, ToggleNotifications, context),
             CommandId::ToggleOverview => KeyBinding::new(key, ToggleOverview, context),
             CommandId::ToggleTabPeek => KeyBinding::new(key, ToggleTabPeek, context),
+            CommandId::FocusPaneLeft => KeyBinding::new(key, FocusPaneLeft, context),
+            CommandId::FocusPaneRight => KeyBinding::new(key, FocusPaneRight, context),
+            CommandId::FocusPaneUp => KeyBinding::new(key, FocusPaneUp, context),
+            CommandId::FocusPaneDown => KeyBinding::new(key, FocusPaneDown, context),
+            CommandId::SplitPaneRight => KeyBinding::new(key, SplitPaneRight, context),
+            CommandId::SplitPaneBelow => KeyBinding::new(key, SplitPaneBelow, context),
+            CommandId::TogglePaneZoom => KeyBinding::new(key, TogglePaneZoom, context),
+            CommandId::RemoveFocusedPane => KeyBinding::new(key, RemoveFocusedPane, context),
+            CommandId::PaneGrowWidth => KeyBinding::new(key, PaneGrowWidth, context),
+            CommandId::PaneShrinkWidth => KeyBinding::new(key, PaneShrinkWidth, context),
+            CommandId::PaneGrowHeight => KeyBinding::new(key, PaneGrowHeight, context),
+            CommandId::PaneShrinkHeight => KeyBinding::new(key, PaneShrinkHeight, context),
+            CommandId::SwapPaneLeft => KeyBinding::new(key, SwapPaneLeft, context),
+            CommandId::SwapPaneRight => KeyBinding::new(key, SwapPaneRight, context),
+            CommandId::SwapPaneUp => KeyBinding::new(key, SwapPaneUp, context),
+            CommandId::SwapPaneDown => KeyBinding::new(key, SwapPaneDown, context),
+            CommandId::MovePaneLeft => KeyBinding::new(key, MovePaneLeft, context),
+            CommandId::MovePaneRight => KeyBinding::new(key, MovePaneRight, context),
+            CommandId::MovePaneUp => KeyBinding::new(key, MovePaneUp, context),
+            CommandId::MovePaneDown => KeyBinding::new(key, MovePaneDown, context),
+
             CommandId::OpenWorktrees => KeyBinding::new(key, OpenWorktrees, context),
             CommandId::OpenSettings => KeyBinding::new(key, OpenSettings, context),
             CommandId::ToggleSidebar => KeyBinding::new(key, ToggleSidebar, context),
@@ -917,7 +1186,14 @@ fn linux_keystroke(id: CommandId, key: &str) -> Option<String> {
     if id == CommandId::DelegateSelectedSession {
         return Some("ctrl-alt-d".to_owned());
     }
-    Some(linux_chord(key))
+    let pane_focus = match id {
+        CommandId::FocusPaneLeft => Some("ctrl-alt-h"),
+        CommandId::FocusPaneRight => Some("ctrl-alt-l"),
+        CommandId::FocusPaneUp => Some("ctrl-alt-k"),
+        CommandId::FocusPaneDown => Some("ctrl-alt-j"),
+        _ => None,
+    };
+    Some(pane_focus.map_or_else(|| linux_chord(key), str::to_owned))
 }
 
 /// Maps a macOS `cmd-` chord onto the string `simulate_keystrokes` must send
@@ -1136,6 +1412,106 @@ impl CommandId {
                 description: "Open or close the session overview",
                 category: Navigation,
             },
+            Self::FocusPaneLeft => ShortcutMetadata {
+                title: "Focus pane left",
+                description: "Move focus to the nearest pane in this direction",
+                category: Workspace,
+            },
+            Self::FocusPaneRight => ShortcutMetadata {
+                title: "Focus pane right",
+                description: "Move focus to the nearest pane in this direction",
+                category: Workspace,
+            },
+            Self::FocusPaneUp => ShortcutMetadata {
+                title: "Focus pane up",
+                description: "Move focus to the nearest pane in this direction",
+                category: Workspace,
+            },
+            Self::FocusPaneDown => ShortcutMetadata {
+                title: "Focus pane down",
+                description: "Move focus to the nearest pane in this direction",
+                category: Workspace,
+            },
+            Self::SplitPaneRight => ShortcutMetadata {
+                title: "Split pane right…",
+                description: "Choose a session for the new split",
+                category: Workspace,
+            },
+            Self::SplitPaneBelow => ShortcutMetadata {
+                title: "Split pane below…",
+                description: "Choose a session for the new split",
+                category: Workspace,
+            },
+            Self::TogglePaneZoom => ShortcutMetadata {
+                title: "Toggle pane zoom",
+                description: "Expand the focused pane or restore its saved layout",
+                category: Workspace,
+            },
+            Self::RemoveFocusedPane => ShortcutMetadata {
+                title: "Remove focused pane",
+                description: "Remove the pane reference while keeping its session running",
+                category: Workspace,
+            },
+            Self::PaneGrowWidth => ShortcutMetadata {
+                title: "Grow pane width",
+                description: "Resize the nearest matching split divider by five percent",
+                category: Workspace,
+            },
+            Self::PaneShrinkWidth => ShortcutMetadata {
+                title: "Shrink pane width",
+                description: "Resize the nearest matching split divider by five percent",
+                category: Workspace,
+            },
+            Self::PaneGrowHeight => ShortcutMetadata {
+                title: "Grow pane height",
+                description: "Resize the nearest matching split divider by five percent",
+                category: Workspace,
+            },
+            Self::PaneShrinkHeight => ShortcutMetadata {
+                title: "Shrink pane height",
+                description: "Resize the nearest matching split divider by five percent",
+                category: Workspace,
+            },
+            Self::SwapPaneLeft => ShortcutMetadata {
+                title: "Swap pane left",
+                description: "Swap the focused pane with its nearest neighbor",
+                category: Workspace,
+            },
+            Self::SwapPaneRight => ShortcutMetadata {
+                title: "Swap pane right",
+                description: "Swap the focused pane with its nearest neighbor",
+                category: Workspace,
+            },
+            Self::SwapPaneUp => ShortcutMetadata {
+                title: "Swap pane up",
+                description: "Swap the focused pane with its nearest neighbor",
+                category: Workspace,
+            },
+            Self::SwapPaneDown => ShortcutMetadata {
+                title: "Swap pane down",
+                description: "Swap the focused pane with its nearest neighbor",
+                category: Workspace,
+            },
+            Self::MovePaneLeft => ShortcutMetadata {
+                title: "Move pane left",
+                description: "Move the focused pane with its nearest neighbor",
+                category: Workspace,
+            },
+            Self::MovePaneRight => ShortcutMetadata {
+                title: "Move pane right",
+                description: "Move the focused pane with its nearest neighbor",
+                category: Workspace,
+            },
+            Self::MovePaneUp => ShortcutMetadata {
+                title: "Move pane up",
+                description: "Move the focused pane with its nearest neighbor",
+                category: Workspace,
+            },
+            Self::MovePaneDown => ShortcutMetadata {
+                title: "Move pane down",
+                description: "Move the focused pane with its nearest neighbor",
+                category: Workspace,
+            },
             Self::ToggleTabPeek => ShortcutMetadata {
                 title: "Peek tabs",
                 description: "Preview tabs in the selected project without changing work",
@@ -1350,6 +1726,27 @@ impl CommandId {
             Self::ToggleNotifications => Box::new(ToggleNotifications),
             Self::ToggleOverview => Box::new(ToggleOverview),
             Self::ToggleTabPeek => Box::new(ToggleTabPeek),
+            Self::FocusPaneLeft => Box::new(FocusPaneLeft),
+            Self::FocusPaneRight => Box::new(FocusPaneRight),
+            Self::FocusPaneUp => Box::new(FocusPaneUp),
+            Self::FocusPaneDown => Box::new(FocusPaneDown),
+            Self::SplitPaneRight => Box::new(SplitPaneRight),
+            Self::SplitPaneBelow => Box::new(SplitPaneBelow),
+            Self::TogglePaneZoom => Box::new(TogglePaneZoom),
+            Self::RemoveFocusedPane => Box::new(RemoveFocusedPane),
+            Self::PaneGrowWidth => Box::new(PaneGrowWidth),
+            Self::PaneShrinkWidth => Box::new(PaneShrinkWidth),
+            Self::PaneGrowHeight => Box::new(PaneGrowHeight),
+            Self::PaneShrinkHeight => Box::new(PaneShrinkHeight),
+            Self::SwapPaneLeft => Box::new(SwapPaneLeft),
+            Self::SwapPaneRight => Box::new(SwapPaneRight),
+            Self::SwapPaneUp => Box::new(SwapPaneUp),
+            Self::SwapPaneDown => Box::new(SwapPaneDown),
+            Self::MovePaneLeft => Box::new(MovePaneLeft),
+            Self::MovePaneRight => Box::new(MovePaneRight),
+            Self::MovePaneUp => Box::new(MovePaneUp),
+            Self::MovePaneDown => Box::new(MovePaneDown),
+
             Self::OpenWorktrees => Box::new(OpenWorktrees),
             Self::OpenSettings => Box::new(OpenSettings),
             Self::ToggleSidebar => Box::new(ToggleSidebar),
@@ -1401,6 +1798,46 @@ mod tests {
     use std::collections::HashSet;
 
     use super::*;
+
+    #[test]
+    fn pane_shortcuts_do_not_shadow_other_contexts_or_alternates() {
+        let overrides = ShortcutOverrides::default();
+        for spec in COMMANDS
+            .iter()
+            .filter(|spec| crate::workspace_workbench::PaneCommand::from_id(spec.id).is_some())
+        {
+            for binding in spec.effective_keystrokes(&overrides) {
+                assert!(
+                    shortcut_conflict(spec.id, &binding, &overrides).is_none(),
+                    "{:?} conflicts on {}",
+                    spec.id,
+                    binding
+                );
+            }
+            if let Some(binding) = spec.keystroke.and_then(|key| linux_keystroke(spec.id, key)) {
+                let parsed = Keystroke::parse(&binding).unwrap();
+                for other in COMMANDS.iter().filter(|other| other.id != spec.id) {
+                    for key in other
+                        .keystroke
+                        .into_iter()
+                        .chain(other.alternate_keystrokes.iter().copied())
+                    {
+                        if let Some(other_key) = linux_keystroke(other.id, key) {
+                            let other_parsed = Keystroke::parse(&other_key).unwrap();
+                            assert!(
+                                parsed.modifiers != other_parsed.modifiers
+                                    || parsed.key != other_parsed.key,
+                                "{:?} conflicts with {:?} on Linux {}",
+                                spec.id,
+                                other.id,
+                                binding
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
 
     #[test]
     fn command_ids_and_stable_ids_are_unique() {
@@ -1526,7 +1963,16 @@ mod tests {
             .iter()
             .map(|command| command.key_bindings(&ShortcutOverrides::new()).len())
             .sum();
-        assert!(binding_count > COMMANDS.len());
+        let expected: usize = COMMANDS
+            .iter()
+            .map(|command| {
+                command
+                    .effective_keystrokes(&ShortcutOverrides::new())
+                    .len()
+            })
+            .sum();
+        assert_eq!(binding_count, expected);
+        assert!(binding_count > 0);
     }
 
     #[test]

@@ -1276,8 +1276,15 @@ impl RootView {
                         crate::workspace_workbench::WorkspaceWorkbenchEvent::RequestSplit {
                             tab,
                             pane,
+                            edge,
                         } => this.sidebar.update(cx, |sidebar, cx| {
-                            sidebar.choose_split_session(tab.clone(), pane.clone(), window, cx)
+                            sidebar.choose_split_session(
+                                tab.clone(),
+                                pane.clone(),
+                                *edge,
+                                window,
+                                cx,
+                            )
                         }),
                         crate::workspace_workbench::WorkspaceWorkbenchEvent::Terminal(
                             TerminalPaneEvent::OpenFileReference { reference, cwd, .. },
@@ -1805,6 +1812,40 @@ impl RootView {
     /// context. This is the only place that translates static commands into
     /// mutations of RootView's child modules.
     fn run_command(&mut self, command: CommandId, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(command) = crate::workspace_workbench::PaneCommand::from_id(command) {
+            if self.sidebar.read(cx).workspace_menu_is_open()
+                || self.launcher.read(cx).is_open()
+                || self
+                    .navigation
+                    .as_ref()
+                    .is_some_and(|view| view.read(cx).is_open())
+                || self
+                    .utility_surfaces
+                    .as_ref()
+                    .is_some_and(|view| view.read(cx).is_open())
+                || self
+                    .session_surfaces
+                    .as_ref()
+                    .is_some_and(|view| view.read(cx).tab_peek_visible())
+                || self.quote_target_picker.is_some()
+            {
+                return;
+            }
+            if self.active_workspace.is_some()
+                && let Some(workbench) = &self.workspace_workbench
+            {
+                workbench.update(cx, |workbench, cx| {
+                    workbench.execute_command(command, window, cx)
+                });
+            } else {
+                self.show_quote_feedback(
+                    "Workspace panes",
+                    "Choose a workspace to arrange its panes.",
+                    cx,
+                );
+            }
+            return;
+        }
         match command {
             // A spawn the catalog vetoes falls back to the launcher, where the
             // unavailability is visible and another Agent is one keystroke
@@ -4038,6 +4079,106 @@ impl Render for RootView {
             .on_action(cx.listener(|this, _: &ToggleHistory, window, cx| {
                 this.run_command(CommandId::ToggleHistory, window, cx);
             }))
+            .on_action(
+                cx.listener(|this, _: &crate::commands::FocusPaneLeft, window, cx| {
+                    this.run_command(CommandId::FocusPaneLeft, window, cx);
+                }),
+            )
+            .on_action(
+                cx.listener(|this, _: &crate::commands::FocusPaneRight, window, cx| {
+                    this.run_command(CommandId::FocusPaneRight, window, cx);
+                }),
+            )
+            .on_action(
+                cx.listener(|this, _: &crate::commands::FocusPaneUp, window, cx| {
+                    this.run_command(CommandId::FocusPaneUp, window, cx);
+                }),
+            )
+            .on_action(
+                cx.listener(|this, _: &crate::commands::FocusPaneDown, window, cx| {
+                    this.run_command(CommandId::FocusPaneDown, window, cx);
+                }),
+            )
+            .on_action(
+                cx.listener(|this, _: &crate::commands::SplitPaneRight, window, cx| {
+                    this.run_command(CommandId::SplitPaneRight, window, cx);
+                }),
+            )
+            .on_action(
+                cx.listener(|this, _: &crate::commands::SplitPaneBelow, window, cx| {
+                    this.run_command(CommandId::SplitPaneBelow, window, cx);
+                }),
+            )
+            .on_action(
+                cx.listener(|this, _: &crate::commands::TogglePaneZoom, window, cx| {
+                    this.run_command(CommandId::TogglePaneZoom, window, cx);
+                }),
+            )
+            .on_action(
+                cx.listener(|this, _: &crate::commands::RemoveFocusedPane, window, cx| {
+                    this.run_command(CommandId::RemoveFocusedPane, window, cx);
+                }),
+            )
+            .on_action(
+                cx.listener(|this, _: &crate::commands::PaneGrowWidth, window, cx| {
+                    this.run_command(CommandId::PaneGrowWidth, window, cx);
+                }),
+            )
+            .on_action(
+                cx.listener(|this, _: &crate::commands::PaneShrinkWidth, window, cx| {
+                    this.run_command(CommandId::PaneShrinkWidth, window, cx);
+                }),
+            )
+            .on_action(
+                cx.listener(|this, _: &crate::commands::PaneGrowHeight, window, cx| {
+                    this.run_command(CommandId::PaneGrowHeight, window, cx);
+                }),
+            )
+            .on_action(
+                cx.listener(|this, _: &crate::commands::PaneShrinkHeight, window, cx| {
+                    this.run_command(CommandId::PaneShrinkHeight, window, cx);
+                }),
+            )
+            .on_action(
+                cx.listener(|this, _: &crate::commands::SwapPaneLeft, window, cx| {
+                    this.run_command(CommandId::SwapPaneLeft, window, cx);
+                }),
+            )
+            .on_action(
+                cx.listener(|this, _: &crate::commands::SwapPaneRight, window, cx| {
+                    this.run_command(CommandId::SwapPaneRight, window, cx);
+                }),
+            )
+            .on_action(
+                cx.listener(|this, _: &crate::commands::SwapPaneUp, window, cx| {
+                    this.run_command(CommandId::SwapPaneUp, window, cx);
+                }),
+            )
+            .on_action(
+                cx.listener(|this, _: &crate::commands::SwapPaneDown, window, cx| {
+                    this.run_command(CommandId::SwapPaneDown, window, cx);
+                }),
+            )
+            .on_action(
+                cx.listener(|this, _: &crate::commands::MovePaneLeft, window, cx| {
+                    this.run_command(CommandId::MovePaneLeft, window, cx);
+                }),
+            )
+            .on_action(
+                cx.listener(|this, _: &crate::commands::MovePaneRight, window, cx| {
+                    this.run_command(CommandId::MovePaneRight, window, cx);
+                }),
+            )
+            .on_action(
+                cx.listener(|this, _: &crate::commands::MovePaneUp, window, cx| {
+                    this.run_command(CommandId::MovePaneUp, window, cx);
+                }),
+            )
+            .on_action(
+                cx.listener(|this, _: &crate::commands::MovePaneDown, window, cx| {
+                    this.run_command(CommandId::MovePaneDown, window, cx);
+                }),
+            )
             .on_action(cx.listener(|this, _: &ToggleTabPeek, window, cx| {
                 this.toggle_tab_peek(window, cx);
             }))
@@ -5250,6 +5391,187 @@ mod tests {
 
     #[cfg(target_os = "macos")]
     #[test]
+    #[ignore = "real local PTYs and native keyboard routing"]
+    fn keyboard_workspace_operations_commit_through_engine_without_restarting_ptys() {
+        use gpui::HeadlessAppContext;
+        let fixture = crate::workspace_fixture::LiveWorkspace::start();
+        let platform = gpui_platform::current_platform(true);
+        let mut cx = HeadlessAppContext::with_platform(
+            platform.text_system(),
+            Arc::new(diri_ui::IconAssets),
+            gpui_platform::current_headless_renderer,
+        );
+        cx.update(|cx| {
+            crate::fonts::init(cx);
+            cx.set_reduce_motion(true);
+            commands::bind_keys(cx, &Default::default());
+        });
+        let services = fixture.services.clone();
+        let store = services.store.clone();
+        let window = cx
+            .open_window(size(px(1100.0), px(700.0)), move |window, cx| {
+                cx.new(|cx| RootView::new(services, false, PreviewScenario::Empty, window, cx))
+            })
+            .unwrap();
+        macro_rules! root_read {
+            ($f:expr) => {
+                cx.update_window(window.into(), |root, _, cx| {
+                    let root = root.downcast::<RootView>().unwrap();
+                    ($f)(root.read(cx), cx)
+                })
+                .unwrap()
+            };
+        }
+        macro_rules! root_update {
+            ($f:expr) => {
+                cx.update_window(window.into(), |root, window, cx| {
+                    root.downcast::<RootView>()
+                        .unwrap()
+                        .update(cx, |root, cx| ($f)(root, window, cx))
+                })
+                .unwrap()
+            };
+        }
+        macro_rules! keys {
+            ($text:expr) => {
+                for key in $text.split_whitespace() {
+                    cx.update_window(window.into(), |_, window, cx| {
+                        window.dispatch_keystroke(gpui::Keystroke::parse(key).unwrap(), cx);
+                    })
+                    .unwrap();
+                    cx.run_until_parked();
+                }
+            };
+        }
+        cx.update_window(window.into(), |root, window, cx| {
+            window.activate_window();
+            root.downcast::<RootView>().unwrap().update(cx, |root, cx| {
+                root.workspace_workbench
+                    .as_ref()
+                    .unwrap()
+                    .update(cx, |workbench, cx| workbench.focus(window, cx))
+            });
+        })
+        .unwrap();
+        let snapshot = || {
+            store
+                .store
+                .read()
+                .unwrap()
+                .workspace_catalog()
+                .snapshot()
+                .unwrap()
+                .clone()
+        };
+        for _ in 0..40 {
+            cx.run_until_parked();
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        let mut revision = snapshot().revision;
+        macro_rules! committed {
+            () => {{
+                let deadline = std::time::Instant::now() + Duration::from_secs(5);
+                loop {
+                    cx.run_until_parked();
+                    let current = snapshot();
+                    if current.revision > revision
+                        && store.store.read().unwrap().workspace_catalog().can_edit()
+                    {
+                        assert_eq!(
+                            current.revision,
+                            revision + 1,
+                            "one durable mutation per command"
+                        );
+                        revision = current.revision;
+                        break current;
+                    }
+                    assert!(
+                        std::time::Instant::now() < deadline,
+                        "command did not commit revision {}, error={:?}",
+                        revision + 1,
+                        store.store.read().unwrap().workspace_catalog().error
+                    );
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+            }};
+        }
+        cx.run_until_parked();
+        let initial = snapshot().workspaces[0].tabs[0].clone();
+        let initial_controllers = root_read!(|_, cx| TerminalPane::controller_counts_for_test(cx));
+        keys!("ctrl-alt-left");
+        let focused = committed!().workspaces[0].tabs[0].focused_pane.clone();
+        assert_ne!(focused, initial.focused_pane);
+        keys!("cmd-shift-enter");
+        assert_eq!(
+            committed!().workspaces[0].tabs[0].zoomed_pane,
+            Some(focused)
+        );
+        keys!("ctrl-alt-right");
+        let zoomed = committed!().workspaces[0].tabs[0].clone();
+        assert_eq!(zoomed.zoomed_pane.as_ref(), Some(&zoomed.focused_pane));
+        keys!("cmd-shift-enter");
+        assert!(committed!().workspaces[0].tabs[0].zoomed_pane.is_none());
+        let before = snapshot().workspaces[0].tabs[0].layout.clone();
+        keys!("cmd-alt-shift-right");
+        assert_ne!(committed!().workspaces[0].tabs[0].layout, before);
+        // The split action opens a real keyboard-operated session picker.
+        keys!("cmd-alt-shift-d");
+        cx.run_until_parked();
+        assert!(root_read!(|root: &RootView, cx| root
+            .sidebar
+            .read(cx)
+            .workspace_menu_is_open()));
+        keys!("down enter");
+        let split = committed!().workspaces[0].tabs[0].clone();
+        for _ in 0..20 {
+            cx.run_until_parked();
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        let split_controllers = root_read!(|_, cx| TerminalPane::controller_counts_for_test(cx));
+        assert_eq!(
+            split_controllers.0, initial_controllers.0,
+            "a duplicate pane reuses the existing controller"
+        );
+        assert_eq!(
+            split_controllers.1,
+            initial_controllers.1 + 1,
+            "only one view was mounted"
+        );
+        fixture.verify_process_identity();
+        assert_ne!(split.layout, before);
+        for command in [
+            CommandId::SwapPaneUp,
+            CommandId::MovePaneDown,
+            CommandId::RemoveFocusedPane,
+        ] {
+            root_update!(|root: &mut RootView, window, cx| root.run_command(command, window, cx));
+            committed!();
+        }
+        let persisted = diri_engine::workspace::WorkspaceStore::new(
+            fixture.directory.path().join("state.json"),
+        )
+        .snapshot()
+        .unwrap();
+        assert_eq!(
+            persisted,
+            snapshot(),
+            "GUI sees the same durable catalog as a new reader"
+        );
+        assert_eq!(persisted.revision, revision);
+        fixture.verify_process_identity();
+        if let Ok(output) = std::env::var("DIRI_KEYBOARD_WORKSPACE_SCREENSHOT") {
+            cx.capture_screenshot(window.into())
+                .unwrap()
+                .save(output)
+                .unwrap();
+        }
+        cx.update_window(window.into(), |_, window, _| window.remove_window())
+            .unwrap();
+        cx.run_until_parked();
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
     #[ignore = "real disposable PTYs and native screenshot to DIRI_WORKSPACE_LIVE_SCREENSHOT"]
     fn render_workspace_real_pty_geometry_screenshot() {
         use gpui::HeadlessAppContext;
@@ -5546,6 +5868,15 @@ mod tests {
                             surface
                                 .tab_gesture(crate::tab_peek::GestureFrame::Released(distance), cx);
                         });
+                });
+            })
+            .unwrap();
+            cx.run_until_parked();
+        }
+        if std::env::var_os("DIRI_WORKSPACE_SPLIT_PICKER").is_some() {
+            cx.update_window(window.into(), |root, window, cx| {
+                root.downcast::<RootView>().unwrap().update(cx, |root, cx| {
+                    root.run_command(CommandId::SplitPaneBelow, window, cx)
                 });
             })
             .unwrap();

@@ -450,6 +450,26 @@ impl Render for ActionHarness {
             NewTerminal,
             ToggleOverview,
             ToggleTabPeek,
+            FocusPaneLeft,
+            FocusPaneRight,
+            FocusPaneUp,
+            FocusPaneDown,
+            SplitPaneRight,
+            SplitPaneBelow,
+            TogglePaneZoom,
+            RemoveFocusedPane,
+            PaneGrowWidth,
+            PaneShrinkWidth,
+            PaneGrowHeight,
+            PaneShrinkHeight,
+            SwapPaneLeft,
+            SwapPaneRight,
+            SwapPaneUp,
+            SwapPaneDown,
+            MovePaneLeft,
+            MovePaneRight,
+            MovePaneUp,
+            MovePaneDown,
             OpenWorktrees,
             ToggleSidebar,
             HorizontalTabs,
@@ -494,7 +514,7 @@ fn every_static_palette_action_dispatches_once_by_mouse_and_keyboard(cx: &mut Te
     };
     assert_eq!(
         actions.len(),
-        10,
+        30,
         "new static actions need a dispatch probe"
     );
     for action in actions {
