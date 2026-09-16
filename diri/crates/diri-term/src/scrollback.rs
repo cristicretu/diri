@@ -290,24 +290,27 @@ impl ScrollbackViewport {
     }
 
     pub fn row_metadata(&self, buffer: &GridBuffer, row: i64) -> RowMetadata {
+        self.row_metadata_ref(buffer, row)
+            .cloned()
+            .unwrap_or_default()
+    }
+
+    pub fn row_graphemes<'a>(&'a self, buffer: &'a GridBuffer, row: i64) -> &'a [(u16, String)] {
+        self.row_metadata_ref(buffer, row)
+            .map_or(&[], |metadata| metadata.graphemes.as_slice())
+    }
+
+    fn row_metadata_ref<'a>(&'a self, buffer: &'a GridBuffer, row: i64) -> Option<&'a RowMetadata> {
         if let (Some(held), Some(start)) = (&self.held_live, self.held_live_start)
             && row >= start
             && row < start + i64::from(held.rows)
         {
-            return held
-                .annotations
-                .get((row - start) as usize)
-                .cloned()
-                .unwrap_or_default();
+            return held.annotations.get((row - start) as usize);
         }
         if row >= self.live_start_row {
-            buffer
-                .annotations
-                .get((row - self.live_start_row) as usize)
-                .cloned()
-                .unwrap_or_default()
+            buffer.annotations.get((row - self.live_start_row) as usize)
         } else {
-            self.annotations.get(&row).cloned().unwrap_or_default()
+            self.annotations.get(&row)
         }
     }
 
