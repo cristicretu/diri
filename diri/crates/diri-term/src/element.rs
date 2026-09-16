@@ -177,7 +177,13 @@ impl TerminalInputHandler {
         state.marked_text.clear();
         let enabled = state.enabled;
         drop(state);
-        if enabled {
+        // Native input is for committed printable/IME text. AppKit can still
+        // send a control character after dispatching a Command shortcut; in
+        // particular, Command-C may arrive as ETX, which would interrupt the
+        // foreground process if forwarded to the PTY. Control keys have their
+        // own key-down encoder, so dropping them here cannot remove a valid
+        // terminal command.
+        if enabled && !text.chars().any(char::is_control) {
             (self.text_input)(text);
         }
     }
@@ -2501,6 +2507,24 @@ mod link_tests {
 
         assert!(mutex_lock(&state).marked_range().is_none());
         assert_eq!(&*mutex_lock(&committed), &["你"]);
+    }
+
+    #[test]
+    fn native_text_commit_never_forwards_terminal_control_bytes() {
+        let committed = Arc::new(Mutex::new(Vec::<String>::new()));
+        let sink = Arc::clone(&committed);
+        let handler = TerminalInputHandler {
+            text_input: Arc::new(move |text| mutex_lock(&sink).push(text.to_owned())),
+            ime_state: Arc::new(Mutex::new(TerminalImeState::default())),
+            cursor_bounds: Bounds::new(point(px(0.0), px(0.0)), size(px(8.0), px(16.0))),
+            cell_width: px(8.0),
+        };
+
+        // AppKit may commit ETX after handling Command-C. ETX is Ctrl-C to a
+        // terminal, so it must never reach the live PTY through the IME path.
+        handler.commit_text("\u{3}");
+
+        assert!(mutex_lock(&committed).is_empty());
     }
 
     #[test]
