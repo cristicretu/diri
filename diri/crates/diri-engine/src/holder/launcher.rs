@@ -189,7 +189,16 @@ fn spawn_manager(executable_path: &Path, directory: &Path) -> HolderResult<()> {
         .name("holder-manager-reaper".into())
         .spawn(move || {
             let mut child = child;
-            let _ = child.wait();
+            let pid = child.id();
+            match child.wait() {
+                Ok(status) if !status.success() => {
+                    eprintln!("diri-engine: holder manager {pid} exited unexpectedly: {status}");
+                }
+                Err(error) => {
+                    eprintln!("diri-engine: holder manager {pid} wait failed: {error}");
+                }
+                _ => {}
+            }
         })
         .map_err(|error| HolderError::io("spawn reaper", error))?;
     Ok(())

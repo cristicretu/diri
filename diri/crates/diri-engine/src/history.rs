@@ -105,6 +105,47 @@ impl TrustedTranscript {
     pub(crate) fn latest_claude_title(&mut self) -> Option<String> {
         latest_claude_title_from(&mut self.file)
     }
+
+    pub(crate) fn is_codex_subagent(&mut self) -> bool {
+        codex_metadata_from(&mut self.file).is_some_and(|meta| meta.is_subagent())
+    }
+}
+
+/// Repair identities saved by older Engines that accepted a child's notify
+/// callback as the owning conversation. Follow only provider-declared parent
+/// links, validating every transcript against the profile, identity and cwd.
+pub(crate) fn codex_root_conversation(
+    profile: Option<&diri_proto::AgentAccountProfile>,
+    home: &Path,
+    agent_id: &str,
+    cwd: &str,
+    path: Option<&str>,
+) -> Option<(String, TrustedTranscript)> {
+    let mut transcript = path
+        .and_then(|path| {
+            validate_profile_transcript_path(
+                profile,
+                home,
+                &AgentKind::CODEX,
+                agent_id,
+                cwd,
+                Path::new(path),
+            )
+        })
+        .or_else(|| find_profile_codex_transcript(profile, home, agent_id, cwd))?;
+    let mut seen = HashSet::from([agent_id.to_owned()]);
+    for _ in 0..16 {
+        let metadata = codex_metadata_from(&mut transcript.file)?;
+        if !metadata.is_subagent() {
+            return (metadata.id != agent_id).then_some((metadata.id, transcript));
+        }
+        let parent = metadata.parent?;
+        if !seen.insert(parent.clone()) {
+            return None;
+        }
+        transcript = find_profile_codex_transcript(profile, home, &parent, cwd)?;
+    }
+    None
 }
 
 /// Scans both stores under `home`, newest first, skipping ids already tracked.
@@ -1093,7 +1134,11 @@ fn scan_codex(root: &Path) -> Vec<HistoryEntry> {
 
 fn codex_entry(path: &Path) -> Option<HistoryEntry> {
     let mut handle = open_regular_readonly(path)?;
-    let (id, cwd) = codex_identity_from(&mut handle)?;
+    let thread = codex_metadata_from(&mut handle)?;
+    if thread.is_subagent() {
+        return None;
+    }
+    let CodexMetadata { id, cwd, .. } = thread;
     let metadata = handle.metadata().ok()?;
 
     let modified = metadata.modified().unwrap_or(SystemTime::UNIX_EPOCH);
@@ -1113,6 +1158,24 @@ fn codex_entry(path: &Path) -> Option<HistoryEntry> {
 }
 
 fn codex_identity_from(handle: &mut File) -> Option<(String, String)> {
+    let metadata = codex_metadata_from(handle)?;
+    Some((metadata.id, metadata.cwd))
+}
+
+struct CodexMetadata {
+    id: String,
+    cwd: String,
+    subagent: bool,
+    parent: Option<String>,
+}
+
+impl CodexMetadata {
+    fn is_subagent(&self) -> bool {
+        self.subagent || self.parent.is_some()
+    }
+}
+
+fn codex_metadata_from(handle: &mut File) -> Option<CodexMetadata> {
     handle.seek(SeekFrom::Start(0)).ok()?;
     let first = read_first_line_from(handle, CODEX_FIRST_LINE_CAP)?;
     let object: Value = serde_json::from_str(&first).ok()?;
@@ -1125,7 +1188,26 @@ fn codex_identity_from(handle: &mut File) -> Option<(String, String)> {
     if cwd.is_empty() {
         return None;
     }
-    Some((id, cwd))
+    let source = payload.get("source");
+    let subagent = source.is_some_and(|source| {
+        source.get("subagent").is_some() || source.as_str() == Some("subagent")
+    });
+    let parent = payload
+        .get("parent_thread_id")
+        .and_then(Value::as_str)
+        .or_else(|| {
+            payload
+                .pointer("/source/subagent/thread_spawn/parent_thread_id")
+                .and_then(Value::as_str)
+        })
+        .map(str::to_owned);
+    // forked_from_id alone denotes a normal fork, which can resume directly.
+    Some(CodexMetadata {
+        id,
+        cwd,
+        subagent,
+        parent,
+    })
 }
 
 // MARK: Shared
@@ -1339,6 +1421,66 @@ mod tests {
             &claude_transcript("/tmp", "hello", None),
         );
         assert!(scan_roots(&claude, &temp.path().join("codex"), &[]).is_empty());
+    }
+
+    #[test]
+    fn codex_subagent_rollouts_are_not_resumable_history() {
+        let temp = tempfile::tempdir().unwrap();
+        let codex = temp.path().join("codex");
+        write(&codex.join("2026/09/15/rollout-now-child.jsonl"), &serde_json::json!({
+            "type": "session_meta", "payload": {
+                "id": "child", "cwd": "/tmp",
+                "source": {"subagent": {"thread_spawn": {"parent_thread_id": "parent", "depth": 1}}}
+            }
+        }).to_string());
+        assert!(scan_roots(&temp.path().join("claude"), &codex, &[]).is_empty());
+    }
+
+    #[test]
+    fn codex_root_repair_follows_nested_parents_but_not_forks_or_cycles() {
+        let home = tempfile::tempdir().unwrap();
+        let root = home.path().join(".codex/sessions/2026/09/15");
+        let write_thread = |id: &str, parent: Option<&str>, source: Value| {
+            write(
+                &root.join(format!("rollout-now-{id}.jsonl")),
+                &serde_json::json!({
+                    "type": "session_meta", "payload": {
+                        "id": id, "cwd": "/tmp", "source": source,
+                        "parent_thread_id": parent, "forked_from_id": "earlier"
+                    }
+                })
+                .to_string(),
+            );
+        };
+        write_thread("main", None, serde_json::json!("cli"));
+        write_thread("child", Some("main"), serde_json::json!("subagent"));
+        write_thread(
+            "grandchild",
+            None,
+            serde_json::json!({
+                "subagent": {"thread_spawn": {"parent_thread_id": "child"}}
+            }),
+        );
+        let resolve = |id| codex_root_conversation(None, home.path(), id, "/tmp", None);
+        assert_eq!(resolve("grandchild").unwrap().0, "main");
+        assert!(
+            resolve("main").is_none(),
+            "a normal fork must retain its own identity"
+        );
+        write_thread("child", Some("grandchild"), serde_json::json!("subagent"));
+        assert!(resolve("grandchild").is_none(), "cycles must fail closed");
+        write_thread("child", Some("missing"), serde_json::json!("subagent"));
+        assert!(
+            resolve("child").is_none(),
+            "missing parents must fail closed"
+        );
+        let entries = scan_roots(
+            &home.path().join("claude"),
+            &home.path().join(".codex/sessions"),
+            &[],
+        );
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].id, "main");
     }
 
     #[test]

@@ -161,6 +161,11 @@ impl Registry {
     /// ignored: treating it as a fresh install would make the next write
     /// overwrite every session record the user had.
     pub fn load(&mut self) -> std::io::Result<usize> {
+        let home = std::env::var_os("HOME").map(PathBuf::from);
+        self.load_with_home(home.as_deref())
+    }
+
+    fn load_with_home(&mut self, home: Option<&Path>) -> std::io::Result<usize> {
         let document = match self.state_file.read() {
             Ok(Some(document)) => document,
             Ok(None) => return Ok(0),
@@ -191,7 +196,13 @@ impl Registry {
                     })
                     .collect::<HashMap<_, _>>();
                 let mut locations = Vec::with_capacity(state.sessions.len());
+                let mut repaired = Vec::new();
                 for mut record in state.sessions {
+                    if let Some(home) = home
+                        && repair_codex_conversation(&mut record, home)
+                    {
+                        repaired.push(record.id.0.clone());
+                    }
                     record.remote_connection = None;
                     repair_persisted_agent_title(&mut record);
                     // Resolve the owning project before repairing its
@@ -207,6 +218,12 @@ impl Registry {
                 }
                 for (root, host) in locations {
                     self.ensure_session_project(&root, host.as_deref());
+                }
+                if !repaired.is_empty() {
+                    self.persist_now()?;
+                    for id in repaired {
+                        self.write_recovery_capsule(&self.records[&id])?;
+                    }
                 }
                 Ok(self.records.len())
             }
@@ -548,7 +565,13 @@ impl Registry {
             }
             let paths = HolderPaths::new(&holder.holders_dir, &session_id);
             let client = HolderClient::new(paths.socket());
-            let Ok(stat) = client.stat() else { continue };
+            let stat = match client.stat() {
+                Ok(stat) => stat,
+                Err(error) => {
+                    eprintln!("diri-engine: holder recovery {session_id}: stat failed: {error}");
+                    continue;
+                }
+            };
             if !stat.alive {
                 continue;
             }
@@ -563,7 +586,10 @@ impl Registry {
                 {
                     continue;
                 }
-                let recovered = recovered_record(capsule);
+                let mut recovered = recovered_record(capsule);
+                if let Some(home) = std::env::var_os("HOME") {
+                    repair_codex_conversation(&mut recovered, Path::new(&home));
+                }
                 self.ensure_session_project(&recovered.cwd, None);
                 self.records.insert(session_id.clone(), recovered);
                 true
@@ -619,7 +645,12 @@ impl Registry {
                     }
                     adopted.push(session_id);
                 }
-                Err(_) => continue,
+                Err(error) => {
+                    eprintln!(
+                        "diri-engine: holder recovery {session_id}: adoption failed: {error}"
+                    );
+                    continue;
+                }
             }
         }
         adopted
@@ -1090,6 +1121,17 @@ impl Registry {
                         .flatten()
                 })
         });
+        // Codex children inherit the parent's Diri notify command. Their
+        // thread IDs and prompts must never replace the owning conversation.
+        if self.records.get(id).is_some_and(|record| {
+            record.host.is_none() && record.effective_kind() == &AgentKind::CODEX
+        }) && meta.agent_session_id.is_some()
+            && transcript
+                .as_mut()
+                .is_none_or(|transcript| transcript.is_codex_subagent())
+        {
+            return false;
+        }
         let native_title = self.records.get(id).and_then(|record| {
             if record.host.is_some() || !accepts_native_title(record.title_source) {
                 return None;
@@ -1712,6 +1754,27 @@ fn fold_session_view(record: &mut SessionRecord, view: &SessionView) {
         record.title = title;
         record.title_source = TitleSource::FirstPrompt;
     }
+}
+
+fn repair_codex_conversation(record: &mut SessionRecord, home: &Path) -> bool {
+    if record.host.is_some() || record.effective_kind() != &AgentKind::CODEX {
+        return false;
+    }
+    let Some(agent_id) = record.agent_session_id.as_deref() else {
+        return false;
+    };
+    let Some((root_id, transcript)) = crate::history::codex_root_conversation(
+        record.account_profile.as_ref(),
+        home,
+        agent_id,
+        &record.cwd,
+        record.transcript_path.as_deref(),
+    ) else {
+        return false;
+    };
+    record.agent_session_id = Some(root_id);
+    record.transcript_path = Some(transcript.path().to_string_lossy().into_owned());
+    true
 }
 
 /// Removes terminal-brand decorations accidentally persisted as conversation
@@ -2646,6 +2709,92 @@ mod tests {
         let updated = registry.record("claude").expect("record");
         assert_eq!(updated.title, "Repair remote session recovery");
         assert_eq!(updated.title_source, TitleSource::AgentProvided);
+    }
+
+    #[test]
+    fn codex_subagent_notify_does_not_replace_the_parent_conversation() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join(".codex/sessions/2026/09/15");
+        std::fs::create_dir_all(&root).unwrap();
+        let parent = root.join("rollout-now-parent.jsonl");
+        std::fs::write(
+            &parent,
+            serde_json::json!({
+                "type": "session_meta", "payload": {
+                    "id": "parent", "cwd": "/tmp", "source": "cli"
+                }
+            })
+            .to_string(),
+        )
+        .unwrap();
+        std::fs::write(root.join("rollout-now-child.jsonl"), serde_json::json!({
+            "type": "session_meta", "payload": {
+                "id": "child", "cwd": "/tmp", "parent_thread_id": "parent",
+                "source": {"subagent": {"thread_spawn": {"parent_thread_id": "parent", "depth": 1}}}
+            }
+        }).to_string()).unwrap();
+        let mut registry = Registry::new(engine(), temp.path().join("state.json"));
+        let mut session = record("codex");
+        session.kind = AgentKind::CODEX;
+        session.agent_session_id = Some("parent".into());
+        session.transcript_path = Some(parent.to_string_lossy().into_owned());
+        registry.insert_record(session);
+        let (_, metadata) = crate::hooks::parse_codex_notify(&serde_json::json!({
+            "type": "agent-turn-complete", "thread-id": "child",
+            "input-messages": ["child task"]
+        }))
+        .unwrap();
+        registry.apply_hook_metadata_with_home("codex", &metadata, Some(temp.path()));
+        let updated = registry.record("codex").unwrap();
+        assert_eq!(updated.agent_session_id.as_deref(), Some("parent"));
+        assert_eq!(updated.transcript_path.as_deref(), parent.to_str());
+        assert_ne!(updated.title, "child task");
+
+        // An older Engine may already have persisted the child identity.
+        let mut damaged = updated;
+        damaged.agent_session_id = Some("child".into());
+        damaged.transcript_path = Some(
+            root.join("rollout-now-child.jsonl")
+                .to_string_lossy()
+                .into_owned(),
+        );
+        registry.insert_record(damaged);
+        registry.persist_now().unwrap();
+        let mut reloaded = Registry::new(engine(), temp.path().join("state.json"));
+        reloaded.load_with_home(Some(temp.path())).unwrap();
+        let mut damaged = reloaded.record("codex").unwrap();
+        assert_eq!(damaged.agent_session_id.as_deref(), Some("parent"));
+        assert_eq!(damaged.transcript_path.as_deref(), parent.to_str());
+        assert!(!repair_codex_conversation(&mut damaged, temp.path()));
+        let disk: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(temp.path().join("state.json")).unwrap())
+                .unwrap();
+        assert_eq!(disk["sessions"][0]["agentSessionID"], "parent");
+        assert_eq!(
+            reloaded
+                .recovery_store("codex")
+                .read_capsule()
+                .unwrap()
+                .unwrap()
+                .agent_session_id
+                .as_deref(),
+            Some("parent")
+        );
+
+        // A missing/unreadable rollout cannot prove that a new ID is a root.
+        let missing = crate::hooks::HookMetadata {
+            agent_session_id: Some("unverified-child".into()),
+            ..Default::default()
+        };
+        assert!(!reloaded.apply_hook_metadata_with_home("codex", &missing, Some(temp.path())));
+        assert_eq!(
+            reloaded
+                .record("codex")
+                .unwrap()
+                .agent_session_id
+                .as_deref(),
+            Some("parent")
+        );
     }
 
     #[test]
