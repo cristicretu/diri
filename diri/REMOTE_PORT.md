@@ -973,6 +973,64 @@ from the Helper/UDS gates and does not claim to measure real WAN latency.
 
 ## Desktop integration
 
+The Engine's local binary attachment hub encodes each publication once and
+shares it among bounded per-client output queues. Its existing one pump per
+Session owns nonblocking writes; the existing connection thread handles input
+with a readiness wait and preserves partial frame headers/bodies. No writer
+worker, remote attachment, or Helper protocol change is added. PTY draining
+remains independent of every local client.
+
+Ordinary queued frames retain at most 1 MiB and 64 frame references per sink.
+One larger valid frame (up to the existing 16 MiB protocol payload limit) may be
+queued with 64 bytes of mode/control overhead. Already-written prefixes still
+count toward retained allocation until their complete frame is released. The
+pump services each sink for at most 256 KiB or 1 ms per turn; it retries at 1 ms
+only while data remains pending. Empty queues use the existing GridWake sleep.
+A sink that exceeds its bound or makes no write progress for two seconds closes;
+the client reconnects and receives a FullSnapshot. Partial frames are never
+spliced with a replacement. Queueing seeds moves all socket I/O outside the
+Registry lock; pongs use the same ordered writer.
+
+The deterministic local regression stalls one client with a 1 KiB socket send
+buffer while another receives 40 interactive redraws. It requires active-reader
+p90 below 150 ms, validates fragmented input, and reconnects to a FullSnapshot
+with the same process identity. Queue tests verify exact partial-frame bytes,
+retained-byte bounds, overflow closure and the no-progress timeout. These are
+Engine-local tests, separate from the Helper/UDS and real SSH release gates.
+
+
+### Receive-only desktop previews
+
+A separate Engine-local first-line handshake, `{"preview":"SESSION","version":1}`,
+observes the Engine's existing terminal mirror. The strict request rejects mixed
+attach/preview fields and unsupported versions before normal attach dispatch.
+A matching versioned acknowledgement precedes the existing binary full grid,
+modes, and pushed diff frames. There is no fallback to a normal attachment.
+
+At most 16 preview connections are admitted per Engine. They share the bounded
+publisher above and do not count as governor visibility. Opening a preview does
+not wake, mark seen, persist, trigger the PR monitor, or refresh activity clocks.
+Input, mouse, resize, and scroll frames close the preview before session lookup;
+only Ping/Pong is accepted. Observing a remote mirror never opens another Helper
+channel or changes its controller lease. The deferred multiple-observer feature
+of the Remote Helper protocol remains deferred.
+
+The Rust client exposes `SessionPreview` with decoded receive-only chunks, a
+capacity-one queue, and cancellation on close/drop. Previews create no idle
+keepalive timer or deadline; local socket EOF reports peer closure. Backpressure never discards
+patches: a slow server queue closes and the caller must explicitly reconnect to
+a new full seed. Session exit remains an authoritative fact from the control stream. Transient
+remote connectivity is not yet projected there, so a remote preview must be
+labeled as the last received image; a preview socket is not proof the remote
+process is currently reachable. UI consumers subscribe only while their cards are visible
+and render every grid at its existing dimensions without resizing the PTY.
+
+Private-socket tests verify pushed updates without a desktop attach, the 16-client
+limit, rejected mutation and mixed handshakes, unchanged stopped process identity,
+geometry/hibernation/last-seen state, and prompt client cancellation with a full
+queue. These local observation checks do not replace real SSH release gates.
+
+
 While the desktop terminal is scrolled back, its renderer retains one local
 screen snapshot and preserves already fetched rows in its bounded 512-row
 history cache. This keeps Agent redraws and overlapping history replies from

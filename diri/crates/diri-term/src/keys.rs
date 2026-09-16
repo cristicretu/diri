@@ -750,4 +750,28 @@ mod paste_protection_tests {
         assert!(!bytes.contains(&3));
         assert!(!bytes.contains(&0));
     }
+
+    /// Issue #275: a clipboard payload that opens with the paste end-marker
+    /// (followed by a bare CR) must not be able to close the bracketed
+    /// envelope early and let the trailing bytes submit as if typed.
+    #[test]
+    fn embedded_end_marker_cannot_submit_without_enter() {
+        let bytes = paste("\x1b[201~printf x\r", true);
+
+        // The only end marker present is the real, outer one — at the very
+        // end of the buffer.
+        let end_marker_positions: Vec<usize> = bytes
+            .windows(6)
+            .enumerate()
+            .filter(|(_, window)| *window == b"\x1b[201~")
+            .map(|(index, _)| index)
+            .collect();
+        assert_eq!(end_marker_positions, vec![bytes.len() - 6]);
+        assert!(bytes.starts_with(b"\x1b[200~"));
+        assert!(bytes.ends_with(b"\x1b[201~"));
+
+        let interior = &bytes[6..bytes.len() - 6];
+        assert!(!interior.contains(&ESC));
+        assert_eq!(interior.iter().filter(|byte| **byte == b'\r').count(), 1);
+    }
 }

@@ -821,7 +821,7 @@ impl NavigationOverlay {
             let hosts = store.hosts().to_vec();
             let selected = store.selected_session().cloned();
             let default_host = store.default_spawn_host();
-            let actions = palette::actions_for_catalogs(
+            let mut actions = palette::actions_for_catalogs(
                 store.preferences().default_agent.clone(),
                 &projects,
                 &hosts,
@@ -829,6 +829,30 @@ impl NavigationOverlay {
                 default_host.as_deref(),
                 store.agent_catalogs(),
             );
+            let orientation = store.preferences().tab_orientation;
+            for action in &mut actions {
+                if let PaletteCommand::Action(command) = action.command {
+                    let current = matches!(
+                        (command, orientation),
+                        (
+                            CommandId::HorizontalTabs,
+                            crate::store::TabOrientation::Horizontal
+                        ) | (
+                            CommandId::VerticalTabs,
+                            crate::store::TabOrientation::Vertical
+                        )
+                    );
+                    if matches!(command, CommandId::HorizontalTabs | CommandId::VerticalTabs) {
+                        if current {
+                            action.detail = Some("Current".into());
+                        } else {
+                            action.shortcut =
+                                crate::commands::command(CommandId::ToggleTabOrientation)
+                                    .shortcut_label();
+                        }
+                    }
+                }
+            }
             let fingerprint = agent_actions_fingerprint(&store);
             (actions, store.ordered_sessions(), fingerprint)
         };
