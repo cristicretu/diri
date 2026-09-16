@@ -909,7 +909,7 @@ impl SessionSurfaces {
             .absolute()
             .inset_0()
             .size_full()
-            .bg(colors.background)
+            .bg(colors.work_surface())
             .occlude()
             .on_scroll_wheel(|_, _, cx| cx.stop_propagation())
             .on_click(cx.listener(|this, _, _, cx| {
@@ -1647,7 +1647,7 @@ impl SessionSurfaces {
             .relative()
             .size_full()
             .overflow_hidden()
-            .bg(colors.background);
+            .bg(colors.work_surface());
         if let Some(ScreenPreview::Ready(lines)) = self.screens.get(&id) {
             preview = preview.child(
                 div()
@@ -1723,7 +1723,7 @@ impl SessionSurfaces {
                 .size_full()
                 .items_center()
                 .justify_center()
-                .bg(colors.background)
+                .bg(colors.work_surface())
                 .opacity(0.60)
                 .child(
                     AgentLogo::new(ui_agent_kind(session.effective_kind()), logo_size, colors)

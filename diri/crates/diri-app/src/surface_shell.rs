@@ -2044,7 +2044,7 @@ impl UtilitySurfaces {
             .size_full()
             .pt(px(Metrics::TITLE_BAR))
             .overflow_hidden()
-            .bg(colors.background)
+            .bg(colors.work_surface())
             .flex()
             // Settings owns the workbench beside the sidebar. Clicking inside
             // still closes any open select before the clicked control handles

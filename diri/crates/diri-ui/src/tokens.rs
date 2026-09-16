@@ -239,7 +239,7 @@ impl SemanticColors {
     pub fn window_fill(self) -> Rgba {
         match self.material {
             Material::Opaque => self.background,
-            Material::Glass => self.background.alpha(self.glass_alpha(0.66, 0.74)),
+            Material::Glass => self.background.alpha(self.glass_alpha(0.60, 0.70)),
         }
     }
 
@@ -248,7 +248,7 @@ impl SemanticColors {
     pub fn work_surface(self) -> Rgba {
         match self.material {
             Material::Opaque => self.background,
-            Material::Glass => self.background.alpha(self.glass_alpha(0.78, 0.84)),
+            Material::Glass => self.background.alpha(self.glass_alpha(0.70, 0.80)),
         }
     }
 
@@ -298,7 +298,7 @@ impl SemanticColors {
     pub fn sidebar_surface(self) -> Rgba {
         match self.material {
             Material::Opaque => self.sidebar_surface,
-            Material::Glass => self.sidebar_surface.alpha(self.glass_alpha(0.62, 0.68)),
+            Material::Glass => self.sidebar_surface.alpha(self.glass_alpha(0.50, 0.60)),
         }
     }
 }

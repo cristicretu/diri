@@ -2833,7 +2833,7 @@ impl TerminalPane {
             .flex()
             .items_center()
             .justify_between()
-            .bg(colors.background)
+            .bg(colors.work_surface())
             .child(
                 div()
                     .min_w(px(0.0))
@@ -3546,7 +3546,7 @@ impl Render for TerminalPane {
                 .overflow_hidden()
                 .border_l_1()
                 .border_color(sidebar_colors.primary.alpha(0.08))
-                .bg(theme.background)
+                .bg(colors.work_surface())
                 .child(self.render_header(&session, sidebar_colors, cx));
             let mut terminal_surface = div()
                 .relative()
@@ -3588,7 +3588,7 @@ impl Render for TerminalPane {
                             .px(px(Metrics::TOOLBAR_EDGE_INSET))
                             .flex()
                             .items_center()
-                            .bg(theme.background)
+                            .bg(colors.work_surface())
                             .child(control),
                     )
                 })

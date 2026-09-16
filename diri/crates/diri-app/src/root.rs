@@ -3139,7 +3139,7 @@ impl RootView {
             .w_full()
             .h(px(card_height))
             .min_h(px(0.0))
-            .bg(terminal.background);
+            .bg(terminal.work_surface());
         if self.active_workspace.is_some() {
             let tab = {
                 let store = self.window_store.read().expect("store");
