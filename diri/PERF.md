@@ -1,5 +1,37 @@
 # diri performance record
 
+## A stalled desktop client cannot block another client (2026-09-15)
+
+The Engine-local AttachHub wrote each client's socket synchronously. A client
+that stopped reading could block the shared publisher indefinitely. A new
+private-socket test reproduces the baseline failure at its fourth redraw:
+the active reader times out after 750 ms, even while the PTY keeps draining.
+
+The existing one pump per Session now owns bounded nonblocking output queues.
+It encodes each frame once and shares it across sinks, preserves partial-frame
+offsets, and disconnects only an overflowing or stalled sink. There is no new
+writer thread. The initial seed is queued outside the Registry lock; pongs use
+the same ordered output. Normal drained connections keep the existing idle wait.
+
+Run `cargo test -p diri-engine --release --test attach -- --nocapture`. On a
+Mac16,5 with 36 GiB RAM, macOS 27.0 and Rust 1.97.1, the 80×24 fixture deliberately
+requests a 1 KiB socket send buffer and stalls the first reader. Forty redraws
+still reach the other reader: p50 32.98 ms, p90 51.43 ms, maximum 61.84 ms. The
+separate ordinary-input test has a 72 µs median across 101 turns. These measure
+arrival at the local client socket, not display presentation, SSH or an Agent's
+application latency. [Raw fixture samples](docs/perf/attach-output-2026-09-15.json)
+include the machine, command and sample values.
+
+Queue tests retain a 2 MiB frame through partial writes and verify exact bytes,
+mode-frame ordering and complete allocation release. Already-written prefixes
+remain included in the retained-byte count. Ordinary backlog is bounded to
+1 MiB/64 references; one larger valid frame permits only 64 additional bytes for
+modes/control until it drains. Overflow closes the stream instead of splicing a
+new frame into a partially transmitted one. A reconnect receives a FullSnapshot
+from the unchanged process. These are explicit queue-allocation bounds, not RSS
+or whole-application memory measurements.
+
+
 ## Stable reading during streaming redraws (2026-09-10)
 
 An absolute scroll anchor did not protect text still backed by the live grid.
