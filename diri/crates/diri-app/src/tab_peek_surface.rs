@@ -520,9 +520,7 @@ impl SessionSurfaces {
             .when(self.peek.visible(), |surface| surface.occlude())
             .opacity(self.peek.reveal())
             .overflow_hidden()
-            .bg(colors
-                .background
-                .alpha(if reduced { 1.0 } else { blend * 0.98 }))
+            .bg(colors.background.alpha(if reduced { 1.0 } else { blend }))
             .on_scroll_wheel(cx.listener(|this, _, _, cx| {
                 if this.peek.visible() {
                     cx.notify();
