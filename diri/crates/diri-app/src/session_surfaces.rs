@@ -24,6 +24,9 @@ use gpui::{
 #[path = "tab_peek_surface.rs"]
 mod tab_peek_surface;
 
+pub(crate) struct TabPeekActivated;
+impl gpui::EventEmitter<TabPeekActivated> for SessionSurfaces {}
+
 pub struct SessionSurfaces {
     peek: crate::tab_peek::TabPeek,
     peek_left: f32,
@@ -31,6 +34,7 @@ pub struct SessionSurfaces {
     peek_width: f32,
     peek_scroll: ScrollHandle,
     peek_previous_focus: Option<FocusHandle>,
+    live_previews: crate::tab_preview::PreviewSet<crate::tab_preview::LivePreview>,
     store: Arc<RwLock<SessionStore>>,
     focus_handle: FocusHandle,
     resident_previews: HashMap<SessionId, TerminalElement>,
@@ -84,6 +88,30 @@ fn overview_columns(width: f32) -> usize {
 }
 
 impl SessionSurfaces {
+    #[cfg(all(test, target_os = "macos"))]
+    pub(crate) fn configure_preview_fixture(
+        &mut self,
+        source: &crate::tab_preview::screenshot_fixture::Source,
+    ) {
+        self.client = Arc::new(diri_client::DaemonClient::with_socket_path(&source.socket));
+        self.tokio = Some(source.runtime.handle().clone());
+    }
+
+    #[cfg(all(test, target_os = "macos"))]
+    pub(crate) fn preview_fixture_states(
+        &self,
+    ) -> Vec<tokio::sync::watch::Receiver<crate::tab_preview::PreviewState>> {
+        self.peek
+            .sessions
+            .iter()
+            .filter_map(|id| {
+                self.live_previews
+                    .get(id)
+                    .map(|preview| preview.state.clone())
+            })
+            .collect()
+    }
+
     pub fn new(
         runtime: Arc<StoreRuntime>,
         tokio: Option<tokio::runtime::Handle>,
@@ -109,6 +137,7 @@ impl SessionSurfaces {
             peek_width: 0.0,
             peek_scroll: ScrollHandle::new(),
             peek_previous_focus: None,
+            live_previews: Default::default(),
             store: Arc::clone(&runtime.store),
             focus_handle: cx.focus_handle(),
             resident_previews: HashMap::new(),
@@ -174,7 +203,7 @@ impl SessionSurfaces {
     }
 
     pub(crate) fn dismiss(&mut self, cx: &mut Context<Self>) {
-        self.peek.dismiss();
+        self.dismiss_tab_peek();
         let mut store = self.store.write().expect("session store lock poisoned");
         store.cancel_switcher();
         store.dismiss_overview();
@@ -186,6 +215,9 @@ impl SessionSurfaces {
 impl Render for SessionSurfaces {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         self.sync_tab_peek_focus(window, cx);
+        if !self.peek.visible() {
+            self.live_previews.clear();
+        }
         let (overview_visible, switcher_visible) = {
             let store = self.store.read().expect("session store lock poisoned");
             (
@@ -1939,6 +1971,194 @@ mod tests {
             (grid.read().unwrap().cols, grid.read().unwrap().rows),
             (100, 40)
         );
+    }
+
+    #[gpui::test]
+    fn tab_peek_streams_inactive_cards_with_one_resident_and_drops_on_escape(
+        cx: &mut TestAppContext,
+    ) {
+        use crate::{tab_peek::GestureFrame, tab_preview::PreviewState};
+        use diri_proto::{
+            frames::{Frame, FrameCodec},
+            grid::GridUpdate,
+        };
+        use diri_term::buffer::GridBuffer;
+        use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
+        let directory = tempfile::tempdir().unwrap();
+        let socket = directory.path().join("preview.sock");
+        // GPUI's deterministic executor rejects wakes from foreign threads.
+        // Drive real socket tasks on this test thread while waiting for I/O.
+        let executor = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let listener = {
+            let _entered = executor.enter();
+            tokio::net::UnixListener::bind(&socket).unwrap()
+        };
+        let opened = Arc::new(AtomicUsize::new(0));
+        let closed = Arc::new(AtomicUsize::new(0));
+        let began = std::time::Instant::now();
+        let events = Arc::new(std::sync::Mutex::new(Vec::<(String, u128)>::new()));
+        let server_events = events.clone();
+        let server_opened = opened.clone();
+        let server_closed = closed.clone();
+        let server = executor.spawn(async move {
+            loop {
+                let (stream, _) = listener.accept().await.unwrap();
+                let opened = server_opened.clone();
+                let closed = server_closed.clone();
+                let events = server_events.clone();
+                tokio::spawn(async move {
+                    let mut stream = BufReader::new(stream);
+                    let mut line = String::new();
+                    stream.read_line(&mut line).await.unwrap();
+                    let request: serde_json::Value = serde_json::from_str(&line).unwrap();
+                    assert!(request.get("attach").is_none());
+                    assert_ne!(request["preview"], "running-00");
+                    let mut ack = serde_json::to_vec(&request).unwrap();
+                    ack.push(b'\n');
+                    stream.get_mut().write_all(&ack).await.unwrap();
+                    let update = GridUpdate {
+                        cols: 80,
+                        rows: 24,
+                        cursor_col: 0,
+                        cursor_row: 0,
+                        cursor_visible: false,
+                        is_full_snapshot: true,
+                        changed_rows: vec![],
+                    };
+                    stream
+                        .get_mut()
+                        .write_all(&FrameCodec::encode(&Frame::grid(&update).unwrap()).unwrap())
+                        .await
+                        .unwrap();
+                    events.lock().unwrap().push((
+                        format!("opened {}", request["preview"]),
+                        began.elapsed().as_micros(),
+                    ));
+                    opened.fetch_add(1, Ordering::SeqCst);
+                    let mut effects = Vec::new();
+                    stream.read_to_end(&mut effects).await.unwrap();
+                    assert!(effects.is_empty());
+                    events.lock().unwrap().push((
+                        format!("EOF {}", request["preview"]),
+                        began.elapsed().as_micros(),
+                    ));
+                    closed.fetch_add(1, Ordering::SeqCst);
+                });
+            }
+        });
+        let runtime = Arc::new(StoreRuntime::inert());
+        runtime.store.write().unwrap().hydrate(SessionListResult {
+            sessions: (0..4).map(session).collect(),
+            projects: vec![],
+        });
+        runtime.store.write().unwrap().select(session(0).id);
+        let store = runtime.store.clone();
+        let resident = Arc::new(RwLock::new(GridBuffer::new(100, 40)));
+        let original = resident.clone();
+        let handle = executor.handle().clone();
+        let (view, cx) = cx.add_window_view(move |_, cx| {
+            let surfaces = cx.new(|cx| {
+                let mut surfaces = SessionSurfaces::new(runtime, Some(handle), cx);
+                surfaces.client = Arc::new(diri_client::DaemonClient::with_socket_path(socket));
+                surfaces.set_resident_buffer(session(0).id, resident);
+                surfaces.tab_gesture(GestureFrame::Released(140.0), cx);
+                surfaces
+            });
+            OverviewHarness {
+                surfaces,
+                background_scrolls: Arc::new(AtomicUsize::new(0)),
+            }
+        });
+        cx.simulate_resize(size(px(1100.0), px(700.0)));
+        assert!(cx.debug_bounds("TAB_PEEK_CARD_0").is_some());
+        let surfaces = view.read_with(cx, |h, _| h.surfaces.clone());
+        let mut states: Vec<_> = surfaces.read_with(cx, |s, _| {
+            assert_eq!(s.resident_previews.len(), 1);
+            (1..4)
+                .map(|i| s.live_previews.get(&session(i).id).unwrap().state.clone())
+                .collect()
+        });
+        executor.block_on(async {
+            for state in &mut states {
+                tokio::time::timeout(std::time::Duration::from_secs(2), async {
+                    while *state.borrow() != PreviewState::Live {
+                        state.changed().await.unwrap();
+                    }
+                })
+                .await
+                .unwrap();
+            }
+        });
+        surfaces.read_with(cx, |s, _| {
+            for i in 1..4 {
+                let preview = s.live_previews.get(&session(i).id).unwrap();
+                assert_eq!(
+                    (preview.element.grid_cols(), preview.element.grid_rows()),
+                    (80, 24)
+                );
+            }
+        });
+        assert_eq!(opened.load(Ordering::SeqCst), 3);
+        assert_eq!(
+            store.read().unwrap().selected_session_id(),
+            Some(&session(0).id)
+        );
+        assert_eq!(
+            (original.read().unwrap().cols, original.read().unwrap().rows),
+            (100, 40)
+        );
+        // Moving two cards offscreen drops their sockets before dismissal.
+        events
+            .lock()
+            .unwrap()
+            .push(("resize begins".into(), began.elapsed().as_micros()));
+        cx.simulate_resize(size(px(250.0), px(700.0)));
+        assert!(cx.debug_bounds("TAB_PEEK_CARD_1").is_some());
+        assert!(cx.debug_bounds("TAB_PEEK_CARD_2").is_none());
+        surfaces.read_with(cx, |s, _| {
+            assert!(s.live_previews.get(&session(1).id).is_some());
+            assert!(s.live_previews.get(&session(2).id).is_none());
+            assert!(s.live_previews.get(&session(3).id).is_none());
+        });
+        events.lock().unwrap().push((
+            "slots retained running-01; dropped running-02/running-03".into(),
+            began.elapsed().as_micros(),
+        ));
+        executor.block_on(async {
+            tokio::time::timeout(std::time::Duration::from_secs(2), async {
+                while closed.load(Ordering::SeqCst) != 2 {
+                    tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+                }
+            })
+            .await
+            .unwrap_or_else(|error| {
+                panic!(
+                    "{error}: opened {}, closed {}; events (microseconds): {:?}",
+                    opened.load(Ordering::SeqCst),
+                    closed.load(Ordering::SeqCst),
+                    events.lock().unwrap()
+                )
+            });
+        });
+        cx.simulate_keystrokes("escape");
+        assert!(!surfaces.read_with(cx, |s, _| s.peek.visible()));
+        executor.block_on(async {
+            tokio::time::timeout(std::time::Duration::from_secs(2), async {
+                while closed.load(Ordering::SeqCst) != 3 {
+                    tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+                }
+            })
+            .await
+            .unwrap();
+        });
+        eprintln!(
+            "preview lifecycle (microseconds): {:?}",
+            events.lock().unwrap()
+        );
+        server.abort();
     }
 
     #[cfg(target_os = "macos")]

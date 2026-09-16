@@ -4698,15 +4698,13 @@ mod tests {
                         }
                         grid.changed_rows.push(row);
                     }
-                    let unicode_find = if scene == "find-unicode" {
+                    let find_fixture = if scene == "find-unicode" {
                         let mut screen = diri_engine::HeadlessScreen::new(80, 28);
                         screen.feed("$ printf 'Unicode terminal output'\r\n\r\n1  <界> cafe\u{301}\r\n2  A🙂B  cafe\u{301}\r\n\r\nSearch keeps wide glyphs and combining marks aligned with their cells.".as_bytes());
                         grid = screen.full_snapshot();
-                        Some(FindSnapshot::from(screen.scrollback()))
-                    } else {
-                        None
-                    };
-                    if scene.starts_with("find") && unicode_find.is_none() {
+                        let query = std::env::var("DIRI_QOL_QUERY").unwrap_or_else(|_| "e\u{301}".into());
+                        Some((query, FindSnapshot::from(screen.scrollback())))
+                    } else if scene.starts_with("find") {
                         for row in [0, 15] {
                             let mut cells = vec![GridCell::BLANK; 80];
                             for (cell, ch) in cells[(width as usize / 12).clamp(4, 60)..]
@@ -4718,38 +4716,27 @@ mod tests {
                             grid.changed_rows.retain(|changed| changed.y != row);
                             grid.changed_rows.push(ChangedRow::new(row, cells));
                         }
-                    }
+                        Some(("needle".into(), FindSnapshot {
+                            cols: 80,
+                            rows: 28,
+                            is_alt_screen: scene == "find-alt",
+                            ..find_snapshot(1)
+                        }))
+                    } else {
+                        None
+                    };
                     let resident = pane.residents.get_mut(&id).unwrap();
                     resident.element.apply_damage(grid);
-                    if let Some(snapshot) = unicode_find {
-                        let query = std::env::var("DIRI_QOL_QUERY").unwrap_or_else(|_| "e\u{301}".into());
+                    if let Some((query, snapshot)) = find_fixture {
                         let mut find = TerminalFindModel::default();
                         let request = due_find_request(&mut find, &query, Duration::ZERO);
                         let result = resident.element.prepare_find_search(&find, &request, snapshot).unwrap().run();
                         resident.element.apply_find_result(&mut find, result);
                         assert!(!find.matches().is_empty());
-                        resident.find_query.insert(&query);
-                        resident.element.sync_find_highlights(&find);
-                        resident.find = Some(find);
-                    } else if scene.starts_with("find") {
-                        let mut find = TerminalFindModel::default();
-                        let request = due_find_request(&mut find, "needle", Duration::ZERO);
-                        let snapshot = FindSnapshot {
-                            cols: 80,
-                            rows: 28,
-                            is_alt_screen: scene == "find-alt",
-                            ..find_snapshot(1)
-                        };
-                        let result = resident
-                            .element
-                            .prepare_find_search(&find, &request, snapshot)
-                            .unwrap()
-                            .run();
-                        resident.element.apply_find_result(&mut find, result);
                         if scene == "find-clear" {
                             resident.element.find_next(&mut find);
                         }
-                        resident.find_query.insert("needle");
+                        resident.find_query.insert(&query);
                         resident.element.sync_find_highlights(&find);
                         resident.find = Some(find);
                     }
