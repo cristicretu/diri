@@ -2948,13 +2948,6 @@ impl Sidebar {
                 colors.primary.alpha(0.0)
             })
             .when(selected, |row| row.shadow(Glass::shadows(colors)))
-            .opacity(if archived {
-                0.58
-            } else if hibernated {
-                0.74
-            } else {
-                1.0
-            })
             .cursor_pointer()
             // This row lives inside the sidebar's tracked focus target. Keep a
             // plain pointer press from entering keyboard-navigation mode; the
@@ -3110,7 +3103,13 @@ impl Sidebar {
                         hovered,
                         title_available_width,
                         Typo::ROW.size,
-                        colors.primary.alpha(if selected { 1.0 } else { 0.82 }),
+                        if selected {
+                            colors.primary
+                        } else if archived || hibernated {
+                            colors.secondary
+                        } else {
+                            colors.primary.alpha(0.90)
+                        },
                     )
                     .font_weight(Typo::ROW.weight)
                     .into_any_element()
@@ -3456,7 +3455,6 @@ impl Sidebar {
             .items_center()
             .gap(px(8.0))
             .rounded(px(SIDEBAR_ROW_RADIUS))
-            .opacity(if focused { 0.82 } else { 0.58 })
             .bg(if selected {
                 RowFill::Selected.color(colors)
             } else if hovered || focused {
@@ -3578,7 +3576,11 @@ impl Sidebar {
                     .overflow_hidden()
                     .text_ellipsis()
                     .text_size(px(Typo::ROW.size))
-                    .text_color(colors.primary.alpha(if selected { 1.0 } else { 0.82 }))
+                    .text_color(if selected {
+                        colors.primary
+                    } else {
+                        colors.secondary
+                    })
                     .child(title),
             )
             .into_any_element()
@@ -8057,7 +8059,11 @@ mod tests {
         fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
             div()
                 .size_full()
-                .bg(self.sidebar.read(_cx).colors().background)
+                .bg(std::env::var("DIRI_VISUAL_BACKDROP")
+                    .ok()
+                    .and_then(|hex| u32::from_str_radix(&hex, 16).ok())
+                    .map(gpui::rgb)
+                    .unwrap_or(self.sidebar.read(_cx).colors().background))
                 .child(
                     div()
                         .h_full()
@@ -9433,6 +9439,8 @@ mod tests {
     /// review without touching a running Diri instance. Set
     /// `DIRI_VISUAL_GROUPING=recency`, `DIRI_VISUAL_LIGHT=1`, or
     /// `DIRI_VISUAL_POPOVER=none` to select the state to capture.
+    /// `DIRI_VISUAL_BACKDROP=62616e` supplies a fixed RGB backdrop under glass;
+    /// headless rendering cannot capture the native desktop blur.
     #[cfg(target_os = "macos")]
     #[test]
     #[ignore = "writes a deterministic sidebar screenshot artifact"]
@@ -9492,6 +9500,11 @@ mod tests {
                             10.0 * 24.0 * 60.0 * 60.0 * 1_000.0,
                         ][index % 4];
                         session.updated_at = diri_proto::DateMillis(now - age);
+                        if std::env::var_os("DIRI_VISUAL_BACKDROP").is_some()
+                            && session.id == SessionId::new("preview-codex")
+                        {
+                            session.host = Some("Forge".into());
+                        }
                         store.upsert_session(session);
                     }
                     store

@@ -176,13 +176,13 @@ impl SemanticColors {
     pub const fn sidebar(appearance: Appearance) -> Self {
         match appearance {
             Appearance::Light => Self {
-                secondary: rgba_f32(0.0, 0.0, 0.0, 0.68),
-                tertiary: rgba_f32(0.0, 0.0, 0.0, 0.42),
+                secondary: rgba_f32(0.0, 0.0, 0.0, 0.86),
+                tertiary: rgba_f32(0.0, 0.0, 0.0, 0.78),
                 ..Self::light()
             },
             Appearance::Dark => Self {
-                secondary: rgba_f32(1.0, 1.0, 1.0, 0.70),
-                tertiary: rgba_f32(1.0, 1.0, 1.0, 0.44),
+                secondary: rgba_f32(1.0, 1.0, 1.0, 0.86),
+                tertiary: rgba_f32(1.0, 1.0, 1.0, 0.78),
                 ..Self::dark()
             },
         }
@@ -201,8 +201,8 @@ impl SemanticColors {
         floating_surface: Rgba,
         sidebar_tones: bool,
     ) -> Self {
-        let secondary_alpha = if sidebar_tones { 0.70 } else { 0.60 };
-        let tertiary_alpha = if sidebar_tones { 0.44 } else { 0.30 };
+        let secondary_alpha = if sidebar_tones { 0.86 } else { 0.60 };
+        let tertiary_alpha = if sidebar_tones { 0.78 } else { 0.30 };
         Self {
             appearance,
             primary: foreground,
@@ -332,7 +332,7 @@ impl Ink {
     pub fn working(kind: crate::AgentKind, semantic: SemanticColors) -> Rgba {
         match kind {
             crate::AgentKind::ClaudeCode => Palette::CLAY,
-            crate::AgentKind::Codex | crate::AgentKind::Cursor => semantic.primary.alpha(0.82),
+            crate::AgentKind::Codex | crate::AgentKind::Cursor => semantic.primary.alpha(0.96),
             crate::AgentKind::Gemini => Palette::GEMINI_BLUE,
             crate::AgentKind::Shell | crate::AgentKind::Generic => Self::GENERIC_WORKING,
         }
@@ -387,15 +387,15 @@ pub struct Glass;
 impl Glass {
     pub fn fill(colors: SemanticColors) -> Rgba {
         match colors.appearance {
-            Appearance::Dark => rgba_f32(1.0, 1.0, 1.0, 0.10),
-            Appearance::Light => rgba_f32(1.0, 1.0, 1.0, 0.55),
+            Appearance::Dark => rgba_f32(1.0, 1.0, 1.0, 0.18),
+            Appearance::Light => rgba_f32(1.0, 1.0, 1.0, 0.72),
         }
     }
 
     pub fn stroke(colors: SemanticColors) -> Rgba {
         match colors.appearance {
-            Appearance::Dark => rgba_f32(1.0, 1.0, 1.0, 0.06),
-            Appearance::Light => rgba_f32(0.0, 0.0, 0.0, 0.06),
+            Appearance::Dark => rgba_f32(1.0, 1.0, 1.0, 0.12),
+            Appearance::Light => rgba_f32(0.0, 0.0, 0.0, 0.12),
         }
     }
 

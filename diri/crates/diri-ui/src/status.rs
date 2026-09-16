@@ -157,9 +157,9 @@ fn static_status_color(kind: AgentKind, state: StatusState, colors: SemanticColo
         StatusState::NeedsInput { destructive: false } => Ink::ATTENTION,
         StatusState::NeedsInput { destructive: true } => Ink::DANGER,
         StatusState::DoneUnseen => Ink::FRESH,
-        StatusState::IdleSeen => colors.primary.alpha(0.42),
-        StatusState::None => colors.primary.alpha(0.28),
-        StatusState::Hibernated => colors.primary.alpha(0.36),
+        StatusState::IdleSeen => colors.secondary,
+        StatusState::None => colors.tertiary,
+        StatusState::Hibernated => colors.tertiary,
     }
 }
 
