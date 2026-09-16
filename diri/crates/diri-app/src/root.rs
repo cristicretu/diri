@@ -6255,8 +6255,8 @@ mod tests {
             root.run_command(CommandId::HorizontalTabs, window, cx)
         });
         cx.run_until_parked();
-        assert!(cx.debug_bounds("workspace-tab-build").is_some());
-        assert!(cx.debug_bounds("workspace-tab-review").is_some());
+        assert!(cx.debug_bounds("horizontal-tab-preview-claude").is_some());
+        assert!(cx.debug_bounds("horizontal-tab-preview-codex").is_some());
         assert_eq!(
             root.read_with(cx, |root, cx| root.active_terminal(cx).unwrap()),
             terminal
@@ -6266,7 +6266,7 @@ mod tests {
         });
         cx.run_until_parked();
         assert!(cx.debug_bounds("SESSION_preview-codex").is_some());
-        assert!(cx.debug_bounds("workspace-tab-build").is_none());
+        assert!(cx.debug_bounds("horizontal-tab-preview-claude").is_none());
         assert_eq!(
             root.read_with(cx, |root, cx| root.active_terminal(cx).unwrap()),
             terminal
