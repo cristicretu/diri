@@ -24,6 +24,7 @@ pub struct ChangedRenderRow {
     pub row: usize,
     pub generation: u64,
     pub cells: Vec<GridCell>,
+    pub graphemes: Vec<(u16, String)>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -188,6 +189,14 @@ impl GridBuffer {
                     row,
                     generation,
                     cells,
+                    graphemes: self.annotations.get(row).map_or_else(Vec::new, |metadata| {
+                        metadata
+                            .graphemes
+                            .iter()
+                            .take_while(|(col, _)| usize::from(*col) < col_count)
+                            .cloned()
+                            .collect()
+                    }),
                 });
                 *known = generation;
             }

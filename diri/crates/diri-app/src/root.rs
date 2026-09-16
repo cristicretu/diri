@@ -845,7 +845,7 @@ impl RootView {
                                 Ok(())
                                 | Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
                                     let buffers = terminal
-                                        .update(cx, |terminal, _| terminal.resident_buffers());
+                                        .update(cx, |terminal, cx| terminal.resident_buffers(cx));
                                     surfaces.update(cx, |surfaces, _| {
                                         surfaces.sync_resident_buffers(buffers);
                                     });
@@ -4591,6 +4591,8 @@ mod tests {
         let (root, cx) = cx.add_window_view(move |window, cx| {
             RootView::new(services, false, PreviewScenario::Empty, window, cx)
         });
+        root.update_in(cx, |_, window, _| window.activate_window());
+        cx.run_until_parked();
         let windowed = size(px(1000.0), px(700.0));
         cx.simulate_resize(windowed);
         cx.run_until_parked();
@@ -4661,6 +4663,8 @@ mod tests {
         let (root, cx) = cx.add_window_view(move |window, cx| {
             RootView::new(services, false, PreviewScenario::Empty, window, cx)
         });
+        root.update_in(cx, |_, window, _| window.activate_window());
+        cx.run_until_parked();
         let mut input = root.update(cx, |root, cx| {
             root.terminal
                 .as_ref()
@@ -5047,7 +5051,7 @@ mod tests {
                 }
                 let terminal = root.terminal.as_ref().unwrap();
                 terminal.update(cx, |terminal, cx| {
-                    terminal.seed_preview_grid_for_test(grid);
+                    terminal.seed_preview_grid_for_test(grid, cx);
                     cx.notify();
                 });
                 let buffers = terminal.read(cx).resident_preview_buffers();
