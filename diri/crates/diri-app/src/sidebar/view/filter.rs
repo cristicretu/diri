@@ -20,12 +20,6 @@ impl Sidebar {
                 // Editing does not activate a result. Arrow/Return enters the
                 // result list; a subsequent Return deliberately selects it.
                 self.focus_handle.focus(window, cx);
-                if self.workspace_nav.active.is_some() {
-                    self.focus_workspace_rows();
-                    cx.stop_propagation();
-                    cx.notify();
-                    return true;
-                }
                 let (rows, selected) = self.focus_rows_snapshot();
                 self.ui
                     .reconcile_focus_cursor(&focus_row_ids(&rows), selected.as_ref());

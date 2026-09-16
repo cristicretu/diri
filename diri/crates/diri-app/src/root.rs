@@ -509,9 +509,11 @@ impl RootView {
         }
         cx.subscribe_in(&sidebar, window, |this, _, event, window, cx| {
             if let SidebarEvent::WorkspaceActivated(id) = event {
+                this.sidebar.update(cx, |sidebar, _| sidebar.sync_focused_agent_selection());
                 this.activate_saved_workspace(id.clone(), window, cx);
             }
             if matches!(event, SidebarEvent::WorkspaceTabActivated) {
+                this.sidebar.update(cx, |sidebar, _| sidebar.sync_focused_agent_selection());
                 if let Some(workbench) = &this.workspace_workbench {
                     workbench.update(cx, |workbench, cx| workbench.focus(window, cx));
                 }
@@ -565,8 +567,15 @@ impl RootView {
                     launcher.update(cx, |launcher, cx| launcher.focus(window, cx));
                 });
             }
-            if matches!(event, SidebarEvent::SessionActivated) {
-                if this.active_workspace.is_some() {
+            if matches!(
+                event,
+                SidebarEvent::SessionActivated | SidebarEvent::ProjectLayoutUnavailable
+            ) {
+                let opening_project = matches!(event, SidebarEvent::SessionActivated)
+                    && this
+                        .sidebar
+                        .update(cx, |sidebar, cx| sidebar.open_selected_project_agent(cx));
+                if !opening_project && this.active_workspace.is_some() {
                     this.sidebar
                         .update(cx, |sidebar, cx| sidebar.activate_workspace(None, cx));
                     this.activate_saved_workspace(None, window, cx);
@@ -941,10 +950,17 @@ impl RootView {
                     Ok(()) | Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
                         if this
                             .update_in(cx, |this, window, cx| {
-                                this.window_store
-                                    .write()
-                                    .expect("store")
-                                    .accept_completed_launches(this.active_workspace.is_none());
+                                let launched = {
+                                    let mut store = this.window_store.write().expect("store");
+                                    let before = store.selected_session_id().cloned();
+                                    store.accept_completed_launches(true);
+                                    (store.selected_session_id() != before.as_ref())
+                                        .then(|| store.selected_session_id().cloned())
+                                        .flatten()
+                                };
+                                if let Some(id) = launched {
+                                    this.open_workspace_launch_session(id, window, cx);
+                                }
                                 let actions = this
                                     .window_store
                                     .write()
@@ -1425,6 +1441,7 @@ impl RootView {
                 )
                 .detach();
                 cx.observe_in(&workbench, window, |this, _, window, cx| {
+                    this.sidebar.update(cx, |sidebar, _| sidebar.sync_focused_agent_selection());
                     this.sync_inspector_context(cx);
                     this.sync_auxiliary_terminal(window, cx);
                     if let Some(surfaces) = &this.session_surfaces
@@ -3151,7 +3168,7 @@ impl RootView {
                     div()
                         .p(px(28.0))
                         .text_color(terminal.secondary)
-                        .child("Add a session to this workspace"),
+                        .child("Choose an agent from the sidebar, or start a New Agent"),
                 );
             }
         } else if self.preview && self.preview_scenario != PreviewScenario::Empty {

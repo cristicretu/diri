@@ -146,6 +146,7 @@ pub(crate) enum SidebarEvent {
     /// A plain click (or shortcut) selected a session: hand keyboard focus
     /// to its terminal surface so the user can type immediately.
     SessionActivated,
+    ProjectLayoutUnavailable,
     /// Escape left keyboard-navigation mode without changing the active
     /// session. Root owns the terminal entity, so it completes the handoff.
     FocusTerminal,
@@ -1177,12 +1178,6 @@ impl Sidebar {
         cx: &mut Context<Self>,
     ) {
         if self.workspace_key(event, window, cx) {
-            return;
-        }
-        if self.workspace_nav.active.is_some()
-            && self.focus_handle.is_focused(window)
-            && self.workspace_navigation_key(event, cx)
-        {
             return;
         }
         if self.filter_focus.is_focused(window) && self.handle_filter_key(event, window, cx) {
@@ -6166,7 +6161,9 @@ impl Sidebar {
     /// Selects the nth session (⌘1–⌘9 order, matching the row hints) and
     /// reports whether a session existed at that index.
     pub fn select_shortcut(&mut self, index: usize, cx: &mut Context<Self>) -> bool {
-        if self.workspace_nav.active.is_some() {
+        if self.workspace_nav.active.is_some()
+            && self.tab_orientation() == crate::store::TabOrientation::Horizontal
+        {
             return self.select_workspace_tab(index, cx);
         }
         self.commit_rename();
@@ -6192,11 +6189,12 @@ impl Sidebar {
     /// Selects the last session in sidebar order (⌘9, matching the browser
     /// convention where the last digit jumps to the final tab).
     pub fn select_last(&mut self, cx: &mut Context<Self>) -> bool {
-        if let Some(workspace) = self.workspace_record() {
-            return workspace
-                .tabs
-                .len()
-                .checked_sub(1)
+        if self.workspace_nav.active.is_some()
+            && self.tab_orientation() == crate::store::TabOrientation::Horizontal
+        {
+            return self
+                .workspace_record()
+                .and_then(|workspace| workspace.tabs.len().checked_sub(1))
                 .is_some_and(|index| self.select_workspace_tab(index, cx));
         }
         let count = self
@@ -6212,7 +6210,9 @@ impl Sidebar {
     /// ⌘←/⌘→), wrapping at both ends. Returns false when there are no
     /// sessions to move between.
     pub fn select_relative(&mut self, delta: isize, cx: &mut Context<Self>) -> bool {
-        if self.workspace_nav.active.is_some() {
+        if self.workspace_nav.active.is_some()
+            && self.tab_orientation() == crate::store::TabOrientation::Horizontal
+        {
             return self.relative_workspace_tab(delta, cx);
         }
         self.commit_rename();
@@ -6286,7 +6286,9 @@ impl Sidebar {
     /// other project, and one that crossed levels would silently re-parent a
     /// session, which is the daemon's call to make, not a keystroke's.
     pub fn reorder_selected(&mut self, delta: isize, cx: &mut Context<Self>) -> bool {
-        if self.workspace_nav.active.is_some() {
+        if self.workspace_nav.active.is_some()
+            && self.tab_orientation() == crate::store::TabOrientation::Horizontal
+        {
             return self.reorder_workspace_tab(delta, cx);
         }
         self.commit_rename();
@@ -6357,7 +6359,9 @@ impl Sidebar {
     /// ⌘R: start renaming the selected row inline, the same edit the context
     /// menu's "Rename…" opens. Returns false when nothing is selected.
     pub fn rename_selected(&mut self, window: &mut Window, cx: &mut Context<Self>) -> bool {
-        if self.workspace_nav.active.is_some() {
+        if self.workspace_nav.active.is_some()
+            && self.tab_orientation() == crate::store::TabOrientation::Horizontal
+        {
             return self.rename_workspace_tab(window, cx);
         }
         let selected = self
@@ -6376,14 +6380,6 @@ impl Sidebar {
     /// ⌥⇧⌘W: archive the selected session, where ⌘W removes it from the
     /// sidebar. Returns false when nothing is selected.
     pub fn archive_selected(&mut self, cx: &mut Context<Self>) -> bool {
-        if self.workspace_nav.active.is_some() {
-            if let Some(id) = self.workspace_focused_session() {
-                self.archive_sessions(vec![id]);
-                cx.notify();
-                return true;
-            }
-            return false;
-        }
         let selected = self
             .store
             .read()
@@ -6404,7 +6400,9 @@ impl Sidebar {
     /// false when nothing is selected so ⌘W falls through to closing the
     /// window.
     pub fn close_selected_now(&mut self, cx: &mut Context<Self>) -> bool {
-        if self.workspace_nav.active.is_some() {
+        if self.workspace_nav.active.is_some()
+            && self.tab_orientation() == crate::store::TabOrientation::Horizontal
+        {
             return self.remove_workspace_tab(cx);
         }
         let selected = self
@@ -6929,8 +6927,6 @@ impl Render for Sidebar {
             .child(self.top_bar(colors, cx));
         if let Some(nav) = self.settings_nav.clone() {
             root = root.child(self.settings_body(&nav, colors, cx));
-        } else if self.workspace_nav.active.is_some() {
-            root = root.child(self.workspace_body(colors, cx));
         } else {
             let mut body = div()
                 .relative()
@@ -6938,7 +6934,6 @@ impl Render for Sidebar {
                 .min_h(px(0.0))
                 .flex()
                 .flex_col()
-                .child(div().mx(px(10.0)).child(self.workspace_control(colors, cx)))
                 .child(self.new_agent_row(colors, cx));
             if projection.projects.is_empty() && !self.filter_query.text().trim().is_empty() {
                 body = body.child(

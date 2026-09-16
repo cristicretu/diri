@@ -7,13 +7,6 @@ pub(super) enum WorkspaceRowKey {
     Heading(WorkspaceId),
     Tab(WorkspaceId, TabId),
 }
-impl WorkspaceRowKey {
-    pub(super) fn workspace(&self) -> &WorkspaceId {
-        match self {
-            Self::Heading(id) | Self::Tab(id, _) => id,
-        }
-    }
-}
 
 pub(super) struct TabRow {
     pub id: TabId,
@@ -306,96 +299,6 @@ impl Sidebar {
                 cx.notify();
             }
         }
-    }
-
-    fn workspace_row_keys(&self) -> Vec<WorkspaceRowKey> {
-        let store = self.store.read().expect("store");
-        store
-            .workspace_catalog()
-            .snapshot()
-            .map(|snapshot| {
-                project_groups(snapshot, &store, self.filter_query.text())
-                    .iter()
-                    .flat_map(|group| group.row_keys())
-                    .collect()
-            })
-            .unwrap_or_default()
-    }
-
-    pub(crate) fn focus_workspace_rows(&mut self) {
-        let keys = self.workspace_row_keys();
-        if self
-            .workspace_nav
-            .cursor
-            .as_ref()
-            .is_none_or(|key| !keys.contains(key))
-        {
-            self.workspace_nav.cursor = self
-                .workspace_record()
-                .and_then(|workspace| {
-                    workspace
-                        .selected_tab
-                        .map(|tab| WorkspaceRowKey::Tab(workspace.id, tab))
-                })
-                .filter(|key| keys.contains(key))
-                .or_else(|| keys.first().cloned());
-        }
-        if let Some(index) = self
-            .workspace_nav
-            .cursor
-            .as_ref()
-            .and_then(|key| keys.iter().position(|row| row == key))
-        {
-            self.workspace_nav.vertical_scroll.scroll_to_item(index);
-        }
-    }
-
-    pub(crate) fn workspace_navigation_key(
-        &mut self,
-        event: &gpui::KeyDownEvent,
-        cx: &mut Context<Self>,
-    ) -> bool {
-        self.focus_workspace_rows();
-        let keys = self.workspace_row_keys();
-        let Some(current) = self.workspace_nav.cursor.clone() else {
-            return false;
-        };
-        match event.keystroke.key.as_str() {
-            "up" | "down" => {
-                let index = keys.iter().position(|key| key == &current).unwrap_or(0);
-                let next = if event.keystroke.key == "up" {
-                    index.saturating_sub(1)
-                } else {
-                    (index + 1).min(keys.len().saturating_sub(1))
-                };
-                self.workspace_nav.cursor = keys.get(next).cloned();
-                self.workspace_nav.vertical_scroll.scroll_to_item(next);
-            }
-            "left" | "right" => {
-                let id = current.workspace().clone();
-                let collapsed = self
-                    .store
-                    .read()
-                    .expect("store")
-                    .preferences()
-                    .sidebar_collapsed_workspaces
-                    .contains(&id);
-                if collapsed == (event.keystroke.key == "right") {
-                    self.toggle_workspace_collapsed(id, cx);
-                }
-            }
-            "enter" => match current {
-                WorkspaceRowKey::Heading(id) => self.activate_workspace(Some(id), cx),
-                WorkspaceRowKey::Tab(workspace, tab) => {
-                    self.request_workspace_tab(workspace, tab, cx)
-                }
-            },
-            "escape" => cx.emit(SidebarEvent::WorkspaceTabActivated),
-            _ => return false,
-        }
-        cx.stop_propagation();
-        cx.notify();
-        true
     }
 }
 
