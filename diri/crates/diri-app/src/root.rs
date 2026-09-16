@@ -4,6 +4,8 @@ mod peek_profile;
 #[cfg(all(test, target_os = "macos"))]
 mod window_navigation_tests;
 mod workspace_launches;
+#[cfg(all(test, target_os = "macos"))]
+mod workspace_palette_tests;
 
 use std::collections::HashSet;
 use std::sync::Arc;
@@ -481,6 +483,24 @@ impl RootView {
                 }
             })
             .detach();
+        }
+        if let Some(navigation) = &navigation {
+            cx.subscribe_in(
+                navigation,
+                window,
+                |this, _, command: &crate::palette_workspace::WorkspaceCommand, window, cx| {
+                    let handled = this.sidebar.update(cx, |sidebar, cx| {
+                        sidebar.run_workspace_palette(command.clone(), window, cx)
+                    });
+                    if !handled {
+                        this.show_quote_feedback(
+                            "Workspace changed",
+                            "The selected target is no longer available. Open the command palette to choose again.",
+                            cx,
+                        );
+                    }
+                },
+            ).detach();
         }
         cx.subscribe_in(&sidebar, window, |this, _, event, window, cx| {
             if let SidebarEvent::WorkspaceActivated(id) = event {

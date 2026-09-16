@@ -93,7 +93,10 @@ struct PageState {
     scroll: UniformListScrollHandle,
 }
 
+impl gpui::EventEmitter<crate::palette_workspace::WorkspaceCommand> for NavigationOverlay {}
+
 pub struct NavigationOverlay {
+    active_workspace: Option<diri_proto::workspace::WorkspaceId>,
     workspace_spawn_target: Option<crate::store::WorkspaceSpawnTarget>,
     focus_handle: FocusHandle,
     previous_focus_handle: Option<FocusHandle>,
@@ -142,8 +145,52 @@ pub struct NavigationOverlay {
 }
 
 impl NavigationOverlay {
+    #[cfg(all(test, target_os = "macos"))]
+    pub(crate) fn workspace_palette_for_test(
+        &mut self,
+        query: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Vec<PaletteAction> {
+        self.open_overlay(Overlay::CommandPalette, window, cx);
+        self.query.clear();
+        self.query.insert(query);
+        self.refresh_command_items();
+        cx.notify();
+        self.ranked_actions
+            .iter()
+            .map(|row| row.item.clone())
+            .collect()
+    }
+    #[cfg(all(test, target_os = "macos"))]
+    pub(crate) fn invoke_workspace_palette_for_test(
+        &mut self,
+        command: PaletteCommand,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.run_palette_command(command, window, cx);
+    }
+
     pub(crate) fn set_window_store(&mut self, store: crate::store::WindowStore) {
         self.store = store;
+    }
+
+    pub(crate) fn set_workspace_palette_context(
+        &mut self,
+        active: Option<diri_proto::workspace::WorkspaceId>,
+        cx: &mut Context<Self>,
+    ) {
+        if self.active_workspace == active {
+            return;
+        }
+        self.active_workspace = active;
+        if self.overlay == Some(Overlay::CommandPalette) {
+            let highlighted = self.highlighted_command();
+            self.refresh_command_items();
+            self.restore_highlight(highlighted.as_ref());
+            cx.notify();
+        }
     }
 
     pub(crate) fn set_workspace_spawn_target(
@@ -180,6 +227,7 @@ impl NavigationOverlay {
             }
         });
         let mut overlay = Self {
+            active_workspace: None,
             workspace_spawn_target: None,
             focus_handle,
             previous_focus_handle: None,
@@ -234,6 +282,7 @@ impl NavigationOverlay {
                 .unwrap(),
         );
         Self {
+            active_workspace: None,
             workspace_spawn_target: None,
             focus_handle: cx.focus_handle(),
             previous_focus_handle: None,
@@ -296,7 +345,11 @@ impl NavigationOverlay {
         if self.overlay == Some(Overlay::CommandPalette) {
             let fingerprint = {
                 let store = self.store.read().expect("session store lock poisoned");
-                palette_context_fingerprint(&store)
+                palette_context_fingerprint(
+                    &store,
+                    self.active_workspace.as_ref(),
+                    store.selected_session(),
+                )
             };
             if fingerprint != self.palette_context_fingerprint {
                 let highlighted = self.highlighted_command();
@@ -758,6 +811,10 @@ impl NavigationOverlay {
         cx: &mut Context<Self>,
     ) {
         match command {
+            PaletteCommand::Workspace(command) => {
+                self.close_overlay(window, cx);
+                cx.emit(command);
+            }
             PaletteCommand::Themes => self.push_page(Overlay::Themes, window, cx),
             PaletteCommand::Action(CommandId::ToggleQuickOpen) => {
                 self.push_page(Overlay::QuickOpen, window, cx)
@@ -847,6 +904,13 @@ impl NavigationOverlay {
                 default_host.as_deref(),
                 store.agent_catalogs(),
             );
+            actions.extend(crate::palette_workspace::actions(
+                store.workspace_catalog().snapshot(),
+                self.active_workspace.as_ref(),
+                selected.as_ref(),
+                store.sessions(),
+                store.workspace_catalog().can_edit(),
+            ));
             let orientation = store.preferences().tab_orientation;
             for action in &mut actions {
                 if let PaletteCommand::Action(command) = action.command {
@@ -871,7 +935,11 @@ impl NavigationOverlay {
                     }
                 }
             }
-            let fingerprint = palette_context_fingerprint(&store);
+            let fingerprint = palette_context_fingerprint(
+                &store,
+                self.active_workspace.as_ref(),
+                store.selected_session(),
+            );
             (actions, store.ordered_sessions(), fingerprint)
         };
         self.palette_context_fingerprint = fingerprint;
@@ -1477,13 +1545,23 @@ impl NavigationOverlay {
                     CommandId::ToggleQuickOpen | CommandId::ToggleHistory | CommandId::OpenSettings
                 )
         );
-        let trailing = action
-            .detail
-            .clone()
-            .map(SharedString::from)
-            .or_else(|| action.shortcut.map(SharedString::from))
-            .into_iter()
-            .collect();
+        let trailing = if matches!(command, PaletteCommand::Workspace(_)) {
+            action
+                .detail
+                .clone()
+                .into_iter()
+                .chain(action.shortcut)
+                .map(SharedString::from)
+                .collect()
+        } else {
+            action
+                .detail
+                .clone()
+                .or(action.shortcut)
+                .into_iter()
+                .map(SharedString::from)
+                .collect()
+        };
         palette_row(
             highlighted_label(action.title, &ranked.title_matches),
             sf_symbol(action.system_image, 12.5, colors.secondary),
@@ -1808,6 +1886,9 @@ fn palette_row(
 
 fn shortcut_hint(text: impl Into<gpui::SharedString>, colors: SemanticColors) -> AnyElement {
     div()
+        .max_w(px(160.0))
+        .overflow_hidden()
+        .text_ellipsis()
         .px(px(5.0))
         .py(px(2.0))
         .text_size(px(11.0))
@@ -1816,8 +1897,22 @@ fn shortcut_hint(text: impl Into<gpui::SharedString>, colors: SemanticColors) ->
         .into_any_element()
 }
 
-fn palette_context_fingerprint(store: &SessionStore) -> u64 {
+fn palette_context_fingerprint(
+    store: &SessionStore,
+    workspace: Option<&diri_proto::workspace::WorkspaceId>,
+    selected: Option<&SessionRecord>,
+) -> u64 {
     let mut hasher = DefaultHasher::new();
+    workspace.hash(&mut hasher);
+    selected
+        .map(|session| (&session.id, &session.title))
+        .hash(&mut hasher);
+    store
+        .workspace_catalog()
+        .snapshot()
+        .map(|snapshot| snapshot.revision)
+        .hash(&mut hasher);
+    store.workspace_catalog().can_edit().hash(&mut hasher);
     std::mem::discriminant(&store.preferences().tab_orientation).hash(&mut hasher);
     store.preferences().shortcut_overrides.hash(&mut hasher);
     store.preferences().default_agent.id().hash(&mut hasher);

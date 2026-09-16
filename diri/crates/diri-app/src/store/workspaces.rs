@@ -23,7 +23,8 @@ pub struct WorkspaceCatalog {
     editing: bool,
     announced_revision: u64,
     pub error: Option<String>,
-    pub created_workspace: Option<diri_proto::workspace::WorkspaceId>,
+    pub created_workspace: Option<(u64, diri_proto::workspace::WorkspaceId)>,
+    pub create_request_id: u64,
     creating: bool,
 }
 
@@ -41,6 +42,7 @@ impl Default for WorkspaceCatalog {
             announced_revision: 0,
             error: None,
             created_workspace: None,
+            create_request_id: 0,
             creating: false,
         }
     }
@@ -151,6 +153,9 @@ impl SessionStore {
         };
         catalog.editing = true;
         catalog.creating = matches!(&params.mutation, WorkspaceMutation::CreateWorkspace { .. });
+        if catalog.creating {
+            catalog.create_request_id = catalog.create_request_id.wrapping_add(1);
+        }
         catalog.created_workspace = None;
         catalog.error = None;
         let generation = catalog.generation;
@@ -186,7 +191,7 @@ impl SessionStore {
                     catalog.created_workspace = snapshot
                         .workspaces
                         .last()
-                        .map(|workspace| workspace.id.clone());
+                        .map(|workspace| (catalog.create_request_id, workspace.id.clone()));
                 }
                 // Within one connection a delayed response cannot roll back
                 // newer event/mutation state. Reconnect hydration is allowed
@@ -322,6 +327,58 @@ mod tests {
             store.workspace_catalog().snapshot().unwrap().revision,
             2,
             "new Engine replaces a read-only prior cache"
+        );
+    }
+
+    #[test]
+    fn creation_results_carry_the_admitted_request_identity() {
+        let (mut store, _, generation) = connected();
+        store.finish_workspace_request(generation, false, Ok(snapshot(0)));
+        let mut state = snapshot(1);
+        assert!(store.edit_workspace(WorkspaceMutation::CreateWorkspace {
+            name: "First".into()
+        }));
+        let first = store.workspace_catalog().create_request_id;
+        state
+            .workspaces
+            .push(diri_proto::workspace::WorkspaceRecord {
+                id: diri_proto::workspace::WorkspaceId::new("first"),
+                name: "First".into(),
+                tabs: vec![],
+                selected_tab: None,
+            });
+        store.finish_workspace_request(generation, true, Ok(state.clone()));
+        assert_eq!(
+            store
+                .workspace_catalog()
+                .created_workspace
+                .as_ref()
+                .map(|(request, id)| (*request, id.0.as_str())),
+            Some((first, "first"))
+        );
+        assert!(store.edit_workspace(WorkspaceMutation::CreateWorkspace {
+            name: "Second".into()
+        }));
+        let second = store.workspace_catalog().create_request_id;
+        assert_ne!(first, second);
+        assert!(store.workspace_catalog().created_workspace.is_none());
+        state.revision += 1;
+        state
+            .workspaces
+            .push(diri_proto::workspace::WorkspaceRecord {
+                id: diri_proto::workspace::WorkspaceId::new("second"),
+                name: "Second".into(),
+                tabs: vec![],
+                selected_tab: None,
+            });
+        store.finish_workspace_request(generation, true, Ok(state));
+        assert_eq!(
+            store
+                .workspace_catalog()
+                .created_workspace
+                .as_ref()
+                .map(|(request, id)| (*request, id.0.as_str())),
+            Some((second, "second"))
         );
     }
 

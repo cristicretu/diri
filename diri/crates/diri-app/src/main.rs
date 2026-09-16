@@ -31,6 +31,7 @@ mod notification_feed;
 pub mod notifications;
 pub mod palette;
 mod palette_chrome;
+mod palette_workspace;
 mod peek_settle;
 mod phone_access;
 mod platform;
