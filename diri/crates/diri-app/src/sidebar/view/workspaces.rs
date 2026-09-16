@@ -534,67 +534,6 @@ impl Sidebar {
         cx.notify();
     }
 
-    pub(super) fn workspace_control(
-        &self,
-        colors: SemanticColors,
-        cx: &mut Context<Self>,
-    ) -> AnyElement {
-        let label = self
-            .workspace_nav
-            .active
-            .as_ref()
-            .and_then(|id| {
-                self.store
-                    .read()
-                    .expect("store")
-                    .workspace_catalog()
-                    .snapshot()
-                    .and_then(|snapshot| {
-                        snapshot
-                            .workspaces
-                            .iter()
-                            .find(|workspace| &workspace.id == id)
-                    })
-                    .map(|workspace| workspace.name.clone())
-            })
-            .unwrap_or_else(|| "Projects".into());
-        div()
-            .id("workspace-picker")
-            .debug_selector(|| "workspace-picker".into())
-            .role(Role::Button)
-            .aria_label("Choose project layout")
-            .h(px(30.0))
-            .px(px(9.0))
-            .flex()
-            .items_center()
-            .gap(px(7.0))
-            .min_w(px(0.0))
-            .rounded(px(7.0))
-            .cursor_pointer()
-            .hover(move |row| row.bg(colors.primary.alpha(0.06)))
-            .child(sf_symbol("square.stack.3d.up", 12.0, colors.secondary))
-            .child(
-                div()
-                    .flex_1()
-                    .min_w(px(0.0))
-                    .overflow_hidden()
-                    .text_ellipsis()
-                    .text_size(px(Typo::META.size))
-                    .child(label),
-            )
-            .child(sf_symbol("chevron.down", 8.0, colors.tertiary))
-            .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
-            .on_click(cx.listener(|this, _, window, cx| {
-                this.workspace_nav.menu = !this.workspace_nav.menu;
-                this.workspace_nav.query.clear();
-                this.workspace_nav.editor = None;
-                this.workspace_nav.destination = None;
-                this.workspace_nav.focus.focus(window, cx);
-                this.peek(window, cx);
-                cx.notify();
-            }))
-            .into_any_element()
-    }
     pub(super) fn workspace_record(&self) -> Option<WorkspaceRecord> {
         let id = self.workspace_nav.active.as_ref()?;
         self.store
@@ -1373,12 +1312,7 @@ impl Sidebar {
             .border_b_1()
             .border_color(colors.primary.alpha(0.07))
             .bg(colors.sidebar_surface())
-            .child(
-                div()
-                    .w(px(150.0))
-                    .flex_none()
-                    .child(self.workspace_control(colors, cx)),
-            )
+            .child(self.project_control(colors, cx))
             .child(self.workspace_rows(true, colors, cx))
             .child(
                 div()
@@ -1392,9 +1326,10 @@ impl Sidebar {
                     .justify_center()
                     .cursor_pointer()
                     .child(sf_symbol("plus", 12.0, colors.secondary))
-                    .on_click(|_, window, cx| {
-                        window.dispatch_action(Box::new(crate::commands::NewDefaultSession), cx);
-                    }),
+                    .on_click(cx.listener(|this, event: &gpui::ClickEvent, window, cx| {
+                        this.open_header_new_agent(event.position(), window, cx);
+                        cx.stop_propagation();
+                    })),
             )
             .into_any_element()
     }

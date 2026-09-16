@@ -509,6 +509,12 @@ impl RootView {
                 },
             ).detach();
         }
+        cx.observe(&sidebar, |_, sidebar, cx| {
+            if sidebar.read(cx).project_picker_active() {
+                cx.notify();
+            }
+        })
+        .detach();
         cx.subscribe_in(&sidebar, window, |this, _, event, window, cx| {
             if let SidebarEvent::WorkspaceActivated(id) = event {
                 this.sidebar
@@ -1942,7 +1948,7 @@ impl RootView {
     /// mutations of RootView's child modules.
     fn run_command(&mut self, command: CommandId, window: &mut Window, cx: &mut Context<Self>) {
         if let Some(command) = crate::workspace_workbench::PaneCommand::from_id(command) {
-            if self.sidebar.read(cx).workspace_menu_is_open()
+            if (self.sidebar.read(cx).workspace_menu_is_open() || self.sidebar.read(cx).project_picker_active())
                 || self.launcher.read(cx).is_open()
                 || self
                     .navigation
@@ -4512,7 +4518,11 @@ impl Render for RootView {
         // This overlay never participates in the terminal's flex layout or
         // viewport sizing. Keep it below dialogs and above workbench content.
         root = root.child(sidebar_wrapper).children(peek_pointer_tracking);
-        if !sidebar_visible && seam == 0.0 && exposed == 0.0 && panel_width == 0.0 {
+        root = root.children(self.sidebar.update(cx, |sidebar, cx| {
+            sidebar.render_project_picker_overlay(window, cx)
+        }));
+        if !sidebar_visible && seam == 0.0 && exposed == 0.0 && panel_width == 0.0
+            && !self.sidebar.read(cx).project_picker_active() {
             root = root.child(
                 div()
                     .id("sidebar-peek-edge")
@@ -4881,12 +4891,13 @@ mod tests {
         assert_eq!(horizontal.y, crate::tab_navigation::TAB_STRIP_HEIGHT);
         let picker = cx.debug_bounds("horizontal-tab-project").unwrap();
         cx.simulate_click(picker.center(), Modifiers::default());
+        assert!(cx.debug_bounds("project-picker-popup").is_some());
         cx.executor().advance_clock(Duration::from_millis(300));
         cx.run_until_parked();
         root.read_with(cx, |root, cx| {
             assert!(
-                root.sidebar.read(cx).is_peeking(),
-                "keyboard project picker remains open"
+                !root.sidebar.read(cx).is_peeking(),
+                "project dropdown never reveals the sidebar"
             );
             assert_eq!(
                 entity.read(cx).geometry_for_test().0.unwrap(),

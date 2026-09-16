@@ -1,4 +1,5 @@
 mod filter;
+mod project_picker;
 mod tabs;
 mod workspaces;
 
@@ -129,6 +130,8 @@ enum HorizontalFocusAction {
 pub(crate) enum SidebarEvent {
     WorkspaceActivated(Option<diri_proto::workspace::WorkspaceId>),
     WorkspaceTabActivated,
+    /// Root-mounted header popup visibility changed; no sidebar layout change.
+    ProjectPickerChanged,
     RefreshUsageLimits,
     ContinueAccount(SessionId),
     VisibilityChanged,
@@ -235,6 +238,7 @@ impl Render for DragPreview {
 
 pub struct Sidebar {
     workspace_nav: workspaces::WorkspaceNavigation,
+    project_picker: project_picker::ProjectPicker,
     store: crate::store::WindowStore,
     // Preview stores have no daemon adapter, so retain their effect receiver.
     _preview_effects: Option<mpsc::UnboundedReceiver<StoreEffect>>,
@@ -406,6 +410,7 @@ impl Sidebar {
             last_tab_selection: None,
             last_tab_available_width: 0.0,
             workspace_nav: workspaces::WorkspaceNavigation::new(cx, active_workspace),
+            project_picker: project_picker::ProjectPicker::new(cx),
             filter_query: Default::default(),
             filter_open: false,
             filter_focus: cx.focus_handle(),
@@ -6991,7 +6996,9 @@ impl Render for Sidebar {
                     .bg(colors.sidebar_stroke()),
             )
         });
-        if let Some(popover) = self.popover(colors, window, cx) {
+        if !self.project_picker.new_agent
+            && let Some(popover) = self.popover(colors, window, cx)
+        {
             root = root.child(popover);
         }
         if let Some(menu) = self.workspace_popup(colors, cx) {

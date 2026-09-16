@@ -205,43 +205,7 @@ impl Sidebar {
             .border_color(colors.primary.alpha(0.07))
             .bg(colors.sidebar_surface())
             .text_color(colors.primary)
-            .child(
-                div()
-                    .w(px(120.0))
-                    .flex_none()
-                    .child(self.workspace_control(colors, cx)),
-            )
-            .child(
-                div()
-                    .id("horizontal-tab-project")
-                    .debug_selector(|| "horizontal-tab-project".into())
-                    .role(Role::Button)
-                    .aria_label(format!("Browse projects, current project {}", tabs.label))
-                    .h(px(30.0))
-                    .max_w(px(140.0))
-                    .px(px(8.0))
-                    .flex_none()
-                    .flex()
-                    .items_center()
-                    .gap(px(6.0))
-                    .rounded(px(SIDEBAR_ROW_RADIUS))
-                    .cursor_pointer()
-                    .hover(move |row| row.bg(colors.primary.alpha(0.06)))
-                    .child(
-                        div()
-                            .min_w(px(0.0))
-                            .overflow_hidden()
-                            .text_ellipsis()
-                            .text_size(px(Typo::META.size))
-                            .child(tabs.label),
-                    )
-                    .child(sf_symbol("chevron.down", 8.0, colors.tertiary))
-                    .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
-                    .on_click(cx.listener(|this, _, window, cx| {
-                        this.peek(window, cx);
-                        this.focus_handle.focus(window, cx);
-                    })),
-            )
+            .child(self.project_control(colors, cx))
             .child(rows)
             .child(
                 div()
