@@ -4771,6 +4771,192 @@ mod tests {
     use crate::sidebar::{PreviewScenario, SidebarPreviewFixture};
     use gpui::{Modifiers, point, size};
 
+    fn workspace_cpu_fixture() -> (Arc<AppServices>, diri_proto::workspace::WorkspaceId) {
+        use diri_proto::workspace::*;
+        let services = test_services();
+        let workspace = WorkspaceId::new("cpu-workspace");
+        let tab = TabId::new("cpu-tab");
+        let pane = PaneId::new("cpu-pane");
+        {
+            let mut store = services.store.store.write().unwrap();
+            store.hydrate(SidebarPreviewFixture::make(PreviewScenario::Typical).list);
+            store.seed_workspace_snapshot_for_test(WorkspaceSnapshot {
+                revision: 1,
+                workspaces: vec![WorkspaceRecord {
+                    project_id: None,
+                    id: workspace.clone(),
+                    name: "CPU fixture".into(),
+                    selected_tab: Some(tab.clone()),
+                    tabs: vec![WorkspaceTab {
+                        id: tab,
+                        title: None,
+                        focused_pane: pane.clone(),
+                        zoomed_pane: None,
+                        layout: LayoutNode::Pane {
+                            id: pane,
+                            session_id: SessionId::new("preview-claude"),
+                        },
+                    }],
+                }],
+                ..Default::default()
+            });
+        }
+        (services, workspace)
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    #[ignore = "headless Metal CPU comparison; run explicitly on macOS"]
+    fn workspace_sidebar_redraw_cpu() {
+        use gpui::HeadlessAppContext;
+        let platform = gpui_platform::current_platform(true);
+        let mut cx = HeadlessAppContext::with_platform(
+            platform.text_system(),
+            Arc::new(diri_ui::IconAssets),
+            gpui_platform::current_headless_renderer,
+        );
+        cx.update(|cx| {
+            crate::fonts::init(cx);
+            cx.set_reduce_motion(true);
+        });
+        let (services, workspace) = workspace_cpu_fixture();
+        let window = cx
+            .open_window(size(px(1600.0), px(1000.0)), |window, cx| {
+                cx.new(|cx| {
+                    let root = RootView::new(services, false, PreviewScenario::Empty, window, cx);
+                    root.sidebar.update(cx, |sidebar, cx| {
+                        sidebar.activate_workspace(Some(workspace), cx)
+                    });
+                    root
+                })
+            })
+            .unwrap();
+        cx.run_until_parked();
+        let (sidebar, terminal) = cx
+            .update_window(window.into(), |root, _, cx| {
+                let root = root.downcast::<RootView>().unwrap();
+                let root = root.read(cx);
+                (
+                    root.sidebar.clone(),
+                    root.workspace_workbench
+                        .as_ref()
+                        .unwrap()
+                        .read(cx)
+                        .focused_terminal()
+                        .unwrap(),
+                )
+            })
+            .unwrap();
+        cx.update(|cx| {
+            terminal.update(cx, |terminal, cx| {
+                let mut grid = diri_term::buffer::GridBuffer::new(160, 50);
+                for (index, cell) in grid.cells.iter_mut().enumerate() {
+                    cell.scalar = u32::from(b'a' + (index % 26) as u8);
+                }
+                terminal.seed_preview_grid_for_test(grid, cx);
+                cx.notify();
+            })
+        });
+        cx.run_until_parked();
+        cx.capture_screenshot(window.into()).unwrap();
+        for _ in 0..20 {
+            cx.update(|cx| sidebar.update(cx, |_, cx| cx.notify()));
+            cx.run_until_parked();
+        }
+        let before = cx.update(|cx| terminal.read(cx).render_count);
+        fn cpu_seconds() -> f64 {
+            let mut usage = std::mem::MaybeUninit::<libc::rusage>::uninit();
+            assert_eq!(
+                unsafe { libc::getrusage(libc::RUSAGE_SELF, usage.as_mut_ptr()) },
+                0
+            );
+            let usage = unsafe { usage.assume_init() };
+            usage.ru_utime.tv_sec as f64
+                + usage.ru_utime.tv_usec as f64 / 1e6
+                + usage.ru_stime.tv_sec as f64
+                + usage.ru_stime.tv_usec as f64 / 1e6
+        }
+        let start_cpu = cpu_seconds();
+        let start = Instant::now();
+        for _ in 0..200 {
+            cx.update(|cx| sidebar.update(cx, |_, cx| cx.notify()));
+            cx.run_until_parked();
+        }
+        let cpu = cpu_seconds() - start_cpu;
+        let wall = start.elapsed();
+        let renders = cx.update(|cx| terminal.read(cx).render_count) - before;
+        eprintln!(
+            "workspace-sidebar-cpu: updates=200 terminal_renders={renders} cpu_ms_per_update={:.3} wall_ms_per_update={:.3}",
+            cpu * 1000.0 / 200.0,
+            wall.as_secs_f64() * 1000.0 / 200.0
+        );
+        if let Ok(output) = std::env::var("DIRI_REDRAW_SCREENSHOT") {
+            cx.capture_screenshot(window.into())
+                .unwrap()
+                .save(output)
+                .unwrap();
+        }
+        cx.update_window(window.into(), |_, window, _| window.remove_window())
+            .unwrap();
+        cx.run_until_parked();
+    }
+
+    #[gpui::test]
+    fn sidebar_updates_do_not_render_unchanged_workspace_terminal(cx: &mut gpui::TestAppContext) {
+        let (services, workspace) = workspace_cpu_fixture();
+        let (root, cx) = cx.add_window_view(move |window, cx| {
+            let root = RootView::new(services, false, PreviewScenario::Empty, window, cx);
+            root.sidebar.update(cx, |sidebar, cx| {
+                sidebar.activate_workspace(Some(workspace), cx);
+            });
+            root
+        });
+        cx.run_until_parked();
+        let terminal = root.read_with(cx, |root, cx| {
+            root.workspace_workbench
+                .as_ref()
+                .unwrap()
+                .read(cx)
+                .focused_terminal()
+                .unwrap()
+        });
+        // Settle initial geometry and focus. Sidebar activity and store updates
+        // both invalidate this entity; neither changes the terminal grid.
+        cx.executor().advance_clock(Duration::from_millis(500));
+        cx.run_until_parked();
+        let before = terminal.read_with(cx, |terminal, _| terminal.render_count);
+        assert!(before > 0, "fixture must mount and render its terminal");
+        let sidebar = root.read_with(cx, |root, _| root.sidebar.clone());
+        for _ in 0..8 {
+            sidebar.update(cx, |_, cx| cx.notify());
+            cx.executor().advance_clock(Duration::from_millis(125));
+            cx.run_until_parked();
+        }
+        let after = terminal.read_with(cx, |terminal, _| terminal.render_count);
+        eprintln!(
+            "unchanged terminal renders during eight sidebar ticks: {}",
+            after - before
+        );
+        assert_eq!(
+            after, before,
+            "sidebar animation repainted an unchanged terminal"
+        );
+        terminal.update(cx, |_, cx| cx.notify());
+        cx.run_until_parked();
+        assert!(
+            terminal.read_with(cx, |terminal, _| terminal.render_count) > after,
+            "terminal notifications must still redraw through the cached parent"
+        );
+        let before_resize = terminal.read_with(cx, |terminal, _| terminal.geometry_for_test());
+        cx.simulate_resize(size(px(1100.0), px(750.0)));
+        cx.run_until_parked();
+        assert_ne!(
+            terminal.read_with(cx, |terminal, _| terminal.geometry_for_test()),
+            before_resize,
+            "cached workspace must propagate new terminal dimensions"
+        );
+    }
+
     #[gpui::test]
     fn close_confirmation_keyboard_from_terminal(cx: &mut gpui::TestAppContext) {
         check_close_confirmation_keyboard(cx, false);

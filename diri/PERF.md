@@ -1,5 +1,47 @@
 # diri performance record
 
+## Workspace terminal redraw isolation (2026-09-16)
+
+A live sample of installed Diri 0.7.4 reproduced 23–31% app CPU, with
+most sampled work in GPUI terminal glyph painting, scene sorting, and layout.
+The Engine was approximately 1.2% and the Holder 0.2% in a separate process
+sample. This was an active session workload, not an idle release gate.
+
+The saved-workspace view was mounted without GPUI view caching. A regression
+through the real RootView, Sidebar, WorkspaceWorkbench, and TerminalPane
+confirmed that eight sidebar invalidations rendered an unchanged terminal
+eight times. Each mounted terminal now has a cache boundary with definite
+bounds.
+Its own notifications invalidate it for terminal updates, and bounds changes
+invalidate it for resize. Regressions require zero redundant renders for both
+sidebar updates and output in a sibling pane, and check that terminal
+notification and resize still propagate.
+
+A macOS headless Metal fixture paints a dense 160×50 terminal in a 1600×1000
+window, warms twenty updates, then measures process user+system CPU across
+200 sidebar notifications. Three alternating before/after debug-build runs
+measured CPU per update at 8.879/8.622/8.515 ms before and
+3.848/3.872/3.747 ms after: a 55.4% reduction at the median. Terminal
+render calls fell from 200 to zero. The resulting 3200×2000 screenshots were pixel-identical. This isolates
+unchanged-terminal redraw cost; it is not a claim that total installed-app
+CPU falls by 55.4%, or a release-profile performance gate.
+
+Reproduce from `diri/`:
+
+```sh
+cargo test -p diri-app --bin diri sidebar_updates_do_not_render_unchanged_workspace_terminal
+cargo test -p diri-app --bin diri workspace_sidebar_redraw_cpu -- --ignored --nocapture
+```
+
+The second command is opt-in on macOS and uses real Metal with synthetic
+session data and an inert runtime. It does not connect to the user's Engine.
+Set `DIRI_REDRAW_SCREENSHOT` to export the resulting frame.
+
+Validation on the original integration base: workspace tests passed (1,966
+tests); the final per-pane change passed all 755 app tests, including the
+sidebar and split-pane regressions. Workspace formatting, Clippy with
+`-D warnings`, and release build passed.
+
 ## Large preview frames keep draining (2026-09-16)
 
 A 160×50 receive-only preview could disconnect despite continuously reading.

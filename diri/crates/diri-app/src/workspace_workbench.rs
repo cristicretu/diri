@@ -21,7 +21,7 @@ use diri_proto::{
 use diri_ui::{Fill, Metrics, Radius};
 use gpui::{
     Context, CursorStyle, DragMoveEvent, Entity, EventEmitter, MouseButton, Render, Role,
-    SharedString, Subscription, Window, div, prelude::*, px,
+    SharedString, StyleRefinement, Subscription, Window, div, prelude::*, px,
 };
 
 #[derive(Clone)]
@@ -800,7 +800,15 @@ impl Render for WorkspaceWorkbench {
                         cx,
                     );
                 });
-                surface = surface.child(mounted.terminal.clone());
+                // A sidebar tick or another pane's output must not repaint
+                // this terminal. Its own notifications and bounds changes
+                // invalidate the cached render, including input and resize.
+                surface = surface.child(
+                    mounted
+                        .terminal
+                        .clone()
+                        .cached(StyleRefinement::default().size_full()),
+                );
             } else {
                 surface = surface.child(
                     div()
@@ -1060,6 +1068,36 @@ mod tests {
         owners.sort_by(|a, b| a.0.cmp(&b.0));
         owners
     }
+    #[gpui::test]
+    fn output_in_one_pane_does_not_render_unchanged_sibling(cx: &mut TestAppContext) {
+        let (runtime, tokio, tab) = fixture(false);
+        let (workbench, cx) = cx.add_window_view(|window, cx| {
+            let mut workbench = WorkspaceWorkbench::new(runtime, tokio, window, cx);
+            workbench.set_tab(tab, viewport(), window, cx);
+            workbench
+        });
+        cx.run_until_parked();
+        let (active, quiet) = workbench.read_with(cx, |workbench, _| {
+            (
+                workbench.mounted[&PaneId::new("a")].terminal.clone(),
+                workbench.mounted[&PaneId::new("b")].terminal.clone(),
+            )
+        });
+        let before_active = active.read_with(cx, |terminal, _| terminal.render_count);
+        let before_quiet = quiet.read_with(cx, |terminal, _| terminal.render_count);
+        assert!(before_active > 0 && before_quiet > 0);
+        for _ in 0..8 {
+            active.update(cx, |_, cx| cx.notify());
+            cx.run_until_parked();
+        }
+        assert!(active.read_with(cx, |terminal, _| terminal.render_count) > before_active);
+        assert_eq!(
+            quiet.read_with(cx, |terminal, _| terminal.render_count),
+            before_quiet,
+            "an output notification must not redraw an unchanged split pane"
+        );
+    }
+
     #[gpui::test]
     fn keyboard_focus_on_unavailable_reference_leaves_live_terminal_input(cx: &mut TestAppContext) {
         let (runtime, tokio, mut tab) = fixture(false);

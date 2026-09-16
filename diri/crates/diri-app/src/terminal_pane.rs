@@ -562,6 +562,8 @@ pub struct TerminalViewport {
 }
 
 pub struct TerminalPane {
+    #[cfg(test)]
+    pub(crate) render_count: usize,
     qol: QolState,
     reconnect: reconnect::ReconnectUi,
     runtime: Arc<StoreRuntime>,
@@ -763,6 +765,8 @@ impl TerminalPane {
             })
             .flatten();
         let mut pane = Self {
+            #[cfg(test)]
+            render_count: 0,
             window_store,
             runtime,
             _tokio_owner: tokio_owner,
@@ -3540,6 +3544,10 @@ fn quote_from_terminal_element(session_id: SessionId, element: &TerminalElement)
 
 impl Render for TerminalPane {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        #[cfg(test)]
+        {
+            self.render_count += 1;
+        }
         self.reconcile_residency(cx);
         if window.is_window_active() && self.focus.is_focused(window) {
             self.claim_selected_control();
