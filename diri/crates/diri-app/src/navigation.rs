@@ -7,7 +7,7 @@ use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
 use std::ops::Range;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, RwLock};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use crate::commands::{
@@ -97,7 +97,7 @@ pub struct NavigationOverlay {
     workspace_spawn_target: Option<crate::store::WorkspaceSpawnTarget>,
     focus_handle: FocusHandle,
     previous_focus_handle: Option<FocusHandle>,
-    store: Arc<RwLock<SessionStore>>,
+    store: crate::store::WindowStore,
     _runtime: Arc<StoreRuntime>,
     overlay: Option<Overlay>,
     query: QueryEditor,
@@ -142,6 +142,10 @@ pub struct NavigationOverlay {
 }
 
 impl NavigationOverlay {
+    pub(crate) fn set_window_store(&mut self, store: crate::store::WindowStore) {
+        self.store = store;
+    }
+
     pub(crate) fn set_workspace_spawn_target(
         &mut self,
         target: Option<crate::store::WorkspaceSpawnTarget>,
@@ -179,7 +183,7 @@ impl NavigationOverlay {
             workspace_spawn_target: None,
             focus_handle,
             previous_focus_handle: None,
-            store: Arc::clone(&runtime.store),
+            store: crate::store::WindowStore::from_canonical(Arc::clone(&runtime.store)),
             _runtime: runtime,
             overlay: None,
             query: QueryEditor::default(),
@@ -233,7 +237,7 @@ impl NavigationOverlay {
             workspace_spawn_target: None,
             focus_handle: cx.focus_handle(),
             previous_focus_handle: None,
-            store: Arc::clone(&runtime.store),
+            store: crate::store::WindowStore::from_canonical(Arc::clone(&runtime.store)),
             _runtime: runtime,
             overlay: Some(Overlay::CommandPalette),
             query: QueryEditor::default(),

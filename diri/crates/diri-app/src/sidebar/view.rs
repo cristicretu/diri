@@ -234,7 +234,7 @@ impl Render for DragPreview {
 
 pub struct Sidebar {
     workspace_nav: workspaces::WorkspaceNavigation,
-    store: Arc<RwLock<SessionStore>>,
+    store: crate::store::WindowStore,
     // Preview stores have no daemon adapter, so retain their effect receiver.
     _preview_effects: Option<mpsc::UnboundedReceiver<StoreEffect>>,
     _store_changes: Option<Task<()>>,
@@ -324,6 +324,13 @@ impl Focusable for Sidebar {
 }
 
 impl Sidebar {
+    pub(crate) fn set_initial_session(&mut self, selected: Option<SessionId>) {
+        self.store = self.store.with_initial_selection(selected);
+    }
+    pub(crate) fn window_store(&self) -> crate::store::WindowStore {
+        self.store.clone()
+    }
+
     pub fn new(
         runtime: Option<Arc<StoreRuntime>>,
         preview: bool,
@@ -349,6 +356,7 @@ impl Sidebar {
                 None,
             )
         };
+        let store = crate::store::WindowStore::from_canonical(store);
         let (width, visible, active_workspace) = {
             let store = store.read().expect("session store lock poisoned");
             let prefs = store.preferences();
@@ -366,6 +374,7 @@ impl Sidebar {
                         Ok(()) | Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
                             if this
                                 .update(cx, |this, cx| {
+                                    this.store.write().expect("store").reconcile();
                                     this.refresh_account_context(false, cx);
                                     cx.notify();
                                 })
@@ -1044,7 +1053,7 @@ impl Sidebar {
         (self.focus_rows_for_store(&mut store), selected)
     }
 
-    fn focus_rows_for_store(&self, store: &mut SessionStore) -> Vec<FocusRow> {
+    fn focus_rows_for_store(&self, store: &mut crate::store::WindowWrite<'_>) -> Vec<FocusRow> {
         let mut expanded_archives = store.preferences().sidebar_expanded_archives.clone();
         let grouping = store.preferences().sidebar_grouping;
         let ordering = store.preferences().sidebar_ordering;

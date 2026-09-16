@@ -1,16 +1,19 @@
 //! AppKit status-item menu. macOS owns layout, appearance, tracking, scrolling,
 //! keyboard navigation and accessibility; every entry is a standard NSMenuItem.
 
+use std::cell::RefCell;
 use std::collections::HashSet;
+use std::ops::Deref;
+use std::rc::{Rc, Weak};
 use std::sync::{Arc, RwLock};
 
 use objc2::rc::Retained;
 use objc2::runtime::{AnyObject, ProtocolObject, Sel};
 use objc2::{DefinedClass, MainThreadOnly, define_class, msg_send, sel};
 use objc2_app_kit::{
-    NSApplication, NSApplicationActivationOptions, NSCellImagePosition, NSControlStateValueOff,
-    NSControlStateValueOn, NSEventModifierFlags, NSImage, NSMenu, NSMenuDelegate, NSMenuItem,
-    NSRunningApplication, NSStatusBar, NSStatusItem, NSVariableStatusItemLength,
+    NSApplication, NSCellImagePosition, NSControlStateValueOff, NSControlStateValueOn,
+    NSEventModifierFlags, NSImage, NSMenu, NSMenuDelegate, NSMenuItem, NSStatusBar, NSStatusItem,
+    NSVariableStatusItemLength,
 };
 use objc2_foundation::{MainThreadMarker, NSObject, NSObjectProtocol, NSString};
 use unicode_segmentation::UnicodeSegmentation;
@@ -20,16 +23,24 @@ use diri_ui::BrandMarkKind;
 
 use crate::macos::brand_raster;
 use crate::menu_inbox::{InboxModel, InboxRow, InboxSessionRow, TrailingStatus, build_inbox};
-use crate::store::{SessionStore, SpawnOptions};
+use crate::store::{SessionStore, WindowAction, WindowStore};
 
-pub struct NativeMenuBar {
+pub struct NativeMenuBar(Rc<NativeMenuBarInner>);
+impl Deref for NativeMenuBar {
+    type Target = NativeMenuBarInner;
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+thread_local! { static SHARED_MENU: RefCell<Weak<NativeMenuBarInner>>=const { RefCell::new(Weak::new()) }; }
+pub struct NativeMenuBarInner {
     status_item: Retained<NSStatusItem>,
     menu: Retained<NSMenu>,
     // AppKit does not retain delegates or action targets.
     target: Retained<MenuBarTarget>,
 }
 
-impl Drop for NativeMenuBar {
+impl Drop for NativeMenuBarInner {
     fn drop(&mut self) {
         self.menu.cancelTracking();
         self.menu.setDelegate(None);
@@ -42,6 +53,9 @@ impl Drop for NativeMenuBar {
 impl NativeMenuBar {
     #[must_use]
     pub fn new(mtm: MainThreadMarker, store: Arc<RwLock<SessionStore>>) -> Option<Self> {
+        if let Some(inner) = SHARED_MENU.with(|menu| menu.borrow().upgrade()) {
+            return Some(Self(inner));
+        }
         let status_item =
             NSStatusBar::systemStatusBar().statusItemWithLength(NSVariableStatusItemLength);
         let button = status_item.button(mtm)?;
@@ -57,11 +71,13 @@ impl NativeMenuBar {
         menu.setDelegate(Some(ProtocolObject::from_ref(&*target)));
         target.menuNeedsUpdate(&menu);
         status_item.setMenu(Some(&menu));
-        Some(Self {
+        let inner = Rc::new(NativeMenuBarInner {
             status_item,
             menu,
             target,
-        })
+        });
+        SHARED_MENU.with(|menu| *menu.borrow_mut() = Rc::downgrade(&inner));
+        Some(Self(inner))
     }
 
     pub fn refresh(&mut self) {
@@ -103,7 +119,8 @@ define_class!(
     unsafe impl NSMenuDelegate for MenuBarTarget {
         #[unsafe(method(menuNeedsUpdate:))]
         fn menu_needs_update(&self, menu: &NSMenu) {
-            let (model, selected) = {
+            let selected=WindowStore::focused(&self.ivars().store).and_then(|window|window.read().expect("store").selected_session_id().cloned());
+            let model = {
                 let mut store = self.ivars().store.write().expect("session store lock poisoned");
                 let projection = store.menu_bar_projection();
                 let mut model = build_inbox(&projection, &HashSet::new());
@@ -115,7 +132,7 @@ define_class!(
                         session.trailing = Some(TrailingStatus::Unread);
                     }
                 }
-                (model, store.selected_session_id().cloned())
+                model
             };
             self.populate(menu, &model, selected.as_ref());
         }
@@ -124,56 +141,35 @@ define_class!(
     impl MenuBarTarget {
         #[unsafe(method(openDiri:))]
         fn open_diri(&self, _sender: Option<&AnyObject>) {
-            self.show_main_window();
+            self.dispatch(WindowAction::Focus);
         }
 
         #[unsafe(method(openSettings:))]
         fn open_settings(&self, _sender: Option<&AnyObject>) {
-            self.ivars().store.write().expect("session store lock poisoned").request_open_settings();
-            self.show_main_window();
+            self.dispatch(WindowAction::OpenSettings);
         }
 
         #[unsafe(method(newAgent:))]
         fn new_agent(&self, _sender: Option<&AnyObject>) {
-            self.ivars().store.write().expect("session store lock poisoned").request_open_launcher();
-            self.show_main_window();
+            self.dispatch(WindowAction::OpenLauncher);
         }
 
         #[unsafe(method(spawnAgent:))]
         fn spawn_agent(&self, sender: &NSMenuItem) {
-            {
-                let mut store = self.ivars().store.write().expect("session store lock poisoned");
-                match sender.tag() {
-                    1 => { store.spawn_shell(SpawnOptions::default()); }
-                    2 => { store.spawn_kind(AgentKind::CODEX, SpawnOptions::default()); }
-                    _ => { store.spawn_default(SpawnOptions::default()); }
-                }
-                store.request_snapshot_publish();
-            }
-            self.show_main_window();
+            let kind=match sender.tag() { 1=>None,2=>Some(AgentKind::CODEX),_=>{
+                let kind=self.ivars().store.read().expect("store").preferences().default_agent.clone();Some(kind)
+            }};
+            self.dispatch(WindowAction::Spawn(kind));
         }
 
         #[unsafe(method(selectSession:))]
         fn select_session(&self, sender: &NSMenuItem) {
-            if let Some(id) = item_session_id(sender) {
-                self.ivars().store.write().expect("session store lock poisoned").select(id);
-                self.show_main_window();
-            }
+            if let Some(id)=item_session_id(sender) { self.dispatch(WindowAction::Select(id)); }
         }
 
         #[unsafe(method(closeSession:))]
         fn close_session(&self, sender: &NSMenuItem) {
-            if let Some(id) = item_session_id(sender) {
-                let needs_confirm = {
-                    let mut store = self.ivars().store.write().expect("session store lock poisoned");
-                    store.request_close(vec![id]);
-                    store.request_snapshot_publish();
-                    store.pending_close().is_some()
-                };
-                if needs_confirm {
-                    self.show_main_window();
-                }
-            }
+            if let Some(id)=item_session_id(sender) { self.dispatch(WindowAction::Close(id)); }
         }
 
         #[unsafe(method(quitDiri:))]
@@ -308,20 +304,9 @@ impl MenuBarTarget {
         item
     }
 
-    fn show_main_window(&self) {
-        let app = NSApplication::sharedApplication(self.mtm());
-        #[allow(deprecated)]
-        app.activateIgnoringOtherApps(true);
-        #[allow(deprecated)]
-        let _ = NSRunningApplication::currentApplication().activateWithOptions(
-            NSApplicationActivationOptions::ActivateAllWindows
-                | NSApplicationActivationOptions::ActivateIgnoringOtherApps,
-        );
-        for window in app.windows().iter() {
-            if window.canBecomeMainWindow() {
-                window.makeKeyAndOrderFront(None);
-                break;
-            }
+    fn dispatch(&self, action: WindowAction) {
+        if !WindowStore::focused(&self.ivars().store).is_some_and(|window| window.enqueue(action)) {
+            objc2_app_kit::NSBeep();
         }
     }
 }

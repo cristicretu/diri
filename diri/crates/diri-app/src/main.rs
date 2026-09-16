@@ -1,5 +1,6 @@
 mod agent_catalog;
 mod app_theme;
+mod application_notifications;
 mod clipboard_transfer;
 mod code_intelligence;
 mod code_viewer;
@@ -399,6 +400,7 @@ fn main() {
                             placement.mode = WindowMode::Windowed;
                             NativeWindowContext {
                                 workspace: root.read(cx).window_workspace(),
+                                selected: root.read(cx).window_session(),
                                 placement,
                             }
                         })
@@ -615,6 +617,7 @@ async fn publish_usage_refresh(
 
 struct NativeWindowContext {
     workspace: Option<diri_proto::workspace::WorkspaceId>,
+    selected: Option<diri_proto::SessionId>,
     placement: WindowPlacement,
 }
 
@@ -623,8 +626,8 @@ fn open_main_window(
     services: Arc<AppServices>,
     preview: bool,
     scenario: PreviewScenario,
-) {
-    open_main_window_with_context(cx, services, preview, scenario, None);
+) -> gpui::WindowHandle<RootView> {
+    open_main_window_with_context(cx, services, preview, scenario, None)
 }
 
 fn open_main_window_with_context(
@@ -633,7 +636,7 @@ fn open_main_window_with_context(
     preview: bool,
     scenario: PreviewScenario,
     context: Option<NativeWindowContext>,
-) {
+) -> gpui::WindowHandle<RootView> {
     let perf_large_window = std::env::var_os("DIRI_PERF_LARGE_WINDOW").is_some();
     let initial_size = if perf_large_window {
         size(px(1800.0), px(1100.0))
@@ -656,6 +659,7 @@ fn open_main_window_with_context(
         .as_ref()
         .map(|context| context.placement.clone())
         .or(saved_placement);
+    let selected_override = context.as_ref().map(|context| context.selected.clone());
     let workspace_override = context.map(|context| context.workspace);
     let (window_bounds, display_id) = saved_placement
         .map(|placement| restore_window_bounds(placement, cx))
@@ -700,11 +704,12 @@ fn open_main_window_with_context(
         move |window, cx| {
             cx.new(|cx| {
                 if workspace_override.is_some() {
-                    RootView::new_with_workspace(
+                    RootView::new_with_selection(
                         services,
                         preview,
                         scenario,
                         workspace_override,
+                        selected_override,
                         window,
                         cx,
                     )
@@ -714,7 +719,7 @@ fn open_main_window_with_context(
             })
         },
     )
-    .expect("failed to open the diri window");
+    .expect("failed to open the diri window")
 }
 
 /// Convert GPUI's runtime window state into the JSON-friendly preference

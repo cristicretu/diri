@@ -16,12 +16,33 @@ pub struct ProjectTabs {
 
 /// Include every active tab in saved tree order, even when its vertical row
 /// is folded. A selected archived tab stays reachable until selection leaves it.
-pub fn selected_project_tabs(store: &mut SessionStore) -> ProjectTabs {
-    let selected = store.selected_session_id().cloned();
-    let project = store
-        .selected_session()
-        .map(|session| session.project_id.clone());
-    let projection = store.sidebar_projection();
+pub trait TabNavigationStore {
+    fn tab_selection(&self) -> Option<(diri_proto::SessionId, ProjectId)>;
+    fn tab_projection(&mut self) -> Arc<crate::store::SidebarProjection>;
+}
+impl TabNavigationStore for SessionStore {
+    fn tab_selection(&self) -> Option<(diri_proto::SessionId, ProjectId)> {
+        self.selected_session()
+            .map(|session| (session.id.clone(), session.project_id.clone()))
+    }
+    fn tab_projection(&mut self) -> Arc<crate::store::SidebarProjection> {
+        self.sidebar_projection()
+    }
+}
+impl TabNavigationStore for crate::store::WindowWrite<'_> {
+    fn tab_selection(&self) -> Option<(diri_proto::SessionId, ProjectId)> {
+        self.selected_session()
+            .map(|session| (session.id.clone(), session.project_id.clone()))
+    }
+    fn tab_projection(&mut self) -> Arc<crate::store::SidebarProjection> {
+        self.sidebar_projection()
+    }
+}
+pub fn selected_project_tabs(store: &mut impl TabNavigationStore) -> ProjectTabs {
+    let selection = store.tab_selection();
+    let selected = selection.as_ref().map(|(id, _)| id);
+    let project = selection.as_ref().map(|(_, project)| project.clone());
+    let projection = store.tab_projection();
     let group = projection
         .projects
         .iter()
@@ -43,7 +64,7 @@ pub fn selected_project_tabs(store: &mut SessionStore) -> ProjectTabs {
     if let Some(archived) = group
         .archived
         .iter()
-        .find(|session| Some(&session.id) == selected.as_ref())
+        .find(|session| Some(&session.id) == selected)
     {
         sessions.push(archived.clone());
     }

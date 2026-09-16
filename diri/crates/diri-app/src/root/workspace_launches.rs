@@ -4,7 +4,7 @@ use crate::store::{WorkspaceSpawnState, WorkspaceSpawnTarget};
 impl RootView {
     pub(super) fn workspace_spawn_target(&self) -> Option<WorkspaceSpawnTarget> {
         let workspace = self.active_workspace.clone()?;
-        let store = self.services.store.store.read().expect("store");
+        let store = self.window_store.read().expect("store");
         let selected_tab = store
             .workspace_catalog()
             .snapshot()?
@@ -37,10 +37,15 @@ impl RootView {
         colors: SemanticColors,
         cx: &mut Context<Self>,
     ) -> Option<AnyElement> {
-        let store = self.services.store.store.read().expect("store");
+        let store = self.window_store.read().expect("store");
         let receipts: Vec<_> = store
             .workspace_spawn_receipts()
-            .filter(|r| !matches!(r.state, WorkspaceSpawnState::Placed { .. }))
+            .filter(|r| {
+                !matches!(
+                    r.state,
+                    WorkspaceSpawnState::Placed { .. } | WorkspaceSpawnState::Created { .. }
+                )
+            })
             .cloned()
             .collect();
         if receipts.is_empty() && !self.launches_expanded {
@@ -146,7 +151,9 @@ impl RootView {
                         (detail.clone(), Some(session.clone()), true)
                     }
                     WorkspaceSpawnState::Unconfirmed(detail) => (detail.clone(), None, false),
-                    WorkspaceSpawnState::Placed { .. } => continue,
+                    WorkspaceSpawnState::Placed { .. } | WorkspaceSpawnState::Created { .. } => {
+                        continue;
+                    }
                 };
                 let mut buttons = div().flex().gap(px(6.0)).text_color(colors.primary);
                 if let Some(session) = session {
@@ -176,9 +183,7 @@ impl RootView {
                             .cursor_pointer()
                             .child("Retry placement")
                             .on_click(cx.listener(move |this, _, _, cx| {
-                                this.services
-                                    .store
-                                    .store
+                                this.window_store
                                     .write()
                                     .expect("store")
                                     .retry_workspace_placement(id);
@@ -198,9 +203,7 @@ impl RootView {
                             .cursor_pointer()
                             .child("Dismiss")
                             .on_click(cx.listener(move |this, _, _, cx| {
-                                this.services
-                                    .store
-                                    .store
+                                this.window_store
                                     .write()
                                     .expect("store")
                                     .dismiss_workspace_spawn(id);
@@ -230,14 +233,17 @@ impl RootView {
                         .flex()
                         .flex_col()
                         .gap(px(7.0))
-                        .child(
-                            div().font_weight(FontWeight::MEDIUM).child(
-                                names
-                                    .get(&receipt.target.workspace)
-                                    .cloned()
-                                    .unwrap_or_else(|| "Removed workspace".into()),
+                        .child(div().font_weight(FontWeight::MEDIUM).child(
+                            receipt.target.workspace().map_or_else(
+                                || "All sessions".into(),
+                                |id| {
+                                    names
+                                        .get(id)
+                                        .cloned()
+                                        .unwrap_or_else(|| "Removed workspace".into())
+                                },
                             ),
-                        )
+                        ))
                         .child(
                             div()
                                 .text_color(colors.secondary)
@@ -255,7 +261,7 @@ impl RootView {
         }
         Some(panel.into_any_element())
     }
-    fn open_workspace_launch_session(
+    pub(super) fn open_workspace_launch_session(
         &mut self,
         session: SessionId,
         window: &mut Window,
@@ -263,12 +269,7 @@ impl RootView {
     ) {
         self.sidebar
             .update(cx, |sidebar, cx| sidebar.activate_workspace(None, cx));
-        self.services
-            .store
-            .store
-            .write()
-            .expect("store")
-            .select(session);
+        self.window_store.write().expect("store").select(session);
         self.launches_expanded = false;
         self.activate_saved_workspace(None, window, cx);
         self.services.store.publish_local_change();
@@ -295,13 +296,16 @@ impl RootView {
             return;
         }
         let receipts: Vec<_> = self
-            .services
-            .store
-            .store
+            .window_store
             .read()
             .expect("store")
             .workspace_spawn_receipts()
-            .filter(|r| !matches!(r.state, WorkspaceSpawnState::Placed { .. }))
+            .filter(|r| {
+                !matches!(
+                    r.state,
+                    WorkspaceSpawnState::Placed { .. } | WorkspaceSpawnState::Created { .. }
+                )
+            })
             .cloned()
             .collect();
         let index = self
@@ -325,9 +329,7 @@ impl RootView {
             }
             "r" => {
                 if let Some(receipt) = receipts.get(index) {
-                    self.services
-                        .store
-                        .store
+                    self.window_store
                         .write()
                         .expect("store")
                         .retry_workspace_placement(receipt.id);
@@ -335,9 +337,7 @@ impl RootView {
             }
             "backspace" | "delete" => {
                 if let Some(receipt) = receipts.get(index) {
-                    self.services
-                        .store
-                        .store
+                    self.window_store
                         .write()
                         .expect("store")
                         .dismiss_workspace_spawn(receipt.id);

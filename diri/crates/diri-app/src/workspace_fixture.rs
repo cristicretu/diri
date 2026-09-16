@@ -204,6 +204,27 @@ impl LiveWorkspace {
             _resources: resources,
         }
     }
+    pub(crate) fn continuous_output(&self) -> OutputDriver {
+        let stop = Arc::new(AtomicBool::new(false));
+        let for_thread = stop.clone();
+        let registry = self.registry.clone();
+        let thread = std::thread::spawn(move || {
+            while !for_thread.load(Ordering::Acquire) {
+                {
+                    let registry = registry.lock().unwrap();
+                    for id in ["build", "review"] {
+                        registry.get(id).unwrap().write_input(b"show\n").unwrap();
+                    }
+                }
+                std::thread::sleep(Duration::from_millis(20));
+            }
+        });
+        OutputDriver {
+            stop,
+            thread: Some(thread),
+        }
+    }
+
     pub(crate) fn held_spawn(&self) -> HeldLaunch {
         use std::os::unix::fs::PermissionsExt;
         let repo = self.directory.path().join("held-repo");
@@ -345,5 +366,18 @@ impl HeldLaunch {
 impl Drop for HeldLaunch {
     fn drop(&mut self) {
         let _ = std::fs::write(&self.release, "release");
+    }
+}
+
+pub(crate) struct OutputDriver {
+    stop: Arc<AtomicBool>,
+    thread: Option<std::thread::JoinHandle<()>>,
+}
+impl Drop for OutputDriver {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::Release);
+        if let Some(thread) = self.thread.take() {
+            thread.join().unwrap();
+        }
     }
 }

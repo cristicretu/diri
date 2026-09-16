@@ -559,6 +559,7 @@ pub struct TerminalPane {
     qol: QolState,
     reconnect: reconnect::ReconnectUi,
     runtime: Arc<StoreRuntime>,
+    window_store: Option<crate::store::WindowStore>,
     _tokio_owner: Arc<tokio::runtime::Runtime>,
     tokio: Handle,
     residents: HashMap<SessionId, ResidentTerminal>,
@@ -620,6 +621,24 @@ impl TerminalPane {
             runtime,
             tokio_owner,
             SessionSource::FollowSelection,
+            None,
+            window,
+            cx,
+        )
+    }
+
+    pub(crate) fn new_for_window(
+        runtime: Arc<StoreRuntime>,
+        tokio_owner: Arc<tokio::runtime::Runtime>,
+        store: crate::store::WindowStore,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Self {
+        Self::new_with_source(
+            runtime,
+            tokio_owner,
+            SessionSource::FollowSelection,
+            Some(store),
             window,
             cx,
         )
@@ -636,6 +655,7 @@ impl TerminalPane {
             runtime,
             tokio_owner,
             SessionSource::Fixed(session_id),
+            None,
             window,
             cx,
         )
@@ -645,6 +665,7 @@ impl TerminalPane {
         runtime: Arc<StoreRuntime>,
         tokio_owner: Arc<tokio::runtime::Runtime>,
         session_source: SessionSource,
+        window_store: Option<crate::store::WindowStore>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
@@ -703,15 +724,21 @@ impl TerminalPane {
         let tokio = tokio_owner.handle().clone();
         let observed_selected_id = matches!(session_source, SessionSource::FollowSelection)
             .then(|| {
-                runtime
-                    .store
-                    .read()
-                    .expect("session store lock poisoned")
-                    .selected_session_id()
-                    .cloned()
+                window_store.as_ref().map_or_else(
+                    || {
+                        runtime
+                            .store
+                            .read()
+                            .expect("store")
+                            .selected_session_id()
+                            .cloned()
+                    },
+                    |store| store.read().expect("store").selected_session_id().cloned(),
+                )
             })
             .flatten();
         let mut pane = Self {
+            window_store,
             runtime,
             _tokio_owner: tokio_owner,
             tokio,
@@ -751,6 +778,10 @@ impl TerminalPane {
     }
 
     fn reconcile_residency(&mut self, cx: &mut Context<Self>) {
+        let window_selected = self
+            .window_store
+            .as_ref()
+            .map(|window| window.read().expect("store").selected_session_id().cloned());
         let store = self
             .runtime
             .store
@@ -758,7 +789,19 @@ impl TerminalPane {
             .expect("session store lock poisoned");
         let resident_ids: HashSet<_> = match &self.session_source {
             SessionSource::FollowSelection => {
-                store.terminal_residency().resident().cloned().collect()
+                if let Some(selected) = window_selected {
+                    selected
+                        .filter(|id| {
+                            store
+                                .sessions()
+                                .get(id)
+                                .is_some_and(|session| !session.is_archived())
+                        })
+                        .into_iter()
+                        .collect()
+                } else {
+                    store.terminal_residency().resident().cloned().collect()
+                }
             }
             SessionSource::Fixed(id) if store.sessions().contains_key(id) => {
                 HashSet::from([id.clone()])
@@ -843,14 +886,7 @@ impl TerminalPane {
 
     fn reconcile_store_change(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let selected_id = matches!(self.session_source, SessionSource::FollowSelection)
-            .then(|| {
-                self.runtime
-                    .store
-                    .read()
-                    .expect("session store lock poisoned")
-                    .selected_session_id()
-                    .cloned()
-            })
+            .then(|| self.selected_id())
             .flatten();
         let selection_changed = selected_id != self.observed_selected_id;
         if selection_changed {
@@ -912,11 +948,18 @@ impl TerminalPane {
         self.utility_surfaces = Some(utility_surfaces);
     }
 
-    pub fn focus(&self, window: &mut Window, cx: &mut Context<Self>) {
+    pub fn focus(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if matches!(self.session_source, SessionSource::FollowSelection)
+            && self.selected_id() != self.observed_selected_id
+        {
+            self.reconcile_store_change(window, cx);
+            return;
+        }
         if window.is_window_active() {
             self.claim_selected_control();
         }
         window.focus(&self.focus, cx);
+        cx.notify();
     }
 
     /// A split workbench explicitly assigns one visible owner per SessionId.
@@ -1499,15 +1542,24 @@ impl TerminalPane {
         });
     }
 
+    #[cfg(all(test, target_os = "macos"))]
+    pub(crate) fn session_id_for_test(&self) -> Option<SessionId> {
+        self.selected_id()
+    }
+
     fn selected_id(&self) -> Option<SessionId> {
         match &self.session_source {
-            SessionSource::FollowSelection => self
-                .runtime
-                .store
-                .read()
-                .expect("session store lock poisoned")
-                .selected_session_id()
-                .cloned(),
+            SessionSource::FollowSelection => self.window_store.as_ref().map_or_else(
+                || {
+                    self.runtime
+                        .store
+                        .read()
+                        .expect("store")
+                        .selected_session_id()
+                        .cloned()
+                },
+                |store| store.read().expect("store").selected_session_id().cloned(),
+            ),
             SessionSource::Fixed(id) => Some(id.clone()),
         }
     }
@@ -2758,11 +2810,15 @@ impl TerminalPane {
                 cx.listener(move |this, event: &gpui::MouseDownEvent, window, cx| {
                     this.focus(window, cx);
                     if follows_selection {
-                        this.runtime
-                            .store
-                            .write()
-                            .expect("session store lock poisoned")
-                            .select(id_for_focus.clone());
+                        if let Some(store) = &this.window_store {
+                            store.write().expect("store").select(id_for_focus.clone());
+                        } else {
+                            this.runtime
+                                .store
+                                .write()
+                                .expect("store")
+                                .select(id_for_focus.clone());
+                        }
                     }
                     this.handle_pointer_down(event, window, cx);
                 }),

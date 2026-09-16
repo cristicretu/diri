@@ -1,6 +1,8 @@
 #[cfg(all(test, target_os = "macos"))]
 #[path = "root/peek_profile.rs"]
 mod peek_profile;
+#[cfg(all(test, target_os = "macos"))]
+mod window_navigation_tests;
 mod workspace_launches;
 
 use std::collections::HashSet;
@@ -35,13 +37,12 @@ use crate::launcher::{LauncherEvent, LauncherOverlay};
 #[cfg(target_os = "macos")]
 use crate::macos::browser::NativeBrowser;
 use crate::navigation::NavigationOverlay;
-use crate::notifications::{InAppBanner, NotificationSound};
+use crate::notifications::InAppBanner;
 use crate::quote::Quote;
 use crate::recovery::{RecoveryAction, RecoveryKind, RecoveryNotice};
 use crate::seam::{SeamSlide, toggle_has_settled};
 use crate::session_surfaces::SessionSurfaces;
 use crate::sidebar::{PreviewScenario, Sidebar, SidebarEvent};
-use crate::sounds::{self, PlatformPlayer, SoundGate, StatusSound};
 use crate::store::SpawnOptions;
 use crate::surface_shell::UtilitySurfaces;
 use crate::terminal_pane::{TerminalPane, TerminalPaneEvent, TerminalViewport};
@@ -202,6 +203,7 @@ fn advance_seam(slide: &mut Option<SeamSlide>, settled: f32, now: Instant, windo
 
 pub struct RootView {
     spawn_owner: crate::store::SpawnOwner,
+    window_store: crate::store::WindowStore,
     launches_expanded: bool,
     launches_focus: FocusHandle,
     launch_cursor: Option<u64>,
@@ -277,10 +279,7 @@ pub struct RootView {
     notification_focus: FocusHandle,
     notification_health: String,
     pending_notification_open: Option<(SessionId, Option<String>)>,
-    #[cfg(target_os = "macos")]
-    _notification_events: Task<()>,
     last_quote_surface: QuoteSurface,
-    sound_gate: SoundGate,
     /// Set when opening settings had to reveal a hidden sidebar to put its
     /// navigation somewhere, so closing settings can hide it again.
     sidebar_revealed_for_settings: bool,
@@ -289,7 +288,7 @@ pub struct RootView {
     #[cfg(target_os = "macos")]
     menu_bar: Option<NativeMenuBar>,
     #[cfg(target_os = "macos")]
-    notifier: NativeNotifier,
+    notifier: std::rc::Rc<NativeNotifier>,
     _subscriptions: Vec<Subscription>,
     _service_events: Task<()>,
     _surface_sync: Option<Task<()>>,
@@ -327,6 +326,34 @@ impl RootView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
+        Self::new_with_selection(
+            services,
+            preview,
+            preview_scenario,
+            workspace_override,
+            None,
+            window,
+            cx,
+        )
+    }
+
+    pub(crate) fn window_session(&self) -> Option<diri_proto::SessionId> {
+        self.window_store
+            .read()
+            .expect("store")
+            .selected_session_id()
+            .cloned()
+    }
+
+    pub(crate) fn new_with_selection(
+        services: Arc<AppServices>,
+        preview: bool,
+        preview_scenario: PreviewScenario,
+        workspace_override: Option<Option<diri_proto::workspace::WorkspaceId>>,
+        selected_override: Option<Option<diri_proto::SessionId>>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Self {
         if !preview {
             sync_system_theme(&services.store, window.appearance());
         }
@@ -342,29 +369,59 @@ impl RootView {
             if let Some(workspace) = &workspace_override {
                 sidebar.set_initial_workspace(workspace.clone());
             }
+            if let Some(selected) = &selected_override {
+                sidebar.set_initial_session(selected.clone());
+            }
             sidebar.set_surface_in_parent();
             sidebar
         });
+        let window_store = if preview {
+            crate::store::WindowStore::from_canonical(services.store.store.clone())
+        } else {
+            sidebar.read(cx).window_store()
+        };
+        cx.on_release(|this, _| this.window_store.close_context())
+            .detach();
         let terminal = (!preview || preview_scenario == PreviewScenario::Empty).then(|| {
             let runtime = Arc::clone(&services.store);
             let tokio = Arc::clone(&services.tokio);
-            cx.new(|cx| TerminalPane::new(runtime, tokio, window, cx))
+            cx.new(|cx| {
+                TerminalPane::new_for_window(runtime, tokio, window_store.clone(), window, cx)
+            })
         });
         let navigation = (!preview).then(|| {
             let runtime = Arc::clone(&services.store);
-            cx.new(|cx| NavigationOverlay::new(runtime, Arc::clone(&services.tokio), window, cx))
+            cx.new(|cx| {
+                let mut navigation =
+                    NavigationOverlay::new(runtime, Arc::clone(&services.tokio), window, cx);
+                navigation.set_window_store(window_store.clone());
+                navigation
+            })
         });
         let session_surfaces = (!preview).then(|| {
             let runtime = Arc::clone(&services.store);
-            cx.new(|cx| SessionSurfaces::new(runtime, Some(services.tokio.handle().clone()), cx))
+            cx.new(|cx| {
+                let mut surfaces =
+                    SessionSurfaces::new(runtime, Some(services.tokio.handle().clone()), cx);
+                surfaces.set_window_store(window_store.clone());
+                surfaces
+            })
         });
         let utility_surfaces = (!preview).then(|| {
             let runtime = Arc::clone(&services.store);
             let tokio = Arc::clone(&services.tokio);
             let updates = services.updates.clone();
-            cx.new(|cx| UtilitySurfaces::new(runtime, tokio, updates, window, cx))
+            cx.new(|cx| {
+                let mut surfaces = UtilitySurfaces::new(runtime, tokio, updates, window, cx);
+                surfaces.set_window_store(window_store.clone(), cx);
+                surfaces
+            })
         });
-        let launcher = cx.new(|cx| LauncherOverlay::new(Arc::clone(&services), preview, cx));
+        let launcher = cx.new(|cx| {
+            let mut launcher = LauncherOverlay::new(Arc::clone(&services), preview, cx);
+            launcher.set_window_store(window_store.clone());
+            launcher
+        });
         let inspector = (!preview || preview_scenario == PreviewScenario::Artifacts).then(|| {
             let runtime = Arc::clone(&services.store);
             let tokio = Arc::clone(&services.tokio);
@@ -708,50 +765,10 @@ impl RootView {
         if let Some(menu_bar) = &mut menu_bar {
             menu_bar.refresh();
         }
+        crate::application_notifications::install(services.clone(), preview, preview_scenario, cx);
         #[cfg(target_os = "macos")]
-        let (notification_tx, mut notification_rx) = tokio::sync::mpsc::unbounded_channel();
-        #[cfg(target_os = "macos")]
-        let notifier = NativeNotifier::new(notification_tx);
-        #[cfg(target_os = "macos")]
-        let notification_events = cx.spawn_in(window, async move |this, cx| {
-            while let Some(event) = notification_rx.recv().await {
-                if this
-                    .update_in(cx, |this, window, cx| {
-                        use crate::macos::notifier::NativeNotificationEvent;
-                        match event {
-                            NativeNotificationEvent::Open {
-                                session_id,
-                                notification_id,
-                            } => {
-                                this.open_notification(
-                                    SessionId::new(session_id),
-                                    Some(notification_id),
-                                    window,
-                                    cx,
-                                );
-                            }
-                            NativeNotificationEvent::Read(id) => {
-                                this.services
-                                    .store
-                                    .store
-                                    .write()
-                                    .expect("store")
-                                    .set_notification_read(&id, true);
-                            }
-                            NativeNotificationEvent::Health(message) => {
-                                this.notification_health = message
-                            }
-                        }
-                        cx.notify();
-                    })
-                    .is_err()
-                {
-                    break;
-                }
-            }
-        });
+        let notifier = crate::application_notifications::notifier(cx);
 
-        let activation_services = Arc::clone(&services);
         let activation = cx.observe_window_activation(window, move |this, window, cx| {
             if !window.is_window_active() {
                 #[cfg(target_os = "macos")]
@@ -762,9 +779,7 @@ impl RootView {
                     surfaces.update(cx, |s, cx| s.cancel_tab_peek_immediately(cx));
                 }
             }
-            activation_services
-                .store
-                .store
+            this.window_store
                 .write()
                 .expect("session store lock poisoned")
                 .set_active(window.is_window_active());
@@ -786,33 +801,6 @@ impl RootView {
                             Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
                         };
                         let _ = this.update(cx, |this, cx| {
-                            #[cfg(target_os = "macos")]
-                            let app_is_active = this
-                                .services
-                                .store
-                                .store
-                                .read()
-                                .expect("session store lock poisoned")
-                                .app_is_active();
-                            #[cfg(target_os = "macos")]
-                            this.notifier.dismiss(&status.dismiss);
-                            let deliver = status.notification.as_ref().is_none_or(|request| this.services.store.store.read().expect("store").should_deliver_notification(request));
-                            if let Some(sound) = status.sound && deliver {
-                                let sound = match sound {
-                                    NotificationSound::NeedsInput => StatusSound::NeedsInput,
-                                    NotificationSound::Done => StatusSound::Done,
-                                    NotificationSound::Frozen => StatusSound::Frozen,
-                                };
-                                if this.sound_gate.should_play(sound, Instant::now()) {
-                                    let _ = sounds::play(&PlatformPlayer, sound);
-                                }
-                            }
-                            #[cfg(target_os = "macos")]
-                            if let Some(notification) = &status.notification
-                                && deliver && (!app_is_active || status.in_app_banner.is_none())
-                            {
-                                this.notifier.post(notification);
-                            }
                             if let Some(banner) = status.in_app_banner {
                                 this.status_banner_generation =
                                     this.status_banner_generation.wrapping_add(1);
@@ -912,21 +900,58 @@ impl RootView {
                     Ok(()) | Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
                         if this
                             .update_in(cx, |this, window, cx| {
+                                this.window_store
+                                    .write()
+                                    .expect("store")
+                                    .accept_completed_launches(this.active_workspace.is_none());
+                                let actions = this
+                                    .window_store
+                                    .write()
+                                    .expect("store")
+                                    .take_window_actions();
+                                for action in actions {
+                                    window.activate_window();
+                                    match action {
+                                        crate::store::WindowAction::Focus => {}
+                                        crate::store::WindowAction::OpenNotification {
+                                            session,
+                                            notification,
+                                        } => this.open_notification(
+                                            session,
+                                            Some(notification),
+                                            window,
+                                            cx,
+                                        ),
+                                        crate::store::WindowAction::Select(id) => {
+                                            this.open_workspace_launch_session(id, window, cx);
+                                        }
+                                        crate::store::WindowAction::Close(id) => this
+                                            .window_store
+                                            .write()
+                                            .expect("store")
+                                            .request_close(vec![id]),
+                                        crate::store::WindowAction::OpenLauncher => {
+                                            this.open_launcher(&OpenLauncher, window, cx)
+                                        }
+                                        crate::store::WindowAction::OpenSettings => {
+                                            this.run_command(CommandId::OpenSettings, window, cx)
+                                        }
+                                        crate::store::WindowAction::Spawn(kind) => {
+                                            this.spawn(kind);
+                                        }
+                                    }
+                                }
                                 // This loop runs on every store change; probe under
                                 // a read lock so only the rare menu-bar request
                                 // pays for exclusive access.
                                 let pending = this
-                                    .services
-                                    .store
-                                    .store
+                                    .window_store
                                     .read()
                                     .expect("session store lock poisoned")
                                     .has_pending_ui_request();
                                 let (open_launcher, open_settings) = if pending {
                                     let mut store = this
-                                        .services
-                                        .store
-                                        .store
+                                        .window_store
                                         .write()
                                         .expect("session store lock poisoned");
                                     (
@@ -951,9 +976,7 @@ impl RootView {
                                 this.sync_inspector_context(cx);
                                 this.sync_auxiliary_terminal(window, cx);
                                 let error = this
-                                    .services
-                                    .store
-                                    .store
+                                    .window_store
                                     .read()
                                     .expect("store")
                                     .workspace_catalog()
@@ -1134,7 +1157,8 @@ impl RootView {
             (None, None)
         };
         let mut root = Self {
-            spawn_owner: crate::store::SpawnOwner::default(),
+            spawn_owner: window_store.owner(),
+            window_store,
             launches_expanded: false,
             launches_focus: cx.focus_handle(),
             launch_cursor: None,
@@ -1196,10 +1220,7 @@ impl RootView {
             notification_health:
                 "Use Test alert to check macOS delivery. Notifications remain available here."
                     .into(),
-            #[cfg(target_os = "macos")]
-            _notification_events: notification_events,
             last_quote_surface: QuoteSurface::default(),
-            sound_gate: SoundGate::default(),
             sidebar_revealed_for_settings: false,
             preview,
             preview_scenario,
@@ -1239,14 +1260,17 @@ impl RootView {
             // placement restored by the next launch.
             root.window_bounds_changed(window, cx);
         }
+        root.window_store
+            .write()
+            .expect("store")
+            .set_active(window.is_window_active());
+        root.sync_inspector_context(cx);
         root
     }
 
     fn window_bounds_changed(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let placement = crate::current_window_placement(window, cx);
-        self.services
-            .store
-            .store
+        self.window_store
             .write()
             .expect("session store lock poisoned")
             .remember_window_placement(placement);
@@ -1261,9 +1285,7 @@ impl RootView {
             let _ = this.update_in(cx, |this, _window, _cx| {
                 this.window_bounds_save.take();
                 if let Err(error) = this
-                    .services
-                    .store
-                    .store
+                    .window_store
                     .write()
                     .expect("session store lock poisoned")
                     .persist_preferences()
@@ -1280,6 +1302,12 @@ impl RootView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if self.active_workspace != id {
+            self.window_store
+                .write()
+                .expect("store")
+                .bump_navigation_context();
+        }
         self.active_workspace = id;
         self.sync_workspace_spawn_context(cx);
         if let Some(workbench) = &self.workspace_workbench {
@@ -1378,9 +1406,7 @@ impl RootView {
 
     fn colors(&self) -> SemanticColors {
         let store = self
-            .services
-            .store
-            .store
+            .window_store
             .read()
             .expect("session store lock poisoned");
         crate::app_theme::colors(store.theme_id())
@@ -1431,9 +1457,7 @@ impl RootView {
                 .as_ref()
                 .and_then(|workbench| workbench.read(cx).focused_session_id())
         } else {
-            self.services
-                .store
-                .store
+            self.window_store
                 .read()
                 .expect("store")
                 .selected_session_id()
@@ -1442,10 +1466,12 @@ impl RootView {
     }
 
     fn sync_inspector_context(&mut self, cx: &mut Context<Self>) {
-        let context = self
-            .active_workspace
-            .as_ref()
-            .map(|_| self.active_session_id(cx));
+        let selected = self.active_session_id(cx);
+        self.window_store
+            .write()
+            .expect("store")
+            .set_visible_session(selected.clone());
+        let context = Some(selected);
         if let Some(inspector) = &self.inspector {
             inspector.update(cx, |inspector, cx| {
                 inspector.set_session_context(context, cx)
@@ -1545,9 +1571,7 @@ impl RootView {
     }
 
     fn quote_targets(&self) -> Vec<SessionRecord> {
-        self.services
-            .store
-            .store
+        self.window_store
             .write()
             .expect("session store lock poisoned")
             .ordered_sessions()
@@ -1626,9 +1650,7 @@ impl RootView {
         cx: &mut Context<Self>,
     ) {
         let target_record = self
-            .services
-            .store
-            .store
+            .window_store
             .read()
             .expect("session store lock poisoned")
             .sessions()
@@ -2074,9 +2096,7 @@ impl RootView {
             return false;
         }
         let mut store = self
-            .services
-            .store
-            .store
+            .window_store
             .write()
             .expect("session store lock poisoned");
         match agent {
@@ -2112,9 +2132,7 @@ impl RootView {
             return false;
         }
         let mut store = self
-            .services
-            .store
-            .store
+            .window_store
             .write()
             .expect("session store lock poisoned");
         let host = store.default_spawn_host();
@@ -2169,9 +2187,7 @@ impl RootView {
             .map_or(0, |inspector| inspector.read(cx).terminal_slot());
         let spawned = {
             let mut store = self
-                .services
-                .store
-                .store
+                .window_store
                 .write()
                 .expect("session store lock poisoned");
             if slot == 0 {
@@ -2219,9 +2235,7 @@ impl RootView {
         let selected = self.active_session_id(cx);
         let (selected, auxiliary, spawn_pending) = {
             let mut store = self
-                .services
-                .store
-                .store
+                .window_store
                 .write()
                 .expect("session store lock poisoned");
 
@@ -2315,9 +2329,7 @@ impl RootView {
     /// own arrow-key navigation, so ⌘↑/⌘↓ stays out of their way.
     fn arrow_surface_visible(&self) -> bool {
         let store = self
-            .services
-            .store
-            .store
+            .window_store
             .read()
             .expect("session store lock poisoned");
         store.switcher_state().is_visible() || store.overview_state().is_visible()
@@ -2338,9 +2350,7 @@ impl RootView {
             .is_some_and(|terminal| terminal.read(cx).is_focused(window))
             && let Some(id) = self.auxiliary_id.clone()
         {
-            self.services
-                .store
-                .store
+            self.window_store
                 .write()
                 .expect("session store lock poisoned")
                 .remove_sessions(vec![id]);
@@ -2672,9 +2682,7 @@ impl RootView {
         }
         let fraction = self.workbench_layout.primary_fraction();
         if let Err(error) = self
-            .services
-            .store
-            .store
+            .window_store
             .write()
             .expect("session store lock poisoned")
             .update_preferences(|prefs| prefs.workbench_primary_fraction = fraction)
@@ -2713,9 +2721,7 @@ impl RootView {
             inspector.update(cx, |inspector, cx| inspector.set_visible(open, cx));
         }
         if let Err(error) = self
-            .services
-            .store
-            .store
+            .window_store
             .write()
             .expect("session store lock poisoned")
             .update_preferences(|prefs| prefs.inspector_open = open)
@@ -2819,9 +2825,7 @@ impl RootView {
         }
         let width = self.inspector_width;
         if let Err(error) = self
-            .services
-            .store
-            .store
+            .window_store
             .write()
             .expect("session store lock poisoned")
             .update_preferences(|prefs| prefs.inspector_width = width)
@@ -2928,9 +2932,7 @@ impl RootView {
         };
         let card_height = (f32::from(viewport_size.height) - tabs_height).max(0.0);
         let selected = self
-            .services
-            .store
-            .store
+            .window_store
             .read()
             .expect("session store lock poisoned")
             .selected_session_id()
@@ -3051,7 +3053,7 @@ impl RootView {
             .bg(terminal.background);
         if self.active_workspace.is_some() {
             let tab = {
-                let store = self.services.store.store.read().expect("store");
+                let store = self.window_store.read().expect("store");
                 store
                     .workspace_catalog()
                     .snapshot()
@@ -3427,9 +3429,7 @@ impl RootView {
         let picker = self.quote_target_picker.as_ref()?;
         let targets = picker.targets.clone();
         let active = self
-            .services
-            .store
-            .store
+            .window_store
             .read()
             .expect("session store lock poisoned")
             .selected_session_id()
@@ -3764,7 +3764,7 @@ impl RootView {
             );
         let mut actions = div().flex().items_center().gap(px(8.0));
         if let Some((action, label)) = notice.primary_action {
-            let store = Arc::clone(&self.services.store.store);
+            let store = self.window_store.clone();
             actions = actions.child(
                 div()
                     .id("recovery-primary-action")
@@ -3818,7 +3818,7 @@ impl RootView {
             bar = bar.child(actions);
         }
         if notice.dismissible {
-            let store = Arc::clone(&self.services.store.store);
+            let store = self.window_store.clone();
             bar = bar.child(
                 div()
                     .id("dismiss-recovery-notice")
@@ -3861,9 +3861,7 @@ impl Render for RootView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         if self.pending_notification_open.is_some()
             && self
-                .services
-                .store
-                .store
+                .window_store
                 .read()
                 .expect("store")
                 .has_hydrated_sessions()
@@ -3877,9 +3875,7 @@ impl Render for RootView {
             None
         } else {
             let store = self
-                .services
-                .store
-                .store
+                .window_store
                 .read()
                 .expect("session store lock poisoned");
             // The composer owns its inline failure while open. Once closed,
@@ -3892,24 +3888,16 @@ impl Render for RootView {
             )
         };
         #[cfg(target_os = "macos")]
-        self.notifier.set_badge(
-            self.services
-                .store
-                .store
-                .read()
-                .expect("store")
-                .notifications()
-                .unread_count(),
-        );
+        {
+            self.notification_health = crate::application_notifications::health(cx);
+        }
         let notification_surface_visible = !launcher_open
             && !self.notification_panel_open
             && !self
                 .utility_surfaces
                 .as_ref()
                 .is_some_and(|surfaces| surfaces.read(cx).is_open());
-        self.services
-            .store
-            .store
+        self.window_store
             .write()
             .expect("store")
             .set_notification_surface_visible(notification_surface_visible);
@@ -4645,6 +4633,7 @@ mod tests {
         let (root, cx) = cx.add_window_view(move |window, cx| {
             RootView::new(services, false, PreviewScenario::Typical, window, cx)
         });
+        let window_store = root.read_with(cx, |root, _| root.window_store.clone());
         if sidebar_focused {
             root.update_in(cx, |root, window, cx| {
                 root.sidebar
@@ -4653,10 +4642,10 @@ mod tests {
         }
 
         cx.simulate_keystrokes(&commands::test_chords("cmd-w"));
-        assert!(runtime.store.read().unwrap().pending_close().is_some());
+        assert!(window_store.read().unwrap().pending_close().is_some());
         cx.simulate_keystrokes("escape");
         {
-            let store = runtime.store.read().unwrap();
+            let store = window_store.read().unwrap();
             assert!(
                 store.pending_close().is_none(),
                 "Escape must cancel closing"
@@ -4665,9 +4654,9 @@ mod tests {
         }
 
         cx.simulate_keystrokes(&commands::test_chords("cmd-w"));
-        assert!(runtime.store.read().unwrap().pending_close().is_some());
+        assert!(window_store.read().unwrap().pending_close().is_some());
         cx.simulate_keystrokes("enter");
-        let store = runtime.store.read().unwrap();
+        let store = window_store.read().unwrap();
         assert!(
             store.pending_close().is_none(),
             "Enter must confirm closing"
@@ -5510,7 +5499,13 @@ mod tests {
         );
         cx.simulate_keystrokes("enter");
         assert_eq!(
-            runtime.store.read().unwrap().selected_session_id(),
+            root.read_with(cx, |root, _| root
+                .window_store
+                .read()
+                .unwrap()
+                .selected_session_id()
+                .cloned())
+                .as_ref(),
             Some(&SessionId::new("preview-codex"))
         );
         assert!(!root.read_with(cx, |root, _| root.launches_expanded));

@@ -2150,6 +2150,7 @@ fn repo_targeting_tracks_the_selected_session_and_dedupes_requests() {
     assert_eq!(
         drain(&mut effects),
         vec![StoreEffect::LocateRepo {
+            owner: None,
             key: "local".into(),
             host: None,
             session_id: id("one"),

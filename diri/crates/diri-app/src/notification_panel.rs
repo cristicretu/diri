@@ -27,9 +27,7 @@ impl RootView {
     }
 
     pub(super) fn notification_rows(&self) -> Vec<usize> {
-        self.services
-            .store
-            .store
+        self.window_store
             .read()
             .expect("store")
             .notifications()
@@ -41,7 +39,7 @@ impl RootView {
             .collect()
     }
 
-    pub(super) fn open_notification(
+    pub(crate) fn open_notification(
         &mut self,
         session: SessionId,
         event: Option<String>,
@@ -57,9 +55,7 @@ impl RootView {
             return;
         }
         if !self
-            .services
-            .store
-            .store
+            .window_store
             .read()
             .expect("store")
             .has_hydrated_sessions()
@@ -70,7 +66,7 @@ impl RootView {
             return;
         }
         let available = {
-            let mut store = self.services.store.store.write().expect("store");
+            let mut store = self.window_store.write().expect("store");
             let available = store.sessions().get(&session).is_some_and(|record| {
                 !record.is_archived()
                     && event
@@ -101,6 +97,8 @@ impl RootView {
             );
             return;
         }
+        self.open_workspace_launch_session(session, window, cx);
+        self.sync_inspector_context(cx);
         self.notification_panel_open = false;
         self.launcher
             .update(cx, |launcher, cx| launcher.dismiss(cx));
@@ -131,9 +129,7 @@ impl RootView {
             "up" => self.notification_selected = self.notification_selected.saturating_sub(1),
             "enter" => {
                 let entry = rows.get(self.notification_selected).and_then(|index| {
-                    self.services
-                        .store
-                        .store
+                    self.window_store
                         .read()
                         .expect("store")
                         .notifications()
@@ -168,9 +164,7 @@ impl RootView {
     ) -> AnyElement {
         let selected = index == self.notification_selected;
         let muted = self
-            .services
-            .store
-            .store
+            .window_store
             .read()
             .expect("store")
             .preferences()
@@ -320,9 +314,7 @@ impl RootView {
                                         .on_click(
                                             cx.listener(move |this, _, _, cx| {
                                                 cx.stop_propagation();
-                                                this.services
-                                                    .store
-                                                    .store
+                                                this.window_store
                                                     .write()
                                                     .expect("store")
                                                     .toggle_notification_mute(mute_session.clone());
@@ -347,9 +339,7 @@ impl RootView {
                                         .on_click(
                                             cx.listener(move |this, _, _, cx| {
                                                 cx.stop_propagation();
-                                                this.services
-                                                    .store
-                                                    .store
+                                                this.window_store
                                                     .write()
                                                     .expect("store")
                                                     .set_notification_read(&read_id, !read);
@@ -381,7 +371,7 @@ impl RootView {
         let rows = self.notification_rows();
         let count = rows.len();
         let (colors, sounds, alerts) = {
-            let store = self.services.store.store.read().expect("store");
+            let store = self.window_store.read().expect("store");
             (
                 crate::app_theme::sidebar_colors(store.theme_id()),
                 store.preferences().status_sounds,
@@ -481,9 +471,7 @@ impl RootView {
                         )
                         .debug_selector(|| "notification-read-all".into())
                         .on_click(cx.listener(|this, _, _, cx| {
-                            this.services
-                                .store
-                                .store
+                            this.window_store
                                 .write()
                                 .expect("store")
                                 .mark_all_notifications_read();
@@ -530,8 +518,7 @@ impl RootView {
                             uniform_list("notification-list", count, move |range, _, cx| {
                                 entity.update(cx, |this, cx| {
                                     let entries = {
-                                        let store =
-                                            this.services.store.store.read().expect("store");
+                                        let store = this.window_store.read().expect("store");
                                         range
                                             .filter_map(|index| {
                                                 store
@@ -644,10 +631,10 @@ impl RootView {
             .flex().items_center().gap(px(8.0))
             .child(option_button("notification-alerts", if alerts { "Alerts on" } else { "Alerts off" }, colors)
                 .tooltip(move |_, cx| cx.new(|_| PaletteTooltip(health.clone(), colors)).into())
-                .on_click(cx.listener(|this, _, _, cx| { this.services.store.store.write().expect("store").toggle_notification_alerts(); cx.notify(); })))
+                .on_click(cx.listener(|this, _, _, cx| { this.window_store.write().expect("store").toggle_notification_alerts(); cx.notify(); })))
             .child(option_button("notification-sounds", if sounds { "Sounds on" } else { "Sounds off" }, colors)
                 .on_click(cx.listener(|this, _, _, cx| {
-                    let _ = this.services.store.store.write().expect("store").update_preferences(|prefs| prefs.status_sounds = !prefs.status_sounds); cx.notify();
+                    let _ = this.window_store.write().expect("store").update_preferences(|prefs| prefs.status_sounds = !prefs.status_sounds); cx.notify();
                 })))
             .child(div().flex_1())
             .child(option_button("notification-test", "Test alert", colors)
@@ -666,7 +653,7 @@ impl RootView {
                 })))
             .child(option_button("notification-clear", "Clear all", colors)
                 .on_click(cx.listener(|this, _, _, cx| {
-                    this.services.store.store.write().expect("store").clear_notifications(); this.notification_selected = 0; cx.notify();
+                    this.window_store.write().expect("store").clear_notifications(); this.notification_selected = 0; cx.notify();
                 })))
             ;
         if cx.reduce_motion() {

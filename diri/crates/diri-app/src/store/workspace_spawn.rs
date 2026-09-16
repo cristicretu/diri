@@ -10,7 +10,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 const MAX_ACTIVE: usize = 8;
 const MAX_RECEIPTS: usize = 32;
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
 pub struct SpawnOwner(u64);
 
 impl Default for SpawnOwner {
@@ -28,8 +28,40 @@ pub struct WorkspaceSpawnTarget {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
+pub struct WindowSpawnTarget {
+    pub owner: SpawnOwner,
+    pub selected_session: Option<SessionId>,
+    pub navigation_revision: u64,
+}
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum SpawnDestination {
+    Workspace(WorkspaceSpawnTarget),
+    Window(WindowSpawnTarget),
+}
+impl From<WorkspaceSpawnTarget> for SpawnDestination {
+    fn from(target: WorkspaceSpawnTarget) -> Self {
+        Self::Workspace(target)
+    }
+}
+impl From<WindowSpawnTarget> for SpawnDestination {
+    fn from(target: WindowSpawnTarget) -> Self {
+        Self::Window(target)
+    }
+}
+impl SpawnDestination {
+    pub fn workspace(&self) -> Option<&WorkspaceId> {
+        match self {
+            Self::Workspace(target) => Some(&target.workspace),
+            Self::Window(_) => None,
+        }
+    }
+}
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub enum WorkspaceSpawnState {
     Creating,
+    Created {
+        session: SessionId,
+    },
     Placing(SessionId),
     Placed {
         session: SessionId,
@@ -52,7 +84,7 @@ impl WorkspaceSpawnState {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct WorkspaceSpawnReceipt {
     pub id: u64,
-    pub target: WorkspaceSpawnTarget,
+    pub target: SpawnDestination,
     pub state: WorkspaceSpawnState,
 }
 
@@ -73,7 +105,11 @@ impl SessionStore {
         let id = self.workspace_spawns.next;
         self.workspace_spawns
             .receipts
-            .push_back(WorkspaceSpawnReceipt { id, target, state });
+            .push_back(WorkspaceSpawnReceipt {
+                id,
+                target: target.into(),
+                state,
+            });
         id
     }
 
@@ -110,9 +146,10 @@ impl SessionStore {
 
     pub fn request_workspace_spawn(
         &mut self,
-        target: WorkspaceSpawnTarget,
+        target: impl Into<SpawnDestination>,
         params: SessionSpawnParams,
     ) -> Option<u64> {
+        let target = target.into();
         let pending = self
             .workspace_spawns
             .receipts
@@ -126,12 +163,12 @@ impl SessionStore {
             return None;
         }
         if self.workspace_spawns.receipts.len() == MAX_RECEIPTS {
-            if let Some(index) = self
-                .workspace_spawns
-                .receipts
-                .iter()
-                .position(|r| matches!(r.state, WorkspaceSpawnState::Placed { .. }))
-            {
+            if let Some(index) = self.workspace_spawns.receipts.iter().position(|r| {
+                matches!(
+                    r.state,
+                    WorkspaceSpawnState::Placed { .. } | WorkspaceSpawnState::Created { .. }
+                )
+            }) {
                 self.workspace_spawns.receipts.remove(index);
             } else {
                 self.reject_workspace_spawn(
@@ -202,7 +239,7 @@ impl SessionStore {
         true
     }
 
-    fn finish_workspace_spawn(&mut self, id: u64, mut state: WorkspaceSpawnState) {
+    pub(super) fn finish_workspace_spawn(&mut self, id: u64, mut state: WorkspaceSpawnState) {
         if let WorkspaceSpawnState::Unplaced { detail, .. }
         | WorkspaceSpawnState::Unconfirmed(detail) = &mut state
             && let Some((byte, _)) = detail.char_indices().nth(1024)
@@ -271,10 +308,12 @@ pub(super) async fn run(
     } else {
         return;
     };
-    let result = place(&client, &receipt.target, &session).await;
-    let state = match result {
-        Ok(tab) => WorkspaceSpawnState::Placed { session, tab },
-        Err(detail) => WorkspaceSpawnState::Unplaced { session, detail },
+    let state = match &receipt.target {
+        SpawnDestination::Window(_) => WorkspaceSpawnState::Created { session },
+        SpawnDestination::Workspace(target) => match place(&client, target, &session).await {
+            Ok(tab) => WorkspaceSpawnState::Placed { session, tab },
+            Err(detail) => WorkspaceSpawnState::Unplaced { session, detail },
+        },
     };
     store
         .write()
@@ -504,8 +543,8 @@ mod tests {
             }
         );
         let receipts: Vec<_> = store.workspace_spawn_receipts().cloned().collect();
-        assert_eq!(receipts[0].target, one);
-        assert_eq!(receipts[1].target, two);
+        assert_eq!(receipts[0].target, one.into());
+        assert_eq!(receipts[1].target, two.into());
         assert_eq!(
             receipts[1].state,
             WorkspaceSpawnState::Placing(SessionId::new("second"))
