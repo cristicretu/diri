@@ -313,12 +313,29 @@ fn detach_reconnect_preserves_pid_snapshot_and_input() {
     let launch: LaunchResult = run_json("launch", &state_dir, Some(&request));
     assert_ne!(launch.holder_pid, launch.process_pid);
 
+    let mut old_hello = hello(&launch, None, "old-client");
+    old_hello.protocol.minor = 9;
+    let mut old = Attach::open(&state_dir, old_hello);
+    let old_handshake = old.receive_until(Duration::from_secs(2), |message| {
+        matches!(message, RemoteMessage::FullSnapshot(_))
+    });
+    assert!(old_handshake.iter().any(|message| matches!(message,
+        RemoteMessage::HelloAck(ack) if ack.child_identity.is_none())));
+    drop(old);
     let mut first = Attach::open(&state_dir, hello(&launch, Some(0), "client-one"));
     let initial = first.receive_until(Duration::from_secs(2), |message| match message {
         RemoteMessage::FullSnapshot(snapshot) => grid_text(&snapshot.grid).contains("ready>"),
         RemoteMessage::GridDelta(delta) => grid_text(&delta.grid).contains("ready>"),
         _ => false,
     });
+    let first_birth = initial
+        .iter()
+        .find_map(|message| match message {
+            RemoteMessage::HelloAck(ack) => ack.child_identity,
+            _ => None,
+        })
+        .expect("owned-child birth from capable Holder");
+    assert_eq!(first_birth.pid(), launch.process_pid);
     let first_epoch = initial
         .iter()
         .find_map(|message| match message {
@@ -360,6 +377,12 @@ fn detach_reconnect_preserves_pid_snapshot_and_input() {
         }
     );
 
+    assert_eq!(inspection.verified_child_identity(), Some(first_birth));
+    assert_eq!(
+        inspection.controller_epoch, first_epoch,
+        "inspection must not acquire control"
+    );
+
     let mut second = Attach::open(&state_dir, hello(&launch, Some(acknowledged), "client-two"));
     let reconnected = second.receive_until(Duration::from_secs(2), |message| {
         matches!(message, RemoteMessage::FullSnapshot(_))
@@ -372,6 +395,7 @@ fn detach_reconnect_preserves_pid_snapshot_and_input() {
         })
         .expect("second HelloAck");
     assert!(second_ack.controller_epoch > first_epoch);
+    assert_eq!(second_ack.child_identity, Some(first_birth));
     assert_eq!(
         second_ack.process_state,
         RemoteProcessState::Running {

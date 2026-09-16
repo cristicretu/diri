@@ -480,7 +480,12 @@ impl Holder {
             usize::from(start.request.rows),
         );
         let log = OutputLog::open(&paths.output)?;
-        let mut state = SessionState::new(&start.request, start.incarnation, process_pid);
+        let mut state = SessionState::new(
+            &start.request,
+            start.incarnation,
+            process_pid,
+            pty.child_identity(),
+        );
         state.output_offset = log.tail_offset();
         write_state(&paths.state, &state)?;
         let state_path = paths.state.clone();
@@ -986,6 +991,10 @@ impl Holder {
             capabilities: PHASE_ONE_CAPABILITIES.to_vec(),
             controller_epoch: epoch,
             process_state: self.state.process_state.clone(),
+            child_identity: (hello.protocol.minor
+                >= diri_proto::remote_pty::PROCESS_IDENTITY_PROTOCOL_MINOR)
+                .then_some(self.state.child_identity)
+                .flatten(),
             output_offset: self.state.output_offset,
             snapshot_sequence: self.state.snapshot_sequence,
             foreground_pid,
