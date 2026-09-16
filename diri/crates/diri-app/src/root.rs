@@ -5389,6 +5389,146 @@ mod tests {
         assert!(cx.debug_bounds("copy-recovery-details").is_none());
     }
 
+    #[gpui::test]
+    fn workspace_filter_and_group_collapse_preserve_terminal_and_restore_rows(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        use diri_proto::workspace::*;
+        cx.update(|cx| cx.set_reduce_motion(true));
+        let services = test_services();
+        let fixture = SidebarPreviewFixture::make(PreviewScenario::Typical);
+        let tab = |id: &str, title: &str, session: &str| WorkspaceTab {
+            id: TabId::new(id),
+            title: Some(title.into()),
+            focused_pane: PaneId::new(id),
+            zoomed_pane: None,
+            layout: LayoutNode::Pane {
+                id: PaneId::new(id),
+                session_id: SessionId::new(session),
+            },
+        };
+        {
+            let mut store = services.store.store.write().unwrap();
+            store.hydrate(fixture.list);
+            store.seed_workspace_snapshot_for_test(WorkspaceSnapshot {
+                revision: 7,
+                workspaces: vec![
+                    WorkspaceRecord {
+                        id: WorkspaceId::new("release"),
+                        name: "Release".into(),
+                        selected_tab: Some(TabId::new("build")),
+                        tabs: vec![
+                            tab("build", "Build frontend", "preview-claude"),
+                            tab("review", "Review notes", "preview-codex"),
+                        ],
+                    },
+                    WorkspaceRecord {
+                        id: WorkspaceId::new("remote"),
+                        name: "Remote".into(),
+                        selected_tab: Some(TabId::new("logs")),
+                        tabs: vec![tab("logs", "Server logs", "preview-claude")],
+                    },
+                ],
+                ..Default::default()
+            });
+            store
+                .update_preferences(|prefs| {
+                    prefs.active_workspace = Some(WorkspaceId::new("release"));
+                    prefs.sidebar_visible = true;
+                })
+                .unwrap();
+        }
+        let runtime = services.store.clone();
+        let (root, cx) = cx.add_window_view(move |window, cx| {
+            RootView::new(services, false, PreviewScenario::Empty, window, cx)
+        });
+        cx.simulate_resize(size(px(1100.0), px(700.0)));
+        cx.run_until_parked();
+        let terminal = root.read_with(cx, |root, cx| root.active_terminal(cx).unwrap());
+        let before = runtime
+            .store
+            .read()
+            .unwrap()
+            .workspace_catalog()
+            .snapshot()
+            .unwrap()
+            .clone();
+        assert!(cx.debug_bounds("workspace-heading-remote").is_some());
+        let fold = cx.debug_bounds("workspace-fold-release").unwrap().center();
+        cx.simulate_click(fold, Modifiers::default());
+        cx.run_until_parked();
+        assert!(cx.debug_bounds("workspace-tab-build").is_none());
+        assert_eq!(
+            root.read_with(cx, |root, cx| root.active_terminal(cx).unwrap()),
+            terminal
+        );
+        let filter = cx.debug_bounds("sidebar-filter").unwrap().center();
+        cx.simulate_click(filter, Modifiers::default());
+        cx.simulate_keystrokes("r e v i e w");
+        cx.run_until_parked();
+        assert!(cx.debug_bounds("workspace-tab-review").is_some());
+        assert!(cx.debug_bounds("workspace-tab-build").is_none());
+        assert!(cx.debug_bounds("workspace-heading-remote").is_some());
+        assert!(cx.debug_bounds("workspace-tab-logs").is_none());
+        assert_eq!(
+            root.read_with(cx, |root, cx| root.active_terminal(cx).unwrap()),
+            terminal
+        );
+        cx.simulate_keystrokes("escape");
+        cx.run_until_parked();
+        assert!(
+            cx.debug_bounds("workspace-tab-review").is_none(),
+            "clear restores the saved collapsed group"
+        );
+        assert!(cx.debug_bounds("workspace-tab-logs").is_some());
+        cx.simulate_click(fold, Modifiers::default());
+        cx.run_until_parked();
+        assert!(cx.debug_bounds("workspace-tab-build").is_some());
+        assert!(cx.debug_bounds("workspace-tab-review").is_some());
+        assert_eq!(
+            runtime.store.read().unwrap().workspace_catalog().snapshot(),
+            Some(&before)
+        );
+        assert_eq!(
+            root.read_with(cx, |root, cx| root.active_terminal(cx).unwrap()),
+            terminal
+        );
+        cx.simulate_click(filter, Modifiers::default());
+        cx.simulate_keystrokes("l o g s down down down");
+        cx.run_until_parked();
+        assert_eq!(
+            root.read_with(cx, |root, _| root.active_workspace.clone()),
+            Some(WorkspaceId::new("release")),
+            "arrow navigation does not activate results"
+        );
+        root.update_in(cx, |root, window, cx| {
+            root.run_command(CommandId::HorizontalTabs, window, cx)
+        });
+        cx.run_until_parked();
+        assert!(cx.debug_bounds("workspace-tab-build").is_some());
+        assert!(cx.debug_bounds("workspace-tab-review").is_some());
+        assert_eq!(
+            root.read_with(cx, |root, cx| root.active_terminal(cx).unwrap()),
+            terminal
+        );
+        root.update_in(cx, |root, window, cx| {
+            root.run_command(CommandId::VerticalTabs, window, cx)
+        });
+        cx.run_until_parked();
+        assert!(cx.debug_bounds("workspace-tab-build").is_none());
+        assert_eq!(
+            root.read_with(cx, |root, cx| root.active_terminal(cx).unwrap()),
+            terminal
+        );
+        cx.simulate_click(filter, Modifiers::default());
+        cx.simulate_keystrokes("down enter");
+        cx.run_until_parked();
+        assert_eq!(
+            root.read_with(cx, |root, _| root.active_workspace.clone()),
+            Some(WorkspaceId::new("remote"))
+        );
+    }
+
     #[cfg(target_os = "macos")]
     #[test]
     #[ignore = "real local PTYs and native keyboard routing"]
@@ -5817,6 +5957,30 @@ mod tests {
                 tab.focused_pane = PaneId::new("verification");
                 tab.zoomed_pane = Some(tab.focused_pane.clone());
             }
+            if let Ok(mode) = std::env::var("DIRI_WORKSPACE_GROUPS") {
+                snapshot.workspaces.push(WorkspaceRecord {
+                    id: WorkspaceId::new("operations-workspace"),
+                    name: "Operations".into(),
+                    selected_tab: Some(TabId::new("deployment-tab")),
+                    tabs: vec![WorkspaceTab {
+                        id: TabId::new("deployment-tab"),
+                        title: Some("Watch deployment logs".into()),
+                        focused_pane: PaneId::new("deployment-pane"),
+                        zoomed_pane: None,
+                        layout: LayoutNode::Pane {
+                            id: PaneId::new("deployment-pane"),
+                            session_id: SessionId::new("preview-codex"),
+                        },
+                    }],
+                });
+                if mode == "collapsed" || mode == "filter" {
+                    store
+                        .update_preferences(|prefs| {
+                            prefs.sidebar_collapsed_workspaces.push(workspace.clone())
+                        })
+                        .unwrap();
+                }
+            }
             store.seed_workspace_snapshot_for_test(snapshot);
         }
         let width = if std::env::var_os("DIRI_WORKSPACE_NARROW").is_some() {
@@ -5829,6 +5993,9 @@ mod tests {
                 cx.new(|cx| {
                     let root = RootView::new(services, false, PreviewScenario::Empty, window, cx);
                     root.sidebar.update(cx, |sidebar, cx| {
+                        if std::env::var("DIRI_WORKSPACE_GROUPS").as_deref() == Ok("filter") {
+                            sidebar.seed_workspace_filter_for_test("review", cx);
+                        }
                         sidebar
                             .set_tab_orientation(
                                 if std::env::var_os("DIRI_WORKSPACE_HORIZONTAL").is_some() {
