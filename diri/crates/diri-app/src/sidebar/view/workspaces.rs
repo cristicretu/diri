@@ -1,7 +1,9 @@
+mod groups;
 use super::*;
 use diri_proto::workspace::{
     DockEdge, PaneId, TabId, WorkspaceId, WorkspaceMutation, WorkspaceRecord,
 };
+use groups::{WorkspaceRowKey, project_groups};
 
 #[derive(Clone)]
 struct DraggedWorkspaceTab {
@@ -44,6 +46,8 @@ pub(super) struct WorkspaceNavigation {
     pub(super) focus: FocusHandle,
     awaiting_create: bool,
     highlighted_session: Option<SessionId>,
+    cursor: Option<WorkspaceRowKey>,
+    pending_activation: Option<(WorkspaceId, TabId, u64)>,
     menu_scroll: ScrollHandle,
     scroll: ScrollHandle,
     vertical_scroll: ScrollHandle,
@@ -61,6 +65,8 @@ impl WorkspaceNavigation {
             focus: cx.focus_handle(),
             awaiting_create: false,
             highlighted_session: None,
+            cursor: None,
+            pending_activation: None,
             menu_scroll: ScrollHandle::new(),
             scroll: ScrollHandle::new(),
             vertical_scroll: ScrollHandle::new(),
@@ -149,6 +155,7 @@ impl Sidebar {
             eprintln!("diri: could not remember workspace selection: {error}");
         }
         self.workspace_nav.awaiting_create = false;
+        self.workspace_nav.pending_activation = None;
         self.workspace_nav.menu = false;
         self.workspace_nav.destination = None;
         self.workspace_nav.editor = None;
@@ -173,6 +180,7 @@ impl Sidebar {
         cx.notify();
     }
     pub(super) fn reconcile_workspace_navigation(&mut self, cx: &mut Context<Self>) {
+        self.reconcile_workspace_activation(cx);
         let (created, active_exists, ready) = {
             let store = self.store.read().expect("store");
             let catalog = store.workspace_catalog();
@@ -419,38 +427,25 @@ impl Sidebar {
         colors: SemanticColors,
         cx: &mut Context<Self>,
     ) -> AnyElement {
-        let Some(workspace) = self.workspace_record() else {
-            return div()
-                .p(px(14.0))
-                .text_color(colors.secondary)
-                .child("Loading workspace…")
-                .into_any_element();
-        };
-        let fingerprint = (
-            workspace.id.clone(),
-            workspace.selected_tab.clone(),
-            horizontal,
-            self.workspace_nav.available_width.to_bits(),
-        );
-        if self.workspace_nav.last_selection.as_ref() != Some(&fingerprint) {
-            if let Some(index) = workspace
-                .tabs
-                .iter()
-                .position(|tab| workspace.selected_tab.as_ref() == Some(&tab.id))
-            {
+        let groups = {
+            let store = self.store.read().expect("store");
+            let Some(snapshot) = store.workspace_catalog().snapshot() else {
+                return div()
+                    .p(px(14.0))
+                    .text_color(colors.secondary)
+                    .child("Loading workspaces…")
+                    .into_any_element();
+            };
+            project_groups(
+                snapshot,
+                &store,
                 if horizontal {
-                    self.workspace_nav
-                        .scroll
-                        .set_offset(point(px(-(index as f32) * 167.0), px(0.0)));
+                    ""
                 } else {
-                    self.workspace_nav
-                        .vertical_scroll
-                        .set_offset(point(px(0.0), px(-(index as f32) * 35.0)));
-                }
-            }
-            self.workspace_nav.last_selection = Some(fingerprint);
-        }
-        let store = self.store.read().expect("store");
+                    self.filter_query.text()
+                },
+            )
+        };
         let mut rows = div()
             .id("workspace-tabs")
             .role(Role::TabList)
@@ -471,119 +466,227 @@ impl Sidebar {
                 .overflow_y_scroll()
                 .track_scroll(&self.workspace_nav.vertical_scroll);
         }
-        for (index, tab) in workspace.tabs.iter().enumerate() {
-            let id = tab.id.clone();
-            let workspace_id = workspace.id.clone();
-            let active = workspace.selected_tab.as_ref() == Some(&tab.id);
-            let title = tab_title(tab, &store);
-            let rename_id = id.clone();
-            let rename_title = title.clone();
-            let source = DraggedWorkspaceTab {
-                tab: id.clone(),
-                revision: store
-                    .workspace_catalog()
-                    .snapshot()
-                    .map_or(0, |snapshot| snapshot.revision),
-            };
-            let destination = workspace.id.clone();
-            let remove = id.clone();
-            let mut row = div()
-                .id(SharedString::from(format!("workspace-tab-{}", id.0)))
-                .role(Role::Tab)
-                .aria_label(title.clone())
-                .h(px(32.0))
-                .px(px(9.0))
-                .flex_none()
-                .flex()
-                .items_center()
-                .gap(px(6.0))
-                .rounded(px(7.0))
-                .cursor_pointer()
-                .bg(if active {
-                    colors.primary.alpha(0.08)
+        let selected_key = groups
+            .iter()
+            .find(|group| self.workspace_nav.active.as_ref() == Some(&group.id))
+            .and_then(|group| {
+                group
+                    .selected
+                    .as_ref()
+                    .map(|tab| WorkspaceRowKey::Tab(group.id.clone(), tab.clone()))
+            });
+        let fingerprint = self.workspace_nav.active.clone().map(|workspace| {
+            (
+                workspace,
+                selected_key.as_ref().and_then(|key| match key {
+                    WorkspaceRowKey::Tab(_, tab) => Some(tab.clone()),
+                    _ => None,
+                }),
+                horizontal,
+                self.workspace_nav.available_width.to_bits(),
+            )
+        });
+        if self.workspace_nav.last_selection != fingerprint {
+            let keys = groups
+                .iter()
+                .flat_map(|group| group.row_keys())
+                .collect::<Vec<_>>();
+            if let Some(index) = selected_key
+                .as_ref()
+                .and_then(|selected| keys.iter().position(|key| key == selected))
+            {
+                if horizontal {
+                    if let Some(group) = groups
+                        .iter()
+                        .find(|group| self.workspace_nav.active.as_ref() == Some(&group.id))
+                        && let Some(index) = group
+                            .tabs
+                            .iter()
+                            .position(|row| group.selected.as_ref() == Some(&row.id))
+                    {
+                        self.workspace_nav
+                            .scroll
+                            .set_offset(point(px(-(index as f32) * 167.0), px(0.0)));
+                    }
                 } else {
-                    colors.primary.alpha(0.0)
-                })
-                .hover(move |row| row.bg(colors.primary.alpha(0.06)))
-                .child(sf_symbol(
-                    "rectangle",
-                    11.0,
-                    if active {
-                        colors.primary
-                    } else {
-                        colors.secondary
-                    },
-                ))
-                .child(
-                    div()
-                        .flex_1()
-                        .min_w(px(0.0))
-                        .overflow_hidden()
-                        .text_ellipsis()
-                        .text_size(px(Typo::ROW.size))
-                        .child(title),
-                )
-                .child(
-                    div()
-                        .id(SharedString::from(format!(
-                            "close-workspace-tab-{}",
-                            remove.0
-                        )))
-                        .role(Role::Button)
-                        .aria_label("Remove tab from workspace")
-                        .size(px(14.0))
-                        .flex_none()
-                        .flex()
-                        .items_center()
-                        .justify_center()
-                        .child(sf_symbol("xmark", 8.0, colors.tertiary))
-                        .on_click(cx.listener(move |this, _, _, cx| {
-                            this.store.write().expect("store").edit_workspace(
-                                WorkspaceMutation::RemoveTab {
-                                    tab_id: remove.clone(),
-                                },
-                            );
-                            cx.stop_propagation();
-                            cx.notify();
-                        })),
-                )
-                .on_drag(source, |source, _, _, cx| cx.new(|_| source.clone()))
-                .drag_over::<DraggedWorkspaceTab>(move |row, _, _, _| {
-                    row.bg(colors.primary.alpha(0.12))
-                })
-                .on_drop(
-                    cx.listener(move |this, dragged: &DraggedWorkspaceTab, _, cx| {
-                        this.move_workspace_tab(dragged, destination.clone(), index, cx);
-                    }),
-                )
-                .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
-                .on_click(
-                    cx.listener(move |this, event: &gpui::ClickEvent, window, cx| {
-                        if event.click_count() == 2 {
-                            this.begin_workspace_editor(
-                                WorkspaceEditor::RenameTab(rename_id.clone()),
-                                &rename_title,
-                                window,
-                                cx,
-                            );
-                        } else {
-                            this.store.write().expect("store").edit_workspace(
-                                WorkspaceMutation::SelectTab {
-                                    workspace_id: workspace_id.clone(),
-                                    tab_id: id.clone(),
-                                },
-                            );
-                            cx.emit(SidebarEvent::WorkspaceTabActivated);
-                            cx.notify();
-                        }
-                    }),
-                );
-            if horizontal {
-                row = row.w(px(164.0));
+                    self.workspace_nav
+                        .vertical_scroll
+                        .set_offset(point(px(0.0), px(-(index as f32) * 35.0)));
+                }
             }
-            rows = rows.child(row);
+            self.workspace_nav.last_selection = fingerprint;
+        }
+        for group in groups {
+            let active_group = self.workspace_nav.active.as_ref() == Some(&group.id);
+            if horizontal && !active_group {
+                continue;
+            }
+            if !horizontal {
+                rows = rows.child(self.workspace_heading(&group, colors, cx));
+            }
+            if horizontal || !group.collapsed {
+                for row in &group.tabs {
+                    rows = rows.child(self.workspace_tab_row(
+                        &group.id,
+                        row,
+                        active_group && group.selected.as_ref() == Some(&row.id),
+                        horizontal,
+                        colors,
+                        cx,
+                    ));
+                }
+            }
         }
         rows.into_any_element()
+    }
+    fn workspace_tab_row(
+        &self,
+        workspace: &WorkspaceId,
+        tab: &groups::TabRow,
+        active: bool,
+        horizontal: bool,
+        colors: SemanticColors,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let store = self.store.read().expect("store");
+        let id = tab.id.clone();
+        let index = tab.index;
+        let workspace_id = workspace.clone();
+        let title = tab.title.clone();
+        let rename_id = id.clone();
+        let rename_title = title.clone();
+        let source = DraggedWorkspaceTab {
+            tab: id.clone(),
+            revision: store
+                .workspace_catalog()
+                .snapshot()
+                .map_or(0, |snapshot| snapshot.revision),
+        };
+        let destination = workspace.clone();
+        let remove = id.clone();
+        let mut row = div()
+            .id(SharedString::from(format!("workspace-tab-{}", id.0)))
+            .role(Role::Tab)
+            .aria_label(title.clone())
+            .aria_selected(active)
+            .debug_selector({
+                let key = format!("workspace-tab-{}", id.0);
+                move || key.clone()
+            })
+            .h(px(32.0))
+            .px(px(9.0))
+            .flex_none()
+            .flex()
+            .items_center()
+            .gap(px(6.0))
+            .rounded(px(7.0))
+            .cursor_pointer()
+            .border_1()
+            .border_color(
+                if self.workspace_nav.cursor.as_ref()
+                    == Some(&WorkspaceRowKey::Tab(workspace_id.clone(), id.clone()))
+                {
+                    colors.primary.alpha(0.22)
+                } else {
+                    colors.primary.alpha(0.0)
+                },
+            )
+            .bg(if active {
+                colors.primary.alpha(0.08)
+            } else {
+                colors.primary.alpha(0.0)
+            })
+            .hover(move |row| row.bg(colors.primary.alpha(0.06)))
+            .child(sf_symbol(
+                "rectangle",
+                11.0,
+                if active {
+                    colors.primary
+                } else {
+                    colors.secondary
+                },
+            ))
+            .child(
+                div()
+                    .flex_1()
+                    .min_w(px(0.0))
+                    .overflow_hidden()
+                    .text_ellipsis()
+                    .text_size(px(Typo::ROW.size))
+                    .child(
+                        if let Some(range) = crate::sidebar::filter::label_match(
+                            &title,
+                            if horizontal {
+                                ""
+                            } else {
+                                self.filter_query.text()
+                            },
+                        ) {
+                            gpui::StyledText::new(title.clone()).with_highlights([(
+                                range,
+                                gpui::HighlightStyle {
+                                    color: Some(Palette::CLAY.into()),
+                                    font_weight: Some(FontWeight::SEMIBOLD),
+                                    ..Default::default()
+                                },
+                            )])
+                        } else {
+                            gpui::StyledText::new(title.clone())
+                        },
+                    ),
+            )
+            .child(
+                div()
+                    .id(SharedString::from(format!(
+                        "close-workspace-tab-{}",
+                        remove.0
+                    )))
+                    .role(Role::Button)
+                    .aria_label("Remove tab from workspace")
+                    .size(px(14.0))
+                    .flex_none()
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .child(sf_symbol("xmark", 8.0, colors.tertiary))
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.store.write().expect("store").edit_workspace(
+                            WorkspaceMutation::RemoveTab {
+                                tab_id: remove.clone(),
+                            },
+                        );
+                        cx.stop_propagation();
+                        cx.notify();
+                    })),
+            )
+            .on_drag(source, |source, _, _, cx| cx.new(|_| source.clone()))
+            .drag_over::<DraggedWorkspaceTab>(move |row, _, _, _| {
+                row.bg(colors.primary.alpha(0.12))
+            })
+            .on_drop(
+                cx.listener(move |this, dragged: &DraggedWorkspaceTab, _, cx| {
+                    this.move_workspace_tab(dragged, destination.clone(), index, cx);
+                }),
+            )
+            .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+            .on_click(
+                cx.listener(move |this, event: &gpui::ClickEvent, window, cx| {
+                    if event.click_count() == 2 {
+                        this.begin_workspace_editor(
+                            WorkspaceEditor::RenameTab(rename_id.clone()),
+                            &rename_title,
+                            window,
+                            cx,
+                        );
+                    } else {
+                        this.request_workspace_tab(workspace_id.clone(), id.clone(), cx);
+                    }
+                }),
+            );
+        if horizontal {
+            row = row.w(px(164.0));
+        }
+        row.into_any_element()
     }
     pub(super) fn workspace_body(
         &mut self,

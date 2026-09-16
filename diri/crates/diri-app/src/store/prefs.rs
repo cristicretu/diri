@@ -182,6 +182,8 @@ pub struct Prefs {
     pub sidebar_pinned_projects: Vec<ProjectId>,
     pub sidebar_pinned_sessions: Vec<SessionId>,
     pub sidebar_collapsed_projects: Vec<ProjectId>,
+    /// Presentation-only disclosure state for named workspace headings.
+    pub sidebar_collapsed_workspaces: Vec<diri_proto::workspace::WorkspaceId>,
     /// Sessions whose spawned children are folded away.
     pub sidebar_collapsed_sessions: Vec<SessionId>,
     pub sidebar_expanded_archives: Vec<ProjectId>,
@@ -237,6 +239,7 @@ impl Default for Prefs {
             sidebar_pinned_projects: Vec::new(),
             sidebar_pinned_sessions: Vec::new(),
             sidebar_collapsed_projects: Vec::new(),
+            sidebar_collapsed_workspaces: Vec::new(),
             sidebar_collapsed_sessions: Vec::new(),
             sidebar_expanded_archives: Vec::new(),
             launch_recipes: LaunchRecipeBook::default(),
