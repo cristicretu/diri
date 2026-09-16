@@ -24,9 +24,11 @@ use diri_proto::terminal::{MouseEncoding, MouseModes, MouseTrackingMode};
 // treated as a cache miss and rebuilt from the authoritative raw log.
 const PREVIOUS_VERSION: u64 = 2;
 const CURRENT_VERSION: u64 = 4;
+const ENHANCED_KEYBOARD_VERSION: u64 = 6;
 
 /// A decoded checkpoint, grid already validated.
 pub struct ScreenCheckpoint {
+    pub keyboard_snapshot: Option<diri_terminal_state::KeyboardSnapshot>,
     /// Versioned optional input-state extension; absent historical state is unknown.
     pub keyboard: Option<diri_proto::terminal_input::KeyboardState>,
     pub log_offset: u64,
@@ -56,7 +58,10 @@ impl ScreenCheckpoint {
         let value = plist::Value::from_file(path).ok()?;
         let dict = value.as_dictionary()?;
         let version = dict.get("version")?.as_unsigned_integer()?;
-        if !matches!(version, PREVIOUS_VERSION | 3 | CURRENT_VERSION) {
+        if !matches!(
+            version,
+            PREVIOUS_VERSION | 3 | CURRENT_VERSION | ENHANCED_KEYBOARD_VERSION
+        ) {
             return None;
         }
         let grid = GridUpdate::decode(as_data(dict.get("gridPayload")?)?).ok()?;
@@ -127,7 +132,24 @@ impl ScreenCheckpoint {
                 })
             }
         };
+        let keyboard_snapshot = match dict.get("keyboardSnapshot") {
+            Some(value) if version == ENHANCED_KEYBOARD_VERSION => Some(
+                diri_terminal_state::KeyboardSnapshot::decode(as_data(value)?)?,
+            ),
+            Some(_) => return None,
+            None if version == ENHANCED_KEYBOARD_VERSION => return None,
+            None => None,
+        };
+        let keyboard = match (keyboard, keyboard_snapshot.as_ref()) {
+            (Some(mut keyboard), Some(snapshot)) => {
+                keyboard.enhancements = Some(snapshot.current().try_into().ok()?);
+                Some(keyboard)
+            }
+            (None, Some(_)) => return None,
+            (keyboard, None) => keyboard,
+        };
         Some(Self {
+            keyboard_snapshot,
             keyboard,
             log_offset: dict.get("logOffset")?.as_unsigned_integer()?,
             history,
@@ -143,6 +165,23 @@ impl ScreenCheckpoint {
     /// Writes atomically (temp file + rename) as a binary plist.
     pub fn write_atomically(&self, path: &Path) -> std::io::Result<()> {
         let mut dict = plist::Dictionary::new();
+        let enhancements = self.keyboard.and_then(|keyboard| keyboard.enhancements);
+        if enhancements.map(|flags| flags.bits())
+            != self
+                .keyboard_snapshot
+                .as_ref()
+                .map(|snapshot| snapshot.current())
+        {
+            return Err(std::io::Error::other(
+                "checkpoint keyboard flags and stacks disagree",
+            ));
+        }
+        if let Some(snapshot) = &self.keyboard_snapshot {
+            dict.insert(
+                "keyboardSnapshot".into(),
+                plist::Value::Data(snapshot.encode()),
+            );
+        }
         if let Some(keyboard) = self.keyboard {
             let mut state = plist::Dictionary::new();
             state.insert("version".into(), plist::Value::Integer(1u64.into()));
@@ -163,7 +202,14 @@ impl ScreenCheckpoint {
         dict.insert("historyMetadata".into(), plist::Value::Data(metadata));
         dict.insert(
             "version".into(),
-            plist::Value::Integer(CURRENT_VERSION.into()),
+            plist::Value::Integer(
+                if self.keyboard_snapshot.is_some() {
+                    ENHANCED_KEYBOARD_VERSION
+                } else {
+                    CURRENT_VERSION
+                }
+                .into(),
+            ),
         );
         dict.insert(
             "logOffset".into(),
@@ -242,12 +288,65 @@ mod tests {
         assert_eq!(super::ScreenCheckpoint::load(&path).unwrap().keyboard, None);
     }
 
+    #[test]
+    fn v6_keyboard_cache_preserves_both_stacks_and_rejects_downgrades() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("screen.plist");
+        for flags in 0..32 {
+            let mut checkpoint = sample();
+            let snapshot = diri_terminal_state::KeyboardSnapshot::decode(&[
+                1, flags, 2, 0, 1, 0, 7, flags, 16,
+            ])
+            .unwrap();
+            checkpoint.keyboard.as_mut().unwrap().enhancements = Some(flags.try_into().unwrap());
+            checkpoint.keyboard_snapshot = Some(snapshot.clone());
+            checkpoint.write_atomically(&path).unwrap();
+            let value = plist::Value::from_file(&path).unwrap();
+            assert_eq!(
+                value.as_dictionary().unwrap()["version"].as_unsigned_integer(),
+                Some(6)
+            );
+            let loaded = super::ScreenCheckpoint::load(&path).unwrap();
+            assert_eq!(loaded.keyboard_snapshot, Some(snapshot));
+            assert_eq!(loaded.keyboard, checkpoint.keyboard);
+        }
+        let original = plist::Value::from_file(&path).unwrap();
+        let mut downgrade = original.clone();
+        downgrade
+            .as_dictionary_mut()
+            .unwrap()
+            .insert("version".into(), plist::Value::Integer(4u64.into()));
+        downgrade.to_file_binary(&path).unwrap();
+        assert!(super::ScreenCheckpoint::load(&path).is_none());
+        let mut missing = original.clone();
+        missing
+            .as_dictionary_mut()
+            .unwrap()
+            .remove("keyboardSnapshot");
+        missing.to_file_binary(&path).unwrap();
+        assert!(super::ScreenCheckpoint::load(&path).is_none());
+        let mut oversized = original;
+        oversized.as_dictionary_mut().unwrap().insert(
+            "keyboardSnapshot".into(),
+            plist::Value::Data(vec![
+                0;
+                diri_terminal_state::KeyboardSnapshot::MAX_BYTES + 1
+            ]),
+        );
+        oversized.to_file_binary(&path).unwrap();
+        assert!(super::ScreenCheckpoint::load(&path).is_none());
+        let mut incomplete = sample();
+        incomplete.keyboard.as_mut().unwrap().enhancements = Some(0.try_into().unwrap());
+        assert!(incomplete.write_atomically(&path).is_err());
+    }
+
     use super::*;
     use diri_proto::grid::{ChangedRow, GridCell};
 
     fn sample() -> ScreenCheckpoint {
         let cells = vec![GridCell::BLANK; 4];
         ScreenCheckpoint {
+            keyboard_snapshot: None,
             keyboard: Some(diri_proto::terminal_input::KeyboardState {
                 enhancements: None,
                 application_cursor_keys: true,

@@ -161,6 +161,10 @@ impl RemoteSessionClient {
         Ok(inspection)
     }
 
+    pub(crate) fn enhanced_keyboard_protocol(&self) -> bool {
+        self.helper.protocol.minor >= diri_proto::remote_pty::ENHANCED_KEYBOARD_PROTOCOL_MINOR
+    }
+
     pub fn connect(
         &self,
         output_offset: u64,
@@ -169,6 +173,13 @@ impl RemoteSessionClient {
         ensure_available(&self.writer.lock().expect("remote writer"))?;
         let mut channel = self.manager.attach(&self.helper)?;
         let setup = (|| {
+            let mut required_capabilities = REQUIRED_CAPABILITIES.to_vec();
+            if self.helper.protocol.minor
+                >= diri_proto::remote_pty::ENHANCED_KEYBOARD_PROTOCOL_MINOR
+            {
+                required_capabilities
+                    .push(diri_proto::remote_pty::RemoteCapability::EnhancedKeyboard);
+            }
             let hello = RemoteMessage::Hello(Hello {
                 protocol: ProtocolVersion::CURRENT,
                 local_build_id: format!("engine-{}", env!("CARGO_PKG_VERSION")),
@@ -177,7 +188,7 @@ impl RemoteSessionClient {
                 expected_incarnation: Some(self.incarnation.clone()),
                 requested_role: RemoteRole::Controller,
                 client_nonce: random_identifier()?,
-                required_capabilities: REQUIRED_CAPABILITIES.to_vec(),
+                required_capabilities,
                 last_acknowledged_output_offset: Some(output_offset),
                 last_acknowledged_grid_sequence: grid_sequence,
             });
@@ -298,6 +309,21 @@ impl RemoteSessionClient {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 "remote process identity changed after reconnect inspection",
+            ));
+        }
+        if self.helper.protocol.minor >= diri_proto::remote_pty::ENHANCED_KEYBOARD_PROTOCOL_MINOR
+            && (acknowledgement.protocol.minor
+                < diri_proto::remote_pty::ENHANCED_KEYBOARD_PROTOCOL_MINOR
+                || !acknowledgement
+                    .capabilities
+                    .contains(&diri_proto::remote_pty::RemoteCapability::EnhancedKeyboard)
+                || !acknowledgement
+                    .capabilities
+                    .contains(&diri_proto::remote_pty::RemoteCapability::InputModes))
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "remote Holder did not confirm enhanced-keyboard-v1",
             ));
         }
         if REQUIRED_CAPABILITIES
@@ -830,6 +856,72 @@ mod tests {
     use diri_proto::frames::FrameType;
 
     use super::*;
+
+    #[test]
+    fn enhanced_keyboard_ack_must_match_the_installed_protocol_contract() {
+        use crate::remote::{
+            executor::ProcessExecutor, manager::ArtifactCatalog, ssh::SshTransport,
+        };
+        use diri_proto::remote_pty::RemoteCapability;
+        let temp = tempfile::tempdir().unwrap();
+        let host = diri_proto::HostEntry {
+            id: "fixture".into(),
+            name: None,
+            ssh: "fixture".into(),
+            default_cwd: None,
+            node: None,
+        };
+        let manager = Arc::new(
+            RemoteManager::new(
+                ProcessExecutor::new("/bin/false"),
+                ArtifactCatalog::without_artifacts_for_test(),
+                temp.path().join("control"),
+            )
+            .unwrap(),
+        );
+        for minor in [8, 13, 14] {
+            let helper = InstalledHelper {
+                target: RemoteTarget::MacosAarch64,
+                build_id: "fixture".into(),
+                protocol: ProtocolVersion { major: 1, minor },
+                transport: SshTransport::new(&host, temp.path().join("control/socket")),
+            };
+            let client = RemoteSessionClient::new(
+                Arc::clone(&manager),
+                helper,
+                "fixture".into(),
+                SessionToken::new("fixture-token-long-enough").unwrap(),
+                "incarnation".into(),
+                RemoteBindingStore::new(temp.path().join(format!("binding-{minor}"))).unwrap(),
+                0,
+            )
+            .unwrap();
+            let mut ack = HelloAck {
+                protocol: ProtocolVersion { major: 1, minor },
+                holder_build_id: "fixture".into(),
+                session_incarnation: "incarnation".into(),
+                capabilities: REQUIRED_CAPABILITIES.to_vec(),
+                controller_epoch: 1,
+                process_state: RemoteProcessState::Running { pid: 123 },
+                child_identity: None,
+                output_offset: 0,
+                snapshot_sequence: 1,
+                foreground_pid: None,
+            };
+            assert_eq!(client.validate_hello(&ack).is_ok(), minor < 14);
+            if minor == 14 {
+                ack.capabilities.push(RemoteCapability::EnhancedKeyboard);
+                assert!(client.validate_hello(&ack).is_err());
+                ack.capabilities.push(RemoteCapability::InputModes);
+                assert!(client.validate_hello(&ack).is_ok());
+                ack.protocol.minor = 13;
+                assert!(client.validate_hello(&ack).is_err());
+                ack.protocol.minor = 14;
+                ack.holder_build_id = "wrong-build".into();
+                assert!(client.validate_hello(&ack).is_err());
+            }
+        }
+    }
 
     #[test]
     fn unsupported_signals_are_rejected_before_delivery() {

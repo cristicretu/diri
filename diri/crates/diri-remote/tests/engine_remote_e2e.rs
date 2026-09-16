@@ -549,7 +549,7 @@ fn engine_bootstraps_detaches_and_adopts_the_same_remote_process() {
     assert_eq!(
         session.keyboard_state(),
         Some(diri_proto::terminal_input::KeyboardState {
-            enhancements: None,
+            enhancements: Some(0.try_into().unwrap()),
             application_cursor_keys: true,
             application_keypad: true
         })
@@ -559,7 +559,7 @@ fn engine_bootstraps_detaches_and_adopts_the_same_remote_process() {
     assert_eq!(
         session.keyboard_state(),
         Some(diri_proto::terminal_input::KeyboardState {
-            enhancements: None,
+            enhancements: Some(0.try_into().unwrap()),
             application_cursor_keys: false,
             application_keypad: true
         })
@@ -630,7 +630,7 @@ fn engine_bootstraps_detaches_and_adopts_the_same_remote_process() {
     assert_eq!(
         session.keyboard_state(),
         Some(diri_proto::terminal_input::KeyboardState {
-            enhancements: None,
+            enhancements: Some(0.try_into().unwrap()),
             application_cursor_keys: false,
             application_keypad: true
         })
@@ -839,7 +839,7 @@ fn interrupted_upload_cleans_only_its_nonce_and_is_retryable() {
 }
 
 #[test]
-fn attach_ssh_disconnect_reconnects_and_flushes_queued_input() {
+fn attach_ssh_disconnect_reconnects_without_replaying_unavailable_input() {
     let temporary = tempfile::tempdir().expect("temp");
     let remote_home = temporary.path().join("remote-home");
     let remote_state = temporary.path().join("remote-state");
@@ -907,20 +907,39 @@ fn attach_ssh_disconnect_reconnects_and_flushes_queued_input() {
     )
     .expect("spawn remote Session");
     wait_until("first attach interruption", Duration::from_secs(5), || {
-        disconnect_marker.is_file()
+        temporary
+            .path()
+            .join("attach-interrupted.disconnected")
+            .is_file()
+            && session.view().remote_connection.is_some_and(|connection| {
+                connection.state == diri_proto::RemoteConnectionState::Reconnecting
+            })
     });
-    // Input during the reconnect window is bounded and delivered after the
-    // replacement controller receives ControlGranted.
+    // The child may have changed modes while disconnected. Reject without
+    // queueing until a matching authoritative seed restores mode knowledge.
+    assert_eq!(
+        session
+            .write_input(b"must-not-replay\n")
+            .unwrap_err()
+            .kind(),
+        std::io::ErrorKind::Unsupported
+    );
+    fs::write(temporary.path().join("attach-interrupted.resume"), b"").unwrap();
+    wait_until("validated reconnect seed", Duration::from_secs(5), || {
+        session.view().remote_connection.is_some_and(|connection| {
+            connection.state == diri_proto::RemoteConnectionState::Connected
+        })
+    });
     session
         .write_input(b"after-ssh-reconnect\n")
-        .expect("queued input");
+        .expect("input after validated seed");
     // Wait for the echo itself, not for the exit. `exited` flips when the
     // remote process is reaped, which can beat the last of its output through
     // the Holder, the frame queue and the terminal parser — so asserting the
     // screen right after it raced the flush and failed on a loaded CI runner
     // while passing locally.
     wait_until(
-        "the queued input to echo after reconnect",
+        "the newly admitted input to echo after reconnect",
         Duration::from_secs(10),
         || {
             session
@@ -1123,9 +1142,11 @@ fn write_fake_ssh_with_attach_disconnect(
     write_executable_script(
         &path,
         &format!(
-            "#!/bin/sh\nexport HOME='{}'\nexport DIRI_REMOTE_STATE_DIR='{}'\nfor last; do :; done\ncase \"$last\" in\n  *' attach'*)\n    if [ ! -e '{}' ]; then\n      : > '{}'\n      /bin/sh -c \"$last\" <&0 & bridge=$!\n      (sleep 0.2; kill \"$bridge\" 2>/dev/null || true) & killer=$!\n      wait \"$bridge\" || true\n      kill \"$killer\" 2>/dev/null || true\n      wait \"$killer\" 2>/dev/null || true\n      printf 'simulated interrupted attach\\n' >&2\n      exit 255\n    fi\n    ;;\nesac\nexec /bin/sh -c \"$last\"",
+            "#!/bin/sh\nexport HOME='{}'\nexport DIRI_REMOTE_STATE_DIR='{}'\nfor last; do :; done\ncase \"$last\" in\n  *' attach'*)\n    if [ ! -e '{}' ]; then\n      : > '{}'\n      /bin/sh -c \"$last\" <&0 & bridge=$!\n      (sleep 0.2; kill \"$bridge\" 2>/dev/null || true) & killer=$!\n      wait \"$bridge\" || true\n      kill \"$killer\" 2>/dev/null || true\n      wait \"$killer\" 2>/dev/null || true\n      printf 'simulated interrupted attach\\n' >&2\n      : > '{}.disconnected'\n      exit 255\n    fi\n    while [ ! -e '{}.resume' ]; do sleep 0.01; done\n    ;;\nesac\nexec /bin/sh -c \"$last\"",
             home.display(),
             state.display(),
+            marker.display(),
+            marker.display(),
             marker.display(),
             marker.display(),
         ),

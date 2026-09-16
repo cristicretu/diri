@@ -247,6 +247,7 @@ fn adoption_seeds_from_the_checkpoint_not_the_raw_tail() {
     // log has never seen.
     let planted_offset = log_tail(&logs, "s_ad");
     ScreenCheckpoint {
+        keyboard_snapshot: None,
         keyboard: Some(diri_proto::terminal_input::KeyboardState {
             enhancements: None,
             application_cursor_keys: true,
@@ -339,6 +340,7 @@ fn a_stale_checkpoint_falls_back_to_tail_replay() {
         row.cells.truncate(40);
     }
     ScreenCheckpoint {
+        keyboard_snapshot: None,
         keyboard: None,
         log_offset: log_tail(&logs, "s_fb"),
         history: Vec::new(),

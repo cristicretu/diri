@@ -28,6 +28,7 @@ use crate::vte::ansi::{
 
 pub mod cell;
 pub mod color;
+pub mod keyboard;
 pub mod search;
 
 /// Minimum number of columns.

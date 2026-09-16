@@ -64,7 +64,10 @@ impl Fixture {
         );
         let pid = child.id();
         let hello = HelloAck {
-            protocol: ProtocolVersion::CURRENT,
+            protocol: ProtocolVersion {
+                major: ProtocolVersion::CURRENT.major,
+                minor: 13,
+            },
             holder_build_id: "fixture".into(),
             session_incarnation: "same-incarnation".into(),
             capabilities: PHASE_ONE_HOLDER_CAPABILITIES.to_vec(),
@@ -172,7 +175,10 @@ fi
         let helper = InstalledHelper {
             target: RemoteTarget::MacosAarch64,
             build_id: "fixture".into(),
-            protocol: ProtocolVersion::CURRENT,
+            protocol: ProtocolVersion {
+                major: ProtocolVersion::CURRENT.major,
+                minor: 13,
+            },
             transport: SshTransport::new(&host, temp.path().join("control/socket"))
                 .with_executable(&fake),
         };
