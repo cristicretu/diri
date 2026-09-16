@@ -128,6 +128,9 @@ impl Pty {
     }
 
     #[must_use]
+    /// Birth captured while this object exclusively owned the unreaped child.
+    /// It never changes or becomes known lazily; it is not a liveness claim.
+    /// Verify it before attributing new host process facts to this child.
     pub fn child_identity(&self) -> Option<diri_proto::process::ProcessIdentity> {
         self.child_identity
     }

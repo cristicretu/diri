@@ -255,6 +255,11 @@ mod tests {
         );
         pty.kill_group(libc::SIGKILL).unwrap();
         pty.wait().unwrap();
+        assert_eq!(
+            pty.child_identity(),
+            Some(expected),
+            "owned birth is immutable after exit"
+        );
         assert!(inspect_verified(&expected, || Ok("stale")).is_err());
     }
 }
