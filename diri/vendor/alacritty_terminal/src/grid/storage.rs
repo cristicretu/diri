@@ -12,6 +12,16 @@ use crate::index::Line;
 /// Maximum number of buffered lines outside of the grid for performance optimization.
 const MAX_CACHE_SIZE: usize = 1_000;
 
+/// Byte budget for newly allocated spare rows, including their row descriptors.
+const MAX_CACHE_BYTES: usize = 64 * 1024;
+
+fn cache_rows<T>(columns: usize) -> usize {
+    let row_bytes = columns
+        .saturating_mul(mem::size_of::<T>())
+        .saturating_add(mem::size_of::<Row<T>>());
+    (MAX_CACHE_BYTES / row_bytes.max(1)).clamp(1, MAX_CACHE_SIZE)
+}
+
 /// A ring buffer for optimizing indexing and rotation.
 ///
 /// The [`Storage::rotate`] and [`Storage::rotate_down`] functions are fast modular additions on
@@ -113,7 +123,8 @@ impl<T> Storage<T> {
         self.len -= shrinkage;
 
         // Free memory.
-        if self.inner.len() > self.len + MAX_CACHE_SIZE {
+        let columns = self.inner.first().map_or(0, Row::len);
+        if self.inner.len() > self.len + cache_rows::<T>(columns) {
             self.truncate();
         }
     }
@@ -135,7 +146,7 @@ impl<T> Storage<T> {
         if self.len + additional_rows > self.inner.len() {
             self.rezero();
 
-            let realloc_size = self.inner.len() + max(additional_rows, MAX_CACHE_SIZE);
+            let realloc_size = self.inner.len() + max(additional_rows, cache_rows::<T>(columns));
             self.inner.resize_with(realloc_size, || Row::new(columns));
         }
 
@@ -295,6 +306,23 @@ mod tests {
 
         fn flags_mut(&mut self) -> &mut Flags {
             unimplemented!();
+        }
+    }
+
+    #[test]
+    fn history_reserve_scales_with_terminal_row_bytes() {
+        use super::MAX_CACHE_BYTES;
+        use crate::term::cell::Cell;
+        for columns in [1, 80, 320, 4096] {
+            let mut storage = Storage::<Cell>::with_capacity(24, columns);
+            storage.initialize(1, columns);
+            let allocated = storage.inner.len() - 24;
+            let row_bytes =
+                columns * std::mem::size_of::<Cell>() + std::mem::size_of::<Row<Cell>>();
+            assert!(allocated == 1 || allocated * row_bytes <= MAX_CACHE_BYTES);
+            assert_eq!(storage.len, 25);
+            storage[Line(-1)][Column(0)].c = 'H';
+            assert_eq!(storage[Line(-1)][Column(0)].c, 'H');
         }
     }
 
