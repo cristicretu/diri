@@ -100,6 +100,7 @@ enum Invocation {
         process_pid: u32,
     },
     HiddenDumpEnvironment,
+    HiddenAccountFacts(u32),
     HiddenEnvironmentTestShell(std::path::PathBuf),
     HiddenPersistenceWitness,
     HiddenPersistenceWitnessArg {
@@ -204,6 +205,9 @@ pub fn execute<W: Write + Send>(
             holder::run_process_guard(stdin, process_pid)
         }
         Invocation::HiddenDumpEnvironment => environment::dump(stdout),
+        Invocation::HiddenAccountFacts(uid) => {
+            diri_pty::process_facts::account::run_worker(uid, stdout)
+        }
         Invocation::HiddenEnvironmentTestShell(shell) => {
             holder::read_limited_json::<_, EnvironmentCaptureRequest>(stdin, 64 * 1024)
                 .and_then(|request| environment::capture_with_shell(&request, executable, &shell))
@@ -284,6 +288,15 @@ fn parse(arguments: impl IntoIterator<Item = String>) -> Result<Invocation, Stri
             Ok(Invocation::HiddenProcessGuard { process_pid })
         }
         "__dump-environment" => no_more(arguments, Invocation::HiddenDumpEnvironment),
+        diri_pty::process_facts::account::WORKER_FLAG => {
+            let values: Vec<_> = arguments.collect();
+            let [uid] = values.as_slice() else {
+                return Err("account worker expects one UID".into());
+            };
+            let uid = diri_pty::process_facts::account::parse_uid(uid)
+                .map_err(|error| error.to_string())?;
+            Ok(Invocation::HiddenAccountFacts(uid))
+        }
         "__environment-test-shell" if cfg!(debug_assertions) => {
             let remainder = arguments.collect::<Vec<_>>();
             let [shell] = remainder.as_slice() else {

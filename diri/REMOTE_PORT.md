@@ -1500,3 +1500,26 @@ The current architecture does not attempt to:
 > The remote host keeps only state that cannot remain local: the PTY, Agent
 > process, and current terminal screen. Session orchestration and product logic
 > remain in the local Rust Engine.
+
+## On-demand process facts: account lookup boundary
+
+Process facts use the captured native child identity on the owning host. Native
+executable, working-directory and real/effective UID observations are bracketed
+by matching birth identities; account records correspond to the observed
+effective UID. They contain no argv or environment and do not infer a PID from
+the PTY foreground PGID. Unsupported, unreadable and timed-out fields remain
+explicitly unavailable.
+
+Account database calls may block in directory services. The existing Rust
+`diri-holder` and `diri-remote` binaries therefore have a narrow one-shot
+`--account-facts <uid>` mode, implemented in shared `diri-pty`. The local mode
+runs before detachment or manager logic. It owns no PTY, socket, lease or service.
+Its parent clears the worker environment, bounds the reply to 8 KiB, defaults to
+a 250 ms deadline (one-second ceiling for an explicitly supplied caller deadline),
+and kills/reaps timed-out workers. Admission allows at most four workers per
+caller process and retains each permit until that worker is reaped. No lookup
+runs in a Holder owner loop, and no idle worker or timer remains afterward.
+
+The stronger public process-inspection request and remote minor-13 capability
+are the next additive projection of this foundation; this worker alone does not
+claim a complete process-inspection API.
