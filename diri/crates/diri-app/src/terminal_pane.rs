@@ -5,6 +5,7 @@
 
 mod controller;
 use controller::{AttachmentControl, ControllerLease};
+mod find_input;
 mod find_overlay;
 #[cfg(all(test, target_os = "macos"))]
 pub(crate) mod find_workflow_tests;
@@ -58,7 +59,7 @@ use crate::commands::{
 };
 use crate::external_drop::{TerminalDropAction, plan_terminal_drop, terminal_drop_text};
 use crate::icons::{SymbolWeight, sf_symbol, sf_symbol_weighted};
-use crate::navigation::{NavigationOverlay, query_label};
+use crate::navigation::NavigationOverlay;
 use crate::query_editor::{self, ClipboardEdit, Edit, QueryEditor};
 use crate::quote::{Quote, QuoteSource};
 use crate::session_surfaces::switcher_key;
@@ -507,6 +508,7 @@ struct ResidentTerminal {
     /// The editable text behind `find`'s query, so ⌘F gets the same caret,
     /// selection, and readline keys as the other query fields.
     find_query: QueryEditor,
+    find_composition: find_input::Composition,
     last_size: (u16, u16),
     pointer_owner: Option<(MouseButton, PointerOwner)>,
     mouse_motion: MouseMotionLimiter,
@@ -605,6 +607,8 @@ pub struct TerminalPane {
     utility_surfaces: Option<Entity<UtilitySurfaces>>,
     local_clipboard_images: Vec<StagedClipboardImage>,
     _focus_owner: gpui::Subscription,
+    _find_blur: gpui::Subscription,
+    _find_focus_change: gpui::Subscription,
     _window_owner: gpui::Subscription,
     _pane_events: Task<()>,
     _store_changes: Task<()>,
@@ -684,6 +688,19 @@ impl TerminalPane {
                 this.claim_selected_control();
             }
             cx.notify();
+        });
+        let find_blur = cx.on_blur(&focus, window, |this, window, cx| {
+            this.cancel_find_composition(window, cx);
+        });
+        let find_focus_change = cx.observe_pending_input(window, |this, window, cx| {
+            if !this.focus.is_focused(window)
+                && this
+                    .residents
+                    .values()
+                    .any(|resident| resident.find_composition.is_composing())
+            {
+                this.cancel_find_composition(window, cx);
+            }
         });
         let window_owner = cx.observe_window_activation(window, |this, window, cx| {
             if window.is_window_active() && this.focus.is_focused(window) {
@@ -774,6 +791,8 @@ impl TerminalPane {
             utility_surfaces: None,
             local_clipboard_images: Vec::new(),
             _focus_owner: focus_owner,
+            _find_blur: find_blur,
+            _find_focus_change: find_focus_change,
             _window_owner: window_owner,
             _pane_events: pane_events,
             _store_changes: store_changes,
@@ -882,6 +901,7 @@ impl TerminalPane {
                     find: None,
                     find_scheduler: FindSearchScheduler::default(),
                     find_query: QueryEditor::default(),
+                    find_composition: find_input::Composition::default(),
                     last_size: (0, 0),
                     pointer_owner: None,
                     mouse_motion: MouseMotionLimiter::default(),
@@ -896,6 +916,7 @@ impl TerminalPane {
             .flatten();
         let selection_changed = selected_id != self.observed_selected_id;
         if selection_changed {
+            self.cancel_find_composition(window, cx);
             if let Some(previous) = &self.observed_selected_id
                 && let Some(resident) = self.residents.get(previous)
             {
@@ -1598,18 +1619,27 @@ impl TerminalPane {
             return;
         };
         if resident.find.is_none() {
-            resident.find = Some(TerminalFindModel::default());
+            resident.find_composition.cancel(&mut resident.find_query);
+            resident.element.set_text_input_enabled(false);
+            let mut find = TerminalFindModel::default();
+            find.set_query(
+                resident.find_query.text().to_owned(),
+                self.started_at.elapsed(),
+            );
+            resident.find = Some(find);
             // Reopening keeps the last query but selects it, so ⌘F then typing
             // starts a new search while ⌘F then ⏎ repeats the old one.
             resident.find_query.select_all();
         }
+        self.schedule_find(id, Duration::from_millis(200), window, cx);
         window.focus(&self.focus, cx);
         cx.stop_propagation();
         cx.notify();
     }
 
-    fn close_find(&mut self, _: &CloseFind, _window: &mut Window, cx: &mut Context<Self>) {
+    fn close_find(&mut self, _: &CloseFind, window: &mut Window, cx: &mut Context<Self>) {
         if self.close_find_for_selected() {
+            find_input::discard_native(window, cx);
             cx.stop_propagation();
             cx.notify();
         } else {
@@ -1627,9 +1657,39 @@ impl TerminalPane {
         if resident.find.take().is_none() {
             return false;
         }
+        resident.find_composition.cancel(&mut resident.find_query);
+        resident.element.set_text_input_enabled(true);
         resident.find_scheduler.cancel();
         resident.element.set_find_highlights(Vec::new());
         true
+    }
+
+    fn cancel_find_composition(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let mut changed = Vec::new();
+        let mut owns_input = false;
+        for (id, resident) in &mut self.residents {
+            if resident.find.is_none() {
+                continue;
+            }
+            owns_input = true;
+            resident.find_composition.cancel(&mut resident.find_query);
+            if let Some(find) = resident.find.as_mut()
+                && find.set_query(
+                    resident.find_query.text().to_owned(),
+                    self.started_at.elapsed(),
+                )
+            {
+                resident.element.set_find_highlights(Vec::new());
+                changed.push(id.clone());
+            }
+        }
+        for id in changed {
+            self.schedule_find(id, Duration::from_millis(200), window, cx);
+        }
+        if owns_input {
+            find_input::discard_native(window, cx);
+            cx.notify();
+        }
     }
 
     fn find_next(&mut self, _: &FindNext, _window: &mut Window, cx: &mut Context<Self>) {
@@ -2171,7 +2231,10 @@ impl TerminalPane {
             return;
         };
         if let Some(find) = resident.find.as_mut() {
-            resident.find_query.insert(&text);
+            resident
+                .find_composition
+                .commit(&mut resident.find_query, &text);
+            find_input::discard_native(window, cx);
             let query = resident.find_query.text().to_owned();
             if find.set_query(query, now) {
                 resident.element.set_find_highlights(Vec::new());
@@ -2273,6 +2336,9 @@ impl TerminalPane {
             match event.keystroke.key.as_str() {
                 "escape" => {
                     resident.find = None;
+                    resident.find_composition.cancel(&mut resident.find_query);
+                    resident.element.set_text_input_enabled(true);
+                    find_input::discard_native(window, cx);
                     resident.find_scheduler.cancel();
                     resident.element.set_find_highlights(Vec::new());
                     cx.notify();
@@ -2294,12 +2360,16 @@ impl TerminalPane {
                         return;
                     };
                     let changed = match edit {
-                        Edit::Local(local) => resident.find_query.apply(local),
+                        Edit::Local(local) => {
+                            resident.find_composition.finish();
+                            resident.find_query.apply(local)
+                        }
                         Edit::Clipboard(ClipboardEdit::Copy) => {
                             query_editor::copy_selection(&resident.find_query, cx);
                             false
                         }
                         Edit::Clipboard(ClipboardEdit::Cut) => {
+                            resident.find_composition.finish();
                             query_editor::cut_selection(&mut resident.find_query, cx)
                         }
                         // ⌘V is already an action (it also handles image
@@ -3034,11 +3104,7 @@ impl TerminalPane {
         } else {
             format!("{}/{}", find.current_index() + 1, find.matches().len())
         };
-        let query = if resident.find_query.is_empty() {
-            div().child("Find").into_any_element()
-        } else {
-            query_label(&resident.find_query)
-        };
+        let query = find_input::render(self, &session.id, colors, cx);
         let alt_screen = find.is_alt_screen();
         Some(find_overlay::render(
             resident.element.clone(),
@@ -3108,8 +3174,9 @@ impl TerminalPane {
                                     colors,
                                     true,
                                     cx,
-                                    |this, _w, cx| {
+                                    |this, window, cx| {
                                         this.close_find_for_selected();
+                                        find_input::discard_native(window, cx);
                                         cx.notify();
                                     },
                                 )),
@@ -5298,7 +5365,15 @@ mod tests {
             anchor,
             "bar returns when result moves clear"
         );
-        let close = gpui::point(anchor.right() - px(22.0), anchor.center().y);
+        pane.update_in(cx, |pane, _, cx| {
+            pane.residents[&id]
+                .element
+                .set_find_highlights(vec![span(0)]);
+            cx.notify();
+        });
+        let relocated = cx.debug_bounds("find-bar").unwrap();
+        assert_eq!(relocated, moved);
+        let close = gpui::point(relocated.right() - px(22.0), relocated.center().y);
         cx.simulate_mouse_down(close, MouseButton::Left, Modifiers::default());
         cx.simulate_mouse_up(close, MouseButton::Left, Modifiers::default());
         assert!(cx.debug_bounds("find-bar").is_none());

@@ -141,9 +141,17 @@ impl TerminalDamageObserver {
     }
 }
 
-#[derive(Default)]
 struct TerminalImeState {
     marked_text: String,
+    enabled: bool,
+}
+impl Default for TerminalImeState {
+    fn default() -> Self {
+        Self {
+            marked_text: String::new(),
+            enabled: true,
+        }
+    }
 }
 
 impl TerminalImeState {
@@ -161,12 +169,20 @@ struct TerminalInputHandler {
 
 impl TerminalInputHandler {
     fn commit_text(&self, text: &str) {
-        mutex_lock(&self.ime_state).marked_text.clear();
-        (self.text_input)(text);
+        let mut state = mutex_lock(&self.ime_state);
+        state.marked_text.clear();
+        let enabled = state.enabled;
+        drop(state);
+        if enabled {
+            (self.text_input)(text);
+        }
     }
 
     fn mark_text(&self, text: &str) {
-        text.clone_into(&mut mutex_lock(&self.ime_state).marked_text);
+        let mut state = mutex_lock(&self.ime_state);
+        if state.enabled {
+            text.clone_into(&mut state.marked_text);
+        }
     }
 }
 
@@ -525,6 +541,14 @@ impl TerminalElement {
         self.focus_handle = Some(focus_handle);
         self.focus_override = None;
         self
+    }
+
+    /// Temporarily hands text ownership to an overlay. Existing native handlers
+    /// observe the same gate, including callbacks delivered before the next paint.
+    pub fn set_text_input_enabled(&self, enabled: bool) {
+        let mut state = mutex_lock(&self.ime_state);
+        state.enabled = enabled;
+        state.marked_text.clear();
     }
 
     /// Receives committed platform text, including multi-stage IME input.
@@ -2397,6 +2421,28 @@ mod link_tests {
 
         assert!(mutex_lock(&state).marked_range().is_none());
         assert_eq!(&*mutex_lock(&committed), &["你"]);
+    }
+
+    #[test]
+    fn overlay_gate_rejects_existing_native_handler_until_terminal_restored() {
+        let terminal = terminal_with_rows(&["test"]);
+        let committed = Arc::new(Mutex::new(Vec::<String>::new()));
+        let sink = Arc::clone(&committed);
+        let handler = TerminalInputHandler {
+            text_input: Arc::new(move |text| mutex_lock(&sink).push(text.to_owned())),
+            ime_state: Arc::clone(&terminal.ime_state),
+            cursor_bounds: Bounds::new(point(px(0.0), px(0.0)), size(px(8.0), px(16.0))),
+            cell_width: px(8.0),
+        };
+        handler.mark_text("old");
+        terminal.set_text_input_enabled(false);
+        handler.mark_text("ni");
+        handler.commit_text("你");
+        assert!(mutex_lock(&terminal.ime_state).marked_range().is_none());
+        assert!(mutex_lock(&committed).is_empty());
+        terminal.set_text_input_enabled(true);
+        handler.commit_text("terminal");
+        assert_eq!(&*mutex_lock(&committed), &["terminal"]);
     }
 
     #[test]
