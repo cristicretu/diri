@@ -6,6 +6,8 @@
 mod controller;
 use controller::{AttachmentControl, ControllerLease};
 mod find_overlay;
+#[cfg(all(test, target_os = "macos"))]
+pub(crate) mod find_workflow_tests;
 mod qol;
 mod reconnect;
 use qol::QolState;
