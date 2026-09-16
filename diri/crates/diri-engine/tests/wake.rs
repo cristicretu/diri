@@ -383,3 +383,151 @@ fn a_data_channel_attach_recovers_a_stopped_tree_with_stale_metadata() {
     assert!(resumed, "attach left the stale-stopped process tree frozen");
     assert!(echoed, "input never reached the stale-stopped session");
 }
+
+fn preview_socket(server: &ControlServer, id: &str) -> BufReader<UnixStream> {
+    let mut stream = UnixStream::connect(server.socket_path()).unwrap();
+    stream
+        .set_read_timeout(Some(Duration::from_secs(2)))
+        .unwrap();
+    writeln!(stream, "{}", json!({"preview": id, "version": 1})).unwrap();
+    let mut reader = BufReader::new(stream);
+    let mut line = String::new();
+    reader.read_line(&mut line).unwrap();
+    let ready: diri_proto::preview::PreviewReady = serde_json::from_str(&line).unwrap();
+    assert_eq!(ready.preview.0, id);
+    reader
+}
+
+fn preview_frame(reader: &mut impl Read) -> Frame {
+    let mut codec = FrameCodec::new();
+    loop {
+        let mut byte = [0];
+        reader.read_exact(&mut byte).unwrap();
+        if let Some(frame) = codec.feed(&byte).unwrap().pop() {
+            return frame;
+        }
+    }
+}
+
+#[test]
+fn previews_are_bounded_read_only_and_do_not_wake_a_stopped_tree() {
+    let temp = tempfile::tempdir().unwrap();
+    let server = start_server(temp.path());
+    let mut control = Control::connect(&server);
+    let id = spawn_cat(&mut control);
+    let pids = hibernate_and_verify_stopped(&mut control, &id);
+    let before = control.request("session.list", json!({}))["sessions"][0].clone();
+    let mut previews = Vec::new();
+    for _ in 0..diri_proto::preview::MAX_PREVIEWS {
+        let mut reader = preview_socket(&server, &id);
+        let grid = preview_frame(&mut reader).grid_payload().unwrap().unwrap();
+        assert_eq!(grid.changed_rows.len(), usize::from(grid.rows));
+        assert_eq!((grid.cols, grid.rows), (80, 24));
+        assert_eq!(preview_frame(&mut reader).frame_type, FrameType::Modes);
+        previews.push(reader);
+    }
+    assert!(
+        !server.attach_hub().has_sinks(&id),
+        "previews are not governor visibility"
+    );
+    let mut excess = UnixStream::connect(server.socket_path()).unwrap();
+    excess
+        .set_read_timeout(Some(Duration::from_secs(2)))
+        .unwrap();
+    writeln!(excess, "{}", json!({"preview": id, "version": 1})).unwrap();
+    assert_eq!(
+        excess.read(&mut [0]).unwrap(),
+        0,
+        "seventeenth preview rejected"
+    );
+    for frame in [
+        Frame::input(b"must-not-run\n".to_vec()),
+        Frame::mouse(b"x".to_vec()),
+        Frame::resize(132, 42),
+        Frame::scroll(0, 1, 0, 0),
+    ] {
+        let mut reader = previews.pop().unwrap();
+        reader
+            .get_mut()
+            .write_all(&FrameCodec::encode(&frame).unwrap())
+            .unwrap();
+        assert_eq!(reader.read(&mut [0]).unwrap(), 0, "mutation closes preview");
+    }
+    for request in [
+        json!({"preview": id, "attach": id, "version": 1}),
+        json!({"preview": id, "version": 99}),
+    ] {
+        let mut stream = UnixStream::connect(server.socket_path()).unwrap();
+        stream
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .unwrap();
+        writeln!(stream, "{request}").unwrap();
+        assert_eq!(stream.read(&mut [0]).unwrap(), 0);
+    }
+    let mut replacement = preview_socket(&server, &id);
+    let grid = preview_frame(&mut replacement)
+        .grid_payload()
+        .unwrap()
+        .unwrap();
+    assert_eq!((grid.cols, grid.rows), (80, 24), "resize was rejected");
+    preview_frame(&mut replacement);
+    replacement
+        .get_mut()
+        .write_all(&FrameCodec::encode(&Frame::ping()).unwrap())
+        .unwrap();
+    assert_eq!(preview_frame(&mut replacement).frame_type, FrameType::Pong);
+    assert!(
+        ps_states(&pids)
+            .iter()
+            .all(|(_, state)| state.starts_with('T'))
+    );
+    assert_eq!(tree_pids(&mut control, &id), pids);
+    let after = control.request("session.list", json!({}))["sessions"][0].clone();
+    for key in ["lastSeenAt", "hibernation"] {
+        assert_eq!(before[key], after[key], "preview changed {key}");
+    }
+    assert!(!server.attach_hub().has_sinks(&id));
+    drop(previews);
+    drop(replacement);
+    control.request("session.kill", json!({"sessionID": id}));
+    control.request("session.remove", json!({"sessionID": id}));
+}
+
+#[test]
+fn a_preview_receives_live_updates_without_a_desktop_attach() {
+    let temp = tempfile::tempdir().unwrap();
+    let server = start_server(temp.path());
+    let mut control = Control::connect(&server);
+    let id = spawn_cat(&mut control);
+    let before = control.request("session.list", json!({}))["sessions"][0]["lastSeenAt"].clone();
+    let mut preview = preview_socket(&server, &id);
+    let seed = preview_frame(&mut preview).grid_payload().unwrap().unwrap();
+    assert!(seed.is_full_snapshot);
+    assert_eq!(preview_frame(&mut preview).frame_type, FrameType::Modes);
+    control.request(
+        "session.send_text",
+        json!({"sessionID":id,"text":"preview-live","submit":true}),
+    );
+    loop {
+        let frame = preview_frame(&mut preview);
+        if let Some(grid) = frame.grid_payload().unwrap() {
+            let text: String = grid
+                .changed_rows
+                .iter()
+                .flat_map(|row| &row.cells)
+                .filter_map(|cell| char::from_u32(cell.scalar))
+                .collect();
+            if text.contains("preview-live") {
+                break;
+            }
+        }
+    }
+    assert!(!server.attach_hub().has_sinks(&id));
+    assert_eq!(
+        control.request("session.list", json!({}))["sessions"][0]["lastSeenAt"],
+        before
+    );
+    drop(preview);
+    control.request("session.kill", json!({"sessionID":id}));
+    control.request("session.remove", json!({"sessionID":id}));
+}

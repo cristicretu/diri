@@ -8,7 +8,7 @@ pub mod state;
 
 pub use attachment::{
     AttachmentChunks, AttachmentClosed, AttachmentError, SessionAttachment,
-    SessionAttachmentHandle, TerminalChunk,
+    SessionAttachmentHandle, SessionPreview, TerminalChunk,
 };
 pub use client::{CLIENT_BUILD, ClientError, DaemonClient};
 pub use node_client::{NodeClient, NodeClientConfig};
