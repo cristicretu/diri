@@ -2,6 +2,8 @@
 #[path = "root/peek_profile.rs"]
 mod peek_profile;
 #[cfg(all(test, target_os = "macos"))]
+mod project_agent_tests;
+#[cfg(all(test, target_os = "macos"))]
 mod window_navigation_tests;
 mod workspace_launches;
 #[cfg(all(test, target_os = "macos"))]
@@ -509,11 +511,13 @@ impl RootView {
         }
         cx.subscribe_in(&sidebar, window, |this, _, event, window, cx| {
             if let SidebarEvent::WorkspaceActivated(id) = event {
-                this.sidebar.update(cx, |sidebar, _| sidebar.sync_focused_agent_selection());
+                this.sidebar
+                    .update(cx, |sidebar, _| sidebar.sync_focused_agent_selection());
                 this.activate_saved_workspace(id.clone(), window, cx);
             }
             if matches!(event, SidebarEvent::WorkspaceTabActivated) {
-                this.sidebar.update(cx, |sidebar, _| sidebar.sync_focused_agent_selection());
+                this.sidebar
+                    .update(cx, |sidebar, _| sidebar.sync_focused_agent_selection());
                 if let Some(workbench) = &this.workspace_workbench {
                     workbench.update(cx, |workbench, cx| workbench.focus(window, cx));
                 }
@@ -1441,7 +1445,8 @@ impl RootView {
                 )
                 .detach();
                 cx.observe_in(&workbench, window, |this, _, window, cx| {
-                    this.sidebar.update(cx, |sidebar, _| sidebar.sync_focused_agent_selection());
+                    this.sidebar
+                        .update(cx, |sidebar, _| sidebar.sync_focused_agent_selection());
                     this.sync_inspector_context(cx);
                     this.sync_auxiliary_terminal(window, cx);
                     if let Some(surfaces) = &this.session_surfaces
@@ -5629,13 +5634,24 @@ mod tests {
     }
 
     #[gpui::test]
-    fn workspace_filter_and_group_collapse_preserve_terminal_and_restore_rows(
+    fn project_filter_and_group_collapse_preserve_workspace_terminal_and_restore_agents(
         cx: &mut gpui::TestAppContext,
     ) {
         use diri_proto::workspace::*;
         cx.update(|cx| cx.set_reduce_motion(true));
         let services = test_services();
-        let fixture = SidebarPreviewFixture::make(PreviewScenario::Typical);
+        let mut fixture = SidebarPreviewFixture::make(PreviewScenario::Typical);
+        for session in &mut fixture.list.sessions {
+            if session.id.0 == "preview-claude" || session.id.0 == "preview-codex" {
+                session.title = if session.id.0 == "preview-claude" {
+                    "Build frontend"
+                } else {
+                    "Review API"
+                }
+                .into();
+                session.title_source = diri_proto::TitleSource::UserRename;
+            }
+        }
         let tab = |id: &str, title: &str, session: &str| WorkspaceTab {
             id: TabId::new(id),
             title: Some(title.into()),
@@ -5694,11 +5710,11 @@ mod tests {
             .snapshot()
             .unwrap()
             .clone();
-        assert!(cx.debug_bounds("workspace-heading-remote").is_some());
-        let fold = cx.debug_bounds("workspace-fold-release").unwrap().center();
+        assert!(cx.debug_bounds("new-agent").is_some());
+        let fold = cx.debug_bounds("PROJECT_preview-dirijor").unwrap().center();
         cx.simulate_click(fold, Modifiers::default());
         cx.run_until_parked();
-        assert!(cx.debug_bounds("workspace-tab-build").is_none());
+        assert!(cx.debug_bounds("SESSION_preview-claude").is_none());
         assert_eq!(
             root.read_with(cx, |root, cx| root.active_terminal(cx).unwrap()),
             terminal
@@ -5707,10 +5723,8 @@ mod tests {
         cx.simulate_click(filter, Modifiers::default());
         cx.simulate_keystrokes("r e v i e w");
         cx.run_until_parked();
-        assert!(cx.debug_bounds("workspace-tab-review").is_some());
-        assert!(cx.debug_bounds("workspace-tab-build").is_none());
-        assert!(cx.debug_bounds("workspace-heading-remote").is_some());
-        assert!(cx.debug_bounds("workspace-tab-logs").is_none());
+        assert!(cx.debug_bounds("SESSION_preview-codex").is_some());
+        assert!(cx.debug_bounds("SESSION_preview-claude").is_none());
         assert_eq!(
             root.read_with(cx, |root, cx| root.active_terminal(cx).unwrap()),
             terminal
@@ -5718,14 +5732,13 @@ mod tests {
         cx.simulate_keystrokes("escape");
         cx.run_until_parked();
         assert!(
-            cx.debug_bounds("workspace-tab-review").is_none(),
-            "clear restores the saved collapsed group"
+            cx.debug_bounds("SESSION_preview-codex").is_none(),
+            "clear restores the saved collapsed project"
         );
-        assert!(cx.debug_bounds("workspace-tab-logs").is_some());
         cx.simulate_click(fold, Modifiers::default());
         cx.run_until_parked();
-        assert!(cx.debug_bounds("workspace-tab-build").is_some());
-        assert!(cx.debug_bounds("workspace-tab-review").is_some());
+        assert!(cx.debug_bounds("SESSION_preview-claude").is_some());
+        assert!(cx.debug_bounds("SESSION_preview-codex").is_some());
         assert_eq!(
             runtime.store.read().unwrap().workspace_catalog().snapshot(),
             Some(&before)
@@ -5735,12 +5748,12 @@ mod tests {
             terminal
         );
         cx.simulate_click(filter, Modifiers::default());
-        cx.simulate_keystrokes("l o g s down down down");
+        cx.simulate_keystrokes("r e v i e w down");
         cx.run_until_parked();
         assert_eq!(
             root.read_with(cx, |root, _| root.active_workspace.clone()),
             Some(WorkspaceId::new("release")),
-            "arrow navigation does not activate results"
+            "filter navigation does not activate an agent or replace its layout"
         );
         root.update_in(cx, |root, window, cx| {
             root.run_command(CommandId::HorizontalTabs, window, cx)
@@ -5756,17 +5769,11 @@ mod tests {
             root.run_command(CommandId::VerticalTabs, window, cx)
         });
         cx.run_until_parked();
+        assert!(cx.debug_bounds("SESSION_preview-codex").is_some());
         assert!(cx.debug_bounds("workspace-tab-build").is_none());
         assert_eq!(
             root.read_with(cx, |root, cx| root.active_terminal(cx).unwrap()),
             terminal
-        );
-        cx.simulate_click(filter, Modifiers::default());
-        cx.simulate_keystrokes("down enter");
-        cx.run_until_parked();
-        assert_eq!(
-            root.read_with(cx, |root, _| root.active_workspace.clone()),
-            Some(WorkspaceId::new("remote"))
         );
     }
 

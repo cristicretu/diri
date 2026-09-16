@@ -41,10 +41,16 @@ impl LiveWorkspace {
         let (manifests, _) =
             ManifestEngine::load_dir(&diri_engine::detect::bundled_manifest_dir()).unwrap();
         let registry = Arc::new(Mutex::new(Registry::new(Arc::new(manifests), &state)));
+        let project_root = directory.path().join("Diri");
+        std::fs::create_dir(&project_root).unwrap();
+        let project = registry
+            .lock()
+            .unwrap()
+            .ensure_session_project(project_root.to_str().unwrap(), None);
         for (id, title) in [("build", "Build frontend"), ("review", "Review API")] {
             let cwd = directory.path().join(id);
             std::fs::create_dir(&cwd).unwrap();
-            let record=serde_json::from_value(serde_json::json!({"id":id,"kind":diri_proto::AgentKind::SHELL,"cwd":cwd,"projectID":"fixture","title":title,"titleSource":diri_proto::TitleSource::UserRename,"status":diri_proto::SessionStatus::Idle,"resumability":diri_proto::Resumability::Live,"createdAt":0,"updatedAt":0,"pinned":false})).unwrap();
+            let record=serde_json::from_value(serde_json::json!({"id":id,"kind":diri_proto::AgentKind::SHELL,"cwd":cwd,"projectID":project["id"],"title":title,"titleSource":diri_proto::TitleSource::UserRename,"status":diri_proto::SessionStatus::Idle,"resumability":diri_proto::Resumability::Live,"createdAt":0,"updatedAt":0,"pinned":false})).unwrap();
             registry
                 .lock()
                 .unwrap()

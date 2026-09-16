@@ -132,16 +132,8 @@ impl Sidebar {
         } else {
             control = control
                 .role(Role::Button)
-                .aria_label(if self.workspace_nav.active.is_some() {
-                    "Filter tabs"
-                } else {
-                    "Filter sessions"
-                })
-                .child(if self.workspace_nav.active.is_some() {
-                    "Filter tabs"
-                } else {
-                    "Filter sessions"
-                });
+                .aria_label("Filter agents")
+                .child("Filter agents");
         }
         let expanded = (self.ui.width - Space::INSET * 2.0).max(0.0);
         if self.filter_open && !cx.reduce_motion() {

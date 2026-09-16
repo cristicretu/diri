@@ -1306,16 +1306,24 @@ impl Sidebar {
             }
             if let Some(workspace) = self.workspace_nav.active.clone() {
                 panel = panel.child(
-                    div().id("workspace-add-existing-agent")
-                        .role(Role::Button).aria_label("Open existing agent in this layout")
-                        .h(px(30.0)).px(px(7.0)).flex().items_center().cursor_pointer()
-                        .text_size(px(12.0)).child("Open existing agent…")
+                    div()
+                        .id("workspace-add-existing-agent")
+                        .role(Role::Button)
+                        .aria_label("Open existing agent in this layout")
+                        .h(px(30.0))
+                        .px(px(7.0))
+                        .flex()
+                        .items_center()
+                        .cursor_pointer()
+                        .text_size(px(12.0))
+                        .child("Open existing agent…")
                         .on_click(cx.listener(move |this, _, window, cx| {
-                            this.workspace_nav.destination = Some(SessionDestination::Tab(workspace.clone()));
+                            this.workspace_nav.destination =
+                                Some(SessionDestination::Tab(workspace.clone()));
                             this.workspace_nav.query.clear();
                             this.workspace_nav.focus.focus(window, cx);
                             cx.notify();
-                        }))
+                        })),
                 );
             }
             panel = panel.child(
@@ -1384,10 +1392,9 @@ impl Sidebar {
                     .justify_center()
                     .cursor_pointer()
                     .child(sf_symbol("plus", 12.0, colors.secondary))
-                    .on_click(cx.listener(|this, _, window, cx| {
-                        this.peek(window, cx);
-                        this.open_new_agent_popover(None, cx);
-                    })),
+                    .on_click(|_, window, cx| {
+                        window.dispatch_action(Box::new(crate::commands::NewDefaultSession), cx);
+                    }),
             )
             .into_any_element()
     }
