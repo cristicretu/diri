@@ -718,6 +718,19 @@ fn launch_response_disconnect_recovers_the_existing_holder_idempotently() {
         expected_incarnation: Some(launched.session_incarnation.clone()),
     };
     let inspection = manager.inspect(&installed, &selector).expect("inspect");
+    let birth = manager
+        .inspect_process_identity(&installed, &selector)
+        .expect("host-verified birth");
+    assert_eq!(birth.pid(), launched.process_pid);
+    assert_eq!(inspection.verified_child_identity(), Some(birth));
+    assert_eq!(
+        manager
+            .inspect(&installed, &selector)
+            .unwrap()
+            .controller_epoch,
+        inspection.controller_epoch,
+        "lease-free facts cannot change control ownership"
+    );
     assert_eq!(
         inspection.process_state,
         diri_proto::remote_pty::RemoteProcessState::Running {

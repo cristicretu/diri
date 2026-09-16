@@ -366,7 +366,64 @@ fn inspect_at(
         // last observed fact and never signal a potentially recycled PID/PGID.
         return Err(RemoteManagementFailure::HolderUnavailable.into_io_error());
     }
-    Ok(state.inspection())
+    let Some(identity) = state.child_identity else {
+        // Old Holders remain inspectable, but cannot supply identity-bound facts.
+        return Ok(state.inspection());
+    };
+    if !matches!(state.process_state, RemoteProcessState::Running { .. }) {
+        return Ok(state.inspection());
+    }
+    if !matches!(state.process_state, RemoteProcessState::Running { pid } if pid == identity.pid())
+    {
+        return Err(RemoteManagementFailure::ProcessIdentityUnavailable.into_io_error());
+    }
+    diri_pty::process_identity::inspect_verified(&identity, || {
+        // This Helper runs on the owning host. Recheck authenticated durable
+        // binding and lock inside the before/after native birth observations.
+        if !state::authenticate(&paths, &selector.session_token)? {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "session authentication changed",
+            ));
+        }
+        let current = state::read_state(&paths.state)?;
+        validate_incarnation(selector, &current)?;
+        validate_process_binding(&state, &current)?;
+        if !state::holder_lock_held(&paths.lock)? {
+            return Err(RemoteManagementFailure::HolderUnavailable.into_io_error());
+        }
+        let mut inspection = current.inspection();
+        inspection.child_identity = Some(identity);
+        Ok(inspection)
+    })
+    .map_err(|error| {
+        if error
+            .get_ref()
+            .is_some_and(|inner| inner.is::<RemoteManagementFailure>())
+            || error.kind() == io::ErrorKind::PermissionDenied
+        {
+            error
+        } else {
+            RemoteManagementFailure::ProcessIdentityUnavailable.into_io_error()
+        }
+    })
+}
+
+fn validate_process_binding(
+    expected: &state::SessionState,
+    current: &state::SessionState,
+) -> io::Result<()> {
+    if expected.session_id != current.session_id
+        || expected.session_incarnation != current.session_incarnation
+        || expected.holder_build_id != current.holder_build_id
+        || expected.holder_pid != current.holder_pid
+        || expected.child_identity != current.child_identity
+        || expected.process_state != current.process_state
+    {
+        Err(RemoteManagementFailure::ProcessIdentityUnavailable.into_io_error())
+    } else {
+        Ok(())
+    }
 }
 
 fn list() -> io::Result<Vec<SessionInspection>> {
@@ -840,7 +897,8 @@ mod tests {
         let paths = roots.session(&request.session_id).unwrap();
         paths.ensure().unwrap();
         state::initialize_auth(&paths, &request.session_token).unwrap();
-        let mut stored = state::SessionState::new(&request, "incarnation".into(), child.0.id());
+        let mut stored =
+            state::SessionState::new(&request, "incarnation".into(), child.0.id(), None);
         state::write_state(&paths.state, &stored).unwrap();
         let selector = SessionSelector {
             session_id: request.session_id,
@@ -872,6 +930,71 @@ mod tests {
             inspect_at(&roots, &selector).unwrap().process_state,
             RemoteProcessState::Running { pid: child.0.id() }
         );
+        // The owned, unreaped child can provide native birth facts while its
+        // Holder lock remains held. Old persisted records stay unsupported.
+        let captured = diri_pty::process_identity::observe(child.0.id()).unwrap();
+        assert_eq!(inspect_at(&roots, &selector).unwrap().child_identity, None);
+        stored.child_identity = Some(captured);
+        state::write_state(&paths.state, &stored).unwrap();
+        assert_eq!(
+            inspect_at(&roots, &selector)
+                .unwrap()
+                .verified_child_identity(),
+            Some(captured)
+        );
+        let changed_birth = match captured.birth() {
+            diri_proto::process::ProcessBirth::Linux {
+                boot_id,
+                start_ticks,
+                clock_ticks_per_second,
+            } => diri_proto::process::ProcessBirth::Linux {
+                boot_id,
+                start_ticks: start_ticks + 1,
+                clock_ticks_per_second,
+            },
+            diri_proto::process::ProcessBirth::Macos {
+                boot_session,
+                start_seconds,
+                start_microseconds,
+            } => diri_proto::process::ProcessBirth::Macos {
+                boot_session,
+                start_seconds: start_seconds + 1,
+                start_microseconds,
+            },
+        };
+        let mut recycled = stored.clone();
+        recycled.child_identity =
+            Some(diri_proto::process::ProcessIdentity::new(child.0.id(), changed_birth).unwrap());
+        state::write_state(&paths.state, &recycled).unwrap();
+        assert_eq!(
+            inspect_at(&roots, &selector)
+                .unwrap_err()
+                .get_ref()
+                .unwrap()
+                .downcast_ref::<RemoteManagementFailure>(),
+            Some(&RemoteManagementFailure::ProcessIdentityUnavailable)
+        );
+        assert!(validate_process_binding(&stored, &recycled).is_err());
+        for change in 0..4 {
+            let mut current = stored.clone();
+            match change {
+                0 => current.session_incarnation.push_str("-changed"),
+                1 => current.holder_build_id.push_str("-changed"),
+                2 => current.holder_pid = current.holder_pid.saturating_add(1),
+                _ => {
+                    current.process_state = RemoteProcessState::Exited {
+                        code: Some(0),
+                        signal: None,
+                    }
+                }
+            }
+            assert!(validate_process_binding(&stored, &current).is_err());
+        }
+        let mut advancing = stored.clone();
+        advancing.output_offset += 1;
+        advancing.snapshot_sequence += 1;
+        assert!(validate_process_binding(&stored, &advancing).is_ok());
+        state::write_state(&paths.state, &stored).unwrap();
         drop(lock);
         let mut stale = selector.clone();
         stale.expected_incarnation = Some("stale".into());

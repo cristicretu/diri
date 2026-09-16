@@ -1130,6 +1130,26 @@ deadline. The inspection must match the session ID, incarnation, Helper build,
 and last known Agent PID. An actual exited inspection records that exit without
 reattaching or inventing a replacement Agent.
 
+### Remote process birth identity (protocol minor 10)
+
+`process-identity-v1` is additive to the existing Helper and Holder capability
+sets. The Holder captures optional platform-native child identity from the owned
+PTY before exit observation/reaping, persists it in schema-1 state, and exposes
+it in the existing HelloAck for clients speaking minor 10 or later. It never
+adopts the process currently using a stored numeric PID. Missing identity in old
+state/Holder responses remains unsupported for identity-dependent operations.
+
+Lease-free `inspect` verifies the captured identity on the remote host before
+and after reading facts, rechecks authentication, incarnation, Holder build/PID,
+child identity and the ownership lock, and returns the optional verified birth
+only for a still-running matching child. Failed verification discards the facts
+and returns a structured `process_identity_unavailable` failure; it never infers
+Agent exit. `list` remains a listing of persisted facts and does not project a
+verified live identity. This adds no observer, terminal frame, polling or SSH
+execution in the client. A HelloAck birth is captured origin metadata, not an
+independent liveness assertion; mode/grid readiness still uses the existing
+validated snapshot boundary. Foreground identifiers remain process-group IDs.
+
 Remote `inspect` treats a missing Holder ownership lock as an unavailable owner,
 not as evidence that the Agent exited. If the last persisted fact is Running,
 it returns nonzero with the additive JSON management error

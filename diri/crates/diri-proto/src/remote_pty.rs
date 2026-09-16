@@ -18,7 +18,8 @@ use crate::grid::{GridCodecError, GridUpdate};
 use crate::terminal::MouseModes;
 
 pub const PROTOCOL_MAJOR: u16 = 1;
-pub const PROTOCOL_MINOR: u16 = 9;
+pub const PROTOCOL_MINOR: u16 = 10;
+pub const PROCESS_IDENTITY_PROTOCOL_MINOR: u16 = 10;
 pub const INPUT_MODES_PROTOCOL_MINOR: u16 = 9;
 pub const TERMINAL_ANNOTATIONS_PROTOCOL_MINOR: u16 = 6;
 pub const MOUSE_INPUT_PROTOCOL_MINOR: u16 = 4;
@@ -82,6 +83,8 @@ pub enum RemoteCapability {
     TerminalAnnotations,
     #[serde(rename = "terminal-input-modes-v1")]
     InputModes,
+    #[serde(rename = "process-identity-v1")]
+    ProcessIdentity,
     IncrementalGrid,
     ProcessExit,
     Signal,
@@ -120,6 +123,7 @@ impl RemoteCapability {
         match self {
             Self::TerminalAnnotations => "terminal-annotations-v1",
             Self::InputModes => "terminal-input-modes-v1",
+            Self::ProcessIdentity => "process-identity-v1",
             Self::FullSnapshot => "full-snapshot",
             Self::IncrementalGrid => "incremental-grid",
             Self::ProcessExit => "process-exit",
@@ -183,6 +187,7 @@ pub const ANNOTATED_HOLDER_CAPABILITIES: &[RemoteCapability] = &[
     RemoteCapability::Scrollback,
     RemoteCapability::TerminalAnnotations,
     RemoteCapability::InputModes,
+    RemoteCapability::ProcessIdentity,
 ];
 pub const ANNOTATED_HELPER_CAPABILITIES: &[RemoteCapability] = &[
     RemoteCapability::FullSnapshot,
@@ -200,6 +205,7 @@ pub const ANNOTATED_HELPER_CAPABILITIES: &[RemoteCapability] = &[
     RemoteCapability::AtomicActivation,
     RemoteCapability::TerminalAnnotations,
     RemoteCapability::InputModes,
+    RemoteCapability::ProcessIdentity,
 ];
 
 /// Authentication bearer shared only by the local Engine and one Holder.
@@ -294,6 +300,9 @@ pub struct HelloAck {
     pub capabilities: Vec<RemoteCapability>,
     pub controller_epoch: u64,
     pub process_state: RemoteProcessState,
+    /// Captured owned-child origin; not proof the process is still alive.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub child_identity: Option<crate::process::ProcessIdentity>,
     pub output_offset: u64,
     pub snapshot_sequence: u64,
     /// PTY foreground process group. Absent from protocol 1.4 HelloAck.
@@ -304,7 +313,21 @@ pub struct HelloAck {
 impl HelloAck {
     pub fn validate(&self) -> Result<(), RemoteCodecError> {
         validate_identifier("holder build id", &self.holder_build_id)?;
-        validate_identifier("session incarnation", &self.session_incarnation)
+        validate_identifier("session incarnation", &self.session_incarnation)?;
+        if let Some(identity) = self.child_identity
+            && (self.protocol.minor < PROCESS_IDENTITY_PROTOCOL_MINOR
+                || !self
+                    .capabilities
+                    .contains(&RemoteCapability::ProcessIdentity)
+                || matches!(self.process_state, RemoteProcessState::Running { pid } if identity.pid() != pid))
+        {
+            return Err(RemoteCodecError::InvalidControlPayload {
+                kind: KIND_HELLO_ACK,
+                detail: "child birth identity is inconsistent with Holder capabilities or PID"
+                    .into(),
+            });
+        }
+        Ok(())
     }
 }
 
@@ -674,12 +697,23 @@ pub struct SessionInspection {
     pub holder_build_id: String,
     pub holder_pid: u32,
     pub process_state: RemoteProcessState,
+    /// Present only after host-local verification of the still-running child.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub child_identity: Option<crate::process::ProcessIdentity>,
     pub cols: u16,
     pub rows: u16,
     pub output_offset: u64,
     pub snapshot_sequence: u64,
     pub controller_epoch: u64,
     pub persistence: PersistenceCapability,
+}
+
+impl SessionInspection {
+    pub fn verified_child_identity(&self) -> Option<crate::process::ProcessIdentity> {
+        let identity = self.child_identity?;
+        matches!(self.process_state, RemoteProcessState::Running { pid } if identity.pid() == pid)
+            .then_some(identity)
+    }
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -770,6 +804,7 @@ pub struct RemoteError {
 #[serde(tag = "error", rename_all = "snake_case", deny_unknown_fields)]
 pub enum RemoteManagementFailure {
     HolderUnavailable,
+    ProcessIdentityUnavailable,
 }
 
 impl std::fmt::Display for RemoteManagementFailure {
@@ -778,6 +813,8 @@ impl std::fmt::Display for RemoteManagementFailure {
             Self::HolderUnavailable => {
                 formatter.write_str("remote Holder owner is unavailable; Agent exit is unknown")
             }
+            Self::ProcessIdentityUnavailable => formatter
+                .write_str("remote process birth could not be verified; Agent exit is unknown"),
         }
     }
 }
@@ -786,7 +823,11 @@ impl std::error::Error for RemoteManagementFailure {}
 
 impl RemoteManagementFailure {
     pub fn into_io_error(self) -> std::io::Error {
-        std::io::Error::new(std::io::ErrorKind::NotConnected, self)
+        let kind = match self {
+            Self::HolderUnavailable => std::io::ErrorKind::NotConnected,
+            Self::ProcessIdentityUnavailable => std::io::ErrorKind::NotFound,
+        };
+        std::io::Error::new(kind, self)
     }
 }
 
@@ -1495,6 +1536,45 @@ mod tests {
         .expect("legacy hello ack");
         assert_eq!(ack.foreground_pid, None);
         assert_eq!(ack.process_state, RemoteProcessState::Running { pid: 12 });
+    }
+
+    #[test]
+    fn child_identity_metadata_is_optional_and_capability_bound() {
+        use crate::process::{BootId, ProcessBirth, ProcessIdentity};
+        let mut ack: HelloAck = serde_json::from_str(
+            r#"{"protocol":{"major":1,"minor":9},"holderBuildId":"b","sessionIncarnation":"i","capabilities":[],"controllerEpoch":1,"processState":{"state":"running","pid":12},"outputOffset":0,"snapshotSequence":1}"#,
+        ).unwrap();
+        assert_eq!(ack.child_identity, None);
+        assert!(ack.validate().is_ok());
+        let identity = ProcessIdentity::new(
+            12,
+            ProcessBirth::Linux {
+                boot_id: BootId::parse("12345678-1234-5678-9abc-def012345678").unwrap(),
+                start_ticks: 42,
+                clock_ticks_per_second: 100,
+            },
+        )
+        .unwrap();
+        ack.child_identity = Some(identity);
+        assert!(
+            ack.validate().is_err(),
+            "old minor/capability cannot claim identity"
+        );
+        ack.protocol.minor = PROCESS_IDENTITY_PROTOCOL_MINOR;
+        ack.capabilities.push(RemoteCapability::ProcessIdentity);
+        assert!(ack.validate().is_ok());
+        let message = RemoteMessage::HelloAck(ack.clone());
+        assert_eq!(
+            RemoteCodec::new()
+                .feed(&RemoteCodec::encode(&message).unwrap())
+                .unwrap(),
+            vec![message]
+        );
+        ack.process_state = RemoteProcessState::Running { pid: 13 };
+        assert!(
+            ack.validate().is_err(),
+            "birth must match the child PID, never foreground PGID"
+        );
     }
 
     #[test]
