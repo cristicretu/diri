@@ -5,6 +5,8 @@
 
 use serde::{Deserialize, Serialize};
 
+pub mod enhanced;
+
 const ESC: u8 = 0x1b;
 
 /// A keyboard event's logical key.
