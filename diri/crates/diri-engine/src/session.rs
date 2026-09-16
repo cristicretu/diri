@@ -1151,7 +1151,7 @@ impl Session {
         // Incarnation-boundary fallback for pre-epoch holders: everything
         // already in the log predates the child about to spawn.
         let pre_spawn_tail = {
-            let mut log = OutputLog::reader(&spec.logs_dir, &spec.id)?;
+            let mut log = OutputLog::reader_before_launch(&spec.logs_dir, &spec.id)?;
             log.refresh_from_disk();
             log.tail_offset()
         };
@@ -1191,7 +1191,7 @@ impl Session {
     ) -> std::io::Result<Self> {
         let paths = HolderPaths::new(&holder.holders_dir, &spec.id);
         let client = HolderClient::new(paths.socket());
-        let log = OutputLog::reader(&spec.logs_dir, &spec.id)?;
+        let log = OutputLog::reader_before_launch(&spec.logs_dir, &spec.id)?;
         let shared = new_shared(&spec, log, &engine, true);
         let deferred = Arc::new(DeferredLaunch::new());
 

@@ -1686,3 +1686,7 @@ log, or recovers/truncates an invalid header. Missing files, incomplete headers
 versions return an error without changing bytes or inode. Only the existing log
 writer owns creation/recovery. The Engine may retry a transient incomplete read;
 it must not rewrite a live Holder's log to manufacture an empty baseline.
+Before a new child is launched, the Engine may hold an explicitly pending,
+in-memory reader view for a missing log. It creates no filesystem state and
+refreshes only after the Holder creates the file; an existing invalid header
+still fails. Adoption continues to require an existing valid log.

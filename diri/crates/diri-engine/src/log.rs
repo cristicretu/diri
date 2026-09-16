@@ -88,7 +88,19 @@ impl OutputLog {
         if !read_only {
             fs::create_dir_all(dir)?;
         }
-        let mut log = Self {
+        let mut log = Self::view(dir, session_id, ring_capacity, disk_capacity, read_only);
+        log.open_or_recover()?;
+        Ok(log)
+    }
+
+    fn view(
+        dir: &Path,
+        session_id: &str,
+        ring_capacity: usize,
+        disk_capacity: usize,
+        read_only: bool,
+    ) -> Self {
+        Self {
             ring_capacity,
             disk_capacity,
             tail_offset: 0,
@@ -103,9 +115,25 @@ impl OutputLog {
             last_sync: Instant::now(),
             sync_points: Vec::new(),
             carry: Vec::new(),
-        };
-        log.open_or_recover()?;
-        Ok(log)
+        }
+    }
+
+    /// An in-memory view for a child which has not been launched yet. Only a
+    /// missing file is allowed; an existing corrupt file is never treated as
+    /// empty. The future Holder remains the sole file creator.
+    pub(crate) fn reader_before_launch(dir: &Path, session_id: &str) -> io::Result<Self> {
+        let mut log = Self::view(
+            dir,
+            session_id,
+            DEFAULT_RING_CAPACITY,
+            DEFAULT_DISK_CAPACITY,
+            true,
+        );
+        match log.open_or_recover() {
+            Ok(()) => Ok(log),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(log),
+            Err(error) => Err(error),
+        }
     }
 
     /// Writer with the standard capacities.
@@ -585,6 +613,22 @@ mod tests {
             io::ErrorKind::NotFound
         );
         assert!(!root.path().join("s.bin").exists());
+    }
+
+    #[test]
+    fn pending_launch_view_waits_for_its_owner_without_creating_a_file() {
+        let root = dir();
+        let missing = root.path().join("future");
+        let mut reader = OutputLog::reader_before_launch(&missing, "s").unwrap();
+        assert_eq!(reader.tail_offset(), 0);
+        assert!(!reader.refresh_from_disk());
+        assert!(!missing.exists());
+        let mut writer = OutputLog::writer(&missing, "s").unwrap();
+        writer.append(b"fresh owner output").unwrap();
+        assert!(reader.refresh_from_disk());
+        assert_eq!(reader.read(0, 100).1, b"fresh owner output");
+        fs::write(missing.join("bad.bin"), b"incomplete").unwrap();
+        assert!(OutputLog::reader_before_launch(&missing, "bad").is_err());
     }
 
     #[cfg(unix)]
