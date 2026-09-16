@@ -697,6 +697,7 @@ impl Sidebar {
 
     pub fn confirm_close(&mut self, cx: &mut Context<Self>) {
         let mut store = self.store.write().expect("session store lock poisoned");
+        let previous = store.selected_session_id().cloned();
         let ids = store
             .pending_close()
             .map(|pending| pending.ids.clone())
@@ -707,7 +708,9 @@ impl Sidebar {
                 store.remove_session_record(&id);
             }
         }
+        let selection_changed = store.selected_session_id() != previous.as_ref();
         drop(store);
+        self.activate_close_survivor(selection_changed, cx);
         cx.emit(SidebarEvent::ConfirmationChanged);
         cx.notify();
     }
@@ -6248,6 +6251,7 @@ impl Sidebar {
 
     fn close_sessions(&mut self, ids: Vec<SessionId>, cx: &mut Context<Self>) {
         let mut store = self.store.write().expect("session store lock poisoned");
+        let previous = store.selected_session_id().cloned();
         store.request_close(ids.clone());
         let raised = store.pending_close().is_some();
         if self.preview && !raised {
@@ -6255,12 +6259,28 @@ impl Sidebar {
                 store.remove_session_record(&id);
             }
         }
+        let selection_changed = store.selected_session_id() != previous.as_ref();
         drop(store);
+        self.activate_close_survivor(selection_changed, cx);
         if raised {
             // Wake RootView so the confirmation shows on this click, not the
             // next time something else happens to redraw the window.
             cx.emit(SidebarEvent::ConfirmationChanged);
         }
+    }
+
+    fn activate_close_survivor(&mut self, selection_changed: bool, cx: &mut Context<Self>) {
+        if !selection_changed {
+            return;
+        }
+        // A saved layout still references the closing session. Leave it before
+        // activating the survivor, so layout synchronization cannot reselect
+        // the closing row while its removal or the next layout is in flight.
+        if self.workspace_nav.active.is_some() {
+            self.activate_workspace(None, cx);
+        }
+        cx.emit(SidebarEvent::SessionActivated);
+        cx.notify();
     }
 
     /// Selects the nth session (⌘1–⌘9 order, matching the row hints) and

@@ -560,14 +560,30 @@ impl WindowWrite<'_> {
         self.navigation.reconciled_revision = Some(self.revision);
     }
     pub fn remove_sessions(&mut self, ids: Vec<SessionId>) {
-        let excluded = ids.iter().cloned().collect();
+        let excluded: HashSet<_> = ids.iter().cloned().collect();
         if self
             .navigation
             .selected_session_id
             .as_ref()
             .is_some_and(|id| ids.contains(id))
         {
-            self.focus_neighbor(&excluded);
+            let previous = self
+                .navigation
+                .mru_order
+                .iter()
+                .find(|id| {
+                    !excluded.contains(*id)
+                        && !self.closing.contains(*id)
+                        && self.sessions.get(*id).is_some_and(|session| {
+                            !session.is_archived() && !is_auxiliary_terminal(session)
+                        })
+                })
+                .cloned();
+            if let Some(previous) = previous {
+                self.set_selected_survivor(Some(previous));
+            } else {
+                self.focus_neighbor(&excluded);
+            }
         }
         self.canonical.remove_sessions(ids);
         self.reconcile();
@@ -1211,6 +1227,35 @@ mod tests {
                 .window_targets
                 .contains_key(&first.owner())
         );
+    }
+
+    #[test]
+    fn close_returns_to_window_mru_instead_of_sidebar_neighbor() {
+        let (first, second, ids) = windows();
+        first.write().unwrap().select(ids[2].clone());
+        first.write().unwrap().select(ids[0].clone());
+        second.write().unwrap().select(ids[1].clone());
+
+        first.write().unwrap().remove_sessions(vec![ids[0].clone()]);
+
+        assert_eq!(first.read().unwrap().selected_session_id(), Some(&ids[2]));
+        assert_eq!(second.read().unwrap().selected_session_id(), Some(&ids[1]));
+    }
+
+    #[test]
+    fn bulk_close_skips_closing_mru_and_background_close_preserves_selection() {
+        let (first, _, ids) = windows();
+        first.write().unwrap().select(ids[2].clone());
+        first.write().unwrap().select(ids[1].clone());
+        first.write().unwrap().select(ids[0].clone());
+
+        first.write().unwrap().remove_sessions(vec![ids[1].clone()]);
+        assert_eq!(first.read().unwrap().selected_session_id(), Some(&ids[0]));
+        first
+            .write()
+            .unwrap()
+            .remove_sessions(vec![ids[0].clone(), ids[1].clone()]);
+        assert_eq!(first.read().unwrap().selected_session_id(), Some(&ids[2]));
     }
 
     #[test]

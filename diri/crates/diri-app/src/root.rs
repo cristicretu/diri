@@ -4979,6 +4979,96 @@ mod tests {
     }
 
     #[gpui::test]
+    fn confirmed_close_restores_previous_session_from_saved_pane(cx: &mut gpui::TestAppContext) {
+        check_close_restores_previous_session_from_saved_pane(cx, true);
+    }
+
+    #[gpui::test]
+    fn immediate_close_restores_previous_session_from_saved_pane(cx: &mut gpui::TestAppContext) {
+        check_close_restores_previous_session_from_saved_pane(cx, false);
+    }
+
+    fn check_close_restores_previous_session_from_saved_pane(
+        cx: &mut gpui::TestAppContext,
+        confirm: bool,
+    ) {
+        cx.update(|cx| commands::bind_keys(cx, &Default::default()));
+        let (services, workspace) = workspace_cpu_fixture();
+        services
+            .store
+            .store
+            .write()
+            .unwrap()
+            .update_preferences(|prefs| {
+                prefs.confirm_before_closing_session = confirm;
+            })
+            .unwrap();
+        let runtime = services.store.clone();
+        let closed = SessionId::new("preview-claude");
+        let previous = services
+            .store
+            .store
+            .write()
+            .unwrap()
+            .ordered_sessions()
+            .into_iter()
+            .find(|session| session.id != closed && !session.is_archived())
+            .unwrap()
+            .id;
+        let expected = previous.clone();
+        let removed = closed.clone();
+        let (root, cx) = cx.add_window_view(move |window, cx| {
+            let root = RootView::new(services, false, PreviewScenario::Empty, window, cx);
+            root.window_store.write().unwrap().select(previous.clone());
+            root.window_store.write().unwrap().select(closed.clone());
+            root.sidebar.update(cx, |sidebar, cx| {
+                sidebar.activate_workspace(Some(workspace), cx)
+            });
+            root
+        });
+        cx.run_until_parked();
+        cx.simulate_keystrokes(&commands::test_chords("cmd-w"));
+        if confirm {
+            assert!(root.read_with(cx, |root, _| {
+                root.window_store.read().unwrap().pending_close().is_some()
+            }));
+            cx.simulate_keystrokes("escape");
+            root.update_in(cx, |root, window, cx| {
+                assert_eq!(root.active_session_id(cx), Some(removed.clone()));
+                assert!(
+                    root.active_terminal(cx)
+                        .unwrap()
+                        .read(cx)
+                        .is_focused(window)
+                );
+            });
+            cx.simulate_keystrokes(&commands::test_chords("cmd-w"));
+            cx.simulate_keystrokes("enter");
+        }
+        // Settle the daemon's removal while its saved layout still references
+        // the closed session: this is when the unavailable placeholder appears.
+        runtime
+            .store
+            .write()
+            .unwrap()
+            .remove_session_record(&removed);
+        cx.run_until_parked();
+        root.update_in(cx, |root, window, cx| {
+            assert_eq!(
+                root.active_session_id(cx),
+                Some(expected),
+                "closing must leave the saved pane and restore the previous session"
+            );
+            assert!(
+                root.active_terminal(cx)
+                    .unwrap()
+                    .read(cx)
+                    .is_focused(window)
+            );
+        });
+    }
+
+    #[gpui::test]
     fn close_confirmation_keyboard_from_terminal(cx: &mut gpui::TestAppContext) {
         check_close_confirmation_keyboard(cx, false);
     }
