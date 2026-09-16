@@ -64,6 +64,9 @@ gpui_platform = { workspace = true, features = ["test-support"] }
 tokio = { workspace = true, features = ["test-util"] }
 
 [target.'cfg(target_os = "macos")'.dependencies]
+# Existing pinned platform crate: read callback-scoped physical keypad identity.
+gpui_macos.workspace = true
+
 block2 = "=0.6.2"
 objc2 = "=0.6.4"
 objc2-app-kit = { version = "=0.3.2", default-features = false, features = [
@@ -154,3 +157,6 @@ objc2-web-kit = { version = "=0.3.2", default-features = false, features = [
     "WKWebView",
     "WKWebViewConfiguration",
 ] }
+
+[target.'cfg(target_os = "macos")'.dev-dependencies]
+gpui_macos = { workspace = true, features = ["test-support"] }

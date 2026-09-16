@@ -3535,6 +3535,10 @@ fn centered_symbol_message(
 }
 
 fn terminal_key_event(event: &KeyDownEvent) -> Option<TermKeyEvent> {
+    #[cfg(target_os = "macos")]
+    if let Some(keypad) = crate::macos::terminal_keys::keypad_event(event) {
+        return Some(keypad);
+    }
     let named = match event.keystroke.key.as_str() {
         "up" => Some(NamedKey::ArrowUp),
         "down" => Some(NamedKey::ArrowDown),
