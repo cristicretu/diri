@@ -110,6 +110,31 @@ impl From<KeyboardModes> for TermMode {
     }
 }
 
+impl From<TermMode> for KeyboardModes {
+    fn from(value: TermMode) -> Self {
+        let mut flags = Self::NO_MODE;
+        for (terminal, keyboard) in [
+            (
+                TermMode::DISAMBIGUATE_ESC_CODES,
+                Self::DISAMBIGUATE_ESC_CODES,
+            ),
+            (TermMode::REPORT_EVENT_TYPES, Self::REPORT_EVENT_TYPES),
+            (TermMode::REPORT_ALTERNATE_KEYS, Self::REPORT_ALTERNATE_KEYS),
+            (
+                TermMode::REPORT_ALL_KEYS_AS_ESC,
+                Self::REPORT_ALL_KEYS_AS_ESC,
+            ),
+            (
+                TermMode::REPORT_ASSOCIATED_TEXT,
+                Self::REPORT_ASSOCIATED_TEXT,
+            ),
+        ] {
+            flags.set(keyboard, value.contains(terminal));
+        }
+        flags
+    }
+}
+
 impl Default for TermMode {
     fn default() -> TermMode {
         TermMode::SHOW_CURSOR
@@ -1382,11 +1407,7 @@ impl<T: EventListener> Handler for Term<T> {
         }
 
         trace!("Reporting active keyboard mode");
-        let current_mode = self
-            .keyboard_mode_stack
-            .last()
-            .unwrap_or(&KeyboardModes::NO_MODE)
-            .bits();
+        let current_mode = KeyboardModes::from(self.mode).bits();
         let text = format!("\x1b[?{current_mode}u");
         self.event_proxy.send_event(Event::PtyWrite(text));
     }
@@ -1440,6 +1461,14 @@ impl<T: EventListener> Handler for Term<T> {
         }
 
         self.set_keyboard_mode(mode.into(), apply);
+        // CSI = changes the current stack entry. Keep the saved screen state
+        // consistent with the mode used to encode input and answer CSI ? u.
+        let current = KeyboardModes::from(self.mode);
+        if let Some(top) = self.keyboard_mode_stack.last_mut() {
+            *top = current;
+        } else {
+            self.keyboard_mode_stack.push(current);
+        }
     }
 
     #[inline]
@@ -2688,6 +2717,44 @@ mod tests {
     use crate::term::cell::{Cell, Flags};
     use crate::term::test::TermSize;
     use crate::vte::ansi::{self, CharsetIndex, Handler, StandardCharset};
+
+    #[test]
+    fn keyboard_query_and_screen_switch_preserve_directly_set_flags() {
+        #[derive(Clone)]
+        struct Replies(std::sync::Arc<std::sync::Mutex<Vec<String>>>);
+        impl EventListener for Replies {
+            fn send_event(&self, event: Event) {
+                if let Event::PtyWrite(reply) = event {
+                    self.0.lock().unwrap().push(reply);
+                }
+            }
+        }
+        let replies = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let mut term = Term::new(
+            Config {
+                kitty_keyboard: true,
+                ..Config::default()
+            },
+            &TermSize::new(5, 10),
+            Replies(replies.clone()),
+        );
+        let mut parser: ansi::Processor = ansi::Processor::new();
+        parser.advance(&mut term, b"\x1b[=5u\x1b[?u");
+        assert_eq!(*replies.lock().unwrap(), vec!["\x1b[?5u"]);
+        parser.advance(&mut term, b"\x1b[?1049h\x1b[=3u\x1b[?u\x1b[?1049l\x1b[?u");
+        assert_eq!(
+            *replies.lock().unwrap(),
+            vec!["\x1b[?5u", "\x1b[?3u", "\x1b[?5u"]
+        );
+        parser.advance(&mut term, b"\x1b[>1u\x1b[=2;2u\x1b[>8u\x1b[<u\x1b[?u");
+        assert_eq!(replies.lock().unwrap().last().unwrap(), "\x1b[?3u");
+        parser.advance(&mut term, b"\x1b[=1;3u\x1b[?u");
+        assert_eq!(replies.lock().unwrap().last().unwrap(), "\x1b[?2u");
+        parser.advance(&mut term, b"\x1b[<u\x1b[?u");
+        assert_eq!(replies.lock().unwrap().last().unwrap(), "\x1b[?5u");
+        parser.advance(&mut term, b"\x1bc\x1b[?u");
+        assert_eq!(replies.lock().unwrap().last().unwrap(), "\x1b[?0u");
+    }
 
     #[test]
     fn scroll_display_page_up() {
