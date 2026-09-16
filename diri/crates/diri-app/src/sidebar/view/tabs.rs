@@ -6,6 +6,15 @@ const TAB_WIDTH: f32 = 164.0;
 const TAB_GAP: f32 = 4.0;
 
 impl Sidebar {
+    pub(super) fn agent_tab_icon(kind: &ProtoAgentKind, colors: SemanticColors) -> AnyElement {
+        match ui_agent_kind(kind).brand_mark() {
+            Some(mark) => diri_ui::BrandMark::solid(mark, 16.0, colors.secondary)
+                .inset(0.08)
+                .into_any_element(),
+            None => sf_symbol("terminal", 16.0, colors.secondary),
+        }
+    }
+
     pub(super) fn navigation_sessions(
         &self,
         store: &mut crate::store::WindowWrite<'_>,
@@ -90,16 +99,12 @@ impl Sidebar {
         Ok(())
     }
 
-    pub fn render_horizontal_tabs(
+    pub(super) fn render_project_tab_rows(
         &mut self,
         available_width: f32,
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let colors = self.colors();
-        if self.workspace_nav.active.is_some() {
-            self.workspace_nav.available_width = available_width;
-            return self.workspace_strip(colors, cx);
-        }
         let (tabs, selected) = {
             let mut store = self.store.write().expect("store");
             let selected = store.selected_session_id().cloned();
@@ -115,7 +120,7 @@ impl Sidebar {
             .gap(px(TAB_GAP))
             .flex_1()
             .min_w(px(0.0))
-            .h_full()
+            .h(px(30.0))
             .overflow_x_scroll()
             .track_scroll(&self.tab_scroll);
         if self.last_tab_selection != selected || self.last_tab_available_width != available_width {
@@ -162,11 +167,7 @@ impl Sidebar {
                     .hover(move |row| {
                         row.bg(colors.primary.alpha(if active { 0.13 } else { 0.06 }))
                     })
-                    .child(sf_symbol(
-                        crate::agent_catalog::system_image(&session.kind),
-                        12.0,
-                        colors.secondary,
-                    ))
+                    .child(Self::agent_tab_icon(session.effective_kind(), colors))
                     .child(
                         div()
                             .flex_1()
@@ -212,6 +213,20 @@ impl Sidebar {
                     })),
             );
         }
+        rows.into_any_element()
+    }
+
+    pub fn render_horizontal_tabs(
+        &mut self,
+        available_width: f32,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let colors = self.colors();
+        if self.workspace_nav.active.is_some() {
+            self.workspace_nav.available_width = available_width;
+            return self.workspace_strip(colors, cx);
+        }
+        let rows = self.render_project_tab_rows(available_width, cx);
         div()
             .id("horizontal-tabs")
             .debug_selector(|| "horizontal-tabs".into())
@@ -222,15 +237,19 @@ impl Sidebar {
             .w_full()
             .flex()
             .items_center()
-            .gap(px(8.0))
+            .relative()
+            .py(px(6.0))
+            .gap(px(0.0))
             .pl(px(if cfg!(target_os = "macos") && !self.ui.visible {
-                84.0
+                92.0
             } else {
                 10.0
             }))
             .pr(px(10.0))
-            .border_b_1()
-            .border_color(colors.primary.alpha(0.07))
+            .child(
+                div().absolute().left(px(0.0)).right(px(0.0)).bottom(px(0.0))
+                    .h(px(1.0)).bg(colors.primary.alpha(0.07)),
+            )
             .bg(colors.sidebar_surface())
             .text_color(colors.primary)
             .child(self.project_control(colors, cx))

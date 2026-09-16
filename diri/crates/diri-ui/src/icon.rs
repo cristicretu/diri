@@ -96,6 +96,7 @@ pub enum IconName {
     SidebarRight,
     Sparkle,
     Stack,
+    Projects,
     Split,
     Expand,
     Collapse,
@@ -108,7 +109,7 @@ pub enum IconName {
 }
 
 impl IconName {
-    pub const ALL: [Self; 59] = [
+    pub const ALL: [Self; 60] = [
         Self::Account,
         Self::Activity,
         Self::Archive,
@@ -159,6 +160,7 @@ impl IconName {
         Self::SidebarRight,
         Self::Sparkle,
         Self::Stack,
+        Self::Projects,
         Self::Split,
         Self::Expand,
         Self::Collapse,
@@ -226,6 +228,7 @@ impl IconName {
             Self::Collapse => "icons/collapse.svg",
             Self::Tab => "icons/tab.svg",
             Self::Stack => "icons/stack.svg",
+            Self::Projects => "icons/projects.svg",
             Self::Terminal => "icons/terminal.svg",
             Self::Trash => "icons/trash.svg",
             Self::Unarchive => "icons/unarchive.svg",
@@ -291,6 +294,7 @@ impl IconName {
             "sidebar.right" => Self::SidebarRight,
             "sparkle" | "sparkles" => Self::Sparkle,
             "square.stack.3d.up" => Self::Stack,
+            "rectangle.stack" => Self::Projects,
             "rectangle.split.2x1" => Self::Split,
             "arrow.up.left.and.arrow.down.right" => Self::Expand,
             "arrow.down.right.and.arrow.up.left" => Self::Collapse,
@@ -420,6 +424,7 @@ fn embedded_svg(path: &str) -> Option<&'static [u8]> {
         "icons/collapse.svg" => include_bytes!("../assets/icons/collapse.svg"),
         "icons/tab.svg" => include_bytes!("../assets/icons/tab.svg"),
         "icons/stack.svg" => include_bytes!("../assets/icons/stack.svg"),
+        "icons/projects.svg" => include_bytes!("../assets/icons/projects.svg"),
         "icons/terminal.svg" => include_bytes!("../assets/icons/terminal.svg"),
         "icons/trash.svg" => include_bytes!("../assets/icons/trash.svg"),
         "icons/unarchive.svg" => include_bytes!("../assets/icons/unarchive.svg"),

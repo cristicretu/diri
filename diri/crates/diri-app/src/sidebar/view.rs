@@ -6166,11 +6166,6 @@ impl Sidebar {
     /// Selects the nth session (⌘1–⌘9 order, matching the row hints) and
     /// reports whether a session existed at that index.
     pub fn select_shortcut(&mut self, index: usize, cx: &mut Context<Self>) -> bool {
-        if self.workspace_nav.active.is_some()
-            && self.tab_orientation() == crate::store::TabOrientation::Horizontal
-        {
-            return self.select_workspace_tab(index, cx);
-        }
         self.commit_rename();
         let id = {
             let mut store = self.store.write().expect("session store lock poisoned");
@@ -6194,14 +6189,6 @@ impl Sidebar {
     /// Selects the last session in sidebar order (⌘9, matching the browser
     /// convention where the last digit jumps to the final tab).
     pub fn select_last(&mut self, cx: &mut Context<Self>) -> bool {
-        if self.workspace_nav.active.is_some()
-            && self.tab_orientation() == crate::store::TabOrientation::Horizontal
-        {
-            return self
-                .workspace_record()
-                .and_then(|workspace| workspace.tabs.len().checked_sub(1))
-                .is_some_and(|index| self.select_workspace_tab(index, cx));
-        }
         let count = self
             .navigation_sessions(&mut self.store.write().expect("store"))
             .len();
@@ -6215,11 +6202,6 @@ impl Sidebar {
     /// ⌘←/⌘→), wrapping at both ends. Returns false when there are no
     /// sessions to move between.
     pub fn select_relative(&mut self, delta: isize, cx: &mut Context<Self>) -> bool {
-        if self.workspace_nav.active.is_some()
-            && self.tab_orientation() == crate::store::TabOrientation::Horizontal
-        {
-            return self.relative_workspace_tab(delta, cx);
-        }
         self.commit_rename();
         {
             let mut store = self.store.write().expect("session store lock poisoned");
@@ -6291,11 +6273,6 @@ impl Sidebar {
     /// other project, and one that crossed levels would silently re-parent a
     /// session, which is the daemon's call to make, not a keystroke's.
     pub fn reorder_selected(&mut self, delta: isize, cx: &mut Context<Self>) -> bool {
-        if self.workspace_nav.active.is_some()
-            && self.tab_orientation() == crate::store::TabOrientation::Horizontal
-        {
-            return self.reorder_workspace_tab(delta, cx);
-        }
         self.commit_rename();
         if self
             .store
@@ -6364,11 +6341,6 @@ impl Sidebar {
     /// ⌘R: start renaming the selected row inline, the same edit the context
     /// menu's "Rename…" opens. Returns false when nothing is selected.
     pub fn rename_selected(&mut self, window: &mut Window, cx: &mut Context<Self>) -> bool {
-        if self.workspace_nav.active.is_some()
-            && self.tab_orientation() == crate::store::TabOrientation::Horizontal
-        {
-            return self.rename_workspace_tab(window, cx);
-        }
         let selected = self
             .store
             .read()
@@ -6405,11 +6377,6 @@ impl Sidebar {
     /// false when nothing is selected so ⌘W falls through to closing the
     /// window.
     pub fn close_selected_now(&mut self, cx: &mut Context<Self>) -> bool {
-        if self.workspace_nav.active.is_some()
-            && self.tab_orientation() == crate::store::TabOrientation::Horizontal
-        {
-            return self.remove_workspace_tab(cx);
-        }
         let selected = self
             .store
             .read()

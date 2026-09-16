@@ -11,6 +11,7 @@ pub(super) enum WorkspaceRowKey {
 pub(super) struct TabRow {
     pub id: TabId,
     pub title: String,
+    pub kind: Option<ProtoAgentKind>,
     pub index: usize,
 }
 pub(super) struct WorkspaceGroup {
@@ -57,6 +58,10 @@ pub(super) fn project_groups(
                     (!filtering || highlight.is_some()).then(|| TabRow {
                         id: tab.id.clone(),
                         title,
+                        kind: store
+                            .sessions()
+                            .get(focused_agent(tab).unwrap_or_else(|| first_agent(&tab.layout)))
+                            .map(|session| session.effective_kind().clone()),
                         index,
                     })
                 })

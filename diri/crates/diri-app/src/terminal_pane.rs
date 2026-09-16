@@ -2766,6 +2766,18 @@ impl TerminalPane {
         }
     }
 
+    /// The top-left pane owns the native window-button lane when navigation
+    /// chrome is hidden, including panes mounted by a saved split layout.
+    fn occupies_window_titlebar(&self) -> bool {
+        self.viewport
+            .is_some_and(|viewport| viewport.x < 0.5 && viewport.y < 0.5)
+    }
+
+    fn shows_navigation_control(&self) -> bool {
+        (matches!(self.session_source, SessionSource::FollowSelection) && !self.sidebar_visible)
+            || self.occupies_window_titlebar()
+    }
+
     fn render_sidebar_reveal_control(
         &self,
         colors: SemanticColors,
@@ -2786,7 +2798,9 @@ impl TerminalPane {
             .gap(px(Metrics::TOOLBAR_ITEM_GAP))
             // The visible lights need more breathing room than their native
             // frames imply, so this is an intentional optical safe area.
-            .child(div().w(px(Metrics::TOOLBAR_TRAFFIC_LIGHT_LANE)).flex_none())
+            .when(self.occupies_window_titlebar(), |control| {
+                control.child(div().w(px(Metrics::TOOLBAR_TRAFFIC_LIGHT_LANE)).flex_none())
+            })
             .child(
                 div()
                     .id("show-sidebar")
@@ -2815,7 +2829,8 @@ impl TerminalPane {
                         colors.secondary,
                     ))
                     .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
-                    .on_click(cx.listener(|_, _, window, cx| {
+                    .on_click(cx.listener(|this, _, window, cx| {
+                        this.focus(window, cx);
                         window.dispatch_action(Box::new(ToggleSidebar), cx);
                         cx.stop_propagation();
                     })),
@@ -2833,7 +2848,7 @@ impl TerminalPane {
         let kind = ui_agent_kind(session.effective_kind());
         let identity_selector = format!("terminal-session-identity-{}", session.id.0);
         let shell_controls = matches!(self.session_source, SessionSource::FollowSelection);
-        let show_sidebar = shell_controls && !self.sidebar_visible;
+        let show_sidebar = self.shows_navigation_control();
         let sidebar_reveal = show_sidebar.then(|| self.render_sidebar_reveal_control(colors, cx));
         let inspector_open = self.inspector_open;
         let header_trailing_inset = self.header_trailing_inset;
@@ -3587,8 +3602,7 @@ impl Render for TerminalPane {
             }
             pane.into_any_element()
         } else {
-            let show_sidebar = matches!(self.session_source, SessionSource::FollowSelection)
-                && !self.sidebar_visible;
+            let show_sidebar = self.shows_navigation_control();
             let sidebar_reveal =
                 show_sidebar.then(|| self.render_sidebar_reveal_control(sidebar_colors, cx));
             div()

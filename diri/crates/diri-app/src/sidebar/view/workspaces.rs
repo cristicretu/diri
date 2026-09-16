@@ -552,6 +552,10 @@ impl Sidebar {
         colors: SemanticColors,
         cx: &mut Context<Self>,
     ) -> AnyElement {
+        if horizontal {
+            return self.render_project_tab_rows(self.workspace_nav.available_width, cx);
+        }
+
         let groups = {
             let store = self.store.read().expect("store");
             let Some(snapshot) = store.workspace_catalog().snapshot() else {
@@ -722,14 +726,9 @@ impl Sidebar {
                 colors.primary.alpha(0.0)
             })
             .hover(move |row| row.bg(colors.primary.alpha(0.06)))
-            .child(sf_symbol(
-                "rectangle",
-                11.0,
-                if active {
-                    colors.primary
-                } else {
-                    colors.secondary
-                },
+            .child(tab.kind.as_ref().map_or_else(
+                || sf_symbol("rectangle", 16.0, colors.secondary),
+                |kind| Self::agent_tab_icon(kind, colors),
             ))
             .child(
                 div()
@@ -1302,15 +1301,19 @@ impl Sidebar {
             .flex_none()
             .flex()
             .items_center()
-            .gap(px(8.0))
+            .relative()
+            .py(px(6.0))
+            .gap(px(0.0))
             .pl(px(if cfg!(target_os = "macos") && !self.ui.visible {
-                84.0
+                92.0
             } else {
                 10.0
             }))
             .pr(px(10.0))
-            .border_b_1()
-            .border_color(colors.primary.alpha(0.07))
+            .child(
+                div().absolute().left(px(0.0)).right(px(0.0)).bottom(px(0.0))
+                    .h(px(1.0)).bg(colors.primary.alpha(0.07)),
+            )
             .bg(colors.sidebar_surface())
             .child(self.project_control(colors, cx))
             .child(self.workspace_rows(true, colors, cx))
@@ -1336,106 +1339,6 @@ impl Sidebar {
 }
 
 impl Sidebar {
-    pub(super) fn select_workspace_tab(&mut self, index: usize, cx: &mut Context<Self>) -> bool {
-        let Some(workspace) = self.workspace_record() else {
-            return false;
-        };
-        let Some(tab) = workspace.tabs.get(index) else {
-            return false;
-        };
-        let accepted =
-            self.store
-                .write()
-                .expect("store")
-                .edit_workspace(WorkspaceMutation::SelectTab {
-                    workspace_id: workspace.id,
-                    tab_id: tab.id.clone(),
-                });
-        if accepted {
-            cx.emit(SidebarEvent::WorkspaceTabActivated);
-            cx.notify();
-        }
-        accepted
-    }
-    pub(super) fn relative_workspace_tab(&mut self, delta: isize, cx: &mut Context<Self>) -> bool {
-        let Some(workspace) = self.workspace_record() else {
-            return false;
-        };
-        if workspace.tabs.is_empty() {
-            return false;
-        }
-        let current = workspace
-            .tabs
-            .iter()
-            .position(|tab| Some(&tab.id) == workspace.selected_tab.as_ref())
-            .unwrap_or(0);
-        self.select_workspace_tab(
-            (current as isize + delta).rem_euclid(workspace.tabs.len() as isize) as usize,
-            cx,
-        )
-    }
-    pub(super) fn reorder_workspace_tab(&mut self, delta: isize, cx: &mut Context<Self>) -> bool {
-        let Some(workspace) = self.workspace_record() else {
-            return false;
-        };
-        let Some(current) = workspace
-            .tabs
-            .iter()
-            .position(|tab| Some(&tab.id) == workspace.selected_tab.as_ref())
-        else {
-            return false;
-        };
-        let index = (current as isize + delta).clamp(0, workspace.tabs.len() as isize - 1) as usize;
-        let accepted =
-            self.store
-                .write()
-                .expect("store")
-                .edit_workspace(WorkspaceMutation::MoveTab {
-                    tab_id: workspace.tabs[current].id.clone(),
-                    workspace_id: workspace.id,
-                    index,
-                });
-        cx.notify();
-        accepted
-    }
-    pub(super) fn rename_workspace_tab(
-        &mut self,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) -> bool {
-        let Some(workspace) = self.workspace_record() else {
-            return false;
-        };
-        let Some(tab) = workspace
-            .tabs
-            .iter()
-            .find(|tab| Some(&tab.id) == workspace.selected_tab.as_ref())
-        else {
-            return false;
-        };
-        let title = tab_title(tab, &self.store.read().expect("store"));
-        self.begin_workspace_editor(
-            WorkspaceEditor::RenameTab(tab.id.clone()),
-            &title,
-            window,
-            cx,
-        );
-        true
-    }
-    pub(super) fn remove_workspace_tab(&mut self, cx: &mut Context<Self>) -> bool {
-        let Some(tab_id) = self
-            .workspace_record()
-            .and_then(|workspace| workspace.selected_tab)
-        else {
-            return false;
-        };
-        self.store
-            .write()
-            .expect("store")
-            .edit_workspace(WorkspaceMutation::RemoveTab { tab_id });
-        cx.notify();
-        true // closing a placement must never fall through to session removal
-    }
     pub(super) fn workspace_focused_session(&self) -> Option<SessionId> {
         fn find(node: &diri_proto::workspace::LayoutNode, id: &PaneId) -> Option<SessionId> {
             match node {

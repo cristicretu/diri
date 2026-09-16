@@ -129,26 +129,18 @@ impl Sidebar {
             .role(Role::Button)
             .aria_label("Projects")
             .relative()
-            .h(px(30.0))
-            .px(px(10.0))
+            .size(px(26.0))
             .flex_none()
             .flex()
             .items_center()
-            .gap(px(7.0))
+            .justify_center()
             .rounded(px(SIDEBAR_ROW_RADIUS))
             .cursor_pointer()
             .bg(colors
                 .primary
                 .alpha(if self.project_picker.open { 0.08 } else { 0.0 }))
             .hover(move |row| row.bg(colors.primary.alpha(0.06)))
-            .child(sf_symbol("folder", 12.0, colors.secondary))
-            .child(
-                div()
-                    .text_size(px(Typo::META.size))
-                    .text_color(colors.primary)
-                    .child("Projects"),
-            )
-            .child(sf_symbol("chevron.down", 8.0, colors.tertiary))
+            .child(sf_symbol("rectangle.stack", 16.0, colors.secondary))
             .child(
                 gpui::canvas(
                     move |bounds, _, _| {

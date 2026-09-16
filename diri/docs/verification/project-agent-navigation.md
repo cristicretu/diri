@@ -44,6 +44,16 @@ returns to its agent or opens New Agent at that project's exact location.
 The picker does not reveal or resize the sidebar. Missing remote hosts retain
 their location and display an unavailable state instead of offering local launches.
 
+Horizontal tabs use the complete active-agent list for the selected project,
+including agents without saved layout placements. Their icons use the same
+provider marks as the sidebar. Navigation, rename, reorder and close shortcuts
+operate on these displayed agents; closing retains session-close confirmation.
+The compact Projects icon keeps the accessible name and existing dropdown.
+
+The top-left saved terminal pane reserves the native window-button lane when
+navigation is hidden. A single pane has no focus stripe; visible split panes
+use a subtle outline to identify keyboard focus.
+
 Cmd+B toggles the sidebar in vertical mode and the top tab strip in horizontal
 mode. Horizontal visibility is persisted independently and defaults to visible
 for existing preferences. The terminal header uses a matching toolbar icon.
