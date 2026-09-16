@@ -451,6 +451,8 @@ impl Render for ActionHarness {
             ToggleOverview,
             OpenWorktrees,
             ToggleSidebar,
+            HorizontalTabs,
+            VerticalTabs,
             OpenSettings,
             ToggleNotifications,
             CheckForUpdates
@@ -489,7 +491,7 @@ fn every_static_palette_action_dispatches_once_by_mouse_and_keyboard(cx: &mut Te
         all.retain(|row| matches!(row.command, PaletteCommand::Action(id) if !matches!(id, CommandId::ToggleHistory | CommandId::ToggleQuickOpen | CommandId::OpenSettings)));
         all
     };
-    assert_eq!(actions.len(), 7, "new static actions need a dispatch probe");
+    assert_eq!(actions.len(), 9, "new static actions need a dispatch probe");
     for action in actions {
         let PaletteCommand::Action(expected) = action.command else {
             unreachable!()
