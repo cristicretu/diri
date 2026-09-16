@@ -6,7 +6,7 @@ use std::cell::Cell;
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
-use std::sync::{Arc, RwLock};
+use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use crate::delegation::worktree_move_proposal;
@@ -296,7 +296,7 @@ pub struct UtilitySurfaces {
     host_initialization: Option<HostInitialization>,
     host_initialization_generation: u64,
     prefs: Prefs,
-    store: Arc<RwLock<SessionStore>>,
+    store: crate::store::WindowStore,
     store_runtime: Arc<StoreRuntime>,
     runtime: Arc<Runtime>,
     updates: UpdateHandle,
@@ -307,6 +307,17 @@ pub struct UtilitySurfaces {
 }
 
 impl UtilitySurfaces {
+    pub(crate) fn set_window_store(
+        &mut self,
+        store: crate::store::WindowStore,
+        cx: &mut Context<Self>,
+    ) {
+        self.store = store;
+        if self.settings_tab == SettingsTab::Skills {
+            self.refresh_skills(cx);
+        }
+    }
+
     pub fn new(
         store_runtime: Arc<StoreRuntime>,
         runtime: Arc<Runtime>,
@@ -446,7 +457,7 @@ impl UtilitySurfaces {
             host_initialization: None,
             host_initialization_generation: 0,
             prefs,
-            store: Arc::clone(&store_runtime.store),
+            store: crate::store::WindowStore::from_canonical(Arc::clone(&store_runtime.store)),
             store_runtime,
             runtime,
             updates,

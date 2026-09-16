@@ -6,7 +6,10 @@ const TAB_WIDTH: f32 = 164.0;
 const TAB_GAP: f32 = 4.0;
 
 impl Sidebar {
-    pub(super) fn navigation_sessions(&self, store: &mut SessionStore) -> Vec<Arc<SessionRecord>> {
+    pub(super) fn navigation_sessions(
+        &self,
+        store: &mut crate::store::WindowWrite<'_>,
+    ) -> Vec<Arc<SessionRecord>> {
         if store.preferences().tab_orientation == TabOrientation::Horizontal {
             selected_project_tabs(store).sessions
         } else if !self.filter_query.text().trim().is_empty() {

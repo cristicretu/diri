@@ -3,6 +3,7 @@
 mod prefs;
 mod projection;
 mod residency;
+mod window_navigation;
 mod workspace_spawn;
 mod workspaces;
 
@@ -38,8 +39,10 @@ pub use prefs::{
 };
 pub use projection::{SidebarProject, SidebarProjection, SidebarRow};
 pub use residency::{ResidencyUpdate, TerminalResidency};
+pub(crate) use window_navigation::{WindowAction, WindowStore, WindowWrite};
 pub use workspace_spawn::{
-    SpawnOwner, WorkspaceSpawnReceipt, WorkspaceSpawnState, WorkspaceSpawnTarget,
+    SpawnDestination, SpawnOwner, WindowSpawnTarget, WorkspaceSpawnReceipt, WorkspaceSpawnState,
+    WorkspaceSpawnTarget,
 };
 pub use workspaces::{WorkspaceCatalog, WorkspaceCatalogStatus};
 
@@ -155,6 +158,7 @@ pub enum StoreEffect {
     /// `host.locate_repo` — resolve the reference session's repo on a host;
     /// the answer lands back in the store as a `RepoTarget`.
     LocateRepo {
+        owner: Option<(SpawnOwner, u64)>,
         key: String,
         host: Option<String>,
         session_id: SessionId,
@@ -162,6 +166,7 @@ pub enum StoreEffect {
     /// One bounded level for the New Agent folder picker. Results are keyed by
     /// generation so a slow host cannot overwrite a newer navigation click.
     ListDirectories {
+        owner: Option<SpawnOwner>,
         request_id: u64,
         host: Option<String>,
         path: String,
@@ -260,6 +265,7 @@ pub struct WorktreeSpawn {
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct SpawnOptions {
     pub workspace_target: Option<WorkspaceSpawnTarget>,
+    pub window_target: Option<WindowSpawnTarget>,
     pub account_profile_id: Option<String>,
     pub cwd: Option<String>,
     pub worktree: Option<WorktreeSpawn>,
@@ -339,6 +345,7 @@ pub struct SessionStore {
     syncing_prefs: HashSet<String>,
     /// Popover repo resolution: host key → state (see `RepoTarget`).
     repo_targets: HashMap<String, RepoTarget>,
+    window_targets: HashMap<SpawnOwner, window_navigation::WindowTargets>,
     /// The session whose repo the popover preserves (selected at open time).
     repo_target_session: Option<SessionId>,
     directory_request_seq: u64,
@@ -347,6 +354,9 @@ pub struct SessionStore {
     theme_preview: Option<String>,
     terminal_residency: TerminalResidency,
     app_is_active: bool,
+    focused_window: Option<SpawnOwner>,
+    window_navigation_enabled: bool,
+    focused_window_session: Option<SessionId>,
     notification_surface_visible: bool,
     last_action_failure: Option<ActionFailure>,
     sidebar_selection_anchor: Option<SessionId>,
@@ -438,6 +448,7 @@ impl SessionStore {
                 migrating: HashSet::new(),
                 syncing_prefs: HashSet::new(),
                 repo_targets: HashMap::new(),
+                window_targets: HashMap::new(),
                 repo_target_session: None,
                 directory_request_seq: 0,
                 directory_listing: None,
@@ -445,6 +456,9 @@ impl SessionStore {
                 theme_preview: None,
                 terminal_residency: TerminalResidency::default(),
                 app_is_active: true,
+                focused_window: None,
+                window_navigation_enabled: false,
+                focused_window_session: None,
                 notification_surface_visible: true,
                 last_action_failure: None,
                 sidebar_selection_anchor: None,
@@ -585,7 +599,7 @@ impl SessionStore {
         self.notification_surface_visible = visible;
         if visible
             && self.app_is_active
-            && let Some(id) = self.selected_session_id.clone()
+            && let Some(id) = self.notification_selected_session().cloned()
         {
             self.mark_notifications_read(&id);
             self.emit(StoreEffect::MarkSeen(id));
@@ -595,7 +609,15 @@ impl SessionStore {
     fn notification_is_focused(&self, id: &SessionId) -> bool {
         self.app_is_active
             && self.notification_surface_visible
-            && self.selected_session_id.as_ref() == Some(id)
+            && self.notification_selected_session() == Some(id)
+    }
+
+    fn notification_selected_session(&self) -> Option<&SessionId> {
+        if self.window_navigation_enabled {
+            self.focused_window_session.as_ref()
+        } else {
+            self.selected_session_id.as_ref()
+        }
     }
 
     pub fn next_unread_notification(&self) -> Option<SessionId> {
@@ -947,6 +969,7 @@ impl SessionStore {
         }
         self.repo_targets.insert(key.clone(), RepoTarget::Pending);
         self.emit(StoreEffect::LocateRepo {
+            owner: None,
             key,
             host,
             session_id,
@@ -967,6 +990,7 @@ impl SessionStore {
             state: DirectoryListingState::Loading,
         });
         self.emit(StoreEffect::ListDirectories {
+            owner: None,
             request_id,
             host,
             path,
@@ -1428,6 +1452,7 @@ impl SessionStore {
         // A restored selection did not travel through `focus_session`, so it
         // still needs terminal residency before the pane can attach.
         if let Some(id) = self.selected_session_id.clone()
+            && !self.window_navigation_enabled
             && self
                 .sessions
                 .get(&id)
@@ -1467,7 +1492,7 @@ impl SessionStore {
         }
         if self.app_is_active
             && self.notification_surface_visible
-            && let Some(id) = self.selected_session_id.clone()
+            && let Some(id) = self.notification_selected_session().cloned()
         {
             self.mark_notifications_read(&id);
         }
@@ -1664,6 +1689,7 @@ impl SessionStore {
         // only focus_session grants terminal residency -- without this, a
         // session created from the UI stays "Preparing terminal" forever.
         if is_new
+            && !self.window_navigation_enabled
             && self.selected_session_id.as_ref() == Some(&id)
             && !arriving_archived
             && !self.terminal_residency.contains(&id)
@@ -2045,7 +2071,7 @@ impl SessionStore {
         StoreSnapshot {
             sessions,
             projects,
-            selected_session_id: self.selected_session_id.clone(),
+            selected_session_id: self.notification_selected_session().cloned(),
             global_attention: self.global_attention(),
         }
     }
@@ -2151,6 +2177,12 @@ impl SessionStore {
     }
 
     pub fn revive_sessions(&mut self, ids: Vec<SessionId>) {
+        if let Some(first) = self.revive_records(ids).first().cloned() {
+            self.select(first);
+        }
+    }
+
+    fn revive_records(&mut self, ids: Vec<SessionId>) -> Vec<SessionId> {
         let mut revived = Vec::new();
         for id in ids {
             let Some(session) = self.sessions.get_mut(&id) else {
@@ -2173,21 +2205,24 @@ impl SessionStore {
             });
         }
         self.invalidate_projection();
-        if let Some(first) = revived.first().cloned() {
-            self.select(first);
-        }
+        revived
     }
 
     pub fn auto_resume_if_needed(&mut self, id: &SessionId) -> bool {
-        let eligible = self.selected_session_id.as_ref() == Some(id)
-            && self.sessions.get(id).is_some_and(|session| {
-                !session.is_archived()
-                    && session.can_resume()
-                    && matches!(
-                        &session.status,
-                        SessionStatus::Exited(info) if info.reason == ExitReason::DaemonRestart
-                    )
-            });
+        !self.window_navigation_enabled
+            && self.selected_session_id.as_ref() == Some(id)
+            && self.auto_resume_referenced(id)
+    }
+
+    fn auto_resume_referenced(&mut self, id: &SessionId) -> bool {
+        let eligible = self.sessions.get(id).is_some_and(|session| {
+            !session.is_archived()
+                && session.can_resume()
+                && matches!(
+                    &session.status,
+                    SessionStatus::Exited(info) if info.reason == ExitReason::DaemonRestart
+                )
+        });
         if !eligible || !self.auto_resume_attempted.insert(id.clone()) {
             return false;
         }
@@ -2348,7 +2383,11 @@ impl SessionStore {
     }
 
     pub fn spawn_kind(&mut self, kind: AgentKind, options: SpawnOptions) {
-        let target = options.workspace_target.clone();
+        let target = options
+            .workspace_target
+            .clone()
+            .map(SpawnDestination::Workspace)
+            .or_else(|| options.window_target.clone().map(SpawnDestination::Window));
         let params = self.spawn_params(kind, options);
         if let Some(target) = target {
             self.request_workspace_spawn(target, params);
@@ -2367,11 +2406,19 @@ impl SessionStore {
             .workspace_target
             .as_ref()
             .and_then(|target| self.workspace_spawn_source(target))
+            .or_else(|| {
+                options
+                    .window_target
+                    .as_ref()
+                    .and_then(|target| target.selected_session.as_ref())
+                    .and_then(|id| self.sessions.get(id))
+                    .map(Arc::as_ref)
+            })
             .map(|session| {
                 if session.host.is_none() {
                     session.cwd.clone()
                 } else {
-                    self.local_fallback_directory()
+                    self.local_fallback_directory_for(Some(session))
                 }
             });
         let host = options.host;
@@ -2423,11 +2470,12 @@ impl SessionStore {
     /// its remote cwd is useless as a local path, so prefer the first project
     /// root that exists on this machine, then home.
     pub fn local_fallback_directory(&self) -> String {
-        if self
-            .selected_session()
-            .is_none_or(|session| session.host.is_none())
-        {
-            return self.default_new_agent_directory();
+        self.local_fallback_directory_for(self.selected_session())
+    }
+
+    fn local_fallback_directory_for(&self, selected: Option<&SessionRecord>) -> String {
+        if selected.is_none_or(|session| session.host.is_none()) {
+            return self.default_new_agent_directory_for(selected);
         }
         let mut roots: Vec<_> = self
             .projects
@@ -2447,16 +2495,24 @@ impl SessionStore {
     /// the repo root of the active project, never the selected session's
     /// worktree cwd (⌘T should default to the main checkout).
     pub fn default_new_agent_directory(&self) -> String {
-        if let Some(session) = self.selected_session()
+        self.default_new_agent_directory_for(self.selected_session())
+    }
+
+    fn default_new_agent_directory_for(&self, selected: Option<&SessionRecord>) -> String {
+        if let Some(session) = selected
             && let Some(project) = self.projects.get(&session.project_id)
         {
             return project.root.clone();
         }
-        self.active_directory()
+        self.active_directory_for(selected)
     }
 
     pub fn active_directory(&self) -> String {
-        if let Some(session) = self.selected_session() {
+        self.active_directory_for(self.selected_session())
+    }
+
+    fn active_directory_for(&self, selected: Option<&SessionRecord>) -> String {
+        if let Some(session) = selected {
             return session.cwd.clone();
         }
         let projection = projection::build_projection(
@@ -2493,7 +2549,7 @@ impl SessionStore {
         self.app_is_active = active;
         if active
             && self.notification_surface_visible
-            && let Some(id) = self.selected_session_id.clone()
+            && let Some(id) = self.notification_selected_session().cloned()
         {
             self.mark_notifications_read(&id);
             self.emit(StoreEffect::MarkSeen(id));
@@ -2504,6 +2560,10 @@ impl SessionStore {
     fn focus_session(&mut self, id: SessionId) {
         let selection_changed = self.selected_session_id.as_ref() != Some(&id);
         self.selected_session_id = Some(id.clone());
+        if self.window_navigation_enabled {
+            self.invalidate_projection();
+            return;
+        }
         if self.notification_is_focused(&id) {
             self.mark_notifications_read(&id);
         }
@@ -3313,6 +3373,7 @@ async fn run_effects(
                 result.map(|_| ())
             }
             StoreEffect::LocateRepo {
+                owner,
                 key,
                 host,
                 session_id,
@@ -3334,13 +3395,16 @@ async fn run_effects(
                     // default directory instead of surfacing an error.
                     Err(_) => RepoTarget::NoOrigin,
                 };
-                store
-                    .write()
-                    .expect("session store lock poisoned")
-                    .set_repo_target(key, target);
+                let mut store = store.write().expect("session store lock poisoned");
+                if let Some((owner, generation)) = owner {
+                    store.finish_window_repo_target(owner, generation, key, target);
+                } else {
+                    store.set_repo_target(key, target);
+                }
                 Ok(())
             }
             StoreEffect::ListDirectories {
+                owner,
                 request_id,
                 host,
                 path,
@@ -3353,10 +3417,13 @@ async fn run_effects(
                         .list_directories(host, path)
                         .await
                         .map_err(|error| error.to_string());
-                    store
-                        .write()
-                        .expect("session store lock poisoned")
-                        .finish_directory_listing(request_id, result);
+                    let mut store = store.write().expect("session store lock poisoned");
+                    if let Some(owner) = owner {
+                        store.finish_window_directory_listing(owner, request_id, result);
+                    } else {
+                        store.finish_directory_listing(request_id, result);
+                    }
+                    drop(store);
                     let _ = change_tx.send(());
                 });
                 Ok(())

@@ -125,6 +125,7 @@ pub(crate) enum LauncherEvent {
 
 pub(crate) struct LauncherOverlay {
     workspace_spawn_target: Option<crate::store::WorkspaceSpawnTarget>,
+    window_store: Option<crate::store::WindowStore>,
     workspace_submission: Option<(u64, u64, LauncherTarget)>,
     accounts: diri_proto::AgentAccountCatalog,
     accounts_loading: bool,
@@ -317,6 +318,10 @@ enum ProjectCommit {
 impl EventEmitter<LauncherEvent> for LauncherOverlay {}
 
 impl LauncherOverlay {
+    pub(crate) fn set_window_store(&mut self, store: crate::store::WindowStore) {
+        self.window_store = Some(store);
+    }
+
     pub(crate) fn new(services: Arc<AppServices>, preview: bool, cx: &mut Context<Self>) -> Self {
         let focus = cx.focus_handle();
         let (selected_harness, selected_root, selected_host) = initial_target(&services);
@@ -351,6 +356,7 @@ impl LauncherOverlay {
 
         Self {
             workspace_spawn_target: None,
+            window_store: None,
             workspace_submission: None,
             accounts: diri_proto::AgentAccountCatalog::default(),
             accounts_loading: false,
@@ -415,6 +421,7 @@ impl LauncherOverlay {
         let result = match state {
             Some(
                 crate::store::WorkspaceSpawnState::Placed { .. }
+                | crate::store::WorkspaceSpawnState::Created { .. }
                 | crate::store::WorkspaceSpawnState::Unplaced { .. },
             ) => Ok(None),
             Some(crate::store::WorkspaceSpawnState::Unconfirmed(error)) => Err(error),
@@ -445,8 +452,13 @@ impl LauncherOverlay {
         // cleared on submit, and only there.
         if self.prompt.is_empty() {
             self.selected_account = None;
-            let (harness, root, host) =
-                initial_target_for_workspace(&self.services, self.workspace_spawn_target.as_ref());
+            let (harness, root, host) = initial_target_in_window(
+                &self.services,
+                self.workspace_spawn_target.as_ref(),
+                self.window_store
+                    .as_ref()
+                    .map(|store| store.read().expect("store").selected_session_id().cloned()),
+            );
             self.selected_harness = harness;
             self.selected_root = root;
             self.selected_host = host;
@@ -1558,9 +1570,18 @@ impl LauncherOverlay {
         let Some(ticket) = self.delivery.begin() else {
             return false;
         };
-        if let (Some(params), Some(workspace_target)) =
-            (spawn.as_ref(), self.workspace_spawn_target.clone())
-        {
+        let destination = self
+            .workspace_spawn_target
+            .clone()
+            .map(crate::store::SpawnDestination::Workspace)
+            .or_else(|| {
+                self.window_store.as_ref().map(|store| {
+                    crate::store::SpawnDestination::Window(
+                        store.write().expect("store").spawn_target(),
+                    )
+                })
+            });
+        if let (Some(params), Some(workspace_target)) = (spawn.as_ref(), destination) {
             let receipt = self
                 .services
                 .store
@@ -4037,6 +4058,14 @@ fn initial_target_for_workspace(
     services: &AppServices,
     target: Option<&crate::store::WorkspaceSpawnTarget>,
 ) -> (AgentKind, String, Option<String>) {
+    initial_target_in_window(services, target, None)
+}
+
+fn initial_target_in_window(
+    services: &AppServices,
+    target: Option<&crate::store::WorkspaceSpawnTarget>,
+    selected_override: Option<Option<SessionId>>,
+) -> (AgentKind, String, Option<String>) {
     let store = services
         .store
         .store
@@ -4044,7 +4073,16 @@ fn initial_target_for_workspace(
         .expect("session store lock poisoned");
     let selected = target
         .map_or_else(
-            || store.selected_session(),
+            || {
+                selected_override.as_ref().map_or_else(
+                    || store.selected_session(),
+                    |id| {
+                        id.as_ref()
+                            .and_then(|id| store.sessions().get(id))
+                            .map(Arc::as_ref)
+                    },
+                )
+            },
             |target| store.workspace_spawn_source(target),
         )
         .and_then(|session| {
