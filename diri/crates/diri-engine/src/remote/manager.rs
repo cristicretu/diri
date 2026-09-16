@@ -15,8 +15,8 @@ use diri_proto::remote_pty::{
     DirectoryListRequest, DirectoryListResult, EnvironmentCaptureRequest, EnvironmentCaptureResult,
     ExecutableDiscoveryRequest, ExecutableDiscoveryResult, GcResult, HelperProbe, LaunchRequest,
     LaunchResult, PHASE_ONE_HELPER_CAPABILITIES, PersistenceCapability, PersistenceProbeAction,
-    PersistenceProbeRequest, PersistenceProbeResult, ProtocolVersion, SessionInspection,
-    SessionSelector,
+    PersistenceProbeRequest, PersistenceProbeResult, ProtocolVersion, RemoteManagementFailure,
+    SessionInspection, SessionSelector,
 };
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
@@ -819,18 +819,16 @@ impl RemoteManager {
         input: Vec<u8>,
         timeout: Duration,
     ) -> io::Result<R> {
-        let output = self
-            .executor
-            .run(
-                helper
-                    .transport
-                    .helper_command(&helper.build_id, command)
-                    .map_err(io::Error::other)?,
-                input,
-                timeout,
-                MAX_RPC_OUTPUT,
-            )?
-            .require_success("remote Helper RPC")?;
+        let output = self.executor.run(
+            helper
+                .transport
+                .helper_command(&helper.build_id, command)
+                .map_err(io::Error::other)?,
+            input,
+            timeout,
+            MAX_RPC_OUTPUT,
+        )?;
+        let output = require_rpc_success(output)?;
         if output.stdout_truncated {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
@@ -850,6 +848,16 @@ impl RemoteManager {
             .with_executable(self.executor.ssh_executable().to_os_string())
             .with_batch_mode(self.batch_mode)
     }
+}
+
+fn require_rpc_success(output: CommandOutput) -> io::Result<CommandOutput> {
+    if !output.status.success()
+        && !output.stdout_truncated
+        && let Ok(failure) = serde_json::from_slice::<RemoteManagementFailure>(&output.stdout)
+    {
+        return Err(failure.into_io_error());
+    }
+    output.require_success("remote Helper RPC")
 }
 
 fn validate_control_dir_if_present(path: &Path) -> io::Result<()> {
@@ -1214,6 +1222,46 @@ mod tests {
                 "rejected signals must not reach SSH"
             );
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn management_owner_loss_is_not_a_successful_exit_response() {
+        use std::os::unix::process::ExitStatusExt;
+        let output = |status, body: &[u8], truncated| CommandOutput {
+            status: std::process::ExitStatus::from_raw(status),
+            stdout: body.to_vec(),
+            stderr: b"synthetic failure".to_vec(),
+            stdout_truncated: truncated,
+            stderr_truncated: false,
+        };
+        let body = br#"{"error":"holder_unavailable"}"#;
+        let error = require_rpc_success(output(256, body, false)).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::NotConnected);
+        assert_eq!(
+            error
+                .get_ref()
+                .unwrap()
+                .downcast_ref::<RemoteManagementFailure>(),
+            Some(&RemoteManagementFailure::HolderUnavailable)
+        );
+        // Neither an unrecognized future error nor truncated output is guessed.
+        for bytes in [
+            b"old Helper failure".as_slice(),
+            br#"{"error":"future_error"}"#,
+        ] {
+            assert!(require_rpc_success(output(256, bytes, false)).is_err());
+        }
+        assert_ne!(
+            require_rpc_success(output(256, body, true))
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::NotConnected
+        );
+        assert!(
+            require_rpc_success(output(0, body, false)).is_ok(),
+            "success decoding remains the caller's existing typed contract"
+        );
     }
 
     #[cfg(unix)]
