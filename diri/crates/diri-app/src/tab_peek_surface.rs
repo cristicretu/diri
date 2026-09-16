@@ -139,7 +139,8 @@ impl SessionSurfaces {
         }
     }
 
-    pub(crate) fn tab_peek_position(&self) -> f32 {
+    pub(crate) fn tab_peek_position(&mut self, now: std::time::Instant) -> f32 {
+        self.peek.advance_motion(now);
         self.peek.position()
     }
     pub(crate) fn tab_peek_visible(&self) -> bool {

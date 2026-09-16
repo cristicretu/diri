@@ -4023,17 +4023,16 @@ impl RootView {
             self.tab_pinch.cancel();
             return;
         }
-        let position = surfaces.read(cx).tab_peek_position();
-        let frame = self
-            .tab_pinch
-            .sample(event, position, cx.background_executor().now());
+        let now = cx.background_executor().now();
+        let position = surfaces.update(cx, |surfaces, _| surfaces.tab_peek_position(now));
+        let frame = self.tab_pinch.sample(event, position, now);
         if self.tab_pinch.take_feedback() {
             #[cfg(target_os = "macos")]
             crate::macos::pinch_feedback();
         }
         if let Some(frame) = frame {
             surfaces.update(cx, |surfaces, cx| {
-                surfaces.tab_gesture(frame, cx);
+                surfaces.tab_gesture_at(frame, now, cx);
                 surfaces.sync_tab_peek_focus(window, cx);
             });
             cx.stop_propagation();

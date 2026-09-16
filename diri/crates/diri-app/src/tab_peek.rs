@@ -17,16 +17,14 @@ pub(crate) enum GestureFrame {
     Released(f32),
 }
 
-/// A physical detent separates the small strip from the full overview.
+/// Direct manipulation across all three poses; detents are chosen on release.
+/// Haptics mark the strip boundary without consuming gesture movement.
 #[derive(Default)]
 pub(crate) struct TabPinch {
     origin: Option<f32>,
     position: f32,
     tracking: bool,
     blocked: bool,
-    waiting_since: Option<Instant>,
-    push: f32,
-    passed_detent: bool,
     boundary_feedback_sent: bool,
     feedback_pending: bool,
 }
@@ -47,7 +45,7 @@ impl TabPinch {
         &mut self,
         event: &gpui::PinchEvent,
         current_position: f32,
-        now: Instant,
+        _now: Instant,
     ) -> Option<GestureFrame> {
         if event.phase == gpui::TouchPhase::Started {
             *self = Self::default();
@@ -64,43 +62,27 @@ impl TabPinch {
             self.position = current_position;
             current_position
         });
-        let step = -event.delta * 1000.0;
-        if step > 0.0 && origin <= PEEK_DISTANCE && !self.passed_detent {
-            if self.position + step >= PEEK_DISTANCE {
-                self.position = PEEK_DISTANCE;
-                let reached = *self.waiting_since.get_or_insert(now);
-                if !self.boundary_feedback_sent {
-                    self.feedback_pending = true;
-                    self.boundary_feedback_sent = true;
-                }
-                // Discard all overshoot until the user has rested at the strip.
-                // Only fresh movement after that pause can cross the detent.
-                if now.saturating_duration_since(reached).as_millis() >= 400 {
-                    self.push += step;
-                    if self.push >= 180.0 {
-                        self.passed_detent = true;
-                        self.feedback_pending = true;
-                        self.position += (self.push - 180.0).min(40.0);
-                    }
-                }
-            } else {
-                self.position += step;
-            }
-        } else {
-            self.position = (self.position + step).clamp(0.0, OVERVIEW_DISTANCE);
-            if step < 0.0 && self.position < PEEK_DISTANCE {
-                self.waiting_since = None;
-                self.push = 0.0;
-            }
+        let previous = self.position;
+        self.position = (self.position - event.delta * 1000.0).clamp(0.0, OVERVIEW_DISTANCE);
+        let crossed_strip = (previous < PEEK_DISTANCE && self.position >= PEEK_DISTANCE)
+            || (previous > PEEK_DISTANCE && self.position <= PEEK_DISTANCE);
+        if crossed_strip && !self.boundary_feedback_sent {
+            self.feedback_pending = true;
+            self.boundary_feedback_sent = true;
         }
         let distance = self.position - origin;
         if event.phase == gpui::TouchPhase::Ended {
             let frame = self.tracking.then_some(GestureFrame::Released(distance));
-            *self = Self::default();
+            *self = Self {
+                feedback_pending: self.feedback_pending,
+                ..Self::default()
+            };
             return frame;
         }
         if !self.tracking {
-            if distance.abs() < 10.0 && self.waiting_since.is_none() {
+            // Grab an existing presentation immediately, including a settle in flight.
+            // The threshold only protects the closed state from incidental pinches.
+            if origin == 0.0 && distance.abs() < 10.0 {
                 return None;
             }
             self.tracking = true;
@@ -343,10 +325,20 @@ pub(crate) fn card_rect<T: Clone + PartialEq>(
     } else {
         peek.overview()
     };
-    let mix = |a, b| a + (b - a) * t;
+    // Make room for rows before enlarging or moving cards sideways. A single
+    // diagonal lerp lets later cards sweep over earlier cards and their labels.
+    // Both phases depend only on gesture position, so reversal retraces the path.
+    let smooth = |v: f32| {
+        let v = v.clamp(0.0, 1.0);
+        v * v * (3.0 - 2.0 * v)
+    };
+    let separate = smooth(t / 0.25);
+    let expand = smooth((t - 0.25) / 0.75);
+    let row_y = 48.0 + (index / columns) as f32 * (114.0 + gap) * separate;
+    let mix = |a, b| a + (b - a) * expand;
     CardRect {
         x: mix(strip_x, target_x),
-        y: mix(48.0, target_y) + preview_reveal_offset(peek, reduced_motion),
+        y: mix(row_y, target_y) + preview_reveal_offset(peek, reduced_motion),
         width: mix(strip_width, target_width),
         height: mix(114.0, target_height),
     }
@@ -666,6 +658,36 @@ mod tests {
     }
 
     #[test]
+    fn cards_do_not_cross_over_each_other_between_strip_and_overview() {
+        let mut peek = TabPeek::default();
+        peek.begin(
+            (0..12).map(|i| SessionId::new(i.to_string())).collect(),
+            None,
+        );
+        for width in [400.0, 800.0, 1100.0] {
+            for focused in [0, 5, 11] {
+                peek.focused = focused;
+                for step in 0..=240 {
+                    peek.update(GestureFrame::Tracking(140.0 + step as f32));
+                    let cards: Vec<_> = (0..12)
+                        .map(|i| card_rect(i, 12, width, 700.0, &peek, false))
+                        .collect();
+                    for (i, a) in cards.iter().enumerate() {
+                        for b in &cards[i + 1..] {
+                            let overlap_x = (a.x + a.width).min(b.x + b.width) - a.x.max(b.x);
+                            let overlap_y = (a.y + a.height).min(b.y + b.height) - a.y.max(b.y);
+                            assert!(
+                                overlap_x <= 0.01 || overlap_y <= 0.01,
+                                "cards overlap at width {width}, focus {focused}, step {step}: {a:?} {b:?}"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
     fn geometry_is_continuous_and_reduced_motion_has_no_terminal_travel() {
         let mut peek = TabPeek::default();
         peek.begin(vec![SessionId::new("one")], None);
@@ -760,5 +782,159 @@ mod settling_tests {
         assert!(!peek.is_settling());
         peek.update_animated(GestureFrame::Cancelled, now, true);
         assert!(!peek.paint_visible());
+    }
+}
+
+#[cfg(test)]
+mod pinch_tests {
+    use super::*;
+    use std::time::Duration;
+
+    fn event(delta: f32, phase: gpui::TouchPhase) -> gpui::PinchEvent {
+        gpui::PinchEvent {
+            delta,
+            phase,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn identical_strokes_have_identical_positions_regardless_of_timing() {
+        let now = Instant::now();
+        for interval in [8, 16, 100, 500] {
+            let mut pinch = TabPinch::default();
+            pinch.sample(&event(0.0, gpui::TouchPhase::Started), 0.0, now);
+            let mut frame = None;
+            for i in 1..=8 {
+                frame = pinch.sample(
+                    &event(-0.04, gpui::TouchPhase::Moved),
+                    0.0,
+                    now + Duration::from_millis(i * interval),
+                );
+            }
+            assert_eq!(frame, Some(GestureFrame::Tracking(320.0)));
+        }
+    }
+
+    #[test]
+    fn reversing_across_strip_has_no_dead_zone_and_feedback_is_bounded() {
+        let now = Instant::now();
+        let mut pinch = TabPinch::default();
+        pinch.sample(&event(0.0, gpui::TouchPhase::Started), 120.0, now);
+        assert_eq!(
+            pinch.sample(&event(-0.04, gpui::TouchPhase::Moved), 120.0, now),
+            Some(GestureFrame::Tracking(40.0))
+        );
+        assert!(pinch.take_feedback());
+        assert_eq!(
+            pinch.sample(&event(0.04, gpui::TouchPhase::Moved), 160.0, now),
+            Some(GestureFrame::Tracking(0.0))
+        );
+        assert!(!pinch.take_feedback());
+        assert_eq!(
+            pinch.sample(&event(-0.04, gpui::TouchPhase::Moved), 120.0, now),
+            Some(GestureFrame::Tracking(40.0))
+        );
+        assert!(!pinch.take_feedback());
+    }
+
+    #[test]
+    fn bounds_do_not_accumulate_hidden_movement_and_cancel_blocks_until_start() {
+        let now = Instant::now();
+        let mut pinch = TabPinch::default();
+        pinch.sample(&event(0.0, gpui::TouchPhase::Started), 380.0, now);
+        pinch.sample(&event(-0.5, gpui::TouchPhase::Moved), 380.0, now);
+        assert_eq!(
+            pinch.sample(&event(0.02, gpui::TouchPhase::Moved), 380.0, now),
+            Some(GestureFrame::Tracking(-20.0))
+        );
+        assert_eq!(
+            pinch.sample(&event(0.0, gpui::TouchPhase::Cancelled), 360.0, now),
+            Some(GestureFrame::Cancelled)
+        );
+        assert_eq!(
+            pinch.sample(&event(-0.1, gpui::TouchPhase::Moved), 0.0, now),
+            None
+        );
+        pinch.sample(&event(0.0, gpui::TouchPhase::Started), 0.0, now);
+        assert_eq!(
+            pinch.sample(&event(-0.04, gpui::TouchPhase::Moved), 0.0, now),
+            Some(GestureFrame::Tracking(40.0))
+        );
+    }
+
+    #[test]
+    fn existing_pose_is_grabbed_before_first_movement() {
+        let now = Instant::now();
+        let mut pinch = TabPinch::default();
+        assert_eq!(
+            pinch.sample(&event(0.0, gpui::TouchPhase::Started), 225.0, now),
+            Some(GestureFrame::Tracking(0.0))
+        );
+        assert_eq!(
+            pinch.sample(&event(0.005, gpui::TouchPhase::Moved), 225.0, now),
+            Some(GestureFrame::Tracking(-5.0))
+        );
+        assert_eq!(
+            pinch.sample(&event(0.0, gpui::TouchPhase::Ended), 220.0, now),
+            Some(GestureFrame::Released(-5.0))
+        );
+    }
+
+    #[test]
+    fn pinch_reversal_interrupts_settle_without_a_pose_jump() {
+        let now = Instant::now();
+        let mut peek = TabPeek::default();
+        peek.begin(vec![SessionId::new("same-work")], None);
+        peek.update_animated(GestureFrame::Tracking(280.0), now, false);
+        peek.update_animated(GestureFrame::Released(280.0), now, false);
+        let grabbed_at = now + Duration::from_millis(80);
+        peek.advance_motion(grabbed_at);
+        let pose = peek.position();
+        let mut pinch = TabPinch::default();
+        let frame = pinch
+            .sample(&event(0.0, gpui::TouchPhase::Started), pose, grabbed_at)
+            .unwrap();
+        peek.update_animated(frame, grabbed_at, false);
+        assert_eq!(peek.position(), pose);
+        assert!(!peek.is_settling());
+        let moved_at = grabbed_at + Duration::from_millis(16);
+        let frame = pinch
+            .sample(&event(0.04, gpui::TouchPhase::Moved), pose, moved_at)
+            .unwrap();
+        peek.update_animated(frame, moved_at, false);
+        assert_eq!(peek.position(), pose - 40.0);
+        assert_eq!(peek.selected(), Some(SessionId::new("same-work")));
+    }
+
+    #[test]
+    fn pinch_from_small_preview_moves_immediately() {
+        let now = Instant::now();
+        let mut pinch = TabPinch::default();
+        pinch.sample(&event(0.0, gpui::TouchPhase::Started), PEEK_DISTANCE, now);
+        assert_eq!(
+            pinch.sample(
+                &event(-0.04, gpui::TouchPhase::Moved),
+                PEEK_DISTANCE,
+                now + Duration::from_millis(16)
+            ),
+            Some(GestureFrame::Tracking(40.0)),
+        );
+    }
+
+    #[test]
+    fn continuous_pinch_preserves_movement_across_preview_boundary() {
+        let now = Instant::now();
+        let mut pinch = TabPinch::default();
+        pinch.sample(&event(0.0, gpui::TouchPhase::Started), 0.0, now);
+        pinch.sample(&event(-0.12, gpui::TouchPhase::Moved), 0.0, now);
+        assert_eq!(
+            pinch.sample(
+                &event(-0.04, gpui::TouchPhase::Moved),
+                120.0,
+                now + Duration::from_millis(16)
+            ),
+            Some(GestureFrame::Tracking(160.0)),
+        );
     }
 }
