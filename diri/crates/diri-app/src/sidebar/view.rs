@@ -1170,18 +1170,10 @@ impl Sidebar {
         if self.workspace_key(event, window, cx) {
             return;
         }
-        if self.workspace_nav.active.is_some() && self.focus_handle.is_focused(window) {
-            match event.keystroke.key.as_str() {
-                "up" => {
-                    self.relative_workspace_tab(-1, cx);
-                }
-                "down" => {
-                    self.relative_workspace_tab(1, cx);
-                }
-                "enter" | "escape" => cx.emit(SidebarEvent::WorkspaceTabActivated),
-                _ => return,
-            }
-            cx.stop_propagation();
+        if self.workspace_nav.active.is_some()
+            && self.focus_handle.is_focused(window)
+            && self.workspace_navigation_key(event, cx)
+        {
             return;
         }
         if self.filter_focus.is_focused(window) && self.handle_filter_key(event, window, cx) {
@@ -6979,7 +6971,7 @@ impl Render for Sidebar {
         if let Some(feedback) = self.external_drop_feedback(colors, cx) {
             root = root.child(feedback);
         }
-        if self.settings_nav.is_none() && self.workspace_nav.active.is_none() {
+        if self.settings_nav.is_none() {
             root = root.child(self.filter_control(colors, window, cx));
         }
         root = root.child(self.account_footer(colors, cx));

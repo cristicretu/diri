@@ -71,6 +71,11 @@ impl SessionStore {
         self.workspaces.hydrated = true;
     }
 
+    #[cfg(test)]
+    pub(crate) fn finish_workspace_edit_for_test(&mut self, snapshot: WorkspaceSnapshot) {
+        self.finish_workspace_request(self.workspaces.generation, true, Ok(snapshot));
+    }
+
     pub fn workspace_catalog(&self) -> &WorkspaceCatalog {
         &self.workspaces
     }

@@ -20,6 +20,12 @@ impl Sidebar {
                 // Editing does not activate a result. Arrow/Return enters the
                 // result list; a subsequent Return deliberately selects it.
                 self.focus_handle.focus(window, cx);
+                if self.workspace_nav.active.is_some() {
+                    self.focus_workspace_rows();
+                    cx.stop_propagation();
+                    cx.notify();
+                    return true;
+                }
                 let (rows, selected) = self.focus_rows_snapshot();
                 self.ui
                     .reconcile_focus_cursor(&focus_row_ids(&rows), selected.as_ref());
@@ -93,7 +99,11 @@ impl Sidebar {
                     .min_w(px(0.0))
                     .overflow_hidden()
                     .role(Role::TextInput)
-                    .aria_label("Filter session labels")
+                    .aria_label(if self.workspace_nav.active.is_some() {
+                        "Filter tab labels"
+                    } else {
+                        "Filter session labels"
+                    })
                     .child(if self.filter_focus.is_focused(window) {
                         query_label(&self.filter_query)
                     } else {
@@ -128,8 +138,16 @@ impl Sidebar {
         } else {
             control = control
                 .role(Role::Button)
-                .aria_label("Filter sessions")
-                .child("Filter sessions");
+                .aria_label(if self.workspace_nav.active.is_some() {
+                    "Filter tabs"
+                } else {
+                    "Filter sessions"
+                })
+                .child(if self.workspace_nav.active.is_some() {
+                    "Filter tabs"
+                } else {
+                    "Filter sessions"
+                });
         }
         let expanded = (self.ui.width - Space::INSET * 2.0).max(0.0);
         if self.filter_open && !cx.reduce_motion() {
