@@ -647,9 +647,9 @@ pub const COMMANDS: &[CommandSpec] = &[
         Some("cmd-b"),
         Some("⌘B"),
         Some(APP_CONTEXT),
-        "Toggle Sidebar",
+        "Toggle Navigation Bar",
         "sidebar.left",
-        "hide show panel"
+        "hide show panel sidebar horizontal vertical tabs top bar"
     ),
     spec!(
         ToggleTabOrientation,
@@ -1659,8 +1659,8 @@ impl CommandId {
                 }
             }
             Self::ToggleSidebar => ShortcutMetadata {
-                title: "Toggle sidebar",
-                description: "Show or hide the sessions sidebar",
+                title: "Toggle navigation bar",
+                description: "Show or hide the sidebar with vertical tabs, or the top bar with horizontal tabs",
                 category: Workspace,
             },
             Self::FocusSidebar => ShortcutMetadata {

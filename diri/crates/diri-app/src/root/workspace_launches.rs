@@ -268,11 +268,16 @@ impl RootView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        self.sidebar
-            .update(cx, |sidebar, cx| sidebar.activate_workspace(None, cx));
         self.window_store.write().expect("store").select(session);
         self.launches_expanded = false;
-        self.activate_saved_workspace(None, window, cx);
+        let opening_project = self
+            .sidebar
+            .update(cx, |sidebar, cx| sidebar.open_selected_project_agent(cx));
+        if !opening_project {
+            self.sidebar
+                .update(cx, |sidebar, cx| sidebar.activate_workspace(None, cx));
+            self.activate_saved_workspace(None, window, cx);
+        }
         self.services.store.publish_local_change();
         cx.notify();
     }

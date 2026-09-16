@@ -466,6 +466,7 @@ mod tests {
         let captured = target(SpawnOwner::default(), "two");
         store.seed_workspace_snapshot_for_test(WorkspaceSnapshot {
             workspaces: vec![WorkspaceRecord {
+                project_id: None,
                 id: captured.workspace.clone(),
                 name: "Two".into(),
                 selected_tab: captured.selected_tab.clone(),

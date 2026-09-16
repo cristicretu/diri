@@ -10,7 +10,6 @@ pub const TAB_STRIP_HEIGHT: f32 = 42.0;
 
 pub struct ProjectTabs {
     pub project: Option<ProjectId>,
-    pub label: String,
     pub sessions: Vec<Arc<SessionRecord>>,
 }
 
@@ -56,7 +55,6 @@ pub fn selected_project_tabs(store: &mut impl TabNavigationStore) -> ProjectTabs
     let Some(group) = group else {
         return ProjectTabs {
             project: None,
-            label: "Projects".into(),
             sessions: Vec::new(),
         };
     };
@@ -70,7 +68,6 @@ pub fn selected_project_tabs(store: &mut impl TabNavigationStore) -> ProjectTabs
     }
     ProjectTabs {
         project: Some(group.project.id.clone()),
-        label: group.project.name.clone(),
         sessions,
     }
 }

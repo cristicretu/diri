@@ -2,7 +2,7 @@
 //! never represent a process, attachment, or controller lease.
 use serde::{Deserialize, Serialize};
 
-use crate::SessionId;
+use crate::{ProjectId, SessionId};
 
 macro_rules! identity {
     ($name:ident) => {
@@ -83,6 +83,10 @@ pub struct WorkspaceTab {
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct WorkspaceRecord {
+    /// A project workspace uses the same durable identity as its agent rows.
+    /// Older, independently named layouts remain unbound.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub project_id: Option<ProjectId>,
     pub id: WorkspaceId,
     pub name: String,
     pub tabs: Vec<WorkspaceTab>,
@@ -115,6 +119,13 @@ impl Default for WorkspaceSnapshot {
     rename_all_fields = "camelCase"
 )]
 pub enum WorkspaceMutation {
+    /// Open an existing agent in its project layout without launching a process.
+    OpenProjectAgent {
+        session_id: SessionId,
+        /// Preserve a currently viewed layout when it already contains the agent.
+        #[serde(default)]
+        preferred_workspace: Option<WorkspaceId>,
+    },
     CreateWorkspace {
         name: String,
     },

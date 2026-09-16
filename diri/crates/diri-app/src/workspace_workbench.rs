@@ -945,15 +945,16 @@ impl Render for WorkspaceWorkbench {
                             cx.notify();
                         })),
                 );
-            if geometry.focused.pane == pane.identity.pane {
+            if geometry.panes.len() > 1 && geometry.focused.pane == pane.identity.pane {
                 surface = surface.child(
                     div()
                         .absolute()
                         .top(px(0.0))
                         .left(px(0.0))
                         .right(px(0.0))
-                        .h(px(2.0))
-                        .bg(gpui::rgba(0x4f83f1aa)),
+                        .bottom(px(0.0))
+                        .border_1()
+                        .border_color(colors.primary.alpha(0.16)),
                 );
             }
             surface = surface.child(controls);
@@ -999,6 +1000,7 @@ mod tests {
         store.seed_workspace_snapshot_for_test(WorkspaceSnapshot {
             revision,
             workspaces: vec![WorkspaceRecord {
+                project_id: None,
                 id: WorkspaceId::new("workspace"),
                 name: "Release".into(),
                 selected_tab: tabs.first().map(|tab| tab.id.clone()),

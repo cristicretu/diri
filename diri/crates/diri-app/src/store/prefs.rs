@@ -193,6 +193,8 @@ pub struct Prefs {
     pub sidebar_width: f32,
     pub sidebar_grouping: SidebarGrouping,
     pub tab_orientation: TabOrientation,
+    /// Visibility of the top tab strip, independent of the vertical sidebar.
+    pub horizontal_tabs_visible: bool,
     /// Initial workspace for new windows; each open window keeps its own selection.
     pub active_workspace: Option<diri_proto::workspace::WorkspaceId>,
     pub sidebar_ordering: SidebarOrdering,
@@ -260,6 +262,7 @@ impl Default for Prefs {
             sidebar_width: 248.0,
             sidebar_grouping: SidebarGrouping::Project,
             tab_orientation: TabOrientation::Vertical,
+            horizontal_tabs_visible: true,
             active_workspace: None,
             sidebar_ordering: SidebarOrdering::Custom,
             sidebar_recency_archives_expanded: false,

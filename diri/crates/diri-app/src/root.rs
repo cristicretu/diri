@@ -2,6 +2,8 @@
 #[path = "root/peek_profile.rs"]
 mod peek_profile;
 #[cfg(all(test, target_os = "macos"))]
+mod project_agent_tests;
+#[cfg(all(test, target_os = "macos"))]
 mod window_navigation_tests;
 mod workspace_launches;
 #[cfg(all(test, target_os = "macos"))]
@@ -252,6 +254,9 @@ pub struct RootView {
     /// from this rather than from the settled width so it picks up wherever the
     /// previous frame left the panel.
     sidebar_seam: f32,
+    tabs_slide: Option<SeamSlide>,
+    tabs_seam: f32,
+    tabs_target: f32,
     /// The panel is always mounted in one absolute slot. Only this exposure
     /// and its floating treatment change; the layout seam independently makes room.
     sidebar_panel_slide: Option<SeamSlide>,
@@ -518,11 +523,21 @@ impl RootView {
                 },
             ).detach();
         }
+        cx.observe(&sidebar, |_, sidebar, cx| {
+            if sidebar.read(cx).project_picker_active() {
+                cx.notify();
+            }
+        })
+        .detach();
         cx.subscribe_in(&sidebar, window, |this, _, event, window, cx| {
             if let SidebarEvent::WorkspaceActivated(id) = event {
+                this.sidebar
+                    .update(cx, |sidebar, _| sidebar.sync_focused_agent_selection());
                 this.activate_saved_workspace(id.clone(), window, cx);
             }
             if matches!(event, SidebarEvent::WorkspaceTabActivated) {
+                this.sidebar
+                    .update(cx, |sidebar, _| sidebar.sync_focused_agent_selection());
                 if let Some(workbench) = &this.workspace_workbench {
                     workbench.update(cx, |workbench, cx| workbench.focus(window, cx));
                 }
@@ -576,8 +591,15 @@ impl RootView {
                     launcher.update(cx, |launcher, cx| launcher.focus(window, cx));
                 });
             }
-            if matches!(event, SidebarEvent::SessionActivated) {
-                if this.active_workspace.is_some() {
+            if matches!(
+                event,
+                SidebarEvent::SessionActivated | SidebarEvent::ProjectLayoutUnavailable
+            ) {
+                let opening_project = matches!(event, SidebarEvent::SessionActivated)
+                    && this
+                        .sidebar
+                        .update(cx, |sidebar, cx| sidebar.open_selected_project_agent(cx));
+                if !opening_project && this.active_workspace.is_some() {
                     this.sidebar
                         .update(cx, |sidebar, cx| sidebar.activate_workspace(None, cx));
                     this.activate_saved_workspace(None, window, cx);
@@ -952,10 +974,17 @@ impl RootView {
                     Ok(()) | Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
                         if this
                             .update_in(cx, |this, window, cx| {
-                                this.window_store
-                                    .write()
-                                    .expect("store")
-                                    .accept_completed_launches(this.active_workspace.is_none());
+                                let launched = {
+                                    let mut store = this.window_store.write().expect("store");
+                                    let before = store.selected_session_id().cloned();
+                                    store.accept_completed_launches(true);
+                                    (store.selected_session_id() != before.as_ref())
+                                        .then(|| store.selected_session_id().cloned())
+                                        .flatten()
+                                };
+                                if let Some(id) = launched {
+                                    this.open_workspace_launch_session(id, window, cx);
+                                }
                                 let actions = this
                                     .window_store
                                     .write()
@@ -1079,6 +1108,11 @@ impl RootView {
             0.0
         };
         let inspector_seam = if inspector_open { inspector_width } else { 0.0 };
+        let tabs_seam = if sidebar.read(cx).horizontal_tabs_visible() {
+            crate::tab_navigation::TAB_STRIP_HEIGHT
+        } else {
+            0.0
+        };
         #[cfg(target_os = "macos")]
         let (browser, mut browser_events) = NativeBrowser::new();
         #[cfg(target_os = "macos")]
@@ -1249,6 +1283,9 @@ impl RootView {
             sidebar_peek_dwell: None,
             sidebar_seam,
             applied_material: None,
+            tabs_slide: None,
+            tabs_seam,
+            tabs_target: tabs_seam,
             auxiliary_terminal: None,
             auxiliary_id: None,
             auxiliary_parent: None,
@@ -1437,6 +1474,8 @@ impl RootView {
                 )
                 .detach();
                 cx.observe_in(&workbench, window, |this, _, window, cx| {
+                    this.sidebar
+                        .update(cx, |sidebar, _| sidebar.sync_focused_agent_selection());
                     this.sync_inspector_context(cx);
                     this.sync_auxiliary_terminal(window, cx);
                     if let Some(surfaces) = &this.session_surfaces
@@ -1951,7 +1990,8 @@ impl RootView {
     /// mutations of RootView's child modules.
     fn run_command(&mut self, command: CommandId, window: &mut Window, cx: &mut Context<Self>) {
         if let Some(command) = crate::workspace_workbench::PaneCommand::from_id(command) {
-            if self.sidebar.read(cx).workspace_menu_is_open()
+            if (self.sidebar.read(cx).workspace_menu_is_open()
+                || self.sidebar.read(cx).project_picker_active())
                 || self.launcher.read(cx).is_open()
                 || self
                     .navigation
@@ -2082,7 +2122,23 @@ impl RootView {
                 cx.notify();
             }
             CommandId::ToggleSidebar => {
-                self.sidebar.update(cx, |sidebar, cx| sidebar.toggle(cx));
+                if self.sidebar.read(cx).tab_orientation()
+                    == crate::store::TabOrientation::Horizontal
+                {
+                    if let Err(error) = self
+                        .sidebar
+                        .update(cx, |sidebar, cx| sidebar.toggle_horizontal_tabs(window, cx))
+                    {
+                        self.show_quote_feedback(
+                            "Tab bar",
+                            format!("Could not save tab bar visibility: {error}"),
+                            cx,
+                        );
+                    }
+                    cx.notify();
+                } else {
+                    self.sidebar.update(cx, |sidebar, cx| sidebar.toggle(cx));
+                }
             }
             CommandId::FocusSidebar => {
                 if self.launcher.read(cx).is_open() {
@@ -3010,14 +3066,19 @@ impl RootView {
         };
         let card_width =
             (f32::from(viewport_size.width) - sidebar_width - inspector_width).max(0.0);
-        let tabs_height = if self.sidebar.read(cx).tab_orientation()
-            == crate::store::TabOrientation::Horizontal
-        {
+        let tabs_height = if self.sidebar.read(cx).horizontal_tabs_visible() {
             crate::tab_navigation::TAB_STRIP_HEIGHT
         } else {
             0.0
         };
         let card_height = (f32::from(viewport_size.height) - tabs_height).max(0.0);
+        if self.tabs_target != tabs_height {
+            self.tabs_target = tabs_height;
+            self.tabs_slide = (!cx.reduce_motion())
+                .then(|| SeamSlide::begin(self.tabs_seam, tabs_height))
+                .flatten();
+        }
+        self.tabs_seam = advance_seam(&mut self.tabs_slide, tabs_height, Instant::now(), window);
         let selected = self
             .window_store
             .read()
@@ -3119,10 +3180,25 @@ impl RootView {
             });
         }
 
-        if tabs_height > 0.0 {
-            card = card.child(self.sidebar.update(cx, |sidebar, cx| {
+        if self.tabs_seam > 0.0 {
+            let strip = self.sidebar.update(cx, |sidebar, cx| {
                 sidebar.render_horizontal_tabs(card_width, cx)
-            }));
+            });
+            card = card.child(
+                div()
+                    .id("animated-top-bar")
+                    .flex_none()
+                    .h(px(self.tabs_seam))
+                    .w_full()
+                    .overflow_hidden()
+                    .child(
+                        div()
+                            .relative()
+                            .top(px(self.tabs_seam - crate::tab_navigation::TAB_STRIP_HEIGHT))
+                            .h(px(crate::tab_navigation::TAB_STRIP_HEIGHT))
+                            .child(strip),
+                    ),
+            );
         }
         // Translation changes only paint placement. The stationary tab strip
         // and settled PTY viewport never participate in the gesture layout.
@@ -3182,7 +3258,7 @@ impl RootView {
                     div()
                         .p(px(28.0))
                         .text_color(terminal.secondary)
-                        .child("Add a session to this workspace"),
+                        .child("Choose an agent from the sidebar, or start a New Agent"),
                 );
             }
         } else if self.preview && self.preview_scenario != PreviewScenario::Empty {
@@ -4522,7 +4598,15 @@ impl Render for RootView {
         // This overlay never participates in the terminal's flex layout or
         // viewport sizing. Keep it below dialogs and above workbench content.
         root = root.child(sidebar_wrapper).children(peek_pointer_tracking);
-        if !sidebar_visible && seam == 0.0 && exposed == 0.0 && panel_width == 0.0 {
+        root = root.children(self.sidebar.update(cx, |sidebar, cx| {
+            sidebar.render_project_picker_overlay(window, cx)
+        }));
+        if !sidebar_visible
+            && seam == 0.0
+            && exposed == 0.0
+            && panel_width == 0.0
+            && !self.sidebar.read(cx).project_picker_active()
+        {
             root = root.child(
                 div()
                     .id("sidebar-peek-edge")
@@ -4891,12 +4975,13 @@ mod tests {
         assert_eq!(horizontal.y, crate::tab_navigation::TAB_STRIP_HEIGHT);
         let picker = cx.debug_bounds("horizontal-tab-project").unwrap();
         cx.simulate_click(picker.center(), Modifiers::default());
+        assert!(cx.debug_bounds("project-picker-popup").is_some());
         cx.executor().advance_clock(Duration::from_millis(300));
         cx.run_until_parked();
         root.read_with(cx, |root, cx| {
             assert!(
-                root.sidebar.read(cx).is_peeking(),
-                "keyboard project picker remains open"
+                !root.sidebar.read(cx).is_peeking(),
+                "project dropdown never reveals the sidebar"
             );
             assert_eq!(
                 entity.read(cx).geometry_for_test().0.unwrap(),
@@ -5049,14 +5134,18 @@ mod tests {
             let mut store = services.store.store.write().unwrap();
             store.hydrate(fixture.list);
             store.select(fixture.selected_session_id.unwrap());
+            // Start with settled horizontal chrome; this test exercises peek motion.
+            store
+                .update_preferences(|prefs| {
+                    prefs.tab_orientation = crate::store::TabOrientation::Horizontal;
+                    prefs.sidebar_visible = false;
+                })
+                .unwrap();
         }
         let (root, cx) = cx.add_window_view(move |window, cx| {
             RootView::new(services, false, PreviewScenario::Empty, window, cx)
         });
         cx.simulate_resize(size(px(1000.0), px(700.0)));
-        root.update_in(cx, |root, window, cx| {
-            root.run_command(CommandId::HorizontalTabs, window, cx)
-        });
         cx.run_until_parked();
         let heading = cx.debug_bounds("horizontal-tabs").unwrap();
         let body = cx.debug_bounds("terminal-card-body").unwrap();
@@ -5644,13 +5733,24 @@ mod tests {
     }
 
     #[gpui::test]
-    fn workspace_filter_and_group_collapse_preserve_terminal_and_restore_rows(
+    fn project_filter_and_group_collapse_preserve_workspace_terminal_and_restore_agents(
         cx: &mut gpui::TestAppContext,
     ) {
         use diri_proto::workspace::*;
         cx.update(|cx| cx.set_reduce_motion(true));
         let services = test_services();
-        let fixture = SidebarPreviewFixture::make(PreviewScenario::Typical);
+        let mut fixture = SidebarPreviewFixture::make(PreviewScenario::Typical);
+        for session in &mut fixture.list.sessions {
+            if session.id.0 == "preview-claude" || session.id.0 == "preview-codex" {
+                session.title = if session.id.0 == "preview-claude" {
+                    "Build frontend"
+                } else {
+                    "Review API"
+                }
+                .into();
+                session.title_source = diri_proto::TitleSource::UserRename;
+            }
+        }
         let tab = |id: &str, title: &str, session: &str| WorkspaceTab {
             id: TabId::new(id),
             title: Some(title.into()),
@@ -5668,6 +5768,7 @@ mod tests {
                 revision: 7,
                 workspaces: vec![
                     WorkspaceRecord {
+                        project_id: None,
                         id: WorkspaceId::new("release"),
                         name: "Release".into(),
                         selected_tab: Some(TabId::new("build")),
@@ -5677,6 +5778,7 @@ mod tests {
                         ],
                     },
                     WorkspaceRecord {
+                        project_id: None,
                         id: WorkspaceId::new("remote"),
                         name: "Remote".into(),
                         selected_tab: Some(TabId::new("logs")),
@@ -5707,11 +5809,11 @@ mod tests {
             .snapshot()
             .unwrap()
             .clone();
-        assert!(cx.debug_bounds("workspace-heading-remote").is_some());
-        let fold = cx.debug_bounds("workspace-fold-release").unwrap().center();
+        assert!(cx.debug_bounds("new-agent").is_some());
+        let fold = cx.debug_bounds("PROJECT_preview-dirijor").unwrap().center();
         cx.simulate_click(fold, Modifiers::default());
         cx.run_until_parked();
-        assert!(cx.debug_bounds("workspace-tab-build").is_none());
+        assert!(cx.debug_bounds("SESSION_preview-claude").is_none());
         assert_eq!(
             root.read_with(cx, |root, cx| root.active_terminal(cx).unwrap()),
             terminal
@@ -5720,10 +5822,8 @@ mod tests {
         cx.simulate_click(filter, Modifiers::default());
         cx.simulate_keystrokes("r e v i e w");
         cx.run_until_parked();
-        assert!(cx.debug_bounds("workspace-tab-review").is_some());
-        assert!(cx.debug_bounds("workspace-tab-build").is_none());
-        assert!(cx.debug_bounds("workspace-heading-remote").is_some());
-        assert!(cx.debug_bounds("workspace-tab-logs").is_none());
+        assert!(cx.debug_bounds("SESSION_preview-codex").is_some());
+        assert!(cx.debug_bounds("SESSION_preview-claude").is_none());
         assert_eq!(
             root.read_with(cx, |root, cx| root.active_terminal(cx).unwrap()),
             terminal
@@ -5731,14 +5831,13 @@ mod tests {
         cx.simulate_keystrokes("escape");
         cx.run_until_parked();
         assert!(
-            cx.debug_bounds("workspace-tab-review").is_none(),
-            "clear restores the saved collapsed group"
+            cx.debug_bounds("SESSION_preview-codex").is_none(),
+            "clear restores the saved collapsed project"
         );
-        assert!(cx.debug_bounds("workspace-tab-logs").is_some());
         cx.simulate_click(fold, Modifiers::default());
         cx.run_until_parked();
-        assert!(cx.debug_bounds("workspace-tab-build").is_some());
-        assert!(cx.debug_bounds("workspace-tab-review").is_some());
+        assert!(cx.debug_bounds("SESSION_preview-claude").is_some());
+        assert!(cx.debug_bounds("SESSION_preview-codex").is_some());
         assert_eq!(
             runtime.store.read().unwrap().workspace_catalog().snapshot(),
             Some(&before)
@@ -5748,12 +5847,12 @@ mod tests {
             terminal
         );
         cx.simulate_click(filter, Modifiers::default());
-        cx.simulate_keystrokes("l o g s down down down");
+        cx.simulate_keystrokes("r e v i e w down");
         cx.run_until_parked();
         assert_eq!(
             root.read_with(cx, |root, _| root.active_workspace.clone()),
             Some(WorkspaceId::new("release")),
-            "arrow navigation does not activate results"
+            "filter navigation does not activate an agent or replace its layout"
         );
         root.update_in(cx, |root, window, cx| {
             root.run_command(CommandId::HorizontalTabs, window, cx)
@@ -5769,17 +5868,11 @@ mod tests {
             root.run_command(CommandId::VerticalTabs, window, cx)
         });
         cx.run_until_parked();
+        assert!(cx.debug_bounds("SESSION_preview-codex").is_some());
         assert!(cx.debug_bounds("workspace-tab-build").is_none());
         assert_eq!(
             root.read_with(cx, |root, cx| root.active_terminal(cx).unwrap()),
             terminal
-        );
-        cx.simulate_click(filter, Modifiers::default());
-        cx.simulate_keystrokes("down enter");
-        cx.run_until_parked();
-        assert_eq!(
-            root.read_with(cx, |root, _| root.active_workspace.clone()),
-            Some(WorkspaceId::new("remote"))
         );
     }
 
@@ -6399,6 +6492,7 @@ mod tests {
             store.seed_workspace_snapshot_for_test(WorkspaceSnapshot {
                 revision: 7,
                 workspaces: vec![WorkspaceRecord {
+                    project_id: None,
                     id: workspace.clone(),
                     name: "Release room".into(),
                     selected_tab: Some(tab.clone()),
@@ -6461,6 +6555,7 @@ mod tests {
             }
             if let Ok(mode) = std::env::var("DIRI_WORKSPACE_GROUPS") {
                 snapshot.workspaces.push(WorkspaceRecord {
+                    project_id: None,
                     id: WorkspaceId::new("operations-workspace"),
                     name: "Operations".into(),
                     selected_tab: Some(TabId::new("deployment-tab")),
@@ -7139,6 +7234,7 @@ mod tests {
             store.seed_workspace_snapshot_for_test(WorkspaceSnapshot {
                 revision: 1,
                 workspaces: vec![WorkspaceRecord {
+                    project_id: None,
                     id: workspace.clone(),
                     name: "Window context".into(),
                     selected_tab: Some(tab.clone()),

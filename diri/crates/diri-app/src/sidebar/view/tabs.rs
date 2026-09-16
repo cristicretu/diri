@@ -6,6 +6,15 @@ const TAB_WIDTH: f32 = 164.0;
 const TAB_GAP: f32 = 4.0;
 
 impl Sidebar {
+    pub(super) fn agent_tab_icon(kind: &ProtoAgentKind, colors: SemanticColors) -> AnyElement {
+        match ui_agent_kind(kind).brand_mark() {
+            Some(mark) => diri_ui::BrandMark::solid(mark, 16.0, colors.secondary)
+                .inset(0.08)
+                .into_any_element(),
+            None => sf_symbol("terminal", 16.0, colors.secondary),
+        }
+    }
+
     pub(super) fn navigation_sessions(
         &self,
         store: &mut crate::store::WindowWrite<'_>,
@@ -37,6 +46,34 @@ impl Sidebar {
             .tab_orientation
     }
 
+    pub fn horizontal_tabs_visible(&self) -> bool {
+        let store = self.store.read().expect("store");
+        store.preferences().tab_orientation == TabOrientation::Horizontal
+            && store.preferences().horizontal_tabs_visible
+    }
+
+    pub fn toggle_horizontal_tabs(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> std::io::Result<()> {
+        self.store
+            .write()
+            .expect("store")
+            .update_preferences(|prefs| {
+                prefs.horizontal_tabs_visible = !prefs.horizontal_tabs_visible;
+            })?;
+        if !self.horizontal_tabs_visible() && self.project_picker_active() {
+            if self.project_picker.new_agent {
+                self.ui.popover = None;
+                self.project_picker.new_agent = false;
+            }
+            self.dismiss_project_picker(window, cx);
+        }
+        cx.notify();
+        Ok(())
+    }
+
     /// Commit the presentation preference before changing the visible chrome.
     /// Selection and all terminal entities stay owned by their existing views.
     pub fn set_tab_orientation(
@@ -62,16 +99,12 @@ impl Sidebar {
         Ok(())
     }
 
-    pub fn render_horizontal_tabs(
+    pub(super) fn render_project_tab_rows(
         &mut self,
         available_width: f32,
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let colors = self.colors();
-        if self.workspace_nav.active.is_some() {
-            self.workspace_nav.available_width = available_width;
-            return self.workspace_strip(colors, cx);
-        }
         let (tabs, selected) = {
             let mut store = self.store.write().expect("store");
             let selected = store.selected_session_id().cloned();
@@ -87,7 +120,7 @@ impl Sidebar {
             .gap(px(TAB_GAP))
             .flex_1()
             .min_w(px(0.0))
-            .h_full()
+            .h(px(30.0))
             .overflow_x_scroll()
             .track_scroll(&self.tab_scroll);
         if self.last_tab_selection != selected || self.last_tab_available_width != available_width {
@@ -136,11 +169,7 @@ impl Sidebar {
                             row.bg(colors.primary.alpha(0.06))
                         }
                     })
-                    .child(sf_symbol(
-                        crate::agent_catalog::system_image(&session.kind),
-                        12.0,
-                        colors.secondary,
-                    ))
+                    .child(Self::agent_tab_icon(session.effective_kind(), colors))
                     .child(
                         div()
                             .flex_1()
@@ -186,6 +215,20 @@ impl Sidebar {
                     })),
             );
         }
+        rows.into_any_element()
+    }
+
+    pub fn render_horizontal_tabs(
+        &mut self,
+        available_width: f32,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let colors = self.colors();
+        if self.workspace_nav.active.is_some() {
+            self.workspace_nav.available_width = available_width;
+            return self.workspace_strip(colors, cx);
+        }
+        let rows = self.render_project_tab_rows(available_width, cx);
         div()
             .id("horizontal-tabs")
             .debug_selector(|| "horizontal-tabs".into())
@@ -196,54 +239,22 @@ impl Sidebar {
             .w_full()
             .flex()
             .items_center()
-            .gap(px(8.0))
+            .relative()
+            .py(px(6.0))
+            .gap(px(0.0))
             .pl(px(if cfg!(target_os = "macos") && !self.ui.visible {
-                84.0
+                92.0
             } else {
                 10.0
             }))
             .pr(px(10.0))
-            .border_b_1()
-            .border_color(colors.primary.alpha(0.07))
+            .child(
+                div().absolute().left(px(0.0)).right(px(0.0)).bottom(px(0.0))
+                    .h(px(1.0)).bg(colors.primary.alpha(0.07)),
+            )
             .bg(colors.sidebar_surface())
             .text_color(colors.primary)
-            .child(
-                div()
-                    .w(px(120.0))
-                    .flex_none()
-                    .child(self.workspace_control(colors, cx)),
-            )
-            .child(
-                div()
-                    .id("horizontal-tab-project")
-                    .debug_selector(|| "horizontal-tab-project".into())
-                    .role(Role::Button)
-                    .aria_label(format!("Browse projects, current project {}", tabs.label))
-                    .h(px(30.0))
-                    .max_w(px(140.0))
-                    .px(px(8.0))
-                    .flex_none()
-                    .flex()
-                    .items_center()
-                    .gap(px(6.0))
-                    .rounded(px(SIDEBAR_ROW_RADIUS))
-                    .cursor_pointer()
-                    .hover(move |row| row.bg(colors.primary.alpha(0.06)))
-                    .child(
-                        div()
-                            .min_w(px(0.0))
-                            .overflow_hidden()
-                            .text_ellipsis()
-                            .text_size(px(Typo::META.size))
-                            .child(tabs.label),
-                    )
-                    .child(sf_symbol("chevron.down", 8.0, colors.tertiary))
-                    .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
-                    .on_click(cx.listener(|this, _, window, cx| {
-                        this.peek(window, cx);
-                        this.focus_handle.focus(window, cx);
-                    })),
-            )
+            .child(self.project_control(colors, cx))
             .child(rows)
             .child(
                 div()

@@ -1,9 +1,11 @@
 mod groups;
+mod project_agents;
 use super::*;
 use diri_proto::workspace::{
     DockEdge, PaneId, TabId, WorkspaceId, WorkspaceMutation, WorkspaceRecord,
 };
 use groups::{WorkspaceRowKey, project_groups};
+use project_agents::{ProjectAgentOpen, first_agent, focused_agent};
 
 #[derive(Clone)]
 struct DraggedWorkspaceTab {
@@ -49,6 +51,7 @@ pub(super) struct WorkspaceNavigation {
     highlighted_workspace: Option<Option<WorkspaceId>>,
     cursor: Option<WorkspaceRowKey>,
     pending_activation: Option<(WorkspaceId, TabId, u64)>,
+    project_agent: Option<ProjectAgentOpen>,
     menu_scroll: ScrollHandle,
     scroll: ScrollHandle,
     vertical_scroll: ScrollHandle,
@@ -69,6 +72,7 @@ impl WorkspaceNavigation {
             highlighted_workspace: None,
             cursor: None,
             pending_activation: None,
+            project_agent: None,
             menu_scroll: ScrollHandle::new(),
             scroll: ScrollHandle::new(),
             vertical_scroll: ScrollHandle::new(),
@@ -105,15 +109,9 @@ fn tab_title(tab: &diri_proto::workspace::WorkspaceTab, store: &SessionStore) ->
     if let Some(title) = &tab.title {
         return title.clone();
     }
-    fn first_session(node: &diri_proto::workspace::LayoutNode) -> &SessionId {
-        match node {
-            diri_proto::workspace::LayoutNode::Pane { session_id, .. } => session_id,
-            diri_proto::workspace::LayoutNode::Split { first, .. } => first_session(first),
-        }
-    }
     store
         .sessions()
-        .get(first_session(&tab.layout))
+        .get(focused_agent(tab).unwrap_or_else(|| first_agent(&tab.layout)))
         .map(|session| display_title(session))
         .unwrap_or_else(|| "Unavailable session".into())
 }
@@ -124,7 +122,7 @@ fn workspace_menu_targets(
 ) -> Vec<Option<WorkspaceId>> {
     let query = query.trim().to_lowercase();
     let mut targets = Vec::new();
-    if "all sessions".contains(&query) {
+    if "projects".contains(&query) {
         targets.push(None);
     }
     if let Some(snapshot) = snapshot {
@@ -284,6 +282,7 @@ impl Sidebar {
     }
 
     pub(crate) fn activate_workspace(&mut self, id: Option<WorkspaceId>, cx: &mut Context<Self>) {
+        self.workspace_nav.project_agent = None;
         self.workspace_nav.active = id.clone();
         if let Err(error) = self
             .store
@@ -319,6 +318,7 @@ impl Sidebar {
         cx.notify();
     }
     pub(super) fn reconcile_workspace_navigation(&mut self, cx: &mut Context<Self>) {
+        self.reconcile_project_agent(cx);
         self.reconcile_workspace_activation(cx);
         let (created, active_exists, ready) = {
             let store = self.store.read().expect("store");
@@ -534,67 +534,6 @@ impl Sidebar {
         cx.notify();
     }
 
-    pub(super) fn workspace_control(
-        &self,
-        colors: SemanticColors,
-        cx: &mut Context<Self>,
-    ) -> AnyElement {
-        let label = self
-            .workspace_nav
-            .active
-            .as_ref()
-            .and_then(|id| {
-                self.store
-                    .read()
-                    .expect("store")
-                    .workspace_catalog()
-                    .snapshot()
-                    .and_then(|snapshot| {
-                        snapshot
-                            .workspaces
-                            .iter()
-                            .find(|workspace| &workspace.id == id)
-                    })
-                    .map(|workspace| workspace.name.clone())
-            })
-            .unwrap_or_else(|| "All sessions".into());
-        div()
-            .id("workspace-picker")
-            .debug_selector(|| "workspace-picker".into())
-            .role(Role::Button)
-            .aria_label("Choose workspace")
-            .h(px(30.0))
-            .px(px(9.0))
-            .flex()
-            .items_center()
-            .gap(px(7.0))
-            .min_w(px(0.0))
-            .rounded(px(7.0))
-            .cursor_pointer()
-            .hover(move |row| row.bg(colors.primary.alpha(0.06)))
-            .child(sf_symbol("square.stack.3d.up", 12.0, colors.secondary))
-            .child(
-                div()
-                    .flex_1()
-                    .min_w(px(0.0))
-                    .overflow_hidden()
-                    .text_ellipsis()
-                    .text_size(px(Typo::META.size))
-                    .child(label),
-            )
-            .child(sf_symbol("chevron.down", 8.0, colors.tertiary))
-            .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
-            .on_click(cx.listener(|this, _, window, cx| {
-                this.workspace_nav.menu = !this.workspace_nav.menu;
-                this.workspace_nav.query.clear();
-                this.workspace_nav.editor = None;
-                this.workspace_nav.destination = None;
-                this.workspace_nav.focus.focus(window, cx);
-                this.peek(window, cx);
-                cx.notify();
-            }))
-            .into_any_element()
-    }
     pub(super) fn workspace_record(&self) -> Option<WorkspaceRecord> {
         let id = self.workspace_nav.active.as_ref()?;
         self.store
@@ -613,6 +552,10 @@ impl Sidebar {
         colors: SemanticColors,
         cx: &mut Context<Self>,
     ) -> AnyElement {
+        if horizontal {
+            return self.render_project_tab_rows(self.workspace_nav.available_width, cx);
+        }
+
         let groups = {
             let store = self.store.read().expect("store");
             let Some(snapshot) = store.workspace_catalog().snapshot() else {
@@ -783,14 +726,9 @@ impl Sidebar {
                 colors.primary.alpha(0.0)
             })
             .hover(move |row| row.bg(colors.primary.alpha(0.06)))
-            .child(sf_symbol(
-                "rectangle",
-                11.0,
-                if active {
-                    colors.primary
-                } else {
-                    colors.secondary
-                },
+            .child(tab.kind.as_ref().map_or_else(
+                || sf_symbol("rectangle", 16.0, colors.secondary),
+                |kind| Self::agent_tab_icon(kind, colors),
             ))
             .child(
                 div()
@@ -873,49 +811,6 @@ impl Sidebar {
             row = row.w(px(164.0));
         }
         row.into_any_element()
-    }
-    pub(super) fn workspace_body(
-        &mut self,
-        colors: SemanticColors,
-        cx: &mut Context<Self>,
-    ) -> AnyElement {
-        let id = self.workspace_nav.active.clone();
-        div()
-            .flex_1()
-            .min_h(px(0.0))
-            .flex()
-            .flex_col()
-            .px(px(10.0))
-            .gap(px(8.0))
-            .child(self.workspace_control(colors, cx))
-            .child(self.workspace_rows(false, colors, cx))
-            .child(
-                div()
-                    .id("workspace-add-tab")
-                    .role(Role::Button)
-                    .aria_label("Add existing session to workspace")
-                    .h(px(30.0))
-                    .flex()
-                    .items_center()
-                    .gap(px(7.0))
-                    .px(px(9.0))
-                    .cursor_pointer()
-                    .text_size(px(Typo::META.size))
-                    .text_color(colors.secondary)
-                    .child(sf_symbol("plus", 11.0, colors.secondary))
-                    .child("Add session")
-                    .on_click(cx.listener(move |this, _, window, cx| {
-                        if let Some(id) = &id {
-                            this.workspace_nav.destination =
-                                Some(SessionDestination::Tab(id.clone()));
-                            this.workspace_nav.menu = true;
-                            this.workspace_nav.query.clear();
-                            this.workspace_nav.focus.focus(window, cx);
-                            cx.notify();
-                        }
-                    })),
-            )
-            .into_any_element()
     }
 }
 
@@ -1185,7 +1080,7 @@ impl Sidebar {
                         .rounded(px(6.0))
                         .cursor_pointer()
                         .hover(move |row| row.bg(colors.primary.alpha(0.06)))
-                        .child("All sessions")
+                        .child("Projects")
                         .on_click(cx.listener(|this, _, _, cx| this.activate_workspace(None, cx))),
                 );
             }
@@ -1347,6 +1242,28 @@ impl Sidebar {
                         .child("Removing a workspace keeps its sessions running."),
                 );
             }
+            if let Some(workspace) = self.workspace_nav.active.clone() {
+                panel = panel.child(
+                    div()
+                        .id("workspace-add-existing-agent")
+                        .role(Role::Button)
+                        .aria_label("Open existing agent in this layout")
+                        .h(px(30.0))
+                        .px(px(7.0))
+                        .flex()
+                        .items_center()
+                        .cursor_pointer()
+                        .text_size(px(12.0))
+                        .child("Open existing agent…")
+                        .on_click(cx.listener(move |this, _, window, cx| {
+                            this.workspace_nav.destination =
+                                Some(SessionDestination::Tab(workspace.clone()));
+                            this.workspace_nav.query.clear();
+                            this.workspace_nav.focus.focus(window, cx);
+                            cx.notify();
+                        })),
+                );
+            }
             panel = panel.child(
                 div()
                     .id("new-workspace")
@@ -1384,28 +1301,27 @@ impl Sidebar {
             .flex_none()
             .flex()
             .items_center()
-            .gap(px(8.0))
+            .relative()
+            .py(px(6.0))
+            .gap(px(0.0))
             .pl(px(if cfg!(target_os = "macos") && !self.ui.visible {
-                84.0
+                92.0
             } else {
                 10.0
             }))
             .pr(px(10.0))
-            .border_b_1()
-            .border_color(colors.primary.alpha(0.07))
-            .bg(colors.sidebar_surface())
             .child(
-                div()
-                    .w(px(150.0))
-                    .flex_none()
-                    .child(self.workspace_control(colors, cx)),
+                div().absolute().left(px(0.0)).right(px(0.0)).bottom(px(0.0))
+                    .h(px(1.0)).bg(colors.primary.alpha(0.07)),
             )
+            .bg(colors.sidebar_surface())
+            .child(self.project_control(colors, cx))
             .child(self.workspace_rows(true, colors, cx))
             .child(
                 div()
                     .id("horizontal-workspace-add-tab")
                     .role(Role::Button)
-                    .aria_label("Add session to workspace")
+                    .aria_label("New Agent")
                     .size(px(26.0))
                     .flex_none()
                     .flex()
@@ -1413,16 +1329,9 @@ impl Sidebar {
                     .justify_center()
                     .cursor_pointer()
                     .child(sf_symbol("plus", 12.0, colors.secondary))
-                    .on_click(cx.listener(|this, _, window, cx| {
-                        if let Some(id) = &this.workspace_nav.active {
-                            this.workspace_nav.destination =
-                                Some(SessionDestination::Tab(id.clone()));
-                            this.workspace_nav.menu = true;
-                            this.workspace_nav.query.clear();
-                            this.workspace_nav.focus.focus(window, cx);
-                            this.peek(window, cx);
-                            cx.notify();
-                        }
+                    .on_click(cx.listener(|this, event: &gpui::ClickEvent, window, cx| {
+                        this.open_header_new_agent(event.position(), window, cx);
+                        cx.stop_propagation();
                     })),
             )
             .into_any_element()
@@ -1430,106 +1339,6 @@ impl Sidebar {
 }
 
 impl Sidebar {
-    pub(super) fn select_workspace_tab(&mut self, index: usize, cx: &mut Context<Self>) -> bool {
-        let Some(workspace) = self.workspace_record() else {
-            return false;
-        };
-        let Some(tab) = workspace.tabs.get(index) else {
-            return false;
-        };
-        let accepted =
-            self.store
-                .write()
-                .expect("store")
-                .edit_workspace(WorkspaceMutation::SelectTab {
-                    workspace_id: workspace.id,
-                    tab_id: tab.id.clone(),
-                });
-        if accepted {
-            cx.emit(SidebarEvent::WorkspaceTabActivated);
-            cx.notify();
-        }
-        accepted
-    }
-    pub(super) fn relative_workspace_tab(&mut self, delta: isize, cx: &mut Context<Self>) -> bool {
-        let Some(workspace) = self.workspace_record() else {
-            return false;
-        };
-        if workspace.tabs.is_empty() {
-            return false;
-        }
-        let current = workspace
-            .tabs
-            .iter()
-            .position(|tab| Some(&tab.id) == workspace.selected_tab.as_ref())
-            .unwrap_or(0);
-        self.select_workspace_tab(
-            (current as isize + delta).rem_euclid(workspace.tabs.len() as isize) as usize,
-            cx,
-        )
-    }
-    pub(super) fn reorder_workspace_tab(&mut self, delta: isize, cx: &mut Context<Self>) -> bool {
-        let Some(workspace) = self.workspace_record() else {
-            return false;
-        };
-        let Some(current) = workspace
-            .tabs
-            .iter()
-            .position(|tab| Some(&tab.id) == workspace.selected_tab.as_ref())
-        else {
-            return false;
-        };
-        let index = (current as isize + delta).clamp(0, workspace.tabs.len() as isize - 1) as usize;
-        let accepted =
-            self.store
-                .write()
-                .expect("store")
-                .edit_workspace(WorkspaceMutation::MoveTab {
-                    tab_id: workspace.tabs[current].id.clone(),
-                    workspace_id: workspace.id,
-                    index,
-                });
-        cx.notify();
-        accepted
-    }
-    pub(super) fn rename_workspace_tab(
-        &mut self,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) -> bool {
-        let Some(workspace) = self.workspace_record() else {
-            return false;
-        };
-        let Some(tab) = workspace
-            .tabs
-            .iter()
-            .find(|tab| Some(&tab.id) == workspace.selected_tab.as_ref())
-        else {
-            return false;
-        };
-        let title = tab_title(tab, &self.store.read().expect("store"));
-        self.begin_workspace_editor(
-            WorkspaceEditor::RenameTab(tab.id.clone()),
-            &title,
-            window,
-            cx,
-        );
-        true
-    }
-    pub(super) fn remove_workspace_tab(&mut self, cx: &mut Context<Self>) -> bool {
-        let Some(tab_id) = self
-            .workspace_record()
-            .and_then(|workspace| workspace.selected_tab)
-        else {
-            return false;
-        };
-        self.store
-            .write()
-            .expect("store")
-            .edit_workspace(WorkspaceMutation::RemoveTab { tab_id });
-        cx.notify();
-        true // closing a placement must never fall through to session removal
-    }
     pub(super) fn workspace_focused_session(&self) -> Option<SessionId> {
         fn find(node: &diri_proto::workspace::LayoutNode, id: &PaneId) -> Option<SessionId> {
             match node {
