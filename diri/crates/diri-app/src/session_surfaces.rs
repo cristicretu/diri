@@ -2,10 +2,10 @@
 //!
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
-use std::sync::{Arc, RwLock};
+use std::sync::Arc;
 
 use crate::icons::{SymbolWeight, sf_symbol, sf_symbol_weighted};
-use crate::store::{SessionStore, StoreRuntime};
+use crate::store::StoreRuntime;
 use crate::switcher::{
     OverviewArrow, OverviewFilter, OverviewLane, OverviewMode, SwitcherKey, display_title,
 };
@@ -57,7 +57,7 @@ pub struct SessionSurfaces {
     peek_frame_pending: bool,
     closing_previews: HashMap<SessionId, TerminalElement>,
     live_previews: crate::tab_preview::PreviewSet<crate::tab_preview::LivePreview>,
-    store: Arc<RwLock<SessionStore>>,
+    store: crate::store::WindowStore,
     focus_handle: FocusHandle,
     resident_previews: HashMap<SessionId, TerminalElement>,
     status_glyphs: HashMap<(SessionId, u16, diri_ui::AgentKind), Entity<StatusGlyph>>,
@@ -110,6 +110,10 @@ fn overview_columns(width: f32) -> usize {
 }
 
 impl SessionSurfaces {
+    pub(crate) fn set_window_store(&mut self, store: crate::store::WindowStore) {
+        self.store = store;
+    }
+
     #[cfg(all(test, target_os = "macos"))]
     pub(crate) fn configure_preview_fixture(
         &mut self,
@@ -166,7 +170,7 @@ impl SessionSurfaces {
             workspace_previews: Default::default(),
             workspace_preview_views: HashMap::new(),
             live_previews: Default::default(),
-            store: Arc::clone(&runtime.store),
+            store: crate::store::WindowStore::from_canonical(Arc::clone(&runtime.store)),
             focus_handle: cx.focus_handle(),
             resident_previews: HashMap::new(),
             status_glyphs: HashMap::new(),
@@ -1813,6 +1817,7 @@ fn status_color(session: &SessionRecord, colors: SemanticColors) -> gpui::Rgba {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::RwLock;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     use diri_proto::{
@@ -1894,11 +1899,15 @@ mod tests {
             sessions: (0..18).map(session).collect(),
             projects: vec![],
         });
-        runtime.store.write().unwrap().toggle_overview();
+
         let background_scrolls = Arc::new(AtomicUsize::new(0));
         let probe = Arc::clone(&background_scrolls);
         let (view, cx) = cx.add_window_view(move |_, cx| OverviewHarness {
-            surfaces: cx.new(|cx| SessionSurfaces::new(runtime, None, cx)),
+            surfaces: cx.new(|cx| {
+                let surfaces = SessionSurfaces::new(runtime, None, cx);
+                surfaces.store.write().unwrap().toggle_overview();
+                surfaces
+            }),
             background_scrolls: probe,
         });
         cx.simulate_resize(size(px(1100.0), px(700.0)));
@@ -1935,11 +1944,12 @@ mod tests {
             sessions: vec![session(0)],
             projects: vec![],
         });
-        runtime.store.write().unwrap().toggle_overview();
+
         let escaped = Arc::new(AtomicUsize::new(0));
         let probe = Arc::clone(&escaped);
         let (_, cx) = cx.add_window_view(move |window, cx| {
             let surfaces = cx.new(|cx| SessionSurfaces::new(runtime, None, cx));
+            surfaces.read(cx).store.write().unwrap().toggle_overview();
             surfaces.read(cx).focus_handle.clone().focus(window, cx);
             OverviewHarness {
                 surfaces,
@@ -1967,7 +1977,6 @@ mod tests {
             .unwrap()
             .toggle_project_collapsed(ProjectId::new("overview"))
             .unwrap();
-        let store = runtime.store.clone();
         let grid = Arc::new(RwLock::new(GridBuffer::new(100, 40)));
         let live = grid.clone();
         let escaped = Arc::new(AtomicUsize::new(0));
@@ -1986,6 +1995,7 @@ mod tests {
         });
         cx.simulate_resize(size(px(1100.0), px(700.0)));
         let surfaces = view.read_with(cx, |h, _| h.surfaces.clone());
+        let store = surfaces.read_with(cx, |surfaces, _| surfaces.store.clone());
         assert!(cx.debug_bounds("TAB_PEEK_CARD_0").is_some());
         assert_eq!(surfaces.read_with(cx, |s, _| s.peek.sessions.len()), 4);
         assert_eq!(

@@ -735,6 +735,11 @@ impl WorkbenchInspector {
         });
     }
 
+    #[cfg(all(test, target_os = "macos"))]
+    pub(crate) fn session_id_for_test(&self) -> Option<SessionId> {
+        self.selected_session().map(|session| session.id)
+    }
+
     fn selected_context(&self) -> Option<DiffContext> {
         let session = self.selected_session()?;
         Some(DiffContext {
