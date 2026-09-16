@@ -282,3 +282,187 @@ fn all_sessions_windows_keep_terminal_inspector_and_mru_independent() {
         .unwrap();
     cx.run_until_parked();
 }
+
+#[test]
+#[ignore = "native focused-terminal close and archive shortcuts with disposable real PTYs"]
+fn window_close_shortcut_preserves_session_and_archive_uses_its_own_chord() {
+    let fixture = crate::workspace_fixture::LiveWorkspace::start();
+    let platform = gpui_platform::current_platform(true);
+    let mut cx = HeadlessAppContext::with_platform(
+        platform.text_system(),
+        Arc::new(diri_ui::IconAssets),
+        gpui_platform::current_headless_renderer,
+    );
+    cx.update(|cx| {
+        crate::fonts::init(cx);
+        cx.set_reduce_motion(true);
+        commands::bind_keys(cx, &Default::default());
+        crate::install_app_menus(cx);
+    });
+    let services = fixture.services.clone();
+    let first = cx
+        .open_window(size(px(1000.0), px(700.0)), |window, cx| {
+            cx.new(|cx| {
+                RootView::new_with_selection(
+                    services,
+                    false,
+                    PreviewScenario::Empty,
+                    Some(None),
+                    Some(Some(SessionId::new("build"))),
+                    window,
+                    cx,
+                )
+            })
+        })
+        .unwrap();
+    for _ in 0..20 {
+        cx.run_until_parked();
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    cx.update_window(first.into(), |root, window, cx| {
+        window.activate_window();
+        root.downcast::<RootView>().unwrap().update(cx, |root, cx| {
+            root.terminal
+                .as_ref()
+                .unwrap()
+                .update(cx, |pane, cx| pane.focus(window, cx))
+        });
+    })
+    .unwrap();
+    cx.run_until_parked();
+    cx.capture_screenshot(first.into()).unwrap();
+    // The originating Root provides context even if saved selection differs.
+    fixture
+        .services
+        .store
+        .store
+        .write()
+        .unwrap()
+        .update_preferences(|prefs| prefs.last_selected_session = Some(SessionId::new("review")))
+        .unwrap();
+    cx.update_window(first.into(), |_, window, cx| {
+        window.dispatch_keystroke(gpui::Keystroke::parse("cmd-shift-n").unwrap(), cx);
+    })
+    .unwrap();
+    cx.run_until_parked();
+    let added = cx.update(|cx| {
+        let windows = cx.windows();
+        assert_eq!(windows.len(), 2);
+        windows
+            .into_iter()
+            .find(|handle| *handle != first.into())
+            .unwrap()
+    });
+    cx.update_window(added, |root, window, cx| {
+        let root = root.downcast::<RootView>().unwrap();
+        assert_eq!(
+            root.read(cx).window_session(),
+            Some(SessionId::new("build"))
+        );
+        window.activate_window();
+        root.update(cx, |root, cx| {
+            root.terminal
+                .as_ref()
+                .unwrap()
+                .update(cx, |pane, cx| pane.focus(window, cx))
+        });
+    })
+    .unwrap();
+    cx.run_until_parked();
+    cx.capture_screenshot(added).unwrap();
+    cx.update_window(added, |_, window, cx| {
+        window.dispatch_keystroke(gpui::Keystroke::parse("cmd-shift-w").unwrap(), cx);
+    })
+    .unwrap();
+    cx.run_until_parked();
+    assert_eq!(cx.update(|cx| cx.windows().len()), 1);
+    fixture.verify_process_identity();
+    assert_eq!(
+        fixture
+            .services
+            .tokio
+            .block_on(fixture.services.store.client().sessions())
+            .unwrap()
+            .sessions
+            .len(),
+        2
+    );
+    cx.update_window(first.into(), |_, window, cx| {
+        window.dispatch_keystroke(gpui::Keystroke::parse("cmd-shift-w").unwrap(), cx);
+    })
+    .unwrap();
+    cx.run_until_parked();
+    assert!(cx.update(|cx| cx.windows().is_empty()));
+    fixture.verify_process_identity();
+    let list = fixture
+        .services
+        .tokio
+        .block_on(fixture.services.store.client().sessions())
+        .unwrap();
+    assert!(
+        !list
+            .sessions
+            .iter()
+            .find(|session| session.id.0 == "build")
+            .unwrap()
+            .is_archived()
+    );
+    let services = fixture.services.clone();
+    let second = cx
+        .open_window(size(px(1000.0), px(700.0)), |window, cx| {
+            cx.new(|cx| {
+                RootView::new_with_selection(
+                    services,
+                    false,
+                    PreviewScenario::Empty,
+                    Some(None),
+                    Some(Some(SessionId::new("build"))),
+                    window,
+                    cx,
+                )
+            })
+        })
+        .unwrap();
+    for _ in 0..20 {
+        cx.run_until_parked();
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    cx.update_window(second.into(), |root, window, cx| {
+        window.activate_window();
+        root.downcast::<RootView>().unwrap().update(cx, |root, cx| {
+            root.terminal
+                .as_ref()
+                .unwrap()
+                .update(cx, |pane, cx| pane.focus(window, cx))
+        });
+    })
+    .unwrap();
+    cx.run_until_parked();
+    cx.capture_screenshot(second.into()).unwrap();
+    cx.update_window(second.into(), |_, window, cx| {
+        window.dispatch_keystroke(gpui::Keystroke::parse("cmd-alt-shift-w").unwrap(), cx);
+    })
+    .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        cx.run_until_parked();
+        let sessions = fixture
+            .services
+            .tokio
+            .block_on(fixture.services.store.client().sessions())
+            .unwrap();
+        if sessions
+            .sessions
+            .iter()
+            .any(|session| session.id.0 == "build" && session.is_archived())
+        {
+            break;
+        }
+        assert!(Instant::now() < deadline, "explicit archive shortcut");
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    assert_eq!(cx.update(|cx| cx.windows().len()), 1);
+    cx.update_window(second.into(), |_, window, _| window.remove_window())
+        .unwrap();
+    cx.run_until_parked();
+}

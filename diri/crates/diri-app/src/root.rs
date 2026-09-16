@@ -314,6 +314,22 @@ impl RootView {
         Self::new_with_workspace(services, preview, preview_scenario, None, window, cx)
     }
 
+    pub(crate) fn native_window_context(
+        &self,
+        window: &Window,
+        cx: &App,
+    ) -> crate::NativeWindowContext {
+        let mut placement = crate::current_window_placement(window, cx);
+        placement.x += 28.0;
+        placement.y += 28.0;
+        placement.mode = crate::store::WindowMode::Windowed;
+        crate::NativeWindowContext {
+            workspace: self.window_workspace(),
+            selected: self.window_session(),
+            placement,
+        }
+    }
+
     pub(crate) fn window_workspace(&self) -> Option<diri_proto::workspace::WorkspaceId> {
         self.active_workspace.clone()
     }
@@ -4091,6 +4107,25 @@ impl Render for RootView {
             .capture_key_down(cx.listener(Self::on_key_down))
             .capture_key_up(cx.listener(Self::on_key_up))
             .on_action(cx.listener(Self::close_selected_session))
+            .on_action(
+                cx.listener(|this, _: &crate::commands::NewWindow, window, cx| {
+                    let context = this.native_window_context(window, cx);
+                    crate::open_main_window_with_context(
+                        cx,
+                        this.services.clone(),
+                        this.preview,
+                        this.preview_scenario,
+                        Some(context),
+                    );
+                }),
+            )
+            .on_action(
+                cx.listener(|_, _: &crate::commands::CloseWindow, window, _| {
+                    // Dispatch already identifies the originating window. Closing
+                    // it must not consult whichever platform window is active later.
+                    window.remove_window();
+                }),
+            )
             .on_action(cx.listener(Self::reopen_last_session))
             .on_action(cx.listener(Self::toggle_launcher))
             .on_action(cx.listener(|this, _: &NewDefaultSession, window, cx| {
