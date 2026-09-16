@@ -931,3 +931,34 @@ fn claude_answering_a_screen_blocker_resumes_the_hook_owned_turn() {
             .turn_completed
     );
 }
+
+#[test]
+fn unavailable_transport_is_not_a_process_exit_and_cannot_complete_a_turn() {
+    let mut reducer = StatusReducer::new(Authority::ProcessOnly, t0());
+    reducer.reduce(StatusSignal::PtyOutputActivity, t0());
+    let outcome = reducer.reduce(StatusSignal::TransportUnavailable, t0());
+    assert_eq!(outcome.status_change, Some(SessionStatus::Unknown));
+    assert!(!outcome.turn_completed);
+    assert_eq!(
+        outcome.status_evidence.unwrap().fallback_reason,
+        Some(StatusFallbackReason::TransportUnavailable)
+    );
+    for signal in [
+        StatusSignal::Tick,
+        StatusSignal::PtyOutputActivity,
+        StatusSignal::UserSubmission,
+    ] {
+        reducer.reduce(signal, t0() + Duration::from_secs(120));
+        assert_eq!(*reducer.status(), SessionStatus::Unknown);
+    }
+    let actual = reducer.reduce(
+        StatusSignal::ProcessExit {
+            code: Some(126),
+            signal: None,
+        },
+        t0(),
+    );
+    assert!(
+        matches!(actual.status_change, Some(SessionStatus::Exited(info)) if info.code == Some(126))
+    );
+}

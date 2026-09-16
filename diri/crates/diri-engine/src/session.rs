@@ -190,6 +190,7 @@ const LIVE_HANDOVER_GAP: u64 = 256 << 10;
 /// What a session looks like from the outside.
 #[derive(Clone, Debug)]
 pub struct SessionView {
+    pub remote_connection: Option<diri_proto::RemoteConnection>,
     pub attention_state: Option<diri_proto::attention::AttentionState>,
     pub id: String,
     pub status: SessionStatus,
@@ -301,6 +302,7 @@ struct Shared {
 }
 
 struct RemoteGridState {
+    connection: diri_proto::RemoteConnection,
     mirror: GridMirror,
     revision: u64,
     pending: Option<diri_proto::grid::GridUpdate>,
@@ -809,6 +811,10 @@ impl Session {
         let log = OutputLog::writer(&spec.logs_dir, &spec.id)?;
         let shared = new_shared(&spec, log, &engine, true);
         *shared.remote_grid.lock().expect("remote grid") = Some(RemoteGridState {
+            connection: diri_proto::RemoteConnection {
+                state: diri_proto::RemoteConnectionState::Connecting,
+                since: diri_proto::DateMillis::from(SystemTime::now()),
+            },
             mirror: GridMirror::new(),
             revision: 0,
             pending: None,
@@ -870,6 +876,10 @@ impl Session {
             .remote_output_offset
             .store(remote.output_offset, Ordering::SeqCst);
         *shared.remote_grid.lock().expect("remote grid") = Some(RemoteGridState {
+            connection: diri_proto::RemoteConnection {
+                state: diri_proto::RemoteConnectionState::Connecting,
+                since: diri_proto::DateMillis::from(SystemTime::now()),
+            },
             mirror: GridMirror::new(),
             revision: 0,
             pending: None,
@@ -1212,6 +1222,13 @@ impl Session {
             )
         };
         SessionView {
+            remote_connection: self
+                .shared
+                .remote_grid
+                .lock()
+                .expect("remote grid")
+                .as_ref()
+                .map(|remote| remote.connection),
             attention_state,
             id: self.shared.id.clone(),
             terminal_title,
@@ -2198,6 +2215,7 @@ fn pump_remote(
             .as_ref()
             .and_then(|state| state.mirror.sequence());
         let Ok((generation, mut output)) = client.connect(output_offset, grid_sequence) else {
+            set_remote_connection(&shared, diri_proto::RemoteConnectionState::Reconnecting);
             reconnects = reconnects.saturating_add(1);
             if reconnects.is_multiple_of(3) && remote_inspection_exited(&shared, &client) {
                 break;
@@ -2220,12 +2238,14 @@ fn pump_remote(
             && !shared.stop.load(Ordering::SeqCst)
             && !shared.exited.load(Ordering::SeqCst)
         {
+            client.fail_closed();
             mark_remote_transport_failed(&shared);
             break;
         }
         match disposition {
             RemoteConnectionDisposition::Continue => continue,
             RemoteConnectionDisposition::Reconnect => {
+                set_remote_connection(&shared, diri_proto::RemoteConnectionState::Reconnecting);
                 reconnects = reconnects.saturating_add(1);
                 if reconnects.is_multiple_of(3) && remote_inspection_exited(&shared, &client) {
                     break;
@@ -2235,6 +2255,7 @@ fn pump_remote(
             }
             RemoteConnectionDisposition::Exited | RemoteConnectionDisposition::Stopped => break,
             RemoteConnectionDisposition::Fatal => {
+                client.fail_closed();
                 mark_remote_transport_failed(&shared);
                 break;
             }
@@ -2480,6 +2501,7 @@ fn handle_remote_message(
             {
                 RemoteConnectionDisposition::Fatal
             } else {
+                set_remote_connection(shared, diri_proto::RemoteConnectionState::Connected);
                 RemoteConnectionDisposition::Continue
             }
         }
@@ -2663,6 +2685,28 @@ fn apply_remote_delta(shared: &Shared, delta: GridDelta) -> std::io::Result<()> 
     Ok(())
 }
 
+fn set_remote_connection(shared: &Shared, state: diri_proto::RemoteConnectionState) {
+    // Reuse the existing mirror lock only at lifecycle transitions. Silent
+    // sessions create no timer, new SSH operation, or repeated status event.
+    let changed = {
+        let mut remote = shared.remote_grid.lock().expect("remote grid");
+        if let Some(remote) = remote.as_mut()
+            && remote.connection.state != state
+        {
+            remote.connection = diri_proto::RemoteConnection {
+                state,
+                since: diri_proto::DateMillis::from(SystemTime::now()),
+            };
+            true
+        } else {
+            false
+        }
+    };
+    if changed {
+        shared.bump_state_version();
+    }
+}
+
 fn record_remote_exit(shared: &Shared, exit: ProcessExit) {
     let local = match (exit.code, exit.signal) {
         (_, Some(signal)) => Exit::Signal(signal),
@@ -2679,19 +2723,20 @@ fn record_remote_exit(shared: &Shared, exit: ProcessExit) {
     );
     apply(shared, &outcome);
     shared.exited.store(true, Ordering::SeqCst);
+    set_remote_connection(shared, diri_proto::RemoteConnectionState::Exited);
 }
 
 fn mark_remote_transport_failed(shared: &Shared) {
-    *shared.exit.lock().expect("exit") = Some(Exit::Code(126));
-    let outcome = shared.reducer.lock().expect("reducer").reduce(
-        StatusSignal::ProcessExit {
-            code: Some(126),
-            signal: None,
-        },
-        SystemTime::now(),
-    );
+    let outcome = shared
+        .reducer
+        .lock()
+        .expect("reducer")
+        .reduce(StatusSignal::TransportUnavailable, SystemTime::now());
     apply(shared, &outcome);
-    shared.exited.store(true, Ordering::SeqCst);
+    *shared.needs_input.lock().expect("needs input") = None;
+    set_remote_connection(shared, diri_proto::RemoteConnectionState::Failed);
+    // The last PID/grid remain observable. Neither transport failure nor an
+    // uncertain write supplies an Agent exit code or permission to replay input.
 }
 
 fn wait_for_remote_retry(shared: &Shared, duration: Duration) {
@@ -3956,5 +4001,243 @@ mod preview_tests {
         assert_eq!(session.shared.last_interaction.load(Ordering::Relaxed), 0);
         assert!(session.deferred.is_some());
         assert!(session.pump.is_none());
+    }
+}
+
+#[cfg(test)]
+mod remote_connection_tests {
+    use super::*;
+    use crate::remote::{
+        binding::RemoteBindingStore,
+        bootstrap::RemoteTarget,
+        executor::ProcessExecutor,
+        manager::{ArtifactCatalog, InstalledHelper, RemoteManager},
+        ssh::SshTransport,
+    };
+    use diri_proto::{HostEntry, RemoteConnectionState as State};
+    use std::os::unix::fs::PermissionsExt;
+
+    fn wait_for(label: &str, mut predicate: impl FnMut() -> bool) {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !predicate() {
+            assert!(Instant::now() < deadline, "timed out: {label}");
+            std::thread::sleep(Duration::from_millis(2));
+        }
+    }
+
+    struct ChildGuard(std::process::Child);
+    impl Drop for ChildGuard {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+
+    #[test]
+    fn bridge_loss_preserves_process_and_grid_until_a_validated_reconnect() {
+        for fatal in [false, true] {
+            let temp = tempfile::tempdir().unwrap();
+            // The fixture process outlives both synthetic SSH bridges. It exits126
+            // only after the test requests and observes that actual process exit.
+            let mut process = ChildGuard(
+                std::process::Command::new("/bin/sh")
+                    .args([
+                        "-c",
+                        "while [ ! -f process-exit ]; do sleep 0.01; done; exit 126",
+                    ])
+                    .current_dir(temp.path())
+                    .spawn()
+                    .unwrap(),
+            );
+            let pid = process.0.id();
+            let hello = RemoteMessage::HelloAck(diri_proto::remote_pty::HelloAck {
+                protocol: diri_proto::remote_pty::ProtocolVersion::CURRENT,
+                holder_build_id: "fixture".into(),
+                session_incarnation: "same-incarnation".into(),
+                capabilities: diri_proto::remote_pty::PHASE_ONE_HOLDER_CAPABILITIES.to_vec(),
+                controller_epoch: 1,
+                process_state: RemoteProcessState::Running { pid },
+                output_offset: 0,
+                snapshot_sequence: 1,
+                foreground_pid: Some(pid as i32),
+            });
+            let mut screen = crate::screen::HeadlessScreen::new(80, 24);
+            screen.feed(b"stable remote image");
+            let snapshot = RemoteMessage::FullSnapshot(FullSnapshot {
+                sequence: 1,
+                alt_screen: false,
+                bracketed_paste: false,
+                mouse: Default::default(),
+                grid: screen.full_snapshot(),
+            });
+            for (name, message) in [
+                ("hello.bin", hello),
+                ("snapshot.bin", snapshot),
+                (
+                    "fatal.bin",
+                    RemoteMessage::Terminal(diri_proto::frames::Frame::input(
+                        b"invalid direction".to_vec(),
+                    )),
+                ),
+                (
+                    "exit.bin",
+                    RemoteMessage::ProcessExit(ProcessExit {
+                        code: Some(126),
+                        signal: None,
+                    }),
+                ),
+            ] {
+                std::fs::write(
+                    temp.path().join(name),
+                    RemoteCodec::encode(&message).unwrap(),
+                )
+                .unwrap();
+            }
+            let fake = temp.path().join("ssh");
+            std::fs::write(
+                &fake,
+                r#"#!/bin/sh
+cd "$(dirname "$0")" || exit 1
+printf x >> attaches
+if mkdir first 2>/dev/null; then
+  cat hello.bin
+  while [ ! -f seed ]; do sleep 0.01; done
+  cat snapshot.bin
+  while [ ! -f disconnect ]; do sleep 0.01; done
+else
+  while [ ! -f reconnect ]; do sleep 0.01; done
+  cat hello.bin snapshot.bin
+  while [ ! -f finish ]; do sleep 0.01; done
+  if [ -f fatal ]; then cat fatal.bin; else cat exit.bin; fi
+fi
+"#,
+            )
+            .unwrap();
+            std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o700)).unwrap();
+            let manager = Arc::new(
+                RemoteManager::new(
+                    ProcessExecutor::new(&fake),
+                    ArtifactCatalog::without_artifacts_for_test(),
+                    temp.path().join("control"),
+                )
+                .unwrap(),
+            );
+            let host = HostEntry {
+                id: "fixture".into(),
+                name: None,
+                ssh: "fixture".into(),
+                default_cwd: None,
+                node: None,
+            };
+            let helper = InstalledHelper {
+                target: RemoteTarget::MacosAarch64,
+                build_id: "fixture".into(),
+                protocol: diri_proto::remote_pty::ProtocolVersion::CURRENT,
+                transport: SshTransport::new(&host, temp.path().join("control/socket"))
+                    .with_executable(&fake),
+            };
+            let (engine, _) =
+                ManifestEngine::load_dir(&crate::detect::bundled_manifest_dir()).unwrap();
+            let session = Session::adopt_remote(
+                SessionSpec {
+                    id: "remote-fixture".into(),
+                    pty: PtySpec::new(vec!["/bin/sh".into()], temp.path()),
+                    manifest_id: "generic".into(),
+                    authority: Authority::ProcessOnly,
+                    logs_dir: temp.path().join("logs"),
+                    holder: None,
+                    remote: None,
+                    defer_launch: false,
+                },
+                RemoteAdoptSpec {
+                    manager,
+                    helper,
+                    token: diri_proto::remote_pty::SessionToken::new("remote-fixture-token")
+                        .unwrap(),
+                    incarnation: "same-incarnation".into(),
+                    binding_store: RemoteBindingStore::new(temp.path().join("bindings")).unwrap(),
+                    output_offset: 0,
+                },
+                Arc::new(engine),
+            )
+            .unwrap();
+            wait_for("HelloAck", || session.child_pid() == pid as i32);
+            assert_eq!(
+                session.view().remote_connection.unwrap().state,
+                State::Connecting
+            );
+            assert!(
+                session
+                    .shared
+                    .remote_grid
+                    .lock()
+                    .unwrap()
+                    .as_ref()
+                    .unwrap()
+                    .mirror
+                    .sequence()
+                    .is_none()
+            );
+            std::fs::write(temp.path().join("seed"), "").unwrap();
+            wait_for("validated snapshot", || {
+                session.view().remote_connection.unwrap().state == State::Connected
+            });
+            let seed = session.preview_seed().grid;
+            let connected = session.view().remote_connection.unwrap();
+            let version = session.state_version();
+            set_remote_connection(&session.shared, State::Connected);
+            assert_eq!(
+                session.state_version(),
+                version,
+                "silent/repeated state has no new event"
+            );
+            assert_eq!(session.view().remote_connection.unwrap(), connected);
+            std::fs::write(temp.path().join("disconnect"), "").unwrap();
+            wait_for("bridge EOF", || {
+                session.view().remote_connection.unwrap().state == State::Reconnecting
+            });
+            assert_eq!(session.child_pid(), pid as i32);
+            assert!(process.0.try_wait().unwrap().is_none());
+            assert_eq!(session.preview_seed().grid, seed);
+            assert!(!session.view().exited);
+            std::fs::write(temp.path().join("reconnect"), "").unwrap();
+            wait_for("reconnected snapshot", || {
+                session.view().remote_connection.unwrap().state == State::Connected
+            });
+            assert_eq!(session.child_pid(), pid as i32);
+            assert_eq!(session.preview_seed().grid, seed);
+            if fatal {
+                std::fs::write(temp.path().join("fatal"), "").unwrap();
+                std::fs::write(temp.path().join("finish"), "").unwrap();
+                wait_for("fatal transport", || {
+                    session.view().remote_connection.unwrap().state == State::Failed
+                });
+                assert_eq!(session.view().status, SessionStatus::Unknown);
+                assert!(!session.view().exited);
+                assert!(!crate::events::satisfies_wait_target(
+                    &session.view().status,
+                    "exited"
+                ));
+                assert!(session.shared.exit.lock().unwrap().is_none());
+                assert_eq!(session.child_pid(), pid as i32);
+                assert_eq!(session.preview_seed().grid, seed);
+                assert!(process.0.try_wait().unwrap().is_none());
+                assert!(session.write_input(b"never replay").is_err());
+                assert!(session.resize(132, 42).is_err());
+                assert_eq!(std::fs::read(temp.path().join("attaches")).unwrap(), b"xx");
+                continue;
+            }
+            std::fs::write(temp.path().join("process-exit"), "").unwrap();
+            assert_eq!(process.0.wait().unwrap().code(), Some(126));
+            std::fs::write(temp.path().join("finish"), "").unwrap();
+            wait_for("real exit126 fact", || session.view().exited);
+            assert_eq!(
+                session.view().remote_connection.unwrap().state,
+                State::Exited
+            );
+            assert!(
+                matches!(session.view().status, SessionStatus::Exited(info) if info.code == Some(126))
+            );
+        }
     }
 }

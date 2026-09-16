@@ -81,6 +81,7 @@ pub fn source_name(source: StatusEvidenceSource) -> &'static str {
         StatusEvidenceSource::ScreenRule => "screen rule",
         StatusEvidenceSource::ProcessLiveness => "process liveness",
         StatusEvidenceSource::Staleness => "signal staleness",
+        StatusEvidenceSource::Transport => "remote transport",
         StatusEvidenceSource::Unknown => "unknown source",
     }
 }
@@ -92,6 +93,9 @@ pub fn fallback_name(reason: StatusFallbackReason) -> &'static str {
         StatusFallbackReason::ProcessOnly => "agent uses process-only status",
         StatusFallbackReason::StaleSignals => "authoritative signals became stale",
         StatusFallbackReason::ProcessExited => "agent process exited",
+        StatusFallbackReason::TransportUnavailable => {
+            "remote transport failed; process exit is unconfirmed"
+        }
         StatusFallbackReason::Unknown => "unknown fallback",
     }
 }
