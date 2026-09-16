@@ -16,7 +16,8 @@ pub(super) struct QolState {
     pub copy_mode: Option<CopyMode>,
     pub paste: Option<PendingPaste>,
     pub feedback: Option<String>,
-    feedback_generation: u64,
+    pub(super) feedback_generation: u64,
+    feedback_timer: Option<Task<()>>,
     pub drag: Option<(SessionId, usize, usize, i64)>,
     pub autoscroll: Option<Task<()>>,
     export_files: Vec<tempfile::NamedTempFile>,
@@ -24,6 +25,12 @@ pub(super) struct QolState {
 }
 
 impl QolState {
+    pub(super) fn clear_feedback(&mut self) {
+        self.feedback = None;
+        self.feedback_timer = None;
+        self.feedback_generation += 1;
+    }
+
     pub fn hover_key_clear(&mut self) {
         self.hover_key = None;
     }
@@ -159,12 +166,16 @@ impl TerminalPane {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        self.qol.feedback = Some(text.into());
+        let text = text.into();
+        if self.qol.feedback.as_deref() == Some(text.as_str()) {
+            return;
+        }
+        self.qol.feedback = Some(text);
         self.qol.feedback_generation += 1;
         let generation = self.qol.feedback_generation;
         let session = self.selected_id();
         cx.notify();
-        cx.spawn_in(window, async move |this, cx| {
+        self.qol.feedback_timer = Some(cx.spawn_in(window, async move |this, cx| {
             cx.background_executor().timer(Duration::from_secs(3)).await;
             let _ = this.update_in(cx, |this, _, cx| {
                 if this.selected_id() == session && this.qol.feedback_generation == generation {
@@ -172,8 +183,7 @@ impl TerminalPane {
                     cx.notify();
                 }
             });
-        })
-        .detach();
+        }));
     }
 
     pub(super) fn open_terminal_menu(

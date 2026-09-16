@@ -1694,10 +1694,13 @@ impl Session {
     /// Titling happens here rather than at submit, so a prompt the injector
     /// types names its session the same way one the user types does. It is
     /// idempotent; delivery itself must never be replayed based on screen echo.
+    ///
+    /// Bracketed text is sanitized first so it cannot embed its own
+    /// end-of-paste marker (#275).
     pub fn paste_text(&self, text: &str) -> std::io::Result<()> {
         self.capture_prompt_title(text);
         let framed = if self.bracketed_paste() {
-            format!("\x1b[200~{text}\x1b[201~")
+            format!("\x1b[200~{}\x1b[201~", sanitize_paste_text(text))
         } else {
             text.to_owned()
         };
@@ -2098,6 +2101,65 @@ fn wait_for_holder(
 
 fn holder_io_error(error: crate::holder::HolderError) -> std::io::Error {
     std::io::Error::other(error.to_string())
+}
+
+/// Replaces control characters other than `\n`, `\r` and `\t` with a space,
+/// so text framed in `ESC[200~ ... ESC[201~` cannot close the envelope early
+/// (#275). Replacing one-for-one never deletes, so no marker can reassemble.
+/// Mirrors `diri_term::keys::paste`; kept local since this crate does not
+/// depend on `diri-term`.
+fn sanitize_paste_text(text: &str) -> String {
+    text.chars()
+        .map(|ch| {
+            if ch.is_control() && !matches!(ch, '\n' | '\r' | '\t') {
+                ' '
+            } else {
+                ch
+            }
+        })
+        .collect()
+}
+
+#[cfg(test)]
+mod paste_text_sanitize_tests {
+    use super::sanitize_paste_text;
+
+    /// Issue #275, audited for `Session::paste_text`: an injected prompt
+    /// that opens with the paste end-marker must not be able to close the
+    /// envelope early and let the rest submit ahead of the real, separate
+    /// Enter that `send_text` sends afterwards.
+    #[test]
+    fn embedded_end_marker_cannot_survive_sanitizing() {
+        let framed = format!(
+            "\x1b[200~{}\x1b[201~",
+            sanitize_paste_text("\x1b[201~printf x\r")
+        );
+        let bytes = framed.as_bytes();
+        let end_marker_positions: Vec<usize> = bytes
+            .windows(6)
+            .enumerate()
+            .filter(|(_, window)| *window == b"\x1b[201~")
+            .map(|(index, _)| index)
+            .collect();
+        assert_eq!(end_marker_positions, vec![bytes.len() - 6]);
+        assert!(!bytes[6..bytes.len() - 6].contains(&0x1b));
+    }
+
+    /// Split-marker bytes must not reassemble once the embedded ESC is gone.
+    #[test]
+    fn nested_partial_markers_cannot_reassemble_after_sanitizing() {
+        let sanitized = sanitize_paste_text("\x1b[20\x1b[201~1~");
+        assert!(!sanitized.contains('\x1b'));
+    }
+
+    #[test]
+    fn ordinary_text_and_newlines_are_untouched() {
+        assert_eq!(
+            sanitize_paste_text("one\ntwo\r\nthree\tfour"),
+            "one\ntwo\r\nthree\tfour"
+        );
+        assert_eq!(sanitize_paste_text("café 🎉"), "café 🎉");
+    }
 }
 
 /// Applies a reducer outcome to the shared state, bumping the state version
@@ -3581,7 +3643,7 @@ fn persist_checkpoint(
     last_key: &mut Option<CheckpointKey>,
 ) {
     let (history, history_metadata, grid, alt_screen, bracketed_paste, mouse, content_seq) = {
-        let screen = shared.screen.lock().expect("screen");
+        let mut screen = shared.screen.lock().expect("screen");
         (
             screen.history_snapshot(),
             screen.history_metadata(),
