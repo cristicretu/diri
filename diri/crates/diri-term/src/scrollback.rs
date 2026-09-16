@@ -133,6 +133,7 @@ impl From<GridCodecError> for ScrollbackApplyError {
 
 #[derive(Clone, Debug, Default)]
 pub struct ScrollbackViewport {
+    find_source: Option<std::sync::Arc<crate::find::RetainedFindSnapshot>>,
     view_offset: i64,
     keyboard_pinned: bool,
     /// Absolute row pinned to the top of the window while scrolled back.
@@ -161,8 +162,38 @@ pub struct ScrollbackViewport {
 }
 
 impl ScrollbackViewport {
+    pub fn has_find_source(&self, source: &crate::find::RetainedFindSnapshot) -> bool {
+        self.find_source.as_deref() == Some(source)
+    }
+    pub fn pin_find_source(
+        &mut self,
+        source: std::sync::Arc<crate::find::RetainedFindSnapshot>,
+        absolute_row: i64,
+        visible_rows: usize,
+    ) {
+        self.held_live = None;
+        self.held_live_start = None;
+        self.cache.clear();
+        self.annotations.clear();
+        self.live_start_row = source.live_start_row;
+        self.total_rows = source.first_row + source.row_count() as i64;
+        self.cache_seq = Some(source.capture_revision);
+        self.geometry_known = true;
+        self.find_source = Some(source);
+        self.queued = None;
+        self.in_flight = None;
+        self.scroll_to_absolute(absolute_row, crate::find::HISTORY_ANCHOR, visible_rows);
+        self.sync_anchor();
+    }
+    pub fn clear_find_source(&mut self) {
+        if self.find_source.take().is_some() {
+            self.view_offset = 0;
+            self.anchor = None;
+            self.release_reading_view();
+        }
+    }
     pub(crate) fn is_reading(&self) -> bool {
-        self.keyboard_pinned || self.view_offset > 0
+        self.find_source.is_some() || self.keyboard_pinned || self.view_offset > 0
     }
 
     pub(crate) fn pin_keyboard(&mut self, pinned: bool, buffer: &GridBuffer) {
@@ -214,6 +245,9 @@ impl ScrollbackViewport {
 
     #[must_use]
     pub fn max_offset(&self, visible_rows: usize) -> i64 {
+        if let Some(source) = &self.find_source {
+            return self.live_start_row.saturating_sub(source.first_row).max(0);
+        }
         if self.geometry_known {
             // The history the daemon actually retains ends where the live grid
             // starts. Clamping to total_rows (history + visible) let the
@@ -235,7 +269,7 @@ impl ScrollbackViewport {
             return false;
         }
         self.view_offset = clamped;
-        if clamped == 0 && !self.keyboard_pinned {
+        if clamped == 0 && !self.keyboard_pinned && self.find_source.is_none() {
             self.release_reading_view();
         }
         self.sync_anchor();
@@ -263,7 +297,9 @@ impl ScrollbackViewport {
     }
 
     pub fn scroll_to_live(&mut self, visible_rows: usize) -> bool {
-        self.set_view_offset(0, visible_rows)
+        let was_find = self.find_source.is_some();
+        self.clear_find_source();
+        self.set_view_offset(0, visible_rows) || was_find
     }
 
     /// Places an absolute history row at approximately `anchor` of the window.
@@ -301,6 +337,9 @@ impl ScrollbackViewport {
     }
 
     fn row_metadata_ref<'a>(&'a self, buffer: &'a GridBuffer, row: i64) -> Option<&'a RowMetadata> {
+        if let Some(source) = &self.find_source {
+            return source.metadata(row);
+        }
         if let (Some(held), Some(start)) = (&self.held_live, self.held_live_start)
             && row >= start
             && row < start + i64::from(held.rows)
@@ -322,6 +361,9 @@ impl ScrollbackViewport {
     #[must_use]
     pub fn row_at_absolute(&self, buffer: &GridBuffer, absolute_row: i64) -> Vec<GridCell> {
         let cols = usize::from(buffer.cols);
+        if let Some(source) = &self.find_source {
+            return normalized_row(source.row(absolute_row).unwrap_or_default(), cols);
+        }
         if self.is_reading()
             && let Some(held) = &self.held_live
             && let Ok(row) = usize::try_from(
@@ -362,7 +404,7 @@ impl ScrollbackViewport {
     /// Called at local navigation and before applying live damage. The live
     /// mirror keeps receiving every update; only the reading view is held.
     pub(crate) fn hold_reading_view(&mut self, buffer: &GridBuffer) {
-        if self.is_reading() && self.held_live.is_none() {
+        if self.find_source.is_none() && self.is_reading() && self.held_live.is_none() {
             self.held_live = Some(buffer.clone());
             self.held_live_start = self.geometry_known.then_some(self.live_start_row);
         }
@@ -408,6 +450,9 @@ impl ScrollbackViewport {
         visible_rows: usize,
     ) -> Result<(), ScrollbackApplyError> {
         self.in_flight = None;
+        if self.find_source.is_some() {
+            return Ok(());
+        }
         let row_count = usize::try_from(result.row_count)
             .map_err(|_| ScrollbackApplyError::NegativeRowCount(result.row_count))?;
         let decoded = GridRowCodec::decode_rows(&result.payload, row_count)?;
@@ -460,6 +505,9 @@ impl ScrollbackViewport {
         content_seq: u64,
         visible_rows: usize,
     ) {
+        if self.find_source.is_some() {
+            return;
+        }
         let old_sequence = self.cache_seq;
         if old_sequence != Some(content_seq) {
             if !self.is_reading() {
@@ -524,6 +572,11 @@ impl ScrollbackViewport {
     /// Alternate screen has no history. Entering it always returns to live.
     pub fn enter_alt_screen(&mut self) -> bool {
         self.keyboard_pinned = false;
+        // A paused search is an explicit immutable reading view, including
+        // when the live application changes screen modes underneath it.
+        if self.find_source.is_some() {
+            return false;
+        }
         if !self.is_reading() {
             return false;
         }
@@ -535,7 +588,7 @@ impl ScrollbackViewport {
     }
 
     fn queue_missing_window(&mut self, visible_rows: usize) {
-        if self.view_offset <= 0 || visible_rows == 0 {
+        if self.find_source.is_some() || self.view_offset <= 0 || visible_rows == 0 {
             return;
         }
         let visible_rows = i64::try_from(visible_rows).unwrap_or(i64::MAX);

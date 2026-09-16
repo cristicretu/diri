@@ -20,3 +20,7 @@ harness = false
 [[bench]]
 name = "terminal_parity"
 harness = false
+
+[[bench]]
+name = "find_snapshot"
+harness = false

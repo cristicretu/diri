@@ -19,12 +19,14 @@ use super::{FindMatch, FindSnapshot, MATCH_CAP, SearchRequest};
 pub struct SearchJob {
     request: SearchRequest,
     snapshot: FindSnapshot,
-    live: GridBuffer,
+    live: Option<GridBuffer>,
 }
 
 /// A completed pure search plus the geometry it was computed against.
 pub struct SearchResult {
     pub(super) request: SearchRequest,
+    pub(super) error: Option<String>,
+    pub(super) source: Option<std::sync::Arc<super::RetainedFindSnapshot>>,
     pub(super) matches: Vec<FindMatch>,
     pub(super) visible_start_row: i64,
     pub(super) rows: i64,
@@ -34,7 +36,11 @@ pub struct SearchResult {
 }
 
 impl SearchJob {
-    pub(super) fn new(request: SearchRequest, snapshot: FindSnapshot, live: GridBuffer) -> Self {
+    pub(super) fn new(
+        request: SearchRequest,
+        snapshot: FindSnapshot,
+        live: Option<GridBuffer>,
+    ) -> Self {
         Self {
             request,
             snapshot,
@@ -44,10 +50,16 @@ impl SearchJob {
 
     #[must_use]
     pub fn run(self) -> SearchResult {
-        let matches = build_matches(&self.request.query, &self.snapshot, &self.live);
+        let matches = build_matches(
+            &self.request.query,
+            &self.snapshot,
+            self.live.as_ref().unwrap_or(&GridBuffer::default()),
+        );
         SearchResult {
             request: self.request,
+            error: self.snapshot.error,
             matches,
+            source: self.snapshot.retained,
             visible_start_row: self.snapshot.visible_start_row,
             rows: self.snapshot.rows,
             cols: self.snapshot.cols,
@@ -70,6 +82,26 @@ fn build_matches(query: &str, snapshot: &FindSnapshot, live: &GridBuffer) -> Vec
     // One char scratch reused across every scanned line: a fresh Vec per line
     // measurably dominates scans of large histories.
     let mut scratch = Vec::new();
+
+    if let Some(source) = &snapshot.retained {
+        for index in 0..source.row_count() {
+            let absolute = source.first_row + index as i64;
+            if source.is_alt_screen && absolute < source.live_start_row {
+                continue;
+            }
+            if let Some((line, columns)) = source.row_text(absolute) {
+                append_matches(
+                    &line,
+                    Some(&columns),
+                    absolute,
+                    &needle,
+                    &mut scratch,
+                    &mut matches,
+                );
+            }
+        }
+        return matches.into();
+    }
 
     if !snapshot.is_alt_screen {
         for (index, line) in snapshot.lines.iter().enumerate() {

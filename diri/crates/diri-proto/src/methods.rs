@@ -35,6 +35,7 @@ impl Method {
     pub const SESSION_SEND_TEXT: &'static str = "session.send_text";
     pub const SESSION_RESIZE: &'static str = "session.resize";
     pub const SESSION_READ_SCREEN: &'static str = "session.read_screen";
+    pub const SESSION_CAPTURE_FIND: &'static str = "session.capture_find";
     pub const SESSION_READ_SCROLLBACK: &'static str = "session.read_scrollback";
     pub const SESSION_READ_SCROLLBACK_CELLS: &'static str = "session.read_scrollback_cells";
     pub const SESSION_READ_DIFF: &'static str = "session.read_diff";
@@ -693,6 +694,24 @@ pub struct ReadScrollbackCellsResult {
     pub live_start_row: i64,
     pub cols: i64,
     pub content_seq: u64,
+}
+
+/// Local-only immutable Find capture limits. Worst-case RLE plus base64 and
+/// bounded annotations fit the existing 4 MiB control response ceiling.
+pub const FIND_CAPTURE_MAX_CELLS: usize = 160_000;
+pub const FIND_CAPTURE_MAX_ROWS: usize = 8192;
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CaptureFindResult {
+    /// Unique for this Engine-owned Session object, including same-ID replacement.
+    pub owner: String,
+    pub capture_revision: u64,
+    pub session_id: SessionId,
+    pub is_alt_screen: bool,
+    pub visible_rows: usize,
+    pub partial: bool,
+    pub cells: ReadScrollbackCellsResult,
 }
 
 pub type SessionReopenLastParams = EmptyParams;

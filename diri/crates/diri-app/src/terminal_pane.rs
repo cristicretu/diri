@@ -1169,13 +1169,16 @@ impl TerminalPane {
                     return;
                 }
                 let now = self.started_at.elapsed();
-                let schedule = self
-                    .residents
-                    .get_mut(&id)
-                    .and_then(|resident| resident.find.as_mut())
-                    .is_some_and(|find| find.on_output(now));
+                let schedule = self.residents.get_mut(&id).is_some_and(|resident| {
+                    let Some(find) = resident.find.as_mut() else {
+                        return false;
+                    };
+                    let scheduled = find.on_output(now);
+                    resident.element.sync_find_highlights(find);
+                    scheduled
+                });
                 if schedule {
-                    self.schedule_find(id.clone(), Duration::from_millis(100), window, cx);
+                    self.schedule_find(id.clone(), self.find_rescan_delay(&id), window, cx);
                 }
                 if terminal_damage_should_repaint(self.selected_id().as_ref(), &id, changed) {
                     self.request_terminal_repaint(window, cx);
@@ -1492,6 +1495,7 @@ impl TerminalPane {
             }
             if applied && let Some(find) = resident.find.as_mut() {
                 schedule_find = find.on_output(now);
+                resident.element.sync_find_highlights(find);
             }
         }
         if !applied {
@@ -1502,7 +1506,8 @@ impl TerminalPane {
         // gating on it freezes a still-visible window on another monitor.
         let repaint = terminal_damage_should_repaint(selected.as_ref(), &id, changed);
         if schedule_find {
-            self.schedule_find(id, Duration::from_millis(100), window, cx);
+            let delay = self.find_rescan_delay(&id);
+            self.schedule_find(id, delay, window, cx);
         }
         if repaint {
             self.request_terminal_repaint(window, cx);
@@ -1556,17 +1561,89 @@ impl TerminalPane {
     }
 
     fn launch_find_read(
-        &self,
+        &mut self,
         id: SessionId,
         generation: AttachmentGeneration,
         request: SearchRequest,
     ) {
+        let capture = self
+            .residents
+            .get_mut(&id)
+            .and_then(|resident| resident.find.as_mut())
+            .map(|find| {
+                (
+                    find.uses_retained_capture(),
+                    find.paused_source(),
+                    if find.uses_retained_capture() {
+                        find.reservation()
+                    } else {
+                        None
+                    },
+                )
+            });
         let client = Arc::clone(self.runtime.client());
         let pane_tx = self.pane_tx.clone();
         self.tokio.spawn(async move {
-            let snapshot = client.read_scrollback(&id).await.ok().map(Into::into);
+            let snapshot = match capture {
+                Some((true, Some(source), _)) => Some(FindSnapshot::from(source)),
+                Some((true, None, Some(reservation))) => {
+                    // Only active searches wait here. A single admission gate
+                    // bounds transient RPC/decode allocations across windows.
+                    let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+                    let permit = loop {
+                        if let Some(permit) = diri_term::find::FindCapturePermit::acquire() {
+                            break Some(permit);
+                        }
+                        if tokio::time::Instant::now() >= deadline {
+                            break None;
+                        }
+                        tokio::time::sleep(Duration::from_millis(25)).await;
+                    };
+                    if let Some(permit) = permit {
+                        match client.capture_find(&id).await {
+                            Ok(result) if result.session_id == id => Some(
+                                tokio::task::spawn_blocking(move || {
+                                    let _permit = permit;
+                                    match diri_term::find::RetainedFindSnapshot::decode(
+                                        result,
+                                        reservation,
+                                    ) {
+                                        Ok(source) => FindSnapshot::from(source),
+                                        Err(error) => FindSnapshot::failure(error),
+                                    }
+                                })
+                                .await
+                                .unwrap_or_else(|_| FindSnapshot::failure("Search interrupted")),
+                            ),
+                            Ok(_) => Some(FindSnapshot::failure("Search session changed")),
+                            Err(_) => Some(FindSnapshot::failure(
+                                "Search unavailable. Refresh results to retry",
+                            )),
+                        }
+                    } else {
+                        Some(FindSnapshot::failure(
+                            "Search busy. Refresh results to retry",
+                        ))
+                    }
+                }
+                Some((true, None, None)) => Some(FindSnapshot::failure(
+                    "Close another Find view to search here",
+                )),
+                Some((false, _, _)) => client.read_scrollback(&id).await.ok().map(Into::into),
+                None => None,
+            };
             let _ = pane_tx.send(PaneEvent::FindSnapshot(id, generation, request, snapshot));
         });
+    }
+
+    fn find_rescan_delay(&self, id: &SessionId) -> Duration {
+        self.residents
+            .get(id)
+            .and_then(|resident| resident.find.as_ref())
+            .map_or(
+                Duration::from_millis(100),
+                TerminalFindModel::output_rescan_delay,
+            )
     }
 
     #[cfg(all(test, target_os = "macos"))]
@@ -1615,13 +1692,20 @@ impl TerminalPane {
         let Some(id) = self.selected_id() else {
             return;
         };
+        let local = self
+            .selected_session()
+            .is_some_and(|session| session.host.is_none());
         let Some(resident) = self.residents.get_mut(&id) else {
             return;
         };
         if resident.find.is_none() {
             resident.find_composition.cancel(&mut resident.find_query);
             resident.element.set_text_input_enabled(false);
-            let mut find = TerminalFindModel::default();
+            let mut find = if local {
+                TerminalFindModel::retained()
+            } else {
+                TerminalFindModel::default()
+            };
             find.set_query(
                 resident.find_query.text().to_owned(),
                 self.started_at.elapsed(),
@@ -1658,6 +1742,7 @@ impl TerminalPane {
             return false;
         }
         resident.find_composition.cancel(&mut resident.find_query);
+        resident.element.clear_find_source();
         resident.element.set_text_input_enabled(true);
         resident.find_scheduler.cancel();
         resident.element.set_find_highlights(Vec::new());
@@ -1698,6 +1783,36 @@ impl TerminalPane {
 
     fn find_previous(&mut self, _: &FindPrevious, _window: &mut Window, cx: &mut Context<Self>) {
         self.navigate_find(true, cx);
+    }
+
+    fn refresh_find(&mut self, cx: &mut Context<Self>) {
+        if let Some(id) = self.selected_id() {
+            if let Some(resident) = self.residents.get_mut(&id)
+                && let Some(find) = resident.find.as_mut()
+            {
+                resident
+                    .element
+                    .scroll_to_live(usize::from(resident.last_size.1));
+                find.refresh(self.started_at.elapsed());
+            }
+            self.start_due_find(&id);
+            cx.notify();
+        }
+    }
+
+    fn return_to_live(&mut self, id: &SessionId, cx: &mut Context<Self>) {
+        if let Some(resident) = self.residents.get_mut(id) {
+            resident
+                .element
+                .scroll_to_live(usize::from(resident.last_size.1));
+            if let Some(find) = resident.find.as_mut()
+                && find.is_paused()
+            {
+                find.refresh(self.started_at.elapsed());
+            }
+            self.start_due_find(id);
+            cx.notify();
+        }
     }
 
     fn navigate_find(&mut self, backwards: bool, cx: &mut Context<Self>) {
@@ -2336,6 +2451,7 @@ impl TerminalPane {
             match event.keystroke.key.as_str() {
                 "escape" => {
                     resident.find = None;
+                    resident.element.clear_find_source();
                     resident.find_composition.cancel(&mut resident.find_query);
                     resident.element.set_text_input_enabled(true);
                     find_input::discard_native(window, cx);
@@ -2982,12 +3098,7 @@ impl TerminalPane {
                     .child(sf_symbol("arrow.down", 11.5, colors.secondary))
                     .child(format!("{view_offset} lines · Return to live"))
                     .on_click(cx.listener(move |this, _, _window, cx| {
-                        if let Some(resident) = this.residents.get_mut(&return_id) {
-                            resident
-                                .element
-                                .scroll_to_live(usize::from(resident.last_size.1));
-                            cx.notify();
-                        }
+                        this.return_to_live(&return_id, cx);
                     })),
             );
         }
@@ -3106,6 +3217,24 @@ impl TerminalPane {
         };
         let query = find_input::render(self, &session.id, colors, cx);
         let alt_screen = find.is_alt_screen();
+        let search_status = find.error().map(str::to_owned).or_else(|| {
+            if find.is_paused() {
+                Some(
+                    match (find.is_partial(), find.has_newer_output()) {
+                        (true, true) => "Paused · Recent output · New output",
+                        (true, false) => "Paused · Recent output",
+                        (false, true) => "Paused · New output available",
+                        (false, false) => "Paused",
+                    }
+                    .to_owned(),
+                )
+            } else if find.is_partial() {
+                Some("Searching recent output".to_owned())
+            } else {
+                None
+            }
+        });
+        let retained_search = find.uses_retained_capture();
         Some(find_overlay::render(
             resident.element.clone(),
             div()
@@ -3164,6 +3293,20 @@ impl TerminalPane {
                                         this.navigate_find(false, cx);
                                     },
                                 ))
+                                .when(retained_search, |row| {
+                                    row.child(find_icon_button(
+                                        FindButtonSpec {
+                                            id: "find-refresh",
+                                            system_image: "arrow.clockwise.circle",
+                                            label: "Refresh results",
+                                            shortcut: "",
+                                        },
+                                        colors,
+                                        true,
+                                        cx,
+                                        |this, _window, cx| this.refresh_find(cx),
+                                    ))
+                                })
                                 .child(find_icon_button(
                                     FindButtonSpec {
                                         id: "find-close",
@@ -3181,6 +3324,15 @@ impl TerminalPane {
                                     },
                                 )),
                         )
+                        .when_some(search_status, |bar, status| {
+                            bar.child(
+                                div()
+                                    .pl(px(20.0))
+                                    .text_size(px(Typo::META.size))
+                                    .text_color(colors.secondary)
+                                    .child(status),
+                            )
+                        })
                         .when(alt_screen, |bar| {
                             bar.child(
                                 div()
@@ -3584,6 +3736,7 @@ fn find_icon_button(
 ) -> AnyElement {
     div()
         .id(spec.id)
+        .debug_selector(move || spec.id.into())
         .size(px(28.0))
         .rounded(px(Radius::CHIP))
         .flex()
@@ -3908,6 +4061,8 @@ mod tests {
 
     fn find_snapshot(content_seq: u64) -> FindSnapshot {
         FindSnapshot {
+            error: None,
+            retained: None,
             text_cells: Default::default(),
             lines: Vec::new(),
             first_row: 0,
@@ -5373,6 +5528,27 @@ mod tests {
         });
         let relocated = cx.debug_bounds("find-bar").unwrap();
         assert_eq!(relocated, moved);
+        pane.update_in(cx, |pane, _, cx| {
+            pane.residents[&id]
+                .element
+                .set_view_offset(3, usize::from(original_size.1));
+            cx.notify();
+        });
+        let refresh = cx
+            .debug_bounds("find-refresh")
+            .expect("reachable refresh control")
+            .center();
+        cx.simulate_mouse_down(refresh, MouseButton::Left, Modifiers::default());
+        cx.simulate_mouse_up(refresh, MouseButton::Left, Modifiers::default());
+        pane.read_with(cx, |pane, _| {
+            assert!(
+                pane.residents[&id].find.is_some(),
+                "Refresh must not close Find"
+            );
+            assert_eq!(pane.residents[&id].element.view_offset(), 0);
+            assert_eq!(pane.residents[&id].last_size, original_size);
+        });
+        let relocated = cx.debug_bounds("find-bar").unwrap();
         let close = gpui::point(relocated.right() - px(22.0), relocated.center().y);
         cx.simulate_mouse_down(close, MouseButton::Left, Modifiers::default());
         cx.simulate_mouse_up(close, MouseButton::Left, Modifiers::default());
@@ -5644,6 +5820,8 @@ mod tests {
             .take_due_search(Duration::from_millis(200))
             .expect("find request");
         let snapshot = FindSnapshot {
+            error: None,
+            retained: None,
             text_cells: Default::default(),
             lines: Vec::new(),
             first_row: 0,

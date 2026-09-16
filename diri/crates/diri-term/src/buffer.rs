@@ -109,12 +109,19 @@ impl GridBuffer {
     /// their base's span, so searching either part still highlights that cell.
     #[must_use]
     pub fn row_text_with_cell_ranges(&self, row: usize) -> Option<(String, Vec<[u16; 2]>)> {
-        let cells = self.row(row)?;
+        Some(Self::text_with_cell_ranges(
+            self.row(row)?,
+            self.annotations.get(row),
+        ))
+    }
+
+    pub(crate) fn text_with_cell_ranges(
+        cells: &[GridCell],
+        metadata: Option<&RowMetadata>,
+    ) -> (String, Vec<[u16; 2]>) {
         let mut text = String::with_capacity(cells.len());
         let mut columns = Vec::with_capacity(cells.len());
-        let mut graphemes = self
-            .annotations
-            .get(row)
+        let mut graphemes = metadata
             .into_iter()
             .flat_map(|metadata| &metadata.graphemes)
             .peekable();
@@ -145,7 +152,7 @@ impl GridBuffer {
                 }
             }
         }
-        Some((text, columns))
+        (text, columns)
     }
 
     #[must_use]

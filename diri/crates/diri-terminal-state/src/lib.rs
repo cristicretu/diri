@@ -1041,6 +1041,57 @@ impl HeadlessScreen {
         }
     }
 
+    /// Local retained Find capture. Unlike a viewport page, every included
+    /// annotation must be complete; older rows may be omitted explicitly.
+    pub fn find_capture_cells(
+        &self,
+    ) -> Result<diri_proto::ReadScrollbackCellsResult, &'static str> {
+        let (cols, visible) = self.size();
+        let grid = self.term.grid();
+        let history = grid.history_size();
+        let total = history + visible;
+        let limit = (diri_proto::FIND_CAPTURE_MAX_CELLS / cols.max(1))
+            .min(diri_proto::FIND_CAPTURE_MAX_ROWS)
+            .min(total);
+        if limit < visible {
+            return Err("Terminal exceeds retained search limits");
+        }
+        let mut rows = Vec::with_capacity(limit);
+        let mut metadata = Vec::with_capacity(limit);
+        let mut remaining = diri_proto::grid::MAX_GRID_METADATA_BYTES / 4;
+        // Walk newest-first, then reverse once: the admitted rows form one
+        // contiguous immutable tail, with complete graphemes and link spans.
+        for index in (total - limit..total).rev() {
+            let line = Line(index as i32 - history as i32);
+            let Some((annotations, bytes)) = self.row_metadata_budgeted(line, remaining, true)
+            else {
+                break;
+            };
+            remaining -= bytes;
+            rows.push(
+                (0..cols)
+                    .map(|x| wire_cell(&grid[line][Column(x)]))
+                    .collect(),
+            );
+            metadata.push(annotations);
+        }
+        if rows.len() < visible {
+            return Err("Visible annotations exceed retained search limits");
+        }
+        rows.reverse();
+        metadata.reverse();
+        Ok(diri_proto::ReadScrollbackCellsResult {
+            first_row: (total - rows.len()) as i64,
+            row_count: rows.len() as i64,
+            total_rows: total as i64,
+            live_start_row: history as i64,
+            cols: cols as i64,
+            content_seq: self.content_seq,
+            metadata,
+            payload: GridRowCodec::encode_rows(&rows).map_err(|_| "Invalid capture cells")?,
+        })
+    }
+
     /// Export only bounded annotations. Oversized targets remain ordinary text.
     fn row_metadata(&self, line: Line) -> RowMetadata {
         self.row_metadata_with_budget(
@@ -1050,10 +1101,21 @@ impl HeadlessScreen {
     }
 
     fn row_metadata_with_budget(&self, line: Line, budget: usize) -> RowMetadata {
+        self.row_metadata_budgeted(line, budget, false)
+            .expect("lossy export always completes")
+            .0
+    }
+
+    fn row_metadata_budgeted(
+        &self,
+        line: Line,
+        budget: usize,
+        complete: bool,
+    ) -> Option<(RowMetadata, usize)> {
         let mut result = RowMetadata::default();
         let grid = self.term.grid();
-        // Reserve enough for JSON framing, including escaping. Both a full
-        // viewport and any bounded scrollback page stay below the codec limit.
+        // Account for framing as well as text before allocating. Retained Find
+        // uses complete mode; existing live/page exports keep their old limits.
         let mut used = 0;
         for x in 0..self.geometry.cols {
             let cell = &grid[line][Column(x)];
@@ -1067,29 +1129,43 @@ impl HeadlessScreen {
                 } else if !uri.is_empty()
                     && uri.len() <= diri_proto::grid::MAX_LINK_URI_BYTES
                     && !uri.chars().any(char::is_control)
-                    && used + uri.len() + 48 <= budget
                 {
-                    used += uri.len() + 48;
-                    result.links.push(LinkSpan {
-                        start: x as u16,
-                        end: x as u16 + 1,
-                        uri: uri.to_owned(),
-                    });
+                    let needed = uri.len() + 48;
+                    if used + needed <= budget {
+                        used += needed;
+                        result.links.push(LinkSpan {
+                            start: x as u16,
+                            end: x as u16 + 1,
+                            uri: uri.to_owned(),
+                        });
+                    } else if complete {
+                        return None;
+                    }
                 }
             }
             if let Some(chars) = cell.zerowidth() {
-                let text: String = chars
+                let text_len = chars
                     .iter()
-                    .copied()
                     .filter(|ch| !ch.is_control())
-                    .collect();
-                if !text.is_empty() && text.len() <= 64 && used + text.len() + 16 <= budget {
-                    used += text.len() + 16;
+                    .map(|ch| ch.len_utf8())
+                    .sum::<usize>();
+                if text_len == 0 {
+                    continue;
+                }
+                if text_len <= 64 && used + text_len + 16 <= budget {
+                    used += text_len + 16;
+                    let text = chars
+                        .iter()
+                        .copied()
+                        .filter(|ch| !ch.is_control())
+                        .collect();
                     result.graphemes.push((x as u16, text));
+                } else if complete {
+                    return None;
                 }
             }
         }
-        result
+        Some((result, used))
     }
 
     /// The visible grid as plain text, trailing blank lines removed.
@@ -2092,5 +2168,38 @@ mod qol_tests {
         ));
         restored.restore_history_metadata(&screen.history_metadata());
         assert_eq!(restored.scrollback_cells(0, 128).metadata, history.metadata);
+    }
+}
+
+#[cfg(test)]
+mod find_capture_tests {
+    use super::*;
+
+    #[test]
+    fn oversized_visible_annotations_fail_instead_of_silently_losing_text() {
+        let mut screen = HeadlessScreen::new(320, 40);
+        let dense = "e\u{301}".repeat(320);
+        screen.feed(dense.repeat(40).as_bytes());
+        assert!(screen.find_capture_cells().is_err());
+    }
+
+    #[test]
+    fn full_history_find_capture_preserves_combining_text_in_every_retained_row() {
+        let mut screen = HeadlessScreen::new(40, 30);
+        screen.feed("needle e\u{301}\r\n".repeat(9000).as_bytes());
+        let capture = screen.find_capture_cells().unwrap();
+        assert!(
+            capture.first_row > 0,
+            "capture explicitly reports a recent tail"
+        );
+        let rows = GridRowCodec::decode_rows(&capture.payload, capture.row_count as usize).unwrap();
+        for (row, metadata) in rows.iter().zip(&capture.metadata) {
+            if row.iter().any(|cell| cell.scalar == 'e' as u32) {
+                assert!(
+                    metadata.graphemes.iter().any(|(_, text)| text == "\u{301}"),
+                    "search capture must not silently drop a combining mark"
+                );
+            }
+        }
     }
 }
