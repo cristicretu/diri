@@ -1501,6 +1501,23 @@ impl Session {
         self.shared.screen.lock().expect("screen").lines()
     }
 
+    /// Reads the local emulator's title without using the conversation name.
+    pub fn terminal_title(&self) -> std::io::Result<Option<String>> {
+        if matches!(&self.transport, Transport::Remote(_)) {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::Unsupported,
+                "Remote Helper snapshots do not provide current terminal titles",
+            ));
+        }
+        Ok(self
+            .shared
+            .screen
+            .lock()
+            .expect("screen")
+            .title()
+            .map(str::to_owned))
+    }
+
     /// The emulator's current geometry.
     /// URLs the screen has shown, for the artifacts inspector.
     pub fn artifacts(&self) -> Vec<diri_proto::SessionArtifact> {

@@ -485,6 +485,16 @@ impl DaemonClient {
         .await
     }
 
+    /// Reads the local terminal's raw OSC title, not its conversation name.
+    /// Remote sessions currently return `terminal_title_unsupported`.
+    pub async fn terminal_title(
+        &self,
+        session_id: &SessionId,
+    ) -> Result<SessionTerminalTitleResult, ClientError> {
+        self.typed(Method::SESSION_TERMINAL_TITLE, &session_params(session_id))
+            .await
+    }
+
     pub async fn process_info(
         &self,
         session_id: &SessionId,

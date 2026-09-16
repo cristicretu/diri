@@ -776,6 +776,7 @@ impl ControlServer {
             Method::SESSION_SEND_TEXT => self.session_send_text(params),
             Method::SESSION_RESIZE => self.session_resize(params),
             Method::SESSION_READ_SCREEN => self.session_read_screen(params),
+            Method::SESSION_TERMINAL_TITLE => self.session_terminal_title(params),
             Method::SESSION_CAPTURE_FIND => self.session_capture_find(params),
             Method::SESSION_READ_SCROLLBACK => self.session_read_scrollback(params),
             Method::SESSION_READ_SCROLLBACK_CELLS => self.session_read_scrollback_cells(params),
@@ -2009,6 +2010,38 @@ impl ControlServer {
             text: session.screen_lines().join("\n"),
             cols: cols as i64,
             rows: rows as i64,
+        })
+    }
+
+    fn session_terminal_title(&self, params: Option<JsonValue>) -> Result<JsonValue, ControlError> {
+        let p: diri_proto::SessionTerminalTitleParams = decode(params)?;
+        let registry = self.registry.lock().map_err(poisoned)?;
+        let record = registry
+            .record(&p.session_id.0)
+            .ok_or_else(|| ControlError::not_found(p.session_id.0.clone()))?;
+        if record.host.is_some() {
+            return Err(ControlError::new(
+                "terminal_title_unsupported",
+                "Remote Helper snapshots do not provide current terminal titles",
+            ));
+        }
+        let session = registry.get(&p.session_id.0).ok_or_else(|| {
+            ControlError::new(
+                "terminal_title_unavailable",
+                "Session has no Engine-owned terminal state",
+            )
+        })?;
+        let title = session.terminal_title().map_err(|error| {
+            let code = if error.kind() == std::io::ErrorKind::Unsupported {
+                "terminal_title_unsupported"
+            } else {
+                "terminal_title_unavailable"
+            };
+            ControlError::new(code, error.to_string())
+        })?;
+        encode(&diri_proto::SessionTerminalTitleResult {
+            session_id: p.session_id,
+            title,
         })
     }
 

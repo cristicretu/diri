@@ -89,7 +89,7 @@ fn run(arguments: &[String]) -> Result<(), CliError> {
 fn print_help() {
     println!(
         "dirijor — Diri automation CLI\n\n\
-         Usage:\n  dirijor status [--json]\n  dirijor activity [--limit N] [--json]\n  dirijor session <list|get|process|read|send|key|wait|spawn|run|fork|reconnect|release|archive> ...\n  \
+         Usage:\n  dirijor status [--json]\n  dirijor activity [--limit N] [--json]\n  dirijor session <list|get|process|terminal-title|read|send|key|wait|spawn|run|fork|reconnect|release|archive> ...\n  \
          dirijor worktree <list|create|remove> ...\n  dirijor artifacts <session> [--json]\n  \
          dirijor events <subscribe|wait> ...\n  dirijor ports [--json]\n  dirijor doctor\n  \
          dirijor hook <event>\n  dirijor notify <json>\n  dirijor notify --title TEXT --body TEXT\n  dirijor mcp-tools\n  \
@@ -101,6 +101,8 @@ fn print_help() {
          dirijor pane move-group SOURCE_TAB SPLIT DEST_TAB TARGET_PANE EDGE | swap TAB PANE TAB PANE\n  \
          dirijor pane resize TAB SPLIT FRACTION | focus TAB PANE | zoom TAB PANE_OR_none\n  \
          Organization edits accept --revision N and return the shared snapshot as JSON.\n\n\
+         dirijor session terminal-title ID [--json]\n  \
+         Reads the current local terminal OSC title, not the conversation name. Remote titles are unsupported.\n\n\
          Deferred on Linux: companion forwarding (dirijor forward)."
     );
 }
@@ -369,6 +371,7 @@ fn session(arguments: &[String]) -> Result<(), CliError> {
         "list" => session_list(rest, false),
         "get" => session_get(rest),
         "process" => session_process(rest),
+        "terminal-title" => session_terminal_title(rest),
         "read" => session_read(rest),
         "send" => session_send(rest),
         "key" => session_key(rest),
@@ -383,6 +386,53 @@ fn session(arguments: &[String]) -> Result<(), CliError> {
             "unknown session action: {other}"
         ))),
     }
+}
+
+fn session_terminal_title(arguments: &[String]) -> Result<(), CliError> {
+    if arguments.len() == 1 && matches!(arguments[0].as_str(), "--help" | "-h") {
+        println!(
+            "Usage: dirijor session terminal-title ID [--json]\n\
+             Reads the current local terminal OSC title, not the conversation name.\n\
+             Remote sessions return terminal_title_unsupported.\n\
+             JSON preserves the raw title; plain output escapes control characters."
+        );
+        return Ok(());
+    }
+    let Some(id) = arguments.first().filter(|id| !id.starts_with('-')) else {
+        return Err(CliError::failure("terminal-title requires a session ID"));
+    };
+    if arguments.len() > 2 || arguments.get(1).is_some_and(|arg| arg != "--json") {
+        return Err(CliError::failure(
+            "usage: dirijor session terminal-title ID [--json]",
+        ));
+    }
+    let result = request(
+        Method::SESSION_TERMINAL_TITLE,
+        json!({"sessionID": id}),
+        Duration::from_secs(3),
+    )?;
+    let parsed: diri_proto::SessionTerminalTitleResult = serde_json::from_value(result)
+        .map_err(|_| CliError::failure("invalid terminal title response"))?;
+    if parsed.session_id.0 != *id {
+        return Err(CliError::failure("terminal title response session mismatch"));
+    }
+    if has_flag(&arguments[1..], "--json") {
+        let value = serde_json::to_value(&parsed)
+            .map_err(|_| CliError::failure("invalid terminal title response"))?;
+        print_json(&value);
+    } else if let Some(title) = parsed.title {
+        for character in title.chars() {
+            if character.is_control() {
+                print!("{}", character.escape_default());
+            } else {
+                print!("{character}");
+            }
+        }
+        println!();
+    } else {
+        println!("(no terminal title)");
+    }
+    Ok(())
 }
 
 fn session_process(arguments: &[String]) -> Result<(), CliError> {

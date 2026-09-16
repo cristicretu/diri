@@ -37,6 +37,7 @@ impl Method {
     pub const SESSION_SEND_TEXT: &'static str = "session.send_text";
     pub const SESSION_RESIZE: &'static str = "session.resize";
     pub const SESSION_READ_SCREEN: &'static str = "session.read_screen";
+    pub const SESSION_TERMINAL_TITLE: &'static str = "session.terminal_title";
     pub const SESSION_CAPTURE_FIND: &'static str = "session.capture_find";
     pub const SESSION_READ_SCROLLBACK: &'static str = "session.read_scrollback";
     pub const SESSION_READ_SCROLLBACK_CELLS: &'static str = "session.read_scrollback_cells";
@@ -439,6 +440,7 @@ pub type SessionRemoveParams = SessionIdParams;
 pub type SessionResumeParams = SessionIdParams;
 pub type SessionReconnectParams = SessionIdParams;
 pub type SessionReadScreenParams = SessionIdParams;
+pub type SessionTerminalTitleParams = SessionIdParams;
 pub type SessionReadScrollbackParams = SessionIdParams;
 pub type SessionMarkSeenParams = SessionIdParams;
 pub type SessionHibernateParams = SessionIdParams;
@@ -661,6 +663,18 @@ pub struct ReadScreenResult {
     pub text: String,
     pub cols: i64,
     pub rows: i64,
+}
+
+/// The local emulator's raw OSC title, independent of the conversation name.
+/// Remote sessions return `terminal_title_unsupported`: the current Helper
+/// snapshot does not carry an authoritative title across reconnects.
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SessionTerminalTitleResult {
+    #[serde(rename = "sessionID")]
+    pub session_id: SessionId,
+    /// `None` means the emulator has no title, including after a title reset.
+    pub title: Option<String>,
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
