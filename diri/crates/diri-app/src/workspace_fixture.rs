@@ -228,6 +228,9 @@ impl LiveWorkspace {
                 id.0
             );
         }
+        self.verify_process_identity();
+    }
+    pub(crate) fn verify_process_identity(&self) {
         let pids = ["build", "review"]
             .iter()
             .map(|id| self.registry.lock().unwrap().get(id).unwrap().child_pid())
