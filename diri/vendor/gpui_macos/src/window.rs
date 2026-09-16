@@ -1551,13 +1551,6 @@ impl PlatformWindow for MacWindow {
     fn set_app_id(&mut self, _app_id: &str) {}
 
     fn set_background_appearance(&self, background_appearance: WindowBackgroundAppearance) {
-        // diri: blur through WindowServer's window-level filter (what Terminal.app
-        // and Ghostty use) rather than an `NSVisualEffectView` backdrop layer. On
-        // macOS 26+ the effect view resolves to a Liquid Glass material whose
-        // per-frame lensing made a 60 fps terminal window stutter; the plain
-        // WindowServer blur is a fixed-cost gaussian on the retained backdrop.
-        const USE_VISUAL_EFFECT_BACKDROP: bool = false;
-        const WINDOW_BLUR_RADIUS: i64 = 28;
         let mut this = self.0.as_ref().lock();
         this.background_appearance = background_appearance;
 
@@ -1573,13 +1566,20 @@ impl PlatformWindow for MacWindow {
                 NSColor::colorWithSRGBRed_green_blue_alpha_(nil, 0f64, 0f64, 0f64, 0.0001)
             };
             this.native_window.setBackgroundColor_(background_color);
+            // diri: AppKit derives a translucent window's shadow from its
+            // content, and a terminal repaints that content continuously.
+            // `DIRI_WINDOW_SHADOW=0` drops the shadow so the cost of that
+            // recompute can be measured against the blur itself.
+            let keep_shadow = opaque
+                || std::env::var_os("DIRI_WINDOW_SHADOW").is_none_or(|value| value != "0");
+            this.native_window.setHasShadow_(keep_shadow as BOOL);
 
-            if NSAppKitVersionNumber < NSAppKitVersionNumber12_0 || !USE_VISUAL_EFFECT_BACKDROP {
+            if NSAppKitVersionNumber < NSAppKitVersionNumber12_0 {
                 // Whether `-[NSVisualEffectView respondsToSelector:@selector(_updateProxyLayer)]`.
                 // On macOS Catalina/Big Sur `NSVisualEffectView` doesn’t own concrete sublayers
                 // but uses a `CAProxyLayer`. Use the legacy WindowServer API.
                 let blur_radius = if background_appearance == WindowBackgroundAppearance::Blurred {
-                    WINDOW_BLUR_RADIUS
+                    80
                 } else {
                     0
                 };
