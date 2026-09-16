@@ -144,6 +144,12 @@ impl Sidebar {
         cx.notify();
     }
 
+    /// Copy window context without changing preferences or emitting a
+    /// navigation event before the root view finishes construction.
+    pub(crate) fn set_initial_workspace(&mut self, id: Option<WorkspaceId>) {
+        self.workspace_nav.active = id;
+    }
+
     pub(crate) fn activate_workspace(&mut self, id: Option<WorkspaceId>, cx: &mut Context<Self>) {
         self.workspace_nav.active = id.clone();
         if let Err(error) = self
