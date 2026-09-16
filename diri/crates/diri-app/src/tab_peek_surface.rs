@@ -50,7 +50,11 @@ impl SessionSurfaces {
                 .into_any_element(),
             None => sf_symbol("terminal", 14.0, colors.secondary),
         };
-        div().flex_none().size(px(14.0)).child(icon).into_any_element()
+        div()
+            .flex_none()
+            .size(px(14.0))
+            .child(icon)
+            .into_any_element()
     }
 
     #[cfg(all(test, target_os = "macos"))]

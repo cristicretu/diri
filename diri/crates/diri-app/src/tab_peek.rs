@@ -33,7 +33,10 @@ pub(crate) struct TabPinch {
 
 impl TabPinch {
     pub(crate) fn cancel(&mut self) {
-        *self = Self { blocked: true, ..Self::default() };
+        *self = Self {
+            blocked: true,
+            ..Self::default()
+        };
     }
 
     pub(crate) fn take_feedback(&mut self) -> bool {

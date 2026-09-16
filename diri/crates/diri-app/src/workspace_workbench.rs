@@ -768,9 +768,10 @@ impl Render for WorkspaceWorkbench {
                     ),
             );
         }
-        let multiple_panes = self.tab.as_ref().is_some_and(|tab| {
-            matches!(tab.layout, LayoutNode::Split { .. })
-        });
+        let multiple_panes = self
+            .tab
+            .as_ref()
+            .is_some_and(|tab| matches!(tab.layout, LayoutNode::Split { .. }));
         for pane in &geometry.panes {
             let bounds = pane.bounds;
             let mut surface = div()
@@ -786,10 +787,8 @@ impl Render for WorkspaceWorkbench {
                 .overflow_hidden();
             if let Some(mounted) = self.mounted.get(&pane.identity.pane) {
                 mounted.terminal.update(cx, |terminal, cx| {
-                    terminal.set_header_trailing_inset(
-                        if multiple_panes { 116.0 } else { 26.0 },
-                        cx,
-                    );
+                    terminal
+                        .set_header_trailing_inset(if multiple_panes { 116.0 } else { 26.0 }, cx);
                     terminal.set_viewport(
                         TerminalViewport {
                             x: self.viewport.x + bounds.x,
@@ -862,29 +861,33 @@ impl Render for WorkspaceWorkbench {
                 }));
             let controls = div()
                 .absolute()
-                .top(px((Metrics::TITLE_BAR - Metrics::TOOLBAR_CONTROL_SIZE) / 2.0))
+                .top(px(
+                    (Metrics::TITLE_BAR - Metrics::TOOLBAR_CONTROL_SIZE) / 2.0
+                ))
                 .right(px(Metrics::TOOLBAR_EDGE_INSET))
                 .flex()
                 .gap(px(4.0))
-                .when(multiple_panes, |controls| controls.child(
-                    div()
-                        .id(SharedString::from(format!("move-pane-{}", pane_id.0)))
-                        .role(Role::Button)
-                        .aria_label("Drag pane to an edge to move, or center to swap")
-                        .size(px(Metrics::TOOLBAR_CONTROL_SIZE))
-                        .rounded(px(Radius::BADGE))
-                        .hover(move |button| button.bg(Fill::subtle(colors)))
-                        .flex()
-                        .items_center()
-                        .justify_center()
-                        .cursor(CursorStyle::OpenHand)
-                        .child(sf_symbol("arrow.up.arrow.down", 14.0, colors.secondary))
-                        .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
-                        .on_drag(move_source, |source, _, _, cx| {
-                            cx.stop_propagation();
-                            cx.new(|_| source.clone())
-                        }),
-                ))
+                .when(multiple_panes, |controls| {
+                    controls.child(
+                        div()
+                            .id(SharedString::from(format!("move-pane-{}", pane_id.0)))
+                            .role(Role::Button)
+                            .aria_label("Drag pane to an edge to move, or center to swap")
+                            .size(px(Metrics::TOOLBAR_CONTROL_SIZE))
+                            .rounded(px(Radius::BADGE))
+                            .hover(move |button| button.bg(Fill::subtle(colors)))
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .cursor(CursorStyle::OpenHand)
+                            .child(sf_symbol("arrow.up.arrow.down", 14.0, colors.secondary))
+                            .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                            .on_drag(move_source, |source, _, _, cx| {
+                                cx.stop_propagation();
+                                cx.new(|_| source.clone())
+                            }),
+                    )
+                })
                 .child(
                     div()
                         .id(SharedString::from(format!("split-pane-{}", pane_id.0)))
@@ -909,62 +912,70 @@ impl Render for WorkspaceWorkbench {
                             }
                         })),
                 )
-                .when(multiple_panes, |controls| controls.child(
-                    div()
-                        .id(SharedString::from(format!("zoom-pane-{}", pane_id.0)))
-                        .role(Role::Button)
-                        .aria_label(if zoomed { "Show all panes" } else { "Focus this pane" })
-                        .size(px(Metrics::TOOLBAR_CONTROL_SIZE))
-                        .rounded(px(Radius::BADGE))
-                        .hover(move |button| button.bg(Fill::subtle(colors)))
-                        .flex()
-                        .items_center()
-                        .justify_center()
-                        .cursor_pointer()
-                        .child(sf_symbol(
-                            if zoomed {
-                                "arrow.down.right.and.arrow.up.left"
+                .when(multiple_panes, |controls| {
+                    controls.child(
+                        div()
+                            .id(SharedString::from(format!("zoom-pane-{}", pane_id.0)))
+                            .role(Role::Button)
+                            .aria_label(if zoomed {
+                                "Show all panes"
                             } else {
-                                "arrow.up.left.and.arrow.down.right"
-                            },
-                            14.0,
-                            colors.secondary,
-                        ))
-                        .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
-                        .on_click(cx.listener(move |this, _, _, cx| {
-                            this.runtime.store.write().expect("store").edit_workspace(
-                                WorkspaceMutation::ZoomPane {
-                                    tab_id: zoom_tab.clone(),
-                                    pane_id: (!zoomed).then(|| zoom_pane.clone()),
+                                "Focus this pane"
+                            })
+                            .size(px(Metrics::TOOLBAR_CONTROL_SIZE))
+                            .rounded(px(Radius::BADGE))
+                            .hover(move |button| button.bg(Fill::subtle(colors)))
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .cursor_pointer()
+                            .child(sf_symbol(
+                                if zoomed {
+                                    "arrow.down.right.and.arrow.up.left"
+                                } else {
+                                    "arrow.up.left.and.arrow.down.right"
                                 },
-                            );
-                            cx.notify();
-                        })),
-                ))
-                .when(multiple_panes, |controls| controls.child(
-                    div()
-                        .id(SharedString::from(format!("remove-pane-{}", pane_id.0)))
-                        .role(Role::Button)
-                        .aria_label("Remove pane from tab")
-                        .size(px(Metrics::TOOLBAR_CONTROL_SIZE))
-                        .rounded(px(Radius::BADGE))
-                        .hover(move |button| button.bg(Fill::subtle(colors)))
-                        .flex()
-                        .items_center()
-                        .justify_center()
-                        .cursor_pointer()
-                        .child(sf_symbol("xmark", 12.0, colors.secondary))
-                        .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
-                        .on_click(cx.listener(move |this, _, _, cx| {
-                            this.runtime.store.write().expect("store").edit_workspace(
-                                WorkspaceMutation::RemovePane {
-                                    tab_id: tab.clone(),
-                                    pane_id: pane_id.clone(),
-                                },
-                            );
-                            cx.notify();
-                        })),
-                ));
+                                14.0,
+                                colors.secondary,
+                            ))
+                            .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                this.runtime.store.write().expect("store").edit_workspace(
+                                    WorkspaceMutation::ZoomPane {
+                                        tab_id: zoom_tab.clone(),
+                                        pane_id: (!zoomed).then(|| zoom_pane.clone()),
+                                    },
+                                );
+                                cx.notify();
+                            })),
+                    )
+                })
+                .when(multiple_panes, |controls| {
+                    controls.child(
+                        div()
+                            .id(SharedString::from(format!("remove-pane-{}", pane_id.0)))
+                            .role(Role::Button)
+                            .aria_label("Remove pane from tab")
+                            .size(px(Metrics::TOOLBAR_CONTROL_SIZE))
+                            .rounded(px(Radius::BADGE))
+                            .hover(move |button| button.bg(Fill::subtle(colors)))
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .cursor_pointer()
+                            .child(sf_symbol("xmark", 12.0, colors.secondary))
+                            .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                this.runtime.store.write().expect("store").edit_workspace(
+                                    WorkspaceMutation::RemovePane {
+                                        tab_id: tab.clone(),
+                                        pane_id: pane_id.clone(),
+                                    },
+                                );
+                                cx.notify();
+                            })),
+                    )
+                });
             if geometry.panes.len() > 1 && geometry.focused.pane == pane.identity.pane {
                 surface = surface.child(
                     div()

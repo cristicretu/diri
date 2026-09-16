@@ -4002,8 +4002,14 @@ impl RootView {
     ) {
         let allowed = window.is_window_active()
             && !self.launcher.read(cx).is_open()
-            && !self.navigation.as_ref().is_some_and(|v| v.read(cx).is_open())
-            && !self.utility_surfaces.as_ref().is_some_and(|v| v.read(cx).is_open())
+            && !self
+                .navigation
+                .as_ref()
+                .is_some_and(|v| v.read(cx).is_open())
+            && !self
+                .utility_surfaces
+                .as_ref()
+                .is_some_and(|v| v.read(cx).is_open())
             && !self.notification_panel_open
             && self.sidebar.read(cx).pending_close_copy().is_none()
             && self.quote_target_picker.is_none()
@@ -4018,7 +4024,9 @@ impl RootView {
             return;
         }
         let position = surfaces.read(cx).tab_peek_position();
-        let frame = self.tab_pinch.sample(event, position, cx.background_executor().now());
+        let frame = self
+            .tab_pinch
+            .sample(event, position, cx.background_executor().now());
         if self.tab_pinch.take_feedback() {
             #[cfg(target_os = "macos")]
             crate::macos::pinch_feedback();
