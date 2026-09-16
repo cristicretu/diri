@@ -1145,8 +1145,29 @@ reducer. Only an actual ProcessExit can establish Agent exit, including code126.
 Explicit kill still uses the existing management RPC; automatic replay or a
 second Holder controller is never introduced. A failed resident `session.resume`
 returns the structured error instead of falsely succeeding as a live no-op.
-Explicit Engine re-adoption remains the recovery boundary; a session-scoped
-reconnect command is a separate follow-up.
+`session.reconnect` is the explicit recovery boundary for a failed resident
+remote transport. It reserves the session identity against concurrent lifecycle
+operations and inspects the same Holder outside Registry, with a 15-second
+deadline. The inspection must match the session ID, incarnation, Helper build,
+and last known Agent PID. An actual exited inspection records that exit without
+reattaching or inventing a replacement Agent.
+
+For a running Agent, recovery retains the existing Session, mirror, process ID,
+output offsets, and incarnation. A replacement pump joins the failed pump outside
+Registry, discards all previous pending/uncertain input and resize operations,
+and requests the existing single-controller attachment. HelloAck must again
+match build/incarnation/PID and advance the previous controller epoch; only a
+validated FullSnapshot restores Connected. A race where the Agent exits between
+inspection and attachment records the genuine exit. Input after exit is rejected
+instead of accumulating in a disconnected transport queue.
+
+The result includes the latest SessionRecord, whether recovery started, and
+whether previous input delivery was uncertain and discarded. That flag never
+means the input was confirmed. Connected or already reconnecting sessions return
+their current state without creating another attachment. Missing Engine owners
+return `remote_owner_unavailable`; reconnect does not silently invoke Agent
+resume/relaunch or replace a persisted session. The Rust client and CLI expose
+the same operation (`dirijor session reconnect ID [--json]`).
 
 Deterministic fake-SSH fixtures preserve one live child across bridge loss and
 validated reconnect, reject a fatal protocol frame without declaring that child
