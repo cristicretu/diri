@@ -73,6 +73,7 @@ impl Fixture {
             output_offset: 0,
             snapshot_sequence: 1,
             foreground_pid: Some(pid as i32),
+            child_identity: None,
         };
         let mut screen = crate::screen::HeadlessScreen::new(80, 24);
         screen.feed(b"preserved remote screen");
@@ -112,6 +113,7 @@ impl Fixture {
             holder_build_id: "fixture".into(),
             holder_pid: pid,
             process_state: RemoteProcessState::Running { pid },
+            child_identity: None,
             cols: 80,
             rows: 24,
             output_offset: 0,

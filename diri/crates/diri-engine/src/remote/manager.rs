@@ -753,6 +753,31 @@ impl RemoteManager {
         self.rpc(helper, HelperCommand::Inspect, selector, RPC_TIMEOUT)
     }
 
+    /// Lease-free identity facts, verified by the Helper on the owning host.
+    /// Older Holders remain usable but cannot answer this stronger operation.
+    pub fn inspect_process_identity(
+        &self,
+        helper: &InstalledHelper,
+        selector: &SessionSelector,
+    ) -> io::Result<diri_proto::process::ProcessIdentity> {
+        if selector.expected_incarnation.is_none() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "verified process identity requires an expected session incarnation",
+            ));
+        }
+        if helper.protocol.major != ProtocolVersion::CURRENT.major
+            || helper.protocol.minor < diri_proto::remote_pty::PROCESS_IDENTITY_PROTOCOL_MINOR
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "remote Helper does not support verified process identity",
+            ));
+        }
+        let inspection = self.inspect(helper, selector)?;
+        identity_from_inspection(&helper.build_id, selector, &inspection)
+    }
+
     pub(crate) fn inspect_for_reconnect(
         &self,
         helper: &InstalledHelper,
@@ -848,6 +873,46 @@ impl RemoteManager {
             .with_executable(self.executor.ssh_executable().to_os_string())
             .with_batch_mode(self.batch_mode)
     }
+}
+
+fn identity_from_inspection(
+    expected_build: &str,
+    selector: &SessionSelector,
+    inspection: &SessionInspection,
+) -> io::Result<diri_proto::process::ProcessIdentity> {
+    if inspection.session_id != selector.session_id
+        || inspection.holder_build_id != expected_build
+        || selector
+            .expected_incarnation
+            .as_ref()
+            .is_none_or(|expected| expected != &inspection.session_incarnation)
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "remote identity facts do not match the expected session incarnation/build",
+        ));
+    }
+    if matches!(
+        inspection.process_state,
+        diri_proto::remote_pty::RemoteProcessState::Exited { .. }
+    ) {
+        return Err(io::Error::new(
+            io::ErrorKind::NotConnected,
+            "remote Agent has exited",
+        ));
+    }
+    if inspection.child_identity.is_none() {
+        return Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "remote Holder has no verified running child identity",
+        ));
+    }
+    inspection.verified_child_identity().ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            "remote child identity disagrees with its process PID",
+        )
+    })
 }
 
 fn require_rpc_success(output: CommandOutput) -> io::Result<CommandOutput> {
@@ -1222,6 +1287,67 @@ mod tests {
                 "rejected signals must not reach SSH"
             );
         }
+    }
+
+    #[test]
+    fn identity_inspection_rejects_old_missing_and_mismatched_facts() {
+        use diri_proto::process::{BootId, ProcessBirth, ProcessIdentity};
+        use diri_proto::remote_pty::{RemoteProcessState, SessionToken};
+        let identity = ProcessIdentity::new(
+            42,
+            ProcessBirth::Linux {
+                boot_id: BootId::parse("12345678-1234-5678-9abc-def012345678").unwrap(),
+                start_ticks: 100,
+                clock_ticks_per_second: 100,
+            },
+        )
+        .unwrap();
+        let selector = SessionSelector {
+            session_id: "session".into(),
+            session_token: SessionToken::new("0123456789abcdef0123456789abcdef").unwrap(),
+            expected_incarnation: Some("incarnation".into()),
+        };
+        let mut inspection: SessionInspection = serde_json::from_value(serde_json::json!({
+            "sessionId":"session", "sessionIncarnation":"incarnation", "holderBuildId":"build",
+            "holderPid":1, "processState":{"state":"running", "pid":42},
+            "cols":80, "rows":24, "outputOffset":0, "snapshotSequence":0,
+            "controllerEpoch":0, "persistence":"non-persistent"
+        }))
+        .unwrap();
+        assert_eq!(
+            identity_from_inspection("build", &selector, &inspection)
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::Unsupported
+        );
+        inspection.child_identity = Some(identity);
+        assert_eq!(
+            identity_from_inspection("build", &selector, &inspection).unwrap(),
+            identity
+        );
+        assert!(identity_from_inspection("wrong-build", &selector, &inspection).is_err());
+        let mut stale = selector.clone();
+        stale.expected_incarnation = Some("stale".into());
+        assert!(identity_from_inspection("build", &stale, &inspection).is_err());
+        stale.expected_incarnation = None;
+        assert!(identity_from_inspection("build", &stale, &inspection).is_err());
+        inspection.process_state = RemoteProcessState::Running { pid: 43 };
+        assert_eq!(
+            identity_from_inspection("build", &selector, &inspection)
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::InvalidData
+        );
+        inspection.process_state = RemoteProcessState::Exited {
+            code: Some(126),
+            signal: None,
+        };
+        assert_eq!(
+            identity_from_inspection("build", &selector, &inspection)
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::NotConnected
+        );
     }
 
     #[cfg(unix)]
