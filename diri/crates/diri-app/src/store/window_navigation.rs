@@ -73,19 +73,69 @@ struct WindowNavigation {
 
 #[derive(Clone, Debug)]
 pub(crate) enum WindowAction {
+    #[cfg_attr(
+        not(target_os = "macos"),
+        allow(
+            dead_code,
+            reason = "Produced by native macOS menu or notification callbacks"
+        )
+    )]
     OpenNotification {
         session: SessionId,
         notification: String,
     },
+    #[cfg_attr(
+        not(target_os = "macos"),
+        allow(
+            dead_code,
+            reason = "Produced by native macOS menu or notification callbacks"
+        )
+    )]
     Focus,
+    #[cfg_attr(
+        not(target_os = "macos"),
+        allow(
+            dead_code,
+            reason = "Produced by native macOS menu or notification callbacks"
+        )
+    )]
     Select(SessionId),
+    #[cfg_attr(
+        not(target_os = "macos"),
+        allow(
+            dead_code,
+            reason = "Produced by native macOS menu or notification callbacks"
+        )
+    )]
     Close(SessionId),
+    #[cfg_attr(
+        all(not(target_os = "macos"), not(test)),
+        allow(
+            dead_code,
+            reason = "Produced by the macOS menu; exercised by portable navigation tests"
+        )
+    )]
     OpenLauncher,
+    #[cfg_attr(
+        not(target_os = "macos"),
+        allow(
+            dead_code,
+            reason = "Produced by native macOS menu or notification callbacks"
+        )
+    )]
     OpenSettings,
+    #[cfg_attr(
+        not(target_os = "macos"),
+        allow(
+            dead_code,
+            reason = "Produced by native macOS menu or notification callbacks"
+        )
+    )]
     Spawn(Option<AgentKind>),
 }
 struct WindowEntry {
     owner: SpawnOwner,
+    #[cfg(any(target_os = "macos", test))]
     canonical: std::sync::Weak<RwLock<SessionStore>>,
     navigation: std::rc::Weak<RefCell<WindowNavigation>>,
 }
@@ -121,6 +171,7 @@ impl WindowStore {
                 0,
                 WindowEntry {
                     owner: view.owner,
+                    #[cfg(any(target_os = "macos", test))]
                     canonical: Arc::downgrade(&view.canonical),
                     navigation: Rc::downgrade(&view.navigation),
                 },
@@ -128,6 +179,7 @@ impl WindowStore {
         });
         view
     }
+    #[cfg(any(target_os = "macos", test))]
     pub fn focused(canonical: &Arc<RwLock<SessionStore>>) -> Option<Self> {
         WINDOWS.with(|windows| {
             windows.borrow().iter().rev().find_map(|entry| {
@@ -141,6 +193,7 @@ impl WindowStore {
             })
         })
     }
+    #[cfg(any(target_os = "macos", test))]
     pub fn enqueue(&self, action: WindowAction) -> bool {
         let mut navigation = self.navigation.borrow_mut();
         if !navigation.live || navigation.actions.len() >= 16 {

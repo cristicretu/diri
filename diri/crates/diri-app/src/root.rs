@@ -1159,8 +1159,7 @@ impl RootView {
                 crate::macos::tab_gesture::TabGestureBridge::install(window)
         {
             let task = cx.spawn_in(window, async move |this, cx| {
-                while frames.changed().await.is_ok() {
-                    let frame = *frames.borrow_and_update();
+                while let Some(batch) = frames.recv().await {
                     if this
                         .update_in(cx, |this, window, cx| {
                             if window.is_window_active()
@@ -1182,7 +1181,13 @@ impl RootView {
                                 && let Some(surfaces) = &this.session_surfaces
                             {
                                 surfaces.update(cx, |surfaces, cx| {
-                                    surfaces.tab_gesture(frame, cx);
+                                    for sample in batch.iter() {
+                                        surfaces.tab_gesture_at(
+                                            sample.frame,
+                                            sample.observed_at,
+                                            cx,
+                                        );
+                                    }
                                     surfaces.sync_tab_peek_focus(window, cx);
                                 });
                             }

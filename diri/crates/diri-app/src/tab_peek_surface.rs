@@ -41,6 +41,10 @@ impl SessionSurfaces {
     }
 
     pub(super) fn dismiss_tab_peek(&mut self, cx: &mut Context<Self>) {
+        self.dismiss_tab_peek_at(cx.background_executor().now(), cx);
+    }
+
+    fn dismiss_tab_peek_at(&mut self, observed_at: std::time::Instant, cx: &mut Context<Self>) {
         if self.peek.is_closing() {
             return;
         }
@@ -58,8 +62,7 @@ impl SessionSurfaces {
             .extend(self.workspace_previews.elements());
         self.workspace_previews.clear();
         self.live_previews.clear();
-        self.peek
-            .animate_to(0.0, cx.background_executor().now(), cx.reduce_motion());
+        self.peek.animate_to(0.0, observed_at, cx.reduce_motion());
     }
 
     pub(crate) fn cancel_tab_peek_immediately(&mut self, cx: &mut Context<Self>) {
@@ -107,8 +110,17 @@ impl SessionSurfaces {
         }
     }
     pub(crate) fn tab_gesture(&mut self, frame: GestureFrame, cx: &mut Context<Self>) {
+        self.tab_gesture_at(frame, cx.background_executor().now(), cx);
+    }
+
+    pub(crate) fn tab_gesture_at(
+        &mut self,
+        frame: GestureFrame,
+        observed_at: std::time::Instant,
+        cx: &mut Context<Self>,
+    ) {
         if matches!(frame, GestureFrame::Cancelled) {
-            self.dismiss_tab_peek(cx);
+            self.dismiss_tab_peek_at(observed_at, cx);
             cx.notify();
             return;
         }
@@ -152,7 +164,7 @@ impl SessionSurfaces {
             self.closing_previews.clear();
         }
         self.peek
-            .update_animated(frame, cx.background_executor().now(), cx.reduce_motion());
+            .update_animated(frame, observed_at, cx.reduce_motion());
         if !self.peek.visible() {
             self.live_previews.clear();
         }
@@ -508,9 +520,7 @@ impl SessionSurfaces {
             .when(self.peek.visible(), |surface| surface.occlude())
             .opacity(self.peek.reveal())
             .overflow_hidden()
-            .bg(colors
-                .background
-                .alpha(if reduced { 1.0 } else { blend * 0.98 }))
+            .bg(colors.background.alpha(if reduced { 1.0 } else { blend }))
             .on_scroll_wheel(cx.listener(|this, _, _, cx| {
                 if this.peek.visible() {
                     cx.notify();
