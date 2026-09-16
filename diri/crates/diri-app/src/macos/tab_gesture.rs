@@ -49,6 +49,10 @@ define_class!(
 );
 impl GestureResponder {
     fn sample(&self, event: &NSEvent, cancelled: bool) {
+        if cancelled {
+            self.sample_contacts(Vec::new(), true);
+            return;
+        }
         let touches =
             event.touchesMatchingPhase_inView(NSTouchPhase::Touching, Some(&self.ivars().view));
         let contacts = touches
@@ -63,6 +67,10 @@ impl GestureResponder {
                 )
             })
             .collect();
+        self.sample_contacts(contacts, cancelled);
+    }
+
+    fn sample_contacts(&self, contacts: Vec<(u64, f32, f32)>, cancelled: bool) {
         if let Some(frame) = self.ivars().gesture.borrow_mut().sample_with_reverse(
             contacts,
             cancelled,
@@ -78,7 +86,7 @@ impl GestureResponder {
 pub(crate) struct TabGestureBridge {
     view: Retained<NSView>,
     responder: Retained<GestureResponder>,
-    previous: Option<Retained<NSResponder>>,
+    _previous: Option<Retained<NSResponder>>,
     previous_touch_types: NSTouchTypeMask,
 }
 impl TabGestureBridge {
@@ -110,6 +118,13 @@ impl TabGestureBridge {
         // GPUI guarantees this NSView remains valid for the window lifetime;
         // retain it so teardown remains safe even during window destruction.
         let view = unsafe { Retained::retain(handle.ns_view.as_ptr().cast::<NSView>()) }?;
+        Some(Self::install_view(marker, view))
+    }
+
+    fn install_view(
+        marker: MainThreadMarker,
+        view: Retained<NSView>,
+    ) -> (Self, tokio::sync::watch::Receiver<GestureFrame>) {
         let previous = unsafe { view.nextResponder() };
         let previous_touch_types = view.allowedTouchTypes();
         let (frames, receiver) = tokio::sync::watch::channel(GestureFrame::Cancelled);
@@ -125,15 +140,15 @@ impl TabGestureBridge {
             view.setNextResponder(Some(&responder));
         }
         view.setAllowedTouchTypes(previous_touch_types | NSTouchTypeMask::Indirect);
-        Some((
+        (
             Self {
                 view,
                 responder,
-                previous,
+                _previous: previous,
                 previous_touch_types,
             },
             receiver,
-        ))
+        )
     }
 }
 impl Drop for TabGestureBridge {
@@ -152,7 +167,7 @@ impl Drop for TabGestureBridge {
                     .as_deref()
                     .is_some_and(|next| std::ptr::eq(next, self.responder.as_super()))
                 {
-                    predecessor.setNextResponder(self.previous.as_deref());
+                    predecessor.setNextResponder(self.responder.nextResponder().as_deref());
                     break;
                 }
                 cursor = next;
@@ -165,4 +180,115 @@ impl Drop for TabGestureBridge {
             self.responder.setNextResponder(None);
         }
     }
+}
+
+#[cfg(test)]
+define_class!(
+    #[unsafe(super(NSResponder))]
+    #[thread_kind = MainThreadOnly]
+    #[ivars = Cell<usize>]
+    struct TouchForwarder;
+    unsafe impl NSObjectProtocol for TouchForwarder {}
+    impl TouchForwarder {
+        #[unsafe(method(touchesCancelledWithEvent:))]
+        fn cancelled(&self, _: &NSEvent) {
+            self.ivars().set(self.ivars().get()+1);
+        }
+    }
+);
+
+// A harness-free integration test runs this on the actual AppKit main thread.
+// Ordinary libtest worker threads cannot exercise this responder ownership seam.
+#[cfg(test)]
+#[allow(dead_code)]
+pub(crate) fn verify_appkit_bridge() {
+    let marker = MainThreadMarker::new().expect("AppKit test must run on the main thread");
+    let view = NSView::new(marker);
+    let previous = marker.alloc::<TouchForwarder>().set_ivars(Cell::new(0));
+    let previous: Retained<TouchForwarder> = unsafe { msg_send![super(previous), init] };
+    unsafe {
+        view.setNextResponder(Some(&previous));
+    }
+    let original_mask = view.allowedTouchTypes();
+    let (bridge, mut frames) = TabGestureBridge::install_view(marker, view.clone());
+    assert!(view.allowedTouchTypes().contains(NSTouchTypeMask::Indirect));
+    assert!(std::ptr::eq(
+        unsafe { view.nextResponder() }.as_deref().unwrap(),
+        bridge.responder.as_super()
+    ));
+    let contacts = |y| (1..=3).map(|id| (id, 0.5, y)).collect();
+    bridge.responder.sample_contacts(contacts(0.7), false);
+    assert!(!frames.has_changed().unwrap());
+    bridge.responder.sample_contacts(contacts(0.5), false);
+    assert!(
+        matches!(*frames.borrow_and_update(), GestureFrame::Tracking(distance) if (distance-240.0).abs()<0.01)
+    );
+    bridge.responder.sample_contacts(Vec::new(), false);
+    assert!(
+        matches!(*frames.borrow_and_update(), GestureFrame::Released(distance) if (distance-240.0).abs()<0.01)
+    );
+    bridge.set_revealed(true);
+    bridge.responder.sample_contacts(contacts(0.3), false);
+    bridge.responder.sample_contacts(contacts(0.5), false);
+    assert!(
+        matches!(*frames.borrow_and_update(), GestureFrame::Tracking(distance) if distance<0.0)
+    );
+    bridge.cancel();
+    assert_eq!(*frames.borrow_and_update(), GestureFrame::Cancelled);
+    let event = NSEvent::otherEventWithType_location_modifierFlags_timestamp_windowNumber_context_subtype_data1_data2(
+        objc2_app_kit::NSEventType::ApplicationDefined,
+        objc2_foundation::NSPoint::new(0.0, 0.0),
+        objc2_app_kit::NSEventModifierFlags::empty(),
+        0.0,
+        0,
+        None,
+        0,
+        0,
+        0,
+    ).unwrap();
+    unsafe {
+        let _: () = msg_send![&*view,touchesCancelledWithEvent:&*event];
+    }
+    assert_eq!(*frames.borrow_and_update(), GestureFrame::Cancelled);
+    assert_eq!(
+        previous.ivars().get(),
+        1,
+        "native NSView touch cancellation must reach and pass through Diri's responder"
+    );
+    // A component inserted after installation retains its responder and mask.
+    let inserted = NSResponder::new(marker);
+    unsafe {
+        inserted.setNextResponder(Some(&bridge.responder));
+        view.setNextResponder(Some(&inserted));
+    }
+    let changed_mask = if view.allowedTouchTypes() == NSTouchTypeMask::Indirect {
+        NSTouchTypeMask::Indirect | NSTouchTypeMask::Direct
+    } else {
+        NSTouchTypeMask::Indirect
+    };
+    view.setAllowedTouchTypes(changed_mask);
+    drop(bridge);
+    assert!(std::ptr::eq(
+        unsafe { view.nextResponder() }.as_deref().unwrap(),
+        inserted.as_ref()
+    ));
+    assert!(std::ptr::eq(
+        unsafe { inserted.nextResponder() }.as_deref().unwrap(),
+        previous.as_super()
+    ));
+    assert_eq!(view.allowedTouchTypes(), changed_mask);
+    // Unmodified ownership restores the exact original chain and allowed types.
+    view.setAllowedTouchTypes(original_mask);
+    let (bridge, _) = TabGestureBridge::install_view(marker, view.clone());
+    let inserted_below = NSResponder::new(marker);
+    unsafe {
+        inserted_below.setNextResponder(Some(&inserted));
+        bridge.responder.setNextResponder(Some(&inserted_below));
+    }
+    drop(bridge);
+    assert_eq!(view.allowedTouchTypes(), original_mask);
+    assert!(std::ptr::eq(
+        unsafe { view.nextResponder() }.as_deref().unwrap(),
+        inserted_below.as_ref()
+    ));
 }

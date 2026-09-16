@@ -8,7 +8,7 @@ use std::{
     collections::HashSet,
     sync::{
         Arc, Mutex,
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
     },
     time::{Duration, Instant},
 };
@@ -35,7 +35,7 @@ impl LiveWorkspace {
         let (manifests, _) =
             ManifestEngine::load_dir(&diri_engine::detect::bundled_manifest_dir()).unwrap();
         let registry = Arc::new(Mutex::new(Registry::new(Arc::new(manifests), &state)));
-        let script = r"stty -echo; printf ready > ready; while IFS= read -r line; do printf '\033[2J\033[H'; stty size > geometry; printf 'Actual PTY rows / columns: '; stty size; printf '\nThis is ordinary shell output. The terminal wraps this complete sentence at the width owned by this pane, including words that cross the right edge. No fixed screenshot grid is used here.\n\n$ '; done";
+        let script = r#"stty -echo; printf ready > ready; while IFS= read -r line; do printf '\033[2J\033[H'; stty size > geometry; printf 'Actual PTY rows / columns: '; stty size; printf 'Output update: %s\n' "$line"; printf '\nThis is ordinary shell output. The terminal wraps this complete sentence at the width owned by this pane, including words that cross the right edge. No fixed screenshot grid is used here.\n\n$ '; done"#;
         for (id, title) in [("build", "Build frontend"), ("review", "Review API")] {
             let cwd = directory.path().join(id);
             std::fs::create_dir(&cwd).unwrap();
@@ -208,18 +208,33 @@ impl LiveWorkspace {
         let stop = Arc::new(AtomicBool::new(false));
         let for_thread = stop.clone();
         let registry = self.registry.clone();
+        let ticks = Arc::new(AtomicU64::new(0));
+        let thread_ticks = ticks.clone();
         let thread = std::thread::spawn(move || {
-            while !for_thread.load(Ordering::Acquire) {
+            let started = Instant::now();
+            // Bound disposable evidence workloads even if a test event loop stalls.
+            let deadline = started + Duration::from_secs(30);
+            while !for_thread.load(Ordering::Acquire) && Instant::now() < deadline {
+                let tick = thread_ticks.fetch_add(1, Ordering::Relaxed);
+                let input = format!("update-{tick}\n");
                 {
                     let registry = registry.lock().unwrap();
                     for id in ["build", "review"] {
-                        registry.get(id).unwrap().write_input(b"show\n").unwrap();
+                        registry
+                            .get(id)
+                            .unwrap()
+                            .write_input(input.as_bytes())
+                            .unwrap();
                     }
                 }
-                std::thread::sleep(Duration::from_millis(20));
+                let next = started + Duration::from_millis(20 * (tick + 1));
+                if let Some(delay) = next.checked_duration_since(Instant::now()) {
+                    std::thread::sleep(delay);
+                }
             }
         });
         OutputDriver {
+            ticks,
             stop,
             thread: Some(thread),
         }
@@ -300,18 +315,29 @@ impl LiveWorkspace {
                 (usize::from(*cols), usize::from(*rows)),
                 "Engine terminal geometry matches the actual PTY"
             );
-            let actual =
-                std::fs::read_to_string(self.directory.path().join(&id.0).join("geometry"))
-                    .unwrap();
-            assert_eq!(
-                actual
+            let path = self.directory.path().join(&id.0).join("geometry");
+            let deadline = Instant::now() + Duration::from_secs(1);
+            loop {
+                // The live shell truncates/replaces this fixture probe at 50Hz.
+                // Read a complete matching observation, not the intermediate file.
+                let actual = std::fs::read_to_string(&path).unwrap_or_default();
+                let parsed = actual
                     .split_whitespace()
-                    .map(|value| value.parse::<u16>().unwrap())
-                    .collect::<Vec<_>>(),
-                [*rows, *cols],
-                "actual PTY geometry for {}",
-                id.0
-            );
+                    .map(str::parse::<u16>)
+                    .collect::<Result<Vec<_>, _>>();
+                if parsed.as_ref().is_ok_and(|size| size == &[*rows, *cols]) {
+                    break;
+                }
+                assert!(
+                    Instant::now() < deadline,
+                    "actual PTY geometry for {}: expected {} {}, got {:?}",
+                    id.0,
+                    rows,
+                    cols,
+                    actual
+                );
+                std::thread::sleep(Duration::from_millis(2));
+            }
         }
         self.verify_process_identity();
     }
@@ -370,8 +396,14 @@ impl Drop for HeldLaunch {
 }
 
 pub(crate) struct OutputDriver {
+    ticks: Arc<AtomicU64>,
     stop: Arc<AtomicBool>,
     thread: Option<std::thread::JoinHandle<()>>,
+}
+impl OutputDriver {
+    pub(crate) fn ticks(&self) -> u64 {
+        self.ticks.load(Ordering::Relaxed)
+    }
 }
 impl Drop for OutputDriver {
     fn drop(&mut self) {
