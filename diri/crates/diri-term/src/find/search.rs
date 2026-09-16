@@ -81,7 +81,7 @@ fn build_matches(query: &str, snapshot: &FindSnapshot, live: &GridBuffer) -> Vec
             }
             append_matches(
                 line,
-                None,
+                snapshot.text_cells.get(&index).map(Vec::as_slice),
                 absolute_row,
                 &needle,
                 &mut scratch,
@@ -94,7 +94,7 @@ fn build_matches(query: &str, snapshot: &FindSnapshot, live: &GridBuffer) -> Vec
         .unwrap_or(usize::MAX)
         .min(usize::from(live.rows));
     for row in 0..live_rows {
-        let Some((line, columns)) = live.row_text_with_columns(row) else {
+        let Some((line, columns)) = live.row_text_with_cell_ranges(row) else {
             continue;
         };
         append_matches(
@@ -114,7 +114,7 @@ fn build_matches(query: &str, snapshot: &FindSnapshot, live: &GridBuffer) -> Vec
 
 fn append_matches(
     line: &str,
-    columns: Option<&[usize]>,
+    columns: Option<&[[u16; 2]]>,
     absolute_row: i64,
     needle: &[char],
     scratch: &mut Vec<char>,
@@ -140,8 +140,12 @@ fn append_matches(
             }
             output.push_back(FindMatch {
                 absolute_row,
-                start_col: column_for(index, columns),
-                end_col_exclusive: column_past_end(index + needle.len(), columns),
+                start_col: columns
+                    .and_then(|ranges| ranges.get(index))
+                    .map_or(index, |range| usize::from(range[0])),
+                end_col_exclusive: columns
+                    .and_then(|ranges| ranges.get(index + needle.len() - 1))
+                    .map_or(index + needle.len(), |range| usize::from(range[1])),
             });
             // Preserve the existing non-overlapping navigation semantics.
             index += needle.len();
@@ -159,23 +163,42 @@ fn chars_equal(haystack: &[char], needle: &[char], case_sensitive: bool) -> bool
     })
 }
 
-fn column_for(index: usize, columns: Option<&[usize]>) -> usize {
-    columns.map_or(index, |columns| {
-        columns
-            .get(index)
-            .copied()
-            .or_else(|| columns.last().map(|last| last + 1))
-            .unwrap_or(index)
-    })
-}
-
-fn column_past_end(index: usize, columns: Option<&[usize]>) -> usize {
-    column_for(index, columns)
-}
-
 #[cfg(test)]
 mod qol_tests {
     use super::*;
+
+    #[test]
+    fn unicode_matches_cover_complete_cells_in_live_grid_and_history() {
+        let mut terminal = diri_terminal_state::HeadlessScreen::new(8, 2);
+        terminal.feed("<界> e\u{301}\r\nplain\r\n<界> e\u{301}".as_bytes());
+        let mut live = GridBuffer::default();
+        live.apply(terminal.full_snapshot());
+        let snapshot = FindSnapshot::from(terminal.scrollback());
+        for (query, start, end) in [
+            ("界", 1, 3),
+            ("<界>", 0, 4),
+            ("e", 5, 6),
+            ("e\u{301}", 5, 6),
+            ("\u{301}", 5, 6),
+        ] {
+            assert_eq!(
+                build_matches(query, &snapshot, &live),
+                vec![
+                    FindMatch {
+                        absolute_row: 0,
+                        start_col: start,
+                        end_col_exclusive: end
+                    },
+                    FindMatch {
+                        absolute_row: 2,
+                        start_col: start,
+                        end_col_exclusive: end
+                    },
+                ],
+                "query {query:?}"
+            );
+        }
+    }
     #[test]
     fn uppercase_query_is_exact_and_lowercase_folds_unicode() {
         let mut result = VecDeque::new();

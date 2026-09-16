@@ -707,6 +707,17 @@ activation, selection, copying, menus, paste review, export, and keyboard modes
 run in `diri-app` / `diri-term`. They do not execute SSH or change controller
 ownership. The existing local Engine RPC serves retained terminal rows.
 
+The local `session.read_scrollback` response includes optional sparse `textCells`
+row mappings from Unicode scalar indices to half-open terminal cell ranges.
+Text omits wide-glyph filler cells and retains combining marks; the mappings
+keep find highlights aligned with the original cells. Ordinary one-cell text
+omits this field. Clients accept an absent field using the older cell-aligned
+text contract. This is an additive local control response, with no Helper
+protocol, controller, snapshot, or history-budget change. Live-grid search uses
+the existing annotations and the same `unicode-width` 0.2.2 width rules as the
+shared parser; making that existing transitive dependency direct in `diri-term`
+avoids a separate, inconsistent width table.
+
 The shared terminal parser additionally retains OSC 8 targets, soft-wrap facts,
 wide-cell continuation facts, combining characters, and OSC 133 A prompt-start
 marks. These are terminal screen facts; the Holder does not infer commands,
