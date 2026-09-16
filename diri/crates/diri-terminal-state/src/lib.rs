@@ -1662,6 +1662,38 @@ mod tests {
     }
 
     #[test]
+    fn first_alternate_screen_matches_a_previously_initialized_screen() {
+        for mode in [47, 1047, 1049] {
+            let mut fresh = HeadlessScreen::new(80, 24);
+            let mut initialized = HeadlessScreen::new(80, 24);
+            initialized.feed(b"\x1b[?1049h\x1b[?1049l");
+            for size in [(40, 10), (120, 30), (12, 3)] {
+                fresh.resize(size.0, size.1);
+                initialized.resize(size.0, size.1);
+                let enter = format!("\x1b[?{mode}h");
+                let leave = format!("\x1b[?{mode}l");
+                for bytes in [
+                    b"primary\r\n\x1b[31mstyled\x1b[0m\x1b7".as_slice(),
+                    enter.as_bytes(),
+                    "alternate: 界e\u{301}\r\nnext".as_bytes(),
+                    leave.as_bytes(),
+                    b"\x1b8!",
+                    enter.as_bytes(),
+                    b"\x1bc", // RIS while the alternate screen is active.
+                    b"after reset",
+                    leave.as_bytes(),
+                ] {
+                    fresh.feed(bytes);
+                    initialized.feed(bytes);
+                    assert_eq!(fresh.full_snapshot(), initialized.full_snapshot());
+                    assert_eq!(fresh.lines(), initialized.lines());
+                    assert_eq!(fresh.is_alt_screen(), initialized.is_alt_screen());
+                }
+            }
+        }
+    }
+
+    #[test]
     fn incremental_grid_matches_fresh_snapshots_through_damage_and_resize() {
         let mut screen = HeadlessScreen::new(24, 8);
         let mut mirror = Vec::new();
