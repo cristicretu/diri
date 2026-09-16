@@ -90,7 +90,15 @@ impl FindSearchScheduler {
             return ReadCompletion::Ignore;
         }
 
-        if let Some(next) = self.pending.take() {
+        // Same-query refreshes must not starve a slow but immutable capture.
+        // Only a changed query/lifetime discards the completed source.
+        if self.pending.as_ref().is_some_and(|next| {
+            next.generation != request.generation
+                || next.query != request.query
+                || !snapshot_available
+                || active.cancelled
+        }) && let Some(next) = self.pending.take()
+        {
             self.start_read(next.clone());
             return ReadCompletion::Read(next);
         }
@@ -155,6 +163,21 @@ mod tests {
         model
             .take_due_search(at.saturating_add(SEARCH_DEBOUNCE))
             .expect("query search should be due")
+    }
+
+    #[test]
+    fn slow_immutable_capture_is_scanned_before_same_query_refresh() {
+        let mut model = TerminalFindModel::retained();
+        let first = next_request(&mut model, "needle", Duration::ZERO);
+        let mut scheduler = FindSearchScheduler::default();
+        assert_eq!(scheduler.schedule(first.clone()), Some(first.clone()));
+        assert!(model.on_output(Duration::from_secs(1)));
+        let refresh = model.take_due_search(Duration::from_secs(2)).unwrap();
+        assert!(scheduler.schedule(refresh.clone()).is_none());
+        assert_eq!(scheduler.finish_read(&first, true), ReadCompletion::Scan);
+        let completion = scheduler.finish_scan(&first).unwrap();
+        assert!(completion.should_apply_result());
+        assert_eq!(completion.into_next_request(), Some(refresh));
     }
 
     #[test]

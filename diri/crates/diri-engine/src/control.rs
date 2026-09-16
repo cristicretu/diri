@@ -561,6 +561,7 @@ impl ControlServer {
                         | Method::HOST_USAGE
                         | Method::HOST_LIST_DIRECTORIES
                         | Method::SESSION_READ_DIFF
+                        | Method::SESSION_CAPTURE_FIND
                         | Method::SESSION_READ_SCROLLBACK_CELLS
                         | Method::SESSION_KILL
                         | Method::SESSION_REMOVE
@@ -767,6 +768,7 @@ impl ControlServer {
             Method::SESSION_SEND_TEXT => self.session_send_text(params),
             Method::SESSION_RESIZE => self.session_resize(params),
             Method::SESSION_READ_SCREEN => self.session_read_screen(params),
+            Method::SESSION_CAPTURE_FIND => self.session_capture_find(params),
             Method::SESSION_READ_SCROLLBACK => self.session_read_scrollback(params),
             Method::SESSION_READ_SCROLLBACK_CELLS => self.session_read_scrollback_cells(params),
             Method::SESSION_KILL => self.session_kill(params),
@@ -1962,6 +1964,18 @@ impl ControlServer {
             cols: cols as i64,
             rows: rows as i64,
         })
+    }
+
+    fn session_capture_find(&self, params: Option<JsonValue>) -> Result<JsonValue, ControlError> {
+        let p: diri_proto::SessionIdParams = decode(params)?;
+        let reader = {
+            let registry = self.registry.lock().map_err(poisoned)?;
+            registry
+                .get(&p.session_id.0)
+                .ok_or_else(|| ControlError::not_found(p.session_id.0.clone()))?
+                .scrollback_reader()
+        };
+        encode(&reader.capture_find()?)
     }
 
     fn session_read_scrollback(
@@ -4020,6 +4034,7 @@ const MAX_PROBE_CHARS: usize = 20;
 mod tests {
     use super::*;
 
+    mod find_capture_tests;
     mod reconnect_tests;
 
     #[test]

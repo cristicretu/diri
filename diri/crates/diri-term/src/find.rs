@@ -1,5 +1,6 @@
 //! Debounced, capped find over daemon history plus the authoritative live grid.
 
+use std::sync::Arc;
 use std::time::Duration;
 
 use diri_proto::methods::ReadScrollbackResult;
@@ -7,7 +8,9 @@ use diri_proto::methods::ReadScrollbackResult;
 use crate::buffer::GridBuffer;
 use crate::scrollback::ScrollbackViewport;
 
+mod retained;
 mod scheduler;
+pub use retained::{FindCapturePermit, FindReservation, RetainedFindSnapshot};
 mod search;
 
 pub use scheduler::{FindSearchScheduler, ReadCompletion, ScanCompletion};
@@ -35,6 +38,8 @@ pub struct FindSpan {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct FindSnapshot {
+    pub error: Option<String>,
+    pub retained: Option<Arc<RetainedFindSnapshot>>,
     pub lines: Vec<String>,
     pub text_cells: std::collections::BTreeMap<usize, Vec<[u16; 2]>>,
     pub first_row: i64,
@@ -48,6 +53,8 @@ pub struct FindSnapshot {
 impl From<ReadScrollbackResult> for FindSnapshot {
     fn from(result: ReadScrollbackResult) -> Self {
         Self {
+            error: None,
+            retained: None,
             lines: result.lines,
             text_cells: result.text_cells,
             first_row: result.first_row,
@@ -56,6 +63,40 @@ impl From<ReadScrollbackResult> for FindSnapshot {
             rows: result.rows,
             content_seq: result.content_seq,
             is_alt_screen: result.is_alt_screen,
+        }
+    }
+}
+
+impl FindSnapshot {
+    pub fn failure(error: impl Into<String>) -> Self {
+        Self {
+            error: Some(error.into()),
+            retained: None,
+            lines: Vec::new(),
+            text_cells: Default::default(),
+            first_row: 0,
+            visible_start_row: 0,
+            cols: 0,
+            rows: 0,
+            content_seq: 0,
+            is_alt_screen: false,
+        }
+    }
+}
+
+impl From<Arc<RetainedFindSnapshot>> for FindSnapshot {
+    fn from(source: Arc<RetainedFindSnapshot>) -> Self {
+        Self {
+            error: None,
+            lines: Vec::new(),
+            text_cells: Default::default(),
+            first_row: source.first_row,
+            visible_start_row: source.live_start_row,
+            cols: source.cols as i64,
+            rows: source.visible_rows as i64,
+            content_seq: source.content_seq,
+            is_alt_screen: source.is_alt_screen,
+            retained: Some(source),
         }
     }
 }
@@ -76,6 +117,12 @@ pub enum NavigationTarget {
 #[derive(Clone, Debug, Default)]
 pub struct TerminalFindModel {
     query: String,
+    retained_mode: bool,
+    reservation: Option<Arc<FindReservation>>,
+    source: Option<Arc<RetainedFindSnapshot>>,
+    paused: bool,
+    newer_output: bool,
+    error: Option<String>,
     matches: Vec<FindMatch>,
     current_index: usize,
     is_alt_screen: bool,
@@ -89,6 +136,60 @@ pub struct TerminalFindModel {
 }
 
 impl TerminalFindModel {
+    pub fn retained() -> Self {
+        Self {
+            retained_mode: true,
+            ..Self::default()
+        }
+    }
+    pub fn retained_highlights(&self) -> Option<(&Arc<RetainedFindSnapshot>, &[FindMatch], usize)> {
+        self.source
+            .as_ref()
+            .map(|source| (source, self.matches.as_slice(), self.current_index))
+    }
+    pub fn uses_retained_capture(&self) -> bool {
+        self.retained_mode
+    }
+    pub fn is_paused(&self) -> bool {
+        self.paused
+    }
+    pub fn has_newer_output(&self) -> bool {
+        self.newer_output
+    }
+    pub fn is_partial(&self) -> bool {
+        self.source.as_ref().is_some_and(|s| s.partial) || self.matches.len() == MATCH_CAP
+    }
+    pub fn error(&self) -> Option<&str> {
+        self.error.as_deref()
+    }
+    pub fn set_error(&mut self, error: String) {
+        self.error = Some(error);
+    }
+    pub fn reservation(&mut self) -> Option<Arc<FindReservation>> {
+        if self.reservation.is_none() {
+            self.reservation = FindReservation::acquire();
+        }
+        self.reservation.clone()
+    }
+    pub fn paused_source(&self) -> Option<Arc<RetainedFindSnapshot>> {
+        self.paused.then(|| self.source.clone()).flatten()
+    }
+    pub fn refresh(&mut self, now: Duration) {
+        self.paused = false;
+        self.error = None;
+        self.generation = self.generation.wrapping_add(1);
+        self.rescan_due = None;
+        if !self.query.is_empty() {
+            self.search_due = Some(now);
+        }
+    }
+    pub fn output_rescan_delay(&self) -> Duration {
+        if self.retained_mode {
+            Duration::from_secs(1)
+        } else {
+            OUTPUT_RESCAN_DELAY
+        }
+    }
     #[must_use]
     pub fn query(&self) -> &str {
         &self.query
@@ -120,6 +221,7 @@ impl TerminalFindModel {
             return false;
         }
         self.query = query;
+        self.error = None;
         self.generation = self.generation.wrapping_add(1);
         self.rescan_due = None;
         self.matches.clear();
@@ -138,6 +240,14 @@ impl TerminalFindModel {
     pub fn on_output(&mut self, now: Duration) -> bool {
         if self.query.is_empty() {
             return false;
+        }
+        self.newer_output = true;
+        if self.retained_mode {
+            if self.paused || self.search_due.is_some() || self.rescan_due.is_some() {
+                return false;
+            }
+            self.rescan_due = Some(now.saturating_add(self.output_rescan_delay()));
+            return true;
         }
         // Content is part of a search generation. Any job that captured the
         // previous live grid must not overwrite a newer screen when it returns.
@@ -181,8 +291,11 @@ impl TerminalFindModel {
         snapshot: FindSnapshot,
         live: &GridBuffer,
     ) -> Option<SearchJob> {
-        self.is_current(request)
-            .then(|| SearchJob::new(request.clone(), snapshot, live.clone()))
+        self.is_current(request).then(|| {
+            let live =
+                (snapshot.retained.is_none() && snapshot.error.is_none()).then(|| live.clone());
+            SearchJob::new(request.clone(), snapshot, live)
+        })
     }
 
     /// Discards stale background results and preserves the current index only
@@ -197,18 +310,41 @@ impl TerminalFindModel {
         }
         let sequence_changed = self.cached_content_seq != Some(result.content_seq)
             || self.cached_cols != Some(result.cols);
+        if let Some(error) = result.error {
+            self.error = Some(error);
+            return true;
+        }
+        if self
+            .source
+            .as_ref()
+            .zip(result.source.as_ref())
+            .is_some_and(|(old, new)| old.owner != new.owner)
+        {
+            self.error = Some("Session changed. Reopen Find to search its current output".into());
+            return true;
+        }
+        if self.paused && self.source.as_ref() != result.source.as_ref() {
+            return false;
+        }
+        self.error = None;
+        if !self.paused {
+            self.newer_output = false;
+        }
+        self.source = result.source;
         self.matches = result.matches;
         self.is_alt_screen = result.is_alt_screen;
         self.cached_visible_start_row = Some(result.visible_start_row);
         self.cached_rows = usize::try_from(result.rows.max(0)).unwrap_or(usize::MAX);
         self.cached_content_seq = Some(result.content_seq);
         self.cached_cols = Some(result.cols);
-        viewport.apply_geometry(
-            result.visible_start_row,
-            result.visible_start_row.max(0),
-            result.content_seq,
-            self.cached_rows,
-        );
+        if !self.retained_mode {
+            viewport.apply_geometry(
+                result.visible_start_row,
+                result.visible_start_row.max(0),
+                result.content_seq,
+                self.cached_rows,
+            );
+        }
 
         if result.request.is_rescan && !sequence_changed {
             self.current_index = self.current_index.min(self.matches.len().saturating_sub(1));
@@ -223,6 +359,71 @@ impl TerminalFindModel {
                 .unwrap_or(0);
         }
         true
+    }
+
+    pub fn visible_spans_with_live(
+        &self,
+        viewport: &ScrollbackViewport,
+        live: &GridBuffer,
+    ) -> Vec<FindSpan> {
+        let Some(source) = &self.source else {
+            return self.visible_spans(viewport);
+        };
+        let pinned = viewport.has_find_source(source);
+        self.matches
+            .iter()
+            .enumerate()
+            .filter_map(|(index, item)| {
+                if !pinned && !source.matches_live_row(item.absolute_row, live) {
+                    return None;
+                }
+                let top = if pinned {
+                    viewport.absolute_row(0)
+                } else {
+                    source.live_start_row
+                };
+                let row = usize::try_from(item.absolute_row.checked_sub(top)?).ok()?;
+                (row < usize::from(live.rows)).then_some(FindSpan {
+                    row,
+                    start_col: item.start_col,
+                    end_col_exclusive: item.end_col_exclusive,
+                    is_current: index == self.current_index,
+                })
+            })
+            .collect()
+    }
+    pub fn navigate_with_live(
+        &mut self,
+        backwards: bool,
+        viewport: &mut ScrollbackViewport,
+        live: &GridBuffer,
+    ) -> Option<NavigationTarget> {
+        let Some(source) = self.source.clone() else {
+            return if backwards {
+                self.previous(viewport)
+            } else {
+                self.next(viewport)
+            };
+        };
+        if self.matches.is_empty() {
+            return None;
+        }
+        let direction = if backwards { -1 } else { 1 };
+        self.current_index = (self.current_index as isize + direction)
+            .rem_euclid(self.matches.len() as isize) as usize;
+        let item = &self.matches[self.current_index];
+        if !self.paused && source.matches_live_row(item.absolute_row, live) {
+            viewport.clear_find_source();
+            viewport.scroll_to_live(usize::from(live.rows));
+            return Some(NavigationTarget::Live);
+        }
+        self.paused = true;
+        self.rescan_due = None;
+        viewport.pin_find_source(source, item.absolute_row, usize::from(live.rows));
+        Some(NavigationTarget::History {
+            absolute_row: item.absolute_row,
+            anchor: HISTORY_ANCHOR,
+        })
     }
 
     fn is_current(&self, request: &SearchRequest) -> bool {
@@ -315,6 +516,8 @@ mod tests {
 
     fn snapshot(lines: Vec<String>, alt: bool) -> FindSnapshot {
         FindSnapshot {
+            error: None,
+            retained: None,
             text_cells: Default::default(),
             lines,
             first_row: 0,
@@ -482,6 +685,8 @@ mod tests {
             &mut model,
             "a",
             FindSnapshot {
+                error: None,
+                retained: None,
                 visible_start_row: 600,
                 ..snapshot(lines.clone(), false)
             },
@@ -497,6 +702,8 @@ mod tests {
             &mut model,
             "a",
             FindSnapshot {
+                error: None,
+                retained: None,
                 visible_start_row: 600,
                 ..snapshot(lines, true)
             },
@@ -505,6 +712,39 @@ mod tests {
         );
         assert_eq!(model.matches().len(), 1);
         assert!(model.is_alt_screen());
+    }
+
+    #[test]
+    fn continuous_output_does_not_starve_a_stable_live_match_behind_slow_history_reads() {
+        let mut model = TerminalFindModel::retained();
+        model.set_query("needle", Duration::ZERO);
+        let mut viewport = ScrollbackViewport::default();
+        let mut in_flight: Option<(Duration, SearchRequest)> = None;
+        for tick in 1..=100 {
+            let now = Duration::from_millis(tick * 20);
+            let live = live_buffer(&["needle", &format!("output {tick}"), ""], 20);
+            model.on_output(now);
+            if in_flight.as_ref().is_some_and(|(due, _)| *due <= now) {
+                let (_, request) = in_flight.take().unwrap();
+                if let Some(job) =
+                    model.prepare_search(&request, snapshot(Vec::new(), false), &live)
+                {
+                    model.apply_result(job.run(), &mut viewport);
+                }
+            }
+            if in_flight.is_none()
+                && let Some(request) = model.take_due_search(now)
+            {
+                in_flight = Some((now + Duration::from_millis(40), request));
+            }
+        }
+        assert!(
+            model
+                .matches()
+                .iter()
+                .any(|hit| hit.start_col == 0 && hit.end_col_exclusive == 6),
+            "a query must remain usable when history responses take longer than the output interval"
+        );
     }
 
     #[test]
@@ -559,6 +799,8 @@ mod tests {
             .prepare_search(
                 &new_request,
                 FindSnapshot {
+                    error: None,
+                    retained: None,
                     content_seq: 2,
                     ..snapshot(Vec::new(), false)
                 },

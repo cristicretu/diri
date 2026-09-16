@@ -261,6 +261,8 @@ impl PromptInputState {
 /// The state the pump thread and the outside world share.
 struct Shared {
     id: String,
+    find_owner: String,
+    find_capture_revision: AtomicU64,
     status: Mutex<SessionStatus>,
     needs_input: Mutex<Option<NeedsInputDetail>>,
     last_turn_completed_at: Mutex<Option<diri_proto::DateMillis>>,
@@ -487,6 +489,41 @@ pub(crate) struct ScrollbackReader {
 }
 
 impl ScrollbackReader {
+    pub(crate) fn capture_find(
+        self,
+    ) -> Result<diri_proto::CaptureFindResult, diri_proto::ControlError> {
+        if self.remote.is_some() {
+            return Err(diri_proto::ControlError::new(
+                "find_capture_unavailable",
+                "Retained history search is not available on this remote transport",
+            ));
+        }
+        let screen = self.shared.screen.lock().expect("screen");
+        let (cols, visible_rows) = screen.size();
+        if cols.saturating_mul(visible_rows) > diri_proto::FIND_CAPTURE_MAX_CELLS {
+            return Err(diri_proto::ControlError::new(
+                "find_capture_too_large",
+                "This terminal is too large for a retained search view",
+            ));
+        }
+        let cells = screen
+            .find_capture_cells()
+            .map_err(|error| diri_proto::ControlError::new("find_capture_too_large", error))?;
+        let first = cells.first_row;
+        Ok(diri_proto::CaptureFindResult {
+            owner: self.shared.find_owner.clone(),
+            capture_revision: self
+                .shared
+                .find_capture_revision
+                .fetch_add(1, Ordering::Relaxed),
+            session_id: diri_proto::SessionId(self.shared.id.clone()),
+            is_alt_screen: screen.is_alt_screen(),
+            visible_rows,
+            partial: first > 0,
+            cells,
+        })
+    }
+
     pub(crate) fn read(
         self,
         first_row: i64,
@@ -2040,6 +2077,16 @@ fn new_shared(
         .map(|event| event.occurred_at);
     Arc::new(Shared {
         id: spec.id.clone(),
+        find_owner: {
+            static NEXT: AtomicU64 = AtomicU64::new(1);
+            let stamp = SystemTime::now()
+                .duration_since(SystemTime::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos();
+            let serial = NEXT.fetch_add(1, Ordering::Relaxed);
+            format!("{}-{stamp}-{serial}", std::process::id())
+        },
+        find_capture_revision: AtomicU64::new(0),
         status: Mutex::new(initial_status),
         needs_input: Mutex::new(initial_detail),
         last_turn_completed_at: Mutex::new(initial_completion),

@@ -307,7 +307,7 @@ async fn exercise_native(
 }
 
 #[test]
-#[ignore = "native Metal Find geometry with disposable PTYs paused before query; optional DIRI_FIND_CAPTURES"]
+#[ignore = "native Metal Find geometry under continuous disposable PTY output; optional DIRI_FIND_CAPTURES"]
 fn real_pty_find_preserves_geometry_across_fonts_and_widths() {
     let output_dir = std::env::var_os("DIRI_FIND_CAPTURES").map(std::path::PathBuf::from);
     if let Some(directory) = &output_dir {
@@ -411,12 +411,7 @@ fn real_pty_find_preserves_geometry_across_fonts_and_widths() {
             })
             .unwrap();
         fixture.verify_geometry(&[(id.clone(), original.0, original.1)]);
-        let output_ticks = output.ticks();
-        // Isolate geometry/composition acceptance from the separately recorded
-        // continuous-output search invalidation regression. The captured cells
-        // still come from a real PTY and its actual resized shell output.
-        drop(output);
-        settle!();
+        let initial_ticks = output.ticks();
         key!("cmd-f");
         key!("界");
         settle!();
@@ -426,7 +421,7 @@ fn real_pty_find_preserves_geometry_across_fonts_and_widths() {
                 assert_eq!(resident.find_query.text(), "界");
                 assert!(
                     !resident.find.as_ref().unwrap().matches().is_empty(),
-                    "real Engine snapshot search after fixture output settles: {:?}; scheduler={:?}",
+                    "real Engine retained search under continuous output: {:?}; scheduler={:?}",
                     resident.find,
                     resident.find_scheduler
                 );
@@ -439,6 +434,81 @@ fn real_pty_find_preserves_geometry_across_fonts_and_widths() {
                 .save(directory.join(format!("{name}-wide-glyph.png")))
                 .unwrap();
         }
+        let before_refresh = window
+            .update(&mut cx, |pane, _, _| {
+                let find = pane.residents[&id].find.as_ref().unwrap();
+                assert!(!find.is_paused());
+                find.retained_highlights().unwrap().0.capture_revision
+            })
+            .unwrap();
+        settle!();
+        settle!();
+        window
+            .update(&mut cx, |pane, _, _| {
+                let find = pane.residents[&id].find.as_ref().unwrap();
+                assert!(!find.is_paused());
+                assert!(
+                    find.retained_highlights().unwrap().0.capture_revision > before_refresh,
+                    "automatically selected live hit continues to refresh"
+                );
+            })
+            .unwrap();
+        key!("shift-enter");
+        let pinned = window
+            .update(&mut cx, |pane, _, _| {
+                let find = pane.residents[&id].find.as_ref().unwrap();
+                assert!(
+                    find.is_paused(),
+                    "explicit previous history hit pauses its source"
+                );
+                let (source, hits, index) = find.retained_highlights().unwrap();
+                assert!(
+                    source
+                        .row_text(hits[index].absolute_row)
+                        .unwrap()
+                        .0
+                        .contains('界')
+                );
+                (source.capture_revision, hits[index].clone())
+            })
+            .unwrap();
+        settle!();
+        settle!();
+        window
+            .update(&mut cx, |pane, _, _| {
+                let find = pane.residents[&id].find.as_ref().unwrap();
+                assert!(find.has_newer_output());
+                let (source, hits, index) = find.retained_highlights().unwrap();
+                assert_eq!(
+                    (source.capture_revision, hits[index].clone()),
+                    pinned,
+                    "continuous output must not retarget the user's selected history hit"
+                );
+            })
+            .unwrap();
+        if let Some(directory) = &output_dir {
+            cx.capture_screenshot(window.into())
+                .unwrap()
+                .save(directory.join(format!("{name}-paused.png")))
+                .unwrap();
+        }
+        window
+            .update(&mut cx, |pane, _, cx| {
+                if width > 500.0 {
+                    pane.return_to_live(&id, cx);
+                } else {
+                    pane.refresh_find(cx);
+                }
+            })
+            .unwrap();
+        settle!();
+        window
+            .update(&mut cx, |pane, _, _| {
+                let find = pane.residents[&id].find.as_ref().unwrap();
+                assert!(!find.is_paused());
+                assert!(find.retained_highlights().unwrap().0.capture_revision > pinned.0);
+            })
+            .unwrap();
         key!("cmd-a");
         key!("e");
         // Combining mark is an input callback unit; this dispatch uses the
@@ -459,7 +529,20 @@ fn real_pty_find_preserves_geometry_across_fonts_and_widths() {
             .update(&mut cx, |pane, _, _| {
                 let resident = &pane.residents[&id];
                 assert_eq!(resident.find_query.text(), "e\u{301}");
-                assert!(!resident.find.as_ref().unwrap().matches().is_empty());
+                let find = resident.find.as_ref().unwrap();
+                assert!(
+                    !find.matches().is_empty(),
+                    "query={:?} paused={} error={:?} source={:?} scheduler={:?}",
+                    find.query(),
+                    find.is_paused(),
+                    find.error(),
+                    find.retained_highlights().map(|(source, _, _)| (
+                        source.capture_revision,
+                        source.cols,
+                        source.row_count()
+                    )),
+                    resident.find_scheduler
+                );
                 assert_eq!(resident.last_size, original);
             })
             .unwrap();
@@ -469,13 +552,31 @@ fn real_pty_find_preserves_geometry_across_fonts_and_widths() {
                 .save(directory.join(format!("{name}-combining.png")))
                 .unwrap();
         }
+        let retained = window
+            .update(&mut cx, |pane, _, _| {
+                Arc::downgrade(
+                    pane.residents[&id]
+                        .find
+                        .as_ref()
+                        .unwrap()
+                        .retained_highlights()
+                        .unwrap()
+                        .0,
+                )
+            })
+            .unwrap();
         key!("escape");
         settle!();
+        assert!(
+            retained.upgrade().is_none(),
+            "closing Find releases the retained reading/highlight source"
+        );
         fixture.verify_geometry(&[(id.clone(), original.0, original.1)]);
         assert!(
-            output_ticks >= 20,
-            "fixture exercised live PTY output before pausing"
+            output.ticks() > initial_ticks + 20,
+            "PTY output continued while both Unicode searches completed"
         );
+        drop(output);
         cx.update_window(window.into(), |_, window, _| window.remove_window())
             .unwrap();
         cx.run_until_parked();

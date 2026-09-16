@@ -665,6 +665,16 @@ impl DaemonClient {
             .await
     }
 
+    /// Captures bounded styled rows from a local Engine session atomically.
+    /// Remote sessions return an explicit unsupported-capability error.
+    pub async fn capture_find(
+        &self,
+        session_id: &SessionId,
+    ) -> Result<diri_proto::CaptureFindResult, ClientError> {
+        self.typed(Method::SESSION_CAPTURE_FIND, &session_params(session_id))
+            .await
+    }
+
     pub async fn read_scrollback(
         &self,
         session_id: &SessionId,

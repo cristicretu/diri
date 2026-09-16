@@ -23,3 +23,7 @@ harness = false
 [[bench]]
 name = "reading_view"
 harness = false
+
+[[bench]]
+name = "find_retained"
+harness = false
