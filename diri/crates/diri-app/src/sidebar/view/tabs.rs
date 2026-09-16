@@ -68,10 +68,29 @@ impl Sidebar {
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let colors = self.colors();
-        if self.workspace_nav.active.is_some() {
+        let strip = if self.workspace_nav.active.is_some() {
             self.workspace_nav.available_width = available_width;
-            return self.workspace_strip(colors, cx);
-        }
+            self.workspace_strip(colors, cx)
+        } else {
+            self.session_tab_strip(available_width, colors, cx)
+        };
+        // The workspace menu floats under the strip here rather than inside
+        // the (hidden) sidebar, so choosing a workspace never reveals it.
+        div()
+            .flex_none()
+            .w_full()
+            .h(px(TAB_STRIP_HEIGHT))
+            .child(strip)
+            .children(self.floating_workspace_popup(colors, cx))
+            .into_any_element()
+    }
+
+    fn session_tab_strip(
+        &mut self,
+        available_width: f32,
+        colors: SemanticColors,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
         let (tabs, selected) = {
             let mut store = self.store.write().expect("store");
             let selected = store.selected_session_id().cloned();

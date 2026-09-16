@@ -6999,7 +6999,9 @@ impl Render for Sidebar {
         if let Some(popover) = self.popover(colors, window, cx) {
             root = root.child(popover);
         }
-        if let Some(menu) = self.workspace_popup(colors, cx) {
+        if self.tab_orientation() != crate::store::TabOrientation::Horizontal
+            && let Some(menu) = self.workspace_popup(colors, cx)
+        {
             root = root.child(menu);
         }
         if let Some(card) = self.hover_card(colors) {

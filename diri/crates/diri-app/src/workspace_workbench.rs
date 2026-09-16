@@ -945,7 +945,9 @@ impl Render for WorkspaceWorkbench {
                             cx.notify();
                         })),
                 );
-            if geometry.focused.pane == pane.identity.pane {
+            // A single pane has nothing to disambiguate; the focus bar only
+            // earns its place once the tab is split.
+            if geometry.panes.len() > 1 && geometry.focused.pane == pane.identity.pane {
                 surface = surface.child(
                     div()
                         .absolute()

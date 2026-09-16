@@ -2051,7 +2051,16 @@ impl RootView {
                 cx.notify();
             }
             CommandId::ToggleSidebar => {
-                self.sidebar.update(cx, |sidebar, cx| sidebar.toggle(cx));
+                // With horizontal tabs there is no sidebar to toggle; ⌘B
+                // reaches the workspace menu that lives in the tab strip.
+                if self.sidebar.read(cx).tab_orientation()
+                    == crate::store::TabOrientation::Horizontal
+                {
+                    self.sidebar
+                        .update(cx, |sidebar, cx| sidebar.toggle_workspace_menu(window, cx));
+                } else {
+                    self.sidebar.update(cx, |sidebar, cx| sidebar.toggle(cx));
+                }
             }
             CommandId::FocusSidebar => {
                 if self.launcher.read(cx).is_open() {
@@ -5006,6 +5015,103 @@ mod tests {
                 .geometry_for_test()),
             original
         );
+    }
+
+    #[gpui::test]
+    fn horizontal_workspace_picker_and_cmd_b_open_the_menu_without_revealing_the_sidebar(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        cx.update(|cx| {
+            cx.set_reduce_motion(true);
+            commands::bind_keys(cx, &Default::default());
+        });
+        let services = test_services();
+        let fixture = SidebarPreviewFixture::make(PreviewScenario::Typical);
+        let selected = fixture.selected_session_id.unwrap();
+        {
+            let mut store = services.store.store.write().unwrap();
+            store.hydrate(fixture.list);
+            store.select(selected);
+        }
+        let (root, cx) = cx.add_window_view(move |window, cx| {
+            RootView::new(services, false, PreviewScenario::Empty, window, cx)
+        });
+        cx.simulate_resize(size(px(1000.0), px(700.0)));
+        root.update_in(cx, |root, window, cx| {
+            root.run_command(CommandId::HorizontalTabs, window, cx)
+        });
+        cx.run_until_parked();
+        root.read_with(cx, |root, cx| {
+            let sidebar = root.sidebar.read(cx);
+            assert!(!sidebar.is_visible());
+            assert!(!sidebar.workspace_menu_is_open());
+        });
+        assert!(cx.debug_bounds("workspace-menu").is_none());
+
+        // The picker pill opens the floating menu; the sidebar stays put.
+        let picker = cx.debug_bounds("workspace-picker").unwrap();
+        cx.simulate_click(picker.center(), Modifiers::default());
+        cx.executor().advance_clock(Duration::from_millis(300));
+        cx.run_until_parked();
+        root.read_with(cx, |root, cx| {
+            let sidebar = root.sidebar.read(cx);
+            assert!(sidebar.workspace_menu_is_open());
+            assert!(!sidebar.is_peeking(), "picker must not peek the sidebar");
+            assert!(!sidebar.is_visible());
+        });
+        let menu = cx.debug_bounds("workspace-menu").unwrap();
+        assert!(
+            menu.origin.y >= picker.bottom() - px(8.0),
+            "menu hangs under the picker: {menu:?} vs {picker:?}"
+        );
+        assert!(cx.debug_bounds("workspace-menu-new-session").is_some());
+        assert!(cx.debug_bounds("workspace-menu-add-remote-host").is_some());
+
+        // Typing lands in the filter field without the sidebar's key handler.
+        cx.simulate_keystrokes("q a");
+        cx.run_until_parked();
+        root.read_with(cx, |root, cx| {
+            assert_eq!(root.sidebar.read(cx).workspace_query_for_test(), "qa");
+        });
+        cx.simulate_keystrokes("escape");
+        cx.run_until_parked();
+        root.read_with(cx, |root, cx| {
+            assert!(!root.sidebar.read(cx).workspace_menu_is_open());
+        });
+        assert!(cx.debug_bounds("workspace-menu").is_none());
+
+        // ⌘B reaches the same menu instead of toggling a sidebar that is not
+        // part of the horizontal layout.
+        cx.simulate_keystrokes(&commands::test_chords("cmd-b"));
+        cx.run_until_parked();
+        root.read_with(cx, |root, cx| {
+            let sidebar = root.sidebar.read(cx);
+            assert!(sidebar.workspace_menu_is_open());
+            assert!(!sidebar.is_visible(), "⌘B must not reveal the sidebar");
+            assert!(!sidebar.is_peeking());
+        });
+        assert!(cx.debug_bounds("workspace-menu").is_some());
+        cx.simulate_keystrokes(&commands::test_chords("cmd-b"));
+        cx.run_until_parked();
+        root.read_with(cx, |root, cx| {
+            let sidebar = root.sidebar.read(cx);
+            assert!(!sidebar.workspace_menu_is_open());
+            assert!(!sidebar.is_visible());
+        });
+
+        // Vertical tabs keep ⌘B as the sidebar toggle.
+        root.update_in(cx, |root, window, cx| {
+            root.run_command(CommandId::VerticalTabs, window, cx)
+        });
+        cx.run_until_parked();
+        assert!(root.read_with(cx, |root, cx| root.sidebar.read(cx).is_visible()));
+        cx.simulate_keystrokes(&commands::test_chords("cmd-b"));
+        cx.run_until_parked();
+        root.read_with(cx, |root, cx| {
+            let sidebar = root.sidebar.read(cx);
+            assert!(!sidebar.is_visible());
+            assert!(!sidebar.workspace_menu_is_open());
+        });
     }
 
     #[gpui::test]

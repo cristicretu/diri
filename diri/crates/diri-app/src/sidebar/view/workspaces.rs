@@ -1,9 +1,13 @@
 mod groups;
 use super::*;
+use crate::store::TabOrientation;
 use diri_proto::workspace::{
     DockEdge, PaneId, TabId, WorkspaceId, WorkspaceMutation, WorkspaceRecord,
 };
+use gpui::{Div, Stateful};
 use groups::{WorkspaceRowKey, project_groups};
+
+const WORKSPACE_MENU_WIDTH: f32 = 272.0;
 
 #[derive(Clone)]
 struct DraggedWorkspaceTab {
@@ -402,6 +406,26 @@ impl Sidebar {
                 if event.keystroke.key == "enter" {
                     self.activate_workspace(target, cx);
                 }
+            } else if event.keystroke.key == "enter" {
+                // "Filter or create": a query that matches nothing becomes
+                // the new workspace's name, as in the explicit editor.
+                let name = self.workspace_nav.query.text().trim().to_owned();
+                if !name.is_empty()
+                    && self
+                        .store
+                        .write()
+                        .expect("store")
+                        .edit_workspace(WorkspaceMutation::CreateWorkspace { name })
+                {
+                    self.workspace_nav.awaiting_create = Some(
+                        self.store
+                            .read()
+                            .expect("store")
+                            .workspace_catalog()
+                            .create_request_id,
+                    );
+                    self.workspace_nav.query.clear();
+                }
             }
             cx.stop_propagation();
             cx.notify();
@@ -447,7 +471,11 @@ impl Sidebar {
                 self.workspace_nav.menu = false;
                 self.workspace_nav.editor = None;
                 self.workspace_nav.destination = None;
-                self.focus_handle.focus(window, cx);
+                if self.tab_orientation() == TabOrientation::Horizontal {
+                    cx.emit(SidebarEvent::FocusTerminal);
+                } else {
+                    self.focus_handle.focus(window, cx);
+                }
             }
             "enter" if self.workspace_nav.editor.is_some() => {
                 let name = self.workspace_nav.query.text().trim().to_owned();
@@ -585,13 +613,7 @@ impl Sidebar {
             .child(sf_symbol("chevron.down", 8.0, colors.tertiary))
             .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
             .on_click(cx.listener(|this, _, window, cx| {
-                this.workspace_nav.menu = !this.workspace_nav.menu;
-                this.workspace_nav.query.clear();
-                this.workspace_nav.editor = None;
-                this.workspace_nav.destination = None;
-                this.workspace_nav.focus.focus(window, cx);
-                this.peek(window, cx);
-                cx.notify();
+                this.toggle_workspace_menu(window, cx);
             }))
             .into_any_element()
     }
@@ -920,43 +942,122 @@ impl Sidebar {
 }
 
 impl Sidebar {
+    /// Opens or closes the workspace menu from the picker pill or ⌘B. In
+    /// horizontal mode the menu floats under the tab strip, so the sidebar is
+    /// never revealed just to host it.
+    pub(crate) fn toggle_workspace_menu(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.workspace_nav.menu = !self.workspace_nav.menu;
+        self.workspace_nav.query.clear();
+        self.workspace_nav.editor = None;
+        self.workspace_nav.destination = None;
+        if self.workspace_nav.menu {
+            self.workspace_nav.focus.focus(window, cx);
+            if self.tab_orientation() != TabOrientation::Horizontal {
+                self.peek(window, cx);
+            }
+        } else if self.tab_orientation() == TabOrientation::Horizontal {
+            cx.emit(SidebarEvent::FocusTerminal);
+        } else {
+            self.focus_handle.focus(window, cx);
+        }
+        cx.notify();
+    }
+
+    #[cfg(test)]
+    pub(crate) fn workspace_query_for_test(&self) -> String {
+        self.workspace_nav.query.text().to_owned()
+    }
+
+    /// The menu as rendered inside the sidebar (vertical tabs). Horizontal
+    /// tabs use [`Self::floating_workspace_popup`] instead.
     pub(super) fn workspace_popup(
         &mut self,
         colors: SemanticColors,
         cx: &mut Context<Self>,
     ) -> Option<AnyElement> {
+        let panel = self.workspace_menu_panel(colors, cx)?;
+        Some(
+            panel
+                .absolute()
+                .top(px(78.0))
+                .left(px(8.0))
+                .right(px(8.0))
+                .into_any_element(),
+        )
+    }
+
+    /// The menu anchored under the workspace pill in the horizontal tab strip.
+    /// Deferred so it paints above the terminal instead of being clipped by
+    /// the strip, and closes on any click outside it.
+    pub(super) fn floating_workspace_popup(
+        &mut self,
+        colors: SemanticColors,
+        cx: &mut Context<Self>,
+    ) -> Option<AnyElement> {
+        let panel = self.workspace_menu_panel(colors, cx)?;
+        let left = if cfg!(target_os = "macos") && !self.ui.visible {
+            84.0
+        } else {
+            10.0
+        };
+        Some(
+            deferred(
+                anchored()
+                    .position(point(
+                        px(left),
+                        px(crate::tab_navigation::TAB_STRIP_HEIGHT - 4.0),
+                    ))
+                    .anchor(Anchor::TopLeft)
+                    .snap_to_window_with_margin(px(8.0))
+                    .child(panel.w(px(WORKSPACE_MENU_WIDTH))),
+            )
+            .with_priority(1)
+            .into_any_element(),
+        )
+    }
+
+    fn workspace_menu_panel(
+        &mut self,
+        colors: SemanticColors,
+        cx: &mut Context<Self>,
+    ) -> Option<Stateful<Div>> {
         if !self.workspace_nav.menu {
             return None;
         }
         let store = self.store.read().expect("store");
         let catalog = store.workspace_catalog();
+        let hairline = colors.primary.alpha(0.08);
         let mut panel = div()
             .id("workspace-menu")
             .debug_selector(|| "workspace-menu".into())
-            .absolute()
-            .top(px(78.0))
-            .left(px(8.0))
-            .right(px(8.0))
             .max_h(px(480.0))
             .flex()
             .flex_col()
-            .gap(px(5.0))
-            .p(px(8.0))
-            .rounded(px(11.0))
+            .p(px(6.0))
+            .rounded(px(Radius::PANEL))
             .border_1()
             .border_color(colors.primary.alpha(0.10))
             .bg(colors.background)
             .shadow_lg()
+            .text_color(colors.primary)
             .occlude()
             .track_focus(&self.workspace_nav.focus)
+            .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+            .on_key_down(cx.listener(|this, event, window, cx| {
+                this.workspace_key(event, window, cx);
+            }))
             .on_mouse_down_out(cx.listener(|this, _, _, cx| {
                 this.workspace_nav.menu = false;
+                this.workspace_nav.editor = None;
+                this.workspace_nav.destination = None;
                 cx.notify();
             }));
         match catalog.status() {
             crate::store::WorkspaceCatalogStatus::Loading => {
                 panel = panel.child(
                     div()
+                        .px(px(8.0))
+                        .py(px(6.0))
                         .text_size(px(12.0))
                         .text_color(colors.secondary)
                         .child("Loading workspaces…"),
@@ -966,6 +1067,8 @@ impl Sidebar {
                 panel = panel
                     .child(
                         div()
+                            .px(px(8.0))
+                            .py(px(6.0))
                             .text_size(px(12.0))
                             .text_color(colors.secondary)
                             .child(detail.clone()),
@@ -976,7 +1079,12 @@ impl Sidebar {
                             .role(Role::Button)
                             .aria_label("Retry loading workspaces")
                             .cursor_pointer()
-                            .p(px(6.0))
+                            .h(px(30.0))
+                            .px(px(8.0))
+                            .flex()
+                            .items_center()
+                            .rounded(px(Radius::ROW))
+                            .hover(move |row| row.bg(colors.primary.alpha(0.06)))
                             .text_size(px(12.0))
                             .child("Retry")
                             .on_click(cx.listener(|this, _, _, cx| {
@@ -984,37 +1092,35 @@ impl Sidebar {
                                 cx.notify();
                             })),
                     );
-                return Some(panel.into_any_element());
+                return Some(panel);
             }
             crate::store::WorkspaceCatalogStatus::Ready => {}
         }
         if let Some(error) = &catalog.error {
             panel = panel.child(
                 div()
+                    .px(px(8.0))
+                    .py(px(4.0))
                     .text_size(px(11.0))
                     .text_color(colors.secondary)
                     .child(error.clone()),
             );
         }
-        let heading = if matches!(
+        let editing = self.workspace_nav.editor.is_some();
+        let picking = self.workspace_nav.destination.is_some();
+        let (heading, placeholder) = if matches!(
             self.workspace_nav.editor,
             Some(WorkspaceEditor::RenameTab(_))
         ) {
-            "Tab name"
-        } else if self.workspace_nav.editor.is_some() {
-            "Workspace name"
-        } else if self.workspace_nav.destination.is_some() {
-            "Find a session"
+            ("Tab name", "Tab name")
+        } else if editing {
+            ("Workspace name", "Workspace name")
+        } else if picking {
+            ("Find a session", "Find a session…")
         } else {
-            "Workspaces"
+            ("Workspaces", "Filter or create…")
         };
-        panel = panel.child(
-            div()
-                .text_size(px(11.0))
-                .text_color(colors.tertiary)
-                .px(px(5.0))
-                .child(heading),
-        );
+        let query_empty = self.workspace_nav.query.is_empty();
         panel = panel.child(
             div()
                 .id("workspace-query")
@@ -1022,48 +1128,63 @@ impl Sidebar {
                 .role(Role::TextInput)
                 .aria_label(heading)
                 .h(px(30.0))
-                .px(px(7.0))
+                .mb(px(4.0))
+                .px(px(9.0))
                 .flex()
                 .items_center()
-                .rounded(px(6.0))
+                .gap(px(7.0))
+                .rounded(px(Radius::ROW))
                 .bg(colors.primary.alpha(0.05))
+                .border_1()
+                .border_color(colors.primary.alpha(0.07))
                 .text_size(px(12.0))
                 .overflow_hidden()
-                .child(query_label(&self.workspace_nav.query))
+                .child(sf_symbol("magnifyingglass", 11.0, colors.tertiary))
+                .child(
+                    div()
+                        .flex_1()
+                        .min_w(px(0.0))
+                        .overflow_hidden()
+                        .when(query_empty, |field| {
+                            field.text_color(colors.tertiary).child(placeholder)
+                        })
+                        .when(!query_empty, |field| {
+                            field.child(query_label(&self.workspace_nav.query))
+                        }),
+                )
                 .on_click(
                     cx.listener(|this, _, window, cx| this.workspace_nav.focus.focus(window, cx)),
                 ),
         );
-        if self.workspace_nav.editor.is_some() {
+        if editing {
             panel = panel.child(
                 div()
-                    .px(px(5.0))
+                    .px(px(8.0))
                     .py(px(6.0))
                     .text_size(px(11.0))
                     .text_color(colors.tertiary)
                     .child("Return to save · Escape to cancel"),
             );
-            return Some(panel.into_any_element());
+            return Some(panel);
         }
         let query = self.workspace_nav.query.text().trim().to_lowercase();
-        if self.workspace_nav.destination.is_some() {
-            panel = panel.child(
-                div()
-                    .px(px(5.0))
-                    .text_size(px(10.0))
-                    .text_color(colors.tertiary)
-                    .child("↑ ↓ to choose · Return to add"),
-            );
-        }
         let mut choices = div()
             .id("workspace-menu-choices")
             .track_scroll(&self.workspace_nav.menu_scroll)
             .flex()
             .flex_col()
             .min_h(px(0.0))
-            .max_h(px(330.0))
+            .max_h(px(300.0))
             .overflow_y_scroll();
         if let Some(destination) = &self.workspace_nav.destination {
+            panel = panel.child(
+                div()
+                    .px(px(8.0))
+                    .pb(px(4.0))
+                    .text_size(px(10.0))
+                    .text_color(colors.tertiary)
+                    .child("↑ ↓ to choose · Return to add"),
+            );
             if let SessionDestination::Split { tab, pane, edge } = destination {
                 let right = *edge == DockEdge::Right;
                 let tab = tab.clone();
@@ -1073,8 +1194,13 @@ impl Sidebar {
                         .id("workspace-split-direction")
                         .role(Role::Button)
                         .aria_label("Change split direction")
-                        .p(px(6.0))
+                        .h(px(28.0))
+                        .px(px(8.0))
+                        .flex()
+                        .items_center()
+                        .rounded(px(Radius::ROW))
                         .cursor_pointer()
+                        .hover(move |row| row.bg(colors.primary.alpha(0.06)))
                         .text_size(px(12.0))
                         .child(if right {
                             "Side by side  ↔"
@@ -1108,7 +1234,8 @@ impl Sidebar {
             if sessions.is_empty() {
                 choices = choices.child(
                     div()
-                        .p(px(7.0))
+                        .px(px(8.0))
+                        .py(px(7.0))
                         .text_size(px(12.0))
                         .text_color(colors.secondary)
                         .child("No matching sessions"),
@@ -1131,9 +1258,9 @@ impl Sidebar {
                         .aria_label(format!("Add {title}"))
                         .aria_selected(selected)
                         .when(selected, |row| row.bg(colors.primary.alpha(0.08)))
-                        .px(px(7.0))
-                        .py(px(6.0))
-                        .rounded(px(6.0))
+                        .px(px(8.0))
+                        .py(px(5.0))
+                        .rounded(px(Radius::ROW))
                         .cursor_pointer()
                         .hover(move |row| row.bg(colors.primary.alpha(0.06)))
                         .child(
@@ -1156,219 +1283,337 @@ impl Sidebar {
                         })),
                 );
             }
-        } else {
-            let targets = workspace_menu_targets(catalog.snapshot(), &query);
-            if self
-                .workspace_nav
-                .highlighted_workspace
-                .as_ref()
-                .is_none_or(|id| !targets.contains(id))
-            {
-                self.workspace_nav.highlighted_workspace = targets.first().cloned();
-            }
-            if targets.contains(&None) {
-                choices = choices.child(
-                    div()
-                        .id("workspace-all-sessions")
-                        .role(Role::Button)
-                        .aria_label("Browse all sessions")
-                        .bg(if self.workspace_nav.highlighted_workspace == Some(None) {
-                            colors.primary.alpha(0.10)
-                        } else {
-                            colors.primary.alpha(0.0)
-                        })
-                        .h(px(30.0))
-                        .px(px(7.0))
-                        .flex()
-                        .items_center()
-                        .text_size(px(12.0))
-                        .rounded(px(6.0))
-                        .cursor_pointer()
-                        .hover(move |row| row.bg(colors.primary.alpha(0.06)))
-                        .child("All sessions")
-                        .on_click(cx.listener(|this, _, _, cx| this.activate_workspace(None, cx))),
-                );
-            }
-            if let Some(snapshot) = catalog.snapshot() {
-                for workspace in &snapshot.workspaces {
-                    if !workspace.name.to_lowercase().contains(&query) {
-                        continue;
-                    }
-                    let id = workspace.id.clone();
-                    let rename_id = id.clone();
-                    let name = workspace.name.clone();
-                    let rename_name = name.clone();
-                    choices = choices.child(
-                        div()
-                            .id(SharedString::from(format!("choose-workspace-{}", id.0)))
-                            .role(Role::Button)
-                            .aria_label(name.clone())
-                            .bg(
-                                if self.workspace_nav.highlighted_workspace
-                                    == Some(Some(id.clone()))
-                                {
-                                    colors.primary.alpha(0.10)
-                                } else {
-                                    colors.primary.alpha(0.0)
-                                },
-                            )
-                            .h(px(32.0))
-                            .px(px(7.0))
-                            .flex()
-                            .items_center()
-                            .gap(px(5.0))
-                            .rounded(px(6.0))
-                            .cursor_pointer()
-                            .hover(move |row| row.bg(colors.primary.alpha(0.06)))
-                            .child(
-                                div()
-                                    .flex_1()
-                                    .min_w(px(0.0))
-                                    .overflow_hidden()
-                                    .text_ellipsis()
-                                    .text_size(px(12.0))
-                                    .child(name),
-                            )
-                            .child(
-                                div()
-                                    .text_size(px(10.0))
-                                    .text_color(colors.tertiary)
-                                    .child(workspace.tabs.len().to_string()),
-                            )
-                            .child(
-                                div()
-                                    .id(SharedString::from(format!("rename-workspace-{}", id.0)))
-                                    .role(Role::Button)
-                                    .aria_label("Rename workspace")
-                                    .size(px(20.0))
-                                    .flex()
-                                    .items_center()
-                                    .justify_center()
-                                    .child(sf_symbol("pencil", 10.0, colors.tertiary))
-                                    .on_click(cx.listener(move |this, _, window, cx| {
-                                        this.begin_workspace_editor(
-                                            WorkspaceEditor::Rename(rename_id.clone()),
-                                            &rename_name,
-                                            window,
-                                            cx,
-                                        );
-                                        cx.stop_propagation();
-                                    })),
-                            )
-                            .drag_over::<DraggedWorkspaceTab>(move |row, _, _, _| {
-                                row.bg(colors.primary.alpha(0.12))
-                            })
-                            .on_drop(cx.listener({
-                                let destination = id.clone();
-                                let index = workspace.tabs.len();
-                                move |this, dragged: &DraggedWorkspaceTab, _, cx| {
-                                    this.move_workspace_tab(dragged, destination.clone(), index, cx)
-                                }
-                            }))
-                            .on_click(cx.listener(move |this, _, _, cx| {
-                                this.activate_workspace(Some(id.clone()), cx)
-                            })),
-                    );
-                }
-            }
-            if let Some(snapshot) = catalog.snapshot()
-                && let Some(index) = snapshot
-                    .workspaces
-                    .iter()
-                    .position(|workspace| Some(&workspace.id) == self.workspace_nav.active.as_ref())
-            {
-                let workspace = &snapshot.workspaces[index];
-                let mut actions = div().flex().items_center().gap(px(4.0)).pt(px(5.0));
-                for (label, icon, mutation, enabled) in [
-                    (
-                        "Move workspace up",
-                        "arrow.up",
-                        WorkspaceMutation::MoveWorkspace {
-                            workspace_id: workspace.id.clone(),
-                            index: index.saturating_sub(1),
-                        },
-                        index > 0,
-                    ),
-                    (
-                        "Move workspace down",
-                        "arrow.down",
-                        WorkspaceMutation::MoveWorkspace {
-                            workspace_id: workspace.id.clone(),
-                            index: index + 1,
-                        },
-                        index + 1 < snapshot.workspaces.len(),
-                    ),
-                    (
-                        "Remove workspace",
-                        "trash",
-                        WorkspaceMutation::RemoveWorkspace {
-                            workspace_id: workspace.id.clone(),
-                        },
-                        true,
-                    ),
-                ] {
-                    actions = actions.child(
-                        div()
-                            .id(SharedString::from(label))
-                            .role(Role::Button)
-                            .aria_label(label)
-                            .h(px(28.0))
-                            .px(px(8.0))
-                            .flex()
-                            .items_center()
-                            .gap(px(5.0))
-                            .rounded(px(5.0))
-                            .opacity(if enabled { 1.0 } else { 0.35 })
-                            .when(enabled, |button| {
-                                button
-                                    .cursor_pointer()
-                                    .hover(move |button| button.bg(colors.primary.alpha(0.07)))
-                            })
-                            .child(sf_symbol(icon, 11.0, colors.secondary))
-                            .when(label == "Remove workspace", |button| {
-                                button.child(div().text_size(px(11.0)).child("Remove"))
-                            })
-                            .on_click(cx.listener(move |this, _, _, cx| {
-                                if enabled {
-                                    this.store
-                                        .write()
-                                        .expect("store")
-                                        .edit_workspace(mutation.clone());
-                                    cx.notify();
-                                }
-                            })),
-                    );
-                }
-                panel = panel.child(actions).child(
-                    div()
-                        .px(px(5.0))
-                        .text_size(px(10.0))
-                        .text_color(colors.tertiary)
-                        .child("Removing a workspace keeps its sessions running."),
-                );
-            }
-            panel = panel.child(
+            panel = panel.child(choices);
+            return Some(panel);
+        }
+
+        let targets = workspace_menu_targets(catalog.snapshot(), &query);
+        if self
+            .workspace_nav
+            .highlighted_workspace
+            .as_ref()
+            .is_none_or(|id| !targets.contains(id))
+        {
+            self.workspace_nav.highlighted_workspace = targets.first().cloned();
+        }
+        if targets.contains(&None) {
+            let active = self.workspace_nav.active.is_none();
+            let highlighted = self.workspace_nav.highlighted_workspace == Some(None);
+            choices = choices.child(
                 div()
-                    .id("new-workspace")
+                    .id("workspace-all-sessions")
                     .role(Role::Button)
-                    .aria_label("Create workspace")
+                    .aria_label("Browse all sessions")
+                    .aria_selected(active)
                     .h(px(30.0))
-                    .px(px(7.0))
+                    .px(px(8.0))
                     .flex()
                     .items_center()
-                    .gap(px(7.0))
-                    .rounded(px(6.0))
+                    .gap(px(8.0))
+                    .rounded(px(Radius::ROW))
                     .cursor_pointer()
+                    .when(highlighted, |row| row.bg(colors.primary.alpha(0.10)))
                     .hover(move |row| row.bg(colors.primary.alpha(0.06)))
-                    .child(sf_symbol("plus", 11.0, colors.secondary))
-                    .child(div().text_size(px(12.0)).child("New workspace"))
-                    .on_click(cx.listener(|this, _, window, cx| {
-                        this.begin_workspace_editor(WorkspaceEditor::Create, "", window, cx)
-                    })),
+                    .child(
+                        div()
+                            .w(px(14.0))
+                            .flex_none()
+                            .flex()
+                            .justify_center()
+                            .when(active, |slot| {
+                                slot.child(sf_symbol("checkmark", 10.0, colors.primary))
+                            }),
+                    )
+                    .child(div().flex_1().text_size(px(12.5)).child("All sessions"))
+                    .on_click(cx.listener(|this, _, _, cx| this.activate_workspace(None, cx))),
+            );
+        }
+        if let Some(snapshot) = catalog.snapshot() {
+            for workspace in &snapshot.workspaces {
+                if !workspace.name.to_lowercase().contains(&query) {
+                    continue;
+                }
+                let id = workspace.id.clone();
+                let rename_id = id.clone();
+                let name = workspace.name.clone();
+                let rename_name = name.clone();
+                let active = self.workspace_nav.active.as_ref() == Some(&id);
+                let highlighted =
+                    self.workspace_nav.highlighted_workspace == Some(Some(id.clone()));
+                let group = SharedString::from(format!("workspace-row-{}", id.0));
+                choices = choices.child(
+                    div()
+                        .id(SharedString::from(format!("choose-workspace-{}", id.0)))
+                        .group(group.clone())
+                        .role(Role::Button)
+                        .aria_label(name.clone())
+                        .aria_selected(active)
+                        .h(px(30.0))
+                        .px(px(8.0))
+                        .flex()
+                        .items_center()
+                        .gap(px(8.0))
+                        .rounded(px(Radius::ROW))
+                        .cursor_pointer()
+                        .when(highlighted, |row| row.bg(colors.primary.alpha(0.10)))
+                        .hover(move |row| row.bg(colors.primary.alpha(0.06)))
+                        .child(
+                            div()
+                                .w(px(14.0))
+                                .flex_none()
+                                .flex()
+                                .justify_center()
+                                .when(active, |slot| {
+                                    slot.child(sf_symbol("checkmark", 10.0, colors.primary))
+                                }),
+                        )
+                        .child(
+                            div()
+                                .flex_1()
+                                .min_w(px(0.0))
+                                .overflow_hidden()
+                                .text_ellipsis()
+                                .text_size(px(12.5))
+                                .child(name),
+                        )
+                        .child(
+                            div()
+                                .text_size(px(10.5))
+                                .text_color(colors.tertiary)
+                                .group_hover(group.clone(), |count| count.invisible())
+                                .child(workspace.tabs.len().to_string()),
+                        )
+                        .child(
+                            div()
+                                .id(SharedString::from(format!("rename-workspace-{}", id.0)))
+                                .role(Role::Button)
+                                .aria_label("Rename workspace")
+                                .absolute()
+                                .right(px(6.0))
+                                .size(px(20.0))
+                                .flex()
+                                .items_center()
+                                .justify_center()
+                                .rounded(px(Radius::CHIP))
+                                .invisible()
+                                .group_hover(group, |button| button.visible())
+                                .hover(move |button| button.bg(colors.primary.alpha(0.08)))
+                                .child(sf_symbol("pencil", 10.0, colors.secondary))
+                                .on_click(cx.listener(move |this, _, window, cx| {
+                                    this.begin_workspace_editor(
+                                        WorkspaceEditor::Rename(rename_id.clone()),
+                                        &rename_name,
+                                        window,
+                                        cx,
+                                    );
+                                    cx.stop_propagation();
+                                })),
+                        )
+                        .drag_over::<DraggedWorkspaceTab>(move |row, _, _, _| {
+                            row.bg(colors.primary.alpha(0.12))
+                        })
+                        .on_drop(cx.listener({
+                            let destination = id.clone();
+                            let index = workspace.tabs.len();
+                            move |this, dragged: &DraggedWorkspaceTab, _, cx| {
+                                this.move_workspace_tab(dragged, destination.clone(), index, cx)
+                            }
+                        }))
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            this.activate_workspace(Some(id.clone()), cx)
+                        })),
+                );
+            }
+        }
+        if targets.is_empty() && !query.is_empty() {
+            choices = choices.child(
+                div()
+                    .px(px(8.0))
+                    .py(px(6.0))
+                    .text_size(px(11.0))
+                    .text_color(colors.tertiary)
+                    .child(format!(
+                        "Return creates “{}”",
+                        self.workspace_nav.query.text().trim()
+                    )),
             );
         }
         panel = panel.child(choices);
-        Some(panel.into_any_element())
+
+        if let Some(snapshot) = catalog.snapshot()
+            && let Some(index) = snapshot
+                .workspaces
+                .iter()
+                .position(|workspace| Some(&workspace.id) == self.workspace_nav.active.as_ref())
+        {
+            let workspace = &snapshot.workspaces[index];
+            let mut actions = div()
+                .flex()
+                .items_center()
+                .gap(px(2.0))
+                .px(px(2.0))
+                .pt(px(4.0))
+                .child(
+                    div()
+                        .flex_1()
+                        .px(px(6.0))
+                        .text_size(px(10.5))
+                        .text_color(colors.tertiary)
+                        .overflow_hidden()
+                        .text_ellipsis()
+                        .child(workspace.name.clone()),
+                );
+            for (label, icon, mutation, enabled) in [
+                (
+                    "Move workspace up",
+                    "arrow.up",
+                    WorkspaceMutation::MoveWorkspace {
+                        workspace_id: workspace.id.clone(),
+                        index: index.saturating_sub(1),
+                    },
+                    index > 0,
+                ),
+                (
+                    "Move workspace down",
+                    "arrow.down",
+                    WorkspaceMutation::MoveWorkspace {
+                        workspace_id: workspace.id.clone(),
+                        index: index + 1,
+                    },
+                    index + 1 < snapshot.workspaces.len(),
+                ),
+                (
+                    "Remove workspace",
+                    "trash",
+                    WorkspaceMutation::RemoveWorkspace {
+                        workspace_id: workspace.id.clone(),
+                    },
+                    true,
+                ),
+            ] {
+                actions = actions.child(
+                    div()
+                        .id(SharedString::from(label))
+                        .role(Role::Button)
+                        .aria_label(label)
+                        .size(px(24.0))
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .rounded(px(Radius::CHIP))
+                        .opacity(if enabled { 1.0 } else { 0.35 })
+                        .when(enabled, |button| {
+                            button
+                                .cursor_pointer()
+                                .hover(move |button| button.bg(colors.primary.alpha(0.07)))
+                        })
+                        .child(sf_symbol(icon, 11.0, colors.secondary))
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            if enabled {
+                                this.store
+                                    .write()
+                                    .expect("store")
+                                    .edit_workspace(mutation.clone());
+                                cx.notify();
+                            }
+                        })),
+                );
+            }
+            panel = panel.child(actions);
+        }
+
+        panel = panel.child(div().h(px(1.0)).mx(px(4.0)).my(px(5.0)).bg(hairline));
+        panel = panel.child(
+            div()
+                .id("workspace-menu-new-session")
+                .debug_selector(|| "workspace-menu-new-session".into())
+                .role(Role::Button)
+                .aria_label("New session")
+                .h(px(30.0))
+                .px(px(8.0))
+                .flex()
+                .items_center()
+                .gap(px(8.0))
+                .rounded(px(Radius::ROW))
+                .cursor_pointer()
+                .hover(move |row| row.bg(colors.primary.alpha(0.06)))
+                .child(
+                    div()
+                        .w(px(14.0))
+                        .flex_none()
+                        .flex()
+                        .justify_center()
+                        .child(sf_symbol("terminal", 11.0, colors.secondary)),
+                )
+                .child(div().flex_1().text_size(px(12.5)).child("New Session"))
+                .child(
+                    div()
+                        .text_size(px(10.5))
+                        .text_color(colors.tertiary)
+                        .child("⌘N"),
+                )
+                .on_click(cx.listener(|this, _, window, cx| {
+                    this.workspace_nav.menu = false;
+                    cx.notify();
+                    window.dispatch_action(Box::new(crate::commands::OpenLauncher), cx);
+                })),
+        );
+        panel = panel.child(
+            div()
+                .id("new-workspace")
+                .role(Role::Button)
+                .aria_label("Create workspace")
+                .h(px(30.0))
+                .px(px(8.0))
+                .flex()
+                .items_center()
+                .gap(px(8.0))
+                .rounded(px(Radius::ROW))
+                .cursor_pointer()
+                .hover(move |row| row.bg(colors.primary.alpha(0.06)))
+                .child(
+                    div()
+                        .w(px(14.0))
+                        .flex_none()
+                        .flex()
+                        .justify_center()
+                        .child(sf_symbol("plus", 11.0, colors.secondary)),
+                )
+                .child(div().flex_1().text_size(px(12.5)).child("New Workspace"))
+                .on_click(cx.listener(|this, _, window, cx| {
+                    this.begin_workspace_editor(WorkspaceEditor::Create, "", window, cx)
+                })),
+        );
+        panel = panel.child(
+            div()
+                .id("workspace-menu-add-remote-host")
+                .debug_selector(|| "workspace-menu-add-remote-host".into())
+                .role(Role::Button)
+                .aria_label("Add remote host")
+                .h(px(30.0))
+                .px(px(8.0))
+                .flex()
+                .items_center()
+                .gap(px(8.0))
+                .rounded(px(Radius::ROW))
+                .cursor_pointer()
+                .hover(move |row| row.bg(colors.primary.alpha(0.06)))
+                .child(
+                    div()
+                        .w(px(14.0))
+                        .flex_none()
+                        .flex()
+                        .justify_center()
+                        .child(sf_symbol("server.rack", 11.0, colors.secondary)),
+                )
+                .child(div().flex_1().text_size(px(12.5)).child("Add Remote Host…"))
+                .on_click(cx.listener(|this, _, _, cx| {
+                    this.workspace_nav.menu = false;
+                    cx.notify();
+                    cx.emit(SidebarEvent::AddRemoteHost);
+                })),
+        );
+        Some(panel)
     }
 
     pub(super) fn workspace_strip(
