@@ -92,6 +92,7 @@ pub enum IconName {
     Server,
     Settings,
     Sidebar,
+    Toolbar,
     SidebarRight,
     Sparkle,
     Stack,
@@ -107,7 +108,7 @@ pub enum IconName {
 }
 
 impl IconName {
-    pub const ALL: [Self; 58] = [
+    pub const ALL: [Self; 59] = [
         Self::Account,
         Self::Activity,
         Self::Archive,
@@ -154,6 +155,7 @@ impl IconName {
         Self::Server,
         Self::Settings,
         Self::Sidebar,
+        Self::Toolbar,
         Self::SidebarRight,
         Self::Sparkle,
         Self::Stack,
@@ -216,6 +218,7 @@ impl IconName {
             Self::Server => "icons/server.svg",
             Self::Settings => "icons/settings.svg",
             Self::Sidebar => "icons/sidebar.svg",
+            Self::Toolbar => "icons/toolbar.svg",
             Self::SidebarRight => "icons/sidebar-right.svg",
             Self::Sparkle => "icons/sparkle.svg",
             Self::Split => "icons/split.svg",
@@ -284,6 +287,7 @@ impl IconName {
             "server.rack" => Self::Server,
             "gearshape" => Self::Settings,
             "sidebar.left" => Self::Sidebar,
+            "rectangle.topthird.inset.filled" => Self::Toolbar,
             "sidebar.right" => Self::SidebarRight,
             "sparkle" | "sparkles" => Self::Sparkle,
             "square.stack.3d.up" => Self::Stack,
@@ -408,6 +412,7 @@ fn embedded_svg(path: &str) -> Option<&'static [u8]> {
         "icons/server.svg" => include_bytes!("../assets/icons/server.svg"),
         "icons/settings.svg" => include_bytes!("../assets/icons/settings.svg"),
         "icons/sidebar.svg" => include_bytes!("../assets/icons/sidebar.svg"),
+        "icons/toolbar.svg" => include_bytes!("../assets/icons/toolbar.svg"),
         "icons/sidebar-right.svg" => include_bytes!("../assets/icons/sidebar-right.svg"),
         "icons/sparkle.svg" => include_bytes!("../assets/icons/sparkle.svg"),
         "icons/split.svg" => include_bytes!("../assets/icons/split.svg"),

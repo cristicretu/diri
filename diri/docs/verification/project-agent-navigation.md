@@ -36,3 +36,23 @@ clicks the second agent through GPUI pointer dispatch, verifies preserved tab,
 pane and process identities, switches orientation, and reopens the project
 through agent navigation. Screenshots show native rendering of fixture data.
 This is not a physical trackpad or remote-host acceptance test.
+
+## Navigation controls
+
+The horizontal header has one anchored Projects picker. Selecting a project
+returns to its agent or opens New Agent at that project's exact location.
+The picker does not reveal or resize the sidebar. Missing remote hosts retain
+their location and display an unavailable state instead of offering local launches.
+
+Cmd+B toggles the sidebar in vertical mode and the top tab strip in horizontal
+mode. Horizontal visibility is persisted independently and defaults to visible
+for existing preferences. The terminal header uses a matching toolbar icon.
+The top strip opens and closes on the existing panel easing; reduced motion
+skips the transition. Terminal viewport sizing follows settled visibility,
+not every animation frame.
+
+The native fixture also exercises Cmd+B with live split terminals, retaining
+the selected agent, layout and process identities. Screenshots in
+`project-agent-navigation/` contain disposable fixture data. Interactive review
+of the actual preview covered the restored agent sidebar, project picker,
+toolbar icon and opening/closing the top bar with both Cmd+B and the icon.

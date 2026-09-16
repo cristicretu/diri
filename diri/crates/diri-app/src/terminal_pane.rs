@@ -2771,6 +2771,14 @@ impl TerminalPane {
         colors: SemanticColors,
         cx: &mut Context<Self>,
     ) -> AnyElement {
+        let horizontal = self
+            .runtime
+            .store
+            .read()
+            .expect("store")
+            .preferences()
+            .tab_orientation
+            == crate::store::TabOrientation::Horizontal;
         div()
             .flex_none()
             .flex()
@@ -2783,6 +2791,12 @@ impl TerminalPane {
                 div()
                     .id("show-sidebar")
                     .debug_selector(|| "show-sidebar".into())
+                    .role(gpui::Role::Button)
+                    .aria_label(if horizontal {
+                        "Toggle top bar"
+                    } else {
+                        "Show sidebar"
+                    })
                     .size(px(Metrics::TOOLBAR_CONTROL_SIZE))
                     .flex_none()
                     .flex()
@@ -2791,7 +2805,15 @@ impl TerminalPane {
                     .rounded(px(Radius::BADGE))
                     .cursor_pointer()
                     .hover(move |button| button.bg(Fill::subtle(colors)))
-                    .child(sf_symbol("sidebar.left", 15.0, colors.secondary))
+                    .child(sf_symbol(
+                        if horizontal {
+                            "rectangle.topthird.inset.filled"
+                        } else {
+                            "sidebar.left"
+                        },
+                        15.0,
+                        colors.secondary,
+                    ))
                     .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
                     .on_click(cx.listener(|_, _, window, cx| {
                         window.dispatch_action(Box::new(ToggleSidebar), cx);

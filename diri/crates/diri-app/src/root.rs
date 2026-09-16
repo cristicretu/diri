@@ -246,6 +246,9 @@ pub struct RootView {
     /// from this rather than from the settled width so it picks up wherever the
     /// previous frame left the panel.
     sidebar_seam: f32,
+    tabs_slide: Option<SeamSlide>,
+    tabs_seam: f32,
+    tabs_target: f32,
     /// The panel is always mounted in one absolute slot. Only this exposure
     /// and its floating treatment change; the layout seam independently makes room.
     sidebar_panel_slide: Option<SeamSlide>,
@@ -1094,6 +1097,11 @@ impl RootView {
             0.0
         };
         let inspector_seam = if inspector_open { inspector_width } else { 0.0 };
+        let tabs_seam = if sidebar.read(cx).horizontal_tabs_visible() {
+            crate::tab_navigation::TAB_STRIP_HEIGHT
+        } else {
+            0.0
+        };
         #[cfg(target_os = "macos")]
         let (browser, mut browser_events) = NativeBrowser::new();
         #[cfg(target_os = "macos")]
@@ -1263,6 +1271,9 @@ impl RootView {
             sidebar_floating: false,
             sidebar_peek_dwell: None,
             sidebar_seam,
+            tabs_slide: None,
+            tabs_seam,
+            tabs_target: tabs_seam,
             auxiliary_terminal: None,
             auxiliary_id: None,
             auxiliary_parent: None,
@@ -1948,7 +1959,8 @@ impl RootView {
     /// mutations of RootView's child modules.
     fn run_command(&mut self, command: CommandId, window: &mut Window, cx: &mut Context<Self>) {
         if let Some(command) = crate::workspace_workbench::PaneCommand::from_id(command) {
-            if (self.sidebar.read(cx).workspace_menu_is_open() || self.sidebar.read(cx).project_picker_active())
+            if (self.sidebar.read(cx).workspace_menu_is_open()
+                || self.sidebar.read(cx).project_picker_active())
                 || self.launcher.read(cx).is_open()
                 || self
                     .navigation
@@ -2079,7 +2091,23 @@ impl RootView {
                 cx.notify();
             }
             CommandId::ToggleSidebar => {
-                self.sidebar.update(cx, |sidebar, cx| sidebar.toggle(cx));
+                if self.sidebar.read(cx).tab_orientation()
+                    == crate::store::TabOrientation::Horizontal
+                {
+                    if let Err(error) = self
+                        .sidebar
+                        .update(cx, |sidebar, cx| sidebar.toggle_horizontal_tabs(window, cx))
+                    {
+                        self.show_quote_feedback(
+                            "Tab bar",
+                            format!("Could not save tab bar visibility: {error}"),
+                            cx,
+                        );
+                    }
+                    cx.notify();
+                } else {
+                    self.sidebar.update(cx, |sidebar, cx| sidebar.toggle(cx));
+                }
             }
             CommandId::FocusSidebar => {
                 if self.launcher.read(cx).is_open() {
@@ -3007,14 +3035,19 @@ impl RootView {
         };
         let card_width =
             (f32::from(viewport_size.width) - sidebar_width - inspector_width).max(0.0);
-        let tabs_height = if self.sidebar.read(cx).tab_orientation()
-            == crate::store::TabOrientation::Horizontal
-        {
+        let tabs_height = if self.sidebar.read(cx).horizontal_tabs_visible() {
             crate::tab_navigation::TAB_STRIP_HEIGHT
         } else {
             0.0
         };
         let card_height = (f32::from(viewport_size.height) - tabs_height).max(0.0);
+        if self.tabs_target != tabs_height {
+            self.tabs_target = tabs_height;
+            self.tabs_slide = (!cx.reduce_motion())
+                .then(|| SeamSlide::begin(self.tabs_seam, tabs_height))
+                .flatten();
+        }
+        self.tabs_seam = advance_seam(&mut self.tabs_slide, tabs_height, Instant::now(), window);
         let selected = self
             .window_store
             .read()
@@ -3116,10 +3149,25 @@ impl RootView {
             });
         }
 
-        if tabs_height > 0.0 {
-            card = card.child(self.sidebar.update(cx, |sidebar, cx| {
+        if self.tabs_seam > 0.0 {
+            let strip = self.sidebar.update(cx, |sidebar, cx| {
                 sidebar.render_horizontal_tabs(card_width, cx)
-            }));
+            });
+            card = card.child(
+                div()
+                    .id("animated-top-bar")
+                    .flex_none()
+                    .h(px(self.tabs_seam))
+                    .w_full()
+                    .overflow_hidden()
+                    .child(
+                        div()
+                            .relative()
+                            .top(px(self.tabs_seam - crate::tab_navigation::TAB_STRIP_HEIGHT))
+                            .h(px(crate::tab_navigation::TAB_STRIP_HEIGHT))
+                            .child(strip),
+                    ),
+            );
         }
         // Translation changes only paint placement. The stationary tab strip
         // and settled PTY viewport never participate in the gesture layout.
@@ -4521,8 +4569,12 @@ impl Render for RootView {
         root = root.children(self.sidebar.update(cx, |sidebar, cx| {
             sidebar.render_project_picker_overlay(window, cx)
         }));
-        if !sidebar_visible && seam == 0.0 && exposed == 0.0 && panel_width == 0.0
-            && !self.sidebar.read(cx).project_picker_active() {
+        if !sidebar_visible
+            && seam == 0.0
+            && exposed == 0.0
+            && panel_width == 0.0
+            && !self.sidebar.read(cx).project_picker_active()
+        {
             root = root.child(
                 div()
                     .id("sidebar-peek-edge")
@@ -5050,14 +5102,18 @@ mod tests {
             let mut store = services.store.store.write().unwrap();
             store.hydrate(fixture.list);
             store.select(fixture.selected_session_id.unwrap());
+            // Start with settled horizontal chrome; this test exercises peek motion.
+            store
+                .update_preferences(|prefs| {
+                    prefs.tab_orientation = crate::store::TabOrientation::Horizontal;
+                    prefs.sidebar_visible = false;
+                })
+                .unwrap();
         }
         let (root, cx) = cx.add_window_view(move |window, cx| {
             RootView::new(services, false, PreviewScenario::Empty, window, cx)
         });
         cx.simulate_resize(size(px(1000.0), px(700.0)));
-        root.update_in(cx, |root, window, cx| {
-            root.run_command(CommandId::HorizontalTabs, window, cx)
-        });
         cx.run_until_parked();
         let heading = cx.debug_bounds("horizontal-tabs").unwrap();
         let body = cx.debug_bounds("terminal-card-body").unwrap();

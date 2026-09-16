@@ -37,6 +37,34 @@ impl Sidebar {
             .tab_orientation
     }
 
+    pub fn horizontal_tabs_visible(&self) -> bool {
+        let store = self.store.read().expect("store");
+        store.preferences().tab_orientation == TabOrientation::Horizontal
+            && store.preferences().horizontal_tabs_visible
+    }
+
+    pub fn toggle_horizontal_tabs(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> std::io::Result<()> {
+        self.store
+            .write()
+            .expect("store")
+            .update_preferences(|prefs| {
+                prefs.horizontal_tabs_visible = !prefs.horizontal_tabs_visible;
+            })?;
+        if !self.horizontal_tabs_visible() && self.project_picker_active() {
+            if self.project_picker.new_agent {
+                self.ui.popover = None;
+                self.project_picker.new_agent = false;
+            }
+            self.dismiss_project_picker(window, cx);
+        }
+        cx.notify();
+        Ok(())
+    }
+
     /// Commit the presentation preference before changing the visible chrome.
     /// Selection and all terminal entities stay owned by their existing views.
     pub fn set_tab_orientation(

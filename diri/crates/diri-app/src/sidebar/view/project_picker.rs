@@ -177,7 +177,7 @@ impl Sidebar {
             .into_any_element()
     }
 
-    fn dismiss_project_picker(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+    pub(super) fn dismiss_project_picker(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.project_picker.open = false;
         cx.emit(SidebarEvent::ProjectPickerChanged);
         if let Some(previous) = self.project_picker.previous_focus.take() {
@@ -298,6 +298,52 @@ impl Sidebar {
         self.project_picker.open || self.project_picker.new_agent
     }
 
+    fn header_new_agent_menu(
+        &self,
+        directory: Option<String>,
+        host: Option<String>,
+        colors: SemanticColors,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        if let Some(host) = host.as_ref()
+            && self.store.read().expect("store").host(host).is_none()
+        {
+            // A project's explicit remote location is never a local fallback.
+            // Host reload may still be in flight, so retain the exact intent;
+            // a subsequent store update can paint its normal agent choices.
+            let content = div()
+                .id("project-picker-remote-unavailable")
+                .debug_selector(|| "project-picker-remote-unavailable".into())
+                .p(px(14.0)).flex().flex_col().gap(px(8.0))
+                .child(div().text_size(px(Typo::ROW.size)).text_color(colors.primary)
+                    .child("Remote host unavailable"))
+                .child(div().text_size(px(Typo::META.size)).text_color(colors.secondary)
+                    .child(format!("The saved host “{host}” is unavailable. Restore this host to start an agent in this project.")))
+                .child(div().id("project-picker-unavailable-dismiss")
+                    .debug_selector(|| "project-picker-unavailable-dismiss".into())
+                    .role(Role::Button).aria_label("Dismiss")
+                    .py(px(6.0)).px(px(9.0)).rounded(px(7.0)).cursor_pointer()
+                    .bg(colors.primary.alpha(0.06)).text_size(px(Typo::META.size)).text_color(colors.primary)
+                    .child("Dismiss")
+                    .on_click(cx.listener(|this, _, window, cx| {
+                        this.ui.popover = None;
+                        this.project_picker.new_agent = false;
+                        this.dismiss_project_picker(window, cx);
+                        cx.stop_propagation();
+                    })));
+            return self.popover_shell_at(
+                self.new_agent_anchor
+                    .unwrap_or_else(|| point(px(12.0), px(46.0))),
+                Anchor::TopLeft,
+                300.0,
+                content,
+                colors,
+                cx,
+            );
+        }
+        self.new_agent_popover(directory, host, colors, cx)
+    }
+
     pub(crate) fn render_project_picker_overlay(
         &mut self,
         window: &mut Window,
@@ -322,10 +368,16 @@ impl Sidebar {
                                     }
                                 },
                             ))
-                            .child(self.new_agent_popover(directory, host, colors, cx))
+                            .child(self.header_new_agent_menu(directory, host, colors, cx))
                             .into_any_element(),
                     )
                 } else {
+                    // Shared menu actions and the outside-click scrim dismiss
+                    // ui.popover. Restore the header's saved focus as that menu
+                    // leaves the render tree, just as its Escape path does.
+                    if let Some(previous) = self.project_picker.previous_focus.take() {
+                        previous.focus(window, cx);
+                    }
                     self.project_picker.new_agent = false;
                     None
                 }
@@ -724,6 +776,87 @@ mod tests {
             ..Default::default()
         });
         assert_eq!(project_agent(&store, &target), Some(saved));
+    }
+
+    #[gpui::test]
+    fn header_agent_menu_outside_dismissal_restores_previous_focus(cx: &mut TestAppContext) {
+        let (sidebar, cx) = harness(cx, false);
+        let previous = cx.update(|window, cx| {
+            let focus = cx.focus_handle();
+            focus.focus(window, cx);
+            focus
+        });
+        open(cx);
+        let project = Project {
+            id: ProjectId("empty".into()),
+            root: "/tmp/empty-project".into(),
+            name: "Empty".into(),
+            pinned_order: None,
+            host: None,
+        };
+        cx.update(|window, cx| {
+            sidebar.update(cx, |sidebar, cx| {
+                sidebar.choose_project(project, window, cx)
+            })
+        });
+        assert!(cx.debug_bounds("sidebar-popover").is_some());
+        assert_ne!(
+            cx.update(|window, cx| window.focused(cx)),
+            Some(previous.clone())
+        );
+        cx.simulate_click(point(px(700.0), px(500.0)), Modifiers::default());
+        assert!(cx.debug_bounds("sidebar-popover").is_none());
+        assert_eq!(cx.update(|window, cx| window.focused(cx)), Some(previous));
+        sidebar.read_with(cx, |sidebar, _| {
+            assert!(!sidebar.project_picker_active());
+            assert!(!sidebar.is_visible());
+            assert!(!sidebar.is_peeking());
+        });
+    }
+
+    #[gpui::test]
+    fn empty_remote_project_with_missing_host_never_offers_local_agent_choices(
+        cx: &mut TestAppContext,
+    ) {
+        let (sidebar, cx) = harness(cx, false);
+        open(cx);
+        let project = Project {
+            id: ProjectId("remote-empty".into()),
+            root: "/srv/remote-project".into(),
+            name: "Remote project".into(),
+            pinned_order: None,
+            host: Some("removed-host".into()),
+        };
+        cx.update(|window, cx| {
+            sidebar.update(cx, |sidebar, cx| {
+                sidebar.choose_project(project, window, cx)
+            })
+        });
+        assert!(
+            cx.debug_bounds("project-picker-remote-unavailable")
+                .is_some()
+        );
+        assert!(cx.debug_bounds("AGENT_OPTION_0").is_none());
+        sidebar.read_with(cx, |sidebar, _| {
+            assert_eq!(
+                sidebar.ui.popover,
+                Some(Popover::NewAgent {
+                    directory: Some("/srv/remote-project".into()),
+                    host: Some("removed-host".into())
+                })
+            );
+            assert!(!sidebar.is_visible());
+            assert!(!sidebar.is_peeking());
+        });
+        let dismiss = cx
+            .debug_bounds("project-picker-unavailable-dismiss")
+            .unwrap();
+        cx.simulate_click(dismiss.center(), Modifiers::default());
+        assert!(
+            cx.debug_bounds("project-picker-remote-unavailable")
+                .is_none()
+        );
+        sidebar.read_with(cx, |sidebar, _| assert!(!sidebar.project_picker_active()));
     }
 
     #[gpui::test]

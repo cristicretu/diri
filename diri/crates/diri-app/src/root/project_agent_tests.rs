@@ -148,6 +148,99 @@ fn project_agents_remain_visible_and_open_preserved_layouts() {
     );
     settle!();
     capture(&mut cx, "project-agents-horizontal.png");
+    // The Projects menu is anchored to the header and must not reveal the sidebar
+    // or change the live terminal's geometry when opened or dismissed.
+    update!(|root: &mut RootView, _, cx: &mut Context<RootView>| root
+        .sidebar
+        .update(cx, |sidebar, cx| sidebar.conceal(cx)));
+    settle!();
+    let (picker, geometry) = update!(|root: &mut RootView, _, cx: &mut Context<RootView>| {
+        assert!(!root.sidebar.read(cx).is_visible());
+        (
+            root.sidebar
+                .read(cx)
+                .project_picker_center_for_test()
+                .unwrap(),
+            root.active_terminal(cx)
+                .unwrap()
+                .read(cx)
+                .geometry_for_test()
+                .0,
+        )
+    });
+    cx.update_window(root.into(), |_, window, cx| {
+        window.simulate_mouse_move(picker, cx);
+        window.dispatch_event(
+            gpui::PlatformInput::MouseDown(gpui::MouseDownEvent {
+                button: MouseButton::Left,
+                position: picker,
+                modifiers: Default::default(),
+                click_count: 1,
+                first_mouse: false,
+            }),
+            cx,
+        );
+        window.dispatch_event(
+            gpui::PlatformInput::MouseUp(gpui::MouseUpEvent {
+                button: MouseButton::Left,
+                position: picker,
+                modifiers: Default::default(),
+                click_count: 1,
+            }),
+            cx,
+        );
+    })
+    .unwrap();
+    settle!();
+    update!(|root: &mut RootView, _, cx: &mut Context<RootView>| {
+        assert!(root.sidebar.read(cx).project_picker_is_open_for_test());
+        assert!(!root.sidebar.read(cx).is_visible());
+        assert!(!root.sidebar.read(cx).is_peeking());
+        assert_eq!(
+            root.active_terminal(cx)
+                .unwrap()
+                .read(cx)
+                .geometry_for_test()
+                .0,
+            geometry
+        );
+    });
+    capture(&mut cx, "projects-dropdown.png");
+    cx.update_window(root.into(), |_, window, cx| {
+        window.dispatch_keystroke(gpui::Keystroke::parse("escape").unwrap(), cx);
+    })
+    .unwrap();
+    settle!();
+    update!(|root: &mut RootView, _, cx: &mut Context<RootView>| {
+        assert!(!root.sidebar.read(cx).project_picker_is_open_for_test());
+        assert!(!root.sidebar.read(cx).is_visible());
+        assert_eq!(
+            root.active_terminal(cx)
+                .unwrap()
+                .read(cx)
+                .geometry_for_test()
+                .0,
+            geometry
+        );
+    });
+    capture(&mut cx, "toolbar-open.png");
+    for visible in [false, true] {
+        cx.update_window(root.into(), |_, window, cx| {
+            window.dispatch_keystroke(gpui::Keystroke::parse("cmd-b").unwrap(), cx);
+        })
+        .unwrap();
+        settle!();
+        update!(|root: &mut RootView, _, cx: &mut Context<RootView>| {
+            assert_eq!(root.sidebar.read(cx).horizontal_tabs_visible(), visible);
+            assert!(!root.sidebar.read(cx).is_visible());
+            assert_eq!(root.active_session_id(cx), Some(SessionId::new("review")));
+        });
+        fixture.verify_process_identity();
+        if !visible {
+            capture(&mut cx, "toolbar-hidden.png");
+        }
+    }
+    assert_eq!(snapshot().workspaces[0].tabs[0].layout, original_layout);
     // Leave the explicit layout, then use the same agent-first navigation.
     // The Engine adopts the one unambiguous project layout, preserving the split.
     update!(
