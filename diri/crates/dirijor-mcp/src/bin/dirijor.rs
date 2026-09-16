@@ -414,7 +414,9 @@ fn session_terminal_title(arguments: &[String]) -> Result<(), CliError> {
     let parsed: diri_proto::SessionTerminalTitleResult = serde_json::from_value(result)
         .map_err(|_| CliError::failure("invalid terminal title response"))?;
     if parsed.session_id.0 != *id {
-        return Err(CliError::failure("terminal title response session mismatch"));
+        return Err(CliError::failure(
+            "terminal title response session mismatch",
+        ));
     }
     if has_flag(&arguments[1..], "--json") {
         let value = serde_json::to_value(&parsed)
