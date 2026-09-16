@@ -2,6 +2,10 @@
 //! `DIRI_TEST_APPKIT_GESTURE=1 cargo test -p diri-app --test tab_gesture_appkit`.
 #[cfg(target_os = "macos")]
 #[allow(dead_code, unused_imports)]
+#[path = "../src/gesture_delivery.rs"]
+mod gesture_delivery;
+#[cfg(target_os = "macos")]
+#[allow(dead_code, unused_imports)]
 #[path = "../src/peek_settle.rs"]
 mod peek_settle;
 #[cfg(target_os = "macos")]

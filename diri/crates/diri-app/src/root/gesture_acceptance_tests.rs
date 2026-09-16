@@ -197,6 +197,49 @@ fn live_gesture_orientation_cancel_and_saved_tab_selection() {
                 .selected_tab,
             Some(first_tab.clone())
         );
+        // Hold delivery over a completed stroke and the next reverse stroke.
+        // Its timestamps include enough elapsed time for the first release to
+        // settle, even though the UI processes the samples in one update.
+        frame!(GestureFrame::Tracking(-200.0));
+        let began = update!(|_: &mut RootView, _, cx: &mut Context<RootView>| cx
+            .background_executor()
+            .now());
+        let (sender, mut receiver) = crate::gesture_delivery::channel();
+        for (millis, sample) in [
+            (10, GestureFrame::Released(-200.0)),
+            (300, GestureFrame::Tracking(-20.0)),
+            (310, GestureFrame::Tracking(-60.0)),
+            (320, GestureFrame::Released(-60.0)),
+        ] {
+            assert!(sender.send(sample, began + Duration::from_millis(millis)));
+        }
+        cx.advance_clock(Duration::from_millis(600));
+        let batch = receiver.take_pending().unwrap();
+        update!(
+            |root: &mut RootView, window: &mut Window, cx: &mut Context<RootView>| {
+                root.session_surfaces
+                    .as_ref()
+                    .unwrap()
+                    .update(cx, |surface, cx| {
+                        for sample in batch.iter() {
+                            surface.tab_gesture_at(sample.frame, sample.observed_at, cx);
+                        }
+                        surface.sync_tab_peek_focus(window, cx);
+                    });
+            }
+        );
+        settle!();
+        assert!(state!().0);
+        assert_eq!(state!().1, 0.0);
+        assert_eq!(state!().2, Some(first_tab.0.clone()));
+        assert_eq!(geometry!(), original_geometry);
+        if !reduced {
+            save(&mut cx, "delayed-strokes-peek.png");
+        }
+        frame!(GestureFrame::Tracking(240.0));
+        frame!(GestureFrame::Released(240.0));
+        settle!();
+        assert_eq!(state!().1, 1.0);
         // A second upward stroke folds the same overview into the strip.
         recognizer.sample_with_reverse(contacts(0.3), false, true);
         frame!(
