@@ -1439,3 +1439,15 @@ The current architecture does not attempt to:
 > The remote host keeps only state that cannot remain local: the PTY, Agent
 > process, and current terminal screen. Session orchestration and product logic
 > remain in the local Rust Engine.
+
+## Bounded local Holder exit-marker continuation
+
+The local Holder's version-1 exit envelope has a reason plus optional signed
+32-bit code/signal fields. The Engine retains at most its fixed prefix plus the
+base64 representation of 128 JSON bytes while waiting for BEL. This includes
+existing compact Rust/Swift encodings and both integer extremes. Longer or
+malformed envelopes are passed to terminal parsing byte-for-byte in their
+original order; they neither invent exit facts nor discard output. Oversized
+input allocations are released after draining. Legitimate markers remain valid
+across every chunk boundary. This bounds the pending exit-marker bytes that an
+exact durable checkpoint must preserve at its raw-log offset.
