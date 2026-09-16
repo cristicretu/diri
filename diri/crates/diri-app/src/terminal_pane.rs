@@ -3,6 +3,7 @@
 //! The daemon remains authoritative: this module only composes
 //! `diri-client::SessionAttachment`, `diri-term`, and the T9 session store.
 
+mod find_overlay;
 mod qol;
 use qol::QolState;
 
@@ -914,6 +915,14 @@ impl TerminalPane {
         cx.notify();
     }
 
+    /// Paint-only previews must not reconcile residency or acquire a controller.
+    pub fn resident_preview_buffers(&self) -> HashMap<SessionId, SharedGridBuffer> {
+        self.residents
+            .iter()
+            .map(|(id, resident)| (id.clone(), resident.element.buffer()))
+            .collect()
+    }
+
     pub fn resident_buffers(&mut self) -> HashMap<SessionId, SharedGridBuffer> {
         self.reconcile_residency();
         self.residents
@@ -941,6 +950,17 @@ impl TerminalPane {
         }
         self.viewport = Some(viewport);
         cx.notify();
+    }
+
+    #[cfg(all(test, target_os = "macos"))]
+    pub(crate) fn seed_preview_grid_for_test(&mut self, grid: GridBuffer) {
+        self.reconcile_residency();
+        if let Some(id) = self.selected_id()
+            && let Some(resident) = self.residents.get_mut(&id)
+        {
+            *resident.element.buffer().write().unwrap() = grid;
+            resident.attachment_state = AttachmentState::Live;
+        }
     }
 
     #[cfg(test)]
@@ -2914,13 +2934,12 @@ impl TerminalPane {
             query_label(&resident.find_query)
         };
         let alt_screen = find.is_alt_screen();
-        Some(
+        Some(find_overlay::render(
+            resident.element.clone(),
             div()
                 .id("find-bar")
-                .absolute()
-                .top(px(Metrics::TITLE_BAR + 6.0))
-                .right(px(16.0))
-                .w(px(360.0))
+                .debug_selector(|| "find-bar".into())
+                .w_full()
                 .child(FloatingSurface::new(
                     colors,
                     div()
@@ -2937,7 +2956,7 @@ impl TerminalPane {
                                 .text_size(px(Typo::ROW.size))
                                 .text_color(colors.primary)
                                 .child(sf_symbol("magnifyingglass", 12.0, colors.tertiary))
-                                .child(div().flex_1().child(query))
+                                .child(div().flex_1().min_w(px(0.0)).overflow_hidden().child(query))
                                 .child(
                                     div()
                                         .text_size(px(Typo::META.size))
@@ -3000,7 +3019,7 @@ impl TerminalPane {
                         }),
                 ))
                 .into_any_element(),
-        )
+        ))
     }
 
     /// The pane-filling card for an exited session, or `None` when the terminal
@@ -3172,7 +3191,7 @@ impl Render for TerminalPane {
                 .border_color(sidebar_colors.primary.alpha(0.08))
                 .bg(theme.background)
                 .child(self.render_header(&session, sidebar_colors, cx));
-            let terminal_surface = div()
+            let mut terminal_surface = div()
                 .relative()
                 .min_h(px(0.0))
                 .flex_1()
@@ -3185,10 +3204,10 @@ impl Render for TerminalPane {
                 .child(
                     self.render_grid_and_overlays(&session, theme, colors, font_size, window, cx),
                 );
-            pane = pane.child(terminal_surface);
             if let Some(find) = self.render_find_bar(&session, colors, cx) {
-                pane = pane.child(find);
+                terminal_surface = terminal_surface.child(find);
             }
+            pane = pane.child(terminal_surface);
             if let Some(summary) = self.render_session_links(&session, sidebar_colors, window, cx) {
                 pane = pane.child(summary);
             }
@@ -4678,8 +4697,43 @@ mod tests {
                         }
                         grid.changed_rows.push(row);
                     }
+                    if scene.starts_with("find") {
+                        for row in [0, 15] {
+                            let mut cells = vec![GridCell::BLANK; 80];
+                            for (cell, ch) in cells[(width as usize / 12).clamp(4, 60)..]
+                                .iter_mut()
+                                .zip("needle".chars())
+                            {
+                                cell.scalar = ch as u32;
+                            }
+                            grid.changed_rows.retain(|changed| changed.y != row);
+                            grid.changed_rows.push(ChangedRow::new(row, cells));
+                        }
+                    }
                     let resident = pane.residents.get_mut(&id).unwrap();
                     resident.element.apply_damage(grid);
+                    if scene.starts_with("find") {
+                        let mut find = TerminalFindModel::default();
+                        let request = due_find_request(&mut find, "needle", Duration::ZERO);
+                        let snapshot = FindSnapshot {
+                            cols: 80,
+                            rows: 28,
+                            is_alt_screen: scene == "find-alt",
+                            ..find_snapshot(1)
+                        };
+                        let result = resident
+                            .element
+                            .prepare_find_search(&find, &request, snapshot)
+                            .unwrap()
+                            .run();
+                        resident.element.apply_find_result(&mut find, result);
+                        if scene == "find-clear" {
+                            resident.element.find_next(&mut find);
+                        }
+                        resident.find_query.insert("needle");
+                        resident.element.sync_find_highlights(&find);
+                        resident.find = Some(find);
+                    }
                     resident.last_size = (80, 28);
                     resident.attachment_state = AttachmentState::Live;
                     pane.focus(window, cx);
@@ -4882,6 +4936,95 @@ mod tests {
                 pane.qol.feedback.as_deref(),
                 Some("Terminal changed. Paste again to review.")
             );
+        });
+    }
+
+    #[gpui::test]
+    fn find_overlay_tracks_painted_match_without_resizing_terminal(cx: &mut TestAppContext) {
+        let runtime = Arc::new(StoreRuntime::inert());
+        let tokio = Arc::new(
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap(),
+        );
+        let session = fixture_session();
+        let id = session.id.clone();
+        {
+            let mut store = runtime.store.write().unwrap();
+            store.upsert_session(session);
+            store.select(id.clone());
+        }
+        let (pane, cx) =
+            cx.add_window_view(move |window, cx| TerminalPane::new(runtime, tokio, window, cx));
+        pane.update_in(cx, |pane, window, cx| {
+            pane.reconcile_store_change(window, cx);
+            let resident = pane.residents.get_mut(&id).unwrap();
+            resident.attachment_state = AttachmentState::Live;
+            resident.element.apply_damage(grid_frame(200, true));
+            cx.notify();
+        });
+        let surface = cx.debug_bounds("terminal-grid-surface").unwrap();
+        let original_size = pane.read_with(cx, |pane, _| pane.residents[&id].last_size);
+        pane.update_in(cx, |pane, window, cx| pane.open_find(&OpenFind, window, cx));
+        let anchor = cx
+            .debug_bounds("find-bar")
+            .expect("find opens over terminal");
+        let span = |row| diri_term::find::FindSpan {
+            row,
+            start_col: 0,
+            end_col_exclusive: 200,
+            is_current: true,
+        };
+        pane.update_in(cx, |pane, _, cx| {
+            pane.residents[&id]
+                .element
+                .set_find_highlights(vec![span(0)]);
+            cx.notify();
+        });
+        let moved = cx.debug_bounds("find-bar").unwrap();
+        let current = pane.read_with(cx, |pane, _| {
+            pane.residents[&id]
+                .element
+                .current_find_match_bounds()
+                .unwrap()
+        });
+        assert!(
+            moved.top() > anchor.top(),
+            "bar must move in the frame with the match"
+        );
+        assert!(
+            !moved.intersects(&current),
+            "active result must remain readable"
+        );
+        assert_eq!(cx.debug_bounds("terminal-grid-surface").unwrap(), surface);
+        pane.read_with(cx, |pane, _| {
+            assert_eq!(pane.residents[&id].last_size, original_size)
+        });
+        pane.update_in(cx, |pane, _, cx| {
+            pane.residents[&id]
+                .element
+                .set_find_highlights(vec![span(15)]);
+            cx.notify();
+        });
+        assert_eq!(
+            cx.debug_bounds("find-bar").unwrap(),
+            anchor,
+            "bar returns when result moves clear"
+        );
+        let close = gpui::point(anchor.right() - px(22.0), anchor.center().y);
+        cx.simulate_mouse_down(close, MouseButton::Left, Modifiers::default());
+        cx.simulate_mouse_up(close, MouseButton::Left, Modifiers::default());
+        assert!(cx.debug_bounds("find-bar").is_none());
+        pane.read_with(cx, |pane, _| {
+            assert!(pane.residents[&id].find.is_none());
+            assert!(
+                pane.residents[&id]
+                    .element
+                    .current_find_match_bounds()
+                    .is_none()
+            );
+            assert_eq!(pane.residents[&id].last_size, original_size);
         });
     }
 

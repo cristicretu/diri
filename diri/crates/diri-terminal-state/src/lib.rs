@@ -1067,7 +1067,18 @@ impl HeadlessScreen {
             let line = Line(row as i32);
             let mut text = String::with_capacity(self.geometry.cols);
             for column in 0..self.geometry.cols {
-                text.push(grid[line][Column(column)].c);
+                let cell = &grid[line][Column(column)];
+                // These occupy terminal columns but are not textual spaces.
+                if cell
+                    .flags
+                    .intersects(Flags::WIDE_CHAR_SPACER | Flags::LEADING_WIDE_CHAR_SPACER)
+                {
+                    continue;
+                }
+                text.push(cell.c);
+                if let Some(combining) = cell.zerowidth() {
+                    text.extend(combining.iter().copied());
+                }
             }
             lines.push(text.trim_end().to_string());
         }
@@ -1929,6 +1940,30 @@ mod qol_tests {
                 .any(|c| c.style.contains(TermStyle::PROMPT_START))
         );
     }
+    #[test]
+    fn visible_text_preserves_unicode_without_terminal_filler_cells() {
+        let mut screen = HeadlessScreen::new(20, 4);
+        screen.feed("<界> e\u{301}\r\nA🙂B".as_bytes());
+        assert_eq!(screen.lines(), vec!["<界> e\u{301}", "A🙂B"]);
+        assert_eq!(screen.snapshot().lines, screen.lines());
+
+        let mut restored = HeadlessScreen::new(20, 4);
+        assert!(restored.restore(&[], &screen.full_snapshot(), false, false, MouseModes::OFF));
+        assert_eq!(restored.lines(), screen.lines());
+
+        screen.feed("\x1b[?1049h\x1b[H<界> e\u{301}".as_bytes());
+        assert_eq!(screen.lines(), vec!["<界> e\u{301}"]);
+        screen.feed(b"\x1b[?1049l");
+        assert_eq!(screen.lines(), vec!["<界> e\u{301}", "A🙂B"]);
+    }
+
+    #[test]
+    fn visible_text_keeps_real_spaces_after_overwriting_a_wide_glyph() {
+        let mut screen = HeadlessScreen::new(8, 2);
+        screen.feed("界X\rA".as_bytes());
+        assert_eq!(screen.lines(), vec!["A X"]);
+    }
+
     #[test]
     fn wrap_wide_glyph_and_combining_metadata_survive_restore() {
         let mut screen = HeadlessScreen::new(6, 3);

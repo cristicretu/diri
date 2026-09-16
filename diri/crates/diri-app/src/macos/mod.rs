@@ -10,3 +10,5 @@ pub(crate) fn bundle_identifier() -> Option<String> {
         .bundleIdentifier()
         .map(|identifier| identifier.to_string())
 }
+
+pub(crate) mod tab_gesture;
