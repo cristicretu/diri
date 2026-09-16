@@ -69,7 +69,7 @@ jobs:
       - name: Test
         run: cargo test --workspace
       - name: Test native keypad dispatch boundary
-        run: cargo test --locked -p gpui_macos native_key::tests
+        run: cargo test --locked -p diri-app -p gpui_macos --lib --bins native_key::tests
 
   ios:
     name: iPhone app

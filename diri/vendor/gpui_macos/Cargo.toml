@@ -112,12 +112,6 @@ uuid = { version = "1.1.2", features = ["v4", "v5", "v7", "serde"] }
 cbindgen = { version = "0.28.0", default-features = false }
 gpui = { git = "https://github.com/zed-industries/zed.git", rev = "dc2a339d5d043da448a3f7ddc7c0a85c63864aad", default-features = false }
 
-# When this crate is itself being tested (cargo test -p gpui_macos), its own
-# cfg(test) flag enables impls of test-only traits like PlatformHeadlessRenderer
-# and PlatformWindow::render_to_image. Those traits/methods only exist in gpui
-# when gpui's `test-support` feature is on, so we have to turn that feature on
-# as a dev-dependency. The `cfg(test)` flag of a dependent crate doesn't
-# propagate to its dependencies, but dev-dependencies do, so this is the
-# correct way to enable the feature exactly when needed.
-[target.'cfg(target_os = "macos")'.dev-dependencies]
-gpui = { git = "https://github.com/zed-industries/zed.git", rev = "dc2a339d5d043da448a3f7ddc7c0a85c63864aad", default-features = false, features = ["test-support"] }
+# This patched dependency is outside the application workspace. Cargo cannot
+# test a non-member package with dev-dependencies. Test it alongside diri-app,
+# whose dev-dependencies enable GPUI test-support for this crate's cfg(test) code.
