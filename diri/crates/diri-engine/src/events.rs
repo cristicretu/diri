@@ -1,5 +1,5 @@
 //! Seq-stamped pub/sub with a bounded replay ring, backing `events.subscribe`
-//! (gapless reconnect via `sinceSeq`, server-side filtering) and `events.wait`
+//! (bounded replay via `sinceSeq`, server-side filtering) and `events.wait`
 //! (long-poll).
 //!
 //! Ported from the Swift `EventBus` actor. Backpressure is the load-bearing
@@ -93,7 +93,7 @@ struct Archived {
 
 impl Archived {
     fn storage_bytes(&self) -> usize {
-        self.name.len() + self.params.len() + 16
+        self.name.len() + self.params.len() + self.session_id.as_ref().map_or(0, String::len) + 16
     }
 
     fn event(&self) -> Event {
@@ -122,38 +122,48 @@ struct QueueState {
     closed: bool,
 }
 
-impl SubscriberQueue {
-    /// Enqueues without ever blocking the publisher. On overflow the oldest
-    /// queued event is evicted and the hole remembered; the marker is emitted
-    /// on the first enqueue that succeeds without eviction — once the
-    /// consumer has caught up — so a merely-slow subscriber gets one summary
-    /// line instead of a marker interleaved with every event it reads.
-    fn push(&self, event: &Event) {
-        let mut state = self.state.lock().expect("queue");
-        if state.closed || !state.filter.admits(event) {
-            return;
+impl QueueState {
+    fn note_gap(&mut self, first: u64, last: u64, count: u64) {
+        if self.dropped == 0 {
+            self.first_dropped_seq = first;
         }
-        if state.queue.len() >= state.capacity {
-            if let Some(evicted) = state.queue.pop_front() {
-                if state.dropped == 0 {
-                    state.first_dropped_seq = evicted.seq;
-                }
-                state.last_dropped_seq = evicted.seq;
-                state.dropped += 1;
-            }
-        } else if state.dropped > 0 {
+        self.last_dropped_seq = last;
+        self.dropped = self.dropped.saturating_add(count);
+    }
+
+    /// Loss is reported by the reader, even when no more events arrive. The
+    /// marker lives outside the bounded data queue and cannot evict an event.
+    fn pop(&mut self) -> Option<Event> {
+        if self.dropped > 0 {
             let marker = Event {
                 name: EVENTS_DROPPED.into(),
                 seq: 0,
                 session_id: None,
                 params: json!({
-                    "dropped": state.dropped,
-                    "fromSeq": state.first_dropped_seq,
-                    "toSeq": state.last_dropped_seq,
+                    "dropped": self.dropped,
+                    "fromSeq": self.first_dropped_seq,
+                    "toSeq": self.last_dropped_seq,
                 }),
             };
-            state.dropped = 0;
-            state.queue.push_back(marker);
+            self.dropped = 0;
+            return Some(marker);
+        }
+        self.queue.pop_front()
+    }
+}
+
+impl SubscriberQueue {
+    /// Enqueues without consumer I/O. Overflow evicts the oldest data event;
+    /// the next read reports the hole before delivering surviving events.
+    fn push(&self, event: &Event) {
+        let mut state = self.state.lock().expect("queue");
+        if state.closed || !state.filter.admits(event) {
+            return;
+        }
+        if state.queue.len() >= state.capacity
+            && let Some(evicted) = state.queue.pop_front()
+        {
+            state.note_gap(evicted.seq, evicted.seq, 1);
         }
         state.queue.push_back(event.clone());
         drop(state);
@@ -249,9 +259,11 @@ impl EventBus {
             }
         }
 
-        let queues: Vec<Arc<SubscriberQueue>> = inner.subscribers.values().cloned().collect();
-        drop(inner);
-        for queue in queues {
+        // Keep sequence assignment, archiving and live enqueue in the same
+        // existing critical section. Unlocking before enqueue lets another
+        // publisher overtake us. Subscribe uses this same lock, so replay
+        // and the following live tail share that order. Queues never do I/O.
+        for queue in inner.subscribers.values() {
             queue.push(&event);
         }
     }
@@ -307,7 +319,10 @@ impl EventBus {
     }
 
     /// Subscribes; ring events with `seq > since_seq` are replayed first.
-    /// The filter applies to both the replay and the live tail.
+    /// The filter applies to both the replay and the live tail. If the cursor
+    /// predates retained data, an unfiltered gap marker precedes replay. Its
+    /// range describes unavailable global events; some may not match the filter.
+    /// Sequence cursors belong to this Engine lifetime, not a durable journal.
     pub fn subscribe(&self, since_seq: Option<u64>, filter: Filter) -> EventStream {
         let queue = Arc::new(SubscriberQueue {
             state: Mutex::new(QueueState {
@@ -324,6 +339,16 @@ impl EventBus {
 
         let mut inner = self.inner.lock().expect("bus");
         if let Some(since) = since_seq {
+            let first_available = inner.ring.front().map_or(inner.next_seq, |event| event.seq);
+            if let Some(first_missing) = since.checked_add(1)
+                && first_missing < first_available
+            {
+                queue.state.lock().expect("queue").note_gap(
+                    first_missing,
+                    first_available - 1,
+                    first_available - first_missing,
+                );
+            }
             for archived in inner.ring.iter().filter(|archived| archived.seq > since) {
                 queue.push(&archived.event());
             }
@@ -361,7 +386,7 @@ impl EventStream {
         let deadline = Instant::now() + timeout;
         let mut state = self.queue.state.lock().expect("queue");
         loop {
-            if let Some(event) = state.queue.pop_front() {
+            if let Some(event) = state.pop() {
                 return Some(event);
             }
             let remaining = deadline.checked_duration_since(Instant::now())?;
@@ -371,7 +396,7 @@ impl EventStream {
                 .wait_timeout(state, remaining)
                 .expect("queue");
             state = next;
-            if wait.timed_out() && state.queue.is_empty() {
+            if wait.timed_out() && state.queue.is_empty() && state.dropped == 0 {
                 return None;
             }
         }
@@ -379,7 +404,7 @@ impl EventStream {
 
     /// An event already queued, without waiting.
     pub fn try_recv(&self) -> Option<Event> {
-        self.queue.state.lock().expect("queue").queue.pop_front()
+        self.queue.state.lock().expect("queue").pop()
     }
 }
 
@@ -549,22 +574,21 @@ mod tests {
         for n in 0..5 {
             bus.publish("burst", json!({ "n": n }), None);
         }
-        // Queue of 2: events 1..=3 were evicted; the newest two remain.
-        let survivors: Vec<Event> = std::iter::from_fn(|| stream.try_recv()).collect();
-        assert_eq!(survivors.len(), 2);
-        assert_eq!(survivors[0].seq, 4);
-        assert_eq!(survivors[1].seq, 5);
-
-        // The consumer caught up: the next publish carries the marker first.
-        bus.publish("after", json!({}), None);
+        // The final burst needs no later publish to report its loss. The
+        // marker is returned before the two surviving events.
         let marker = stream.recv(Duration::from_secs(1)).expect("marker");
         assert_eq!(marker.name, EVENTS_DROPPED);
         assert_eq!(marker.seq, 0, "outside the published seq space");
         assert_eq!(marker.params["dropped"], 3);
         assert_eq!(marker.params["fromSeq"], 1);
         assert_eq!(marker.params["toSeq"], 3);
-        let after = stream.recv(Duration::from_secs(1)).expect("event");
-        assert_eq!(after.name, "after");
+        let survivors: Vec<Event> = std::iter::from_fn(|| stream.try_recv()).collect();
+        assert_eq!(survivors.len(), 2);
+        assert_eq!(survivors[0].seq, 4);
+        assert_eq!(survivors[1].seq, 5);
+
+        bus.publish("after", json!({}), None);
+        assert_eq!(event_names(&stream), ["after"]);
     }
 
     #[test]
