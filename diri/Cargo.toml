@@ -87,3 +87,11 @@ xcb = { git = "https://github.com/rust-x-bindings/rust-xcb.git", rev = "ae3b2cd0
 # synchronization buffer only when a child actually sends a synchronized frame.
 # See vendor/vte/DIRI-PATCH.md for provenance and verification.
 vte = { path = "vendor/vte" }
+
+# Host artifacts only (proc macros, build scripts and their deps). Cargo's
+# release default of strip = "debuginfo" produces proc-macro dylibs that the
+# macOS 27 / Xcode 27 dyld refuses to load ("mis-aligned LINKEDIT string
+# pool"), which breaks every clean release build. Shipped binaries keep the
+# default; only the compiler-side helpers stay unstripped.
+[profile.release.build-override]
+strip = "none"

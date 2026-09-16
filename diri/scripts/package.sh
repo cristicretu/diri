@@ -52,6 +52,14 @@ if ! command -v cargo-packager >/dev/null 2>&1; then
     exit 1
 fi
 
+
+# Xcode 27's lipo rejects `-verify_arch arm64 x86_64` ("requires exactly one
+# input file"); one architecture per invocation works on old and new lipo.
+verify_universal() {
+    lipo "$1" -verify_arch arm64
+    lipo "$1" -verify_arch x86_64
+}
+
 cd "${workspace_dir}"
 
 echo "==> Building diri for Apple silicon"
@@ -70,17 +78,17 @@ lipo -create \
     "${target_dir}/aarch64-apple-darwin/release/diri" \
     "${target_dir}/x86_64-apple-darwin/release/diri" \
     -output "${universal_binary}"
-lipo "${universal_binary}" -verify_arch arm64 x86_64
+verify_universal "${universal_binary}"
 lipo -create \
     "${target_dir}/aarch64-apple-darwin/release/dirijor" \
     "${target_dir}/x86_64-apple-darwin/release/dirijor" \
     -output "${universal_cli_binary}"
-lipo "${universal_cli_binary}" -verify_arch arm64 x86_64
+verify_universal "${universal_cli_binary}"
 lipo -create \
     "${target_dir}/aarch64-apple-darwin/release/dirijor-mcp" \
     "${target_dir}/x86_64-apple-darwin/release/dirijor-mcp" \
     -output "${universal_mcp_binary}"
-lipo "${universal_mcp_binary}" -verify_arch arm64 x86_64
+verify_universal "${universal_mcp_binary}"
 
 echo "==> Assembling ${app_path} with cargo-packager"
 cargo packager \
@@ -131,9 +139,9 @@ lipo -create \
     "${target_dir}/aarch64-apple-darwin/release/diri-ssh-askpass" \
     "${target_dir}/x86_64-apple-darwin/release/diri-ssh-askpass" \
     -output "${universal_askpass_binary}"
-lipo "${universal_engine_binary}" -verify_arch arm64 x86_64
-lipo "${universal_holder_binary}" -verify_arch arm64 x86_64
-lipo "${universal_askpass_binary}" -verify_arch arm64 x86_64
+verify_universal "${universal_engine_binary}"
+verify_universal "${universal_holder_binary}"
+verify_universal "${universal_askpass_binary}"
 cp "${universal_engine_binary}" "${app_bin_dir}/dirijord-rs"
 cp "${universal_holder_binary}" "${app_bin_dir}/diri-holder"
 cp "${universal_askpass_binary}" "${app_bin_dir}/diri-ssh-askpass"
