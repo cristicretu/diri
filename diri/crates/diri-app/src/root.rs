@@ -1342,6 +1342,9 @@ impl RootView {
                 let workbench = cx.new(|cx| {
                     crate::workspace_workbench::WorkspaceWorkbench::new(runtime, tokio, window, cx)
                 });
+                workbench.update(cx, |workbench, cx| {
+                    workbench.set_window_store(self.window_store.clone(), cx);
+                });
                 cx.subscribe_in(
                     &workbench,
                     window,
@@ -2296,6 +2299,9 @@ impl RootView {
             let id = session.id.clone();
             let terminal =
                 cx.new(|cx| TerminalPane::new_fixed(runtime, tokio, id.clone(), window, cx));
+            terminal.update(cx, |terminal, _| {
+                terminal.set_window_store(self.window_store.clone())
+            });
             if let (Some(navigation), Some(utility_surfaces)) =
                 (&self.navigation, &self.utility_surfaces)
             {

@@ -111,6 +111,7 @@ struct MountedPane {
 pub(crate) struct WorkspaceWorkbench {
     runtime: Arc<StoreRuntime>,
     tokio: Arc<tokio::runtime::Runtime>,
+    window_store: Option<crate::store::WindowStore>,
     tab: Option<WorkspaceTab>,
     enabled: bool,
     placeholder_focus: gpui::FocusHandle,
@@ -172,6 +173,7 @@ impl WorkspaceWorkbench {
         Self {
             runtime,
             tokio,
+            window_store: None,
             tab: None,
             enabled: false,
             placeholder_focus: cx.focus_handle(),
@@ -185,6 +187,18 @@ impl WorkspaceWorkbench {
             resize: None,
             _activation: activation,
         }
+    }
+
+    pub(crate) fn set_window_store(
+        &mut self,
+        store: crate::store::WindowStore,
+        cx: &mut Context<Self>,
+    ) {
+        for pane in self.mounted.values() {
+            pane.terminal
+                .update(cx, |terminal, _| terminal.set_window_store(store.clone()));
+        }
+        self.window_store = Some(store);
     }
 
     pub(crate) fn set_tab(
@@ -332,6 +346,9 @@ impl WorkspaceWorkbench {
             let tokio = self.tokio.clone();
             let id = identity.session.clone();
             let terminal = cx.new(|cx| TerminalPane::new_fixed(runtime, tokio, id, window, cx));
+            if let Some(store) = &self.window_store {
+                terminal.update(cx, |terminal, _| terminal.set_window_store(store.clone()));
+            }
             let focus_handle = terminal.read(cx).quote_focus_handle();
             let pane_id = identity.pane.clone();
             let focus = cx.on_focus(&focus_handle, window, move |this, window, cx| {
