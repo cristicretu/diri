@@ -18,6 +18,7 @@ const MAX_SIGNAL: libc::c_int = 65;
 pub struct Pty {
     master: OwnedFd,
     child: Child,
+    child_identity: Option<diri_proto::process::ProcessIdentity>,
 }
 
 impl Pty {
@@ -116,10 +117,21 @@ impl Pty {
 
         let child = command.spawn()?;
         drop(slave);
-        Ok(Self { master, child })
+        // This object still exclusively owns the unreaped child. Never learn
+        // a replacement identity later from a numeric PID during adoption.
+        let child_identity = crate::process_identity::observe(child.id()).ok();
+        Ok(Self {
+            master,
+            child,
+            child_identity,
+        })
     }
 
     #[must_use]
+    pub fn child_identity(&self) -> Option<diri_proto::process::ProcessIdentity> {
+        self.child_identity
+    }
+
     pub fn pid(&self) -> u32 {
         self.child.id()
     }
