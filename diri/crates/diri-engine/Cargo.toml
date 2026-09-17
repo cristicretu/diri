@@ -18,6 +18,7 @@ rusqlite.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 sha2.workspace = true
+toml_edit = { version = "0.22.27", features = ["serde"] }
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"

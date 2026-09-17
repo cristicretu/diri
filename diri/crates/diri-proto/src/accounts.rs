@@ -33,3 +33,29 @@ pub struct AgentAccountCatalog {
 pub struct AgentAccountId {
     pub id: String,
 }
+
+/// Switch every tracked conversation for this profile's Agent and execution host.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SwitchAccountParams {
+    pub account_profile_id: String,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SwitchAccountResult {
+    pub switched: Vec<crate::SessionRecord>,
+    pub failures: Vec<AccountSwitchFailure>,
+    pub unchanged: Vec<crate::SessionId>,
+    pub default_changed: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub default_error: Option<String>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AccountSwitchFailure {
+    #[serde(rename = "sessionID")]
+    pub session_id: crate::SessionId,
+    pub message: String,
+}

@@ -8,6 +8,7 @@ pub(super) struct AccountsState {
     loaded: bool,
     busy: bool,
     error: Option<String>,
+    notice: Option<String>,
     editor: Option<ProfileEditor>,
     sequence: u64,
     continue_session: Option<diri_proto::SessionId>,
@@ -65,7 +66,7 @@ impl UtilitySurfaces {
             .profiles
             .iter()
             .filter(|profile| {
-                profile.agent == "claude-code"
+                profile.agent == source.kind.id()
                     && profile.host == source.host
                     && source
                         .account_profile
@@ -80,19 +81,20 @@ impl UtilitySurfaces {
         if self.accounts.busy {
             return;
         }
-        let Some(id) = self.accounts.continue_session.clone() else {
+        if self.accounts.continue_session.is_none() {
             return;
-        };
+        }
         self.accounts.busy = true;
         self.accounts.continuing = true;
         self.accounts.error = None;
+        self.accounts.notice = None;
         let runtime = Arc::clone(&self.runtime);
         let client = Arc::clone(self.store_runtime.client());
         cx.spawn(async move |this, cx| {
             let result = runtime
                 .spawn(async move {
                     client.wait_until_connected(Duration::from_secs(5)).await?;
-                    client.continue_with_account(&id, profile_id).await
+                    client.switch_all_accounts(profile_id).await
                 })
                 .await
                 .map_err(|error| error.to_string())
@@ -101,21 +103,26 @@ impl UtilitySurfaces {
                 this.accounts.busy = false;
                 this.accounts.continuing = false;
                 match result {
-                    Ok(record) => {
-                        let id = record.id.clone();
-                        let return_to_session =
-                            this.accounts.continue_session.as_ref() == Some(&id);
+                    Ok(result) => {
+                        let switched = result.switched.len();
                         {
-                            let mut store =
-                                this.store.write().expect("session store lock poisoned");
-                            store.upsert_session(record);
-                            if return_to_session {
-                                store.select(id);
-                            }
+                            let mut store = this.store.write().expect("session store lock poisoned");
+                            for record in result.switched { store.upsert_session(record); }
                         }
                         this.store_runtime.publish_local_change();
-                        if return_to_session {
-                            this.close_surface(cx);
+                        if result.failures.is_empty() && result.default_changed {
+                            this.accounts.error = None;
+                            this.accounts.notice = Some(format!("Switched {switched} conversations. This account is now the default. Direct MCP definitions and supported credentials were preserved. Account-linked connections may ask you to sign in again."));
+                            this.accounts.continue_session = None;
+                            this.account_action(AccountAction::Refresh, cx);
+                        } else {
+                            let store = this.store.read().expect("session store lock poisoned");
+                            let mut details = result.failures.iter().map(|failure| {
+                                let label = store.sessions().get(&failure.session_id).map(|s| s.title.as_str()).unwrap_or(&failure.session_id.0);
+                                format!("{label}: {}", failure.message)
+                            }).collect::<Vec<_>>().join("\n");
+                            if let Some(error) = result.default_error { details.push_str(&format!("\nCould not save the default account: {error}")); }
+                            this.accounts.error = Some(format!("{switched} conversations switched.\n{details}"));
                         }
                     }
                     Err(error) => this.accounts.error = Some(error),
@@ -130,9 +137,37 @@ impl UtilitySurfaces {
     fn continue_account_settings(&self, cx: &mut Context<Self>) -> AnyElement {
         let colors = self.settings_colors();
         let source = self.continuation_source();
+        let heading = source.as_ref().map_or_else(
+            || "Session unavailable".to_owned(),
+            |source| {
+                let count = self
+                    .store
+                    .read()
+                    .map(|store| {
+                        store
+                            .sessions()
+                            .values()
+                            .filter(|session| {
+                                session.kind == source.kind && session.host == source.host
+                            })
+                            .count()
+                    })
+                    .unwrap_or(0);
+                let agent = if source.kind == diri_proto::AgentKind::CODEX {
+                    "Codex"
+                } else {
+                    "Claude"
+                };
+                format!(
+                    "{count} {agent} conversation{}",
+                    if count == 1 { "" } else { "s" }
+                )
+            },
+        );
         let mut content = div().flex().flex_col().gap(px(16.0))
-            .child(div().text_size(px(14.0)).child(source.as_ref().map_or("Session unavailable".to_owned(), |s| s.title.clone())))
-            .child(div().text_size(px(12.0)).text_color(colors.secondary).child("Choose a signed-in Claude account on the same machine. Diri restarts Claude with this conversation and keeps your working files in place."));
+            .child(div().text_size(px(14.0)).child(heading))
+            .child(div().text_size(px(12.0)).text_color(colors.secondary).child("All Diri conversations for this Agent on this machine will use the selected account. Running Agents restart; saved conversations stay stopped. Working files and direct MCP definitions are kept."))
+            .child(div().text_size(px(11.0)).text_color(colors.tertiary).child("Running tools are interrupted. Account-linked connections may ask you to sign in again."));
         if let Some(source) = &source {
             content = content.child(
                 div()
@@ -162,7 +197,7 @@ impl UtilitySurfaces {
                     .text_size(px(12.0))
                     .text_color(colors.secondary)
                     .child(if self.accounts.continuing {
-                        "Saving conversation and switching account…"
+                        "Saving conversations and switching accounts…"
                     } else {
                         "Loading accounts…"
                     }),
@@ -170,7 +205,7 @@ impl UtilitySurfaces {
         }
         let choices = self.continuation_choices();
         if choices.is_empty() && self.accounts.loaded && !self.accounts.busy {
-            content = content.child(div().text_size(px(12.0)).child("No other Claude account is set up for this machine. Add a profile and sign in through Open Agent, then return here."));
+            content = content.child(div().text_size(px(12.0)).child("No other account is set up for this Agent on this machine. Add a profile and sign in through Open Agent, then return here."));
         }
         for (index, profile) in choices.into_iter().enumerate() {
             let id = profile.id.clone();
@@ -208,7 +243,7 @@ impl UtilitySurfaces {
                     )
                     .child(self.account_button(
                         format!("continue-account-{id}"),
-                        format!("Continue with {}", profile.label),
+                        format!("Switch all to {}", profile.label),
                         cx,
                         move |this, _, cx| this.continue_account(id.clone(), cx),
                     )),
@@ -236,7 +271,7 @@ impl UtilitySurfaces {
                     |this, _, cx| this.close_surface(cx),
                 )),
         );
-        settings_page("Continue with another account", content, colors).into_any_element()
+        settings_page("Switch all conversations", content, colors).into_any_element()
     }
 
     #[cfg(test)]
@@ -367,19 +402,22 @@ impl UtilitySurfaces {
         if self.accounts.busy {
             return;
         }
-        let profile = profile.unwrap_or_else(|| AgentAccountProfile {
-            id: format!(
+        let profile = profile.unwrap_or_else(|| {
+            let id = format!(
                 "profile-{}",
                 std::time::SystemTime::now()
                     .duration_since(std::time::UNIX_EPOCH)
                     .unwrap_or_default()
                     .as_nanos()
-            ),
-            label: String::new(),
-            agent: "codex".into(),
-            host: None,
-            config_home: "~/.codex-work".into(),
-            is_default: false,
+            );
+            AgentAccountProfile {
+                config_home: format!("~/.diri/accounts/{id}/codex"),
+                id,
+                label: String::new(),
+                agent: "codex".into(),
+                host: None,
+                is_default: false,
+            }
         });
         self.accounts.editor = Some(ProfileEditor {
             name: text_editor(&profile.label),
@@ -492,7 +530,7 @@ impl UtilitySurfaces {
         }
         let colors = self.settings_colors();
         let mut content = div().flex().flex_col().gap(px(16.0))
-            .child(div().text_size(px(12.0)).text_color(colors.secondary).child("Choose which Claude or Codex account each new session uses. Profiles keep their own provider configuration on the machine where the Agent runs."))
+            .child(div().text_size(px(12.0)).text_color(colors.secondary).child("Sign in to each Claude or Codex account once with Open Agent. Switch all conversations to another account when needed; direct MCP setup follows the conversations. Running tools are interrupted, and hosted connections may need authorization on the selected account."))
             .child(div().flex().items_center().justify_between()
                 .child(div().text_size(px(12.0)).text_color(colors.secondary).child(if self.accounts.busy { "Updating accounts…" } else { "Saved profiles" }))
                 .child(self.account_button("add-account", "Add profile", cx, |this, window, cx| this.edit_account(None, window, cx))));
@@ -539,8 +577,13 @@ impl UtilitySurfaces {
                         |this, _, cx| {
                             if let Some(editor) = &mut this.accounts.editor {
                                 editor.profile.agent = "codex".into();
-                                if editor.path.text() == "~/.claude-work" {
-                                    editor.path = text_editor("~/.codex-work");
+                                if editor.path.text()
+                                    == format!("~/.diri/accounts/{}/claude", editor.profile.id)
+                                {
+                                    editor.path = text_editor(&format!(
+                                        "~/.diri/accounts/{}/codex",
+                                        editor.profile.id
+                                    ));
                                 }
                             }
                             cx.notify();
@@ -557,8 +600,13 @@ impl UtilitySurfaces {
                         |this, _, cx| {
                             if let Some(editor) = &mut this.accounts.editor {
                                 editor.profile.agent = "claude-code".into();
-                                if editor.path.text() == "~/.codex-work" {
-                                    editor.path = text_editor("~/.claude-work");
+                                if editor.path.text()
+                                    == format!("~/.diri/accounts/{}/codex", editor.profile.id)
+                                {
+                                    editor.path = text_editor(&format!(
+                                        "~/.diri/accounts/{}/claude",
+                                        editor.profile.id
+                                    ));
                                 }
                             }
                             cx.notify();
@@ -677,7 +725,16 @@ impl UtilitySurfaces {
                 .child(div().text_size(px(14.0)).child("Work and personal, side by side"))
                 .child(div().text_size(px(12.0)).text_color(colors.secondary).child("Add a named profile to select an account in the launcher. Without a profile, Diri uses your CLI’s current environment.")));
         }
+        if let Some(notice) = &self.accounts.notice {
+            content = content.child(
+                div()
+                    .text_size(px(12.0))
+                    .text_color(colors.secondary)
+                    .child(notice.clone()),
+            );
+        }
         for profile in &self.accounts.catalog.profiles {
+            let switch = profile.clone();
             let edit = profile.clone();
             let open = profile.clone();
             let remove = profile.id.clone();
@@ -763,6 +820,31 @@ impl UtilitySurfaces {
                                     );
                                     drop(store);
                                     this.close_surface(cx);
+                                },
+                            ))
+                            .child(self.account_button(
+                                format!("switch-{}", profile.id),
+                                "Switch all conversations",
+                                cx,
+                                move |this, _, cx| {
+                                    let source = this.store.read().ok().and_then(|store| {
+                                        store
+                                            .sessions()
+                                            .values()
+                                            .find(|session| {
+                                                session.kind.id() == switch.agent
+                                                    && session.host == switch.host
+                                            })
+                                            .map(|session| session.id.clone())
+                                    });
+                                    if let Some(id) = source {
+                                        this.accounts.continue_session = Some(id);
+                                        this.continue_account(switch.id.clone(), cx);
+                                    } else {
+                                        let mut profile = switch.clone();
+                                        profile.is_default = true;
+                                        this.account_action(AccountAction::Save(profile), cx);
+                                    }
                                 },
                             ))
                             .child(self.account_button(

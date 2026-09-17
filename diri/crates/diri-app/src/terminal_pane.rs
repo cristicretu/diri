@@ -1682,8 +1682,10 @@ impl TerminalPane {
 
     fn open_account_continuation(&self, cx: &mut Context<Self>) {
         if let Some(session) = self.selected_session()
-            && session.kind == diri_proto::AgentKind::CLAUDE_CODE
-            && session.agent_session_id.is_some()
+            && matches!(
+                session.kind.id(),
+                diri_proto::AgentKind::CLAUDE_CODE_ID | diri_proto::AgentKind::CODEX_ID
+            )
         {
             cx.emit(TerminalPaneEvent::ContinueAccount(session.id.clone()));
         }

@@ -1,3 +1,4 @@
+mod accounts;
 mod filter;
 mod project_picker;
 mod tabs;
@@ -133,6 +134,8 @@ pub(crate) enum SidebarEvent {
     /// Root-mounted header popup visibility changed; no sidebar layout change.
     ProjectPickerChanged,
     RefreshUsageLimits,
+    AccountAction(Option<String>),
+    ManageAccounts,
     ContinueAccount(SessionId),
     VisibilityChanged,
     /// The sidebar and top strip must adopt the new layout together.
@@ -292,6 +295,7 @@ pub struct Sidebar {
     usage: Option<UsageSnapshot>,
     number_flows: crate::number_flow::Bank,
     number_tick: Option<Task<()>>,
+    accounts: accounts::MenuAccounts,
     account_context: Option<crate::transcript::ContextUsage>,
     account_context_session: Option<SessionId>,
     account_context_task: Option<Task<()>>,
@@ -448,6 +452,7 @@ impl Sidebar {
             usage: None,
             number_flows: crate::number_flow::Bank::default(),
             number_tick: None,
+            accounts: accounts::MenuAccounts::new(preview),
             account_context: None,
             account_context_session: None,
             account_context_task: None,
@@ -3738,6 +3743,7 @@ impl Sidebar {
                         this.refresh_account_context(true, cx);
                         if !this.preview && this.ui.popover == Some(Popover::Account) {
                             cx.emit(SidebarEvent::RefreshUsageLimits);
+                            cx.emit(SidebarEvent::AccountAction(None));
                         }
                         cx.notify();
                     }))
@@ -5069,6 +5075,8 @@ impl Sidebar {
                     ),
             )
             .child(menu_divider(colors))
+            .child(self.account_switch_menu(colors, cx))
+            .child(menu_divider(colors))
             .when_some(context, |menu, context| {
                 menu.child(account_context_menu(context, colors))
                     .child(menu_divider(colors))
@@ -5383,9 +5391,12 @@ impl Sidebar {
                 .child(copy_session_id_row(id, colors, cx));
         } else {
             let running = !matches!(session.status, diri_proto::SessionStatus::Exited(_));
-            if session.kind == ProtoAgentKind::CLAUDE_CODE && session.agent_session_id.is_some() {
+            if matches!(
+                session.kind.id(),
+                ProtoAgentKind::CLAUDE_CODE_ID | ProtoAgentKind::CODEX_ID
+            ) {
                 content = content.child(menu_row(
-                    "Continue with another account…",
+                    "Switch account for all conversations…",
                     colors,
                     cx.listener({
                         let id = id.clone();
@@ -9347,16 +9358,27 @@ mod tests {
 
     #[gpui::test]
     fn account_popover_exposes_usage_and_account_shortcuts(cx: &mut TestAppContext) {
+        let actions = Rc::new(RefCell::new(Vec::new()));
+        let observed = actions.clone();
         let (_view, cx) = cx.add_window_view(|_, cx| {
             let sidebar = cx.new(|cx| {
                 let mut sidebar = Sidebar::new(None, true, PreviewScenario::Typical, cx);
                 sidebar.ui.popover = Some(Popover::Account);
                 sidebar
             });
+            cx.subscribe(&sidebar, move |_, _, event: &SidebarEvent, _| {
+                if let SidebarEvent::AccountAction(Some(id)) = event {
+                    observed.borrow_mut().push(id.clone());
+                }
+            })
+            .detach();
             SidebarPopoverHarness { sidebar }
         });
 
         assert!(cx.debug_bounds("account-menu").is_some());
+        assert!(cx.debug_bounds("account-switcher").is_some());
+        assert!(cx.debug_bounds("switch-account-preview-1").is_some());
+        assert!(cx.debug_bounds("manage-accounts").is_some());
         assert!(cx.debug_bounds("account-context-window").is_some());
         assert!(cx.debug_bounds("account-plan-limits").is_some());
         assert!(cx.debug_bounds("account-usage-session").is_some());
@@ -9365,6 +9387,13 @@ mod tests {
         assert!(cx.debug_bounds("account-whats-new").is_some());
         assert!(cx.debug_bounds("quick-add-remote-host").is_some());
         assert!(cx.debug_bounds("account-settings").is_some());
+        let target = cx.debug_bounds("switch-account-preview-1").unwrap();
+        cx.simulate_click(target.center(), Modifiers::default());
+        assert_eq!(*actions.borrow(), vec!["preview-1".to_owned()]);
+        assert!(
+            cx.debug_bounds("account-menu").is_some(),
+            "switch stays in menu"
+        );
     }
 
     /// Produces a deterministic image for design review without reading live

@@ -107,18 +107,35 @@ environment through the existing structured LaunchRequest. Resume and fork use
 the recorded binding, not the current catalog default. Cross-host migration of
 bound sessions fails until an explicit destination-account mapping exists.
 
-An explicit same-host Claude account continuation is also owned by the local
-Engine. It preflights the source and destination, stops the existing Holder's
-Agent tree, reads the final main JSONL transcript through bounded fixed-script
-SSH, installs it atomically in the selected profile, and resumes the same
-conversation through the existing Holder launch path. Only transcript bytes
-travel through Engine memory; credentials and provider configuration never move.
-The transcript is bounded to 64 MiB. Symlinks and conflicting destination history
-fail closed; an existing byte-prefix copy permits switching back. The updated
-profile binding is durable before relaunch. Preflight errors leave the original
-session running; later failures keep the saved conversation recoverable and
-report the stopped session. This does not implement cross-host handoff, file
-rewind/subagent checkpoint transfer, or provider usage/authentication discovery.
+Same-host account continuation and bulk account switching are owned by the
+local Engine. Codex and Claude transcripts are validated, bounded to 64 MiB,
+and installed atomically in the destination profile; provider login credentials
+never travel with history. Bulk switching reserves and preflights every tracked
+conversation for the selected Agent and host before stopping any. It stops all
+selected live Agents before transferring direct MCP configuration and file-backed
+MCP OAuth grants, then persists each new binding before relaunch. Stopped and
+archived conversations remain stopped. Each failure is surfaced individually;
+there is no claim of an atomic multi-process switch or automatic prompt replay.
+Only a fully successful switch changes the default for future launches.
+
+Direct MCP configuration and file-backed OAuth grants are transferred on the
+same host through the bounded fixed-script SSH seam, with paths on stdin,
+owner checks, conflict checks and owner-only atomic file replacement. These
+are independent tool authorizations, never Codex auth.json or Claude provider
+login fields. Hosted account-bound connector grants are excluded. Keychain
+credentials remain in their native store; on the local Mac, the Engine merges
+only Claude MCP grants between existing native Keychain items. Remote Keychain
+migration is not implemented. This does not add an MCP gateway,
+remote MCP forwarding, a credential vault, or a Helper capability. Unsupported
+credential backends and account-bound hosted connections can require provider
+reauthorization. Source data is preserved for recovery. No credentials cross
+execution hosts or appear in control responses/logs.
+
+Codex requires a known native conversation ID and rollout path (local path
+discovery is supported). This does not introduce remote thread discovery or
+cross-host handoff. Transcript conflicts fail closed; an existing byte-prefix
+copy permits switching back. Main transcripts are preserved, not running tool
+processes or provider-specific rewind/subagent sidecars.
 
 The Helper protocol and Holder ownership remain unchanged. Account settings,
 directory preparation, and profile resolution belong to the local Engine;

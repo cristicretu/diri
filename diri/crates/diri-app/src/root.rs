@@ -540,6 +540,21 @@ impl RootView {
                 }
                 cx.notify();
             }
+            if let SidebarEvent::AccountAction(profile) = event {
+                let services = this.services.clone();
+                this.sidebar.update(cx, |sidebar, cx| {
+                    sidebar.account_menu_action(profile.clone(), services, cx);
+                });
+            }
+            if matches!(event, SidebarEvent::ManageAccounts)
+                && let Some(surfaces) = &this.utility_surfaces
+            {
+                surfaces.update(cx, |surfaces, cx| {
+                    surfaces.open_settings(cx);
+                    surfaces.open_settings_tab(crate::settings::SettingsTab::Accounts, cx);
+                    surfaces.focus_handle(cx).focus(window, cx);
+                });
+            }
             if matches!(event, SidebarEvent::RefreshUsageLimits) {
                 let _ = this.services.usage_limits_refresh.try_send(());
             }

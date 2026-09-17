@@ -68,6 +68,7 @@ pub struct ControlServer {
     workspaces: crate::workspace::WorkspaceStore,
     agent_catalog: Arc<Mutex<crate::agent_catalog::AgentCatalogStore>>,
     accounts: Mutex<crate::accounts::AccountStore>,
+    account_operations: std::sync::RwLock<()>,
     session_operations: Mutex<std::collections::HashSet<String>>,
     agent_scans: Arc<Mutex<std::collections::HashMap<String, Arc<Mutex<()>>>>>,
 }
@@ -166,6 +167,7 @@ impl ControlServer {
             workspaces,
             agent_catalog: Arc::new(Mutex::new(agent_catalog)),
             accounts,
+            account_operations: std::sync::RwLock::new(()),
             session_operations: Mutex::new(std::collections::HashSet::new()),
             agent_scans: Arc::new(Mutex::new(std::collections::HashMap::new())),
         }
@@ -563,6 +565,7 @@ impl ControlServer {
                     Method::SESSION_SPAWN
                         | Method::SESSION_SPAWN_TRACKED
                         | Method::SESSION_CONTINUE_ACCOUNT
+                        | Method::ACCOUNT_SWITCH_ALL
                         | Method::HOST_INITIALIZE
                         | Method::HOST_USAGE
                         | Method::HOST_LIST_DIRECTORIES
@@ -745,8 +748,37 @@ impl ControlServer {
     }
 
     fn dispatch(&self, method: &str, params: Option<JsonValue>) -> Result<JsonValue, ControlError> {
+        // Bulk switching excludes concurrent launches/catalog edits without blocking input,
+        // output, snapshots, or unrelated read-only requests.
+        let _account_switch = if method == Method::ACCOUNT_SWITCH_ALL {
+            Some(self.account_operations.try_write().map_err(|_| ControlError::bad_request("An account or session operation is already in progress. Retry when it finishes."))?)
+        } else {
+            None
+        };
+        let _account_use = if matches!(
+            method,
+            Method::SESSION_SPAWN
+                | Method::SESSION_RESUME
+                | Method::SESSION_FORK
+                | Method::SESSION_CONTINUE_ACCOUNT
+                | Method::ACCOUNT_PROFILES_SAVE
+                | Method::ACCOUNT_PROFILES_REMOVE
+                | Method::SESSION_RESUME_FROM_HISTORY
+                | Method::SESSION_MIGRATE
+                | Method::SESSION_WAKE
+                | Method::SESSION_HIBERNATE
+        ) {
+            Some(self.account_operations.try_read().map_err(|_| {
+                ControlError::bad_request(
+                    "An account switch is in progress. Retry when it finishes.",
+                )
+            })?)
+        } else {
+            None
+        };
         let _operation = account_handoff::SessionOperation::acquire(self, method, params.as_ref())?;
         match method {
+            Method::ACCOUNT_SWITCH_ALL => self.account_switch_all(params),
             Method::SESSION_CONTINUE_ACCOUNT => self.session_continue_account(params),
             Method::ACCOUNT_PROFILES_LIST => {
                 encode(&self.accounts.lock().map_err(poisoned)?.catalog()?)

@@ -73,6 +73,7 @@ impl Method {
     pub const ACCOUNT_PROFILES_LIST: &'static str = "account.profiles.list";
     pub const ACCOUNT_PROFILES_SAVE: &'static str = "account.profiles.save";
     pub const ACCOUNT_PROFILES_REMOVE: &'static str = "account.profiles.remove";
+    pub const ACCOUNT_SWITCH_ALL: &'static str = "account.switch_all";
     pub const SESSION_CONTINUE_ACCOUNT: &'static str = "session.continue_with_account";
     pub const EVENTS_SUBSCRIBE: &'static str = "events.subscribe";
     pub const EVENTS_WAIT: &'static str = "events.wait";
