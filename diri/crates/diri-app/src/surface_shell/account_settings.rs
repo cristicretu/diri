@@ -27,6 +27,7 @@ enum AccountAction {
     Refresh,
     Save(AgentAccountProfile),
     Remove(String),
+    Capture(String),
 }
 
 impl UtilitySurfaces {
@@ -77,11 +78,102 @@ impl UtilitySurfaces {
             .collect()
     }
 
-    fn continue_account(&mut self, profile_id: String, cx: &mut Context<Self>) {
+    fn login_codex_account(&mut self, id: String, cx: &mut Context<Self>) {
         if self.accounts.busy {
             return;
         }
-        if self.accounts.continue_session.is_none() {
+        self.accounts.busy = true;
+        self.accounts.error = None;
+        let runtime = Arc::clone(&self.runtime);
+        let client = Arc::clone(self.store_runtime.client());
+        cx.spawn(async move |this, cx| {
+            let result = runtime
+                .spawn(async move { client.login_codex_account(id).await })
+                .await
+                .map_err(|e| e.to_string())
+                .and_then(|r| r.map_err(|e| e.to_string()));
+            let _ = this.update(cx, |this, cx| {
+                this.accounts.busy = false;
+                match result {
+                    Ok(record) => {
+                        let mut store = this.store.write().expect("session store lock poisoned");
+                        let id = record.id.clone();
+                        store.upsert_session(record);
+                        store.select(id);
+                        drop(store);
+                        this.store_runtime.publish_local_change();
+                        this.close_surface(cx);
+                        cx.emit(UtilitySurfacesEvent::AccountLoginOpened);
+                    }
+                    Err(e) => this.accounts.error = Some(e),
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+        cx.notify();
+    }
+
+    fn continue_claude_account(&mut self, profile_id: String, cx: &mut Context<Self>) {
+        if self.accounts.busy {
+            return;
+        }
+        let Some(id) = self.accounts.continue_session.clone() else {
+            return;
+        };
+        self.accounts.busy = true;
+        self.accounts.continuing = true;
+        self.accounts.error = None;
+        let runtime = Arc::clone(&self.runtime);
+        let client = Arc::clone(self.store_runtime.client());
+        cx.spawn(async move |this, cx| {
+            let result = runtime
+                .spawn(async move {
+                    client.wait_until_connected(Duration::from_secs(5)).await?;
+                    client.continue_with_account(&id, profile_id).await
+                })
+                .await
+                .map_err(|error| error.to_string())
+                .and_then(|r| r.map_err(|e| e.to_string()));
+            let _ = this.update(cx, |this, cx| {
+                this.accounts.busy = false;
+                this.accounts.continuing = false;
+                match result {
+                    Ok(record) => {
+                        let id = record.id.clone();
+                        let return_to_session =
+                            this.accounts.continue_session.as_ref() == Some(&id);
+                        {
+                            let mut store =
+                                this.store.write().expect("session store lock poisoned");
+                            store.upsert_session(record);
+                            if return_to_session {
+                                store.select(id);
+                            }
+                        }
+                        this.store_runtime.publish_local_change();
+                        if return_to_session {
+                            this.close_surface(cx);
+                        }
+                    }
+                    Err(error) => this.accounts.error = Some(error),
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+        cx.notify();
+    }
+
+    fn continue_account(&mut self, profile_id: String, cx: &mut Context<Self>) {
+        if self
+            .continuation_source()
+            .is_some_and(|s| s.kind == diri_proto::AgentKind::CLAUDE_CODE)
+        {
+            self.continue_claude_account(profile_id, cx);
+            return;
+        }
+        if self.accounts.busy {
             return;
         }
         self.accounts.busy = true;
@@ -105,6 +197,7 @@ impl UtilitySurfaces {
                 match result {
                     Ok(result) => {
                         let switched = result.switched.len();
+                        let unchanged = result.unchanged.len();
                         {
                             let mut store = this.store.write().expect("session store lock poisoned");
                             for record in result.switched { store.upsert_session(record); }
@@ -112,7 +205,7 @@ impl UtilitySurfaces {
                         this.store_runtime.publish_local_change();
                         if result.failures.is_empty() && result.default_changed {
                             this.accounts.error = None;
-                            this.accounts.notice = Some(format!("Switched {switched} conversations. This account is now the default. Direct MCP definitions and supported credentials were preserved. Account-linked connections may ask you to sign in again."));
+                            this.accounts.notice = Some(format!("Switched {switched} conversations; {unchanged} separate-home tabs unchanged. This account is now the default. Local MCP configuration is unchanged. Hosted connectors such as Slack require a connection on the selected account."));
                             this.accounts.continue_session = None;
                             this.account_action(AccountAction::Refresh, cx);
                         } else {
@@ -174,8 +267,8 @@ impl UtilitySurfaces {
         );
         let mut content = div().flex().flex_col().gap(px(16.0))
             .child(div().text_size(px(14.0)).child(heading))
-            .child(div().text_size(px(12.0)).text_color(colors.secondary).child("Conversations open in Diri tabs for this Agent on this machine will use the selected account. Running Agents restart; sleeping and stopped conversations keep their state. Working files and direct MCP definitions are kept."))
-            .child(div().text_size(px(11.0)).text_color(colors.tertiary).child("Running tools are interrupted. Account-linked connections may ask you to sign in again."));
+            .child(div().text_size(px(12.0)).text_color(colors.secondary).child("Local Codex switches the login for open tabs sharing ~/.codex. Running Agents restart and sleeping tabs return to sleep. Claude continues only the selected conversation using its existing handoff flow."))
+            .child(div().text_size(px(11.0)).text_color(colors.tertiary).child("Running tools are interrupted. Hosted connectors such as Slack need a connection on the selected account."));
         if let Some(source) = &source {
             content = content.child(
                 div()
@@ -205,7 +298,7 @@ impl UtilitySurfaces {
                     .text_size(px(12.0))
                     .text_color(colors.secondary)
                     .child(if self.accounts.continuing {
-                        "Saving conversations and switching accounts…"
+                        "Switching login and resuming conversations…"
                     } else {
                         "Loading accounts…"
                     }),
@@ -373,6 +466,7 @@ impl UtilitySurfaces {
                         AccountAction::Refresh => client.account_profiles().await,
                         AccountAction::Save(profile) => client.save_account_profile(&profile).await,
                         AccountAction::Remove(id) => client.remove_account_profile(id).await,
+                        AccountAction::Capture(id) => client.capture_codex_account(id).await,
                     }
                 })
                 .await;
@@ -419,7 +513,7 @@ impl UtilitySurfaces {
                     .as_nanos()
             );
             AgentAccountProfile {
-                config_home: format!("~/.diri/accounts/{id}/codex"),
+                config_home: "~/.codex".into(),
                 id,
                 label: String::new(),
                 agent: "codex".into(),
@@ -446,6 +540,15 @@ impl UtilitySurfaces {
         let mut profile = editor.profile.clone();
         profile.label = editor.name.text().trim().into();
         profile.config_home = editor.path.text().trim().into();
+        if profile.agent == "codex" && profile.host.is_none() {
+            profile.is_default = self
+                .accounts
+                .catalog
+                .profiles
+                .iter()
+                .find(|p| p.id == profile.id)
+                .is_some_and(|p| p.is_default);
+        }
         self.account_action(AccountAction::Save(profile), cx);
     }
 
@@ -716,10 +819,10 @@ impl UtilitySurfaces {
                 ));
             }
             form = form.child(hosts).child(div().text_size(px(11.0)).text_color(colors.secondary).child(format!("Selected: {host_label}. The directory is on this machine.")))
-                .child(self.account_button("account-default", if editor.profile.is_default { "✓ Default for this Agent on this host" } else { "Use by default for this Agent on this host" }, cx, |this, _, cx| {
+                .when(editor.profile.agent != "codex" || editor.profile.host.is_some(), |form| form.child(self.account_button("account-default", if editor.profile.is_default { "✓ Default for this Agent on this host" } else { "Use by default for this Agent on this host" }, cx, |this, _, cx| {
                     if let Some(editor) = &mut this.accounts.editor { editor.profile.is_default = !editor.profile.is_default; } cx.notify();
-                }))
-                .child(div().text_size(px(11.0)).text_color(colors.tertiary).child("Choose an existing account directory, or a new one for a separate login. Open Agent to complete provider sign-in. Diri stores the directory and label; credentials stay with the provider."))
+                })))
+                .child(div().text_size(px(11.0)).text_color(colors.tertiary).child("Local Codex profiles share ~/.codex. Save the current login, or Sign in to save another account. Hosted connectors such as Slack must be connected on each account. Claude and remote profiles use their own directories."))
                 .child(div().flex().gap(px(8.0))
                     .child(self.account_button("save-account", "Save profile", cx, |this, _, cx| this.save_account(cx)))
                     .child(self.account_button("cancel-account", "Cancel", cx, |this, _, cx| { this.accounts.editor = None; cx.notify(); })));
@@ -746,6 +849,8 @@ impl UtilitySurfaces {
             let edit = profile.clone();
             let open = profile.clone();
             let remove = profile.id.clone();
+            let capture = profile.id.clone();
+            let local_codex = profile.agent == "codex" && profile.host.is_none();
             let host = profile
                 .host
                 .as_deref()
@@ -807,9 +912,13 @@ impl UtilitySurfaces {
                             .gap(px(8.0))
                             .child(self.account_button(
                                 format!("open-{}", profile.id),
-                                "Open Agent",
+                                if local_codex { "Sign in" } else { "Open Agent" },
                                 cx,
                                 move |this, _, cx| {
+                                    if local_codex {
+                                        this.login_codex_account(open.id.clone(), cx);
+                                        return;
+                                    }
                                     let kind = diri_proto::AgentKind::new(&open.agent);
                                     let mut store =
                                         this.store.write().expect("session store lock poisoned");
@@ -830,31 +939,29 @@ impl UtilitySurfaces {
                                     this.close_surface(cx);
                                 },
                             ))
-                            .child(self.account_button(
-                                format!("switch-{}", profile.id),
-                                "Switch open conversations",
-                                cx,
-                                move |this, _, cx| {
-                                    let source = this.store.read().ok().and_then(|store| {
-                                        store
-                                            .sessions()
-                                            .values()
-                                            .find(|session| {
-                                                session.kind.id() == switch.agent
-                                                    && session.host == switch.host
-                                            })
-                                            .map(|session| session.id.clone())
-                                    });
-                                    if let Some(id) = source {
-                                        this.accounts.continue_session = Some(id);
+                            .when(local_codex, |row| {
+                                row.child(self.account_button(
+                                    format!("capture-{}", profile.id),
+                                    "Save current login",
+                                    cx,
+                                    move |this, _, cx| {
+                                        this.account_action(
+                                            AccountAction::Capture(capture.clone()),
+                                            cx,
+                                        )
+                                    },
+                                ))
+                            })
+                            .when(local_codex, |row| {
+                                row.child(self.account_button(
+                                    format!("switch-{}", profile.id),
+                                    "Switch open conversations",
+                                    cx,
+                                    move |this, _, cx| {
                                         this.continue_account(switch.id.clone(), cx);
-                                    } else {
-                                        let mut profile = switch.clone();
-                                        profile.is_default = true;
-                                        this.account_action(AccountAction::Save(profile), cx);
-                                    }
-                                },
-                            ))
+                                    },
+                                ))
+                            })
                             .child(self.account_button(
                                 format!("edit-{}", profile.id),
                                 "Edit",

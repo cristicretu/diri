@@ -45,7 +45,7 @@ impl Sidebar {
         self.accounts.busy = true;
         if profile.is_some() {
             self.accounts.failed = false;
-            self.accounts.message = Some("Saving conversations and switching accounts…".into());
+            self.accounts.message = Some("Switching login and resuming conversations…".into());
         }
         let client = services.store.client().clone();
         let runtime = services.tokio.clone();
@@ -79,6 +79,7 @@ impl Sidebar {
                     Ok((switched, catalog)) => {
                         if let Some(result) = switched {
                             let count = result.switched.len();
+                            let unchanged = result.unchanged.len();
                             let mut store =
                                 this.store.write().expect("session store lock poisoned");
                             for record in result.switched {
@@ -103,7 +104,7 @@ impl Sidebar {
                             this.accounts.message = Some(if this.accounts.failed {
                                 format!("{count} conversations switched. {}", errors.join("\n"))
                             } else {
-                                format!("Switched {count} conversations. Default account updated.")
+                                format!("Switched {count} conversations; {unchanged} separate-home tabs unchanged. Default account updated.")
                             });
                             drop(store);
                             services.store.publish_local_change();
@@ -140,8 +141,14 @@ impl Sidebar {
     ) -> AnyElement {
         let mut section = div().id("account-switcher").debug_selector(|| "account-switcher".into()).flex().flex_col().py(px(3.0))
             .child(div().px(px(14.0)).text_size(px(Typo::META.size)).text_color(colors.tertiary).child("Switch open conversations"))
-            .child(div().px(px(14.0)).py(px(4.0)).text_size(px(Typo::META.size)).text_color(colors.tertiary).child("Open Diri tabs for this provider and machine. Running agents restart; direct MCPs are kept."));
-        for profile in &self.accounts.catalog.profiles {
+            .child(div().px(px(14.0)).py(px(4.0)).text_size(px(Typo::META.size)).text_color(colors.tertiary).child("Local Codex tabs resume with the selected login. Local MCP setup stays; hosted connectors require per-account connections."));
+        for profile in self
+            .accounts
+            .catalog
+            .profiles
+            .iter()
+            .filter(|p| p.agent == "codex" && p.host.is_none())
+        {
             let id = profile.id.clone();
             let subtitle = format!(
                 "{} · {}{}",

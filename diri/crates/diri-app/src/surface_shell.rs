@@ -265,6 +265,11 @@ impl HostEditor {
     }
 }
 
+pub(crate) enum UtilitySurfacesEvent {
+    AccountLoginOpened,
+}
+impl gpui::EventEmitter<UtilitySurfacesEvent> for UtilitySurfaces {}
+
 pub struct UtilitySurfaces {
     skills: gpui::Entity<crate::skills_page::SkillsPage>,
     accounts: AccountsState,

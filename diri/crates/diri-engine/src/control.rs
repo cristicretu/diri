@@ -25,6 +25,7 @@ use sha2::{Digest, Sha256};
 
 use crate::registry::Registry;
 mod account_handoff;
+mod codex_accounts;
 mod message_delivery;
 mod operations;
 mod tasks;
@@ -566,6 +567,7 @@ impl ControlServer {
                         | Method::SESSION_SPAWN_TRACKED
                         | Method::SESSION_CONTINUE_ACCOUNT
                         | Method::ACCOUNT_SWITCH_ALL
+                        | Method::ACCOUNT_CODEX_LOGIN
                         | Method::HOST_INITIALIZE
                         | Method::HOST_USAGE
                         | Method::HOST_LIST_DIRECTORIES
@@ -750,7 +752,12 @@ impl ControlServer {
     fn dispatch(&self, method: &str, params: Option<JsonValue>) -> Result<JsonValue, ControlError> {
         // Bulk switching excludes concurrent launches/catalog edits without blocking input,
         // output, snapshots, or unrelated read-only requests.
-        let _account_switch = if method == Method::ACCOUNT_SWITCH_ALL {
+        let _account_switch = if matches!(
+            method,
+            Method::ACCOUNT_SWITCH_ALL
+                | Method::ACCOUNT_CODEX_LOGIN
+                | Method::ACCOUNT_CODEX_CAPTURE
+        ) {
             Some(self.account_operations.try_write().map_err(|_| ControlError::bad_request("An account or session operation is already in progress. Retry when it finishes."))?)
         } else {
             None
@@ -779,6 +786,8 @@ impl ControlServer {
         let _operation = account_handoff::SessionOperation::acquire(self, method, params.as_ref())?;
         match method {
             Method::ACCOUNT_SWITCH_ALL => self.account_switch_all(params),
+            Method::ACCOUNT_CODEX_LOGIN => self.codex_account_login(params),
+            Method::ACCOUNT_CODEX_CAPTURE => self.codex_account_capture(params),
             Method::SESSION_CONTINUE_ACCOUNT => self.session_continue_account(params),
             Method::ACCOUNT_PROFILES_LIST => {
                 encode(&self.accounts.lock().map_err(poisoned)?.catalog()?)
@@ -917,6 +926,19 @@ impl ControlServer {
         if p.host.is_some() {
             return self.session_spawn_remote(p, argv, account_profile, reserved_id);
         }
+        if let Some(profile) = &account_profile
+            && profile.agent == "codex"
+            && !profile.is_default
+            && (profile.config_home == "~/.codex"
+                || std::env::var("HOME").is_ok_and(|home| {
+                    PathBuf::from(home).join(".codex") == Path::new(&profile.config_home)
+                }))
+        {
+            return Err(ControlError::bad_request(
+                "Select this Codex account in the bottom-left menu before starting a conversation. Shared-home profiles use the active login.",
+            ));
+        }
+
         let kind = p.kind.id().to_string();
         // A generic kind carries the user's command line inside itself.
         let argv = if argv.is_empty() {

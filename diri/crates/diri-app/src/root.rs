@@ -453,6 +453,16 @@ impl RootView {
                 surfaces
             })
         });
+        if let Some(surfaces) = &utility_surfaces {
+            cx.subscribe(
+                surfaces,
+                |this, _, _: &crate::surface_shell::UtilitySurfacesEvent, cx| {
+                    this.sidebar
+                        .update(cx, |_, cx| cx.emit(SidebarEvent::SessionActivated));
+                },
+            )
+            .detach();
+        }
         let launcher = cx.new(|cx| {
             let mut launcher = LauncherOverlay::new(Arc::clone(&services), preview, cx);
             launcher.set_window_store(window_store.clone());

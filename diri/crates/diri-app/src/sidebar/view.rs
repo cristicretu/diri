@@ -5391,12 +5391,15 @@ impl Sidebar {
                 .child(copy_session_id_row(id, colors, cx));
         } else {
             let running = !matches!(session.status, diri_proto::SessionStatus::Exited(_));
-            if matches!(
-                session.kind.id(),
-                ProtoAgentKind::CLAUDE_CODE_ID | ProtoAgentKind::CODEX_ID
-            ) {
+            if session.kind == ProtoAgentKind::CLAUDE_CODE
+                || (session.kind == ProtoAgentKind::CODEX && session.host.is_none())
+            {
                 content = content.child(menu_row(
-                    "Switch account for open conversations…",
+                    if session.kind == ProtoAgentKind::CLAUDE_CODE {
+                        "Continue with another account…"
+                    } else {
+                        "Switch account for open conversations…"
+                    },
                     colors,
                     cx.listener({
                         let id = id.clone();

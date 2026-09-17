@@ -1,11 +1,8 @@
-//! Same-host account handoff. Provider logins never travel with conversation history.
+//! Explicit same-host Claude account handoff. Credentials never travel with history.
 use super::*;
 use diri_proto::{AgentKind, ContinueAccountParams, SessionRecord};
 use std::fs;
 use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt};
-
-mod local_codex;
-mod tools;
 
 const MAX_TRANSCRIPT: usize = 64 * 1024 * 1024;
 const MARKER: &[u8] = b"\x1eDIRI-ACCOUNT-TRANSCRIPT\n";
@@ -25,8 +22,8 @@ impl<'a> SessionOperation<'a> {
         let guarded = matches!(
             method,
             Method::SESSION_CONTINUE_ACCOUNT
-                | Method::SESSION_HIBERNATE
                 | Method::SESSION_WAKE
+                | Method::SESSION_HIBERNATE
                 | Method::SESSION_RESUME
                 | Method::SESSION_RECONNECT
                 | Method::SESSION_FORK
@@ -74,145 +71,22 @@ impl Drop for SessionOperation<'_> {
 }
 
 impl ControlServer {
-    pub(super) fn account_switch_all(&self, params: Option<Value>) -> Result<Value, ControlError> {
-        let params: diri_proto::SwitchAccountParams = decode(params)?;
-        let mut profile = self
-            .accounts
-            .lock()
-            .map_err(poisoned)?
-            .catalog()?
-            .profiles
-            .into_iter()
-            .find(|p| p.id == params.account_profile_id)
-            .ok_or_else(|| ControlError::not_found("Choose a saved account profile"))?;
-        let mut records = self.registry.lock().map_err(poisoned)?.records();
-        let open = self.workspaces.snapshot()?.open_session_ids();
-        records.retain(|r| {
-            r.kind.id() == profile.agent
-                && r.host == profile.host
-                && !r.is_archived()
-                && open.contains(&r.id)
-        });
-        records.sort_by(|a, b| a.id.0.cmp(&b.id.0));
-        let mut result = diri_proto::SwitchAccountResult::default();
-        let mut guards = Vec::new();
-        let mut prepared = Vec::new();
-        for record in records {
-            let params = ContinueAccountParams {
-                session_id: record.id.clone(),
-                account_profile_id: profile.id.clone(),
-            };
-            let value = serde_json::to_value(&params)
-                .map_err(|_| ControlError::internal("Cannot prepare account switch"))?;
-            let preparation =
-                SessionOperation::acquire(self, Method::SESSION_CONTINUE_ACCOUNT, Some(&value))
-                    .and_then(|guard| {
-                        let handoff = self.prepare_account_handoff(&params)?;
-                        guards.push(guard);
-                        Ok(handoff)
-                    });
-            match preparation {
-                Ok(handoff) => prepared.push(handoff),
-                Err(error) => result.failures.push(diri_proto::AccountSwitchFailure {
-                    session_id: record.id,
-                    message: error.message,
-                }),
-            }
-        }
-        // Nothing is stopped if any conversation cannot be safely prepared.
-        if !result.failures.is_empty() {
-            return encode(&result);
-        }
-        let mut conversations = std::collections::HashSet::new();
-        for handoff in &prepared {
-            if !conversations.insert(handoff.source.agent_session_id.clone()) {
-                return Err(ControlError::bad_request(
-                    "Multiple tracked sessions use the same conversation. Close duplicate sessions before switching accounts.",
-                ));
-            }
-        }
-        let tools = tools::ToolTransfer::prepare(&prepared)?;
-        let mut stopped = Vec::new();
-        for handoff in prepared {
-            match self.stop_account_handoff(&handoff) {
-                Ok(()) => stopped.push(handoff),
-                Err(error) => result.failures.push(diri_proto::AccountSwitchFailure {
-                    session_id: handoff.source.id,
-                    message: error.message,
-                }),
-            }
-        }
-        // Do not move refreshable tool credentials while any selected Agent is still running.
-        if !result.failures.is_empty() {
-            for handoff in stopped {
-                result.failures.push(diri_proto::AccountSwitchFailure { session_id: handoff.source.id, message: "Stopped on the original account because another conversation could not stop. Resume it or retry the switch.".into() });
-            }
-            return encode(&result);
-        }
-        if let Err(error) = tools.install(&stopped) {
-            for handoff in stopped {
-                result.failures.push(diri_proto::AccountSwitchFailure {
-                    session_id: handoff.source.id,
-                    message: format!(
-                        "Stopped on the original account: {}. Resume it or retry the switch.",
-                        error.message
-                    ),
-                });
-            }
-            return encode(&result);
-        }
-        for handoff in stopped {
-            let id = handoff.source.id.clone();
-            match self.finish_account_handoff(handoff) {
-                Ok(value) => result.switched.push(
-                    serde_json::from_value(value)
-                        .map_err(|_| ControlError::internal("Invalid switched session"))?,
-                ),
-                Err(error) => result.failures.push(diri_proto::AccountSwitchFailure {
-                    session_id: id,
-                    message: error.message,
-                }),
-            }
-        }
-        if result.failures.is_empty() {
-            profile.is_default = true;
-            match self.accounts.lock().map_err(poisoned)?.upsert(profile) {
-                Ok(_) => result.default_changed = true,
-                Err(error) => result.default_error = Some(error.message),
-            }
-        }
-        encode(&result)
-    }
-
     pub(super) fn session_continue_account(
         &self,
         params: Option<Value>,
     ) -> Result<Value, ControlError> {
         let params: ContinueAccountParams = decode(params)?;
-        let mut prepared = self.prepare_account_handoff(&params)?;
-        // The single-conversation API is an explicit resume, including stopped sessions.
-        prepared.was_running = true;
-        self.stop_account_handoff(&prepared)?;
-        self.finish_account_handoff(prepared)
-    }
-
-    fn prepare_account_handoff(
-        &self,
-        params: &ContinueAccountParams,
-    ) -> Result<PreparedHandoff, ControlError> {
         let source = self
             .registry
             .lock()
             .map_err(poisoned)?
             .record(&params.session_id.0)
             .ok_or_else(|| ControlError::not_found("Session no longer exists"))?;
-        if !matches!(
-            source.kind.id(),
-            AgentKind::CLAUDE_CODE_ID | AgentKind::CODEX_ID
-        ) || source.effective_kind() != &source.kind
+        if source.kind != AgentKind::CLAUDE_CODE
+            || source.effective_kind() != &AgentKind::CLAUDE_CODE
         {
             return Err(ControlError::bad_request(
-                "Continue with another account supports Claude Code and Codex conversations",
+                "Continue with another account currently supports Claude Code conversations",
             ));
         }
         let conversation = source
@@ -220,10 +94,12 @@ impl ControlServer {
             .as_deref()
             .filter(|id| safe_component(id))
             .ok_or_else(|| {
-                ControlError::bad_request("This Agent has not saved a resumable conversation yet. Finish or close this setup session before switching all conversations.")
+                ControlError::bad_request("Claude has not saved a resumable conversation yet")
             })?;
         if params.account_profile_id.is_empty() {
-            return Err(ControlError::bad_request("Choose a saved account profile"));
+            return Err(ControlError::bad_request(
+                "Choose a saved Claude account profile",
+            ));
         }
         let mut profile = self
             .accounts
@@ -234,7 +110,7 @@ impl ControlServer {
                 source.kind.id(),
                 source.host.as_deref(),
             )?
-            .ok_or_else(|| ControlError::bad_request("Choose a saved account profile"))?;
+            .ok_or_else(|| ControlError::bad_request("Choose a saved Claude account profile"))?;
         let host = source
             .host
             .as_deref()
@@ -273,120 +149,64 @@ impl ControlServer {
                 ControlError::bad_request("Execution host did not report its home directory")
             })?;
         let source_root = source.account_profile.as_ref().map_or_else(
-            || {
-                Path::new(home).join(if source.kind == AgentKind::CODEX {
-                    ".codex"
-                } else {
-                    ".claude"
-                })
-            },
+            || Path::new(home).join(".claude"),
             |p| PathBuf::from(&p.config_home),
         );
-        let source_location = if source.kind == AgentKind::CODEX {
-            Location::codex_source(&source_root, &source, conversation, Path::new(home))?
-        } else {
-            Location::source(&source_root, &source, conversation)?
-        };
-        let target_location = Location {
-            root: PathBuf::from(&profile.config_home),
-            relative: source_location.relative.clone(),
-        };
+        if source_root == Path::new(&profile.config_home) {
+            return Err(ControlError::bad_request(
+                "This profile uses the same account directory. Choose a different account.",
+            ));
+        }
+        let source_location = Location::source(&source_root, &source, conversation)?;
+        let target_location = Location::new(
+            PathBuf::from(&profile.config_home),
+            crate::inject::claude_project_slug(&source.cwd),
+            conversation.to_owned(),
+        )?;
         let storage = Storage {
             remote: host.zip(self.remote.clone()),
         };
-        if source.kind == AgentKind::CODEX && storage.remote.is_none() {
-            local_codex::preflight(&source_location, &target_location, &source)?;
-            storage.check_codex_destination(&target_location, conversation)?;
-        } else {
-            let before = storage
+        let before = storage
+            .read(&source_location)?
+            .ok_or_else(missing_transcript)?;
+        validate_transcript(&before, conversation)?;
+        let destination = storage.read(&target_location)?;
+        compatible_destination(destination.as_deref(), &before)?;
+        {
+            let mut registry = self.registry.lock().map_err(poisoned)?;
+            let current = registry
+                .record(&source.id.0)
+                .ok_or_else(|| ControlError::not_found("Session no longer exists"))?;
+            ensure_same_source(&source, &current)?;
+            if registry.records().iter().any(|record| {
+                record.id != source.id
+                    && record.host == source.host
+                    && record.agent_session_id.as_deref() == Some(conversation)
+                    && record
+                        .account_profile
+                        .as_ref()
+                        .is_some_and(|p| p.config_home == profile.config_home)
+                    && registry.get(&record.id.0).is_some()
+            }) {
+                return Err(ControlError::bad_request(
+                    "Another session is using this conversation in the destination account. Stop it first.",
+                ));
+            }
+            registry.persist_now().map_err(io_control_error)?;
+            // Termination waits for the old process tree; no two Claude writers share this session.
+            drop(registry);
+            self.terminate_session_unlocked(&source.id.0, Duration::from_secs(3))?;
+            let mut registry = self.registry.lock().map_err(poisoned)?;
+            registry.persist_now().map_err(io_control_error)?;
+            self.publish_updated(&registry, &source.id.0);
+        }
+        let final_result = (|| {
+            // Capture the final flushed transcript, including output written during shutdown.
+            let final_bytes = storage
                 .read(&source_location)?
                 .ok_or_else(missing_transcript)?;
-            validate_conversation(&before, &source)?;
-            if source.kind == AgentKind::CODEX {
-                storage.check_codex_destination(&target_location, conversation)?;
-            }
-            let destination = storage.read(&target_location)?;
-            compatible_destination(destination.as_deref(), &before)?;
-        }
-        let was_running = self
-            .registry
-            .lock()
-            .map_err(poisoned)?
-            .get(&source.id.0)
-            .is_some();
-        Ok(PreparedHandoff {
-            source,
-            profile,
-            spec,
-            source_location,
-            target_location,
-            storage,
-            was_running,
-        })
-    }
-
-    fn stop_account_handoff(&self, prepared: &PreparedHandoff) -> Result<(), ControlError> {
-        let source = &prepared.source;
-        let mut registry = self.registry.lock().map_err(poisoned)?;
-        let current = registry
-            .record(&source.id.0)
-            .ok_or_else(|| ControlError::not_found("Session no longer exists"))?;
-        ensure_same_source(source, &current)?;
-        if registry.records().iter().any(|record| {
-            record.id != source.id
-                && record.host == source.host
-                && record.agent_session_id.as_deref() == source.agent_session_id.as_deref()
-                && record
-                    .account_profile
-                    .as_ref()
-                    .is_some_and(|p| p.config_home == prepared.profile.config_home)
-                && registry.get(&record.id.0).is_some()
-        }) {
-            return Err(ControlError::bad_request(
-                "Another session is using this conversation in the destination account. Stop it first.",
-            ));
-        }
-        registry.persist_now().map_err(io_control_error)?;
-        // Termination waits for the old process tree; no two Claude writers share this session.
-        drop(registry);
-        self.terminate_session_unlocked(&source.id.0, Duration::from_secs(3))?;
-        let mut registry = self.registry.lock().map_err(poisoned)?;
-        registry.persist_now().map_err(io_control_error)?;
-        self.publish_updated(&registry, &source.id.0);
-        Ok(())
-    }
-
-    fn finish_account_handoff(&self, prepared: PreparedHandoff) -> Result<Value, ControlError> {
-        let PreparedHandoff {
-            source,
-            profile,
-            spec,
-            source_location,
-            target_location,
-            storage,
-            was_running,
-        } = prepared;
-        let final_result = (|| {
-            if source.kind == AgentKind::CODEX && storage.remote.is_none() {
-                storage.check_codex_destination(
-                    &target_location,
-                    source.agent_session_id.as_deref().expect("validated"),
-                )?;
-                local_codex::install(&source_location, &target_location, &source)?;
-            } else {
-                // Capture the final flushed transcript, including output written during shutdown.
-                let final_bytes = storage
-                    .read(&source_location)?
-                    .ok_or_else(missing_transcript)?;
-                validate_conversation(&final_bytes, &source)?;
-                if source.kind == AgentKind::CODEX {
-                    storage.check_codex_destination(
-                        &target_location,
-                        source.agent_session_id.as_deref().expect("validated"),
-                    )?;
-                }
-                storage.install(&target_location, &final_bytes)?;
-            }
+            validate_transcript(&final_bytes, conversation)?;
+            storage.install(&target_location, &final_bytes)?;
             let mut registry = self.registry.lock().map_err(poisoned)?;
             let stopped = registry
                 .record(&source.id.0)
@@ -407,9 +227,7 @@ impl ControlServer {
             }
             // The new binding is durable before launch. A launch failure retries this account,
             // never the limited account, and recovery capsules use the same binding.
-            let result = if !was_running {
-                Ok(())
-            } else if spec.remote.is_some() {
+            let result = if spec.remote.is_some() {
                 drop(registry);
                 let result = self.spawn_session_unlocked(spec, None);
                 registry = self.registry.lock().map_err(poisoned)?;
@@ -419,12 +237,6 @@ impl ControlServer {
             };
             self.publish_updated(&registry, &source.id.0);
             result?;
-            if was_running && let Some(sleep) = &source.hibernation {
-                registry
-                    .hibernate(&source.id.0, sleep.reason)
-                    .map_err(io_control_error)?;
-                self.publish_updated(&registry, &source.id.0);
-            }
             registry.persist_now().map_err(io_control_error)?;
             encode(
                 &registry
@@ -432,53 +244,8 @@ impl ControlServer {
                     .ok_or_else(|| ControlError::internal("Continued session vanished"))?,
             )
         })();
-        final_result.map_err(|error: ControlError| ControlError { code: error.code, message: format!("The Agent was stopped, but the account handoff could not finish: {}. Your saved conversation is intact; check the session's account and resume when ready.", error.message) })
+        final_result.map_err(|error: ControlError| ControlError { code: error.code, message: format!("Claude was stopped, but the account handoff could not finish: {}. Your saved conversation is intact; check the session's account and resume when ready.", error.message) })
     }
-}
-
-struct PreparedHandoff {
-    source: SessionRecord,
-    profile: diri_proto::AgentAccountProfile,
-    spec: crate::session::SessionSpec,
-    source_location: Location,
-    target_location: Location,
-    storage: Storage,
-    was_running: bool,
-}
-
-fn validate_conversation(bytes: &[u8], source: &SessionRecord) -> Result<(), ControlError> {
-    let conversation = source
-        .agent_session_id
-        .as_deref()
-        .ok_or_else(missing_transcript)?;
-    if source.kind != AgentKind::CODEX {
-        return validate_transcript(bytes, conversation);
-    }
-    if bytes.is_empty() || bytes.len() > MAX_TRANSCRIPT || bytes.last() != Some(&b'\n') {
-        return Err(ControlError::bad_request(
-            "Codex transcript is empty, incomplete, or larger than 64 MiB",
-        ));
-    }
-    let mut identity = false;
-    for line in bytes.split(|b| *b == b'\n').filter(|l| !l.is_empty()) {
-        let value: Value = serde_json::from_slice(line)
-            .map_err(|_| ControlError::bad_request("Codex transcript is incomplete or invalid"))?;
-        if value["type"] == "session_meta" {
-            if identity
-                || value["payload"]["id"].as_str() != Some(conversation)
-                || value["payload"]["cwd"].as_str() != Some(source.cwd.as_str())
-            {
-                return Err(ControlError::bad_request(
-                    "Codex transcript belongs to another conversation or folder",
-                ));
-            }
-            identity = true;
-        }
-    }
-    if !identity {
-        return Err(missing_transcript());
-    }
-    Ok(())
 }
 
 fn ensure_same_source(
@@ -500,7 +267,7 @@ fn ensure_same_source(
 
 fn missing_transcript() -> ControlError {
     ControlError::bad_request(
-        "The saved conversation could not be found. Finish or close this setup session, then retry the account switch.",
+        "The saved Claude conversation could not be found. Wait for Claude to save it, then try again.",
     )
 }
 
@@ -516,7 +283,8 @@ fn safe_component(value: &str) -> bool {
 
 struct Location {
     root: PathBuf,
-    relative: PathBuf,
+    project: String,
+    conversation: String,
 }
 impl Location {
     fn new(root: PathBuf, project: String, conversation: String) -> Result<Self, ControlError> {
@@ -534,9 +302,8 @@ impl Location {
         }
         Ok(Self {
             root,
-            relative: PathBuf::from("projects")
-                .join(project)
-                .join(format!("{conversation}.jsonl")),
+            project,
+            conversation,
         })
     }
     fn source(
@@ -565,65 +332,21 @@ impl Location {
         };
         Self::new(root.to_owned(), project, conversation.to_owned())
     }
-    fn codex_source(
-        root: &Path,
-        record: &SessionRecord,
-        conversation: &str,
-        home: &Path,
-    ) -> Result<Self, ControlError> {
-        let path = record
-            .transcript_path
-            .as_ref()
-            .map(PathBuf::from)
-            .or_else(|| {
-                if record.host.is_some() {
-                    return None;
-                }
-                crate::history::find_profile_codex_transcript(
-                    record.account_profile.as_ref(),
-                    home,
-                    conversation,
-                    &record.cwd,
-                )
-                .map(|t| t.path().to_owned())
-            })
-            .ok_or_else(|| {
-                ControlError::bad_request("Codex has not saved a discoverable conversation yet")
-            })?;
-        let relative = path
-            .strip_prefix(root)
-            .map_err(|_| {
-                ControlError::bad_request("Saved transcript is outside the source account")
-            })?
-            .to_path_buf();
-        let components: Vec<_> = relative.components().collect();
-        if components.len() != 5
-            || components[0].as_os_str() != "sessions"
-            || components.iter().any(|c| {
-                !matches!(c, std::path::Component::Normal(_))
-                    || !safe_component(&c.as_os_str().to_string_lossy())
-            })
-            || !path.file_name().and_then(|n| n.to_str()).is_some_and(|n| {
-                n.starts_with("rollout-") && n.ends_with(&format!("-{conversation}.jsonl"))
-            })
-        {
-            return Err(ControlError::bad_request(
-                "Invalid Codex conversation location",
-            ));
-        }
-        Ok(Self {
-            root: root.to_owned(),
-            relative,
-        })
-    }
     fn directory(&self) -> PathBuf {
-        self.path().parent().expect("transcript parent").to_owned()
+        self.root.join("projects").join(&self.project)
     }
     fn path(&self) -> PathBuf {
-        self.root.join(&self.relative)
+        self.directory()
+            .join(format!("{}.jsonl", self.conversation))
     }
     fn input(&self) -> Vec<u8> {
-        format!("{}\n{}\n", self.root.display(), self.relative.display()).into_bytes()
+        format!(
+            "{}\n{}\n{}\n",
+            self.root.display(),
+            self.project,
+            self.conversation
+        )
+        .into_bytes()
     }
 }
 
@@ -674,66 +397,6 @@ struct Storage {
     )>,
 }
 impl Storage {
-    fn check_codex_destination(
-        &self,
-        location: &Location,
-        conversation: &str,
-    ) -> Result<(), ControlError> {
-        let conflict = || {
-            ControlError::bad_request(
-                "The destination contains another rollout for this Codex conversation. Resolve its history before switching accounts.",
-            )
-        };
-        if let Some((host, manager)) = &self.remote {
-            let mut input = location.input();
-            input.extend_from_slice(format!("{conversation}\n").as_bytes());
-            let output = manager
-                .run_fixed_script(
-                    host,
-                    CHECK_CODEX_DESTINATION,
-                    input,
-                    Duration::from_secs(20),
-                    4096,
-                )
-                .map_err(|_| conflict())?;
-            return if output.status.success() {
-                Ok(())
-            } else {
-                Err(conflict())
-            };
-        }
-        let suffix = format!("-{conversation}.jsonl");
-        let expected = location.path();
-        let mut pending = vec![
-            (location.root.join("sessions"), 0),
-            (location.root.join("archived_sessions"), 3),
-        ];
-        let mut count = 0;
-        while let Some((directory, depth)) = pending.pop() {
-            if !private_directory(&directory, false)? {
-                continue;
-            }
-            for entry in fs::read_dir(directory).map_err(|_| conflict())? {
-                count += 1;
-                if count > 100_000 {
-                    return Err(conflict());
-                }
-                let entry = entry.map_err(|_| conflict())?;
-                let kind = entry.file_type().map_err(|_| conflict())?;
-                if kind.is_dir() && depth < 3 {
-                    pending.push((entry.path(), depth + 1));
-                }
-                if depth == 3
-                    && entry.file_name().to_string_lossy().ends_with(&suffix)
-                    && entry.path() != expected
-                {
-                    return Err(conflict());
-                }
-            }
-        }
-        Ok(())
-    }
-
     fn read(&self, location: &Location) -> Result<Option<Vec<u8>>, ControlError> {
         if let Some((host, manager)) = &self.remote {
             let output = manager
@@ -830,18 +493,12 @@ fn private_directory(path: &Path, create: bool) -> Result<bool, ControlError> {
 }
 
 fn check_directories(location: &Location, create: bool) -> Result<bool, ControlError> {
-    let mut path = location.root.clone();
-    if !private_directory(&path, create)? {
-        return Ok(false);
-    }
-    for part in location
-        .relative
-        .parent()
-        .expect("transcript parent")
-        .components()
-    {
-        path.push(part);
-        if !private_directory(&path, create)? {
+    for path in [
+        &location.root,
+        &location.root.join("projects"),
+        &location.directory(),
+    ] {
+        if !private_directory(path, create)? {
             return Ok(false);
         }
     }
@@ -873,7 +530,7 @@ fn read_local(location: &Location) -> Result<Option<Vec<u8>>, ControlError> {
         || metadata.len() > MAX_TRANSCRIPT as u64
     {
         return Err(ControlError::bad_request(
-            "Transcript is unsafe or exceeds the 64 MiB transfer limit",
+            "Claude transcript is unsafe or too large",
         ));
     }
     let mut bytes = Vec::new();
@@ -913,9 +570,8 @@ fn install_local(location: &Location, bytes: &[u8]) -> Result<(), ControlError> 
 
 // Paths are data on stdin, never shell source. Only one bounded conversation is
 // read/written. Startup noise is outside the read envelope; stderr is never surfaced.
-const CHECK_CODEX_DESTINATION: &str = r#"sh -c 'IFS= read -r root && IFS= read -r relative && IFS= read -r conversation || exit 73; expected="$root/$relative"; for file in "$root"/sessions/*/*/*/*-"$conversation".jsonl "$root"/archived_sessions/*-"$conversation".jsonl; do [ -e "$file" ] || continue; [ "$file" = "$expected" ] || exit 76; done'"#;
-const READ_TRANSCRIPT: &str = r#"sh -c 'IFS= read -r root && IFS= read -r relative || exit 73; set -f; dir="$root"; [ ! -L "$dir" ] || exit 73; [ -e "$dir" ] || exit 44; [ -d "$dir" ] && [ -O "$dir" ] || exit 73; oldifs="$IFS"; IFS=/; set -- $relative; IFS="$oldifs"; while [ "$#" -gt 1 ]; do dir="$dir/$1"; shift; [ ! -L "$dir" ] || exit 73; [ -e "$dir" ] || exit 44; [ -d "$dir" ] && [ -O "$dir" ] || exit 73; done; file="$root/$relative"; [ ! -L "$file" ] || exit 73; [ -e "$file" ] || exit 44; [ -f "$file" ] && [ -O "$file" ] || exit 73; [ "$(wc -c < "$file")" -le 67108864 ] || exit 74; printf "\036DIRI-ACCOUNT-TRANSCRIPT\n"; head -c 67108865 "$file"'"#;
-const INSTALL_TRANSCRIPT: &str = r#"sh -c 'IFS= read -r root && IFS= read -r relative && IFS= read -r nonce || exit 73; set -f; umask 077; dir="$root"; [ ! -L "$dir" ] || exit 73; mkdir -p "$dir" || exit 73; [ -d "$dir" ] && [ -O "$dir" ] || exit 73; oldifs="$IFS"; IFS=/; set -- $relative; IFS="$oldifs"; while [ "$#" -gt 1 ]; do dir="$dir/$1"; shift; [ ! -L "$dir" ] || exit 73; mkdir -p "$dir" || exit 73; [ -d "$dir" ] && [ -O "$dir" ] || exit 73; done; target="$root/$relative"; tmp="$dir/.diri-account-$nonce.tmp"; set -C; : > "$tmp" || exit 75; cleanup() { rm -f "$tmp"; }; trap cleanup 0; cat >> "$tmp" || exit 75; [ "$(wc -c < "$tmp")" -le 67108864 ] || exit 74; [ ! -L "$target" ] || exit 73; if [ -e "$target" ]; then [ -f "$target" ] && [ -O "$target" ] || exit 73; count=$(wc -c < "$target"); [ "$count" -le 67108864 ] || exit 74; head -c "$count" "$tmp" | cmp -s - "$target" || exit 76; fi; mv -f "$tmp" "$target"'"#;
+const READ_TRANSCRIPT: &str = r#"sh -c 'IFS= read -r root && IFS= read -r project && IFS= read -r conversation || exit 73; for dir in "$root" "$root/projects" "$root/projects/$project"; do [ ! -L "$dir" ] || exit 73; [ -e "$dir" ] || exit 44; [ -d "$dir" ] && [ -O "$dir" ] || exit 73; done; file="$root/projects/$project/$conversation.jsonl"; [ ! -L "$file" ] || exit 73; [ -e "$file" ] || exit 44; [ -f "$file" ] && [ -O "$file" ] || exit 73; [ "$(wc -c < "$file")" -le 67108864 ] || exit 74; printf "\036DIRI-ACCOUNT-TRANSCRIPT\n"; head -c 67108865 "$file"'"#;
+const INSTALL_TRANSCRIPT: &str = r#"sh -c 'IFS= read -r root && IFS= read -r project && IFS= read -r conversation && IFS= read -r nonce || exit 73; umask 077; for dir in "$root" "$root/projects" "$root/projects/$project"; do [ ! -L "$dir" ] || exit 73; mkdir -p "$dir" || exit 73; [ -d "$dir" ] && [ -O "$dir" ] || exit 73; done; target="$root/projects/$project/$conversation.jsonl"; tmp="$root/projects/$project/.diri-account-$nonce.tmp"; set -C; : > "$tmp" || exit 75; cleanup() { rm -f "$tmp"; }; trap cleanup 0; cat >> "$tmp" || exit 75; [ "$(wc -c < "$tmp")" -le 67108864 ] || exit 74; [ ! -L "$target" ] || exit 73; if [ -e "$target" ]; then [ -f "$target" ] && [ -O "$target" ] || exit 73; count=$(wc -c < "$target"); [ "$count" -le 67108864 ] || exit 74; head -c "$count" "$tmp" | cmp -s - "$target" || exit 76; fi; mv -f "$tmp" "$target"'"#;
 
 #[cfg(test)]
 mod tests {
@@ -947,328 +603,6 @@ mod tests {
         // Fixtures are small enough to fit in a pipe; no concurrent reader is necessary.
         child.stdin.take().unwrap().write_all(&input).unwrap();
         child.wait_with_output().unwrap()
-    }
-
-    #[test]
-    fn bulk_codex_switch_preserves_all_conversations_tools_and_login_isolation() {
-        let temp = tempfile::tempdir().unwrap();
-        let server = super::super::tests::server(temp.path());
-        let executable = temp.path().join("codex");
-        fs::write(
-            &executable,
-            "#!/bin/sh\nprintf '%s\\n' \"$@\" > \"$CODEX_HOME/args\"\nexec /bin/sleep 30\n",
-        )
-        .unwrap();
-        fs::set_permissions(&executable, fs::Permissions::from_mode(0o700)).unwrap();
-        server
-            .agent_catalog
-            .lock()
-            .unwrap()
-            .configure(
-                None,
-                "codex",
-                crate::agent_catalog::AgentPreference {
-                    executable_path: Some(executable.to_string_lossy().into_owned()),
-                    show_in_quick_create: Some(true),
-                },
-            )
-            .unwrap();
-        let profiles = ["one", "two"].map(|id| diri_proto::AgentAccountProfile {
-            id: id.into(),
-            label: id.into(),
-            agent: "codex".into(),
-            host: None,
-            config_home: temp.path().join(id).to_string_lossy().into_owned(),
-            is_default: false,
-        });
-        for profile in &profiles {
-            fs::create_dir(&profile.config_home).unwrap();
-            fs::write(
-                Path::new(&profile.config_home).join("auth.json"),
-                profile.id.as_bytes(),
-            )
-            .unwrap();
-            server
-                .accounts
-                .lock()
-                .unwrap()
-                .upsert(profile.clone())
-                .unwrap();
-        }
-        fs::write(
-            Path::new(&profiles[0].config_home).join("config.toml"),
-            "[mcp_servers.docs]\nurl='https://example.test/mcp'\n",
-        )
-        .unwrap();
-        fs::write(
-            Path::new(&profiles[1].config_home).join("config.toml"),
-            "model='target-model'\n",
-        )
-        .unwrap();
-        let cache = Path::new(&profiles[0].config_home).join("plugins/cache/fixture/1");
-        fs::create_dir_all(&cache).unwrap();
-        fs::write(cache.join("plugin.json"), b"{}").unwrap();
-        let mut sources = Vec::new();
-        for index in 0..3 {
-            let source: SessionRecord = serde_json::from_value(
-                server
-                    .session_spawn(Some(
-                        json!({"kind":AgentKind::CODEX,"cwd":temp.path(),"accountProfileId":"one"}),
-                    ))
-                    .unwrap(),
-            )
-            .unwrap();
-            let conversation = format!("11111111-1111-4111-8111-{index:012}");
-            let relative = PathBuf::from(format!(
-                "sessions/2026/09/17/rollout-2026-09-17T12-00-00-{conversation}.jsonl"
-            ));
-            let location = Location {
-                root: profiles[0].config_home.clone().into(),
-                relative: relative.clone(),
-            };
-            let bytes = format!(
-                "{}\n",
-                json!({"type":"session_meta","payload":{"id":conversation,"cwd":temp.path()}})
-            )
-            .into_bytes();
-            install_local(&location, &bytes).unwrap();
-            // Real Codex histories can exceed the remote/Claude 64 MiB envelope.
-            let mut bytes = bytes;
-            if index == 0 {
-                let line = format!(
-                    "{}\n",
-                    json!({"type":"event_msg","payload":{"text":"x".repeat(256 * 1024)}})
-                );
-                for _ in 0..260 {
-                    bytes.extend_from_slice(line.as_bytes());
-                }
-                fs::write(location.path(), &bytes).unwrap();
-            }
-            server
-                .registry
-                .lock()
-                .unwrap()
-                .update_record(&source.id.0, |r| {
-                    r.agent_session_id = Some(conversation);
-                    r.transcript_path = Some(location.path().to_string_lossy().into_owned());
-                    r.title = format!("conversation {index}");
-                });
-            if index == 1 {
-                server
-                    .registry
-                    .lock()
-                    .unwrap()
-                    .hibernate(&source.id.0, diri_proto::HibernationReason::Manual)
-                    .unwrap();
-            }
-            if index == 2 {
-                server
-                    .session_kill(Some(json!({"sessionID":source.id})))
-                    .unwrap();
-            }
-            server
-                .workspace_mutate(Some(json!({
-                    "expectedRevision": server.workspaces.snapshot().unwrap().revision,
-                    "mutation": {"type":"openProjectAgent", "sessionId":source.id}
-                })))
-                .unwrap();
-            sources.push((source, relative, bytes));
-        }
-        let mut closed = super::super::tests::test_record("closed-codex");
-        closed.kind = AgentKind::CODEX;
-        closed.account_profile = Some(profiles[0].clone());
-        server.registry.lock().unwrap().insert_record(closed);
-        let mut archived = super::super::tests::test_record("archived-codex");
-        archived.kind = AgentKind::CODEX;
-        archived.archived_at = Some(archived.created_at);
-        archived.account_profile = Some(profiles[0].clone());
-        server.registry.lock().unwrap().insert_record(archived);
-        assert_eq!(
-            server
-                .workspaces
-                .snapshot()
-                .unwrap()
-                .open_session_ids()
-                .len(),
-            3
-        );
-        // A conflict blocks the entire batch before any original process is stopped.
-        let collision = Location {
-            root: profiles[1].config_home.clone().into(),
-            relative: sources[1].1.clone(),
-        };
-        install_local(&collision, b"conflict\n").unwrap();
-        let params = json!({"accountProfileId":"two"});
-        let rejected: diri_proto::SwitchAccountResult = serde_json::from_value(
-            server
-                .dispatch(Method::ACCOUNT_SWITCH_ALL, Some(params.clone()))
-                .unwrap(),
-        )
-        .unwrap();
-        assert_eq!(rejected.failures.len(), 1);
-        assert!(!rejected.default_changed);
-        for (source, _, _) in &sources[..2] {
-            assert!(server.registry.lock().unwrap().get(&source.id.0).is_some());
-        }
-        fs::remove_file(collision.path()).unwrap();
-        let result: diri_proto::SwitchAccountResult = serde_json::from_value(
-            server
-                .dispatch(Method::ACCOUNT_SWITCH_ALL, Some(params))
-                .unwrap(),
-        )
-        .unwrap();
-        assert!(result.failures.is_empty(), "{:?}", result.failures);
-        assert_eq!(result.switched.len(), 3);
-        assert!(result.default_changed);
-        for (index, (source, relative, bytes)) in sources.iter().enumerate() {
-            let registry = server.registry.lock().unwrap();
-            let target = registry.record(&source.id.0).unwrap();
-            assert_eq!(target.account_profile.as_ref().unwrap().id, "two");
-            assert_eq!(target.title, format!("conversation {index}"));
-            assert_eq!(target.hibernation.is_some(), index == 1);
-            assert_eq!(target.cwd, source.cwd);
-            assert_eq!(registry.get(&source.id.0).is_some(), index != 2);
-            assert_eq!(
-                fs::read(Path::new(&profiles[1].config_home).join(relative)).unwrap(),
-                *bytes
-            );
-        }
-        assert!(
-            fs::read_to_string(Path::new(&profiles[1].config_home).join("config.toml"))
-                .unwrap()
-                .contains("mcp_servers.docs")
-        );
-        for profile in &profiles {
-            assert_eq!(
-                fs::read(Path::new(&profile.config_home).join("auth.json")).unwrap(),
-                profile.id.as_bytes()
-            );
-        }
-        assert_eq!(
-            fs::read(
-                Path::new(&profiles[1].config_home).join("plugins/cache/fixture/1/plugin.json")
-            )
-            .unwrap(),
-            b"{}"
-        );
-        let back: diri_proto::SwitchAccountResult = serde_json::from_value(
-            server
-                .dispatch(
-                    Method::ACCOUNT_SWITCH_ALL,
-                    Some(json!({"accountProfileId":"one"})),
-                )
-                .unwrap(),
-        )
-        .unwrap();
-        assert!(back.failures.is_empty());
-        for id in ["closed-codex", "archived-codex"] {
-            assert_eq!(
-                server
-                    .registry
-                    .lock()
-                    .unwrap()
-                    .record(id)
-                    .unwrap()
-                    .account_profile
-                    .unwrap()
-                    .id,
-                "one"
-            );
-        }
-        assert_eq!(back.switched.len(), 3);
-        for (source, _, _) in sources {
-            server
-                .registry
-                .lock()
-                .unwrap()
-                .terminate(&source.id.0, Duration::from_secs(1))
-                .unwrap();
-        }
-    }
-
-    #[test]
-    fn bulk_reservation_excludes_launches_and_profile_edits_but_allows_reads() {
-        let temp = tempfile::tempdir().unwrap();
-        let server = super::super::tests::server(temp.path());
-        let guard = server.account_operations.write().unwrap();
-        for method in [
-            Method::SESSION_SPAWN,
-            Method::SESSION_RESUME,
-            Method::ACCOUNT_PROFILES_SAVE,
-            Method::ACCOUNT_SWITCH_ALL,
-        ] {
-            assert!(
-                server
-                    .dispatch(method, Some(json!({})))
-                    .unwrap_err()
-                    .message
-                    .contains("progress")
-            );
-        }
-        assert!(server.dispatch(Method::ACCOUNT_PROFILES_LIST, None).is_ok());
-        drop(guard);
-        assert!(
-            server
-                .dispatch(
-                    Method::ACCOUNT_SWITCH_ALL,
-                    Some(json!({"accountProfileId":"missing"}))
-                )
-                .unwrap_err()
-                .message
-                .contains("saved account")
-        );
-    }
-
-    #[test]
-    fn codex_destination_rejects_duplicate_rollouts_even_in_other_dates() {
-        let temp = tempfile::tempdir().unwrap();
-        let expected = Location {
-            root: temp.path().to_owned(),
-            relative: "sessions/2026/09/17/rollout-time-conversation.jsonl".into(),
-        };
-        let duplicate = Location {
-            root: temp.path().to_owned(),
-            relative: "sessions/2026/09/16/rollout-other-conversation.jsonl".into(),
-        };
-        let storage = Storage { remote: None };
-        storage
-            .check_codex_destination(&expected, "conversation")
-            .unwrap();
-        install_local(&duplicate, b"{}\n").unwrap();
-        assert!(
-            storage
-                .check_codex_destination(&expected, "conversation")
-                .is_err()
-        );
-        fs::remove_file(duplicate.path()).unwrap();
-        install_local(&expected, b"{}\n").unwrap();
-        storage
-            .check_codex_destination(&expected, "conversation")
-            .unwrap();
-    }
-
-    #[test]
-    fn codex_transcript_rejects_wrong_identity_folder_and_partial_records() {
-        // Reuse a plain record; validation depends solely on its explicit identity.
-        let mut source = super::super::tests::test_record("codex-test");
-        source.kind = AgentKind::CODEX;
-        source.agent_session_id = Some("conversation".into());
-        source.cwd = "/repo".into();
-        let good = format!(
-            "{}\n",
-            json!({"type":"session_meta","payload":{"id":"conversation","cwd":"/repo"}})
-        )
-        .into_bytes();
-        validate_conversation(&good, &source).unwrap();
-        for bytes in [
-            b"{}\n".as_slice(),
-            &good[..good.len() - 1],
-            b"{\"type\":\"session_meta\",\"payload\":{\"id\":\"other\",\"cwd\":\"/repo\"}}\n",
-        ] {
-            assert!(validate_conversation(bytes, &source).is_err());
-        }
-        source.cwd = "/other".into();
-        assert!(validate_conversation(&good, &source).is_err());
     }
 
     #[test]

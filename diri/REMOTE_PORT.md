@@ -107,43 +107,31 @@ environment through the existing structured LaunchRequest. Resume and fork use
 the recorded binding, not the current catalog default. Cross-host migration of
 bound sessions fails until an explicit destination-account mapping exists.
 
-Same-host account continuation and bulk account switching are owned by the local
-Engine. Codex and Claude transcripts are validated and installed atomically in
-the destination profile; provider login credentials never travel with history.
-Bulk switching reserves and preflights non-archived conversations open in Diri
-tabs and split panes for the selected Agent and host before stopping any. It
-stops all selected live Agents before transferring direct MCP configuration and
-file-backed MCP OAuth grants, then persists each new binding before relaunch.
-Stopped open conversations remain stopped and sleeping sessions return to sleep.
-Closed and archived conversations are excluded. Local Codex history is streamed
-with a 4 GiB file bound and 64 MiB JSON-line bound; remote and Claude history
-retain the 64 MiB transfer bound. Each failure is surfaced individually; there
-is no claim of an atomic multi-process switch or automatic prompt replay. Only a
-fully successful switch changes the default for future launches.
-
-Direct MCP configuration and file-backed OAuth grants are transferred on the
-same host through the bounded fixed-script SSH seam, with paths on stdin,
-owner checks, conflict checks and owner-only atomic file replacement. These
-are independent tool authorizations, never Codex auth.json or Claude provider
-login fields. Hosted account-bound connector grants are excluded. Keychain
-credentials remain in their native store; on the local Mac, the Engine merges
-only Claude MCP grants between existing native Keychain items. Remote Keychain
-migration is not implemented. This does not add an MCP gateway,
-remote MCP forwarding, a credential vault, or a Helper capability. Unsupported
-credential backends and account-bound hosted connections can require provider
-reauthorization. Source data is preserved for recovery. No credentials cross
-execution hosts or appear in control responses/logs.
-
-Codex requires a known native conversation ID and rollout path (local path
-discovery is supported). This does not introduce remote thread discovery or
-cross-host handoff. Transcript conflicts fail closed; an existing byte-prefix
-copy permits switching back. Main transcripts are preserved, not running tool
-processes or provider-specific rewind/subagent sidecars.
+An explicit same-host Claude account continuation is also owned by the local
+Engine. It preflights the source and destination, stops the existing Holder's
+Agent tree, reads the final main JSONL transcript through bounded fixed-script
+SSH, installs it atomically in the selected profile, and resumes the same
+conversation through the existing Holder launch path. Only transcript bytes
+travel through Engine memory; credentials and provider configuration never move.
+The transcript is bounded to 64 MiB. Symlinks and conflicting destination history
+fail closed; an existing byte-prefix copy permits switching back. The updated
+profile binding is durable before relaunch. Preflight errors leave the original
+session running; later failures keep the saved conversation recoverable and
+report the stopped session. This does not implement cross-host handoff, file
+rewind/subagent checkpoint transfer, or provider usage/authentication discovery.
 
 The Helper protocol and Holder ownership remain unchanged. Account settings,
 directory preparation, and profile resolution belong to the local Engine;
 the Holder receives only the resulting argv/environment/cwd. This enhancement
 adds no remote service, credential store, or transport dependency.
+
+Local Codex account switching is a separate local Engine enhancement. It stores
+file-backed provider logins in owner-only slots beside the local account catalog,
+replaces only the shared `~/.codex/auth.json`, and resumes the same native IDs in
+open local Diri tabs. It never copies transcripts, MCP settings, plugins or tool
+credentials. Hosted connectors such as Slack still require authorization for the
+selected provider account. This does not alter remote launch, Helper ownership,
+SSH or the remote protocol. See [ACCOUNTS.md](ACCOUNTS.md) for limitations.
 
 ## Remote transcript usage enhancement
 

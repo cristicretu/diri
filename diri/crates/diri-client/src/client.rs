@@ -919,6 +919,25 @@ impl DaemonClient {
         self.no_params(Method::ACCOUNT_PROFILES_LIST).await
     }
 
+    pub async fn login_codex_account(&self, id: String) -> Result<SessionRecord, ClientError> {
+        self.typed(
+            Method::ACCOUNT_CODEX_LOGIN,
+            &diri_proto::AgentAccountId { id },
+        )
+        .await
+    }
+
+    pub async fn capture_codex_account(
+        &self,
+        id: String,
+    ) -> Result<diri_proto::AgentAccountCatalog, ClientError> {
+        self.typed(
+            Method::ACCOUNT_CODEX_CAPTURE,
+            &diri_proto::AgentAccountId { id },
+        )
+        .await
+    }
+
     pub async fn switch_all_accounts(
         &self,
         account_profile_id: String,
