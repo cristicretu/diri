@@ -5396,7 +5396,7 @@ impl Sidebar {
                 ProtoAgentKind::CLAUDE_CODE_ID | ProtoAgentKind::CODEX_ID
             ) {
                 content = content.child(menu_row(
-                    "Switch account for all conversations…",
+                    "Switch account for open conversations…",
                     colors,
                     cx.listener({
                         let id = id.clone();

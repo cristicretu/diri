@@ -4,6 +4,7 @@ use diri_proto::{AgentKind, ContinueAccountParams, SessionRecord};
 use std::fs;
 use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt};
 
+mod local_codex;
 mod tools;
 
 const MAX_TRANSCRIPT: usize = 64 * 1024 * 1024;
@@ -85,7 +86,13 @@ impl ControlServer {
             .find(|p| p.id == params.account_profile_id)
             .ok_or_else(|| ControlError::not_found("Choose a saved account profile"))?;
         let mut records = self.registry.lock().map_err(poisoned)?.records();
-        records.retain(|r| r.kind.id() == profile.agent && r.host == profile.host);
+        let open = self.workspaces.snapshot()?.open_session_ids();
+        records.retain(|r| {
+            r.kind.id() == profile.agent
+                && r.host == profile.host
+                && !r.is_archived()
+                && open.contains(&r.id)
+        });
         records.sort_by(|a, b| a.id.0.cmp(&b.id.0));
         let mut result = diri_proto::SwitchAccountResult::default();
         let mut guards = Vec::new();
@@ -287,15 +294,20 @@ impl ControlServer {
         let storage = Storage {
             remote: host.zip(self.remote.clone()),
         };
-        let before = storage
-            .read(&source_location)?
-            .ok_or_else(missing_transcript)?;
-        validate_conversation(&before, &source)?;
-        if source.kind == AgentKind::CODEX {
+        if source.kind == AgentKind::CODEX && storage.remote.is_none() {
+            local_codex::preflight(&source_location, &target_location, &source)?;
             storage.check_codex_destination(&target_location, conversation)?;
+        } else {
+            let before = storage
+                .read(&source_location)?
+                .ok_or_else(missing_transcript)?;
+            validate_conversation(&before, &source)?;
+            if source.kind == AgentKind::CODEX {
+                storage.check_codex_destination(&target_location, conversation)?;
+            }
+            let destination = storage.read(&target_location)?;
+            compatible_destination(destination.as_deref(), &before)?;
         }
-        let destination = storage.read(&target_location)?;
-        compatible_destination(destination.as_deref(), &before)?;
         let was_running = self
             .registry
             .lock()
@@ -355,18 +367,26 @@ impl ControlServer {
             was_running,
         } = prepared;
         let final_result = (|| {
-            // Capture the final flushed transcript, including output written during shutdown.
-            let final_bytes = storage
-                .read(&source_location)?
-                .ok_or_else(missing_transcript)?;
-            validate_conversation(&final_bytes, &source)?;
-            if source.kind == AgentKind::CODEX {
+            if source.kind == AgentKind::CODEX && storage.remote.is_none() {
                 storage.check_codex_destination(
                     &target_location,
                     source.agent_session_id.as_deref().expect("validated"),
                 )?;
+                local_codex::install(&source_location, &target_location, &source)?;
+            } else {
+                // Capture the final flushed transcript, including output written during shutdown.
+                let final_bytes = storage
+                    .read(&source_location)?
+                    .ok_or_else(missing_transcript)?;
+                validate_conversation(&final_bytes, &source)?;
+                if source.kind == AgentKind::CODEX {
+                    storage.check_codex_destination(
+                        &target_location,
+                        source.agent_session_id.as_deref().expect("validated"),
+                    )?;
+                }
+                storage.install(&target_location, &final_bytes)?;
             }
-            storage.install(&target_location, &final_bytes)?;
             let mut registry = self.registry.lock().map_err(poisoned)?;
             let stopped = registry
                 .record(&source.id.0)
@@ -399,6 +419,12 @@ impl ControlServer {
             };
             self.publish_updated(&registry, &source.id.0);
             result?;
+            if was_running && let Some(sleep) = &source.hibernation {
+                registry
+                    .hibernate(&source.id.0, sleep.reason)
+                    .map_err(io_control_error)?;
+                self.publish_updated(&registry, &source.id.0);
+            }
             registry.persist_now().map_err(io_control_error)?;
             encode(
                 &registry
@@ -847,7 +873,7 @@ fn read_local(location: &Location) -> Result<Option<Vec<u8>>, ControlError> {
         || metadata.len() > MAX_TRANSCRIPT as u64
     {
         return Err(ControlError::bad_request(
-            "Claude transcript is unsafe or too large",
+            "Transcript is unsafe or exceeds the 64 MiB transfer limit",
         ));
     }
     let mut bytes = Vec::new();
@@ -1006,6 +1032,18 @@ mod tests {
             )
             .into_bytes();
             install_local(&location, &bytes).unwrap();
+            // Real Codex histories can exceed the remote/Claude 64 MiB envelope.
+            let mut bytes = bytes;
+            if index == 0 {
+                let line = format!(
+                    "{}\n",
+                    json!({"type":"event_msg","payload":{"text":"x".repeat(256 * 1024)}})
+                );
+                for _ in 0..260 {
+                    bytes.extend_from_slice(line.as_bytes());
+                }
+                fs::write(location.path(), &bytes).unwrap();
+            }
             server
                 .registry
                 .lock()
@@ -1015,13 +1053,45 @@ mod tests {
                     r.transcript_path = Some(location.path().to_string_lossy().into_owned());
                     r.title = format!("conversation {index}");
                 });
+            if index == 1 {
+                server
+                    .registry
+                    .lock()
+                    .unwrap()
+                    .hibernate(&source.id.0, diri_proto::HibernationReason::Manual)
+                    .unwrap();
+            }
             if index == 2 {
                 server
                     .session_kill(Some(json!({"sessionID":source.id})))
                     .unwrap();
             }
+            server
+                .workspace_mutate(Some(json!({
+                    "expectedRevision": server.workspaces.snapshot().unwrap().revision,
+                    "mutation": {"type":"openProjectAgent", "sessionId":source.id}
+                })))
+                .unwrap();
             sources.push((source, relative, bytes));
         }
+        let mut closed = super::super::tests::test_record("closed-codex");
+        closed.kind = AgentKind::CODEX;
+        closed.account_profile = Some(profiles[0].clone());
+        server.registry.lock().unwrap().insert_record(closed);
+        let mut archived = super::super::tests::test_record("archived-codex");
+        archived.kind = AgentKind::CODEX;
+        archived.archived_at = Some(archived.created_at);
+        archived.account_profile = Some(profiles[0].clone());
+        server.registry.lock().unwrap().insert_record(archived);
+        assert_eq!(
+            server
+                .workspaces
+                .snapshot()
+                .unwrap()
+                .open_session_ids()
+                .len(),
+            3
+        );
         // A conflict blocks the entire batch before any original process is stopped.
         let collision = Location {
             root: profiles[1].config_home.clone().into(),
@@ -1055,6 +1125,7 @@ mod tests {
             let target = registry.record(&source.id.0).unwrap();
             assert_eq!(target.account_profile.as_ref().unwrap().id, "two");
             assert_eq!(target.title, format!("conversation {index}"));
+            assert_eq!(target.hibernation.is_some(), index == 1);
             assert_eq!(target.cwd, source.cwd);
             assert_eq!(registry.get(&source.id.0).is_some(), index != 2);
             assert_eq!(
@@ -1090,6 +1161,20 @@ mod tests {
         )
         .unwrap();
         assert!(back.failures.is_empty());
+        for id in ["closed-codex", "archived-codex"] {
+            assert_eq!(
+                server
+                    .registry
+                    .lock()
+                    .unwrap()
+                    .record(id)
+                    .unwrap()
+                    .account_profile
+                    .unwrap()
+                    .id,
+                "one"
+            );
+        }
         assert_eq!(back.switched.len(), 3);
         for (source, _, _) in sources {
             server

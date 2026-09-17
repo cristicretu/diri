@@ -139,8 +139,8 @@ impl Sidebar {
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let mut section = div().id("account-switcher").debug_selector(|| "account-switcher".into()).flex().flex_col().py(px(3.0))
-            .child(div().px(px(14.0)).text_size(px(Typo::META.size)).text_color(colors.tertiary).child("Switch all conversations"))
-            .child(div().px(px(14.0)).py(px(4.0)).text_size(px(Typo::META.size)).text_color(colors.tertiary).child("For this provider and machine. Running agents restart; direct MCPs are kept."));
+            .child(div().px(px(14.0)).text_size(px(Typo::META.size)).text_color(colors.tertiary).child("Switch open conversations"))
+            .child(div().px(px(14.0)).py(px(4.0)).text_size(px(Typo::META.size)).text_color(colors.tertiary).child("Open Diri tabs for this provider and machine. Running agents restart; direct MCPs are kept."));
         for profile in &self.accounts.catalog.profiles {
             let id = profile.id.clone();
             let subtitle = format!(

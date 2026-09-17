@@ -34,7 +34,7 @@ pub struct AgentAccountId {
     pub id: String,
 }
 
-/// Switch every tracked conversation for this profile's Agent and execution host.
+/// Switch conversations open in Diri tabs for this profile's Agent and execution host.
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SwitchAccountParams {

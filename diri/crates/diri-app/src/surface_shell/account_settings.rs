@@ -144,11 +144,19 @@ impl UtilitySurfaces {
                     .store
                     .read()
                     .map(|store| {
+                        let open = store
+                            .workspace_catalog()
+                            .snapshot()
+                            .map(|s| s.open_session_ids())
+                            .unwrap_or_default();
                         store
                             .sessions()
                             .values()
                             .filter(|session| {
-                                session.kind == source.kind && session.host == source.host
+                                session.kind == source.kind
+                                    && session.host == source.host
+                                    && !session.is_archived()
+                                    && open.contains(&session.id)
                             })
                             .count()
                     })
@@ -166,7 +174,7 @@ impl UtilitySurfaces {
         );
         let mut content = div().flex().flex_col().gap(px(16.0))
             .child(div().text_size(px(14.0)).child(heading))
-            .child(div().text_size(px(12.0)).text_color(colors.secondary).child("All Diri conversations for this Agent on this machine will use the selected account. Running Agents restart; saved conversations stay stopped. Working files and direct MCP definitions are kept."))
+            .child(div().text_size(px(12.0)).text_color(colors.secondary).child("Conversations open in Diri tabs for this Agent on this machine will use the selected account. Running Agents restart; sleeping and stopped conversations keep their state. Working files and direct MCP definitions are kept."))
             .child(div().text_size(px(11.0)).text_color(colors.tertiary).child("Running tools are interrupted. Account-linked connections may ask you to sign in again."));
         if let Some(source) = &source {
             content = content.child(
@@ -243,7 +251,7 @@ impl UtilitySurfaces {
                     )
                     .child(self.account_button(
                         format!("continue-account-{id}"),
-                        format!("Switch all to {}", profile.label),
+                        format!("Switch open conversations to {}", profile.label),
                         cx,
                         move |this, _, cx| this.continue_account(id.clone(), cx),
                     )),
@@ -271,7 +279,7 @@ impl UtilitySurfaces {
                     |this, _, cx| this.close_surface(cx),
                 )),
         );
-        settings_page("Switch all conversations", content, colors).into_any_element()
+        settings_page("Switch open conversations", content, colors).into_any_element()
     }
 
     #[cfg(test)]
@@ -530,7 +538,7 @@ impl UtilitySurfaces {
         }
         let colors = self.settings_colors();
         let mut content = div().flex().flex_col().gap(px(16.0))
-            .child(div().text_size(px(12.0)).text_color(colors.secondary).child("Sign in to each Claude or Codex account once with Open Agent. Switch all conversations to another account when needed; direct MCP setup follows the conversations. Running tools are interrupted, and hosted connections may need authorization on the selected account."))
+            .child(div().text_size(px(12.0)).text_color(colors.secondary).child("Sign in to each Claude or Codex account once with Open Agent. Switch open conversations to another account when needed; direct MCP setup follows the conversations. Running tools are interrupted, and hosted connections may need authorization on the selected account."))
             .child(div().flex().items_center().justify_between()
                 .child(div().text_size(px(12.0)).text_color(colors.secondary).child(if self.accounts.busy { "Updating accounts…" } else { "Saved profiles" }))
                 .child(self.account_button("add-account", "Add profile", cx, |this, window, cx| this.edit_account(None, window, cx))));
@@ -824,7 +832,7 @@ impl UtilitySurfaces {
                             ))
                             .child(self.account_button(
                                 format!("switch-{}", profile.id),
-                                "Switch all conversations",
+                                "Switch open conversations",
                                 cx,
                                 move |this, _, cx| {
                                     let source = this.store.read().ok().and_then(|store| {

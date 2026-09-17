@@ -107,16 +107,19 @@ environment through the existing structured LaunchRequest. Resume and fork use
 the recorded binding, not the current catalog default. Cross-host migration of
 bound sessions fails until an explicit destination-account mapping exists.
 
-Same-host account continuation and bulk account switching are owned by the
-local Engine. Codex and Claude transcripts are validated, bounded to 64 MiB,
-and installed atomically in the destination profile; provider login credentials
-never travel with history. Bulk switching reserves and preflights every tracked
-conversation for the selected Agent and host before stopping any. It stops all
-selected live Agents before transferring direct MCP configuration and file-backed
-MCP OAuth grants, then persists each new binding before relaunch. Stopped and
-archived conversations remain stopped. Each failure is surfaced individually;
-there is no claim of an atomic multi-process switch or automatic prompt replay.
-Only a fully successful switch changes the default for future launches.
+Same-host account continuation and bulk account switching are owned by the local
+Engine. Codex and Claude transcripts are validated and installed atomically in
+the destination profile; provider login credentials never travel with history.
+Bulk switching reserves and preflights non-archived conversations open in Diri
+tabs and split panes for the selected Agent and host before stopping any. It
+stops all selected live Agents before transferring direct MCP configuration and
+file-backed MCP OAuth grants, then persists each new binding before relaunch.
+Stopped open conversations remain stopped and sleeping sessions return to sleep.
+Closed and archived conversations are excluded. Local Codex history is streamed
+with a 4 GiB file bound and 64 MiB JSON-line bound; remote and Claude history
+retain the 64 MiB transfer bound. Each failure is surfaced individually; there
+is no claim of an atomic multi-process switch or automatic prompt replay. Only a
+fully successful switch changes the default for future launches.
 
 Direct MCP configuration and file-backed OAuth grants are transferred on the
 same host through the bounded fixed-script SSH seam, with paths on stdin,
@@ -1100,7 +1103,7 @@ worker, remote attachment, or Helper protocol change is added. PTY draining
 remains independent of every local client.
 
 Ordinary queued frames retain at most 1 MiB and 64 frame references per sink.
-One larger valid frame (up to the existing 16 MiB protocol payload limit) may be
+One larger valid frame (up to the existing 64 MiB protocol payload limit) may be
 queued with 64 bytes of mode/control overhead. Already-written prefixes still
 count toward retained allocation until their complete frame is released. The
 pump services each sink for at most 256 KiB or 1 ms per turn. While bytes remain

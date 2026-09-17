@@ -40,27 +40,29 @@ Local transcript discovery and native title lookup use the bound configuration
 directory. Global history import and existing usage panels retain their current
 scope; this feature does not aggregate usage across profile directories.
 
-## Switch all conversations
+## Switch open conversations
 
-Open the bottom-left account menu and choose a saved account under **Switch all
+Open the bottom-left account menu and choose a saved account under **Switch open
 conversations**. Each row identifies its provider, machine, and default status.
 Progress and any failures stay in the menu. **Add or manage accounts…** opens
-account setup. The switch applies to all tracked conversations for that provider
-and machine, including stopped conversations.
+account setup. The switch applies to conversations open in Diri tabs and split panes for that provider
+and machine, including sleeping or stopped open conversations. Closed and archived
+conversations are excluded.
 
-Choose **Switch account for all conversations…** from a Codex or Claude session
-menu, or **Switch all conversations** on a saved profile in Settings → Accounts.
+Choose **Switch account for open conversations…** from a Codex or Claude session
+menu, or **Switch open conversations** on a saved profile in Settings → Accounts.
 Sign in to each profile once with **Open Agent**. Switching uses that saved login;
 it never logs out the other accounts or replaces their model-provider tokens.
 
-The action covers every tracked Diri conversation for the selected Agent on the
-same execution host, including stopped and archived records. It does not change
-other Agents or other hosts, or conversations managed outside Diri. Running
-Agents restart with their native conversation IDs; stopped/archived conversations
-remain stopped and use the new account when resumed. Working folders, worktrees,
-titles, Diri IDs, and conversation history are retained. Running tool processes
-are interrupted, not migrated or automatically replayed. After a fully successful
-switch, the selected account becomes the default for new conversations.
+The action covers non-archived conversations in Diri tabs and split panes for
+the selected Agent on the same execution host. It does not change other Agents
+or other hosts, or conversations managed outside Diri. Running Agents restart
+with their native conversation IDs; stopped conversations remain stopped, and
+sleeping conversations return to sleep and use the new account when resumed.
+Working folders, worktrees, titles, Diri IDs, and conversation history are
+retained. Running tool processes are interrupted, not migrated or automatically
+replayed. After a fully successful switch, the selected account becomes the
+default for new conversations.
 
 Every conversation must have a known native ID and a valid saved transcript.
 Codex rollout discovery is supported locally; remote Codex requires an already
@@ -72,13 +74,15 @@ saved history stays recoverable and the UI does not claim a complete switch.
 The current profile badge and Resume action describe recovery after a partial
 switch. New launches and concurrent account edits cannot race the switch.
 
-Main transcripts are bounded to 64 MiB and copied atomically, with identity and
-working-directory checks for Codex. A destination copy must be an exact prefix
-of the source, permitting switching back without overwriting a divergent branch.
-Source transcripts are retained. The new binding is durable before relaunch;
-a relaunch failure can be retried with Resume. Codex reconstructs its runtime
-state from the rollout; Diri does not copy a live SQLite database. This does not
-transfer provider-specific subagent/file-rewind sidecars or running tools.
+Local Codex rollouts stream through bounded buffers (4 GiB per file, 64 MiB per
+JSON line); remote and Claude transcripts retain the 64 MiB limit. Copies are
+atomic, with identity and working-directory checks for Codex. A destination copy
+must be an exact prefix of the source, permitting switching back without
+overwriting a divergent branch. Source transcripts are retained. The new binding
+is durable before relaunch; a relaunch failure can be retried with Resume. Codex
+reconstructs its runtime state from the rollout; Diri does not copy a live
+SQLite database. This does not transfer provider-specific subagent/file-rewind
+sidecars or running tools.
 
 ### MCP preservation
 

@@ -100,6 +100,30 @@ pub struct WorkspaceSnapshot {
     pub revision: u64,
     pub workspaces: Vec<WorkspaceRecord>,
 }
+impl WorkspaceSnapshot {
+    /// Sessions placed in any saved tab or split pane, including sleeping sessions.
+    pub fn open_session_ids(&self) -> std::collections::HashSet<SessionId> {
+        fn collect(node: &LayoutNode, ids: &mut std::collections::HashSet<SessionId>) {
+            match node {
+                LayoutNode::Pane { session_id, .. } => {
+                    ids.insert(session_id.clone());
+                }
+                LayoutNode::Split { first, second, .. } => {
+                    collect(first, ids);
+                    collect(second, ids);
+                }
+            }
+        }
+        let mut ids = std::collections::HashSet::new();
+        for workspace in &self.workspaces {
+            for tab in &workspace.tabs {
+                collect(&tab.layout, &mut ids);
+            }
+        }
+        ids
+    }
+}
+
 impl Default for WorkspaceSnapshot {
     fn default() -> Self {
         Self {
