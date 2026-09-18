@@ -310,6 +310,7 @@ impl Sidebar {
     /// fixtures that cannot simulate the pointer. The control must have
     /// painted once so the popup has an anchor.
     #[cfg(test)]
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
     pub(crate) fn open_project_picker_for_test(
         &mut self,
         window: &mut Window,

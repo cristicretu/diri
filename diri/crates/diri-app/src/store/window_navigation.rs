@@ -400,6 +400,7 @@ impl WindowWrite<'_> {
     /// Test/preview seam: install a completed folder listing for this window
     /// without a daemon round trip, so the New Agent folder browser renders.
     #[cfg(test)]
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
     pub fn set_directory_listing(
         &mut self,
         host: Option<String>,
