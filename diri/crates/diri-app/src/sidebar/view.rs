@@ -9603,6 +9603,12 @@ mod tests {
             }),
             _ => Some(Popover::SidebarLayout),
         };
+        // First row of a right-click menu, for `DIRI_VISUAL_MENU_HOVER`.
+        let menu_hover = match &popover {
+            Some(Popover::ProjectActions { .. }) => Some(point(px(140.0), px(168.0))),
+            Some(Popover::SessionActions { .. }) => Some(point(px(140.0), px(228.0))),
+            _ => None,
+        };
         let scenario =
             PreviewScenario::from_env(std::env::var("DIRI_VISUAL_SCENARIO").ok().as_deref());
         let width: f32 = std::env::var("DIRI_VISUAL_WIDTH")
@@ -9691,6 +9697,18 @@ mod tests {
         cx.update_window(window.into(), |_, window, _| window.refresh())
             .expect("refresh sidebar window");
         cx.run_until_parked();
+        // `DIRI_VISUAL_MENU_HOVER=1` rests the pointer on the first row of a
+        // context menu so its hover material is part of the capture.
+        if std::env::var_os("DIRI_VISUAL_MENU_HOVER").is_some() {
+            if let Some(hover) = menu_hover {
+                cx.update_window(window.into(), |_, window, cx| {
+                    window.simulate_mouse_move(hover, cx);
+                    window.refresh();
+                })
+                .expect("hover menu row");
+                cx.run_until_parked();
+            }
+        }
         if std::env::var_os("DIRI_VISUAL_BENCH").is_some() {
             // Force exactly the same work in before/after runs; warm all eight
             // frames before measuring. Includes layout, paint, and GPU submission.
