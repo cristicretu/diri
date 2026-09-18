@@ -1446,6 +1446,10 @@ impl Sidebar {
 }
 
 impl Sidebar {
+    #[cfg(test)]
+    pub(super) fn project_agent_open_pending(&self) -> bool {
+        self.workspace_nav.project_agent.is_some()
+    }
     pub(super) fn workspace_focused_session(&self) -> Option<SessionId> {
         fn find(node: &diri_proto::workspace::LayoutNode, id: &PaneId) -> Option<SessionId> {
             match node {

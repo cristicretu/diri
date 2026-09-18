@@ -695,7 +695,7 @@ mod tests {
                 .flex()
                 .flex_col()
                 .child(self.sidebar.update(cx, |sidebar, cx| {
-                    sidebar.render_horizontal_tabs(900.0, None, cx)
+                    sidebar.render_horizontal_tabs(900.0, None, window, cx)
                 }))
                 .children(self.sidebar.update(cx, |sidebar, cx| {
                     sidebar.render_project_picker_overlay(window, cx)

@@ -6526,7 +6526,7 @@ impl Sidebar {
     /// gating on it freezes a still-visible window on another monitor.
     fn schedule_activity_tick(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let animate = self.working_row_rendered
-            && (self.ui.visible || self.peek_open)
+            && self.activity_marks_painted()
             && self.settings_nav.is_none()
             && !cx.reduce_motion();
         if !animate {
@@ -6538,7 +6538,7 @@ impl Sidebar {
                     .await;
                 let _ = this.update_in(cx, |this, _window, cx| {
                     this.activity_tick = None;
-                    if (this.ui.visible || this.peek_open)
+                    if this.activity_marks_painted()
                         && this.settings_nav.is_none()
                         && !cx.reduce_motion()
                     {
@@ -6548,6 +6548,12 @@ impl Sidebar {
                 });
             }));
         }
+    }
+
+    /// Where a working mark can currently be seen: the sidebar panel, its
+    /// peek, or the horizontal strip that stands in for the hidden panel.
+    fn activity_marks_painted(&self) -> bool {
+        self.ui.visible || self.peek_open || self.horizontal_tabs_visible()
     }
 
     fn status_glyph(

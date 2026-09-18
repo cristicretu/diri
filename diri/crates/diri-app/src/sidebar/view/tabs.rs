@@ -16,9 +16,12 @@ impl Render for DraggedTab {
     }
 }
 
-/// The static face of a session tab: agent mark and title.
+/// The static face of a session tab: leading mark and title. The mark is
+/// the agent's brand while it has nothing to say, and the same activity
+/// mark as the sidebar rows (working, needs input, done, sleeping) when it
+/// does; both sit in one fixed slot so the title never shifts between them.
 pub(super) fn session_tab_face(
-    kind: &ProtoAgentKind,
+    mark: AnyElement,
     title: SharedString,
     active: bool,
     colors: SemanticColors,
@@ -29,7 +32,15 @@ pub(super) fn session_tab_face(
         .flex()
         .items_center()
         .gap(px(7.0))
-        .child(Sidebar::agent_tab_icon(kind, colors))
+        .child(
+            div()
+                .size(px(18.0))
+                .flex_none()
+                .flex()
+                .items_center()
+                .justify_center()
+                .child(mark),
+        )
         .child(
             div()
                 .flex_1()
@@ -233,11 +244,24 @@ impl Sidebar {
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let colors = self.colors();
-        let (tabs, selected, custom_ordering) = {
+        let (tabs, selected, custom_ordering, marks) = {
             let mut store = self.store.write().expect("store");
             let selected = store.selected_session_id().cloned();
             let custom = store.preferences().sidebar_ordering == SidebarOrdering::Custom;
-            (selected_project_tabs(&mut store), selected, custom)
+            let tabs = selected_project_tabs(&mut store);
+            // The same reduction the sidebar rows use, so a tab and its row
+            // never disagree about what a session is doing.
+            let marks: Vec<StatusState> = tabs
+                .sessions
+                .iter()
+                .map(|session| {
+                    sidebar_activity_state(
+                        status_state(session, store.migrating().contains(&session.id)),
+                        store.notifications().session_unread(&session.id),
+                    )
+                })
+                .collect();
+            (tabs, selected, custom, marks)
         };
         let reduce_motion = cx.reduce_motion();
         if self.tab_shift.settled.get() {
@@ -271,10 +295,34 @@ impl Sidebar {
             self.last_tab_selection = selected.clone();
             self.last_tab_available_width = available_width;
         }
-        for session in tabs.sessions {
+        for (session, state) in tabs.sessions.into_iter().zip(marks) {
             let id = session.id.clone();
             let active = selected.as_ref() == Some(&id);
             let title = display_title(&session);
+            self.working_row_rendered |= state == StatusState::Working;
+            let mark = match state {
+                StatusState::IdleSeen | StatusState::None => div()
+                    .id(SharedString::from(format!("horizontal-tab-logo-{}", id.0)))
+                    .debug_selector({
+                        let id = id.0.clone();
+                        move || format!("horizontal-tab-logo-{id}")
+                    })
+                    .child(Self::agent_tab_icon(session.effective_kind(), colors))
+                    .into_any_element(),
+                state => div()
+                    .id(SharedString::from(format!(
+                        "horizontal-tab-status-{}",
+                        id.0
+                    )))
+                    .debug_selector({
+                        let id = id.0.clone();
+                        move || format!("horizontal-tab-status-{id}")
+                    })
+                    .role(Role::Image)
+                    .aria_label(state.label())
+                    .child(activity_mark(state, self.activity_frame, colors))
+                    .into_any_element(),
+            };
             let debug_id = id.0.clone();
             let close_id = id.clone();
             let probe_key = SharedString::from(format!("tab:{}", id.0));
@@ -290,121 +338,116 @@ impl Sidebar {
             if shift.is_none() {
                 self.tab_shift.applied.borrow_mut().remove(&id);
             }
-            let tab = session_tab_face(
-                session.effective_kind(),
-                title.clone().into(),
-                active,
-                colors,
-            )
-            .id(SharedString::from(format!("horizontal-tab-{}", id.0)))
-            .debug_selector(move || format!("horizontal-tab-{}", debug_id))
-            .role(Role::Tab)
-            .aria_label(title.clone())
-            .aria_selected(active)
-            .relative()
-            .child(self.fade_probe(probe_key.clone()))
-            .flex_none()
-            .w(px(TAB_WIDTH))
-            .h(px(30.0))
-            .cursor_pointer()
-            .border_1()
-            .border_color(colors.primary.alpha(0.0))
-            .glass_pill(colors, active)
-            .hover(move |row| {
-                if active {
-                    row
-                } else {
-                    row.bg(colors.primary.alpha(0.06))
-                }
-            })
-            .when(custom_ordering, |row| {
-                let drag_id = id.clone();
-                let drag_entity = entity.clone();
-                row.on_drag(DraggedTab(id.clone()), move |dragged, grab, window, cx| {
-                    // The tab itself lifts from where the pointer grabbed it
-                    // and travels only along the strip.
-                    let origin = window.mouse_position() - grab;
-                    drag_entity.update(cx, |this, cx| {
-                        let order = this.store.write().expect("store").sidebar_session_order();
-                        this.ui.session_order_at_drag_start = Some(order);
-                        this.lift = Some(Lift::new(
-                            LiftKey::SessionTab(drag_id.clone()),
-                            origin,
-                            grab,
-                            LiftAxis::Horizontal,
-                        ));
-                        cx.notify();
-                    });
-                    cx.new(|_| dragged.clone())
-                })
-                // Tabs trade places once the pointer crosses a tab's
-                // midline in its direction of travel, and the displaced
-                // tabs slide into their new slots.
-                .drag_over::<DraggedTab>({
-                    let id = id.clone();
-                    let entity = entity.clone();
-                    move |row, dragged, _, cx| {
-                        entity.update(cx, |this, cx| {
-                            if this.pointer_crossed_tab(&dragged.0, &id)
-                                && this.reorder_tab(&dragged.0, &id, cx.reduce_motion())
-                            {
-                                cx.notify();
-                            }
-                        });
+            let tab = session_tab_face(mark, title.clone().into(), active, colors)
+                .id(SharedString::from(format!("horizontal-tab-{}", id.0)))
+                .debug_selector(move || format!("horizontal-tab-{}", debug_id))
+                .role(Role::Tab)
+                .aria_label(title.clone())
+                .aria_selected(active)
+                .relative()
+                .child(self.fade_probe(probe_key.clone()))
+                .flex_none()
+                .w(px(TAB_WIDTH))
+                .h(px(30.0))
+                .cursor_pointer()
+                .border_1()
+                .border_color(colors.primary.alpha(0.0))
+                .glass_pill(colors, active)
+                .hover(move |row| {
+                    if active {
                         row
+                    } else {
+                        row.bg(colors.primary.alpha(0.06))
                     }
                 })
-            })
-            .child(
-                div()
-                    .id(SharedString::from(format!(
-                        "close-horizontal-tab-{}",
-                        close_id.0
-                    )))
-                    .role(Role::Button)
-                    .aria_label("Close session")
-                    .size(px(18.0))
-                    .flex_none()
-                    .flex()
-                    .items_center()
-                    .justify_center()
-                    .rounded(px(5.0))
-                    .hover(move |button| button.bg(colors.primary.alpha(0.10)))
-                    .child(sf_symbol("xmark", 8.0, colors.tertiary))
-                    .on_click(cx.listener(move |this, _, _, cx| {
-                        this.close_sessions(vec![close_id.clone()], cx);
-                        cx.stop_propagation();
-                        cx.notify();
-                    })),
-            )
-            .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
-            .on_mouse_down(
-                MouseButton::Right,
-                cx.listener({
+                .when(custom_ordering, |row| {
+                    let drag_id = id.clone();
+                    let drag_entity = entity.clone();
+                    row.on_drag(DraggedTab(id.clone()), move |dragged, grab, window, cx| {
+                        // The tab itself lifts from where the pointer grabbed it
+                        // and travels only along the strip.
+                        let origin = window.mouse_position() - grab;
+                        drag_entity.update(cx, |this, cx| {
+                            let order = this.store.write().expect("store").sidebar_session_order();
+                            this.ui.session_order_at_drag_start = Some(order);
+                            this.lift = Some(Lift::new(
+                                LiftKey::SessionTab(drag_id.clone()),
+                                origin,
+                                grab,
+                                LiftAxis::Horizontal,
+                            ));
+                            cx.notify();
+                        });
+                        cx.new(|_| dragged.clone())
+                    })
+                    // Tabs trade places once the pointer crosses a tab's
+                    // midline in its direction of travel, and the displaced
+                    // tabs slide into their new slots.
+                    .drag_over::<DraggedTab>({
+                        let id = id.clone();
+                        let entity = entity.clone();
+                        move |row, dragged, _, cx| {
+                            entity.update(cx, |this, cx| {
+                                if this.pointer_crossed_tab(&dragged.0, &id)
+                                    && this.reorder_tab(&dragged.0, &id, cx.reduce_motion())
+                                {
+                                    cx.notify();
+                                }
+                            });
+                            row
+                        }
+                    })
+                })
+                .child(
+                    div()
+                        .id(SharedString::from(format!(
+                            "close-horizontal-tab-{}",
+                            close_id.0
+                        )))
+                        .role(Role::Button)
+                        .aria_label("Close session")
+                        .size(px(18.0))
+                        .flex_none()
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .rounded(px(5.0))
+                        .hover(move |button| button.bg(colors.primary.alpha(0.10)))
+                        .child(sf_symbol("xmark", 8.0, colors.tertiary))
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            this.close_sessions(vec![close_id.clone()], cx);
+                            cx.stop_propagation();
+                            cx.notify();
+                        })),
+                )
+                .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                .on_mouse_down(
+                    MouseButton::Right,
+                    cx.listener({
+                        let id = id.clone();
+                        move |this, event: &gpui::MouseDownEvent, window, cx| {
+                            cx.stop_propagation();
+                            this.ui.focus_cursor = Some(id.clone());
+                            this.open_strip_menu(
+                                Popover::SessionActions {
+                                    id: id.clone(),
+                                    position: event.position,
+                                },
+                                window,
+                                cx,
+                            );
+                        }
+                    }),
+                )
+                .on_click(cx.listener({
                     let id = id.clone();
-                    move |this, event: &gpui::MouseDownEvent, window, cx| {
-                        cx.stop_propagation();
-                        this.ui.focus_cursor = Some(id.clone());
-                        this.open_strip_menu(
-                            Popover::SessionActions {
-                                id: id.clone(),
-                                position: event.position,
-                            },
-                            window,
-                            cx,
-                        );
+                    move |this, _, _, cx| {
+                        this.commit_rename();
+                        this.store.write().expect("store").select(id.clone());
+                        cx.emit(SidebarEvent::SessionActivated);
+                        cx.notify();
                     }
-                }),
-            )
-            .on_click(cx.listener({
-                let id = id.clone();
-                move |this, _, _, cx| {
-                    this.commit_rename();
-                    this.store.write().expect("store").select(id.clone());
-                    cx.emit(SidebarEvent::SessionActivated);
-                    cx.notify();
-                }
-            }));
+                }));
             let tab = match (lifting, shift) {
                 (Some(offset), _) => lift_in_place(tab, LiftAxis::Horizontal, offset, colors),
                 (None, None) => tab.into_any_element(),
@@ -543,6 +586,28 @@ impl Sidebar {
         &mut self,
         available_width: f32,
         trailing: Option<AnyElement>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        // While horizontal tabs hide the panel this strip is the sidebar's
+        // only painted surface, so the per-frame work `Sidebar::render`
+        // does has to happen here: settle workspace navigation (a pending
+        // project-agent open, a created or removed workspace) and keep the
+        // working marks' 8 Hz tick alive only while one is on screen.
+        self.reconcile_workspace_navigation(cx);
+        self.working_row_rendered = false;
+        if cx.reduce_motion() {
+            self.activity_frame = 0;
+        }
+        let strip = self.horizontal_strip(available_width, trailing, cx);
+        self.schedule_activity_tick(window, cx);
+        strip
+    }
+
+    fn horizontal_strip(
+        &mut self,
+        available_width: f32,
+        trailing: Option<AnyElement>,
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let colors = self.colors();
@@ -665,4 +730,189 @@ fn tab_shift_deltas(
         }
     }
     deltas
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use diri_proto::workspace::{
+        LayoutNode, PaneId, TabId, WorkspaceId, WorkspaceRecord, WorkspaceSnapshot, WorkspaceTab,
+    };
+    use gpui::{TestAppContext, VisualTestContext};
+
+    /// Only the strip paints, exactly as the app does while horizontal tabs
+    /// hide the sidebar panel.
+    struct StripOnly {
+        sidebar: Entity<Sidebar>,
+    }
+    impl Render for StripOnly {
+        fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+            div()
+                .size_full()
+                .child(self.sidebar.update(cx, |sidebar, cx| {
+                    sidebar.render_horizontal_tabs(900.0, None, window, cx)
+                }))
+        }
+    }
+    fn strip_harness(
+        cx: &mut TestAppContext,
+        reduce_motion: bool,
+    ) -> (Entity<Sidebar>, &mut VisualTestContext) {
+        cx.update(|cx| cx.set_reduce_motion(reduce_motion));
+        let (view, cx) = cx.add_window_view(move |_, cx| {
+            let sidebar = cx.new(|cx| {
+                let mut sidebar = Sidebar::new(None, true, PreviewScenario::Typical, cx);
+                sidebar
+                    .set_tab_orientation(TabOrientation::Horizontal, cx)
+                    .unwrap();
+                sidebar
+            });
+            cx.observe(&sidebar, |_, _, cx| cx.notify()).detach();
+            StripOnly { sidebar }
+        });
+        (view.read_with(cx, |view, _| view.sidebar.clone()), cx)
+    }
+
+    #[gpui::test]
+    fn horizontal_tabs_show_the_activity_mark_instead_of_the_logo(cx: &mut TestAppContext) {
+        let (_sidebar, cx) = strip_harness(cx, true);
+        // Working and needs-input sessions carry their state in the leading slot.
+        assert!(
+            cx.debug_bounds("horizontal-tab-status-preview-codex")
+                .is_some()
+        );
+        assert!(
+            cx.debug_bounds("horizontal-tab-logo-preview-codex")
+                .is_none()
+        );
+        assert!(
+            cx.debug_bounds("horizontal-tab-status-preview-claude")
+                .is_some()
+        );
+        // A turn that finished after the session was last seen is unread.
+        assert!(
+            cx.debug_bounds("horizontal-tab-status-preview-cursor")
+                .is_some()
+        );
+        // A session with nothing to report keeps the agent's brand mark.
+        assert!(
+            cx.debug_bounds("horizontal-tab-logo-preview-shell")
+                .is_some()
+        );
+        assert!(
+            cx.debug_bounds("horizontal-tab-status-preview-shell")
+                .is_none()
+        );
+        // Both marks occupy the same slot, so the title never shifts.
+        let status = cx
+            .debug_bounds("horizontal-tab-status-preview-codex")
+            .unwrap();
+        let logo = cx
+            .debug_bounds("horizontal-tab-logo-preview-shell")
+            .unwrap();
+        let status_tab = cx.debug_bounds("horizontal-tab-preview-codex").unwrap();
+        let logo_tab = cx.debug_bounds("horizontal-tab-preview-shell").unwrap();
+        assert_eq!(
+            status.center().x - status_tab.left(),
+            logo.center().x - logo_tab.left()
+        );
+    }
+
+    #[gpui::test]
+    fn horizontal_strip_keeps_the_working_mark_ticking_while_the_panel_is_hidden(
+        cx: &mut TestAppContext,
+    ) {
+        let (sidebar, cx) = strip_harness(cx, false);
+        cx.update(|window, _| window.activate_window());
+        cx.run_until_parked();
+        sidebar.read_with(cx, |sidebar, _| {
+            assert!(!sidebar.is_visible(), "the panel is hidden");
+            assert!(sidebar.working_row_rendered);
+            assert!(sidebar.activity_tick.is_some());
+        });
+        for _ in 0..3 {
+            let frame = sidebar.read_with(cx, |sidebar, _| sidebar.activity_frame);
+            cx.executor().advance_clock(Duration::from_millis(125));
+            cx.run_until_parked();
+            assert_eq!(
+                sidebar.read_with(cx, |sidebar, _| sidebar.activity_frame),
+                (frame + 1) % 8,
+            );
+        }
+        // Once nothing works, the strip lets the wake lapse.
+        sidebar.update(cx, |sidebar, cx| {
+            let mut store = sidebar.store.write().unwrap();
+            let sessions: Vec<_> = store.sessions().values().cloned().collect();
+            for session in sessions {
+                let mut session = (*session).clone();
+                session.status = diri_proto::SessionStatus::Idle;
+                store.upsert_session(session);
+            }
+            drop(store);
+            cx.notify();
+        });
+        cx.run_until_parked();
+        cx.executor().advance_clock(Duration::from_millis(125));
+        cx.run_until_parked();
+        sidebar.read_with(cx, |sidebar, _| {
+            assert!(!sidebar.working_row_rendered);
+            assert!(sidebar.activity_tick.is_none());
+        });
+    }
+
+    #[gpui::test]
+    fn horizontal_strip_settles_a_pending_project_agent_open(cx: &mut TestAppContext) {
+        let (sidebar, cx) = strip_harness(cx, true);
+        let claude = SessionId::new("preview-claude");
+        let workspace = WorkspaceId::new("project-view");
+        let snapshot = |revision: u64, project: &diri_proto::ProjectId| WorkspaceSnapshot {
+            revision,
+            workspaces: vec![WorkspaceRecord {
+                id: workspace.clone(),
+                project_id: Some(project.clone()),
+                name: "Project".into(),
+                selected_tab: Some(TabId::new("agent-tab")),
+                tabs: vec![WorkspaceTab {
+                    id: TabId::new("agent-tab"),
+                    title: None,
+                    layout: LayoutNode::Pane {
+                        id: PaneId::new("pane"),
+                        session_id: claude.clone(),
+                    },
+                    focused_pane: PaneId::new("pane"),
+                    zoomed_pane: None,
+                }],
+            }],
+            ..Default::default()
+        };
+        // A tab click: the session is selected and its project agent opens.
+        let project = sidebar.update(cx, |sidebar, cx| {
+            sidebar.preview = false;
+            let mut store = sidebar.store.write().unwrap();
+            let project = store.sessions()[&claude].project_id.clone();
+            store.seed_workspace_snapshot_for_test(snapshot(4, &project));
+            store.select(claude.clone());
+            drop(store);
+            assert!(sidebar.open_selected_project_agent(cx));
+            assert!(sidebar.project_agent_open_pending());
+            project
+        });
+        // The Engine answers while only the strip is painting.
+        sidebar.update(cx, |sidebar, cx| {
+            sidebar
+                .store
+                .write()
+                .unwrap()
+                .finish_workspace_edit_for_test(snapshot(5, &project));
+            cx.notify();
+        });
+        cx.run_until_parked();
+        sidebar.read_with(cx, |sidebar, _| {
+            assert!(
+                !sidebar.project_agent_open_pending(),
+                "the strip must settle the open the way the panel's render does"
+            );
+            assert_eq!(sidebar.workspace_nav.active.as_ref(), Some(&workspace));
+        });
+    }
 }

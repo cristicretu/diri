@@ -3230,7 +3230,7 @@ impl RootView {
                     })
                 });
             let strip = self.sidebar.update(cx, |sidebar, cx| {
-                sidebar.render_horizontal_tabs(card_width, trailing, cx)
+                sidebar.render_horizontal_tabs(card_width, trailing, window, cx)
             });
             card = card.child(
                 div()
@@ -6981,6 +6981,143 @@ mod tests {
             .unwrap();
         cx.run_until_parked();
         fixture.verify_process_identity();
+    }
+
+    /// A tab click in the strip opens the project-agent workspace for that
+    /// session, so every later "new tab" is placed into that workspace and
+    /// must still become the selected session in either orientation.
+    fn new_session_selected_in_orientation(orientation: crate::store::TabOrientation) {
+        use gpui::HeadlessAppContext;
+        let fixture = crate::workspace_fixture::LiveWorkspace::start();
+        fixture
+            .services
+            .store
+            .store
+            .write()
+            .unwrap()
+            .update_preferences(|prefs| {
+                prefs.tab_orientation = orientation;
+                prefs.sidebar_visible = orientation == crate::store::TabOrientation::Vertical;
+            })
+            .unwrap();
+        let platform = gpui_platform::current_platform(true);
+        let mut cx = HeadlessAppContext::with_platform(
+            platform.text_system(),
+            Arc::new(diri_ui::IconAssets),
+            gpui_platform::current_headless_renderer,
+        );
+        cx.update(|cx| {
+            crate::fonts::init(cx);
+            cx.set_reduce_motion(true);
+        });
+        let services = fixture.services.clone();
+        let window = cx
+            .open_window(size(px(1000.0), px(700.0)), |window, cx| {
+                cx.new(|cx| RootView::new(services, false, PreviewScenario::Empty, window, cx))
+            })
+            .unwrap();
+        let settle = |cx: &mut HeadlessAppContext| {
+            for _ in 0..10 {
+                cx.update_window(window.into(), |_, window, cx| {
+                    window.simulate_next_frame(cx)
+                })
+                .unwrap();
+                cx.run_until_parked();
+                std::thread::sleep(Duration::from_millis(5));
+            }
+        };
+        settle(&mut cx);
+        let before: Vec<SessionId> = cx
+            .update_window(window.into(), |root, _, cx| {
+                let root = root.downcast::<RootView>().unwrap();
+                let root = root.read(cx);
+                let store = root.window_store.read().unwrap();
+                store.sessions().keys().cloned().collect()
+            })
+            .unwrap();
+        assert_eq!(before.len(), 2, "{before:?}");
+        cx.update_window(window.into(), |root, _, cx| {
+            let root = root.downcast::<RootView>().unwrap();
+            root.update(cx, |root, cx| {
+                root.sidebar.update(cx, |sidebar, cx| {
+                    sidebar
+                        .window_store()
+                        .write()
+                        .unwrap()
+                        .select(SessionId::new("build"));
+                    cx.emit(crate::sidebar::SidebarEvent::SessionActivated);
+                    cx.notify();
+                });
+            });
+        })
+        .unwrap();
+        for _ in 0..5 {
+            settle(&mut cx);
+        }
+        let active = cx
+            .update_window(window.into(), |root, _, cx| {
+                let root = root.downcast::<RootView>().unwrap();
+                root.read(cx).active_workspace.clone()
+            })
+            .unwrap();
+        assert!(active.is_some(), "project agent workspace did not open");
+        cx.update_window(window.into(), |root, window, cx| {
+            let root = root.downcast::<RootView>().unwrap();
+            root.update(cx, |root, cx| {
+                root.run_command(CommandId::NewTerminal, window, cx);
+            });
+        })
+        .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let created = loop {
+            settle(&mut cx);
+            let created = cx
+                .update_window(window.into(), |root, _, cx| {
+                    let root = root.downcast::<RootView>().unwrap();
+                    let root = root.read(cx);
+                    let store = root.window_store.read().unwrap();
+                    store
+                        .sessions()
+                        .keys()
+                        .find(|id| !before.contains(id))
+                        .cloned()
+                })
+                .unwrap();
+            if let Some(created) = created {
+                break created;
+            }
+            assert!(Instant::now() < deadline, "session never arrived");
+        };
+        // Give the launch receipt, the placement, and the window a chance to meet.
+        for _ in 0..5 {
+            settle(&mut cx);
+        }
+        let selected = cx
+            .update_window(window.into(), |root, _, cx| {
+                let root = root.downcast::<RootView>().unwrap();
+                let root = root.read(cx);
+                let store = root.window_store.read().unwrap();
+                store.selected_session_id().cloned()
+            })
+            .unwrap();
+        assert_eq!(selected.as_ref(), Some(&created), "{orientation:?}");
+        cx.update_window(window.into(), |_, window, _| window.remove_window())
+            .unwrap();
+        cx.run_until_parked();
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    #[ignore = "disposable real Engine PTYs"]
+    fn new_session_is_selected_with_vertical_tabs() {
+        new_session_selected_in_orientation(crate::store::TabOrientation::Vertical);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    #[ignore = "disposable real Engine PTYs"]
+    fn new_session_is_selected_with_horizontal_tabs() {
+        new_session_selected_in_orientation(crate::store::TabOrientation::Horizontal);
     }
 
     #[cfg(target_os = "macos")]
