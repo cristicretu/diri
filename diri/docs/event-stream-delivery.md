@@ -9,3 +9,5 @@ The existing marker payload has `dropped`, `fromSeq`, and `toSeq`. A consumer mu
 If `sinceSeq` is older than the retained replay ring, the first read likewise reports the unavailable range. That range covers global events and can include events outside the subscription filter. It does not prove that a particular matching event was lost. Filters cannot suppress gap markers.
 
 This stream is bounded, not a durable journal. Sequence numbers are local to one Engine lifetime; clients must resynchronize after Engine replacement. This change does not add new terminal event kinds or claim exactly-once delivery across reconnects.
+
+`HelloResult.engineInstanceId` lets a client tell one Engine lifetime from the next; see [engine-event-cursors.md](engine-event-cursors.md) for how the Rust client scopes its replay cursor to it.

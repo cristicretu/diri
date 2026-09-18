@@ -85,18 +85,35 @@ impl From<ControlError> for ClientError {
 
 type PendingResult = Result<JsonValue, ClientError>;
 
+#[derive(Default)]
+struct EventCursor {
+    connection: u64,
+    engine_instance_id: Option<String>,
+    verified: bool,
+    rejected: bool,
+    subscribed: bool,
+    last_seq: u64,
+}
+
+#[derive(Clone)]
+struct ConnectionWriter {
+    connection: u64,
+    sender: mpsc::Sender<Vec<u8>>,
+}
+
 pub(crate) struct ClientCore {
     socket_path: PathBuf,
     build: String,
     token: Option<String>,
     next_request_id: AtomicU64,
     pending: Mutex<HashMap<u64, oneshot::Sender<PendingResult>>>,
-    writer: RwLock<Option<mpsc::Sender<Vec<u8>>>>,
+    writer: RwLock<Option<ConnectionWriter>>,
     state_tx: watch::Sender<ConnectionState>,
     event_tx: broadcast::Sender<EventEnvelope>,
     want_events: AtomicBool,
-    events_subscribed: AtomicBool,
-    last_seq: AtomicU64,
+    event_cursor: StdMutex<EventCursor>,
+    event_subscription: Mutex<()>,
+    identity_failure_tx: watch::Sender<u64>,
     shutdown_tx: watch::Sender<bool>,
     retry_tx: watch::Sender<u64>,
 }
@@ -133,6 +150,17 @@ impl ClientCore {
         params: Option<&P>,
         timeout: Option<Duration>,
     ) -> Result<JsonValue, ClientError> {
+        self.request_on_connection(method, params, timeout, None)
+            .await
+    }
+
+    async fn request_on_connection<P: Serialize + ?Sized>(
+        &self,
+        method: &str,
+        params: Option<&P>,
+        timeout: Option<Duration>,
+        connection: Option<u64>,
+    ) -> Result<JsonValue, ClientError> {
         let id = self.next_request_id.fetch_add(1, Ordering::Relaxed) + 1;
         let params = params
             .map(serde_json::to_value)
@@ -150,10 +178,13 @@ impl ClientCore {
             .await
             .clone()
             .ok_or_else(|| ClientError::disconnected("not connected to daemon"))?;
+        if connection.is_some_and(|expected| expected != writer.connection) {
+            return Err(ClientError::disconnected("control connection changed"));
+        }
         let (response_tx, response_rx) = oneshot::channel();
         self.pending.lock().await.insert(id, response_tx);
 
-        if writer.send(line).await.is_err() {
+        if writer.sender.send(line).await.is_err() {
             self.pending.lock().await.remove(&id);
             return Err(ClientError::disconnected(
                 "control connection writer stopped",
@@ -196,26 +227,71 @@ impl ClientCore {
     }
 
     async fn hello(&self, timeout: Option<Duration>) -> Result<HelloResult, ClientError> {
+        let connection = self.event_cursor.lock().expect("event cursor").connection;
         let params = HelloParams {
             proto: diri_proto::control::WIRE_VERSION,
             build: self.build.clone(),
             token: self.token.clone(),
         };
-        self.request_typed(Method::HELLO, Some(&params), timeout)
-            .await
+        let value = self
+            .request_on_connection(Method::HELLO, Some(&params), timeout, Some(connection))
+            .await?;
+        let hello: HelloResult = serde_json::from_value(value).map_err(ClientError::json)?;
+        let mut cursor = self.event_cursor.lock().expect("event cursor");
+        if cursor.connection != connection {
+            return Err(ClientError::disconnected(
+                "Hello belongs to an old connection",
+            ));
+        }
+        let invalid_instance = hello.engine_instance_id.as_ref().is_some_and(|id| {
+            id.is_empty() || id.len() > 128 || !id.bytes().all(|byte| byte.is_ascii_graphic())
+        });
+        if cursor.rejected
+            || hello.engine_kind.as_deref() != Some(RUST_ENGINE_KIND)
+            || invalid_instance
+            || (cursor.verified && cursor.engine_instance_id != hello.engine_instance_id)
+        {
+            cursor.rejected = true;
+            cursor.verified = false;
+            cursor.subscribed = false;
+            cursor.last_seq = 0;
+            self.identity_failure_tx.send_replace(connection);
+            return Err(ClientError::protocol(
+                "Engine identity changed or is invalid",
+            ));
+        }
+        if !cursor.verified {
+            if hello.engine_instance_id.is_none()
+                || cursor.engine_instance_id != hello.engine_instance_id
+            {
+                cursor.last_seq = 0;
+            }
+            cursor.engine_instance_id = hello.engine_instance_id.clone();
+            cursor.verified = true;
+        }
+        Ok(hello)
     }
 
     async fn subscribe_to_events(&self) -> Result<EventsSubscribeResult, ClientError> {
-        if self
-            .events_subscribed
-            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
-            .is_err()
-        {
-            return Ok(EventsSubscribeResult { subscribed: true });
-        }
-        let seq = self.last_seq.load(Ordering::Acquire);
+        // All callers wait for the actual acknowledgement. An old request
+        // cannot reset the subscription state of its replacement connection.
+        let _subscription = self.event_subscription.lock().await;
+        let (connection, since_seq) = {
+            let cursor = self.event_cursor.lock().expect("event cursor");
+            if !cursor.verified || cursor.rejected {
+                return Err(ClientError::disconnected("Engine Hello is not verified"));
+            }
+            if cursor.subscribed {
+                return Ok(EventsSubscribeResult { subscribed: true });
+            }
+            (
+                cursor.connection,
+                (cursor.engine_instance_id.is_some() && cursor.last_seq != 0)
+                    .then_some(cursor.last_seq),
+            )
+        };
         let params = EventsSubscribeParams {
-            since_seq: (seq != 0).then_some(seq),
+            since_seq,
             sessions: None,
             kinds: Some(
                 Self::EVENT_KINDS
@@ -224,20 +300,30 @@ impl ClientCore {
                     .collect(),
             ),
         };
-        let result = self
-            .request_typed(
+        let value = self
+            .request_on_connection(
                 Method::EVENTS_SUBSCRIBE,
                 Some(&params),
                 HEARTBEAT_TIMEOUT.into(),
+                Some(connection),
             )
-            .await;
-        if result.is_err() {
-            self.events_subscribed.store(false, Ordering::Release);
+            .await?;
+        let result: EventsSubscribeResult =
+            serde_json::from_value(value).map_err(ClientError::json)?;
+        let mut cursor = self.event_cursor.lock().expect("event cursor");
+        if cursor.connection != connection || !cursor.verified || cursor.rejected {
+            return Err(ClientError::disconnected(
+                "event subscription connection changed",
+            ));
         }
-        result
+        cursor.subscribed = result.subscribed;
+        Ok(result)
     }
 
-    pub(crate) async fn route_message(&self, message: ControlMessage) {
+    pub(crate) async fn route_message(&self, connection: u64, message: ControlMessage) {
+        if self.event_cursor.lock().expect("event cursor").connection != connection {
+            return;
+        }
         match message {
             ControlMessage::Response { id, result } => {
                 let Some(sender) = self.pending.lock().await.remove(&id) else {
@@ -247,7 +333,11 @@ impl ClientCore {
                 let _ = sender.send(result);
             }
             ControlMessage::Event { name, seq, params } => {
-                self.last_seq.fetch_max(seq, Ordering::AcqRel);
+                let mut cursor = self.event_cursor.lock().expect("event cursor");
+                if cursor.connection != connection || !cursor.verified || cursor.rejected {
+                    return;
+                }
+                cursor.last_seq = cursor.last_seq.max(seq);
                 let _ = self.event_tx.send(EventEnvelope { name, seq, params });
             }
             ControlMessage::Request { .. } => {}
@@ -303,6 +393,7 @@ impl DaemonClient {
         let (event_tx, _) = broadcast::channel(EVENT_CHANNEL_CAPACITY);
         let (shutdown_tx, _) = watch::channel(false);
         let (retry_tx, _) = watch::channel(0);
+        let (identity_failure_tx, _) = watch::channel(0);
         Self {
             core: Arc::new(ClientCore {
                 socket_path: socket_path.into(),
@@ -314,8 +405,9 @@ impl DaemonClient {
                 state_tx,
                 event_tx,
                 want_events: AtomicBool::new(false),
-                events_subscribed: AtomicBool::new(false),
-                last_seq: AtomicU64::new(0),
+                event_cursor: StdMutex::new(EventCursor::default()),
+                event_subscription: Mutex::new(()),
+                identity_failure_tx,
                 shutdown_tx,
                 retry_tx,
             }),
@@ -401,7 +493,11 @@ impl DaemonClient {
     }
 
     pub fn last_seq(&self) -> u64 {
-        self.core.last_seq.load(Ordering::Acquire)
+        self.core
+            .event_cursor
+            .lock()
+            .expect("event cursor")
+            .last_seq
     }
 
     pub async fn wait_until_connected(
@@ -1076,8 +1172,13 @@ async fn run_lifecycle(core: Arc<ClientCore>) {
     while !*shutdown.borrow() {
         core.set_state(ConnectionState::Connecting);
         let outcome = run_once(Arc::clone(&core), &mut shutdown).await;
+        {
+            let mut cursor = core.event_cursor.lock().expect("event cursor");
+            cursor.connection = cursor.connection.wrapping_add(1);
+            cursor.verified = false;
+            cursor.subscribed = false;
+        }
         *core.writer.write().await = None;
-        core.events_subscribed.store(false, Ordering::Release);
         core.fail_pending(outcome.error.clone()).await;
         core.set_state(ConnectionState::Disconnected(outcome.error.to_string()));
         if *shutdown.borrow() {
@@ -1104,20 +1205,34 @@ async fn run_lifecycle(core: Arc<ClientCore>) {
 }
 
 async fn run_once(core: Arc<ClientCore>, shutdown: &mut watch::Receiver<bool>) -> AttemptOutcome {
-    let mut connection = match ActiveConnection::open(&core.socket_path, Arc::clone(&core)).await {
-        Ok(connection) => connection,
-        Err(error) => {
-            return AttemptOutcome {
-                error,
-                established: false,
-            };
-        }
+    let generation = {
+        let mut cursor = core.event_cursor.lock().expect("event cursor");
+        cursor.connection = cursor.connection.wrapping_add(1);
+        cursor.verified = false;
+        cursor.rejected = false;
+        cursor.subscribed = false;
+        cursor.connection
     };
-    *core.writer.write().await = Some(connection.sender());
+    let mut identity_failures = core.identity_failure_tx.subscribe();
+    let mut connection =
+        match ActiveConnection::open(&core.socket_path, Arc::clone(&core), generation).await {
+            Ok(connection) => connection,
+            Err(error) => {
+                return AttemptOutcome {
+                    error,
+                    established: false,
+                };
+            }
+        };
+    *core.writer.write().await = Some(ConnectionWriter {
+        connection: generation,
+        sender: connection.sender(),
+    });
 
     let hello = tokio::select! {
         result = core.hello(Some(HEARTBEAT_TIMEOUT)) => result,
         error = connection.closed() => Err(error),
+        _ = identity_failures.changed() => Err(ClientError::protocol("Engine identity rejected")),
         _ = shutdown.changed() => Err(ClientError::disconnected("client shut down")),
     };
     let hello = match hello {
@@ -1142,6 +1257,7 @@ async fn run_once(core: Arc<ClientCore>, shutdown: &mut watch::Receiver<bool>) -
         let subscribed = tokio::select! {
             result = core.subscribe_to_events() => result.map(|_| ()),
             error = connection.closed() => Err(error),
+            _ = identity_failures.changed() => Err(ClientError::protocol("Engine identity rejected")),
             _ = shutdown.changed() => Err(ClientError::disconnected("client shut down")),
         };
         if let Err(error) = subscribed {
@@ -1159,6 +1275,12 @@ async fn run_once(core: Arc<ClientCore>, shutdown: &mut watch::Receiver<bool>) -
             error = connection.closed() => {
                 return AttemptOutcome { error, established: true };
             }
+            _ = identity_failures.changed() => {
+                return AttemptOutcome {
+                    error: ClientError::protocol("Engine identity rejected"),
+                    established: true,
+                };
+            }
             _ = shutdown.changed() => {
                 return AttemptOutcome {
                     error: ClientError::disconnected("client shut down"),
@@ -1170,6 +1292,7 @@ async fn run_once(core: Arc<ClientCore>, shutdown: &mut watch::Receiver<bool>) -
         let heartbeat = tokio::select! {
             result = core.hello(Some(HEARTBEAT_TIMEOUT)) => result.map(|_| ()),
             error = connection.closed() => Err(error),
+            _ = identity_failures.changed() => Err(ClientError::protocol("Engine identity rejected")),
             _ = shutdown.changed() => Err(ClientError::disconnected("client shut down")),
         };
         if let Err(error) = heartbeat {
@@ -1189,6 +1312,7 @@ mod tests {
     use std::error::Error;
     use std::fs;
     use std::time::{SystemTime, UNIX_EPOCH};
+    use tokio::io::AsyncBufReadExt;
 
     #[test]
     fn begin_shutdown_publishes_without_an_async_runtime_turn() {
@@ -1216,6 +1340,263 @@ mod tests {
                 .expect("lifecycle mutex poisoned")
                 .is_none()
         );
+    }
+
+    /// Scripted local Engine: answers Hello with a configurable instance
+    /// identity, records every `events.subscribe` request and pushes a fixed
+    /// batch of events after each subscription. Tests drop connections
+    /// through `close` to force the client's reconnect path.
+    struct FakeEngine {
+        socket: PathBuf,
+        instance: Arc<StdMutex<Option<String>>>,
+        subscriptions: Mutex<mpsc::UnboundedReceiver<EventsSubscribeParams>>,
+        close: mpsc::UnboundedSender<()>,
+        _temp: tempfile::TempDir,
+        _server: JoinHandle<()>,
+    }
+
+    impl FakeEngine {
+        fn start(instance: Option<&str>, events: u64) -> Self {
+            let temp = tempfile::tempdir().expect("temp dir");
+            let socket = temp.path().join("daemon.sock");
+            let listener = tokio::net::UnixListener::bind(&socket).expect("bind");
+            let instance = Arc::new(StdMutex::new(instance.map(str::to_owned)));
+            let (subscription_tx, subscription_rx) = mpsc::unbounded_channel();
+            let (close_tx, mut close_rx) = mpsc::unbounded_channel::<()>();
+            let identity = Arc::clone(&instance);
+            let server = tokio::spawn(async move {
+                loop {
+                    let Ok((stream, _)) = listener.accept().await else {
+                        return;
+                    };
+                    let (read_half, mut write_half) = stream.into_split();
+                    let mut lines = tokio::io::BufReader::new(read_half).lines();
+                    loop {
+                        let line = tokio::select! {
+                            line = lines.next_line() => match line {
+                                Ok(Some(line)) => line,
+                                _ => break,
+                            },
+                            _ = close_rx.recv() => break,
+                        };
+                        let ControlMessage::Request { id, method, params } =
+                            diri_proto::control::decode_line(line.as_bytes()).expect("request")
+                        else {
+                            continue;
+                        };
+                        let mut out = Vec::new();
+                        match method.as_str() {
+                            Method::HELLO => {
+                                let hello = HelloResult {
+                                    proto: diri_proto::control::WIRE_VERSION,
+                                    build: "fake-engine".to_owned(),
+                                    pid: std::process::id() as i32,
+                                    engine_instance_id: identity.lock().expect("identity").clone(),
+                                    engine_kind: Some(diri_proto::RUST_ENGINE_KIND.to_owned()),
+                                    executable_hash: None,
+                                };
+                                out.push(ControlMessage::Response {
+                                    id,
+                                    result: Ok(serde_json::to_value(hello).expect("hello")),
+                                });
+                            }
+                            Method::EVENTS_SUBSCRIBE => {
+                                let params: EventsSubscribeParams =
+                                    serde_json::from_value(params.expect("params"))
+                                        .expect("params");
+                                let _ = subscription_tx.send(params);
+                                out.push(ControlMessage::Response {
+                                    id,
+                                    result: Ok(serde_json::json!({ "subscribed": true })),
+                                });
+                                for seq in 1..=events {
+                                    out.push(ControlMessage::Event {
+                                        name: EventName::SESSION_UPDATED.to_owned(),
+                                        seq,
+                                        params: serde_json::json!({ "seq": seq }),
+                                    });
+                                }
+                            }
+                            _ => out.push(ControlMessage::Response {
+                                id,
+                                result: Err(ControlError::bad_request("unsupported in test")),
+                            }),
+                        }
+                        for message in out {
+                            let bytes = encode_line(&message).expect("encode");
+                            if tokio::io::AsyncWriteExt::write_all(&mut write_half, &bytes)
+                                .await
+                                .is_err()
+                            {
+                                break;
+                            }
+                        }
+                    }
+                }
+            });
+            Self {
+                socket,
+                instance,
+                subscriptions: Mutex::new(subscription_rx),
+                close: close_tx,
+                _temp: temp,
+                _server: server,
+            }
+        }
+
+        fn set_instance(&self, instance: Option<&str>) {
+            *self.instance.lock().expect("identity") = instance.map(str::to_owned);
+        }
+
+        /// Drops the current client connection from the Engine side.
+        fn close_connection(&self) {
+            self.close.send(()).expect("server alive");
+        }
+
+        async fn next_subscription(&self) -> EventsSubscribeParams {
+            tokio::time::timeout(
+                Duration::from_secs(5),
+                self.subscriptions.lock().await.recv(),
+            )
+            .await
+            .expect("a subscription within five seconds")
+            .expect("server alive")
+        }
+    }
+
+    async fn connect_with_events(
+        engine: &FakeEngine,
+    ) -> (DaemonClient, broadcast::Receiver<EventEnvelope>) {
+        let client = DaemonClient::with_socket_path(&engine.socket);
+        let events = client.subscribe_events().await.expect("register interest");
+        client.connect();
+        client
+            .wait_until_connected(Duration::from_secs(5))
+            .await
+            .expect("connected");
+        (client, events)
+    }
+
+    async fn drain_events(events: &mut broadcast::Receiver<EventEnvelope>, expected: u64) {
+        for seq in 1..=expected {
+            let event = tokio::time::timeout(Duration::from_secs(5), events.recv())
+                .await
+                .expect("event within five seconds")
+                .expect("event channel alive");
+            assert_eq!(event.seq, seq);
+        }
+    }
+
+    async fn wait_for_reconnect(
+        client: &DaemonClient,
+        mut states: watch::Receiver<ConnectionState>,
+    ) {
+        let saw_disconnect = async {
+            loop {
+                states.changed().await.expect("state sender alive");
+                if !states.borrow().is_connected() {
+                    break;
+                }
+            }
+        };
+        tokio::time::timeout(Duration::from_secs(5), saw_disconnect)
+            .await
+            .expect("the connection drop is observed");
+        client.retry_now();
+        client
+            .wait_until_connected(Duration::from_secs(5))
+            .await
+            .expect("reconnected");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn same_engine_instance_resumes_the_event_cursor_across_reconnect() {
+        let engine = FakeEngine::start(Some("engine-a"), 3);
+        let (client, mut events) = connect_with_events(&engine).await;
+        assert_eq!(engine.next_subscription().await.since_seq, None);
+        drain_events(&mut events, 3).await;
+        assert_eq!(client.last_seq(), 3);
+
+        let states = client.connection_state();
+        engine.close_connection();
+        wait_for_reconnect(&client, states).await;
+
+        assert_eq!(
+            engine.next_subscription().await.since_seq,
+            Some(3),
+            "the verified same instance resumes from the last delivered sequence"
+        );
+        client.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_replacement_engine_instance_resets_the_event_cursor() {
+        let engine = FakeEngine::start(Some("engine-a"), 3);
+        let (client, mut events) = connect_with_events(&engine).await;
+        engine.next_subscription().await;
+        drain_events(&mut events, 3).await;
+        assert_eq!(client.last_seq(), 3);
+
+        let states = client.connection_state();
+        engine.set_instance(Some("engine-b"));
+        engine.close_connection();
+        wait_for_reconnect(&client, states).await;
+
+        assert_eq!(
+            engine.next_subscription().await.since_seq,
+            None,
+            "sequence numbers from another Engine lifetime must not be replayed"
+        );
+        // The new lifetime's events are delivered from its own sequence start.
+        drain_events(&mut events, 3).await;
+        client.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn engines_without_instance_identity_never_resume_a_cursor() {
+        let engine = FakeEngine::start(None, 3);
+        let (client, mut events) = connect_with_events(&engine).await;
+        assert_eq!(engine.next_subscription().await.since_seq, None);
+        drain_events(&mut events, 3).await;
+
+        let states = client.connection_state();
+        engine.close_connection();
+        wait_for_reconnect(&client, states).await;
+
+        assert_eq!(
+            engine.next_subscription().await.since_seq,
+            None,
+            "an older Engine cannot prove its sequence lifetime, so replay is not requested"
+        );
+        client.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_identity_change_on_a_live_connection_is_rejected_and_reconnects() {
+        let engine = FakeEngine::start(Some("engine-a"), 3);
+        let (client, mut events) = connect_with_events(&engine).await;
+        engine.next_subscription().await;
+        drain_events(&mut events, 3).await;
+
+        // The same socket now answers as a different Engine lifetime, which
+        // is what a heartbeat would observe after an in-place replacement.
+        let states = client.connection_state();
+        engine.set_instance(Some("engine-b"));
+        let error = client
+            .hello()
+            .await
+            .expect_err("conflicting identity fails closed");
+        assert!(
+            error.to_string().contains("identity"),
+            "unexpected error: {error}"
+        );
+        wait_for_reconnect(&client, states).await;
+        assert_eq!(
+            engine.next_subscription().await.since_seq,
+            None,
+            "the rejected connection's cursor must not survive into the new lifetime"
+        );
+        client.shutdown().await;
     }
 
     #[tokio::test]

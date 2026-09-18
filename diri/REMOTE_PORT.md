@@ -73,6 +73,21 @@ The current baseline:
   capability-compatible Helper is available;
 - retains orchestration and user-facing state in the local Rust Engine.
 
+## Local Engine event cursor identity
+
+The local control Hello includes additive `engineInstanceId`, a random identity
+created once with the Engine's control server and event bus. Build IDs and PIDs
+are not event cursor identities. The client retains an event replay cursor only
+across connections that verify the same Engine instance. A changed instance
+resets the cursor before subscribing; older Engines without this field receive
+subscriptions without a replay cursor. A conflicting Hello on one connection
+fails closed and reconnects. Connection generations reject messages and delayed
+handshake/subscription completions from old sockets.
+
+This scopes local event replay only. It does not make event history durable,
+recover dropped application state, or alter Remote Holder controller epochs,
+transport, or PTY ownership.
+
 ## Terminal input-mode projection
 
 Protocol minor 9 adds optional `terminal-input-modes-v1`. A capable Holder

@@ -741,6 +741,7 @@ mod tests {
                             proto: WIRE_VERSION,
                             build: "test-engine".to_owned(),
                             pid: std::process::id() as i32,
+                            engine_instance_id: None,
                             engine_kind: Some(RUST_ENGINE_KIND.to_owned()),
                             executable_hash: None,
                         })

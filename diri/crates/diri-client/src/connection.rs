@@ -23,7 +23,11 @@ pub(crate) struct ActiveConnection {
 }
 
 impl ActiveConnection {
-    pub(crate) async fn open(path: &Path, core: Arc<ClientCore>) -> Result<Self, ClientError> {
+    pub(crate) async fn open(
+        path: &Path,
+        core: Arc<ClientCore>,
+        generation: u64,
+    ) -> Result<Self, ClientError> {
         let stream = UnixStream::connect(path).await.map_err(ClientError::io)?;
         let (read_half, mut write_half) = stream.into_split();
         let (write_tx, mut write_rx) = mpsc::channel::<Vec<u8>>(WRITE_QUEUE_CAPACITY);
@@ -68,7 +72,7 @@ impl ActiveConnection {
                     }
                     Ok(()) if line.iter().all(u8::is_ascii_whitespace) => continue,
                     Ok(()) => match decode_line(&line) {
-                        Ok(message) => core.route_message(message).await,
+                        Ok(message) => core.route_message(generation, message).await,
                         Err(error) => {
                             let _ = reader_failure_tx.send(ClientError::json(error));
                             break;

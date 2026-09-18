@@ -273,6 +273,7 @@ mod tests {
             proto: 1,
             build: "0.5.0".to_owned(),
             pid: 42,
+            engine_instance_id: None,
             engine_kind: Some(RUST_ENGINE_KIND.to_owned()),
             executable_hash: Some("private-full-executable-hash".to_owned()),
         };

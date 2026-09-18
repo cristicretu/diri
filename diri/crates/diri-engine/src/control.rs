@@ -53,6 +53,7 @@ const fn default_shell() -> &'static str {
 }
 
 pub struct ControlServer {
+    engine_instance_id: String,
     registry: Arc<Mutex<Registry>>,
     socket_path: PathBuf,
     logs_dir: PathBuf,
@@ -155,6 +156,11 @@ impl ControlServer {
             eprintln!("diri-engine: activity history unavailable: {error}");
         }
         Self {
+            engine_instance_id: {
+                let mut bytes = [0_u8; 16];
+                getrandom::fill(&mut bytes).expect("the OS random source");
+                bytes.iter().map(|byte| format!("{byte:02x}")).collect()
+            },
             registry,
             socket_path,
             logs_dir,
@@ -900,6 +906,7 @@ impl ControlServer {
             "proto": WIRE_VERSION,
             "build": BUILD,
             "engineKind": diri_proto::RUST_ENGINE_KIND,
+            "engineInstanceId": self.engine_instance_id,
             "pid": std::process::id() as i32,
             "executableHash": process_executable_hash(),
         }))
@@ -4550,6 +4557,35 @@ mod tests {
             Some(64),
             "the app needs a stable content identity for upgrade coordination"
         );
+    }
+
+    #[test]
+    fn hello_reports_one_engine_instance_identity_per_control_lifetime() {
+        let temp = tempfile::tempdir().expect("temp");
+        let hello = |server: &Arc<ControlServer>| {
+            ok_of(call(
+                server,
+                "hello",
+                Some(json!({ "proto": WIRE_VERSION, "build": "test-client" })),
+            ))["engineInstanceId"]
+                .as_str()
+                .expect("engineInstanceId is a string")
+                .to_owned()
+        };
+        let server = server(temp.path());
+        let first = hello(&server);
+        assert_eq!(first.len(), 32, "128 random bits as lowercase hex: {first}");
+        assert!(first.bytes().all(|byte| byte.is_ascii_hexdigit()));
+        assert_eq!(
+            hello(&server),
+            first,
+            "every Hello from one control server must report the same instance"
+        );
+
+        // A replacement Engine with the same executable, build and possibly a
+        // reused PID must still look like a different event cursor lifetime.
+        let other = tempfile::tempdir().expect("temp");
+        assert_ne!(hello(&self::tests::server(other.path())), first);
     }
 
     #[test]

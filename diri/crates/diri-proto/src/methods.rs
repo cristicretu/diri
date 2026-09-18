@@ -176,6 +176,11 @@ pub struct HelloResult {
     pub proto: u32,
     pub build: String,
     pub pid: i32,
+    /// Unique to this Engine's control/event lifetime, not its executable build.
+    /// Older Engines omit this field; their event cursors cannot be resumed
+    /// safely across connections.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub engine_instance_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub engine_kind: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
