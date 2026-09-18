@@ -22,10 +22,10 @@ use diri_ui::{
 };
 use gpui::{
     Anchor, Animation, AnimationExt, AnyElement, App, AppContext as _, Bounds, Context,
-    CursorStyle, Entity, EventEmitter, ExternalPaths, FocusHandle, Focusable, FontWeight, Hsla,
-    IntoElement, MouseButton, PathPromptOptions, Pixels, Point, Render, Rgba, Role, ScrollHandle,
-    SharedString, Size, Task, WeakEntity, Window, anchored, deferred, div, linear_color_stop,
-    linear_gradient, point, prelude::*, px,
+    CursorStyle, Div, Entity, EventEmitter, ExternalPaths, FocusHandle, Focusable, FontWeight,
+    Hsla, IntoElement, MouseButton, PathPromptOptions, Pixels, Point, Render, Rgba, Role,
+    ScrollHandle, SharedString, Size, Task, WeakEntity, Window, anchored, deferred, div,
+    linear_color_stop, linear_gradient, point, prelude::*, px,
 };
 use tokio::sync::mpsc;
 
@@ -596,14 +596,10 @@ pub struct Sidebar {
     /// When visibility last flipped, so a held ⌘B cannot outrun the slide.
     last_toggle: Option<Instant>,
     preview: bool,
-    /// The New Agent popover toggles between agent choices and a bounded
-    /// one-level directory browser. The listing payload itself lives in the
-    /// Store so the daemon adapter can complete it asynchronously.
-    directory_picker_open: bool,
-    /// Whether the New Agent menu's machine list is expanded under its
-    /// "on <machine>" chip. It is a one-shot disclosure: choosing a machine
-    /// collapses it again so the agent rows stay the menu's main content.
-    host_picker_open: bool,
+    /// Which face the New Agent menu shows. The remote directory listing
+    /// itself lives in the Store so the daemon adapter can complete it
+    /// asynchronously.
+    new_agent_panel: NewAgentPanel,
     /// Optional window-space top-left anchor used when New Agent was opened
     /// from a project button rather than the sticky sidebar row.
     new_agent_anchor: Option<Point<Pixels>>,
@@ -632,7 +628,7 @@ pub struct Sidebar {
 #[derive(Clone, Debug, PartialEq)]
 struct BrowseRequest {
     popover: Option<Popover>,
-    directory_picker_open: bool,
+    panel: NewAgentPanel,
 }
 
 impl EventEmitter<SidebarEvent> for Sidebar {}
@@ -762,8 +758,7 @@ impl Sidebar {
             update: UpdateState::default(),
             last_toggle: None,
             preview,
-            directory_picker_open: false,
-            host_picker_open: false,
+            new_agent_panel: NewAgentPanel::Agents,
             new_agent_anchor: None,
             external_drop_feedback: None,
             settings_nav: None,
@@ -1173,7 +1168,7 @@ impl Sidebar {
         // resurrecting a dismissed popover or overwriting a newer target.
         let requested_by = BrowseRequest {
             popover: self.ui.popover.clone(),
-            directory_picker_open: self.directory_picker_open,
+            panel: self.new_agent_panel,
         };
         cx.spawn_in(window, async move |this, cx| {
             let Ok(Ok(Some(mut paths))) = paths.await else {
@@ -1194,9 +1189,7 @@ impl Sidebar {
     /// Agent popover that opened the panel is still the one on screen and
     /// still targets this machine.
     fn apply_browsed_local_folder(&mut self, requested_by: &BrowseRequest, path: String) {
-        if self.directory_picker_open != requested_by.directory_picker_open
-            || self.ui.popover != requested_by.popover
-        {
+        if self.new_agent_panel != requested_by.panel || self.ui.popover != requested_by.popover {
             return;
         }
         let Some(Popover::NewAgent { host, .. }) = &self.ui.popover else {
@@ -1216,7 +1209,7 @@ impl Sidebar {
         if targets_a_remote_host {
             return;
         }
-        self.directory_picker_open = false;
+        self.new_agent_panel = NewAgentPanel::Agents;
         self.ui.popover = Some(Popover::NewAgent {
             directory: Some(path),
             host: None,
@@ -1238,8 +1231,7 @@ impl Sidebar {
         location_host: Option<String>,
         cx: &mut Context<Self>,
     ) {
-        self.directory_picker_open = false;
-        self.host_picker_open = false;
+        self.new_agent_panel = NewAgentPanel::Agents;
         self.new_agent_anchor = None;
         let host = {
             let mut store = self.store.write().expect("session store lock poisoned");
@@ -4828,293 +4820,51 @@ impl Sidebar {
             || crate::platform::local_machine_label().to_owned(),
             |host| host.display_name().to_owned(),
         );
-        let mut header = div()
-            .px(px(12.0))
-            .pt(px(10.0))
-            .pb(px(8.0))
-            .flex()
-            .flex_col()
-            .gap(px(3.0))
-            .child(
-                div()
-                    .flex()
-                    .items_center()
-                    .justify_between()
-                    .gap(px(8.0))
-                    .child(
-                        div()
-                            .text_size(px(Typo::ROW_EMPHASIZED.size))
-                            .font_weight(Typo::ROW_EMPHASIZED.weight)
-                            .text_color(colors.primary)
-                            .child("New Agent"),
-                    )
-                    .child(
-                        div()
-                            .min_w(px(0.0))
-                            .overflow_hidden()
-                            .whitespace_nowrap()
-                            .text_ellipsis()
-                            .text_size(px(Typo::META.size))
-                            .text_color(colors.secondary)
-                            .child(location),
-                    ),
-            )
-            .child({
-                let browse_host = selected_host.as_ref().map(|entry| entry.id.clone());
-                let browse_target = target.clone();
-                div()
-                    .id("new-agent-directory")
-                    .px(px(4.0))
-                    .py(px(3.0))
-                    .ml(px(-4.0))
-                    .flex()
-                    .items_center()
-                    .gap(px(5.0))
-                    .rounded(px(Radius::CHIP))
-                    .cursor_pointer()
-                    .hover(move |row| row.bg(colors.primary.alpha(0.06)))
-                    .text_size(px(Typo::META.size))
-                    .text_color(colors.secondary)
-                    .child(sf_symbol("folder.fill", 11.0, colors.secondary))
-                    .child(
-                        div()
-                            .min_w(px(0.0))
-                            .flex_1()
-                            .whitespace_nowrap()
-                            .overflow_hidden()
-                            .text_ellipsis()
-                            .child(folder),
-                    )
-                    .child(sf_symbol("chevron.right", 9.0, colors.tertiary))
-                    .on_click(cx.listener(move |this, _, _, cx| {
-                        this.directory_picker_open = true;
-                        this.directory_scroll = ScrollHandle::new();
-                        // Pin the currently visible target. A concurrent repo
-                        // lookup must not switch the directory underneath an
-                        // open browser and leave it waiting on the wrong key.
-                        this.ui.popover = Some(Popover::NewAgent {
-                            directory: Some(browse_target.clone()),
-                            host: browse_host.clone(),
-                        });
-                        this.store
-                            .write()
-                            .expect("session store lock poisoned")
-                            .request_directory_listing(browse_host.clone(), browse_target.clone());
-                        cx.notify();
-                    }))
-            })
-            .when(
-                selected_host.is_none() && self.directory_picker_open,
-                |header| {
-                    header.child(
-                        div()
-                            .id("new-agent-browse")
-                            .debug_selector(|| "new-agent-browse".into())
-                            .px(px(4.0))
-                            .py(px(3.0))
-                            .ml(px(-4.0))
-                            .flex()
-                            .items_center()
-                            .gap(px(5.0))
-                            .rounded(px(Radius::CHIP))
-                            .cursor_pointer()
-                            .hover(move |row| row.bg(colors.primary.alpha(0.06)))
-                            .text_size(px(Typo::META.size))
-                            .text_color(colors.secondary)
-                            .child(sf_symbol("plus", 11.0, colors.secondary))
-                            .child("Browse…")
-                            .on_click(cx.listener(|this, _, window, cx| {
-                                this.in_main_window(window, cx, |this, window, cx| {
-                                    this.browse_local_folder(window, cx);
-                                });
-                            })),
-                    )
-                },
-            );
-        if let Some(subtitle) = subtitle {
-            // Repo-resolution state: "locating repo…" or the visible fallback
-            // ("anara not on Forge — opens in code").
-            header = header.child(
-                div()
-                    .text_size(px(Typo::META.size))
-                    .text_color(colors.tertiary)
-                    .child(subtitle),
-            );
-        }
-        let mut content = div()
-            .flex()
-            .flex_col()
-            .child(header)
-            .child(HairlineDivider::horizontal(colors));
-        // Host selector — only when hosts.json configures remote hosts:
-        // "This Mac" plus one row per host, checkmark on the selection.
-        //
-        // This list is the single surface that owns the persisted shortcut
-        // destination, so it must always be able to undo itself: "This Mac" is
-        // the first row and is a real target, not just the absence of one, and
-        // it is worded exactly like the destination printed on the always-
-        // visible New Agent row ("Claude Code · This Mac · ⌘T") so the label a
-        // user reads is the label they come here to change.
-        if !hosts.is_empty() {
-            content = content.child(
-                div()
-                    .px(px(12.0))
-                    .pt(px(7.0))
-                    .pb(px(3.0))
-                    .text_size(px(Typo::SECTION_HEADER.size))
-                    .font_weight(Typo::SECTION_HEADER.weight)
-                    .text_color(colors.tertiary)
-                    .child("Run shortcuts on"),
-            );
-            let mut targets: Vec<(Option<String>, String, &'static str)> = vec![(
-                None,
-                crate::platform::local_machine_label().to_owned(),
-                "desktopcomputer",
-            )];
-            for entry in &hosts {
-                targets.push((
-                    Some(entry.id.clone()),
-                    entry.display_name().to_owned(),
-                    "network",
-                ));
-            }
-            for (index, (target_host, label, symbol)) in targets.into_iter().enumerate() {
-                let selected =
-                    target_host.as_deref() == selected_host.as_ref().map(|entry| entry.id.as_str());
-                let directory = directory.clone();
-                let previous_host = host.clone();
-                let active_host = active_host.clone();
-                let sync_host = target_host.clone();
-                let is_syncing = sync_host.as_deref().is_some_and(|id| syncing.contains(id));
-                content = content.child(
-                    div()
-                        .id(format!("host-option-{index}"))
-                        .debug_selector(move || format!("HOST_OPTION_{index}"))
-                        .mx(px(6.0))
-                        .my(px(1.0))
-                        .px(px(8.0))
-                        .h(px(28.0))
-                        .flex()
-                        .items_center()
-                        .gap(px(8.0))
-                        .rounded(px(SIDEBAR_MENU_ROW_RADIUS))
-                        .cursor_pointer()
-                        .glass_menu_row(colors, false)
-                        .on_click(cx.listener(move |this, _, _, cx| {
-                            cx.stop_propagation();
-                            let next_directory = if target_host != previous_host {
-                                None
-                            } else {
-                                directory.clone()
-                            };
-                            // Choosing a row here is an explicit, persistent
-                            // setting, not last-used memory: one destination
-                            // drives this spawn, ⌘T, ⌥⌘T and the palette, so
-                            // the checkmark never disagrees with where a
-                            // shortcut lands. Persisting is only defensible
-                            // because the choice stays visible (the New Agent
-                            // row and every palette title name the target) and
-                            // reversible (the "This Mac" row above sets it
-                            // back, and a host deleted from hosts.json is
-                            // repaired to local on load).
-                            this.store
-                                .write()
-                                .expect("session store lock poisoned")
-                                .set_default_spawn_host(target_host.clone());
-                            this.store
-                                .write()
-                                .expect("session store lock poisoned")
-                                .request_agent_catalog(target_host.clone(), false);
-                            // Only remote -> local needs a matching checkout.
-                            // A remote destination starts at its configured cwd.
-                            if should_resolve_active_repo(
-                                next_directory.as_deref(),
-                                target_host.as_deref(),
-                                active_host.as_deref(),
-                            ) {
-                                this.store
-                                    .write()
-                                    .expect("session store lock poisoned")
-                                    .request_repo_target(target_host.clone());
-                            }
-                            this.directory_picker_open = false;
-                            this.ui.popover = Some(Popover::NewAgent {
-                                directory: next_directory,
-                                host: target_host.clone(),
-                            });
-                            cx.notify();
-                        }))
-                        .child(sf_symbol(symbol, 11.0, colors.secondary))
-                        .child(
-                            div()
-                                .flex_1()
-                                .text_size(px(Typo::ROW.size))
-                                .text_color(colors.primary)
-                                .child(label),
-                        )
-                        .when(selected && sync_host.is_some(), |row| {
-                            // Push local agent prefs to this host (rsync over
-                            // ssh, daemon-side). Spins tertiary while running.
-                            let sync_host = sync_host.clone();
-                            row.child(
-                                div()
-                                    .id(format!("host-sync-{index}"))
-                                    .flex()
-                                    .items_center()
-                                    .justify_center()
-                                    .size(px(18.0))
-                                    .rounded(px(Radius::CHIP))
-                                    .cursor_pointer()
-                                    .hover(move |element| element.bg(colors.primary.alpha(0.08)))
-                                    .child(sf_symbol(
-                                        "arrow.triangle.2.circlepath",
-                                        10.0,
-                                        if is_syncing {
-                                            colors.tertiary
-                                        } else {
-                                            colors.secondary
-                                        },
-                                    ))
-                                    .on_click(cx.listener(move |this, _, _, cx| {
-                                        cx.stop_propagation();
-                                        if let Some(host) = sync_host.clone() {
-                                            this.store
-                                                .write()
-                                                .expect("session store lock poisoned")
-                                                .sync_prefs(host);
-                                        }
-                                        cx.notify();
-                                    })),
-                            )
-                        })
-                        .when(selected, |row| {
-                            row.child(sf_symbol_weighted(
-                                "checkmark",
-                                10.0,
-                                SymbolWeight::Semibold,
-                                colors.secondary,
-                            ))
-                        }),
+        let selected_host_id = selected_host.as_ref().map(|entry| entry.id.clone());
+        let anchor = self
+            .new_agent_anchor
+            .unwrap_or_else(|| point(px(12.0), px(70.0)));
+        let width = if self.new_agent_anchor.is_some() {
+            244.0
+        } else {
+            276.0
+        };
+        match self.new_agent_panel {
+            NewAgentPanel::Browse => {
+                let content = self.new_agent_browse_panel(selected_host_id, target, colors, cx);
+                return self.popover_shell_at(
+                    anchor,
+                    Anchor::TopLeft,
+                    320.0,
+                    content.pb(px(6.0)),
+                    colors,
+                    cx,
                 );
             }
-            content = content.child(HairlineDivider::horizontal(colors));
-        }
-        if self.directory_picker_open {
-            content = content.child(self.directory_picker(
-                selected_host.as_ref().map(|entry| entry.id.clone()),
-                target,
-                colors,
-                cx,
-            ));
-            return self.popover_shell_at(
-                self.new_agent_anchor
-                    .unwrap_or_else(|| point(px(12.0), px(70.0))),
-                Anchor::TopLeft,
-                320.0,
-                content.pb(px(6.0)),
-                colors,
-                cx,
-            );
+            NewAgentPanel::Where => {
+                let content = self.new_agent_where_panel(
+                    WherePanel {
+                        selected_host: selected_host_id,
+                        hosts: &hosts,
+                        target,
+                        directory,
+                        previous_host: host,
+                        active_host,
+                        syncing: &syncing,
+                    },
+                    colors,
+                    cx,
+                );
+                return self.popover_shell_at(
+                    anchor,
+                    Anchor::TopLeft,
+                    width,
+                    content.pb(px(6.0)),
+                    colors,
+                    cx,
+                );
+            }
+            NewAgentPanel::Agents => {}
         }
         // Carried on repo-preserving spawns so the daemon re-resolves the
         // checkout itself (covers a click that lands while still "locating").
@@ -5123,217 +4873,599 @@ impl Sidebar {
         } else {
             None
         };
-        for (index, option) in options.into_iter().enumerate() {
-            let row_id = format!("agent-option-{index}");
-            let target = target.clone();
-            let spawn_host = selected_host.as_ref().map(|entry| entry.id.clone());
-            let same_repo_as = same_repo_reference.clone();
-            // The picker selection is also the global shortcut destination,
-            // so every shortcut stays visible and follows the checkmark.
-            let shortcut = agent_picker_shortcut(&option.kind, &default_kind, &option.shortcut);
-            let agent_kind = ui_agent_kind(&option.kind);
-            let spawn_kind = option.kind.clone();
-            let available = option.available;
-            let unavailable = (!available).then_some(option.unavailable_detail).flatten();
-            let setup_url = (!available).then_some(option.setup_url).flatten();
-            content = content.child(
-                div()
-                    .id(row_id)
-                    .debug_selector(move || format!("AGENT_OPTION_{index}"))
-                    .mx(px(6.0))
-                    .my(px(1.0))
-                    .px(px(8.0))
-                    .h(px(32.0))
-                    .flex()
-                    .items_center()
-                    .gap(px(8.0))
-                    .rounded(px(SIDEBAR_MENU_ROW_RADIUS))
-                    .when(available, |row| {
-                        row.cursor_pointer()
-                            .glass_menu_row(colors, false)
-                            .on_click(cx.listener(move |this, _, _, cx| {
-                                this.store
-                                    .write()
-                                    .expect("session store lock poisoned")
-                                    .spawn_kind(
-                                        spawn_kind.clone(),
-                                        SpawnOptions {
-                                            cwd: Some(target.clone()),
-                                            host: spawn_host.clone(),
-                                            account_profile_id: None,
-                                            same_repo_as: same_repo_as.clone(),
-                                            ..SpawnOptions::default()
-                                        },
-                                    );
-                                this.ui.popover = None;
-                                cx.notify();
-                            }))
-                    })
-                    .child(
-                        div()
-                            .w(px(24.0))
-                            .flex_none()
-                            .flex()
-                            .items_center()
-                            .justify_center()
-                            .child(AgentLogo::new(agent_kind, 20.0, colors).badged(false)),
-                    )
-                    .child(
-                        div()
-                            .min_w_0()
-                            .flex_1()
-                            .flex()
-                            .flex_col()
-                            .text_size(px(Typo::ROW.size))
-                            .text_color(if available {
-                                colors.primary
-                            } else {
-                                colors.secondary
-                            })
-                            .child(option.title)
-                            .when_some(unavailable, |label, unavailable| {
-                                label.child(
-                                    div()
-                                        .whitespace_nowrap()
-                                        .overflow_hidden()
-                                        .text_ellipsis()
-                                        .text_size(px(Typo::META.size))
-                                        .text_color(colors.tertiary)
-                                        .child(unavailable),
-                                )
-                            }),
-                    )
-                    .when_some(setup_url, |row, url| {
-                        row.child(
-                            div()
-                                .id(format!("agent-setup-{index}"))
-                                .px(px(6.0))
-                                .py(px(3.0))
-                                .rounded(px(Radius::CHIP))
-                                .cursor_pointer()
-                                .text_size(px(Typo::META.size))
-                                .text_color(colors.secondary)
-                                .bg(Fill::subtle(colors))
-                                .hover(move |button| button.bg(colors.primary.alpha(0.10)))
-                                .on_click(move |_, _, cx| cx.open_url(&url))
-                                .child("Setup…"),
-                        )
-                    })
-                    .when(!shortcut.is_empty(), |row| {
-                        row.child(
-                            div()
-                                .px(px(5.0))
-                                .py(px(2.0))
-                                .rounded(px(Radius::CHIP))
-                                .bg(Fill::subtle(colors))
-                                .text_size(px(Typo::META.size))
-                                .font_weight(Typo::META.weight)
-                                .text_color(colors.tertiary)
-                                .child(shortcut),
-                        )
-                    }),
-            );
+        let mut content = div().flex().flex_col().pt(px(5.0));
+        // The Agents are the menu, with the default leading: it is what ⌘T
+        // launches, so it is the row most opens are looking for. Terminal is
+        // set apart below them; it is the escape hatch, not an Agent.
+        let options = lead_with_default(options, &default_kind);
+        let (agents, terminals): (Vec<_>, Vec<_>) = options
+            .into_iter()
+            .partition(|option| option.kind != ProtoAgentKind::SHELL);
+        let mut index = 0;
+        for option in agents {
+            content = content.child(self.new_agent_option_row(
+                index,
+                option,
+                &default_kind,
+                &target,
+                &selected_host_id,
+                &same_repo_reference,
+                colors,
+                cx,
+            ));
+            index += 1;
         }
-        let manage_host = selected_host.as_ref().map(|host| host.id.clone());
-        content = content.child(HairlineDivider::horizontal(colors)).child(
+        if !terminals.is_empty() {
+            content = content.child(menu_separator(colors));
+            for option in terminals {
+                content = content.child(self.new_agent_option_row(
+                    index,
+                    option,
+                    &default_kind,
+                    &target,
+                    &selected_host_id,
+                    &same_repo_reference,
+                    colors,
+                    cx,
+                ));
+                index += 1;
+            }
+        }
+        // Where the session lands, and the way to change it, sit together
+        // under the launch rows: "dirijor · Forge" names the folder and, once
+        // hosts.json has a remote host, the machine. Same row shape as the
+        // Agents so the menu is one column of rows, not a form above a list.
+        let mut location = div().min_w(px(0.0)).flex_1().flex().flex_col().child(
             div()
-                .id("manage-agents")
-                .mx(px(6.0))
-                .my(px(1.0))
-                .px(px(8.0))
-                .h(px(32.0))
                 .flex()
                 .items_center()
-                .gap(px(8.0))
-                .rounded(px(SIDEBAR_MENU_ROW_RADIUS))
-                .cursor_pointer()
-                .glass_menu_row(colors, false)
-                .on_click(cx.listener(move |this, _, _, cx| {
+                .gap(px(5.0))
+                .text_size(px(Typo::ROW.size))
+                .text_color(colors.primary)
+                .child(
+                    div()
+                        .min_w(px(0.0))
+                        .flex_shrink(1.0)
+                        .whitespace_nowrap()
+                        .overflow_hidden()
+                        .text_ellipsis()
+                        .child(folder),
+                )
+                .when(!hosts.is_empty(), |row| {
+                    row.child(div().text_color(colors.tertiary).child("·"))
+                        .child(
+                            div()
+                                .whitespace_nowrap()
+                                .text_color(colors.secondary)
+                                .child(location),
+                        )
+                }),
+        );
+        if let Some(subtitle) = subtitle {
+            // Repo-resolution state: "locating repo…" or the visible fallback
+            // ("anara not on Forge — opens in code").
+            location = location.child(
+                div()
+                    .whitespace_nowrap()
+                    .overflow_hidden()
+                    .text_ellipsis()
+                    .text_size(px(Typo::META.size))
+                    .text_color(colors.tertiary)
+                    .child(subtitle),
+            );
+        }
+        content = content.child(menu_separator(colors)).child(
+            menu_action_row(
+                "new-agent-where",
+                "folder.fill",
+                colors,
+                cx.listener(|this, _, _, cx| {
+                    cx.stop_propagation();
+                    this.new_agent_panel = NewAgentPanel::Where;
+                    cx.notify();
+                }),
+            )
+            .debug_selector(|| "new-agent-where".into())
+            .child(location)
+            .child(sf_symbol("chevron.right", 9.0, colors.tertiary)),
+        );
+        let manage_host = selected_host_id.clone();
+        content = content.child(
+            menu_action_row(
+                "manage-agents",
+                "gearshape",
+                colors,
+                cx.listener(move |this, _, _, cx| {
                     this.ui.popover = None;
                     cx.emit(SidebarEvent::OpenAgentSettings(manage_host.clone()));
                     cx.notify();
-                }))
-                .child(sf_symbol("gearshape", 11.0, colors.secondary))
-                .child(
-                    div()
-                        .text_size(px(Typo::ROW.size))
-                        .text_color(colors.secondary)
-                        .child("Manage Agents…"),
-                ),
-        );
-        if let Some(position) = self.new_agent_anchor {
-            self.popover_shell_at(
-                position,
-                Anchor::TopLeft,
-                244.0,
-                content.pb(px(6.0)),
-                colors,
-                cx,
+                }),
             )
-        } else {
-            self.popover_shell(70.0, content.pb(px(6.0)), colors, cx)
-        }
+            .child(
+                div()
+                    .flex_1()
+                    .text_size(px(Typo::ROW.size))
+                    .text_color(colors.primary)
+                    .child("Manage Agents…"),
+            ),
+        );
+        self.popover_shell_at(
+            anchor,
+            Anchor::TopLeft,
+            width,
+            content.pb(px(5.0)),
+            colors,
+            cx,
+        )
     }
 
-    fn directory_picker(
+    /// One launchable row of the New Agent menu. Shortcuts are plain text,
+    /// the way a native menu prints them, not badges competing with the logo.
+    #[allow(clippy::too_many_arguments)]
+    fn new_agent_option_row(
+        &self,
+        index: usize,
+        option: AgentPickerOption,
+        default_kind: &ProtoAgentKind,
+        target: &str,
+        spawn_host: &Option<String>,
+        same_repo_as: &Option<SessionId>,
+        colors: SemanticColors,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let target = target.to_owned();
+        let spawn_host = spawn_host.clone();
+        let same_repo_as = same_repo_as.clone();
+        // The picker selection is also the global shortcut destination,
+        // so every shortcut stays visible and follows the checkmark.
+        let shortcut = agent_picker_shortcut(&option.kind, default_kind, &option.shortcut);
+        let is_default = option.kind == *default_kind;
+        let agent_kind = ui_agent_kind(&option.kind);
+        let spawn_kind = option.kind.clone();
+        let available = option.available;
+        let unavailable = (!available).then_some(option.unavailable_detail).flatten();
+        let setup_url = (!available).then_some(option.setup_url).flatten();
+        div()
+            .id(format!("agent-option-{index}"))
+            .debug_selector(move || format!("AGENT_OPTION_{index}"))
+            .mx(px(6.0))
+            .px(px(MENU_ROW_INSET))
+            .h(px(MENU_ROW_HEIGHT))
+            .flex()
+            .items_center()
+            .gap(px(MENU_ROW_GAP))
+            .rounded(px(SIDEBAR_MENU_ROW_RADIUS))
+            .when(available, |row| {
+                row.cursor_pointer()
+                    .glass_menu_row(colors, false)
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.store
+                            .write()
+                            .expect("session store lock poisoned")
+                            .spawn_kind(
+                                spawn_kind.clone(),
+                                SpawnOptions {
+                                    cwd: Some(target.clone()),
+                                    host: spawn_host.clone(),
+                                    account_profile_id: None,
+                                    same_repo_as: same_repo_as.clone(),
+                                    ..SpawnOptions::default()
+                                },
+                            );
+                        this.ui.popover = None;
+                        cx.notify();
+                    }))
+            })
+            .child(
+                div()
+                    .w(px(MENU_ROW_ICON_SLOT))
+                    .flex_none()
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .child(AgentLogo::new(agent_kind, 20.0, colors).badged(false)),
+            )
+            .child(
+                div()
+                    .min_w_0()
+                    .flex_1()
+                    .flex()
+                    .flex_col()
+                    .text_size(px(Typo::ROW.size))
+                    .font_weight(if is_default {
+                        Typo::ROW_EMPHASIZED.weight
+                    } else {
+                        Typo::ROW.weight
+                    })
+                    .text_color(if available {
+                        colors.primary
+                    } else {
+                        colors.secondary
+                    })
+                    .child(option.title)
+                    .when_some(unavailable, |label, unavailable| {
+                        label.child(
+                            div()
+                                .whitespace_nowrap()
+                                .overflow_hidden()
+                                .text_ellipsis()
+                                .text_size(px(Typo::META.size))
+                                .font_weight(Typo::META.weight)
+                                .text_color(colors.tertiary)
+                                .child(unavailable),
+                        )
+                    }),
+            )
+            .when_some(setup_url, |row, url| {
+                row.child(
+                    div()
+                        .id(format!("agent-setup-{index}"))
+                        .px(px(6.0))
+                        .py(px(3.0))
+                        .rounded(px(Radius::CHIP))
+                        .cursor_pointer()
+                        .text_size(px(Typo::META.size))
+                        .text_color(colors.secondary)
+                        .bg(Fill::subtle(colors))
+                        .hover(move |button| button.bg(colors.primary.alpha(0.10)))
+                        .on_click(move |_, _, cx| cx.open_url(&url))
+                        .child("Setup…"),
+                )
+            })
+            .when(!shortcut.is_empty(), |row| {
+                row.child(
+                    div()
+                        .text_size(px(Typo::META.size))
+                        .font_weight(Typo::META.weight)
+                        .text_color(colors.tertiary)
+                        .child(shortcut),
+                )
+            })
+            .into_any_element()
+    }
+
+    /// The secondary panel of the New Agent menu: which machine and which
+    /// folder. Folders are the projects already known on that machine, so
+    /// moving a launch to another project is one click; an arbitrary folder
+    /// goes through Finder locally or a directory walk remotely. Every choice
+    /// returns to the Agents.
+    fn new_agent_where_panel(
+        &self,
+        panel: WherePanel<'_>,
+        colors: SemanticColors,
+        cx: &mut Context<Self>,
+    ) -> Div {
+        let WherePanel {
+            selected_host,
+            hosts,
+            target,
+            directory,
+            previous_host,
+            active_host,
+            syncing,
+        } = panel;
+        let mut content = div().flex().flex_col().child(panel_header(
+            "Where",
+            colors,
+            cx.listener(|this, _, _, cx| {
+                cx.stop_propagation();
+                this.new_agent_panel = NewAgentPanel::Agents;
+                cx.notify();
+            }),
+        ));
+        if !hosts.is_empty() {
+            content = content.child(section_label("Machine", colors));
+            // "This Mac" first: it is a real target, not the absence of one,
+            // so the choice can always be undone here.
+            //
+            // Choosing a machine is an explicit, persistent setting, not
+            // last-used memory: one destination drives this spawn, ⌘T, ⌥⌘T
+            // and the palette, so the menu never disagrees with where a
+            // shortcut lands. Persisting is only defensible because the
+            // choice stays visible (the New Agent row and the location row name the
+            // target) and reversible, and a host deleted from hosts.json is
+            // repaired to local on load.
+            let mut targets: Vec<(Option<String>, String, &'static str)> = vec![(
+                None,
+                crate::platform::local_machine_label().to_owned(),
+                "desktopcomputer",
+            )];
+            for entry in hosts {
+                targets.push((
+                    Some(entry.id.clone()),
+                    entry.display_name().to_owned(),
+                    "network",
+                ));
+            }
+            for (index, (target_host, label, symbol)) in targets.into_iter().enumerate() {
+                let selected = target_host.as_deref() == selected_host.as_deref();
+                let directory = directory.clone();
+                let previous_host = previous_host.clone();
+                let active_host = active_host.clone();
+                let sync_host = target_host.clone();
+                let is_syncing = sync_host.as_deref().is_some_and(|id| syncing.contains(id));
+                let mut row = choice_row(
+                    format!("host-option-{index}"),
+                    symbol,
+                    label,
+                    selected,
+                    colors,
+                    cx.listener(move |this, _, _, cx| {
+                        cx.stop_propagation();
+                        let next_directory = if target_host != previous_host {
+                            None
+                        } else {
+                            directory.clone()
+                        };
+                        this.store
+                            .write()
+                            .expect("session store lock poisoned")
+                            .set_default_spawn_host(target_host.clone());
+                        this.store
+                            .write()
+                            .expect("session store lock poisoned")
+                            .request_agent_catalog(target_host.clone(), false);
+                        // Only remote -> local needs a matching checkout.
+                        // A remote destination starts at its configured cwd.
+                        if should_resolve_active_repo(
+                            next_directory.as_deref(),
+                            target_host.as_deref(),
+                            active_host.as_deref(),
+                        ) {
+                            this.store
+                                .write()
+                                .expect("session store lock poisoned")
+                                .request_repo_target(target_host.clone());
+                        }
+                        this.new_agent_panel = NewAgentPanel::Agents;
+                        this.ui.popover = Some(Popover::NewAgent {
+                            directory: next_directory,
+                            host: target_host.clone(),
+                        });
+                        cx.notify();
+                    }),
+                )
+                .debug_selector(move || format!("HOST_OPTION_{index}"));
+                if selected && sync_host.is_some() {
+                    // Push local agent prefs to this host (rsync over ssh,
+                    // daemon-side). Spins tertiary while running.
+                    row = row.child(
+                        div()
+                            .id(format!("host-sync-{index}"))
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .size(px(18.0))
+                            .rounded(px(Radius::CHIP))
+                            .cursor_pointer()
+                            .hover(move |element| element.bg(colors.primary.alpha(0.08)))
+                            .child(sf_symbol(
+                                "arrow.triangle.2.circlepath",
+                                10.0,
+                                if is_syncing {
+                                    colors.tertiary
+                                } else {
+                                    colors.secondary
+                                },
+                            ))
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                cx.stop_propagation();
+                                if let Some(host) = sync_host.clone() {
+                                    this.store
+                                        .write()
+                                        .expect("session store lock poisoned")
+                                        .sync_prefs(host);
+                                }
+                                cx.notify();
+                            })),
+                    );
+                }
+                content = content.child(row.child(check_slot(selected, colors)));
+            }
+            content = content.child(
+                div()
+                    .px(px(16.0))
+                    .pt(px(2.0))
+                    .pb(px(4.0))
+                    .text_size(px(Typo::META.size))
+                    .text_color(colors.tertiary)
+                    .child("Also where ⌘T opens"),
+            );
+        }
+        content = content.child(section_label("Folder", colors));
+        let current_name = target.rsplit('/').next().unwrap_or(&target).to_owned();
+        content = content.child(
+            choice_row(
+                "folder-option-current",
+                "folder.fill",
+                current_name,
+                true,
+                colors,
+                cx.listener(|this, _, _, cx| {
+                    cx.stop_propagation();
+                    this.new_agent_panel = NewAgentPanel::Agents;
+                    cx.notify();
+                }),
+            )
+            .child(check_slot(true, colors)),
+        );
+        for (index, project) in self
+            .new_agent_project_choices(selected_host.as_deref(), &target)
+            .into_iter()
+            .enumerate()
+        {
+            let host = selected_host.clone();
+            let root = project.root.clone();
+            content = content.child(
+                choice_row(
+                    format!("folder-option-{index}"),
+                    "folder",
+                    project.name,
+                    false,
+                    colors,
+                    cx.listener(move |this, _, _, cx| {
+                        cx.stop_propagation();
+                        this.new_agent_panel = NewAgentPanel::Agents;
+                        this.ui.popover = Some(Popover::NewAgent {
+                            directory: Some(root.clone()),
+                            host: host.clone(),
+                        });
+                        cx.notify();
+                    }),
+                )
+                .debug_selector(move || format!("FOLDER_OPTION_{index}"))
+                .child(check_slot(false, colors)),
+            );
+        }
+        let browse_label = match &selected_host {
+            None => "Choose Folder…".to_owned(),
+            Some(id) => format!(
+                "Browse {}…",
+                hosts
+                    .iter()
+                    .find(|entry| entry.id == *id)
+                    .map_or(id.as_str(), |entry| entry.display_name())
+            ),
+        };
+        let browse_host = selected_host.clone();
+        let browse_target = target;
+        content = content.child(
+            choice_row(
+                "new-agent-browse",
+                "plus",
+                browse_label,
+                false,
+                colors,
+                cx.listener(move |this, _, window, cx| {
+                    cx.stop_propagation();
+                    if browse_host.is_none() {
+                        // Finder is the folder picker on this Mac; the walk
+                        // below exists for machines Finder cannot see.
+                        this.browse_local_folder(window, cx);
+                        return;
+                    }
+                    this.new_agent_panel = NewAgentPanel::Browse;
+                    this.directory_scroll = ScrollHandle::new();
+                    // Pin the currently visible target. A concurrent repo
+                    // lookup must not switch the directory underneath an
+                    // open browser and leave it waiting on the wrong key.
+                    this.ui.popover = Some(Popover::NewAgent {
+                        directory: Some(browse_target.clone()),
+                        host: browse_host.clone(),
+                    });
+                    this.store
+                        .write()
+                        .expect("session store lock poisoned")
+                        .request_directory_listing(browse_host.clone(), browse_target.clone());
+                    cx.notify();
+                }),
+            )
+            .debug_selector(|| "new-agent-browse".into())
+            .child(check_slot(false, colors)),
+        );
+        content
+    }
+
+    /// Projects on `host` other than the folder already targeted, pinned first
+    /// then by name, capped so the panel stays a menu rather than a list.
+    fn new_agent_project_choices(
+        &self,
+        host: Option<&str>,
+        target: &str,
+    ) -> Vec<diri_proto::Project> {
+        let store = self.store.read().expect("session store lock poisoned");
+        let mut projects: Vec<_> = store
+            .projects()
+            .values()
+            .filter(|project| {
+                // The project record is the authority for which machine owns
+                // the root; sessions cover records from daemons that predate
+                // the host field.
+                let project_host = project.host.clone().or_else(|| {
+                    store
+                        .sessions()
+                        .values()
+                        .find(|session| session.project_id == project.id)
+                        .and_then(|session| session.host.clone())
+                });
+                project_host.as_deref() == host && project.root != target
+            })
+            .cloned()
+            .collect();
+        projects.sort_by(|left, right| {
+            left.pinned_order
+                .unwrap_or(i64::MAX)
+                .cmp(&right.pinned_order.unwrap_or(i64::MAX))
+                .then_with(|| left.name.to_lowercase().cmp(&right.name.to_lowercase()))
+        });
+        projects.truncate(NEW_AGENT_PROJECT_CHOICES);
+        projects
+    }
+
+    /// The remote directory walk: the listing for `requested_path` under a
+    /// header naming it, with "Use this folder" as the first row rather than
+    /// a button, so the panel reads like the menu it lives in.
+    fn new_agent_browse_panel(
         &self,
         host: Option<String>,
         requested_path: String,
         colors: SemanticColors,
         cx: &mut Context<Self>,
-    ) -> AnyElement {
-        let state = self
+    ) -> Div {
+        let listing = self
             .store
             .read()
             .expect("session store lock poisoned")
             .directory_listing(host.as_deref(), &requested_path)
             .cloned();
-        let mut panel = div().flex().flex_col();
-        match state {
+        let ready_path = match &listing {
+            Some(DirectoryListingState::Ready(result)) => Some(result.path.clone()),
+            _ => None,
+        };
+        let shown_path = ready_path.clone().unwrap_or_else(|| requested_path.clone());
+        let mut panel = div().flex().flex_col().child(panel_header(
+            div()
+                .min_w(px(0.0))
+                .flex_1()
+                .whitespace_nowrap()
+                .overflow_hidden()
+                .text_ellipsis()
+                .text_size(px(Typo::META_MONO.size))
+                .font_family(crate::fonts::mono_family())
+                .text_color(colors.secondary)
+                .child(shown_path),
+            colors,
+            cx.listener(|this, _, _, cx| {
+                cx.stop_propagation();
+                this.new_agent_panel = NewAgentPanel::Where;
+                cx.notify();
+            }),
+        ));
+        if let Some(use_path) = ready_path {
+            let use_host = host.clone();
+            panel = panel.child(
+                choice_row(
+                    "use-new-agent-directory",
+                    "checkmark.circle",
+                    "Use this folder".to_owned(),
+                    true,
+                    colors,
+                    cx.listener(move |this, _, _, cx| {
+                        cx.stop_propagation();
+                        this.new_agent_panel = NewAgentPanel::Agents;
+                        this.ui.popover = Some(Popover::NewAgent {
+                            directory: Some(use_path.clone()),
+                            host: use_host.clone(),
+                        });
+                        cx.notify();
+                    }),
+                )
+                .child(check_slot(false, colors)),
+            );
+            panel = panel.child(menu_separator(colors));
+        }
+        match listing {
             Some(DirectoryListingState::Ready(result)) => {
-                let use_path = result.path.clone();
-                let use_host = host.clone();
-                panel = panel.child(
-                    div()
-                        .px(px(10.0))
-                        .py(px(7.0))
-                        .flex()
-                        .items_center()
-                        .gap(px(8.0))
-                        .child(
-                            div()
-                                .min_w(px(0.0))
-                                .flex_1()
-                                .whitespace_nowrap()
-                                .overflow_hidden()
-                                .text_ellipsis()
-                                .text_size(px(Typo::META_MONO.size))
-                                .font_family(crate::fonts::mono_family())
-                                .text_color(colors.secondary)
-                                .child(result.path.clone()),
-                        )
-                        .child(
-                            div()
-                                .id("use-new-agent-directory")
-                                .px(px(8.0))
-                                .py(px(4.0))
-                                .rounded(px(Radius::CHIP))
-                                .bg(Ink::FRESH)
-                                .text_size(px(Typo::META.size))
-                                .font_weight(FontWeight::SEMIBOLD)
-                                .text_color(colors.background)
-                                .cursor_pointer()
-                                .on_click(cx.listener(move |this, _, _, cx| {
-                                    this.directory_picker_open = false;
-                                    this.ui.popover = Some(Popover::NewAgent {
-                                        directory: Some(use_path.clone()),
-                                        host: use_host.clone(),
-                                    });
-                                    cx.notify();
-                                }))
-                                .child("Use folder"),
-                        ),
-                );
                 let mut rows = div()
                     .id("directory-picker-list")
                     .track_scroll(&self.directory_scroll)
@@ -5385,21 +5517,21 @@ impl Sidebar {
                 if result.truncated {
                     rows = rows.child(
                         div()
-                            .px(px(12.0))
+                            .px(px(14.0))
                             .py(px(7.0))
                             .text_size(px(Typo::META.size))
                             .text_color(colors.tertiary)
                             .child("Showing the first 512 folders"),
                     );
                 }
-                panel = panel.child(HairlineDivider::horizontal(colors)).child(rows);
+                panel = panel.child(rows);
             }
             Some(DirectoryListingState::Error(error)) => {
                 let retry_host = host.clone();
                 let retry_path = requested_path.clone();
                 panel = panel.child(
                     div()
-                        .px(px(12.0))
+                        .px(px(14.0))
                         .py(px(12.0))
                         .flex()
                         .items_start()
@@ -5416,7 +5548,7 @@ impl Sidebar {
                             div()
                                 .id("retry-directory-listing")
                                 .cursor_pointer()
-                                .text_color(Ink::FRESH)
+                                .text_color(colors.primary)
                                 .child("Retry")
                                 .on_click(cx.listener(move |this, _, _, cx| {
                                     this.store
@@ -5434,8 +5566,8 @@ impl Sidebar {
             Some(DirectoryListingState::Loading) | None => {
                 panel = panel.child(
                     div()
-                        .px(px(12.0))
-                        .py(px(16.0))
+                        .px(px(14.0))
+                        .py(px(14.0))
                         .flex()
                         .items_center()
                         .gap(px(8.0))
@@ -5450,7 +5582,7 @@ impl Sidebar {
                 );
             }
         }
-        panel.into_any_element()
+        panel
     }
 
     /// Version line in the account popover, doubling as the manual check.
@@ -8293,15 +8425,23 @@ fn directory_row(
     let row_id = format!("directory-row-{label}");
     div()
         .id(row_id)
-        .px(px(10.0))
-        .h(px(30.0))
+        .mx(px(6.0))
+        .px(px(MENU_ROW_INSET))
+        .h(px(MENU_ROW_HEIGHT))
         .flex()
         .items_center()
-        .gap(px(9.0))
+        .gap(px(MENU_ROW_GAP))
         .rounded(px(SIDEBAR_MENU_ROW_RADIUS))
         .cursor_pointer()
         .glass_menu_row(colors, false)
-        .child(sf_symbol(symbol, 11.0, colors.secondary))
+        .child(
+            div()
+                .w(px(MENU_ROW_ICON_SLOT))
+                .flex_none()
+                .flex()
+                .justify_center()
+                .child(sf_symbol(symbol, 13.0, colors.secondary)),
+        )
         .child(
             div()
                 .min_w(px(0.0))
@@ -8504,7 +8644,7 @@ fn account_limits_menu(
                         .cursor_pointer()
                         .rounded(px(4.0))
                         .p(px(2.0))
-                        .hover(move |row| row.bg(colors.primary.alpha(0.06)))
+                        .glass_menu_row(colors, false)
                         .child(sf_symbol(
                             "arrow.triangle.2.circlepath",
                             11.0,
@@ -8763,6 +8903,217 @@ fn agent_picker_options(
         unavailable_detail: None,
     });
     options
+}
+
+/// Moves the default Agent to the front of the picker, keeping every other
+/// row in catalog order. The default is what ⌘T launches, so it is the row
+/// most opens of the menu are looking for.
+fn lead_with_default(
+    mut options: Vec<AgentPickerOption>,
+    default_kind: &ProtoAgentKind,
+) -> Vec<AgentPickerOption> {
+    if let Some(position) = options
+        .iter()
+        .position(|option| option.kind == *default_kind)
+        .filter(|position| *position > 0)
+    {
+        let default = options.remove(position);
+        options.insert(0, default);
+    }
+    options
+}
+
+/// Which face the New Agent menu is showing. `Agents` is the menu; the other
+/// two are its one secondary flow (where the session lands) and, for remote
+/// machines only, the directory walk behind it.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+enum NewAgentPanel {
+    #[default]
+    Agents,
+    Where,
+    Browse,
+}
+
+/// Projects offered as one-click folder choices in the Where panel.
+const NEW_AGENT_PROJECT_CHOICES: usize = 5;
+
+struct WherePanel<'a> {
+    selected_host: Option<String>,
+    hosts: &'a [diri_proto::HostEntry],
+    target: String,
+    directory: Option<String>,
+    previous_host: Option<String>,
+    active_host: Option<String>,
+    syncing: &'a HashSet<String>,
+}
+
+/// One row shape for everything in the New Agent menu and its panels: the
+/// Agents, the location, Manage Agents, machines and folders all share it,
+/// so the menu reads as one column of rows rather than a form above a list.
+const MENU_ROW_HEIGHT: f32 = 32.0;
+const MENU_ROW_INSET: f32 = 10.0;
+const MENU_ROW_GAP: f32 = 10.0;
+const MENU_ROW_ICON_SLOT: f32 = 22.0;
+
+/// A secondary row of the menu: glyph in the icon slot, then whatever the
+/// caller adds (a label, a location, a trailing chevron).
+fn menu_action_row(
+    id: &'static str,
+    symbol: &'static str,
+    colors: SemanticColors,
+    on_click: impl Fn(&gpui::ClickEvent, &mut Window, &mut App) + 'static,
+) -> gpui::Stateful<Div> {
+    div()
+        .id(id)
+        .mx(px(6.0))
+        .px(px(MENU_ROW_INSET))
+        .h(px(MENU_ROW_HEIGHT))
+        .flex()
+        .items_center()
+        .gap(px(MENU_ROW_GAP))
+        .rounded(px(SIDEBAR_MENU_ROW_RADIUS))
+        .cursor_pointer()
+        .glass_menu_row(colors, false)
+        .on_click(on_click)
+        .child(
+            div()
+                .w(px(MENU_ROW_ICON_SLOT))
+                .flex_none()
+                .flex()
+                .justify_center()
+                .child(sf_symbol(symbol, 13.0, colors.secondary)),
+        )
+}
+
+/// Menu separator with the breathing room a native menu gives one.
+fn menu_separator(colors: SemanticColors) -> Div {
+    div().py(px(4.0)).child(HairlineDivider::horizontal(colors))
+}
+
+/// Secondary-panel header: a back chevron and the panel's title or path.
+fn panel_header(
+    title: impl IntoElement,
+    colors: SemanticColors,
+    on_back: impl Fn(&gpui::ClickEvent, &mut Window, &mut App) + 'static,
+) -> Div {
+    div()
+        .pl(px(8.0))
+        .pr(px(14.0))
+        .pt(px(6.0))
+        .pb(px(2.0))
+        .flex()
+        .items_center()
+        .gap(px(4.0))
+        .child(
+            div()
+                .id("new-agent-back")
+                .debug_selector(|| "new-agent-back".into())
+                .role(Role::Button)
+                .aria_label("Back to agents")
+                .size(px(22.0))
+                .flex_none()
+                .flex()
+                .items_center()
+                .justify_center()
+                .rounded(px(Radius::CHIP))
+                .cursor_pointer()
+                .hover(move |button| button.bg(colors.primary.alpha(0.08)))
+                .child(sf_symbol_weighted(
+                    "chevron.left",
+                    10.0,
+                    SymbolWeight::Semibold,
+                    colors.secondary,
+                ))
+                .on_click(on_back),
+        )
+        .child(
+            div()
+                .min_w(px(0.0))
+                .flex_1()
+                .flex()
+                .items_center()
+                .text_size(px(Typo::ROW_EMPHASIZED.size))
+                .font_weight(Typo::ROW_EMPHASIZED.weight)
+                .text_color(colors.primary)
+                .child(title),
+        )
+}
+
+fn section_label(label: &'static str, colors: SemanticColors) -> Div {
+    div()
+        .px(px(16.0))
+        .pt(px(8.0))
+        .pb(px(2.0))
+        .text_size(px(Typo::SECTION_HEADER.size))
+        .font_weight(Typo::SECTION_HEADER.weight)
+        .text_color(colors.tertiary)
+        .child(label)
+}
+
+/// A pickable row in a secondary panel: glyph, label, then whatever trailing
+/// content the caller adds (a checkmark slot, a sync button).
+fn choice_row(
+    id: impl Into<gpui::ElementId>,
+    symbol: &'static str,
+    label: String,
+    selected: bool,
+    colors: SemanticColors,
+    on_click: impl Fn(&gpui::ClickEvent, &mut Window, &mut App) + 'static,
+) -> gpui::Stateful<Div> {
+    div()
+        .id(id)
+        .mx(px(6.0))
+        .px(px(MENU_ROW_INSET))
+        .h(px(MENU_ROW_HEIGHT))
+        .flex()
+        .items_center()
+        .gap(px(MENU_ROW_GAP))
+        .rounded(px(SIDEBAR_MENU_ROW_RADIUS))
+        .cursor_pointer()
+        .glass_menu_row(colors, false)
+        .on_click(on_click)
+        .child(
+            div()
+                .w(px(MENU_ROW_ICON_SLOT))
+                .flex_none()
+                .flex()
+                .justify_center()
+                .child(sf_symbol(symbol, 13.0, colors.secondary)),
+        )
+        .child(
+            div()
+                .min_w(px(0.0))
+                .flex_1()
+                .whitespace_nowrap()
+                .overflow_hidden()
+                .text_ellipsis()
+                .text_size(px(Typo::ROW.size))
+                .font_weight(if selected {
+                    Typo::ROW_EMPHASIZED.weight
+                } else {
+                    Typo::ROW.weight
+                })
+                .text_color(colors.primary)
+                .child(label),
+        )
+}
+
+/// Fixed-width trailing slot so labels line up whether or not a row is the
+/// current choice.
+fn check_slot(selected: bool, colors: SemanticColors) -> Div {
+    div()
+        .w(px(14.0))
+        .flex_none()
+        .flex()
+        .justify_center()
+        .when(selected, |slot| {
+            slot.child(sf_symbol_weighted(
+                "checkmark",
+                10.0,
+                SymbolWeight::Semibold,
+                colors.secondary,
+            ))
+        })
 }
 
 fn agent_picker_shortcut(
@@ -10736,9 +11087,9 @@ mod tests {
                     drop(store);
                     // `DIRI_VISUAL_POPOVER=new-agent` opens the New Agent
                     // menu; `DIRI_VISUAL_HOSTS=1` adds a remote host so the
-                    // machine choice renders, `DIRI_VISUAL_NEW_AGENT=folder`
-                    // opens the folder browser on a seeded listing, and
-                    // `DIRI_VISUAL_NEW_AGENT=host` expands the machine list.
+                    // machine choice renders, `DIRI_VISUAL_NEW_AGENT=where`
+                    // opens the Where panel, and `DIRI_VISUAL_NEW_AGENT=browse`
+                    // opens the remote directory walk on a seeded listing.
                     let new_agent = std::env::var("DIRI_VISUAL_POPOVER")
                         .is_ok_and(|value| value.eq_ignore_ascii_case("new-agent"));
                     if new_agent {
@@ -10747,7 +11098,7 @@ mod tests {
                         let host = with_hosts
                             .then(|| std::env::var("DIRI_VISUAL_HOST").ok())
                             .flatten();
-                        let directory = "/Users/preview/code/dirijor".to_owned();
+                        let directory = "/Users/preview/Projects/dirijor".to_owned();
                         {
                             let mut store = sidebar.store.write().expect("preview session store");
                             let catalog = |host: Option<&str>, agents: &[(&str, &str)]| {
@@ -10795,13 +11146,13 @@ mod tests {
                                 }]);
                                 store.set_default_spawn_host(host.clone());
                             }
-                            if sub_state.eq_ignore_ascii_case("folder") {
+                            if sub_state.eq_ignore_ascii_case("browse") {
                                 store.set_directory_listing(
                                     host.clone(),
                                     directory.clone(),
                                     diri_proto::remote_pty::DirectoryListResult {
                                         path: directory.clone(),
-                                        parent: Some("/Users/preview/code".into()),
+                                        parent: Some("/Users/preview/Projects".into()),
                                         entries: ["crates", "docs", "infra", "scripts", "web"]
                                             .into_iter()
                                             .map(|name| diri_proto::remote_pty::DirectoryEntry {
@@ -10815,8 +11166,11 @@ mod tests {
                                 );
                             }
                         }
-                        sidebar.directory_picker_open = sub_state.eq_ignore_ascii_case("folder");
-                        sidebar.host_picker_open = sub_state.eq_ignore_ascii_case("host");
+                        sidebar.new_agent_panel = match sub_state.to_ascii_lowercase().as_str() {
+                            "where" => NewAgentPanel::Where,
+                            "browse" => NewAgentPanel::Browse,
+                            _ => NewAgentPanel::Agents,
+                        };
                         sidebar.ui.popover = Some(Popover::NewAgent {
                             directory: Some(directory),
                             host,
@@ -10836,15 +11190,15 @@ mod tests {
         cx.run_until_parked();
         // `DIRI_VISUAL_MENU_HOVER=1` rests the pointer on the first row of a
         // context menu so its hover material is part of the capture.
-        if std::env::var_os("DIRI_VISUAL_MENU_HOVER").is_some() {
-            if let Some(hover) = menu_hover {
-                cx.update_window(window.into(), |_, window, cx| {
-                    window.simulate_mouse_move(hover, cx);
-                    window.refresh();
-                })
-                .expect("hover menu row");
-                cx.run_until_parked();
-            }
+        if std::env::var_os("DIRI_VISUAL_MENU_HOVER").is_some()
+            && let Some(hover) = menu_hover
+        {
+            cx.update_window(window.into(), |_, window, cx| {
+                window.simulate_mouse_move(hover, cx);
+                window.refresh();
+            })
+            .expect("hover menu row");
+            cx.run_until_parked();
         }
         if std::env::var_os("DIRI_VISUAL_BENCH").is_some() {
             // Force exactly the same work in before/after runs; warm all eight
@@ -11448,7 +11802,7 @@ mod tests {
         let (_view, cx) = cx.add_window_view(|_, cx| {
             let sidebar = cx.new(|cx| {
                 let mut sidebar = Sidebar::new(None, true, PreviewScenario::Typical, cx);
-                sidebar.directory_picker_open = true;
+                sidebar.new_agent_panel = NewAgentPanel::Where;
                 sidebar.ui.popover = Some(Popover::NewAgent {
                     directory: Some("/Users/preview".to_owned()),
                     host: None,
@@ -11478,7 +11832,7 @@ mod tests {
                         default_cwd: None,
                         node: None,
                     }]);
-                sidebar.directory_picker_open = true;
+                sidebar.new_agent_panel = NewAgentPanel::Browse;
                 sidebar.ui.popover = Some(Popover::NewAgent {
                     directory: None,
                     host: Some("forge".into()),
@@ -11499,7 +11853,7 @@ mod tests {
         let (view, cx) = cx.add_window_view(|_, cx| {
             let sidebar = cx.new(|cx| {
                 let mut sidebar = Sidebar::new(None, true, PreviewScenario::Typical, cx);
-                sidebar.directory_picker_open = true;
+                sidebar.new_agent_panel = NewAgentPanel::Browse;
                 sidebar.ui.popover = Some(Popover::NewAgent {
                     directory: Some("/Users/preview".to_owned()),
                     host: None,
@@ -11516,7 +11870,7 @@ mod tests {
     fn browse_request(sidebar: &Sidebar) -> BrowseRequest {
         BrowseRequest {
             popover: sidebar.ui.popover.clone(),
-            directory_picker_open: sidebar.directory_picker_open,
+            panel: sidebar.new_agent_panel,
         }
     }
 
@@ -11536,7 +11890,10 @@ mod tests {
                 host: None,
             })
         );
-        assert!(!sidebar.read_with(cx, |sidebar, _| sidebar.directory_picker_open));
+        assert_eq!(
+            sidebar.read_with(cx, |sidebar, _| sidebar.new_agent_panel),
+            NewAgentPanel::Agents
+        );
 
         sidebar.update(cx, |sidebar, cx| {
             sidebar
@@ -11550,7 +11907,7 @@ mod tests {
                     default_cwd: None,
                     node: None,
                 }]);
-            sidebar.directory_picker_open = true;
+            sidebar.new_agent_panel = NewAgentPanel::Browse;
             sidebar.ui.popover = Some(Popover::NewAgent {
                 directory: Some("/old".to_owned()),
                 host: Some("forge".into()),
@@ -11566,7 +11923,10 @@ mod tests {
                 host: Some("forge".into()),
             })
         );
-        assert!(sidebar.read_with(cx, |sidebar, _| sidebar.directory_picker_open));
+        assert_eq!(
+            sidebar.read_with(cx, |sidebar, _| sidebar.new_agent_panel),
+            NewAgentPanel::Browse
+        );
 
         sidebar.update(cx, |sidebar, cx| {
             sidebar.ui.popover = Some(Popover::Account);
@@ -11590,7 +11950,7 @@ mod tests {
         sidebar.update(cx, |sidebar, cx| {
             let request = browse_request(sidebar);
             sidebar.ui.popover = None;
-            sidebar.directory_picker_open = false;
+            sidebar.new_agent_panel = NewAgentPanel::Agents;
             sidebar.apply_browsed_local_folder(&request, "/Users/me/code".into());
             cx.notify();
         });
@@ -11599,7 +11959,10 @@ mod tests {
             sidebar.read_with(cx, |sidebar, _| sidebar.ui.popover.clone()),
             None
         );
-        assert!(!sidebar.read_with(cx, |sidebar, _| sidebar.directory_picker_open));
+        assert_eq!(
+            sidebar.read_with(cx, |sidebar, _| sidebar.new_agent_panel),
+            NewAgentPanel::Agents
+        );
     }
 
     /// Dismiss the panel's popover, reopen New Agent on a specific folder, and
@@ -11610,7 +11973,7 @@ mod tests {
 
         sidebar.update(cx, |sidebar, cx| {
             let request = browse_request(sidebar);
-            sidebar.directory_picker_open = false;
+            sidebar.new_agent_panel = NewAgentPanel::Agents;
             sidebar.ui.popover = Some(Popover::NewAgent {
                 directory: Some("/Users/me/other-repo".to_owned()),
                 host: None,
@@ -11657,7 +12020,10 @@ mod tests {
                 host: None,
             })
         );
-        assert!(!sidebar.read_with(cx, |sidebar, _| sidebar.directory_picker_open));
+        assert_eq!(
+            sidebar.read_with(cx, |sidebar, _| sidebar.new_agent_panel),
+            NewAgentPanel::Agents
+        );
     }
 
     #[gpui::test]
@@ -11685,9 +12051,15 @@ mod tests {
             SidebarPopoverHarness { sidebar }
         });
         let sidebar = view.read_with(cx, |harness, _| harness.sidebar.clone());
+        // Machines live behind the location row; the agents are the menu.
+        assert!(cx.debug_bounds("HOST_OPTION_1").is_none());
+        let location = cx.debug_bounds("new-agent-where").expect("location row");
+        cx.simulate_click(location.center(), Modifiers::default());
+        cx.run_until_parked();
         let host = cx.debug_bounds("HOST_OPTION_1").expect("remote host row");
 
         cx.simulate_click(host.center(), Modifiers::default());
+        cx.run_until_parked();
 
         assert_eq!(
             sidebar.read_with(cx, |sidebar, _| sidebar
@@ -11696,6 +12068,13 @@ mod tests {
                 .expect("session store lock poisoned")
                 .default_spawn_host()),
             Some("forge".into())
+        );
+        // Choosing returns to the agents; the location row names the new target.
+        assert!(cx.debug_bounds("HOST_OPTION_1").is_none());
+        assert!(cx.debug_bounds("AGENT_OPTION_0").is_some());
+        assert_eq!(
+            sidebar.read_with(cx, |sidebar, _| sidebar.new_agent_panel),
+            NewAgentPanel::Agents
         );
     }
 
@@ -11738,6 +12117,9 @@ mod tests {
             Some("forge".into())
         );
 
+        let location = cx.debug_bounds("new-agent-where").expect("location row");
+        cx.simulate_click(location.center(), Modifiers::default());
+        cx.run_until_parked();
         let local = cx.debug_bounds("HOST_OPTION_0").expect("this-mac row");
         cx.simulate_click(local.center(), Modifiers::default());
         cx.run_until_parked();
@@ -11756,6 +12138,143 @@ mod tests {
                 directory: None,
                 host: None,
             })
+        );
+    }
+
+    #[test]
+    fn the_default_agent_leads_the_new_agent_menu() {
+        let option = |id: &str| AgentPickerOption {
+            title: id.to_owned(),
+            kind: ProtoAgentKind::new(id),
+            shortcut: String::new(),
+            binary: id.to_owned(),
+            available: true,
+            setup_url: None,
+            unavailable_detail: None,
+        };
+        let options = vec![
+            option("claude-code"),
+            option("codex"),
+            option("cursor"),
+            option("shell"),
+        ];
+        let order = |options: Vec<AgentPickerOption>| {
+            options
+                .into_iter()
+                .map(|option| option.title)
+                .collect::<Vec<_>>()
+        };
+        // The default moves to the front; everything else keeps catalog order.
+        assert_eq!(
+            order(lead_with_default(options.clone(), &ProtoAgentKind::CURSOR)),
+            ["cursor", "claude-code", "codex", "shell"]
+        );
+        // Already first: untouched.
+        assert_eq!(
+            order(lead_with_default(
+                options.clone(),
+                &ProtoAgentKind::CLAUDE_CODE
+            )),
+            ["claude-code", "codex", "cursor", "shell"]
+        );
+        // A default absent from this target leaves the list alone.
+        assert_eq!(
+            order(lead_with_default(options, &ProtoAgentKind::GEMINI)),
+            ["claude-code", "codex", "cursor", "shell"]
+        );
+    }
+
+    #[gpui::test]
+    fn the_new_agent_menu_leads_with_the_agents(cx: &mut TestAppContext) {
+        let (_view, cx) = cx.add_window_view(|_, cx| {
+            let sidebar = cx.new(|cx| {
+                let mut sidebar = Sidebar::new(None, true, PreviewScenario::Typical, cx);
+                sidebar.ui.popover = Some(Popover::NewAgent {
+                    directory: None,
+                    host: None,
+                });
+                sidebar
+            });
+            SidebarPopoverHarness { sidebar }
+        });
+
+        let first_agent = cx.debug_bounds("AGENT_OPTION_0").expect("first agent row");
+        let location = cx.debug_bounds("new-agent-where").expect("location row");
+        let popover = cx.debug_bounds("sidebar-popover").expect("menu");
+        // The agents lead the menu; where they land is a row below them.
+        assert!(first_agent.top() - popover.top() < px(20.0));
+        assert!(location.top() > first_agent.bottom());
+        assert!(cx.debug_bounds("HOST_OPTION_0").is_none());
+        assert!(cx.debug_bounds("new-agent-back").is_none());
+    }
+
+    #[gpui::test]
+    fn the_folder_browser_returns_to_the_agents_with_its_back_chevron(cx: &mut TestAppContext) {
+        let (view, cx) = cx.add_window_view(|_, cx| {
+            let sidebar = cx.new(|cx| {
+                let mut sidebar = Sidebar::new(None, true, PreviewScenario::Typical, cx);
+                sidebar.new_agent_panel = NewAgentPanel::Browse;
+                sidebar.ui.popover = Some(Popover::NewAgent {
+                    directory: Some("/Users/preview".to_owned()),
+                    host: None,
+                });
+                sidebar
+            });
+            SidebarPopoverHarness { sidebar }
+        });
+        let sidebar = view.read_with(cx, |harness, _| harness.sidebar.clone());
+        assert!(cx.debug_bounds("AGENT_OPTION_0").is_none());
+
+        // The walk backs out to the Where panel, and that backs out to the
+        // agents; the folder being browsed survives both.
+        let back = cx.debug_bounds("new-agent-back").expect("back chevron");
+        cx.simulate_click(back.center(), Modifiers::default());
+        cx.run_until_parked();
+        assert_eq!(
+            sidebar.read_with(cx, |sidebar, _| sidebar.new_agent_panel),
+            NewAgentPanel::Where
+        );
+        assert!(cx.debug_bounds("new-agent-browse").is_some());
+        let back = cx.debug_bounds("new-agent-back").expect("back chevron");
+        cx.simulate_click(back.center(), Modifiers::default());
+        cx.run_until_parked();
+
+        assert!(cx.debug_bounds("AGENT_OPTION_0").is_some());
+        assert!(cx.debug_bounds("new-agent-back").is_none());
+        assert_eq!(
+            sidebar.read_with(cx, |sidebar, _| sidebar.new_agent_panel),
+            NewAgentPanel::Agents
+        );
+        // Backing out keeps the folder that was being browsed.
+        assert_eq!(
+            sidebar.read_with(cx, |sidebar, _| sidebar.ui.popover.clone()),
+            Some(Popover::NewAgent {
+                directory: Some("/Users/preview".to_owned()),
+                host: None,
+            })
+        );
+    }
+
+    #[gpui::test]
+    fn reopening_the_new_agent_menu_folds_the_machine_list(cx: &mut TestAppContext) {
+        let (view, cx) = cx.add_window_view(|_, cx| {
+            let sidebar = cx.new(|cx| {
+                let mut sidebar = Sidebar::new(None, true, PreviewScenario::Typical, cx);
+                sidebar.new_agent_panel = NewAgentPanel::Where;
+                sidebar.new_agent_panel = NewAgentPanel::Browse;
+                sidebar
+            });
+            SidebarPopoverHarness { sidebar }
+        });
+        let sidebar = view.read_with(cx, |harness, _| harness.sidebar.clone());
+        sidebar.update(cx, |sidebar, cx| sidebar.show_new_agent(cx));
+        assert_eq!(
+            sidebar.read_with(cx, |sidebar, _| sidebar.new_agent_panel),
+            NewAgentPanel::Agents
+        );
+        assert_eq!(
+            sidebar.read_with(cx, |sidebar, _| sidebar.new_agent_panel),
+            NewAgentPanel::Agents
         );
     }
 }
