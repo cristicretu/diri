@@ -68,8 +68,8 @@ const SIDEBAR_ROW_RADIUS: f32 = 10.0;
 const SIDEBAR_MENU_ROW_RADIUS: f32 = 12.0;
 const SIDEBAR_ACTION_SLOT: f32 = 24.0;
 /// Width of the trailing identity column shared by every row: a session's
-/// agent mark, a project's fold chevron, and the ✕ that replaces either on
-/// hover. One width keeps them on a single vertical line.
+/// agent mark, and the ✕ that stands on that column when a session or
+/// project row is hovered. One width keeps them on a single vertical line.
 const SIDEBAR_TRAILING_SLOT: f32 = 16.0;
 
 /// How far a swapped-in body travels before it settles, and how long the
@@ -2285,7 +2285,17 @@ impl Sidebar {
                         cx,
                     );
                 }))
-                .child(project_badge(colors))
+                // The fold state leads the row, where a session row keeps its
+                // activity mark: a project is a fold first, and the chevron
+                // says which way it is folded before the name is read.
+                .child(
+                    div()
+                        .debug_selector({
+                            let id = id.clone();
+                            move || format!("PROJECT_DISCLOSURE_{}", id.0)
+                        })
+                        .child(project_disclosure(collapsed, colors)),
+                )
                 .child(
                     div()
                         .min_w(px(0.0))
@@ -2296,7 +2306,9 @@ impl Sidebar {
                         .text_size(px(Typo::ROW_EMPHASIZED.size))
                         .font_weight(Typo::ROW_EMPHASIZED.weight)
                         .text_color(colors.primary.alpha(0.90))
-                        .when(is_hovered, |title| title.pr(px(SIDEBAR_ACTION_SLOT * 2.0)))
+                        .when(is_hovered, |title| {
+                            title.pr(px(SIDEBAR_ACTION_SLOT * 2.0 + SIDEBAR_TRAILING_SLOT))
+                        })
                         .child(group.project.name.clone()),
                 )
                 .when(group.pinned && !is_hovered, |row| {
@@ -2313,8 +2325,8 @@ impl Sidebar {
                         div()
                             .absolute()
                             .top(px(0.0))
-                            .right(px(Space::ROW_H + SIDEBAR_TRAILING_SLOT))
-                            .w(px(SIDEBAR_ACTION_SLOT * 2.0))
+                            .right(px(Space::ROW_H))
+                            .w(px(SIDEBAR_ACTION_SLOT * 2.0 + SIDEBAR_TRAILING_SLOT))
                             .h(px(SIDEBAR_NAV_ROW_HEIGHT))
                             .flex()
                             .items_center()
@@ -2387,81 +2399,50 @@ impl Sidebar {
                                             );
                                         },
                                     )),
+                            )
+                            // Sits on the same column as the session rows'
+                            // agent marks and their hover ✕.
+                            .child(
+                                div()
+                                    .id(format!("project-close:{}", id.0))
+                                    .debug_selector({
+                                        let id = id.clone();
+                                        move || format!("PROJECT_CLOSE_{}", id.0)
+                                    })
+                                    .role(Role::Button)
+                                    .aria_label("Close all sessions")
+                                    .size(px(SIDEBAR_TRAILING_SLOT))
+                                    .flex()
+                                    .items_center()
+                                    .justify_center()
+                                    .rounded(px(Radius::CHIP))
+                                    .cursor_pointer()
+                                    .text_color(colors.secondary)
+                                    .hover(move |button| button.bg(Fill::subtle(colors)))
+                                    .active(|button| button.opacity(0.72))
+                                    // The row drags; a press that wanders 2px
+                                    // becomes a drag that swallows the click.
+                                    // Keeping mouse-down off the row makes
+                                    // every press on the ✕ a close.
+                                    .on_mouse_down(MouseButton::Left, |_, _, cx| {
+                                        cx.stop_propagation();
+                                    })
+                                    .child(sf_symbol_weighted(
+                                        "xmark",
+                                        8.5,
+                                        SymbolWeight::Bold,
+                                        colors.secondary,
+                                    ))
+                                    .on_click(cx.listener({
+                                        let id = id.clone();
+                                        move |this, _, _, cx| {
+                                            cx.stop_propagation();
+                                            this.close_project_sessions(&id, cx);
+                                        }
+                                    })),
                             ),
                     )
                 })
-                // The trailing slot is exactly the width of a session row's
-                // agent mark, so the chevron sits on the same column as the
-                // marks beneath it. Hover swaps the chevron for a close
-                // control, the way session rows swap their mark for ✕; the
-                // row itself still toggles the fold on click.
-                .child(
-                    div()
-                        .debug_selector({
-                            let id = id.clone();
-                            move || format!("PROJECT_DISCLOSURE_{}", id.0)
-                        })
-                        .size(px(SIDEBAR_TRAILING_SLOT))
-                        .flex_none()
-                        .flex()
-                        .items_center()
-                        .justify_center()
-                        .text_size(px(9.0))
-                        .text_color(colors.secondary)
-                        .map(|slot| {
-                            if is_hovered {
-                                slot.child(
-                                    div()
-                                        .id(format!("project-close:{}", id.0))
-                                        .debug_selector({
-                                            let id = id.clone();
-                                            move || format!("PROJECT_CLOSE_{}", id.0)
-                                        })
-                                        .role(Role::Button)
-                                        .aria_label("Close all sessions")
-                                        .size(px(SIDEBAR_TRAILING_SLOT))
-                                        .flex()
-                                        .items_center()
-                                        .justify_center()
-                                        .rounded(px(Radius::CHIP))
-                                        .cursor_pointer()
-                                        .hover(move |button| button.bg(Fill::subtle(colors)))
-                                        .active(|button| button.opacity(0.72))
-                                        // The row drags; a press that wanders
-                                        // 2px becomes a drag that swallows the
-                                        // click. Keeping mouse-down off the row
-                                        // makes every press on the ✕ a close.
-                                        .on_mouse_down(MouseButton::Left, |_, _, cx| {
-                                            cx.stop_propagation();
-                                        })
-                                        .child(sf_symbol_weighted(
-                                            "xmark",
-                                            8.5,
-                                            SymbolWeight::Bold,
-                                            colors.secondary,
-                                        ))
-                                        .on_click(cx.listener({
-                                            let id = id.clone();
-                                            move |this, _, _, cx| {
-                                                cx.stop_propagation();
-                                                this.close_project_sessions(&id, cx);
-                                            }
-                                        })),
-                                )
-                            } else {
-                                slot.child(sf_symbol_weighted(
-                                    if collapsed {
-                                        "chevron.right"
-                                    } else {
-                                        "chevron.down"
-                                    },
-                                    9.0,
-                                    SymbolWeight::Bold,
-                                    colors.secondary,
-                                ))
-                            }
-                        }),
-                ),
         );
 
         // Keep the last visible rows only for the close animation. The Store
@@ -7452,18 +7433,27 @@ fn remote_mark(colors: SemanticColors) -> AnyElement {
         .into_any_element()
 }
 
-fn project_badge(colors: SemanticColors) -> AnyElement {
+/// Leading fold chevron of a project row. Same 18px slot the folder badge
+/// used to fill, so titles keep their column against session rows.
+fn project_disclosure(collapsed: bool, colors: SemanticColors) -> AnyElement {
     div()
         .flex_none()
         .size(px(18.0))
         .flex()
         .items_center()
         .justify_center()
-        .rounded(px(Radius::CHIP))
-        .bg(colors.primary.alpha(0.08))
         .text_size(px(9.0))
         .text_color(colors.secondary)
-        .child(sf_symbol("folder.fill", 9.0, colors.secondary))
+        .child(sf_symbol_weighted(
+            if collapsed {
+                "chevron.right"
+            } else {
+                "chevron.down"
+            },
+            9.0,
+            SymbolWeight::Bold,
+            colors.secondary,
+        ))
         .into_any_element()
 }
 
@@ -9868,7 +9858,8 @@ mod tests {
         expected.sort_by(|a, b| a.0.cmp(&b.0));
         assert!(expected.len() > 1, "the fixture project has several sessions");
 
-        // The ✕ lives in the chevron's slot, so it cannot shift the row.
+        // The ✕ joins the hover strip on the trailing edge; the leading
+        // chevron stays put so the row never reflows under the pointer.
         let project = cx
             .debug_bounds("PROJECT_preview-dirijor")
             .expect("project row");
@@ -9880,7 +9871,12 @@ mod tests {
         let close = cx
             .debug_bounds("PROJECT_CLOSE_preview-dirijor")
             .expect("hover reveals the project close control");
-        assert_eq!(close, chevron);
+        assert_eq!(
+            cx.debug_bounds("PROJECT_DISCLOSURE_preview-dirijor"),
+            Some(chevron)
+        );
+        assert!(close.left() > chevron.right());
+        assert_eq!(close.right(), project.right() - px(Space::ROW_H));
 
         cx.simulate_click(close.center(), Modifiers::default());
 
