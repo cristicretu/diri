@@ -21,7 +21,7 @@ use diri_ui::{
     RowFill, SemanticColors, Space, StateChip, StatusGlyph, StatusState, Typo,
 };
 use gpui::{
-    Anchor, Animation, AnimationExt, AnyElement, App, AppContext as _, Bounds, Context,
+    Anchor, Animation, AnimationExt, AnyElement, App, AppContext as _, Bounds, BoxShadow, Context,
     CursorStyle, Entity, EventEmitter, ExternalPaths, FocusHandle, Focusable, FontWeight, Hsla,
     IntoElement, MouseButton, PathPromptOptions, Pixels, Point, Render, Rgba, Role, ScrollHandle,
     SharedString, Task, WeakEntity, Window, anchored, deferred, div, linear_color_stop,
@@ -67,6 +67,15 @@ const SIDEBAR_NAV_ROW_HEIGHT: f32 = 30.0;
 const SIDEBAR_ROW_RADIUS: f32 = 10.0;
 const SIDEBAR_MENU_ROW_RADIUS: f32 = 12.0;
 const SIDEBAR_ACTION_SLOT: f32 = 24.0;
+/// How long a project section takes to slide into its new slot after a live
+/// reorder. Short enough that a fast drag never feels held back, long enough
+/// that the neighbours visibly step aside rather than teleporting.
+const SECTION_SHIFT_TIME: Duration = Duration::from_millis(220);
+/// How long the lifted header takes to gain its shadow once the drag begins.
+const DRAG_LIFT_TIME: Duration = Duration::from_millis(140);
+/// Vertical gap between project sections in the list, mirrored here because
+/// the slide animation reconstructs slot positions from section heights.
+const SECTION_GAP: f32 = 8.0;
 /// Width of the trailing identity column shared by every row: a session's
 /// agent mark, and the ✕ that stands on that column when a session or
 /// project row is hovered. One width keeps them on a single vertical line.
@@ -217,8 +226,23 @@ enum RowDrop {
     Refused(String),
 }
 
+/// What the pointer carries during a sidebar drag.
+enum DragGhost {
+    /// A compact pill naming the item, for rows whose drop targets are other
+    /// rows (sessions delegate, archives revive).
+    Label(SharedString),
+    /// The project header itself, at the width it had in the list. GPUI paints
+    /// the ghost at the pointer minus the grab offset, so a ghost with the
+    /// row's exact size lifts off in place and moves as the row would.
+    ProjectRow {
+        name: SharedString,
+        collapsed: bool,
+        width: f32,
+    },
+}
+
 struct DragPreview {
-    label: SharedString,
+    ghost: DragGhost,
     colors: SemanticColors,
     /// Escape cancelled the gesture. GPUI keeps the drag alive until the
     /// button comes up, so the ghost hides itself instead.
@@ -226,23 +250,162 @@ struct DragPreview {
 }
 
 impl Render for DragPreview {
-    fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         if self.hidden {
-            return div();
+            return div().into_any_element();
         }
-        div()
-            .px(px(10.0))
-            .h(px(28.0))
-            .flex()
-            .items_center()
-            .rounded(px(Radius::ROW))
-            .bg(self.colors.background.alpha(0.92))
-            .border_1()
-            .border_color(self.colors.primary.alpha(0.10))
-            .text_size(px(Typo::META.size))
-            .text_color(self.colors.primary)
-            .child(self.label.clone())
+        let colors = self.colors;
+        match &self.ghost {
+            DragGhost::Label(label) => div()
+                .px(px(10.0))
+                .h(px(28.0))
+                .flex()
+                .items_center()
+                .rounded(px(Radius::ROW))
+                .bg(colors.background.alpha(0.92))
+                .border_1()
+                .border_color(colors.primary.alpha(0.10))
+                .text_size(px(Typo::META.size))
+                .text_color(colors.primary)
+                .child(label.clone())
+                .into_any_element(),
+            DragGhost::ProjectRow {
+                name,
+                collapsed,
+                width,
+            } => {
+                let row = div()
+                    .debug_selector(|| "PROJECT_DRAG_GHOST".to_owned())
+                    .w(px(*width))
+                    .h(px(SIDEBAR_NAV_ROW_HEIGHT))
+                    .px(px(Space::ROW_H))
+                    .flex()
+                    .items_center()
+                    .gap(px(8.0))
+                    .rounded(px(SIDEBAR_ROW_RADIUS))
+                    .bg(colors.floating_surface().alpha(0.98))
+                    .border_1()
+                    .border_color(colors.floating_stroke())
+                    .child(project_disclosure(*collapsed, colors))
+                    .child(
+                        div()
+                            .min_w(px(0.0))
+                            .flex_1()
+                            .whitespace_nowrap()
+                            .overflow_hidden()
+                            .text_ellipsis()
+                            .text_size(px(Typo::ROW_EMPHASIZED.size))
+                            .font_weight(Typo::ROW_EMPHASIZED.weight)
+                            .text_color(colors.primary.alpha(0.90))
+                            .child(name.clone()),
+                    );
+                if cx.reduce_motion() {
+                    return row.shadow(lift_shadow(1.0)).into_any_element();
+                }
+                // The row starts as the flat row it was and gains its shadow
+                // as it lifts, so the pickup reads as one motion rather than
+                // a swap between a row and a ghost.
+                row.with_animation(
+                    "project-drag-lift",
+                    Animation::new(DRAG_LIFT_TIME).with_easing(|delta| Motion::SNAP.settle(delta)),
+                    |row, delta| row.shadow(lift_shadow(delta)),
+                )
+                .into_any_element()
+            }
+        }
     }
+}
+
+fn lift_shadow(strength: f32) -> Vec<BoxShadow> {
+    vec![
+        BoxShadow {
+            color: gpui::black().alpha(0.28 * strength),
+            offset: point(px(0.0), px(6.0 * strength)),
+            blur_radius: px(18.0 * strength),
+            spread_radius: px(0.0),
+            inset: false,
+        },
+        BoxShadow {
+            color: gpui::black().alpha(0.18 * strength),
+            offset: point(px(0.0), px(1.0)),
+            blur_radius: px(2.0),
+            spread_radius: px(0.0),
+            inset: false,
+        },
+    ]
+}
+
+/// Slide state for project sections displaced by a live header reorder.
+///
+/// A reorder changes where every section between the two headers lays out.
+/// Rather than let them snap, each displaced section is rendered with a
+/// `top` offset that starts at (old visual y − new layout y) and eases to
+/// zero, so the list visibly steps aside for the dragged project.
+#[derive(Default)]
+struct SectionShift {
+    /// Starting offset per displaced section, in pixels.
+    deltas: HashMap<ProjectId, f32>,
+    /// Bumped per reorder so a fresh animation replaces the in-flight one.
+    generation: u64,
+    /// Offset applied this frame per section, written by the animation
+    /// closure. Bounds probes subtract it to record layout positions, and the
+    /// next reorder adds it back so a mid-slide reorder starts from where the
+    /// section is on screen, not where it would have landed.
+    applied: Rc<RefCell<HashMap<ProjectId, f32>>>,
+    /// Set by the animation closure on its final frame. Header reorders are
+    /// gated on it: a section still sliding under the pointer must not be
+    /// treated as a header the pointer crossed.
+    settled: Rc<Cell<bool>>,
+    /// When the slide began. A covered window can miss the final frame, so
+    /// the gate also lapses on its own once the slide's duration has passed.
+    started: Option<Instant>,
+}
+
+impl SectionShift {
+    fn in_flight(&self) -> bool {
+        if self.deltas.is_empty() || self.settled.get() {
+            return false;
+        }
+        self.started.is_some_and(|started| {
+            started.elapsed() < SECTION_SHIFT_TIME + Duration::from_millis(50)
+        })
+    }
+}
+
+/// Offsets that carry each section from where it is drawn to where the new
+/// order lays it out. `layout` holds each section's layout bounds (visual
+/// minus any in-flight offset), `applied` the in-flight offsets. Sections
+/// without bounds (filtered out, never painted) are skipped and take no part
+/// in the slot arithmetic.
+fn section_shift_deltas(
+    old_order: &[ProjectId],
+    new_order: &[ProjectId],
+    layout: &HashMap<ProjectId, Bounds<Pixels>>,
+    applied: &HashMap<ProjectId, f32>,
+    gap: f32,
+) -> HashMap<ProjectId, f32> {
+    let top = old_order
+        .iter()
+        .filter_map(|id| layout.get(id))
+        .map(|bounds| f32::from(bounds.origin.y))
+        .fold(f32::INFINITY, f32::min);
+    if !top.is_finite() {
+        return HashMap::new();
+    }
+    let mut deltas = HashMap::new();
+    let mut y = top;
+    for id in new_order {
+        let Some(bounds) = layout.get(id) else {
+            continue;
+        };
+        let visual = f32::from(bounds.origin.y) + applied.get(id).copied().unwrap_or(0.0);
+        let delta = visual - y;
+        if delta.abs() >= 0.5 {
+            deltas.insert(id.clone(), delta);
+        }
+        y += f32::from(bounds.size.height) + gap;
+    }
+    deltas
 }
 
 pub struct Sidebar {
@@ -274,6 +437,10 @@ pub struct Sidebar {
     /// Window-space bounds of rows that are not sessions (project headers)
     /// from the latest prepaint, so they can take part in the edge fade.
     fade_bounds: Rc<RefCell<HashMap<SharedString, Bounds<Pixels>>>>,
+    /// Layout bounds of each project section (header plus rows), for the
+    /// slide that follows a live header reorder.
+    section_bounds: Rc<RefCell<HashMap<ProjectId, Bounds<Pixels>>>>,
+    section_shift: SectionShift,
     /// The session list's viewport from the latest prepaint.
     fade_viewport: Rc<Cell<Option<Bounds<Pixels>>>>,
     /// Whether rows fade themselves at the list edges. On a glass window a
@@ -439,6 +606,8 @@ impl Sidebar {
             filter_generation: 0,
             row_bounds: Rc::new(RefCell::new(HashMap::new())),
             fade_bounds: Rc::new(RefCell::new(HashMap::new())),
+            section_bounds: Rc::new(RefCell::new(HashMap::new())),
+            section_shift: SectionShift::default(),
             fade_viewport: Rc::new(Cell::new(None)),
             fade_glass: false,
             weak_self: cx.entity().downgrade(),
@@ -2130,7 +2299,9 @@ impl Sidebar {
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let id = group.project.id.clone();
-        let is_hovered = self.ui.hovered_project.as_ref() == Some(&id);
+        let dragging_self =
+            matches!(&self.ui.drag, Some(DragItem::Project(dragged)) if *dragged == id);
+        let is_hovered = self.ui.hovered_project.as_ref() == Some(&id) && !dragging_self;
         let collapsed = self
             .store
             .read()
@@ -2145,305 +2316,351 @@ impl Sidebar {
         let project_is_remote = project_host.is_some();
         let entity = cx.entity();
         let drag_label: SharedString = group.project.name.clone().into();
-        let mut section = div().flex_none().flex().flex_col().child(
-            div()
-                .id(format!("project:{}", id.0))
-                .debug_selector({
-                    let id = id.clone();
-                    move || format!("PROJECT_{}", id.0)
-                })
-                .relative()
-                .opacity(
-                    self.edge_fade_alpha(
-                        self.fade_bounds
-                            .borrow()
-                            .get(&SharedString::from(format!("project:{}", id.0)))
-                            .copied(),
-                    ),
-                )
-                .child(self.fade_probe(SharedString::from(format!("project:{}", id.0))))
-                .px(px(Space::ROW_H))
-                .h(px(SIDEBAR_NAV_ROW_HEIGHT))
-                .flex()
-                .items_center()
-                .gap(px(8.0))
-                .rounded(px(SIDEBAR_ROW_RADIUS))
-                .bg(Fill::hover(colors, is_hovered))
-                .cursor_pointer()
-                .on_hover(cx.listener({
-                    let id = id.clone();
-                    move |this, hovered: &bool, _, cx| {
-                        this.ui.hovered_project = hovered.then(|| id.clone());
-                        cx.notify();
-                    }
-                }))
-                .on_click(cx.listener({
-                    let id = id.clone();
-                    move |this, _, _, cx| {
-                        this.commit_rename();
-                        let _ = this
-                            .store
-                            .write()
-                            .expect("session store lock poisoned")
-                            .toggle_project_collapsed(id.clone());
-                        cx.notify();
-                    }
-                }))
-                .on_mouse_down(
-                    MouseButton::Right,
-                    cx.listener({
+        let reduce_motion = cx.reduce_motion();
+        let shift = if reduce_motion {
+            None
+        } else {
+            self.section_shift.deltas.get(&id).copied()
+        };
+        if shift.is_none() {
+            self.section_shift.applied.borrow_mut().remove(&id);
+        }
+        let mut section = div()
+            .relative()
+            .flex_none()
+            .flex()
+            .flex_col()
+            // While its header rides under the pointer, the section left in
+            // the list is the slot it will drop back into: present, so the
+            // list keeps its shape, but clearly not the thing being moved.
+            .when(dragging_self, |section| section.opacity(0.35))
+            .child(self.section_probe(id.clone()))
+            .child(
+                div()
+                    .id(format!("project:{}", id.0))
+                    .debug_selector({
                         let id = id.clone();
-                        move |this, event: &gpui::MouseDownEvent, window, cx| {
-                            cx.stop_propagation();
-                            this.commit_rename();
-                            this.dismiss_hover_card(cx);
-                            this.focus_handle.focus(window, cx);
-                            this.ui.popover = Some(Popover::ProjectActions {
-                                id: id.clone(),
-                                position: Some(event.position),
-                            });
+                        move || format!("PROJECT_{}", id.0)
+                    })
+                    .relative()
+                    .opacity(
+                        self.edge_fade_alpha(
+                            self.fade_bounds
+                                .borrow()
+                                .get(&SharedString::from(format!("project:{}", id.0)))
+                                .copied(),
+                        ),
+                    )
+                    .child(self.fade_probe(SharedString::from(format!("project:{}", id.0))))
+                    .px(px(Space::ROW_H))
+                    .h(px(SIDEBAR_NAV_ROW_HEIGHT))
+                    .flex()
+                    .items_center()
+                    .gap(px(8.0))
+                    .rounded(px(SIDEBAR_ROW_RADIUS))
+                    .bg(Fill::hover(colors, is_hovered))
+                    .cursor_pointer()
+                    .on_hover(cx.listener({
+                        let id = id.clone();
+                        move |this, hovered: &bool, _, cx| {
+                            this.ui.hovered_project = hovered.then(|| id.clone());
                             cx.notify();
                         }
-                    }),
-                )
-                .on_drag(DraggedSidebarItem(DragItem::Project(id.clone())), {
-                    let drag_entity = entity.clone();
-                    move |dragged, _, _, cx| {
-                        let dragged = dragged.0.clone();
-                        let preview = cx.new(|_| DragPreview {
-                            label: drag_label.clone(),
-                            colors,
-                            hidden: false,
-                        });
-                        drag_entity.update(cx, |this, cx| {
-                            this.begin_drag(dragged, preview.clone(), cx);
-                        });
-                        preview
-                    }
-                })
-                // Headers reorder live under the pointer: the dragged
-                // project crosses to the far side of whichever header it is
-                // over, so one step down works as well as one step up.
-                .drag_over::<DraggedSidebarItem>({
-                    let id = id.clone();
-                    move |element, dragged, _, cx| {
-                        if let DragItem::Project(moved) = &dragged.0 {
-                            entity.update(cx, |this, cx| {
-                                let target = format!("project:{}", id.0);
-                                let moved_now = this.reorder_project(moved, &id);
-                                if moved_now || this.ui.drag_target.as_deref() != Some(&target) {
-                                    this.ui.drag_target = Some(target);
-                                    cx.notify();
-                                }
+                    }))
+                    .on_click(cx.listener({
+                        let id = id.clone();
+                        move |this, _, _, cx| {
+                            this.commit_rename();
+                            let _ = this
+                                .store
+                                .write()
+                                .expect("session store lock poisoned")
+                                .toggle_project_collapsed(id.clone());
+                            cx.notify();
+                        }
+                    }))
+                    .on_mouse_down(
+                        MouseButton::Right,
+                        cx.listener({
+                            let id = id.clone();
+                            move |this, event: &gpui::MouseDownEvent, window, cx| {
+                                cx.stop_propagation();
+                                this.commit_rename();
+                                this.dismiss_hover_card(cx);
+                                this.focus_handle.focus(window, cx);
+                                this.ui.popover = Some(Popover::ProjectActions {
+                                    id: id.clone(),
+                                    position: Some(event.position),
+                                });
+                                cx.notify();
+                            }
+                        }),
+                    )
+                    .on_drag(DraggedSidebarItem(DragItem::Project(id.clone())), {
+                        let drag_entity = entity.clone();
+                        let id = id.clone();
+                        move |dragged, _, _, cx| {
+                            let dragged = dragged.0.clone();
+                            // The ghost is the header at its painted width, so
+                            // it lifts off in place rather than snapping to a
+                            // pill at the grab point.
+                            let width = drag_entity
+                                .read(cx)
+                                .fade_bounds
+                                .borrow()
+                                .get(&SharedString::from(format!("project:{}", id.0)))
+                                .map_or(0.0, |bounds| f32::from(bounds.size.width));
+                            let preview = cx.new(|_| DragPreview {
+                                ghost: DragGhost::ProjectRow {
+                                    name: drag_label.clone(),
+                                    collapsed,
+                                    width,
+                                },
+                                colors,
+                                hidden: false,
                             });
-                            element.bg(colors.primary.alpha(0.08))
-                        } else if entity.read(cx).revivable_drop(dragged, Some(&id)).is_some() {
-                            element.bg(Palette::CLAY.alpha(0.18))
+                            drag_entity.update(cx, |this, cx| {
+                                this.begin_drag(dragged, preview.clone(), cx);
+                            });
+                            preview
+                        }
+                    })
+                    // Headers reorder live under the pointer: once the pointer
+                    // crosses a header's midline in its direction of travel, the
+                    // dragged project moves to the far side of it and the
+                    // displaced sections slide into their new slots. The midline
+                    // (rather than the header's edge) is what keeps a project
+                    // from bouncing back and forth while the pointer rests on a
+                    // boundary, and the slide's own duration gates the next
+                    // crossing so a section still moving under the pointer is
+                    // never mistaken for one the pointer crossed.
+                    .drag_over::<DraggedSidebarItem>({
+                        let id = id.clone();
+                        move |element, dragged, window, cx| {
+                            if let DragItem::Project(moved) = &dragged.0 {
+                                entity.update(cx, |this, cx| {
+                                    let target = format!("project:{}", id.0);
+                                    let moved_now = this.pointer_crossed_header(moved, &id, window)
+                                        && this.reorder_project(moved, &id);
+                                    if moved_now || this.ui.drag_target.as_deref() != Some(&target)
+                                    {
+                                        this.ui.drag_target = Some(target);
+                                        cx.notify();
+                                    }
+                                });
+                                element
+                            } else if entity.read(cx).revivable_drop(dragged, Some(&id)).is_some() {
+                                element.bg(Palette::CLAY.alpha(0.18))
+                            } else {
+                                element
+                            }
+                        }
+                    })
+                    .on_drop(cx.listener({
+                        let id = id.clone();
+                        move |this, dragged: &DraggedSidebarItem, _, cx| {
+                            cx.stop_propagation();
+                            if this.ui.drag.is_some()
+                                && let Some(session) = this.revivable_drop(dragged, Some(&id))
+                            {
+                                this.store
+                                    .write()
+                                    .expect("session store lock poisoned")
+                                    .revive_sessions(vec![session]);
+                            }
+                            this.finish_drag();
+                            cx.notify();
+                        }
+                    }))
+                    .drag_over::<ExternalPaths>(move |element, paths, _, _| {
+                        if Self::can_accept_external_drop(
+                            paths,
+                            ExternalDropTarget::Project {
+                                remote: project_is_remote,
+                            },
+                        ) {
+                            element
+                                .bg(Ink::FRESH.alpha(0.10))
+                                .border_1()
+                                .border_color(Ink::FRESH.alpha(0.38))
                         } else {
                             element
                         }
-                    }
-                })
-                .on_drop(cx.listener({
-                    let id = id.clone();
-                    move |this, dragged: &DraggedSidebarItem, _, cx| {
+                    })
+                    .on_drop(cx.listener(move |this, paths: &ExternalPaths, _, cx| {
                         cx.stop_propagation();
-                        if this.ui.drag.is_some()
-                            && let Some(session) = this.revivable_drop(dragged, Some(&id))
-                        {
-                            this.store
-                                .write()
-                                .expect("session store lock poisoned")
-                                .revive_sessions(vec![session]);
-                        }
-                        this.finish_drag();
-                        cx.notify();
-                    }
-                }))
-                .drag_over::<ExternalPaths>(move |element, paths, _, _| {
-                    if Self::can_accept_external_drop(
-                        paths,
-                        ExternalDropTarget::Project {
-                            remote: project_is_remote,
-                        },
-                    ) {
-                        element
-                            .bg(Ink::FRESH.alpha(0.10))
-                            .border_1()
-                            .border_color(Ink::FRESH.alpha(0.38))
-                    } else {
-                        element
-                    }
-                })
-                .on_drop(cx.listener(move |this, paths: &ExternalPaths, _, cx| {
-                    cx.stop_propagation();
-                    this.external_drop(
-                        paths,
-                        ExternalDropTarget::Project {
-                            remote: project_is_remote,
-                        },
-                        cx,
-                    );
-                }))
-                // The fold state leads the row, where a session row keeps its
-                // activity mark: a project is a fold first, and the chevron
-                // says which way it is folded before the name is read.
-                .child(
-                    div()
-                        .debug_selector({
-                            let id = id.clone();
-                            move || format!("PROJECT_DISCLOSURE_{}", id.0)
-                        })
-                        .child(project_disclosure(collapsed, colors)),
-                )
-                .child(
-                    div()
-                        .min_w(px(0.0))
-                        .flex_1()
-                        .whitespace_nowrap()
-                        .overflow_hidden()
-                        .text_ellipsis()
-                        .text_size(px(Typo::ROW_EMPHASIZED.size))
-                        .font_weight(Typo::ROW_EMPHASIZED.weight)
-                        .text_color(colors.primary.alpha(0.90))
-                        .when(is_hovered, |title| {
-                            title.pr(px(SIDEBAR_ACTION_SLOT * 2.0 + SIDEBAR_TRAILING_SLOT))
-                        })
-                        .child(group.project.name.clone()),
-                )
-                .when(group.pinned && !is_hovered, |row| {
-                    row.child(pin_mark(colors))
-                })
-                .when(project_is_remote && !is_hovered, |row| {
-                    row.child(remote_mark(colors))
-                })
-                .when(!is_hovered && collapsed, |row| {
-                    row.child(AttentionDot::new(rollup_attention(&group.active), colors))
-                })
-                .when(is_hovered, |row| {
-                    row.child(
+                        this.external_drop(
+                            paths,
+                            ExternalDropTarget::Project {
+                                remote: project_is_remote,
+                            },
+                            cx,
+                        );
+                    }))
+                    // The fold state leads the row, where a session row keeps its
+                    // activity mark: a project is a fold first, and the chevron
+                    // says which way it is folded before the name is read.
+                    .child(
                         div()
-                            .absolute()
-                            .top(px(0.0))
-                            .right(px(Space::ROW_H))
-                            .w(px(SIDEBAR_ACTION_SLOT * 2.0 + SIDEBAR_TRAILING_SLOT))
-                            .h(px(SIDEBAR_NAV_ROW_HEIGHT))
-                            .flex()
-                            .items_center()
-                            .child(
-                                div()
-                                    .id(format!("project-menu:{}", id.0))
-                                    .debug_selector({
-                                        let id = id.clone();
-                                        move || format!("PROJECT_MENU_{}", id.0)
-                                    })
-                                    .size(px(SIDEBAR_ACTION_SLOT))
-                                    .flex()
-                                    .items_center()
-                                    .justify_center()
-                                    .rounded(px(Radius::BADGE))
-                                    .text_color(colors.secondary)
-                                    .hover(|button| button.bg(colors.primary.alpha(0.07)))
-                                    .active(|button| button.opacity(0.72))
-                                    .child(sf_symbol_weighted(
-                                        "ellipsis",
-                                        12.0,
-                                        SymbolWeight::Semibold,
-                                        colors.secondary,
-                                    ))
-                                    .on_click(cx.listener({
-                                        let project = project_for_click.clone();
-                                        move |this, event: &gpui::ClickEvent, _, cx| {
-                                            cx.stop_propagation();
-                                            this.ui.popover = Some(Popover::ProjectActions {
-                                                id: project.id.clone(),
-                                                position: Some(point(
-                                                    px(12.0),
-                                                    event.position().y
-                                                        + px(SIDEBAR_NAV_ROW_HEIGHT / 2.0 + 3.0),
-                                                )),
-                                            });
-                                            cx.notify();
-                                        }
-                                    })),
-                            )
-                            .child(
-                                div()
-                                    .id(format!("project-plus:{}", id.0))
-                                    .debug_selector({
-                                        let id = id.clone();
-                                        move || format!("PROJECT_ADD_{}", id.0)
-                                    })
-                                    .size(px(SIDEBAR_ACTION_SLOT))
-                                    .flex()
-                                    .items_center()
-                                    .justify_center()
-                                    .rounded(px(Radius::BADGE))
-                                    .text_color(colors.secondary)
-                                    .hover(|button| button.bg(colors.primary.alpha(0.07)))
-                                    .active(|button| button.opacity(0.72))
-                                    .child(sf_symbol_weighted(
-                                        "plus",
-                                        12.0,
-                                        SymbolWeight::Medium,
-                                        colors.secondary,
-                                    ))
-                                    .on_click(cx.listener(
-                                        move |this, event: &gpui::ClickEvent, _, cx| {
-                                            cx.stop_propagation();
-                                            this.open_new_agent_popover_below(
-                                                Some(project_root.clone()),
-                                                project_host.clone(),
-                                                event.position(),
-                                                cx,
-                                            );
-                                        },
-                                    )),
-                            )
-                            // Sits on the same column as the session rows'
-                            // agent marks and their hover ✕.
-                            .child(
-                                div()
-                                    .id(format!("project-close:{}", id.0))
-                                    .debug_selector({
-                                        let id = id.clone();
-                                        move || format!("PROJECT_CLOSE_{}", id.0)
-                                    })
-                                    .role(Role::Button)
-                                    .aria_label("Close all sessions")
-                                    .size(px(SIDEBAR_TRAILING_SLOT))
-                                    .flex()
-                                    .items_center()
-                                    .justify_center()
-                                    .rounded(px(Radius::CHIP))
-                                    .cursor_pointer()
-                                    .text_color(colors.secondary)
-                                    .hover(move |button| button.bg(Fill::subtle(colors)))
-                                    .active(|button| button.opacity(0.72))
-                                    // The row drags; a press that wanders 2px
-                                    // becomes a drag that swallows the click.
-                                    // Keeping mouse-down off the row makes
-                                    // every press on the ✕ a close.
-                                    .on_mouse_down(MouseButton::Left, |_, _, cx| {
-                                        cx.stop_propagation();
-                                    })
-                                    .child(sf_symbol_weighted(
-                                        "xmark",
-                                        8.5,
-                                        SymbolWeight::Bold,
-                                        colors.secondary,
-                                    ))
-                                    .on_click(cx.listener({
-                                        let id = id.clone();
-                                        move |this, _, _, cx| {
-                                            cx.stop_propagation();
-                                            this.close_project_sessions(&id, cx);
-                                        }
-                                    })),
-                            ),
+                            .debug_selector({
+                                let id = id.clone();
+                                move || format!("PROJECT_DISCLOSURE_{}", id.0)
+                            })
+                            .child(project_disclosure(collapsed, colors)),
                     )
-                })
-        );
+                    .child(
+                        div()
+                            .min_w(px(0.0))
+                            .flex_1()
+                            .whitespace_nowrap()
+                            .overflow_hidden()
+                            .text_ellipsis()
+                            .text_size(px(Typo::ROW_EMPHASIZED.size))
+                            .font_weight(Typo::ROW_EMPHASIZED.weight)
+                            .text_color(colors.primary.alpha(0.90))
+                            .when(is_hovered, |title| {
+                                title.pr(px(SIDEBAR_ACTION_SLOT * 2.0 + SIDEBAR_TRAILING_SLOT))
+                            })
+                            .child(group.project.name.clone()),
+                    )
+                    .when(group.pinned && !is_hovered, |row| {
+                        row.child(pin_mark(colors))
+                    })
+                    .when(project_is_remote && !is_hovered, |row| {
+                        row.child(remote_mark(colors))
+                    })
+                    .when(!is_hovered && collapsed, |row| {
+                        row.child(AttentionDot::new(rollup_attention(&group.active), colors))
+                    })
+                    .when(is_hovered, |row| {
+                        row.child(
+                            div()
+                                .absolute()
+                                .top(px(0.0))
+                                .right(px(Space::ROW_H))
+                                .w(px(SIDEBAR_ACTION_SLOT * 2.0 + SIDEBAR_TRAILING_SLOT))
+                                .h(px(SIDEBAR_NAV_ROW_HEIGHT))
+                                .flex()
+                                .items_center()
+                                .child(
+                                    div()
+                                        .id(format!("project-menu:{}", id.0))
+                                        .debug_selector({
+                                            let id = id.clone();
+                                            move || format!("PROJECT_MENU_{}", id.0)
+                                        })
+                                        .size(px(SIDEBAR_ACTION_SLOT))
+                                        .flex()
+                                        .items_center()
+                                        .justify_center()
+                                        .rounded(px(Radius::BADGE))
+                                        .text_color(colors.secondary)
+                                        .hover(|button| button.bg(colors.primary.alpha(0.07)))
+                                        .active(|button| button.opacity(0.72))
+                                        .child(sf_symbol_weighted(
+                                            "ellipsis",
+                                            12.0,
+                                            SymbolWeight::Semibold,
+                                            colors.secondary,
+                                        ))
+                                        .on_click(
+                                            cx.listener({
+                                                let project = project_for_click.clone();
+                                                move |this, event: &gpui::ClickEvent, _, cx| {
+                                                    cx.stop_propagation();
+                                                    this.ui.popover =
+                                                        Some(Popover::ProjectActions {
+                                                            id: project.id.clone(),
+                                                            position: Some(point(
+                                                                px(12.0),
+                                                                event.position().y
+                                                                    + px(SIDEBAR_NAV_ROW_HEIGHT
+                                                                        / 2.0
+                                                                        + 3.0),
+                                                            )),
+                                                        });
+                                                    cx.notify();
+                                                }
+                                            }),
+                                        ),
+                                )
+                                .child(
+                                    div()
+                                        .id(format!("project-plus:{}", id.0))
+                                        .debug_selector({
+                                            let id = id.clone();
+                                            move || format!("PROJECT_ADD_{}", id.0)
+                                        })
+                                        .size(px(SIDEBAR_ACTION_SLOT))
+                                        .flex()
+                                        .items_center()
+                                        .justify_center()
+                                        .rounded(px(Radius::BADGE))
+                                        .text_color(colors.secondary)
+                                        .hover(|button| button.bg(colors.primary.alpha(0.07)))
+                                        .active(|button| button.opacity(0.72))
+                                        .child(sf_symbol_weighted(
+                                            "plus",
+                                            12.0,
+                                            SymbolWeight::Medium,
+                                            colors.secondary,
+                                        ))
+                                        .on_click(cx.listener(
+                                            move |this, event: &gpui::ClickEvent, _, cx| {
+                                                cx.stop_propagation();
+                                                this.open_new_agent_popover_below(
+                                                    Some(project_root.clone()),
+                                                    project_host.clone(),
+                                                    event.position(),
+                                                    cx,
+                                                );
+                                            },
+                                        )),
+                                )
+                                // Sits on the same column as the session rows'
+                                // agent marks and their hover ✕.
+                                .child(
+                                    div()
+                                        .id(format!("project-close:{}", id.0))
+                                        .debug_selector({
+                                            let id = id.clone();
+                                            move || format!("PROJECT_CLOSE_{}", id.0)
+                                        })
+                                        .role(Role::Button)
+                                        .aria_label("Close all sessions")
+                                        .size(px(SIDEBAR_TRAILING_SLOT))
+                                        .flex()
+                                        .items_center()
+                                        .justify_center()
+                                        .rounded(px(Radius::CHIP))
+                                        .cursor_pointer()
+                                        .text_color(colors.secondary)
+                                        .hover(move |button| button.bg(Fill::subtle(colors)))
+                                        .active(|button| button.opacity(0.72))
+                                        // The row drags; a press that wanders 2px
+                                        // becomes a drag that swallows the click.
+                                        // Keeping mouse-down off the row makes
+                                        // every press on the ✕ a close.
+                                        .on_mouse_down(MouseButton::Left, |_, _, cx| {
+                                            cx.stop_propagation();
+                                        })
+                                        .child(sf_symbol_weighted(
+                                            "xmark",
+                                            8.5,
+                                            SymbolWeight::Bold,
+                                            colors.secondary,
+                                        ))
+                                        .on_click(cx.listener({
+                                            let id = id.clone();
+                                            move |this, _, _, cx| {
+                                                cx.stop_propagation();
+                                                this.close_project_sessions(&id, cx);
+                                            }
+                                        })),
+                                ),
+                        )
+                    }),
+            );
 
         // Keep the last visible rows only for the close animation. The Store
         // remains authoritative for keyboard navigation and selection.
@@ -2514,7 +2731,118 @@ impl Sidebar {
             }
             section = section.child(disclosure_body(children, &frame, !collapsed));
         }
-        section.into_any_element()
+        let Some(delta) = shift else {
+            return section.into_any_element();
+        };
+        let applied = Rc::clone(&self.section_shift.applied);
+        let settled = Rc::clone(&self.section_shift.settled);
+        section
+            .with_animation(
+                SharedString::from(format!(
+                    "section-shift:{}:{}",
+                    id.0, self.section_shift.generation
+                )),
+                Animation::new(SECTION_SHIFT_TIME)
+                    .with_easing(|delta| Motion::SETTLE.settle(delta)),
+                move |section, progress| {
+                    let offset = delta * (1.0 - progress);
+                    applied.borrow_mut().insert(id.clone(), offset);
+                    if progress >= 1.0 {
+                        settled.set(true);
+                    }
+                    section.top(px(offset))
+                },
+            )
+            .into_any_element()
+    }
+
+    /// Records a project section's layout bounds: what the probe sees is the
+    /// painted position, so any slide offset in flight is subtracted back out.
+    fn section_probe(&self, id: ProjectId) -> impl IntoElement {
+        let bounds = Rc::clone(&self.section_bounds);
+        let applied = Rc::clone(&self.section_shift.applied);
+        gpui::canvas(
+            move |painted, _, _| {
+                let offset = applied.borrow().get(&id).copied().unwrap_or(0.0);
+                let layout = Bounds {
+                    origin: point(painted.origin.x, painted.origin.y - px(offset)),
+                    size: painted.size,
+                };
+                bounds.borrow_mut().insert(id.clone(), layout);
+            },
+            |_, _, _, _| (),
+        )
+        .absolute()
+        .inset_0()
+    }
+
+    /// Whether the pointer has passed `target`'s header far enough, in the
+    /// direction `moved` is travelling, for the two to trade places. Nothing
+    /// crosses while a previous reorder's slide is still in flight.
+    fn pointer_crossed_header(
+        &mut self,
+        moved: &ProjectId,
+        target: &ProjectId,
+        window: &Window,
+    ) -> bool {
+        if moved == target || self.section_shift.in_flight() {
+            return false;
+        }
+        let Some(header) = self
+            .fade_bounds
+            .borrow()
+            .get(&SharedString::from(format!("project:{}", target.0)))
+            .copied()
+        else {
+            return false;
+        };
+        let order = self
+            .store
+            .write()
+            .expect("session store lock poisoned")
+            .sidebar_project_order();
+        let position = |id: &ProjectId| order.iter().position(|candidate| candidate == id);
+        let (Some(from), Some(to)) = (position(moved), position(target)) else {
+            return false;
+        };
+        let pointer = window.mouse_position().y;
+        let midline = header.origin.y + header.size.height / 2.0;
+        if from < to {
+            pointer >= midline
+        } else {
+            pointer <= midline
+        }
+    }
+
+    /// Current display order of project sections, pins included.
+    fn visible_project_order(&self) -> Vec<ProjectId> {
+        self.store
+            .write()
+            .expect("session store lock poisoned")
+            .sidebar_projection()
+            .projects
+            .iter()
+            .map(|group| group.project.id.clone())
+            .collect()
+    }
+
+    /// Starts the slide from the sections' current positions to where
+    /// `after` lays them out.
+    fn shift_sections(&mut self, before: &[ProjectId], after: &[ProjectId]) {
+        let deltas = section_shift_deltas(
+            before,
+            after,
+            &self.section_bounds.borrow(),
+            &self.section_shift.applied.borrow(),
+            SECTION_GAP,
+        );
+        if deltas.is_empty() {
+            return;
+        }
+        self.section_shift.deltas = deltas;
+        self.section_shift.generation += 1;
+        self.section_shift.settled = Rc::new(Cell::new(false));
+        self.section_shift.started = Some(Instant::now());
     }
 
     fn recency_sections(
@@ -3061,7 +3389,7 @@ impl Sidebar {
             .on_drag(drag_payload, move |dragged, _, _, cx| {
                 let dragged = dragged.0.clone();
                 let preview = cx.new(|_| DragPreview {
-                    label: drag_label.clone(),
+                    ghost: DragGhost::Label(drag_label.clone()),
                     colors,
                     hidden: false,
                 });
@@ -3573,7 +3901,7 @@ impl Sidebar {
                 move |dragged, _, _, cx| {
                     let dragged = dragged.0.clone();
                     let preview = cx.new(|_| DragPreview {
-                        label: drag_label.clone(),
+                        ghost: DragGhost::Label(drag_label.clone()),
                         colors,
                         hidden: false,
                     });
@@ -6005,10 +6333,13 @@ impl Sidebar {
             return false;
         }
         if let Some(order) = self.ui.project_order_at_drag_start.take() {
+            let before = self.visible_project_order();
             self.store
                 .write()
                 .expect("session store lock poisoned")
                 .stage_project_order(order);
+            let after = self.visible_project_order();
+            self.shift_sections(&before, &after);
         }
         self.ui.order_dirty = false;
         self.ui.drag = None;
@@ -6300,14 +6631,21 @@ impl Sidebar {
 
     /// Live header reorder; returns whether the order changed.
     fn reorder_project(&mut self, moved: &ProjectId, target: &ProjectId) -> bool {
-        let mut store = self.store.write().expect("session store lock poisoned");
-        if store.preferences().sidebar_ordering != SidebarOrdering::Custom {
-            return false;
-        }
-        let mut order = store.sidebar_project_order();
-        move_past(&mut order, moved, target);
-        let changed = store.stage_project_order(order);
+        let before = self.visible_project_order();
+        let changed = {
+            let mut store = self.store.write().expect("session store lock poisoned");
+            if store.preferences().sidebar_ordering != SidebarOrdering::Custom {
+                return false;
+            }
+            let mut order = store.sidebar_project_order();
+            move_past(&mut order, moved, target);
+            store.stage_project_order(order)
+        };
         self.ui.order_dirty |= changed;
+        if changed {
+            let after = self.visible_project_order();
+            self.shift_sections(&before, &after);
+        }
         changed
     }
 
@@ -8282,32 +8620,15 @@ mod tests {
     fn title_overflow_threshold_accounts_for_sidebar_badges() {
         let plain =
             session_title_available_width(248.0, 0, false, false, false, false, false, false);
-        let remote = session_title_available_width(
-            248.0,
-            0,
-            false,
-            false,
-            false,
-            true,
-            false,
-            true,
-        );
+        let remote =
+            session_title_available_width(248.0, 0, false, false, false, true, false, true);
         assert!(plain > remote);
         // A nested row pays for every indent column it sits behind.
         let nested =
             session_title_available_width(248.0, 2, false, false, false, false, false, false);
         assert!(plain > nested);
         assert_eq!(
-            session_title_available_width(
-                200.0,
-                1,
-                true,
-                true,
-                true,
-                true,
-                true,
-                true,
-            ),
+            session_title_available_width(200.0, 1, true, true, true, true, true, true,),
             36.0
         );
     }
@@ -9164,6 +9485,191 @@ mod tests {
         assert_eq!(drag_state(&sidebar, cx), (false, None, false));
     }
 
+    fn project_order(sidebar: &Entity<Sidebar>, cx: &VisualTestContext) -> Vec<String> {
+        sidebar.read_with(cx, |sidebar, _| {
+            sidebar
+                .visible_project_order()
+                .into_iter()
+                .map(|id| id.0)
+                .collect()
+        })
+    }
+
+    #[test]
+    fn section_shift_carries_each_section_from_its_drawn_position_to_its_new_slot() {
+        let a = ProjectId::new("a");
+        let b = ProjectId::new("b");
+        let c = ProjectId::new("c");
+        let section = |y: f32, height: f32| Bounds {
+            origin: point(px(10.0), px(y)),
+            size: gpui::size(px(200.0), px(height)),
+        };
+        let layout = HashMap::from([
+            (a.clone(), section(0.0, 100.0)),
+            (b.clone(), section(108.0, 30.0)),
+            (c.clone(), section(146.0, 60.0)),
+        ]);
+        let old = [a.clone(), b.clone(), c.clone()];
+
+        // a past b: b rises by a's slot, a sinks by b's.
+        let deltas = section_shift_deltas(
+            &old,
+            &[b.clone(), a.clone(), c.clone()],
+            &layout,
+            &HashMap::new(),
+            8.0,
+        );
+        assert_eq!(deltas.get(&b), Some(&108.0));
+        assert_eq!(deltas.get(&a), Some(&-38.0));
+        assert!(
+            !deltas.contains_key(&c),
+            "an untouched section does not slide"
+        );
+
+        // A reorder mid-slide starts from where the section is drawn, not
+        // from its settled layout position.
+        let applied = HashMap::from([(b.clone(), 40.0)]);
+        let deltas = section_shift_deltas(
+            &old,
+            &[b.clone(), a.clone(), c.clone()],
+            &layout,
+            &applied,
+            8.0,
+        );
+        assert_eq!(deltas.get(&b), Some(&148.0));
+
+        // A section without bounds takes no part in the slot arithmetic.
+        let deltas = section_shift_deltas(
+            &old,
+            &[ProjectId::new("ghost"), c.clone(), b.clone(), a.clone()],
+            &layout,
+            &HashMap::new(),
+            8.0,
+        );
+        assert_eq!(deltas.get(&c), Some(&146.0));
+        assert_eq!(deltas.get(&b), Some(&40.0));
+        assert_eq!(deltas.get(&a), Some(&-106.0));
+    }
+
+    #[gpui::test]
+    fn dragging_a_project_lifts_the_header_itself(cx: &mut TestAppContext) {
+        let (sidebar, _, cx) = drag_harness(cx);
+        let header = cx.debug_bounds("PROJECT_preview-dirijor").unwrap();
+        assert!(cx.debug_bounds("PROJECT_DRAG_GHOST").is_none());
+
+        // `drag_to` crosses GPUI's threshold 6px below the press; the ghost
+        // keeps the grab offset from that moment, so it trails the pointer
+        // by exactly the distance travelled since.
+        drag_to(
+            cx,
+            header.center(),
+            header.center() + point(px(0.0), px(12.0)),
+        );
+
+        let ghost = cx
+            .debug_bounds("PROJECT_DRAG_GHOST")
+            .expect("a project drag carries the header as its ghost");
+        assert_eq!(
+            ghost.size, header.size,
+            "the ghost is the row at its own size"
+        );
+        assert_eq!(
+            ghost.origin,
+            header.origin + point(px(0.0), px(6.0)),
+            "the ghost lifts off in place and follows the pointer from there"
+        );
+        assert_eq!(
+            cx.debug_bounds("PROJECT_preview-dirijor"),
+            Some(header),
+            "the row stays in the list as the slot the drop lands in"
+        );
+        assert!(
+            cx.debug_bounds("PROJECT_MENU_preview-dirijor").is_none(),
+            "hover affordances do not ride along under a drag"
+        );
+
+        cx.simulate_mouse_up(
+            header.center() + point(px(0.0), px(12.0)),
+            MouseButton::Left,
+            Modifiers::default(),
+        );
+        assert!(cx.debug_bounds("PROJECT_DRAG_GHOST").is_none());
+        assert_eq!(
+            project_order(&sidebar, cx),
+            ["preview-dirijor", "preview-anara", "preview-settings-kit"]
+        );
+    }
+
+    #[gpui::test]
+    fn a_project_crosses_a_header_at_its_midline_and_never_bounces_back(cx: &mut TestAppContext) {
+        let (sidebar, _, cx) = drag_harness(cx);
+        let dirijor = cx.debug_bounds("PROJECT_preview-dirijor").unwrap();
+        let anara = cx.debug_bounds("PROJECT_preview-anara").unwrap();
+        let x = anara.center().x;
+        let above_midline = point(x, anara.top() + px(3.0));
+        let below_midline = point(x, anara.bottom() - px(3.0));
+
+        drag_to(cx, dirijor.center(), above_midline);
+        assert_eq!(
+            project_order(&sidebar, cx),
+            ["preview-dirijor", "preview-anara", "preview-settings-kit"],
+            "touching a header's near edge is not yet a crossing"
+        );
+
+        cx.simulate_mouse_move(below_midline, MouseButton::Left, Modifiers::default());
+        assert_eq!(
+            project_order(&sidebar, cx),
+            ["preview-anara", "preview-dirijor", "preview-settings-kit"],
+            "passing the midline trades places"
+        );
+        cx.run_until_parked();
+        let drawn = cx.debug_bounds("PROJECT_preview-anara").unwrap();
+        assert!(
+            (drawn.top() - anara.top()).abs() < px(1.0),
+            "the displaced header starts its slide from where it was drawn"
+        );
+
+        // The pointer is still over the header that has not slid away yet.
+        cx.simulate_mouse_move(
+            below_midline - point(px(0.0), px(1.0)),
+            MouseButton::Left,
+            Modifiers::default(),
+        );
+        assert_eq!(
+            project_order(&sidebar, cx),
+            ["preview-anara", "preview-dirijor", "preview-settings-kit"],
+            "a section still sliding under the pointer is not crossed again"
+        );
+
+        // Element animations run on the wall clock, and tests have no frame
+        // loop: wait the slide out, then deliver the frame it asked for.
+        std::thread::sleep(SECTION_SHIFT_TIME + Duration::from_millis(60));
+        cx.update(|window, cx| {
+            window.simulate_next_frame(cx);
+        });
+        cx.run_until_parked();
+        let settled = cx.debug_bounds("PROJECT_preview-anara").unwrap();
+        assert!(
+            (settled.top() - dirijor.top()).abs() < px(1.0),
+            "the displaced section settles into the dragged one's old slot"
+        );
+        let slot = cx.debug_bounds("PROJECT_preview-dirijor").unwrap();
+        assert!(
+            slot.top() >= settled.bottom(),
+            "the dragged project's slot now sits below the section it crossed"
+        );
+        assert!(
+            sidebar.read_with(cx, |sidebar, _| !sidebar.section_shift.in_flight()),
+            "a finished slide stops gating reorders"
+        );
+
+        cx.simulate_mouse_up(below_midline, MouseButton::Left, Modifiers::default());
+        assert_eq!(
+            project_order(&sidebar, cx),
+            ["preview-anara", "preview-dirijor", "preview-settings-kit"]
+        );
+    }
+
     #[gpui::test]
     fn cancelled_archived_session_drag_does_not_revive(cx: &mut TestAppContext) {
         let (sidebar, _, cx) = drag_harness(cx);
@@ -9856,7 +10362,10 @@ mod tests {
             (expected, other)
         });
         expected.sort_by(|a, b| a.0.cmp(&b.0));
-        assert!(expected.len() > 1, "the fixture project has several sessions");
+        assert!(
+            expected.len() > 1,
+            "the fixture project has several sessions"
+        );
 
         // The ✕ joins the hover strip on the trailing edge; the leading
         // chevron stays put so the row never reflows under the pointer.
