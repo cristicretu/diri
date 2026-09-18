@@ -32,6 +32,7 @@ impl SessionSurfaces {
         let reduced = cx.reduce_motion();
         let width = self.peek_width.max(1.0);
         let height = (f32::from(window.viewport_size().height) - self.peek_top).max(1.0);
+        self.sync_peek_scroll(width, height, reduced);
         let scroll = f32::from(self.peek_scroll.offset().y);
         let (tabs, theme, eligible) = {
             let store = self.store.read().expect("store");
@@ -162,7 +163,9 @@ impl SessionSurfaces {
             .relative()
             .w_full()
             .min_h_full();
-        let mut content_height = height;
+        // Keep enough scroll extent while rows separate to preserve the focal
+        // card; GPUI otherwise clamps the anchor against the previous strip.
+        let mut content_height = height + self.peek_scroll_anchor;
         for index in 0..self.peek.sessions.len() {
             let bounds = card_rect(
                 index,

@@ -1,5 +1,5 @@
-//! One navigation scope for horizontal tabs and tab previews. This is a view
-//! of the existing project/host group, never a second session or layout store.
+//! Project-scoped horizontal tabs and fleet-wide session previews, projected
+//! from the existing sidebar groups without a second session or layout store.
 use std::sync::Arc;
 
 use diri_proto::{ProjectId, SessionRecord};
@@ -70,6 +70,33 @@ pub fn selected_project_tabs(store: &mut impl TabNavigationStore) -> ProjectTabs
         project: Some(group.project.id.clone()),
         sessions,
     }
+}
+
+/// Pinch previews span the active fleet, keeping the current project's tabs
+/// together at the front. Horizontal tab navigation retains its project scope.
+pub fn preview_sessions(store: &mut impl TabNavigationStore) -> Vec<Arc<SessionRecord>> {
+    let selection = store.tab_selection();
+    let projection = store.tab_projection();
+    let mut groups: Vec<_> = projection.projects.iter().collect();
+    groups.sort_by_key(|group| {
+        selection
+            .as_ref()
+            .is_none_or(|(_, project)| project != &group.project.id)
+    });
+    groups
+        .into_iter()
+        .flat_map(|group| {
+            group
+                .active
+                .iter()
+                .chain(
+                    group.archived.iter().filter(|session| {
+                        selection.as_ref().is_some_and(|(id, _)| id == &session.id)
+                    }),
+                )
+                .cloned()
+        })
+        .collect()
 }
 
 #[cfg(test)]

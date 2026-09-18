@@ -53,6 +53,7 @@ pub struct SessionSurfaces {
     peek_top: f32,
     peek_width: f32,
     peek_scroll: ScrollHandle,
+    peek_scroll_anchor: f32,
     peek_previous_focus: Option<FocusHandle>,
     peek_frame_pending: bool,
     closing_previews: HashMap<SessionId, TerminalElement>,
@@ -162,6 +163,7 @@ impl SessionSurfaces {
             peek_top: 0.0,
             peek_width: 0.0,
             peek_scroll: ScrollHandle::new(),
+            peek_scroll_anchor: 0.0,
             peek_previous_focus: None,
             peek_frame_pending: false,
             closing_previews: HashMap::new(),
@@ -1966,7 +1968,15 @@ mod tests {
         use diri_term::buffer::GridBuffer;
         let runtime = Arc::new(StoreRuntime::inert());
         runtime.store.write().unwrap().hydrate(SessionListResult {
-            sessions: (0..4).map(session).collect(),
+            sessions: (0..4)
+                .map(|i| {
+                    let mut record = session(i);
+                    if i >= 2 {
+                        record.project_id = ProjectId::new("other-project");
+                    }
+                    record
+                })
+                .collect(),
             projects: vec![],
         });
         runtime.store.write().unwrap().select(session(0).id);
@@ -2015,10 +2025,10 @@ mod tests {
         );
         assert!(!surfaces.read_with(cx, |s, _| s.tab_peek_visible()));
         surfaces.update(cx, |s, cx| s.toggle_tab_peek(cx));
-        cx.simulate_keystrokes("right enter");
+        cx.simulate_keystrokes("right right enter");
         assert_eq!(
             store.read().unwrap().selected_session_id(),
-            Some(&session(1).id)
+            Some(&session(2).id)
         );
         assert!(!surfaces.read_with(cx, |s, _| s.tab_peek_visible()));
         assert_eq!(
@@ -2124,7 +2134,57 @@ mod tests {
     }
 
     #[gpui::test]
-    fn tab_peek_streams_inactive_cards_with_one_resident_and_drops_on_escape(
+    fn tab_peek_late_card_stays_mounted_through_expand_and_reverse(cx: &mut TestAppContext) {
+        use crate::tab_peek::GestureFrame;
+        let runtime = Arc::new(StoreRuntime::inert());
+        runtime.store.write().unwrap().hydrate(SessionListResult {
+            sessions: (0..24).map(session).collect(),
+            projects: vec![],
+        });
+        let (view, cx) = cx.add_window_view(move |_, cx| {
+            let surfaces = cx.new(|cx| {
+                let mut surface = SessionSurfaces::new(runtime, None, cx);
+                let items: Vec<_> = (0..24).map(|i| PeekItem::Session(session(i).id)).collect();
+                surface
+                    .peek
+                    .begin(items, Some(&PeekItem::Session(session(23).id)));
+                surface.tab_gesture(GestureFrame::Tracking(140.0), cx);
+                surface
+            });
+            OverviewHarness {
+                surfaces,
+                background_scrolls: Arc::new(AtomicUsize::new(0)),
+            }
+        });
+        cx.simulate_resize(size(px(400.0), px(700.0)));
+        let surfaces = view.read_with(cx, |view, _| view.surfaces.clone());
+        let mut previous = cx.debug_bounds("TAB_PEEK_CARD_23").unwrap();
+        for step in (0..=120).chain((0..120).rev()) {
+            surfaces.update(cx, |surface, cx| {
+                surface.tab_gesture(GestureFrame::Tracking(140.0 + step as f32 * 2.0), cx)
+            });
+            cx.run_until_parked();
+            let card = cx
+                .debug_bounds("TAB_PEEK_CARD_23")
+                .expect("selected preview remains mounted");
+            assert!(
+                card.top() >= px(0.0) && card.bottom() <= px(700.0),
+                "{step}: {card:?}"
+            );
+            assert!(
+                (card.top() - previous.top()).abs() < px(20.0),
+                "card jumped at {step}"
+            );
+            previous = card;
+        }
+        assert_eq!(
+            surfaces.read_with(cx, |s, _| s.peek_scroll.offset().y),
+            px(0.0)
+        );
+    }
+
+    #[gpui::test]
+    fn tab_peek_streams_across_projects_with_one_resident_and_drops_on_escape(
         cx: &mut TestAppContext,
     ) {
         use crate::{tab_peek::GestureFrame, tab_preview::PreviewState};
@@ -2201,7 +2261,16 @@ mod tests {
         });
         let runtime = Arc::new(StoreRuntime::inert());
         runtime.store.write().unwrap().hydrate(SessionListResult {
-            sessions: (0..4).map(session).collect(),
+            sessions: (0..4)
+                .map(|i| {
+                    let mut record = session(i);
+                    if i >= 2 {
+                        record.project_id = ProjectId::new("other-project");
+                        record.host = Some("fixture-host".into());
+                    }
+                    record
+                })
+                .collect(),
             projects: vec![],
         });
         runtime.store.write().unwrap().select(session(0).id);

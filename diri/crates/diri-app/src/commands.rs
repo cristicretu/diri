@@ -1586,7 +1586,7 @@ impl CommandId {
             },
             Self::ToggleTabPeek => ShortcutMetadata {
                 title: "Peek tabs",
-                description: "Preview tabs in the selected project without changing work",
+                description: "Preview sessions across projects without changing work",
                 category: Navigation,
             },
             Self::OpenWorktrees => ShortcutMetadata {

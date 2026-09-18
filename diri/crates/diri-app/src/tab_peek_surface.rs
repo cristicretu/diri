@@ -1,6 +1,7 @@
 use super::*;
 use crate::tab_peek::{
-    GestureFrame, card_rect, preview_reveal_offset, terminal_offset, visible_card_indices,
+    GestureFrame, card_rect, preview_reveal_offset, preview_scroll_anchor, terminal_offset,
+    visible_card_indices,
 };
 use gpui::App;
 
@@ -206,8 +207,7 @@ impl SessionSurfaces {
                     .unwrap_or_default()
             } else {
                 let selected = store.selected_session_id().cloned().map(PeekItem::Session);
-                let sessions = crate::tab_navigation::selected_project_tabs(&mut store)
-                    .sessions
+                let sessions = crate::tab_navigation::preview_sessions(&mut store)
                     .iter()
                     .map(|session| PeekItem::Session(session.id.clone()))
                     .collect();
@@ -215,6 +215,7 @@ impl SessionSurfaces {
             };
             self.peek.begin(sessions, selected.as_ref());
             self.peek_scroll.set_offset(point(px(0.0), px(0.0)));
+            self.peek_scroll_anchor = 0.0;
         }
         if matches!(frame, GestureFrame::Tracking(_)) {
             self.closing_previews.clear();
@@ -309,6 +310,7 @@ impl SessionSurfaces {
         }
         if self.peek.visible() && self.peek.overview() > 0.5 {
             let height = (f32::from(window.viewport_size().height) - self.peek_top).max(0.0);
+            self.sync_peek_scroll(self.peek_width, height, cx.reduce_motion());
             let bounds = card_rect(
                 self.peek.focused,
                 self.peek.sessions.len(),
@@ -332,6 +334,19 @@ impl SessionSurfaces {
         cx.notify();
         true
     }
+    pub(super) fn sync_peek_scroll(&mut self, width: f32, height: f32, reduced: bool) {
+        if self.peek.is_closing() {
+            return;
+        }
+        let anchor = preview_scroll_anchor(&self.peek, width, height, reduced);
+        if anchor != self.peek_scroll_anchor {
+            let offset = f32::from(self.peek_scroll.offset().y) + self.peek_scroll_anchor - anchor;
+            self.peek_scroll
+                .set_offset(point(px(0.0), px(offset.min(0.0))));
+            self.peek_scroll_anchor = anchor;
+        }
+    }
+
     pub(super) fn render_tab_peek(
         &mut self,
         window: &mut Window,
@@ -383,6 +398,7 @@ impl SessionSurfaces {
                 })
                 .collect()
         };
+        self.sync_peek_scroll(width, height, reduced);
         let visible = visible_card_indices(
             &self.peek,
             width,
@@ -409,7 +425,9 @@ impl SessionSurfaces {
             });
         }
         let theme = crate::app_theme::terminal_theme(self.store.read().unwrap().theme_id());
-        let mut content_height = height;
+        // Keep enough scroll extent while rows separate to preserve the focal
+        // card; GPUI otherwise clamps the anchor against the previous strip.
+        let mut content_height = height + self.peek_scroll_anchor;
         for (index, session) in sessions.iter().enumerate() {
             let bounds = card_rect(index, sessions.len(), width, height, &self.peek, reduced);
             content_height = content_height.max(bounds.y + bounds.height + 24.0);

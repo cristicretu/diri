@@ -6,6 +6,9 @@ use std::time::Instant;
 pub(crate) const PEEK_DISTANCE: f32 = 140.0;
 const OVERVIEW_DISTANCE: f32 = 380.0;
 const PEEK_CONTENT_OFFSET: f32 = 176.0;
+// A normal stroke should comfortably land in the strip. Keep gain independent
+// of event timing so a quick pinch is no stronger than the same slow stroke.
+const PINCH_GAIN: f32 = 500.0;
 
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub(crate) enum GestureFrame {
@@ -63,7 +66,7 @@ impl TabPinch {
             current_position
         });
         let previous = self.position;
-        self.position = (self.position - event.delta * 1000.0).clamp(0.0, OVERVIEW_DISTANCE);
+        self.position = (self.position - event.delta * PINCH_GAIN).clamp(0.0, OVERVIEW_DISTANCE);
         let crossed_strip = (previous < PEEK_DISTANCE && self.position >= PEEK_DISTANCE)
             || (previous > PEEK_DISTANCE && self.position <= PEEK_DISTANCE);
         if crossed_strip && !self.boundary_feedback_sent {
@@ -295,14 +298,7 @@ pub(crate) struct CardRect {
     pub height: f32,
 }
 
-pub(crate) fn card_rect<T: Clone + PartialEq>(
-    index: usize,
-    count: usize,
-    width: f32,
-    height: f32,
-    peek: &TabPeek<T>,
-    reduced_motion: bool,
-) -> CardRect {
+fn overview_card_rect(index: usize, count: usize, width: f32, height: f32) -> CardRect {
     let width = width.max(1.0);
     let columns = if width < 620.0 { 1 } else { 2 };
     let rows = count.div_ceil(columns).max(1);
@@ -315,33 +311,87 @@ pub(crate) fn card_rect<T: Clone + PartialEq>(
     let target_y = 60.0
         + ((height - 80.0 - total_height) / 2.0).max(0.0)
         + (index / columns) as f32 * (target_height + gap);
+    CardRect {
+        x: target_x,
+        y: target_y,
+        width: target_width,
+        height: target_height,
+    }
+}
+
+pub(crate) fn card_rect<T: Clone + PartialEq>(
+    index: usize,
+    count: usize,
+    width: f32,
+    height: f32,
+    peek: &TabPeek<T>,
+    reduced_motion: bool,
+) -> CardRect {
+    let width = width.max(1.0);
+    let columns = if width < 620.0 { 1 } else { 2 };
+    let gap = 16.0;
+    let target = overview_card_rect(index, count, width, height);
+    let target_top = overview_card_rect(0, count, width, height).y;
     let strip_width = 176.0_f32.min((width - 24.0).max(1.0));
-    // Keep the keyboard-focused tab on screen in the strip without changing
-    // session order. The overview becomes a vertically scrollable collection.
-    let strip_x = 12.0 + index as f32 * (strip_width + 12.0)
-        - ((peek.focused as f32 * (strip_width + 12.0) + strip_width + 24.0 - width).max(0.0));
     let t = if reduced_motion {
         if peek.overview() > 0.5 { 1.0 } else { 0.0 }
     } else {
         peek.overview()
     };
-    // Make room for rows before enlarging or moving cards sideways. A single
-    // diagonal lerp lets later cards sweep over earlier cards and their labels.
-    // Both phases depend only on gesture position, so reversal retraces the path.
     let smooth = |v: f32| {
         let v = v.clamp(0.0, 1.0);
         v * v * (3.0 - 2.0 * v)
     };
+    let growth = smooth(t);
+    let mix = |a, b| a + (b - a) * growth;
+    let card_width = mix(strip_width, target.width);
+    let card_height = mix(114.0, target.height);
+    // Grow from the first movement. Until rows separate, use the growing card
+    // width for strip spacing; then fold into columns without crossing cards.
     let separate = smooth(t / 0.25);
-    let expand = smooth((t - 0.25) / 0.75);
-    let row_y = 48.0 + (index / columns) as f32 * (114.0 + gap) * separate;
-    let mix = |a, b| a + (b - a) * expand;
+    let fold = smooth((t - 0.25) / 0.75);
+    let strip_x = 12.0 + index as f32 * (card_width + 12.0)
+        - ((peek.focused as f32 * (card_width + 12.0) + card_width + 24.0 - width).max(0.0));
     CardRect {
-        x: mix(strip_x, target_x),
-        y: mix(row_y, target_y) + preview_reveal_offset(peek, reduced_motion),
-        width: mix(strip_width, target_width),
-        height: mix(114.0, target_height),
+        x: strip_x + (target.x - strip_x) * fold,
+        y: mix(48.0, target_top)
+            + (index / columns) as f32 * (card_height + gap) * separate
+            + preview_reveal_offset(peek, reduced_motion),
+        width: card_width,
+        height: card_height,
     }
+}
+
+/// Scroll with the morph so the selected strip card stays in view even when
+/// it belongs to a late overview row. This uses the painted geometry (including
+/// row separation), rather than waiting until expansion finishes to jump rows.
+pub(crate) fn preview_scroll_anchor<T: Clone + PartialEq>(
+    peek: &TabPeek<T>,
+    width: f32,
+    height: f32,
+    reduced_motion: bool,
+) -> f32 {
+    if peek.sessions.is_empty() {
+        return 0.0;
+    }
+    let count = peek.sessions.len();
+    let target = overview_card_rect(peek.focused, count, width, height);
+    // Keep the whole initial strip in view when its focused card already fits
+    // in the overview. Only late rows need the camera to follow the morph.
+    if target.y + target.height + 24.0 <= height {
+        return 0.0;
+    }
+    let first = card_rect(0, count, width, height, peek, reduced_motion);
+    let focused = card_rect(peek.focused, count, width, height, peek, reduced_motion);
+    let t = if reduced_motion {
+        if peek.overview() > 0.5 { 1.0 } else { 0.0 }
+    } else {
+        peek.overview()
+    };
+    let growth = t * t * (3.0 - 2.0 * t);
+    let bottom = (height - focused.height - 24.0).max(first.y);
+    let viewport_y = first.y + (bottom - first.y) * growth;
+    (focused.y - viewport_y).max(0.0)
 }
 
 /// Intersect the same interpolated geometry used by the painter. Offscreen
@@ -799,6 +849,81 @@ mod pinch_tests {
     }
 
     #[test]
+    fn ordinary_pinch_settles_at_small_preview_even_when_delivered_quickly() {
+        let now = Instant::now();
+        for interval in [8, 100] {
+            let mut pinch = TabPinch::default();
+            let mut peek = TabPeek::default();
+            peek.begin(vec![SessionId::new("work")], None);
+            for (i, phase, delta) in [
+                (0, gpui::TouchPhase::Started, 0.0),
+                (1, gpui::TouchPhase::Moved, -0.16),
+                (2, gpui::TouchPhase::Moved, -0.16),
+                (3, gpui::TouchPhase::Ended, 0.0),
+            ] {
+                let time = now + Duration::from_millis(i * interval);
+                if let Some(frame) = pinch.sample(&event(delta, phase), peek.position(), time) {
+                    peek.update_animated(frame, time, true);
+                }
+            }
+            assert_eq!(peek.position(), PEEK_DISTANCE);
+        }
+    }
+
+    #[test]
+    fn cards_start_growing_when_leaving_the_strip() {
+        let mut peek = TabPeek::default();
+        peek.begin(vec![SessionId::new("work")], None);
+        peek.update(GestureFrame::Tracking(PEEK_DISTANCE));
+        let small = card_rect(0, 1, 1000.0, 700.0, &peek, false);
+        peek.update(GestureFrame::Tracking(PEEK_DISTANCE + 24.0));
+        let growing = card_rect(0, 1, 1000.0, 700.0, &peek, false);
+        assert!(growing.width > small.width && growing.height > small.height);
+    }
+
+    #[test]
+    fn early_cards_do_not_scroll_out_before_the_overview_needs_scroll() {
+        let mut peek = TabPeek::default();
+        peek.begin(
+            (0..6).map(|i| SessionId::new(i.to_string())).collect(),
+            None,
+        );
+        peek.focused = 2;
+        for step in 0..=240 {
+            peek.update(GestureFrame::Tracking(PEEK_DISTANCE + step as f32));
+            assert_eq!(preview_scroll_anchor(&peek, 1000.0, 700.0, false), 0.0);
+        }
+    }
+
+    #[test]
+    fn focused_card_stays_visible_while_small_preview_expands() {
+        let mut peek = TabPeek::default();
+        peek.begin(
+            (0..24).map(|i| SessionId::new(i.to_string())).collect(),
+            None,
+        );
+        for width in [400.0, 800.0, 1100.0] {
+            for focused in [5, 11, 23] {
+                peek.focused = focused;
+                for step in 0..=240 {
+                    peek.update(GestureFrame::Tracking(PEEK_DISTANCE + step as f32));
+                    assert!(
+                        visible_card_indices(
+                            &peek,
+                            width,
+                            700.0,
+                            -preview_scroll_anchor(&peek, width, 700.0, false),
+                            false
+                        )
+                        .contains(&focused),
+                        "focused card disappeared at width {width}, focus {focused}, step {step}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
     fn identical_strokes_have_identical_positions_regardless_of_timing() {
         let now = Instant::now();
         for interval in [8, 16, 100, 500] {
@@ -807,7 +932,7 @@ mod pinch_tests {
             let mut frame = None;
             for i in 1..=8 {
                 frame = pinch.sample(
-                    &event(-0.04, gpui::TouchPhase::Moved),
+                    &event(-0.08, gpui::TouchPhase::Moved),
                     0.0,
                     now + Duration::from_millis(i * interval),
                 );
@@ -822,17 +947,17 @@ mod pinch_tests {
         let mut pinch = TabPinch::default();
         pinch.sample(&event(0.0, gpui::TouchPhase::Started), 120.0, now);
         assert_eq!(
-            pinch.sample(&event(-0.04, gpui::TouchPhase::Moved), 120.0, now),
+            pinch.sample(&event(-0.08, gpui::TouchPhase::Moved), 120.0, now),
             Some(GestureFrame::Tracking(40.0))
         );
         assert!(pinch.take_feedback());
         assert_eq!(
-            pinch.sample(&event(0.04, gpui::TouchPhase::Moved), 160.0, now),
+            pinch.sample(&event(0.08, gpui::TouchPhase::Moved), 160.0, now),
             Some(GestureFrame::Tracking(0.0))
         );
         assert!(!pinch.take_feedback());
         assert_eq!(
-            pinch.sample(&event(-0.04, gpui::TouchPhase::Moved), 120.0, now),
+            pinch.sample(&event(-0.08, gpui::TouchPhase::Moved), 120.0, now),
             Some(GestureFrame::Tracking(40.0))
         );
         assert!(!pinch.take_feedback());
@@ -845,7 +970,7 @@ mod pinch_tests {
         pinch.sample(&event(0.0, gpui::TouchPhase::Started), 380.0, now);
         pinch.sample(&event(-0.5, gpui::TouchPhase::Moved), 380.0, now);
         assert_eq!(
-            pinch.sample(&event(0.02, gpui::TouchPhase::Moved), 380.0, now),
+            pinch.sample(&event(0.04, gpui::TouchPhase::Moved), 380.0, now),
             Some(GestureFrame::Tracking(-20.0))
         );
         assert_eq!(
@@ -858,7 +983,7 @@ mod pinch_tests {
         );
         pinch.sample(&event(0.0, gpui::TouchPhase::Started), 0.0, now);
         assert_eq!(
-            pinch.sample(&event(-0.04, gpui::TouchPhase::Moved), 0.0, now),
+            pinch.sample(&event(-0.08, gpui::TouchPhase::Moved), 0.0, now),
             Some(GestureFrame::Tracking(40.0))
         );
     }
@@ -872,7 +997,7 @@ mod pinch_tests {
             Some(GestureFrame::Tracking(0.0))
         );
         assert_eq!(
-            pinch.sample(&event(0.005, gpui::TouchPhase::Moved), 225.0, now),
+            pinch.sample(&event(0.01, gpui::TouchPhase::Moved), 225.0, now),
             Some(GestureFrame::Tracking(-5.0))
         );
         assert_eq!(
@@ -900,7 +1025,7 @@ mod pinch_tests {
         assert!(!peek.is_settling());
         let moved_at = grabbed_at + Duration::from_millis(16);
         let frame = pinch
-            .sample(&event(0.04, gpui::TouchPhase::Moved), pose, moved_at)
+            .sample(&event(0.08, gpui::TouchPhase::Moved), pose, moved_at)
             .unwrap();
         peek.update_animated(frame, moved_at, false);
         assert_eq!(peek.position(), pose - 40.0);
@@ -914,7 +1039,7 @@ mod pinch_tests {
         pinch.sample(&event(0.0, gpui::TouchPhase::Started), PEEK_DISTANCE, now);
         assert_eq!(
             pinch.sample(
-                &event(-0.04, gpui::TouchPhase::Moved),
+                &event(-0.08, gpui::TouchPhase::Moved),
                 PEEK_DISTANCE,
                 now + Duration::from_millis(16)
             ),
@@ -927,10 +1052,10 @@ mod pinch_tests {
         let now = Instant::now();
         let mut pinch = TabPinch::default();
         pinch.sample(&event(0.0, gpui::TouchPhase::Started), 0.0, now);
-        pinch.sample(&event(-0.12, gpui::TouchPhase::Moved), 0.0, now);
+        pinch.sample(&event(-0.24, gpui::TouchPhase::Moved), 0.0, now);
         assert_eq!(
             pinch.sample(
-                &event(-0.04, gpui::TouchPhase::Moved),
+                &event(-0.08, gpui::TouchPhase::Moved),
                 120.0,
                 now + Duration::from_millis(16)
             ),
