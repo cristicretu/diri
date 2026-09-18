@@ -16,9 +16,9 @@ use diri_proto::{
     SessionRecord,
 };
 use diri_ui::{
-    AgentLogo, AlertChip, AttentionDot, AttentionLevel, Fill, FloatingSurface, Glass, GlassPill,
-    HairlineDivider, HoverMarquee, Ink, LoadingIndicator, Metrics, Motion, Palette, Radius,
-    RowFill, SemanticColors, Space, StateChip, StatusGlyph, StatusState, Typo,
+    AgentLogo, AlertChip, Fill, FloatingSurface, Glass, GlassPill, HairlineDivider, HoverMarquee,
+    Ink, LoadingIndicator, Metrics, Motion, Palette, Radius, RowFill, SemanticColors, Space,
+    StateChip, StatusGlyph, StatusState, Typo,
 };
 use gpui::{
     Anchor, Animation, AnimationExt, AnyElement, App, AppContext as _, Bounds, Context,
@@ -2578,9 +2578,6 @@ impl Sidebar {
             })
             .when(project_is_remote && !is_hovered, |row| {
                 row.child(trailing_remote_mark(colors))
-            })
-            .when(!is_hovered && collapsed, |row| {
-                row.child(AttentionDot::new(rollup_attention(&group.active), colors))
             })
             .when(is_hovered, |row| {
                 row.child(
@@ -8506,38 +8503,6 @@ fn agent_picker_shortcut(
             .unwrap_or_default()
     } else {
         fallback.to_owned()
-    }
-}
-
-fn rollup_attention(sessions: &[Arc<SessionRecord>]) -> AttentionLevel {
-    sessions
-        .iter()
-        .fold(AttentionLevel::None, |rollup, session| {
-            let state = match status_state(session, false) {
-                StatusState::NeedsInput { destructive } => {
-                    AttentionLevel::NeedsInput { destructive }
-                }
-                StatusState::DoneUnseen => AttentionLevel::DoneUnseen,
-                StatusState::Working => AttentionLevel::Working,
-                StatusState::IdleSeen => AttentionLevel::IdleSeen,
-                StatusState::Hibernated => AttentionLevel::Hibernated,
-                StatusState::None => AttentionLevel::None,
-            };
-            if attention_rank(state) > attention_rank(rollup) {
-                state
-            } else {
-                rollup
-            }
-        })
-}
-
-const fn attention_rank(level: AttentionLevel) -> u8 {
-    match level {
-        AttentionLevel::None | AttentionLevel::Hibernated => 0,
-        AttentionLevel::IdleSeen => 1,
-        AttentionLevel::Working => 2,
-        AttentionLevel::DoneUnseen => 3,
-        AttentionLevel::NeedsInput { .. } => 4,
     }
 }
 
