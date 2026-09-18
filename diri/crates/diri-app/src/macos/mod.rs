@@ -1,5 +1,6 @@
 pub mod brand_raster;
 pub mod browser;
+pub(crate) mod floating_panel;
 pub mod menu_bar;
 pub mod notifier;
 pub(crate) mod terminal_keys;

@@ -308,13 +308,19 @@ impl Sidebar {
         self.project_picker.open || self.project_picker.new_agent
     }
 
-    fn header_new_agent_menu(
+    /// Whether the dropdown list itself is open (the header's New Session
+    /// menu is a popover, not the picker).
+    pub(super) fn project_picker_open(&self) -> bool {
+        self.project_picker.open
+    }
+
+    pub(super) fn header_new_agent_menu(
         &self,
         directory: Option<String>,
         host: Option<String>,
         colors: SemanticColors,
         cx: &mut Context<Self>,
-    ) -> AnyElement {
+    ) -> PopoverSpec {
         if let Some(host) = host.as_ref()
             && self.store.read().expect("store").host(host).is_none()
         {
@@ -338,7 +344,9 @@ impl Sidebar {
                     .on_click(cx.listener(|this, _, window, cx| {
                         this.ui.popover = None;
                         this.project_picker.new_agent = false;
-                        this.dismiss_project_picker(window, cx);
+                        this.in_main_window(window, cx, |this, window, cx| {
+                            this.dismiss_project_picker(window, cx);
+                        });
                         cx.stop_propagation();
                     })));
             return self.popover_shell_at(
@@ -361,8 +369,14 @@ impl Sidebar {
     ) -> Option<AnyElement> {
         let colors = self.colors();
         if !self.project_picker.open {
+            self.close_panel(PanelTarget::Picker, cx);
+            if self.ui.popover.is_none() {
+                self.close_panel(PanelTarget::Popover, cx);
+            }
             return if self.project_picker.new_agent {
                 if let Some(Popover::NewAgent { directory, host }) = self.ui.popover.clone() {
+                    let spec = self.header_new_agent_menu(directory, host, colors, cx);
+                    let menu = self.host_popover(spec, window, cx);
                     Some(
                         div()
                             .absolute()
@@ -378,7 +392,7 @@ impl Sidebar {
                                     }
                                 },
                             ))
-                            .child(self.header_new_agent_menu(directory, host, colors, cx))
+                            .child(menu)
                             .into_any_element(),
                     )
                 } else {
@@ -395,12 +409,114 @@ impl Sidebar {
                 None
             };
         }
+        let layout = self.project_picker_layout(window.viewport_size())?;
+        let scrim = div()
+            .id("project-picker-overlay")
+            .debug_selector(|| "project-picker-overlay".into())
+            .absolute()
+            .inset_0()
+            .occlude()
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|this, _, window, cx| {
+                    this.dismiss_project_picker(window, cx);
+                    cx.stop_propagation();
+                }),
+            );
+        if self.uses_floating_panels(cx) {
+            // The panel paints the dropdown; the main window keeps the focus
+            // and key handling, since the search field is driven by key-down
+            // events rather than a text input handler.
+            let content = self.project_picker_content(colors, layout.height, cx);
+            let probe =
+                crate::floating::surface(colors, Radius::FLOATING_MENU, layout.width, content)
+                    .into_any_element();
+            let measure = self.measure_for_panel(
+                PanelTarget::Picker,
+                probe,
+                layout.width,
+                point(px(layout.left), px(layout.top)),
+                Anchor::TopLeft,
+                window,
+                cx,
+            );
+            return Some(
+                scrim
+                    .child(
+                        div()
+                            .id("project-picker-popup")
+                            .absolute()
+                            .left(px(layout.left))
+                            .top(px(layout.top))
+                            .w(px(0.0))
+                            .h(px(0.0))
+                            .track_focus(&self.project_picker.focus)
+                            .on_key_down(cx.listener(Self::project_picker_key))
+                            .child(measure),
+                    )
+                    .into_any_element(),
+            );
+        }
+        self.close_panel(PanelTarget::Picker, cx);
+        let content = self.project_picker_content(colors, layout.height, cx);
+        Some(
+            scrim
+                .child(
+                    div()
+                        .id("project-picker-popup")
+                        .debug_selector(|| "project-picker-popup".into())
+                        .role(Role::Menu)
+                        .absolute()
+                        .left(px(layout.left))
+                        .top(px(layout.top))
+                        .w(px(layout.width))
+                        .occlude()
+                        .track_focus(&self.project_picker.focus)
+                        .on_key_down(cx.listener(Self::project_picker_key))
+                        .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                        .child(FloatingSurface::new(colors, content).radius(Radius::FLOATING_MENU)),
+                )
+                .into_any_element(),
+        )
+    }
+
+    /// Where the dropdown sits under its header control, clamped to the
+    /// viewport the way the in-window popup always was.
+    fn project_picker_layout(&self, viewport: Size<Pixels>) -> Option<PickerLayout> {
         let bounds = (*self.project_picker.anchor.borrow())?;
-        let width = 300.0_f32.min((f32::from(window.viewport_size().width) - 16.0).max(0.0));
-        let left = f32::from(bounds.left())
-            .min((f32::from(window.viewport_size().width) - width - 8.0).max(8.0));
+        let width = 300.0_f32.min((f32::from(viewport.width) - 16.0).max(0.0));
+        let left = f32::from(bounds.left()).min((f32::from(viewport.width) - width - 8.0).max(8.0));
         let top = f32::from(bounds.bottom()) + 4.0;
-        let height = (f32::from(window.viewport_size().height) - top - 12.0).clamp(0.0, 420.0);
+        let height = (f32::from(viewport.height) - top - 12.0).clamp(0.0, 420.0);
+        Some(PickerLayout {
+            left,
+            top,
+            width,
+            height,
+        })
+    }
+
+    /// The dropdown's pixels for its floating panel.
+    pub(super) fn project_picker_panel_content(
+        &mut self,
+        cx: &mut Context<Self>,
+    ) -> Option<AnyElement> {
+        let colors = self.colors();
+        let layout = self.project_picker_layout(self.main_viewport)?;
+        let content = self.project_picker_content(colors, layout.height, cx);
+        Some(
+            crate::floating::surface(colors, Radius::FLOATING_MENU, layout.width, content)
+                .into_any_element(),
+        )
+    }
+
+    /// The search field and project rows, at most `height` tall.
+    fn project_picker_content(
+        &mut self,
+        colors: SemanticColors,
+        height: f32,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
         let choices = projects(
             &self.store.read().expect("store"),
             self.project_picker.query.text(),
@@ -441,7 +557,7 @@ impl Sidebar {
                     .h(px(48.0))
                     .flex_none()
                     .px(px(9.0))
-                    .rounded(px(8.0))
+                    .rounded(px(Radius::inner(Radius::FLOATING_MENU, 5.0)))
                     .flex()
                     .items_center()
                     .gap(px(9.0))
@@ -476,7 +592,10 @@ impl Sidebar {
                         row.child(sf_symbol("checkmark", 10.0, colors.secondary))
                     })
                     .on_click(cx.listener(move |this, _, window, cx| {
-                        this.choose_project(project.clone(), window, cx);
+                        let project = project.clone();
+                        this.in_main_window(window, cx, move |this, window, cx| {
+                            this.choose_project(project, window, cx);
+                        });
                         cx.stop_propagation();
                     })),
             );
@@ -489,64 +608,39 @@ impl Sidebar {
         } else {
             query_label(&self.project_picker.query)
         };
-        Some(
-            div()
-                .id("project-picker-overlay")
-                .debug_selector(|| "project-picker-overlay".into())
-                .absolute()
-                .inset_0()
-                .occlude()
-                .on_mouse_down(
-                    MouseButton::Left,
-                    cx.listener(|this, _, window, cx| {
-                        this.dismiss_project_picker(window, cx);
-                        cx.stop_propagation();
-                    }),
-                )
-                .child(
-                    div()
-                        .id("project-picker-popup")
-                        .debug_selector(|| "project-picker-popup".into())
-                        .role(Role::Menu)
-                        .absolute()
-                        .left(px(left))
-                        .top(px(top))
-                        .w(px(width))
-                        .occlude()
-                        .track_focus(&self.project_picker.focus)
-                        .on_key_down(cx.listener(Self::project_picker_key))
-                        .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
-                        .child(FloatingSurface::new(
-                            colors,
-                            div()
-                                .max_h(px(height))
-                                .flex()
-                                .flex_col()
-                                .child(
-                                    div()
-                                        .id("project-picker-search")
-                                        .debug_selector(|| "project-picker-search".into())
-                                        .role(Role::TextInput)
-                                        .aria_label("Search projects")
-                                        .text_size(px(Typo::META.size))
-                                        .text_color(colors.primary)
-                                        .h(px(42.0))
-                                        .flex_none()
-                                        .px(px(13.0))
-                                        .flex()
-                                        .items_center()
-                                        .gap(px(8.0))
-                                        .border_b_1()
-                                        .border_color(colors.floating_stroke())
-                                        .child(sf_symbol("magnifyingglass", 12.0, colors.tertiary))
-                                        .child(query),
-                                )
-                                .child(list),
-                        )),
-                )
-                .into_any_element(),
-        )
+        div()
+            .max_h(px(height))
+            .flex()
+            .flex_col()
+            .child(
+                div()
+                    .id("project-picker-search")
+                    .debug_selector(|| "project-picker-search".into())
+                    .role(Role::TextInput)
+                    .aria_label("Search projects")
+                    .text_size(px(Typo::META.size))
+                    .text_color(colors.primary)
+                    .h(px(42.0))
+                    .flex_none()
+                    .px(px(13.0))
+                    .flex()
+                    .items_center()
+                    .gap(px(8.0))
+                    .border_b_1()
+                    .border_color(colors.floating_stroke())
+                    .child(sf_symbol("magnifyingglass", 12.0, colors.tertiary))
+                    .child(query),
+            )
+            .child(list)
+            .into_any_element()
     }
+}
+
+struct PickerLayout {
+    left: f32,
+    top: f32,
+    width: f32,
+    height: f32,
 }
 
 #[cfg(test)]

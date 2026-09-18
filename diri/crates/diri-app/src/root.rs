@@ -293,6 +293,11 @@ pub struct RootView {
     status_banner_generation: u64,
     quote_target_picker: Option<QuoteTargetPicker>,
     notification_panel_open: bool,
+    /// The notification panel's blurred panel under glass (see `crate::floating`).
+    floating_notifications: Option<crate::floating::Panel>,
+    main_window: Option<gpui::AnyWindowHandle>,
+    main_bounds: gpui::Bounds<gpui::Pixels>,
+    main_viewport: gpui::Size<gpui::Pixels>,
     notification_filter_unread: bool,
     notification_selected: usize,
     notification_scroll: gpui::UniformListScrollHandle,
@@ -899,6 +904,12 @@ impl RootView {
         let activation = cx.observe_window_activation(window, move |this, window, cx| {
             if !window.is_window_active() {
                 this.tab_pinch.cancel();
+                // The notification panel is its own window under glass; the
+                // main window losing key status is its "click outside".
+                if this.floating_notifications.is_some() {
+                    crate::floating::close(this, notification_panel::NOTIFICATIONS_PANEL, cx);
+                    this.toggle_notifications(window, cx);
+                }
                 if let Some(surfaces) = &this.session_surfaces {
                     surfaces.update(cx, |s, cx| s.cancel_tab_peek_immediately(cx));
                 }
@@ -1298,6 +1309,10 @@ impl RootView {
             status_banner_generation: 0,
             quote_target_picker: None,
             notification_panel_open: false,
+            floating_notifications: None,
+            main_window: None,
+            main_bounds: gpui::Bounds::default(),
+            main_viewport: gpui::Size::default(),
             notification_filter_unread: true,
             notification_selected: 0,
             notification_scroll: gpui::UniformListScrollHandle::new(),
@@ -1497,6 +1512,17 @@ impl RootView {
         self.sync_inspector_context(cx);
         self.sync_auxiliary_terminal(window, cx);
         cx.notify();
+    }
+
+    /// Runs `f` against the main window even from a panel handler.
+    fn in_main_window(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+        f: impl FnOnce(&mut Self, &mut Window, &mut Context<Self>) + 'static,
+    ) {
+        let main = self.main_window;
+        crate::floating::in_main_window(self, main, window, cx, f);
     }
 
     fn colors(&self) -> SemanticColors {
@@ -4083,6 +4109,9 @@ impl RootView {
 
 impl Render for RootView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        self.main_window = Some(window.window_handle());
+        self.main_bounds = window.bounds();
+        self.main_viewport = window.viewport_size();
         if self.pending_notification_open.is_some()
             && self
                 .window_store

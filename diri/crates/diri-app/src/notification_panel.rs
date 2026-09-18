@@ -7,6 +7,28 @@ use gpui::{ScrollStrategy, uniform_list};
 
 const NOTIFICATION_ROW_HEIGHT: f32 = 52.0;
 
+/// The notification panel's corner radius: the menu radius, with rows inset
+/// six points rounding at ten.
+const NOTIFICATION_RADIUS: f32 = Radius::FLOATING_MENU;
+
+/// The notification panel as a panel target (see `crate::floating::Target`).
+pub(super) const NOTIFICATIONS_PANEL: crate::floating::Target<RootView> = crate::floating::Target {
+    radius: NOTIFICATION_RADIUS,
+    slot: |root| &mut root.floating_notifications,
+    wanted: |root| root.notification_panel_open,
+    content: RootView::notification_panel_content,
+};
+
+/// What `notification_content` builds: the list plus the geometry the host
+/// needs to place it.
+struct NotificationContent {
+    content: AnyElement,
+    colors: SemanticColors,
+    width: f32,
+    panel_top: f32,
+    settings_open: bool,
+}
+
 impl RootView {
     pub(super) fn toggle_notifications(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.notification_panel_open = !self.notification_panel_open;
@@ -207,7 +229,7 @@ impl RootView {
                     .group("notification-row")
                     .h_full()
                     .px(px(10.0))
-                    .rounded(px(Radius::ROW))
+                    .rounded(px(Radius::inner(NOTIFICATION_RADIUS, 6.0)))
                     .flex()
                     .items_center()
                     .gap(px(6.0))
@@ -223,12 +245,10 @@ impl RootView {
                     .active(move |style| style.bg(colors.primary.alpha(0.14)))
                     .tooltip(move |_, cx| cx.new(|_| PaletteTooltip(detail.clone(), colors)).into())
                     .on_click(cx.listener(move |this, _, window, cx| {
-                        this.open_notification(
-                            entry.session_id.clone(),
-                            Some(entry.id.clone()),
-                            window,
-                            cx,
-                        );
+                        let (session_id, id) = (entry.session_id.clone(), entry.id.clone());
+                        this.in_main_window(window, cx, move |this, window, cx| {
+                            this.open_notification(session_id, Some(id), window, cx);
+                        });
                     }))
                     .child(
                         div()
@@ -360,11 +380,13 @@ impl RootView {
             .min(self.notification_rows().len().saturating_sub(1));
     }
 
-    pub(super) fn notification_panel(
+    /// The notification list and its header for a `viewport`-sized window,
+    /// without any host chrome.
+    fn notification_content(
         &self,
-        window: &Window,
+        viewport: gpui::Size<gpui::Pixels>,
         cx: &mut Context<Self>,
-    ) -> Option<AnyElement> {
+    ) -> Option<NotificationContent> {
         if !self.notification_panel_open {
             return None;
         }
@@ -387,7 +409,6 @@ impl RootView {
         } else {
             Metrics::TITLE_BAR + 6.0
         };
-        let viewport = window.inner_window_bounds().get_bounds().size;
         let list_height = (count.max(1) as f32 * NOTIFICATION_ROW_HEIGHT)
             .min(NOTIFICATION_ROW_HEIGHT * 7.0)
             .min(
@@ -502,7 +523,9 @@ impl RootView {
                             .hover(move |style| style.bg(Fill::hover(colors, true)))
                             .child("esc")
                             .on_click(cx.listener(|this, _, window, cx| {
-                                this.toggle_notifications(window, cx)
+                                this.in_main_window(window, cx, |this, window, cx| {
+                                    this.toggle_notifications(window, cx)
+                                })
                             })),
                     ),
             )
@@ -568,6 +591,50 @@ impl RootView {
             .when(self.notification_options_open, |view| {
                 view.child(self.notification_options(sounds, alerts, colors, cx))
             });
+        Some(NotificationContent {
+            content: content.into_any_element(),
+            colors,
+            width: (f32::from(viewport.width) - 28.0).clamp(0.0, 440.0),
+            panel_top,
+            settings_open,
+        })
+    }
+
+    /// The notification panel's pixels for its floating panel.
+    pub(super) fn notification_panel_content(
+        &mut self,
+        cx: &mut Context<Self>,
+    ) -> Option<AnyElement> {
+        let notification = self.notification_content(self.main_viewport, cx)?;
+        Some(
+            crate::floating::surface(
+                notification.colors,
+                NOTIFICATION_RADIUS,
+                notification.width,
+                notification.content,
+            )
+            .into_any_element(),
+        )
+    }
+
+    pub(super) fn notification_panel(
+        &mut self,
+        window: &Window,
+        cx: &mut Context<Self>,
+    ) -> Option<AnyElement> {
+        let viewport = window.inner_window_bounds().get_bounds().size;
+        let Some(notification) = self.notification_content(viewport, cx) else {
+            crate::floating::close(self, NOTIFICATIONS_PANEL, cx);
+            return None;
+        };
+        let NotificationContent {
+            content,
+            colors,
+            width,
+            panel_top,
+            settings_open,
+        } = notification;
+        let floating = crate::floating::uses_panels(self.preview, colors, cx);
         let panel = div()
             .id("notification-panel")
             .debug_selector(|| "notification-panel".into())
@@ -575,11 +642,33 @@ impl RootView {
             .absolute()
             .top(px(panel_top))
             .right(px(14.0))
-            .w(px((f32::from(viewport.width) - 28.0).clamp(0.0, 440.0)))
             .occlude()
             .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
-            .on_click(|_, _, cx| cx.stop_propagation())
-            .child(FloatingSurface::new(colors, content).radius(Radius::PANEL));
+            .on_click(|_, _, cx| cx.stop_propagation());
+        let panel = if floating {
+            // Focus, keys, and the dismiss layer stay here; the panel paints
+            // the surface where the in-window one would sit.
+            let probe = crate::floating::surface(colors, NOTIFICATION_RADIUS, width, content)
+                .into_any_element();
+            let measure = crate::floating::measure_element(
+                cx.entity().downgrade(),
+                NOTIFICATIONS_PANEL,
+                probe,
+                width,
+                self.main_bounds,
+                gpui::point(viewport.width - px(14.0), px(panel_top)),
+                gpui::Anchor::TopRight,
+                0.0,
+                window,
+                cx,
+            );
+            panel.w(px(0.0)).h(px(0.0)).child(measure)
+        } else {
+            crate::floating::close(self, NOTIFICATIONS_PANEL, cx);
+            panel
+                .w(px(width))
+                .child(FloatingSurface::new(colors, content).radius(NOTIFICATION_RADIUS))
+        };
         Some(
             div()
                 .absolute()

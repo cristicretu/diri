@@ -336,7 +336,7 @@ impl TerminalPane {
         }
         session_rows(session)
     }
-    fn close_session_links(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+    pub(super) fn close_session_links(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.session_links.close();
         self.focus.focus(window, cx);
         cx.notify();
@@ -611,11 +611,18 @@ impl TerminalPane {
                                         })
                                         .on_click(cx.listener(move |this, _, window, cx| {
                                             this.session_links.selected = index;
-                                            this.activate_link(
-                                                &LinkAction::PullRequest(url.clone()),
-                                                false,
+                                            let url = url.clone();
+                                            this.in_main_window(
                                                 window,
                                                 cx,
+                                                move |this, window, cx| {
+                                                    this.activate_link(
+                                                        &LinkAction::PullRequest(url),
+                                                        false,
+                                                        window,
+                                                        cx,
+                                                    );
+                                                },
                                             );
                                             cx.stop_propagation();
                                         })),
@@ -629,16 +636,19 @@ impl TerminalPane {
             .tooltip(move |_, cx| cx.new(|_| PaletteTooltip(help.clone(), colors)).into())
             .on_click(cx.listener(move |this, event: &ClickEvent, window, cx| {
                 this.session_links.selected = index;
-                this.activate_link(&action, event.modifiers().alt, window, cx);
+                let (action, alt) = (action.clone(), event.modifiers().alt);
+                this.in_main_window(window, cx, move |this, window, cx| {
+                    this.activate_link(&action, alt, window, cx);
+                });
                 cx.stop_propagation();
             }))
             .into_any_element()
     }
-    pub(super) fn render_session_links(
+    /// The Links popover's rows for `session`, without any host chrome.
+    fn links_content(
         &mut self,
         session: &SessionRecord,
         colors: SemanticColors,
-        window: &Window,
         cx: &mut Context<Self>,
     ) -> Option<AnyElement> {
         if !self.session_links.open {
@@ -738,7 +748,7 @@ impl TerminalPane {
         let row_height = ROW_HEIGHT;
         let list_height = (row_count as f32 * row_height)
             .min(364.0)
-            .min((f32::from(window.viewport_size().height) - 230.0).max(ROW_HEIGHT));
+            .min((f32::from(self.main_viewport.height) - 230.0).max(ROW_HEIGHT));
         let body = if rows.is_empty() {
             div()
                 .px(px(14.0))
@@ -886,7 +896,9 @@ impl TerminalPane {
                             )
                             .child(Icon::new(IconName::ChevronRight, 14.0, colors.tertiary))
                             .on_click(cx.listener(|this, _, window, cx| {
-                                this.activate_link(&LinkAction::Account, false, window, cx);
+                                this.in_main_window(window, cx, |this, window, cx| {
+                                    this.activate_link(&LinkAction::Account, false, window, cx);
+                                });
                                 cx.stop_propagation();
                             })),
                     );
@@ -894,24 +906,75 @@ impl TerminalPane {
                 content = content.child(context);
             }
         }
+        Some(content.into_any_element())
+    }
+
+    /// How wide the Links popover may be inside `viewport`.
+    fn links_width(viewport: gpui::Size<Pixels>) -> f32 {
+        380.0_f32.min(f32::from(viewport.width) - 24.0).max(120.0)
+    }
+
+    /// The Links popover's pixels for its floating panel.
+    pub(super) fn links_panel_content(&mut self, cx: &mut Context<Self>) -> Option<AnyElement> {
+        let session = self.selected_session()?;
+        let colors = self.panel_colors();
+        let content = self.links_content(&session, colors, cx)?;
+        let width = Self::links_width(self.main_viewport);
+        Some(crate::floating::surface(colors, Radius::PANEL, width, content).into_any_element())
+    }
+
+    pub(super) fn render_session_links(
+        &mut self,
+        session: &SessionRecord,
+        colors: SemanticColors,
+        window: &Window,
+        cx: &mut Context<Self>,
+    ) -> Option<AnyElement> {
+        let Some(content) = self.links_content(session, colors, cx) else {
+            crate::floating::close(self, LINKS_PANEL, cx);
+            return None;
+        };
+        let position = self.session_links.anchor.get() + point(px(0.0), px(8.0));
+        let shell = div()
+            .absolute()
+            .inset_0()
+            .track_focus(&self.session_links.focus)
+            .on_key_down(cx.listener(Self::links_key_down))
+            .on_scroll_wheel(|_, _, cx| cx.stop_propagation())
+            .child(div().absolute().inset_0().occlude().on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|this, _, window, cx| {
+                    this.close_session_links(window, cx);
+                    cx.stop_propagation();
+                }),
+            ));
+        if crate::floating::uses_panels(false, colors, cx) {
+            // Focus, keys, and the dismiss scrim stay here; the panel paints
+            // the surface where the in-window one would anchor.
+            let width = Self::links_width(window.viewport_size());
+            let probe =
+                crate::floating::surface(colors, Radius::PANEL, width, content).into_any_element();
+            let measure = crate::floating::measure_element(
+                cx.entity().downgrade(),
+                LINKS_PANEL,
+                probe,
+                width,
+                self.main_bounds,
+                position,
+                Anchor::TopRight,
+                12.0,
+                window,
+                cx,
+            );
+            return Some(shell.child(measure).into_any_element());
+        }
+        crate::floating::close(self, LINKS_PANEL, cx);
         Some(
-            div()
-                .absolute()
-                .inset_0()
-                .track_focus(&self.session_links.focus)
-                .on_key_down(cx.listener(Self::links_key_down))
-                .on_scroll_wheel(|_, _, cx| cx.stop_propagation())
-                .child(div().absolute().inset_0().occlude().on_mouse_down(
-                    MouseButton::Left,
-                    cx.listener(|this, _, window, cx| {
-                        this.close_session_links(window, cx);
-                        cx.stop_propagation();
-                    }),
-                ))
+            shell
                 .child(deferred(
                     anchored()
                         .anchor(Anchor::TopRight)
-                        .position(self.session_links.anchor.get() + point(px(0.0), px(8.0)))
+                        .position(position)
                         .snap_to_window_with_margin(px(12.0))
                         .child(
                             div()
@@ -928,6 +991,15 @@ impl TerminalPane {
         )
     }
 }
+
+/// The Links popover as a panel target (see `crate::floating::Target`).
+pub(super) const LINKS_PANEL: crate::floating::Target<TerminalPane> = crate::floating::Target {
+    radius: Radius::PANEL,
+    slot: |pane| &mut pane.floating_links,
+    wanted: |pane| pane.session_links.open,
+    content: TerminalPane::links_panel_content,
+};
+
 fn pr_number(url: &str) -> Option<String> {
     let parts: Vec<_> = url.split('/').filter(|part| !part.is_empty()).collect();
     if let Some(index) = parts.iter().position(|part| *part == "pull") {

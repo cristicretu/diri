@@ -45,13 +45,27 @@ use gpui::{
 const SEARCH_HEIGHT: f32 = 48.0;
 const ROW_HEIGHT: f32 = 36.0;
 const LIST_HEIGHT: f32 = ROW_HEIGHT * 9.0;
-const SURFACE_WIDTH: f32 = 600.0;
+const SURFACE_WIDTH: f32 = 540.0;
 const KEYCAP_WIDTH: f32 = 28.0;
 const KEYCAP_HEIGHT: f32 = 20.0;
 const CHAT_PREVIEW_LIMIT: usize = 5;
 const PAGE_DURATION: Duration = Duration::from_millis(140);
 
 /// Where the overlay sits and how tall its list may grow in this window.
+/// The palette's corner radius: the menu radius, so every floating surface
+/// shares one outer shape and its rows (inset six points) round at ten.
+pub(crate) const PALETTE_RADIUS: f32 = Radius::FLOATING_MENU;
+/// Horizontal inset of a result row inside the palette surface.
+pub(crate) const PALETTE_ROW_INSET: f32 = 6.0;
+
+/// The palette as a panel target (see `crate::floating::Target`).
+const PALETTE_PANEL: crate::floating::Target<NavigationOverlay> = crate::floating::Target {
+    radius: PALETTE_RADIUS,
+    slot: |this| &mut this.floating,
+    wanted: |this| this.overlay.is_some(),
+    content: NavigationOverlay::palette_panel_content,
+};
+
 #[derive(Clone, Copy, Debug, PartialEq)]
 struct OverlayLayout {
     top_inset: Pixels,
@@ -100,6 +114,12 @@ pub struct NavigationOverlay {
     workspace_spawn_target: Option<crate::store::WorkspaceSpawnTarget>,
     focus_handle: FocusHandle,
     previous_focus_handle: Option<FocusHandle>,
+    /// The palette's blurred panel window under glass (see `crate::floating`).
+    floating: Option<crate::floating::Panel>,
+    main_window: Option<gpui::AnyWindowHandle>,
+    main_bounds: gpui::Bounds<Pixels>,
+    main_viewport: gpui::Size<Pixels>,
+    activation: Option<gpui::Subscription>,
     store: crate::store::WindowStore,
     _runtime: Arc<StoreRuntime>,
     overlay: Option<Overlay>,
@@ -231,6 +251,11 @@ impl NavigationOverlay {
             workspace_spawn_target: None,
             focus_handle,
             previous_focus_handle: None,
+            floating: None,
+            main_window: None,
+            main_bounds: gpui::Bounds::default(),
+            main_viewport: gpui::Size::default(),
+            activation: None,
             store: crate::store::WindowStore::from_canonical(Arc::clone(&runtime.store)),
             _runtime: runtime,
             overlay: None,
@@ -286,6 +311,11 @@ impl NavigationOverlay {
             workspace_spawn_target: None,
             focus_handle: cx.focus_handle(),
             previous_focus_handle: None,
+            floating: None,
+            main_window: None,
+            main_bounds: gpui::Bounds::default(),
+            main_viewport: gpui::Size::default(),
+            activation: None,
             store: crate::store::WindowStore::from_canonical(Arc::clone(&runtime.store)),
             _runtime: runtime,
             overlay: Some(Overlay::CommandPalette),
@@ -440,6 +470,7 @@ impl NavigationOverlay {
 
     fn clear_overlay(&mut self, cx: &mut Context<Self>) {
         self.cancel_theme_preview();
+        self.refresh_main_window(cx);
         self.back_stack.clear();
         self.overlay = None;
         self.query.clear();
@@ -690,7 +721,7 @@ impl NavigationOverlay {
             Some(Overlay::History) => self.filter_history(),
             Some(Overlay::Themes) => {
                 self.filter_themes();
-                self.preview_highlighted_theme();
+                self.preview_highlighted_theme(cx);
             }
             Some(Overlay::CommandPalette) => self.refresh_command_items(),
             _ => {}
@@ -705,7 +736,7 @@ impl NavigationOverlay {
         }
         self.highlight = (self.highlight as isize + delta).rem_euclid(count as isize) as usize;
         self.scroll_to_highlight();
-        self.preview_highlighted_theme();
+        self.preview_highlighted_theme(cx);
         cx.notify();
     }
 
@@ -1010,6 +1041,7 @@ impl NavigationOverlay {
     fn prepare_page(&mut self, page: Overlay, cx: &mut Context<Self>) {
         self.rank_task = None;
         self.cancel_theme_preview();
+        self.refresh_main_window(cx);
         self.overlay = Some(page);
         self.page_error = None;
         self.query.clear();
@@ -1099,7 +1131,7 @@ impl NavigationOverlay {
             .collect();
     }
 
-    fn preview_highlighted_theme(&mut self) {
+    fn preview_highlighted_theme(&mut self, cx: &mut Context<Self>) {
         if self.overlay != Some(Overlay::Themes) {
             return;
         }
@@ -1114,7 +1146,20 @@ impl NavigationOverlay {
             .preview_theme(theme)
         {
             self._runtime.publish_local_change();
+            self.refresh_main_window(cx);
         }
+    }
+
+    /// Repaints the palette's own window. Theme previews only touch the
+    /// store; while the palette painted inside that window its own redraw
+    /// carried the new colours everywhere, but a panel is a separate window.
+    fn refresh_main_window(&self, cx: &mut Context<Self>) {
+        let Some(main) = self.main_window else {
+            return;
+        };
+        App::defer(cx, move |cx| {
+            let _ = cx.update_window(main, |_, window, _| window.refresh());
+        });
     }
 
     fn commit_theme(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -1156,8 +1201,11 @@ impl NavigationOverlay {
         )
     }
 
-    fn render_overlay(&mut self, layout: OverlayLayout, cx: &mut Context<Self>) -> AnyElement {
+    /// The palette's search header and result list for `layout`, with the
+    /// page-change motion applied. Both hosts paint exactly this.
+    fn palette_content(&mut self, layout: OverlayLayout, cx: &mut Context<Self>) -> AnyElement {
         let colors = self.colors();
+        let panels = self.uses_floating_panel(cx);
         let list_height = layout
             .list_height
             .min(px(self.page_rows() as f32 * ROW_HEIGHT));
@@ -1208,9 +1256,11 @@ impl NavigationOverlay {
                                         cx.new(|_| PaletteTooltip("Back · ⌘[".into(), colors))
                                             .into()
                                     })
-                                    .on_click(
-                                        cx.listener(|this, _, window, cx| this.back(window, cx)),
-                                    )
+                                    .on_click(cx.listener(|this, _, window, cx| {
+                                        this.in_main(window, cx, |this, window, cx| {
+                                            this.back(window, cx)
+                                        })
+                                    }))
                             })
                             .child(sf_symbol(
                                 if page == Overlay::CommandPalette {
@@ -1273,9 +1323,11 @@ impl NavigationOverlay {
                             .debug_selector(|| "palette-escape".into())
                             .cursor_pointer()
                             .hover(move |style| style.bg(Fill::hover(colors, true)))
-                            .on_click(
-                                cx.listener(|this, _, window, cx| this.close_overlay(window, cx)),
-                            )
+                            .on_click(cx.listener(|this, _, window, cx| {
+                                this.in_main(window, cx, |this, window, cx| {
+                                    this.close_overlay(window, cx)
+                                })
+                            }))
                             .child("esc"),
                     ),
             )
@@ -1308,7 +1360,11 @@ impl NavigationOverlay {
                             .track_scroll(&self.list_scroll)
                             .size_full(),
                         )
-                        .child(scroll_fades(self.list_scroll.clone(), colors))
+                        // Painted fades are a tint of the opaque surface; on a
+                        // blurred panel they read as bands, so the list clips.
+                        .when(!panels, |view| {
+                            view.child(scroll_fades(self.list_scroll.clone(), colors))
+                        })
                     })
                     .when(count == 0, |view| {
                         view.child(
@@ -1334,7 +1390,9 @@ impl NavigationOverlay {
         // Only page changes animate. Typing, selection, and theme previews have
         // stable IDs and do not restart motion or schedule idle frames.
         let direction = self.page_direction;
-        let content = if self.page_generation > 0 && !cx.reduce_motion() {
+        // A panel is a window: animating the list height would resize it
+        // every frame and fade rows over live blur, so pages there just swap.
+        if self.page_generation > 0 && !cx.reduce_motion() && !panels {
             content
                 .with_animation(
                     ("palette-page", self.page_generation),
@@ -1352,7 +1410,95 @@ impl NavigationOverlay {
                 .into_any_element()
         } else {
             content.into_any_element()
-        };
+        }
+    }
+
+    /// The palette's pixels for its floating panel.
+    fn palette_panel_content(&mut self, cx: &mut Context<Self>) -> Option<AnyElement> {
+        self.overlay?;
+        let colors = self.colors();
+        let layout = OverlayLayout::command_palette(self.main_viewport);
+        let width = f32::from(layout.width);
+        let content = self.palette_content(layout, cx);
+        Some(
+            crate::floating::surface(
+                colors,
+                PALETTE_RADIUS,
+                width,
+                div().text_color(colors.primary).child(content),
+            )
+            .into_any_element(),
+        )
+    }
+
+    fn uses_floating_panel(&self, cx: &App) -> bool {
+        crate::floating::uses_panels(false, self.colors(), cx)
+    }
+
+    /// Runs `f` against the palette's own window even from a panel handler.
+    fn in_main(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+        f: impl FnOnce(&mut Self, &mut Window, &mut Context<Self>) + 'static,
+    ) {
+        let main = self.main_window;
+        crate::floating::in_main_window(self, main, window, cx, f);
+    }
+
+    fn render_overlay(
+        &mut self,
+        layout: OverlayLayout,
+        window: &Window,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let colors = self.colors();
+        let content = self.palette_content(layout, cx);
+        let backdrop = div()
+            .absolute()
+            .inset_0()
+            .occlude()
+            .bg(rgba(0x00000030))
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|this, _, window, cx| this.close_overlay(window, cx)),
+            );
+        if self.uses_floating_panel(cx) {
+            // The dimming backdrop and the focus stay here; the panel paints
+            // the surface at the spot the in-window one would occupy.
+            let width = f32::from(layout.width);
+            let probe = crate::floating::surface(
+                colors,
+                PALETTE_RADIUS,
+                width,
+                div().text_color(colors.primary).child(content),
+            )
+            .into_any_element();
+            let position = gpui::point(
+                (self.main_viewport.width - layout.width) / 2.0,
+                layout.top_inset,
+            );
+            let measure = crate::floating::measure_element(
+                cx.entity().downgrade(),
+                PALETTE_PANEL,
+                probe,
+                width,
+                self.main_bounds,
+                position,
+                gpui::Anchor::TopLeft,
+                0.0,
+                window,
+                cx,
+            );
+            return div()
+                .absolute()
+                .inset_0()
+                .on_scroll_wheel(|_, _, cx| cx.stop_propagation())
+                .child(backdrop)
+                .child(measure)
+                .into_any_element();
+        }
+        crate::floating::close(self, PALETTE_PANEL, cx);
         let surface = FloatingSurface::new(
             colors,
             div()
@@ -1362,7 +1508,7 @@ impl NavigationOverlay {
                 .text_color(colors.primary)
                 .child(content),
         )
-        .radius(Radius::PANEL);
+        .radius(PALETTE_RADIUS);
         div()
             .absolute()
             .inset_0()
@@ -1371,17 +1517,7 @@ impl NavigationOverlay {
             .items_start()
             .justify_center()
             .pt(layout.top_inset)
-            .child(
-                div()
-                    .absolute()
-                    .inset_0()
-                    .occlude()
-                    .bg(rgba(0x00000030))
-                    .on_mouse_down(
-                        MouseButton::Left,
-                        cx.listener(|this, _, window, cx| this.close_overlay(window, cx)),
-                    ),
-            )
+            .child(backdrop)
             .child(
                 div()
                     // Consume hit tests inside the surface before the dismiss
@@ -1523,13 +1659,15 @@ impl NavigationOverlay {
         .on_hover(cx.listener(move |this, hovered: &bool, _, cx| {
             if *hovered && this.highlight != index {
                 this.highlight = index;
-                this.preview_highlighted_theme();
+                this.preview_highlighted_theme(cx);
                 cx.notify();
             }
         }))
         .on_click(cx.listener(move |this, _, window, cx| {
-            this.highlight = index;
-            this.run_highlighted(false, window, cx);
+            this.in_main(window, cx, move |this, window, cx| {
+                this.highlight = index;
+                this.run_highlighted(false, window, cx);
+            })
         }))
         .into_any_element()
     }
@@ -1588,7 +1726,10 @@ impl NavigationOverlay {
         }))
         .when(enabled, |row| {
             row.on_click(cx.listener(move |this, _, window, cx| {
-                this.run_command_selection(CommandSelection::Action(command.clone()), window, cx);
+                let command = command.clone();
+                this.in_main(window, cx, move |this, window, cx| {
+                    this.run_command_selection(CommandSelection::Action(command), window, cx);
+                })
             }))
         })
         .into_any_element()
@@ -1635,7 +1776,10 @@ impl NavigationOverlay {
             }
         }))
         .on_click(cx.listener(move |this, _, window, cx| {
-            this.run_command_selection(CommandSelection::Session(id.clone()), window, cx);
+            let id = id.clone();
+            this.in_main(window, cx, move |this, window, cx| {
+                this.run_command_selection(CommandSelection::Session(id), window, cx);
+            })
         }))
         .into_any_element()
     }
@@ -1703,8 +1847,11 @@ impl NavigationOverlay {
         }))
         .on_click(
             cx.listener(move |this, event: &gpui::ClickEvent, window, cx| {
-                this.highlight = index;
-                this.run_highlighted(event.modifiers().platform, window, cx);
+                let secondary = event.modifiers().platform;
+                this.in_main(window, cx, move |this, window, cx| {
+                    this.highlight = index;
+                    this.run_highlighted(secondary, window, cx);
+                })
             }),
         )
         .into_any_element()
@@ -1721,7 +1868,26 @@ impl Render for NavigationOverlay {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         self.activity_frame = frame_at(diri_ui::wall_clock_seconds() * 1000.0, cx.reduce_motion());
         let layout = OverlayLayout::command_palette(window.viewport_size());
-        let overlay = self.overlay.map(|_| self.render_overlay(layout, cx));
+        self.main_window = Some(window.window_handle());
+        self.main_bounds = window.bounds();
+        self.main_viewport = window.viewport_size();
+        if self.activation.is_none() {
+            self.activation = Some(cx.observe_window_activation(window, |this, window, cx| {
+                // A panel is not part of this window; losing key status is
+                // the only "click outside" it can observe, and the window may
+                // stop drawing right after, so close here rather than later.
+                if !window.is_window_active() && this.floating.is_some() {
+                    crate::floating::close(this, PALETTE_PANEL, cx);
+                    this.close_overlay(window, cx);
+                }
+            }));
+        }
+        if self.overlay.is_none() {
+            crate::floating::close(self, PALETTE_PANEL, cx);
+        }
+        let overlay = self
+            .overlay
+            .map(|_| self.render_overlay(layout, window, cx));
         let root = div()
             .id("navigation-overlay")
             .key_context(NAVIGATION_CONTEXT)
@@ -1844,7 +2010,7 @@ fn palette_row(
         // Nine plus the pill hairline keeps a ten-point inset, so trailing
         // keycaps stay on the header's escape column.
         .px(px(9.0))
-        .rounded(px(Radius::ROW))
+        .rounded(px(Radius::inner(PALETTE_RADIUS, PALETTE_ROW_INSET)))
         .glass_menu_row(colors, highlighted)
         .opacity(if enabled { 1.0 } else { 0.48 })
         .when(enabled, |row| row.cursor_pointer())

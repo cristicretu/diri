@@ -19,6 +19,14 @@ impl Radius {
     pub const CARD: f32 = 10.0;
     pub const PANEL: f32 = 12.0;
     pub const FLOATING_MENU: f32 = 16.0;
+
+    /// Radius for a control inset `inset` points inside a surface with
+    /// `outer` corners, so the two arcs share a centre and read as one
+    /// shape; a nested corner never drops below a two-point round.
+    pub const fn inner(outer: f32, inset: f32) -> f32 {
+        let radius = outer - inset;
+        if radius < 2.0 { 2.0 } else { radius }
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -421,6 +429,13 @@ impl Glass {
             Appearance::Dark => rgba_f32(1.0, 1.0, 1.0, 0.12),
             Appearance::Light => rgba_f32(0.0, 0.0, 0.0, 0.12),
         }
+    }
+
+    /// Fill for a menu that is its own blurred window: the sidebar's settled
+    /// material, so a menu over the desktop matches the sidebar exactly and a
+    /// menu over the terminal darkens the same way the sidebar would there.
+    pub fn panel_fill(colors: SemanticColors) -> Rgba {
+        colors.sidebar_surface_settled()
     }
 
     /// One-point light catch along the top inner edge of a floating glass

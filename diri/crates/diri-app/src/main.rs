@@ -14,6 +14,7 @@ mod diagnostics;
 pub mod diff;
 mod empty_workbench;
 mod external_drop;
+mod floating;
 pub mod fonts;
 pub mod fuzzy;
 #[cfg(test)]
@@ -387,6 +388,11 @@ fn main() {
     });
     app.run(move |cx: &mut App| {
         load_system_fonts(cx);
+        // Menus and popovers open as blurred panels under glass; DIRI_FLOATING_PANELS=0
+        // keeps them inside the window for comparison or when a panel misbehaves.
+        if std::env::var_os("DIRI_FLOATING_PANELS").is_none_or(|value| value != "0") {
+            floating::enable(cx);
+        }
         #[cfg(target_os = "macos")]
         diri_ui::set_mark_rasterizer(macos::brand_raster::raster_mark);
         let shortcut_overrides = services

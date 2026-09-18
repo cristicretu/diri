@@ -207,7 +207,10 @@ impl NavigationOverlay {
                     // Nine plus the pill hairline keeps the keycap on the
                     // header's escape column.
                     .px(px(9.0))
-                    .rounded(px(Radius::ROW))
+                    .rounded(px(Radius::inner(
+                        super::PALETTE_RADIUS,
+                        super::PALETTE_ROW_INSET,
+                    )))
                     .flex()
                     .items_center()
                     .gap(px(6.0))
@@ -221,8 +224,11 @@ impl NavigationOverlay {
                     })
                     .tooltip(move |_, cx| cx.new(|_| PaletteTooltip(detail.clone(), colors)).into())
                     .on_click(cx.listener(move |this, _, window, cx| {
-                        this.highlight = index;
-                        this.resume_history(entry.clone(), window, cx);
+                        let entry = entry.clone();
+                        this.in_main(window, cx, move |this, window, cx| {
+                            this.highlight = index;
+                            this.resume_history(entry, window, cx);
+                        })
                     }))
                     .child(AgentLogo::new(agent, 28.0, colors).badged(false))
                     .child(
