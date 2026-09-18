@@ -2222,7 +2222,7 @@ impl TerminalPane {
             )
         };
         match dispatch {
-            MotionDispatch::SendNow(bytes) => attachment.mouse(bytes),
+            MotionDispatch::SendNow(bytes) => attachment.mouse_motion(bytes),
             MotionDispatch::Schedule { delay, generation } => {
                 self.schedule_mouse_motion_flush(id, delay, generation, cx);
             }
@@ -2252,7 +2252,7 @@ impl TerminalPane {
                     return;
                 };
                 if let Some(bytes) = resident.mouse_motion.flush(generation, Instant::now()) {
-                    resident.attachment.mouse(bytes);
+                    resident.attachment.mouse_motion(bytes);
                 }
             });
         })
