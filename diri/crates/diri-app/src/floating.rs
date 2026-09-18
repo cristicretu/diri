@@ -135,6 +135,10 @@ pub(crate) fn surface(
         .w(px(width))
         .rounded(px(radius))
         .overflow_hidden()
+        // A panel window has no ancestors to inherit from, so the surface
+        // sets the text colour its rows would otherwise get from the page.
+        .text_color(colors.primary)
+        .text_size(px(diri_ui::Typo::ROW.size))
         .bg(Glass::panel_fill(colors))
         .border_1()
         .border_color(colors.floating_stroke())
