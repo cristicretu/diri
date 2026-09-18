@@ -50,6 +50,7 @@ pub enum IconName {
     Activity,
     Archive,
     ArrowDown,
+    Pin,
     ArrowUp,
     Bell,
     Branch,
@@ -110,12 +111,13 @@ pub enum IconName {
 }
 
 impl IconName {
-    pub const ALL: [Self; 61] = [
+    pub const ALL: [Self; 62] = [
         Self::Account,
         Self::Activity,
         Self::Archive,
         Self::ArrowDown,
         Self::ArrowUp,
+        Self::Pin,
         Self::Bell,
         Self::Branch,
         Self::ChartBar,
@@ -179,6 +181,7 @@ impl IconName {
             Self::Account => "icons/account.svg",
             Self::Activity => "icons/activity.svg",
             Self::Archive => "icons/archive.svg",
+            Self::Pin => "icons/pin.svg",
             Self::ArrowDown => "icons/arrow-down.svg",
             Self::ArrowUp => "icons/arrow-up.svg",
             Self::Bell => "icons/bell.svg",
@@ -246,6 +249,7 @@ impl IconName {
         Some(match name {
             "waveform.circle" | "waveform.circle.fill" => Self::Activity,
             "archivebox" | "archivebox.fill" => Self::Archive,
+            "pin" | "pin.fill" => Self::Pin,
             "arrow.down" => Self::ArrowDown,
             "arrow.up.arrow.down" => Self::ResizeHorizontal,
             "arrow.up" => Self::ArrowUp,
@@ -377,6 +381,7 @@ fn embedded_svg(path: &str) -> Option<&'static [u8]> {
         "icons/account.svg" => include_bytes!("../assets/icons/account.svg"),
         "icons/activity.svg" => include_bytes!("../assets/icons/activity.svg"),
         "icons/archive.svg" => include_bytes!("../assets/icons/archive.svg"),
+        "icons/pin.svg" => include_bytes!("../assets/icons/pin.svg"),
         "icons/arrow-down.svg" => include_bytes!("../assets/icons/arrow-down.svg"),
         "icons/arrow-up.svg" => include_bytes!("../assets/icons/arrow-up.svg"),
         "icons/bell.svg" => include_bytes!("../assets/icons/bell.svg"),
@@ -488,6 +493,7 @@ mod tests {
     #[test]
     fn every_legacy_symbol_used_by_the_app_resolves() {
         for name in [
+            "pin.fill",
             "archivebox",
             "archivebox.fill",
             "arrow.branch",

@@ -9,6 +9,20 @@ marks, so eagerly allocating these textures consumed substantial unified memory
 without rendering any paths. Scenes that do contain a path still allocate the
 same textures on demand and retain upstream antialiasing quality.
 
+The main and path-sprite pipelines also use source-over alpha blending. Upstream
+adds destination alpha unchanged, making glyph coverage and translucent badges
+too opaque and producing dark fringes over bright window backdrops. RGB blending
+is unchanged; opaque surfaces retain their existing appearance.
+
+To check transparent glyphs, rounded badges, and paths against opaque references
+over white, gray, and black, run from Diri's workspace on a Mac with GPU access.
+Selecting `diri-term` enables the existing GPUI test-support dev-dependencies
+for this patched crate, which is not a workspace member:
+
+```sh
+cargo test -p diri-term -p gpui_macos compositing_tests
+```
+
 `src/shaders.metallib` is the unchanged upstream shader source compiled from
 that pinned revision. Bundling it keeps ordinary Diri builds reproducible on
 machines where Xcode's separately downloaded Metal Toolchain is not installed.

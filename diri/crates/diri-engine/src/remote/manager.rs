@@ -844,17 +844,24 @@ impl RemoteManager {
         self.rpc_empty(helper, HelperCommand::List, RPC_TIMEOUT)
     }
 
+    /// Stops the session through the exact Helper build that owns it. Helpers
+    /// since `STOP_SESSION_PROTOCOL_MINOR` stop through the owning Holder and
+    /// report the exit it observed. Older Helpers stay live across Engine
+    /// upgrades (their Holders are never replaced; see `existing_helper`) and
+    /// still answer `kill` with the exit recorded in their session state, which
+    /// is the only stop fact such a session can ever produce. Refusing them
+    /// would leave every pre-upgrade remote session impossible to close, so
+    /// only a protocol-major mismatch is rejected here; the response is held
+    /// to the same identity and exit-fact validation either way.
     pub fn kill(
         &self,
         helper: &InstalledHelper,
         selector: &SessionSelector,
     ) -> io::Result<SessionInspection> {
-        if helper.protocol.major != ProtocolVersion::CURRENT.major
-            || helper.protocol.minor < diri_proto::remote_pty::STOP_SESSION_PROTOCOL_MINOR
-        {
+        if helper.protocol.major != ProtocolVersion::CURRENT.major {
             return Err(io::Error::new(
                 io::ErrorKind::Unsupported,
-                "remote Helper does not support observed stop facts",
+                "remote Helper protocol major does not match this Engine",
             ));
         }
         let inspection = self.rpc(helper, HelperCommand::Kill, selector, RPC_TIMEOUT)?;
@@ -1530,6 +1537,83 @@ mod tests {
     }
 
     #[cfg(unix)]
+    /// Holders launched by a pre-`STOP_SESSION_PROTOCOL_MINOR` Helper outlive
+    /// Engine upgrades. Their `kill` still answers with the exit recorded in
+    /// session state, and that answer must close the session instead of being
+    /// refused up front.
+    #[cfg(unix)]
+    #[test]
+    fn kill_accepts_the_recorded_exit_from_a_legacy_helper() {
+        use diri_proto::remote_pty::{RemoteProcessState, SessionToken};
+
+        let temporary = tempfile::tempdir_in("/tmp").expect("temp");
+        let fake_ssh = temporary.path().join("ssh");
+        let legacy_inspection = concat!(
+            "{\"sessionId\":\"legacy\",\"sessionIncarnation\":\"legacy-incarnation\",",
+            "\"holderBuildId\":\"legacy-build\",\"holderPid\":4242,",
+            "\"processState\":{\"state\":\"exited\",\"code\":null,\"signal\":15},",
+            "\"cols\":80,\"rows\":24,\"outputOffset\":0,\"snapshotSequence\":0,",
+            "\"controllerEpoch\":1,\"persistence\":\"non-persistent\"}"
+        );
+        fs::write(
+            &fake_ssh,
+            format!(
+                "#!/bin/sh\nfor last; do :; done\ncase \"$last\" in\n  *'diri-remote\" kill'*) cat >/dev/null; printf '%s\\n' '{legacy_inspection}';;\n  *) exit 64;;\nesac\n"
+            ),
+        )
+        .expect("fake ssh");
+        fs::set_permissions(&fake_ssh, fs::Permissions::from_mode(0o700)).expect("mode");
+        let manager = RemoteManager::new(
+            ProcessExecutor::new(&fake_ssh),
+            ArtifactCatalog {
+                artifacts: HashMap::new(),
+            },
+            temporary.path().join("control"),
+        )
+        .expect("manager");
+        let host = HostEntry {
+            id: "fixture".into(),
+            name: None,
+            ssh: "fake-host".into(),
+            default_cwd: None,
+            node: None,
+        };
+        let helper = InstalledHelper {
+            target: RemoteTarget::LinuxX86_64,
+            build_id: "legacy-build".into(),
+            protocol: ProtocolVersion { major: 1, minor: 4 },
+            transport: manager.transport(&host),
+        };
+        let selector = SessionSelector {
+            session_id: "legacy".into(),
+            session_token: SessionToken::new("legacy-stop-token").expect("token"),
+            expected_incarnation: Some("legacy-incarnation".into()),
+        };
+
+        let inspection = manager
+            .kill(&helper, &selector)
+            .expect("a legacy Helper's recorded exit closes the session");
+        assert_eq!(
+            inspection.process_state,
+            RemoteProcessState::Exited {
+                code: None,
+                signal: Some(libc::SIGTERM),
+            }
+        );
+
+        let foreign_major = InstalledHelper {
+            protocol: ProtocolVersion {
+                major: ProtocolVersion::CURRENT.major + 1,
+                minor: 0,
+            },
+            ..helper
+        };
+        let error = manager
+            .kill(&foreign_major, &selector)
+            .expect_err("another protocol major is never driven");
+        assert_eq!(error.kind(), io::ErrorKind::Unsupported);
+    }
+
     #[test]
     fn fake_ssh_bootstrap_uploads_activates_and_then_reuses_exact_build() {
         let temporary = tempfile::tempdir().expect("temp");

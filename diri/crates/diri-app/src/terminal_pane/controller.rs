@@ -212,6 +212,22 @@ impl AttachmentControl {
         }
     }
 
+    /// Pointer motion carries no intent to type. GPUI routes mouse events
+    /// through the last painted frame, so right after a session closes or a
+    /// layout changes the pane under the pointer may already have lost its
+    /// lease; an any-motion terminal such as Codex would then raise the
+    /// "active in another view" notice on every pointer move. A passive view
+    /// drops motion silently; delivery failures are still reported.
+    pub(super) fn mouse_motion(&self, bytes: Vec<u8>) {
+        if bytes.is_empty() {
+            return;
+        }
+        match self.submit(AttachmentCommand::Mouse(bytes)) {
+            Err(InputRejection::PassiveView) => {}
+            result => self.report(result),
+        }
+    }
+
     pub(super) fn scroll(&self, direction: u8, lines: u16, col: u16, row: u16) {
         self.report(self.submit(AttachmentCommand::Scroll {
             direction,
@@ -824,6 +840,50 @@ mod tests {
             samples[500], samples[950]
         );
         assert!(control.is_controller());
+    }
+
+    #[gpui::test]
+    fn passive_view_drops_pointer_motion_silently(cx: &mut TestAppContext) {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let engine = FakeEngine::start(&runtime);
+        let (events, rx) = pane_event_channel();
+        let (_lease, control, _) = cx.update(|cx| {
+            ControllerLease::mount(
+                engine.path.clone(),
+                SessionId("shared-session".into()),
+                runtime.handle(),
+                events,
+                1,
+                None,
+                cx,
+            )
+        });
+        wait_for(cx, &runtime, || {
+            control.state.lock().unwrap().writer.is_some()
+                && engine.connects.load(Ordering::SeqCst) == 1
+        });
+        assert!(!control.is_controller(), "first mount starts passive");
+        let feedback = || {
+            rx.state
+                .lock()
+                .unwrap()
+                .events
+                .iter()
+                .filter(|event| matches!(event, PaneEvent::InputFeedback(..)))
+                .count()
+        };
+        // SGR any-motion report at (1, 1), as an any-motion terminal emits
+        // while the pointer merely crosses the grid.
+        control.mouse_motion(b"\x1b[<35;1;1M".to_vec());
+        assert_eq!(feedback(), 0, "passive motion raises no notice");
+        control.mouse(b"\x1b[<0;1;1M".to_vec());
+        assert_eq!(feedback(), 1, "a passive click still explains itself");
+        control.claim();
+        control.mouse_motion(b"\x1b[<35;2;2M".to_vec());
+        assert_eq!(feedback(), 1, "owned motion is delivered, not reported");
     }
 
     #[gpui::test]

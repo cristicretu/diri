@@ -8,19 +8,15 @@ use groups::{WorkspaceRowKey, project_groups};
 use project_agents::{ProjectAgentOpen, first_agent, focused_agent};
 
 #[derive(Clone)]
-struct DraggedWorkspaceTab {
+pub(super) struct DraggedWorkspaceTab {
     tab: TabId,
     revision: u64,
 }
 impl Render for DraggedWorkspaceTab {
+    /// No ghost: the tab itself is lifted by the sidebar (`Lift`), locked to
+    /// the axis its strip runs along.
     fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
         div()
-            .px(px(10.0))
-            .py(px(6.0))
-            .rounded(px(6.0))
-            .bg(gpui::rgba(0x34363aff))
-            .text_color(gpui::white())
-            .child("Move tab")
     }
 }
 
@@ -693,6 +689,7 @@ impl Sidebar {
         };
         let destination = workspace.clone();
         let remove = id.clone();
+        let lifting = self.lift_offset(&LiftKey::WorkspaceTab(id.clone()));
         let mut row = div()
             .id(SharedString::from(format!("workspace-tab-{}", id.0)))
             .role(Role::Tab)
@@ -702,6 +699,7 @@ impl Sidebar {
                 let key = format!("workspace-tab-{}", id.0);
                 move || key.clone()
             })
+            .relative()
             .h(px(32.0))
             .px(px(9.0))
             .flex_none()
@@ -783,7 +781,29 @@ impl Sidebar {
                         cx.notify();
                     })),
             )
-            .on_drag(source, |source, _, _, cx| cx.new(|_| source.clone()))
+            .on_drag(source, {
+                let entity = cx.entity();
+                let tab_id = id.clone();
+                move |source, grab, window, cx| {
+                    // The tab itself lifts from where the pointer grabbed it,
+                    // locked to the axis its strip runs along.
+                    let origin = window.mouse_position() - grab;
+                    entity.update(cx, |this, cx| {
+                        this.lift = Some(Lift::new(
+                            LiftKey::WorkspaceTab(tab_id.clone()),
+                            origin,
+                            grab,
+                            if horizontal {
+                                LiftAxis::Horizontal
+                            } else {
+                                LiftAxis::Vertical
+                            },
+                        ));
+                        cx.notify();
+                    });
+                    cx.new(|_| source.clone())
+                }
+            })
             .drag_over::<DraggedWorkspaceTab>(move |row, _, _, _| {
                 row.bg(colors.primary.alpha(0.12))
             })
@@ -810,7 +830,19 @@ impl Sidebar {
         if horizontal {
             row = row.w(px(164.0));
         }
-        row.into_any_element()
+        match lifting {
+            Some(offset) => lift_in_place(
+                row,
+                if horizontal {
+                    LiftAxis::Horizontal
+                } else {
+                    LiftAxis::Vertical
+                },
+                offset,
+                colors,
+            ),
+            None => row.into_any_element(),
+        }
     }
 }
 
@@ -1355,9 +1387,17 @@ impl Sidebar {
         colors: SemanticColors,
         cx: &mut Context<Self>,
     ) -> AnyElement {
+        self.end_lift_if_released(cx);
         div()
             .id("horizontal-workspace-tabs")
             .debug_selector(|| "horizontal-workspace-tabs".into())
+            // The strip is rendered outside the sidebar's own root, so it
+            // tracks the pointer for its lifted tab itself.
+            .on_drag_move::<DraggedWorkspaceTab>(cx.listener(
+                |this, event: &gpui::DragMoveEvent<DraggedWorkspaceTab>, _, cx| {
+                    this.track_lift_pointer(event.event.position, cx);
+                },
+            ))
             .h(px(crate::tab_navigation::TAB_STRIP_HEIGHT))
             .w_full()
             .flex_none()

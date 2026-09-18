@@ -1,6 +1,7 @@
 //! The horizontal header's project menu is a window overlay. Opening it must
 //! never change sidebar visibility or resize an attached terminal.
 use super::*;
+use crate::tab_navigation::selected_project_tabs;
 use diri_proto::Project;
 
 pub(super) struct ProjectPicker {
@@ -152,6 +153,25 @@ impl Sidebar {
                 .size_full(),
             )
             .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+            .on_mouse_down(
+                MouseButton::Right,
+                cx.listener(|this, event: &gpui::MouseDownEvent, window, cx| {
+                    cx.stop_propagation();
+                    let project =
+                        selected_project_tabs(&mut this.store.write().expect("store")).project;
+                    let Some(id) = project else {
+                        return;
+                    };
+                    this.open_strip_menu(
+                        Popover::ProjectActions {
+                            id,
+                            position: Some(event.position),
+                        },
+                        window,
+                        cx,
+                    );
+                }),
+            )
             .on_click(cx.listener(|this, _, window, cx| {
                 if this.project_picker.open {
                     this.dismiss_project_picker(window, cx);
@@ -304,14 +324,12 @@ impl Sidebar {
         cx.notify();
     }
 
-    pub(crate) fn project_picker_active(&self) -> bool {
-        self.project_picker.open || self.project_picker.new_agent
+    pub(super) fn project_picker_is_open(&self) -> bool {
+        self.project_picker.open
     }
 
-    /// Whether the dropdown list itself is open (the header's New Session
-    /// menu is a popover, not the picker).
-    pub(super) fn project_picker_open(&self) -> bool {
-        self.project_picker.open
+    pub(crate) fn project_picker_active(&self) -> bool {
+        self.project_picker.open || self.project_picker.new_agent
     }
 
     pub(super) fn header_new_agent_menu(
@@ -496,7 +514,7 @@ impl Sidebar {
         &mut self,
         cx: &mut Context<Self>,
     ) -> Option<AnyElement> {
-        if !self.project_picker_open() {
+        if !self.project_picker_is_open() {
             return None;
         }
         let colors = self.colors();
@@ -589,6 +607,23 @@ impl Sidebar {
                     .when(current, |row| {
                         row.child(sf_symbol("checkmark", 10.0, colors.secondary))
                     })
+                    .on_mouse_down(
+                        MouseButton::Right,
+                        cx.listener({
+                            let id = project.id.clone();
+                            move |this, event: &gpui::MouseDownEvent, window, cx| {
+                                cx.stop_propagation();
+                                this.open_strip_menu(
+                                    Popover::ProjectActions {
+                                        id: id.clone(),
+                                        position: Some(event.position),
+                                    },
+                                    window,
+                                    cx,
+                                );
+                            }
+                        }),
+                    )
                     .on_click(cx.listener(move |this, _, window, cx| {
                         let project = project.clone();
                         this.in_main_window(window, cx, move |this, window, cx| {
@@ -659,12 +694,14 @@ mod tests {
                 .size_full()
                 .flex()
                 .flex_col()
-                .child(
-                    self.sidebar
-                        .update(cx, |sidebar, cx| sidebar.render_horizontal_tabs(900.0, cx)),
-                )
+                .child(self.sidebar.update(cx, |sidebar, cx| {
+                    sidebar.render_horizontal_tabs(900.0, None, cx)
+                }))
                 .children(self.sidebar.update(cx, |sidebar, cx| {
                     sidebar.render_project_picker_overlay(window, cx)
+                }))
+                .children(self.sidebar.update(cx, |sidebar, cx| {
+                    sidebar.render_strip_menu_overlay(false, window, cx)
                 }))
         }
     }
@@ -740,6 +777,97 @@ mod tests {
         popup
     }
 
+    fn right_click(cx: &mut VisualTestContext, at: Point<Pixels>) {
+        cx.simulate_mouse_down(at, MouseButton::Right, Modifiers::default());
+        cx.simulate_mouse_up(at, MouseButton::Right, Modifiers::default());
+    }
+
+    #[gpui::test]
+    fn horizontal_tab_right_click_opens_session_menu(cx: &mut TestAppContext) {
+        let (sidebar, cx) = harness(cx, false);
+        let tab = cx
+            .debug_bounds("horizontal-tab-preview-codex")
+            .expect("codex tab");
+        right_click(cx, tab.center());
+        sidebar.read_with(cx, |sidebar, _| {
+            assert!(
+                matches!(&sidebar.ui.popover, Some(Popover::SessionActions { id, .. })
+                    if id == &SessionId::new("preview-codex")),
+                "{:?}",
+                sidebar.ui.popover
+            );
+            assert!(!sidebar.is_visible(), "menu never reveals the sidebar");
+        });
+        let menu = cx
+            .debug_bounds("sidebar-popover")
+            .expect("session menu paints");
+        assert!(menu.top() >= tab.top(), "menu anchors at the click");
+        cx.simulate_keystrokes("escape");
+        assert!(cx.debug_bounds("sidebar-popover").is_none());
+        sidebar.read_with(cx, |sidebar, _| assert!(sidebar.ui.popover.is_none()));
+    }
+
+    #[gpui::test]
+    fn horizontal_project_button_right_click_opens_project_menu(cx: &mut TestAppContext) {
+        let (sidebar, cx) = harness(cx, false);
+        let expected = sidebar.read_with(cx, |sidebar, _| {
+            sidebar
+                .store
+                .read()
+                .unwrap()
+                .selected_session()
+                .unwrap()
+                .project_id
+                .clone()
+        });
+        let button = cx
+            .debug_bounds("horizontal-tab-project")
+            .expect("Projects button");
+        right_click(cx, button.center());
+        sidebar.read_with(cx, |sidebar, _| {
+            assert!(
+                matches!(&sidebar.ui.popover, Some(Popover::ProjectActions { id, position: Some(_) })
+                    if id == &expected),
+                "{:?}",
+                sidebar.ui.popover
+            );
+            assert!(!sidebar.project_picker_is_open_for_test());
+        });
+        assert!(cx.debug_bounds("sidebar-popover").is_some());
+        // Outside clicks dismiss the menu like every other sidebar popover.
+        cx.simulate_click(point(px(700.0), px(500.0)), Modifiers::default());
+        assert!(cx.debug_bounds("sidebar-popover").is_none());
+        sidebar.read_with(cx, |sidebar, _| assert!(sidebar.ui.popover.is_none()));
+    }
+
+    #[gpui::test]
+    fn project_picker_row_right_click_opens_project_menu(cx: &mut TestAppContext) {
+        let (sidebar, cx) = harness(cx, false);
+        open(cx);
+        let id = sidebar.read_with(cx, |sidebar, _| {
+            let store = sidebar.store.read().unwrap();
+            projects(&store, "")
+                .into_iter()
+                .next()
+                .expect("a project")
+                .id
+        });
+        let selector: &'static str = Box::leak(format!("project-picker-{}", id.0).into_boxed_str());
+        let row = cx.debug_bounds(selector).expect("picker row");
+        right_click(cx, row.center());
+        sidebar.read_with(cx, |sidebar, _| {
+            assert!(
+                matches!(&sidebar.ui.popover, Some(Popover::ProjectActions { id: menu, .. })
+                    if menu == &id),
+                "{:?}",
+                sidebar.ui.popover
+            );
+            assert!(!sidebar.project_picker_is_open_for_test());
+        });
+        assert!(cx.debug_bounds("project-picker-popup").is_none());
+        assert!(cx.debug_bounds("sidebar-popover").is_some());
+    }
+
     #[gpui::test]
     fn project_picker_in_horizontal_header_never_reveals_or_changes_sidebar(
         cx: &mut TestAppContext,
@@ -766,6 +894,109 @@ mod tests {
             assert!(!sidebar.is_peeking());
             assert_eq!(sidebar.store.read().unwrap().preferences(), &before);
         });
+    }
+
+    #[gpui::test]
+    fn a_dragged_horizontal_tab_lifts_itself_and_crosses_its_neighbour_at_the_midline(
+        cx: &mut TestAppContext,
+    ) {
+        let (sidebar, cx) = harness(cx, false);
+        let order = |sidebar: &Entity<Sidebar>, cx: &VisualTestContext| -> Vec<String> {
+            sidebar.read_with(cx, |sidebar, _| {
+                sidebar
+                    .visible_tab_order()
+                    .into_iter()
+                    .map(|id| id.0)
+                    .collect()
+            })
+        };
+        // Two adjacent unpinned siblings: pinned rows always sort first, so
+        // a tab can never trade places across the pin boundary.
+        let (first, second) = sidebar.read_with(cx, |sidebar, _| {
+            let mut store = sidebar.store.write().unwrap();
+            let projection = store.sidebar_projection();
+            let run = sibling_run(&projection, &SessionId::new("preview-claude"));
+            let pinned = &store.preferences().sidebar_pinned_sessions;
+            run.windows(2)
+                .find(|pair| !pinned.contains(&pair[0]) && !pinned.contains(&pair[1]))
+                .map(|pair| (pair[0].clone(), pair[1].clone()))
+                .expect("two adjacent unpinned siblings")
+        });
+        let selector = |id: &SessionId| -> &'static str {
+            Box::leak(format!("horizontal-tab-{}", id.0).into_boxed_str())
+        };
+        let before = order(&sidebar, cx);
+        let a = cx
+            .debug_bounds(selector(&first))
+            .expect("first sibling tab");
+        let b = cx
+            .debug_bounds(selector(&second))
+            .expect("second sibling tab");
+        assert!(a.left() < b.left(), "siblings run left to right");
+
+        let grab = a.center();
+        cx.simulate_mouse_down(grab, MouseButton::Left, Modifiers::default());
+        // Cross GPUI's drag threshold 4px to the right; the grab offset is
+        // taken from this moment.
+        cx.simulate_mouse_move(
+            grab + point(px(4.0), px(0.0)),
+            MouseButton::Left,
+            Modifiers::default(),
+        );
+        let near_edge = point(b.left() + px(6.0), grab.y + px(20.0));
+        cx.simulate_mouse_move(near_edge, MouseButton::Left, Modifiers::default());
+
+        let lifted = cx
+            .debug_bounds(selector(&first))
+            .expect("the tab is still the tab");
+        assert_eq!(lifted.size, a.size, "the tab keeps its size");
+        assert_eq!(
+            lifted.origin,
+            point(a.origin.x + (near_edge.x - grab.x - px(4.0)), a.origin.y),
+            "the tab itself moves, and only along the strip"
+        );
+        assert_eq!(
+            order(&sidebar, cx),
+            before,
+            "touching a neighbour's edge is not a crossing"
+        );
+
+        let past_midline = point(b.center().x + px(6.0), grab.y);
+        cx.simulate_mouse_move(past_midline, MouseButton::Left, Modifiers::default());
+        let after = order(&sidebar, cx);
+        let position = |list: &[String], id: &SessionId| {
+            list.iter()
+                .position(|candidate| *candidate == id.0)
+                .expect("tab is in the strip")
+        };
+        assert!(
+            position(&after, &second) < position(&after, &first),
+            "passing the midline trades places: {after:?}"
+        );
+        // The strip flattens a session tree, so a parent takes its subtree
+        // along; every other tab keeps its relative order.
+        let others = |list: &[String]| -> Vec<String> {
+            list.iter()
+                .filter(|id| **id != first.0 && **id != second.0)
+                .cloned()
+                .collect()
+        };
+        assert_eq!(others(&before), others(&after));
+
+        cx.simulate_mouse_up(past_midline, MouseButton::Left, Modifiers::default());
+        assert!(
+            sidebar.read_with(cx, |sidebar, _| sidebar.lift.is_none()),
+            "the release ends the lift"
+        );
+        assert_eq!(
+            order(&sidebar, cx),
+            after,
+            "the release keeps the new order"
+        );
+        assert!(
+            sidebar.read_with(cx, |sidebar, _| !sidebar.ui.order_dirty),
+            "the release wrote the staged order"
+        );
     }
 
     #[gpui::test]
