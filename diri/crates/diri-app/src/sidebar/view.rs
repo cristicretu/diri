@@ -2987,11 +2987,12 @@ impl Sidebar {
                 })
                 .aria_description(format!("{count} archived sessions"))
                 .mt(px(4.0))
-                .px(px(Space::ROW_H))
+                .pl(px(Space::ROW_H))
+                .pr(px(Space::ROW_H))
                 .h(px(SIDEBAR_NAV_ROW_HEIGHT))
                 .flex()
                 .items_center()
-                .gap(px(6.0))
+                .gap(px(8.0))
                 .rounded(px(SIDEBAR_ROW_RADIUS))
                 .cursor_pointer()
                 .text_size(px(Typo::SECTION_HEADER.size))
@@ -3009,30 +3010,9 @@ impl Sidebar {
                         });
                     cx.notify();
                 }))
+                .child(project_disclosure(!expanded, colors))
                 .child(div().min_w(px(0.0)).flex_1().child("Archived"))
-                .child(
-                    div()
-                        .font_weight(FontWeight::NORMAL)
-                        .child(count.to_string()),
-                )
-                .child(
-                    div()
-                        .size(px(SIDEBAR_ACTION_SLOT))
-                        .flex_none()
-                        .flex()
-                        .items_center()
-                        .justify_center()
-                        .child(sf_symbol_weighted(
-                            if expanded {
-                                "chevron.down"
-                            } else {
-                                "chevron.right"
-                            },
-                            8.0,
-                            SymbolWeight::Bold,
-                            colors.tertiary,
-                        )),
-                ),
+                .child(archive_count(count, colors)),
         );
         let now = Instant::now();
         let motion = self
@@ -3776,16 +3756,20 @@ impl Sidebar {
                     cx.notify();
                 }
             }))
+            // The fold sits on the session grid one level in: chevron tile
+            // in the activity column, label in the title column, count on the
+            // identity column. Same anatomy as a project row, so the eye
+            // reads it as a folder of sessions rather than a footer.
             .child(
                 div()
                     .id(format!("archive-header:{}", project_id.0))
                     .mt(px(4.0))
-                    .pl(px(Space::ROW_H + Space::INDENT + 24.0))
+                    .pl(px(Space::ROW_H))
                     .pr(px(Space::ROW_H))
                     .h(px(SIDEBAR_NAV_ROW_HEIGHT))
                     .flex()
                     .items_center()
-                    .gap(px(6.0))
+                    .gap(px(8.0))
                     .rounded(px(SIDEBAR_ROW_RADIUS))
                     .cursor_pointer()
                     .text_size(px(Typo::SECTION_HEADER.size))
@@ -3803,30 +3787,9 @@ impl Sidebar {
                             cx.notify();
                         }
                     }))
+                    .child(project_disclosure(!expanded, colors))
                     .child(div().min_w(px(0.0)).flex_1().child("Archived"))
-                    .child(
-                        div()
-                            .font_weight(FontWeight::NORMAL)
-                            .child(group.archived.len().to_string()),
-                    )
-                    .child(
-                        div()
-                            .size(px(SIDEBAR_ACTION_SLOT))
-                            .flex_none()
-                            .flex()
-                            .items_center()
-                            .justify_center()
-                            .child(sf_symbol_weighted(
-                                if expanded {
-                                    "chevron.down"
-                                } else {
-                                    "chevron.right"
-                                },
-                                8.0,
-                                SymbolWeight::Bold,
-                                colors.tertiary,
-                            )),
-                    ),
+                    .child(archive_count(group.archived.len(), colors)),
             );
         let now = Instant::now();
         let motion = self
@@ -3882,7 +3845,9 @@ impl Sidebar {
         let drag_entity = cx.entity();
         div()
             .id(format!("archived-session:{}", id.0))
-            .pl(px(Space::ROW_H + Space::INDENT))
+            // Same insets as a live row: the archive glyph takes the activity
+            // column and the title lands on the title column.
+            .pl(px(Space::ROW_H - 1.0))
             .pr(px(Space::ROW_H))
             .h(px(SIDEBAR_NAV_ROW_HEIGHT))
             .flex()
@@ -3965,42 +3930,12 @@ impl Sidebar {
             )
             .child(
                 div()
-                    .id(format!("revive:{}", id.0))
-                    .size(px(16.0))
+                    .size(px(18.0))
+                    .flex_none()
                     .flex()
                     .items_center()
                     .justify_center()
-                    .rounded(px(Radius::CHIP))
-                    .bg(if hovered {
-                        Fill::subtle(colors)
-                    } else {
-                        colors.primary.alpha(0.0)
-                    })
-                    .text_size(px(if hovered { 9.0 } else { 10.0 }))
-                    .text_color(colors.secondary)
-                    .child(sf_symbol_weighted(
-                        if hovered {
-                            "tray.and.arrow.up.fill"
-                        } else {
-                            "archivebox.fill"
-                        },
-                        if hovered { 8.0 } else { 10.0 },
-                        if hovered {
-                            SymbolWeight::Bold
-                        } else {
-                            SymbolWeight::Regular
-                        },
-                        colors.secondary,
-                    ))
-                    .aria_label("Revive session")
-                    .on_click(cx.listener(move |this, _, _, cx| {
-                        cx.stop_propagation();
-                        this.store
-                            .write()
-                            .expect("session store lock poisoned")
-                            .revive_sessions(vec![revive_id.clone()]);
-                        cx.notify();
-                    })),
+                    .child(sf_symbol("archivebox", 12.0, colors.tertiary)),
             )
             .child(
                 div()
@@ -4017,6 +3952,63 @@ impl Sidebar {
                     })
                     .child(title),
             )
+            // The identity column keeps the agent glyph at its resting tone:
+            // an archived row is still that agent's work. Hover swaps it for
+            // the revive control on the same column, mirroring the close
+            // control on a live row.
+            .child(if hovered || focused {
+                div()
+                    .id(format!("revive:{}", id.0))
+                    .debug_selector({
+                        let id = id.clone();
+                        move || format!("session-revive:{}", id.0)
+                    })
+                    .role(Role::Button)
+                    .aria_label("Revive session")
+                    .size(px(SIDEBAR_TRAILING_SLOT))
+                    .flex_none()
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .rounded(px(Radius::CHIP))
+                    .cursor_pointer()
+                    .text_color(colors.secondary)
+                    .hover(move |button| button.bg(Fill::subtle(colors)))
+                    // The row drags; keep mouse-down off it so a press on
+                    // the control is always a revive.
+                    .on_mouse_down(MouseButton::Left, |_, _, cx| {
+                        cx.stop_propagation();
+                    })
+                    .child(sf_symbol_weighted(
+                        "tray.and.arrow.up.fill",
+                        9.0,
+                        SymbolWeight::Bold,
+                        colors.secondary,
+                    ))
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        cx.stop_propagation();
+                        this.store
+                            .write()
+                            .expect("session store lock poisoned")
+                            .revive_sessions(vec![revive_id.clone()]);
+                        cx.notify();
+                    }))
+                    .into_any_element()
+            } else {
+                div()
+                    .size(px(SIDEBAR_TRAILING_SLOT))
+                    .flex_none()
+                    .child(
+                        StatusGlyph::new(
+                            ui_agent_kind(session.effective_kind()),
+                            StatusState::None,
+                            SIDEBAR_TRAILING_SLOT,
+                            colors,
+                        )
+                        .rendered_mark(),
+                    )
+                    .into_any_element()
+            })
             .into_any_element()
     }
 
@@ -7859,12 +7851,36 @@ fn indent_rails(row: &crate::store::SidebarRow, colors: SemanticColors) -> Vec<A
         .collect()
 }
 
+/// Quiet pin for rows held at the top of their band. It takes the same 16px
+/// slot as the agent glyph beside it, so the two read as one column rather
+/// than a glyph and a straggler.
 fn pin_mark(colors: SemanticColors) -> AnyElement {
     div()
+        .debug_selector(|| "pin-mark".to_owned())
+        .flex_none()
+        .size(px(SIDEBAR_TRAILING_SLOT))
+        .flex()
+        .items_center()
+        .justify_center()
+        .child(sf_symbol("pin.fill", 9.0, colors.tertiary))
+        .into_any_element()
+}
+
+/// Trailing count on a fold that hides archived sessions. It stands on the
+/// identity column so it lines up under the agent glyphs above it, growing
+/// leftward if the number needs more than the slot.
+fn archive_count(count: usize, colors: SemanticColors) -> AnyElement {
+    div()
+        .min_w(px(SIDEBAR_TRAILING_SLOT))
+        .h(px(SIDEBAR_TRAILING_SLOT))
         .flex_none()
         .flex()
         .items_center()
-        .child(sf_symbol("pin.fill", 9.0, colors.tertiary))
+        .justify_center()
+        .text_size(px(Typo::META.size))
+        .font_weight(FontWeight::NORMAL)
+        .text_color(colors.tertiary)
+        .child(count.to_string())
         .into_any_element()
 }
 
@@ -8567,7 +8583,7 @@ fn session_title_available_width(
         available -= 18.0;
     }
     if pinned {
-        available -= 18.0;
+        available -= SIDEBAR_TRAILING_SLOT + 8.0;
     }
     // The close button replaces the logo without consuming title space.
     // Only the keyboard shortcut needs an additional reservation.
@@ -9530,11 +9546,11 @@ mod tests {
         let (sidebar, _, cx) = drag_harness(cx);
         archive_drag_source(&sidebar, cx);
         let archived = row_bounds(&sidebar, cx, "preview-codex");
-        let icon = point(
-            archived.left() + px(Space::ROW_H + Space::INDENT + 8.0),
-            archived.center().y,
-        );
-        cx.simulate_click(icon, Modifiers::default());
+        cx.simulate_mouse_move(archived.center(), None, Modifiers::default());
+        let revive = cx
+            .debug_bounds("session-revive:preview-codex")
+            .expect("hovering an archived row reveals its revive control");
+        cx.simulate_click(revive.center(), Modifiers::default());
         assert_drag_source_revived(&sidebar, cx);
     }
 
