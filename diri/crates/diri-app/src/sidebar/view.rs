@@ -455,6 +455,7 @@ fn section_shift_deltas(
 pub struct Sidebar {
     workspace_nav: workspaces::WorkspaceNavigation,
     project_picker: project_picker::ProjectPicker,
+    strip_menu: tabs::StripMenu,
     store: crate::store::WindowStore,
     // Preview stores have no daemon adapter, so retain their effect receiver.
     _preview_effects: Option<mpsc::UnboundedReceiver<StoreEffect>>,
@@ -648,6 +649,7 @@ impl Sidebar {
             last_tab_available_width: 0.0,
             workspace_nav: workspaces::WorkspaceNavigation::new(cx, active_workspace),
             project_picker: project_picker::ProjectPicker::new(cx),
+            strip_menu: tabs::StripMenu::new(cx),
             filter_query: Default::default(),
             filter_open: false,
             filter_focus: cx.focus_handle(),

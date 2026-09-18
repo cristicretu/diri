@@ -4663,6 +4663,9 @@ impl Render for RootView {
         root = root.children(self.sidebar.update(cx, |sidebar, cx| {
             sidebar.render_project_picker_overlay(window, cx)
         }));
+        root = root.children(self.sidebar.update(cx, |sidebar, cx| {
+            sidebar.render_strip_menu_overlay(exposed > 0.0, window, cx)
+        }));
         if !sidebar_visible
             && seam == 0.0
             && exposed == 0.0

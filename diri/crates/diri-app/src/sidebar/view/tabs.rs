@@ -46,7 +46,93 @@ pub(super) fn session_tab_face(
         )
 }
 
+/// Focus bookkeeping for context menus opened from the horizontal strip.
+///
+/// The sidebar's own menus live inside its render tree, which never paints
+/// while horizontal tabs hide the panel. The strip therefore hosts the same
+/// menus in a window-level overlay, and this handle gives them keyboard
+/// dismissal without leaving focus on a hidden sidebar afterwards.
+pub(super) struct StripMenu {
+    focus: FocusHandle,
+    previous_focus: Option<FocusHandle>,
+}
+
+impl StripMenu {
+    pub(super) fn new(cx: &mut App) -> Self {
+        Self {
+            focus: cx.focus_handle(),
+            previous_focus: None,
+        }
+    }
+}
+
 impl Sidebar {
+    /// Open a session or project context menu from the horizontal strip.
+    pub(super) fn open_strip_menu(
+        &mut self,
+        popover: Popover,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.commit_rename();
+        self.dismiss_hover_card(cx);
+        if self.project_picker_is_open() {
+            self.dismiss_project_picker(window, cx);
+        }
+        if self.strip_menu.previous_focus.is_none() {
+            self.strip_menu.previous_focus = window.focused(cx);
+        }
+        self.ui.popover = Some(popover);
+        self.strip_menu.focus.focus(window, cx);
+        cx.notify();
+    }
+
+    fn close_strip_menu(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.ui.popover = None;
+        if let Some(previous) = self.strip_menu.previous_focus.take() {
+            previous.focus(window, cx);
+        }
+        cx.notify();
+    }
+
+    /// The strip's context menus, painted above the workbench when the
+    /// sidebar itself is not on screen. Called on every root render so a
+    /// menu dismissed by a row action or the outside-click scrim hands focus
+    /// back as it leaves the tree, the same way its Escape path does.
+    pub(crate) fn render_strip_menu_overlay(
+        &mut self,
+        sidebar_painted: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Option<AnyElement> {
+        if self.ui.popover.is_none() {
+            if let Some(previous) = self.strip_menu.previous_focus.take() {
+                previous.focus(window, cx);
+            }
+            return None;
+        }
+        if sidebar_painted || self.project_picker.new_agent {
+            return None;
+        }
+        let colors = self.colors();
+        let popover = self.popover(colors, window, cx)?;
+        Some(
+            div()
+                .id("strip-menu-overlay")
+                .absolute()
+                .inset_0()
+                .track_focus(&self.strip_menu.focus)
+                .on_key_down(cx.listener(|this, event: &gpui::KeyDownEvent, window, cx| {
+                    if event.keystroke.key == "escape" {
+                        this.close_strip_menu(window, cx);
+                        cx.stop_propagation();
+                    }
+                }))
+                .child(popover)
+                .into_any_element(),
+        )
+    }
+
     pub(super) fn agent_tab_icon(kind: &ProtoAgentKind, colors: SemanticColors) -> AnyElement {
         match ui_agent_kind(kind).brand_mark() {
             Some(mark) => diri_ui::BrandMark::solid(mark, 16.0, colors.secondary)
@@ -291,6 +377,24 @@ impl Sidebar {
                     })),
             )
             .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+            .on_mouse_down(
+                MouseButton::Right,
+                cx.listener({
+                    let id = id.clone();
+                    move |this, event: &gpui::MouseDownEvent, window, cx| {
+                        cx.stop_propagation();
+                        this.ui.focus_cursor = Some(id.clone());
+                        this.open_strip_menu(
+                            Popover::SessionActions {
+                                id: id.clone(),
+                                position: event.position,
+                            },
+                            window,
+                            cx,
+                        );
+                    }
+                }),
+            )
             .on_click(cx.listener({
                 let id = id.clone();
                 move |this, _, _, cx| {

@@ -1,6 +1,7 @@
 //! The horizontal header's project menu is a window overlay. Opening it must
 //! never change sidebar visibility or resize an attached terminal.
 use super::*;
+use crate::tab_navigation::selected_project_tabs;
 use diri_proto::Project;
 
 pub(super) struct ProjectPicker {
@@ -152,6 +153,25 @@ impl Sidebar {
                 .size_full(),
             )
             .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+            .on_mouse_down(
+                MouseButton::Right,
+                cx.listener(|this, event: &gpui::MouseDownEvent, window, cx| {
+                    cx.stop_propagation();
+                    let project =
+                        selected_project_tabs(&mut this.store.write().expect("store")).project;
+                    let Some(id) = project else {
+                        return;
+                    };
+                    this.open_strip_menu(
+                        Popover::ProjectActions {
+                            id,
+                            position: Some(event.position),
+                        },
+                        window,
+                        cx,
+                    );
+                }),
+            )
             .on_click(cx.listener(|this, _, window, cx| {
                 if this.project_picker.open {
                     this.dismiss_project_picker(window, cx);
@@ -283,6 +303,10 @@ impl Sidebar {
 
     #[cfg(test)]
     pub(crate) fn project_picker_is_open_for_test(&self) -> bool {
+        self.project_picker.open
+    }
+
+    pub(super) fn project_picker_is_open(&self) -> bool {
         self.project_picker.open
     }
 
@@ -464,6 +488,23 @@ impl Sidebar {
                     .when(current, |row| {
                         row.child(sf_symbol("checkmark", 10.0, colors.secondary))
                     })
+                    .on_mouse_down(
+                        MouseButton::Right,
+                        cx.listener({
+                            let id = project.id.clone();
+                            move |this, event: &gpui::MouseDownEvent, window, cx| {
+                                cx.stop_propagation();
+                                this.open_strip_menu(
+                                    Popover::ProjectActions {
+                                        id: id.clone(),
+                                        position: Some(event.position),
+                                    },
+                                    window,
+                                    cx,
+                                );
+                            }
+                        }),
+                    )
                     .on_click(cx.listener(move |this, _, window, cx| {
                         this.choose_project(project.clone(), window, cx);
                         cx.stop_propagation();
@@ -564,6 +605,9 @@ mod tests {
                 .children(self.sidebar.update(cx, |sidebar, cx| {
                     sidebar.render_project_picker_overlay(window, cx)
                 }))
+                .children(self.sidebar.update(cx, |sidebar, cx| {
+                    sidebar.render_strip_menu_overlay(false, window, cx)
+                }))
         }
     }
     fn harness(cx: &mut TestAppContext, active: bool) -> (Entity<Sidebar>, &mut VisualTestContext) {
@@ -636,6 +680,97 @@ mod tests {
         );
         assert!(popup.left() >= button.left() - px(1.0));
         popup
+    }
+
+    fn right_click(cx: &mut VisualTestContext, at: Point<Pixels>) {
+        cx.simulate_mouse_down(at, MouseButton::Right, Modifiers::default());
+        cx.simulate_mouse_up(at, MouseButton::Right, Modifiers::default());
+    }
+
+    #[gpui::test]
+    fn horizontal_tab_right_click_opens_session_menu(cx: &mut TestAppContext) {
+        let (sidebar, cx) = harness(cx, false);
+        let tab = cx
+            .debug_bounds("horizontal-tab-preview-codex")
+            .expect("codex tab");
+        right_click(cx, tab.center());
+        sidebar.read_with(cx, |sidebar, _| {
+            assert!(
+                matches!(&sidebar.ui.popover, Some(Popover::SessionActions { id, .. })
+                    if id == &SessionId::new("preview-codex")),
+                "{:?}",
+                sidebar.ui.popover
+            );
+            assert!(!sidebar.is_visible(), "menu never reveals the sidebar");
+        });
+        let menu = cx
+            .debug_bounds("sidebar-popover")
+            .expect("session menu paints");
+        assert!(menu.top() >= tab.top(), "menu anchors at the click");
+        cx.simulate_keystrokes("escape");
+        assert!(cx.debug_bounds("sidebar-popover").is_none());
+        sidebar.read_with(cx, |sidebar, _| assert!(sidebar.ui.popover.is_none()));
+    }
+
+    #[gpui::test]
+    fn horizontal_project_button_right_click_opens_project_menu(cx: &mut TestAppContext) {
+        let (sidebar, cx) = harness(cx, false);
+        let expected = sidebar.read_with(cx, |sidebar, _| {
+            sidebar
+                .store
+                .read()
+                .unwrap()
+                .selected_session()
+                .unwrap()
+                .project_id
+                .clone()
+        });
+        let button = cx
+            .debug_bounds("horizontal-tab-project")
+            .expect("Projects button");
+        right_click(cx, button.center());
+        sidebar.read_with(cx, |sidebar, _| {
+            assert!(
+                matches!(&sidebar.ui.popover, Some(Popover::ProjectActions { id, position: Some(_) })
+                    if id == &expected),
+                "{:?}",
+                sidebar.ui.popover
+            );
+            assert!(!sidebar.project_picker_is_open_for_test());
+        });
+        assert!(cx.debug_bounds("sidebar-popover").is_some());
+        // Outside clicks dismiss the menu like every other sidebar popover.
+        cx.simulate_click(point(px(700.0), px(500.0)), Modifiers::default());
+        assert!(cx.debug_bounds("sidebar-popover").is_none());
+        sidebar.read_with(cx, |sidebar, _| assert!(sidebar.ui.popover.is_none()));
+    }
+
+    #[gpui::test]
+    fn project_picker_row_right_click_opens_project_menu(cx: &mut TestAppContext) {
+        let (sidebar, cx) = harness(cx, false);
+        open(cx);
+        let id = sidebar.read_with(cx, |sidebar, _| {
+            let store = sidebar.store.read().unwrap();
+            projects(&store, "")
+                .into_iter()
+                .next()
+                .expect("a project")
+                .id
+        });
+        let selector: &'static str = Box::leak(format!("project-picker-{}", id.0).into_boxed_str());
+        let row = cx.debug_bounds(selector).expect("picker row");
+        right_click(cx, row.center());
+        sidebar.read_with(cx, |sidebar, _| {
+            assert!(
+                matches!(&sidebar.ui.popover, Some(Popover::ProjectActions { id: menu, .. })
+                    if menu == &id),
+                "{:?}",
+                sidebar.ui.popover
+            );
+            assert!(!sidebar.project_picker_is_open_for_test());
+        });
+        assert!(cx.debug_bounds("project-picker-popup").is_none());
+        assert!(cx.debug_bounds("sidebar-popover").is_some());
     }
 
     #[gpui::test]
