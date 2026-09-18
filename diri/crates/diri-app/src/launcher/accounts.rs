@@ -182,11 +182,8 @@ impl LauncherOverlay {
                     .rounded(px(8.0))
                     .text_size(px(12.0))
                     .text_color(colors.primary)
-                    .when(self.highlight == index, |row| {
-                        row.bg(colors.primary.alpha(0.08))
-                    })
                     .cursor_pointer()
-                    .hover(move |row| row.bg(colors.primary.alpha(0.06)))
+                    .glass_menu_row(colors, self.highlight == index)
                     .on_click(cx.listener(move |this, _, _, cx| {
                         this.selected_account = id.clone();
                         this.picker = None;
@@ -209,11 +206,9 @@ impl LauncherOverlay {
                 .items_center()
                 .text_size(px(11.0))
                 .text_color(colors.secondary)
-                .when(self.highlight == self.account_choices().len(), |row| {
-                    row.bg(colors.primary.alpha(0.08))
-                })
+                .rounded(px(8.0))
                 .cursor_pointer()
-                .hover(move |s| s.bg(colors.primary.alpha(0.06)))
+                .glass_menu_row(colors, self.highlight == self.account_choices().len())
                 .on_click(cx.listener(|this, _, _, cx| this.manage_accounts(cx)))
                 .child("Manage accounts…"),
         );

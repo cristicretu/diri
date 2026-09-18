@@ -7477,6 +7477,27 @@ mod tests {
             })
             .unwrap();
             cx.run_until_parked();
+            // `DIRI_TABS_PICKER=1` captures the header's project dropdown open
+            // over the workbench instead of the bare strip.
+            if orientation == crate::store::TabOrientation::Horizontal
+                && std::env::var_os("DIRI_TABS_PICKER").is_some()
+            {
+                cx.update_window(window.into(), |view, window, cx| {
+                    view.downcast::<RootView>().unwrap().update(cx, |root, cx| {
+                        root.sidebar.update(cx, |sidebar, cx| {
+                            sidebar.open_project_picker_for_test(window, cx);
+                        });
+                    });
+                })
+                .unwrap();
+                cx.run_until_parked();
+                // Let the surface's wall-clock entry fade finish so the capture
+                // shows the settled material rather than its first frame.
+                std::thread::sleep(Duration::from_millis(220));
+                cx.update_window(window.into(), |_, window, _| window.refresh())
+                    .unwrap();
+                cx.run_until_parked();
+            }
             cx.capture_screenshot(window.into())
                 .unwrap()
                 .save(std::path::Path::new(&output).join(format!("{name}.png")))

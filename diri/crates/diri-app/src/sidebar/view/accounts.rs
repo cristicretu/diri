@@ -182,8 +182,7 @@ impl Sidebar {
                     .flex()
                     .flex_col()
                     .when(!busy, |row| {
-                        row.cursor_pointer()
-                            .hover(move |row| row.bg(colors.primary.alpha(0.06)))
+                        row.cursor_pointer().glass_menu_row(colors, false)
                     })
                     .text_color(if busy {
                         colors.tertiary
@@ -246,7 +245,7 @@ impl Sidebar {
                     .py(px(7.0))
                     .rounded(px(SIDEBAR_MENU_ROW_RADIUS))
                     .cursor_pointer()
-                    .hover(move |row| row.bg(colors.primary.alpha(0.06)))
+                    .glass_menu_row(colors, false)
                     .text_size(px(Typo::ROW.size))
                     .text_color(colors.secondary)
                     .child("Add or manage accounts…")

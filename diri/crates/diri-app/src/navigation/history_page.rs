@@ -204,25 +204,20 @@ impl NavigationOverlay {
                     .debug_selector(move || format!("history-row-{index}"))
                     .group("history-row")
                     .h_full()
-                    .px(px(10.0))
+                    // Nine plus the pill hairline keeps the keycap on the
+                    // header's escape column.
+                    .px(px(9.0))
                     .rounded(px(Radius::ROW))
                     .flex()
                     .items_center()
                     .gap(px(6.0))
-                    .bg(Fill::selected(colors, selected))
+                    .glass_menu_row(colors, selected)
                     .when(resumable && !busy, |row| {
                         row.cursor_pointer()
-                            .active(move |style| style.bg(colors.primary.alpha(0.14)))
+                            .active(move |style| style.opacity(0.74))
                     })
                     .when(!resumable, |row| {
                         row.cursor(CursorStyle::OperationNotAllowed)
-                    })
-                    .hover(move |style| {
-                        style.bg(if selected {
-                            Fill::selected(colors, true)
-                        } else {
-                            Fill::hover(colors, true)
-                        })
                     })
                     .tooltip(move |_, cx| cx.new(|_| PaletteTooltip(detail.clone(), colors)).into())
                     .on_click(cx.listener(move |this, _, window, cx| {

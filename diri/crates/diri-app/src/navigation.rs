@@ -29,8 +29,8 @@ use diri_proto::AgentKind;
 use diri_proto::{SessionId, SessionRecord};
 use diri_term::theme::TermTheme;
 use diri_ui::{
-    Fill, FloatingSurface, HairlineDivider, Icon, IconName, Ink, LoadingIndicator, Palette, Radius,
-    SemanticColors, StatusGlyph,
+    Fill, FloatingSurface, GlassMenuRow, HairlineDivider, Icon, IconName, Ink, LoadingIndicator,
+    Palette, Radius, SemanticColors, StatusGlyph,
 };
 use gpui::{
     Animation, AnimationExt, AnyElement, App, Context, FocusHandle, Focusable, FontWeight,
@@ -1841,13 +1841,11 @@ fn palette_row(
         .items_center()
         .gap(px(6.0))
         .h_full()
-        .px(px(10.0))
+        // Nine plus the pill hairline keeps a ten-point inset, so trailing
+        // keycaps stay on the header's escape column.
+        .px(px(9.0))
         .rounded(px(Radius::ROW))
-        .bg(if highlighted {
-            colors.primary.alpha(0.10)
-        } else {
-            colors.primary.alpha(0.0)
-        })
+        .glass_menu_row(colors, highlighted)
         .opacity(if enabled { 1.0 } else { 0.48 })
         .when(enabled, |row| row.cursor_pointer())
         .text_size(px(13.0))
@@ -1999,9 +1997,15 @@ mod tests {
     #[cfg(target_os = "macos")]
     impl Render for CommandPalettePreviewHarness {
         fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+            // `DIRI_VISUAL_BACKDROP=62616e` stands in for the blurred desktop
+            // under glass, exactly like the sidebar fixture.
             div()
                 .size_full()
-                .bg(self.overlay.read(cx).colors().background)
+                .bg(std::env::var("DIRI_VISUAL_BACKDROP")
+                    .ok()
+                    .and_then(|hex| u32::from_str_radix(&hex, 16).ok())
+                    .map(gpui::rgb)
+                    .unwrap_or(self.overlay.read(cx).colors().background))
                 .child(crate::root::cached_window_overlay(self.overlay.clone()))
         }
     }

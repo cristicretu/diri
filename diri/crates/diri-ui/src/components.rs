@@ -6,7 +6,7 @@ use gpui::{
     prelude::*, px, svg,
 };
 
-use crate::{Chip, Fill, Glass, IconName, Ink, Radius, SemanticColors, Typo, rgba_f32};
+use crate::{Chip, Fill, Glass, IconName, Ink, Material, Radius, SemanticColors, Typo, rgba_f32};
 
 /// Shared, platform-independent activity mark for bounded asynchronous work.
 /// Repeating GPUI animations automatically become static when Reduce Motion
@@ -261,13 +261,31 @@ pub trait GlassPill: Styled + Sized {
 
 impl<T: Styled> GlassPill for T {}
 
+/// Styles a row inside floating chrome (context menus, pickers, the command
+/// palette). The active row, whether the keyboard cursor or the pointer
+/// rests on it, wears the same glass pill as a selected sidebar row, so the
+/// sidebar and everything that floats over it highlight with one material.
+/// This owns the row's hover style; callers must not set another.
+pub trait GlassMenuRow: Styled + InteractiveElement + Sized {
+    fn glass_menu_row(self, colors: SemanticColors, on: bool) -> Self {
+        self.border_1()
+            .border_color(colors.primary.alpha(0.0))
+            .glass_pill(colors, on)
+            .hover(move |row| {
+                row.bg(Glass::fill(colors))
+                    .border_color(Glass::stroke(colors))
+            })
+    }
+}
+
+impl<T: Styled + InteractiveElement> GlassMenuRow for T {}
+
 /// Shared panel recipe for palettes, popovers, and find surfaces.
 #[derive(IntoElement)]
 pub struct FloatingSurface {
     colors: SemanticColors,
     child: AnyElement,
     radius: f32,
-    surface_opacity: f32,
     animate_entry: bool,
 }
 
@@ -277,18 +295,12 @@ impl FloatingSurface {
             colors,
             child: child.into_any_element(),
             radius: Radius::PANEL,
-            surface_opacity: 1.0,
             animate_entry: true,
         }
     }
 
     pub const fn radius(mut self, radius: f32) -> Self {
         self.radius = radius;
-        self
-    }
-
-    pub const fn surface_opacity(mut self, opacity: f32) -> Self {
-        self.surface_opacity = opacity;
         self
     }
 
@@ -302,14 +314,19 @@ impl RenderOnce for FloatingSurface {
     fn render(self, _window: &mut Window, cx: &mut App) -> impl IntoElement {
         let colors = self.colors;
         let animate_entry = self.animate_entry;
-        let surface_opacity = self.surface_opacity;
+        let rim = match colors.material() {
+            Material::Glass => Glass::rim(colors),
+            Material::Opaque => colors.primary.alpha(0.035),
+        };
         let surface = div()
             .relative()
             .rounded(px(self.radius))
             .overflow_hidden()
             // Floating chrome keeps the sidebar hue but uses a denser material
             // so live terminal content never competes with labels or controls.
-            .bg(colors.floating_surface().alpha(surface_opacity))
+            // Under glass the fill lifts a shade and the outline becomes the
+            // pill hairline, so a menu reads as a sheet raised off the sidebar.
+            .bg(colors.floating_fill())
             .border_1()
             .border_color(colors.floating_stroke())
             .shadow(vec![
@@ -321,7 +338,7 @@ impl RenderOnce for FloatingSurface {
                     inset: false,
                 },
                 BoxShadow {
-                    color: colors.primary.alpha(0.035).into(),
+                    color: rim.into(),
                     offset: point(px(0.0), px(1.0)),
                     blur_radius: px(0.0),
                     spread_radius: px(0.0),

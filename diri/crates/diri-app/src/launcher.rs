@@ -7,7 +7,7 @@ use std::time::Duration;
 
 use diri_proto::{AgentKind, Project, SessionId};
 use diri_ui::{
-    AgentKind as UiAgentKind, AgentLogo, Fill, FloatingSurface, Ink, Palette, Radius,
+    AgentKind as UiAgentKind, AgentLogo, Fill, FloatingSurface, GlassMenuRow, Ink, Palette, Radius,
     SemanticColors,
 };
 use gpui::{
@@ -2115,9 +2115,8 @@ impl LauncherOverlay {
                     .rounded(px(8.0))
                     .text_size(px(12.0))
                     .text_color(colors.primary)
-                    .when(highlighted, |row| row.bg(colors.primary.alpha(0.08)))
                     .cursor_pointer()
-                    .hover(move |row| row.bg(colors.primary.alpha(0.06)))
+                    .glass_menu_row(colors, highlighted)
                     .on_click(cx.listener(move |this, _, _, cx| {
                         this.pending_recipe_activation = None;
                         this.selected_harness = kind.clone();
@@ -2154,7 +2153,7 @@ impl LauncherOverlay {
                 .gap(px(8.0))
                 .rounded(px(8.0))
                 .cursor_pointer()
-                .hover(move |row| row.bg(colors.primary.alpha(0.06)))
+                .glass_menu_row(colors, false)
                 .on_click(cx.listener(move |this, _, _, cx| {
                     this.open = false;
                     this.picker = None;
@@ -2200,8 +2199,7 @@ impl LauncherOverlay {
                     .gap(px(9.0))
                     .rounded(px(8.0))
                     .cursor_pointer()
-                    .when(highlighted, |row| row.bg(colors.primary.alpha(0.08)))
-                    .hover(move |row| row.bg(colors.primary.alpha(0.06)))
+                    .glass_menu_row(colors, highlighted)
                     .on_click(cx.listener(move |this, _, _, cx| {
                         this.pending_recipe_activation = None;
                         this.selected_root.clone_from(&root);
@@ -2265,8 +2263,7 @@ impl LauncherOverlay {
                 .gap(px(9.0))
                 .rounded(px(8.0))
                 .cursor_pointer()
-                .when(highlighted, |row| row.bg(colors.primary.alpha(0.08)))
-                .hover(move |row| row.bg(colors.primary.alpha(0.06)))
+                .glass_menu_row(colors, highlighted)
                 .on_click(cx.listener(|this, _, window, cx| {
                     this.choose_folder(window, cx);
                 }))
@@ -2373,10 +2370,8 @@ impl LauncherOverlay {
                         "Enter launches, Space previews, E edits, Command-D duplicates, Command-Up or Command-Down reorders, Delete removes",
                     )
                     .cursor_pointer()
-                    .when(highlighted || active, |row| {
-                        row.bg(colors.primary.alpha(if active { 0.10 } else { 0.07 }))
-                    })
-                    .hover(move |row| row.bg(colors.primary.alpha(0.07)))
+                    .bg(Fill::selected(colors, active && !highlighted))
+                    .glass_menu_row(colors, highlighted)
                     .on_click(cx.listener(move |this, _, window, cx| {
                         this.activate_recipe(&id, window, cx);
                     }))

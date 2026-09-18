@@ -19,8 +19,8 @@ pub use brand::{
     MarkRasterizer, OPENAI_PATH, set_mark_rasterizer,
 };
 pub use components::{
-    AlertChip, FloatingSurface, GlassPill, HairlineDivider, HoverMarquee, LoadingIndicator,
-    RowFill, StateChip,
+    AlertChip, FloatingSurface, GlassMenuRow, GlassPill, HairlineDivider, HoverMarquee,
+    LoadingIndicator, RowFill, StateChip,
 };
 pub use icon::{Icon, IconAssets, IconName, IconSize, icon_from_system_name};
 pub use status::{

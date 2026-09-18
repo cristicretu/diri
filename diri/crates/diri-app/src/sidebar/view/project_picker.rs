@@ -286,6 +286,24 @@ impl Sidebar {
         self.project_picker.open
     }
 
+    /// Opens the picker the way a click on the header control does, for
+    /// fixtures that cannot simulate the pointer. The control must have
+    /// painted once so the popup has an anchor.
+    #[cfg(test)]
+    pub(crate) fn open_project_picker_for_test(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.project_picker.previous_focus = window.focused(cx);
+        self.project_picker.open = true;
+        self.project_picker.new_agent = false;
+        self.project_picker.query.clear();
+        self.project_picker.highlighted = 0;
+        self.project_picker.focus.focus(window, cx);
+        cx.notify();
+    }
+
     pub(crate) fn project_picker_active(&self) -> bool {
         self.project_picker.open || self.project_picker.new_agent
     }
@@ -428,14 +446,7 @@ impl Sidebar {
                     .items_center()
                     .gap(px(9.0))
                     .cursor_pointer()
-                    .bg(colors
-                        .primary
-                        .alpha(if index == self.project_picker.highlighted {
-                            0.07
-                        } else {
-                            0.0
-                        }))
-                    .hover(move |row| row.bg(colors.primary.alpha(0.07)))
+                    .glass_menu_row(colors, index == self.project_picker.highlighted)
                     .child(sf_symbol("folder", 13.0, colors.secondary))
                     .child(
                         div()
@@ -501,38 +512,37 @@ impl Sidebar {
                         .left(px(left))
                         .top(px(top))
                         .w(px(width))
-                        .max_h(px(height))
-                        .flex()
-                        .flex_col()
-                        .rounded(px(12.0))
-                        .bg(colors.background)
-                        .border_1()
-                        .border_color(colors.floating_stroke())
-                        .shadow_lg()
                         .occlude()
                         .track_focus(&self.project_picker.focus)
                         .on_key_down(cx.listener(Self::project_picker_key))
                         .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
-                        .child(
+                        .child(FloatingSurface::new(
+                            colors,
                             div()
-                                .id("project-picker-search")
-                                .debug_selector(|| "project-picker-search".into())
-                                .role(Role::TextInput)
-                                .aria_label("Search projects")
-                                .text_size(px(Typo::META.size))
-                                .text_color(colors.primary)
-                                .h(px(42.0))
-                                .flex_none()
-                                .px(px(13.0))
+                                .max_h(px(height))
                                 .flex()
-                                .items_center()
-                                .gap(px(8.0))
-                                .border_b_1()
-                                .border_color(colors.floating_stroke())
-                                .child(sf_symbol("magnifyingglass", 12.0, colors.tertiary))
-                                .child(query),
-                        )
-                        .child(list),
+                                .flex_col()
+                                .child(
+                                    div()
+                                        .id("project-picker-search")
+                                        .debug_selector(|| "project-picker-search".into())
+                                        .role(Role::TextInput)
+                                        .aria_label("Search projects")
+                                        .text_size(px(Typo::META.size))
+                                        .text_color(colors.primary)
+                                        .h(px(42.0))
+                                        .flex_none()
+                                        .px(px(13.0))
+                                        .flex()
+                                        .items_center()
+                                        .gap(px(8.0))
+                                        .border_b_1()
+                                        .border_color(colors.floating_stroke())
+                                        .child(sf_symbol("magnifyingglass", 12.0, colors.tertiary))
+                                        .child(query),
+                                )
+                                .child(list),
+                        )),
                 )
                 .into_any_element(),
         )

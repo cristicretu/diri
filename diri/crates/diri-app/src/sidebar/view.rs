@@ -16,9 +16,9 @@ use diri_proto::{
     SessionRecord,
 };
 use diri_ui::{
-    AgentLogo, AlertChip, AttentionDot, AttentionLevel, Fill, FloatingSurface, Glass, GlassPill,
-    HairlineDivider, HoverMarquee, Ink, LoadingIndicator, Metrics, Motion, Palette, Radius,
-    RowFill, SemanticColors, Space, StateChip, StatusGlyph, StatusState, Typo,
+    AgentLogo, AlertChip, AttentionDot, AttentionLevel, Fill, FloatingSurface, Glass, GlassMenuRow,
+    GlassPill, HairlineDivider, HoverMarquee, Ink, LoadingIndicator, Metrics, Motion, Palette,
+    Radius, RowFill, SemanticColors, Space, StateChip, StatusGlyph, StatusState, Typo,
 };
 use gpui::{
     Anchor, Animation, AnimationExt, AnyElement, App, AppContext as _, Bounds, Context,
@@ -2442,7 +2442,7 @@ impl Sidebar {
                                     })),
                             ),
                     )
-                })
+                }),
         );
 
         // Keep the last visible rows only for the close animation. The Store
@@ -3872,10 +3872,6 @@ impl Sidebar {
             .flex_col()
             .role(Role::Menu)
             .aria_label("Sidebar view options")
-            // The sidebar itself remains translucent, while menu labels need
-            // a settled semantic material so the session list cannot compete
-            // with this denser layer in light themes.
-            .bg(colors.floating_surface().alpha(0.995))
             .rounded(px(Radius::FLOATING_MENU))
             .p(px(4.0))
             .child(section_label("Grouping"))
@@ -4122,10 +4118,6 @@ impl Sidebar {
                                         div().overflow_hidden().child(child),
                                     )
                                     .radius(Radius::FLOATING_MENU)
-                                    // GPUI has no per-element backdrop blur.
-                                    // Preserve the material without leaving
-                                    // terminal text legible through the menu.
-                                    .surface_opacity(0.975)
                                     .animate_entry(!self.preview),
                                 ),
                         ),
@@ -4403,7 +4395,7 @@ impl Sidebar {
                         .gap(px(8.0))
                         .rounded(px(SIDEBAR_MENU_ROW_RADIUS))
                         .cursor_pointer()
-                        .hover(move |element| element.bg(colors.primary.alpha(0.06)))
+                        .glass_menu_row(colors, false)
                         .on_click(cx.listener(move |this, _, _, cx| {
                             cx.stop_propagation();
                             let next_directory = if target_host != previous_host {
@@ -4554,7 +4546,7 @@ impl Sidebar {
                     .rounded(px(SIDEBAR_MENU_ROW_RADIUS))
                     .when(available, |row| {
                         row.cursor_pointer()
-                            .hover(move |element| element.bg(colors.primary.alpha(0.06)))
+                            .glass_menu_row(colors, false)
                             .on_click(cx.listener(move |this, _, _, cx| {
                                 this.store
                                     .write()
@@ -4651,7 +4643,7 @@ impl Sidebar {
                 .gap(px(8.0))
                 .rounded(px(SIDEBAR_MENU_ROW_RADIUS))
                 .cursor_pointer()
-                .hover(move |row| row.bg(colors.primary.alpha(0.06)))
+                .glass_menu_row(colors, false)
                 .on_click(cx.listener(move |this, _, _, cx| {
                     this.ui.popover = None;
                     cx.emit(SidebarEvent::OpenAgentSettings(manage_host.clone()));
@@ -4926,7 +4918,7 @@ impl Sidebar {
             };
             row = row
                 .cursor_pointer()
-                .hover(move |element| element.bg(colors.primary.alpha(0.06)))
+                .glass_menu_row(colors, false)
                 .child(
                     div()
                         .flex_none()
@@ -5142,7 +5134,7 @@ impl Sidebar {
                     .gap(px(9.0))
                     .rounded(px(SIDEBAR_MENU_ROW_RADIUS))
                     .cursor_pointer()
-                    .hover(move |element| element.bg(colors.primary.alpha(0.06)))
+                    .glass_menu_row(colors, false)
                     .text_size(px(Typo::ROW.size))
                     .text_color(colors.primary)
                     .child(
@@ -5173,7 +5165,7 @@ impl Sidebar {
                     .gap(px(9.0))
                     .rounded(px(SIDEBAR_MENU_ROW_RADIUS))
                     .cursor_pointer()
-                    .hover(move |element| element.bg(colors.primary.alpha(0.06)))
+                    .glass_menu_row(colors, false)
                     .text_size(px(Typo::ROW.size))
                     .text_color(colors.primary)
                     .child(
@@ -5210,7 +5202,7 @@ impl Sidebar {
                     .gap(px(9.0))
                     .rounded(px(SIDEBAR_MENU_ROW_RADIUS))
                     .cursor_pointer()
-                    .hover(move |element| element.bg(colors.primary.alpha(0.06)))
+                    .glass_menu_row(colors, false)
                     .text_size(px(Typo::ROW.size))
                     .text_color(colors.primary)
                     .child(
@@ -7471,7 +7463,7 @@ fn menu_row(
         .items_center()
         .rounded(px(SIDEBAR_MENU_ROW_RADIUS))
         .cursor_pointer()
-        .hover(move |element| element.bg(colors.primary.alpha(0.06)))
+        .glass_menu_row(colors, false)
         .text_size(px(Typo::ROW.size))
         .text_color(colors.primary)
         .child(label)
@@ -7502,18 +7494,10 @@ fn choice_menu_row(
         .gap(px(8.0))
         .rounded(px(SIDEBAR_MENU_ROW_RADIUS))
         .cursor_pointer()
-        .bg(if focused {
-            colors.primary.alpha(0.075)
-        } else {
-            Fill::selected(colors, selected)
-        })
-        .border_1()
-        .border_color(if focused {
-            colors.primary.alpha(0.18)
-        } else {
-            colors.primary.alpha(0.0)
-        })
-        .hover(move |element| element.bg(colors.primary.alpha(0.07)))
+        // The checkmark names the current choice; the keyboard cursor and the
+        // pointer share the sidebar's selected pill.
+        .bg(Fill::selected(colors, selected && !focused))
+        .glass_menu_row(colors, focused)
         .active(|element| element.opacity(0.74))
         .text_size(px(Typo::ROW.size))
         .text_color(colors.primary)
@@ -7561,7 +7545,7 @@ fn directory_row(
         .gap(px(9.0))
         .rounded(px(SIDEBAR_MENU_ROW_RADIUS))
         .cursor_pointer()
-        .hover(move |row| row.bg(colors.primary.alpha(0.06)))
+        .glass_menu_row(colors, false)
         .child(sf_symbol(symbol, 11.0, colors.secondary))
         .child(
             div()
@@ -8282,32 +8266,15 @@ mod tests {
     fn title_overflow_threshold_accounts_for_sidebar_badges() {
         let plain =
             session_title_available_width(248.0, 0, false, false, false, false, false, false);
-        let remote = session_title_available_width(
-            248.0,
-            0,
-            false,
-            false,
-            false,
-            true,
-            false,
-            true,
-        );
+        let remote =
+            session_title_available_width(248.0, 0, false, false, false, true, false, true);
         assert!(plain > remote);
         // A nested row pays for every indent column it sits behind.
         let nested =
             session_title_available_width(248.0, 2, false, false, false, false, false, false);
         assert!(plain > nested);
         assert_eq!(
-            session_title_available_width(
-                200.0,
-                1,
-                true,
-                true,
-                true,
-                true,
-                true,
-                true,
-            ),
+            session_title_available_width(200.0, 1, true, true, true, true, true, true,),
             36.0
         );
     }
@@ -9606,7 +9573,8 @@ mod tests {
     /// Produces the sidebar layout variants used for material and hierarchy
     /// review without touching a running Diri instance. Set
     /// `DIRI_VISUAL_GROUPING=recency`, `DIRI_VISUAL_LIGHT=1`, or
-    /// `DIRI_VISUAL_POPOVER=none` to select the state to capture.
+    /// `DIRI_VISUAL_POPOVER=none|project|session` to select the state to
+    /// capture (the default opens the grouping menu).
     /// `DIRI_VISUAL_BACKDROP=62616e` supplies a fixed RGB backdrop under glass;
     /// headless rendering cannot capture the native desktop blur.
     #[cfg(target_os = "macos")]
@@ -9619,8 +9587,22 @@ mod tests {
         let recency = std::env::var_os("DIRI_VISUAL_GROUPING")
             .is_some_and(|value| value.to_string_lossy().eq_ignore_ascii_case("recency"));
         let light = std::env::var_os("DIRI_VISUAL_LIGHT").is_some();
-        let show_popover = std::env::var_os("DIRI_VISUAL_POPOVER")
-            .is_none_or(|value| !value.to_string_lossy().eq_ignore_ascii_case("none"));
+        let popover = match std::env::var("DIRI_VISUAL_POPOVER")
+            .unwrap_or_default()
+            .to_ascii_lowercase()
+            .as_str()
+        {
+            "none" => None,
+            "project" => Some(Popover::ProjectActions {
+                id: ProjectId::new("preview-dirijor"),
+                position: Some(point(px(48.0), px(150.0))),
+            }),
+            "session" => Some(Popover::SessionActions {
+                id: SessionId::new("preview-codex"),
+                position: point(px(48.0), px(210.0)),
+            }),
+            _ => Some(Popover::SidebarLayout),
+        };
         let scenario =
             PreviewScenario::from_env(std::env::var("DIRI_VISUAL_SCENARIO").ok().as_deref());
         let width: f32 = std::env::var("DIRI_VISUAL_WIDTH")
@@ -9698,9 +9680,7 @@ mod tests {
                         })
                         .expect("preview preferences");
                     drop(store);
-                    if show_popover {
-                        sidebar.ui.popover = Some(Popover::SidebarLayout);
-                    }
+                    sidebar.ui.popover = popover;
                     sidebar
                 });
                 cx.new(|_| SidebarPopoverHarness { sidebar })
@@ -9856,7 +9836,10 @@ mod tests {
             (expected, other)
         });
         expected.sort_by(|a, b| a.0.cmp(&b.0));
-        assert!(expected.len() > 1, "the fixture project has several sessions");
+        assert!(
+            expected.len() > 1,
+            "the fixture project has several sessions"
+        );
 
         // The ✕ joins the hover strip on the trailing edge; the leading
         // chevron stays put so the row never reflows under the pointer.

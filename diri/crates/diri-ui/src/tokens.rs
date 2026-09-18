@@ -278,10 +278,15 @@ impl SemanticColors {
         self.primary.alpha(alpha)
     }
 
+    /// Outline of floating chrome. Under glass it is the same hairline that
+    /// edges a selected sidebar pill, so menus and rows share one stroke.
     pub const fn floating_stroke(self) -> Rgba {
-        match self.appearance {
-            Appearance::Dark => rgba_f32(1.0, 1.0, 1.0, 0.08),
-            Appearance::Light => rgba_f32(0.0, 0.0, 0.0, 0.10),
+        match self.material {
+            Material::Glass => Glass::stroke(self),
+            Material::Opaque => match self.appearance {
+                Appearance::Dark => rgba_f32(1.0, 1.0, 1.0, 0.08),
+                Appearance::Light => rgba_f32(0.0, 0.0, 0.0, 0.10),
+            },
         }
     }
 
@@ -301,6 +306,25 @@ impl SemanticColors {
     /// sidebars so text and controls never compete with the content beneath.
     pub const fn floating_surface(self) -> Rgba {
         self.floating_surface
+    }
+
+    /// The floating material as it paints. Opaque windows keep the full
+    /// surface. Under glass the menu reads as a sheet lifted off the sidebar:
+    /// the same hue, lightened the way a selected pill lightens its row, and
+    /// only a hair short of opaque. GPUI has no per-element backdrop blur, so
+    /// anything thinner lets terminal output and sidebar rows read straight
+    /// through the menu instead of dissolving into a blur.
+    pub fn floating_fill(self) -> Rgba {
+        match self.material {
+            Material::Opaque => self.floating_surface,
+            Material::Glass => {
+                let lift = match self.appearance {
+                    Appearance::Dark => rgba_f32(1.0, 1.0, 1.0, 0.05),
+                    Appearance::Light => rgba_f32(1.0, 1.0, 1.0, 0.30),
+                };
+                composite(lift, self.floating_surface).alpha(0.97)
+            }
+        }
     }
 
     /// Shared translucent material for the leading and trailing sidebars.
@@ -392,10 +416,20 @@ impl Glass {
         }
     }
 
-    pub fn stroke(colors: SemanticColors) -> Rgba {
+    pub const fn stroke(colors: SemanticColors) -> Rgba {
         match colors.appearance {
             Appearance::Dark => rgba_f32(1.0, 1.0, 1.0, 0.12),
             Appearance::Light => rgba_f32(0.0, 0.0, 0.0, 0.12),
+        }
+    }
+
+    /// One-point light catch along the top inner edge of a floating glass
+    /// surface (menus, palettes, popovers). Pills sit flush on their panel
+    /// and do not carry it; a lifted panel does.
+    pub const fn rim(colors: SemanticColors) -> Rgba {
+        match colors.appearance {
+            Appearance::Dark => rgba_f32(1.0, 1.0, 1.0, 0.10),
+            Appearance::Light => rgba_f32(1.0, 1.0, 1.0, 0.65),
         }
     }
 
@@ -537,6 +571,27 @@ mod tests {
             let colors = SemanticColors::new(appearance);
             assert!(colors.floating_surface().a > colors.sidebar_surface().a);
             assert_eq!(colors.floating_surface().a, 1.0);
+            assert_eq!(colors.floating_fill(), colors.floating_surface());
+        }
+    }
+
+    #[test]
+    fn glass_floating_fill_thins_but_stays_far_denser_than_the_sidebar() {
+        for appearance in [Appearance::Light, Appearance::Dark] {
+            let colors = SemanticColors::new(appearance).with_material(Material::Glass);
+            let fill = colors.floating_fill();
+            assert!(fill.a < 1.0, "menus stay a hair translucent under glass");
+            assert!(
+                fill.a >= 0.96,
+                "GPUI cannot blur behind a menu, so content must not read through it"
+            );
+            let surface = colors.floating_surface();
+            assert!(
+                fill.r > surface.r && fill.g > surface.g && fill.b > surface.b,
+                "the sheet lifts off the sidebar hue instead of sinking below it"
+            );
+            assert_eq!(colors.floating_stroke(), Glass::stroke(colors));
+            assert!(Glass::rim(colors).a > 0.0);
         }
     }
 
