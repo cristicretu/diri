@@ -600,6 +600,10 @@ pub struct Sidebar {
     /// one-level directory browser. The listing payload itself lives in the
     /// Store so the daemon adapter can complete it asynchronously.
     directory_picker_open: bool,
+    /// Whether the New Agent menu's machine list is expanded under its
+    /// "on <machine>" chip. It is a one-shot disclosure: choosing a machine
+    /// collapses it again so the agent rows stay the menu's main content.
+    host_picker_open: bool,
     /// Optional window-space top-left anchor used when New Agent was opened
     /// from a project button rather than the sticky sidebar row.
     new_agent_anchor: Option<Point<Pixels>>,
@@ -759,6 +763,7 @@ impl Sidebar {
             last_toggle: None,
             preview,
             directory_picker_open: false,
+            host_picker_open: false,
             new_agent_anchor: None,
             external_drop_feedback: None,
             settings_nav: None,
@@ -1234,6 +1239,7 @@ impl Sidebar {
         cx: &mut Context<Self>,
     ) {
         self.directory_picker_open = false;
+        self.host_picker_open = false;
         self.new_agent_anchor = None;
         let host = {
             let mut store = self.store.write().expect("session store lock poisoned");
@@ -10728,7 +10734,96 @@ mod tests {
                         })
                         .expect("preview preferences");
                     drop(store);
-                    sidebar.ui.popover = popover;
+                    // `DIRI_VISUAL_POPOVER=new-agent` opens the New Agent
+                    // menu; `DIRI_VISUAL_HOSTS=1` adds a remote host so the
+                    // machine choice renders, `DIRI_VISUAL_NEW_AGENT=folder`
+                    // opens the folder browser on a seeded listing, and
+                    // `DIRI_VISUAL_NEW_AGENT=host` expands the machine list.
+                    let new_agent = std::env::var("DIRI_VISUAL_POPOVER")
+                        .is_ok_and(|value| value.eq_ignore_ascii_case("new-agent"));
+                    if new_agent {
+                        let with_hosts = std::env::var_os("DIRI_VISUAL_HOSTS").is_some();
+                        let sub_state = std::env::var("DIRI_VISUAL_NEW_AGENT").unwrap_or_default();
+                        let host = with_hosts
+                            .then(|| std::env::var("DIRI_VISUAL_HOST").ok())
+                            .flatten();
+                        let directory = "/Users/preview/code/dirijor".to_owned();
+                        {
+                            let mut store = sidebar.store.write().expect("preview session store");
+                            let catalog = |host: Option<&str>, agents: &[(&str, &str)]| {
+                                diri_proto::AgentReadinessResult {
+                                    host: host.map(str::to_owned),
+                                    scanned_at: None,
+                                    agents: agents
+                                        .iter()
+                                        .map(|(id, name)| diri_proto::AgentReadinessItem {
+                                            kind: ProtoAgentKind::new(*id),
+                                            binary: (*id).to_owned(),
+                                            path: Some(format!("/usr/local/bin/{id}")),
+                                            show_in_quick_create: true,
+                                            descriptor: Some(diri_proto::AgentDescriptor {
+                                                id: (*id).to_owned(),
+                                                display_name: (*name).to_owned(),
+                                                first_class: true,
+                                                ..diri_proto::AgentDescriptor::default()
+                                            }),
+                                            ..diri_proto::AgentReadinessItem::default()
+                                        })
+                                        .collect(),
+                                }
+                            };
+                            store.set_agent_catalog(catalog(
+                                None,
+                                &[
+                                    ("claude-code", "Claude Code"),
+                                    ("codex", "Codex"),
+                                    ("cursor", "Cursor"),
+                                    ("opencode", "OpenCode"),
+                                ],
+                            ));
+                            if with_hosts {
+                                store.set_agent_catalog(catalog(
+                                    Some("forge"),
+                                    &[("claude-code", "Claude Code"), ("codex", "Codex")],
+                                ));
+                                store.set_hosts(vec![diri_proto::HostEntry {
+                                    id: "forge".into(),
+                                    name: Some("Forge".into()),
+                                    ssh: "you@forge".into(),
+                                    default_cwd: Some("~/code".into()),
+                                    node: None,
+                                }]);
+                                store.set_default_spawn_host(host.clone());
+                            }
+                            if sub_state.eq_ignore_ascii_case("folder") {
+                                store.set_directory_listing(
+                                    host.clone(),
+                                    directory.clone(),
+                                    diri_proto::remote_pty::DirectoryListResult {
+                                        path: directory.clone(),
+                                        parent: Some("/Users/preview/code".into()),
+                                        entries: ["crates", "docs", "infra", "scripts", "web"]
+                                            .into_iter()
+                                            .map(|name| diri_proto::remote_pty::DirectoryEntry {
+                                                name: name.to_owned(),
+                                                path: format!("{directory}/{name}"),
+                                                kind: Default::default(),
+                                            })
+                                            .collect(),
+                                        truncated: false,
+                                    },
+                                );
+                            }
+                        }
+                        sidebar.directory_picker_open = sub_state.eq_ignore_ascii_case("folder");
+                        sidebar.host_picker_open = sub_state.eq_ignore_ascii_case("host");
+                        sidebar.ui.popover = Some(Popover::NewAgent {
+                            directory: Some(directory),
+                            host,
+                        });
+                    } else {
+                        sidebar.ui.popover = popover;
+                    }
                     sidebar
                 });
                 cx.new(|_| SidebarPopoverHarness { sidebar })

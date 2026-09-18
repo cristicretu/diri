@@ -397,6 +397,28 @@ impl WindowWrite<'_> {
         });
     }
 
+    /// Test/preview seam: install a completed folder listing for this window
+    /// without a daemon round trip, so the New Agent folder browser renders.
+    pub fn set_directory_listing(
+        &mut self,
+        host: Option<String>,
+        requested_path: String,
+        result: DirectoryListResult,
+    ) {
+        self.canonical.directory_request_seq = self.canonical.directory_request_seq.wrapping_add(1);
+        let request_id = self.canonical.directory_request_seq;
+        self.canonical
+            .window_targets
+            .entry(self.owner)
+            .or_default()
+            .listing = Some(DirectoryListing {
+            request_id,
+            host,
+            requested_path,
+            state: DirectoryListingState::Ready(result),
+        });
+    }
+
     pub fn set_visible_session(&mut self, session: Option<SessionId>) {
         if self.navigation.visible_session.as_ref() == Some(&session) {
             return;
