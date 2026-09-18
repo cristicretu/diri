@@ -15,6 +15,7 @@ pub(super) struct QolState {
     pub menu: Option<TerminalMenu>,
     pub copy_mode: Option<CopyMode>,
     pub paste: Option<PendingPaste>,
+    /// Last toast message, retained briefly to suppress repeated rejections.
     pub feedback: Option<String>,
     pub(super) feedback_generation: u64,
     feedback_timer: Option<Task<()>>,
@@ -170,6 +171,9 @@ impl TerminalPane {
         if self.qol.feedback.as_deref() == Some(text.as_str()) {
             return;
         }
+        cx.emit(TerminalPaneEvent::Feedback {
+            message: text.clone(),
+        });
         self.qol.feedback = Some(text);
         self.qol.feedback_generation += 1;
         let generation = self.qol.feedback_generation;
@@ -768,18 +772,6 @@ impl TerminalPane {
             .absolute()
             .size_full(),
         );
-        if let Some(message) = &self.qol.feedback {
-            overlay = overlay.child(
-                div()
-                    .absolute()
-                    .bottom(px(54.0))
-                    .left(px(14.0))
-                    .right(px(14.0))
-                    .text_size(px(11.0))
-                    .text_color(colors.secondary)
-                    .child(message.clone()),
-            );
-        }
         if self.qol.copy_mode.is_some() {
             overlay = overlay.child(
                 div()

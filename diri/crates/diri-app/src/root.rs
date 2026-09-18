@@ -507,6 +507,9 @@ impl RootView {
                         });
                     }
                 }
+                TerminalPaneEvent::Feedback { message } => {
+                    this.show_quote_feedback("Terminal", message.clone(), cx);
+                }
                 TerminalPaneEvent::ExternalDropFeedback { message } => {
                     this.show_quote_feedback("Dropped files", message.clone(), cx);
                 }
@@ -1447,6 +1450,9 @@ impl RootView {
                                 });
                             }
                         }
+                        crate::workspace_workbench::WorkspaceWorkbenchEvent::Terminal(
+                            TerminalPaneEvent::Feedback { message },
+                        ) => this.show_quote_feedback("Terminal", message.clone(), cx),
                         crate::workspace_workbench::WorkspaceWorkbenchEvent::Terminal(
                             TerminalPaneEvent::ExternalDropFeedback { message },
                         ) => this.show_quote_feedback("Dropped files", message.clone(), cx),
@@ -5202,6 +5208,58 @@ mod tests {
                     .unwrap(),
             ),
         })
+    }
+
+    #[gpui::test]
+    fn terminal_feedback_reaches_the_standard_toast_in_both_layouts(cx: &mut gpui::TestAppContext) {
+        let services = test_services();
+        let (root, cx) = cx.add_window_view(move |window, cx| {
+            RootView::new(services, false, PreviewScenario::Empty, window, cx)
+        });
+        for workspace in [false, true] {
+            root.update_in(cx, |root, window, cx| {
+                let event = TerminalPaneEvent::Feedback {
+                    message: format!("Input rejected in workspace={workspace}"),
+                };
+                if workspace {
+                    root.activate_saved_workspace(
+                        Some(diri_proto::workspace::WorkspaceId::new("toast-test")),
+                        window,
+                        cx,
+                    );
+                    root.workspace_workbench
+                        .as_ref()
+                        .unwrap()
+                        .update(cx, |_, cx| {
+                            cx.emit(
+                                crate::workspace_workbench::WorkspaceWorkbenchEvent::Terminal(
+                                    event,
+                                ),
+                            );
+                        });
+                } else {
+                    root.terminal
+                        .as_ref()
+                        .unwrap()
+                        .update(cx, |_, cx| cx.emit(event));
+                }
+            });
+            cx.run_until_parked();
+            root.read_with(cx, |root, _| {
+                let banner = root
+                    .status_banner
+                    .as_ref()
+                    .expect("standard right-side toast");
+                assert_eq!(banner.title, "Terminal");
+                assert_eq!(
+                    banner.body,
+                    format!("Input rejected in workspace={workspace}")
+                );
+            });
+        }
+        cx.executor().advance_clock(Duration::from_secs(4));
+        cx.run_until_parked();
+        root.read_with(cx, |root, _| assert!(root.status_banner.is_none()));
     }
 
     #[gpui::test]

@@ -119,6 +119,10 @@ pub enum TerminalPaneEvent {
         cwd: String,
         session_id: SessionId,
     },
+    /// Transient terminal feedback belongs in the window's standard toast.
+    Feedback {
+        message: String,
+    },
     /// Files were dropped on the grid and some (or all) could not be used.
     ExternalDropFeedback {
         message: String,
@@ -1424,6 +1428,14 @@ impl TerminalPane {
         if let Some(message) = plan.feedback() {
             cx.emit(TerminalPaneEvent::ExternalDropFeedback { message });
         }
+        if plan.action.is_some() {
+            // A Finder drop is an explicit interaction even when macOS has
+            // not activated this window. Claim synchronously: focus callbacks
+            // run after this handler, too late to admit the dropped paths.
+            window.activate_window();
+            window.focus(&self.focus, cx);
+            self.claim_selected_control();
+        }
         match plan.action {
             None => {}
             Some(TerminalDropAction::Paste(text)) => {
@@ -1448,8 +1460,6 @@ impl TerminalPane {
                 });
             }
         }
-        // The drop lands where the caret is, so the next keystroke should too.
-        window.focus(&self.focus, cx);
         cx.notify();
     }
 
@@ -5370,6 +5380,114 @@ mod tests {
     }
 
     #[gpui::test]
+    fn image_drop_claims_input_before_pasting(cx: &mut TestAppContext) {
+        let runtime = Arc::new(StoreRuntime::inert());
+        let tokio = Arc::new(
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap(),
+        );
+        let mut session = fixture_session();
+        session.host = None;
+        session.kind = diri_proto::AgentKind::CODEX;
+        let id = session.id.clone();
+        {
+            let mut store = runtime.store.write().unwrap();
+            store.upsert_session(session);
+            store.select(id.clone());
+        }
+        let image = tempfile::Builder::new().suffix(".png").tempfile().unwrap();
+        let paths = ExternalPaths(smallvec::smallvec![image.path().to_path_buf()]);
+        let (pane, cx) =
+            cx.add_window_view(move |window, cx| TerminalPane::new(runtime, tokio, window, cx));
+        pane.update_in(cx, |pane, window, cx| {
+            pane.reconcile_store_change(window, cx);
+            let other = cx.new(|cx| {
+                TerminalPane::new_fixed(
+                    pane.runtime.clone(),
+                    pane._tokio_owner.clone(),
+                    id.clone(),
+                    window,
+                    cx,
+                )
+            });
+            other.update(cx, |other, cx| {
+                other.reconcile_residency(cx);
+                other.claim_selected_control();
+            });
+            let (tx, mut input) = mpsc::unbounded_channel();
+            let resident = pane.residents.get_mut(&id).unwrap();
+            resident.attachment.input_observer = Some((id.clone(), tx));
+            resident.bracketed_paste = true;
+            assert!(!resident.attachment.is_controller());
+            pane.external_drop(&paths, window, cx);
+            let expected = terminal_file_paste(
+                &terminal_drop_text([image.path().to_str().unwrap()]),
+                true,
+                Some(&diri_proto::AgentKind::CODEX),
+            );
+            assert_eq!(
+                input.try_recv().ok(),
+                Some((id.clone(), expected)),
+                "dropping an image must claim the target before admitting its path"
+            );
+            assert!(input.try_recv().is_err(), "drop must paste exactly once");
+            assert!(pane.focus.is_focused(window));
+            assert!(
+                !other.read(cx).residents[&id].attachment.is_controller(),
+                "the previous view must lose input authority"
+            );
+        });
+    }
+
+    #[gpui::test]
+    fn terminal_feedback_uses_shell_toast(cx: &mut TestAppContext) {
+        let runtime = Arc::new(StoreRuntime::inert());
+        let tokio = Arc::new(
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap(),
+        );
+        let session = fixture_session();
+        let id = session.id.clone();
+        {
+            let mut store = runtime.store.write().unwrap();
+            store.upsert_session(session);
+            store.select(id.clone());
+        }
+        let (pane, cx) =
+            cx.add_window_view(move |window, cx| TerminalPane::new(runtime, tokio, window, cx));
+        let mut events = cx.events(&pane);
+        pane.update_in(cx, |pane, window, cx| {
+            pane.handle_pane_event(
+                PaneEvent::InputFeedback(id.clone(), "Input rejected".into()),
+                window,
+                cx,
+            );
+        });
+        assert_eq!(
+            events.try_recv().ok(),
+            Some(TerminalPaneEvent::Feedback {
+                message: "Input rejected".into(),
+            }),
+            "input feedback must reach the shell toast"
+        );
+        pane.update_in(cx, |pane, window, cx| {
+            pane.handle_pane_event(
+                PaneEvent::InputFeedback(id, "Input rejected".into()),
+                window,
+                cx,
+            );
+        });
+        assert!(
+            events.try_recv().is_err(),
+            "repeated rejection must not flood toasts"
+        );
+    }
+
+    #[gpui::test]
     fn terminal_local_file_links_open_in_the_default_app(cx: &mut TestAppContext) {
         let runtime = Arc::new(StoreRuntime::inert());
         let tokio = Arc::new(
@@ -5430,7 +5548,12 @@ mod tests {
             );
         });
         assert_eq!(cx.opened_url().as_deref(), Some("https://example.com"));
-        assert!(events.try_recv().is_err());
+        assert_eq!(
+            events.try_recv().ok(),
+            Some(TerminalPaneEvent::Feedback {
+                message: "Could not open this local file link".into(),
+            })
+        );
 
         pane.update_in(cx, |pane, window, cx| {
             let mut session = (*pane.selected_session().unwrap()).clone();
