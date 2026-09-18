@@ -67,6 +67,10 @@ const SIDEBAR_NAV_ROW_HEIGHT: f32 = 30.0;
 const SIDEBAR_ROW_RADIUS: f32 = 10.0;
 const SIDEBAR_MENU_ROW_RADIUS: f32 = 12.0;
 const SIDEBAR_ACTION_SLOT: f32 = 24.0;
+/// Width of the trailing identity column shared by every row: a session's
+/// agent mark, a project's fold chevron, and the ✕ that replaces either on
+/// hover. One width keeps them on a single vertical line.
+const SIDEBAR_TRAILING_SLOT: f32 = 16.0;
 
 /// How far a swapped-in body travels before it settles, and how long the
 /// whole swap takes. The travel is deliberately short: the sidebar itself
@@ -685,7 +689,9 @@ impl Sidebar {
     pub fn pending_close_copy(&self) -> Option<(String, String)> {
         let store = self.store.read().expect("session store lock poisoned");
         let pending = store.pending_close()?;
-        let title = if pending.ids.len() == 1 {
+        let title = if let Some(project) = &pending.project {
+            format!("Close all sessions in “{project}”?")
+        } else if pending.ids.len() == 1 {
             store
                 .sessions()
                 .get(&pending.ids[0])
@@ -703,7 +709,22 @@ impl Sidebar {
                 })
             })
             .count();
-        Some((title, format!("{running} still running.")))
+        let archived = pending
+            .ids
+            .iter()
+            .filter(|id| {
+                store
+                    .sessions()
+                    .get(*id)
+                    .is_some_and(|session| session.is_archived())
+            })
+            .count();
+        let message = if pending.project.is_some() && archived > 0 {
+            format!("{running} still running, {archived} archived.")
+        } else {
+            format!("{running} still running.")
+        };
+        Some((title, message))
     }
 
     pub fn confirm_close(&mut self, cx: &mut Context<Self>) {
@@ -1472,27 +1493,22 @@ impl Sidebar {
 
     fn new_agent_row(&self, colors: SemanticColors, cx: &mut Context<Self>) -> AnyElement {
         let hovering = self.ui.hovered_control == Some("new-agent");
-        let agent_context = {
+        let (agent_kind, host_label) = {
             let store = self.store.read().expect("session store lock poisoned");
             let host = store.default_spawn_host();
             let catalog = store.agent_catalog(host.as_deref());
-            // Without readiness facts the row names the saved preference: that
+            // Without readiness facts the row shows the saved preference: that
             // is what this control will attempt, and resolution happens against
-            // real facts at press time. Naming Terminal here would advertise a
+            // real facts at press time. Showing Terminal here would advertise a
             // session the user never chose.
-            let agent = catalog.map_or_else(
-                || crate::agent_catalog::title_case_id(store.preferences().default_agent.id()),
-                |catalog| {
-                    let kind = crate::agent_catalog::resolved_target_agent(
-                        &store.preferences().default_agent,
-                        Some(catalog),
-                    );
-                    crate::agent_catalog::display_name(&kind, catalog)
-                },
+            let saved = &store.preferences().default_agent;
+            let kind = catalog.map_or_else(
+                || saved.clone(),
+                |catalog| crate::agent_catalog::resolved_target_agent(saved, Some(catalog)),
             );
-            host.map_or_else(
-                || agent.clone(),
-                |id| format!("{agent} · {}", store.host_display_name(&id)),
+            (
+                ui_agent_kind(&kind),
+                host.map(|id| store.host_display_name(&id)),
             )
         };
         div()
@@ -1535,17 +1551,28 @@ impl Sidebar {
                     .text_ellipsis()
                     .child("New Agent"),
             )
+            // The agent about to launch is shown by its mark, the way session
+            // rows show theirs, rather than spelled out beside the label.
             .child(
                 div()
                     .debug_selector(|| "new-agent-context".into())
-                    .min_w(px(0.0))
-                    .max_w(px(112.0))
-                    .whitespace_nowrap()
-                    .overflow_hidden()
-                    .text_ellipsis()
-                    .text_size(px(Typo::META.size))
-                    .text_color(colors.tertiary)
-                    .child(agent_context),
+                    .flex_none()
+                    .flex()
+                    .items_center()
+                    .gap(px(6.0))
+                    .when_some(host_label, |context, host| {
+                        context.child(
+                            div()
+                                .max_w(px(88.0))
+                                .whitespace_nowrap()
+                                .overflow_hidden()
+                                .text_ellipsis()
+                                .text_size(px(Typo::META.size))
+                                .text_color(colors.tertiary)
+                                .child(host),
+                        )
+                    })
+                    .child(AgentLogo::new(agent_kind, 16.0, colors).badged(false)),
             )
             .into_any_element()
     }
@@ -2116,12 +2143,6 @@ impl Sidebar {
         let project_root = group.project.root.clone();
         let project_host = group.host.clone();
         let project_is_remote = project_host.is_some();
-        let project_host_label = group.host.as_deref().filter(|_| !is_hovered).map(|host| {
-            self.store
-                .read()
-                .expect("session store lock poisoned")
-                .host_display_name(host)
-        });
         let entity = cx.entity();
         let drag_label: SharedString = group.project.name.clone().into();
         let mut section = div().flex_none().flex().flex_col().child(
@@ -2281,21 +2302,8 @@ impl Sidebar {
                 .when(group.pinned && !is_hovered, |row| {
                     row.child(pin_mark(colors))
                 })
-                .when_some(project_host_label, |row, host| {
-                    row.child(
-                        div()
-                            .max_w(px(72.0))
-                            .px(px(5.0))
-                            .py(px(1.0))
-                            .rounded(px(Radius::CHIP))
-                            .bg(Fill::subtle(colors))
-                            .whitespace_nowrap()
-                            .overflow_hidden()
-                            .text_ellipsis()
-                            .text_size(px(Typo::META.size - 1.0))
-                            .text_color(colors.tertiary)
-                            .child(host),
-                    )
+                .when(project_is_remote && !is_hovered, |row| {
+                    row.child(remote_mark(colors))
                 })
                 .when(!is_hovered && collapsed, |row| {
                     row.child(AttentionDot::new(rollup_attention(&group.active), colors))
@@ -2305,7 +2313,7 @@ impl Sidebar {
                         div()
                             .absolute()
                             .top(px(0.0))
-                            .right(px(Space::ROW_H + SIDEBAR_ACTION_SLOT))
+                            .right(px(Space::ROW_H + SIDEBAR_TRAILING_SLOT))
                             .w(px(SIDEBAR_ACTION_SLOT * 2.0))
                             .h(px(SIDEBAR_NAV_ROW_HEIGHT))
                             .flex()
@@ -2382,29 +2390,77 @@ impl Sidebar {
                             ),
                     )
                 })
+                // The trailing slot is exactly the width of a session row's
+                // agent mark, so the chevron sits on the same column as the
+                // marks beneath it. Hover swaps the chevron for a close
+                // control, the way session rows swap their mark for ✕; the
+                // row itself still toggles the fold on click.
                 .child(
                     div()
                         .debug_selector({
                             let id = id.clone();
                             move || format!("PROJECT_DISCLOSURE_{}", id.0)
                         })
-                        .size(px(SIDEBAR_ACTION_SLOT))
+                        .size(px(SIDEBAR_TRAILING_SLOT))
                         .flex_none()
                         .flex()
                         .items_center()
                         .justify_center()
                         .text_size(px(9.0))
                         .text_color(colors.secondary)
-                        .child(sf_symbol_weighted(
-                            if collapsed {
-                                "chevron.right"
+                        .map(|slot| {
+                            if is_hovered {
+                                slot.child(
+                                    div()
+                                        .id(format!("project-close:{}", id.0))
+                                        .debug_selector({
+                                            let id = id.clone();
+                                            move || format!("PROJECT_CLOSE_{}", id.0)
+                                        })
+                                        .role(Role::Button)
+                                        .aria_label("Close all sessions")
+                                        .size(px(SIDEBAR_TRAILING_SLOT))
+                                        .flex()
+                                        .items_center()
+                                        .justify_center()
+                                        .rounded(px(Radius::CHIP))
+                                        .cursor_pointer()
+                                        .hover(move |button| button.bg(Fill::subtle(colors)))
+                                        .active(|button| button.opacity(0.72))
+                                        // The row drags; a press that wanders
+                                        // 2px becomes a drag that swallows the
+                                        // click. Keeping mouse-down off the row
+                                        // makes every press on the ✕ a close.
+                                        .on_mouse_down(MouseButton::Left, |_, _, cx| {
+                                            cx.stop_propagation();
+                                        })
+                                        .child(sf_symbol_weighted(
+                                            "xmark",
+                                            8.5,
+                                            SymbolWeight::Bold,
+                                            colors.secondary,
+                                        ))
+                                        .on_click(cx.listener({
+                                            let id = id.clone();
+                                            move |this, _, _, cx| {
+                                                cx.stop_propagation();
+                                                this.close_project_sessions(&id, cx);
+                                            }
+                                        })),
+                                )
                             } else {
-                                "chevron.down"
-                            },
-                            9.0,
-                            SymbolWeight::Bold,
-                            colors.secondary,
-                        )),
+                                slot.child(sf_symbol_weighted(
+                                    if collapsed {
+                                        "chevron.right"
+                                    } else {
+                                        "chevron.down"
+                                    },
+                                    9.0,
+                                    SymbolWeight::Bold,
+                                    colors.secondary,
+                                ))
+                            }
+                        }),
                 ),
         );
 
@@ -2455,7 +2511,15 @@ impl Sidebar {
                     Some(RowDrop::Insert(zone)) => Some((zone, row.depth)),
                     _ => None,
                 };
-                let rendered = self.session_row(row, shortcut, drop, colors, window, cx);
+                let rendered = self.session_row(
+                    row,
+                    shortcut,
+                    drop,
+                    group.host.is_some(),
+                    colors,
+                    window,
+                    cx,
+                );
                 let rendered = if collapsed {
                     rendered
                 } else {
@@ -2510,7 +2574,7 @@ impl Sidebar {
                 let shortcut = self.shortcut_for(row.id());
                 let id = row.id().clone();
                 let drop = self.row_drop_feedback(row, window, cx);
-                let rendered = self.session_row(row, shortcut, drop, colors, window, cx);
+                let rendered = self.session_row(row, shortcut, drop, false, colors, window, cx);
                 section = section.child(self.track_row_bounds(id, rendered, None));
             }
             sections.push(section.into_any_element());
@@ -2775,11 +2839,16 @@ impl Sidebar {
         )
     }
 
+    /// `host_marked_above` says the enclosing project header already carries
+    /// the remote mark, so this row does not repeat it. Rows without a header
+    /// (recency grouping) show their own.
+    #[allow(clippy::too_many_arguments)]
     fn session_row(
         &mut self,
         row: &crate::store::SidebarRow,
         shortcut: Option<usize>,
         drop: Option<RowDrop>,
+        host_marked_above: bool,
         colors: SemanticColors,
         window: &mut Window,
         cx: &mut Context<Self>,
@@ -2808,12 +2877,7 @@ impl Sidebar {
         let loading = is_loading(session, migrating);
         let session_is_remote = session.host.is_some();
         let ended = matches!(session.status, diri_proto::SessionStatus::Exited(_)) && !archived;
-        let host_label = session.host.as_ref().map(|host| {
-            self.store
-                .read()
-                .expect("session store lock poisoned")
-                .host_display_name(host)
-        });
+        let remote_marked = session_is_remote && !host_marked_above;
         let title = display_title(session);
         let non_persistent =
             session.remote_persistence == Some(PersistenceCapability::NonPersistent);
@@ -2825,7 +2889,7 @@ impl Sidebar {
             migrating,
             non_persistent,
             ended_chip,
-            host_label.as_deref(),
+            remote_marked,
             row.pinned,
             !hovered && focused && shortcut.is_some(),
         ) - if loading { 60.0 } else { 0.0 }
@@ -3148,9 +3212,9 @@ impl Sidebar {
             .when(loading, |element| {
                 element.child(StateChip::new("Loading", colors.secondary, colors))
             })
-            .when_some(host_label, |element, host| {
-                // Remote-host chip: this session's agent runs on another machine.
-                element.child(StateChip::new(host, colors.tertiary, colors))
+            .when(remote_marked, |element| {
+                // This session's agent runs on another machine.
+                element.child(remote_mark(colors))
             })
             .when(row.has_children, |element| {
                 element.child(self.disclosure(row, colors, cx))
@@ -5260,14 +5324,25 @@ impl Sidebar {
             .child(menu_row(
                 if collapsed { "Expand" } else { "Collapse" },
                 colors,
+                cx.listener({
+                    let id = id.clone();
+                    move |this, _, _, cx| {
+                        let _ = this
+                            .store
+                            .write()
+                            .expect("session store lock poisoned")
+                            .toggle_project_collapsed(id.clone());
+                        this.ui.popover = None;
+                        cx.notify();
+                    }
+                }),
+            ))
+            .child(menu_divider(colors))
+            .child(menu_row(
+                "Close All Sessions",
+                colors,
                 cx.listener(move |this, _, _, cx| {
-                    let _ = this
-                        .store
-                        .write()
-                        .expect("session store lock poisoned")
-                        .toggle_project_collapsed(id.clone());
-                    this.ui.popover = None;
-                    cx.notify();
+                    this.close_project_sessions(&id, cx);
                 }),
             ));
         match position {
@@ -6294,6 +6369,31 @@ impl Sidebar {
             .write()
             .expect("session store lock poisoned")
             .archive_sessions(ids);
+    }
+
+    /// The project's ✕ and its "Close All Sessions" menu item: every session
+    /// under the project, archived history included, behind one confirmation.
+    fn close_project_sessions(&mut self, project: &ProjectId, cx: &mut Context<Self>) {
+        self.commit_rename();
+        self.ui.popover = None;
+        let mut store = self.store.write().expect("session store lock poisoned");
+        let Some(name) = store.projects().get(project).map(|p| p.name.clone()) else {
+            return;
+        };
+        let mut ids: Vec<SessionId> = store
+            .sessions()
+            .values()
+            .filter(|session| session.project_id == *project)
+            .map(|session| session.id.clone())
+            .collect();
+        ids.sort_by(|a, b| a.0.cmp(&b.0));
+        store.request_project_close(ids, name);
+        let raised = store.pending_close().is_some();
+        drop(store);
+        if raised {
+            cx.emit(SidebarEvent::ConfirmationChanged);
+        }
+        cx.notify();
     }
 
     fn close_sessions(&mut self, ids: Vec<SessionId>, cx: &mut Context<Self>) {
@@ -7338,6 +7438,20 @@ fn pin_mark(colors: SemanticColors) -> AnyElement {
         .into_any_element()
 }
 
+/// Quiet trailing glyph for rows whose agent runs on a remote host. A glyph
+/// rather than the host's name: the name repeated down a whole project reads
+/// as a wall of chips, while one small server mark says "not this machine"
+/// without competing with the titles.
+fn remote_mark(colors: SemanticColors) -> AnyElement {
+    div()
+        .debug_selector(|| "remote-mark".to_owned())
+        .flex_none()
+        .flex()
+        .items_center()
+        .child(sf_symbol("server.rack", 9.0, colors.tertiary))
+        .into_any_element()
+}
+
 fn project_badge(colors: SemanticColors) -> AnyElement {
     div()
         .flex_none()
@@ -8007,7 +8121,7 @@ fn session_title_available_width(
     migrating: bool,
     non_persistent: bool,
     ended: bool,
-    host_label: Option<&str>,
+    remote_marked: bool,
     pinned: bool,
     shortcut_visible: bool,
 ) -> f32 {
@@ -8023,8 +8137,8 @@ fn session_title_available_width(
     if ended {
         available -= 48.0;
     }
-    if let Some(host) = host_label {
-        available -= host.chars().count() as f32 * 6.2 + 18.0;
+    if remote_marked {
+        available -= 18.0;
     }
     if pinned {
         available -= 18.0;
@@ -8177,21 +8291,21 @@ mod tests {
     #[test]
     fn title_overflow_threshold_accounts_for_sidebar_badges() {
         let plain =
-            session_title_available_width(248.0, 0, false, false, false, None, false, false);
+            session_title_available_width(248.0, 0, false, false, false, false, false, false);
         let remote = session_title_available_width(
             248.0,
             0,
             false,
             false,
             false,
-            Some("mini-b"),
+            true,
             false,
             true,
         );
         assert!(plain > remote);
         // A nested row pays for every indent column it sits behind.
         let nested =
-            session_title_available_width(248.0, 2, false, false, false, None, false, false);
+            session_title_available_width(248.0, 2, false, false, false, false, false, false);
         assert!(plain > nested);
         assert_eq!(
             session_title_available_width(
@@ -8200,7 +8314,7 @@ mod tests {
                 true,
                 true,
                 true,
-                Some("very-long-host"),
+                true,
                 true,
                 true,
             ),
@@ -9546,6 +9660,9 @@ mod tests {
                         sidebar.filter_query.insert(&query);
                     }
 
+                    if std::env::var_os("DIRI_VISUAL_HOVER_PROJECT").is_some() {
+                        sidebar.ui.hovered_project = Some(ProjectId::new("preview-dirijor"));
+                    }
                     if std::env::var_os("DIRI_VISUAL_HOVER").is_some() {
                         sidebar.ui.hovered_session = Some(SessionId::new("preview-codex"));
                     }
@@ -9722,6 +9839,84 @@ mod tests {
         assert_eq!(before, after, "hover affordances must not reflow the row");
         assert!(cx.debug_bounds("PROJECT_MENU_preview-dirijor").is_some());
         assert!(cx.debug_bounds("PROJECT_ADD_preview-dirijor").is_some());
+    }
+
+    #[gpui::test]
+    fn project_close_control_confirms_then_removes_every_session(cx: &mut TestAppContext) {
+        let (view, cx) = cx.add_window_view(|_, cx| {
+            let sidebar = cx.new(|cx| Sidebar::new(None, true, PreviewScenario::Typical, cx));
+            SidebarPopoverHarness { sidebar }
+        });
+        let sidebar = view.read_with(cx, |harness, _| harness.sidebar.clone());
+        let project_id = ProjectId::new("preview-dirijor");
+        let (mut expected, other) = sidebar.read_with(cx, |sidebar, _| {
+            let store = sidebar.store.read().unwrap();
+            let expected: Vec<SessionId> = store
+                .sessions()
+                .values()
+                .filter(|session| session.project_id == project_id)
+                .map(|session| session.id.clone())
+                .collect();
+            let other = store
+                .sessions()
+                .values()
+                .find(|session| session.project_id != project_id)
+                .map(|session| session.id.clone())
+                .expect("the fixture has a second project");
+            (expected, other)
+        });
+        expected.sort_by(|a, b| a.0.cmp(&b.0));
+        assert!(expected.len() > 1, "the fixture project has several sessions");
+
+        // The ✕ lives in the chevron's slot, so it cannot shift the row.
+        let project = cx
+            .debug_bounds("PROJECT_preview-dirijor")
+            .expect("project row");
+        let chevron = cx
+            .debug_bounds("PROJECT_DISCLOSURE_preview-dirijor")
+            .expect("project disclosure");
+        assert!(cx.debug_bounds("PROJECT_CLOSE_preview-dirijor").is_none());
+        cx.simulate_mouse_move(project.center(), None, Modifiers::default());
+        let close = cx
+            .debug_bounds("PROJECT_CLOSE_preview-dirijor")
+            .expect("hover reveals the project close control");
+        assert_eq!(close, chevron);
+
+        cx.simulate_click(close.center(), Modifiers::default());
+
+        let pending = sidebar.read_with(cx, |sidebar, _| {
+            sidebar.store.read().unwrap().pending_close().cloned()
+        });
+        let pending = pending.expect("closing a project always asks first");
+        let mut ids = pending.ids.clone();
+        ids.sort_by(|a, b| a.0.cmp(&b.0));
+        assert_eq!(ids, expected);
+        assert_eq!(pending.project.as_deref(), Some("Dirijor"));
+        let (title, _) = sidebar
+            .read_with(cx, |sidebar, _| sidebar.pending_close_copy())
+            .expect("confirmation copy");
+        assert_eq!(title, "Close all sessions in “Dirijor”?");
+        // Nothing is gone until the user says so.
+        sidebar.read_with(cx, |sidebar, _| {
+            let store = sidebar.store.read().unwrap();
+            for id in &expected {
+                assert!(store.sessions().contains_key(id));
+            }
+        });
+
+        sidebar.update(cx, |sidebar, cx| sidebar.confirm_close(cx));
+
+        sidebar.read_with(cx, |sidebar, _| {
+            let store = sidebar.store.read().unwrap();
+            for id in &expected {
+                assert!(!store.sessions().contains_key(id), "{id:?} survived");
+            }
+            assert!(
+                store.sessions().contains_key(&other),
+                "other projects are untouched"
+            );
+            assert!(store.pending_close().is_none());
+        });
     }
 
     #[gpui::test]

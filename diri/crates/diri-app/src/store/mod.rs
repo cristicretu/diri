@@ -248,6 +248,9 @@ pub struct StoreSnapshot {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PendingClose {
     pub ids: Vec<SessionId>,
+    /// Set when the request came from a project's close control: the
+    /// confirmation then names the project instead of counting rows.
+    pub project: Option<String>,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -2092,7 +2095,7 @@ impl SessionStore {
                 .is_some_and(|session| !matches!(session.status, SessionStatus::Exited(_)))
         });
         if self.prefs.confirm_before_closing_session && has_running {
-            self.pending_close = Some(PendingClose { ids });
+            self.pending_close = Some(PendingClose { ids, project: None });
         } else {
             self.remove_sessions(ids);
         }

@@ -984,10 +984,28 @@ impl WindowWrite<'_> {
                 .is_some_and(|session| !matches!(session.status, SessionStatus::Exited(_)))
         });
         if self.prefs.confirm_before_closing_session && has_running {
-            self.navigation.pending_close = Some(PendingClose { ids });
+            self.navigation.pending_close = Some(PendingClose { ids, project: None });
         } else {
             self.remove_sessions(ids);
         }
+    }
+
+    /// Close every session under one project. Unlike `request_close`, this
+    /// always raises the confirmation, whatever the confirm-before-closing
+    /// preference says: one click removing a whole project's worth of rows
+    /// (archived history included) is never a thing to do silently.
+    pub fn request_project_close(&mut self, ids: Vec<SessionId>, project: String) {
+        let ids: Vec<_> = ids
+            .into_iter()
+            .filter(|id| !self.closing.contains(id))
+            .collect();
+        if ids.is_empty() {
+            return;
+        }
+        self.navigation.pending_close = Some(PendingClose {
+            ids,
+            project: Some(project),
+        });
     }
 
     pub fn confirm_pending_close(&mut self) {
