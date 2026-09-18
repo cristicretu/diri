@@ -145,9 +145,14 @@ impl Sidebar {
         colors: SemanticColors,
         cx: &mut Context<Self>,
     ) -> AnyElement {
-        let mut section = div().id("account-switcher").debug_selector(|| "account-switcher".into()).flex().flex_col().py(px(3.0))
-            .child(div().px(px(14.0)).text_size(px(Typo::META.size)).text_color(colors.tertiary).child("Switch open conversations"))
-            .child(div().px(px(14.0)).py(px(4.0)).text_size(px(Typo::META.size)).text_color(colors.tertiary).child("Open Claude and Codex tabs on this Mac resume with the selected login. Local MCP setup stays; hosted connectors require per-account connections."));
+        let busy = self.accounts.busy;
+        let mut section = div()
+            .id("account-switcher")
+            .debug_selector(|| "account-switcher".into())
+            .flex()
+            .flex_col()
+            .py(px(3.0))
+            .child(menu_eyebrow("Accounts", colors));
         for profile in self
             .accounts
             .catalog
@@ -156,34 +161,26 @@ impl Sidebar {
             .filter(|p| p.host.is_none() && matches!(p.agent.as_str(), "codex" | "claude-code"))
         {
             let id = profile.id.clone();
-            let subtitle = format!(
-                "{} · {}{}",
-                if profile.agent == "codex" {
-                    "Codex"
-                } else {
-                    "Claude"
-                },
-                profile.host.as_deref().unwrap_or("This Mac"),
-                if profile.is_default {
-                    " · Default"
-                } else {
-                    ""
-                }
-            );
-            let busy = self.accounts.busy;
+            let agent = if profile.agent == "codex" {
+                "Codex"
+            } else {
+                "Claude"
+            };
             section = section.child(
                 div()
                     .id(SharedString::from(format!("switch-account-{id}")))
                     .debug_selector(move || format!("switch-account-{id}"))
                     .mx(px(6.0))
                     .px(px(8.0))
-                    .py(px(6.0))
-                    .rounded(px(SIDEBAR_MENU_ROW_RADIUS))
+                    .h(px(26.0))
                     .flex()
-                    .flex_col()
+                    .items_center()
+                    .gap(px(8.0))
+                    .rounded(px(SIDEBAR_MENU_ROW_RADIUS))
                     .when(!busy, |row| {
                         row.cursor_pointer().glass_menu_row(colors, false)
                     })
+                    .text_size(px(Typo::ROW.size))
                     .text_color(if busy {
                         colors.tertiary
                     } else {
@@ -191,14 +188,29 @@ impl Sidebar {
                     })
                     .child(
                         div()
-                            .text_size(px(Typo::ROW.size))
+                            .min_w(px(0.0))
+                            .flex_1()
+                            .whitespace_nowrap()
+                            .overflow_hidden()
+                            .text_ellipsis()
                             .child(profile.label.clone()),
                     )
                     .child(
                         div()
+                            .flex_none()
                             .text_size(px(Typo::META.size))
                             .text_color(colors.tertiary)
-                            .child(subtitle),
+                            .child(agent),
+                    )
+                    .child(
+                        div()
+                            .flex_none()
+                            .w(px(12.0))
+                            .flex()
+                            .justify_center()
+                            .when(profile.is_default, |slot| {
+                                slot.child(sf_symbol("checkmark", 9.0, colors.secondary))
+                            }),
                     )
                     .on_click(cx.listener({
                         let id = profile.id.clone();
@@ -211,21 +223,14 @@ impl Sidebar {
             );
         }
         if !self.accounts.loaded && !self.accounts.failed {
-            section = section.child(
-                div()
-                    .px(px(14.0))
-                    .py(px(5.0))
-                    .text_size(px(Typo::META.size))
-                    .text_color(colors.tertiary)
-                    .child("Loading accounts…"),
-            );
+            section = section.child(menu_note("Loading accounts…", colors));
         }
         if let Some(message) = &self.accounts.message {
             section = section.child(
                 div()
                     .id("account-switch-status")
                     .px(px(14.0))
-                    .py(px(5.0))
+                    .py(px(3.0))
                     .text_size(px(Typo::META.size))
                     .text_color(if self.accounts.failed {
                         Ink::DANGER
@@ -242,13 +247,15 @@ impl Sidebar {
                     .debug_selector(|| "manage-accounts".into())
                     .mx(px(6.0))
                     .px(px(8.0))
-                    .py(px(7.0))
+                    .h(px(26.0))
+                    .flex()
+                    .items_center()
                     .rounded(px(SIDEBAR_MENU_ROW_RADIUS))
                     .cursor_pointer()
                     .glass_menu_row(colors, false)
                     .text_size(px(Typo::ROW.size))
                     .text_color(colors.secondary)
-                    .child("Add or manage accounts…")
+                    .child("Manage accounts…")
                     .on_click(cx.listener(|this, _, _, cx| {
                         this.ui.popover = None;
                         cx.emit(SidebarEvent::ManageAccounts);
