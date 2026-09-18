@@ -112,6 +112,7 @@ objc2-app-kit = { version = "=0.3.2", default-features = false, features = [
     "NSRunningApplication",
     "NSScreen",
     "NSScrollView",
+    "NSScroller",
     "NSStatusBar",
     "NSStatusBarButton",
     "NSStatusItem",
