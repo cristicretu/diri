@@ -18,7 +18,8 @@ use crate::grid::{GridCodecError, GridUpdate};
 use crate::terminal::MouseModes;
 
 pub const PROTOCOL_MAJOR: u16 = 1;
-pub const PROTOCOL_MINOR: u16 = 14;
+pub const PROTOCOL_MINOR: u16 = 15;
+pub const TERMINAL_RESET_PROTOCOL_MINOR: u16 = 15;
 pub const ENHANCED_KEYBOARD_PROTOCOL_MINOR: u16 = 14;
 pub const PROCESS_FACTS_PROTOCOL_MINOR: u16 = 13;
 pub const STOP_SESSION_PROTOCOL_MINOR: u16 = 12;
@@ -58,6 +59,8 @@ const KIND_SCROLLBACK_RESPONSE: u8 = 44;
 const KIND_FOREGROUND_PROCESS: u8 = 45;
 const KIND_INPUT_MODES: u8 = 46;
 const KIND_STOP_SESSION: u8 = 47;
+const KIND_TERMINAL_RESET: u8 = 48;
+const KIND_TERMINAL_RESET_STATE: u8 = 49;
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -95,6 +98,8 @@ pub enum RemoteCapability {
     ProcessFacts,
     #[serde(rename = "stop-session-v1")]
     StopSession,
+    #[serde(rename = "terminal-reset-v1")]
+    TerminalReset,
     IncrementalGrid,
     ProcessExit,
     Signal,
@@ -137,6 +142,7 @@ impl RemoteCapability {
             Self::ProcessIdentity => "process-identity-v1",
             Self::ProcessFacts => "process-facts-v1",
             Self::StopSession => "stop-session-v1",
+            Self::TerminalReset => "terminal-reset-v1",
             Self::FullSnapshot => "full-snapshot",
             Self::IncrementalGrid => "incremental-grid",
             Self::ProcessExit => "process-exit",
@@ -203,6 +209,7 @@ pub const ANNOTATED_HOLDER_CAPABILITIES: &[RemoteCapability] = &[
     RemoteCapability::EnhancedKeyboard,
     RemoteCapability::ProcessIdentity,
     RemoteCapability::StopSession,
+    RemoteCapability::TerminalReset,
 ];
 pub const ANNOTATED_HELPER_CAPABILITIES: &[RemoteCapability] = &[
     RemoteCapability::ProcessFacts,
@@ -224,6 +231,7 @@ pub const ANNOTATED_HELPER_CAPABILITIES: &[RemoteCapability] = &[
     RemoteCapability::EnhancedKeyboard,
     RemoteCapability::ProcessIdentity,
     RemoteCapability::StopSession,
+    RemoteCapability::TerminalReset,
 ];
 
 /// Authentication bearer shared only by the local Engine and one Holder.
@@ -811,6 +819,31 @@ pub struct StopSession {
     pub controller_epoch: u64,
 }
 
+/// Emulator-only mutation, admitted by the existing authenticated owner.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct TerminalReset {
+    pub controller_epoch: u64,
+    pub expected_incarnation: String,
+}
+
+/// Reset boundary paired with an authoritative full grid. Offset is the raw
+/// output boundary at the last reset, not the snapshot's latest output offset.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct TerminalResetState {
+    pub incarnation: String,
+    pub generation: u64,
+    pub sequence: u64,
+    pub output_offset: u64,
+}
+
+impl TerminalResetState {
+    pub fn validate(&self) -> Result<(), RemoteCodecError> {
+        validate_identifier("reset incarnation", &self.incarnation)
+    }
+}
+
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct AcquireControl {
@@ -940,6 +973,8 @@ pub enum RemoteMessage {
     ProcessExit(ProcessExit),
     Signal(Signal),
     StopSession(StopSession),
+    TerminalReset(TerminalReset),
+    TerminalResetState(TerminalResetState),
     AcquireControl(AcquireControl),
     ControlGranted(ControlGranted),
     ControlRevoked(ControlRevoked),
@@ -1115,6 +1150,14 @@ impl RemoteCodec {
             RemoteMessage::Signal(value) => append_json(KIND_SIGNAL, value, output, start),
             RemoteMessage::StopSession(value) => {
                 append_json(KIND_STOP_SESSION, value, output, start)
+            }
+            RemoteMessage::TerminalReset(value) => {
+                validate_identifier("reset incarnation", &value.expected_incarnation)?;
+                append_json(KIND_TERMINAL_RESET, value, output, start)
+            }
+            RemoteMessage::TerminalResetState(value) => {
+                value.validate()?;
+                append_json(KIND_TERMINAL_RESET_STATE, value, output, start)
             }
             RemoteMessage::AcquireControl(value) => {
                 validate_identifier("client nonce", &value.client_nonce)?;
@@ -1324,6 +1367,16 @@ fn decode_message(kind: u8, payload: &[u8]) -> Result<RemoteMessage, RemoteCodec
         KIND_PROCESS_EXIT => Ok(RemoteMessage::ProcessExit(decode_json(kind, payload)?)),
         KIND_SIGNAL => Ok(RemoteMessage::Signal(decode_json(kind, payload)?)),
         KIND_STOP_SESSION => Ok(RemoteMessage::StopSession(decode_json(kind, payload)?)),
+        KIND_TERMINAL_RESET => {
+            let request: TerminalReset = decode_json(kind, payload)?;
+            validate_identifier("reset incarnation", &request.expected_incarnation)?;
+            Ok(RemoteMessage::TerminalReset(request))
+        }
+        KIND_TERMINAL_RESET_STATE => {
+            let state: TerminalResetState = decode_json(kind, payload)?;
+            state.validate()?;
+            Ok(RemoteMessage::TerminalResetState(state))
+        }
         KIND_ACQUIRE_CONTROL => {
             let value: AcquireControl = decode_json(kind, payload)?;
             validate_identifier("client nonce", &value.client_nonce)?;
@@ -1351,7 +1404,7 @@ fn decode_message(kind: u8, payload: &[u8]) -> Result<RemoteMessage, RemoteCodec
 
 fn validate_kind(kind: u8) -> Result<(), RemoteCodecError> {
     if (1..=FrameType::Mouse as u8).contains(&kind)
-        || (KIND_HELLO..=KIND_STOP_SESSION).contains(&kind)
+        || (KIND_HELLO..=KIND_TERMINAL_RESET_STATE).contains(&kind)
     {
         Ok(())
     } else {
@@ -1563,6 +1616,55 @@ mod tests {
             decoded.extend(codec.feed(&encoded[split..]).unwrap());
             assert_eq!(decoded, vec![message.clone()]);
         }
+    }
+
+    #[test]
+    fn terminal_reset_messages_round_trip_and_validate_their_incarnation() {
+        let request = RemoteMessage::TerminalReset(TerminalReset {
+            controller_epoch: 7,
+            expected_incarnation: "incarnation-1".into(),
+        });
+        let state = RemoteMessage::TerminalResetState(TerminalResetState {
+            incarnation: "incarnation-1".into(),
+            generation: 3,
+            sequence: 99,
+            output_offset: 4096,
+        });
+        for (message, kind) in [
+            (request, KIND_TERMINAL_RESET),
+            (state, KIND_TERMINAL_RESET_STATE),
+        ] {
+            let encoded = RemoteCodec::encode(&message).unwrap();
+            assert_eq!(encoded[0], kind);
+            for split in 0..=encoded.len() {
+                let mut codec = RemoteCodec::new();
+                let mut decoded = codec.feed(&encoded[..split]).unwrap();
+                decoded.extend(codec.feed(&encoded[split..]).unwrap());
+                assert_eq!(decoded, vec![message.clone()]);
+            }
+        }
+        assert!(
+            RemoteCodec::encode(&RemoteMessage::TerminalReset(TerminalReset {
+                controller_epoch: 1,
+                expected_incarnation: "../escape".into(),
+            }))
+            .is_err(),
+            "an incarnation is an identifier, never a path"
+        );
+        assert!(
+            RemoteCodec::encode(&RemoteMessage::TerminalResetState(TerminalResetState {
+                incarnation: String::new(),
+                generation: 1,
+                sequence: 1,
+                output_offset: 0,
+            }))
+            .is_err()
+        );
+        assert_eq!(
+            serde_json::to_value(RemoteCapability::TerminalReset).unwrap(),
+            serde_json::json!("terminal-reset-v1")
+        );
+        assert!(ANNOTATED_HOLDER_CAPABILITIES.contains(&RemoteCapability::TerminalReset));
     }
 
     #[test]

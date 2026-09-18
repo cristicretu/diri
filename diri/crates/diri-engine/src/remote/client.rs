@@ -67,6 +67,7 @@ pub struct RemoteSessionClient {
     observed_output_offset: AtomicU64,
     scheduled_output_offset: AtomicU64,
     next_request_id: AtomicU64,
+    reset_generation: AtomicU64,
     scrollback_requests: Mutex<HashMap<u64, mpsc::Sender<diri_proto::ReadScrollbackCellsResult>>>,
 }
 
@@ -109,6 +110,7 @@ impl RemoteSessionClient {
             observed_output_offset: AtomicU64::new(initial_output_offset),
             scheduled_output_offset: AtomicU64::new(initial_output_offset),
             next_request_id: AtomicU64::new(1),
+            reset_generation: AtomicU64::new(0),
             scrollback_requests: Mutex::new(HashMap::new()),
         })
     }
@@ -179,6 +181,9 @@ impl RemoteSessionClient {
             {
                 required_capabilities
                     .push(diri_proto::remote_pty::RemoteCapability::EnhancedKeyboard);
+            }
+            if self.helper.protocol.minor >= diri_proto::remote_pty::TERMINAL_RESET_PROTOCOL_MINOR {
+                required_capabilities.push(diri_proto::remote_pty::RemoteCapability::TerminalReset);
             }
             let hello = RemoteMessage::Hello(Hello {
                 protocol: ProtocolVersion::CURRENT,
@@ -326,6 +331,18 @@ impl RemoteSessionClient {
                 "remote Holder did not confirm enhanced-keyboard-v1",
             ));
         }
+        if self.supports_terminal_reset()
+            && (acknowledgement.protocol.minor
+                < diri_proto::remote_pty::TERMINAL_RESET_PROTOCOL_MINOR
+                || !acknowledgement
+                    .capabilities
+                    .contains(&diri_proto::remote_pty::RemoteCapability::TerminalReset))
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "remote Holder did not confirm terminal-reset-v1",
+            ));
+        }
         if REQUIRED_CAPABILITIES
             .iter()
             .any(|required| !acknowledgement.capabilities.contains(required))
@@ -436,6 +453,47 @@ impl RemoteSessionClient {
         Ok(())
     }
 
+    pub(crate) fn supports_terminal_reset(&self) -> bool {
+        self.helper.protocol.minor >= diri_proto::remote_pty::TERMINAL_RESET_PROTOCOL_MINOR
+    }
+
+    /// Queues one emulator reset. Acceptance is not a completion guarantee.
+    /// Unlike Resize, a reset is never coalesced or retained for reconnect.
+    pub(crate) fn reset_terminal(&self) -> io::Result<()> {
+        if !self.supports_terminal_reset() {
+            return Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "live Holder does not support terminal-reset-v1",
+            ));
+        }
+        let mut writer = self.writer.lock().expect("remote writer");
+        ensure_available(&writer)?;
+        let epoch = writer
+            .controller_epoch
+            .filter(|_| writer.control_granted)
+            .ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::NotConnected,
+                    "remote controller is reconnecting; reset was not accepted",
+                )
+            })?;
+        write_message(
+            &mut writer,
+            &RemoteMessage::TerminalReset(diri_proto::remote_pty::TerminalReset {
+                controller_epoch: epoch,
+                expected_incarnation: self.incarnation.clone(),
+            }),
+        )
+    }
+
+    pub(crate) fn observe_terminal_reset(&self, generation: u64) {
+        self.reset_generation.store(generation, Ordering::Release);
+        self.scrollback_requests
+            .lock()
+            .expect("scrollback requests")
+            .clear();
+    }
+
     pub fn resize(&self, cols: u16, rows: u16) -> io::Result<()> {
         validate_terminal_dimensions(cols, rows)
             .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error))?;
@@ -530,6 +588,7 @@ impl RemoteSessionClient {
         first_row: i64,
         max_rows: i64,
     ) -> io::Result<diri_proto::ReadScrollbackCellsResult> {
+        let reset_generation = self.reset_generation.load(Ordering::Acquire);
         let request_id = self.next_request_id.fetch_add(1, Ordering::Relaxed);
         let (sender, receiver) = mpsc::channel();
         self.scrollback_requests
@@ -560,7 +619,13 @@ impl RemoteSessionClient {
             return Err(error);
         }
         match receiver.recv_timeout(std::time::Duration::from_secs(5)) {
-            Ok(result) => Ok(result),
+            Ok(result) if self.reset_generation.load(Ordering::Acquire) == reset_generation => {
+                Ok(result)
+            }
+            Ok(_) => Err(io::Error::new(
+                io::ErrorKind::Interrupted,
+                "terminal reset invalidated this history read",
+            )),
             Err(_) => {
                 self.scrollback_requests
                     .lock()
@@ -664,7 +729,7 @@ fn write_message(writer: &mut WriterState, message: &RemoteMessage) -> io::Resul
         {
             (None, frame.resize_payload(), false)
         }
-        RemoteMessage::Signal(_) => (None, None, true),
+        RemoteMessage::Signal(_) | RemoteMessage::TerminalReset(_) => (None, None, true),
         _ => (None, None, false),
     };
     writer.pending_bytes += bytes.len();

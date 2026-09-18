@@ -674,6 +674,180 @@ fn engine_bootstraps_detaches_and_adopts_the_same_remote_process() {
     let _ = session.terminate(Duration::from_millis(100));
 }
 
+/// A remote emulator reset clears the Holder's terminal state without
+/// replacing its PTY or process, and the reset survives detach and adoption
+/// because the Holder, not the Engine, owns the emulator.
+#[test]
+fn engine_resets_a_remote_terminal_without_replacing_the_process() {
+    let temporary = tempfile::tempdir().expect("temp");
+    let remote_home = temporary.path().join("remote-home");
+    let remote_state = temporary.path().join("remote-state");
+    fs::create_dir(&remote_home).expect("remote home");
+    let fake_ssh = write_fake_ssh(temporary.path(), &remote_home, &remote_state);
+    let manager = Arc::new(
+        RemoteManager::new(
+            ProcessExecutor::new(fake_ssh),
+            ArtifactCatalog::from_native_helper(Path::new(helper())).expect("catalog"),
+            temporary.path().join("ssh-control"),
+        )
+        .expect("manager"),
+    );
+    let host = HostEntry {
+        id: "fixture-reset".into(),
+        name: None,
+        ssh: "fixture-host".into(),
+        default_cwd: Some("/".into()),
+        node: None,
+    };
+    let installed = manager.ensure_helper(&host).expect("bootstrap");
+    let session_id = "engine-remote-reset".to_string();
+    let token = SessionToken::new("fedcba9876543210fedcba9876543210").expect("token");
+    let request = LaunchRequest {
+        session_id: session_id.clone(),
+        session_token: token.clone(),
+        argv: vec![
+            "/bin/sh".into(),
+            "-c".into(),
+            "printf '\\033]0;remote-title\\007ready>'; IFS= read -r first; printf 'first:%s\\nnext>' \"$first\"; IFS= read -r second; printf 'second:%s\\n' \"$second\"".into(),
+        ],
+        cwd: "/".into(),
+        environment: vec![EnvironmentVariable {
+            name: "TERM".into(),
+            value: "xterm-256color".into(),
+        }],
+        cols: 80,
+        rows: 24,
+        persistence: PersistenceCapability::NativeDetach,
+    };
+    let bindings = RemoteBindingStore::new(temporary.path().join("bindings")).expect("bindings");
+    let engine = Arc::new(ManifestEngine::new(Vec::new()));
+    let mut session = Session::spawn(
+        SessionSpec {
+            id: session_id.clone(),
+            pty: PtySpec::new(request.argv.clone(), "/").size(80, 24),
+            manifest_id: "shell".into(),
+            authority: Authority::ProcessOnly,
+            logs_dir: temporary.path().join("logs"),
+            holder: None,
+            remote: Some(RemoteSessionSpec {
+                manager: Arc::clone(&manager),
+                helper: installed.clone(),
+                launch: request,
+                host_id: host.id.clone(),
+                binding_store: bindings.clone(),
+            }),
+            defer_launch: false,
+        },
+        Arc::clone(&engine),
+    )
+    .expect("spawn remote Session");
+    wait_for_grid(&session, "ready>");
+    let binding = bindings
+        .load_all()
+        .expect("load binding")
+        .into_iter()
+        .next()
+        .expect("saved binding");
+    let selector = || SessionSelector {
+        session_id: session_id.clone(),
+        session_token: token.clone(),
+        expected_incarnation: Some(binding.session_incarnation.clone()),
+    };
+    let pid_before = match manager
+        .inspect(&installed, &selector())
+        .expect("inspect")
+        .process_state
+    {
+        diri_proto::remote_pty::RemoteProcessState::Running { pid } => pid,
+        state => panic!("unexpected process state: {state:?}"),
+    };
+
+    session
+        .reset_terminal()
+        .expect("the live Holder accepts a reset");
+    wait_until(
+        "the reset snapshot to arrive",
+        Duration::from_secs(5),
+        || !session.screen_lines().join("\n").contains("ready>"),
+    );
+    assert!(
+        session
+            .screen_lines()
+            .iter()
+            .all(|line| line.trim().is_empty()),
+        "the visible grid is blank after a reset: {:?}",
+        session.screen_lines()
+    );
+    assert!(
+        matches!(
+            manager.inspect(&installed, &selector()).expect("inspect").process_state,
+            diri_proto::remote_pty::RemoteProcessState::Running { pid } if pid == pid_before
+        ),
+        "a reset never replaces the Agent process"
+    );
+
+    // The same child keeps reading from the same PTY after the reset.
+    session.write_input(b"alpha\n").expect("input after reset");
+    wait_for_grid(&session, "next>");
+    let screen = session.screen_lines().join("\n");
+    assert!(screen.contains("first:alpha"), "{screen}");
+    assert!(
+        !screen.contains("ready>"),
+        "pre-reset content must not reappear: {screen}"
+    );
+
+    // Detach and adopt: the reconnect seed comes from the reset Holder.
+    drop(session);
+    let binding = bindings
+        .load_all()
+        .expect("reload binding after detach")
+        .into_iter()
+        .next()
+        .expect("persisted binding");
+    let helper = manager
+        .existing_helper(&host, &binding.helper_build_id, binding.protocol)
+        .expect("same build");
+    session = Session::adopt_remote_with_status(
+        SessionSpec {
+            id: session_id.clone(),
+            pty: PtySpec::new(Vec::new(), "/").size(80, 24),
+            manifest_id: "shell".into(),
+            authority: Authority::ProcessOnly,
+            logs_dir: temporary.path().join("logs"),
+            holder: None,
+            remote: None,
+            defer_launch: false,
+        },
+        RemoteAdoptSpec {
+            manager: Arc::clone(&manager),
+            helper,
+            token: binding.session_token,
+            incarnation: binding.session_incarnation.clone(),
+            binding_store: bindings.clone(),
+            output_offset: binding.last_output_offset,
+        },
+        engine,
+        Some((SessionStatus::Idle, None)),
+    )
+    .expect("adopt remote Session");
+    wait_for_grid(&session, "next>");
+    let screen = session.screen_lines().join("\n");
+    assert!(
+        !screen.contains("ready>"),
+        "a reconnect must not resurrect pre-reset content: {screen}"
+    );
+    assert!(matches!(
+        manager.inspect(&installed, &selector()).expect("inspect after adopt").process_state,
+        diri_proto::remote_pty::RemoteProcessState::Running { pid } if pid == pid_before
+    ));
+    session.write_input(b"omega\n").expect("input after adopt");
+    wait_until("remote exit", Duration::from_secs(5), || {
+        session.view().exited
+    });
+    assert!(session.screen_lines().join("\n").contains("second:omega"));
+    let _ = session.terminate(Duration::from_millis(100));
+}
+
 #[test]
 fn launch_response_disconnect_recovers_the_existing_holder_idempotently() {
     let temporary = tempfile::tempdir().expect("temp");

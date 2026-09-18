@@ -308,6 +308,9 @@ struct Shared {
 }
 
 struct RemoteGridState {
+    reset_required: bool,
+    reset_staged: Option<diri_proto::remote_pty::TerminalResetState>,
+    reset_committed: Option<diri_proto::remote_pty::TerminalResetState>,
     keyboard: RemoteKeyboardProjection,
     connection: diri_proto::RemoteConnection,
     mirror: GridMirror,
@@ -412,6 +415,7 @@ fn unix_secs() -> u64 {
 /// observable changed. Default is "never seen anything".
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub struct GridSignature {
+    pub reset_generation: u64,
     pub keyboard: Option<diri_proto::terminal_input::KeyboardState>,
     pub content_seq: u64,
     pub size: (usize, usize),
@@ -924,6 +928,9 @@ impl Session {
         let shared = new_shared(&spec, log, &engine, true);
         shared.keyboard_known.store(false, Ordering::SeqCst);
         *shared.remote_grid.lock().expect("remote grid") = Some(RemoteGridState {
+            reset_required: false,
+            reset_staged: None,
+            reset_committed: None,
             keyboard: RemoteKeyboardProjection {
                 enhanced: client.enhanced_keyboard_protocol(),
                 ..Default::default()
@@ -1067,6 +1074,9 @@ impl Session {
             .store(remote.output_offset, Ordering::SeqCst);
         shared.keyboard_known.store(false, Ordering::SeqCst);
         *shared.remote_grid.lock().expect("remote grid") = Some(RemoteGridState {
+            reset_required: false,
+            reset_staged: None,
+            reset_committed: None,
             keyboard: RemoteKeyboardProjection {
                 enhanced: client.enhanced_keyboard_protocol(),
                 ..Default::default()
@@ -1568,6 +1578,10 @@ impl Session {
                         grid,
                         (alt_screen, bracketed_paste, mouse),
                         GridSignature {
+                            reset_generation: remote
+                                .reset_committed
+                                .as_ref()
+                                .map_or(0, |state| state.generation),
                             keyboard: remote.keyboard.committed,
                             content_seq: remote.revision,
                             size: (usize::from(cols), usize::from(rows)),
@@ -1588,6 +1602,7 @@ impl Session {
                         screen.mouse_modes(),
                     ),
                     GridSignature {
+                        reset_generation: 0,
                         keyboard: self
                             .shared
                             .keyboard_known
@@ -1639,6 +1654,10 @@ impl Session {
             let (cols, rows) = remote.mirror.size();
             let modes = remote.mirror.modes();
             let current = GridSignature {
+                reset_generation: remote
+                    .reset_committed
+                    .as_ref()
+                    .map_or(0, |state| state.generation),
                 keyboard: remote.keyboard.committed,
                 content_seq: remote.revision,
                 size: (usize::from(cols), usize::from(rows)),
@@ -1649,11 +1668,17 @@ impl Session {
             let grid = if current == *signature {
                 None
             } else {
+                let reset_changed = signature.reset_generation != current.reset_generation;
                 *signature = current;
-                remote
-                    .pending
-                    .take()
-                    .or_else(|| remote.mirror.full_update())
+                if reset_changed {
+                    remote.pending = None;
+                    remote.mirror.full_update()
+                } else {
+                    remote
+                        .pending
+                        .take()
+                        .or_else(|| remote.mirror.full_update())
+                }
             };
             return TerminalPublication {
                 grid,
@@ -1668,6 +1693,7 @@ impl Session {
             screen.mouse_modes(),
         );
         let current = GridSignature {
+            reset_generation: 0,
             keyboard: self
                 .shared
                 .keyboard_known
@@ -2115,6 +2141,22 @@ impl Session {
             *current = Some(title);
             drop(current);
             self.shared.bump_state_version();
+        }
+    }
+
+    pub fn reset_terminal(&self) -> std::io::Result<()> {
+        if self.shared.exited.load(Ordering::SeqCst) {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::NotConnected,
+                "session has exited",
+            ));
+        }
+        match &self.transport {
+            Transport::Remote(client) => client.reset_terminal(),
+            _ => Err(std::io::Error::new(
+                std::io::ErrorKind::Unsupported,
+                "local emulator reset requires an ordered durable replay boundary",
+            )),
         }
     }
 
@@ -2786,6 +2828,19 @@ fn handle_remote_message(
     if !*hello_accepted && !matches!(message, RemoteMessage::HelloAck(_)) {
         return RemoteConnectionDisposition::Fatal;
     }
+    if shared
+        .remote_grid
+        .lock()
+        .expect("remote grid")
+        .as_ref()
+        .is_some_and(|remote| remote.reset_staged.is_some())
+        && !matches!(
+            &message,
+            RemoteMessage::InputModes(_) | RemoteMessage::FullSnapshot(_)
+        )
+    {
+        return RemoteConnectionDisposition::Fatal;
+    }
     match message {
         RemoteMessage::HelloAck(acknowledgement) => {
             if *hello_accepted
@@ -2810,6 +2865,8 @@ fn handle_remote_message(
                 );
             }
             if let Some(remote) = shared.remote_grid.lock().expect("remote grid").as_mut() {
+                remote.reset_required = client.supports_terminal_reset();
+                remote.reset_staged = None;
                 remote.keyboard = RemoteKeyboardProjection {
                     enhanced: acknowledgement.protocol.minor
                         >= diri_proto::remote_pty::ENHANCED_KEYBOARD_PROTOCOL_MINOR
@@ -2863,8 +2920,28 @@ fn handle_remote_message(
             }
             _ => RemoteConnectionDisposition::Fatal,
         },
+        RemoteMessage::TerminalResetState(reset) => {
+            let mut remote = shared.remote_grid.lock().expect("remote grid");
+            let Some(remote) = remote.as_mut() else {
+                return RemoteConnectionDisposition::Fatal;
+            };
+            if !remote.reset_required
+                || remote.reset_staged.is_some()
+                || reset.incarnation != client.incarnation()
+                || remote.reset_committed.as_ref().is_some_and(|old| {
+                    reset.generation < old.generation
+                        || (reset.generation == old.generation
+                            && reset.output_offset != old.output_offset)
+                })
+            {
+                return RemoteConnectionDisposition::Fatal;
+            }
+            remote.reset_staged = Some(reset);
+            RemoteConnectionDisposition::Continue
+        }
         RemoteMessage::FullSnapshot(snapshot) => {
-            if apply_remote_snapshot(shared, engine, manifest_id, last_eval_seq, snapshot).is_err()
+            if apply_remote_snapshot(shared, engine, client, manifest_id, last_eval_seq, snapshot)
+                .is_err()
             {
                 RemoteConnectionDisposition::Fatal
             } else {
@@ -2985,6 +3062,7 @@ fn apply_remote_output(
 fn apply_remote_snapshot(
     shared: &Shared,
     engine: &ManifestEngine,
+    client: &RemoteSessionClient,
     manifest_id: &str,
     last_eval_seq: &mut u64,
     snapshot: FullSnapshot,
@@ -2994,6 +3072,23 @@ fn apply_remote_snapshot(
         let remote = remote
             .as_mut()
             .ok_or_else(|| std::io::Error::other("remote grid state is unavailable"))?;
+        let reset = remote.reset_staged.take();
+        if remote.reset_required
+            && reset
+                .as_ref()
+                .is_none_or(|reset| reset.sequence != snapshot.sequence)
+        {
+            return Err(std::io::Error::other(
+                "full snapshot reset boundary is missing or mismatched",
+            ));
+        }
+        let reset_changed = reset.as_ref().is_some_and(|reset| {
+            reset.generation != 0
+                && remote
+                    .reset_committed
+                    .as_ref()
+                    .is_none_or(|old| old.generation != reset.generation)
+        });
         let keyboard = remote.keyboard.state_for(snapshot.sequence)?;
         remote
             .mirror
@@ -3006,6 +3101,12 @@ fn apply_remote_snapshot(
             )
             .map_err(std::io::Error::other)?;
         remote.keyboard.commit(keyboard);
+        if reset_changed {
+            shared.screen.lock().expect("screen").reset();
+            client.observe_terminal_reset(reset.as_ref().expect("changed reset").generation);
+            shared.bump_state_version();
+        }
+        remote.reset_committed = reset.or_else(|| remote.reset_committed.clone());
         remote.revision = remote.revision.saturating_add(1);
         remote.pending = Some(snapshot.grid.clone());
     }

@@ -1701,6 +1701,44 @@ and snapshot stacks must agree before writing; missing or malformed v6 state
 uses the existing cache-miss recovery. Whole-parser parking must retain the
 wrapper's knowledge bit as well as the parser's exact flags/stacks.
 
+## Terminal reset (protocol minor 15)
+
+Protocol minor 15 adds optional `terminal-reset-v1`. A reset is an emulator
+mutation owned by the Holder: it rebuilds the shared `HeadlessScreen` at the
+current dimensions and never sends `ESC c`, `clear` or any other bytes to the
+child. The PTY, process tree, session incarnation, controller lease and raw
+output log are untouched. Local sessions do not support this yet: the local
+pump replay would undo a memory-only reset after Engine replacement, so a
+local reset waits for an identity-bound durable replay boundary.
+
+The Engine requests the capability only from Helpers at or above minor 15 and
+fails closed if the acknowledgement omits it. `TerminalReset` carries the
+current controller epoch and expected incarnation; a stale epoch, a wrong
+incarnation or a controller that did not negotiate the capability is refused
+with no state change. Acceptance means the reset is queued, not that it
+completed. Unlike `Resize`, a reset is never coalesced or retained for
+reconnect: a partially written request is an uncertain effect and the Engine
+must not retry it or replace a live Holder to force it.
+
+On acceptance the Holder first publishes any parsed-but-unpublished output
+bytes, then resets the screen, advances a per-incarnation reset generation
+and the snapshot sequence, and queues an authoritative `FullSnapshot`. For a
+capable controller every `FullSnapshot` (reset, reconnect seed or slow-client
+reseed) is preceded by `TerminalResetState` with the same sequence: the
+incarnation, the reset generation and the raw output offset at the last
+reset. The Engine stages that boundary and admits only the matching modes and
+snapshot before anything else; a snapshot without its boundary, a boundary
+whose sequence differs from its snapshot, a regressing generation or another
+incarnation is fatal for the connection. A changed generation resets the
+Engine's local status screen, invalidates in-flight scrollback reads so
+pre-reset history cannot return, and forces the next publication to the
+attached client to be a full grid rather than a diff against pre-reset cells.
+Old Holders never receive the request or the boundary and report unsupported.
+
+Not included: a control/CLI reset method, local session reset, and desktop
+invalidation of retained reading views, selections and Find captures by
+reset generation. Those remain open work for the reset API.
+
 ## Read-only output log ownership
 
 Opening a raw output log as a reader never creates directories, creates a missing

@@ -433,6 +433,8 @@ struct Holder {
     interactive_grid_budget: u8,
     last_persisted_offset: u64,
     controller_protocol_minor: u16,
+    reset_generation: u64,
+    reset_output_offset: u64,
     last_foreground_pid: Option<Option<i32>>,
     foreground_probe_deadline: Option<Instant>,
 }
@@ -526,6 +528,8 @@ impl Holder {
             interactive_grid_budget: 0,
             last_persisted_offset: 0,
             controller_protocol_minor: 0,
+            reset_generation: 0,
+            reset_output_offset: 0,
             last_foreground_pid: None,
             foreground_probe_deadline: None,
         })
@@ -1013,6 +1017,48 @@ impl Holder {
                 }
                 self.begin_stop()
             }
+            RemoteMessage::TerminalReset(request) => {
+                if !connection.terminal_reset
+                    || request.controller_epoch != epoch
+                    || request.expected_incarnation != self.state.session_incarnation
+                {
+                    return Err(io::Error::new(
+                        io::ErrorKind::PermissionDenied,
+                        "terminal reset capability, incarnation or controller epoch is invalid",
+                    ));
+                }
+                if connection.outbound.len() > MAX_OUTBOUND_BYTES {
+                    return Err(io::Error::new(
+                        io::ErrorKind::WouldBlock,
+                        "reset output queue is full",
+                    ));
+                }
+                let generation = self
+                    .reset_generation
+                    .checked_add(1)
+                    .ok_or_else(|| io::Error::other("terminal reset generation exhausted"))?;
+                let sequence = self
+                    .state
+                    .snapshot_sequence
+                    .checked_add(1)
+                    .ok_or_else(|| io::Error::other("terminal sequence exhausted"))?;
+                // read_messages owns this connection outside self.connection.
+                // Publish already parsed bytes before the reset boundary, never
+                // through self.queue (which would see no current connection).
+                if !self.pending_output.is_empty() {
+                    connection.queue(RemoteMessage::Terminal(Frame::output(
+                        self.pending_output_offset,
+                        &self.pending_output,
+                    )))?;
+                    self.pending_output.clear();
+                }
+                self.screen.reset();
+                self.reset_generation = generation;
+                self.reset_output_offset = self.state.output_offset;
+                self.state.snapshot_sequence = sequence;
+                self.dirty_since = None;
+                self.queue_snapshot(connection)
+            }
             RemoteMessage::AcquireControl(_) => {
                 connection.queue(RemoteMessage::ControlGranted(ControlGranted {
                     controller_epoch: epoch,
@@ -1107,6 +1153,18 @@ impl Holder {
                 "enhanced-keyboard-v1 requires protocol minor 14",
             ));
         }
+        let reset_requested = hello
+            .required_capabilities
+            .contains(&diri_proto::remote_pty::RemoteCapability::TerminalReset);
+        if reset_requested
+            && hello.protocol.minor < diri_proto::remote_pty::TERMINAL_RESET_PROTOCOL_MINOR
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "terminal-reset-v1 requires protocol minor 15",
+            ));
+        }
+        connection.terminal_reset = reset_requested;
         ensure_keyboard_controller(self.screen.input_keyboard_state(), enhanced_keyboard)?;
         connection.enhanced_keyboard = enhanced_keyboard;
         self.state.controller_epoch = self.state.controller_epoch.saturating_add(1);
@@ -1313,6 +1371,12 @@ impl Holder {
             return Ok(());
         };
         connection.keyboard = self.screen.input_keyboard_state();
+        connection.reset_state = Some(diri_proto::remote_pty::TerminalResetState {
+            incarnation: self.state.session_incarnation.clone(),
+            generation: self.reset_generation,
+            sequence: self.state.snapshot_sequence,
+            output_offset: self.reset_output_offset,
+        });
         if ensure_keyboard_controller(connection.keyboard, connection.enhanced_keyboard).is_err() {
             // An output mode change invalidates only this controller. The
             // Holder and Agent continue, and a capable client can reseed.
@@ -1347,6 +1411,12 @@ impl Holder {
 
     fn queue_snapshot(&self, connection: &mut Connection) -> io::Result<()> {
         connection.keyboard = self.screen.input_keyboard_state();
+        connection.reset_state = Some(diri_proto::remote_pty::TerminalResetState {
+            incarnation: self.state.session_incarnation.clone(),
+            generation: self.reset_generation,
+            sequence: self.state.snapshot_sequence,
+            output_offset: self.reset_output_offset,
+        });
         connection.queue(RemoteMessage::FullSnapshot(FullSnapshot {
             sequence: self.state.snapshot_sequence,
             alt_screen: self.screen.is_alt_screen(),
@@ -1513,6 +1583,8 @@ fn ensure_keyboard_controller(
 
 struct Connection {
     enhanced_keyboard: bool,
+    terminal_reset: bool,
+    reset_state: Option<diri_proto::remote_pty::TerminalResetState>,
     protocol_minor: u16,
     keyboard: Option<diri_proto::terminal_input::KeyboardState>,
     stream: UnixStream,
@@ -1526,6 +1598,8 @@ impl Connection {
     fn new(stream: UnixStream) -> Self {
         Self {
             enhanced_keyboard: false,
+            terminal_reset: false,
+            reset_state: None,
             protocol_minor: 0,
             keyboard: Some(Default::default()),
             stream,
@@ -1570,6 +1644,13 @@ impl Connection {
                 *capability != diri_proto::remote_pty::RemoteCapability::EnhancedKeyboard
             });
         }
+        if !self.terminal_reset
+            && let RemoteMessage::HelloAck(value) = &mut message
+        {
+            value.capabilities.retain(|capability| {
+                *capability != diri_proto::remote_pty::RemoteCapability::TerminalReset
+            });
+        }
         if matches!(
             &message,
             RemoteMessage::FullSnapshot(_) | RemoteMessage::GridDelta(_)
@@ -1580,6 +1661,20 @@ impl Connection {
         // overflow/reseed decision must never run between these two frames.
         let start = self.outbound.len();
         let result = (|| {
+            if self.terminal_reset
+                && let RemoteMessage::FullSnapshot(snapshot) = &message
+            {
+                let mut reset = self.reset_state.clone().ok_or_else(|| {
+                    diri_proto::remote_pty::RemoteCodecError::InvalidFullSnapshot(
+                        "reset boundary is unavailable".into(),
+                    )
+                })?;
+                reset.sequence = snapshot.sequence;
+                RemoteCodec::encode_into(
+                    &RemoteMessage::TerminalResetState(reset),
+                    &mut self.outbound,
+                )?;
+            }
             if self.protocol_minor >= diri_proto::remote_pty::INPUT_MODES_PROTOCOL_MINOR {
                 let sequence = match &message {
                     RemoteMessage::FullSnapshot(value) => Some(value.sequence),
@@ -1982,6 +2077,8 @@ mod tests {
             interactive_grid_budget: 0,
             last_persisted_offset: 0,
             controller_protocol_minor: 0,
+            reset_generation: 0,
+            reset_output_offset: 0,
             last_foreground_pid: None,
             foreground_probe_deadline: None,
         };
@@ -2095,6 +2192,225 @@ mod tests {
             assert!(Instant::now() < deadline);
             std::thread::sleep(Duration::from_millis(1));
         }
+    }
+
+    #[test]
+    fn terminal_reset_flushes_output_then_publishes_a_boundary_with_a_blank_snapshot() {
+        use diri_proto::remote_pty::{
+            PROTOCOL_MAJOR, PROTOCOL_MINOR, RemoteCapability, ScrollbackRequest, TerminalReset,
+        };
+        let (_temp, mut holder, request) = waiting_holder();
+        initialize_auth(&holder.paths, &request.session_token).unwrap();
+        let incarnation = holder.state.session_incarnation.clone();
+        let hello_incarnation = incarnation.clone();
+        let hello = move |capabilities: Vec<RemoteCapability>, minor: u16| Hello {
+            protocol: diri_proto::remote_pty::ProtocolVersion {
+                major: PROTOCOL_MAJOR,
+                minor,
+            },
+            local_build_id: "fixture".into(),
+            session_id: request.session_id.clone(),
+            session_token: request.session_token.clone(),
+            expected_incarnation: Some(hello_incarnation.clone()),
+            requested_role: diri_proto::remote_pty::RemoteRole::Controller,
+            client_nonce: "fixture-nonce".into(),
+            required_capabilities: capabilities,
+            last_acknowledged_output_offset: None,
+            last_acknowledged_grid_sequence: None,
+        };
+        let (stream, _peer) = UnixStream::pair().unwrap();
+        let mut connection = Connection::new(stream);
+        // The capability is bound to protocol minor 15; an older controller
+        // cannot request it even if it knows the name.
+        assert_eq!(
+            holder
+                .handshake(
+                    &mut connection,
+                    hello(vec![RemoteCapability::TerminalReset], 14)
+                )
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::Unsupported
+        );
+        holder
+            .handshake(
+                &mut connection,
+                hello(vec![RemoteCapability::TerminalReset], PROTOCOL_MINOR),
+            )
+            .unwrap();
+        assert!(connection.terminal_reset);
+        let epoch = connection.epoch.unwrap();
+        let reset = |controller_epoch: u64, expected_incarnation: &str| {
+            RemoteMessage::TerminalReset(TerminalReset {
+                controller_epoch,
+                expected_incarnation: expected_incarnation.to_owned(),
+            })
+        };
+        connection.outbound.clear();
+        holder
+            .screen
+            .feed(b"\x1b]0;busy\x07\x1b[?2004hvisible before reset\r\n");
+        holder.screen.grid_update(false);
+        // Bytes parsed but not yet published must reach the client before the
+        // boundary, so its raw log never ends up ahead of its grid.
+        holder.pending_output = b"tail".to_vec();
+        holder.pending_output_offset = 0;
+        holder.state.output_offset = 4;
+
+        for (stale_epoch, wrong_incarnation) in
+            [(epoch + 1, incarnation.as_str()), (epoch, "other")]
+        {
+            assert_eq!(
+                holder
+                    .handle_message(&mut connection, reset(stale_epoch, wrong_incarnation))
+                    .unwrap_err()
+                    .kind(),
+                io::ErrorKind::PermissionDenied
+            );
+        }
+        assert_eq!(holder.reset_generation, 0);
+        assert_eq!(holder.screen.lines(), vec!["visible before reset"]);
+        assert!(
+            connection.outbound.is_empty(),
+            "a refused reset publishes nothing"
+        );
+
+        let before_sequence = holder.state.snapshot_sequence;
+        holder
+            .handle_message(&mut connection, reset(epoch, &incarnation))
+            .unwrap();
+        let published = RemoteCodec::new().feed(&connection.outbound).unwrap();
+        let RemoteMessage::Terminal(frame) = &published[0] else {
+            panic!("pending output first: {published:?}")
+        };
+        assert_eq!(frame.output_payload().unwrap(), (0, b"tail".as_slice()));
+        let RemoteMessage::TerminalResetState(boundary) = &published[1] else {
+            panic!("boundary before the snapshot: {published:?}")
+        };
+        assert_eq!(boundary.generation, 1);
+        assert_eq!(boundary.incarnation, incarnation);
+        assert_eq!(boundary.output_offset, 4);
+        let RemoteMessage::InputModes(modes) = &published[2] else {
+            panic!("modes: {published:?}")
+        };
+        let RemoteMessage::FullSnapshot(snapshot) = &published[3] else {
+            panic!("full snapshot: {published:?}")
+        };
+        assert_eq!(published.len(), 4);
+        assert_eq!(snapshot.sequence, before_sequence + 1);
+        assert_eq!(boundary.sequence, snapshot.sequence);
+        assert_eq!(modes.sequence, snapshot.sequence);
+        assert!(snapshot.grid.is_full_snapshot);
+        assert!(!snapshot.bracketed_paste);
+        assert!(
+            snapshot
+                .grid
+                .changed_rows
+                .iter()
+                .flat_map(|row| &row.cells)
+                .all(|cell| *cell == diri_proto::grid::GridCell::BLANK)
+        );
+        assert!(holder.screen.lines().is_empty());
+        assert_eq!(holder.screen.title(), None);
+        assert!(holder.pending_output.is_empty());
+        assert_eq!(holder.reset_generation, 1);
+        assert_eq!(holder.reset_output_offset, 4);
+        assert_eq!(holder.state.output_offset, 4, "the raw log is untouched");
+
+        // History before the boundary is gone for good.
+        connection.outbound.clear();
+        holder
+            .handle_message(
+                &mut connection,
+                RemoteMessage::ScrollbackRequest(ScrollbackRequest {
+                    request_id: 1,
+                    first_row: 0,
+                    max_rows: 100,
+                }),
+            )
+            .unwrap();
+        let published = RemoteCodec::new().feed(&connection.outbound).unwrap();
+        let RemoteMessage::ScrollbackResponse(response) = &published[0] else {
+            panic!("scrollback: {published:?}")
+        };
+        let fresh = HeadlessScreen::new(80, 24).scrollback_cells(0, 100);
+        assert_eq!(response.result.row_count, fresh.row_count);
+        assert_eq!(response.result.payload, fresh.payload);
+
+        // The first publication after a reset is a full grid carrying the
+        // same boundary, so a client cannot diff against pre-reset cells.
+        connection.outbound.clear();
+        holder.screen.feed(b"after");
+        holder.connection = Some(connection);
+        holder.emit_grid_delta().unwrap();
+        let mut connection = holder.connection.take().unwrap();
+        let published = RemoteCodec::new().feed(&connection.outbound).unwrap();
+        let RemoteMessage::TerminalResetState(boundary) = &published[0] else {
+            panic!("boundary: {published:?}")
+        };
+        assert_eq!(boundary.generation, 1);
+        let RemoteMessage::FullSnapshot(snapshot) = &published[2] else {
+            panic!("full snapshot after reset: {published:?}")
+        };
+        assert_eq!(boundary.sequence, snapshot.sequence);
+        assert!(
+            snapshot.grid.changed_rows[0].cells[..5]
+                .iter()
+                .map(|cell| char::from_u32(cell.scalar).unwrap())
+                .eq("after".chars())
+        );
+
+        // Every further reset advances the generation.
+        connection.outbound.clear();
+        holder
+            .handle_message(&mut connection, reset(epoch, &incarnation))
+            .unwrap();
+        let published = RemoteCodec::new().feed(&connection.outbound).unwrap();
+        assert!(matches!(
+            &published[0],
+            RemoteMessage::TerminalResetState(boundary) if boundary.generation == 2
+        ));
+
+        // A controller that did not negotiate the capability is told so in
+        // its HelloAck and cannot reset, while the Holder keeps running.
+        let (stream, _peer) = UnixStream::pair().unwrap();
+        let mut legacy = Connection::new(stream);
+        holder
+            .handshake(&mut legacy, hello(vec![], PROTOCOL_MINOR))
+            .unwrap();
+        assert!(!legacy.terminal_reset);
+        let published = RemoteCodec::new().feed(&legacy.outbound).unwrap();
+        let acknowledgement = published
+            .iter()
+            .find_map(|message| match message {
+                RemoteMessage::HelloAck(value) => Some(value),
+                _ => None,
+            })
+            .expect("HelloAck");
+        assert!(
+            !acknowledgement
+                .capabilities
+                .contains(&RemoteCapability::TerminalReset)
+        );
+        assert!(
+            !published
+                .iter()
+                .any(|message| matches!(message, RemoteMessage::TerminalResetState(_))),
+            "legacy controllers never see the boundary message"
+        );
+        let legacy_epoch = legacy.epoch.unwrap();
+        assert_eq!(
+            holder
+                .handle_message(&mut legacy, reset(legacy_epoch, &incarnation))
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::PermissionDenied
+        );
+        assert_eq!(holder.reset_generation, 2);
+        assert!(
+            holder.pty.try_wait().unwrap().is_none(),
+            "the child is untouched"
+        );
     }
 
     #[test]
