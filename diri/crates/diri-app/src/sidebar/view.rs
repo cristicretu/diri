@@ -21,7 +21,7 @@ use diri_ui::{
     RowFill, SemanticColors, Space, StateChip, StatusGlyph, StatusState, Typo,
 };
 use gpui::{
-    Anchor, Animation, AnimationExt, AnyElement, App, AppContext as _, Bounds, BoxShadow, Context,
+    Anchor, Animation, AnimationExt, AnyElement, App, AppContext as _, Bounds, Context,
     CursorStyle, Entity, EventEmitter, ExternalPaths, FocusHandle, Focusable, FontWeight, Hsla,
     IntoElement, MouseButton, PathPromptOptions, Pixels, Point, Render, Rgba, Role, ScrollHandle,
     SharedString, Task, WeakEntity, Window, anchored, deferred, div, linear_color_stop,
@@ -71,8 +71,6 @@ const SIDEBAR_ACTION_SLOT: f32 = 24.0;
 /// reorder. Short enough that a fast drag never feels held back, long enough
 /// that the neighbours visibly step aside rather than teleporting.
 const SECTION_SHIFT_TIME: Duration = Duration::from_millis(220);
-/// How long the lifted header takes to gain its shadow once the drag begins.
-const DRAG_LIFT_TIME: Duration = Duration::from_millis(140);
 /// Vertical gap between project sections in the list, mirrored here because
 /// the slide animation reconstructs slot positions from section heights.
 const SECTION_GAP: f32 = 8.0;
@@ -328,16 +326,18 @@ impl Lift {
     }
 }
 
-/// Draws `row` as the lifted row: offset along `axis` from its slot, on a
-/// floating material, gaining its shadow as it lifts, and painted after the
-/// rest of its list so it rides above the rows it passes. Layout is left
-/// alone, so the slot stays open where the row will land.
+/// Draws `row` as the lifted row: offset along `axis` from its slot and
+/// painted after the rest of its list so it rides above the rows it passes.
+/// It looks like the row at rest, not a picture of it; the one addition is
+/// the list's own settled surface behind it, since a row at rest is painted
+/// straight onto that surface and would otherwise show the rows it crosses
+/// through its text. Layout is left alone, so the slot stays open where the
+/// row will land.
 pub(super) fn lift_in_place<E>(
     row: E,
     axis: LiftAxis,
     offset: Pixels,
     colors: SemanticColors,
-    reduce_motion: bool,
 ) -> AnyElement
 where
     E: gpui::Styled + gpui::Element + 'static,
@@ -346,41 +346,13 @@ where
         LiftAxis::Vertical => row.top(offset),
         LiftAxis::Horizontal => row.left(offset),
     }
-    .bg(colors.floating_surface().alpha(0.98))
-    .border_1()
-    .border_color(colors.floating_stroke());
-    let row = if reduce_motion {
-        row.shadow(lift_shadow(1.0)).into_any_element()
-    } else {
-        // The row starts as the flat row it was and gains its shadow as it
-        // lifts, so the pickup reads as one motion.
-        row.with_animation(
-            "drag-lift",
-            Animation::new(DRAG_LIFT_TIME).with_easing(|delta| Motion::SNAP.settle(delta)),
-            |row, delta| row.shadow(lift_shadow(delta)),
-        )
-        .into_any_element()
-    };
+    // Fully opaque on purpose: on the glass material the settled surface
+    // keeps some alpha, and the rows being crossed would bleed through.
+    .bg(Rgba {
+        a: 1.0,
+        ..colors.sidebar_surface_settled()
+    });
     deferred(row).with_priority(1).into_any_element()
-}
-
-fn lift_shadow(strength: f32) -> Vec<BoxShadow> {
-    vec![
-        BoxShadow {
-            color: gpui::black().alpha(0.28 * strength),
-            offset: point(px(0.0), px(6.0 * strength)),
-            blur_radius: px(18.0 * strength),
-            spread_radius: px(0.0),
-            inset: false,
-        },
-        BoxShadow {
-            color: gpui::black().alpha(0.18 * strength),
-            offset: point(px(0.0), px(1.0)),
-            blur_radius: px(2.0),
-            spread_radius: px(0.0),
-            inset: false,
-        },
-    ]
 }
 
 /// Slide state for rows displaced by a live reorder: project sections in
@@ -2380,25 +2352,22 @@ impl Sidebar {
         let lifting = self.lift_offset(&LiftKey::Project(id.clone()));
         let dragging_self = lifting.is_some();
         let is_hovered = self.ui.hovered_project.as_ref() == Some(&id) && !dragging_self;
-        // A lifted project folds its rows away: what rides under the pointer
-        // is one row, and every section in motion stays one row tall.
-        let collapsed = (self
+        let collapsed = self
             .store
             .read()
             .expect("session store lock poisoned")
             .preferences()
             .sidebar_collapsed_projects
             .contains(&id)
-            && self.filter_query.text().trim().is_empty())
-            || dragging_self;
+            && self.filter_query.text().trim().is_empty();
         let project_for_click = group.project.clone();
         let project_root = group.project.root.clone();
         let project_host = group.host.clone();
         let project_is_remote = project_host.is_some();
         let entity = cx.entity();
         let reduce_motion = cx.reduce_motion();
-        // The lifted section never slides: its header is drawn from the
-        // pointer, and its slot simply moves.
+        // The lifted section never slides: it is drawn from the pointer, and
+        // its slot simply moves.
         let shift = if reduce_motion || dragging_self {
             None
         } else {
@@ -2419,7 +2388,7 @@ impl Sidebar {
             .flex_none()
             .flex()
             .flex_col()
-            .child(self.section_probe(id.clone()));
+            .child(self.section_probe(id.clone(), lifting.unwrap_or(px(0.0))));
         let header = div()
             .id(format!("project:{}", id.0))
             .debug_selector({
@@ -2442,7 +2411,7 @@ impl Sidebar {
             .items_center()
             .gap(px(8.0))
             .rounded(px(SIDEBAR_ROW_RADIUS))
-            .bg(Fill::hover(colors, is_hovered))
+            .bg(Fill::hover(colors, is_hovered || dragging_self))
             .cursor_pointer()
             .on_hover(cx.listener({
                 let id = id.clone();
@@ -2736,12 +2705,7 @@ impl Sidebar {
                         ),
                 )
             });
-        section = section.child(match lifting {
-            Some(offset) => {
-                lift_in_place(header, LiftAxis::Vertical, offset, colors, reduce_motion)
-            }
-            None => header.into_any_element(),
-        });
+        section = section.child(header);
 
         // Keep the last visible rows only for the close animation. The Store
         // remains authoritative for keyboard navigation and selection.
@@ -2812,6 +2776,11 @@ impl Sidebar {
             }
             section = section.child(disclosure_body(children, &frame, !collapsed));
         }
+        // The whole section rides with the pointer, sessions included,
+        // exactly as it looks at rest. Its slot moves under it on reorder.
+        if let Some(offset) = lifting {
+            return lift_in_place(section, LiftAxis::Vertical, offset, colors);
+        }
         let Some(delta) = shift else {
             return section.into_any_element();
         };
@@ -2838,15 +2807,16 @@ impl Sidebar {
     }
 
     /// Records a project section's layout bounds: what the probe sees is the
-    /// painted position, so any slide offset in flight is subtracted back out.
-    fn section_probe(&self, id: ProjectId) -> impl IntoElement {
+    /// painted position, so any slide offset in flight, and the lift offset
+    /// of a section riding with the pointer, are subtracted back out.
+    fn section_probe(&self, id: ProjectId, lifted_by: Pixels) -> impl IntoElement {
         let bounds = Rc::clone(&self.section_bounds);
         let applied = Rc::clone(&self.section_shift.applied);
         gpui::canvas(
             move |painted, _, _| {
                 let offset = applied.borrow().get(&id).copied().unwrap_or(0.0);
                 let layout = Bounds {
-                    origin: point(painted.origin.x, painted.origin.y - px(offset)),
+                    origin: point(painted.origin.x, painted.origin.y - px(offset) - lifted_by),
                     size: painted.size,
                 };
                 bounds.borrow_mut().insert(id.clone(), layout);
@@ -9697,6 +9667,7 @@ mod tests {
     fn dragging_a_project_lifts_the_header_itself(cx: &mut TestAppContext) {
         let (sidebar, _, cx) = drag_harness(cx);
         let header = cx.debug_bounds("PROJECT_preview-dirijor").unwrap();
+        let codex = cx.debug_bounds("SESSION_preview-codex").unwrap();
 
         // `drag_to` crosses GPUI's threshold 6px below the press; the row
         // keeps the grab offset from that moment, so it trails the pointer
@@ -9716,6 +9687,12 @@ mod tests {
             lifted.origin,
             header.origin + point(px(0.0), px(6.0)),
             "the row itself moves, and only along the list"
+        );
+        assert_eq!(
+            cx.debug_bounds("SESSION_preview-codex")
+                .map(|bounds| bounds.origin),
+            Some(codex.origin + point(px(0.0), px(6.0))),
+            "the project's sessions ride along, nothing folds or hides"
         );
         assert!(
             cx.debug_bounds("PROJECT_MENU_preview-dirijor").is_none(),
@@ -9755,30 +9732,12 @@ mod tests {
         let (sidebar, _, cx) = drag_harness(cx);
         let dirijor = cx.debug_bounds("PROJECT_preview-dirijor").unwrap();
 
-        // Pick the header up. A lifted project folds its rows away, so the
-        // neighbours below rise: wait the fold out before aiming at Anara.
-        drag_to(
-            cx,
-            dirijor.center(),
-            dirijor.center() + point(px(0.0), px(8.0)),
-        );
-        std::thread::sleep(Duration::from_millis(400));
-        for _ in 0..3 {
-            cx.update(|window, cx| {
-                window.simulate_next_frame(cx);
-            });
-            cx.run_until_parked();
-        }
         let anara = cx.debug_bounds("PROJECT_preview-anara").unwrap();
-        assert!(
-            anara.top() < dirijor.bottom() + px(2.0 * SIDEBAR_NAV_ROW_HEIGHT),
-            "the lifted project folded, so Anara sits right below its row"
-        );
         let x = anara.center().x;
         let above_midline = point(x, anara.top() + px(3.0));
         let below_midline = point(x, anara.bottom() - px(3.0));
 
-        cx.simulate_mouse_move(above_midline, MouseButton::Left, Modifiers::default());
+        drag_to(cx, dirijor.center(), above_midline);
         assert_eq!(
             project_order(&sidebar, cx),
             ["preview-dirijor", "preview-anara", "preview-settings-kit"],

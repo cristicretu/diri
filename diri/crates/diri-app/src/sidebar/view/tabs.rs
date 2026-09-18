@@ -301,9 +301,7 @@ impl Sidebar {
                 }
             }));
             let tab = match (lifting, shift) {
-                (Some(offset), _) => {
-                    lift_in_place(tab, LiftAxis::Horizontal, offset, colors, reduce_motion)
-                }
+                (Some(offset), _) => lift_in_place(tab, LiftAxis::Horizontal, offset, colors),
                 (None, None) => tab.into_any_element(),
                 (None, Some(delta)) => {
                     let applied = Rc::clone(&self.tab_shift.applied);

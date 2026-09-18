@@ -840,7 +840,6 @@ impl Sidebar {
                 },
                 offset,
                 colors,
-                cx.reduce_motion(),
             ),
             None => row.into_any_element(),
         }
