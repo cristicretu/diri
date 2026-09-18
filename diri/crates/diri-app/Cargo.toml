@@ -147,6 +147,7 @@ objc2-foundation = { version = "=0.3.2", default-features = false, features = [
     "NSSet",
     "NSString",
     "NSTimer",
+    "NSUserDefaults",
     "block2",
 ] }
 objc2-user-notifications = { version = "=0.3.2", default-features = false, features = [

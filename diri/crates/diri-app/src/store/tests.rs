@@ -14,7 +14,7 @@ use tokio::sync::mpsc;
 use crate::notifications::NotificationSound;
 
 use super::{
-    ClickModifiers, ClientStartup, EventEnvelope, InspectorTab, Prefs, SessionStore,
+    ClickModifiers, ClientStartup, EventEnvelope, InspectorTab, Prefs, SavedWindow, SessionStore,
     SidebarOrdering, SidebarProjection, StoreEffect, StoreEventChange, StoreRuntime,
     TerminalResidency, WindowMode, WindowPlacement, event_publication_policy,
 };
@@ -1303,6 +1303,61 @@ fn a_pending_confirmation_hides_the_row_only_once_confirmed() {
     assert_eq!(store.ordered_sessions().len(), 1);
     store.confirm_pending_close();
     assert!(store.ordered_sessions().is_empty());
+}
+
+#[test]
+fn additional_windows_round_trip_and_drop_unusable_placements() {
+    let good = WindowPlacement {
+        display_uuid: Some("studio".to_owned()),
+        mode: WindowMode::Fullscreen,
+        x: 40.0,
+        y: 60.0,
+        width: 1200.0,
+        height: 800.0,
+    };
+    let directory = tempdir().unwrap();
+    let path = directory.path().join("prefs.json");
+    let prefs = Prefs {
+        additional_windows: vec![SavedWindow {
+            placement: good.clone(),
+            workspace: None,
+            selected_session: Some(id("t")),
+        }],
+        ..Prefs::default()
+    };
+    prefs.save(&path).unwrap();
+    assert_eq!(Prefs::load(&path).unwrap(), prefs);
+
+    // Files written before the field existed still load.
+    let legacy: Prefs = serde_json::from_str("{}").unwrap();
+    assert!(legacy.additional_windows.is_empty());
+
+    let mut prefs = Prefs {
+        additional_windows: vec![
+            SavedWindow {
+                placement: WindowPlacement {
+                    width: f32::NAN,
+                    ..good.clone()
+                },
+                workspace: None,
+                selected_session: None,
+            },
+            SavedWindow {
+                placement: WindowPlacement {
+                    width: 10.0,
+                    height: 10.0,
+                    ..good.clone()
+                },
+                workspace: None,
+                selected_session: None,
+            },
+        ],
+        ..Prefs::default()
+    };
+    prefs.normalize();
+    assert_eq!(prefs.additional_windows.len(), 1);
+    let placement = &prefs.additional_windows[0].placement;
+    assert_eq!((placement.width, placement.height), (900.0, 560.0));
 }
 
 #[test]

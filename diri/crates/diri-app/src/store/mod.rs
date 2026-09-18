@@ -34,8 +34,8 @@ use crate::switcher::{
 };
 
 pub use prefs::{
-    InspectorTab, Prefs, SidebarGrouping, SidebarOrdering, TabOrientation, WindowMaterial,
-    WindowMode, WindowPlacement,
+    InspectorTab, Prefs, SavedWindow, SidebarGrouping, SidebarOrdering, TabOrientation,
+    WindowMaterial, WindowMode, WindowPlacement,
 };
 pub use projection::{SidebarProject, SidebarProjection, SidebarRow};
 pub use residency::{ResidencyUpdate, TerminalResidency};
@@ -817,6 +817,12 @@ impl SessionStore {
     /// flush so the last resize or move cannot be lost.
     pub fn remember_window_placement(&mut self, placement: WindowPlacement) {
         self.prefs.window_placement = Some(placement);
+    }
+
+    /// Record the windows open beside the key one. Written at quit, when the
+    /// full set is known; a launch that keeps windows reopens them.
+    pub fn remember_additional_windows(&mut self, windows: Vec<SavedWindow>) {
+        self.prefs.additional_windows = windows;
     }
 
     pub fn daemon_state(&self) -> &DaemonState {

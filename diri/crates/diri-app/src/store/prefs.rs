@@ -63,6 +63,36 @@ pub struct WindowPlacement {
     pub height: f32,
 }
 
+impl WindowPlacement {
+    /// Repair a placement read from disk. Returns false when it cannot be
+    /// trusted at all and should be dropped.
+    pub fn normalize(&mut self) -> bool {
+        let valid = self.x.is_finite()
+            && self.y.is_finite()
+            && self.width.is_finite()
+            && self.height.is_finite()
+            && self.width > 0.0
+            && self.height > 0.0;
+        if valid {
+            self.width = self.width.max(900.0);
+            self.height = self.height.max(560.0);
+        }
+        valid
+    }
+}
+
+/// A window that was open beside the key window when diri last quit, with
+/// enough of its view state to bring it back as it was.
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SavedWindow {
+    pub placement: WindowPlacement,
+    #[serde(default)]
+    pub workspace: Option<diri_proto::workspace::WorkspaceId>,
+    #[serde(default)]
+    pub selected_session: Option<SessionId>,
+}
+
 #[derive(Clone, Copy, Debug, Default, Deserialize, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub enum InspectorTab {
@@ -186,8 +216,12 @@ pub struct Prefs {
     /// files written before it existed pick up glass.
     #[serde(default)]
     pub window_material: WindowMaterial,
-    /// Last size, position, and presentation mode of the main window.
+    /// Last size, position, and presentation mode of the key window.
     pub window_placement: Option<WindowPlacement>,
+    /// The other windows open at the last quit, in no particular order. They
+    /// come back only when macOS keeps windows across a quit.
+    #[serde(default)]
+    pub additional_windows: Vec<SavedWindow>,
     /// Whether the leading sidebar was mounted when the app last ran.
     pub sidebar_visible: bool,
     pub sidebar_width: f32,
@@ -258,6 +292,7 @@ impl Default for Prefs {
             terminal_paste_protection: false,
             window_material: WindowMaterial::Glass,
             window_placement: None,
+            additional_windows: Vec::new(),
             sidebar_visible: false,
             sidebar_width: 248.0,
             sidebar_grouping: SidebarGrouping::Project,
@@ -381,20 +416,15 @@ impl Prefs {
         self.terminal_font_size = self
             .terminal_font_size
             .clamp(Self::MIN_TERMINAL_FONT_SIZE, Self::MAX_TERMINAL_FONT_SIZE);
-        if let Some(placement) = &mut self.window_placement {
-            let valid = placement.x.is_finite()
-                && placement.y.is_finite()
-                && placement.width.is_finite()
-                && placement.height.is_finite()
-                && placement.width > 0.0
-                && placement.height > 0.0;
-            if valid {
-                placement.width = placement.width.max(900.0);
-                placement.height = placement.height.max(560.0);
-            } else {
-                self.window_placement = None;
-            }
+        if self
+            .window_placement
+            .as_mut()
+            .is_some_and(|placement| !placement.normalize())
+        {
+            self.window_placement = None;
         }
+        self.additional_windows
+            .retain_mut(|window| window.placement.normalize());
         if !self.sidebar_width.is_finite() {
             self.sidebar_width = 248.0;
         }

@@ -63,6 +63,7 @@ pub mod terminal_pane;
 pub mod transcript;
 pub mod updates;
 pub mod usage;
+mod window_restore;
 mod workbench;
 #[cfg(all(test, target_os = "macos"))]
 mod workspace_fixture;
@@ -106,6 +107,7 @@ use crate::usage::{
     CursorBatch, CursorRefresh, TranscriptInvalidation, TranscriptWatcher, UsageSnapshot,
     UsageStore, merge_fleet_usage,
 };
+use crate::window_restore::{DisplayFrame, RestorePolicy};
 
 pub mod store;
 
@@ -382,7 +384,15 @@ fn main() {
     let reopen_services = Arc::clone(&services);
     app.on_reopen(move |cx| {
         if cx.windows().is_empty() {
-            open_main_window(cx, Arc::clone(&reopen_services), preview, scenario);
+            // A window the user closed comes back fresh, at its last frame
+            // but never straight into full screen.
+            open_main_window(
+                cx,
+                Arc::clone(&reopen_services),
+                preview,
+                scenario,
+                RestorePolicy::FRAME_ONLY,
+            );
         }
         cx.activate(true);
     });
@@ -417,15 +427,35 @@ fn main() {
                     .ok()
                     .flatten()
             });
-            open_main_window_with_context(cx, window_services.clone(), preview, scenario, context);
+            match context {
+                Some(context) => open_main_window_with_context(
+                    cx,
+                    window_services.clone(),
+                    preview,
+                    scenario,
+                    context,
+                ),
+                None => open_main_window(
+                    cx,
+                    window_services.clone(),
+                    preview,
+                    scenario,
+                    RestorePolicy::FRAME_ONLY,
+                ),
+            };
         });
         let quit_services = Arc::clone(&services);
         let quit_updates = services.updates.clone();
         let release_owned_daemon =
             !preview && std::env::var_os(diri_proto::paths::ENV_SOCKET).is_none();
-        cx.on_app_quit(move |_| {
+        cx.on_app_quit(move |cx| {
             let quit_services = Arc::clone(&quit_services);
             let quit_updates = quit_updates.clone();
+            // Windows are still open here; this is the one moment the full
+            // set is known, so record it before preferences are flushed.
+            if !preview {
+                remember_open_windows(cx, &quit_services.store);
+            }
             // This runs while GPUI is constructing the quit future, before its
             // 200 ms grace period begins. The coordinator never transfers its
             // sole task handle into that cancellable future: pending startup
@@ -466,7 +496,38 @@ fn main() {
             }
         })
         .detach();
-        open_main_window(cx, Arc::clone(&services), preview, scenario);
+        let policy = if preview {
+            RestorePolicy::FRAME_ONLY
+        } else {
+            RestorePolicy::for_system(window_restore::system_keeps_windows_on_quit())
+        };
+        let key_window = open_main_window(cx, Arc::clone(&services), preview, scenario, policy);
+        if policy.extra_windows {
+            let additional = services
+                .store
+                .store
+                .read()
+                .expect("session store lock poisoned")
+                .preferences()
+                .additional_windows
+                .clone();
+            for saved in additional {
+                open_main_window_with_context(
+                    cx,
+                    Arc::clone(&services),
+                    preview,
+                    scenario,
+                    NativeWindowContext {
+                        workspace: saved.workspace,
+                        selected: saved.selected_session,
+                        placement: saved.placement,
+                        policy,
+                    },
+                );
+            }
+            // The window that was key at quit is key again.
+            let _ = key_window.update(cx, |_, window, _| window.activate_window());
+        }
         cx.activate(true);
         // `open_main_window` must stay before this call. The supervisor can
         // spend up to five seconds probing and retiring an outdated Engine;
@@ -628,6 +689,15 @@ struct NativeWindowContext {
     workspace: Option<diri_proto::workspace::WorkspaceId>,
     selected: Option<diri_proto::SessionId>,
     placement: WindowPlacement,
+    policy: RestorePolicy,
+}
+
+/// Where a main window's frame and view state come from.
+enum WindowOpen {
+    /// The key window's saved placement, under the given policy.
+    Restore(RestorePolicy),
+    /// A live window's state (⌘N) or a window brought back beside the key one.
+    Context(NativeWindowContext),
 }
 
 fn open_main_window(
@@ -635,8 +705,9 @@ fn open_main_window(
     services: Arc<AppServices>,
     preview: bool,
     scenario: PreviewScenario,
+    policy: RestorePolicy,
 ) -> gpui::WindowHandle<RootView> {
-    open_main_window_with_context(cx, services, preview, scenario, None)
+    open_window(cx, services, preview, scenario, WindowOpen::Restore(policy))
 }
 
 fn open_main_window_with_context(
@@ -644,7 +715,23 @@ fn open_main_window_with_context(
     services: Arc<AppServices>,
     preview: bool,
     scenario: PreviewScenario,
-    context: Option<NativeWindowContext>,
+    context: NativeWindowContext,
+) -> gpui::WindowHandle<RootView> {
+    open_window(
+        cx,
+        services,
+        preview,
+        scenario,
+        WindowOpen::Context(context),
+    )
+}
+
+fn open_window(
+    cx: &mut App,
+    services: Arc<AppServices>,
+    preview: bool,
+    scenario: PreviewScenario,
+    open: WindowOpen,
 ) -> gpui::WindowHandle<RootView> {
     let perf_large_window = std::env::var_os("DIRI_PERF_LARGE_WINDOW").is_some();
     let initial_size = if perf_large_window {
@@ -652,26 +739,32 @@ fn open_main_window_with_context(
     } else {
         size(px(1100.0), px(700.0))
     };
-    let saved_placement = (!preview && !perf_large_window)
-        .then(|| {
-            services
-                .store
-                .store
-                .read()
-                .expect("session store lock poisoned")
-                .preferences()
-                .window_placement
-                .clone()
-        })
-        .flatten();
-    let saved_placement = context
-        .as_ref()
-        .map(|context| context.placement.clone())
-        .or(saved_placement);
+    let (saved_placement, policy, context) = match open {
+        WindowOpen::Restore(policy) => {
+            let saved = (!preview && !perf_large_window)
+                .then(|| {
+                    services
+                        .store
+                        .store
+                        .read()
+                        .expect("session store lock poisoned")
+                        .preferences()
+                        .window_placement
+                        .clone()
+                })
+                .flatten();
+            (saved, policy, None)
+        }
+        WindowOpen::Context(context) => (
+            Some(context.placement.clone()),
+            context.policy,
+            Some(context),
+        ),
+    };
     let selected_override = context.as_ref().map(|context| context.selected.clone());
     let workspace_override = context.map(|context| context.workspace);
     let (window_bounds, display_id) = saved_placement
-        .map(|placement| restore_window_bounds(placement, cx))
+        .map(|placement| restore_window_bounds(&placement, policy, cx))
         .unwrap_or_else(|| {
             (
                 WindowBounds::Windowed(Bounds::centered(None, initial_size, cx)),
@@ -767,41 +860,62 @@ pub(crate) fn current_window_placement(window: &Window, cx: &App) -> WindowPlace
     }
 }
 
+/// Record every open main window so the next launch can bring them back. The
+/// key window becomes the placement every launch restores; the rest ride
+/// along for launches that keep windows.
+fn remember_open_windows(cx: &mut App, runtime: &StoreRuntime) {
+    let active = cx.active_window();
+    let mut windows = Vec::new();
+    for handle in cx.windows() {
+        let saved = handle
+            .update(cx, |root, window, cx| {
+                root.downcast::<RootView>()
+                    .ok()
+                    .map(|root| root.read(cx).saved_window(window, cx))
+            })
+            .ok()
+            .flatten();
+        if let Some(saved) = saved {
+            windows.push((Some(handle) == active, saved));
+        }
+    }
+    let mut store = runtime.store.write().expect("session store lock poisoned");
+    if windows.is_empty() {
+        // Every window was closed before quitting. The bounds observer's last
+        // placement is all that should come back.
+        store.remember_additional_windows(Vec::new());
+        return;
+    }
+    let key = windows
+        .iter()
+        .position(|(active, _)| *active)
+        .unwrap_or_default();
+    let (_, key_window) = windows.remove(key);
+    store.remember_window_placement(key_window.placement);
+    store.remember_additional_windows(windows.into_iter().map(|(_, saved)| saved).collect());
+}
+
+/// Place a saved window on the displays attached right now.
 fn restore_window_bounds(
-    placement: WindowPlacement,
+    placement: &WindowPlacement,
+    policy: RestorePolicy,
     cx: &App,
 ) -> (WindowBounds, Option<gpui::DisplayId>) {
-    let display = placement.display_uuid.as_deref().and_then(|uuid| {
-        cx.displays().into_iter().find(|display| {
-            display
-                .uuid()
-                .is_ok_and(|candidate| candidate.to_string() == uuid)
+    let displays = cx.displays();
+    let primary = cx.primary_display().map(|display| display.id());
+    let frames: Vec<DisplayFrame> = displays
+        .iter()
+        .map(|display| DisplayFrame {
+            uuid: display.uuid().ok().map(|uuid| uuid.to_string()),
+            visible: display.visible_bounds(),
+            primary: Some(display.id()) == primary,
         })
-    });
-    let display_id = display.as_ref().map(|display| display.id());
-    let size = size(px(placement.width), px(placement.height));
-    let saved = Bounds::new(point(px(placement.x), px(placement.y)), size);
-    // Display arrangements change. Preserve the saved size, but center it on
-    // the current primary display if the old origin is now wholly off-screen.
-    let visible = display.as_ref().map_or_else(
-        || {
-            cx.displays()
-                .iter()
-                .any(|display| saved.intersects(&display.visible_bounds()))
-        },
-        |display| saved.intersects(&display.visible_bounds()),
-    );
-    let bounds = if visible {
-        saved
-    } else {
-        Bounds::centered(display_id, size, cx)
-    };
-    let bounds = match placement.mode {
-        WindowMode::Windowed => WindowBounds::Windowed(bounds),
-        WindowMode::Maximized => WindowBounds::Maximized(bounds),
-        WindowMode::Fullscreen => WindowBounds::Fullscreen(bounds),
-    };
-    (bounds, display_id)
+        .collect();
+    let restored = window_restore::resolve(placement, &frames, policy);
+    (
+        restored.bounds,
+        restored.display.map(|index| displays[index].id()),
+    )
 }
 
 #[cfg(target_os = "macos")]

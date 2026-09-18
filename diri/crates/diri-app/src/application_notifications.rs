@@ -139,7 +139,13 @@ pub(crate) fn route(
             }
             // No live recipient (or its bounded action queue is saturated).
             // Open a fresh workbench and retain the exact notification target.
-            let window = crate::open_main_window(cx, services.clone(), preview, scenario);
+            let window = crate::open_main_window(
+                cx,
+                services.clone(),
+                preview,
+                scenario,
+                crate::window_restore::RestorePolicy::FRAME_ONLY,
+            );
             let WindowAction::OpenNotification {
                 session,
                 notification,

@@ -351,6 +351,16 @@ impl RootView {
             workspace: self.window_workspace(),
             selected: self.window_session(),
             placement,
+            policy: crate::window_restore::RestorePolicy::FRAME_ONLY,
+        }
+    }
+
+    /// This window as the next launch should bring it back.
+    pub(crate) fn saved_window(&self, window: &Window, cx: &App) -> crate::store::SavedWindow {
+        crate::store::SavedWindow {
+            placement: crate::current_window_placement(window, cx),
+            workspace: self.window_workspace(),
+            selected_session: self.window_session(),
         }
     }
 
@@ -4362,7 +4372,7 @@ impl Render for RootView {
                         this.services.clone(),
                         this.preview,
                         this.preview_scenario,
-                        Some(context),
+                        context,
                     );
                 }),
             )
