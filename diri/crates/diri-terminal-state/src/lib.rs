@@ -424,6 +424,29 @@ impl HeadlessScreen {
         self
     }
 
+    /// Resets the emulator at its current dimensions without touching a PTY.
+    ///
+    /// Both screens and history, terminal modes, title/progress, queued replies,
+    /// notifications and incomplete escape/synchronized-update sequences are
+    /// discarded. Constructor options remain enabled exactly as before. A reset
+    /// establishes known default keyboard state even after incomplete recovery.
+    /// The content revision advances and the next `grid_update(false)` is full.
+    ///
+    /// The terminal owner must order this with output, publication and durable
+    /// replay. This primitive does not implement a session reset or log boundary.
+    pub fn reset(&mut self) {
+        let mut reset = Self::new_with_keyboard_config(
+            self.geometry.cols,
+            self.geometry.rows,
+            self.keyboard_enhancements_enabled(),
+        );
+        if self.notifications.is_some() {
+            reset = reset.with_notifications();
+        }
+        reset.content_seq = self.content_seq.saturating_add(1);
+        *self = reset;
+    }
+
     pub fn reset_notification_sequence(&mut self) {
         if let Some(parser) = &mut self.notifications {
             parser.reset_sequence();
@@ -1925,6 +1948,190 @@ mod tests {
             first.style.contains(TermStyle::INVERSE),
             "the restyled cell must reach the wire"
         );
+    }
+
+    #[test]
+    fn reset_clears_screens_history_modes_title_progress_and_owed_replies() {
+        let mut screen = HeadlessScreen::new(12, 3);
+        // Enough lines to push rows into history, then a title, progress,
+        // bracketed paste, SGR any-motion mouse, application cursor keys, a
+        // pending cursor-position report and finally the alternate screen.
+        screen.feed(b"one\r\ntwo\r\nthree\r\nfour\r\nfive\r\n");
+        assert!(!screen.history_snapshot().is_empty());
+        screen.feed(
+            b"\x1b]0;busy\x07\x1b]9;4;1;40\x07\x1b[?2004h\x1b[?1003h\x1b[?1006h\x1b[?1h\x1b[6n",
+        );
+        screen.feed(b"\x1b[?1049h\x1b[Halt content");
+        assert!(screen.is_alt_screen());
+        assert!(screen.bracketed_paste());
+        assert!(screen.mouse_reporting());
+        assert_eq!(screen.title(), Some("busy"));
+        assert_eq!(screen.progress(), Some((1, 40)));
+        assert!(screen.keyboard_state().application_cursor_keys);
+        let before = screen.content_seq();
+
+        screen.reset();
+
+        assert_eq!(
+            screen.size(),
+            (12, 3),
+            "dimensions are the owner's, not the child's"
+        );
+        assert!(
+            screen.lines().is_empty(),
+            "the visible grid is blank: {:?}",
+            screen.lines()
+        );
+        assert!(screen.history_snapshot().is_empty(), "history is discarded");
+        assert!(!screen.is_alt_screen(), "the alternate screen is left");
+        assert!(!screen.bracketed_paste());
+        assert_eq!(screen.mouse_modes(), MouseModes::OFF);
+        assert_eq!(screen.title(), None);
+        assert_eq!(screen.progress(), None);
+        assert_eq!(screen.cursor(), (0, 0, true));
+        assert_eq!(
+            screen.keyboard_state(),
+            diri_proto::terminal_input::KeyboardState {
+                enhancements: Some(0.try_into().unwrap()),
+                ..Default::default()
+            }
+        );
+        assert!(
+            screen.take_replies().is_empty(),
+            "a reply owed by the old emulator must not reach the child"
+        );
+        assert!(
+            screen.content_seq() > before,
+            "observers must notice the reset"
+        );
+
+        // The primary screen is genuinely empty too: leaving the alternate
+        // screen after a reset must not reveal the pre-reset primary grid.
+        screen.feed(b"\x1b[?1049h\x1b[?1049l");
+        assert!(screen.lines().is_empty());
+    }
+
+    #[test]
+    fn reset_discards_partial_sequences_and_an_open_synchronized_update() {
+        let mut screen = screen_with(b"before\r\n");
+        // An open DECSET 2026 bracket holding an erase, a split OSC progress
+        // prefix and a truncated CSI parameter are all in flight.
+        screen.feed(b"\x1b[?2026h\x1b[2J\x1b[H\x1b]9;4;1");
+        screen.feed(b"\x1b[3");
+        assert_eq!(
+            screen.lines(),
+            vec!["before"],
+            "the bracket still holds the erase"
+        );
+
+        screen.reset();
+
+        assert!(
+            !screen.flush_expired_sync(),
+            "no synchronized update survives a reset"
+        );
+        screen.feed(b"plain");
+        assert_eq!(
+            screen.lines(),
+            vec!["plain"],
+            "bytes after the reset are interpreted from a clean parser state"
+        );
+        assert_eq!(
+            screen.progress(),
+            None,
+            "the split progress prefix was dropped"
+        );
+        assert!(screen.progress_carry.is_empty());
+    }
+
+    #[test]
+    fn reset_forces_the_next_incremental_grid_update_to_be_full() {
+        let mut screen = screen_with(b"row one\r\nrow two\r\n");
+        let baseline = screen.grid_update(false);
+        assert!(baseline.is_full_snapshot);
+        screen.feed(b"row three\r\n");
+        assert!(
+            !screen.grid_update(false).is_full_snapshot,
+            "steady state diffs"
+        );
+
+        screen.reset();
+
+        let update = screen.grid_update(false);
+        assert!(
+            update.is_full_snapshot,
+            "a diff against pre-reset cells is meaningless"
+        );
+        assert_eq!(update.changed_rows.len(), 24);
+        assert!(
+            update
+                .changed_rows
+                .iter()
+                .flat_map(|row| &row.cells)
+                .all(|cell| *cell == GridCell::BLANK)
+        );
+        assert_eq!(screen.filled_cells(), 0);
+        assert!(
+            screen
+                .full_snapshot()
+                .changed_rows
+                .iter()
+                .all(|row| row.cells.len() == 80)
+        );
+    }
+
+    #[test]
+    fn reset_keeps_constructor_options_and_makes_keyboard_state_known() {
+        // Enhanced parser + product notifications, as the local Engine builds it.
+        let mut screen = HeadlessScreen::new_with_keyboard_enhancements(40, 4).with_notifications();
+        screen.feed(b"\x1b[>1u\x1b]777;notify;Tests;All green\x1b\\");
+        assert!(screen.has_notifications());
+        assert_ne!(screen.keyboard_snapshot().unwrap().current(), 0);
+        screen.invalidate_keyboard_enhancements();
+        assert!(
+            screen.input_keyboard_state().is_none(),
+            "unknown state stays unknown"
+        );
+
+        screen.reset();
+
+        assert!(
+            screen.keyboard_enhancements_enabled(),
+            "the parser opt-in is preserved"
+        );
+        assert!(
+            !screen.has_notifications(),
+            "queued notifications are discarded"
+        );
+        assert_eq!(
+            screen
+                .keyboard_snapshot()
+                .map(|snapshot| snapshot.current()),
+            Some(0),
+            "a reset establishes known default enhanced state"
+        );
+        assert!(screen.input_keyboard_state().is_some());
+        screen.feed(b"\x1b]777;notify;Later;Still parsed\x1b\\");
+        assert!(
+            screen.has_notifications(),
+            "notification parsing stays enabled"
+        );
+        screen.feed(b"\x1b[>1u");
+        assert_ne!(screen.keyboard_snapshot().unwrap().current(), 0);
+
+        // A legacy-only screen stays legacy-only after a reset.
+        let mut legacy = HeadlessScreen::new(40, 4);
+        legacy.reset();
+        assert!(!legacy.keyboard_enhancements_enabled());
+        assert!(!legacy.has_notifications());
+        legacy.feed(b"\x1b[>1u\x1b]777;notify;Ignored;Not parsed\x1b\\");
+        assert_eq!(
+            legacy
+                .keyboard_snapshot()
+                .map(|snapshot| snapshot.current()),
+            Some(0)
+        );
+        assert!(!legacy.has_notifications());
     }
 
     #[test]
