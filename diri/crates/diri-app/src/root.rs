@@ -3194,9 +3194,29 @@ impl RootView {
             });
         }
 
+        // The strip hosts the primary pane's title-bar actions whenever it is
+        // the settled chrome, so the pane hides its own title bar in step with
+        // `set_header_hidden` below rather than with the slide.
+        let hosts_pane_actions =
+            tabs_height > 0.0 && self.active_workspace.is_none() && !self.preview;
         if self.tabs_seam > 0.0 {
+            let sidebar_colors = {
+                let store = self
+                    .window_store
+                    .read()
+                    .expect("session store lock poisoned");
+                crate::app_theme::sidebar_colors_for(store.preferences())
+            };
+            let trailing = hosts_pane_actions
+                .then_some(self.terminal.as_ref())
+                .flatten()
+                .and_then(|primary| {
+                    primary.update(cx, |terminal, cx| {
+                        terminal.render_hosted_header_actions(sidebar_colors, cx)
+                    })
+                });
             let strip = self.sidebar.update(cx, |sidebar, cx| {
-                sidebar.render_horizontal_tabs(card_width, cx)
+                sidebar.render_horizontal_tabs(card_width, trailing, cx)
             });
             card = card.child(
                 div()
@@ -3284,6 +3304,7 @@ impl RootView {
             if let Some(primary) = &self.terminal {
                 primary.update(cx, |terminal, cx| {
                     terminal.set_shell_chrome(visible_sidebar, self.inspector_open, cx);
+                    terminal.set_header_hidden(hosts_pane_actions, cx);
                     terminal.set_viewport(
                         TerminalViewport {
                             x: sidebar_width,
@@ -3377,6 +3398,7 @@ impl RootView {
             self.terminal_available_height = card_height;
             primary.update(cx, |terminal, cx| {
                 terminal.set_shell_chrome(visible_sidebar, self.inspector_open, cx);
+                terminal.set_header_hidden(hosts_pane_actions, cx);
                 terminal.set_viewport(
                     TerminalViewport {
                         x: sidebar_width,
@@ -5612,6 +5634,108 @@ mod tests {
                 .geometry_for_test()),
             original
         );
+    }
+
+    #[gpui::test]
+    fn horizontal_strip_hosts_the_pane_title_bar_actions(cx: &mut gpui::TestAppContext) {
+        cx.update(|cx| cx.set_reduce_motion(true));
+        let services = test_services();
+        let fixture = SidebarPreviewFixture::make(PreviewScenario::Typical);
+        {
+            let mut store = services.store.store.write().unwrap();
+            store.hydrate(fixture.list);
+            store.select(fixture.selected_session_id.unwrap());
+            store
+                .update_preferences(|prefs| {
+                    prefs.tab_orientation = crate::store::TabOrientation::Horizontal;
+                    prefs.sidebar_visible = false;
+                })
+                .unwrap();
+        }
+        let (root, cx) = cx.add_window_view(move |window, cx| {
+            RootView::new(services, false, PreviewScenario::Empty, window, cx)
+        });
+        cx.simulate_resize(size(px(1000.0), px(700.0)));
+        cx.run_until_parked();
+
+        let strip = cx
+            .debug_bounds("horizontal-tabs")
+            .expect("horizontal strip");
+        let new_tab = cx
+            .debug_bounds("horizontal-new-tab")
+            .expect("new tab control");
+        let actions = cx
+            .debug_bounds("hosted-header-actions")
+            .expect("the strip hosts the pane's title-bar actions");
+        assert!(
+            actions.left() >= new_tab.right() && actions.right() <= strip.right(),
+            "actions sit after the new-tab control inside the strip: {actions:?} vs {new_tab:?}"
+        );
+        for selector in [
+            "session-links-trigger",
+            "toggle-inspector",
+            "notification-inbox-button",
+        ] {
+            let control = cx
+                .debug_bounds(selector)
+                .unwrap_or_else(|| panic!("missing hosted control {selector}"));
+            assert!(
+                control.top() >= strip.top() && control.bottom() <= strip.bottom(),
+                "{selector} must live in the strip: {control:?} vs {strip:?}"
+            );
+        }
+        assert!(
+            cx.debug_bounds("show-sidebar").is_none(),
+            "no pane title bar remains to carry the top-bar toggle"
+        );
+        let grid = cx
+            .debug_bounds("terminal-grid-surface")
+            .expect("grid surface");
+        assert!(
+            grid.top() < strip.bottom() + px(2.0),
+            "the grid reclaims the title bar height directly under the strip: {grid:?}"
+        );
+        assert!(root.read_with(cx, |root, cx| {
+            root.terminal.as_ref().unwrap().read(cx).header_hidden()
+        }));
+
+        let trigger = cx.debug_bounds("session-links-trigger").unwrap().center();
+        cx.simulate_click(trigger, Modifiers::default());
+        cx.run_until_parked();
+        let panel = cx
+            .debug_bounds("session-links-panel")
+            .expect("the hosted trigger still opens the pane's links popover");
+        assert!(
+            panel.top() >= strip.bottom(),
+            "the popover drops from the strip-hosted trigger: {panel:?}"
+        );
+        cx.simulate_click(trigger, Modifiers::default());
+        cx.run_until_parked();
+
+        // Hiding the strip hands the actions back to the pane's own title bar.
+        root.update_in(cx, |root, window, cx| {
+            root.run_command(CommandId::ToggleSidebar, window, cx)
+        });
+        cx.run_until_parked();
+        assert!(cx.debug_bounds("hosted-header-actions").is_none());
+        assert!(
+            cx.debug_bounds("show-sidebar").is_some(),
+            "the pane title bar returns with its top-bar toggle"
+        );
+        let bell = cx.debug_bounds("notification-inbox-button").unwrap();
+        assert!(bell.center().y < px(Metrics::TITLE_BAR));
+        assert!(!root.read_with(cx, |root, cx| {
+            root.terminal.as_ref().unwrap().read(cx).header_hidden()
+        }));
+
+        // Vertical tabs never host actions in a strip.
+        root.update_in(cx, |root, window, cx| {
+            root.run_command(CommandId::VerticalTabs, window, cx)
+        });
+        cx.run_until_parked();
+        assert!(cx.debug_bounds("horizontal-tabs").is_none());
+        assert!(cx.debug_bounds("hosted-header-actions").is_none());
+        assert!(cx.debug_bounds("toggle-inspector").is_some());
     }
 
     #[gpui::test]

@@ -360,7 +360,7 @@ impl TerminalPane {
             return;
         };
         let viewport = self.viewport.unwrap_or_default();
-        let top = viewport.y + Metrics::TITLE_BAR + 2.0;
+        let top = viewport.y + self.header_height() + 2.0;
         let bottom = viewport.y + viewport.height - 10.0;
         let y = f32::from(position.y);
         let delta = if y < top {
@@ -792,9 +792,10 @@ impl TerminalPane {
             let x = (f32::from(menu.position.x) - viewport.x)
                 .clamp(8.0, (viewport.width - 258.0).max(8.0));
             let menu_height = menu.actions.len() as f32 * 29.0 + 12.0;
-            let y = (f32::from(menu.position.y) - viewport.y - Metrics::TITLE_BAR).clamp(
+            let header_height = self.header_height();
+            let y = (f32::from(menu.position.y) - viewport.y - header_height).clamp(
                 4.0,
-                (viewport.height - Metrics::TITLE_BAR - menu_height).max(4.0),
+                (viewport.height - header_height - menu_height).max(4.0),
             );
             let mut items = div()
                 .id("terminal-context-menu")

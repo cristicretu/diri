@@ -431,9 +431,13 @@ impl Sidebar {
         self.tab_shift.start(deltas, reduce_motion);
     }
 
+    /// `trailing` is the workbench's title-bar action cluster (links,
+    /// inspector, notifications) hosted here beside the new-tab control, so
+    /// the terminal pane below can drop its own title bar.
     pub fn render_horizontal_tabs(
         &mut self,
         available_width: f32,
+        trailing: Option<AnyElement>,
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let colors = self.colors();
@@ -505,6 +509,7 @@ impl Sidebar {
             .child(
                 div()
                     .id("horizontal-new-tab")
+                    .debug_selector(|| "horizontal-new-tab".into())
                     .role(Role::Button)
                     .aria_label("New session")
                     .size(px(28.0))
@@ -521,6 +526,16 @@ impl Sidebar {
                         window.dispatch_action(Box::new(crate::commands::NewDefaultSession), cx)
                     }),
             )
+            .when_some(trailing, |strip, trailing| {
+                strip.child(
+                    div()
+                        .flex_none()
+                        .ml(px(6.0))
+                        .flex()
+                        .items_center()
+                        .child(trailing),
+                )
+            })
             .into_any_element()
     }
 }

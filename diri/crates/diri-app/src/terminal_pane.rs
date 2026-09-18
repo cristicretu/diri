@@ -611,6 +611,10 @@ pub struct TerminalPane {
     /// Space in the title bar reserved for workbench-owned controls painted
     /// above this pane, such as the auxiliary terminal's close button.
     header_trailing_inset: f32,
+    /// The workbench hosts this pane's title-bar actions elsewhere (the
+    /// horizontal tab strip), so the pane paints no title bar of its own and
+    /// the grid takes the reclaimed height.
+    header_hidden: bool,
     navigation: Option<Entity<NavigationOverlay>>,
     utility_surfaces: Option<Entity<UtilitySurfaces>>,
     local_clipboard_images: Vec<StagedClipboardImage>,
@@ -797,6 +801,7 @@ impl TerminalPane {
             sidebar_visible: true,
             inspector_open: false,
             header_trailing_inset: 0.0,
+            header_hidden: false,
             navigation: None,
             utility_surfaces: None,
             local_clipboard_images: Vec::new(),
@@ -1092,6 +1097,30 @@ impl TerminalPane {
         }
         self.header_trailing_inset = inset.max(0.0);
         cx.notify();
+    }
+
+    /// Drop the pane's own title bar because the workbench hosts its actions
+    /// in the horizontal tab strip. Grid geometry follows on the next layout.
+    pub fn set_header_hidden(&mut self, hidden: bool, cx: &mut Context<Self>) {
+        if self.header_hidden == hidden {
+            return;
+        }
+        self.header_hidden = hidden;
+        cx.notify();
+    }
+
+    pub fn header_hidden(&self) -> bool {
+        self.header_hidden
+    }
+
+    /// Height of the chrome painted above the terminal surface, which every
+    /// grid-space calculation must subtract from the viewport.
+    pub(crate) fn header_height(&self) -> f32 {
+        if self.header_hidden {
+            0.0
+        } else {
+            Metrics::TITLE_BAR
+        }
     }
 
     pub fn is_focused(&self, window: &Window) -> bool {
@@ -1929,7 +1958,7 @@ impl TerminalPane {
         let anchor = self
             .grid_row_overflow(grid_rows, font_size, window)
             .map_or(0.0, |grid_height| self.grid_inner_height() - grid_height);
-        let grid_y = viewport.y + Metrics::TITLE_BAR + 2.0 + anchor;
+        let grid_y = viewport.y + self.header_height() + 2.0 + anchor;
         let col = ((f32::from(position.x) - grid_x) / f32::from(metrics.cell_width))
             .floor()
             .max(0.0) as usize;
@@ -2056,7 +2085,7 @@ impl TerminalPane {
             let y = f32::from(event.position.y);
             x >= viewport.x
                 && x < viewport.x + viewport.width
-                && y >= viewport.y + Metrics::TITLE_BAR
+                && y >= viewport.y + self.header_height()
                 && y < viewport.y + viewport.height
         });
         let pressed = self.qol.pressed.take();
@@ -2259,7 +2288,8 @@ impl TerminalPane {
     /// same figure [`estimated_grid_size`] turns into a row count.
     fn grid_inner_height(&self) -> f32 {
         let height = self.viewport.map_or(0.0, |viewport| viewport.height);
-        (height - Metrics::TITLE_BAR - GRID_VERTICAL_PADDING - GRID_LAYOUT_VERTICAL_CHROME).max(1.0)
+        (height - self.header_height() - GRID_VERTICAL_PADDING - GRID_LAYOUT_VERTICAL_CHROME)
+            .max(1.0)
     }
 
     fn copy_selection(&mut self, _: &CopySelection, window: &mut Window, cx: &mut Context<Self>) {
@@ -2665,7 +2695,7 @@ impl TerminalPane {
         let metrics = CellMetrics::measure(window.text_system(), &font, px(font_size));
         let viewport = self.viewport.unwrap_or_default();
         let grid_x = viewport.x + GRID_HORIZONTAL_PADDING / 2.0;
-        let grid_y = viewport.y + Metrics::TITLE_BAR + 2.0;
+        let grid_y = viewport.y + self.header_height() + 2.0;
         let col = ((f32::from(event.position.x) - grid_x) / f32::from(metrics.cell_width))
             .floor()
             .max(0.0) as u16;
@@ -2728,7 +2758,13 @@ impl TerminalPane {
             &font(crate::fonts::mono_family()),
             px(font_size),
         );
-        let size = estimated_grid_size(viewport.width, viewport.height, 0.0, metrics);
+        let size = estimated_grid_size(
+            viewport.width,
+            viewport.height,
+            self.header_height(),
+            0.0,
+            metrics,
+        );
         if let Some(resident) = self.residents.get_mut(&session.id)
             && resident.attachment.is_controller()
             && (resident.last_size != size || resident.attachment.needs_resize(size))
@@ -2870,18 +2906,10 @@ impl TerminalPane {
         let shell_controls = matches!(self.session_source, SessionSource::FollowSelection);
         let show_sidebar = self.shows_navigation_control();
         let sidebar_reveal = show_sidebar.then(|| self.render_sidebar_reveal_control(colors, cx));
-        let inspector_open = self.inspector_open;
         let header_trailing_inset = self.header_trailing_inset;
         let header_width = self
             .viewport
             .map_or(f32::INFINITY, |viewport| viewport.width);
-        let unread = self
-            .runtime
-            .store
-            .read()
-            .expect("session store lock poisoned")
-            .notifications()
-            .unread_count();
         div()
             .h(px(Metrics::TITLE_BAR))
             .flex_none()
@@ -2934,80 +2962,130 @@ impl TerminalPane {
                     .items_center()
                     .gap(px(Metrics::TOOLBAR_ITEM_GAP))
                     .when(shell_controls, |trailing| {
-                        trailing.child(
-                            div()
-                                .id("toggle-inspector")
-                                .size(px(Metrics::TOOLBAR_CONTROL_SIZE))
-                                .flex_none()
-                                .flex()
-                                .items_center()
-                                .justify_center()
-                                .rounded(px(Radius::BADGE))
-                                .cursor_pointer()
-                                .when(inspector_open, |button| button.bg(Fill::subtle(colors)))
-                                .hover(move |button| button.bg(Fill::subtle(colors)))
-                                .child(sf_symbol(
-                                    "sidebar.right",
-                                    15.0,
-                                    if inspector_open {
-                                        colors.primary
-                                    } else {
-                                        colors.secondary
-                                    },
-                                ))
-                                .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
-                                .on_click(cx.listener(|_, _, window, cx| {
-                                    window.dispatch_action(Box::new(ToggleInspector), cx);
-                                    cx.stop_propagation();
-                                })),
-                        )
-                    })
-                    .when(shell_controls, |trailing| {
-                        trailing.child(
-                            div()
-                                .id("notification-inbox-button")
-                                .debug_selector(|| "notification-inbox-button".into())
-                                .relative()
-                                .size(px(Metrics::TOOLBAR_CONTROL_SIZE))
-                                .flex_none()
-                                .flex()
-                                .items_center()
-                                .justify_center()
-                                .rounded(px(Radius::BADGE))
-                                .cursor_pointer()
-                                .hover(move |button| button.bg(Fill::subtle(colors)))
-                                .child(sf_symbol(
-                                    if unread > 0 { "bell.fill" } else { "bell" },
-                                    14.0,
-                                    if unread > 0 {
-                                        Ink::FRESH
-                                    } else {
-                                        colors.secondary
-                                    },
-                                ))
-                                .when(unread > 0, |button| {
-                                    button.child(
-                                        div()
-                                            .absolute()
-                                            .top(px(2.0))
-                                            .right(px(2.0))
-                                            .size(px(5.0))
-                                            .rounded_full()
-                                            .bg(Ink::FRESH),
-                                    )
-                                })
-                                .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
-                                .on_click(|_, window, cx| {
-                                    window.dispatch_action(
-                                        Box::new(crate::commands::ToggleNotifications),
-                                        cx,
-                                    );
-                                    cx.stop_propagation();
-                                }),
-                        )
+                        trailing
+                            .child(self.render_inspector_toggle(colors, cx))
+                            .child(self.render_notification_button(colors))
                     }),
             )
             .into_any_element()
+    }
+
+    fn render_inspector_toggle(
+        &self,
+        colors: SemanticColors,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let inspector_open = self.inspector_open;
+        div()
+            .id("toggle-inspector")
+            .debug_selector(|| "toggle-inspector".into())
+            .role(gpui::Role::Button)
+            .aria_label("Toggle inspector")
+            .size(px(Metrics::TOOLBAR_CONTROL_SIZE))
+            .flex_none()
+            .flex()
+            .items_center()
+            .justify_center()
+            .rounded(px(Radius::BADGE))
+            .cursor_pointer()
+            .when(inspector_open, |button| button.bg(Fill::subtle(colors)))
+            .hover(move |button| button.bg(Fill::subtle(colors)))
+            .child(sf_symbol(
+                "sidebar.right",
+                15.0,
+                if inspector_open {
+                    colors.primary
+                } else {
+                    colors.secondary
+                },
+            ))
+            .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+            .on_click(cx.listener(|_, _, window, cx| {
+                window.dispatch_action(Box::new(ToggleInspector), cx);
+                cx.stop_propagation();
+            }))
+            .into_any_element()
+    }
+
+    fn render_notification_button(&self, colors: SemanticColors) -> AnyElement {
+        let unread = self
+            .runtime
+            .store
+            .read()
+            .expect("session store lock poisoned")
+            .notifications()
+            .unread_count();
+        div()
+            .id("notification-inbox-button")
+            .debug_selector(|| "notification-inbox-button".into())
+            .role(gpui::Role::Button)
+            .aria_label("Notifications")
+            .relative()
+            .size(px(Metrics::TOOLBAR_CONTROL_SIZE))
+            .flex_none()
+            .flex()
+            .items_center()
+            .justify_center()
+            .rounded(px(Radius::BADGE))
+            .cursor_pointer()
+            .hover(move |button| button.bg(Fill::subtle(colors)))
+            .child(sf_symbol(
+                if unread > 0 { "bell.fill" } else { "bell" },
+                14.0,
+                if unread > 0 {
+                    Ink::FRESH
+                } else {
+                    colors.secondary
+                },
+            ))
+            .when(unread > 0, |button| {
+                button.child(
+                    div()
+                        .absolute()
+                        .top(px(2.0))
+                        .right(px(2.0))
+                        .size(px(5.0))
+                        .rounded_full()
+                        .bg(Ink::FRESH),
+                )
+            })
+            .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+            .on_click(|_, window, cx| {
+                window.dispatch_action(Box::new(crate::commands::ToggleNotifications), cx);
+                cx.stop_propagation();
+            })
+            .into_any_element()
+    }
+
+    /// The title-bar actions for a workbench that paints them itself, in the
+    /// horizontal tab strip beside the new-tab control. Only the pane that
+    /// follows the selection owns shell-wide controls; a fixed pane hosts
+    /// nothing. The links popover keeps its window-space anchor, so it still
+    /// drops from wherever this trigger ends up.
+    pub fn render_hosted_header_actions(
+        &self,
+        colors: SemanticColors,
+        cx: &mut Context<Self>,
+    ) -> Option<AnyElement> {
+        if !matches!(self.session_source, SessionSource::FollowSelection) {
+            return None;
+        }
+        let session = self.selected_session();
+        Some(
+            div()
+                .id("hosted-header-actions")
+                .debug_selector(|| "hosted-header-actions".into())
+                .flex_none()
+                .flex()
+                .items_center()
+                .gap(px(Metrics::TOOLBAR_COMPACT_GAP))
+                .when_some(session, |actions, session| {
+                    actions.child(self.render_session_links_trigger(&session, colors, cx))
+                })
+                .child(self.render_inspector_toggle(colors, cx))
+                .child(self.render_notification_button(colors))
+                .into_any_element(),
+        )
     }
 
     fn render_grid_and_overlays(
@@ -3599,15 +3677,20 @@ impl Render for TerminalPane {
                 .border_l_1()
                 .border_color(sidebar_colors.primary.alpha(0.08))
                 .bg(colors.work_surface())
-                .child(self.render_header(&session, sidebar_colors, cx));
+                .when(!self.header_hidden, |pane| {
+                    pane.child(self.render_header(&session, sidebar_colors, cx))
+                });
             let mut terminal_surface = div()
                 .relative()
                 .min_h(px(0.0))
                 .flex_1()
                 .flex()
                 .flex_col()
-                .rounded_tl(px(Radius::CARD))
-                .rounded_tr(px(Radius::CARD))
+                .when(!self.header_hidden, |surface| {
+                    surface
+                        .rounded_tl(px(Radius::CARD))
+                        .rounded_tr(px(Radius::CARD))
+                })
                 .overflow_hidden()
                 .bg(colors.work_surface_nested())
                 .child(
@@ -3622,7 +3705,7 @@ impl Render for TerminalPane {
             }
             pane.into_any_element()
         } else {
-            let show_sidebar = self.shows_navigation_control();
+            let show_sidebar = self.shows_navigation_control() && !self.header_hidden;
             let sidebar_reveal =
                 show_sidebar.then(|| self.render_sidebar_reveal_control(sidebar_colors, cx));
             div()
@@ -4094,6 +4177,7 @@ fn should_hold_reflow(
 fn estimated_grid_size(
     window_width: f32,
     window_height: f32,
+    header_height: f32,
     chrome_inset: f32,
     metrics: CellMetrics,
 ) -> (u16, u16) {
@@ -4103,7 +4187,7 @@ fn estimated_grid_size(
         - GRID_LAYOUT_HORIZONTAL_CHROME)
         .max(1.0));
     let height = px((window_height
-        - Metrics::TITLE_BAR
+        - header_height
         - GRID_VERTICAL_PADDING
         - GRID_LAYOUT_VERTICAL_CHROME)
         .max(1.0));
@@ -6373,7 +6457,7 @@ mod tests {
         // A fractional-width boundary where the window estimate reports ten
         // columns, but the actual grid content box is three border pixels
         // narrower and can paint only nine.
-        let reported = estimated_grid_size(101.5, 100.0, 0.0, metrics);
+        let reported = estimated_grid_size(101.5, 100.0, Metrics::TITLE_BAR, 0.0, metrics);
         let painted = metrics.cols_for_width(px(101.5
             - GRID_HORIZONTAL_PADDING
             - GRID_LAYOUT_HORIZONTAL_CHROME));
