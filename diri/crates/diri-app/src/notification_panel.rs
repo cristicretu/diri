@@ -13,10 +13,14 @@ const NOTIFICATION_RADIUS: f32 = Radius::FLOATING_MENU;
 
 /// The notification panel as a panel target (see `crate::floating::Target`).
 pub(super) const NOTIFICATIONS_PANEL: crate::floating::Target<RootView> = crate::floating::Target {
+    key: "notifications",
     radius: NOTIFICATION_RADIUS,
-    slot: |root| &mut root.floating_notifications,
-    wanted: |root| root.notification_panel_open,
     content: RootView::notification_panel_content,
+    dismiss: |root, window, cx| {
+        if root.notification_panel_open {
+            root.toggle_notifications(window, cx);
+        }
+    },
 };
 
 /// What `notification_content` builds: the list plus the geometry the host
@@ -619,14 +623,11 @@ impl RootView {
 
     pub(super) fn notification_panel(
         &mut self,
-        window: &Window,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Option<AnyElement> {
         let viewport = window.inner_window_bounds().get_bounds().size;
-        let Some(notification) = self.notification_content(viewport, cx) else {
-            crate::floating::close(self, NOTIFICATIONS_PANEL, cx);
-            return None;
-        };
+        let notification = self.notification_content(viewport, cx)?;
         let NotificationContent {
             content,
             colors,
@@ -650,12 +651,10 @@ impl RootView {
             // the surface where the in-window one would sit.
             let probe = crate::floating::surface(colors, NOTIFICATION_RADIUS, width, content)
                 .into_any_element();
-            let measure = crate::floating::measure_element(
-                cx.entity().downgrade(),
+            let measure = crate::floating::host_element(
                 NOTIFICATIONS_PANEL,
                 probe,
                 width,
-                self.main_bounds,
                 gpui::point(viewport.width - px(14.0), px(panel_top)),
                 gpui::Anchor::TopRight,
                 0.0,
@@ -664,7 +663,6 @@ impl RootView {
             );
             panel.w(px(0.0)).h(px(0.0)).child(measure)
         } else {
-            crate::floating::close(self, NOTIFICATIONS_PANEL, cx);
             panel
                 .w(px(width))
                 .child(FloatingSurface::new(colors, content).radius(NOTIFICATION_RADIUS))

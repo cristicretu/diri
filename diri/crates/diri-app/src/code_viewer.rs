@@ -57,6 +57,20 @@ impl Render for ExplorerTooltip {
     }
 }
 
+/// Corner radius of the search popup; the menu radius like every dropdown.
+const CODE_PICKER_RADIUS: f32 = crate::floating::MENU_RADIUS;
+
+/// The search popup as a panel target (see `crate::floating::Target`).
+const CODE_PICKER: crate::floating::Target<CodeViewer> = crate::floating::Target {
+    key: "code-picker",
+    radius: CODE_PICKER_RADIUS,
+    content: CodeViewer::picker_panel_content,
+    dismiss: |this, _, cx| {
+        this.picker_open = false;
+        cx.notify();
+    },
+};
+
 pub struct CodeViewer {
     tokio: tokio::runtime::Handle,
     focus: FocusHandle,
@@ -1021,7 +1035,8 @@ impl CodeViewer {
         .into_any_element()
     }
 
-    fn render_picker(&self, colors: SemanticColors, cx: &mut Context<Self>) -> Option<AnyElement> {
+    /// The search popup's input, mode tabs, and results, without host chrome.
+    fn picker_content(&self, colors: SemanticColors, cx: &mut Context<Self>) -> Option<AnyElement> {
         if !self.picker_open {
             return None;
         }
@@ -1144,109 +1159,152 @@ impl CodeViewer {
         };
         Some(
             div()
+                .rounded(px(CODE_PICKER_RADIUS))
+                .overflow_hidden()
+                .child(
+                    div()
+                        .id("code-search-input")
+                        .h(px(38.0))
+                        .px(px(10.0))
+                        .flex()
+                        .items_center()
+                        .gap(px(7.0))
+                        .border_b_1()
+                        .border_color(colors.primary.alpha(0.08))
+                        .cursor_text()
+                        .on_mouse_down(
+                            MouseButton::Left,
+                            cx.listener(|this, _, window, cx| {
+                                this.in_main_window(window, cx, |this, window, cx| {
+                                    window.focus(&this.focus, cx);
+                                });
+                                cx.stop_propagation();
+                            }),
+                        )
+                        .child(sf_symbol("magnifyingglass", 11.0, colors.tertiary))
+                        .child(
+                            div()
+                                .min_w(px(0.0))
+                                .flex_1()
+                                .font_family(crate::fonts::mono_family())
+                                .text_size(px(11.0))
+                                .text_color(colors.primary)
+                                .child(query),
+                        ),
+                )
+                .child(
+                    div()
+                        .h(px(30.0))
+                        .px(px(8.0))
+                        .flex()
+                        .items_center()
+                        .gap(px(8.0))
+                        .children(
+                            [(false, "Files & symbols"), (true, "Text")]
+                                .into_iter()
+                                .map(|(content, label)| {
+                                    let active = self.content_search == content;
+                                    div()
+                                        .id(("search-mode", usize::from(content)))
+                                        .px(px(7.0))
+                                        .py(px(3.0))
+                                        .rounded(px(Radius::BADGE))
+                                        .text_size(px(10.0))
+                                        .text_color(if active {
+                                            colors.primary
+                                        } else {
+                                            colors.tertiary
+                                        })
+                                        .bg(colors.primary.alpha(if active { 0.09 } else { 0.0 }))
+                                        .cursor_pointer()
+                                        .child(label)
+                                        .on_click(cx.listener(move |this, _, window, cx| {
+                                            this.in_main_window(
+                                                window,
+                                                cx,
+                                                move |this, window, cx| {
+                                                    this.content_search = content;
+                                                    window.focus(&this.focus, cx);
+                                                    this.schedule_search(cx);
+                                                    cx.notify();
+                                                },
+                                            );
+                                        }))
+                                }),
+                        ),
+                )
+                .child(results)
+                .child(
+                    div()
+                        .px(px(10.0))
+                        .py(px(6.0))
+                        .text_size(px(9.0))
+                        .text_color(colors.tertiary)
+                        .child(format!(
+                            "{}{} results · ↑↓ select · ↵ open · Esc close{}",
+                            self.results.len().min(200),
+                            if self.results.len() > 200 { "+" } else { "" },
+                            if self.content_search {
+                                " · smart case · 32 MB scan limit"
+                            } else {
+                                ""
+                            }
+                        )),
+                )
+                .into_any_element(),
+        )
+    }
+
+    fn render_picker(&self, colors: SemanticColors, cx: &mut Context<Self>) -> Option<AnyElement> {
+        let content = self.picker_content(colors, cx)?;
+        if crate::floating::uses_panels(false, colors, cx) {
+            return Some(
+                crate::floating::host_here(
+                    CODE_PICKER,
+                    crate::floating::surface_full(colors, CODE_PICKER_RADIUS, content)
+                        .into_any_element(),
+                    None,
+                    gpui::Anchor::TopLeft,
+                    8.0,
+                    cx,
+                )
+                .absolute()
+                .top(px(40.0))
+                .left(px(8.0))
+                .right(px(8.0))
+                .h(px(0.0))
+                .into_any_element(),
+            );
+        }
+        Some(
+            div()
                 .absolute()
                 .top(px(40.0))
                 .left(px(8.0))
                 .right(px(8.0))
                 .occlude()
-                .rounded(px(Radius::PANEL))
+                .rounded(px(CODE_PICKER_RADIUS))
                 .bg(colors.sidebar_surface().alpha(1.0))
-                .child(FloatingSurface::new(
-                    colors,
-                    div()
-                        .rounded(px(Radius::PANEL))
-                        .overflow_hidden()
-                        .child(
-                            div()
-                                .id("code-search-input")
-                                .h(px(38.0))
-                                .px(px(10.0))
-                                .flex()
-                                .items_center()
-                                .gap(px(7.0))
-                                .border_b_1()
-                                .border_color(colors.primary.alpha(0.08))
-                                .cursor_text()
-                                .on_mouse_down(
-                                    MouseButton::Left,
-                                    cx.listener(|this, _, window, cx| {
-                                        window.focus(&this.focus, cx);
-                                        cx.stop_propagation();
-                                    }),
-                                )
-                                .child(sf_symbol("magnifyingglass", 11.0, colors.tertiary))
-                                .child(
-                                    div()
-                                        .min_w(px(0.0))
-                                        .flex_1()
-                                        .font_family(crate::fonts::mono_family())
-                                        .text_size(px(11.0))
-                                        .text_color(colors.primary)
-                                        .child(query),
-                                ),
-                        )
-                        .child(
-                            div()
-                                .h(px(30.0))
-                                .px(px(8.0))
-                                .flex()
-                                .items_center()
-                                .gap(px(8.0))
-                                .children(
-                                    [(false, "Files & symbols"), (true, "Text")]
-                                        .into_iter()
-                                        .map(|(content, label)| {
-                                            let active = self.content_search == content;
-                                            div()
-                                                .id(("search-mode", usize::from(content)))
-                                                .px(px(7.0))
-                                                .py(px(3.0))
-                                                .rounded(px(Radius::BADGE))
-                                                .text_size(px(10.0))
-                                                .text_color(if active {
-                                                    colors.primary
-                                                } else {
-                                                    colors.tertiary
-                                                })
-                                                .bg(colors.primary.alpha(if active {
-                                                    0.09
-                                                } else {
-                                                    0.0
-                                                }))
-                                                .cursor_pointer()
-                                                .child(label)
-                                                .on_click(cx.listener(
-                                                    move |this, _, window, cx| {
-                                                        this.content_search = content;
-                                                        window.focus(&this.focus, cx);
-                                                        this.schedule_search(cx);
-                                                        cx.notify();
-                                                    },
-                                                ))
-                                        }),
-                                ),
-                        )
-                        .child(results)
-                        .child(
-                            div()
-                                .px(px(10.0))
-                                .py(px(6.0))
-                                .text_size(px(9.0))
-                                .text_color(colors.tertiary)
-                                .child(format!(
-                                    "{}{} results · ↑↓ select · ↵ open · Esc close{}",
-                                    self.results.len().min(200),
-                                    if self.results.len() > 200 { "+" } else { "" },
-                                    if self.content_search {
-                                        " · smart case · 32 MB scan limit"
-                                    } else {
-                                        ""
-                                    }
-                                )),
-                        ),
-                ))
+                .child(FloatingSurface::new(colors, content).radius(CODE_PICKER_RADIUS))
                 .into_any_element(),
         )
+    }
+
+    /// The search popup's pixels for its floating panel.
+    fn picker_panel_content(&mut self, cx: &mut Context<Self>) -> Option<AnyElement> {
+        let colors = self.colors;
+        let content = self.picker_content(colors, cx)?;
+        Some(crate::floating::surface_full(colors, CODE_PICKER_RADIUS, content).into_any_element())
+    }
+
+    /// Runs `f` against the viewer's own window even from a panel handler.
+    fn in_main_window(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+        f: impl FnOnce(&mut Self, &mut Window, &mut Context<Self>) + 'static,
+    ) {
+        crate::floating::in_main_window(self, window, cx, f);
     }
 
     fn render_message(

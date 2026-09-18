@@ -150,7 +150,7 @@ impl LauncherOverlay {
         &self,
         colors: SemanticColors,
         cx: &mut Context<Self>,
-    ) -> AnyElement {
+    ) -> gpui::Stateful<gpui::Div> {
         let mut list = div()
             .id("launcher-account-list")
             .py(px(4.0))
@@ -212,6 +212,6 @@ impl LauncherOverlay {
                 .on_click(cx.listener(|this, _, _, cx| this.manage_accounts(cx)))
                 .child("Manage accounts…"),
         );
-        FloatingSurface::new(colors, list).into_any_element()
+        list
     }
 }

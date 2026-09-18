@@ -186,6 +186,17 @@ enum Picker {
     Recipe,
 }
 
+/// The open picker as a panel target (see `crate::floating::Target`).
+const LAUNCHER_PICKER: crate::floating::Target<LauncherOverlay> = crate::floating::Target {
+    key: "launcher-picker",
+    radius: crate::floating::MENU_RADIUS,
+    content: LauncherOverlay::picker_panel_content,
+    dismiss: |this, _, cx| {
+        this.picker = None;
+        cx.notify();
+    },
+};
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum RecipeMetadataField {
     Name,
@@ -2091,7 +2102,11 @@ impl LauncherOverlay {
         .detach();
     }
 
-    fn render_harness_picker(&self, colors: SemanticColors, cx: &mut Context<Self>) -> AnyElement {
+    fn render_harness_picker(
+        &self,
+        colors: SemanticColors,
+        cx: &mut Context<Self>,
+    ) -> gpui::Stateful<gpui::Div> {
         let mut list = div()
             .id("launcher-harness-list")
             .py(px(4.0))
@@ -2168,10 +2183,14 @@ impl LauncherOverlay {
                         .child("Manage Agents…"),
                 ),
         );
-        FloatingSurface::new(colors, list).into_any_element()
+        list
     }
 
-    fn render_project_picker(&self, colors: SemanticColors, cx: &mut Context<Self>) -> AnyElement {
+    fn render_project_picker(
+        &self,
+        colors: SemanticColors,
+        cx: &mut Context<Self>,
+    ) -> gpui::Stateful<gpui::Div> {
         let projects = self.projects();
         let mut list = div()
             .id("launcher-project-list")
@@ -2265,7 +2284,9 @@ impl LauncherOverlay {
                 .cursor_pointer()
                 .glass_menu_row(colors, highlighted)
                 .on_click(cx.listener(|this, _, window, cx| {
-                    this.choose_folder(window, cx);
+                    this.in_main_window(window, cx, |this, window, cx| {
+                        this.choose_folder(window, cx);
+                    });
                 }))
                 .child(sf_symbol("folder.badge.plus", 12.0, colors.secondary))
                 .child(
@@ -2275,7 +2296,7 @@ impl LauncherOverlay {
                         .child("Choose Folder…"),
                 ),
         );
-        FloatingSurface::new(colors, list).into_any_element()
+        list
     }
 
     fn render_recipe_picker(
@@ -3379,21 +3400,21 @@ impl LauncherOverlay {
                 panel.child(
                     self.floating(picker_top, cx)
                         .right(px(0.0))
-                        .child(self.render_harness_picker(colors, cx)),
+                        .child(self.picker_host(Picker::Harness, colors, cx)),
                 )
             })
             .when(self.picker == Some(Picker::Account), |panel| {
                 panel.child(
                     self.floating(picker_top, cx)
                         .left(px(12.0))
-                        .child(self.render_account_picker(colors, cx)),
+                        .child(self.picker_host(Picker::Account, colors, cx)),
                 )
             })
             .when(project_open, |panel| {
                 panel.child(
                     self.floating(picker_top, cx)
                         .left(px(12.0))
-                        .child(self.render_project_picker(colors, cx)),
+                        .child(self.picker_host(Picker::Project, colors, cx)),
                 )
             })
             .when(recipe_open, |panel| {
@@ -3922,6 +3943,96 @@ impl LauncherOverlay {
     /// Wrapper for a picker popover. It swallows its own mouse-down so the
     /// canvas behind it — which closes any open picker — does not tear the
     /// list away between press and release, which would eat the click.
+    /// One of the launcher's dropdown pickers: its rows, width, and which
+    /// corner of its mount it hangs from.
+    fn picker_list(
+        &self,
+        picker: Picker,
+        colors: SemanticColors,
+        cx: &mut Context<Self>,
+    ) -> Option<(gpui::Stateful<gpui::Div>, f32, gpui::Anchor)> {
+        Some(match picker {
+            Picker::Harness => (
+                self.render_harness_picker(colors, cx),
+                260.0,
+                gpui::Anchor::TopRight,
+            ),
+            Picker::Account => (
+                self.render_account_picker(colors, cx),
+                280.0,
+                gpui::Anchor::TopLeft,
+            ),
+            Picker::Project => (
+                self.render_project_picker(colors, cx),
+                310.0,
+                gpui::Anchor::TopLeft,
+            ),
+            Picker::Recipe => return None,
+        })
+    }
+
+    /// Mounts `picker` where its control put it: a blurred panel under
+    /// glass, otherwise the in-window surface.
+    fn picker_host(
+        &self,
+        picker: Picker,
+        colors: SemanticColors,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let Some((list, width, anchor)) = self.picker_list(picker, colors, cx) else {
+            return div().into_any_element();
+        };
+        if crate::floating::uses_panels(false, colors, cx) {
+            return crate::floating::host_here(
+                LAUNCHER_PICKER,
+                crate::floating::surface(colors, crate::floating::MENU_RADIUS, width, list)
+                    .into_any_element(),
+                Some(width),
+                anchor,
+                8.0,
+                cx,
+            )
+            .w(px(0.0))
+            .h(px(0.0))
+            .into_any_element();
+        }
+        FloatingSurface::new(colors, list)
+            .radius(crate::floating::MENU_RADIUS)
+            .into_any_element()
+    }
+
+    /// The open picker's pixels for its floating panel.
+    fn picker_panel_content(&mut self, cx: &mut Context<Self>) -> Option<AnyElement> {
+        let picker = self.picker?;
+        let colors = self.panel_colors();
+        let (list, width, _) = self.picker_list(picker, colors, cx)?;
+        Some(
+            crate::floating::surface(colors, crate::floating::MENU_RADIUS, width, list)
+                .into_any_element(),
+        )
+    }
+
+    /// The palette the launcher paints with, for its panel.
+    fn panel_colors(&self) -> SemanticColors {
+        let store = self
+            .services
+            .store
+            .store
+            .read()
+            .expect("session store lock poisoned");
+        crate::app_theme::colors_in(&store)
+    }
+
+    /// Runs `f` against the launcher's own window even from a panel handler.
+    fn in_main_window(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+        f: impl FnOnce(&mut Self, &mut Window, &mut Context<Self>) + 'static,
+    ) {
+        crate::floating::in_main_window(self, window, cx, f);
+    }
+
     fn floating(&self, top: f32, cx: &mut Context<Self>) -> gpui::Div {
         div().absolute().top(px(top)).on_mouse_down(
             MouseButton::Left,

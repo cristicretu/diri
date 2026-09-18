@@ -815,11 +815,86 @@ impl Sidebar {
 }
 
 impl Sidebar {
+    /// Mounts the workspace menu under the header: a blurred panel under
+    /// glass, otherwise the in-window surface. Focus and the click-outside
+    /// dismissal stay in this window either way.
     pub(super) fn workspace_popup(
         &mut self,
         colors: SemanticColors,
         cx: &mut Context<Self>,
     ) -> Option<AnyElement> {
+        let panel = self.workspace_menu_content(colors, cx)?;
+        let shell = div()
+            .id("workspace-menu-shell")
+            .absolute()
+            .top(px(78.0))
+            .left(px(8.0))
+            .right(px(8.0))
+            .track_focus(&self.workspace_nav.focus)
+            .on_mouse_down_out(cx.listener(|this, _, _, cx| {
+                this.workspace_nav.menu = false;
+                cx.notify();
+            }));
+        if self.uses_floating_panels(cx) {
+            return Some(
+                shell
+                    .h(px(0.0))
+                    .child(
+                        crate::floating::host_here(
+                            PanelTarget::WorkspaceMenu.spec(),
+                            crate::floating::surface_full(
+                                colors,
+                                crate::floating::MENU_RADIUS,
+                                panel,
+                            )
+                            .into_any_element(),
+                            None,
+                            Anchor::TopLeft,
+                            8.0,
+                            cx,
+                        )
+                        .absolute()
+                        .top_0()
+                        .left_0()
+                        .right_0()
+                        .h(px(0.0)),
+                    )
+                    .into_any_element(),
+            );
+        }
+        Some(
+            shell
+                .occlude()
+                .child(FloatingSurface::new(colors, panel).radius(crate::floating::MENU_RADIUS))
+                .into_any_element(),
+        )
+    }
+
+    /// Closes the workspace menu, as a click outside would.
+    pub(super) fn dismiss_workspace_menu(&mut self, cx: &mut Context<Self>) {
+        self.workspace_nav.menu = false;
+        cx.notify();
+    }
+
+    /// The workspace menu's pixels for its floating panel.
+    pub(super) fn workspace_menu_panel_content(
+        &mut self,
+        cx: &mut Context<Self>,
+    ) -> Option<AnyElement> {
+        let colors = self.colors();
+        let panel = self.workspace_menu_content(colors, cx)?;
+        Some(
+            crate::floating::surface_full(colors, crate::floating::MENU_RADIUS, panel)
+                .into_any_element(),
+        )
+    }
+
+    /// The workspace menu's rows and editor, without host chrome.
+    fn workspace_menu_content(
+        &mut self,
+        colors: SemanticColors,
+        cx: &mut Context<Self>,
+    ) -> Option<gpui::Stateful<gpui::Div>> {
         if !self.workspace_nav.menu {
             return None;
         }
@@ -828,26 +903,11 @@ impl Sidebar {
         let mut panel = div()
             .id("workspace-menu")
             .debug_selector(|| "workspace-menu".into())
-            .absolute()
-            .top(px(78.0))
-            .left(px(8.0))
-            .right(px(8.0))
             .max_h(px(480.0))
             .flex()
             .flex_col()
             .gap(px(5.0))
-            .p(px(8.0))
-            .rounded(px(11.0))
-            .border_1()
-            .border_color(colors.primary.alpha(0.10))
-            .bg(colors.background)
-            .shadow_lg()
-            .occlude()
-            .track_focus(&self.workspace_nav.focus)
-            .on_mouse_down_out(cx.listener(|this, _, _, cx| {
-                this.workspace_nav.menu = false;
-                cx.notify();
-            }));
+            .p(px(8.0));
         match catalog.status() {
             crate::store::WorkspaceCatalogStatus::Loading => {
                 panel = panel.child(
@@ -879,7 +939,7 @@ impl Sidebar {
                                 cx.notify();
                             })),
                     );
-                return Some(panel.into_any_element());
+                return Some(panel);
             }
             crate::store::WorkspaceCatalogStatus::Ready => {}
         }
@@ -925,9 +985,11 @@ impl Sidebar {
                 .text_size(px(12.0))
                 .overflow_hidden()
                 .child(query_label(&self.workspace_nav.query))
-                .on_click(
-                    cx.listener(|this, _, window, cx| this.workspace_nav.focus.focus(window, cx)),
-                ),
+                .on_click(cx.listener(|this, _, window, cx| {
+                    this.in_main_window(window, cx, |this, window, cx| {
+                        this.workspace_nav.focus.focus(window, cx)
+                    })
+                })),
         );
         if self.workspace_nav.editor.is_some() {
             panel = panel.child(
@@ -938,7 +1000,7 @@ impl Sidebar {
                     .text_color(colors.tertiary)
                     .child("Return to save · Escape to cancel"),
             );
-            return Some(panel.into_any_element());
+            return Some(panel);
         }
         let query = self.workspace_nav.query.text().trim().to_lowercase();
         if self.workspace_nav.destination.is_some() {
@@ -1285,7 +1347,7 @@ impl Sidebar {
             );
         }
         panel = panel.child(choices);
-        Some(panel.into_any_element())
+        Some(panel)
     }
 
     pub(super) fn workspace_strip(

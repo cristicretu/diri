@@ -1630,6 +1630,9 @@ impl UtilitySurfaces {
                     crate::number_flow::tabular(text, 13.0, colors.primary, FontWeight::NORMAL),
                 ))
             });
+        let series_menu = self
+            .usage_series_menu_open()
+            .then(|| self.series_menu_host(split, colors, cx));
         let series_chips = div()
             .flex()
             .gap(px(3.0))
@@ -1664,9 +1667,7 @@ impl UtilitySurfaces {
                                 colors.tertiary,
                             )),
                     )
-                    .when(self.usage_series_menu_open(), |wrap| {
-                        wrap.child(series_provider_menu(split, colors, cx))
-                    }),
+                    .when_some(series_menu, |wrap, menu| wrap.child(menu)),
             );
         div()
             .flex()
@@ -1857,12 +1858,22 @@ fn usage_control(
     usage_control_frame(id, selected, colors).child(text.into())
 }
 
-fn series_provider_menu(
+/// The provider rows of the series menu, without any host chrome. Hover
+/// on them keeps the menu open, whichever window paints them.
+fn series_provider_items(
     split: Option<[bool; 3]>,
     colors: SemanticColors,
     cx: &mut Context<UtilitySurfaces>,
-) -> impl IntoElement {
-    let mut items = div().flex().flex_col().p(px(4.0)).w(px(148.0));
+) -> gpui::Stateful<gpui::Div> {
+    let mut items = div()
+        .id("usage-series-items")
+        .flex()
+        .flex_col()
+        .p(px(4.0))
+        .w(px(148.0))
+        .on_hover(cx.listener(|this, hovered: &bool, _, cx| {
+            this.hover_usage_series_menu(SERIES_HOVER_MENU, *hovered, cx);
+        }));
     for index in 0..3 {
         let selected = split.is_some_and(|visible| visible[index]);
         items = items.child(
@@ -1870,15 +1881,17 @@ fn series_provider_menu(
                 .id(SharedString::from(format!("usage-series-{index}")))
                 .h(px(Metrics::ROW_HEIGHT))
                 .px(px(8.0))
-                .rounded(px(Radius::ROW))
+                .rounded(px(Radius::inner(SERIES_MENU_RADIUS, 4.0)))
                 .flex()
                 .items_center()
                 .gap(px(8.0))
                 .bg(Fill::selected(colors, selected))
                 .cursor_pointer()
-                .hover(move |style| style.bg(colors.primary.alpha(0.08)))
+                .glass_menu_row(colors, false)
                 .on_click(cx.listener(move |this, _, window, cx| {
-                    this.toggle_usage_chart_provider(index, window, cx);
+                    this.in_main_window(window, cx, move |this, window, cx| {
+                        this.toggle_usage_chart_provider(index, window, cx);
+                    });
                 }))
                 .child(
                     div()
@@ -1897,25 +1910,79 @@ fn series_provider_menu(
                 }),
         );
     }
-    deferred(
-        div()
-            .id("usage-series-menu")
+    items
+}
+
+/// Corner radius of the series menu; its rows sit four points in.
+const SERIES_MENU_RADIUS: f32 = Radius::PANEL;
+
+/// The series menu as a panel target (see `crate::floating::Target`).
+const USAGE_SERIES_MENU: crate::floating::Target<UtilitySurfaces> = crate::floating::Target {
+    key: "usage-series",
+    radius: SERIES_MENU_RADIUS,
+    content: UtilitySurfaces::usage_series_panel_content,
+    dismiss: |this, _, cx| {
+        this.usage_series_hover = 0;
+        this.usage_series_menu_close = None;
+        cx.notify();
+    },
+};
+
+impl UtilitySurfaces {
+    /// The series menu's pixels for its floating panel.
+    fn usage_series_panel_content(&mut self, cx: &mut Context<Self>) -> Option<AnyElement> {
+        if !self.usage_series_menu_open() {
+            return None;
+        }
+        let colors = self.settings_colors();
+        let items = series_provider_items(self.usage_chart_split, colors, cx);
+        Some(crate::floating::surface(colors, SERIES_MENU_RADIUS, 148.0, items).into_any_element())
+    }
+
+    /// Mounts the series menu under its pill: a blurred panel under glass,
+    /// otherwise the in-window surface.
+    fn series_menu_host(
+        &self,
+        split: Option<[bool; 3]>,
+        colors: SemanticColors,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let items = series_provider_items(split, colors, cx);
+        if crate::floating::uses_panels(false, colors, cx) {
+            return crate::floating::host_here(
+                USAGE_SERIES_MENU,
+                crate::floating::surface(colors, SERIES_MENU_RADIUS, 148.0, items)
+                    .into_any_element(),
+                Some(148.0),
+                gpui::Anchor::TopLeft,
+                8.0,
+                cx,
+            )
             .absolute()
-            .top(px(27.0))
+            .top(px(31.0))
             .left_0()
-            .pt(px(4.0))
-            .occlude()
-            .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
-            .on_hover(cx.listener(|this, hovered: &bool, _, cx| {
-                this.hover_usage_series_menu(SERIES_HOVER_MENU, *hovered, cx);
-            }))
-            .child(
-                FloatingSurface::new(colors, items)
-                    .animate_entry(false)
-                    .radius(8.0),
-            ),
-    )
-    .with_priority(5)
+            .w(px(0.0))
+            .h(px(0.0))
+            .into_any_element();
+        }
+        deferred(
+            div()
+                .id("usage-series-menu")
+                .absolute()
+                .top(px(27.0))
+                .left_0()
+                .pt(px(4.0))
+                .occlude()
+                .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                .child(
+                    FloatingSurface::new(colors, items)
+                        .animate_entry(false)
+                        .radius(SERIES_MENU_RADIUS),
+                ),
+        )
+        .with_priority(5)
+        .into_any_element()
+    }
 }
 #[derive(Clone, Copy)]
 enum ShareAction {

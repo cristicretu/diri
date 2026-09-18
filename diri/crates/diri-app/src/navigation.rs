@@ -60,10 +60,10 @@ pub(crate) const PALETTE_ROW_INSET: f32 = 6.0;
 
 /// The palette as a panel target (see `crate::floating::Target`).
 const PALETTE_PANEL: crate::floating::Target<NavigationOverlay> = crate::floating::Target {
+    key: "palette",
     radius: PALETTE_RADIUS,
-    slot: |this| &mut this.floating,
-    wanted: |this| this.overlay.is_some(),
     content: NavigationOverlay::palette_panel_content,
+    dismiss: |this, window, cx| this.close_overlay(window, cx),
 };
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -114,12 +114,10 @@ pub struct NavigationOverlay {
     workspace_spawn_target: Option<crate::store::WorkspaceSpawnTarget>,
     focus_handle: FocusHandle,
     previous_focus_handle: Option<FocusHandle>,
-    /// The palette's blurred panel window under glass (see `crate::floating`).
-    floating: Option<crate::floating::Panel>,
+    /// The window the palette belongs to, for repaints its panel cannot
+    /// trigger from another window.
     main_window: Option<gpui::AnyWindowHandle>,
-    main_bounds: gpui::Bounds<Pixels>,
     main_viewport: gpui::Size<Pixels>,
-    activation: Option<gpui::Subscription>,
     store: crate::store::WindowStore,
     _runtime: Arc<StoreRuntime>,
     overlay: Option<Overlay>,
@@ -251,11 +249,8 @@ impl NavigationOverlay {
             workspace_spawn_target: None,
             focus_handle,
             previous_focus_handle: None,
-            floating: None,
             main_window: None,
-            main_bounds: gpui::Bounds::default(),
             main_viewport: gpui::Size::default(),
-            activation: None,
             store: crate::store::WindowStore::from_canonical(Arc::clone(&runtime.store)),
             _runtime: runtime,
             overlay: None,
@@ -311,11 +306,8 @@ impl NavigationOverlay {
             workspace_spawn_target: None,
             focus_handle: cx.focus_handle(),
             previous_focus_handle: None,
-            floating: None,
             main_window: None,
-            main_bounds: gpui::Bounds::default(),
             main_viewport: gpui::Size::default(),
-            activation: None,
             store: crate::store::WindowStore::from_canonical(Arc::clone(&runtime.store)),
             _runtime: runtime,
             overlay: Some(Overlay::CommandPalette),
@@ -1442,14 +1434,13 @@ impl NavigationOverlay {
         cx: &mut Context<Self>,
         f: impl FnOnce(&mut Self, &mut Window, &mut Context<Self>) + 'static,
     ) {
-        let main = self.main_window;
-        crate::floating::in_main_window(self, main, window, cx, f);
+        crate::floating::in_main_window(self, window, cx, f);
     }
 
     fn render_overlay(
         &mut self,
         layout: OverlayLayout,
-        window: &Window,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let colors = self.colors();
@@ -1478,12 +1469,10 @@ impl NavigationOverlay {
                 (self.main_viewport.width - layout.width) / 2.0,
                 layout.top_inset,
             );
-            let measure = crate::floating::measure_element(
-                cx.entity().downgrade(),
+            let measure = crate::floating::host_element(
                 PALETTE_PANEL,
                 probe,
                 width,
-                self.main_bounds,
                 position,
                 gpui::Anchor::TopLeft,
                 0.0,
@@ -1498,7 +1487,6 @@ impl NavigationOverlay {
                 .child(measure)
                 .into_any_element();
         }
-        crate::floating::close(self, PALETTE_PANEL, cx);
         let surface = FloatingSurface::new(
             colors,
             div()
@@ -1869,22 +1857,7 @@ impl Render for NavigationOverlay {
         self.activity_frame = frame_at(diri_ui::wall_clock_seconds() * 1000.0, cx.reduce_motion());
         let layout = OverlayLayout::command_palette(window.viewport_size());
         self.main_window = Some(window.window_handle());
-        self.main_bounds = window.bounds();
         self.main_viewport = window.viewport_size();
-        if self.activation.is_none() {
-            self.activation = Some(cx.observe_window_activation(window, |this, window, cx| {
-                // A panel is not part of this window; losing key status is
-                // the only "click outside" it can observe, and the window may
-                // stop drawing right after, so close here rather than later.
-                if !window.is_window_active() && this.floating.is_some() {
-                    crate::floating::close(this, PALETTE_PANEL, cx);
-                    this.close_overlay(window, cx);
-                }
-            }));
-        }
-        if self.overlay.is_none() {
-            crate::floating::close(self, PALETTE_PANEL, cx);
-        }
         let overlay = self
             .overlay
             .map(|_| self.render_overlay(layout, window, cx));

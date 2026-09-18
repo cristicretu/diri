@@ -8,14 +8,24 @@
 //! element would have been. The main window keeps key status the whole time,
 //! so keyboard handling, Escape, and the dismiss scrim stay where they are,
 //! and the in-window path remains the one tests exercise.
+//!
+//! A host view declares a [`Target`] and, while its dropdown is open, renders
+//! [`host_element`] in place of the surface. That measures the content and
+//! opens, moves, or closes the panel; a global registry keyed by entity and
+//! target keeps the panel windows, so the host carries no state of its own.
+//! Panels close themselves when their target stops wanting them, and every
+//! panel over a window closes when that window loses key status, with the
+//! target's `dismiss` restoring the host's own state.
 
+use std::collections::HashMap;
 use std::rc::Rc;
 
 use diri_ui::{Glass, Radius, SemanticColors};
 use gpui::{
     Anchor, AnyElement, AnyWindowHandle, App, Bounds, BoxShadow, Context, DisplayId, Div, Entity,
-    Global, Pixels, Point, Render, Size, WeakEntity, Window, WindowBackgroundAppearance,
-    WindowBounds, WindowKind, WindowOptions, div, point, prelude::*, px, size,
+    EntityId, Global, Pixels, Point, Render, Size, Subscription, WeakEntity, Window,
+    WindowBackgroundAppearance, WindowBounds, WindowKind, WindowOptions, div, point, prelude::*,
+    px, size,
 };
 
 /// Present once the running app may open panels. Tests and previews never set
@@ -26,6 +36,7 @@ impl Global for FloatingPanels {}
 
 pub(crate) fn enable(cx: &mut App) {
     cx.set_global(FloatingPanels);
+    cx.set_global(Registry::default());
 }
 
 pub(crate) fn enabled(cx: &App) -> bool {
@@ -39,13 +50,17 @@ pub(crate) fn uses_panels(preview: bool, colors: SemanticColors, cx: &App) -> bo
     !preview && enabled(cx) && colors.material() == diri_ui::Material::Glass
 }
 
-/// One floating surface a view can host in a panel: where the panel lives on
-/// the view, whether it should be open, and the pixels it paints.
+/// One floating surface a view can host in a panel.
 pub(crate) struct Target<T: 'static> {
+    /// Distinguishes this surface from the view's other panels.
+    pub key: &'static str,
     pub radius: f32,
-    pub slot: fn(&mut T) -> &mut Option<Panel>,
-    pub wanted: fn(&T) -> bool,
+    /// Builds the pixels the panel paints, or `None` once the surface is
+    /// closed, which closes the panel.
     pub content: fn(&mut T, &mut Context<T>) -> Option<AnyElement>,
+    /// Closes the surface from the host's side: what a click outside would
+    /// do. Runs in the host's window when the window loses key status.
+    pub dismiss: fn(&mut T, &mut Window, &mut Context<T>),
 }
 
 impl<T: 'static> Clone for Target<T> {
@@ -55,119 +70,6 @@ impl<T: 'static> Clone for Target<T> {
 }
 
 impl<T: 'static> Copy for Target<T> {}
-
-/// Closes `target`'s panel if it is open.
-pub(crate) fn close<T: 'static>(host: &mut T, target: Target<T>, cx: &mut App) {
-    if let Some(panel) = (target.slot)(host).take() {
-        panel.close(cx);
-    }
-}
-
-/// A zero-size element that lays `probe` out at `width` during prepaint and
-/// then, outside this frame, opens or resizes `target`'s panel to that size
-/// at `position`, anchored inside `main_bounds` like `anchored()` would with
-/// `margin` to the window edge.
-#[allow(clippy::too_many_arguments)]
-pub(crate) fn measure_element<T: 'static>(
-    host: WeakEntity<T>,
-    target: Target<T>,
-    mut probe: AnyElement,
-    width: f32,
-    main_bounds: Bounds<Pixels>,
-    position: Point<Pixels>,
-    anchor: Anchor,
-    margin: f32,
-    window: &Window,
-    cx: &App,
-) -> AnyElement {
-    let display = window.display(cx).map(|display| display.id());
-    gpui::canvas(
-        move |_, window, cx| {
-            let max_height = (main_bounds.size.height - px(2.0 * margin)).max(px(120.0));
-            let size = measure(&mut probe, width, max_height, window, cx);
-            let frame = frame_in(main_bounds, position, anchor, size, target.radius, margin);
-            cx.defer(move |cx| sync(&host, target, frame, display, cx));
-        },
-        |_, _, _, _| {},
-    )
-    .absolute()
-    .w(px(0.0))
-    .h(px(0.0))
-    .into_any_element()
-}
-
-/// Opens, moves, or closes `target`'s panel to match `frame`. Runs at App
-/// level on purpose: opening a window draws its first frame at once, and
-/// that frame renders the host, so the host must not be inside an update of
-/// its own while the panel comes up.
-pub(crate) fn sync<T: 'static>(
-    host: &WeakEntity<T>,
-    target: Target<T>,
-    frame: PanelFrame,
-    display: Option<DisplayId>,
-    cx: &mut App,
-) {
-    let Some(strong) = host.upgrade() else {
-        return;
-    };
-    let (open, panel) = strong.update(cx, |this, _| {
-        ((target.wanted)(this), (target.slot)(this).take())
-    });
-    let panel = match (open, panel) {
-        (false, Some(panel)) => {
-            panel.close(cx);
-            None
-        }
-        (false, None) => None,
-        (true, Some(mut panel)) => {
-            panel.set_frame(frame, cx);
-            Some(panel)
-        }
-        (true, None) => {
-            let source = strong.clone();
-            let render = move |_: &mut Window, cx: &mut App| -> AnyElement {
-                source.update(cx, |this, cx| {
-                    (target.content)(this, cx).unwrap_or_else(|| div().into_any_element())
-                })
-            };
-            Panel::open(&strong, frame, display, render, cx)
-        }
-    };
-    // A dismissal may have landed while the window came up.
-    let stale = strong.update(cx, |this, _| {
-        if (target.wanted)(this) {
-            *(target.slot)(this) = panel;
-            None
-        } else {
-            panel
-        }
-    });
-    if let Some(panel) = stale {
-        panel.close(cx);
-    }
-}
-
-/// Runs `f` against the view's own window. Handlers inside a panel receive
-/// the panel's `Window`, which owns none of the view's focus or actions.
-pub(crate) fn in_main_window<T: 'static>(
-    this: &mut T,
-    main: Option<AnyWindowHandle>,
-    window: &mut Window,
-    cx: &mut Context<T>,
-    f: impl FnOnce(&mut T, &mut Window, &mut Context<T>) + 'static,
-) {
-    match main {
-        Some(main) if main != window.window_handle() => {
-            let host = cx.entity();
-            App::defer(cx, move |cx| {
-                let _ = cx.update_window(main, |_, window, cx| {
-                    host.update(cx, |this, cx| f(this, window, cx));
-                });
-            });
-        }
-        _ => f(this, window, cx),
-    }
-}
 
 /// Screen placement of a panel, in GPUI's global coordinates (the same space
 /// `Window::bounds` reports for the main window).
@@ -179,7 +81,7 @@ pub(crate) struct PanelFrame {
 }
 
 /// Resolves where a popover anchored inside `main` lands on screen, mirroring
-/// `anchored().snap_to_window_with_margin(8)` so the two hosts agree.
+/// `anchored().snap_to_window_with_margin(margin)` so the two hosts agree.
 pub(crate) fn frame_in(
     main: Bounds<Pixels>,
     position: Point<Pixels>,
@@ -249,26 +151,283 @@ pub(crate) fn surface(
 /// Default corner radius for a menu panel.
 pub(crate) const MENU_RADIUS: f32 = Radius::FLOATING_MENU;
 
-type RenderFn = Rc<dyn Fn(&mut Window, &mut App) -> AnyElement>;
+/// Measures `content` the way the panel will lay it out, so the window can
+/// open at its final size instead of resizing after a first frame. The
+/// height is offered as a definite bound rather than min-content: a scroll
+/// container asked for its min-content height answers with its `max_h`,
+/// which left the account menu's window twice as tall as its rows.
+pub(crate) fn measure(
+    content: &mut AnyElement,
+    width: f32,
+    max_height: Pixels,
+    window: &mut Window,
+    cx: &mut App,
+) -> Size<Pixels> {
+    let measured = content.layout_as_root(
+        size(
+            gpui::AvailableSpace::Definite(px(width)),
+            gpui::AvailableSpace::Definite(max_height),
+        ),
+        window,
+        cx,
+    );
+    size(px(width), measured.height.min(max_height))
+}
+
+/// Every open panel, keyed by the host entity and the target's key, plus the
+/// window each host renders in.
+#[derive(Default)]
+struct Registry {
+    panels: HashMap<(EntityId, &'static str), Entry>,
+    mains: HashMap<EntityId, AnyWindowHandle>,
+    /// One activation watcher per host entity; each closes every panel over
+    /// its window, so any live watcher covers the whole window.
+    watchers: HashMap<EntityId, Subscription>,
+}
+
+impl Global for Registry {}
+
+struct Entry {
+    panel: Panel,
+    main: AnyWindowHandle,
+    dismiss: Rc<dyn Fn(&mut App)>,
+}
+
+/// A zero-size element that lays `probe` out at `width` during prepaint and
+/// then, outside this frame, opens or resizes `target`'s panel to that size
+/// at `position`, anchored inside the host's window like `anchored()` would
+/// with `margin` to the window edge. Render it only while the surface is
+/// open; the panel closes itself once `target.content` returns `None`.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn host_element<T: 'static>(
+    target: Target<T>,
+    mut probe: AnyElement,
+    width: f32,
+    position: Point<Pixels>,
+    anchor: Anchor,
+    margin: f32,
+    window: &mut Window,
+    cx: &mut Context<T>,
+) -> AnyElement {
+    let host = cx.weak_entity();
+    let main_bounds = window.bounds();
+    let display = window.display(cx).map(|display| display.id());
+    register_host(window, cx);
+    gpui::canvas(
+        move |_, window, cx| {
+            let max_height = (main_bounds.size.height - px(2.0 * margin)).max(px(120.0));
+            let size = measure(&mut probe, width, max_height, window, cx);
+            let frame = frame_in(main_bounds, position, anchor, size, target.radius, margin);
+            cx.defer(move |cx| sync(&host, target, frame, display, cx));
+        },
+        |_, _, _, _| {},
+    )
+    .absolute()
+    .w(px(0.0))
+    .h(px(0.0))
+    .into_any_element()
+}
+
+/// Like [`host_element`], but the panel opens where this element sits: give
+/// it the absolute offsets the in-window surface used and it reads its own
+/// window position during prepaint, so a dropdown nested in a control needs
+/// no anchor bookkeeping. `width: None` uses the element's laid-out width,
+/// for surfaces that stretch between two edges of their container.
+pub(crate) fn host_here<T: 'static>(
+    target: Target<T>,
+    mut probe: AnyElement,
+    width: Option<f32>,
+    anchor: Anchor,
+    margin: f32,
+    cx: &mut Context<T>,
+) -> gpui::Canvas<()> {
+    let host = cx.weak_entity();
+    gpui::canvas(
+        move |bounds, window, cx| {
+            let Some(strong) = host.upgrade() else {
+                return;
+            };
+            strong.update(cx, |_, cx| register_host(window, cx));
+            let main_bounds = window.bounds();
+            let display = window.display(cx).map(|display| display.id());
+            let width = width.unwrap_or_else(|| f32::from(bounds.size.width));
+            let position = match anchor {
+                Anchor::TopLeft | Anchor::LeftCenter => bounds.origin,
+                Anchor::TopRight | Anchor::RightCenter => point(bounds.right(), bounds.top()),
+                Anchor::TopCenter => point(bounds.center().x, bounds.top()),
+                Anchor::BottomLeft => point(bounds.left(), bounds.bottom()),
+                Anchor::BottomRight => point(bounds.right(), bounds.bottom()),
+                Anchor::BottomCenter => point(bounds.center().x, bounds.bottom()),
+            };
+            let max_height = (main_bounds.size.height - px(2.0 * margin)).max(px(120.0));
+            let size = measure(&mut probe, width, max_height, window, cx);
+            let frame = frame_in(main_bounds, position, anchor, size, target.radius, margin);
+            cx.defer(move |cx| sync(&host, target, frame, display, cx));
+        },
+        |_, _, _, _| {},
+    )
+}
+
+/// Records which window `cx`'s view renders in and, once per view, watches
+/// that window's activation so a lost key status closes the view's panels.
+fn register_host<T: 'static>(window: &mut Window, cx: &mut Context<T>) {
+    let id = cx.entity_id();
+    let main = window.window_handle();
+    let needs_watcher = {
+        let registry = cx.global_mut::<Registry>();
+        registry.mains.insert(id, main);
+        !registry.watchers.contains_key(&id)
+    };
+    if needs_watcher {
+        // A panel is not part of its host's window; that window losing key
+        // status is the only "click outside" it can observe, and the window
+        // may stop drawing right after, so close here rather than on render.
+        let subscription = cx.observe_window_activation(window, |_, window, cx| {
+            if !window.is_window_active() {
+                close_all_over(window.window_handle(), cx);
+            }
+        });
+        cx.global_mut::<Registry>()
+            .watchers
+            .insert(id, subscription);
+    }
+}
+
+/// [`surface`] for a panel whose width the measurement chose: the panel
+/// window is exactly that wide, so the surface fills it.
+pub(crate) fn surface_full(colors: SemanticColors, radius: f32, content: impl IntoElement) -> Div {
+    surface(colors, radius, 0.0, content).w_full()
+}
+
+/// Runs `f` against the view's own window. Handlers inside a panel receive
+/// the panel's `Window`, which owns none of the view's focus or actions.
+pub(crate) fn in_main_window<T: 'static>(
+    this: &mut T,
+    window: &mut Window,
+    cx: &mut Context<T>,
+    f: impl FnOnce(&mut T, &mut Window, &mut Context<T>) + 'static,
+) {
+    let main = cx
+        .try_global::<Registry>()
+        .and_then(|registry| registry.mains.get(&cx.entity_id()).copied());
+    match main {
+        Some(main) if main != window.window_handle() => {
+            let host = cx.entity();
+            App::defer(cx, move |cx| {
+                let _ = cx.update_window(main, |_, window, cx| {
+                    host.update(cx, |this, cx| f(this, window, cx));
+                });
+            });
+        }
+        _ => f(this, window, cx),
+    }
+}
+
+/// Opens, moves, or closes `target`'s panel to match `frame`. Runs at App
+/// level on purpose: opening a window draws its first frame at once, and
+/// that frame renders the host, so the host must not be inside an update of
+/// its own while the panel comes up.
+fn sync<T: 'static>(
+    host: &WeakEntity<T>,
+    target: Target<T>,
+    frame: PanelFrame,
+    display: Option<DisplayId>,
+    cx: &mut App,
+) {
+    let Some(strong) = host.upgrade() else {
+        return;
+    };
+    let id = strong.entity_id();
+    let slot = (id, target.key);
+    let existing = cx.global_mut::<Registry>().panels.remove(&slot);
+    let entry = match existing {
+        Some(mut entry) => {
+            entry.panel.set_frame(frame, cx);
+            entry
+        }
+        None => {
+            let Some(main) = cx.global::<Registry>().mains.get(&id).copied() else {
+                return;
+            };
+            let render = {
+                let source = strong.clone();
+                move |_: &mut Window, cx: &mut App| -> Option<AnyElement> {
+                    source.update(cx, |this, cx| (target.content)(this, cx))
+                }
+            };
+            let on_empty = move |cx: &mut App| close_entry(slot, cx);
+            let Some(panel) = Panel::open(&strong, frame, display, render, on_empty, cx) else {
+                return;
+            };
+            let dismiss: Rc<dyn Fn(&mut App)> = {
+                let host = host.clone();
+                Rc::new(move |cx| {
+                    let _ = cx.update_window(main, |_, window, cx| {
+                        let _ = host.update(cx, |this, cx| (target.dismiss)(this, window, cx));
+                    });
+                })
+            };
+            Entry {
+                panel,
+                main,
+                dismiss,
+            }
+        }
+    };
+    cx.global_mut::<Registry>().panels.insert(slot, entry);
+}
+
+fn close_entry(slot: (EntityId, &'static str), cx: &mut App) {
+    if let Some(entry) = cx.global_mut::<Registry>().panels.remove(&slot) {
+        entry.panel.close(cx);
+    }
+}
+
+/// Closes every panel hosted over `main` and lets each host dismiss its
+/// surface, as a click outside would have.
+fn close_all_over(main: AnyWindowHandle, cx: &mut App) {
+    let closing: Vec<Entry> = {
+        let registry = cx.global_mut::<Registry>();
+        let keys: Vec<_> = registry
+            .panels
+            .iter()
+            .filter(|(_, entry)| entry.main == main)
+            .map(|(slot, _)| *slot)
+            .collect();
+        keys.into_iter()
+            .filter_map(|slot| registry.panels.remove(&slot))
+            .collect()
+    };
+    for entry in closing {
+        entry.panel.close(cx);
+        (entry.dismiss)(cx);
+    }
+}
+
+type RenderFn = Rc<dyn Fn(&mut Window, &mut App) -> Option<AnyElement>>;
+type OnEmpty = Rc<dyn Fn(&mut App)>;
 
 /// An open popup panel. Dropping the value does not close the window; call
 /// [`Panel::close`] so the platform window is removed.
-pub(crate) struct Panel {
+struct Panel {
     handle: AnyWindowHandle,
     frame: PanelFrame,
 }
 
 impl Panel {
     /// Opens a blurred, non-activating panel at `frame` that paints
-    /// `render` and repaints whenever `source` notifies.
-    pub(crate) fn open<T: 'static>(
+    /// `render` and repaints whenever `source` notifies. Once `render`
+    /// answers `None` the panel runs `on_empty`, which closes it.
+    fn open<T: 'static>(
         source: &Entity<T>,
         frame: PanelFrame,
         display: Option<DisplayId>,
-        render: impl Fn(&mut Window, &mut App) -> AnyElement + 'static,
+        render: impl Fn(&mut Window, &mut App) -> Option<AnyElement> + 'static,
+        on_empty: impl Fn(&mut App) + 'static,
         cx: &mut App,
     ) -> Option<Self> {
         let render: RenderFn = Rc::new(render);
+        let on_empty: OnEmpty = Rc::new(on_empty);
         let source = source.clone();
         let handle = cx
             .open_window(
@@ -291,10 +450,13 @@ impl Panel {
                 move |window, cx| {
                     #[cfg(target_os = "macos")]
                     crate::macos::floating_panel::prepare(window, frame.radius);
+                    #[cfg(not(target_os = "macos"))]
+                    let _ = window;
                     cx.new(|cx| {
                         cx.observe(&source, |_, _, cx| cx.notify()).detach();
                         PanelView {
                             render,
+                            on_empty,
                             frames: 0,
                             settled_frames: 0,
                             revealed: false,
@@ -310,7 +472,7 @@ impl Panel {
     }
 
     /// Moves or resizes the panel; a no-op when nothing changed.
-    pub(crate) fn set_frame(&mut self, frame: PanelFrame, cx: &mut App) {
+    fn set_frame(&mut self, frame: PanelFrame, cx: &mut App) {
         if frame == self.frame {
             return;
         }
@@ -324,17 +486,21 @@ impl Panel {
                 cx.foreground_executor(),
             );
             #[cfg(not(target_os = "macos"))]
-            window.resize(frame.size);
+            {
+                let _ = cx;
+                window.resize(frame.size);
+            }
         });
     }
 
-    pub(crate) fn close(self, cx: &mut App) {
+    fn close(self, cx: &mut App) {
         let _ = cx.update_window(self.handle, |_, window, _| window.remove_window());
     }
 }
 
 struct PanelView {
     render: RenderFn,
+    on_empty: OnEmpty,
     frames: u32,
     /// Frames painted after AppKit reported the window on screen. Only those
     /// reach a full-size drawable; earlier ones land in GPUI's placeholder
@@ -351,6 +517,11 @@ const REVEAL_DEADLINE_FRAMES: u32 = 120;
 
 impl Render for PanelView {
     fn render(&mut self, window: &mut Window, cx: &mut gpui::Context<Self>) -> impl IntoElement {
+        let Some(content) = (self.render)(window, cx) else {
+            let on_empty = self.on_empty.clone();
+            App::defer(cx, move |cx| on_empty(cx));
+            return div().opacity(0.0);
+        };
         self.frames += 1;
         #[cfg(target_os = "macos")]
         let on_screen = crate::macos::floating_panel::is_on_screen(window);
@@ -379,31 +550,8 @@ impl Render for PanelView {
         // placeholder drawable, so the first visible frame is a complete one.
         div()
             .opacity(if self.revealed { 1.0 } else { 0.0 })
-            .child((self.render)(window, cx))
+            .child(content)
     }
-}
-
-/// Measures `content` the way the panel will lay it out, so the window can
-/// open at its final size instead of resizing after a first frame. The
-/// height is offered as a definite bound rather than min-content: a scroll
-/// container asked for its min-content height answers with its `max_h`,
-/// which left the account menu's window twice as tall as its rows.
-pub(crate) fn measure(
-    content: &mut AnyElement,
-    width: f32,
-    max_height: Pixels,
-    window: &mut Window,
-    cx: &mut App,
-) -> Size<Pixels> {
-    let measured = content.layout_as_root(
-        size(
-            gpui::AvailableSpace::Definite(px(width)),
-            gpui::AvailableSpace::Definite(max_height),
-        ),
-        window,
-        cx,
-    );
-    size(px(width), measured.height.min(max_height))
 }
 
 #[cfg(test)]
@@ -415,49 +563,28 @@ mod tests {
     #[test]
     fn scroll_containers_measure_at_their_content() {
         use std::cell::Cell;
-        struct Probe(Rc<Cell<Option<(Pixels, Pixels, Pixels)>>>);
+        struct Probe(Rc<Cell<Option<Pixels>>>);
         impl Render for Probe {
             fn render(&mut self, _: &mut Window, _: &mut gpui::Context<Self>) -> impl IntoElement {
                 let out = self.0.clone();
                 gpui::canvas(
                     move |_, window, cx| {
-                        let build = || {
-                            div()
-                                .w(px(200.0))
-                                .child(
-                                    div()
-                                        .id("probe-scroll")
-                                        .max_h(px(600.0))
-                                        .overflow_y_scroll()
-                                        .flex()
-                                        .flex_col()
-                                        .child(div().h(px(100.0)))
-                                        .child(div().h(px(50.0))),
-                                )
-                                .into_any_element()
-                        };
-                        let definite = measure(&mut build(), 200.0, px(700.0), window, cx).height;
-                        let min_content = build()
-                            .layout_as_root(
-                                size(
-                                    gpui::AvailableSpace::Definite(px(200.0)),
-                                    gpui::AvailableSpace::MinContent,
-                                ),
-                                window,
-                                cx,
+                        let mut probe = div()
+                            .w(px(200.0))
+                            .child(
+                                div()
+                                    .id("probe-scroll")
+                                    .max_h(px(600.0))
+                                    .overflow_y_scroll()
+                                    .flex()
+                                    .flex_col()
+                                    .child(div().h(px(100.0)))
+                                    .child(div().h(px(50.0))),
                             )
-                            .height;
-                        let max_content = build()
-                            .layout_as_root(
-                                size(
-                                    gpui::AvailableSpace::Definite(px(200.0)),
-                                    gpui::AvailableSpace::MaxContent,
-                                ),
-                                window,
-                                cx,
-                            )
-                            .height;
-                        out.set(Some((definite, min_content, max_content)));
+                            .into_any_element();
+                        out.set(Some(
+                            measure(&mut probe, 200.0, px(700.0), window, cx).height,
+                        ));
                     },
                     |_, _, _, _| {},
                 )
@@ -481,9 +608,7 @@ mod tests {
         cx.update_window(window.into(), |_, window, _| window.refresh())
             .unwrap();
         cx.run_until_parked();
-        let (definite, min_content, max_content) = out.get().unwrap();
-        eprintln!("definite={definite:?} min_content={min_content:?} max_content={max_content:?}");
-        assert_eq!(definite, px(150.0));
+        assert_eq!(out.get().unwrap(), px(150.0));
     }
 
     fn main() -> Bounds<Pixels> {

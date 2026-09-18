@@ -21,11 +21,11 @@ use diri_ui::{
     Radius, RowFill, SemanticColors, Space, StateChip, StatusGlyph, StatusState, Typo,
 };
 use gpui::{
-    Anchor, Animation, AnimationExt, AnyElement, AnyWindowHandle, App, AppContext as _, Bounds,
-    Context, CursorStyle, Entity, EventEmitter, ExternalPaths, FocusHandle, Focusable, FontWeight,
-    Hsla, IntoElement, MouseButton, PathPromptOptions, Pixels, Point, Render, Rgba, Role,
-    ScrollHandle, SharedString, Size, Task, WeakEntity, Window, anchored, deferred, div,
-    linear_color_stop, linear_gradient, point, prelude::*, px,
+    Anchor, Animation, AnimationExt, AnyElement, App, AppContext as _, Bounds, Context,
+    CursorStyle, Entity, EventEmitter, ExternalPaths, FocusHandle, Focusable, FontWeight, Hsla,
+    IntoElement, MouseButton, PathPromptOptions, Pixels, Point, Render, Rgba, Role, ScrollHandle,
+    SharedString, Size, Task, WeakEntity, Window, anchored, deferred, div, linear_color_stop,
+    linear_gradient, point, prelude::*, px,
 };
 use tokio::sync::mpsc;
 
@@ -274,28 +274,38 @@ pub(super) enum PanelTarget {
     Popover,
     Picker,
     HoverCard,
+    WorkspaceMenu,
 }
 
 impl PanelTarget {
-    fn spec(self) -> crate::floating::Target<Sidebar> {
+    pub(super) fn spec(self) -> crate::floating::Target<Sidebar> {
         match self {
             Self::Popover => crate::floating::Target {
+                key: "popover",
                 radius: crate::floating::MENU_RADIUS,
-                slot: |sidebar| &mut sidebar.floating_panel,
-                wanted: |sidebar| sidebar.ui.popover.is_some(),
                 content: Sidebar::popover_panel_content,
+                dismiss: |sidebar, _, cx| {
+                    sidebar.ui.popover = None;
+                    cx.notify();
+                },
             },
             Self::Picker => crate::floating::Target {
+                key: "picker",
                 radius: Radius::FLOATING_MENU,
-                slot: |sidebar| &mut sidebar.floating_picker,
-                wanted: |sidebar| sidebar.project_picker_open(),
                 content: Sidebar::project_picker_panel_content,
+                dismiss: |sidebar, window, cx| sidebar.dismiss_project_picker(window, cx),
             },
             Self::HoverCard => crate::floating::Target {
+                key: "hover-card",
                 radius: Radius::ROW,
-                slot: |sidebar| &mut sidebar.floating_hover_card,
-                wanted: |sidebar| sidebar.ui.hover_card.is_some(),
                 content: Sidebar::hover_card_panel_content,
+                dismiss: |sidebar, _, cx| sidebar.dismiss_hover_card(cx),
+            },
+            Self::WorkspaceMenu => crate::floating::Target {
+                key: "workspace-menu",
+                radius: crate::floating::MENU_RADIUS,
+                content: Sidebar::workspace_menu_panel_content,
+                dismiss: |sidebar, _, cx| sidebar.dismiss_workspace_menu(cx),
             },
         }
     }
@@ -349,17 +359,8 @@ pub struct Sidebar {
     activity_frame: usize,
     activity_tick: Option<Task<()>>,
     activity_activation: Option<gpui::Subscription>,
-    /// The open popover's blurred panel window, when the platform hosts
-    /// popovers outside the main window (see `crate::floating`).
-    floating_panel: Option<crate::floating::Panel>,
-    /// The project dropdown's panel, when it floats (see `PanelTarget`).
-    floating_picker: Option<crate::floating::Panel>,
-    /// The session hover card's panel, when it floats.
-    floating_hover_card: Option<crate::floating::Panel>,
-    /// The window this sidebar renders in, so handlers that run inside a
-    /// panel can still act on it.
-    main_window: Option<AnyWindowHandle>,
-    main_bounds: Bounds<Pixels>,
+    /// The main window's viewport, for content that sizes to it while a
+    /// panel paints it elsewhere.
     main_viewport: Size<Pixels>,
     working_row_rendered: bool,
     /// Rebuilt once per projection render. Looking up ⌘1…⌘9 inside every row
@@ -520,11 +521,6 @@ impl Sidebar {
             activity_frame: 0,
             activity_tick: None,
             activity_activation: None,
-            floating_panel: None,
-            floating_picker: None,
-            floating_hover_card: None,
-            main_window: None,
-            main_bounds: Bounds::default(),
             main_viewport: Size::default(),
             working_row_rendered: false,
             shortcut_ranks: HashMap::new(),
@@ -4177,7 +4173,7 @@ impl Sidebar {
         self.popover(colors, cx)
     }
 
-    fn uses_floating_panels(&self, cx: &App) -> bool {
+    pub(super) fn uses_floating_panels(&self, cx: &App) -> bool {
         crate::floating::uses_panels(self.preview, self.colors(), cx)
     }
 
@@ -4208,7 +4204,6 @@ impl Sidebar {
     ) -> AnyElement {
         let colors = self.colors();
         if !self.uses_floating_panels(cx) {
-            self.close_panel(PanelTarget::Popover, cx);
             return self.mount_popover_in_window(spec, colors, cx);
         }
         let PopoverSpec {
@@ -4259,7 +4254,7 @@ impl Sidebar {
             .into_any_element()
     }
 
-    /// See `crate::floating::measure_element`; popovers snap to the window
+    /// See `crate::floating::host_element`; popovers snap to the window
     /// with the same eight-point margin `anchored()` gives them.
     #[allow(clippy::too_many_arguments)]
     pub(super) fn measure_for_panel(
@@ -4269,15 +4264,13 @@ impl Sidebar {
         width: f32,
         position: Point<Pixels>,
         anchor: Anchor,
-        window: &Window,
-        cx: &App,
+        window: &mut Window,
+        cx: &mut Context<Self>,
     ) -> AnyElement {
-        crate::floating::measure_element(
-            self.weak_self.clone(),
+        crate::floating::host_element(
             target.spec(),
             probe,
             width,
-            self.main_bounds,
             position,
             anchor,
             8.0,
@@ -4286,19 +4279,14 @@ impl Sidebar {
         )
     }
 
-    pub(super) fn close_panel(&mut self, target: PanelTarget, cx: &mut App) {
-        crate::floating::close(self, target.spec(), cx);
-    }
-
     /// Runs `f` against the sidebar's own window even from a panel handler.
-    fn in_main_window(
+    pub(super) fn in_main_window(
         &mut self,
         window: &mut Window,
         cx: &mut Context<Self>,
         f: impl FnOnce(&mut Self, &mut Window, &mut Context<Self>) + 'static,
     ) {
-        let main = self.main_window;
-        crate::floating::in_main_window(self, main, window, cx, f);
+        crate::floating::in_main_window(self, window, cx, f);
     }
 
     /// The in-window host: a sidebar-wide scrim so stray clicks only dismiss,
@@ -5956,13 +5944,10 @@ impl Sidebar {
     fn hover_card(
         &mut self,
         colors: SemanticColors,
-        window: &Window,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Option<AnyElement> {
-        let Some((card, row)) = self.hover_card_body(colors) else {
-            self.close_panel(PanelTarget::HoverCard, cx);
-            return None;
-        };
+        let (card, row) = self.hover_card_body(colors)?;
         let position = point(row.right() + px(8.0), row.top());
         if self.uses_floating_panels(cx) {
             let probe =
@@ -5977,7 +5962,6 @@ impl Sidebar {
                 cx,
             ));
         }
-        self.close_panel(PanelTarget::HoverCard, cx);
         Some(
             deferred(
                 anchored()
@@ -7209,31 +7193,12 @@ impl Render for Sidebar {
         if cx.reduce_motion() {
             self.activity_frame = 0;
         }
-        self.main_window = Some(window.window_handle());
-        self.main_bounds = window.bounds();
         self.main_viewport = window.viewport_size();
         if self.activity_activation.is_none() {
-            self.activity_activation =
-                Some(cx.observe_window_activation(window, |this, window, cx| {
-                    this.dismiss_hover_card(cx);
-                    // A popover panel is not part of this window, so losing
-                    // key status is the only "click outside" it can observe.
-                    // Close the panels here rather than on the next render:
-                    // a window covered by another app stops drawing, and a
-                    // menu left to that render would outlive the app switch.
-                    if !window.is_window_active() {
-                        if this.floating_panel.is_some() {
-                            this.ui.popover = None;
-                            this.close_panel(PanelTarget::Popover, cx);
-                        }
-                        if this.floating_picker.is_some() {
-                            this.close_panel(PanelTarget::Picker, cx);
-                            this.dismiss_project_picker(window, cx);
-                        }
-                        this.close_panel(PanelTarget::HoverCard, cx);
-                    }
-                    cx.notify();
-                }));
+            self.activity_activation = Some(cx.observe_window_activation(window, |this, _, cx| {
+                this.dismiss_hover_card(cx);
+                cx.notify();
+            }));
         }
         // A menu or editor may finish after the pointer has already left.
         // Resume dismissal on that notification without polling while idle.
@@ -7516,9 +7481,6 @@ impl Render for Sidebar {
                     .bg(colors.sidebar_stroke()),
             )
         });
-        if self.ui.popover.is_none() {
-            self.close_panel(PanelTarget::Popover, cx);
-        }
         if !self.project_picker.new_agent
             && let Some(spec) = self.popover(colors, cx)
         {

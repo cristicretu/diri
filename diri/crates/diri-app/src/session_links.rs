@@ -927,13 +927,10 @@ impl TerminalPane {
         &mut self,
         session: &SessionRecord,
         colors: SemanticColors,
-        window: &Window,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Option<AnyElement> {
-        let Some(content) = self.links_content(session, colors, cx) else {
-            crate::floating::close(self, LINKS_PANEL, cx);
-            return None;
-        };
+        let content = self.links_content(session, colors, cx)?;
         let position = self.session_links.anchor.get() + point(px(0.0), px(8.0));
         let shell = div()
             .absolute()
@@ -954,12 +951,10 @@ impl TerminalPane {
             let width = Self::links_width(window.viewport_size());
             let probe =
                 crate::floating::surface(colors, Radius::PANEL, width, content).into_any_element();
-            let measure = crate::floating::measure_element(
-                cx.entity().downgrade(),
+            let measure = crate::floating::host_element(
                 LINKS_PANEL,
                 probe,
                 width,
-                self.main_bounds,
                 position,
                 Anchor::TopRight,
                 12.0,
@@ -968,7 +963,6 @@ impl TerminalPane {
             );
             return Some(shell.child(measure).into_any_element());
         }
-        crate::floating::close(self, LINKS_PANEL, cx);
         Some(
             shell
                 .child(deferred(
@@ -994,10 +988,10 @@ impl TerminalPane {
 
 /// The Links popover as a panel target (see `crate::floating::Target`).
 pub(super) const LINKS_PANEL: crate::floating::Target<TerminalPane> = crate::floating::Target {
+    key: "links",
     radius: Radius::PANEL,
-    slot: |pane| &mut pane.floating_links,
-    wanted: |pane| pane.session_links.open,
     content: TerminalPane::links_panel_content,
+    dismiss: |pane, window, cx| pane.close_session_links(window, cx),
 };
 
 fn pr_number(url: &str) -> Option<String> {

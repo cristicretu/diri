@@ -15,8 +15,8 @@ use diri_proto::{
     SessionArtifact, SessionDiffBase, SessionId, SessionRecord, SessionStatus,
 };
 use diri_ui::{
-    AgentKind, AgentLogo, Appearance, Fill, FloatingSurface, GlassPill, Ink, LoadingIndicator,
-    Metrics, Radius, SemanticColors, Typo,
+    AgentKind, AgentLogo, Appearance, Fill, FloatingSurface, GlassMenuRow, GlassPill, Ink,
+    LoadingIndicator, Metrics, Radius, SemanticColors, Typo,
 };
 use gpui::{
     Animation, AnimationExt, AnyElement, App, Context, DragMoveEvent, Entity, EventEmitter,
@@ -277,6 +277,29 @@ struct SessionWorkspace {
     visible: bool,
     next_terminal_slot: usize,
 }
+
+/// The review file navigator as a panel target (see `crate::floating::Target`).
+const INSPECTOR_FILES_MENU: crate::floating::Target<WorkbenchInspector> = crate::floating::Target {
+    key: "inspector-files",
+    radius: crate::floating::MENU_RADIUS,
+    content: WorkbenchInspector::files_panel_content,
+    dismiss: |this, _, cx| {
+        this.files_open = false;
+        cx.notify();
+    },
+};
+
+/// The comparison base menu as a panel target.
+const INSPECTOR_COMPARISON_MENU: crate::floating::Target<WorkbenchInspector> =
+    crate::floating::Target {
+        key: "inspector-comparison",
+        radius: crate::floating::MENU_RADIUS,
+        content: WorkbenchInspector::comparison_panel_content,
+        dismiss: |this, _, cx| {
+            this.comparison_menu_open = false;
+            cx.notify();
+        },
+    };
 
 pub struct WorkbenchInspector {
     runtime: Arc<StoreRuntime>,
@@ -3362,12 +3385,13 @@ impl WorkbenchInspector {
             .into_any_element()
     }
 
-    fn render_file_navigator(
+    /// The changed-file rows of the review navigator, without host chrome.
+    fn file_navigator_list(
         &self,
         snapshot: Arc<DiffSnapshot>,
         colors: SemanticColors,
         cx: &mut Context<Self>,
-    ) -> AnyElement {
+    ) -> gpui::Stateful<gpui::Div> {
         let mut files = div()
             .id("review-file-navigator-list")
             .max_h(px(390.0))
@@ -3385,7 +3409,9 @@ impl WorkbenchInspector {
                     .items_center()
                     .gap(px(8.0))
                     .cursor_pointer()
-                    .hover(move |item| item.bg(colors.primary.alpha(0.065)))
+                    .mx(px(4.0))
+                    .rounded(px(Radius::inner(crate::floating::MENU_RADIUS, 4.0)))
+                    .glass_menu_row(colors, false)
                     .child(sf_symbol(
                         "chevron.left.forwardslash.chevron.right",
                         11.5,
@@ -3424,34 +3450,116 @@ impl WorkbenchInspector {
             );
         }
 
+        files
+    }
+
+    fn render_file_navigator(
+        &self,
+        snapshot: Arc<DiffSnapshot>,
+        colors: SemanticColors,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let files = self.file_navigator_list(snapshot, colors, cx);
+        let scrim = div().absolute().inset_0().occlude().on_mouse_down(
+            MouseButton::Left,
+            cx.listener(|this, _, _, cx| {
+                this.files_open = false;
+                cx.notify();
+                cx.stop_propagation();
+            }),
+        );
+        let panel = if crate::floating::uses_panels(false, colors, cx) {
+            crate::floating::host_here(
+                INSPECTOR_FILES_MENU,
+                crate::floating::surface(colors, crate::floating::MENU_RADIUS, 330.0, files)
+                    .into_any_element(),
+                Some(330.0),
+                gpui::Anchor::TopRight,
+                8.0,
+                cx,
+            )
+            .absolute()
+            .top(px(40.0))
+            .right(px(9.0))
+            .w(px(0.0))
+            .h(px(0.0))
+            .into_any_element()
+        } else {
+            div()
+                .id("review-file-navigator")
+                .debug_selector(|| "INSPECTOR_FILE_NAVIGATOR".to_owned())
+                .absolute()
+                .top(px(40.0))
+                .right(px(9.0))
+                .w(px(330.0))
+                .occlude()
+                .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                .on_mouse_down_out(cx.listener(|this, _, _, cx| {
+                    this.files_open = false;
+                    cx.notify();
+                }))
+                .child(FloatingSurface::new(colors, files).radius(crate::floating::MENU_RADIUS))
+                .into_any_element()
+        };
         div()
             .absolute()
             .inset_0()
-            .child(div().absolute().inset_0().occlude().on_mouse_down(
-                MouseButton::Left,
-                cx.listener(|this, _, _, cx| {
-                    this.files_open = false;
-                    cx.notify();
-                    cx.stop_propagation();
-                }),
-            ))
-            .child(
-                div()
-                    .id("review-file-navigator")
-                    .debug_selector(|| "INSPECTOR_FILE_NAVIGATOR".to_owned())
-                    .absolute()
-                    .top(px(40.0))
-                    .right(px(9.0))
-                    .w(px(330.0))
-                    .occlude()
-                    .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
-                    .on_mouse_down_out(cx.listener(|this, _, _, cx| {
-                        this.files_open = false;
-                        cx.notify();
-                    }))
-                    .child(FloatingSurface::new(colors, files)),
-            )
+            .child(scrim)
+            .child(panel)
             .into_any_element()
+    }
+
+    /// The comparison base rows, without host chrome.
+    fn comparison_menu_items(&self, colors: SemanticColors, cx: &mut Context<Self>) -> gpui::Div {
+        div()
+            .py(px(4.0))
+            .overflow_hidden()
+            .child(self.render_comparison_option(SessionDiffBase::DefaultBranch, colors, cx))
+            .child(self.render_comparison_option(SessionDiffBase::Head, colors, cx))
+    }
+
+    fn remote_context(&self) -> bool {
+        self.context.as_ref().is_some_and(|context| context.remote)
+    }
+
+    /// The sidebar palette the inspector paints with, for its panels.
+    fn panel_colors(&self) -> SemanticColors {
+        let store = self
+            .runtime
+            .store
+            .read()
+            .expect("session store lock poisoned");
+        crate::app_theme::sidebar_colors_for(store.preferences())
+    }
+
+    /// The file navigator's pixels for its floating panel.
+    fn files_panel_content(&mut self, cx: &mut Context<Self>) -> Option<AnyElement> {
+        if !self.files_open || self.remote_context() {
+            return None;
+        }
+        let LoadState::Ready(snapshot) = &self.state else {
+            return None;
+        };
+        let snapshot = Arc::clone(snapshot);
+        let colors = self.panel_colors();
+        let files = self.file_navigator_list(snapshot, colors, cx);
+        Some(
+            crate::floating::surface(colors, crate::floating::MENU_RADIUS, 330.0, files)
+                .into_any_element(),
+        )
+    }
+
+    /// The comparison menu's pixels for its floating panel.
+    fn comparison_panel_content(&mut self, cx: &mut Context<Self>) -> Option<AnyElement> {
+        if !(self.comparison_menu_open && self.remote_context()) {
+            return None;
+        }
+        let colors = self.panel_colors();
+        let items = self.comparison_menu_items(colors, cx);
+        Some(
+            crate::floating::surface(colors, crate::floating::MENU_RADIUS, 230.0, items)
+                .into_any_element(),
+        )
     }
 
     fn render_review_controls(
@@ -4045,7 +4153,28 @@ impl WorkbenchInspector {
                             cx.stop_propagation();
                         }),
                     ))
-                    .child(
+                    .child(if crate::floating::uses_panels(false, colors, cx) {
+                        crate::floating::host_here(
+                            INSPECTOR_COMPARISON_MENU,
+                            crate::floating::surface(
+                                colors,
+                                crate::floating::MENU_RADIUS,
+                                230.0,
+                                self.comparison_menu_items(colors, cx),
+                            )
+                            .into_any_element(),
+                            Some(230.0),
+                            gpui::Anchor::TopRight,
+                            8.0,
+                            cx,
+                        )
+                        .absolute()
+                        .top(px(40.0))
+                        .right(px(10.0))
+                        .w(px(0.0))
+                        .h(px(0.0))
+                        .into_any_element()
+                    } else {
                         div()
                             .id("inspector-comparison-menu")
                             .absolute()
@@ -4058,24 +4187,15 @@ impl WorkbenchInspector {
                                 this.comparison_menu_open = false;
                                 cx.notify();
                             }))
-                            .child(FloatingSurface::new(
-                                colors,
-                                div()
-                                    .py(px(4.0))
-                                    .rounded(px(Radius::PANEL))
-                                    .overflow_hidden()
-                                    .child(self.render_comparison_option(
-                                        SessionDiffBase::DefaultBranch,
-                                        colors,
-                                        cx,
-                                    ))
-                                    .child(self.render_comparison_option(
-                                        SessionDiffBase::Head,
-                                        colors,
-                                        cx,
-                                    )),
-                            )),
-                    )
+                            .child(
+                                FloatingSurface::new(
+                                    colors,
+                                    self.comparison_menu_items(colors, cx),
+                                )
+                                .radius(crate::floating::MENU_RADIUS),
+                            )
+                            .into_any_element()
+                    })
                     .into_any_element(),
             )
         } else {

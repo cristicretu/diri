@@ -588,12 +588,9 @@ pub struct TerminalPane {
     focus: FocusHandle,
     glyphs: HashMap<SessionId, Entity<StatusGlyph>>,
     session_links: SessionLinks,
-    /// The Links popover's blurred panel under glass (see `crate::floating`).
-    floating_links: Option<crate::floating::Panel>,
-    main_window: Option<gpui::AnyWindowHandle>,
-    main_bounds: gpui::Bounds<gpui::Pixels>,
+    /// The main window's viewport, for content that sizes to it while a
+    /// panel paints it elsewhere.
     main_viewport: gpui::Size<gpui::Pixels>,
-    panel_activation: Option<gpui::Subscription>,
     /// Paced PTY resizes: window and sidebar drags relayout every frame, but
     /// sustained grid frames leave the daemon at up to 120 Hz, so intermediate
     /// sizes coalesce onto that cadence (see [`RESIZE_CADENCE`]).
@@ -788,11 +785,7 @@ impl TerminalPane {
             focus,
             glyphs: HashMap::new(),
             session_links: SessionLinks::new(cx),
-            floating_links: None,
-            main_window: None,
-            main_bounds: gpui::Bounds::default(),
             main_viewport: gpui::Size::default(),
-            panel_activation: None,
             qol: QolState::default(),
             reconnect: Default::default(),
             pending_resizes: HashMap::new(),
@@ -1729,8 +1722,7 @@ impl TerminalPane {
         cx: &mut Context<Self>,
         f: impl FnOnce(&mut Self, &mut Window, &mut Context<Self>) + 'static,
     ) {
-        let main = self.main_window;
-        crate::floating::in_main_window(self, main, window, cx, f);
+        crate::floating::in_main_window(self, window, cx, f);
     }
 
     fn selected_session(&self) -> Option<Arc<SessionRecord>> {
@@ -3617,21 +3609,7 @@ impl Render for TerminalPane {
         };
         self.sync_status_glyphs(colors, window, cx);
         self.update_selected_geometry(window, cx);
-        self.main_window = Some(window.window_handle());
-        self.main_bounds = window.bounds();
         self.main_viewport = window.viewport_size();
-        if self.panel_activation.is_none() {
-            self.panel_activation =
-                Some(cx.observe_window_activation(window, |this, window, cx| {
-                    // The panel is not part of this window; losing key status
-                    // is its "click outside", and the window may stop drawing
-                    // right after, so close here rather than on a render.
-                    if !window.is_window_active() && this.floating_links.is_some() {
-                        crate::floating::close(this, session_links::LINKS_PANEL, cx);
-                        this.close_session_links(window, cx);
-                    }
-                }));
-        }
 
         let selected = self.selected_session();
 

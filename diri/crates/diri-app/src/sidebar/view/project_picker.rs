@@ -369,10 +369,6 @@ impl Sidebar {
     ) -> Option<AnyElement> {
         let colors = self.colors();
         if !self.project_picker.open {
-            self.close_panel(PanelTarget::Picker, cx);
-            if self.ui.popover.is_none() {
-                self.close_panel(PanelTarget::Popover, cx);
-            }
             return if self.project_picker.new_agent {
                 if let Some(Popover::NewAgent { directory, host }) = self.ui.popover.clone() {
                     let spec = self.header_new_agent_menu(directory, host, colors, cx);
@@ -457,7 +453,6 @@ impl Sidebar {
                     .into_any_element(),
             );
         }
-        self.close_panel(PanelTarget::Picker, cx);
         let content = self.project_picker_content(colors, layout.height, cx);
         Some(
             scrim
@@ -501,6 +496,9 @@ impl Sidebar {
         &mut self,
         cx: &mut Context<Self>,
     ) -> Option<AnyElement> {
+        if !self.project_picker_open() {
+            return None;
+        }
         let colors = self.colors();
         let layout = self.project_picker_layout(self.main_viewport)?;
         let content = self.project_picker_content(colors, layout.height, cx);

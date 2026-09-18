@@ -28,8 +28,8 @@ use account_settings::AccountsState;
 use diri_proto::{AgentKind as ProtoAgentKind, HostEntry, HostsConfig};
 use diri_term::theme::{TermTheme, ThemeAppearance};
 use diri_ui::{
-    AgentLogo, Fill, FloatingSurface, HairlineDivider, Ink, LoadingIndicator, Metrics, Palette,
-    Radius, SemanticColors, Typo,
+    AgentLogo, Fill, FloatingSurface, GlassMenuRow, HairlineDivider, Ink, LoadingIndicator,
+    Metrics, Palette, Radius, SemanticColors, Typo,
 };
 use gpui::{
     Animation, AnimationExt, AnyElement, App, Bounds, ClickEvent, Context, CursorStyle,
@@ -88,6 +88,16 @@ impl Render for DraggedEditorResize {
     }
 }
 
+/// Hibernate-after choices: minutes and their labels.
+const HIBERNATE_OPTIONS: [(u32, &str); 6] = [
+    (0, "Off"),
+    (15, "15 minutes"),
+    (30, "30 minutes"),
+    (60, "1 hour"),
+    (120, "2 hours"),
+    (240, "4 hours"),
+];
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[allow(dead_code)] // Remaining dropdowns are introduced incrementally.
 enum SettingsMenu {
@@ -96,6 +106,17 @@ enum SettingsMenu {
     HibernateAfter,
     MemoryLimit,
 }
+
+/// The open settings select as a panel target (see `crate::floating::Target`).
+const SETTINGS_MENU: crate::floating::Target<UtilitySurfaces> = crate::floating::Target {
+    key: "settings-menu",
+    radius: crate::floating::MENU_RADIUS,
+    content: UtilitySurfaces::settings_menu_panel_content,
+    dismiss: |this, _, cx| {
+        this.settings_menu = None;
+        cx.notify();
+    },
+};
 
 #[derive(Default)]
 enum ReleaseNotesState {
@@ -3693,6 +3714,247 @@ impl UtilitySurfaces {
         .into_any_element()
     }
 
+    /// The open settings select's rows and its dropdown width.
+    fn settings_menu_options(
+        &self,
+        colors: SemanticColors,
+        cx: &mut Context<Self>,
+    ) -> Option<(AnyElement, f32)> {
+        Some(match self.settings_menu.as_ref()? {
+            SettingsMenu::DefaultAgent => (self.default_agent_options(colors, cx), 204.0),
+            SettingsMenu::TerminalTheme => (self.terminal_theme_options(colors, cx), 252.0),
+            SettingsMenu::HibernateAfter => (self.hibernate_options(colors, cx), 172.0),
+            SettingsMenu::MemoryLimit => (self.memory_options(colors, cx), 132.0),
+        })
+    }
+
+    /// Mounts the open select's dropdown under its control: a blurred panel
+    /// under glass, otherwise the in-window surface.
+    fn settings_menu_host(&self, cx: &mut Context<Self>) -> AnyElement {
+        let colors = self.settings_colors();
+        let Some((options, width)) = self.settings_menu_options(colors, cx) else {
+            return div().into_any_element();
+        };
+        if crate::floating::uses_panels(false, colors, cx) {
+            return crate::floating::host_here(
+                SETTINGS_MENU,
+                crate::floating::surface(colors, crate::floating::MENU_RADIUS, width, options)
+                    .into_any_element(),
+                Some(width),
+                gpui::Anchor::TopRight,
+                8.0,
+                cx,
+            )
+            .absolute()
+            .top(px(32.0))
+            .right_0()
+            .w(px(0.0))
+            .h(px(0.0))
+            .into_any_element();
+        }
+        settings_dropdown(options, width, colors).into_any_element()
+    }
+
+    /// The open select's dropdown for its floating panel.
+    fn settings_menu_panel_content(&mut self, cx: &mut Context<Self>) -> Option<AnyElement> {
+        let colors = self.settings_colors();
+        let (options, width) = self.settings_menu_options(colors, cx)?;
+        Some(
+            crate::floating::surface(colors, crate::floating::MENU_RADIUS, width, options)
+                .into_any_element(),
+        )
+    }
+
+    fn default_agent_options(&self, colors: SemanticColors, cx: &mut Context<Self>) -> AnyElement {
+        let selected = self.prefs.default_agent.clone();
+        let agents = {
+            let store = self.store.read().expect("session store lock poisoned");
+            crate::agent_catalog::installed_agent_options(store.agent_catalog(None))
+        };
+        let mut options = div().p(px(4.0)).flex().flex_col();
+        for (index, option) in agents.into_iter().enumerate() {
+            let is_selected = option.kind == selected;
+            let agent = option.kind.clone();
+            options = options.child(
+                div()
+                    .id(SharedString::from(format!("default-agent-option-{index}")))
+                    .min_h(px(Metrics::ROW_HEIGHT))
+                    .px(px(8.0))
+                    .py(px(5.0))
+                    .flex()
+                    .items_center()
+                    .gap(px(8.0))
+                    .rounded(px(Radius::inner(crate::floating::MENU_RADIUS, 4.0)))
+                    .bg(Fill::selected(colors, is_selected))
+                    .cursor_pointer()
+                    .glass_menu_row(colors, false)
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.prefs.default_agent = agent.clone();
+                        this.settings_menu = None;
+                        this.persist_prefs();
+                        cx.notify();
+                    }))
+                    .child(AgentLogo::new(ui_agent(&option.kind), 16.0, colors).badged(false))
+                    .child(
+                        div()
+                            .min_w_0()
+                            .flex_1()
+                            .flex()
+                            .flex_col()
+                            .text_size(px(Typo::ROW.size))
+                            .text_color(colors.primary)
+                            .child(option.display_name),
+                    )
+                    .when(is_selected, |row| {
+                        row.child(sf_symbol_weighted(
+                            "checkmark",
+                            10.0,
+                            SymbolWeight::Semibold,
+                            colors.secondary,
+                        ))
+                    }),
+            );
+        }
+        options.into_any_element()
+    }
+
+    fn terminal_theme_options(&self, colors: SemanticColors, cx: &mut Context<Self>) -> AnyElement {
+        let selected = theme(&self.prefs.terminal_theme);
+        let mut options = div()
+            .id("terminal-theme-options")
+            .max_h(px(300.0))
+            .overflow_y_scroll()
+            .p(px(4.0))
+            .flex()
+            .flex_col();
+        for appearance in ThemeAppearance::ALL {
+            options = options.child(
+                div()
+                    .h(px(24.0))
+                    .px(px(8.0))
+                    .flex()
+                    .items_center()
+                    .text_size(px(Typo::META.size - 1.0))
+                    .font_weight(FontWeight::SEMIBOLD)
+                    .text_color(colors.tertiary)
+                    .child(appearance.label()),
+            );
+            for (index, candidate) in TermTheme::CATALOG
+                .into_iter()
+                .enumerate()
+                .filter(|(_, theme)| theme.appearance == appearance)
+            {
+                let is_selected = candidate.id == selected.id;
+                options = options.child(
+                    div()
+                        .id(SharedString::from(format!("terminal-theme-option-{index}")))
+                        .h(px(Metrics::ROW_HEIGHT))
+                        .px(px(8.0))
+                        .rounded(px(Radius::inner(crate::floating::MENU_RADIUS, 4.0)))
+                        .flex()
+                        .items_center()
+                        .gap(px(8.0))
+                        .bg(Fill::selected(colors, is_selected))
+                        .cursor_pointer()
+                        .glass_menu_row(colors, false)
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            this.prefs.follow_system_theme = false;
+                            this.prefs.terminal_theme = candidate.id.to_owned();
+                            this.settings_menu = None;
+                            this.persist_prefs();
+                            cx.notify();
+                        }))
+                        .child(
+                            div()
+                                .size(px(16.0))
+                                .rounded(px(5.0))
+                                .bg(candidate.background)
+                                .border_1()
+                                .border_color(colors.primary.alpha(0.16))
+                                .flex()
+                                .items_center()
+                                .justify_center()
+                                .child(
+                                    div()
+                                        .size(px(5.0))
+                                        .rounded(px(2.5))
+                                        .bg(candidate.foreground),
+                                ),
+                        )
+                        .child(
+                            div().flex().gap(px(2.0)).children(
+                                [candidate.ansi[2], candidate.ansi[4], candidate.ansi[5]]
+                                    .map(|color| div().size(px(5.0)).rounded(px(2.5)).bg(color)),
+                            ),
+                        )
+                        .child(
+                            div()
+                                .flex_1()
+                                .text_size(px(Typo::ROW.size))
+                                .child(candidate.name),
+                        )
+                        .when(is_selected, |row| {
+                            row.child(sf_symbol("checkmark", 10.0, colors.secondary))
+                        }),
+                );
+            }
+        }
+        options.into_any_element()
+    }
+
+    fn hibernate_options(&self, colors: SemanticColors, cx: &mut Context<Self>) -> AnyElement {
+        let mut options = div().p(px(4.0)).flex().flex_col();
+        for (index, (value, label)) in HIBERNATE_OPTIONS.into_iter().enumerate() {
+            let is_selected = value == self.prefs.hibernate_after_minutes;
+            options = options.child(settings_choice_row(
+                format!("hibernate-option-{index}"),
+                label,
+                is_selected,
+                colors,
+                cx,
+                move |this, cx| {
+                    this.prefs.hibernate_after_minutes = value;
+                    this.settings_menu = None;
+                    this.persist_prefs();
+                    cx.notify();
+                },
+            ));
+        }
+        options.into_any_element()
+    }
+
+    fn memory_options(&self, colors: SemanticColors, cx: &mut Context<Self>) -> AnyElement {
+        const OPTIONS: [u64; 6] = [4, 8, 16, 32, 64, 128];
+        let mut options = div().p(px(4.0)).flex().flex_col();
+        for (index, value) in OPTIONS.into_iter().enumerate() {
+            let is_selected = value == self.prefs.memory_hard_limit_gb;
+            options = options.child(settings_choice_row(
+                format!("memory-option-{index}"),
+                format!("{value} GB"),
+                is_selected,
+                colors,
+                cx,
+                move |this, cx| {
+                    this.prefs.memory_hard_limit_gb = value;
+                    this.settings_menu = None;
+                    this.persist_prefs();
+                    cx.notify();
+                },
+            ));
+        }
+        options.into_any_element()
+    }
+
+    /// Runs `f` against the surfaces' own window even from a panel handler.
+    fn in_main_window(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+        f: impl FnOnce(&mut Self, &mut Window, &mut Context<Self>) + 'static,
+    ) {
+        crate::floating::in_main_window(self, window, cx, f);
+    }
+
     fn default_agent_dropdown(&self, cx: &mut Context<Self>) -> AnyElement {
         let colors = self.settings_colors();
         let selected = self.prefs.default_agent.clone();
@@ -3721,51 +3983,7 @@ impl UtilitySurfaces {
 
         let mut control = div().relative().min_w(px(154.0)).child(trigger);
         if open {
-            let mut options = div().p(px(4.0)).flex().flex_col();
-            for (index, option) in agents.into_iter().enumerate() {
-                let is_selected = option.kind == selected;
-                let agent = option.kind.clone();
-                options = options.child(
-                    div()
-                        .id(SharedString::from(format!("default-agent-option-{index}")))
-                        .min_h(px(Metrics::ROW_HEIGHT))
-                        .px(px(8.0))
-                        .py(px(5.0))
-                        .flex()
-                        .items_center()
-                        .gap(px(8.0))
-                        .rounded(px(Radius::ROW))
-                        .bg(Fill::selected(colors, is_selected))
-                        .cursor_pointer()
-                        .hover(move |style| style.bg(colors.primary.alpha(0.08)))
-                        .on_click(cx.listener(move |this, _, _, cx| {
-                            this.prefs.default_agent = agent.clone();
-                            this.settings_menu = None;
-                            this.persist_prefs();
-                            cx.notify();
-                        }))
-                        .child(AgentLogo::new(ui_agent(&option.kind), 16.0, colors).badged(false))
-                        .child(
-                            div()
-                                .min_w_0()
-                                .flex_1()
-                                .flex()
-                                .flex_col()
-                                .text_size(px(Typo::ROW.size))
-                                .text_color(colors.primary)
-                                .child(option.display_name),
-                        )
-                        .when(is_selected, |row| {
-                            row.child(sf_symbol_weighted(
-                                "checkmark",
-                                10.0,
-                                SymbolWeight::Semibold,
-                                colors.secondary,
-                            ))
-                        }),
-                );
-            }
-            control = control.child(settings_dropdown(options, 204.0, colors));
+            control = control.child(self.settings_menu_host(cx));
         }
         control.into_any_element()
     }
@@ -4980,101 +5198,14 @@ impl UtilitySurfaces {
                 cx,
             ));
         if open {
-            let mut options = div()
-                .id("terminal-theme-options")
-                .max_h(px(300.0))
-                .overflow_y_scroll()
-                .p(px(4.0))
-                .flex()
-                .flex_col();
-            for appearance in ThemeAppearance::ALL {
-                options = options.child(
-                    div()
-                        .h(px(24.0))
-                        .px(px(8.0))
-                        .flex()
-                        .items_center()
-                        .text_size(px(Typo::META.size - 1.0))
-                        .font_weight(FontWeight::SEMIBOLD)
-                        .text_color(colors.tertiary)
-                        .child(appearance.label()),
-                );
-                for (index, candidate) in TermTheme::CATALOG
-                    .into_iter()
-                    .enumerate()
-                    .filter(|(_, theme)| theme.appearance == appearance)
-                {
-                    let is_selected = candidate.id == selected.id;
-                    options =
-                        options.child(
-                            div()
-                                .id(SharedString::from(format!("terminal-theme-option-{index}")))
-                                .h(px(Metrics::ROW_HEIGHT))
-                                .px(px(8.0))
-                                .rounded(px(Radius::ROW))
-                                .flex()
-                                .items_center()
-                                .gap(px(8.0))
-                                .bg(Fill::selected(colors, is_selected))
-                                .cursor_pointer()
-                                .hover(move |style| style.bg(colors.primary.alpha(0.08)))
-                                .on_click(cx.listener(move |this, _, _, cx| {
-                                    this.prefs.follow_system_theme = false;
-                                    this.prefs.terminal_theme = candidate.id.to_owned();
-                                    this.settings_menu = None;
-                                    this.persist_prefs();
-                                    cx.notify();
-                                }))
-                                .child(
-                                    div()
-                                        .size(px(16.0))
-                                        .rounded(px(5.0))
-                                        .bg(candidate.background)
-                                        .border_1()
-                                        .border_color(colors.primary.alpha(0.16))
-                                        .flex()
-                                        .items_center()
-                                        .justify_center()
-                                        .child(
-                                            div()
-                                                .size(px(5.0))
-                                                .rounded(px(2.5))
-                                                .bg(candidate.foreground),
-                                        ),
-                                )
-                                .child(div().flex().gap(px(2.0)).children(
-                                    [candidate.ansi[2], candidate.ansi[4], candidate.ansi[5]].map(
-                                        |color| div().size(px(5.0)).rounded(px(2.5)).bg(color),
-                                    ),
-                                ))
-                                .child(
-                                    div()
-                                        .flex_1()
-                                        .text_size(px(Typo::ROW.size))
-                                        .child(candidate.name),
-                                )
-                                .when(is_selected, |row| {
-                                    row.child(sf_symbol("checkmark", 10.0, colors.secondary))
-                                }),
-                        );
-                }
-            }
-            control = control.child(settings_dropdown(options, 252.0, colors));
+            control = control.child(self.settings_menu_host(cx));
         }
         control.into_any_element()
     }
 
     fn hibernate_dropdown(&self, cx: &mut Context<Self>) -> AnyElement {
-        const OPTIONS: [(u32, &str); 6] = [
-            (0, "Off"),
-            (15, "15 minutes"),
-            (30, "30 minutes"),
-            (60, "1 hour"),
-            (120, "2 hours"),
-            (240, "4 hours"),
-        ];
         let colors = self.settings_colors();
-        let selected_label = OPTIONS
+        let selected_label = HIBERNATE_OPTIONS
             .into_iter()
             .find_map(|(value, label)| {
                 (value == self.prefs.hibernate_after_minutes).then_some(label)
@@ -5093,30 +5224,12 @@ impl UtilitySurfaces {
                 cx,
             ));
         if open {
-            let mut options = div().p(px(4.0)).flex().flex_col();
-            for (index, (value, label)) in OPTIONS.into_iter().enumerate() {
-                let is_selected = value == self.prefs.hibernate_after_minutes;
-                options = options.child(settings_choice_row(
-                    format!("hibernate-option-{index}"),
-                    label,
-                    is_selected,
-                    colors,
-                    cx,
-                    move |this, cx| {
-                        this.prefs.hibernate_after_minutes = value;
-                        this.settings_menu = None;
-                        this.persist_prefs();
-                        cx.notify();
-                    },
-                ));
-            }
-            control = control.child(settings_dropdown(options, 172.0, colors));
+            control = control.child(self.settings_menu_host(cx));
         }
         control.into_any_element()
     }
 
     fn memory_dropdown(&self, cx: &mut Context<Self>) -> AnyElement {
-        const OPTIONS: [u64; 6] = [4, 8, 16, 32, 64, 128];
         let colors = self.settings_colors();
         let open = self.settings_menu == Some(SettingsMenu::MemoryLimit);
         let mut control = div()
@@ -5131,24 +5244,7 @@ impl UtilitySurfaces {
                 cx,
             ));
         if open {
-            let mut options = div().p(px(4.0)).flex().flex_col();
-            for (index, value) in OPTIONS.into_iter().enumerate() {
-                let is_selected = value == self.prefs.memory_hard_limit_gb;
-                options = options.child(settings_choice_row(
-                    format!("memory-option-{index}"),
-                    format!("{value} GB"),
-                    is_selected,
-                    colors,
-                    cx,
-                    move |this, cx| {
-                        this.prefs.memory_hard_limit_gb = value;
-                        this.settings_menu = None;
-                        this.persist_prefs();
-                        cx.notify();
-                    },
-                ));
-            }
-            control = control.child(settings_dropdown(options, 132.0, colors));
+            control = control.child(self.settings_menu_host(cx));
         }
         control.into_any_element()
     }
@@ -6419,13 +6515,13 @@ fn settings_choice_row(
         .id(id.into())
         .h(px(Metrics::ROW_HEIGHT))
         .px(px(8.0))
-        .rounded(px(Radius::ROW))
+        .rounded(px(Radius::inner(crate::floating::MENU_RADIUS, 4.0)))
         .flex()
         .items_center()
         .gap(px(8.0))
         .bg(Fill::selected(colors, selected))
         .cursor_pointer()
-        .hover(move |style| style.bg(colors.primary.alpha(0.08)))
+        .glass_menu_row(colors, false)
         .on_click(cx.listener(move |this, _, _, cx| handler(this, cx)))
         .child(
             div()
