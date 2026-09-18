@@ -12,6 +12,7 @@ pub(super) struct ProjectPicker {
     previous_focus: Option<FocusHandle>,
     highlighted: usize,
     scroll: ScrollHandle,
+    scroller: diri_ui::ScrollerState,
     anchor: Rc<RefCell<Option<Bounds<Pixels>>>>,
 }
 impl ProjectPicker {
@@ -24,6 +25,7 @@ impl ProjectPicker {
             previous_focus: None,
             highlighted: 0,
             scroll: ScrollHandle::new(),
+            scroller: diri_ui::ScrollerState::new(),
             anchor: Default::default(),
         }
     }
@@ -664,7 +666,16 @@ impl Sidebar {
                     .child(sf_symbol("magnifyingglass", 12.0, colors.tertiary))
                     .child(query),
             )
-            .child(list)
+            .child(
+                diri_ui::scroll_area(
+                    &self.project_picker.scroller,
+                    self.project_picker.scroll.clone(),
+                    colors,
+                    list,
+                )
+                .flex_1()
+                .min_h(px(0.0)),
+            )
             .into_any_element()
     }
 }

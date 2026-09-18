@@ -135,6 +135,7 @@ pub struct NavigationOverlay {
     /// rebuild ranked rows; orientation and shortcut changes do.
     palette_context_fingerprint: u64,
     list_scroll: UniformListScrollHandle,
+    list_scroller: diri_ui::ScrollerState,
     tokio: Arc<tokio::runtime::Runtime>,
     history: Vec<diri_proto::HistoryEntry>,
     history_loading: bool,
@@ -264,6 +265,7 @@ impl NavigationOverlay {
             ranked_items: Vec::new(),
             palette_context_fingerprint: 0,
             list_scroll: UniformListScrollHandle::new(),
+            list_scroller: diri_ui::ScrollerState::new(),
             tokio,
             history: Vec::new(),
             history_loading: false,
@@ -321,6 +323,7 @@ impl NavigationOverlay {
             ranked_items: Vec::new(),
             palette_context_fingerprint: 0,
             list_scroll: UniformListScrollHandle::new(),
+            list_scroller: diri_ui::ScrollerState::new(),
             tokio,
             history: Vec::new(),
             history_loading: false,
@@ -1342,14 +1345,20 @@ impl NavigationOverlay {
                     .overflow_hidden()
                     .when(count > 0, |view| {
                         view.child(
-                            uniform_list("palette-results", count, move |range, _, cx| {
-                                entity.update(cx, |this, cx| {
-                                    range
-                                        .map(|index| this.render_result(index, colors, cx))
-                                        .collect()
+                            diri_ui::scroll_area(
+                                &self.list_scroller,
+                                self.list_scroll.clone(),
+                                colors,
+                                uniform_list("palette-results", count, move |range, _, cx| {
+                                    entity.update(cx, |this, cx| {
+                                        range
+                                            .map(|index| this.render_result(index, colors, cx))
+                                            .collect()
+                                    })
                                 })
-                            })
-                            .track_scroll(&self.list_scroll)
+                                .track_scroll(&self.list_scroll)
+                                .size_full(),
+                            )
                             .size_full(),
                         )
                         // Painted fades are a tint of the opaque surface; on a

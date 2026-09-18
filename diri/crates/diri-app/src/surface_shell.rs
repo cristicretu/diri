@@ -347,6 +347,7 @@ pub struct UtilitySurfaces {
     usage_numbers: crate::number_flow::Bank,
     release_notes: ReleaseNotesState,
     settings_scroll: ScrollHandle,
+    settings_scroller: diri_ui::ScrollerState,
     settings_search: QueryEditor,
     settings_search_active: bool,
     shortcut_search: QueryEditor,
@@ -537,6 +538,7 @@ impl UtilitySurfaces {
             usage_numbers: crate::number_flow::Bank::default(),
             release_notes: ReleaseNotesState::default(),
             settings_scroll: ScrollHandle::new(),
+            settings_scroller: diri_ui::ScrollerState::new(),
             settings_search: QueryEditor::default(),
             settings_search_active: false,
             shortcut_search: QueryEditor::default(),
@@ -2414,9 +2416,7 @@ impl UtilitySurfaces {
             .debug_selector(|| "settings-pane".into())
             .relative()
             .track_scroll(&self.settings_scroll)
-            .flex_1()
-            .min_w(px(0.0))
-            .h_full()
+            .size_full()
             .overflow_y_scroll()
             .bg(colors.background)
             .child(
@@ -2448,6 +2448,15 @@ impl UtilitySurfaces {
             )
             .into_any_element()
         };
+        let pane = diri_ui::scroll_area(
+            &self.settings_scroller,
+            self.settings_scroll.clone(),
+            colors,
+            pane,
+        )
+        .flex_1()
+        .min_w(px(0.0))
+        .h_full();
 
         div()
             .id("settings-shell")

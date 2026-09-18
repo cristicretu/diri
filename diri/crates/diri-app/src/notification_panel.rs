@@ -542,30 +542,36 @@ impl RootView {
                     .overflow_hidden()
                     .when(count > 0, |view| {
                         view.child(
-                            uniform_list("notification-list", count, move |range, _, cx| {
-                                entity.update(cx, |this, cx| {
-                                    let entries = {
-                                        let store = this.window_store.read().expect("store");
-                                        range
-                                            .filter_map(|index| {
-                                                store
-                                                    .notifications()
-                                                    .entries()
-                                                    .get(rows[index])
-                                                    .cloned()
-                                                    .map(|entry| (index, entry))
+                            diri_ui::scroll_area(
+                                &self.notification_scroller,
+                                self.notification_scroll.clone(),
+                                colors,
+                                uniform_list("notification-list", count, move |range, _, cx| {
+                                    entity.update(cx, |this, cx| {
+                                        let entries = {
+                                            let store = this.window_store.read().expect("store");
+                                            range
+                                                .filter_map(|index| {
+                                                    store
+                                                        .notifications()
+                                                        .entries()
+                                                        .get(rows[index])
+                                                        .cloned()
+                                                        .map(|entry| (index, entry))
+                                                })
+                                                .collect::<Vec<_>>()
+                                        };
+                                        entries
+                                            .into_iter()
+                                            .map(|(index, entry)| {
+                                                this.notification_row(index, entry, colors, cx)
                                             })
-                                            .collect::<Vec<_>>()
-                                    };
-                                    entries
-                                        .into_iter()
-                                        .map(|(index, entry)| {
-                                            this.notification_row(index, entry, colors, cx)
-                                        })
-                                        .collect()
+                                            .collect()
+                                    })
                                 })
-                            })
-                            .track_scroll(&self.notification_scroll)
+                                .track_scroll(&self.notification_scroll)
+                                .size_full(),
+                            )
                             .size_full(),
                         )
                         .child(scroll_fades(self.notification_scroll.clone(), colors))

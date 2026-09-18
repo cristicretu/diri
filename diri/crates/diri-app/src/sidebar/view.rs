@@ -539,6 +539,7 @@ pub struct Sidebar {
     /// Session list scroll position, read back each frame to size the top and
     /// bottom fades.
     list_scroll: ScrollHandle,
+    list_scroller: diri_ui::ScrollerState,
     tab_scroll: ScrollHandle,
     last_tab_selection: Option<SessionId>,
     last_tab_available_width: f32,
@@ -717,6 +718,7 @@ impl Sidebar {
             surface_in_parent: false,
             peek_close: None,
             list_scroll: ScrollHandle::new(),
+            list_scroller: diri_ui::ScrollerState::new(),
             tab_scroll: ScrollHandle::new(),
             last_tab_selection: None,
             last_tab_available_width: 0.0,
@@ -8025,7 +8027,16 @@ impl Render for Sidebar {
                                 Self::refresh_on_next_frame(&weak, window);
                             }
                         })
-                        .children(list)
+                        .children(list.map(|list| {
+                            diri_ui::scroll_area(
+                                &self.list_scroller,
+                                self.list_scroll.clone(),
+                                colors,
+                                list,
+                            )
+                            .flex_1()
+                            .min_h(px(0.0))
+                        }))
                         .children(self.scroll_fades(colors)),
                 );
             }

@@ -294,6 +294,8 @@ enum PaneEvent {
     FindResult(SessionId, AttachmentGeneration, SearchRequest, SearchResult),
     ScrollbackCells(SessionId, diri_proto::ReadScrollbackCellsResult, usize),
     ScrollbackFailed(SessionId),
+    /// The scroller knob moved the viewport; fetch whatever it now shows.
+    ScrollbackPump(SessionId, usize),
     ClipboardUploadFinished(SessionId, Result<String, String>),
     /// Files dropped on a remote session finished copying; on success the
     /// remote paths are ready to paste in drop order.
@@ -569,6 +571,8 @@ pub struct TerminalPane {
     #[cfg(test)]
     pub(crate) render_count: usize,
     qol: QolState,
+    /// Overlay scroller and rubber band over the grid's scrollback.
+    scroller: diri_ui::ScrollerState,
     reconnect: reconnect::ReconnectUi,
     runtime: Arc<StoreRuntime>,
     window_store: Option<crate::store::WindowStore>,
@@ -791,6 +795,7 @@ impl TerminalPane {
             session_links: SessionLinks::new(cx),
             main_viewport: gpui::Size::default(),
             qol: QolState::default(),
+            scroller: diri_ui::ScrollerState::new(),
             reconnect: Default::default(),
             pending_resizes: HashMap::new(),
             resize_flush: None,
@@ -1374,6 +1379,10 @@ impl TerminalPane {
                 if self.selected_id().as_ref() == Some(&id) {
                     cx.notify();
                 }
+            }
+            PaneEvent::ScrollbackPump(id, visible_rows) => {
+                self.pump_scrollback_fetch(&id, visible_rows);
+                cx.notify();
             }
             PaneEvent::ScrollbackFailed(id) => {
                 if let Some(resident) = self.residents.get_mut(&id) {
@@ -3174,6 +3183,20 @@ impl TerminalPane {
         let view_offset = resident.element.view_offset();
         let attachment_state = resident.attachment_state;
         let overflow = self.grid_row_overflow(resident.element.grid_rows(), font_size, window);
+        let scroll_target = TerminalScrollTarget {
+            element: resident.element.clone(),
+            visible_rows: usize::from(resident.last_size.1.max(1)),
+            line_height: f32::from(
+                CellMetrics::measure(
+                    window.text_system(),
+                    &font(crate::fonts::mono_family()),
+                    px(font_size),
+                )
+                .line_height,
+            ),
+            session: session.id.clone(),
+            pane_tx: self.pane_tx.clone(),
+        };
 
         let id_for_focus = session.id.clone();
         let follows_selection = matches!(self.session_source, SessionSource::FollowSelection);
@@ -3230,26 +3253,34 @@ impl TerminalPane {
             .on_mouse_up_out(MouseButton::Right, cx.listener(Self::handle_pointer_up))
             .on_mouse_move(cx.listener(Self::handle_pointer_move))
             .on_scroll_wheel(cx.listener(Self::handle_scroll))
-            .child(match overflow {
-                // Settled: the mirrored screen fits, so the grid fills the pane
-                // exactly as before.
-                None => div().size_full().child(element),
-                // The daemon's screen is still taller than the pane -- a shrink
-                // that has not round-tripped yet. Give the grid its natural
-                // height, bottom-anchored: the extra rows clip off the top, the
-                // way a terminal drops scrollback, instead of the prompt and the
-                // agent's input box vanishing off the bottom until the reflow
-                // lands. Collapses back to the branch above on the next frame.
-                Some(grid_height) => div().size_full().relative().overflow_hidden().child(
-                    div()
-                        .absolute()
-                        .bottom(px(0.0))
-                        .left(px(0.0))
-                        .right(px(0.0))
-                        .h(px(grid_height))
-                        .child(element),
-                ),
-            });
+            .child(
+                diri_ui::scroll_area(
+                    &self.scroller,
+                    scroll_target,
+                    colors,
+                    match overflow {
+                        // Settled: the mirrored screen fits, so the grid fills the pane
+                        // exactly as before.
+                        None => div().size_full().child(element),
+                        // The daemon's screen is still taller than the pane -- a shrink
+                        // that has not round-tripped yet. Give the grid its natural
+                        // height, bottom-anchored: the extra rows clip off the top, the
+                        // way a terminal drops scrollback, instead of the prompt and the
+                        // agent's input box vanishing off the bottom until the reflow
+                        // lands. Collapses back to the branch above on the next frame.
+                        Some(grid_height) => div().size_full().relative().overflow_hidden().child(
+                            div()
+                                .absolute()
+                                .bottom(px(0.0))
+                                .left(px(0.0))
+                                .right(px(0.0))
+                                .h(px(grid_height))
+                                .child(element),
+                        ),
+                    },
+                )
+                .size_full(),
+            );
 
         // The exit pill owns the bottom slot; the transient pills stack above it.
         let pill_bottom = if exited { 52.0 } else { 18.0 };
@@ -4244,6 +4275,55 @@ fn exit_description(session: &SessionRecord) -> String {
     }
 }
 
+/// Lets the shared scroller drive the terminal's scrollback viewport, which
+/// counts lines from the live edge rather than pixels from the top.
+struct TerminalScrollTarget {
+    element: TerminalElement,
+    visible_rows: usize,
+    line_height: f32,
+    session: SessionId,
+    pane_tx: PaneEventSender,
+}
+
+impl TerminalScrollTarget {
+    fn max_lines(&self) -> i64 {
+        if self.element.alt_screen() {
+            0
+        } else {
+            self.element.max_view_offset(self.visible_rows)
+        }
+    }
+}
+
+impl diri_ui::ScrollTarget for TerminalScrollTarget {
+    fn offset(&self) -> gpui::Point<gpui::Pixels> {
+        let scrolled_up = self.element.view_offset().min(self.max_lines());
+        let from_top = (self.max_lines() - scrolled_up) as f32 * self.line_height;
+        gpui::point(px(0.0), px(-from_top))
+    }
+
+    fn max_offset(&self) -> gpui::Point<gpui::Pixels> {
+        gpui::point(px(0.0), px(self.max_lines() as f32 * self.line_height))
+    }
+
+    fn set_offset(&self, offset: gpui::Point<gpui::Pixels>, _: &mut Window, _: &mut gpui::App) {
+        let from_top = (-f32::from(offset.y) / self.line_height).round() as i64;
+        let target = (self.max_lines() - from_top).max(0);
+        if self.element.set_view_offset(target, self.visible_rows) {
+            let _ = self.pane_tx.send(PaneEvent::ScrollbackPump(
+                self.session.clone(),
+                self.visible_rows,
+            ));
+        }
+    }
+
+    /// The top of history gives; the live edge is where output lands and
+    /// must stay put.
+    fn bounce_edges(&self) -> (bool, bool) {
+        (true, false)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use diri_proto::grid::{ChangedRow, GridCell, TermColor, TermStyle};
@@ -5166,6 +5246,12 @@ mod tests {
                     resident.last_size = (80, 28);
                     resident.attachment_state = AttachmentState::Live;
                     resident.controller.seed_live_for_test();
+                    if scene == "scrolled" {
+                        // Six hundred rows of history, read a third of the
+                        // way up: enough for the scroller to show a knob.
+                        resident.element.adopt_history_geometry(600, 628, 1, 28);
+                        resident.element.set_view_offset(180, 28);
+                    }
                     pane.focus(window, cx);
                     pane.reset_qol_session(&id);
                     pane.qol.hover = Some((2, 1));
