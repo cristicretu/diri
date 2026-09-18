@@ -753,6 +753,14 @@ impl Registry {
         for (id, version, view) in changed_views {
             published.insert(id.clone(), version);
             if let Some(record) = self.records.get_mut(&id) {
+                // Final exit facts must reach disk even when no title or
+                // Agent-turn timestamp changes (for example, a quiet shell
+                // command that exits). Keep transient status changes out of
+                // this persistence trigger to preserve the existing cadence.
+                let previous_exit = match &record.status {
+                    SessionStatus::Exited(exit) => Some(exit.clone()),
+                    _ => None,
+                };
                 let previous_persisted = (
                     record.title.clone(),
                     record.title_source,
@@ -760,12 +768,17 @@ impl Registry {
                 );
                 fold_session_view(record, &view);
                 fold_record_lifecycle(&self.engine, record);
-                let record_persistence_changed = previous_persisted
-                    != (
-                        record.title.clone(),
-                        record.title_source,
-                        record.last_turn_completed_at,
-                    );
+                let exit_changed = match &record.status {
+                    SessionStatus::Exited(exit) => previous_exit.as_ref() != Some(exit),
+                    _ => false,
+                };
+                let record_persistence_changed = exit_changed
+                    || previous_persisted
+                        != (
+                            record.title.clone(),
+                            record.title_source,
+                            record.last_turn_completed_at,
+                        );
                 if record_persistence_changed {
                     record.updated_at = DateMillis::from(std::time::SystemTime::now());
                     persistence_changed = true;
@@ -3365,6 +3378,75 @@ mod tests {
             );
             std::thread::sleep(std::time::Duration::from_millis(2));
         }
+    }
+
+    #[test]
+    fn quiet_natural_exit_reaches_disk_without_a_title_or_turn_change() {
+        // A shell command that exits without ever changing its title or
+        // completing an Agent turn used to leave the registry clean: the exit
+        // facts lived only in memory, and the next restart reported the
+        // session as lost to a daemon restart instead of its real exit code.
+        let temp = tempfile::tempdir().unwrap();
+        let state = temp.path().join("state.json");
+        let mut registry = Registry::new(engine(), state.clone());
+        registry
+            .spawn(
+                SessionSpec {
+                    id: "quiet-exit".into(),
+                    pty: crate::PtySpec::new(
+                        vec!["/bin/sh".into(), "-c".into(), "exit 3".into()],
+                        "/tmp",
+                    ),
+                    manifest_id: "shell".into(),
+                    authority: crate::Authority::ProcessOnly,
+                    logs_dir: temp.path().join("logs"),
+                    holder: None,
+                    remote: None,
+                    defer_launch: false,
+                },
+                record("quiet-exit"),
+            )
+            .unwrap();
+        registry.persist_now().unwrap();
+        assert!(!registry.dirty);
+
+        let mut published = HashMap::new();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        let exit = loop {
+            registry.changed_since(&mut published);
+            if let SessionStatus::Exited(exit) = registry.record("quiet-exit").unwrap().status {
+                break exit;
+            }
+            assert!(std::time::Instant::now() < deadline, "child never exited");
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        };
+        assert_eq!(exit.reason, diri_proto::ExitReason::Exited);
+        assert_eq!(exit.code, Some(3));
+        assert!(
+            registry.dirty,
+            "an observed exit must schedule persistence on its own"
+        );
+        let before = registry.record("quiet-exit").unwrap();
+        assert_eq!(before.title, "test");
+        assert_eq!(before.title_source, TitleSource::Placeholder);
+        assert!(before.last_turn_completed_at.is_none());
+
+        // Observing the same exit again is not a new persistence trigger.
+        registry.flush_dirty().unwrap();
+        published.clear();
+        registry.changed_since(&mut published);
+        assert!(
+            !registry.dirty,
+            "an unchanged exit must not rewrite the state file"
+        );
+
+        let mut restored = Registry::new(engine(), state);
+        restored.load().unwrap();
+        let restored = restored.record("quiet-exit").unwrap();
+        assert_eq!(restored.status, SessionStatus::Exited(exit));
+        registry
+            .terminate("quiet-exit", std::time::Duration::from_secs(1))
+            .ok();
     }
 
     #[test]
