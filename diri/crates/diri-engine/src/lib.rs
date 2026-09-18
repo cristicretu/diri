@@ -27,6 +27,8 @@ pub mod attach;
 pub mod attention;
 pub mod browser;
 pub mod checkpoint;
+#[cfg(unix)]
+pub mod completed_terminal;
 pub mod control;
 pub mod detect;
 pub mod directories;

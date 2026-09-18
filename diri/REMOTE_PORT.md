@@ -1698,3 +1698,40 @@ Before a new child is launched, the Engine may hold an explicitly pending,
 in-memory reader view for a missing log. It creates no filesystem state and
 refreshes only after the Holder creates the file; an existing invalid header
 still fails. Adoption continues to require an existing valid log.
+
+## Completed local terminal storage groundwork
+
+The Engine provides an unconnected storage primitive for completed local terminal
+views. It does not yet save terminals during exit, change launch or adoption,
+restore a pane, or add a public control API. Remote records are rejected; the
+Remote Helper protocol, ownership and persistence baseline are unchanged.
+
+A storage key captures the local SessionRecord identity/creation time and the
+actual Holder's verified native child birth and epoch offset while it is alive.
+Each key addresses an immutable version-1 artifact. An explicit expected key is
+required for reads; directory scanning, timestamp selection and bare PID matching
+are not supported. A future lifecycle integration must durably bind the current
+record run, preserve prior completed artifacts across failed launch, and reject
+stale reads after resume before enabling this path in the app.
+
+Files contain observed exit metadata and the retained visible-grid/history cache
+in a separate envelope, with SHA-256 integrity verification. They do not represent
+the complete parser, inactive screen, full transcript, selection, query-delivery
+receipts or exact input replay. The final raw offset is retained; raw-log replay
+is not performed. Producers must establish complete PTY drain and genuine exit
+before publication. Storage alone does not establish either fact.
+
+Read admission is bounded before decoding: 4 KiB metadata, 16 MiB checkpoint,
+10,000 history rows and 1,048,576 total decoded cells. The payload frames the existing grid, history-row, annotation and keyboard
+codecs directly, without plist parsing. RLE row widths/counts are checked before
+expansion; annotation JSON is separately bounded to 256 KiB per section. At most two storage operations are admitted concurrently.
+These bounds do not claim a whole-process memory or latency benchmark. The caller
+must perform storage work outside Registry and revalidate its pinned run afterward.
+
+An already-existing owner-only directory is opened by descriptor; files use
+no-follow, owner-only regular-file checks. Reads never create or repair files.
+Writers create a private nonce file, sync its content, atomically publish without
+replacing an existing run artifact, remove only their nonce and sync the directory.
+A failed fsync returns an error even if publication became visible; visibility is
+not evidence of a completed durability acknowledgement. No worker, timer, watcher,
+Holder or manager is created by this primitive.
