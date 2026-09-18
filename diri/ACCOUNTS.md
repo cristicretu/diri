@@ -1,34 +1,54 @@
 # Account profiles
 
-The bottom-left account menu switches local Codex logins while keeping one shared
-conversation home, `~/.codex`. It replaces only `auth.json` and resumes open Diri
-tabs with the same native conversation IDs. No transcript migration runs.
+The bottom-left account menu switches the login for every open Claude or Codex
+tab on this Mac while keeping one shared conversation home per Agent
+(`~/.claude`, `~/.codex`). Open tabs relaunch on their existing conversations;
+nothing is copied or migrated.
 
 ## Set up and switch
 
 1. Open the bottom-left account menu → **Add or manage accounts…**.
-2. Add a local Codex profile with a meaningful name. Use **Save current login**
-   to remember the account currently signed into `~/.codex`.
-3. Add another profile and choose **Sign in**. Diri opens a login-only terminal
-   with an isolated credential directory. Complete Codex's browser login; the
-   login process exits when finished. Close that setup tab.
-4. Choose the saved account in the bottom-left menu. Diri stops running Codex
-   conversations open in its tabs/split panes, swaps the shared login once, and
-   resumes their existing native IDs. Sleeping processes restart and return to
+2. Add a profile for the Agent with a meaningful name. Use **Save current
+   login** to remember the account currently signed in on this Mac.
+3. Add another profile and choose **Sign in**. Diri opens a login-only tab
+   whose credentials land in that profile's private store. Complete the
+   browser login; the process exits when finished. Close that tab.
+4. Choose the account in the bottom-left menu. Diri stops the Agent's
+   conversations open in its tabs/split panes, installs the login, and resumes
+   their existing conversations. Sleeping processes restart and return to
    sleep; stopped tabs stay stopped. The login becomes the default for new tabs.
 
 Profile names are user labels, not verified email addresses. **Save current
 login** replaces that profile's saved credential. It does not switch accounts.
-Signing in does not change the shared login until you choose the account.
+Signing in does not change the active login until you choose the account.
 
-Closed and archived sessions are excluded from restart. Since authentication is
-shared, their next resume also uses the current shared login. CLI processes
-outside Diri are not restarted and may retain cached credentials; do not switch
-while independently managed processes are writing the same authentication file.
-Running tools are interrupted, not replayed. A native conversation ID is required
-before any open tab is restarted. Separate-home conversations created by earlier
-builds are left in their original home and counted as unchanged. Their history is
-never copied. A legacy profile's login alone can be imported on first switch.
+A switch is never refused because of one tab. A Codex tab whose conversation
+Diri has not learned yet (it never finished a turn, or predates id binding) is
+identified from the rollout Codex wrote at launch, matched by directory and
+launch time. A tab that still cannot be identified keeps running on the
+previous login and is reported; it switches when restarted.
+
+### How each Agent switches
+
+- **Codex** keeps one `~/.codex`. Diri stores each profile's `auth.json` in a
+  private slot and swaps only that file. Codex reads it once at launch, so
+  open tabs relaunch with `codex resume <thread>`.
+- **Claude Code** keeps one `~/.claude`. Claude derives its credential store
+  from `CLAUDE_SECURESTORAGE_CONFIG_DIR` (a macOS Keychain item named after the
+  path, `.credentials.json` elsewhere), so each profile owns a private store
+  directory and Diri never copies tokens on a switch. Open tabs relaunch with
+  `claude --resume <conversation>`; a tab that has not saved a transcript yet
+  relaunches fresh with the same conversation id. The account identity that
+  `/status` displays is kept per profile and swapped alongside the login.
+
+Closed and archived sessions are excluded from restart. Since the login is
+shared, their next resume also uses the current login. CLI processes outside
+Diri are not restarted and may retain cached credentials; do not switch while
+independently managed processes are writing the same authentication file.
+Running tools are interrupted, not replayed. Profiles created by earlier
+builds with their own config directory are left in that directory and counted
+as unchanged; their history is never copied. A legacy Codex profile's login
+alone can be imported on first switch.
 
 ## What happens to MCPs
 
@@ -44,8 +64,10 @@ Diri cannot turn an account-side grant into a portable credential file.
 
 The Engine stores the catalog in `accounts.json` beside its socket (version 1,
 0600). Local Codex logins are stored under `codex-logins/<profile-id>/auth.json`
-beside that catalog, in owner-only directories and files. These are credentials:
-protect this directory like Codex's own auth file. They are never returned in
+beside that catalog; local Claude stores live under `claude-logins/<profile-id>`
+(the Keychain item name is derived from that path on macOS, and the profile
+records the path as `loginStore`). All are owner-only directories and files.
+These are credentials: protect this directory like the Agent's own auth file. They are never returned in
 control responses, logged or passed as process arguments. Removing a catalog
 profile does not delete provider directories or its saved login slot.
 
@@ -63,24 +85,29 @@ edits. Preparation fails before stopping processes. A later failure reports the
 login/default error and attempts to resume stopped tabs; failed relaunches can be
 retried with Resume. This is not an atomic multi-process transaction.
 
-`account.codex.login` and `account.codex.capture` take `{id}` and return a login
-SessionRecord or the catalog. `account.switch_all` takes `{accountProfileId}` and
-returns updated sessions, unchanged IDs, failures and the default-save outcome.
-No credential material is part of these responses.
+`account.codex.login`, `account.codex.capture`, `account.claude.login` and
+`account.claude.capture` take `{id}` and return a login SessionRecord or the
+catalog. `account.switch_all` takes `{accountProfileId}` for either Agent and
+returns updated sessions, unchanged IDs, deferred tabs (kept on the previous
+login), failures and the default-save outcome. No credential material is part
+of these responses.
 
 ## Other profiles
 
-Claude and remote profiles retain their existing directory-based launch behavior.
-The Engine binds `CLAUDE_CONFIG_DIR` or `CODEX_HOME`, clears ambient provider
-authentication/routing overrides and reasserts the binding after shell startup.
-They can use **Open Agent** for sign-in. The shared-login switch applies only to
-local Codex. Existing explicit Claude single-conversation continuation remains
-available; it does not transfer MCP grants. Remote profiles stay scoped to one
+Remote profiles and legacy isolated-home profiles retain their directory-based
+launch behavior. The Engine binds `CLAUDE_CONFIG_DIR` or `CODEX_HOME`, clears
+ambient provider authentication/routing overrides and reasserts the binding
+after shell startup. They can use **Open Agent** for sign-in. Existing explicit
+Claude single-conversation continuation remains available for isolated-home
+profiles; it does not transfer MCP grants. Remote profiles stay scoped to one
 Agent and host, and use the existing structured Remote PTY Holder launch path.
 
 ## Verification
 
-The `codex_accounts` tests exercise credential permissions, malformed files,
+The `claude_accounts` tests exercise the shared Claude switch with a fake
+Claude (resume in place, fresh relaunch keeping the id, no `CLAUDE_CONFIG_DIR`,
+display identity swapped under Claude's config lock) and the Keychain name
+derivation. The `codex_accounts` tests exercise credential permissions, malformed files,
 symlinks, unsupported backends, refreshed-login switch-back, running/sleeping/
 stopped open tabs and excluded closed records. A fixture with an 800 MiB invalid
 history file verifies switching never parses or copies history and leaves tool

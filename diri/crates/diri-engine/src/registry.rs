@@ -2123,6 +2123,7 @@ mod tests {
                         host: None,
                         config_home: config.to_string_lossy().into_owned(),
                         is_default: false,
+                        login_store: None,
                     }),
                     id: format!("{label}-{index}"),
                     kind: AgentKind::CODEX,
@@ -3164,6 +3165,7 @@ mod tests {
             host: None,
             config_home: config.to_string_lossy().into_owned(),
             is_default: false,
+            login_store: None,
         });
         // Reproduce a title already overwritten by an older Engine after
         // adoption, while the provider still knows the actual first prompt.

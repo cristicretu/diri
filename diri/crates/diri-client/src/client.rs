@@ -938,6 +938,29 @@ impl DaemonClient {
         .await
     }
 
+    pub async fn login_claude_account(&self, id: String) -> Result<SessionRecord, ClientError> {
+        self.core
+            .request_typed(
+                Method::ACCOUNT_CLAUDE_LOGIN,
+                Some(&diri_proto::AgentAccountId { id }),
+                Some(std::time::Duration::from_secs(60)),
+            )
+            .await
+    }
+
+    pub async fn capture_claude_account(
+        &self,
+        id: String,
+    ) -> Result<diri_proto::AgentAccountCatalog, ClientError> {
+        self.core
+            .request_typed(
+                Method::ACCOUNT_CLAUDE_CAPTURE,
+                Some(&diri_proto::AgentAccountId { id }),
+                Some(std::time::Duration::from_secs(60)),
+            )
+            .await
+    }
+
     pub async fn switch_all_accounts(
         &self,
         account_profile_id: String,

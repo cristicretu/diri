@@ -1262,6 +1262,7 @@ mod tests {
             host: None,
             config_home: "~/.claude-work".into(),
             is_default: false,
+            login_store: None,
         });
         for session_host in [None, Some("forge".to_owned())] {
             session.host = session_host;

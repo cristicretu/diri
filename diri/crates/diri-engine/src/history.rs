@@ -242,6 +242,78 @@ pub(crate) fn find_profile_codex_transcript(
     matches.into_iter().next().map(|(_, path)| path)
 }
 
+/// Identify the Codex thread a Diri tab launched when no notify callback has
+/// bound it yet (a tab that never completed a turn, or one started before the
+/// Engine learned to bind ids). Codex creates the rollout as the TUI starts,
+/// so the tab's thread is the root rollout whose `session_meta.cwd` matches
+/// the launch cwd and whose file was born at or after the launch, closest to
+/// it. Threads already bound to other tabs are excluded so two tabs in one
+/// directory can never resolve to the same conversation. Bounded like every
+/// other rollout walk: the newest date directories and a fixed entry budget.
+pub(crate) fn find_codex_thread_for_launch(
+    codex_root: &Path,
+    cwd: &str,
+    launched_at: SystemTime,
+    exclude: &HashSet<String>,
+) -> Option<(String, PathBuf)> {
+    // Clocks on the two writers (Diri's launch stamp, the filesystem birth
+    // time) are the same host clock, but allow a little slack for rounding.
+    let earliest = launched_at
+        .checked_sub(Duration::from_secs(5))
+        .unwrap_or(SystemTime::UNIX_EPOCH);
+    let mut seen = 0usize;
+    let mut best: Option<(Duration, String, PathBuf)> = None;
+    for date in newest_codex_date_dirs(codex_root) {
+        let Ok(entries) = std::fs::read_dir(date) else {
+            continue;
+        };
+        for entry in entries.filter_map(Result::ok) {
+            if seen >= CODEX_ASSOCIATION_ENTRIES {
+                break;
+            }
+            seen += 1;
+            let name = entry.file_name();
+            let name = name.to_string_lossy();
+            if !name.starts_with("rollout-") || !name.ends_with(".jsonl") {
+                continue;
+            }
+            let path = entry.path();
+            let Some(mut file) = open_trusted_regular_file(codex_root, &path) else {
+                continue;
+            };
+            let Ok(metadata) = file.metadata() else {
+                continue;
+            };
+            let born = metadata
+                .created()
+                .or_else(|_| metadata.modified())
+                .unwrap_or(SystemTime::UNIX_EPOCH);
+            if born < earliest {
+                continue;
+            }
+            let Some(meta) = codex_metadata_from(&mut file) else {
+                continue;
+            };
+            if meta.is_subagent()
+                || meta.cwd != cwd
+                || !safe_agent_id(&meta.id)
+                || exclude.contains(&meta.id)
+                || !name.ends_with(&format!("-{}.jsonl", meta.id))
+            {
+                continue;
+            }
+            let distance = born.duration_since(launched_at).unwrap_or(Duration::ZERO);
+            if best.as_ref().is_none_or(|(d, _, _)| distance < *d) {
+                best = Some((distance, meta.id, path));
+            }
+        }
+        if seen >= CODEX_ASSOCIATION_ENTRIES {
+            break;
+        }
+    }
+    best.map(|(_, id, path)| (id, path))
+}
+
 /// Validate an agent-reported transcript path before it enters SessionRecord.
 /// The path must resolve inside the provider's transcript root, must not be a
 /// symlink or non-regular file, must belong to this user, and must be tied to
@@ -1677,6 +1749,7 @@ mod tests {
             host: None,
             config_home: config.to_string_lossy().into_owned(),
             is_default: false,
+            login_store: None,
         };
         let transcript = config.join("sessions/2026/09/04/rollout-now-thread-9.jsonl");
         write(

@@ -212,6 +212,7 @@ fn a_capsule_and_hook_seed_recover_a_holder_when_global_state_is_gone() {
         host: None,
         config_home: "/tmp/work-claude".into(),
         is_default: false,
+        login_store: None,
     };
     store
         .write_capsule(&diri_proto::recovery::SessionRecoveryCapsule {

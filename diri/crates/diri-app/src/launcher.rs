@@ -4472,6 +4472,7 @@ mod tests {
             host: host.map(str::to_owned),
             config_home: format!("~/.{agent}-{id}"),
             is_default: default,
+            login_store: None,
         }
     }
 

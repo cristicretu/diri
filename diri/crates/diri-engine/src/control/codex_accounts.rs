@@ -1,7 +1,9 @@
 //! Local Codex login slots. Conversation and tool state stays in one shared home.
+use super::account_switch::PreparedTab;
 use super::*;
 use base64::Engine as _;
 use diri_proto::{AgentAccountProfile, AgentKind, SwitchAccountResult};
+use std::time::SystemTime;
 use std::{
     fs,
     io::{Read, Write},
@@ -224,9 +226,7 @@ impl ControlServer {
             "argv": ["/bin/zsh", "-lc", script, "diri-codex-login", slot, binary]}),
         ))
     }
-    pub(super) fn account_switch_all(&self, params: Option<Value>) -> Result<Value, ControlError> {
-        let p: diri_proto::SwitchAccountParams = decode(params)?;
-        let profile = self.codex_profile(&p.account_profile_id)?;
+    pub(super) fn switch_codex(&self, profile: AgentAccountProfile) -> Result<Value, ControlError> {
         let home = self.codex_home()?;
         self.switch_codex_at(profile, home)
     }
@@ -256,19 +256,18 @@ impl ControlServer {
             let bytes = login(&expanded.join("auth.json"))?;
             write(&slot.join("auth.json"), &bytes)?;
         };
-        let open = self.workspaces.snapshot()?.open_session_ids();
-        let records = self.registry.lock().map_err(poisoned)?.records();
+        let records = self.open_local_tabs(&AgentKind::CODEX)?;
         let mut result = SwitchAccountResult::default();
         let mut prepared = Vec::new();
         let mut guards = Vec::new();
         profile.config_home = home.to_string_lossy().into_owned();
         profile.is_default = true;
-        for record in records.into_iter().filter(|r| {
-            r.kind == AgentKind::CODEX
-                && r.host.is_none()
-                && !r.is_archived()
-                && open.contains(&r.id)
-        }) {
+        // Threads already owned by a tab can never be handed to another one.
+        let mut bound: std::collections::HashSet<String> = records
+            .iter()
+            .filter_map(|r| r.agent_session_id.clone())
+            .collect();
+        for mut record in records {
             if record
                 .account_profile
                 .as_ref()
@@ -277,8 +276,40 @@ impl ControlServer {
                 result.unchanged.push(record.id);
                 continue;
             }
-            let Some(native) = record.agent_session_id.as_deref().filter(|s| !s.is_empty()) else {
-                result.failures.push(diri_proto::AccountSwitchFailure { session_id: record.id, message: "This open tab has no resumable conversation yet. Close it before switching.".into() });
+            if record.agent_session_id.as_deref().is_none_or(str::is_empty) {
+                // No notify callback bound this tab yet (it never finished a
+                // turn, or predates id binding). Codex wrote its rollout at
+                // launch, so identify the thread from the launch itself.
+                let launched_at = SystemTime::UNIX_EPOCH
+                    + Duration::from_millis(record.created_at.0.max(0.0) as u64);
+                if let Some((thread, path)) = crate::history::find_codex_thread_for_launch(
+                    &home.join("sessions"),
+                    &record.cwd,
+                    launched_at,
+                    &bound,
+                ) {
+                    let transcript = path.to_string_lossy().into_owned();
+                    self.registry
+                        .lock()
+                        .map_err(poisoned)?
+                        .update_record(&record.id.0, |r| {
+                            r.agent_session_id = Some(thread.clone());
+                            r.transcript_path = Some(transcript.clone());
+                        });
+                    bound.insert(thread.clone());
+                    record.agent_session_id = Some(thread);
+                    record.transcript_path = Some(transcript);
+                }
+            }
+            let Some(native) = record.agent_session_id.clone() else {
+                // Codex reads auth.json once at launch and keeps the login in
+                // memory, so this tab is safe to leave alone: it continues on
+                // the previous account until it is restarted. Never a reason
+                // to refuse the switch for everything else.
+                result.deferred.push(diri_proto::AccountSwitchFailure {
+                    session_id: record.id,
+                    message: "This tab's conversation could not be identified, so it keeps the previous login until it is restarted.".into(),
+                });
                 continue;
             };
             guards.push(account_handoff::SessionOperation::for_session(
@@ -289,19 +320,20 @@ impl ControlServer {
             let running = registry.get(&record.id.0).is_some()
                 && !matches!(record.status, diri_proto::SessionStatus::Exited(_));
             let mut spec =
-                self.resume_spec(&registry, &record.id.0, "codex", &record.cwd, Some(native))?;
+                self.resume_spec(&registry, &record.id.0, "codex", &record.cwd, Some(&native))?;
             crate::accounts::bind_pty(&mut profile.clone(), &mut spec.pty)?;
-            prepared.push((record, running, spec));
-        }
-        if !result.failures.is_empty() {
-            return encode(&result);
+            prepared.push(PreparedTab {
+                record,
+                running,
+                spec,
+            });
         }
         // Validate current credentials before interrupting any process.
         let _ = read(&home.join("auth.json"))?;
         let installation = (|| -> Result<(), ControlError> {
-            for (record, running, _) in &prepared {
-                if *running {
-                    self.terminate_session_unlocked(&record.id.0, Duration::from_secs(3))?;
+            for tab in &prepared {
+                if tab.running {
+                    self.terminate_session_unlocked(&tab.record.id.0, Duration::from_secs(3))?;
                 }
             }
             // Keep refreshed credentials for every saved slot matching this account identity.
@@ -355,42 +387,7 @@ impl ControlServer {
                 error.message
             ));
         }
-        for (record, running, spec) in prepared {
-            let change = (|| {
-                let mut registry = self.registry.lock().map_err(poisoned)?;
-                if installed {
-                    registry.update_record(&record.id.0, |r| {
-                        r.account_profile = Some(profile.clone());
-                        r.hibernation = None;
-                    });
-                }
-                registry.persist_now().map_err(io_control_error)?;
-                if running
-                    && (registry.get(&record.id.0).is_none()
-                        || registry.record(&record.id.0).is_some_and(|r| {
-                            matches!(r.status, diri_proto::SessionStatus::Exited(_))
-                        }))
-                {
-                    registry.respawn(spec).map_err(io_control_error)?;
-                    if let Some(sleep) = record.hibernation {
-                        registry
-                            .hibernate(&record.id.0, sleep.reason)
-                            .map_err(io_control_error)?;
-                    }
-                }
-                self.publish_updated(&registry, &record.id.0);
-                registry.persist_now().map_err(io_control_error)?;
-                registry.record(&record.id.0).ok_or_else(failure)
-            })();
-            match change {
-                Ok(r) if installed => result.switched.push(r),
-                Ok(r) => result.unchanged.push(r.id),
-                Err(e) => result.failures.push(diri_proto::AccountSwitchFailure {
-                    session_id: record.id,
-                    message: e.message,
-                }),
-            }
-        }
+        self.relaunch_switched(prepared, &profile, installed, &mut result);
         encode(&result)
     }
 }
@@ -435,6 +432,7 @@ mod tests {
             host: None,
             config_home: home.to_string_lossy().into_owned(),
             is_default: false,
+            login_store: None,
         };
         server
             .accounts
@@ -519,6 +517,7 @@ mod tests {
             host: None,
             config_home: home.to_string_lossy().into_owned(),
             is_default: false,
+            login_store: None,
         });
         for p in &profiles {
             server.accounts.lock().unwrap().upsert(p.clone()).unwrap();
@@ -647,6 +646,150 @@ mod tests {
         );
         for source in sources {
             let _ = server.session_kill(Some(json!({"sessionID":source.id})));
+        }
+    }
+
+    #[test]
+    fn shared_switch_identifies_unbound_tabs_from_their_rollout_and_never_refuses() {
+        let tmp = tempfile::tempdir().unwrap();
+        let server = super::super::tests::server(tmp.path());
+        let home = tmp.path().join("shared");
+        directory(&home).unwrap();
+        let executable = tmp.path().join("codex");
+        fs::write(&executable, "#!/bin/sh\nexec /bin/sleep 30\n").unwrap();
+        fs::set_permissions(&executable, fs::Permissions::from_mode(0o700)).unwrap();
+        server
+            .agent_catalog
+            .lock()
+            .unwrap()
+            .configure(
+                None,
+                "codex",
+                crate::agent_catalog::AgentPreference {
+                    executable_path: Some(executable.to_string_lossy().into_owned()),
+                    show_in_quick_create: Some(true),
+                },
+            )
+            .unwrap();
+        let profiles = ["one", "two"].map(|id| AgentAccountProfile {
+            id: id.into(),
+            label: id.into(),
+            agent: "codex".into(),
+            host: None,
+            config_home: home.to_string_lossy().into_owned(),
+            is_default: false,
+            login_store: None,
+        });
+        for p in &profiles {
+            server.accounts.lock().unwrap().upsert(p.clone()).unwrap();
+            write(
+                &server.codex_slot(&p.id).unwrap().join("auth.json"),
+                &auth(&p.id, "saved"),
+            )
+            .unwrap();
+        }
+        write(&home.join("auth.json"), &auth("one", "current")).unwrap();
+        let cwd = tmp.path().join("project");
+        fs::create_dir_all(&cwd).unwrap();
+        let spawn = || -> diri_proto::SessionRecord {
+            let record: diri_proto::SessionRecord = serde_json::from_value(
+                server
+                    .session_spawn(Some(
+                        json!({"kind":AgentKind::CODEX,"cwd":cwd,"accountProfileId":"one"}),
+                    ))
+                    .unwrap(),
+            )
+            .unwrap();
+            server.workspace_mutate(Some(json!({"expectedRevision":server.workspaces.snapshot().unwrap().revision,"mutation":{"type":"openProjectAgent","sessionId":record.id}}))).unwrap();
+            record
+        };
+        let identified = spawn();
+        let orphan = spawn();
+        for record in [&identified, &orphan] {
+            assert!(
+                server
+                    .registry
+                    .lock()
+                    .unwrap()
+                    .record(&record.id.0)
+                    .unwrap()
+                    .agent_session_id
+                    .is_none(),
+                "Codex does not pre-mint conversation ids"
+            );
+        }
+        // Codex wrote these as the tabs started: the tab's own root thread, a
+        // subagent rollout in the same directory, and a thread elsewhere.
+        let day = home.join("sessions/2026/09/18");
+        fs::create_dir_all(&day).unwrap();
+        let rollout = |name: &str, meta: serde_json::Value| {
+            fs::write(
+                day.join(format!("rollout-2026-09-18T15-00-00-{name}.jsonl")),
+                format!("{}\n", json!({"type":"session_meta","payload":meta})),
+            )
+            .unwrap();
+        };
+        rollout("thread-a", json!({"id":"thread-a","cwd":cwd}));
+        rollout(
+            "thread-sub",
+            json!({"id":"thread-sub","cwd":cwd,"source":{"subagent":{"thread_spawn":{"parent_thread_id":"thread-a","depth":1}}}}),
+        );
+        rollout(
+            "thread-elsewhere",
+            json!({"id":"thread-elsewhere","cwd":tmp.path()}),
+        );
+        let result: SwitchAccountResult = serde_json::from_value(
+            server
+                .switch_codex_at(profiles[1].clone(), home.clone())
+                .unwrap(),
+        )
+        .unwrap();
+        assert!(result.failures.is_empty(), "{:?}", result.failures);
+        assert!(result.default_changed, "{:?}", result.default_error);
+        assert_eq!(
+            login(&home.join("auth.json")).unwrap(),
+            auth("two", "saved"),
+            "an unidentified tab must not block the login swap"
+        );
+        assert_eq!(result.switched.len(), 1);
+        assert_eq!(result.deferred.len(), 1);
+        let switched = &result.switched[0];
+        let deferred = &result.deferred[0];
+        let bound_one = identified.id == switched.id && orphan.id == deferred.session_id;
+        let bound_other = orphan.id == switched.id && identified.id == deferred.session_id;
+        assert!(
+            bound_one || bound_other,
+            "exactly one tab claims the one matching rollout"
+        );
+        assert_eq!(switched.agent_session_id.as_deref(), Some("thread-a"));
+        assert!(
+            switched
+                .transcript_path
+                .as_deref()
+                .is_some_and(|p| p.ends_with("rollout-2026-09-18T15-00-00-thread-a.jsonl"))
+        );
+        assert_eq!(
+            switched.account_profile.as_ref().map(|p| p.id.as_str()),
+            Some("two")
+        );
+        let untouched = server
+            .registry
+            .lock()
+            .unwrap()
+            .record(&deferred.session_id.0)
+            .unwrap();
+        assert!(untouched.agent_session_id.is_none());
+        assert!(
+            server
+                .registry
+                .lock()
+                .unwrap()
+                .get(&deferred.session_id.0)
+                .is_some(),
+            "a deferred tab keeps running on the previous login"
+        );
+        for record in [&identified, &orphan] {
+            let _ = server.session_kill(Some(json!({"sessionID":record.id})));
         }
     }
 }

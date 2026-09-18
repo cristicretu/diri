@@ -46,11 +46,14 @@ fn sources(home: &Path, accounts: &AgentAccountCatalog) -> Vec<AccountSource> {
             .profiles
             .iter()
             .find(|p| p.agent == agent && p.host.is_none() && p.is_default);
-        let config = profile.map(|p| PathBuf::from(&p.config_home)).or_else(|| {
-            std::env::var_os(variable)
-                .filter(|p| !p.is_empty())
-                .map(PathBuf::from)
-        });
+        // A shared-home Claude profile keeps its login in its own store.
+        let config = profile
+            .map(|p| PathBuf::from(p.login_store.as_deref().unwrap_or(&p.config_home)))
+            .or_else(|| {
+                std::env::var_os(variable)
+                    .filter(|p| !p.is_empty())
+                    .map(PathBuf::from)
+            });
         let config = config.map(|path| {
             path.to_str()
                 .and_then(|path| path.strip_prefix("~/"))
@@ -405,6 +408,7 @@ mod tests {
                 host: host.map(str::to_owned),
                 config_home: directory.into(),
                 is_default: true,
+                login_store: None,
             }
         };
         let catalog = AgentAccountCatalog {

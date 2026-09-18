@@ -25,6 +25,7 @@ impl MenuAccounts {
                     host: None,
                     config_home: String::new(),
                     is_default: i == 0,
+                    login_store: None,
                 })
                 .collect();
         }
@@ -85,6 +86,7 @@ impl Sidebar {
                             for record in result.switched {
                                 store.upsert_session(record);
                             }
+                            let deferred = result.deferred.len();
                             let mut errors = result
                                 .failures
                                 .iter()
@@ -104,7 +106,11 @@ impl Sidebar {
                             this.accounts.message = Some(if this.accounts.failed {
                                 format!("{count} conversations switched. {}", errors.join("\n"))
                             } else {
-                                format!("Switched {count} conversations; {unchanged} separate-home tabs unchanged. Default account updated.")
+                                if deferred > 0 {
+                                    format!("Switched {count} conversations; {unchanged} separate-home tabs unchanged; {deferred} unidentified tab(s) keep the previous login until restarted. Default account updated.")
+                                } else {
+                                    format!("Switched {count} conversations; {unchanged} separate-home tabs unchanged. Default account updated.")
+                                }
                             });
                             drop(store);
                             services.store.publish_local_change();
@@ -141,13 +147,13 @@ impl Sidebar {
     ) -> AnyElement {
         let mut section = div().id("account-switcher").debug_selector(|| "account-switcher".into()).flex().flex_col().py(px(3.0))
             .child(div().px(px(14.0)).text_size(px(Typo::META.size)).text_color(colors.tertiary).child("Switch open conversations"))
-            .child(div().px(px(14.0)).py(px(4.0)).text_size(px(Typo::META.size)).text_color(colors.tertiary).child("Local Codex tabs resume with the selected login. Local MCP setup stays; hosted connectors require per-account connections."));
+            .child(div().px(px(14.0)).py(px(4.0)).text_size(px(Typo::META.size)).text_color(colors.tertiary).child("Open Claude and Codex tabs on this Mac resume with the selected login. Local MCP setup stays; hosted connectors require per-account connections."));
         for profile in self
             .accounts
             .catalog
             .profiles
             .iter()
-            .filter(|p| p.agent == "codex" && p.host.is_none())
+            .filter(|p| p.host.is_none() && matches!(p.agent.as_str(), "codex" | "claude-code"))
         {
             let id = profile.id.clone();
             let subtitle = format!(

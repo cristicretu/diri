@@ -75,6 +75,8 @@ impl Method {
     pub const ACCOUNT_PROFILES_REMOVE: &'static str = "account.profiles.remove";
     pub const ACCOUNT_CODEX_LOGIN: &'static str = "account.codex.login";
     pub const ACCOUNT_CODEX_CAPTURE: &'static str = "account.codex.capture";
+    pub const ACCOUNT_CLAUDE_LOGIN: &'static str = "account.claude.login";
+    pub const ACCOUNT_CLAUDE_CAPTURE: &'static str = "account.claude.capture";
     pub const ACCOUNT_SWITCH_ALL: &'static str = "account.switch_all";
     pub const SESSION_CONTINUE_ACCOUNT: &'static str = "session.continue_with_account";
     pub const EVENTS_SUBSCRIBE: &'static str = "events.subscribe";

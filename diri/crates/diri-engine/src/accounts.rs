@@ -212,6 +212,22 @@ fn validate(profile: &AgentAccountProfile) -> Result<(), ControlError> {
     }) {
         return Err(ControlError::bad_request("Invalid execution host"));
     }
+    if let Some(store) = &profile.login_store {
+        if profile.agent != "claude-code" || profile.host.is_some() {
+            return Err(ControlError::bad_request(
+                "Login stores apply to local Claude Code profiles",
+            ));
+        }
+        if store.len() > 4096
+            || store.chars().any(char::is_control)
+            || !Path::new(store).is_absolute()
+            || Path::new(store)
+                .components()
+                .any(|p| p == std::path::Component::ParentDir)
+        {
+            return Err(ControlError::bad_request("Invalid login store path"));
+        }
+    }
     let path = &profile.config_home;
     if path.len() > 4096
         || path.chars().any(char::is_control)
@@ -252,11 +268,26 @@ pub fn bind(
     }
     // Ambient provider credentials would silently override the chosen account.
     env.retain(|(key, _)| !ACCOUNT_ENVIRONMENT.contains(&key.as_str()));
-    env.push((
-        profile.environment_key().expect("validated").into(),
-        profile.config_home.clone(),
-    ));
+    env.extend(launch_assignments(profile));
     Ok(())
+}
+
+/// The environment that selects this profile at launch.
+///
+/// A shared-home Claude profile keeps `~/.claude` (no `CLAUDE_CONFIG_DIR`) and
+/// points only Claude Code's credential store at its private login slot, so
+/// every profile sees the same conversations, MCP servers and settings while
+/// signing in on its own. Everything else binds the whole config home.
+pub fn launch_assignments(profile: &AgentAccountProfile) -> Vec<(String, String)> {
+    match (&profile.login_store, profile.agent.as_str()) {
+        (Some(store), "claude-code") => {
+            vec![("CLAUDE_SECURESTORAGE_CONFIG_DIR".to_owned(), store.clone())]
+        }
+        _ => vec![(
+            profile.environment_key().expect("validated").to_owned(),
+            profile.config_home.clone(),
+        )],
+    }
 }
 
 pub fn bind_pty(
@@ -270,12 +301,14 @@ pub fn bind_pty(
     // Local Agents run through a login shell. Reassert the account after shell
     // startup files so they cannot redirect this launch to another account.
     if profile.host.is_none() && pty.argv.len() == 5 && pty.argv[3] == "-c" {
-        let assignment = format!(
-            "{}={}",
-            profile.environment_key().expect("validated"),
-            profile.config_home
-        );
-        let quoted = format!("'{}'", assignment.replace('\'', "'\\''"));
+        let quoted = launch_assignments(profile)
+            .into_iter()
+            .map(|(key, value)| {
+                let assignment = format!("{key}={value}");
+                format!("'{}'", assignment.replace('\'', "'\\''"))
+            })
+            .collect::<Vec<_>>()
+            .join(" ");
         let scrub = ACCOUNT_ENVIRONMENT
             .iter()
             .map(|key| format!("-u {key}"))
@@ -362,6 +395,7 @@ mod tests {
             host: None,
             config_home: "~/codex-work".into(),
             is_default: true,
+            login_store: None,
         }
     }
     #[test]

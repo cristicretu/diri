@@ -25,6 +25,8 @@ use sha2::{Digest, Sha256};
 
 use crate::registry::Registry;
 mod account_handoff;
+mod account_switch;
+mod claude_accounts;
 mod codex_accounts;
 mod message_delivery;
 mod operations;
@@ -86,6 +88,9 @@ pub struct InjectionConfig {
 enum ConversationAction {
     Resume,
     Fork,
+    /// A new provider conversation that keeps an already-minted id, for a tab
+    /// whose transcript does not exist yet and therefore cannot be resumed.
+    Fresh,
 }
 
 /// Whether a local session's execution directory is inside `target`.
@@ -568,6 +573,7 @@ impl ControlServer {
                         | Method::SESSION_CONTINUE_ACCOUNT
                         | Method::ACCOUNT_SWITCH_ALL
                         | Method::ACCOUNT_CODEX_LOGIN
+                        | Method::ACCOUNT_CLAUDE_LOGIN
                         | Method::HOST_INITIALIZE
                         | Method::HOST_USAGE
                         | Method::HOST_LIST_DIRECTORIES
@@ -757,6 +763,8 @@ impl ControlServer {
             Method::ACCOUNT_SWITCH_ALL
                 | Method::ACCOUNT_CODEX_LOGIN
                 | Method::ACCOUNT_CODEX_CAPTURE
+                | Method::ACCOUNT_CLAUDE_LOGIN
+                | Method::ACCOUNT_CLAUDE_CAPTURE
         ) {
             Some(self.account_operations.try_write().map_err(|_| ControlError::bad_request("An account or session operation is already in progress. Retry when it finishes."))?)
         } else {
@@ -788,6 +796,8 @@ impl ControlServer {
             Method::ACCOUNT_SWITCH_ALL => self.account_switch_all(params),
             Method::ACCOUNT_CODEX_LOGIN => self.codex_account_login(params),
             Method::ACCOUNT_CODEX_CAPTURE => self.codex_account_capture(params),
+            Method::ACCOUNT_CLAUDE_LOGIN => self.claude_account_login(params),
+            Method::ACCOUNT_CLAUDE_CAPTURE => self.claude_account_capture(params),
             Method::SESSION_CONTINUE_ACCOUNT => self.session_continue_account(params),
             Method::ACCOUNT_PROFILES_LIST => {
                 encode(&self.accounts.lock().map_err(poisoned)?.catalog()?)
@@ -2746,6 +2756,10 @@ impl ControlServer {
                 source_id: record.agent_session_id.as_deref(),
                 session_dir: provider_dir.as_deref(),
             },
+            ConversationAction::Fresh => crate::agent::ConversationLaunch::Fresh {
+                new_id: record.agent_session_id.as_deref(),
+                session_dir: provider_dir.as_deref(),
+            },
         };
         launch_args = descriptor
             .conversation_plan(&launch_args, launch)
@@ -2756,6 +2770,7 @@ impl ControlServer {
                     match action {
                         ConversationAction::Resume => "resume",
                         ConversationAction::Fork => "fork",
+                        ConversationAction::Fresh => "a fresh launch",
                     }
                 ))
             })?
@@ -2881,6 +2896,25 @@ impl ControlServer {
         )
     }
 
+    /// A new conversation on an existing tab that keeps its minted id.
+    pub(super) fn fresh_spec(
+        &self,
+        registry: &Registry,
+        id: &str,
+        kind: &str,
+        cwd: &str,
+        agent_session_id: Option<&str>,
+    ) -> Result<crate::session::SessionSpec, ControlError> {
+        self.local_conversation_spec(
+            registry,
+            id,
+            kind,
+            cwd,
+            agent_session_id,
+            ConversationAction::Fresh,
+        )
+    }
+
     fn local_conversation_spec(
         &self,
         registry: &Registry,
@@ -2923,6 +2957,10 @@ impl ControlServer {
                 source_id: agent_session_id,
                 session_dir: Some(&provider_dir),
             },
+            ConversationAction::Fresh => crate::agent::ConversationLaunch::Fresh {
+                new_id: agent_session_id,
+                session_dir: Some(&provider_dir),
+            },
         };
         launch_args = descriptor
             .conversation_plan(&launch_args, launch)
@@ -2932,6 +2970,7 @@ impl ControlServer {
                     match action {
                         ConversationAction::Resume => "resume",
                         ConversationAction::Fork => "fork",
+                        ConversationAction::Fresh => "a fresh launch",
                     }
                 ))
             })?
@@ -4692,6 +4731,7 @@ mod tests {
                 .to_string_lossy()
                 .into_owned(),
             is_default: true,
+            login_store: None,
         };
         server
             .accounts
@@ -5235,6 +5275,7 @@ mod tests {
                 host: None,
                 config_home: config.to_string_lossy().into_owned(),
                 is_default: false,
+                login_store: None,
             });
             registry
                 .spawn(

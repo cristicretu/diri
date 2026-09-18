@@ -27,7 +27,13 @@ enum AccountAction {
     Refresh,
     Save(AgentAccountProfile),
     Remove(String),
-    Capture(String),
+    Capture(AgentAccountProfile),
+}
+
+/// A local profile that shares the provider's home and switches only its
+/// login: every open tab of that Agent follows it.
+fn shares_login(profile: &AgentAccountProfile) -> bool {
+    profile.host.is_none() && matches!(profile.agent.as_str(), "codex" | "claude-code")
 }
 
 impl UtilitySurfaces {
@@ -78,7 +84,7 @@ impl UtilitySurfaces {
             .collect()
     }
 
-    fn login_codex_account(&mut self, id: String, cx: &mut Context<Self>) {
+    fn login_account(&mut self, profile: AgentAccountProfile, cx: &mut Context<Self>) {
         if self.accounts.busy {
             return;
         }
@@ -88,7 +94,13 @@ impl UtilitySurfaces {
         let client = Arc::clone(self.store_runtime.client());
         cx.spawn(async move |this, cx| {
             let result = runtime
-                .spawn(async move { client.login_codex_account(id).await })
+                .spawn(async move {
+                    if profile.agent == "claude-code" {
+                        client.login_claude_account(profile.id).await
+                    } else {
+                        client.login_codex_account(profile.id).await
+                    }
+                })
                 .await
                 .map_err(|e| e.to_string())
                 .and_then(|r| r.map_err(|e| e.to_string()));
@@ -205,7 +217,11 @@ impl UtilitySurfaces {
                         this.store_runtime.publish_local_change();
                         if result.failures.is_empty() && result.default_changed {
                             this.accounts.error = None;
-                            this.accounts.notice = Some(format!("Switched {switched} conversations; {unchanged} separate-home tabs unchanged. This account is now the default. Local MCP configuration is unchanged. Hosted connectors such as Slack require a connection on the selected account."));
+                            let mut notice = format!("Switched {switched} conversations; {unchanged} separate-home tabs unchanged. This account is now the default. Local MCP configuration is unchanged. Hosted connectors such as Slack require a connection on the selected account.");
+                            if !result.deferred.is_empty() {
+                                notice.push_str(&format!(" {} open tab(s) could not be identified and keep the previous login until restarted.", result.deferred.len()));
+                            }
+                            this.accounts.notice = Some(notice);
                             this.accounts.continue_session = None;
                             this.account_action(AccountAction::Refresh, cx);
                         } else {
@@ -306,7 +322,7 @@ impl UtilitySurfaces {
         }
         let choices = self.continuation_choices();
         if choices.is_empty() && self.accounts.loaded && !self.accounts.busy {
-            content = content.child(div().text_size(px(12.0)).child("No other account is set up for this Agent on this machine. Add a profile and sign in through Open Agent, then return here."));
+            content = content.child(div().text_size(px(12.0)).child("No other account is set up for this Agent on this machine. Add a profile and sign in, then return here."));
         }
         for (index, profile) in choices.into_iter().enumerate() {
             let id = profile.id.clone();
@@ -384,6 +400,7 @@ impl UtilitySurfaces {
             host: None,
             config_home: "~/.codex-work".into(),
             is_default: true,
+            login_store: None,
         };
         self.accounts = AccountsState {
             loaded: true,
@@ -421,12 +438,14 @@ impl UtilitySurfaces {
             host: None,
             config_home: "~/.claude-work".into(),
             is_default: true,
+            login_store: None,
         };
         let personal = AgentAccountProfile {
             id: "personal".into(),
             label: "Personal".into(),
             config_home: "~/.claude-personal".into(),
             is_default: false,
+            login_store: None,
             ..work.clone()
         };
         source.account_profile = Some(work.clone());
@@ -466,7 +485,13 @@ impl UtilitySurfaces {
                         AccountAction::Refresh => client.account_profiles().await,
                         AccountAction::Save(profile) => client.save_account_profile(&profile).await,
                         AccountAction::Remove(id) => client.remove_account_profile(id).await,
-                        AccountAction::Capture(id) => client.capture_codex_account(id).await,
+                        AccountAction::Capture(profile) => {
+                            if profile.agent == "claude-code" {
+                                client.capture_claude_account(profile.id).await
+                            } else {
+                                client.capture_codex_account(profile.id).await
+                            }
+                        }
                     }
                 })
                 .await;
@@ -519,6 +544,7 @@ impl UtilitySurfaces {
                 agent: "codex".into(),
                 host: None,
                 is_default: false,
+                login_store: None,
             }
         });
         self.accounts.editor = Some(ProfileEditor {
@@ -540,7 +566,7 @@ impl UtilitySurfaces {
         let mut profile = editor.profile.clone();
         profile.label = editor.name.text().trim().into();
         profile.config_home = editor.path.text().trim().into();
-        if profile.agent == "codex" && profile.host.is_none() {
+        if shares_login(&profile) {
             profile.is_default = self
                 .accounts
                 .catalog
@@ -641,7 +667,7 @@ impl UtilitySurfaces {
         }
         let colors = self.settings_colors();
         let mut content = div().flex().flex_col().gap(px(16.0))
-            .child(div().text_size(px(12.0)).text_color(colors.secondary).child("Sign in to each Claude or Codex account once with Open Agent. Switch open conversations to another account when needed; direct MCP setup follows the conversations. Running tools are interrupted, and hosted connections may need authorization on the selected account."))
+            .child(div().text_size(px(12.0)).text_color(colors.secondary).child("Sign in to each Claude or Codex account once, or save the login already active on this Mac. Choosing an account from the bottom-left menu switches every open conversation of that Agent in place; conversations, MCP setup and settings stay in the shared home. Running tools are interrupted, and hosted connections may need authorization on the selected account."))
             .child(div().flex().items_center().justify_between()
                 .child(div().text_size(px(12.0)).text_color(colors.secondary).child(if self.accounts.busy { "Updating accounts…" } else { "Saved profiles" }))
                 .child(self.account_button("add-account", "Add profile", cx, |this, window, cx| this.edit_account(None, window, cx))));
@@ -688,13 +714,10 @@ impl UtilitySurfaces {
                         |this, _, cx| {
                             if let Some(editor) = &mut this.accounts.editor {
                                 editor.profile.agent = "codex".into();
-                                if editor.path.text()
-                                    == format!("~/.diri/accounts/{}/claude", editor.profile.id)
+                                if editor.profile.host.is_none()
+                                    && matches!(editor.path.text(), "~/.claude" | "")
                                 {
-                                    editor.path = text_editor(&format!(
-                                        "~/.diri/accounts/{}/codex",
-                                        editor.profile.id
-                                    ));
+                                    editor.path = text_editor("~/.codex");
                                 }
                             }
                             cx.notify();
@@ -711,13 +734,10 @@ impl UtilitySurfaces {
                         |this, _, cx| {
                             if let Some(editor) = &mut this.accounts.editor {
                                 editor.profile.agent = "claude-code".into();
-                                if editor.path.text()
-                                    == format!("~/.diri/accounts/{}/codex", editor.profile.id)
+                                if editor.profile.host.is_none()
+                                    && matches!(editor.path.text(), "~/.codex" | "")
                                 {
-                                    editor.path = text_editor(&format!(
-                                        "~/.diri/accounts/{}/claude",
-                                        editor.profile.id
-                                    ));
+                                    editor.path = text_editor("~/.claude");
                                 }
                             }
                             cx.notify();
@@ -819,7 +839,7 @@ impl UtilitySurfaces {
                 ));
             }
             form = form.child(hosts).child(div().text_size(px(11.0)).text_color(colors.secondary).child(format!("Selected: {host_label}. The directory is on this machine.")))
-                .when(editor.profile.agent != "codex" || editor.profile.host.is_some(), |form| form.child(self.account_button("account-default", if editor.profile.is_default { "✓ Default for this Agent on this host" } else { "Use by default for this Agent on this host" }, cx, |this, _, cx| {
+                .when(!shares_login(&editor.profile), |form| form.child(self.account_button("account-default", if editor.profile.is_default { "✓ Default for this Agent on this host" } else { "Use by default for this Agent on this host" }, cx, |this, _, cx| {
                     if let Some(editor) = &mut this.accounts.editor { editor.profile.is_default = !editor.profile.is_default; } cx.notify();
                 })))
                 .child(div().text_size(px(11.0)).text_color(colors.tertiary).child("Local Codex profiles share ~/.codex. Save the current login, or Sign in to save another account. Hosted connectors such as Slack must be connected on each account. Claude and remote profiles use their own directories."))
@@ -849,8 +869,8 @@ impl UtilitySurfaces {
             let edit = profile.clone();
             let open = profile.clone();
             let remove = profile.id.clone();
-            let capture = profile.id.clone();
-            let local_codex = profile.agent == "codex" && profile.host.is_none();
+            let capture = profile.clone();
+            let local_codex = shares_login(profile);
             let host = profile
                 .host
                 .as_deref()
@@ -916,7 +936,7 @@ impl UtilitySurfaces {
                                 cx,
                                 move |this, _, cx| {
                                     if local_codex {
-                                        this.login_codex_account(open.id.clone(), cx);
+                                        this.login_account(open.clone(), cx);
                                         return;
                                     }
                                     let kind = diri_proto::AgentKind::new(&open.agent);

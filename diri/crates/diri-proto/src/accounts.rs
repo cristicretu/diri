@@ -12,6 +12,13 @@ pub struct AgentAccountProfile {
     pub config_home: String,
     #[serde(default)]
     pub is_default: bool,
+    /// Credentials-only store for a local Claude profile that shares `~/.claude`.
+    /// Claude Code keys its Keychain item (macOS) or `.credentials.json` (Linux)
+    /// by this path, so conversations, MCP setup and settings stay in one home
+    /// while each profile signs in separately. `None` keeps the legacy
+    /// isolated-home behaviour driven by `config_home`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub login_store: Option<String>,
 }
 
 impl AgentAccountProfile {
@@ -47,6 +54,11 @@ pub struct SwitchAccountResult {
     pub switched: Vec<crate::SessionRecord>,
     pub failures: Vec<AccountSwitchFailure>,
     pub unchanged: Vec<crate::SessionId>,
+    /// Open tabs left running on the previous login because their provider
+    /// conversation could not be identified; they pick up the new login when
+    /// restarted. Never a reason to refuse the switch.
+    #[serde(default)]
+    pub deferred: Vec<AccountSwitchFailure>,
     pub default_changed: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub default_error: Option<String>,

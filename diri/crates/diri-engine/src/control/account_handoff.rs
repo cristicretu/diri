@@ -779,6 +779,7 @@ mod tests {
             host: None,
             config_home: temp.path().join(id).to_string_lossy().into_owned(),
             is_default: false,
+            login_store: None,
         });
         for profile in &profiles {
             server
