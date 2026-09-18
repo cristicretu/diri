@@ -57,7 +57,6 @@ pub(super) struct ShareModel {
     pub provider: &'static str,
     pub value: String,
     pub share: String,
-    pub tokens: String,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -175,15 +174,11 @@ impl ShareCard {
                         money(provider.tokens.c)
                     },
                     detail: if tokens {
-                        format!(
-                            "{:.1}% of tokens · {}",
-                            share * 100.0,
-                            money(provider.tokens.c)
-                        )
+                        format!("{} · {}", percent(share), money(provider.tokens.c))
                     } else {
                         format!(
-                            "{:.1}% of cost · {} tokens",
-                            share * 100.0,
+                            "{} · {} tokens",
+                            percent(share),
                             UsageFormat::tokens(provider_tokens)
                         )
                     },
@@ -207,13 +202,24 @@ impl ShareCard {
         period_phrase(self.days)
     }
 
+    /// Card height in points. The legend lays providers out as columns, so
+    /// only the optional model list changes the height.
     pub(super) fn height(&self) -> f32 {
-        let mut height = 214.0;
-        height += 46.0 * self.providers.len() as f32;
+        let mut height = layout::LEGEND_Y + layout::LEGEND_H;
         if let Some(models) = &self.models {
-            height += 26.0 + 24.0 * models.len() as f32;
+            height +=
+                layout::MODELS_GAP + layout::MODELS_HEAD + layout::MODEL_ROW * models.len() as f32;
         }
-        (height + 20.0).max(300.0)
+        height + layout::PAD
+    }
+
+    /// Header line on the card: "Last 30 days · this Mac".
+    pub(super) fn title(&self) -> String {
+        let mut title = capitalize(self.period());
+        if let Some(host) = self.host.phrase() {
+            title = format!("{title} · {host}");
+        }
+        title
     }
 
     pub(super) fn caption(&self) -> String {
@@ -301,6 +307,36 @@ fn money(value: f64) -> String {
     format!("${value:.2}")
 }
 
+fn percent(share: f64) -> String {
+    format!("{:.0}%", share * 100.0)
+}
+
+fn capitalize(text: &str) -> String {
+    let mut chars = text.chars();
+    match chars.next() {
+        Some(first) => first.to_uppercase().chain(chars).collect(),
+        None => String::new(),
+    }
+}
+
+/// Card geometry in points at 1x. Shared with the preview so the sheet can
+/// size itself before a PNG exists.
+pub(super) mod layout {
+    pub const PAD: f32 = 28.0;
+    pub const RADIUS: f32 = 18.0;
+    pub const HEADER_Y: f32 = 26.0;
+    pub const HERO_BASELINE: f32 = 92.0;
+    pub const GRAPH_Y: f32 = 118.0;
+    pub const GRAPH_H: f32 = 82.0;
+    pub const SPLIT_Y: f32 = 226.0;
+    pub const SPLIT_H: f32 = 6.0;
+    pub const LEGEND_Y: f32 = 248.0;
+    pub const LEGEND_H: f32 = 54.0;
+    pub const MODELS_GAP: f32 = 22.0;
+    pub const MODELS_HEAD: f32 = 22.0;
+    pub const MODEL_ROW: f32 = 22.0;
+}
+
 fn ratio(value: f64, total: f64) -> f64 {
     if total > 0.0 {
         (value / total).clamp(0.0, 1.0)
@@ -359,8 +395,7 @@ fn top_models(report: &UsageReport, tokens: bool) -> Vec<ShareModel> {
                 } else {
                     money(detail.cost)
                 },
-                share: format!("{:.0}%", share * 100.0),
-                tokens: UsageFormat::tokens(detail.total_tokens()),
+                share: percent(share),
             }
         })
         .collect()
@@ -375,6 +410,14 @@ fn rasterize(card: &ShareCard, palette: SharePalette) -> Option<RgbaImage> {
     macos::rasterize(card, palette)
 }
 
+/// Renders the card from a test thread. AppKit bitmap drawing is safe there;
+/// the production path keeps its main-thread guard because it runs beside
+/// live window drawing.
+#[cfg(all(test, target_os = "macos"))]
+pub(super) fn render_png_for_fixture(card: &ShareCard, palette: SharePalette) -> Option<Vec<u8>> {
+    encode_png(&macos::rasterize_unchecked(card, palette)?)
+}
+
 #[cfg(not(target_os = "macos"))]
 fn rasterize(_card: &ShareCard, _palette: SharePalette) -> Option<RgbaImage> {
     None
@@ -383,15 +426,13 @@ fn rasterize(_card: &ShareCard, _palette: SharePalette) -> Option<RgbaImage> {
 #[cfg(target_os = "macos")]
 mod macos {
     use super::*;
-    use crate::macos::brand_raster::{
-        DIRI_LOGO_BASELINE, DIRI_LOGO_CHEVRON, DIRI_LOGO_STROKE, DIRI_LOGO_VB_H, DIRI_LOGO_VB_W,
-    };
     use objc2::runtime::AnyObject;
     use objc2::{AnyThread, MainThreadMarker};
     use objc2_app_kit::{
         NSBezierPath, NSBitmapFormat, NSBitmapImageRep, NSColor, NSDeviceRGBColorSpace, NSFont,
-        NSFontAttributeName, NSFontWeightMedium, NSForegroundColorAttributeName, NSGraphicsContext,
-        NSLineCapStyle, NSLineJoinStyle, NSStringDrawing,
+        NSFontAttributeName, NSFontWeightMedium, NSFontWeightSemibold,
+        NSForegroundColorAttributeName, NSGradient, NSGraphicsContext, NSLineCapStyle,
+        NSLineJoinStyle, NSStringDrawing,
     };
     use objc2_foundation::{
         NSAttributedStringKey, NSDictionary, NSPoint, NSRect, NSSize, NSString,
@@ -399,15 +440,19 @@ mod macos {
     use std::ptr;
 
     const SCALE: f32 = 2.0;
-    const PAD: f32 = 20.0;
-    const RADIUS: f32 = 20.0;
-    const MARK_H: f32 = 18.0;
-    const GRAPH_Y: f32 = 82.0;
-    const GRAPH_H: f32 = 118.0;
-    const PROVIDER_Y: f32 = 214.0;
+    const PAD: f32 = layout::PAD;
+    const RADIUS: f32 = layout::RADIUS;
+    const INNER_W: f32 = CARD_W - PAD * 2.0;
 
     pub(super) fn rasterize(card: &ShareCard, palette: SharePalette) -> Option<RgbaImage> {
         let _mtm = MainThreadMarker::new()?;
+        rasterize_unchecked(card, palette)
+    }
+
+    pub(super) fn rasterize_unchecked(
+        card: &ShareCard,
+        palette: SharePalette,
+    ) -> Option<RgbaImage> {
         let card_h = card.height();
         let pixel_w = (CARD_W * SCALE).round() as usize;
         let pixel_h = (card_h * SCALE).round() as usize;
@@ -470,6 +515,8 @@ mod macos {
         RgbaImage::from_raw(pixel_w as u32, pixel_h as u32, rgba)
     }
 
+    /// The card reads top to bottom: a quiet header line, one hero number,
+    /// the trend, then how the total splits across agents.
     fn paint(card: &ShareCard, palette: SharePalette, card_h: f32) {
         fill_round_rect(
             0.0,
@@ -480,142 +527,110 @@ mod macos {
             opaque(palette.background),
             card_h,
         );
-        let mark_w = MARK_H * (DIRI_LOGO_VB_W / DIRI_LOGO_VB_H);
-        let brand_font = brand_font_matching(MARK_H);
-        let brand_size = measure(BRAND, &brand_font);
-        let header_h = MARK_H.max(brand_size.1);
-        let mut kicker = card.period().to_owned();
-        if let Some(host) = card.host.phrase() {
-            kicker = format!("{host} · {kicker}");
-        }
-        let kicker_font = medium_font(px(12.0));
-        let kicker_size = measure(&kicker, &kicker_font);
+        // A hairline just inside the edge keeps the card legible when the PNG
+        // lands on a background close to its own color.
+        stroke_round_rect(
+            0.5,
+            0.5,
+            CARD_W - 1.0,
+            card_h - 1.0,
+            RADIUS - 0.5,
+            palette.primary.alpha(0.08),
+            card_h,
+        );
+
+        let header_font = medium_font(px(12.0));
         draw_text(
-            &kicker,
+            &card.title(),
             PAD,
-            PAD + (header_h - kicker_size.1) * 0.5,
-            &kicker_font,
+            layout::HEADER_Y,
+            &header_font,
             palette.secondary,
             card_h,
         );
-        let brand_x = CARD_W - PAD - brand_size.0;
-        let mark_x = brand_x - 8.0 - mark_w;
-        draw_mark(
-            mark_x,
-            PAD + (header_h - MARK_H) * 0.5,
-            MARK_H,
-            palette.primary,
-            card_h,
-        );
+        let brand_w = measure(BRAND, &header_font).0;
         draw_text(
             BRAND,
-            brand_x,
-            PAD + (header_h - brand_size.1) * 0.5,
-            &brand_font,
-            palette.primary,
+            CARD_W - PAD - brand_w,
+            layout::HEADER_Y,
+            &header_font,
+            palette.tertiary,
             card_h,
         );
 
-        let hero_font = medium_mono(px(26.0));
-        draw_text(&card.hero, PAD, 48.0, &hero_font, palette.primary, card_h);
+        let hero_font = semibold_mono(px(40.0));
+        draw_text_on_baseline(
+            &card.hero,
+            PAD,
+            layout::HERO_BASELINE,
+            &hero_font,
+            palette.primary,
+            card_h,
+        );
         if card.tokens {
-            let unit_font = medium_font(px(11.0));
-            let hero_size = measure(&card.hero, &hero_font);
-            draw_text(
+            let hero_w = measure(&card.hero, &hero_font).0;
+            draw_text_on_baseline(
                 "tokens",
-                PAD + hero_size.0 + 6.0,
-                48.0,
-                &unit_font,
+                PAD + hero_w + 8.0,
+                layout::HERO_BASELINE,
+                &medium_font(px(14.0)),
                 palette.tertiary,
                 card_h,
             );
         }
-        let metric_font = medium_font(px(11.0));
 
         draw_graph(card, palette, card_h);
+        draw_split(card, palette, card_h);
+        draw_legend(card, palette, card_h);
 
-        let name_font = medium_font(px(13.0));
-        let value_font = medium_mono(px(13.0));
-        let detail_font = NSFont::systemFontOfSize(px(11.0));
-        let mut y = PROVIDER_Y;
-        for provider in &card.providers {
-            let color = palette.providers[provider.index];
-            fill_round_rect(PAD, y + 4.0, 6.0, 6.0, 3.0, color, card_h);
+        if let Some(models) = &card.models {
+            let mut y = layout::LEGEND_Y + layout::LEGEND_H + layout::MODELS_GAP;
             draw_text(
-                provider.name,
-                PAD + 12.0,
+                "Top models",
+                PAD,
                 y,
-                &name_font,
-                palette.secondary,
-                card_h,
-            );
-            let value_size = measure(&provider.value, &value_font);
-            draw_text(
-                &provider.value,
-                CARD_W - PAD - value_size.0,
-                y,
-                &value_font,
-                palette.primary,
-                card_h,
-            );
-            draw_text(
-                &provider.detail,
-                PAD + 12.0,
-                y + 16.0,
-                &detail_font,
+                &medium_font(px(11.0)),
                 palette.tertiary,
                 card_h,
             );
-            let bar_y = y + 34.0;
-            let bar_w = CARD_W - PAD * 2.0;
-            fill_round_rect(
-                PAD,
-                bar_y,
-                bar_w,
-                3.0,
-                1.5,
-                palette.primary.alpha(0.08),
-                card_h,
-            );
-            let fill =
-                (bar_w * provider.share as f32).max(if provider.share > 0.0 { 3.0 } else { 0.0 });
-            if fill > 0.0 {
-                fill_round_rect(PAD, bar_y, fill, 3.0, 1.5, color, card_h);
-            }
-            y += 46.0;
-        }
-
-        if let Some(models) = &card.models {
-            y += 4.0;
-            draw_text("Top models", PAD, y, &metric_font, palette.tertiary, card_h);
-            y += 18.0;
-            let model_font = medium_font(px(12.0));
-            let meta_font = medium_mono(px(11.0));
+            y += layout::MODELS_HEAD;
+            let name_font = medium_font(px(12.5));
+            let value_font = medium_mono(px(12.5));
+            let share_font = medium_mono(px(11.0));
             for model in models {
-                draw_text(&model.name, PAD, y, &model_font, palette.primary, card_h);
-                let value_size = measure(&model.value, &meta_font);
-                let share_size = measure(&model.share, &meta_font);
-                let tokens_size = measure(&model.tokens, &meta_font);
-                let mut x = CARD_W - PAD;
-                x -= tokens_size.0;
-                draw_text(&model.tokens, x, y, &meta_font, palette.secondary, card_h);
-                x -= 12.0 + share_size.0;
-                draw_text(&model.share, x, y, &meta_font, palette.tertiary, card_h);
-                x -= 12.0 + value_size.0;
-                draw_text(&model.value, x, y, &meta_font, palette.primary, card_h);
-                y += 24.0;
+                draw_text(&model.name, PAD, y, &name_font, palette.primary, card_h);
+                let value_w = measure(&model.value, &value_font).0;
+                let share_w = measure(&model.share, &share_font).0;
+                let value_x = CARD_W - PAD - value_w;
+                draw_text(
+                    &model.value,
+                    value_x,
+                    y,
+                    &value_font,
+                    palette.primary,
+                    card_h,
+                );
+                draw_text(
+                    &model.share,
+                    value_x - 14.0 - share_w,
+                    y + 1.0,
+                    &share_font,
+                    palette.tertiary,
+                    card_h,
+                );
+                y += layout::MODEL_ROW;
             }
         }
     }
 
     fn draw_graph(card: &ShareCard, palette: SharePalette, card_h: f32) {
         let x = PAD;
-        let y = GRAPH_Y;
-        let w = CARD_W - PAD * 2.0;
-        let h = GRAPH_H;
+        let y = layout::GRAPH_Y;
+        let w = INNER_W;
+        let h = layout::GRAPH_H;
         fill_round_rect(
             x,
-            y + h - 1.0,
+            y + h - 0.5,
             w,
             1.0,
             0.5,
@@ -631,7 +646,7 @@ mod macos {
             let mut pts: Vec<(f32, f32)> = series
                 .points
                 .iter()
-                .map(|(px, py)| (x + px * w, y + h - py * h))
+                .map(|(px, py)| (x + px * w, y + h - 6.0 - py * (h - 12.0)))
                 .collect();
             if pts.len() == 1 {
                 let gy = pts[0].1;
@@ -641,11 +656,81 @@ mod macos {
                 continue;
             }
             if fill_under {
-                fill_series(&pts, y + h, color.alpha(0.16), card_h);
+                fill_series(&pts, y + h - 1.0, color, card_h);
             }
             stroke_series(&pts, color, card_h);
             let last = pts[pts.len() - 1];
-            fill_round_rect(last.0 - 3.5, last.1 - 3.5, 7.0, 7.0, 3.5, color, card_h);
+            fill_round_rect(
+                last.0 - 5.0,
+                last.1 - 5.0,
+                10.0,
+                10.0,
+                5.0,
+                opaque(palette.background),
+                card_h,
+            );
+            fill_round_rect(last.0 - 3.0, last.1 - 3.0, 6.0, 6.0, 3.0, color, card_h);
+        }
+    }
+
+    /// One bar, split by agent, in the same order as the legend below it.
+    fn draw_split(card: &ShareCard, palette: SharePalette, card_h: f32) {
+        let y = layout::SPLIT_Y;
+        let h = layout::SPLIT_H;
+        let gap = 2.0;
+        NSGraphicsContext::saveGraphicsState_class();
+        round_rect_path(PAD, y, INNER_W, h, h * 0.5, card_h).addClip();
+        fill_round_rect(PAD, y, INNER_W, h, 0.0, palette.primary.alpha(0.08), card_h);
+        let segments = card.providers.len() as f32;
+        let usable = INNER_W - gap * (segments - 1.0).max(0.0);
+        let mut x = PAD;
+        for provider in &card.providers {
+            let w =
+                (usable * provider.share as f32).max(if provider.share > 0.0 { h } else { 0.0 });
+            if w > 0.0 {
+                fill_round_rect(x, y, w, h, 0.0, palette.providers[provider.index], card_h);
+            }
+            x += w + gap;
+        }
+        NSGraphicsContext::restoreGraphicsState_class();
+    }
+
+    /// Agents as equal columns: name, value, then the share and other unit.
+    fn draw_legend(card: &ShareCard, palette: SharePalette, card_h: f32) {
+        let y = layout::LEGEND_Y;
+        let columns = card.providers.len().max(1) as f32;
+        let column_w = INNER_W / columns;
+        let name_font = medium_font(px(11.5));
+        let value_font = medium_mono(px(18.0));
+        let detail_font = NSFont::systemFontOfSize(px(11.0));
+        for (column, provider) in card.providers.iter().enumerate() {
+            let x = PAD + column_w * column as f32;
+            let color = palette.providers[provider.index];
+            fill_round_rect(x, y + 4.5, 6.0, 6.0, 3.0, color, card_h);
+            draw_text(
+                provider.name,
+                x + 12.0,
+                y,
+                &name_font,
+                palette.secondary,
+                card_h,
+            );
+            draw_text(
+                &provider.value,
+                x,
+                y + 17.0,
+                &value_font,
+                palette.primary,
+                card_h,
+            );
+            draw_text(
+                &provider.detail,
+                x,
+                y + 41.0,
+                &detail_font,
+                palette.tertiary,
+                card_h,
+            );
         }
     }
 
@@ -658,8 +743,19 @@ mod macos {
         let last = pts[pts.len() - 1];
         path.lineToPoint(NSPoint::new(px(last.0), appkit_y(base_y, 0.0, card_h)));
         path.closePath();
-        ns_color(color).setFill();
-        path.fill();
+        // AppKit angles run counter-clockwise from +x: 90 degrees is bottom
+        // to top, so the fill fades out towards the baseline.
+        match NSGradient::initWithStartingColor_endingColor(
+            NSGradient::alloc(),
+            &ns_color(color.alpha(0.0)),
+            &ns_color(color.alpha(0.14)),
+        ) {
+            Some(gradient) => gradient.drawInBezierPath_angle(&path, 90.0),
+            None => {
+                ns_color(color.alpha(0.12)).setFill();
+                path.fill();
+            }
+        }
     }
 
     fn stroke_series(pts: &[(f32, f32)], color: Rgba, card_h: f32) {
@@ -675,43 +771,31 @@ mod macos {
         path.stroke();
     }
 
-    fn draw_mark(x: f32, y: f32, height: f32, color: Rgba, card_h: f32) {
-        let scale = (height * SCALE) / DIRI_LOGO_VB_H;
-        let origin_x = x * SCALE;
-        let origin_y = (card_h - y - height) * SCALE;
-        let map = |mark_x: f32, mark_y: f32| {
-            NSPoint::new(
-                f64::from(origin_x + mark_x * scale),
-                f64::from(origin_y + (DIRI_LOGO_VB_H - mark_y) * scale),
-            )
-        };
-        let strokes = NSBezierPath::bezierPath();
-        strokes.setLineWidth(f64::from(DIRI_LOGO_STROKE * scale));
-        strokes.setLineCapStyle(NSLineCapStyle::Round);
-        strokes.setLineJoinStyle(NSLineJoinStyle::Round);
-        let mut chevron = DIRI_LOGO_CHEVRON.iter();
-        if let Some(&(mark_x, mark_y)) = chevron.next() {
-            strokes.moveToPoint(map(mark_x, mark_y));
-        }
-        for &(mark_x, mark_y) in chevron {
-            strokes.lineToPoint(map(mark_x, mark_y));
-        }
-        let ((from_x, from_y), (to_x, to_y)) = DIRI_LOGO_BASELINE;
-        strokes.moveToPoint(map(from_x, from_y));
-        strokes.lineToPoint(map(to_x, to_y));
-        ns_color(color).setStroke();
-        strokes.stroke();
-    }
-
-    fn fill_round_rect(x: f32, y: f32, w: f32, h: f32, radius: f32, color: Rgba, card_h: f32) {
+    fn round_rect_path(
+        x: f32,
+        y: f32,
+        w: f32,
+        h: f32,
+        radius: f32,
+        card_h: f32,
+    ) -> objc2::rc::Retained<NSBezierPath> {
         let rect = NSRect::new(
             NSPoint::new(px(x), appkit_y(y, h, card_h)),
             NSSize::new(px(w), px(h)),
         );
-        let path =
-            NSBezierPath::bezierPathWithRoundedRect_xRadius_yRadius(rect, px(radius), px(radius));
+        NSBezierPath::bezierPathWithRoundedRect_xRadius_yRadius(rect, px(radius), px(radius))
+    }
+
+    fn fill_round_rect(x: f32, y: f32, w: f32, h: f32, radius: f32, color: Rgba, card_h: f32) {
         ns_color(color).setFill();
-        path.fill();
+        round_rect_path(x, y, w, h, radius, card_h).fill();
+    }
+
+    fn stroke_round_rect(x: f32, y: f32, w: f32, h: f32, radius: f32, color: Rgba, card_h: f32) {
+        let path = round_rect_path(x, y, w, h, radius, card_h);
+        path.setLineWidth(px(1.0));
+        ns_color(color).setStroke();
+        path.stroke();
     }
 
     fn draw_text(text: &str, x: f32, y: f32, font: &NSFont, color: Rgba, card_h: f32) {
@@ -726,6 +810,20 @@ mod macos {
         }
     }
 
+    /// Places text by its baseline so a hero number and its unit share one
+    /// line regardless of font size.
+    fn draw_text_on_baseline(
+        text: &str,
+        x: f32,
+        baseline: f32,
+        font: &NSFont,
+        color: Rgba,
+        card_h: f32,
+    ) {
+        let top = baseline - font.ascender() as f32 / SCALE;
+        draw_text(text, x, top, font, color, card_h);
+    }
+
     fn measure(text: &str, font: &NSFont) -> (f32, f32) {
         let ns = NSString::from_str(text);
         let attrs = attributes(font, Rgba::default());
@@ -737,21 +835,12 @@ mod macos {
         NSFont::systemFontOfSize_weight(size, unsafe { NSFontWeightMedium })
     }
 
-    fn brand_font_matching(height: f32) -> objc2::rc::Retained<NSFont> {
-        let mut size = height;
-        for _ in 0..8 {
-            let font = medium_font(px(size));
-            let cap = font.capHeight() as f32 / SCALE;
-            if (cap - height).abs() < 0.35 {
-                return font;
-            }
-            size *= height / cap.max(1.0);
-        }
-        medium_font(px(size))
-    }
-
     fn medium_mono(size: f64) -> objc2::rc::Retained<NSFont> {
         NSFont::monospacedDigitSystemFontOfSize_weight(size, unsafe { NSFontWeightMedium })
+    }
+
+    fn semibold_mono(size: f64) -> objc2::rc::Retained<NSFont> {
+        NSFont::monospacedDigitSystemFontOfSize_weight(size, unsafe { NSFontWeightSemibold })
     }
 
     fn attributes(
@@ -908,7 +997,8 @@ mod tests {
             Some(caption.as_str())
         );
         assert_eq!(card.file_name(), "diri-usage-30d-cost.png");
-        assert_eq!(card.providers[0].detail, "44.4% of cost · 1.2M tokens");
+        assert_eq!(card.providers[0].detail, "44% · 1.2M tokens");
+        assert_eq!(card.title(), "Last 30 days · Forge");
     }
 
     #[test]
@@ -925,11 +1015,8 @@ mod tests {
         assert!(caption.contains("last 24 hours"), "{caption}");
         assert!(caption.contains("tokens"), "{caption}");
         assert_eq!(card.file_name(), "diri-usage-24h-tokens.png");
-        assert!(
-            card.providers[0].detail.contains("% of tokens"),
-            "{}",
-            card.providers[0].detail
-        );
+        assert_eq!(card.providers[0].detail, "47% · $4.00");
+        assert_eq!(card.title(), "Last 24 hours · this Mac");
     }
 
     #[test]

@@ -906,7 +906,26 @@ impl UtilitySurfaces {
         )
     }
 
-    fn toggle_usage_share(&mut self, cx: &mut Context<Self>) {
+    /// Fills the open share preview with a card rendered on the current
+    /// thread so headless screenshot fixtures show the real PNG.
+    #[cfg(all(test, target_os = "macos"))]
+    pub(super) fn seed_usage_share_image_for_fixture(&mut self, cx: &mut Context<Self>) {
+        let options = self.usage_share_options();
+        let card = self.usage_share_card(&options);
+        let palette = self.usage_share_palette(&options.theme_id);
+        let Some(png) = usage_share::render_png_for_fixture(&card, palette) else {
+            return;
+        };
+        let image = Arc::new(gpui::Image::from_bytes(gpui::ImageFormat::Png, png));
+        if let Some(preview) = self.usage_share.as_mut() {
+            let key = usage_share::SharePreview::cache_key(&options.theme_id, &options);
+            preview.cache.insert(key, Arc::clone(&image));
+            preview.image = Some(image);
+            cx.notify();
+        }
+    }
+
+    pub(super) fn toggle_usage_share(&mut self, cx: &mut Context<Self>) {
         if !usage_share::SUPPORTED {
             return;
         }
@@ -917,7 +936,7 @@ impl UtilitySurfaces {
         self.rebuild_usage_share(self.usage_share_options(), cx);
     }
 
-    fn set_usage_share_options(
+    pub(super) fn set_usage_share_options(
         &mut self,
         update: impl FnOnce(&mut usage_share::ShareOptions),
         cx: &mut Context<Self>,
@@ -979,43 +998,99 @@ impl UtilitySurfaces {
         let colors = self.settings_colors();
         let viewport = window.viewport_size();
         let top = (viewport.height.as_f32() / 6.0).clamp(12.0, 96.0);
-        let rail = 176.0;
-        let preview_w = (viewport.width.as_f32() - 56.0 - rail).clamp(280.0, 600.0);
+        let rail = 204.0;
+        let sheet_pad = 16.0;
+        let preview_w =
+            (viewport.width.as_f32() - 56.0 - rail - sheet_pad * 3.0).clamp(280.0, 600.0);
         let preview_h = preview_w * preview.height / usage_share::CARD_W;
-        let surface_width = preview_w + rail + 32.0;
+        let preview_radius = usage_share::layout::RADIUS * preview_w / usage_share::CARD_W;
+        let surface_width = preview_w + rail + sheet_pad * 3.0;
         let options = preview.options.clone();
         let theme_menu = preview.theme_menu;
         let selected_theme = crate::app_theme::terminal_theme(&options.theme_id);
-        let item = |id: &'static str, label: &'static str, action: ShareAction, emphasize: bool| {
-            usage_control(id, label, emphasize, colors).on_mouse_down(
-                MouseButton::Left,
-                cx.listener(move |this, _, window, cx| {
-                    cx.stop_propagation();
-                    match action {
-                        ShareAction::PostX => this.post_usage_share(cx),
-                        ShareAction::CopyImage => this.copy_usage_share_image(cx),
-                        ShareAction::Save => this.save_usage_share(window, cx),
-                    }
-                    this.dismiss_usage_share(cx);
-                }),
-            )
-        };
+
+        // The PNG already paints its own rounded card and hairline edge, so
+        // the frame only sizes and clips it; a second fill or radius here is
+        // what read as a card inside a card.
         let preview_frame = div()
             .id("usage-share-preview")
             .debug_selector(|| "usage-share-preview".into())
+            .flex_none()
             .w(px(preview_w))
             .h(px(preview_h))
-            .rounded(px(Radius::CARD))
+            .rounded(px(preview_radius))
             .overflow_hidden()
-            .bg(colors.primary.alpha(0.04))
             .flex()
             .items_center()
             .justify_center();
         let preview_frame = if let Some(image) = preview.image.clone() {
             preview_frame.child(img(image).w(px(preview_w)).h(px(preview_h)).flex_none())
         } else {
-            preview_frame.child(label("Preview unavailable", 11.0, colors.tertiary))
+            preview_frame.bg(colors.primary.alpha(0.04)).child(label(
+                "Preview unavailable",
+                11.0,
+                colors.tertiary,
+            ))
         };
+
+        let section = |title: &'static str, content: AnyElement| {
+            div()
+                .flex()
+                .flex_col()
+                .gap(px(6.0))
+                .child(
+                    div()
+                        .text_size(px(10.5))
+                        .font_weight(FontWeight::SEMIBOLD)
+                        .text_color(colors.tertiary)
+                        .child(title),
+                )
+                .child(content)
+        };
+        let segment = |id: &'static str,
+                       text: &'static str,
+                       selected: bool,
+                       update: fn(&mut usage_share::ShareOptions)| {
+            div()
+                .id(id)
+                .debug_selector(move || id.into())
+                .flex_1()
+                .h_full()
+                .rounded(px(Radius::CHIP))
+                .flex()
+                .items_center()
+                .justify_center()
+                .text_size(px(11.0))
+                .text_color(if selected {
+                    colors.primary
+                } else {
+                    colors.secondary
+                })
+                .bg(colors.primary.alpha(if selected { 0.10 } else { 0.0 }))
+                .cursor_pointer()
+                .when(!selected, |cell| {
+                    cell.hover(move |style| style.bg(colors.primary.alpha(0.05)))
+                })
+                .on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(move |this, _, _, cx| {
+                        cx.stop_propagation();
+                        this.set_usage_share_options(update, cx);
+                    }),
+                )
+                .child(text)
+        };
+        let segmented = |cells: [AnyElement; 2]| {
+            div()
+                .h(px(26.0))
+                .p(px(2.0))
+                .rounded(px(Radius::ROW))
+                .bg(colors.primary.alpha(0.05))
+                .flex()
+                .gap(px(2.0))
+                .children(cells)
+        };
+
         let mut theme_list = div()
             .id("usage-share-themes")
             .debug_selector(|| "usage-share-themes".into())
@@ -1071,23 +1146,11 @@ impl UtilitySurfaces {
                                 this.close_share_theme_menu(cx);
                             }),
                         )
-                        .child(
-                            div()
-                                .size(px(16.0))
-                                .rounded(px(5.0))
-                                .bg(candidate.background)
-                                .border_1()
-                                .border_color(colors.primary.alpha(0.16))
-                                .flex()
-                                .items_center()
-                                .justify_center()
-                                .child(
-                                    div()
-                                        .size(px(5.0))
-                                        .rounded(px(2.5))
-                                        .bg(candidate.foreground),
-                                ),
-                        )
+                        .child(theme_swatch(
+                            candidate.background,
+                            candidate.foreground,
+                            colors,
+                        ))
                         .child(
                             div()
                                 .flex_1()
@@ -1107,17 +1170,16 @@ impl UtilitySurfaces {
             .child(
                 div()
                     .id("usage-share-theme-button")
-                    .h(px(28.0))
-                    .px(px(9.0))
-                    .rounded(px(Radius::BADGE))
-                    .border_1()
-                    .border_color(colors.primary.alpha(if theme_menu { 0.20 } else { 0.10 }))
-                    .bg(colors.primary.alpha(if theme_menu { 0.08 } else { 0.04 }))
+                    .h(px(26.0))
+                    .pl(px(6.0))
+                    .pr(px(8.0))
+                    .rounded(px(Radius::ROW))
+                    .bg(colors.primary.alpha(if theme_menu { 0.10 } else { 0.05 }))
                     .flex()
                     .items_center()
                     .gap(px(8.0))
                     .cursor_pointer()
-                    .hover(move |style| style.bg(colors.primary.alpha(0.075)))
+                    .hover(move |style| style.bg(colors.primary.alpha(0.08)))
                     .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
                     .on_click(cx.listener(|this, _, _, cx| {
                         if this
@@ -1133,28 +1195,16 @@ impl UtilitySurfaces {
                             cx.notify();
                         }
                     }))
-                    .child(
-                        div()
-                            .size(px(16.0))
-                            .rounded(px(5.0))
-                            .bg(selected_theme.background)
-                            .border_1()
-                            .border_color(colors.primary.alpha(0.16))
-                            .flex()
-                            .items_center()
-                            .justify_center()
-                            .child(
-                                div()
-                                    .size(px(5.0))
-                                    .rounded(px(2.5))
-                                    .bg(selected_theme.foreground),
-                            ),
-                    )
+                    .child(theme_swatch(
+                        selected_theme.background,
+                        selected_theme.foreground,
+                        colors,
+                    ))
                     .child(
                         div()
                             .flex_1()
                             .min_w(px(0.0))
-                            .text_size(px(Typo::META.size))
+                            .text_size(px(11.0))
                             .text_color(colors.primary)
                             .child(selected_theme.name),
                     )
@@ -1171,121 +1221,200 @@ impl UtilitySurfaces {
             .when(theme_menu, |wrap| {
                 wrap.child(settings_dropdown(theme_list, 220.0, colors))
             });
-        let share_chip = |id: &'static str,
-                          label: &'static str,
-                          selected: bool,
-                          update: fn(&mut usage_share::ShareOptions)| {
-            usage_control(id, label, selected, colors).on_mouse_down(
-                MouseButton::Left,
-                cx.listener(move |this, _, _, cx| {
-                    cx.stop_propagation();
-                    this.set_usage_share_options(update, cx);
-                }),
-            )
+
+        let models_row =
+            div()
+                .id("usage-share-models")
+                .debug_selector(|| "usage-share-models".into())
+                .w_full()
+                .h(px(26.0))
+                .flex()
+                .items_center()
+                .justify_between()
+                .gap(px(8.0))
+                .cursor_pointer()
+                .on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(|this, _, _, cx| {
+                        cx.stop_propagation();
+                        this.set_usage_share_options(
+                            |options| options.include_models = !options.include_models,
+                            cx,
+                        );
+                    }),
+                )
+                .child(label("Top models", 11.0, colors.primary))
+                .child(
+                    div()
+                        .flex_none()
+                        .w(px(28.0))
+                        .h(px(16.0))
+                        .p(px(2.0))
+                        .rounded(px(8.0))
+                        .bg(if options.include_models {
+                            Ink::FRESH.alpha(0.78)
+                        } else {
+                            colors.primary.alpha(0.14)
+                        })
+                        .flex()
+                        .justify_end()
+                        .when(!options.include_models, |toggle| toggle.justify_start())
+                        .child(div().size(px(12.0)).rounded(px(6.0)).bg(
+                            if options.include_models {
+                                rgba(0xffffffff)
+                            } else {
+                                colors.primary
+                            },
+                        )),
+                );
+
+        let action = |id: &'static str, text: &'static str, action: ShareAction, primary: bool| {
+            div()
+                .id(id)
+                .debug_selector(move || id.into())
+                .flex_1()
+                .h(px(28.0))
+                .rounded(px(Radius::ROW))
+                .border_1()
+                .border_color(colors.primary.alpha(if primary { 0.0 } else { 0.10 }))
+                .bg(colors.primary.alpha(if primary { 0.12 } else { 0.0 }))
+                .flex()
+                .items_center()
+                .justify_center()
+                .text_size(px(11.0))
+                .font_weight(if primary {
+                    FontWeight::MEDIUM
+                } else {
+                    FontWeight::NORMAL
+                })
+                .text_color(if primary {
+                    colors.primary
+                } else {
+                    colors.secondary
+                })
+                .cursor_pointer()
+                .hover(move |style| {
+                    style.bg(colors.primary.alpha(if primary { 0.16 } else { 0.05 }))
+                })
+                .active(move |style| {
+                    style.bg(colors.primary.alpha(if primary { 0.20 } else { 0.09 }))
+                })
+                .on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(move |this, _, window, cx| {
+                        cx.stop_propagation();
+                        match action {
+                            ShareAction::PostX => this.post_usage_share(cx),
+                            ShareAction::CopyImage => this.copy_usage_share_image(cx),
+                            ShareAction::Save => this.save_usage_share(window, cx),
+                        }
+                        this.dismiss_usage_share(cx);
+                    }),
+                )
+                .child(text)
         };
-        let tools = div()
-            .w(px(rail))
-            .h(px(preview_h))
+
+        let header = div()
+            .h(px(22.0))
             .flex()
-            .flex_col()
-            .gap(px(8.0))
+            .items_center()
+            .justify_between()
             .child(
                 div()
-                    .id("usage-share-models")
-                    .debug_selector(|| "usage-share-models".into())
-                    .w_full()
-                    .h(px(28.0))
+                    .text_size(px(12.0))
+                    .font_weight(FontWeight::SEMIBOLD)
+                    .text_color(colors.primary)
+                    .child("Share usage"),
+            )
+            .child(
+                div()
+                    .id("usage-share-close")
+                    .debug_selector(|| "usage-share-close".into())
+                    .size(px(22.0))
+                    .mr(px(-4.0))
+                    .rounded(px(Radius::BADGE))
                     .flex()
                     .items_center()
-                    .justify_between()
-                    .gap(px(8.0))
+                    .justify_center()
                     .cursor_pointer()
+                    .hover(move |style| style.bg(colors.primary.alpha(0.08)))
                     .on_mouse_down(
                         MouseButton::Left,
                         cx.listener(|this, _, _, cx| {
                             cx.stop_propagation();
-                            this.set_usage_share_options(
-                                |options| options.include_models = !options.include_models,
-                                cx,
-                            );
+                            this.dismiss_usage_share(cx);
                         }),
                     )
-                    .child(label("Top models", 11.0, colors.primary))
-                    .child(
-                        div()
-                            .flex_none()
-                            .w(px(30.0))
-                            .h(px(18.0))
-                            .p(px(2.0))
-                            .rounded(px(9.0))
-                            .bg(if options.include_models {
-                                Ink::FRESH.alpha(0.72)
-                            } else {
-                                colors.primary.alpha(0.14)
-                            })
-                            .flex()
-                            .justify_end()
-                            .when(!options.include_models, |toggle| toggle.justify_start())
-                            .child(div().size(px(14.0)).rounded(px(7.0)).bg(colors.primary)),
-                    ),
-            )
-            .child(theme_trigger)
-            .child(
-                div()
-                    .flex()
-                    .flex_wrap()
-                    .gap(px(3.0))
-                    .child(share_chip(
+                    .child(sf_symbol("xmark", 10.0, colors.secondary)),
+            );
+
+        let tools = div()
+            .w(px(rail))
+            .min_h(px(preview_h))
+            .flex()
+            .flex_col()
+            .gap(px(14.0))
+            .child(header)
+            .child(section(
+                "Metric",
+                segmented([
+                    segment("usage-share-cost", "Cost", !options.tokens, |options| {
+                        options.tokens = false
+                    })
+                    .into_any_element(),
+                    segment("usage-share-tokens", "Tokens", options.tokens, |options| {
+                        options.tokens = true
+                    })
+                    .into_any_element(),
+                ])
+                .into_any_element(),
+            ))
+            .child(section(
+                "Graph",
+                segmented([
+                    segment(
                         "usage-share-graph-all",
-                        "All",
+                        "Total",
                         !options.individual,
                         |options| options.individual = false,
-                    ))
-                    .child(share_chip(
+                    )
+                    .into_any_element(),
+                    segment(
                         "usage-share-graph-individual",
-                        "Individual",
+                        "Per agent",
                         options.individual,
                         |options| options.individual = true,
-                    )),
-            )
+                    )
+                    .into_any_element(),
+                ])
+                .into_any_element(),
+            ))
+            .child(section("Theme", theme_trigger.into_any_element()))
+            .child(models_row)
+            .child(div().flex_1())
             .child(
                 div()
                     .flex()
-                    .flex_wrap()
-                    .gap(px(3.0))
-                    .child(share_chip(
-                        "usage-share-cost",
-                        "Cost",
-                        !options.tokens,
-                        |options| options.tokens = false,
+                    .flex_col()
+                    .gap(px(6.0))
+                    .child(action(
+                        "usage-share-copy-image",
+                        "Copy image",
+                        ShareAction::CopyImage,
+                        true,
                     ))
-                    .child(share_chip(
-                        "usage-share-tokens",
-                        "Tokens",
-                        options.tokens,
-                        |options| options.tokens = true,
-                    )),
-            )
-            .child(div().flex_1())
-            .child(
-                item(
-                    "usage-share-copy-image",
-                    "Copy",
-                    ShareAction::CopyImage,
-                    true,
-                )
-                .w_full()
-                .justify_center(),
-            )
-            .child(
-                item("usage-share-save", "Save", ShareAction::Save, false)
-                    .w_full()
-                    .justify_center(),
-            )
-            .child(
-                item("usage-share-x", "Post on X", ShareAction::PostX, false)
-                    .w_full()
-                    .justify_center(),
+                    .child(
+                        div()
+                            .flex()
+                            .gap(px(6.0))
+                            .child(action("usage-share-save", "Save", ShareAction::Save, false))
+                            .child(action(
+                                "usage-share-x",
+                                "Post on X",
+                                ShareAction::PostX,
+                                false,
+                            )),
+                    ),
             );
         div()
             .id("usage-share-overlay")
@@ -1324,45 +1453,14 @@ impl UtilitySurfaces {
                                 .debug_selector(|| "usage-share-menu".into())
                                 .relative()
                                 .flex()
-                                .flex_col()
-                                .gap(px(10.0))
-                                .px(px(12.0))
-                                .pt(px(36.0))
-                                .pb(px(12.0))
+                                .items_start()
+                                .gap(px(sheet_pad))
+                                .p(px(sheet_pad))
                                 .w(px(surface_width))
-                                .child(
-                                    div()
-                                        .id("usage-share-close")
-                                        .debug_selector(|| "usage-share-close".into())
-                                        .absolute()
-                                        .top(px(8.0))
-                                        .right(px(8.0))
-                                        .size(px(24.0))
-                                        .rounded(px(Radius::BADGE))
-                                        .flex()
-                                        .items_center()
-                                        .justify_center()
-                                        .cursor_pointer()
-                                        .hover(move |style| style.bg(colors.primary.alpha(0.08)))
-                                        .on_mouse_down(
-                                            MouseButton::Left,
-                                            cx.listener(|this, _, _, cx| {
-                                                cx.stop_propagation();
-                                                this.dismiss_usage_share(cx);
-                                            }),
-                                        )
-                                        .child(sf_symbol("xmark", 11.0, colors.secondary)),
-                                )
-                                .child(
-                                    div()
-                                        .flex()
-                                        .items_start()
-                                        .gap(px(8.0))
-                                        .child(preview_frame)
-                                        .child(tools),
-                                ),
+                                .child(preview_frame)
+                                .child(tools),
                         )
-                        .radius(Radius::PANEL),
+                        .radius(Radius::FLOATING_MENU),
                     ),
             )
     }
@@ -1730,6 +1828,19 @@ fn value_with_delta(
         .when_some(delta, |row, change| {
             row.child(change_delta(numbers, id, change, colors))
         })
+}
+fn theme_swatch(background: Rgba, foreground: Rgba, colors: SemanticColors) -> impl IntoElement {
+    div()
+        .flex_none()
+        .size(px(14.0))
+        .rounded(px(4.0))
+        .bg(background)
+        .border_1()
+        .border_color(colors.primary.alpha(0.16))
+        .flex()
+        .items_center()
+        .justify_center()
+        .child(div().size(px(4.0)).rounded(px(2.0)).bg(foreground))
 }
 fn label(text: impl Into<SharedString>, size: f32, color: Rgba) -> gpui::Div {
     div()

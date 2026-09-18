@@ -6959,6 +6959,122 @@ mod tests {
         screenshot.save(output).expect("save settings screenshot");
     }
 
+    /// Seeds a month of plausible hourly usage so the share card has a
+    /// trend, a split, and top models to draw.
+    #[cfg(target_os = "macos")]
+    fn seed_usage_preview(surfaces: &mut UtilitySurfaces, now: i64) {
+        use crate::usage::UsageHourAgg;
+        use crate::usage::dashboard::UsageDetail;
+        let hour_now = now.div_euclid(3600);
+        let history = std::sync::Arc::make_mut(&mut surfaces.usage.history);
+        let seed = |models: &mut crate::usage::dashboard::ModelHours,
+                    model: &str,
+                    scale: f64,
+                    phase: i64| {
+            let hours = models.entry(model.to_owned()).or_default();
+            for back in 0..(24 * 30) {
+                let hour = hour_now - back;
+                let local = hour.rem_euclid(24);
+                if !(9..=23).contains(&local) || (hour + phase).rem_euclid(7) == 3 {
+                    continue;
+                }
+                let wave = 1.0 + 0.6 * ((hour + phase) as f64 * 0.37).sin();
+                let weekly = 1.0 + 0.4 * ((hour as f64) / 24.0 * 0.9).cos();
+                let weight = (scale * wave * weekly).max(0.05);
+                let i = (140_000.0 * weight) as i64;
+                let o = (18_000.0 * weight) as i64;
+                let cr = (900_000.0 * weight) as i64;
+                hours.insert(
+                    hour,
+                    UsageDetail {
+                        tokens: UsageHourAgg {
+                            i,
+                            o,
+                            cr,
+                            cw: (60_000.0 * weight) as i64,
+                            c: 0.62 * weight,
+                        },
+                        reasoning: 0,
+                        priced_tokens: i + o + cr,
+                        read_savings: 0.4 * weight,
+                    },
+                );
+            }
+        };
+        seed(&mut history.claude, "claude-opus-4-6", 1.0, 0);
+        seed(&mut history.claude, "claude-sonnet-4-6", 0.35, 5);
+        seed(&mut history.codex, "gpt-5.4", 0.55, 2);
+        seed(&mut history.cursor, "composer-2", 0.18, 4);
+        surfaces.usage.updated_at = now;
+    }
+
+    /// Renders Settings > Usage with the share sheet open. Set
+    /// DIRI_VISUAL_SHARE_MODELS, DIRI_VISUAL_SHARE_TOKENS, or
+    /// DIRI_VISUAL_SHARE_INDIVIDUAL to review those variants, and
+    /// DIRI_VISUAL_SHARE_THEME to a terminal theme id.
+    #[cfg(target_os = "macos")]
+    #[test]
+    #[ignore = "writes the deterministic usage-share screenshot artifact"]
+    fn render_usage_share_preview_screenshot() {
+        let output = std::env::var_os("DIRI_VISUAL_OUTPUT")
+            .map(PathBuf::from)
+            .expect("set DIRI_VISUAL_OUTPUT to the target PNG path");
+        let platform = gpui_platform::current_platform(true);
+        let mut cx = HeadlessAppContext::with_platform(
+            platform.text_system(),
+            Arc::new(diri_ui::IconAssets),
+            gpui_platform::current_headless_renderer,
+        );
+        cx.update(|cx| {
+            crate::fonts::init(cx);
+            cx.set_reduce_motion(true);
+        });
+        let window = cx
+            .open_window(size(px(1200.0), px(800.0)), move |window, cx| {
+                let harness =
+                    cx.new(|cx| SettingsWorkbenchHarness::open_at(SettingsTab::Usage, window, cx));
+                harness.update(cx, |harness, cx| {
+                    harness.surfaces.update(cx, |surfaces, cx| {
+                        seed_usage_preview(surfaces, 1_789_000_000);
+                        surfaces.usage_days = 30;
+                        surfaces.toggle_usage_share(cx);
+                        let models = std::env::var_os("DIRI_VISUAL_SHARE_MODELS").is_some();
+                        let tokens = std::env::var_os("DIRI_VISUAL_SHARE_TOKENS").is_some();
+                        let individual = std::env::var_os("DIRI_VISUAL_SHARE_INDIVIDUAL").is_some();
+                        let theme = std::env::var("DIRI_VISUAL_SHARE_THEME").ok();
+                        surfaces.set_usage_share_options(
+                            move |options| {
+                                options.include_models = models;
+                                options.tokens = tokens;
+                                options.individual = individual;
+                                if let Some(theme) = theme {
+                                    options.theme_id = theme;
+                                }
+                            },
+                            cx,
+                        );
+                        surfaces.seed_usage_share_image_for_fixture(cx);
+                    });
+                });
+                harness
+            })
+            .expect("open headless usage share window");
+        cx.run_until_parked();
+        cx.advance_clock(SETTINGS_TRANSITION_DURATION + Duration::from_millis(300));
+        cx.update_window(window.into(), |_, window, _| window.refresh())
+            .expect("refresh usage share window");
+        cx.run_until_parked();
+        let screenshot = cx
+            .capture_screenshot(window.into())
+            .expect("capture usage share screenshot");
+        if let Some(parent) = output.parent() {
+            std::fs::create_dir_all(parent).expect("create screenshot directory");
+        }
+        screenshot
+            .save(output)
+            .expect("save usage share screenshot");
+    }
+
     #[gpui::test]
     fn whats_new_is_searchable_and_renders_release_markdown(cx: &mut TestAppContext) {
         let (harness, cx) = open_settings_workbench(cx);
