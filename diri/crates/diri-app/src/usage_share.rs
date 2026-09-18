@@ -214,6 +214,7 @@ impl ShareCard {
     }
 
     /// Header line on the card: "Last 30 days · this Mac".
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
     pub(super) fn title(&self) -> String {
         let mut title = capitalize(self.period());
         if let Some(host) = self.host.phrase() {
@@ -311,6 +312,7 @@ fn percent(share: f64) -> String {
     format!("{:.0}%", share * 100.0)
 }
 
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 fn capitalize(text: &str) -> String {
     let mut chars = text.chars();
     match chars.next() {
@@ -321,6 +323,7 @@ fn capitalize(text: &str) -> String {
 
 /// Card geometry in points at 1x. Shared with the preview so the sheet can
 /// size itself before a PNG exists.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 pub(super) mod layout {
     pub const PAD: f32 = 28.0;
     pub const RADIUS: f32 = 18.0;

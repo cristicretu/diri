@@ -8292,6 +8292,15 @@ mod tests {
         cx.executor()
             .advance_clock(SETTINGS_TRANSITION_DURATION + Duration::from_millis(300));
         cx.run_until_parked();
+        // Both panels are cached views, and GPUI's cache reuse replays the
+        // scene without re-registering debug bounds. A parent-only re-render
+        // after the transition therefore samples nothing, so mark both dirty
+        // and let them paint once more before reading the frame.
+        harness.update(cx, |harness, cx| {
+            harness.sidebar.update(cx, |_, cx| cx.notify());
+            harness.surfaces.update(cx, |_, cx| cx.notify());
+        });
+        cx.run_until_parked();
 
         let in_sessions = cx.debug_bounds("sidebar").expect("sidebar");
         assert_eq!(
