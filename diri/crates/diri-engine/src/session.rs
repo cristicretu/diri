@@ -4874,8 +4874,18 @@ mod remote_connection_tests {
                 mouse: Default::default(),
                 grid: screen.full_snapshot(),
             });
+            // A capable controller receives the reset boundary before every
+            // full snapshot, even when no reset has ever happened.
+            let boundary =
+                RemoteMessage::TerminalResetState(diri_proto::remote_pty::TerminalResetState {
+                    incarnation: "same-incarnation".into(),
+                    generation: 0,
+                    sequence: 1,
+                    output_offset: 0,
+                });
             for (name, message) in [
                 ("hello.bin", hello),
+                ("reset.bin", boundary),
                 ("snapshot.bin", snapshot),
                 (
                     "modes.bin",
@@ -4917,11 +4927,11 @@ printf x >> attaches
 if mkdir first 2>/dev/null; then
   cat hello.bin modes.bin
   while [ ! -f seed ]; do sleep 0.01; done
-  cat snapshot.bin
+  cat reset.bin snapshot.bin
   while [ ! -f disconnect ]; do sleep 0.01; done
 else
   while [ ! -f reconnect ]; do sleep 0.01; done
-  cat hello.bin modes.bin snapshot.bin
+  cat hello.bin modes.bin reset.bin snapshot.bin
   while [ ! -f finish ]; do sleep 0.01; done
   if [ -f fatal ]; then cat fatal.bin; else cat exit.bin; fi
 fi
