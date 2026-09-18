@@ -10,6 +10,7 @@ mod brand;
 mod components;
 mod icon;
 pub mod motion;
+pub mod scroller;
 mod status;
 mod svg;
 mod tokens;
@@ -23,6 +24,10 @@ pub use components::{
     LoadingIndicator, RowFill, StateChip,
 };
 pub use icon::{Icon, IconAssets, IconName, IconSize, icon_from_system_name};
+pub use scroller::{
+    Overscroll, ScrollArea, ScrollTarget, ScrollerState, ScrollerStyle, ThumbGeometry,
+    WheelOutcome, WheelSample, scroll_area, scroller_style, set_scroller_style, thumb_geometry,
+};
 pub use status::{
     AnimationPhase, AttentionDot, AttentionLevel, StatusGlyph, StatusState, wall_clock_seconds,
 };

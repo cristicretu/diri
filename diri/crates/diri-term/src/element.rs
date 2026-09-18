@@ -653,6 +653,20 @@ impl TerminalElement {
         mutex_lock(&self.shared.viewport).view_offset()
     }
 
+    /// How many lines the viewport can scroll back, without cloning the
+    /// viewport's row cache the way `viewport()` does.
+    #[must_use]
+    pub fn max_view_offset(&self, visible_rows: usize) -> i64 {
+        mutex_lock(&self.shared.viewport).max_offset(visible_rows)
+    }
+
+    /// True while the foreground program owns the whole screen, when there is
+    /// no scrollback to indicate.
+    #[must_use]
+    pub fn alt_screen(&self) -> bool {
+        mutex_lock(&self.shared.modes).alt_screen
+    }
+
     #[must_use]
     pub fn scrolled_state(&self) -> Option<ScrolledState> {
         let offset_lines = self.view_offset();
