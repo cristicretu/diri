@@ -158,12 +158,6 @@ pub(crate) enum SidebarEvent {
     /// through the typed `OpenSettings` action; this event carries the host
     /// the picker row was about, which an action cannot.
     OpenAgentSettings(Option<String>),
-    /// One-click path from the footer menu into the Remote host editor.
-    AddRemoteHost,
-    /// One-click path from the account menu to the latest release notes.
-    OpenWhatsNew,
-    /// The Usage page of Settings, from the spend rows of the account menu.
-    OpenUsage,
     /// A plain click (or shortcut) selected a session: hand keyboard focus
     /// to its terminal surface so the user can type immediately.
     SessionActivated,
@@ -591,9 +585,6 @@ pub struct Sidebar {
     number_flows: crate::number_flow::Bank,
     number_tick: Option<Task<()>>,
     accounts: accounts::MenuAccounts,
-    account_context: Option<crate::transcript::ContextUsage>,
-    account_context_session: Option<SessionId>,
-    account_context_task: Option<Task<()>>,
     update: UpdateState,
     /// When visibility last flipped, so a held ⌘B cannot outrun the slide.
     last_toggle: Option<Instant>,
@@ -693,7 +684,6 @@ impl Sidebar {
                             if this
                                 .update(cx, |this, cx| {
                                     this.store.write().expect("store").reconcile();
-                                    this.refresh_account_context(false, cx);
                                     cx.notify();
                                 })
                                 .is_err()
@@ -754,9 +744,6 @@ impl Sidebar {
             number_flows: crate::number_flow::Bank::default(),
             number_tick: None,
             accounts: accounts::MenuAccounts::new(preview),
-            account_context: None,
-            account_context_session: None,
-            account_context_task: None,
             update: UpdateState::default(),
             last_toggle: None,
             preview,
@@ -923,63 +910,7 @@ impl Sidebar {
             cx.emit(SidebarEvent::RefreshUsageLimits);
         }
         self.usage = Some(snapshot);
-        self.refresh_account_context(true, cx);
         cx.notify();
-    }
-
-    fn refresh_account_context(&mut self, force: bool, cx: &mut Context<Self>) {
-        if self.preview || self.ui.popover != Some(Popover::Account) {
-            return;
-        }
-        let session = self
-            .store
-            .read()
-            .expect("session store lock poisoned")
-            .selected_session()
-            .cloned();
-        let id = session.as_ref().map(|session| session.id.clone());
-        if !force && self.account_context_session == id {
-            return;
-        }
-        self.account_context_task = None;
-        if self.account_context_session != id {
-            self.account_context = None;
-        }
-        self.account_context_session = id.clone();
-        let Some(session) = session.filter(|session| session.host.is_none()) else {
-            self.account_context = None;
-            return;
-        };
-        let Some((path, agent_id)) = session.transcript_path.zip(session.agent_session_id) else {
-            self.account_context = None;
-            return;
-        };
-        let home = std::env::var_os("HOME")
-            .map(std::path::PathBuf::from)
-            .unwrap_or_else(|| std::path::PathBuf::from("/nonexistent"));
-        self.account_context_task = Some(cx.spawn(async move |this, cx| {
-            let context = cx
-                .background_spawn(async move {
-                    crate::transcript::load(
-                        &home,
-                        std::path::Path::new(&path),
-                        &session.kind,
-                        &agent_id,
-                        &session.cwd,
-                        None,
-                    )
-                    .ok()
-                    .flatten()
-                    .and_then(|snapshot| snapshot.document.context_usage)
-                })
-                .await;
-            let _ = this.update(cx, |this, cx| {
-                if this.account_context_session == id {
-                    this.account_context = context;
-                    cx.notify();
-                }
-            });
-        }));
     }
 
     pub fn pending_close_copy(&self) -> Option<(String, String)> {
@@ -4230,7 +4161,6 @@ impl Sidebar {
                         } else {
                             Some(Popover::Account)
                         };
-                        this.refresh_account_context(true, cx);
                         if !this.preview && this.ui.popover == Some(Popover::Account) {
                             cx.emit(SidebarEvent::RefreshUsageLimits);
                             cx.emit(SidebarEvent::AccountAction(None));
@@ -5587,26 +5517,26 @@ impl Sidebar {
         panel
     }
 
-    fn update_menu_row(&self, colors: SemanticColors, cx: &mut Context<Self>) -> AnyElement {
-        let unsupported = matches!(self.update.phase, UpdatePhase::Unsupported(_));
-        let command = match &self.update.phase {
-            UpdatePhase::Available(_) => Some(UpdateCommand::Download),
-            UpdatePhase::Ready(_) => Some(UpdateCommand::Install),
-            UpdatePhase::Checking | UpdatePhase::Downloading { .. } | UpdatePhase::Installing => {
-                None
-            }
-            _ if unsupported => None,
-            _ => Some(UpdateCommand::Check {
-                user_initiated: true,
-            }),
-        };
-        let label = if self.preview {
-            format!("diri {}", crate::updates::CURRENT_VERSION)
-        } else {
-            self.update.summary()
+    /// The update row only exists while there is an update to act on or
+    /// watch. Checking, the current version, and unsupported builds are
+    /// Settings and command-palette matters.
+    fn update_menu_row(
+        &self,
+        colors: SemanticColors,
+        cx: &mut Context<Self>,
+    ) -> Option<AnyElement> {
+        if self.preview {
+            return None;
+        }
+        let action = match &self.update.phase {
+            UpdatePhase::Available(_) => Some((UpdateCommand::Download, "Download")),
+            UpdatePhase::Ready(_) => Some((UpdateCommand::Install, "Restart")),
+            UpdatePhase::Downloading { .. } => None,
+            _ => return None,
         };
         let mut row = div()
             .id("account-version")
+            .debug_selector(|| "account-version".into())
             .mx(px(6.0))
             .px(px(8.0))
             .h(px(ACCOUNT_MENU_ACTION_ROW_HEIGHT))
@@ -5615,11 +5545,7 @@ impl Sidebar {
             .gap(px(8.0))
             .rounded(px(SIDEBAR_MENU_ROW_RADIUS))
             .text_size(px(Typo::ROW.size))
-            .text_color(if unsupported {
-                colors.tertiary
-            } else {
-                colors.primary
-            })
+            .text_color(colors.primary)
             .child(
                 div()
                     .min_w(px(0.0))
@@ -5627,14 +5553,9 @@ impl Sidebar {
                     .whitespace_nowrap()
                     .overflow_hidden()
                     .text_ellipsis()
-                    .child(label),
+                    .child(self.update.summary()),
             );
-        if let Some(command) = command {
-            let action = match command {
-                UpdateCommand::Download => "Download",
-                UpdateCommand::Install => "Restart",
-                _ => "Check",
-            };
+        if let Some((command, label)) = action {
             row = row
                 .cursor_pointer()
                 .glass_menu_row(colors, false)
@@ -5643,7 +5564,7 @@ impl Sidebar {
                         .flex_none()
                         .text_size(px(Typo::META.size))
                         .text_color(colors.tertiary)
-                        .child(action),
+                        .child(label),
                 )
                 .on_click(cx.listener(move |this, _, _, cx: &mut Context<Self>| {
                     cx.emit(SidebarEvent::Update(command.clone()));
@@ -5651,7 +5572,7 @@ impl Sidebar {
                     cx.notify();
                 }));
         }
-        row.into_any_element()
+        Some(row.into_any_element())
     }
 
     fn account_popover(&self, colors: SemanticColors, cx: &mut Context<Self>) -> PopoverSpec {
@@ -5664,22 +5585,12 @@ impl Sidebar {
          * The shared FloatingSurface owns the entry timing. Rows never
          * animate independently: this is a frequent, keyboard-adjacent menu.
          *
-         * Four short sections, one line per fact: who is signed in, which
-         * login open tabs use, how much of each budget is spent, and the
-         * app-level actions. Detail lives in Settings, not here.
+         * Who is signed in, which login open tabs use, how much of each
+         * plan window is spent, and Settings. Everything else lives in
+         * Settings or the command palette; an update row appears only
+         * while there is one to act on.
          * ───────────────────────────────────────────────────────── */
         let account_label = local_account_label(self.preview);
-        let context = if self.preview {
-            Some(crate::transcript::ContextUsage {
-                tokens: 17_800,
-                window: 258_400,
-            })
-        } else {
-            let store = self.store.read().expect("session store lock poisoned");
-            (store.selected_session_id() == self.account_context_session.as_ref())
-                .then_some(self.account_context)
-                .flatten()
-        };
         let limits = if self.preview {
             crate::usage::limits::preview()
         } else {
@@ -5698,61 +5609,35 @@ impl Sidebar {
                 div()
                     .mx(px(6.0))
                     .px(px(8.0))
-                    .h(px(40.0))
+                    .h(px(32.0))
                     .flex()
                     .items_center()
-                    .gap(px(9.0))
-                    .child(account_avatar(&account_label, 24.0, colors))
+                    .gap(px(8.0))
+                    .child(account_avatar(&account_label, 20.0, colors))
                     .child(
                         div()
                             .min_w(px(0.0))
                             .flex_1()
-                            .flex()
-                            .flex_col()
-                            .child(
-                                div()
-                                    .whitespace_nowrap()
-                                    .overflow_hidden()
-                                    .text_ellipsis()
-                                    .text_size(px(Typo::ROW.size))
-                                    .text_color(colors.primary)
-                                    .child(account_label),
-                            )
-                            .child(
-                                div()
-                                    .text_size(px(Typo::META.size))
-                                    .text_color(colors.tertiary)
-                                    .child("Local agents · This Mac"),
-                            ),
+                            .whitespace_nowrap()
+                            .overflow_hidden()
+                            .text_ellipsis()
+                            .text_size(px(Typo::ROW.size))
+                            .text_color(colors.primary)
+                            .child(account_label),
+                    )
+                    .child(
+                        div()
+                            .flex_none()
+                            .text_size(px(Typo::META.size))
+                            .text_color(colors.tertiary)
+                            .child("This Mac"),
                     ),
             )
             .child(menu_divider(colors))
             .child(self.account_switch_menu(colors, cx))
             .child(menu_divider(colors))
-            .child(self.account_usage_menu(context, &limits, colors, cx))
+            .child(account_limits_menu(&limits, colors))
             .child(menu_divider(colors))
-            .child(account_action_row(
-                "account-whats-new",
-                "What's New",
-                None,
-                colors,
-                cx.listener(|this, _, _, cx| {
-                    this.ui.popover = None;
-                    cx.emit(SidebarEvent::OpenWhatsNew);
-                    cx.notify();
-                }),
-            ))
-            .child(account_action_row(
-                "quick-add-remote-host",
-                "Add remote host",
-                Some("SSH".into()),
-                colors,
-                cx.listener(|this, _, _, cx| {
-                    this.ui.popover = None;
-                    cx.emit(SidebarEvent::AddRemoteHost);
-                    cx.notify();
-                }),
-            ))
             .child(account_action_row(
                 "account-settings",
                 "Settings",
@@ -5766,147 +5651,11 @@ impl Sidebar {
                     cx.notify();
                 }),
             ))
-            .child(self.update_menu_row(colors, cx))
+            .when_some(self.update_menu_row(colors, cx), |menu, row| {
+                menu.child(row)
+            })
             .child(div().h(px(3.0)));
         self.popover_shell_above_footer(content, colors, cx)
-    }
-
-    /// Context, plan limits, and spend as one stat block: a line per figure
-    /// with a short meter, so the menu reads at a glance instead of
-    /// scrolling. Spend rows open the Usage page for the full breakdown.
-    fn account_usage_menu(
-        &self,
-        context: Option<crate::transcript::ContextUsage>,
-        limits: &[crate::usage::limits::AccountLimits],
-        colors: SemanticColors,
-        cx: &mut Context<Self>,
-    ) -> AnyElement {
-        let now = crate::usage::Clock::read(&crate::usage::SystemClock).unix_seconds;
-        let mut section = div()
-            .id("account-plan-limits")
-            .debug_selector(|| "account-plan-limits".into())
-            .flex_none()
-            .flex()
-            .flex_col()
-            .py(px(3.0))
-            .child(
-                menu_eyebrow("Usage", colors).child(
-                    div()
-                        .id("account-refresh-limits")
-                        .cursor_pointer()
-                        .rounded(px(4.0))
-                        .p(px(2.0))
-                        .hover(move |row| row.bg(colors.primary.alpha(0.06)))
-                        .child(sf_symbol(
-                            "arrow.triangle.2.circlepath",
-                            10.0,
-                            colors.tertiary,
-                        ))
-                        .on_click(cx.listener(|this, _, _, cx| {
-                            if !this.preview {
-                                cx.emit(SidebarEvent::RefreshUsageLimits);
-                            }
-                        })),
-                ),
-            );
-        if let Some(context) = context {
-            let percent = (context.tokens as f64 / context.window as f64 * 100.0).clamp(0.0, 100.0);
-            section = section.child(account_meter_row(
-                "account-context-window".into(),
-                format!("Context · {}", UsageFormat::tokens(context.tokens)),
-                percent,
-                false,
-                format!("of {}", UsageFormat::tokens(context.window)),
-                colors,
-            ));
-        }
-        if limits.is_empty() {
-            section = section.child(menu_note("Checking provider limits…", colors));
-        }
-        for account in limits {
-            for (index, limit) in account.windows.iter().enumerate() {
-                let expired = limit.resets_at.is_some_and(|reset| reset <= now);
-                let stale = expired || account.error.is_some() || now - account.checked_at > 360;
-                let trailing = if stale {
-                    "stale".to_owned()
-                } else {
-                    match limit.resets_at {
-                        Some(reset) if reset > now => compact_reset(reset - now),
-                        _ => String::new(),
-                    }
-                };
-                section = section.child(account_meter_row(
-                    SharedString::from(format!(
-                        "account-limit-{}-{index}",
-                        account.provider.to_ascii_lowercase()
-                    )),
-                    format!("{} {}", account.provider, limit_window_label(&limit.label)),
-                    limit.used_percent,
-                    stale,
-                    trailing,
-                    colors,
-                ));
-            }
-            if let Some(error) = account.error {
-                section = section.child(menu_note(error, colors));
-            }
-        }
-        let spend: Vec<(&'static str, &'static str, String, String)> = if self.preview {
-            vec![
-                (
-                    "account-usage-today",
-                    "Today",
-                    "1.8M tokens".into(),
-                    "$4.82".into(),
-                ),
-                (
-                    "account-usage-month",
-                    "This month",
-                    String::new(),
-                    "$86.40".into(),
-                ),
-            ]
-        } else if let Some(snapshot) = &self.usage {
-            vec![
-                (
-                    "account-usage-today",
-                    "Today",
-                    format!(
-                        "{} tokens",
-                        UsageFormat::tokens(snapshot.today().total_tokens())
-                    ),
-                    UsageFormat::money(snapshot.today().cost),
-                ),
-                (
-                    "account-usage-month",
-                    "This month",
-                    String::new(),
-                    UsageFormat::money(snapshot.month().cost),
-                ),
-            ]
-        } else {
-            vec![(
-                "account-usage-measuring",
-                "Spend",
-                "measuring…".into(),
-                "—".into(),
-            )]
-        };
-        for (id, label, detail, value) in spend {
-            section = section.child(account_stat_row(
-                id,
-                label,
-                detail,
-                value,
-                colors,
-                cx.listener(|this, _, _, cx| {
-                    this.ui.popover = None;
-                    cx.emit(SidebarEvent::OpenUsage);
-                    cx.notify();
-                }),
-            ));
-        }
-        section.into_any_element()
     }
 
     fn project_actions_popover(
@@ -8499,18 +8248,52 @@ const ACCOUNT_MENU_ACTION_ROW_HEIGHT: f32 = 28.0;
 /// Height of the single-line stat rows in the account menu.
 const ACCOUNT_MENU_STAT_ROW_HEIGHT: f32 = 22.0;
 
-/// Section label inside the account menu. Extra children sit at the right
-/// edge, which is where the refresh control lives.
-fn menu_eyebrow(label: &'static str, colors: SemanticColors) -> gpui::Div {
-    div()
-        .px(px(14.0))
-        .h(px(ACCOUNT_MENU_STAT_ROW_HEIGHT))
+/// One meter per plan window, prefixed with its provider. Limits refresh
+/// when the menu opens, so there is no control here.
+fn account_limits_menu(
+    limits: &[crate::usage::limits::AccountLimits],
+    colors: SemanticColors,
+) -> AnyElement {
+    let now = crate::usage::Clock::read(&crate::usage::SystemClock).unix_seconds;
+    let mut section = div()
+        .id("account-plan-limits")
+        .debug_selector(|| "account-plan-limits".into())
+        .flex_none()
         .flex()
-        .items_center()
-        .justify_between()
-        .text_size(px(Typo::META.size))
-        .text_color(colors.tertiary)
-        .child(label)
+        .flex_col()
+        .py(px(3.0));
+    if limits.is_empty() {
+        section = section.child(menu_note("Checking provider limits…", colors));
+    }
+    for account in limits {
+        for (index, limit) in account.windows.iter().enumerate() {
+            let expired = limit.resets_at.is_some_and(|reset| reset <= now);
+            let stale = expired || account.error.is_some() || now - account.checked_at > 360;
+            let trailing = if stale {
+                "stale".to_owned()
+            } else {
+                match limit.resets_at {
+                    Some(reset) if reset > now => compact_reset(reset - now),
+                    _ => String::new(),
+                }
+            };
+            section = section.child(account_meter_row(
+                SharedString::from(format!(
+                    "account-limit-{}-{index}",
+                    account.provider.to_ascii_lowercase()
+                )),
+                format!("{} {}", account.provider, limit_window_label(&limit.label)),
+                limit.used_percent,
+                stale,
+                trailing,
+                colors,
+            ));
+        }
+        if let Some(error) = account.error {
+            section = section.child(menu_note(error, colors));
+        }
+    }
+    section.into_any_element()
 }
 
 /// One quiet line of status under an eyebrow: loading, stale, or an error.
@@ -8630,67 +8413,6 @@ fn account_meter_row(
                 .text_color(colors.tertiary)
                 .child(trailing),
         )
-        .into_any_element()
-}
-
-/// A label with optional detail and a monospaced figure; clicking opens the
-/// Usage page.
-fn account_stat_row(
-    id: &'static str,
-    label: &'static str,
-    detail: String,
-    value: String,
-    colors: SemanticColors,
-    on_click: impl Fn(&gpui::ClickEvent, &mut Window, &mut App) + 'static,
-) -> AnyElement {
-    div()
-        .id(id)
-        .debug_selector(move || id.into())
-        .mx(px(6.0))
-        .px(px(8.0))
-        .h(px(ACCOUNT_MENU_STAT_ROW_HEIGHT))
-        .flex()
-        .items_center()
-        .gap(px(6.0))
-        .rounded(px(SIDEBAR_MENU_ROW_RADIUS))
-        .cursor_pointer()
-        .glass_menu_row(colors, false)
-        .child(
-            div()
-                .min_w(px(0.0))
-                .flex_1()
-                .flex()
-                .items_baseline()
-                .gap(px(5.0))
-                .child(
-                    div()
-                        .flex_none()
-                        .text_size(px(Typo::META.size))
-                        .text_color(colors.secondary)
-                        .child(label),
-                )
-                .when(!detail.is_empty(), |row| {
-                    row.child(
-                        div()
-                            .min_w(px(0.0))
-                            .whitespace_nowrap()
-                            .overflow_hidden()
-                            .text_ellipsis()
-                            .text_size(px(Typo::META.size))
-                            .text_color(colors.tertiary)
-                            .child(detail),
-                    )
-                }),
-        )
-        .child(
-            div()
-                .flex_none()
-                .font_family(crate::fonts::mono_family())
-                .text_size(px(Typo::META_MONO.size))
-                .text_color(colors.primary)
-                .child(value),
-        )
-        .on_click(on_click)
         .into_any_element()
 }
 
@@ -10642,12 +10364,7 @@ mod tests {
         assert!(cx.debug_bounds("account-switcher").is_some());
         assert!(cx.debug_bounds("switch-account-preview-1").is_some());
         assert!(cx.debug_bounds("manage-accounts").is_some());
-        assert!(cx.debug_bounds("account-context-window").is_some());
         assert!(cx.debug_bounds("account-plan-limits").is_some());
-        assert!(cx.debug_bounds("account-usage-today").is_some());
-        assert!(cx.debug_bounds("account-usage-month").is_some());
-        assert!(cx.debug_bounds("account-whats-new").is_some());
-        assert!(cx.debug_bounds("quick-add-remote-host").is_some());
         assert!(cx.debug_bounds("account-settings").is_some());
         let target = cx.debug_bounds("switch-account-preview-1").unwrap();
         cx.simulate_click(target.center(), Modifiers::default());

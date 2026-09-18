@@ -1878,11 +1878,6 @@ impl UtilitySurfaces {
         cx.notify();
     }
 
-    pub(crate) fn open_whats_new(&mut self, cx: &mut Context<Self>) {
-        self.open_settings(cx);
-        self.select_settings_tab(SettingsTab::WhatsNew, cx);
-    }
-
     fn open_diagnostics(&mut self, cx: &mut Context<Self>) {
         let store = self.store.read().expect("session store lock poisoned");
         let report = build_diagnostics_report(&store);
@@ -1891,13 +1886,6 @@ impl UtilitySurfaces {
         self.surface = Surface::Diagnostics;
         self.settings_menu = None;
         cx.notify();
-    }
-
-    pub(crate) fn open_add_remote_host(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        self.open_settings(cx);
-        self.settings_tab = SettingsTab::Remote;
-        self.reload_hosts();
-        self.begin_adding_host(window, cx);
     }
 
     pub(crate) fn key_down(
@@ -8127,7 +8115,10 @@ mod tests {
         let (view, cx) = cx.add_window_view(move |window, cx| {
             let surfaces = cx.new(|cx| {
                 let mut surfaces = UtilitySurfaces::new(runtime, tokio, updates, window, cx);
-                surfaces.open_add_remote_host(window, cx);
+                surfaces.open_settings(cx);
+                surfaces.settings_tab = SettingsTab::Remote;
+                surfaces.reload_hosts();
+                surfaces.begin_adding_host(window, cx);
                 surfaces
                     .host_editor
                     .as_mut()
@@ -8180,36 +8171,6 @@ mod tests {
                 .cursor()),
             "abcdef".len()
         );
-    }
-
-    #[gpui::test]
-    fn remote_host_shortcut_opens_the_add_form_directly(cx: &mut TestAppContext) {
-        let runtime = Arc::new(StoreRuntime::inert());
-        let tokio = Arc::new(
-            tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .build()
-                .expect("test runtime"),
-        );
-        let updates = crate::updates::inert();
-        let (view, cx) = cx.add_window_view(move |window, cx| {
-            let surfaces = cx.new(|cx| UtilitySurfaces::new(runtime, tokio, updates, window, cx));
-            SettingsModalHarness {
-                surfaces,
-                background_events: Arc::new(AtomicUsize::new(0)),
-            }
-        });
-        let surfaces = view.read_with(cx, |harness, _| harness.surfaces.clone());
-
-        surfaces.update_in(cx, |surfaces, window, cx| {
-            surfaces.open_add_remote_host(window, cx);
-        });
-
-        surfaces.read_with(cx, |surfaces, _| {
-            assert_eq!(surfaces.surface, Surface::Settings);
-            assert_eq!(surfaces.settings_tab, SettingsTab::Remote);
-            assert!(surfaces.host_editor.is_some());
-        });
     }
 
     impl Render for CachedSettingsModalHarness {

@@ -660,27 +660,6 @@ impl RootView {
                     surfaces.open_agent_settings(host.clone(), cx);
                 });
             }
-            if matches!(event, SidebarEvent::AddRemoteHost)
-                && let Some(surfaces) = &this.utility_surfaces
-            {
-                surfaces.update(cx, |surfaces, cx| {
-                    surfaces.open_add_remote_host(window, cx);
-                });
-            }
-            if matches!(event, SidebarEvent::OpenWhatsNew)
-                && let Some(surfaces) = &this.utility_surfaces
-            {
-                surfaces.update(cx, |surfaces, cx| surfaces.open_whats_new(cx));
-            }
-            if matches!(event, SidebarEvent::OpenUsage)
-                && let Some(surfaces) = &this.utility_surfaces
-            {
-                surfaces.update(cx, |surfaces, cx| {
-                    surfaces.open_settings(cx);
-                    surfaces.open_settings_tab(crate::settings::SettingsTab::Usage, cx);
-                    surfaces.focus_handle(cx).focus(window, cx);
-                });
-            }
             if matches!(
                 event,
                 SidebarEvent::VisibilityChanged | SidebarEvent::TabOrientationChanged

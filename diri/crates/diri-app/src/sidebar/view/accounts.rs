@@ -151,8 +151,7 @@ impl Sidebar {
             .debug_selector(|| "account-switcher".into())
             .flex()
             .flex_col()
-            .py(px(3.0))
-            .child(menu_eyebrow("Accounts", colors));
+            .py(px(3.0));
         for profile in self
             .accounts
             .catalog
@@ -172,7 +171,7 @@ impl Sidebar {
                     .debug_selector(move || format!("switch-account-{id}"))
                     .mx(px(6.0))
                     .px(px(8.0))
-                    .h(px(26.0))
+                    .h(px(ACCOUNT_MENU_ACTION_ROW_HEIGHT))
                     .flex()
                     .items_center()
                     .gap(px(8.0))
@@ -247,7 +246,7 @@ impl Sidebar {
                     .debug_selector(|| "manage-accounts".into())
                     .mx(px(6.0))
                     .px(px(8.0))
-                    .h(px(26.0))
+                    .h(px(ACCOUNT_MENU_ACTION_ROW_HEIGHT))
                     .flex()
                     .items_center()
                     .rounded(px(SIDEBAR_MENU_ROW_RADIUS))
