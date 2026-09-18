@@ -309,7 +309,7 @@ impl Sidebar {
     /// Opens the picker the way a click on the header control does, for
     /// fixtures that cannot simulate the pointer. The control must have
     /// painted once so the popup has an anchor.
-    #[cfg(test)]
+    #[cfg(all(test, target_os = "macos"))]
     pub(crate) fn open_project_picker_for_test(
         &mut self,
         window: &mut Window,

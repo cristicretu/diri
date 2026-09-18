@@ -6986,6 +6986,7 @@ mod tests {
     /// A tab click in the strip opens the project-agent workspace for that
     /// session, so every later "new tab" is placed into that workspace and
     /// must still become the selected session in either orientation.
+    #[cfg(target_os = "macos")]
     fn new_session_selected_in_orientation(orientation: crate::store::TabOrientation) {
         use gpui::HeadlessAppContext;
         let fixture = crate::workspace_fixture::LiveWorkspace::start();
