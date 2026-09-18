@@ -10248,6 +10248,212 @@ mod tests {
         screenshot.save(output).expect("save sidebar screenshot");
     }
 
+    /// Renders a real project drag, frame by frame, into
+    /// `DIRI_VISUAL_OUTPUT_DIR` as `frame_NNNN.png` plus an ffmpeg concat list
+    /// (`frames.txt`) carrying each frame's wall-clock duration. The pointer
+    /// is driven with genuine platform mouse events, so the ghost, the live
+    /// reorder, the midline rule and the slide are the shipped code paths,
+    /// not a staged imitation.
+    #[test]
+    #[ignore = "writes a frame sequence; run with DIRI_VISUAL_OUTPUT_DIR"]
+    #[cfg(target_os = "macos")]
+    fn render_sidebar_project_drag_video_frames() {
+        use gpui::{MouseDownEvent, MouseMoveEvent, MouseUpEvent, PlatformInput};
+
+        let output = std::env::var_os("DIRI_VISUAL_OUTPUT_DIR")
+            .map(PathBuf::from)
+            .expect("set DIRI_VISUAL_OUTPUT_DIR to the frame directory");
+        std::fs::create_dir_all(&output).expect("create frame directory");
+        let width = 248.0;
+        let height = 720.0;
+        let platform = gpui_platform::current_platform(true);
+        let mut cx = HeadlessAppContext::with_platform(
+            platform.text_system(),
+            Arc::new(diri_ui::IconAssets),
+            gpui_platform::current_headless_renderer,
+        );
+        cx.update(|cx| crate::fonts::init(cx));
+        let window = cx
+            .open_window(size(px(width), px(height)), |_, cx| {
+                let sidebar = cx.new(|cx| {
+                    let mut sidebar = Sidebar::new(None, true, PreviewScenario::Typical, cx);
+                    sidebar.ui.width = width;
+                    let now = wall_clock_millis();
+                    let mut store = sidebar.store.write().expect("preview session store");
+                    let sessions: Vec<_> = store
+                        .sessions()
+                        .values()
+                        .map(|session| (**session).clone())
+                        .collect();
+                    for (index, mut session) in sessions.into_iter().enumerate() {
+                        let age = [
+                            2.0 * 60.0 * 60.0 * 1_000.0,
+                            26.0 * 60.0 * 60.0 * 1_000.0,
+                            3.0 * 24.0 * 60.0 * 60.0 * 1_000.0,
+                            10.0 * 24.0 * 60.0 * 60.0 * 1_000.0,
+                        ][index % 4];
+                        session.updated_at = diri_proto::DateMillis(now - age);
+                        store.upsert_session(session);
+                    }
+                    store
+                        .update_preferences(|prefs| {
+                            prefs.terminal_theme = "dirijor-dark".into();
+                            prefs.sidebar_grouping = SidebarGrouping::Project;
+                            prefs.sidebar_ordering = SidebarOrdering::Custom;
+                        })
+                        .expect("preview preferences");
+                    drop(store);
+                    sidebar
+                });
+                cx.new(|_| SidebarPopoverHarness { sidebar })
+            })
+            .expect("open headless sidebar window");
+        cx.run_until_parked();
+        std::thread::sleep(Duration::from_millis(180));
+        let draw = |cx: &mut HeadlessAppContext| {
+            cx.update_window(window.into(), |_, window, _| window.refresh())
+                .expect("refresh sidebar window");
+            cx.run_until_parked();
+        };
+        draw(&mut cx);
+
+        let sidebar = cx
+            .update_window(window.into(), |root, _, cx| {
+                root.downcast::<SidebarPopoverHarness>()
+                    .expect("harness root")
+                    .read(cx)
+                    .sidebar
+                    .clone()
+            })
+            .expect("read harness");
+        let header = |cx: &mut HeadlessAppContext, id: &str| -> Bounds<Pixels> {
+            cx.update(|cx| {
+                sidebar
+                    .read(cx)
+                    .fade_bounds
+                    .borrow()
+                    .get(&SharedString::from(format!("project:{id}")))
+                    .copied()
+                    .unwrap_or_else(|| panic!("{id} header bounds"))
+            })
+        };
+        let dirijor = header(&mut cx, "preview-dirijor");
+        let anara = header(&mut cx, "preview-anara");
+        let settings = header(&mut cx, "preview-settings-kit");
+        let x = dirijor.center().x;
+        let start_y = f32::from(dirijor.center().y);
+        // Past Anara's midline, then on past Settings Kit's, which does not
+        // move when the first two trade places.
+        let first_stop = f32::from(anara.center().y) + 6.0;
+        let second_stop = f32::from(settings.center().y) + 6.0;
+        // (end time in seconds, y at that time). Holds are flat segments.
+        let path: [(f32, f32); 7] = [
+            (0.30, start_y),
+            (0.45, start_y + 8.0),
+            (1.60, first_stop),
+            (2.20, first_stop),
+            (3.40, second_stop),
+            (4.00, second_stop),
+            (4.80, second_stop),
+        ];
+        let release_at = 4.00;
+        let smooth = |t: f32| t * t * (3.0 - 2.0 * t);
+        let pointer_y = |t: f32| -> f32 {
+            let mut previous = (0.0, start_y);
+            for (end, y) in path {
+                if t <= end {
+                    let span = end - previous.0;
+                    let progress = if span <= 0.0 {
+                        1.0
+                    } else {
+                        (t - previous.0) / span
+                    };
+                    return previous.1 + (y - previous.1) * smooth(progress.clamp(0.0, 1.0));
+                }
+                previous = (end, y);
+            }
+            previous.1
+        };
+        let modifiers = Modifiers::default();
+
+        cx.update_window(window.into(), |_, window, cx| {
+            window.dispatch_event(
+                PlatformInput::MouseDown(MouseDownEvent {
+                    button: MouseButton::Left,
+                    position: point(x, px(start_y)),
+                    modifiers,
+                    click_count: 1,
+                    first_mouse: false,
+                }),
+                cx,
+            );
+        })
+        .expect("press");
+
+        let started = Instant::now();
+        let mut released = false;
+        // Frames stay in memory until the gesture is over: encoding a PNG
+        // per frame inside the loop would cost more than the frame itself.
+        let mut frames = Vec::new();
+        loop {
+            let t = started.elapsed().as_secs_f32();
+            let position = point(x, px(pointer_y(t)));
+            cx.update_window(window.into(), |_, window, cx| {
+                if released {
+                    return;
+                }
+                if t >= release_at {
+                    window.dispatch_event(
+                        PlatformInput::MouseUp(MouseUpEvent {
+                            button: MouseButton::Left,
+                            position,
+                            modifiers,
+                            click_count: 1,
+                        }),
+                        cx,
+                    );
+                    released = true;
+                } else {
+                    window.dispatch_event(
+                        PlatformInput::MouseMove(MouseMoveEvent {
+                            position,
+                            pressed_button: Some(MouseButton::Left),
+                            modifiers,
+                        }),
+                        cx,
+                    );
+                }
+            })
+            .expect("pointer event");
+            draw(&mut cx);
+            let frame = cx.capture_screenshot(window.into()).expect("capture frame");
+            frames.push((started.elapsed().as_secs_f32(), frame));
+            if t >= path[path.len() - 1].0 {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(4));
+        }
+        let stamps: Vec<f32> = frames.iter().map(|(stamp, _)| *stamp).collect();
+        for (index, (_, frame)) in frames.iter().enumerate() {
+            frame
+                .save(output.join(format!("frame_{index:04}.png")))
+                .expect("save frame");
+        }
+        let mut list = String::new();
+        for (index, window) in stamps.windows(2).enumerate() {
+            list.push_str(&format!(
+                "file 'frame_{index:04}.png'\nduration {:.4}\n",
+                (window[1] - window[0]).max(0.001)
+            ));
+        }
+        list.push_str(&format!(
+            "file 'frame_{:04}.png'\nduration 0.5\n",
+            stamps.len() - 1
+        ));
+        std::fs::write(output.join("frames.txt"), list).expect("write concat list");
+        eprintln!("rendered {} frames", stamps.len());
+    }
+
     #[gpui::test]
     fn project_plus_opens_the_agent_kind_menu_in_that_project(cx: &mut TestAppContext) {
         let (view, cx) = cx.add_window_view(|_, cx| {
