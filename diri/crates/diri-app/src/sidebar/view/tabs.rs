@@ -46,18 +46,6 @@ pub(super) fn session_tab_face(
         )
 }
 
-/// The close mark at a tab's trailing edge, drawn inert on a lifted copy.
-pub(super) fn session_tab_close_glyph(colors: SemanticColors) -> AnyElement {
-    div()
-        .size(px(18.0))
-        .flex_none()
-        .flex()
-        .items_center()
-        .justify_center()
-        .child(sf_symbol("xmark", 8.0, colors.tertiary))
-        .into_any_element()
-}
-
 impl Sidebar {
     pub(super) fn agent_tab_icon(kind: &ProtoAgentKind, colors: SemanticColors) -> AnyElement {
         match ui_agent_kind(kind).brand_mark() {
@@ -203,11 +191,11 @@ impl Sidebar {
             let debug_id = id.0.clone();
             let close_id = id.clone();
             let probe_key = SharedString::from(format!("tab:{}", id.0));
-            let dragging_self = matches!(
-                &self.lift,
-                Some(Lift { face: LiftFace::SessionTab { id: lifted, .. }, .. }) if *lifted == id
-            );
-            let shift = if reduce_motion {
+            let lifting = self.lift_offset(&LiftKey::SessionTab(id.clone()));
+            let dragging_self = lifting.is_some();
+            // The lifted tab never slides: it is drawn from the pointer, and
+            // its slot simply moves.
+            let shift = if reduce_motion || dragging_self {
                 None
             } else {
                 self.tab_shift.deltas.get(&id).copied()
@@ -235,9 +223,6 @@ impl Sidebar {
             .border_1()
             .border_color(colors.primary.alpha(0.0))
             .glass_pill(colors, active)
-            // The tab left in the strip is the slot the lifted one
-            // returns to.
-            .when(dragging_self, |row| row.opacity(0.35))
             .hover(move |row| {
                 if active {
                     row
@@ -248,25 +233,15 @@ impl Sidebar {
             .when(custom_ordering, |row| {
                 let drag_id = id.clone();
                 let drag_entity = entity.clone();
-                let kind = session.effective_kind().clone();
-                let title: SharedString = title.clone().into();
                 row.on_drag(DraggedTab(id.clone()), move |dragged, grab, window, cx| {
-                    // The probe sits inside the tab's 1px border; the
-                    // pointer minus the grab offset is the border box.
-                    let origin = Bounds {
-                        origin: window.mouse_position() - grab,
-                        size: gpui::size(px(TAB_WIDTH), px(30.0)),
-                    };
+                    // The tab itself lifts from where the pointer grabbed it
+                    // and travels only along the strip.
+                    let origin = window.mouse_position() - grab;
                     drag_entity.update(cx, |this, cx| {
                         let order = this.store.write().expect("store").sidebar_session_order();
                         this.ui.session_order_at_drag_start = Some(order);
                         this.lift = Some(Lift::new(
-                            LiftFace::SessionTab {
-                                id: drag_id.clone(),
-                                title: title.clone(),
-                                kind: kind.clone(),
-                                active,
-                            },
+                            LiftKey::SessionTab(drag_id.clone()),
                             origin,
                             grab,
                             LiftAxis::Horizontal,
@@ -325,9 +300,12 @@ impl Sidebar {
                     cx.notify();
                 }
             }));
-            let tab = match shift {
-                None => tab.into_any_element(),
-                Some(delta) => {
+            let tab = match (lifting, shift) {
+                (Some(offset), _) => {
+                    lift_in_place(tab, LiftAxis::Horizontal, offset, colors, reduce_motion)
+                }
+                (None, None) => tab.into_any_element(),
+                (None, Some(delta)) => {
                     let applied = Rc::clone(&self.tab_shift.applied);
                     let settled = Rc::clone(&self.tab_shift.settled);
                     let id = id.clone();
@@ -444,7 +422,14 @@ impl Sidebar {
         reduce_motion: bool,
     ) {
         let applied = self.tab_shift.applied.borrow().clone();
-        let deltas = tab_shift_deltas(before, after, &applied, TAB_WIDTH + TAB_GAP);
+        let mut deltas = tab_shift_deltas(before, after, &applied, TAB_WIDTH + TAB_GAP);
+        // The lifted tab does not slide; its slot moves under it.
+        if let Some(lift) = self.lift.as_mut()
+            && let LiftKey::SessionTab(session) = &lift.key
+            && let Some(delta) = deltas.remove(session)
+        {
+            lift.slot.x -= px(delta);
+        }
         self.tab_shift.start(deltas, reduce_motion);
     }
 
@@ -454,23 +439,22 @@ impl Sidebar {
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let colors = self.colors();
+        self.end_lift_if_released(cx);
         if self.workspace_nav.active.is_some() {
             self.workspace_nav.available_width = available_width;
             return self.workspace_strip(colors, cx);
         }
         let rows = self.render_project_tab_rows(available_width, cx);
-        // The strip is rendered outside the sidebar's own root, so it hosts
-        // the lifted tab and the pointer tracking itself.
-        let lifted = self.lifted_row(colors, cx);
         div()
             .id("horizontal-tabs")
             .debug_selector(|| "horizontal-tabs".into())
+            // The strip is rendered outside the sidebar's own root, so it
+            // tracks the pointer for its lifted tab itself.
             .on_drag_move::<DraggedTab>(cx.listener(
                 |this, event: &gpui::DragMoveEvent<DraggedTab>, _, cx| {
                     this.track_lift_pointer(event.event.position, cx);
                 },
             ))
-            .children(lifted)
             .role(Role::TabList)
             .aria_label("Project sessions")
             .flex_none()

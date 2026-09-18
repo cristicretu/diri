@@ -703,7 +703,6 @@ mod tests {
             .debug_bounds(selector(&second))
             .expect("second sibling tab");
         assert!(a.left() < b.left(), "siblings run left to right");
-        assert!(cx.debug_bounds("LIFTED_ROW").is_none());
 
         let grab = a.center();
         cx.simulate_mouse_down(grab, MouseButton::Left, Modifiers::default());
@@ -718,18 +717,13 @@ mod tests {
         cx.simulate_mouse_move(near_edge, MouseButton::Left, Modifiers::default());
 
         let lifted = cx
-            .debug_bounds("LIFTED_ROW")
-            .expect("dragging a tab lifts the tab itself");
-        assert_eq!(lifted.size, a.size, "the lifted tab keeps its size");
+            .debug_bounds(selector(&first))
+            .expect("the tab is still the tab");
+        assert_eq!(lifted.size, a.size, "the tab keeps its size");
         assert_eq!(
             lifted.origin,
             point(a.origin.x + (near_edge.x - grab.x - px(4.0)), a.origin.y),
-            "a strip's tab travels only along the strip"
-        );
-        assert_eq!(
-            cx.debug_bounds(selector(&first)),
-            Some(a),
-            "the tab stays in the strip as the slot it returns to"
+            "the tab itself moves, and only along the strip"
         );
         assert_eq!(
             order(&sidebar, cx),
@@ -760,7 +754,10 @@ mod tests {
         assert_eq!(others(&before), others(&after));
 
         cx.simulate_mouse_up(past_midline, MouseButton::Left, Modifiers::default());
-        assert!(cx.debug_bounds("LIFTED_ROW").is_none());
+        assert!(
+            sidebar.read_with(cx, |sidebar, _| sidebar.lift.is_none()),
+            "the release ends the lift"
+        );
         assert_eq!(
             order(&sidebar, cx),
             after,
