@@ -5517,22 +5517,26 @@ impl Sidebar {
         panel
     }
 
-    /// The update row only exists while there is an update to act on or
-    /// watch. Checking, the current version, and unsupported builds are
-    /// Settings and command-palette matters.
-    fn update_menu_row(
-        &self,
-        colors: SemanticColors,
-        cx: &mut Context<Self>,
-    ) -> Option<AnyElement> {
-        if self.preview {
-            return None;
-        }
-        let action = match &self.update.phase {
-            UpdatePhase::Available(_) => Some((UpdateCommand::Download, "Download")),
-            UpdatePhase::Ready(_) => Some((UpdateCommand::Install, "Restart")),
-            UpdatePhase::Downloading { .. } => None,
-            _ => return None,
+    /// Version and update state, always present: Check when idle, Download
+    /// or Restart when an update is available or staged, no action while a
+    /// check or download runs or on builds that cannot update themselves.
+    fn update_menu_row(&self, colors: SemanticColors, cx: &mut Context<Self>) -> AnyElement {
+        let unsupported = matches!(self.update.phase, UpdatePhase::Unsupported(_));
+        let command = match &self.update.phase {
+            UpdatePhase::Available(_) => Some(UpdateCommand::Download),
+            UpdatePhase::Ready(_) => Some(UpdateCommand::Install),
+            UpdatePhase::Checking | UpdatePhase::Downloading { .. } | UpdatePhase::Installing => {
+                None
+            }
+            _ if unsupported => None,
+            _ => Some(UpdateCommand::Check {
+                user_initiated: true,
+            }),
+        };
+        let label = if self.preview {
+            format!("diri {}", crate::updates::CURRENT_VERSION)
+        } else {
+            self.update.summary()
         };
         let mut row = div()
             .id("account-version")
@@ -5545,7 +5549,11 @@ impl Sidebar {
             .gap(px(8.0))
             .rounded(px(SIDEBAR_MENU_ROW_RADIUS))
             .text_size(px(Typo::ROW.size))
-            .text_color(colors.primary)
+            .text_color(if unsupported {
+                colors.tertiary
+            } else {
+                colors.primary
+            })
             .child(
                 div()
                     .min_w(px(0.0))
@@ -5553,9 +5561,14 @@ impl Sidebar {
                     .whitespace_nowrap()
                     .overflow_hidden()
                     .text_ellipsis()
-                    .child(self.update.summary()),
+                    .child(label),
             );
-        if let Some((command, label)) = action {
+        if let Some(command) = command {
+            let action = match command {
+                UpdateCommand::Download => "Download",
+                UpdateCommand::Install => "Restart",
+                _ => "Check",
+            };
             row = row
                 .cursor_pointer()
                 .glass_menu_row(colors, false)
@@ -5564,7 +5577,7 @@ impl Sidebar {
                         .flex_none()
                         .text_size(px(Typo::META.size))
                         .text_color(colors.tertiary)
-                        .child(label),
+                        .child(action),
                 )
                 .on_click(cx.listener(move |this, _, _, cx: &mut Context<Self>| {
                     cx.emit(SidebarEvent::Update(command.clone()));
@@ -5572,7 +5585,7 @@ impl Sidebar {
                     cx.notify();
                 }));
         }
-        Some(row.into_any_element())
+        row.into_any_element()
     }
 
     fn account_popover(&self, colors: SemanticColors, cx: &mut Context<Self>) -> PopoverSpec {
@@ -5586,9 +5599,8 @@ impl Sidebar {
          * animate independently: this is a frequent, keyboard-adjacent menu.
          *
          * Who is signed in, which login open tabs use, how much of each
-         * plan window is spent, and Settings. Everything else lives in
-         * Settings or the command palette; an update row appears only
-         * while there is one to act on.
+         * plan window is spent, Settings, and the version with its update
+         * action. Everything else lives in Settings or the command palette.
          * ───────────────────────────────────────────────────────── */
         let account_label = local_account_label(self.preview);
         let limits = if self.preview {
@@ -5651,9 +5663,7 @@ impl Sidebar {
                     cx.notify();
                 }),
             ))
-            .when_some(self.update_menu_row(colors, cx), |menu, row| {
-                menu.child(row)
-            })
+            .child(self.update_menu_row(colors, cx))
             .child(div().h(px(3.0)));
         self.popover_shell_above_footer(content, colors, cx)
     }
