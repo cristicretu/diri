@@ -231,14 +231,9 @@ enum DragGhost {
     /// A compact pill naming the item, for rows whose drop targets are other
     /// rows (sessions delegate, archives revive).
     Label(SharedString),
-    /// The project header itself, at the width it had in the list. GPUI paints
-    /// the ghost at the pointer minus the grab offset, so a ghost with the
-    /// row's exact size lifts off in place and moves as the row would.
-    ProjectRow {
-        name: SharedString,
-        collapsed: bool,
-        width: f32,
-    },
+    /// Nothing: the row itself is lifted inside the sidebar (`Lift`), locked
+    /// to its list's axis, so a free-floating ghost would be a second copy.
+    Lifted,
 }
 
 struct DragPreview {
@@ -250,7 +245,7 @@ struct DragPreview {
 }
 
 impl Render for DragPreview {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
         if self.hidden {
             return div().into_any_element();
         }
@@ -269,51 +264,101 @@ impl Render for DragPreview {
                 .text_color(colors.primary)
                 .child(label.clone())
                 .into_any_element(),
-            DragGhost::ProjectRow {
-                name,
-                collapsed,
-                width,
-            } => {
-                let row = div()
-                    .debug_selector(|| "PROJECT_DRAG_GHOST".to_owned())
-                    .w(px(*width))
-                    .h(px(SIDEBAR_NAV_ROW_HEIGHT))
-                    .px(px(Space::ROW_H))
-                    .flex()
-                    .items_center()
-                    .gap(px(8.0))
-                    .rounded(px(SIDEBAR_ROW_RADIUS))
-                    .bg(colors.floating_surface().alpha(0.98))
-                    .border_1()
-                    .border_color(colors.floating_stroke())
-                    .child(project_disclosure(*collapsed, colors))
-                    .child(
-                        div()
-                            .min_w(px(0.0))
-                            .flex_1()
-                            .whitespace_nowrap()
-                            .overflow_hidden()
-                            .text_ellipsis()
-                            .text_size(px(Typo::ROW_EMPHASIZED.size))
-                            .font_weight(Typo::ROW_EMPHASIZED.weight)
-                            .text_color(colors.primary.alpha(0.90))
-                            .child(name.clone()),
-                    );
-                if cx.reduce_motion() {
-                    return row.shadow(lift_shadow(1.0)).into_any_element();
-                }
-                // The row starts as the flat row it was and gains its shadow
-                // as it lifts, so the pickup reads as one motion rather than
-                // a swap between a row and a ghost.
-                row.with_animation(
-                    "project-drag-lift",
-                    Animation::new(DRAG_LIFT_TIME).with_easing(|delta| Motion::SNAP.settle(delta)),
-                    |row, delta| row.shadow(lift_shadow(delta)),
-                )
-                .into_any_element()
-            }
+            DragGhost::Lifted => div().into_any_element(),
         }
     }
+}
+
+/// Which way a lifted row may travel: the axis its list runs along.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum LiftAxis {
+    Vertical,
+    Horizontal,
+}
+
+/// What a lifted row looks like, so it can be drawn away from its source.
+pub(super) enum LiftFace {
+    Project {
+        name: SharedString,
+        collapsed: bool,
+    },
+    WorkspaceTab {
+        title: SharedString,
+        kind: Option<ProtoAgentKind>,
+        active: bool,
+    },
+    /// A session tab in the horizontal strip.
+    SessionTab {
+        id: SessionId,
+        title: SharedString,
+        kind: ProtoAgentKind,
+        active: bool,
+    },
+}
+
+/// A row picked up by a drag. The row is drawn by the sidebar at its own
+/// size, on top of the list, at its pickup position moved along `axis` by
+/// however far the pointer has travelled since the grab. There is no
+/// separate ghost: what moves is the row, and it moves the way the list
+/// runs, so a wobble sideways during a vertical drag changes nothing.
+pub(super) struct Lift {
+    pub(super) face: LiftFace,
+    /// The row's bounds when it was picked up, in window coordinates.
+    pub(super) origin: Bounds<Pixels>,
+    /// Where within the row the pointer grabbed it.
+    pub(super) grab: Point<Pixels>,
+    pub(super) axis: LiftAxis,
+    /// The pointer's last reported position, fed by drag-move listeners so
+    /// the row can be placed at render time without a window in hand.
+    pub(super) pointer: Point<Pixels>,
+}
+
+impl Lift {
+    pub(super) fn new(
+        face: LiftFace,
+        origin: Bounds<Pixels>,
+        grab: Point<Pixels>,
+        axis: LiftAxis,
+    ) -> Self {
+        Self {
+            face,
+            origin,
+            grab,
+            axis,
+            pointer: origin.origin + grab,
+        }
+    }
+
+    /// Where the lifted row sits for the pointer as last seen.
+    pub(super) fn position(&self) -> Point<Pixels> {
+        match self.axis {
+            LiftAxis::Vertical => point(self.origin.origin.x, self.pointer.y - self.grab.y),
+            LiftAxis::Horizontal => point(self.pointer.x - self.grab.x, self.origin.origin.y),
+        }
+    }
+}
+
+/// The static face of a project header: the fold chevron and the name.
+fn project_header_face(name: SharedString, collapsed: bool, colors: SemanticColors) -> gpui::Div {
+    div()
+        .px(px(Space::ROW_H))
+        .flex()
+        .items_center()
+        .gap(px(8.0))
+        .rounded(px(SIDEBAR_ROW_RADIUS))
+        .child(project_disclosure(collapsed, colors))
+        .child(
+            div()
+                .min_w(px(0.0))
+                .flex_1()
+                .whitespace_nowrap()
+                .overflow_hidden()
+                .text_ellipsis()
+                .text_size(px(Typo::ROW_EMPHASIZED.size))
+                .font_weight(Typo::ROW_EMPHASIZED.weight)
+                .text_color(colors.primary.alpha(0.90))
+                .child(name),
+        )
 }
 
 fn lift_shadow(strength: f32) -> Vec<BoxShadow> {
@@ -335,33 +380,57 @@ fn lift_shadow(strength: f32) -> Vec<BoxShadow> {
     ]
 }
 
-/// Slide state for project sections displaced by a live header reorder.
+/// Slide state for rows displaced by a live reorder: project sections in
+/// the list, session tabs in the horizontal strip.
 ///
-/// A reorder changes where every section between the two headers lays out.
-/// Rather than let them snap, each displaced section is rendered with a
-/// `top` offset that starts at (old visual y − new layout y) and eases to
-/// zero, so the list visibly steps aside for the dragged project.
-#[derive(Default)]
-struct SectionShift {
-    /// Starting offset per displaced section, in pixels.
-    deltas: HashMap<ProjectId, f32>,
+/// A reorder changes where every row between the two lays out. Rather than
+/// let them snap, each displaced row is rendered with an offset along its
+/// list's axis that starts at (old visual position − new layout position)
+/// and eases to zero, so the list visibly steps aside for the dragged row.
+pub(super) struct Shift<K> {
+    /// Starting offset per displaced row, in pixels.
+    deltas: HashMap<K, f32>,
     /// Bumped per reorder so a fresh animation replaces the in-flight one.
     generation: u64,
     /// Offset applied this frame per section, written by the animation
     /// closure. Bounds probes subtract it to record layout positions, and the
     /// next reorder adds it back so a mid-slide reorder starts from where the
     /// section is on screen, not where it would have landed.
-    applied: Rc<RefCell<HashMap<ProjectId, f32>>>,
-    /// Set by the animation closure on its final frame. Header reorders are
-    /// gated on it: a section still sliding under the pointer must not be
-    /// treated as a header the pointer crossed.
+    applied: Rc<RefCell<HashMap<K, f32>>>,
+    /// Set by the animation closure on its final frame. Reorders are gated
+    /// on it: a row still sliding under the pointer must not be treated as
+    /// one the pointer crossed.
     settled: Rc<Cell<bool>>,
     /// When the slide began. A covered window can miss the final frame, so
     /// the gate also lapses on its own once the slide's duration has passed.
     started: Option<Instant>,
 }
 
-impl SectionShift {
+impl<K> Default for Shift<K> {
+    fn default() -> Self {
+        Self {
+            deltas: HashMap::new(),
+            generation: 0,
+            applied: Rc::new(RefCell::new(HashMap::new())),
+            settled: Rc::new(Cell::new(false)),
+            started: None,
+        }
+    }
+}
+
+impl<K: Clone + Eq + std::hash::Hash> Shift<K> {
+    /// Starts a slide from `deltas`. With motion reduced nothing slides and
+    /// nothing gates: rows simply appear in their new slots.
+    fn start(&mut self, deltas: HashMap<K, f32>, reduce_motion: bool) {
+        if deltas.is_empty() || reduce_motion {
+            return;
+        }
+        self.deltas = deltas;
+        self.generation += 1;
+        self.settled = Rc::new(Cell::new(false));
+        self.started = Some(Instant::now());
+    }
+
     fn in_flight(&self) -> bool {
         if self.deltas.is_empty() || self.settled.get() {
             return false;
@@ -440,7 +509,11 @@ pub struct Sidebar {
     /// Layout bounds of each project section (header plus rows), for the
     /// slide that follows a live header reorder.
     section_bounds: Rc<RefCell<HashMap<ProjectId, Bounds<Pixels>>>>,
-    section_shift: SectionShift,
+    section_shift: Shift<ProjectId>,
+    /// Slide state for session tabs in the horizontal strip.
+    pub(super) tab_shift: Shift<SessionId>,
+    /// The row a drag has picked up, drawn by the sidebar on its list's axis.
+    pub(super) lift: Option<Lift>,
     /// The session list's viewport from the latest prepaint.
     fade_viewport: Rc<Cell<Option<Bounds<Pixels>>>>,
     /// Whether rows fade themselves at the list edges. On a glass window a
@@ -607,7 +680,9 @@ impl Sidebar {
             row_bounds: Rc::new(RefCell::new(HashMap::new())),
             fade_bounds: Rc::new(RefCell::new(HashMap::new())),
             section_bounds: Rc::new(RefCell::new(HashMap::new())),
-            section_shift: SectionShift::default(),
+            section_shift: Shift::default(),
+            tab_shift: Shift::default(),
+            lift: None,
             fade_viewport: Rc::new(Cell::new(None)),
             fade_glass: false,
             weak_self: cx.entity().downgrade(),
@@ -2399,28 +2474,38 @@ impl Sidebar {
                     .on_drag(DraggedSidebarItem(DragItem::Project(id.clone())), {
                         let drag_entity = entity.clone();
                         let id = id.clone();
-                        move |dragged, _, _, cx| {
+                        move |dragged, grab, window, cx| {
                             let dragged = dragged.0.clone();
-                            // The ghost is the header at its painted width, so
-                            // it lifts off in place rather than snapping to a
-                            // pill at the grab point.
-                            let width = drag_entity
-                                .read(cx)
-                                .fade_bounds
-                                .borrow()
-                                .get(&SharedString::from(format!("project:{}", id.0)))
-                                .map_or(0.0, |bounds| f32::from(bounds.size.width));
                             let preview = cx.new(|_| DragPreview {
-                                ghost: DragGhost::ProjectRow {
-                                    name: drag_label.clone(),
-                                    collapsed,
-                                    width,
-                                },
+                                ghost: DragGhost::Lifted,
                                 colors,
                                 hidden: false,
                             });
+                            let pointer = window.mouse_position();
                             drag_entity.update(cx, |this, cx| {
                                 this.begin_drag(dragged, preview.clone(), cx);
+                                // The header itself lifts, at the size it was
+                                // painted with and from the pointer minus the
+                                // grab offset, and travels only up and down.
+                                let origin = this
+                                    .fade_bounds
+                                    .borrow()
+                                    .get(&SharedString::from(format!("project:{}", id.0)))
+                                    .map(|painted| Bounds {
+                                        origin: pointer - grab,
+                                        size: painted.size,
+                                    });
+                                if let (Some(origin), true) = (origin, this.ui.drag.is_some()) {
+                                    this.lift = Some(Lift::new(
+                                        LiftFace::Project {
+                                            name: drag_label.clone(),
+                                            collapsed,
+                                        },
+                                        origin,
+                                        grab,
+                                        LiftAxis::Vertical,
+                                    ));
+                                }
                             });
                             preview
                         }
@@ -2441,7 +2526,7 @@ impl Sidebar {
                                 entity.update(cx, |this, cx| {
                                     let target = format!("project:{}", id.0);
                                     let moved_now = this.pointer_crossed_header(moved, &id, window)
-                                        && this.reorder_project(moved, &id);
+                                        && this.reorder_project(moved, &id, cx.reduce_motion());
                                     if moved_now || this.ui.drag_target.as_deref() != Some(&target)
                                     {
                                         this.ui.drag_target = Some(target);
@@ -2828,7 +2913,7 @@ impl Sidebar {
 
     /// Starts the slide from the sections' current positions to where
     /// `after` lays them out.
-    fn shift_sections(&mut self, before: &[ProjectId], after: &[ProjectId]) {
+    fn shift_sections(&mut self, before: &[ProjectId], after: &[ProjectId], reduce_motion: bool) {
         let deltas = section_shift_deltas(
             before,
             after,
@@ -2836,13 +2921,7 @@ impl Sidebar {
             &self.section_shift.applied.borrow(),
             SECTION_GAP,
         );
-        if deltas.is_empty() {
-            return;
-        }
-        self.section_shift.deltas = deltas;
-        self.section_shift.generation += 1;
-        self.section_shift.settled = Rc::new(Cell::new(false));
-        self.section_shift.started = Some(Instant::now());
+        self.section_shift.start(deltas, reduce_motion);
     }
 
     fn recency_sections(
@@ -5973,6 +6052,78 @@ impl Sidebar {
         fades
     }
 
+    /// A drag-move listener's report of where the pointer is. GPUI repaints
+    /// on every drag move, but the lifted row is placed at render time, so
+    /// the view re-renders too.
+    pub(super) fn track_lift_pointer(&mut self, position: Point<Pixels>, cx: &mut Context<Self>) {
+        if let Some(lift) = self.lift.as_mut() {
+            lift.pointer = position;
+            cx.notify();
+        }
+    }
+
+    /// The row a drag has picked up, drawn over the list at its pickup
+    /// bounds moved along its axis by the pointer's travel. GPUI only ends a
+    /// drag on mouse-up, and a release over nothing fires no drop handler,
+    /// so the lift is dropped here the moment no drag is live.
+    pub(super) fn lifted_row(
+        &mut self,
+        colors: SemanticColors,
+        cx: &mut Context<Self>,
+    ) -> Option<AnyElement> {
+        if !cx.has_active_drag() {
+            if self.lift.take().is_some() {
+                // A release over nothing fires no drop handler, so this is
+                // where such a gesture ends and any staged order is written.
+                self.finish_drag();
+            }
+            return None;
+        }
+        let lift = self.lift.as_ref()?;
+        let position = lift.position();
+        let face = match &lift.face {
+            LiftFace::Project { name, collapsed } => {
+                project_header_face(name.clone(), *collapsed, colors)
+            }
+            LiftFace::WorkspaceTab {
+                title,
+                kind,
+                active,
+            } => self.workspace_tab_face(title.clone(), kind.as_ref(), *active, colors),
+            LiftFace::SessionTab {
+                title,
+                kind,
+                active,
+                ..
+            } => tabs::session_tab_face(kind, title.clone(), *active, colors)
+                .child(tabs::session_tab_close_glyph(colors)),
+        };
+        let row = face
+            .debug_selector(|| "LIFTED_ROW".to_owned())
+            .w(lift.origin.size.width)
+            .h(lift.origin.size.height)
+            .bg(colors.floating_surface().alpha(0.98))
+            .border_1()
+            .border_color(colors.floating_stroke());
+        let row = if cx.reduce_motion() {
+            row.shadow(lift_shadow(1.0)).into_any_element()
+        } else {
+            // The row starts as the flat row it was and gains its shadow as
+            // it lifts, so the pickup reads as one motion.
+            row.with_animation(
+                "drag-lift",
+                Animation::new(DRAG_LIFT_TIME).with_easing(|delta| Motion::SNAP.settle(delta)),
+                |row, delta| row.shadow(lift_shadow(delta)),
+            )
+            .into_any_element()
+        };
+        Some(
+            deferred(anchored().position(position).child(row))
+                .with_priority(2)
+                .into_any_element(),
+        )
+    }
+
     fn hover_card(&self, colors: SemanticColors) -> Option<AnyElement> {
         let id = self.ui.hover_card.as_ref()?;
         let row = *self.row_bounds.borrow().get(id)?;
@@ -6329,9 +6480,10 @@ impl Sidebar {
     /// hides the ghost, restores any live header reorder, and forgets the
     /// gesture; the eventual release then lands as a no-op everywhere.
     pub fn cancel_active_drag(&mut self, cx: &mut Context<Self>) -> bool {
-        if self.ui.drag.is_none() {
+        if self.ui.drag.is_none() && self.lift.is_none() {
             return false;
         }
+        let reduce_motion = cx.reduce_motion();
         if let Some(order) = self.ui.project_order_at_drag_start.take() {
             let before = self.visible_project_order();
             self.store
@@ -6339,11 +6491,21 @@ impl Sidebar {
                 .expect("session store lock poisoned")
                 .stage_project_order(order);
             let after = self.visible_project_order();
-            self.shift_sections(&before, &after);
+            self.shift_sections(&before, &after, reduce_motion);
+        }
+        if let Some(order) = self.ui.session_order_at_drag_start.take() {
+            let before = self.visible_tab_order();
+            self.store
+                .write()
+                .expect("session store lock poisoned")
+                .stage_session_order(order);
+            let after = self.visible_tab_order();
+            self.shift_tabs(&before, &after, reduce_motion);
         }
         self.ui.order_dirty = false;
         self.ui.drag = None;
         self.ui.drag_target = None;
+        self.lift = None;
         if let Some(preview) = self.drag_preview.take() {
             preview.update(cx, |preview, cx| {
                 preview.hidden = true;
@@ -6630,7 +6792,12 @@ impl Sidebar {
     }
 
     /// Live header reorder; returns whether the order changed.
-    fn reorder_project(&mut self, moved: &ProjectId, target: &ProjectId) -> bool {
+    fn reorder_project(
+        &mut self,
+        moved: &ProjectId,
+        target: &ProjectId,
+        reduce_motion: bool,
+    ) -> bool {
         let before = self.visible_project_order();
         let changed = {
             let mut store = self.store.write().expect("session store lock poisoned");
@@ -6644,7 +6811,7 @@ impl Sidebar {
         self.ui.order_dirty |= changed;
         if changed {
             let after = self.visible_project_order();
-            self.shift_sections(&before, &after);
+            self.shift_sections(&before, &after, reduce_motion);
         }
         changed
     }
@@ -6662,7 +6829,9 @@ impl Sidebar {
         self.ui.drag = None;
         self.ui.drag_target = None;
         self.ui.project_order_at_drag_start = None;
+        self.ui.session_order_at_drag_start = None;
         self.drag_preview = None;
+        self.lift = None;
         if self.ui.order_dirty {
             self.ui.order_dirty = false;
             let _ = self
@@ -7460,6 +7629,19 @@ impl Render for Sidebar {
                 root.bg(Self::surface_fill(colors))
             })
             .track_focus(&self.focus_handle)
+            // GPUI repaints on every drag move, but a lifted row is placed
+            // at render time from the pointer, so the view has to re-render
+            // too.
+            .on_drag_move::<DraggedSidebarItem>(cx.listener(
+                |this, event: &gpui::DragMoveEvent<DraggedSidebarItem>, _, cx| {
+                    this.track_lift_pointer(event.event.position, cx);
+                },
+            ))
+            .on_drag_move::<workspaces::DraggedWorkspaceTab>(cx.listener(
+                |this, event: &gpui::DragMoveEvent<workspaces::DraggedWorkspaceTab>, _, cx| {
+                    this.track_lift_pointer(event.event.position, cx);
+                },
+            ))
             .on_hover(cx.listener(|this, hovered: &bool, window, cx| {
                 if !this.surface_in_parent {
                     this.hover_peek(*hovered, window, cx);
@@ -7573,6 +7755,9 @@ impl Render for Sidebar {
         }
         if let Some(card) = self.hover_card(colors) {
             root = root.child(card);
+        }
+        if let Some(lifted) = self.lifted_row(colors, cx) {
+            root = root.child(lifted);
         }
         if self.hover_task.is_some() || self.ui.hover_card.is_some() {
             root = root.child(self.hover_card_input(cx));
@@ -9555,28 +9740,29 @@ mod tests {
     fn dragging_a_project_lifts_the_header_itself(cx: &mut TestAppContext) {
         let (sidebar, _, cx) = drag_harness(cx);
         let header = cx.debug_bounds("PROJECT_preview-dirijor").unwrap();
-        assert!(cx.debug_bounds("PROJECT_DRAG_GHOST").is_none());
+        assert!(cx.debug_bounds("LIFTED_ROW").is_none());
 
-        // `drag_to` crosses GPUI's threshold 6px below the press; the ghost
+        // `drag_to` crosses GPUI's threshold 6px below the press; the row
         // keeps the grab offset from that moment, so it trails the pointer
-        // by exactly the distance travelled since.
+        // by exactly the distance travelled since. The sideways 40px is
+        // ignored: the list runs vertically, so the row only moves that way.
         drag_to(
             cx,
             header.center(),
-            header.center() + point(px(0.0), px(12.0)),
+            header.center() + point(px(40.0), px(12.0)),
         );
 
-        let ghost = cx
-            .debug_bounds("PROJECT_DRAG_GHOST")
-            .expect("a project drag carries the header as its ghost");
+        let lifted = cx
+            .debug_bounds("LIFTED_ROW")
+            .expect("a project drag lifts the header itself");
         assert_eq!(
-            ghost.size, header.size,
-            "the ghost is the row at its own size"
+            lifted.size, header.size,
+            "the lifted row is the row at its own size"
         );
         assert_eq!(
-            ghost.origin,
+            lifted.origin,
             header.origin + point(px(0.0), px(6.0)),
-            "the ghost lifts off in place and follows the pointer from there"
+            "the row lifts off in place and travels only along the list"
         );
         assert_eq!(
             cx.debug_bounds("PROJECT_preview-dirijor"),
@@ -9588,12 +9774,23 @@ mod tests {
             "hover affordances do not ride along under a drag"
         );
 
-        cx.simulate_mouse_up(
-            header.center() + point(px(0.0), px(12.0)),
+        cx.simulate_mouse_move(
+            header.center() + point(px(40.0), px(30.0)),
             MouseButton::Left,
             Modifiers::default(),
         );
-        assert!(cx.debug_bounds("PROJECT_DRAG_GHOST").is_none());
+        assert_eq!(
+            cx.debug_bounds("LIFTED_ROW").map(|bounds| bounds.origin),
+            Some(header.origin + point(px(0.0), px(24.0))),
+            "the lifted row follows every pointer move"
+        );
+
+        cx.simulate_mouse_up(
+            header.center() + point(px(40.0), px(30.0)),
+            MouseButton::Left,
+            Modifiers::default(),
+        );
+        assert!(cx.debug_bounds("LIFTED_ROW").is_none());
         assert_eq!(
             project_order(&sidebar, cx),
             ["preview-dirijor", "preview-anara", "preview-settings-kit"]

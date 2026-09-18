@@ -5,6 +5,59 @@ use crate::tab_navigation::{TAB_STRIP_HEIGHT, selected_project_tabs};
 const TAB_WIDTH: f32 = 164.0;
 const TAB_GAP: f32 = 4.0;
 
+/// A session tab picked up in the horizontal strip. It carries no ghost:
+/// the tab itself is lifted by the strip, locked to the strip's axis.
+#[derive(Clone)]
+pub(super) struct DraggedTab(pub(super) SessionId);
+
+impl Render for DraggedTab {
+    fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+        div()
+    }
+}
+
+/// The static face of a session tab: agent mark and title.
+pub(super) fn session_tab_face(
+    kind: &ProtoAgentKind,
+    title: SharedString,
+    active: bool,
+    colors: SemanticColors,
+) -> gpui::Div {
+    div()
+        .px(px(10.0))
+        .rounded(px(SIDEBAR_ROW_RADIUS))
+        .flex()
+        .items_center()
+        .gap(px(7.0))
+        .child(Sidebar::agent_tab_icon(kind, colors))
+        .child(
+            div()
+                .flex_1()
+                .min_w(px(0.0))
+                .overflow_hidden()
+                .text_ellipsis()
+                .text_size(px(Typo::ROW.size))
+                .text_color(if active {
+                    colors.primary
+                } else {
+                    colors.secondary
+                })
+                .child(title),
+        )
+}
+
+/// The close mark at a tab's trailing edge, drawn inert on a lifted copy.
+pub(super) fn session_tab_close_glyph(colors: SemanticColors) -> AnyElement {
+    div()
+        .size(px(18.0))
+        .flex_none()
+        .flex()
+        .items_center()
+        .justify_center()
+        .child(sf_symbol("xmark", 8.0, colors.tertiary))
+        .into_any_element()
+}
+
 impl Sidebar {
     pub(super) fn agent_tab_icon(kind: &ProtoAgentKind, colors: SemanticColors) -> AnyElement {
         match ui_agent_kind(kind).brand_mark() {
@@ -105,11 +158,17 @@ impl Sidebar {
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let colors = self.colors();
-        let (tabs, selected) = {
+        let (tabs, selected, custom_ordering) = {
             let mut store = self.store.write().expect("store");
             let selected = store.selected_session_id().cloned();
-            (selected_project_tabs(&mut store), selected)
+            let custom = store.preferences().sidebar_ordering == SidebarOrdering::Custom;
+            (selected_project_tabs(&mut store), selected, custom)
         };
+        let reduce_motion = cx.reduce_motion();
+        if self.tab_shift.settled.get() {
+            self.tab_shift.deltas.clear();
+        }
+        let entity = cx.entity();
         let mut rows = div()
             .id(SharedString::from(format!(
                 "horizontal-tab-list-{}",
@@ -143,79 +202,250 @@ impl Sidebar {
             let title = display_title(&session);
             let debug_id = id.0.clone();
             let close_id = id.clone();
-            rows = rows.child(
+            let probe_key = SharedString::from(format!("tab:{}", id.0));
+            let dragging_self = matches!(
+                &self.lift,
+                Some(Lift { face: LiftFace::SessionTab { id: lifted, .. }, .. }) if *lifted == id
+            );
+            let shift = if reduce_motion {
+                None
+            } else {
+                self.tab_shift.deltas.get(&id).copied()
+            };
+            if shift.is_none() {
+                self.tab_shift.applied.borrow_mut().remove(&id);
+            }
+            let tab = session_tab_face(
+                session.effective_kind(),
+                title.clone().into(),
+                active,
+                colors,
+            )
+            .id(SharedString::from(format!("horizontal-tab-{}", id.0)))
+            .debug_selector(move || format!("horizontal-tab-{}", debug_id))
+            .role(Role::Tab)
+            .aria_label(title.clone())
+            .aria_selected(active)
+            .relative()
+            .child(self.fade_probe(probe_key.clone()))
+            .flex_none()
+            .w(px(TAB_WIDTH))
+            .h(px(30.0))
+            .cursor_pointer()
+            .border_1()
+            .border_color(colors.primary.alpha(0.0))
+            .glass_pill(colors, active)
+            // The tab left in the strip is the slot the lifted one
+            // returns to.
+            .when(dragging_self, |row| row.opacity(0.35))
+            .hover(move |row| {
+                if active {
+                    row
+                } else {
+                    row.bg(colors.primary.alpha(0.06))
+                }
+            })
+            .when(custom_ordering, |row| {
+                let drag_id = id.clone();
+                let drag_entity = entity.clone();
+                let kind = session.effective_kind().clone();
+                let title: SharedString = title.clone().into();
+                row.on_drag(DraggedTab(id.clone()), move |dragged, grab, window, cx| {
+                    // The probe sits inside the tab's 1px border; the
+                    // pointer minus the grab offset is the border box.
+                    let origin = Bounds {
+                        origin: window.mouse_position() - grab,
+                        size: gpui::size(px(TAB_WIDTH), px(30.0)),
+                    };
+                    drag_entity.update(cx, |this, cx| {
+                        let order = this.store.write().expect("store").sidebar_session_order();
+                        this.ui.session_order_at_drag_start = Some(order);
+                        this.lift = Some(Lift::new(
+                            LiftFace::SessionTab {
+                                id: drag_id.clone(),
+                                title: title.clone(),
+                                kind: kind.clone(),
+                                active,
+                            },
+                            origin,
+                            grab,
+                            LiftAxis::Horizontal,
+                        ));
+                        cx.notify();
+                    });
+                    cx.new(|_| dragged.clone())
+                })
+                // Tabs trade places once the pointer crosses a tab's
+                // midline in its direction of travel, and the displaced
+                // tabs slide into their new slots.
+                .drag_over::<DraggedTab>({
+                    let id = id.clone();
+                    let entity = entity.clone();
+                    move |row, dragged, _, cx| {
+                        entity.update(cx, |this, cx| {
+                            if this.pointer_crossed_tab(&dragged.0, &id)
+                                && this.reorder_tab(&dragged.0, &id, cx.reduce_motion())
+                            {
+                                cx.notify();
+                            }
+                        });
+                        row
+                    }
+                })
+            })
+            .child(
                 div()
-                    .id(SharedString::from(format!("horizontal-tab-{}", id.0)))
-                    .debug_selector(move || format!("horizontal-tab-{}", debug_id))
-                    .role(Role::Tab)
-                    .aria_label(title.clone())
-                    .aria_selected(active)
+                    .id(SharedString::from(format!(
+                        "close-horizontal-tab-{}",
+                        close_id.0
+                    )))
+                    .role(Role::Button)
+                    .aria_label("Close session")
+                    .size(px(18.0))
                     .flex_none()
-                    .w(px(TAB_WIDTH))
-                    .h(px(30.0))
-                    .px(px(10.0))
-                    .rounded(px(SIDEBAR_ROW_RADIUS))
                     .flex()
                     .items_center()
-                    .gap(px(7.0))
-                    .cursor_pointer()
-                    .border_1()
-                    .border_color(colors.primary.alpha(0.0))
-                    .glass_pill(colors, active)
-                    .hover(move |row| {
-                        if active {
-                            row
-                        } else {
-                            row.bg(colors.primary.alpha(0.06))
-                        }
-                    })
-                    .child(Self::agent_tab_icon(session.effective_kind(), colors))
-                    .child(
-                        div()
-                            .flex_1()
-                            .min_w(px(0.0))
-                            .overflow_hidden()
-                            .text_ellipsis()
-                            .text_size(px(Typo::ROW.size))
-                            .text_color(if active {
-                                colors.primary
-                            } else {
-                                colors.secondary
-                            })
-                            .child(title),
-                    )
-                    .child(
-                        div()
-                            .id(SharedString::from(format!(
-                                "close-horizontal-tab-{}",
-                                close_id.0
-                            )))
-                            .role(Role::Button)
-                            .aria_label("Close session")
-                            .size(px(18.0))
-                            .flex_none()
-                            .flex()
-                            .items_center()
-                            .justify_center()
-                            .rounded(px(5.0))
-                            .hover(move |button| button.bg(colors.primary.alpha(0.10)))
-                            .child(sf_symbol("xmark", 8.0, colors.tertiary))
-                            .on_click(cx.listener(move |this, _, _, cx| {
-                                this.close_sessions(vec![close_id.clone()], cx);
-                                cx.stop_propagation();
-                                cx.notify();
-                            })),
-                    )
-                    .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                    .justify_center()
+                    .rounded(px(5.0))
+                    .hover(move |button| button.bg(colors.primary.alpha(0.10)))
+                    .child(sf_symbol("xmark", 8.0, colors.tertiary))
                     .on_click(cx.listener(move |this, _, _, cx| {
-                        this.commit_rename();
-                        this.store.write().expect("store").select(id.clone());
-                        cx.emit(SidebarEvent::SessionActivated);
+                        this.close_sessions(vec![close_id.clone()], cx);
+                        cx.stop_propagation();
                         cx.notify();
                     })),
-            );
+            )
+            .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+            .on_click(cx.listener({
+                let id = id.clone();
+                move |this, _, _, cx| {
+                    this.commit_rename();
+                    this.store.write().expect("store").select(id.clone());
+                    cx.emit(SidebarEvent::SessionActivated);
+                    cx.notify();
+                }
+            }));
+            let tab = match shift {
+                None => tab.into_any_element(),
+                Some(delta) => {
+                    let applied = Rc::clone(&self.tab_shift.applied);
+                    let settled = Rc::clone(&self.tab_shift.settled);
+                    let id = id.clone();
+                    tab.with_animation(
+                        SharedString::from(format!(
+                            "tab-shift:{}:{}",
+                            id.0, self.tab_shift.generation
+                        )),
+                        Animation::new(SECTION_SHIFT_TIME)
+                            .with_easing(|delta| Motion::SETTLE.settle(delta)),
+                        move |tab, progress| {
+                            let offset = delta * (1.0 - progress);
+                            applied.borrow_mut().insert(id.clone(), offset);
+                            if progress >= 1.0 {
+                                settled.set(true);
+                            }
+                            tab.left(px(offset))
+                        },
+                    )
+                    .into_any_element()
+                }
+            };
+            rows = rows.child(tab);
         }
         rows.into_any_element()
+    }
+
+    /// Session tabs as the strip currently shows them, in order.
+    pub(super) fn visible_tab_order(&self) -> Vec<SessionId> {
+        let mut store = self.store.write().expect("store");
+        selected_project_tabs(&mut store)
+            .sessions
+            .iter()
+            .map(|session| session.id.clone())
+            .collect()
+    }
+
+    /// Whether the pointer has passed `target`'s midline in the direction
+    /// `moved` is travelling along the strip. Nothing crosses while a
+    /// previous reorder's slide is still in flight.
+    fn pointer_crossed_tab(&mut self, moved: &SessionId, target: &SessionId) -> bool {
+        if moved == target || self.tab_shift.in_flight() {
+            return false;
+        }
+        let Some(pointer) = self.lift.as_ref().map(|lift| lift.pointer) else {
+            return false;
+        };
+        let Some(tab) = self
+            .fade_bounds
+            .borrow()
+            .get(&SharedString::from(format!("tab:{}", target.0)))
+            .copied()
+        else {
+            return false;
+        };
+        let order = self.visible_tab_order();
+        let position = |id: &SessionId| order.iter().position(|candidate| candidate == id);
+        let (Some(from), Some(to)) = (position(moved), position(target)) else {
+            return false;
+        };
+        let midline = tab.origin.x + tab.size.width / 2.0;
+        if from < to {
+            pointer.x >= midline
+        } else {
+            pointer.x <= midline
+        }
+    }
+
+    /// Live tab reorder; returns whether the strip's order changed. Tabs only
+    /// trade places within their sibling run (the strip flattens a session
+    /// tree, and a child cannot be ordered past its parent's peers) and never
+    /// across the pin boundary, since pinned rows always sort first.
+    fn reorder_tab(&mut self, moved: &SessionId, target: &SessionId, reduce_motion: bool) -> bool {
+        let before = self.visible_tab_order();
+        let staged = {
+            let mut store = self.store.write().expect("store");
+            if store.preferences().sidebar_ordering != SidebarOrdering::Custom {
+                return false;
+            }
+            let projection = store.sidebar_projection();
+            if !sibling_run(&projection, moved).contains(target) {
+                return false;
+            }
+            let pinned = |id: &SessionId| {
+                projection
+                    .projects
+                    .iter()
+                    .flat_map(|group| group.sessions.iter())
+                    .find(|row| row.id() == id)
+                    .map(|row| row.pinned)
+            };
+            if pinned(moved) != pinned(target) {
+                return false;
+            }
+            let mut order = store.sidebar_session_order();
+            move_past(&mut order, moved, target);
+            store.stage_session_order(order)
+        };
+        self.ui.order_dirty |= staged;
+        let after = self.visible_tab_order();
+        let changed = staged && before != after;
+        if changed {
+            self.shift_tabs(&before, &after, reduce_motion);
+        }
+        changed
+    }
+
+    /// Starts the slide from the tabs' current positions to their new slots.
+    /// Every tab is the same width, so a slot is an index.
+    pub(super) fn shift_tabs(
+        &mut self,
+        before: &[SessionId],
+        after: &[SessionId],
+        reduce_motion: bool,
+    ) {
+        let applied = self.tab_shift.applied.borrow().clone();
+        let deltas = tab_shift_deltas(before, after, &applied, TAB_WIDTH + TAB_GAP);
+        self.tab_shift.start(deltas, reduce_motion);
     }
 
     pub fn render_horizontal_tabs(
@@ -229,9 +459,18 @@ impl Sidebar {
             return self.workspace_strip(colors, cx);
         }
         let rows = self.render_project_tab_rows(available_width, cx);
+        // The strip is rendered outside the sidebar's own root, so it hosts
+        // the lifted tab and the pointer tracking itself.
+        let lifted = self.lifted_row(colors, cx);
         div()
             .id("horizontal-tabs")
             .debug_selector(|| "horizontal-tabs".into())
+            .on_drag_move::<DraggedTab>(cx.listener(
+                |this, event: &gpui::DragMoveEvent<DraggedTab>, _, cx| {
+                    this.track_lift_pointer(event.event.position, cx);
+                },
+            ))
+            .children(lifted)
             .role(Role::TabList)
             .aria_label("Project sessions")
             .flex_none()
@@ -302,4 +541,26 @@ impl Sidebar {
             )
             .into_any_element()
     }
+}
+
+/// Offsets that carry each tab from where it is drawn to its new slot.
+/// `pitch` is one slot: tab width plus gap.
+fn tab_shift_deltas(
+    before: &[SessionId],
+    after: &[SessionId],
+    applied: &HashMap<SessionId, f32>,
+    pitch: f32,
+) -> HashMap<SessionId, f32> {
+    let mut deltas = HashMap::new();
+    for (new_index, id) in after.iter().enumerate() {
+        let Some(old_index) = before.iter().position(|candidate| candidate == id) else {
+            continue;
+        };
+        let delta =
+            (old_index as f32 - new_index as f32) * pitch + applied.get(id).copied().unwrap_or(0.0);
+        if delta.abs() >= 0.5 {
+            deltas.insert(id.clone(), delta);
+        }
+    }
+    deltas
 }

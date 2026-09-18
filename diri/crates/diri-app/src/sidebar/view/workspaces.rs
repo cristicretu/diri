@@ -8,19 +8,15 @@ use groups::{WorkspaceRowKey, project_groups};
 use project_agents::{ProjectAgentOpen, first_agent, focused_agent};
 
 #[derive(Clone)]
-struct DraggedWorkspaceTab {
+pub(super) struct DraggedWorkspaceTab {
     tab: TabId,
     revision: u64,
 }
 impl Render for DraggedWorkspaceTab {
+    /// No ghost: the tab itself is lifted by the sidebar (`Lift`), locked to
+    /// the axis its strip runs along.
     fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
         div()
-            .px(px(10.0))
-            .py(px(6.0))
-            .rounded(px(6.0))
-            .bg(gpui::rgba(0x34363aff))
-            .text_color(gpui::white())
-            .child("Move tab")
     }
 }
 
@@ -693,6 +689,14 @@ impl Sidebar {
         };
         let destination = workspace.clone();
         let remove = id.clone();
+        let probe_key = SharedString::from(format!("tab:{}", id.0));
+        let lifted = matches!(
+            &self.lift,
+            Some(Lift {
+                face: LiftFace::WorkspaceTab { .. },
+                ..
+            })
+        ) && self.ui.drag_target.as_deref() == Some(probe_key.as_ref());
         let mut row = div()
             .id(SharedString::from(format!("workspace-tab-{}", id.0)))
             .role(Role::Tab)
@@ -702,6 +706,10 @@ impl Sidebar {
                 let key = format!("workspace-tab-{}", id.0);
                 move || key.clone()
             })
+            .relative()
+            .child(self.fade_probe(probe_key.clone()))
+            // The tab left in the strip is the slot the lifted one returns to.
+            .when(lifted, |row| row.opacity(0.35))
             .h(px(32.0))
             .px(px(9.0))
             .flex_none()
@@ -783,7 +791,48 @@ impl Sidebar {
                         cx.notify();
                     })),
             )
-            .on_drag(source, |source, _, _, cx| cx.new(|_| source.clone()))
+            .on_drag(source, {
+                let entity = cx.entity();
+                let kind = tab.kind.clone();
+                let title = title.clone();
+                move |source, grab, window, cx| {
+                    // The tab itself lifts, locked to the axis its strip runs
+                    // along; the strip keeps a dimmed slot where it was. The
+                    // probe sits inside the tab's 1px border, so the size is
+                    // grown back to the border box and the origin taken from
+                    // the pointer minus the grab offset.
+                    let pointer = window.mouse_position();
+                    entity.update(cx, |this, cx| {
+                        let origin =
+                            this.fade_bounds
+                                .borrow()
+                                .get(&probe_key)
+                                .map(|inner| Bounds {
+                                    origin: pointer - grab,
+                                    size: inner.size + gpui::size(px(2.0), px(2.0)),
+                                });
+                        if let Some(origin) = origin {
+                            this.lift = Some(Lift::new(
+                                LiftFace::WorkspaceTab {
+                                    title: title.clone().into(),
+                                    kind: kind.clone(),
+                                    active,
+                                },
+                                origin,
+                                grab,
+                                if horizontal {
+                                    LiftAxis::Horizontal
+                                } else {
+                                    LiftAxis::Vertical
+                                },
+                            ));
+                            this.ui.drag_target = Some(probe_key.to_string());
+                            cx.notify();
+                        }
+                    });
+                    cx.new(|_| source.clone())
+                }
+            })
             .drag_over::<DraggedWorkspaceTab>(move |row, _, _, _| {
                 row.bg(colors.primary.alpha(0.12))
             })
@@ -815,6 +864,36 @@ impl Sidebar {
 }
 
 impl Sidebar {
+    /// The static face of a workspace tab, for drawing the lifted copy.
+    pub(super) fn workspace_tab_face(
+        &self,
+        title: SharedString,
+        kind: Option<&ProtoAgentKind>,
+        active: bool,
+        colors: SemanticColors,
+    ) -> gpui::Div {
+        div()
+            .px(px(9.0))
+            .flex()
+            .items_center()
+            .gap(px(6.0))
+            .rounded(px(7.0))
+            .when(active, |row| row.bg(colors.primary.alpha(0.08)))
+            .child(kind.map_or_else(
+                || sf_symbol("rectangle", 16.0, colors.secondary),
+                |kind| Self::agent_tab_icon(kind, colors),
+            ))
+            .child(
+                div()
+                    .flex_1()
+                    .min_w(px(0.0))
+                    .overflow_hidden()
+                    .text_ellipsis()
+                    .text_size(px(Typo::ROW.size))
+                    .child(title),
+            )
+    }
+
     pub(super) fn workspace_popup(
         &mut self,
         colors: SemanticColors,
@@ -1293,9 +1372,18 @@ impl Sidebar {
         colors: SemanticColors,
         cx: &mut Context<Self>,
     ) -> AnyElement {
+        // The strip is rendered outside the sidebar's own root, so it hosts
+        // the lifted tab and the pointer tracking itself.
+        let lifted = self.lifted_row(colors, cx);
         div()
             .id("horizontal-workspace-tabs")
             .debug_selector(|| "horizontal-workspace-tabs".into())
+            .on_drag_move::<DraggedWorkspaceTab>(cx.listener(
+                |this, event: &gpui::DragMoveEvent<DraggedWorkspaceTab>, _, cx| {
+                    this.track_lift_pointer(event.event.position, cx);
+                },
+            ))
+            .children(lifted)
             .h(px(crate::tab_navigation::TAB_STRIP_HEIGHT))
             .w_full()
             .flex_none()

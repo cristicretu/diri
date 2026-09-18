@@ -667,6 +667,112 @@ mod tests {
     }
 
     #[gpui::test]
+    fn a_dragged_horizontal_tab_lifts_itself_and_crosses_its_neighbour_at_the_midline(
+        cx: &mut TestAppContext,
+    ) {
+        let (sidebar, cx) = harness(cx, false);
+        let order = |sidebar: &Entity<Sidebar>, cx: &VisualTestContext| -> Vec<String> {
+            sidebar.read_with(cx, |sidebar, _| {
+                sidebar
+                    .visible_tab_order()
+                    .into_iter()
+                    .map(|id| id.0)
+                    .collect()
+            })
+        };
+        // Two adjacent unpinned siblings: pinned rows always sort first, so
+        // a tab can never trade places across the pin boundary.
+        let (first, second) = sidebar.read_with(cx, |sidebar, _| {
+            let mut store = sidebar.store.write().unwrap();
+            let projection = store.sidebar_projection();
+            let run = sibling_run(&projection, &SessionId::new("preview-claude"));
+            let pinned = &store.preferences().sidebar_pinned_sessions;
+            run.windows(2)
+                .find(|pair| !pinned.contains(&pair[0]) && !pinned.contains(&pair[1]))
+                .map(|pair| (pair[0].clone(), pair[1].clone()))
+                .expect("two adjacent unpinned siblings")
+        });
+        let selector = |id: &SessionId| -> &'static str {
+            Box::leak(format!("horizontal-tab-{}", id.0).into_boxed_str())
+        };
+        let before = order(&sidebar, cx);
+        let a = cx
+            .debug_bounds(selector(&first))
+            .expect("first sibling tab");
+        let b = cx
+            .debug_bounds(selector(&second))
+            .expect("second sibling tab");
+        assert!(a.left() < b.left(), "siblings run left to right");
+        assert!(cx.debug_bounds("LIFTED_ROW").is_none());
+
+        let grab = a.center();
+        cx.simulate_mouse_down(grab, MouseButton::Left, Modifiers::default());
+        // Cross GPUI's drag threshold 4px to the right; the grab offset is
+        // taken from this moment.
+        cx.simulate_mouse_move(
+            grab + point(px(4.0), px(0.0)),
+            MouseButton::Left,
+            Modifiers::default(),
+        );
+        let near_edge = point(b.left() + px(6.0), grab.y + px(20.0));
+        cx.simulate_mouse_move(near_edge, MouseButton::Left, Modifiers::default());
+
+        let lifted = cx
+            .debug_bounds("LIFTED_ROW")
+            .expect("dragging a tab lifts the tab itself");
+        assert_eq!(lifted.size, a.size, "the lifted tab keeps its size");
+        assert_eq!(
+            lifted.origin,
+            point(a.origin.x + (near_edge.x - grab.x - px(4.0)), a.origin.y),
+            "a strip's tab travels only along the strip"
+        );
+        assert_eq!(
+            cx.debug_bounds(selector(&first)),
+            Some(a),
+            "the tab stays in the strip as the slot it returns to"
+        );
+        assert_eq!(
+            order(&sidebar, cx),
+            before,
+            "touching a neighbour's edge is not a crossing"
+        );
+
+        let past_midline = point(b.center().x + px(6.0), grab.y);
+        cx.simulate_mouse_move(past_midline, MouseButton::Left, Modifiers::default());
+        let after = order(&sidebar, cx);
+        let position = |list: &[String], id: &SessionId| {
+            list.iter()
+                .position(|candidate| *candidate == id.0)
+                .expect("tab is in the strip")
+        };
+        assert!(
+            position(&after, &second) < position(&after, &first),
+            "passing the midline trades places: {after:?}"
+        );
+        // The strip flattens a session tree, so a parent takes its subtree
+        // along; every other tab keeps its relative order.
+        let others = |list: &[String]| -> Vec<String> {
+            list.iter()
+                .filter(|id| **id != first.0 && **id != second.0)
+                .cloned()
+                .collect()
+        };
+        assert_eq!(others(&before), others(&after));
+
+        cx.simulate_mouse_up(past_midline, MouseButton::Left, Modifiers::default());
+        assert!(cx.debug_bounds("LIFTED_ROW").is_none());
+        assert_eq!(
+            order(&sidebar, cx),
+            after,
+            "the release keeps the new order"
+        );
+        assert!(
+            sidebar.read_with(cx, |sidebar, _| !sidebar.ui.order_dirty),
+            "the release wrote the staged order"
+        );
+    }
+
+    #[gpui::test]
     fn active_layout_uses_the_same_single_project_header_picker(cx: &mut TestAppContext) {
         let (sidebar, cx) = harness(cx, true);
         let before = sidebar.read_with(cx, |sidebar, _| {

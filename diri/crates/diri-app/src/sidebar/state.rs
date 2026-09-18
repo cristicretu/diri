@@ -102,6 +102,8 @@ pub struct SidebarUiState {
     /// Project order when a header drag began. Headers reorder live under the
     /// pointer, so cancelling the gesture has to put them back.
     pub project_order_at_drag_start: Option<Vec<ProjectId>>,
+    /// Session order when a horizontal tab drag began, for the same reason.
+    pub session_order_at_drag_start: Option<Vec<SessionId>>,
     /// Keyboard source for the two-step mark-then-delegate equivalent.
     pub delegation_mark: Option<SessionId>,
     /// Empty-space drops stop here until the user confirms the sibling spawn.
@@ -136,6 +138,7 @@ impl SidebarUiState {
             drag: None,
             drag_target: None,
             project_order_at_drag_start: None,
+            session_order_at_drag_start: None,
             delegation_mark: None,
             pending_sibling: None,
             delegation_notice: None,
