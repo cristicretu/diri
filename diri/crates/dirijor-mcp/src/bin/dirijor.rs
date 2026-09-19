@@ -89,7 +89,7 @@ fn run(arguments: &[String]) -> Result<(), CliError> {
 fn print_help() {
     println!(
         "dirijor — Diri automation CLI\n\n\
-         Usage:\n  dirijor status [--json]\n  dirijor activity [--limit N] [--json]\n  dirijor session <list|get|process|terminal-title|read|send|key|wait|spawn|run|fork|reconnect|release|archive> ...\n  \
+         Usage:\n  dirijor status [--json]\n  dirijor activity [--limit N] [--json]\n  dirijor session <list|get|process|terminal-title|reset-terminal|read|send|key|wait|spawn|run|fork|reconnect|release|archive> ...\n  \
          dirijor worktree <list|create|remove> ...\n  dirijor artifacts <session> [--json]\n  \
          dirijor events <subscribe|wait> ...\n  dirijor ports [--json]\n  dirijor doctor\n  \
          dirijor hook <event>\n  dirijor notify <json>\n  dirijor notify --title TEXT --body TEXT\n  dirijor mcp-tools\n  \
@@ -103,6 +103,8 @@ fn print_help() {
          Organization edits accept --revision N and return the shared snapshot as JSON.\n\n\
          dirijor session terminal-title ID [--json]\n  \
          Reads the current local terminal OSC title, not the conversation name. Remote titles are unsupported.\n\n\
+         dirijor session reset-terminal ID\n  \
+         Resets the emulator (screen, history, modes, title) without touching the process.\n\n\
          Deferred on Linux: companion forwarding (dirijor forward)."
     );
 }
@@ -372,6 +374,7 @@ fn session(arguments: &[String]) -> Result<(), CliError> {
         "get" => session_get(rest),
         "process" => session_process(rest),
         "terminal-title" => session_terminal_title(rest),
+        "reset-terminal" => session_reset_terminal(rest),
         "read" => session_read(rest),
         "send" => session_send(rest),
         "key" => session_key(rest),
@@ -386,6 +389,33 @@ fn session(arguments: &[String]) -> Result<(), CliError> {
             "unknown session action: {other}"
         ))),
     }
+}
+
+fn session_reset_terminal(arguments: &[String]) -> Result<(), CliError> {
+    if arguments.len() == 1 && matches!(arguments[0].as_str(), "--help" | "-h") {
+        println!(
+            "Usage: dirijor session reset-terminal ID\n\
+             Resets the emulator: both screens, history, modes and title are cleared.\n\
+             The PTY, process and session identity are untouched; nothing is sent to the child.\n\
+             Completed sessions return terminal_reset_unavailable."
+        );
+        return Ok(());
+    }
+    let Some(id) = arguments.first().filter(|id| !id.starts_with('-')) else {
+        return Err(CliError::failure("reset-terminal requires a session ID"));
+    };
+    if arguments.len() > 1 {
+        return Err(CliError::failure(
+            "usage: dirijor session reset-terminal ID",
+        ));
+    }
+    request(
+        Method::SESSION_RESET_TERMINAL,
+        json!({"sessionID": id}),
+        Duration::from_secs(3),
+    )?;
+    println!("reset queued for {id}");
+    Ok(())
 }
 
 fn session_terminal_title(arguments: &[String]) -> Result<(), CliError> {

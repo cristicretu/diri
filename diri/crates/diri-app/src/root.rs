@@ -293,6 +293,8 @@ pub struct RootView {
     status_banner_generation: u64,
     quote_target_picker: Option<QuoteTargetPicker>,
     notification_panel_open: bool,
+    /// The system alert asking whether to close sessions, while it is up.
+    close_prompt: Option<Task<()>>,
     /// The main window's viewport, for content that sizes to it while a
     /// panel paints it elsewhere.
     main_viewport: gpui::Size<gpui::Pixels>,
@@ -1300,6 +1302,7 @@ impl RootView {
             status_banner_generation: 0,
             quote_target_picker: None,
             notification_panel_open: false,
+            close_prompt: None,
             main_viewport: gpui::Size::default(),
             notification_filter_unread: true,
             notification_selected: 0,
@@ -3530,6 +3533,39 @@ impl RootView {
             .into_any_element()
     }
 
+    /// Raises the system's alert sheet for a pending close and applies its
+    /// answer; a no-op while one is already up or nothing is pending.
+    fn sync_close_prompt(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some((title, message)) = self.sidebar.read(cx).pending_close_copy() else {
+            self.close_prompt = None;
+            return;
+        };
+        if self.close_prompt.is_some() {
+            return;
+        }
+        let answer = window.prompt(
+            gpui::PromptLevel::Warning,
+            &title,
+            Some(&message),
+            &[
+                gpui::PromptButton::ok("Close"),
+                gpui::PromptButton::cancel("Cancel"),
+            ],
+            cx,
+        );
+        let sidebar = self.sidebar.clone();
+        self.close_prompt = Some(cx.spawn(async move |this, cx| {
+            let choice = answer.await.ok();
+            let _ = this.update(cx, |root, cx| {
+                root.close_prompt = None;
+                sidebar.update(cx, |sidebar, cx| match choice {
+                    Some(0) => sidebar.confirm_close(cx),
+                    _ => sidebar.cancel_close(cx),
+                });
+            });
+        }));
+    }
+
     fn close_confirmation(
         &self,
         colors: SemanticColors,
@@ -4745,7 +4781,9 @@ impl Render for RootView {
         if let Some(launches) = self.workspace_launches(colors, cx) {
             root = root.child(launches);
         }
-        if let Some(confirmation) = self.close_confirmation(colors, cx) {
+        if crate::alerts::enabled(cx) {
+            self.sync_close_prompt(window, cx);
+        } else if let Some(confirmation) = self.close_confirmation(colors, cx) {
             root = root.child(confirmation);
         }
         // Overlay views are cached reactive boundaries too: each subscribes to
@@ -5176,6 +5214,54 @@ mod tests {
                     .is_focused(window)
             );
         });
+    }
+
+    #[gpui::test]
+    fn close_confirmation_is_the_system_alert_when_native(cx: &mut gpui::TestAppContext) {
+        cx.update(|cx| {
+            commands::bind_keys(cx, &Default::default());
+            crate::alerts::enable(cx);
+        });
+        let services = test_services();
+        let runtime = services.store.clone();
+        let fixture = SidebarPreviewFixture::make(PreviewScenario::Typical);
+        let selected = fixture.selected_session_id.expect("selected session");
+        {
+            let mut store = runtime.store.write().unwrap();
+            store.hydrate(fixture.list);
+            store.select(selected.clone());
+        }
+        let (root, cx) = cx.add_window_view(move |window, cx| {
+            RootView::new(services, false, PreviewScenario::Typical, window, cx)
+        });
+        let window_store = root.read_with(cx, |root, _| root.window_store.clone());
+
+        cx.simulate_keystrokes(&commands::test_chords("cmd-w"));
+        assert!(window_store.read().unwrap().pending_close().is_some());
+        assert!(cx.has_pending_prompt(), "a system alert asks first");
+        assert!(
+            cx.debug_bounds("cancel-close").is_none(),
+            "no in-window dialog beside the alert"
+        );
+        cx.simulate_prompt_answer("Cancel");
+        cx.run_until_parked();
+        {
+            let store = window_store.read().unwrap();
+            assert!(store.pending_close().is_none(), "Cancel keeps the session");
+            assert_eq!(store.selected_session_id(), Some(&selected));
+        }
+
+        cx.simulate_keystrokes(&commands::test_chords("cmd-w"));
+        assert!(cx.has_pending_prompt());
+        cx.simulate_prompt_answer("Close");
+        cx.run_until_parked();
+        let store = window_store.read().unwrap();
+        assert!(store.pending_close().is_none());
+        assert_ne!(
+            store.selected_session_id(),
+            Some(&selected),
+            "Close removes it"
+        );
     }
 
     #[gpui::test]

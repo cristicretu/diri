@@ -582,6 +582,21 @@ impl DaemonClient {
     }
 
     /// Reads the local terminal's raw OSC title, not its conversation name.
+    /// Resets a session's emulator without touching its PTY or process. The
+    /// Engine queues it to the terminal owner; the result arrives as a full
+    /// grid on attached terminals. Completed and direct-PTY sessions refuse.
+    pub async fn reset_terminal(&self, session_id: &SessionId) -> Result<(), ClientError> {
+        let _: JsonValue = self
+            .core
+            .request_typed(
+                Method::SESSION_RESET_TERMINAL,
+                Some(&session_params(session_id)),
+                None,
+            )
+            .await?;
+        Ok(())
+    }
+
     /// Remote sessions currently return `terminal_title_unsupported`.
     pub async fn terminal_title(
         &self,

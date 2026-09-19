@@ -16,7 +16,7 @@ use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use diri_proto::control::MAX_CONTROL_LINE_BYTES;
 use diri_proto::{ControlError, ControlMessage, JsonValue, Method, WIRE_VERSION};
@@ -834,6 +834,7 @@ impl ControlServer {
             Method::SESSION_RESIZE => self.session_resize(params),
             Method::SESSION_READ_SCREEN => self.session_read_screen(params),
             Method::SESSION_TERMINAL_TITLE => self.session_terminal_title(params),
+            Method::SESSION_RESET_TERMINAL => self.session_reset_terminal(params),
             Method::SESSION_CAPTURE_FIND => self.session_capture_find(params),
             Method::SESSION_READ_SCROLLBACK => self.session_read_scrollback(params),
             Method::SESSION_READ_SCROLLBACK_CELLS => self.session_read_scrollback_cells(params),
@@ -2173,6 +2174,33 @@ impl ControlServer {
             session_id: p.session_id,
             title,
         })
+    }
+
+    fn session_reset_terminal(&self, params: Option<JsonValue>) -> Result<JsonValue, ControlError> {
+        let p: diri_proto::SessionIdParams = decode(params)?;
+        let registry = self.registry.lock().map_err(poisoned)?;
+        if registry.get(&p.session_id.0).is_none() {
+            return if registry.record(&p.session_id.0).is_some() {
+                Err(ControlError::new(
+                    "terminal_reset_unavailable",
+                    "the session has no live terminal to reset",
+                ))
+            } else {
+                Err(ControlError::not_found(p.session_id.0.clone()))
+            };
+        }
+        let session = registry
+            .get(&p.session_id.0)
+            .ok_or_else(|| ControlError::not_found(p.session_id.0.clone()))?;
+        session.reset_terminal().map_err(|error| {
+            let code = match error.kind() {
+                std::io::ErrorKind::Unsupported => "terminal_reset_unsupported",
+                std::io::ErrorKind::NotConnected => "terminal_reset_unavailable",
+                _ => "terminal_reset_failed",
+            };
+            ControlError::new(code, error.to_string())
+        })?;
+        Ok(json!({ "sessionID": p.session_id.0 }))
     }
 
     fn session_capture_find(&self, params: Option<JsonValue>) -> Result<JsonValue, ControlError> {
@@ -3541,19 +3569,7 @@ impl ControlServer {
                         .lock()
                         .is_ok_and(|registry| registry.live_count() == 0);
                     if still_idle {
-                        if let Some(remote) = remote {
-                            let _ = remote.close_control_masters();
-                        }
-                        if let Some(holder) = holder {
-                            let paths = crate::holder::HolderManagerPaths::new(&holder.holders_dir);
-                            let _ = crate::holder::HolderManagerClient::new(paths.socket())
-                                .shutdown_if_idle();
-                        }
-                        if let Some(browser) = browser {
-                            browser.shutdown();
-                        }
-                        let _ = std::fs::remove_file(socket_path);
-                        std::process::exit(0);
+                        release_idle_engine(remote, holder, browser, &socket_path);
                     }
                     return;
                 }
@@ -3563,6 +3579,48 @@ impl ControlServer {
             will_exit: true,
             reason: None,
         })
+    }
+
+    /// Lets an Engine nobody can reach any more retire itself. The App asks for
+    /// `daemon.shutdown_if_idle` when it quits cleanly; an App that was killed
+    /// never asks, and its Engine then outlived it for days with no sessions
+    /// and no client. Only an Engine launched with the opt-in runs this: one
+    /// kept up by a service manager must stay up while idle.
+    ///
+    /// The test is the one the request applies, held continuously for `grace`:
+    /// a live session or any connection resets it, so nothing that could be
+    /// stranded or interrupted ever sees the exit.
+    pub fn spawn_orphan_watch(self: &Arc<Self>, grace: Duration, tick: Duration) {
+        let server = Arc::clone(self);
+        let _ = std::thread::Builder::new()
+            .name("dirijord-orphan-watch".into())
+            .spawn(move || {
+                let mut watch = OrphanWatch::default();
+                loop {
+                    std::thread::sleep(tick);
+                    let connections = server.active_connections.load(Ordering::Acquire);
+                    let Ok(mut registry) = server.registry.lock() else {
+                        return;
+                    };
+                    let live_sessions = registry.live_count();
+                    if !watch.observe(live_sessions, connections, Instant::now(), grace) {
+                        continue;
+                    }
+                    if registry.persist_for_shutdown().is_err() {
+                        // Losing the final write would cost state; stay up.
+                        watch = OrphanWatch::default();
+                        continue;
+                    }
+                    drop(registry);
+                    eprintln!("dirijord-rs: no session or client for {grace:?}; exiting");
+                    release_idle_engine(
+                        server.remote.clone(),
+                        server.holder.clone(),
+                        server.browser.get().cloned(),
+                        &server.socket_path,
+                    );
+                }
+            });
     }
 
     /// Ack first, then exit: the response has to flush before the process
@@ -3823,6 +3881,52 @@ impl ActiveConnectionGuard {
 impl Drop for ActiveConnectionGuard {
     fn drop(&mut self) {
         self.connections.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
+/// The last steps of an Engine that has nothing left to look after. Callers
+/// have already persisted the registry and checked that no session is live.
+fn release_idle_engine(
+    remote: Option<Arc<crate::remote::manager::RemoteManager>>,
+    holder: Option<crate::session::HolderConfig>,
+    browser: Option<crate::browser::BrowserPool>,
+    socket_path: &Path,
+) -> ! {
+    if let Some(remote) = remote {
+        let _ = remote.close_control_masters();
+    }
+    if let Some(holder) = holder {
+        let paths = crate::holder::HolderManagerPaths::new(&holder.holders_dir);
+        let _ = crate::holder::HolderManagerClient::new(paths.socket()).shutdown_if_idle();
+    }
+    if let Some(browser) = browser {
+        browser.shutdown();
+    }
+    let _ = std::fs::remove_file(socket_path);
+    std::process::exit(0);
+}
+
+/// How long an Engine has been unreachable: no live session and no client.
+#[derive(Default)]
+struct OrphanWatch {
+    idle_since: Option<Instant>,
+}
+
+impl OrphanWatch {
+    /// True once the Engine has been idle for `grace` without interruption.
+    fn observe(
+        &mut self,
+        live_sessions: usize,
+        connections: usize,
+        now: Instant,
+        grace: Duration,
+    ) -> bool {
+        if live_sessions != 0 || connections != 0 {
+            self.idle_since = None;
+            return false;
+        }
+        let since = *self.idle_since.get_or_insert(now);
+        now.duration_since(since) >= grace
     }
 }
 
@@ -4724,6 +4828,24 @@ mod tests {
                 Some(json!({ "sessionID": "finished", "text": "x", "submit": false })),
             ),
             ControlMessage::Response { result: Err(_), .. }
+        ));
+
+        // There is no live emulator behind a retained terminal to reset.
+        assert!(matches!(
+            call(
+                &server,
+                "session.reset_terminal",
+                Some(json!({ "sessionID": "finished" })),
+            ),
+            ControlMessage::Response { result: Err(error), .. } if error.code == "terminal_reset_unavailable"
+        ));
+        assert!(matches!(
+            call(
+                &server,
+                "session.reset_terminal",
+                Some(json!({ "sessionID": "never-existed" })),
+            ),
+            ControlMessage::Response { result: Err(error), .. } if error.code == "not_found"
         ));
 
         // Another exit than the retained one is a different run: unavailable.
@@ -6294,6 +6416,31 @@ mod tests {
         assert!(!is_claude_workspace_trust_screen(
             "Yes, I trust this folder"
         ));
+    }
+
+    #[test]
+    fn an_orphaned_engine_retires_only_after_an_unbroken_idle_grace() {
+        let grace = Duration::from_secs(600);
+        let start = Instant::now();
+        let at = |seconds: u64| start + Duration::from_secs(seconds);
+        let mut watch = OrphanWatch::default();
+
+        assert!(!watch.observe(0, 0, at(0), grace), "the grace starts now");
+        assert!(!watch.observe(0, 0, at(599), grace));
+        assert!(watch.observe(0, 0, at(600), grace));
+
+        // A client or a live session at any point starts the grace over.
+        let mut watch = OrphanWatch::default();
+        assert!(!watch.observe(0, 0, at(0), grace));
+        assert!(!watch.observe(0, 1, at(500), grace), "a client is attached");
+        assert!(
+            !watch.observe(0, 0, at(700), grace),
+            "idle again only since 700"
+        );
+        assert!(!watch.observe(1, 0, at(900), grace), "a session is live");
+        assert!(!watch.observe(0, 0, at(1000), grace));
+        assert!(!watch.observe(0, 0, at(1599), grace));
+        assert!(watch.observe(0, 0, at(1600), grace));
     }
 
     #[test]
