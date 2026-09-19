@@ -47,6 +47,12 @@ impl BlockGlyph {
         }))
     }
 
+    /// A single rectangle spanning the cell's full width: the blocks that tile
+    /// into bars, and so the only ones worth joining.
+    pub(crate) fn spans_cell_width(self) -> bool {
+        matches!(self.0, [[0, _, 8, _]])
+    }
+
     pub(crate) fn rectangles(
         self,
         origin: Point<Pixels>,
@@ -65,6 +71,31 @@ impl BlockGlyph {
             )
         })
     }
+}
+
+/// `left` extended over `right`, only when the union provably rasterizes as
+/// the pair does.
+///
+/// GPUI snaps each quad edge to a device pixel independently, so two quads
+/// cover exactly the pixels of one when they share an edge bit for bit and the
+/// joined quad reproduces the outer edges bit for bit. `right()` is a float sum
+/// of origin and width, so the width is nudged until that sum lands on the
+/// original edge; where it cannot, the cells stay separate quads.
+pub(crate) fn join_horizontally(
+    left: Bounds<Pixels>,
+    right: Bounds<Pixels>,
+) -> Option<Bounds<Pixels>> {
+    if left.right() != right.left()
+        || left.top() != right.top()
+        || left.size.height != right.size.height
+    {
+        return None;
+    }
+    let width = f32::from(right.right()) - f32::from(left.left());
+    [width, width.next_up(), width.next_down()]
+        .into_iter()
+        .map(|width| Bounds::new(left.origin, size(gpui::px(width), left.size.height)))
+        .find(|joined| joined.right() == right.right())
 }
 
 #[cfg(test)]
@@ -92,6 +123,46 @@ mod tests {
                 assert_eq!(rect('▌', col, 1).right(), rect('▐', col, 1).left());
             }
         }
+    }
+
+    #[test]
+    fn joined_blocks_keep_the_outer_edges_of_their_cells_bit_for_bit() {
+        for width in [7.25, 7.8265624, 8.5, 14.449219] {
+            let metrics =
+                CellMetrics::from_measurements(px(width), px(12.0), px(5.0), px(0.0), FontId(0));
+            for origin_x in [0.0, 2.25, 13.1, 251.7] {
+                let origin = point(px(origin_x), px(3.5));
+                let block = BlockGlyph::from_scalar('▄' as u32).unwrap();
+                assert!(block.spans_cell_width());
+                let rect = |col| block.rectangles(origin, metrics, col, 2).next().unwrap();
+                let mut joined = rect(3);
+                for col in 4..160 {
+                    // A refusal is allowed (the caller keeps separate quads);
+                    // an inexact join is not.
+                    let Some(next) = join_horizontally(joined, rect(col)) else {
+                        joined = rect(col);
+                        continue;
+                    };
+                    assert_eq!(next.left(), joined.left());
+                    assert_eq!(next.right(), rect(col).right());
+                    assert_eq!(
+                        (next.top(), next.bottom()),
+                        (rect(col).top(), rect(col).bottom())
+                    );
+                    joined = next;
+                }
+            }
+        }
+        assert!(
+            !BlockGlyph::from_scalar('▌' as u32)
+                .unwrap()
+                .spans_cell_width()
+        );
+        assert!(
+            !BlockGlyph::from_scalar('▚' as u32)
+                .unwrap()
+                .spans_cell_width()
+        );
     }
 
     #[test]

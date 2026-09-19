@@ -1845,16 +1845,42 @@ fn append_row_quads(
     append_background_quads(row, row_index, origin, metrics, theme, background_quads);
     // Keep blocks in the foreground layer, above selection/search backgrounds
     // and below the cursor. The same path serves cached live rows and history.
-    for (col, cell) in row.iter().enumerate() {
-        if let Some(block) = BlockGlyph::from_scalar(cell.scalar) {
-            let style = theme.resolve_cell(*cell);
-            if style.visible {
-                decoration_quads.extend(
-                    block
-                        .rectangles(origin, metrics, col, row_index)
-                        .map(|bounds| fill(bounds, style.foreground)),
-                );
+    let mut col = 0;
+    while col < row.len() {
+        let cell = row[col];
+        let start = col;
+        col += 1;
+        let Some(block) = BlockGlyph::from_scalar(cell.scalar) else {
+            continue;
+        };
+        let style = theme.resolve_cell(cell);
+        if !style.visible {
+            continue;
+        }
+        let mut rectangles = block.rectangles(origin, metrics, start, row_index);
+        if block.spans_cell_width()
+            && let Some(mut bar) = rectangles.next()
+        {
+            // A progress bar is one block repeated; paint the run as one quad
+            // for as long as that is provably the same pixels.
+            let continues = |next: &GridCell| {
+                let next_style = theme.resolve_cell(*next);
+                next.scalar == cell.scalar
+                    && next_style.visible
+                    && next_style.foreground == style.foreground
+            };
+            while row.get(col).is_some_and(continues)
+                && let Some(joined) = block
+                    .rectangles(origin, metrics, col, row_index)
+                    .next()
+                    .and_then(|bounds| crate::blocks::join_horizontally(bar, bounds))
+            {
+                bar = joined;
+                col += 1;
             }
+            decoration_quads.push(fill(bar, style.foreground));
+        } else {
+            decoration_quads.extend(rectangles.map(|bounds| fill(bounds, style.foreground)));
         }
     }
     append_decoration_quads(row, row_index, origin, metrics, theme, decoration_quads);
@@ -2320,6 +2346,44 @@ mod block_tests {
                 "the block must reserve one text column without painting a second glyph"
             );
         }
+    }
+
+    #[test]
+    fn a_bar_of_one_block_in_one_colour_is_one_quad() {
+        let metrics =
+            CellMetrics::from_measurements(px(8.5), px(12.0), px(5.0), px(0.0), FontId(0));
+        fn bar(text: &str, color: u8) -> impl Iterator<Item = GridCell> + '_ {
+            text.chars().map(move |ch| {
+                GridCell::new(
+                    ch as u32,
+                    TermColor::Ansi(color),
+                    TermColor::DefaultInverted,
+                    TermStyle::empty(),
+                )
+            })
+        }
+        let row: Vec<_> = bar("████", 2)
+            .chain(bar("██", 1))
+            .chain(bar("▄▄▀", 1))
+            .chain(bar("▌▌", 1))
+            .collect();
+        let mut backgrounds = Vec::new();
+        let mut foregrounds = Vec::new();
+        append_row_quads(
+            &row,
+            0,
+            point(px(0.0), px(0.0)),
+            metrics,
+            TermTheme::DIRIJOR_DARK,
+            &mut backgrounds,
+            &mut foregrounds,
+        );
+        let widths: Vec<_> = foregrounds
+            .iter()
+            .map(|quad| f32::from(quad.bounds.size.width) / 8.5)
+            .collect();
+        // Colour, glyph, and partial-width blocks each end a run.
+        assert_eq!(widths, [4.0, 2.0, 2.0, 1.0, 0.5, 0.5]);
     }
 
     #[test]
