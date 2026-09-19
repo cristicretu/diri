@@ -12,6 +12,7 @@ use std::process::Command;
 
 use diri_proto::{SessionDiffBase, SessionId, SessionReadDiffResult};
 
+use crate::git_review::path_from_output_line;
 use crate::quote::{Quote, QuoteSource};
 
 #[cfg(unix)]
@@ -300,7 +301,9 @@ fn discover_repository(cwd: &Path) -> Result<PathBuf, DiffError> {
     if !root_output.status.success() {
         return Err(DiffError::NotRepository);
     }
-    let repo_root = PathBuf::from(String::from_utf8_lossy(&root_output.stdout).trim());
+    // Only the record terminator is Git's; any other trailing whitespace is
+    // part of the directory name and may distinguish sibling checkouts.
+    let repo_root = path_from_output_line(&root_output.stdout);
     if repo_root.as_os_str().is_empty() {
         return Err(DiffError::NotRepository);
     }
@@ -1145,6 +1148,75 @@ mod tests {
         assert_eq!(dirty.files, 1);
         assert_eq!(dirty.additions, 1);
         assert_eq!(dirty.deletions, 1);
+    }
+
+    /// A checkout directory may legitimately end in whitespace. Trimming the
+    /// discovered root either fails or, worse, reads a sibling checkout.
+    #[test]
+    fn trailing_space_checkout_loads_its_own_diff() {
+        let directory = tempfile::tempdir().expect("temporary parent");
+        let spaced = directory.path().join("project ");
+        fs::create_dir(&spaced).unwrap();
+        init_with_baseline(&spaced);
+        fs::write(spaced.join("base.txt"), "spaced checkout edit\n").unwrap();
+
+        // Without a trimmed sibling the old loader failed outright.
+        let alone = load_local_diff(&spaced, DiffLayer::Working).expect("working lane");
+        assert_eq!(alone.repo_root, spaced.canonicalize().unwrap());
+
+        // With one, it silently displayed the sibling's changes instead.
+        let sibling = directory.path().join("project");
+        fs::create_dir(&sibling).unwrap();
+        init_with_baseline(&sibling);
+        fs::write(sibling.join("base.txt"), "unrelated checkout edit\n").unwrap();
+
+        let snapshot = load_local_diff(&spaced, DiffLayer::Working).expect("working lane");
+        assert_eq!(snapshot.repo_root, spaced.canonicalize().unwrap());
+        let additions: Vec<_> = snapshot
+            .rows
+            .iter()
+            .filter(|row| row.kind == DiffRowKind::Addition)
+            .map(|row| row.text.as_str())
+            .collect();
+        assert_eq!(additions, ["spaced checkout edit"]);
+
+        // The mutation path discovers the repository separately; a file action
+        // on the displayed diff must land in the same checkout.
+        crate::git_review::GitRepository::discover(&spaced)
+            .expect("repository")
+            .stage_paths(&[snapshot.file_diffs[0].path.clone()])
+            .expect("stage displayed file");
+        assert_eq!(
+            load_local_diff(&spaced, DiffLayer::Staged)
+                .expect("staged lane")
+                .files,
+            1
+        );
+        assert_eq!(
+            load_local_diff(&sibling, DiffLayer::Staged)
+                .expect("sibling staged lane")
+                .files,
+            0
+        );
+    }
+
+    fn init_with_baseline(root: &Path) {
+        run(root, &["init", "--quiet"]);
+        fs::write(root.join("base.txt"), "base\n").unwrap();
+        run(root, &["add", "base.txt"]);
+        run(
+            root,
+            &[
+                "-c",
+                "user.name=diri tests",
+                "-c",
+                "user.email=diri@example.invalid",
+                "commit",
+                "--quiet",
+                "-m",
+                "fixture",
+            ],
+        );
     }
 
     fn run(cwd: &Path, arguments: &[&str]) {
