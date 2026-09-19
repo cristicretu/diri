@@ -292,8 +292,15 @@ enum PaneEvent {
         Option<FindSnapshot>,
     ),
     FindResult(SessionId, AttachmentGeneration, SearchRequest, SearchResult),
-    ScrollbackCells(SessionId, diri_proto::ReadScrollbackCellsResult, usize),
-    ScrollbackFailed(SessionId),
+    /// A scrollback reply, tagged like grid frames: a session id outlives the
+    /// resident that asked, and a late reply must not reach its replacement.
+    ScrollbackCells(
+        SessionId,
+        AttachmentGeneration,
+        diri_proto::ReadScrollbackCellsResult,
+        usize,
+    ),
+    ScrollbackFailed(SessionId, AttachmentGeneration),
     /// The scroller knob moved the viewport; fetch whatever it now shows.
     ScrollbackPump(SessionId, usize),
     ClipboardUploadFinished(SessionId, Result<String, String>),
@@ -520,6 +527,19 @@ struct ResidentTerminal {
     last_size: (u16, u16),
     pointer_owner: Option<(MouseButton, PointerOwner)>,
     mouse_motion: MouseMotionLimiter,
+}
+
+impl ResidentTerminal {
+    /// Delivers input the user aimed at the PTY: typing, line navigation and
+    /// paste. A reading view hides the cursor and holds still under output, so
+    /// the prompt comes back on screen before the bytes go out. Returns whether
+    /// the view moved and the pane owes a repaint.
+    fn send_user_input(&self, bytes: Vec<u8>) -> bool {
+        let returned =
+            !bytes.is_empty() && self.element.scroll_to_live(usize::from(self.last_size.1));
+        self.attachment.input(bytes);
+        returned
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -1369,7 +1389,10 @@ impl TerminalPane {
                     self.launch_find_read(id, generation, next);
                 }
             }
-            PaneEvent::ScrollbackCells(id, result, visible_rows) => {
+            PaneEvent::ScrollbackCells(id, generation, result, visible_rows) => {
+                if !self.attachment_is_current(&id, generation) {
+                    return;
+                }
                 if let Some(resident) = self.residents.get_mut(&id) {
                     let _ = resident
                         .element
@@ -1384,7 +1407,10 @@ impl TerminalPane {
                 self.pump_scrollback_fetch(&id, visible_rows);
                 cx.notify();
             }
-            PaneEvent::ScrollbackFailed(id) => {
+            PaneEvent::ScrollbackFailed(id, generation) => {
+                if !self.attachment_is_current(&id, generation) {
+                    return;
+                }
                 if let Some(resident) = self.residents.get_mut(&id) {
                     resident.element.fail_scrollback_fetch();
                 }
@@ -1394,18 +1420,30 @@ impl TerminalPane {
             }
             PaneEvent::ClipboardUploadFinished(id, result) => match result {
                 Ok(remote_path) => {
-                    if let Some(resident) = self.residents.get(&id) {
-                        resident
-                            .attachment
-                            .input(terminal_paste(&remote_path, resident.bracketed_paste));
+                    if let Some(resident) = self.residents.get(&id)
+                        && resident
+                            .send_user_input(terminal_paste(&remote_path, resident.bracketed_paste))
+                    {
+                        cx.notify();
                     }
                 }
-                Err(error) => eprintln!("diri: clipboard image upload failed: {error}"),
+                Err(error) => {
+                    // scp's stderr can name hosts, users and key paths; it
+                    // stays in the developer log and out of the app.
+                    eprintln!("diri: clipboard image upload failed: {error}");
+                    self.show_terminal_feedback(
+                        "Couldn't copy the clipboard image to the session's host",
+                        window,
+                        cx,
+                    );
+                }
             },
             PaneEvent::DroppedFilesUploaded(id, result) => match result {
                 Ok(remote_paths) => {
                     let text = terminal_drop_text(remote_paths.iter().map(String::as_str));
-                    self.paste_into_session(&id, &text);
+                    if self.paste_into_session(&id, &text) {
+                        cx.notify();
+                    }
                 }
                 Err(error) => {
                     eprintln!("diri: dropped file upload failed: {error}");
@@ -1419,21 +1457,21 @@ impl TerminalPane {
         }
     }
 
-    /// Writes dropped file paths to the target session's composer.
-    fn paste_into_session(&self, id: &SessionId, text: &str) {
-        if let Some(resident) = self.residents.get(id) {
-            let store = self
-                .runtime
-                .store
-                .read()
-                .expect("session store lock poisoned");
-            // Use the declared direct-launch kind, not foreground detection:
-            // a detected Claude inside a shell can return to that shell.
-            let kind = store.sessions().get(id).map(|session| &session.kind);
-            resident
-                .attachment
-                .input(terminal_file_paste(text, resident.bracketed_paste, kind));
-        }
+    /// Writes dropped file paths to the target session's composer. Returns
+    /// whether that brought a reading view back to live.
+    fn paste_into_session(&self, id: &SessionId, text: &str) -> bool {
+        let Some(resident) = self.residents.get(id) else {
+            return false;
+        };
+        let store = self
+            .runtime
+            .store
+            .read()
+            .expect("session store lock poisoned");
+        // Use the declared direct-launch kind, not foreground detection:
+        // a detected Claude inside a shell can return to that shell.
+        let kind = store.sessions().get(id).map(|session| &session.kind);
+        resident.send_user_input(terminal_file_paste(text, resident.bracketed_paste, kind))
     }
 
     /// Finder released files over the grid. Behaves like a desktop terminal:
@@ -2348,6 +2386,64 @@ impl TerminalPane {
         quote_from_terminal_element(id, &resident.element)
     }
 
+    /// Pastes a clipboard image as the path of its staged file, copying it to
+    /// the session's host first when that is not this machine.
+    fn paste_staged_clipboard_image(
+        &mut self,
+        id: &SessionId,
+        staged: std::io::Result<StagedClipboardImage>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let staged = match staged {
+            Ok(staged) => staged,
+            Err(error) => {
+                eprintln!("diri: could not stage clipboard image: {error}");
+                // The kind says what went wrong ("storage full") without the
+                // temp path the full error may carry.
+                self.show_terminal_feedback(
+                    format!("Couldn't paste the clipboard image: {}", error.kind()),
+                    window,
+                    cx,
+                );
+                return;
+            }
+        };
+        let ssh = {
+            let store = self
+                .runtime
+                .store
+                .read()
+                .expect("session store lock poisoned");
+            store
+                .sessions()
+                .get(id)
+                .and_then(|session| session.host.as_deref())
+                .and_then(|host_id| store.host(host_id))
+                .map(|host| host.ssh.clone())
+        };
+
+        if let Some(ssh) = ssh {
+            let pane_tx = self.pane_tx.clone();
+            let upload_id = id.clone();
+            self.tokio.spawn(async move {
+                let result = tokio::task::spawn_blocking(move || staged.upload(&ssh))
+                    .await
+                    .unwrap_or_else(|error| Err(format!("upload task failed: {error}")));
+                let _ = pane_tx.send(PaneEvent::ClipboardUploadFinished(upload_id, result));
+            });
+        } else {
+            let local_path = staged.path().to_string_lossy().into_owned();
+            if let Some(resident) = self.residents.get(id) {
+                resident.send_user_input(terminal_paste(&local_path, resident.bracketed_paste));
+            }
+            self.local_clipboard_images.push(staged);
+            if self.local_clipboard_images.len() > 32 {
+                self.local_clipboard_images.remove(0);
+            }
+        }
+    }
+
     fn paste(&mut self, _: &Paste, window: &mut Window, cx: &mut Context<Self>) {
         if self.qol.copy_mode.is_some() {
             self.show_terminal_feedback("Exit copy mode before pasting", window, cx);
@@ -2370,48 +2466,8 @@ impl TerminalPane {
                 return;
             }
 
-            let staged = match StagedClipboardImage::stage(bytes, extension) {
-                Ok(staged) => staged,
-                Err(error) => {
-                    eprintln!("diri: could not stage clipboard image: {error}");
-                    return;
-                }
-            };
-            let ssh = {
-                let store = self
-                    .runtime
-                    .store
-                    .read()
-                    .expect("session store lock poisoned");
-                store
-                    .sessions()
-                    .get(&id)
-                    .and_then(|session| session.host.as_deref())
-                    .and_then(|host_id| store.host(host_id))
-                    .map(|host| host.ssh.clone())
-            };
-
-            if let Some(ssh) = ssh {
-                let pane_tx = self.pane_tx.clone();
-                let upload_id = id.clone();
-                self.tokio.spawn(async move {
-                    let result = tokio::task::spawn_blocking(move || staged.upload(&ssh))
-                        .await
-                        .unwrap_or_else(|error| Err(format!("upload task failed: {error}")));
-                    let _ = pane_tx.send(PaneEvent::ClipboardUploadFinished(upload_id, result));
-                });
-            } else {
-                let local_path = staged.path().to_string_lossy().into_owned();
-                if let Some(resident) = self.residents.get(&id) {
-                    resident
-                        .attachment
-                        .input(terminal_paste(&local_path, resident.bracketed_paste));
-                }
-                self.local_clipboard_images.push(staged);
-                if self.local_clipboard_images.len() > 32 {
-                    self.local_clipboard_images.remove(0);
-                }
-            }
+            let staged = StagedClipboardImage::stage(bytes, extension);
+            self.paste_staged_clipboard_image(&id, staged, window, cx);
             cx.stop_propagation();
             cx.notify();
             return;
@@ -2443,9 +2499,7 @@ impl TerminalPane {
             }
             self.schedule_find(id, Duration::from_millis(200), window, cx);
         } else {
-            resident
-                .attachment
-                .input(terminal_paste(&text, resident.bracketed_paste));
+            resident.send_user_input(terminal_paste(&text, resident.bracketed_paste));
         }
         cx.stop_propagation();
         cx.notify();
@@ -2598,7 +2652,9 @@ impl TerminalPane {
 
         if event.keystroke.modifiers.platform && event.keystroke.key != "backspace" {
             if let Some(bytes) = terminal_command_navigation(&event.keystroke) {
-                resident.attachment.input(bytes.to_vec());
+                if resident.send_user_input(bytes.to_vec()) {
+                    cx.notify();
+                }
                 cx.stop_propagation();
                 return;
             }
@@ -2635,7 +2691,9 @@ impl TerminalPane {
         if bytes.is_empty() {
             cx.propagate();
         } else {
-            resident.attachment.input(bytes);
+            if resident.send_user_input(bytes) {
+                cx.notify();
+            }
             cx.stop_propagation();
         }
     }
@@ -2689,6 +2747,7 @@ impl TerminalPane {
         let Some(request) = resident.element.begin_scrollback_fetch(visible_rows) else {
             return;
         };
+        let generation = resident.attachment_generation;
         let client = Arc::clone(self.runtime.client());
         let pane_tx = self.pane_tx.clone();
         let fetch_id = id.clone();
@@ -2698,11 +2757,15 @@ impl TerminalPane {
                 .await
             {
                 Ok(result) => {
-                    let _ =
-                        pane_tx.send(PaneEvent::ScrollbackCells(fetch_id, result, visible_rows));
+                    let _ = pane_tx.send(PaneEvent::ScrollbackCells(
+                        fetch_id,
+                        generation,
+                        result,
+                        visible_rows,
+                    ));
                 }
                 Err(_) => {
-                    let _ = pane_tx.send(PaneEvent::ScrollbackFailed(fetch_id));
+                    let _ = pane_tx.send(PaneEvent::ScrollbackFailed(fetch_id, generation));
                 }
             }
         });
@@ -4381,7 +4444,7 @@ mod tests {
         for _ in 0..PANE_EVENT_QUEUE_CAPACITY {
             assert!(
                 sender
-                    .send(PaneEvent::ScrollbackFailed(SessionId::new("pressure")))
+                    .send(PaneEvent::ScrollbackFailed(SessionId::new("pressure"), 0))
                     .is_ok()
             );
         }
@@ -5836,6 +5899,279 @@ mod tests {
     }
 
     #[gpui::test]
+    fn explicit_terminal_input_returns_a_reading_view_to_live(cx: &mut TestAppContext) {
+        const ROWS: usize = 10;
+        const READING: i64 = 5;
+        let runtime = Arc::new(StoreRuntime::inert());
+        let tokio = Arc::new(
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap(),
+        );
+        let session = fixture_session();
+        let id = session.id.clone();
+        {
+            let mut store = runtime.store.write().unwrap();
+            store.upsert_session(session);
+            store.select(id.clone());
+        }
+        let (pane, cx) =
+            cx.add_window_view(move |window, cx| TerminalPane::new(runtime, tokio, window, cx));
+        let key = |key: &str| KeyDownEvent {
+            keystroke: Keystroke::parse(key).unwrap(),
+            is_held: false,
+            prefer_character_input: false,
+        };
+        pane.update_in(cx, |pane, window, cx| {
+            pane.reconcile_store_change(window, cx);
+            let (tx, mut input) = mpsc::unbounded_channel();
+            let resident = pane.residents.get_mut(&id).unwrap();
+            resident.attachment.claim();
+            resident.attachment.input_observer = Some((id.clone(), tx));
+            let generation = resident.attachment_generation;
+            resident.element.adopt_history_geometry(100, 110, 1, ROWS);
+            let read_history = |pane: &TerminalPane| {
+                let element = &pane.residents[&id].element;
+                element.set_view_offset(READING, ROWS);
+                assert_eq!(element.view_offset(), READING);
+            };
+            let offset = |pane: &TerminalPane| pane.residents[&id].element.view_offset();
+
+            // Typed text, Enter and the command-key line navigation all reach
+            // the PTY, so each has to put the prompt back on screen.
+            for (keystroke, expected) in [
+                ("a", b"a".as_slice()),
+                ("enter", b"\r"),
+                ("cmd-left", b"\x01"),
+            ] {
+                read_history(pane);
+                pane.handle_key_down(&key(keystroke), window, cx);
+                assert_eq!(input.try_recv().unwrap(), (id.clone(), expected.to_vec()));
+                assert_eq!(offset(pane), 0, "{keystroke} left the terminal in history");
+            }
+
+            read_history(pane);
+            cx.write_to_clipboard(ClipboardItem::new_string("echo pasted".to_owned()));
+            pane.paste(&Paste, window, cx);
+            assert_eq!(
+                input.try_recv().unwrap(),
+                (id.clone(), b"echo pasted".to_vec())
+            );
+            assert_eq!(offset(pane), 0, "paste left the terminal in history");
+
+            // Nothing below is input aimed at the PTY: the reader keeps their
+            // place, including while output keeps streaming underneath.
+            read_history(pane);
+            pane.handle_pane_event(
+                PaneEvent::Chunk(
+                    id.clone(),
+                    generation,
+                    TerminalChunk::Grid(filled_grid('o')),
+                ),
+                window,
+                cx,
+            );
+            assert_eq!(offset(pane), READING, "background output moved the reader");
+
+            pane.handle_modifiers_changed(
+                &ModifiersChangedEvent {
+                    modifiers: Modifiers {
+                        shift: true,
+                        ..Modifiers::default()
+                    },
+                    capslock: Default::default(),
+                },
+                window,
+                cx,
+            );
+            assert_eq!(offset(pane), READING, "a pure modifier moved the reader");
+
+            pane.handle_key_down(&key("cmd-c"), window, cx);
+            pane.copy_selection(&CopySelection, window, cx);
+            assert_eq!(offset(pane), READING, "copy moved the reader");
+
+            pane.open_find(&OpenFind, window, cx);
+            let mut typed = key("n");
+            typed.keystroke = typed.keystroke.with_simulated_ime();
+            pane.handle_key_down(&typed, window, cx);
+            cx.write_to_clipboard(ClipboardItem::new_string("eedle".to_owned()));
+            pane.paste(&Paste, window, cx);
+            assert_eq!(pane.residents[&id].find_query.text(), "needle");
+            assert_eq!(
+                offset(pane),
+                READING,
+                "editing the Find query moved the reader"
+            );
+
+            assert!(input.try_recv().is_err(), "a local gesture reached the PTY");
+        });
+    }
+
+    #[gpui::test]
+    fn clipboard_image_failures_are_shown_and_paste_nothing(cx: &mut TestAppContext) {
+        let runtime = Arc::new(StoreRuntime::inert());
+        let tokio = Arc::new(
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap(),
+        );
+        let session = fixture_session();
+        let id = session.id.clone();
+        {
+            let mut store = runtime.store.write().unwrap();
+            store.upsert_session(session);
+            store.select(id.clone());
+        }
+        let (pane, cx) =
+            cx.add_window_view(move |window, cx| TerminalPane::new(runtime, tokio, window, cx));
+        let shown = Arc::new(Mutex::new(Vec::<String>::new()));
+        let sink = Arc::clone(&shown);
+        cx.update(|_, cx| {
+            cx.subscribe(&pane, move |_, event: &TerminalPaneEvent, _| {
+                if let TerminalPaneEvent::Feedback { message } = event {
+                    sink.lock().unwrap().push(message.clone());
+                }
+            })
+            .detach();
+        });
+        let mut input = pane.update_in(cx, |pane, window, cx| {
+            pane.reconcile_store_change(window, cx);
+            let (tx, mut input) = mpsc::unbounded_channel();
+            let resident = pane.residents.get_mut(&id).unwrap();
+            resident.attachment.claim();
+            resident.attachment.input_observer = Some((id.clone(), tx));
+
+            // The staging seam fails with a detail only a developer can use.
+            pane.paste_staged_clipboard_image(
+                &id,
+                Err(std::io::Error::new(
+                    std::io::ErrorKind::PermissionDenied,
+                    "open /private/var/folders/secret/T/dirijor-clipboard-x.png",
+                )),
+                window,
+                cx,
+            );
+            assert!(input.try_recv().is_err(), "a failed staging pasted a path");
+
+            // The uploader fails with whatever scp wrote to stderr.
+            pane.handle_pane_event(
+                PaneEvent::ClipboardUploadFinished(
+                    id.clone(),
+                    Err("scp failed: deploy@forge.internal: Permission denied (publickey)".into()),
+                ),
+                window,
+                cx,
+            );
+            assert!(input.try_recv().is_err(), "a failed upload pasted a path");
+            input
+        });
+        assert_eq!(
+            &*shown.lock().unwrap(),
+            &[
+                "Couldn't paste the clipboard image: permission denied",
+                "Couldn't copy the clipboard image to the session's host",
+            ],
+            "each failure is shown once, without paths, hosts or subprocess output"
+        );
+
+        pane.update_in(cx, |pane, window, cx| {
+            let staged = StagedClipboardImage::stage(b"png bytes", "png").unwrap();
+            let local_path = staged.path().to_string_lossy().into_owned();
+            pane.paste_staged_clipboard_image(&id, Ok(staged), window, cx);
+            assert_eq!(
+                input.try_recv().unwrap(),
+                (id.clone(), local_path.into_bytes())
+            );
+            assert!(input.try_recv().is_err(), "the local path was pasted once");
+
+            pane.handle_pane_event(
+                PaneEvent::ClipboardUploadFinished(
+                    id.clone(),
+                    Ok("/tmp/dirijor-clipboard-x.png".into()),
+                ),
+                window,
+                cx,
+            );
+            assert_eq!(
+                input.try_recv().unwrap(),
+                (id.clone(), b"/tmp/dirijor-clipboard-x.png".to_vec())
+            );
+            assert!(input.try_recv().is_err(), "the remote path was pasted once");
+        });
+        assert_eq!(shown.lock().unwrap().len(), 2, "success shows no failure");
+    }
+
+    #[gpui::test]
+    fn arrow_keys_follow_the_attachment_application_cursor_mode(cx: &mut TestAppContext) {
+        let runtime = Arc::new(StoreRuntime::inert());
+        let tokio = Arc::new(
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap(),
+        );
+        let session = fixture_session();
+        let id = session.id.clone();
+        {
+            let mut store = runtime.store.write().unwrap();
+            store.upsert_session(session);
+            store.select(id.clone());
+        }
+        let (pane, cx) =
+            cx.add_window_view(move |window, cx| TerminalPane::new(runtime, tokio, window, cx));
+        pane.update_in(cx, |pane, window, cx| {
+            pane.reconcile_store_change(window, cx);
+            let (tx, mut input) = mpsc::unbounded_channel();
+            let resident = pane.residents.get_mut(&id).unwrap();
+            resident.attachment.claim();
+            resident.attachment.input_observer = Some((id.clone(), tx));
+            let generation = resident.attachment_generation;
+            // DECCKM reaches the pane as the daemon's Modes frame, the same
+            // event an attach seed and every later ESC[?1h / ESC[?1l produce.
+            for (application_cursor_keys, up, shift_up) in [
+                (true, b"\x1bOA".as_slice(), b"\x1b[1;2A".as_slice()),
+                (false, b"\x1b[A", b"\x1b[1;2A"),
+            ] {
+                pane.handle_pane_event(
+                    PaneEvent::Chunk(
+                        id.clone(),
+                        generation,
+                        TerminalChunk::Modes {
+                            keyboard: Some(diri_proto::terminal_input::KeyboardState {
+                                application_cursor_keys,
+                                ..Default::default()
+                            }),
+                            alt_screen: false,
+                            bracketed_paste: false,
+                            mouse: Default::default(),
+                        },
+                    ),
+                    window,
+                    cx,
+                );
+                for (key, expected) in [("up", up), ("shift-up", shift_up)] {
+                    pane.handle_key_down(
+                        &KeyDownEvent {
+                            keystroke: Keystroke::parse(key).unwrap(),
+                            is_held: false,
+                            prefer_character_input: false,
+                        },
+                        window,
+                        cx,
+                    );
+                    assert_eq!(
+                        input.try_recv().unwrap(),
+                        (id.clone(), expected.to_vec()),
+                        "{key} with application cursor keys = {application_cursor_keys}"
+                    );
+                }
+            }
+        });
+    }
+
+    #[gpui::test]
     fn terminal_copy_mode_and_paste_review_keep_input_local(cx: &mut TestAppContext) {
         let runtime = Arc::new(StoreRuntime::inert());
         let tokio = Arc::new(
@@ -6361,6 +6697,144 @@ mod tests {
                 resident.find_scheduler.finish_scan(&request).is_some(),
                 "stale result completed the new resident's active scan"
             );
+        });
+    }
+
+    fn scrollback_reply(first: i64, live: i64, seq: u64) -> diri_proto::ReadScrollbackCellsResult {
+        let rows: Vec<_> = (first..live)
+            .map(|_| vec![GridCell::default(); 8])
+            .collect();
+        diri_proto::ReadScrollbackCellsResult {
+            metadata: Vec::new(),
+            payload: diri_proto::grid::GridRowCodec::encode_rows(&rows).expect("encoded rows"),
+            first_row: first,
+            row_count: live - first,
+            live_start_row: live,
+            total_rows: live + 10,
+            cols: 8,
+            content_seq: seq,
+        }
+    }
+
+    #[gpui::test]
+    fn late_scrollback_replies_cannot_mutate_a_reselected_session(cx: &mut TestAppContext) {
+        const ROWS: usize = 10;
+        let runtime = Arc::new(StoreRuntime::inert());
+        // Never driven: every fetch this pane starts stays paused in flight,
+        // and the test delivers the replies by hand.
+        let tokio = Arc::new(
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("test runtime"),
+        );
+        let mut reselected = fixture_session();
+        reselected.id = SessionId::new("reselected");
+        let mut other = fixture_session();
+        other.id = SessionId::new("other");
+        {
+            let mut store = runtime.store.write().expect("session store lock poisoned");
+            store.upsert_session(reselected.clone());
+            store.upsert_session(other.clone());
+            store.select(reselected.id.clone());
+        }
+
+        let runtime_for_view = Arc::clone(&runtime);
+        let (pane, cx) = cx.add_window_view(move |window, cx| {
+            TerminalPane::new(runtime_for_view, tokio, window, cx)
+        });
+
+        // R1: the first resident scrolls into history and asks for rows.
+        let old_generation = pane.update(cx, |pane, _| {
+            let resident = &pane.residents[&reselected.id];
+            resident.element.adopt_history_geometry(100, 110, 1, ROWS);
+            assert!(resident.element.set_view_offset(10, ROWS));
+            let generation = resident.attachment_generation;
+            pane.pump_scrollback_fetch(&reselected.id, ROWS);
+            assert!(
+                pane.residents[&reselected.id]
+                    .element
+                    .begin_scrollback_fetch(ROWS)
+                    .is_none(),
+                "R1 is in flight"
+            );
+            generation
+        });
+
+        for id in [other.id.clone(), reselected.id.clone()] {
+            runtime
+                .store
+                .write()
+                .expect("session store lock poisoned")
+                .select(id);
+            pane.update_in(cx, |pane, window, cx| {
+                pane.reconcile_store_change(window, cx);
+            });
+        }
+
+        pane.update_in(cx, |pane, window, cx| {
+            // R2: the replacement resident reads a different stretch of a
+            // history that has since grown.
+            let resident = &pane.residents[&reselected.id];
+            let new_generation = resident.attachment_generation;
+            assert_ne!(new_generation, old_generation);
+            resident.element.adopt_history_geometry(200, 210, 2, ROWS);
+            assert!(resident.element.set_view_offset(10, ROWS));
+            pane.pump_scrollback_fetch(&reselected.id, ROWS);
+
+            // R1 fails late. Requeueing it here would let a second request
+            // start while R2 is still in flight.
+            pane.handle_pane_event(
+                PaneEvent::ScrollbackFailed(reselected.id.clone(), old_generation),
+                window,
+                cx,
+            );
+            let element = &pane.residents[&reselected.id].element;
+            assert!(
+                element.begin_scrollback_fetch(ROWS).is_none(),
+                "a stale failure cleared the replacement's in-flight request"
+            );
+
+            // R1 succeeds late, carrying the old geometry and rows.
+            pane.handle_pane_event(
+                PaneEvent::ScrollbackCells(
+                    reselected.id.clone(),
+                    old_generation,
+                    scrollback_reply(80, 100, 1),
+                    ROWS,
+                ),
+                window,
+                cx,
+            );
+            let element = &pane.residents[&reselected.id].element;
+            let viewport = element.viewport();
+            assert_eq!(
+                viewport.cached_row_count(),
+                0,
+                "a stale reply seeded the replacement's row cache"
+            );
+            assert_eq!(viewport.live_start_row(), 200);
+            assert_eq!(viewport.view_offset(), 10);
+            assert!(
+                element.begin_scrollback_fetch(ROWS).is_none(),
+                "a stale reply cleared the replacement's in-flight request"
+            );
+
+            // R2 still completes normally.
+            pane.handle_pane_event(
+                PaneEvent::ScrollbackCells(
+                    reselected.id.clone(),
+                    new_generation,
+                    scrollback_reply(180, 200, 2),
+                    ROWS,
+                ),
+                window,
+                cx,
+            );
+            let viewport = pane.residents[&reselected.id].element.viewport();
+            assert_eq!(viewport.cached_row_count(), 20);
+            assert_eq!(viewport.live_start_row(), 200);
+            assert_eq!(viewport.view_offset(), 10);
         });
     }
 
