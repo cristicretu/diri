@@ -1,4 +1,5 @@
 mod agent_catalog;
+mod alerts;
 mod app_theme;
 mod application_notifications;
 mod clipboard_transfer;
@@ -403,6 +404,9 @@ fn main() {
         if std::env::var_os("DIRI_FLOATING_PANELS").is_none_or(|value| value != "0") {
             floating::enable(cx);
         }
+        // Confirmations are the system's alert sheets on macOS.
+        #[cfg(target_os = "macos")]
+        alerts::enable(cx);
         #[cfg(target_os = "macos")]
         diri_ui::set_mark_rasterizer(macos::brand_raster::raster_mark);
         #[cfg(target_os = "macos")]
