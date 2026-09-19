@@ -21,6 +21,19 @@ pub(super) struct SelectionPaint {
     animating: bool,
 }
 
+impl SelectionPaint {
+    /// Moves the outline with a reading view that is scrolled by part of a
+    /// row. The quads travel with `overlay_quads`; the path has to be told.
+    pub(super) fn shift_up(&mut self, shift: Pixels) {
+        if let Some(path) = &mut self.path {
+            path.bounds.origin.y -= shift;
+            for vertex in &mut path.vertices {
+                vertex.xy_position.y -= shift;
+            }
+        }
+    }
+}
+
 impl TerminalElement {
     /// The spans inside the window, and whether the selection carries on past
     /// the window's first or last row.

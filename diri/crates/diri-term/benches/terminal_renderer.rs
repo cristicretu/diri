@@ -1,5 +1,6 @@
 use diri_proto::grid::{ChangedRow, GridCell, GridRowCodec, GridUpdate, TermColor, TermStyle};
 use diri_proto::methods::ReadScrollbackCellsResult;
+use diri_term::scrollback::{WheelDelta, WheelEvent};
 use diri_term::{buffer::GridBuffer, element::TerminalElement};
 use gpui::{
     AppContext as _, BenchAppContext, Context, IntoElement, ParentElement, Render, Styled, Window,
@@ -92,6 +93,99 @@ fn terminal_reading_view_redraw(cx: &mut BenchAppContext) {
             stats.average_frame_time(),
             stats.shape_cache_hits,
             stats.shape_cache_hits + stats.shape_cache_misses,
+        );
+    }
+}
+
+/// A trackpad fling up through about two thousand rows of history and back,
+/// one precise wheel event per frame the way macOS delivers momentum. Fetches
+/// are answered as the viewport asks for them. The cycle sums to zero, so it
+/// repeats from the same place for as long as the harness runs.
+#[gpui::bench(fps = 120)]
+fn terminal_trackpad_fling(cx: &mut BenchAppContext) {
+    const LIVE_START: i64 = 5_000;
+    const LINE_HEIGHT: f32 = 16.0;
+    let terminal = TerminalElement::with_buffer(GridBuffer::new(COLS, ROWS)).focused(true);
+    terminal.apply_damage(build_frame(0, true, plain_row));
+    let serve = |terminal: &TerminalElement| {
+        while let Some(request) = terminal.begin_scrollback_fetch(usize::from(ROWS)) {
+            let first = request.first_row.clamp(0, LIVE_START);
+            let end = (request.first_row + request.max_rows).clamp(first, LIVE_START);
+            let rows = (first..end)
+                .map(|row| {
+                    let mut cells = styled_row(row as usize);
+                    cells.resize(usize::from(COLS), GridCell::BLANK);
+                    cells
+                })
+                .collect::<Vec<_>>();
+            terminal
+                .complete_scrollback_fetch(
+                    ReadScrollbackCellsResult {
+                        metadata: Vec::new(),
+                        payload: GridRowCodec::encode_rows(&rows).unwrap(),
+                        first_row: first,
+                        row_count: end - first,
+                        live_start_row: LIVE_START,
+                        total_rows: LIVE_START + i64::from(ROWS),
+                        cols: i64::from(COLS),
+                        content_seq: 1,
+                    },
+                    usize::from(ROWS),
+                )
+                .unwrap();
+        }
+    };
+    assert!(terminal.set_view_offset(300, usize::from(ROWS)));
+    serve(&terminal);
+
+    // Momentum decays geometrically: 320 px on the first event, under a
+    // pixel on the last, a little over 2,000 rows in total.
+    let up = (0..600)
+        .map(|event| 320.0 * 0.99f32.powi(event))
+        .collect::<Vec<_>>();
+    let fling = up
+        .iter()
+        .copied()
+        .chain(up.iter().rev().map(|delta| -delta))
+        .collect::<Vec<_>>();
+    let mut next = 0;
+
+    let mut window = cx.add_empty_window();
+    let view = window.update(|window, cx| {
+        window.replace_root(cx, |_window, _cx| TerminalBenchView {
+            terminal,
+            frames: [
+                build_frame(0, false, plain_row),
+                build_frame(0, false, plain_row),
+            ],
+            next_frame: 0,
+        })
+    });
+    cx.bench_renderer(view.clone(), move |view, _window, cx| {
+        view.terminal.route_wheel(WheelEvent {
+            delta: WheelDelta::PrecisePoints(fling[next]),
+            col: 0,
+            row: 0,
+            visible_rows: ROWS,
+            line_height: LINE_HEIGHT,
+        });
+        next = (next + 1) % fling.len();
+        serve(&view.terminal);
+        cx.notify();
+    });
+    let stats = cx.read_entity(&view, |view, _cx| view.terminal.stats());
+    if stats.frames >= MIN_GATED_FRAMES {
+        eprintln!(
+            "terminal-fling: frames={}, average={:?}, max={:?}, shape-cache={}/{}",
+            stats.frames,
+            stats.average_frame_time(),
+            stats.max_frame_time,
+            stats.shape_cache_hits,
+            stats.shape_cache_hits + stats.shape_cache_misses,
+        );
+        assert!(
+            stats.average_frame_time() < FRAME_BUDGET,
+            "a fling through history exceeded its {FRAME_BUDGET:?} safety budget: {stats:?}",
         );
     }
 }
@@ -227,6 +321,7 @@ gpui::bench_group!(
     benches,
     terminal_build_log_scroll,
     terminal_styled_tui_scroll,
-    terminal_reading_view_redraw
+    terminal_reading_view_redraw,
+    terminal_trackpad_fling
 );
 gpui::bench_main!(benches);

@@ -11,4 +11,5 @@ pub mod scrollback;
 pub mod selection;
 mod selection_shape;
 pub mod selection_shimmer;
+pub mod smooth_scroll;
 pub mod theme;

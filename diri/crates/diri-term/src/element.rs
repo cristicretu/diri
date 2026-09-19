@@ -21,7 +21,7 @@ use crate::find::{
 use crate::metrics::CellMetrics;
 use crate::scrollback::{
     ScrollRouter, ScrollbackApplyError, ScrollbackRequest, ScrollbackViewport, ScrolledState,
-    TerminalModes, WheelEvent, WheelRoute,
+    TerminalModes, WheelDelta, WheelEvent, WheelRoute,
 };
 use crate::selection::{SelectionPoint, TerminalSelection};
 use crate::selection_shimmer::SelectionShimmer;
@@ -513,6 +513,21 @@ pub struct TerminalPrepaintState {
     /// Live path: paint straight out of the shared row cache instead of
     /// composed copies, so an unchanged frame clones nothing.
     paint_from_cache: bool,
+    scroll: Option<ScrollPaint>,
+}
+
+/// A reading view resting between rows. Everything row-positioned is built
+/// on whole rows and moved up by `shift` in one place at the end of
+/// `prepaint`; only glyph lines, which paint from the shape cache, apply it
+/// in `paint`.
+struct ScrollPaint {
+    shift: Pixels,
+    /// The terminal fill, which stays put and spans the full bounds.
+    backdrop: PaintQuad,
+    /// The grid's rows. The extra row slides in under this edge rather than
+    /// showing through the partial-row strip below the grid, which would
+    /// blink off whenever the view came to rest on a whole row.
+    clip: Bounds<Pixels>,
 }
 
 struct CursorPaint {
@@ -784,6 +799,11 @@ impl TerminalElement {
     /// routes are returned for the app to pass to `SessionAttachment::scroll`.
     pub fn route_wheel(&self, event: WheelEvent) -> Option<WheelRoute> {
         let modes = *mutex_lock(&self.shared.modes);
+        if let WheelDelta::PrecisePoints(points) = event.delta
+            && ScrollRouter::is_local(modes)
+        {
+            return self.scroll_by_pixels(points, event);
+        }
         let route = mutex_lock(&self.shared.scroll_router).route(modes, event)?;
         match route {
             WheelRoute::Local { lines } => {
@@ -799,6 +819,59 @@ impl TerminalElement {
             WheelRoute::Daemon { .. } => mutex_lock(&self.shared.selection).clear(),
         }
         Some(route)
+    }
+
+    /// A trackpad moves local scrollback by the pixel. `lines` reports the
+    /// whole rows crossed, which is zero for most events of a slow gesture.
+    fn scroll_by_pixels(&self, points: f32, event: WheelEvent) -> Option<WheelRoute> {
+        mutex_lock(&self.shared.scroll_router).reset();
+        let mut viewport = mutex_lock(&self.shared.viewport);
+        let before = viewport.view_offset();
+        if !viewport.scroll_by_pixels(points, event.line_height, usize::from(event.visible_rows)) {
+            return None;
+        }
+        viewport.hold_reading_view(&read_lock(&self.buffer));
+        if !viewport.is_reading() {
+            mutex_lock(&self.shared.selection).clear();
+        }
+        Some(WheelRoute::Local {
+            lines: viewport.view_offset().saturating_sub(before),
+        })
+    }
+
+    /// Rows scrolled back from the live edge, with the sub-row part a
+    /// trackpad gesture left. For indicators; content is addressed in rows.
+    #[must_use]
+    pub fn scroll_position(&self) -> f64 {
+        mutex_lock(&self.shared.viewport)
+            .scroll_position()
+            .as_rows()
+    }
+
+    /// [`Self::set_view_offset`] for a fractional position, as a dragged
+    /// scroller knob produces.
+    pub fn set_scroll_position(&self, rows: f64, visible_rows: usize) -> bool {
+        let mut viewport = mutex_lock(&self.shared.viewport);
+        let position = crate::smooth_scroll::ScrollPosition::from_rows(
+            rows,
+            viewport.max_offset(visible_rows),
+        );
+        let changed = viewport.set_scroll_position(position, visible_rows);
+        viewport.hold_reading_view(&read_lock(&self.buffer));
+        if changed && !viewport.is_reading() {
+            mutex_lock(&self.shared.selection).clear();
+        }
+        changed
+    }
+
+    /// How far the reading view is painted above its integral rows, in
+    /// logical pixels. Pointer hit-testing adds this before dividing by the
+    /// line height; it is the exact value `prepaint` translates by.
+    #[must_use]
+    pub fn scroll_shift(&self, line_height: Pixels, scale_factor: f32) -> Pixels {
+        px(mutex_lock(&self.shared.viewport)
+            .scroll_position()
+            .shift(f32::from(line_height), scale_factor))
     }
 
     pub fn begin_scrollback_fetch(&self, visible_rows: usize) -> Option<ScrollbackRequest> {
@@ -1305,6 +1378,7 @@ impl Element for TerminalElement {
                 cache_hits: 0,
                 cache_misses: 0,
                 paint_from_cache: false,
+                scroll: None,
             };
         }
 
@@ -1328,6 +1402,7 @@ impl Element for TerminalElement {
                 cache_hits: 0,
                 cache_misses: 0,
                 paint_from_cache: false,
+                scroll: None,
             };
         }
 
@@ -1356,6 +1431,12 @@ impl Element for TerminalElement {
         // it: every party that touches these mutexes runs on the main thread,
         // and the clone copied the entire fetched-history cell cache per frame.
         let viewport = mutex_lock(&self.shared.viewport);
+        // Zero on the live grid and on a reading view resting on a whole row,
+        // where `painted_rows` is `visible_rows` and nothing below differs.
+        let scroll_shift = px(viewport
+            .scroll_position()
+            .shift(f32::from(metrics.line_height), window.scale_factor()));
+        let painted_rows = visible_rows + usize::from(scroll_shift > px(0.0));
         let mut background_quads = vec![fill(
             bounds,
             self.theme.background.alpha(self.background_opacity),
@@ -1387,7 +1468,7 @@ impl Element for TerminalElement {
             history.validate(key, viewport.absolute_row(0));
             let mut hits = 0u64;
             let mut cells = Vec::with_capacity(usize::from(grid_cols));
-            for row_index in 0..visible_rows {
+            for row_index in 0..painted_rows {
                 let absolute = viewport.absolute_row(row_index);
                 viewport.window_row_into(&buffer, row_index, &mut cells);
                 cells.truncate(visible_cols);
@@ -1417,7 +1498,7 @@ impl Element for TerminalElement {
                 lines.push((row_index as u16, absolute));
             }
             cache_hits = hits;
-            cache_misses = (visible_rows as u64).saturating_sub(hits);
+            cache_misses = (painted_rows as u64).saturating_sub(hits);
         } else {
             mutex_lock(&self.shared.history_lines).release();
             let context = RowRenderContext {
@@ -1489,9 +1570,11 @@ impl Element for TerminalElement {
             paint_from_cache = true;
         }
 
-        let selection = self.prepare_selection(
+        // `painted_rows` covers the partial row a sub-row scroll brings in, so
+        // the shape reaches into it like every other layer.
+        let mut selection = self.prepare_selection(
             &viewport,
-            visible_rows,
+            painted_rows,
             visible_cols,
             bounds,
             metrics,
@@ -1501,7 +1584,7 @@ impl Element for TerminalElement {
         if let Some(hit) = &self.hovered_reference {
             let top = viewport.absolute_row(0);
             for &(row, start, end) in &hit.spans {
-                if row < top || row >= top + visible_rows as i64 {
+                if row < top || row >= top + painted_rows as i64 {
                     continue;
                 }
                 let origin = point(
@@ -1540,7 +1623,7 @@ impl Element for TerminalElement {
                         return None;
                     }
                     let row = usize::try_from(item.absolute_row.checked_sub(top)?).ok()?;
-                    (row < visible_rows).then_some(FindSpan {
+                    (row < painted_rows).then_some(FindSpan {
                         row,
                         start_col: item.start_col,
                         end_col_exclusive: item.end_col_exclusive,
@@ -1551,7 +1634,7 @@ impl Element for TerminalElement {
         }
         drop(buffer);
         highlights.current_bounds = highlights.spans.iter().find_map(|span| {
-            if !span.is_current || span.row >= visible_rows {
+            if !span.is_current || span.row >= painted_rows {
                 return None;
             }
             let start = span.start_col.min(visible_cols);
@@ -1560,7 +1643,7 @@ impl Element for TerminalElement {
                 Bounds::new(
                     point(
                         bounds.left() + metrics.cell_width * start as f32,
-                        bounds.top() + metrics.line_height * span.row as f32,
+                        bounds.top() + metrics.line_height * span.row as f32 - scroll_shift,
                     ),
                     size(
                         metrics.cell_width * (end - start) as f32,
@@ -1630,6 +1713,28 @@ impl Element for TerminalElement {
             None
         };
 
+        let scroll = (scroll_shift > px(0.0)).then(|| {
+            let backdrop = background_quads.remove(0);
+            for quad in background_quads
+                .iter_mut()
+                .chain(&mut overlay_quads)
+                .chain(&mut decoration_quads)
+            {
+                quad.bounds.origin.y -= scroll_shift;
+            }
+            // A stepped selection is a path rather than a quad, so it is not
+            // in the vectors above; its sheen ramps are.
+            selection.shift_up(scroll_shift);
+            ScrollPaint {
+                shift: scroll_shift,
+                backdrop,
+                clip: Bounds::new(
+                    bounds.origin,
+                    size(bounds.size.width, metrics.line_height * visible_rows as f32),
+                ),
+            }
+        });
+
         TerminalPrepaintState {
             started_at: Some(started_at),
             background_quads,
@@ -1642,6 +1747,7 @@ impl Element for TerminalElement {
             cache_hits,
             cache_misses,
             paint_from_cache,
+            scroll,
         }
     }
 
@@ -1692,7 +1798,20 @@ impl Element for TerminalElement {
             return;
         };
 
-        window.with_content_mask(Some(ContentMask { bounds }), |window| {
+        let scroll_shift = prepaint
+            .scroll
+            .as_ref()
+            .map_or(px(0.0), |scroll| scroll.shift);
+        let content = prepaint
+            .scroll
+            .as_ref()
+            .map_or(bounds, |scroll| scroll.clip);
+        if let Some(scroll) = &prepaint.scroll {
+            window.with_content_mask(Some(ContentMask { bounds }), |window| {
+                window.paint_quad(scroll.backdrop.clone());
+            });
+        }
+        window.with_content_mask(Some(ContentMask { bounds: content }), |window| {
             // Live path: rows come straight from the shared cache. Quads are
             // plain structs (a stack copy each) and `ShapedLine::paint` takes
             // a reference, so nothing per-row is heap-cloned per frame.
@@ -1793,7 +1912,10 @@ impl Element for TerminalElement {
                 Some((row, line))
             });
             for (row, line) in lines {
-                let origin = point(bounds.left(), bounds.top() + metrics.y_for_row(*row));
+                let origin = point(
+                    bounds.left(),
+                    bounds.top() + metrics.y_for_row(*row) - scroll_shift,
+                );
                 if prepaint
                     .cursor
                     .as_ref()
@@ -3315,6 +3437,88 @@ mod selection_repaint_tests {
         );
         assert_eq!(element.selected_text(), selected);
         assert_eq!(visible_selection_count(&element), 2);
+    }
+
+    fn trackpad(points: f32) -> WheelEvent {
+        WheelEvent {
+            delta: WheelDelta::PrecisePoints(points),
+            ..wheel(0.0)
+        }
+    }
+
+    #[test]
+    fn a_trackpad_scrolls_history_by_the_pixel_and_addresses_the_extra_row() {
+        let element = populated_element();
+        mutex_lock(&element.shared.viewport).apply_rows(
+            vec![row("hist six"), row("hist sev")],
+            6,
+            8,
+            11,
+            1,
+            usize::from(ROWS),
+        );
+        // Four pixels of a 16 px line: no row is crossed, the view still moves.
+        assert_eq!(
+            element.route_wheel(trackpad(4.0)),
+            Some(WheelRoute::Local { lines: 1 })
+        );
+        assert_eq!(element.view_offset(), 1);
+        assert!((element.scroll_position() - 0.25).abs() < 1e-6);
+        assert_eq!(element.scroll_shift(gpui::px(16.0), 2.0), gpui::px(12.0));
+        assert_eq!(
+            element.route_wheel(trackpad(4.0)),
+            Some(WheelRoute::Local { lines: 0 })
+        );
+        assert_eq!(element.scroll_shift(gpui::px(16.0), 2.0), gpui::px(8.0));
+
+        // The window is rows 7..10 slid up by half a row, so the row under
+        // its bottom edge (window row ROWS) is live row "two".
+        element.select_line(usize::from(ROWS));
+        assert_eq!(element.selected_text(), "two");
+        let viewport = mutex_lock(&element.shared.viewport);
+        let painted = viewport.painted_rows(usize::from(ROWS));
+        assert_eq!(painted, usize::from(ROWS) + 1);
+        let spans =
+            mutex_lock(&element.shared.selection).visible_spans(&viewport, painted, COLS.into());
+        assert_eq!(spans.len(), 1);
+        assert_eq!(spans[0].row, usize::from(ROWS));
+        drop(viewport);
+
+        // Momentum carries the view back onto the live grid, exactly.
+        assert!(element.route_wheel(trackpad(-90.0)).is_some());
+        assert_eq!(element.view_offset(), 0);
+        assert_eq!(element.scroll_shift(gpui::px(16.0), 2.0), gpui::px(0.0));
+        assert_eq!(element.route_wheel(trackpad(-90.0)), None);
+    }
+
+    #[test]
+    fn a_trackpad_over_a_mouse_reporting_program_still_sends_whole_lines() {
+        let element = populated_element();
+        element.set_modes(
+            false,
+            MouseModes::new(
+                diri_proto::terminal::MouseTrackingMode::ButtonEvents,
+                diri_proto::terminal::MouseEncoding::Legacy,
+            ),
+        );
+        assert_eq!(element.route_wheel(trackpad(9.0)), None);
+        assert_eq!(
+            element.route_wheel(trackpad(9.0)),
+            Some(WheelRoute::Daemon {
+                direction: 0,
+                lines: 1,
+                col: 2,
+                row: 1,
+            })
+        );
+        assert_eq!(element.scroll_position(), 0.0, "scrollback never moved");
+
+        element.set_modes(true, MouseModes::OFF);
+        assert!(matches!(
+            element.route_wheel(trackpad(20.0)),
+            Some(WheelRoute::Daemon { .. })
+        ));
+        assert_eq!(element.scroll_position(), 0.0);
     }
 
     #[test]

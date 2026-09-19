@@ -3,6 +3,11 @@
 //! Rows are cached by absolute, scroll-invariant terminal row. The live grid
 //! starts at [`ScrollbackViewport::live_start_row`], and a window row projects
 //! to `live_start_row - view_offset + window_row`.
+//!
+//! Rows are the whole model. A precise (trackpad) gesture also leaves a
+//! sub-row remainder, kept beside `view_offset` as presentation state and
+//! described in [`crate::smooth_scroll`]: nothing here positions content by
+//! it except the one extra row a partly slid window shows at its bottom.
 
 use std::collections::BTreeMap;
 use std::error::Error;
@@ -17,6 +22,7 @@ use diri_proto::model::SessionId;
 use diri_proto::terminal::MouseModes;
 
 use crate::buffer::GridBuffer;
+use crate::smooth_scroll::ScrollPosition;
 
 const MAX_SCROLLBACK_CACHE_BYTES: usize = 4 * 1024 * 1024;
 
@@ -135,6 +141,11 @@ impl From<GridCodecError> for ScrollbackApplyError {
 pub struct ScrollbackViewport {
     find_source: Option<std::sync::Arc<crate::find::RetainedFindSnapshot>>,
     view_offset: i64,
+    /// How far the window at `view_offset` is slid up, as a part of one row.
+    /// Zero whenever `view_offset` is: the live edge has no residue.
+    sub_row: f32,
+    /// Precise travel not yet large enough to leave the live edge.
+    leaving_live: f32,
     keyboard_pinned: bool,
     /// Absolute row pinned to the top of the window while scrolled back.
     ///
@@ -188,6 +199,7 @@ impl ScrollbackViewport {
     pub fn clear_find_source(&mut self) {
         if self.find_source.take().is_some() {
             self.view_offset = 0;
+            self.sub_row = 0.0;
             self.anchor = None;
             self.release_reading_view();
         }
@@ -209,6 +221,22 @@ impl ScrollbackViewport {
     #[must_use]
     pub const fn view_offset(&self) -> i64 {
         self.view_offset
+    }
+
+    /// The offset with its sub-row part.
+    #[must_use]
+    pub const fn scroll_position(&self) -> ScrollPosition {
+        ScrollPosition {
+            rows: self.view_offset,
+            fraction: self.sub_row,
+        }
+    }
+
+    /// Rows a frame must compose: a window slid up by part of a row shows
+    /// the top of one more row at its bottom.
+    #[must_use]
+    pub fn painted_rows(&self, visible_rows: usize) -> usize {
+        visible_rows + usize::from(self.sub_row > 0.0)
     }
 
     #[must_use]
@@ -262,19 +290,48 @@ impl ScrollbackViewport {
     }
 
     /// Sets the local offset and records any newly needed fetch. Returns true
-    /// when the displayed window changed.
+    /// when the displayed window changed. Everything that navigates by rows
+    /// (keys, find, the line wheel) lands on a whole row.
     pub fn set_view_offset(&mut self, offset: i64, visible_rows: usize) -> bool {
-        let clamped = offset.clamp(0, self.max_offset(visible_rows));
-        if clamped == self.view_offset {
+        self.set_scroll_position(ScrollPosition::whole(offset), visible_rows)
+    }
+
+    /// [`Self::set_view_offset`] with a sub-row part.
+    pub fn set_scroll_position(&mut self, position: ScrollPosition, visible_rows: usize) -> bool {
+        let clamped = position.clamped(self.max_offset(visible_rows));
+        self.leaving_live = 0.0;
+        if clamped == self.scroll_position() {
             return false;
         }
-        self.view_offset = clamped;
-        if clamped == 0 && !self.keyboard_pinned && self.find_source.is_none() {
+        let rows_changed = clamped.rows != self.view_offset;
+        self.view_offset = clamped.rows;
+        self.sub_row = clamped.fraction;
+        if !rows_changed {
+            // Same integral window: the anchor holds, and only the extra row
+            // may be newly needed.
+            self.queue_missing_window(visible_rows);
+            return true;
+        }
+        if clamped.rows == 0 && !self.keyboard_pinned && self.find_source.is_none() {
             self.release_reading_view();
         }
         self.sync_anchor();
         self.queue_missing_window(visible_rows);
         true
+    }
+
+    /// Follows a precise wheel delta 1:1, positive toward history. Returns
+    /// true when the displayed window changed.
+    pub fn scroll_by_pixels(&mut self, delta: f32, line_height: f32, visible_rows: usize) -> bool {
+        let step = self.scroll_position().step_pixels(
+            self.leaving_live,
+            delta,
+            line_height,
+            self.max_offset(visible_rows),
+        );
+        let changed = self.set_scroll_position(step.position, visible_rows);
+        self.leaving_live = step.pending;
+        changed
     }
 
     /// Re-pins the anchor to whatever content the window now shows. Returning
@@ -293,7 +350,8 @@ impl ScrollbackViewport {
     }
 
     pub fn scroll_by(&mut self, lines: i64, visible_rows: usize) -> bool {
-        self.set_view_offset(self.view_offset.saturating_add(lines), visible_rows)
+        let from = self.scroll_position().nearest_row();
+        self.set_view_offset(from.saturating_add(lines), visible_rows)
     }
 
     pub fn scroll_to_live(&mut self, visible_rows: usize) -> bool {
@@ -555,7 +613,13 @@ impl ScrollbackViewport {
         if let Some(anchor) = self.anchor {
             self.view_offset = self.live_start_row.saturating_sub(anchor);
         }
-        self.view_offset = self.view_offset.clamp(0, self.max_offset(visible_rows));
+        // An offset pushed onto either end rests on it, without the sub-row
+        // part it had somewhere else.
+        let clamped = self
+            .scroll_position()
+            .clamped(self.max_offset(visible_rows));
+        self.view_offset = clamped.rows;
+        self.sub_row = clamped.fraction;
         if !self.is_reading() && self.held_live.is_some() {
             self.release_reading_view();
         }
@@ -599,6 +663,8 @@ impl ScrollbackViewport {
             return false;
         }
         self.view_offset = 0;
+        self.sub_row = 0.0;
+        self.leaving_live = 0.0;
         self.release_reading_view();
         self.anchor = None;
         self.queued = None;
@@ -609,9 +675,10 @@ impl ScrollbackViewport {
         if self.find_source.is_some() || self.view_offset <= 0 || visible_rows == 0 {
             return;
         }
+        let painted_rows = i64::try_from(self.painted_rows(visible_rows)).unwrap_or(i64::MAX);
         let visible_rows = i64::try_from(visible_rows).unwrap_or(i64::MAX);
         let top = self.live_start_row.saturating_sub(self.view_offset);
-        let needed_end = self.live_start_row.min(top.saturating_add(visible_rows));
+        let needed_end = self.live_start_row.min(top.saturating_add(painted_rows));
         if top >= needed_end || (top..needed_end).all(|row| self.cache.contains_key(&row)) {
             return;
         }
@@ -685,18 +752,34 @@ pub enum WheelRoute {
 }
 
 /// Stateful precise-scroll accumulator plus the two Swift routing regimes.
+///
+/// Programs are sent whole lines, so precise deltas bound for the daemon
+/// accumulate here. Local scrollback follows precise deltas by the pixel
+/// instead ([`ScrollbackViewport::scroll_by_pixels`]) and never reaches this.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct ScrollRouter {
     accumulated_points: f32,
 }
 
 impl ScrollRouter {
+    /// True when the wheel moves Diri's scrollback rather than the program.
+    #[must_use]
+    pub fn is_local(modes: TerminalModes) -> bool {
+        !modes.alt_screen && !modes.mouse.is_reporting()
+    }
+
+    /// Forgets a partly accumulated line, so travel spent on local scrollback
+    /// is not later delivered to a program that turns mouse reporting on.
+    pub fn reset(&mut self) {
+        self.accumulated_points = 0.0;
+    }
+
     pub fn route(&mut self, modes: TerminalModes, event: WheelEvent) -> Option<WheelRoute> {
         let steps = match event.delta {
             WheelDelta::PrecisePoints(delta) => self.precise_steps(delta, event.line_height),
             WheelDelta::Lines(delta) => classic_steps(delta, event.visible_rows),
         }?;
-        if !modes.alt_screen && !modes.mouse.is_reporting() {
+        if Self::is_local(modes) {
             return Some(WheelRoute::Local {
                 lines: i64::from(steps),
             });
@@ -1119,6 +1202,157 @@ mod tests {
         assert!(viewport.cached_row(20_000).is_some());
         assert!(viewport.cached_row(0).is_none());
         assert!(viewport.cached_row(39_999).is_none());
+    }
+
+    fn rows_back(viewport: &ScrollbackViewport) -> f64 {
+        viewport.scroll_position().as_rows()
+    }
+
+    #[test]
+    fn a_trackpad_moves_the_view_by_the_pixel_and_rows_carry() {
+        let mut viewport = ScrollbackViewport::default();
+        viewport.apply_geometry(1_000, 1_040, 1, 40);
+        assert!(viewport.scroll_by_pixels(6.0, 15.0, 40));
+        assert_eq!(viewport.view_offset(), 1, "a partial row is a reading view");
+        assert!(viewport.is_reading());
+        assert!((rows_back(&viewport) - 0.4).abs() < 1e-6);
+        assert_eq!(viewport.painted_rows(40), 41);
+        assert_eq!(viewport.absolute_row(0), 999);
+
+        assert!(viewport.scroll_by_pixels(9.0, 15.0, 40));
+        assert_eq!(viewport.view_offset(), 1);
+        assert_eq!(viewport.painted_rows(40), 40, "resting on a whole row");
+        assert!(viewport.scroll_by_pixels(1.0, 15.0, 40));
+        assert_eq!(viewport.view_offset(), 2);
+    }
+
+    #[test]
+    fn the_live_edge_is_reached_exactly_and_releases_the_reading_view() {
+        let mut viewport = ScrollbackViewport::default();
+        viewport.apply_geometry(1_000, 1_040, 1, 40);
+        viewport.scroll_by_pixels(22.0, 15.0, 40);
+        viewport.hold_reading_view(&GridBuffer::new(8, 40));
+        assert!(viewport.is_reading());
+
+        // Momentum overshoots the edge by a wide margin.
+        assert!(viewport.scroll_by_pixels(-400.0, 15.0, 40));
+        assert_eq!(viewport.scroll_position(), ScrollPosition::LIVE);
+        assert!(!viewport.is_reading());
+        assert_eq!(viewport.painted_rows(40), 40);
+        assert!(viewport.held_live.is_none());
+        assert!(
+            !viewport.scroll_by_pixels(-30.0, 15.0, 40),
+            "pushing on the live edge changes nothing"
+        );
+    }
+
+    #[test]
+    fn the_oldest_row_stops_the_view_with_no_partial_row_above_it() {
+        let mut viewport = ScrollbackViewport::default();
+        viewport.apply_geometry(100, 140, 1, 40);
+        assert!(viewport.scroll_by_pixels(99.5 * 15.0, 15.0, 40));
+        assert_eq!(viewport.view_offset(), 100);
+        assert_eq!(viewport.painted_rows(40), 41);
+        assert!(viewport.scroll_by_pixels(500.0, 15.0, 40));
+        assert_eq!(viewport.scroll_position(), ScrollPosition::whole(100));
+        assert_eq!(viewport.absolute_row(0), 0);
+        assert!(!viewport.scroll_by_pixels(500.0, 15.0, 40));
+    }
+
+    #[test]
+    fn output_under_a_view_resting_mid_row_moves_neither_rows_nor_pixels() {
+        let mut viewport = ScrollbackViewport::default();
+        viewport.apply_geometry(1_000, 1_040, 1, 40);
+        viewport.scroll_by_pixels(100.0 * 15.0 - 4.0, 15.0, 40);
+        let (anchored, resting) = (viewport.absolute_row(0), viewport.scroll_position());
+        assert_eq!(anchored, 900);
+
+        viewport.apply_rows(Vec::new(), 0, 1_500, 1_540, 2, 40);
+
+        assert_eq!(viewport.absolute_row(0), anchored);
+        assert_eq!(viewport.scroll_position().fraction, resting.fraction);
+        assert_eq!(viewport.view_offset(), 600);
+    }
+
+    #[test]
+    fn a_resize_keeps_the_resting_offset_and_a_shrunken_history_clamps_it() {
+        let mut viewport = ScrollbackViewport::default();
+        viewport.apply_geometry(1_000, 1_040, 1, 40);
+        viewport.scroll_by_pixels(307.0, 15.0, 40);
+        let resting = viewport.scroll_position();
+
+        // Fewer rows fit; the same content stays under the top edge.
+        viewport.apply_rows(Vec::new(), 0, 1_000, 1_024, 2, 24);
+        assert_eq!(viewport.scroll_position(), resting);
+        assert_eq!(viewport.painted_rows(24), 25);
+
+        // A reflow that leaves less history than the view was scrolled.
+        viewport.anchor = None;
+        viewport.apply_rows(Vec::new(), 0, 12, 36, 3, 24);
+        assert_eq!(viewport.scroll_position(), ScrollPosition::whole(12));
+
+        // And one that leaves none returns to live without residue.
+        viewport.anchor = None;
+        viewport.apply_rows(Vec::new(), 0, 0, 24, 4, 24);
+        assert_eq!(viewport.scroll_position(), ScrollPosition::LIVE);
+        assert_eq!(viewport.painted_rows(24), 24);
+    }
+
+    #[test]
+    fn the_partly_shown_row_is_fetched_with_the_window() {
+        let mut viewport = ScrollbackViewport::default();
+        viewport.apply_rows(Vec::new(), 0, 100, 110, 1, 10);
+        viewport.set_view_offset(30, 10);
+        let rows: Vec<_> = (70..80).map(|_| row("cached", 8)).collect();
+        viewport.apply_rows(rows, 70, 100, 110, 1, 10);
+        assert!(
+            viewport.begin_fetch(10).is_none(),
+            "the whole window is held"
+        );
+
+        // Sliding up by part of a row shows row 80, which is not.
+        viewport.scroll_by_pixels(-5.0, 15.0, 10);
+        assert_eq!(viewport.view_offset(), 30);
+        let request = viewport.begin_fetch(10).expect("the extra row is needed");
+        assert!(request.range().contains(&80));
+    }
+
+    #[test]
+    fn rows_navigation_lands_on_whole_rows() {
+        let mut viewport = ScrollbackViewport::default();
+        viewport.apply_geometry(1_000, 1_040, 1, 40);
+        viewport.scroll_by_pixels(10.0 * 15.0 + 11.0, 15.0, 40);
+        assert_eq!(viewport.view_offset(), 11);
+
+        // A wheel notch steps from the nearest row, 11, not from 10.27.
+        assert!(viewport.scroll_by(1, 40));
+        assert_eq!(viewport.scroll_position(), ScrollPosition::whole(12));
+
+        viewport.scroll_by_pixels(4.0, 15.0, 40);
+        assert!(
+            viewport.set_view_offset(13, 40),
+            "same rows, but the view moved onto the row"
+        );
+        assert_eq!(viewport.scroll_position(), ScrollPosition::whole(13));
+
+        viewport.scroll_by_pixels(4.0, 15.0, 40);
+        viewport.hold_reading_view(&GridBuffer::new(8, 40));
+        assert!(viewport.enter_alt_screen());
+        assert_eq!(viewport.scroll_position(), ScrollPosition::LIVE);
+    }
+
+    #[test]
+    fn a_resting_finger_does_not_leave_live() {
+        let mut viewport = ScrollbackViewport::default();
+        viewport.apply_geometry(1_000, 1_040, 1, 40);
+        for delta in [0.5, -0.5, 0.75, -0.25, 0.5] {
+            assert!(!viewport.scroll_by_pixels(delta, 15.0, 40));
+            assert!(!viewport.is_reading());
+        }
+        // Deliberate travel leaves, and keeps every pixel of it.
+        assert!(!viewport.scroll_by_pixels(1.0, 15.0, 40));
+        assert!(viewport.scroll_by_pixels(1.0, 15.0, 40));
+        assert!((rows_back(&viewport) - 2.5 / 15.0).abs() < 1e-6);
     }
 
     #[test]

@@ -2033,15 +2033,28 @@ impl TerminalPane {
         let col = ((f32::from(position.x) - grid_x) / f32::from(metrics.cell_width))
             .floor()
             .max(0.0) as usize;
-        let row = ((f32::from(position.y) - grid_y) / f32::from(metrics.line_height))
+        let resident = self.selected_id().and_then(|id| self.residents.get(&id))?;
+        // A reading view resting between rows is painted this far above its
+        // whole-row positions, and shows part of one more row at the bottom.
+        let shift = f32::from(
+            resident
+                .element
+                .scroll_shift(metrics.line_height, window.scale_factor()),
+        );
+        let row = ((f32::from(position.y) - grid_y + shift) / f32::from(metrics.line_height))
             .floor()
             .max(0.0) as usize;
-        let resident = self.selected_id().and_then(|id| self.residents.get(&id))?;
+        // The extra row is addressable for selection and links. A program
+        // reading the mouse is only ever told about rows of its own screen.
+        let extra_row = shift > 0.0 && !resident.element.mouse_modes().is_reporting();
         clamp_grid_cell(
             col,
             row,
             resident.element.grid_cols(),
-            resident.element.grid_rows(),
+            resident
+                .element
+                .grid_rows()
+                .saturating_add(u16::from(extra_row)),
         )
         .map(|(col, row)| (usize::from(col), usize::from(row)))
     }
@@ -4366,8 +4379,11 @@ impl TerminalScrollTarget {
 
 impl diri_ui::ScrollTarget for TerminalScrollTarget {
     fn offset(&self) -> gpui::Point<gpui::Pixels> {
-        let scrolled_up = self.element.view_offset().min(self.max_lines());
-        let from_top = (self.max_lines() - scrolled_up) as f32 * self.line_height;
+        // Fractional, so the knob glides with a trackpad gesture and the top
+        // only reports itself reached once the last partial row is.
+        let max = self.max_lines() as f64;
+        let scrolled_up = self.element.scroll_position().min(max);
+        let from_top = (max - scrolled_up) as f32 * self.line_height;
         gpui::point(px(0.0), px(-from_top))
     }
 
@@ -4376,9 +4392,9 @@ impl diri_ui::ScrollTarget for TerminalScrollTarget {
     }
 
     fn set_offset(&self, offset: gpui::Point<gpui::Pixels>, _: &mut Window, _: &mut gpui::App) {
-        let from_top = (-f32::from(offset.y) / self.line_height).round() as i64;
-        let target = (self.max_lines() - from_top).max(0);
-        if self.element.set_view_offset(target, self.visible_rows) {
+        let from_top = f64::from(-f32::from(offset.y) / self.line_height);
+        let target = (self.max_lines() as f64 - from_top).max(0.0);
+        if self.element.set_scroll_position(target, self.visible_rows) {
             let _ = self.pane_tx.send(PaneEvent::ScrollbackPump(
                 self.session.clone(),
                 self.visible_rows,
