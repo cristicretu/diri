@@ -346,6 +346,7 @@ impl LauncherOverlay {
                             .update(cx, |this, cx| {
                                 this.finish_workspace_submission(cx);
                                 this.resume_pending_recipe_activation(cx);
+                                this.prune_session_drafts();
                                 if this.open
                                     && !this.delivery.is_sending()
                                     && matches!(this.target, LauncherTarget::NewSession)
@@ -583,6 +584,27 @@ impl LauncherOverlay {
         self.open = true;
         window.focus(&self.focus, cx);
         cx.notify();
+    }
+
+    /// Drafts are keyed by session identity, and a removed session can never
+    /// be targeted again; unsent text for it would otherwise stay for good.
+    fn prune_session_drafts(&mut self) {
+        if self.session_drafts.is_empty() && self.session_drafts_with_local_paths.is_empty() {
+            return;
+        }
+        let store = self
+            .services
+            .store
+            .store
+            .read()
+            .expect("session store lock poisoned");
+        let target = match &self.target {
+            LauncherTarget::Session(id) => Some(id),
+            LauncherTarget::NewSession => None,
+        };
+        let keep = |id: &SessionId| store.sessions().contains_key(id) || target == Some(id);
+        self.session_drafts.retain(|id, _| keep(id));
+        self.session_drafts_with_local_paths.retain(|id| keep(id));
     }
 
     fn switch_target(&mut self, target: LauncherTarget) {
@@ -4382,6 +4404,37 @@ mod tests {
             #[cfg(unix)]
             daemon_startup: None,
         })
+    }
+
+    #[gpui::test]
+    fn drafts_for_removed_sessions_are_pruned(cx: &mut TestAppContext) {
+        let runtime = Arc::new(StoreRuntime::inert());
+        let fixture =
+            crate::sidebar::SidebarPreviewFixture::make(crate::sidebar::PreviewScenario::Typical);
+        let live = fixture.list.sessions[0].id.clone();
+        let removed = fixture.list.sessions[1].id.clone();
+        runtime.store.write().expect("store").hydrate(fixture.list);
+        let services = test_services(runtime.clone());
+        let (launcher, cx) =
+            cx.add_window_view(move |_, cx| LauncherOverlay::new(services, false, cx));
+        launcher.update(cx, |launcher, _| {
+            for id in [&live, &removed] {
+                launcher.session_drafts.insert(id.clone(), "draft".into());
+                launcher.session_drafts_with_local_paths.insert(id.clone());
+            }
+            runtime
+                .store
+                .write()
+                .expect("store")
+                .remove_session_record(&removed);
+            launcher.prune_session_drafts();
+            assert_eq!(
+                launcher.session_drafts.keys().collect::<Vec<_>>(),
+                vec![&live]
+            );
+            assert!(!launcher.session_drafts_with_local_paths.contains(&removed));
+            assert!(launcher.session_drafts_with_local_paths.contains(&live));
+        });
     }
 
     #[gpui::test]
