@@ -341,9 +341,7 @@ impl TerminalPane {
         {
             self.show_terminal_feedback("Terminal changed. Paste again to review.", window, cx);
         } else {
-            resident
-                .attachment
-                .input(terminal_paste(&pending.text, resident.bracketed_paste));
+            resident.send_user_input(terminal_paste(&pending.text, resident.bracketed_paste));
         }
         cx.notify();
     }
