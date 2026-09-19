@@ -494,6 +494,10 @@ impl WindowWrite<'_> {
         let options = self.scoped_spawn_options(options);
         self.canonical.spawn_kind(kind, options);
     }
+    pub(crate) fn install_agent(&mut self, option: &crate::agent_catalog::AgentOption) -> bool {
+        let target = self.spawn_target();
+        self.canonical.install_agent(option, Some(target))
+    }
     pub fn accept_completed_launches(&mut self, all_sessions: bool) {
         let receipts = self
             .canonical

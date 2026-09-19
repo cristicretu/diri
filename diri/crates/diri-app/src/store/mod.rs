@@ -25,8 +25,9 @@ use tokio::sync::{Notify, broadcast, mpsc};
 use tokio::task::JoinHandle;
 
 use crate::notifications::{
-    SendTextCommand, StatusTransition, immediate_transitions_for_update, migration_transition,
-    prefs_sync_transition, reach_failure_transition,
+    SendTextCommand, StatusTransition, agent_installed_transition,
+    immediate_transitions_for_update, migration_transition, prefs_sync_transition,
+    reach_failure_transition,
 };
 use crate::switcher::{
     OverviewArrow, OverviewFilter, OverviewMode, OverviewOutcome, SessionOverviewState,
@@ -70,6 +71,11 @@ const UI_PUBLISH_INTERVAL: Duration = Duration::from_millis(50);
 // that, repeated Refresh clicks would queue daemon-side scans that each hold a
 // thread behind the same per-target single-flight lock.
 const MAX_AGENT_CATALOG_SCANS: u32 = 2;
+
+// A started install is watched for ten minutes: long enough for a slow
+// download, short enough that a closed installer tab stops costing scans.
+const AGENT_INSTALL_SCAN_INTERVAL: Duration = Duration::from_secs(5);
+const AGENT_INSTALL_SCANS: u32 = 120;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum StoreEventChange {
@@ -160,6 +166,11 @@ pub enum StoreEffect {
         title: String,
     },
     Spawn(SessionSpawnParams),
+    /// Rescan this Mac until the Agent the user is installing appears.
+    WatchAgentInstall {
+        kind: AgentKind,
+        display_name: String,
+    },
     WorkspaceSpawn {
         id: u64,
         params: Option<SessionSpawnParams>,
@@ -419,6 +430,9 @@ pub struct SessionStore {
     /// spinner has to stay up until the last of them replies.
     agent_catalog_scans: HashMap<String, u32>,
     agent_catalog_errors: HashMap<String, String>,
+    /// The Agent whose installer the user started from Diri. While set, the
+    /// runtime rescans this Mac so setup surfaces flip to ready unprompted.
+    agent_install: Option<AgentKind>,
     /// Attention states serving out their settle window, newest arming wins.
     /// Drained by the settle task in `StoreHandle`, which is what turns one of
     /// these into a chime and a banner — see `drain_settled_attention`.
@@ -509,6 +523,7 @@ impl SessionStore {
                 agents: HashMap::new(),
                 agent_catalog_scans: HashMap::new(),
                 agent_catalog_errors: HashMap::new(),
+                agent_install: None,
                 notification_feed,
                 attention_wake: Arc::new(Notify::new()),
                 effects,
@@ -726,6 +741,40 @@ impl SessionStore {
         }
         self.agent_catalog_scans.insert(key, outstanding + 1);
         self.emit(StoreEffect::RefreshAgents { host, force });
+    }
+
+    /// Runs an Agent's vendor installer where the user can watch it: a
+    /// Terminal session in the home folder with the command typed in. Only
+    /// this Mac is offered; a remote target keeps its setup guide.
+    pub(crate) fn install_agent(
+        &mut self,
+        option: &crate::agent_catalog::AgentOption,
+        window_target: Option<WindowSpawnTarget>,
+    ) -> bool {
+        let Some(install) = &option.install else {
+            return false;
+        };
+        self.spawn_kind(
+            AgentKind::SHELL,
+            SpawnOptions {
+                window_target,
+                cwd: Some(std::env::var("HOME").unwrap_or_else(|_| "/".to_owned())),
+                title: Some(format!("Install {}", option.display_name)),
+                initial_prompt: Some(install.command.clone()),
+                ..SpawnOptions::default()
+            },
+        );
+        self.agent_install = Some(option.kind.clone());
+        self.emit(StoreEffect::WatchAgentInstall {
+            kind: option.kind.clone(),
+            display_name: option.display_name.clone(),
+        });
+        true
+    }
+
+    /// The Agent being installed from Diri, until detection finds it.
+    pub fn installing_agent(&self) -> Option<&AgentKind> {
+        self.agent_install.as_ref()
     }
 
     pub fn configure_agent(&mut self, params: diri_proto::AgentConfigureParams) {
@@ -3546,6 +3595,55 @@ async fn run_effects(
                 });
                 Ok(())
             }
+            StoreEffect::WatchAgentInstall { kind, display_name } => {
+                let client = Arc::clone(&client);
+                let store = Arc::clone(&store);
+                let change_tx = change_tx.clone();
+                let status_tx = status_tx.clone();
+                tokio::spawn(async move {
+                    // Installers finish in seconds to a few minutes. Bounded,
+                    // so an abandoned install cannot leave a scan loop behind.
+                    for _ in 0..AGENT_INSTALL_SCANS {
+                        tokio::time::sleep(AGENT_INSTALL_SCAN_INTERVAL).await;
+                        let watching =
+                            |store: &SessionStore| store.agent_install.as_ref() == Some(&kind);
+                        if !watching(&store.read().expect("session store lock poisoned")) {
+                            return;
+                        }
+                        let Ok(catalog) = client
+                            .agent_readiness(diri_proto::AgentReadinessParams {
+                                host: None,
+                                force_refresh: true,
+                            })
+                            .await
+                        else {
+                            continue;
+                        };
+                        let installed = crate::agent_catalog::kind_spawnable(&kind, Some(&catalog));
+                        let mut locked = store.write().expect("session store lock poisoned");
+                        if !watching(&locked) {
+                            return;
+                        }
+                        locked.set_agent_catalog(catalog);
+                        if installed {
+                            locked.agent_install = None;
+                        }
+                        drop(locked);
+                        let _ = change_tx.send(());
+                        if installed {
+                            let _ = status_tx.send(agent_installed_transition(&display_name));
+                            return;
+                        }
+                    }
+                    let mut locked = store.write().expect("session store lock poisoned");
+                    if locked.agent_install.as_ref() == Some(&kind) {
+                        locked.agent_install = None;
+                        drop(locked);
+                        let _ = change_tx.send(());
+                    }
+                });
+                Ok(())
+            }
             StoreEffect::ConfigureAgent(params) => {
                 let client = Arc::clone(&client);
                 let store = Arc::clone(&store);
@@ -3666,7 +3764,9 @@ fn action_context(effect: &StoreEffect) -> Option<ActionContext> {
         // Catalog failures land in `agent_catalog_errors`, which the Agents
         // settings page and launch surfaces render in place — a toast on top
         // would double-report every unreachable host.
-        StoreEffect::RefreshAgents { .. } | StoreEffect::ConfigureAgent(_) => return None,
+        StoreEffect::RefreshAgents { .. }
+        | StoreEffect::ConfigureAgent(_)
+        | StoreEffect::WatchAgentInstall { .. } => return None,
     };
     Some(ActionContext { title, retry })
 }

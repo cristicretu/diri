@@ -159,7 +159,25 @@ fn setup_metadata_is_additive_for_old_and_new_catalog_entries() {
     .expect("new descriptor");
     let setup = guided.setup.as_ref().expect("setup metadata");
     assert_eq!(setup.url.as_deref(), Some("https://ampcode.com/manual"));
+    assert_eq!(setup.install_command, None);
     typed_round_trip(&guided);
+
+    let installable: AgentDescriptor = serde_json::from_value(json!({
+        "id": "gemini",
+        "displayName": "Gemini CLI",
+        "setup": {
+            "installCommand": "npm install -g @google/gemini-cli",
+            "installRequirement": "Node.js"
+        }
+    }))
+    .expect("installable descriptor");
+    let setup = installable.setup.as_ref().expect("setup metadata");
+    assert_eq!(
+        setup.install_command.as_deref(),
+        Some("npm install -g @google/gemini-cli")
+    );
+    assert_eq!(setup.install_requirement.as_deref(), Some("Node.js"));
+    typed_round_trip(&installable);
 }
 
 #[test]

@@ -3364,12 +3364,10 @@ impl UtilitySurfaces {
                         .flex()
                         .items_center()
                         .justify_between()
-                        .child(
-                            div()
-                                .text_size(px(10.0))
-                                .text_color(colors.tertiary)
-                                .child("Detected from the account login PATH."),
-                        )
+                        .child(div().text_size(px(10.0)).text_color(colors.tertiary).child(
+                            "Found through your shell's PATH. Use Add… for an agent \
+                                     installed somewhere else.",
+                        ))
                         .child(surface_button(
                             if loading { "Checking…" } else { "Refresh" },
                             "refresh-agent-catalog",
@@ -3402,7 +3400,40 @@ impl UtilitySurfaces {
             .map(|descriptor| descriptor.display_name.clone())
             .filter(|label| !label.is_empty())
             .unwrap_or_else(|| item.kind.id().to_owned());
-        let path = item.path.clone().unwrap_or_else(|| "Not found".into());
+        // Only this Mac can run an installer from here; a remote target
+        // keeps its guide link and manual path.
+        let install = (self.agents_host.is_none() && !item.available())
+            .then(|| crate::agent_catalog::option_from_readiness(&item))
+            .filter(|option| option.install.is_some());
+        let installing = install.is_some()
+            && self
+                .store
+                .read()
+                .expect("session store lock poisoned")
+                .installing_agent()
+                == Some(&item.kind);
+        let path = item.path.clone().unwrap_or_else(|| {
+            if installing {
+                "Installing in its own tab. Diri notices when it finishes.".into()
+            } else if let Some(install) =
+                install.as_ref().and_then(|option| option.install.as_ref())
+            {
+                install.requirement.as_ref().map_or_else(
+                    || install.command.clone(),
+                    |requirement| format!("Needs {requirement} · {}", install.command),
+                )
+            } else {
+                // The badge already says "Not found"; the line under the name
+                // is for what to do about it.
+                item.descriptor
+                    .as_ref()
+                    .and_then(|descriptor| descriptor.setup.as_ref())
+                    .and_then(|setup| setup.install_hint.as_deref())
+                    .map(str::trim)
+                    .filter(|hint| !hint.is_empty())
+                    .map_or_else(|| "Not found".into(), str::to_owned)
+            }
+        });
         let status = match item.path_source {
             Some(diri_proto::AgentPathSource::Manual) => "Manual",
             Some(diri_proto::AgentPathSource::SystemPath) => "Installed",
@@ -3481,7 +3512,37 @@ impl UtilitySurfaces {
                     .cursor_pointer()
                     .hover(move |button| button.bg(colors.primary.alpha(0.07)))
                     .on_click(move |_, _, cx| cx.open_url(&url))
-                    .child(sf_symbol("arrow.up.right.square", 10.0, colors.secondary)),
+                    .child(sf_symbol("link", 10.0, colors.secondary)),
+            );
+        }
+        if let Some(option) = install.filter(|_| !installing) {
+            actions = actions.child(
+                div()
+                    .id(format!("agent-install-{index}"))
+                    .role(gpui::Role::Button)
+                    .aria_label(format!("Install {}", option.display_name))
+                    .h(px(24.0))
+                    .px(px(8.0))
+                    .rounded(px(Radius::CHIP))
+                    .bg(colors.primary)
+                    .cursor_pointer()
+                    .hover(|button| button.opacity(0.88))
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.store
+                            .write()
+                            .expect("session store lock poisoned")
+                            .install_agent(&option);
+                        cx.notify();
+                    }))
+                    .flex()
+                    .items_center()
+                    .child(
+                        div()
+                            .text_size(px(10.0))
+                            .font_weight(FontWeight::MEDIUM)
+                            .text_color(colors.background)
+                            .child("Install"),
+                    ),
             );
         }
         let edit_kind = item.kind.clone();
@@ -7814,6 +7875,16 @@ mod tests {
 
         fn open_at(tab: SettingsTab, window: &mut Window, cx: &mut Context<Self>) -> Self {
             let runtime = Arc::new(StoreRuntime::inert());
+            // `DIRI_VISUAL_AGENTS=claude-code,codex` seeds the shipped catalog
+            // with those ids installed; an empty value is a Mac with none.
+            if let Ok(installed) = std::env::var("DIRI_VISUAL_AGENTS") {
+                let installed: Vec<_> = installed.split(',').filter(|id| !id.is_empty()).collect();
+                runtime
+                    .store
+                    .write()
+                    .expect("preview store")
+                    .set_agent_catalog(crate::agent_setup::bundled_catalog(&installed));
+            }
             if std::env::var_os("DIRI_VISUAL_LIGHT").is_some() {
                 runtime
                     .store

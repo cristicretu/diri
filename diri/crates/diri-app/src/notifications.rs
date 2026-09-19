@@ -108,6 +108,15 @@ fn plain_banner(prefix: &str, title: String, body: String) -> StatusTransition {
     }
 }
 
+/// Detection found an Agent the user asked Diri to install.
+pub fn agent_installed_transition(display_name: &str) -> StatusTransition {
+    plain_banner(
+        "agent-install",
+        format!("{display_name} is ready"),
+        "Start a session to give it a task. It asks you to sign in the first time.".to_owned(),
+    )
+}
+
 fn foreground_banner(title: String, body: String) -> StatusTransition {
     StatusTransition {
         dismiss: Vec::new(),

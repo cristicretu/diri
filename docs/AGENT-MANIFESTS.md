@@ -104,7 +104,7 @@ Do not use an ignored key for behavior.
 | `glyph` | No | One-character mark for places without an icon; defaults to `▸`. |
 | `aliases` | No | Additional case-insensitive names accepted by spawn surfaces. Do not reuse another agent's alias. |
 | `firstClass` | No | `true` when the manifest provides real detailed status. Keep this aligned with `statusModel: full`. |
-| `setup` | First-class agents | Display-only setup guidance: an official HTTP(S) `url`, concise `installHint`, and optional `signInHint`. Clients show these strings but never execute them. |
+| `setup` | First-class agents | Setup guidance: an official HTTP(S) `url`, concise `installHint`, and optional `signInHint`. Clients show these strings but never execute them. An optional `installCommand` (with `installRequirement`) is the one exception, described below. |
 | `statusAuthority` | Yes for built-ins | `screen` for ordinary TUI agents, `hooks` when a supported hook integration is primary, or `process` for liveness only. |
 | `binary` | Yes for a launchable agent | `argv[0]`, such as `maki`; omit only for pseudo-agents such as `shell` and `generic`. |
 | `spawnArgs` | No | Fixed argv words inserted on every launch. Each item is one word; never concatenate a shell command. |
@@ -128,6 +128,27 @@ search or third-party tutorial. Keep commands in `installHint` short enough for
 an unavailable-agent row, and use `signInHint` only for the documented next
 step after installation. Setup metadata is guidance: Diri does not run either
 hint or open its URL without an explicit user action.
+
+`installCommand` is the publisher's documented one-line installer, such as
+`curl -fsSL https://claude.ai/install.sh | bash`. It powers the Install button
+on the welcome screen, the launcher, and Settings for an agent that is not on
+this Mac. The Engine never runs it. The app types it into a Terminal session
+in the home folder only after the user presses an Install control that showed
+the full text, and then rescans until the agent appears. Rules:
+
+- Copy it verbatim from the publisher's own install page and prefer the
+  self-contained installer over one that needs a toolchain. When it does need
+  one, name it in `installRequirement` (for example `"Node.js"`); the row shows
+  "Needs Node.js" and sorts after installers that need nothing.
+- One visible line, 200 characters at most, no control characters. The client
+  drops anything else and falls back to the guide link.
+- Never `sudo`, never a package-manager bootstrap, never a command that edits
+  system configuration.
+- Bundled commands are pinned in
+  `bundled_install_commands_are_the_reviewed_vendor_installers`
+  (`diri-engine/src/detect/mod.rs`). Adding or changing one means updating
+  that list in the same change, so an installer never changes unreviewed.
+- Installers are offered for this Mac only. A remote host keeps its guide link.
 
 ### Conversation behavior
 

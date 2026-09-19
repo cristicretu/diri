@@ -147,6 +147,10 @@ pub struct SetupSpec {
     pub install_hint: Option<String>,
     #[serde(default)]
     pub sign_in_hint: Option<String>,
+    #[serde(default)]
+    pub install_command: Option<String>,
+    #[serde(default)]
+    pub install_requirement: Option<String>,
 }
 
 #[derive(Clone, Debug, Default, Deserialize)]

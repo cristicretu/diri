@@ -995,4 +995,60 @@ mod tests {
             "the bundled first-class roster unexpectedly shrank"
         );
     }
+
+    /// An install command is typed into a user's shell, so the bundled set is
+    /// pinned verbatim: changing one is a reviewed edit of this list, checked
+    /// against the vendor's own install page, never a drive-by manifest tweak.
+    #[test]
+    fn bundled_install_commands_are_the_reviewed_vendor_installers() {
+        let engine = engine();
+        let mut bundled = Vec::new();
+        for id in engine.ids() {
+            let descriptor: diri_proto::AgentDescriptor =
+                serde_json::from_value(engine.raw_agent(id).expect("bundled descriptor").clone())
+                    .expect("client descriptor");
+            let Some(setup) = descriptor.setup else {
+                continue;
+            };
+            if let Some(command) = setup.install_command {
+                bundled.push((id.to_owned(), command, setup.install_requirement));
+            } else {
+                assert_eq!(
+                    setup.install_requirement, None,
+                    "{id} names a requirement for an installer it does not ship"
+                );
+            }
+        }
+        bundled.sort();
+        let reviewed = [
+            (
+                "claude-code",
+                "curl -fsSL https://claude.ai/install.sh | bash",
+                None,
+            ),
+            (
+                "codex",
+                "curl -fsSL https://chatgpt.com/codex/install.sh | sh",
+                None,
+            ),
+            (
+                "gemini",
+                "npm install -g @google/gemini-cli",
+                Some("Node.js"),
+            ),
+            (
+                "opencode",
+                "curl -fsSL https://opencode.ai/install | bash",
+                None,
+            ),
+        ]
+        .map(|(id, command, requirement)| {
+            (
+                id.to_owned(),
+                command.to_owned(),
+                requirement.map(str::to_owned),
+            )
+        });
+        assert_eq!(bundled, reviewed);
+    }
 }

@@ -770,6 +770,7 @@ mod tests {
                     url: Some(url.into()),
                     install_hint: Some(format!("Install {display_name}.")),
                     sign_in_hint: sign_in_hint.map(str::to_owned),
+                    ..AgentSetup::default()
                 }),
                 ..AgentDescriptor::default()
             }),

@@ -1544,6 +1544,47 @@ fn a_configure_issued_during_an_inflight_scan_still_reaches_the_engine() {
 }
 
 #[test]
+fn installing_an_agent_types_the_shown_command_into_a_home_terminal_and_watches_for_it() {
+    let (mut store, mut effects) = SessionStore::headless(Prefs::default());
+    let catalog = crate::agent_setup::bundled_catalog(&[]);
+    let claude = crate::agent_catalog::agent_options(&catalog)
+        .into_iter()
+        .find(|option| option.kind == AgentKind::CLAUDE_CODE)
+        .expect("bundled Claude Code");
+    let shown = claude.install.clone().expect("bundled installer").command;
+
+    assert!(store.install_agent(&claude, None));
+    let Ok(StoreEffect::Spawn(params)) = effects.try_recv() else {
+        panic!("install opens a session");
+    };
+    // A Terminal the user can watch, never an Agent launch, and exactly the
+    // text the Install control displayed.
+    assert_eq!(params.kind, AgentKind::SHELL);
+    assert_eq!(params.initial_prompt.as_deref(), Some(shown.as_str()));
+    assert_eq!(params.title.as_deref(), Some("Install Claude Code"));
+    assert_eq!(params.host, None, "installers only run on this Mac");
+    assert_eq!(params.new_worktree, None);
+    assert!(matches!(
+        effects.try_recv(),
+        Ok(StoreEffect::WatchAgentInstall { kind, .. }) if kind == AgentKind::CLAUDE_CODE
+    ));
+    assert_eq!(store.installing_agent(), Some(&AgentKind::CLAUDE_CODE));
+}
+
+#[test]
+fn an_agent_without_a_bundled_installer_is_never_run() {
+    let (mut store, mut effects) = SessionStore::headless(Prefs::default());
+    let catalog = crate::agent_setup::bundled_catalog(&[]);
+    let manual = crate::agent_catalog::agent_options(&catalog)
+        .into_iter()
+        .find(|option| option.install.is_none())
+        .expect("an agent with only a setup guide");
+    assert!(!store.install_agent(&manual, None));
+    assert!(effects.try_recv().is_err());
+    assert_eq!(store.installing_agent(), None);
+}
+
+#[test]
 fn a_failed_scan_is_retried_only_by_an_explicit_rescan() {
     let (mut store, mut effects) = SessionStore::headless(Prefs::default());
     store.request_agent_catalog(Some("forge".into()), false);

@@ -655,6 +655,47 @@ impl LauncherOverlay {
         window.focus(&self.focus, cx);
     }
 
+    /// Install rows for a Mac with no coding agent. Remote targets keep the
+    /// Settings link: only a local installer can be run from here.
+    fn agent_setup(&self) -> Option<(Vec<AgentOption>, Option<AgentKind>)> {
+        if self.selected_host.is_some() || !self.selected_harness.is_terminal() {
+            return None;
+        }
+        let store = self
+            .services
+            .store
+            .store
+            .read()
+            .expect("session store lock poisoned");
+        match crate::agent_setup::AgentSetupState::from_catalog(store.agent_catalog(None)) {
+            crate::agent_setup::AgentSetupState::Missing(candidates) if !candidates.is_empty() => {
+                Some((candidates, store.installing_agent().cloned()))
+            }
+            _ => None,
+        }
+    }
+
+    /// The installer opens as its own Terminal tab, so the launcher gets out
+    /// of its way instead of covering the output the user was promised.
+    fn install_agent(&mut self, option: &AgentOption, cx: &mut Context<Self>) {
+        let started = if let Some(window_store) = &self.window_store {
+            window_store
+                .write()
+                .expect("window navigation lock poisoned")
+                .install_agent(option)
+        } else {
+            self.services
+                .store
+                .store
+                .write()
+                .expect("session store lock poisoned")
+                .install_agent(option, None)
+        };
+        if started {
+            self.close(cx);
+        }
+    }
+
     fn close(&mut self, cx: &mut Context<Self>) {
         if !self.open
             || (self.delivery.is_sending() && matches!(self.mode, LauncherMode::Handoff(_)))
@@ -2998,7 +3039,7 @@ impl LauncherOverlay {
                         .text_color(colors.primary).child("Where are we working?"))
                     .child(div().text_size(px(14.0)).line_height(px(22.0))
                         .text_color(colors.secondary)
-                        .child("Choose a project folder on your computer. Next, pick an agent and give it a task.")),
+                        .child("Pick the folder that holds your project. The agent works on the files inside it. Next you choose an agent and describe the task.")),
             )
             .child(
                 div().flex().items_center().gap(px(14.0))
@@ -3016,7 +3057,7 @@ impl LauncherOverlay {
                             .child(sf_symbol("folder", 14.0, colors.background))
                             .child("Choose folder"),
                     )
-                    .child(div().text_size(px(12.0)).text_color(colors.secondary).child("↵  Choose folder")),
+                    .child(div().text_size(px(12.0)).text_color(colors.secondary).child("↵")),
             )
             .child(div().text_size(px(12.0)).line_height(px(18.0)).text_color(colors.secondary)
                 .child("Nothing runs until you start the session."))
@@ -3049,6 +3090,8 @@ impl LauncherOverlay {
             && self.blocker().is_none()
             && !self.delivery.is_sending();
         let harness_open = self.picker == Some(Picker::Harness);
+        let agent_setup = self.agent_setup();
+        let setup_shown = agent_setup.is_some();
         let project_open = self.picker == Some(Picker::Project);
         let recipe_open = self.picker == Some(Picker::Recipe);
         let text_height = composer_text_height(self.prompt.line_count()).max(64.0);
@@ -3364,12 +3407,18 @@ impl LauncherOverlay {
                     ),
             )
             .when_some(
-                self.fallback_notice.clone().or_else(|| {
-                    // An empty task needs only its placeholder. Real blockers remain visible.
-                    (!self.prompt.is_empty() || self.delivery.is_sending())
-                        .then(|| self.blocker())
-                        .flatten()
-                }),
+                // With nothing installed the setup rows below say why this is
+                // a Terminal; "Claude Code is unavailable here" would blame a
+                // default the newcomer never picked.
+                self.fallback_notice
+                    .clone()
+                    .filter(|_| agent_setup.is_none())
+                    .or_else(|| {
+                        // An empty task needs only its placeholder. Real blockers remain visible.
+                        (!self.prompt.is_empty() || self.delivery.is_sending())
+                            .then(|| self.blocker())
+                            .flatten()
+                    }),
                 |panel, notice| {
                     panel.child(
                         div()
@@ -3383,41 +3432,93 @@ impl LauncherOverlay {
                     )
                 },
             )
-            .when(self.selected_harness.is_terminal(), |panel| {
+            .when_some(agent_setup, |panel, (candidates, installing)| {
+                let launcher = cx.weak_entity();
+                let install: crate::agent_setup::InstallHandler =
+                    std::rc::Rc::new(move |option, _, cx| {
+                        let _ = launcher.update(cx, |this, cx| this.install_agent(option, cx));
+                    });
                 panel.child(
                     div()
-                        .id("launcher-agent-setup")
-                        .mt(px(10.0))
-                        .px(px(12.0))
+                        .id("launcher-agent-install")
+                        .mt(px(18.0))
                         .flex()
-                        .items_center()
-                        .gap(px(8.0))
+                        .flex_col()
+                        .gap(px(10.0))
                         .child(
                             div()
-                                .text_size(px(11.0))
-                                .text_color(colors.secondary)
-                                .child("Terminal runs shell commands."),
+                                .px(px(12.0))
+                                .flex()
+                                .flex_col()
+                                .gap(px(3.0))
+                                .child(
+                                    div()
+                                        .text_size(px(13.0))
+                                        .font_weight(FontWeight::MEDIUM)
+                                        .text_color(colors.primary)
+                                        .child(format!(
+                                            "No coding agent on {} yet",
+                                            crate::platform::local_machine_label_lowercase()
+                                        )),
+                                )
+                                .child(
+                                    div()
+                                        .text_size(px(12.0))
+                                        .line_height(px(17.0))
+                                        .text_color(colors.secondary)
+                                        .child(
+                                            "This session is a plain terminal. Install an agent \
+                                             to give it tasks in plain English.",
+                                        ),
+                                ),
                         )
-                        .child(
-                            div()
-                                .id("launcher-setup-agents")
-                                .role(Role::Button)
-                                .aria_label("Set up a coding agent")
-                                .text_size(px(11.0))
-                                .text_color(colors.primary)
-                                .cursor_pointer()
-                                .on_click(cx.listener(|this, _, _, cx| {
-                                    this.open = false;
-                                    this.picker = None;
-                                    cx.emit(LauncherEvent::ManageAgents(
-                                        this.selected_host.clone(),
-                                    ));
-                                    cx.notify();
-                                }))
-                                .child("Set up an agent…"),
-                        ),
+                        .child(crate::agent_setup::setup_list(
+                            "launcher",
+                            &candidates,
+                            installing.as_ref(),
+                            colors,
+                            &install,
+                        )),
                 )
             })
+            .when(
+                self.selected_harness.is_terminal() && !setup_shown,
+                |panel| {
+                    panel.child(
+                        div()
+                            .id("launcher-agent-setup")
+                            .mt(px(10.0))
+                            .px(px(12.0))
+                            .flex()
+                            .items_center()
+                            .gap(px(8.0))
+                            .child(
+                                div()
+                                    .text_size(px(11.0))
+                                    .text_color(colors.secondary)
+                                    .child("Terminal runs shell commands."),
+                            )
+                            .child(
+                                div()
+                                    .id("launcher-setup-agents")
+                                    .role(Role::Button)
+                                    .aria_label("Set up a coding agent")
+                                    .text_size(px(11.0))
+                                    .text_color(colors.primary)
+                                    .cursor_pointer()
+                                    .on_click(cx.listener(|this, _, _, cx| {
+                                        this.open = false;
+                                        this.picker = None;
+                                        cx.emit(LauncherEvent::ManageAgents(
+                                            this.selected_host.clone(),
+                                        ));
+                                        cx.notify();
+                                    }))
+                                    .child("Set up an agent…"),
+                            ),
+                    )
+                },
+            )
             .when(harness_open, |panel| {
                 panel.child(
                     self.floating(picker_top, cx)
@@ -5221,16 +5322,36 @@ mod tests {
     #[test]
     #[ignore = "writes first-experience visual review artifacts"]
     fn render_first_experience_screenshots() {
-        struct Welcome(SemanticColors);
+        struct Welcome {
+            colors: SemanticColors,
+            installed: &'static [&'static str],
+            installing: Option<AgentKind>,
+            has_sessions: bool,
+        }
         impl Render for Welcome {
             fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+                let catalog = crate::agent_setup::bundled_catalog(self.installed);
                 div()
                     .size_full()
-                    .bg(self.0.background)
+                    .bg(self.colors.background)
                     .font_family(crate::fonts::ui_family())
                     .flex()
                     .flex_col()
-                    .child(crate::empty_workbench::render(false, self.0))
+                    .child(crate::empty_workbench::render(
+                        crate::empty_workbench::EmptyWorkbench {
+                            has_sessions: self.has_sessions,
+                            agents: crate::agent_setup::AgentSetupState::from_catalog(Some(
+                                &catalog,
+                            )),
+                            installing: self.installing.clone(),
+                            scanning: false,
+                        },
+                        crate::empty_workbench::EmptyWorkbenchActions {
+                            install: std::rc::Rc::new(|_, _, _| {}),
+                            check_again: std::rc::Rc::new(|_, _| {}),
+                        },
+                        self.colors,
+                    ))
             }
         }
         let output = std::path::PathBuf::from(
@@ -5251,20 +5372,38 @@ mod tests {
                 crate::fonts::init(cx);
                 cx.set_reduce_motion(true);
             });
-            let welcome = cx
-                .open_window(gpui::size(px(width), px(height)), |_, cx| {
-                    cx.new(|_| Welcome(launcher_colors_for_theme(theme)))
-                })
-                .unwrap();
-            cx.run_until_parked();
-            cx.capture_screenshot(welcome.into())
-                .unwrap()
-                .save(output.join(format!("{theme}-welcome.png")))
-                .unwrap();
-            welcome
-                .update(&mut cx, |_, window, _| window.remove_window())
-                .unwrap();
-            cx.run_until_parked();
+            let claude: &[&str] = &["claude-code", "codex"];
+            for (name, installed, installing, has_sessions) in [
+                ("welcome", &[][..], None, false),
+                (
+                    "welcome-installing",
+                    &[][..],
+                    Some(AgentKind::CLAUDE_CODE),
+                    false,
+                ),
+                ("welcome-ready", claude, None, false),
+                ("resting", claude, None, true),
+            ] {
+                let welcome = cx
+                    .open_window(gpui::size(px(width), px(height)), |_, cx| {
+                        cx.new(|_| Welcome {
+                            colors: launcher_colors_for_theme(theme),
+                            installed,
+                            installing,
+                            has_sessions,
+                        })
+                    })
+                    .unwrap();
+                cx.run_until_parked();
+                cx.capture_screenshot(welcome.into())
+                    .unwrap()
+                    .save(output.join(format!("{theme}-{name}.png")))
+                    .unwrap();
+                welcome
+                    .update(&mut cx, |_, window, _| window.remove_window())
+                    .unwrap();
+                cx.run_until_parked();
+            }
             let runtime = Arc::new(StoreRuntime::inert());
             runtime
                 .store
@@ -5318,7 +5457,7 @@ mod tests {
                 .store
                 .write()
                 .unwrap()
-                .set_agent_catalog(diri_proto::AgentReadinessResult::default());
+                .set_agent_catalog(crate::agent_setup::bundled_catalog(&[]));
             launcher
                 .update(&mut cx, |launcher, _, cx| {
                     launcher.reconcile_harness();

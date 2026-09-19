@@ -223,9 +223,10 @@ pub struct AgentKeystroke {
     pub submit: bool,
 }
 
-/// Optional, display-only guidance for installing and authenticating an
-/// Agent. Clients must never execute either hint; the URL is opened only after
-/// an explicit user action and is validated by the client as HTTP(S).
+/// Optional guidance for installing and authenticating an Agent. The hints
+/// are display-only and clients must never execute them; the URL is opened
+/// only after an explicit user action and is validated by the client as
+/// HTTP(S).
 #[derive(Clone, Debug, Default, Deserialize, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct AgentSetup {
@@ -235,6 +236,16 @@ pub struct AgentSetup {
     pub install_hint: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sign_in_hint: Option<String>,
+    /// The vendor's documented one-line installer. Neither the Engine nor a
+    /// client runs it on its own: a client may type it into a visible
+    /// Terminal session only after the user chose an install control that
+    /// displayed this exact text. Additive; older peers ignore or omit it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub install_command: Option<String>,
+    /// What `install_command` needs on the machine first (for example
+    /// "Node.js"). Absent means the installer is self-contained.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub install_requirement: Option<String>,
 }
 
 /// The daemon-side manifest descriptor for one agent, as much of it as the

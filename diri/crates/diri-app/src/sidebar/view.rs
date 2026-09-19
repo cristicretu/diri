@@ -9133,6 +9133,7 @@ mod tests {
                             url: Some("https://opencode.ai/docs".into()),
                             install_hint: Some("Install OpenCode.".into()),
                             sign_in_hint: Some("Run /connect.".into()),
+                            ..diri_proto::AgentSetup::default()
                         }),
                         ..diri_proto::AgentDescriptor::default()
                     }),

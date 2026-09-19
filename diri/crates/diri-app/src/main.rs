@@ -1,4 +1,5 @@
 mod agent_catalog;
+mod agent_setup;
 mod alerts;
 mod app_theme;
 mod application_notifications;

@@ -18,7 +18,8 @@
     "setup": {
       "url": "https://docs.anthropic.com/en/docs/claude-code/getting-started",
       "installHint": "Follow Anthropic's Claude Code installation guide.",
-      "signInHint": "Run claude and choose an Anthropic Console or Claude account."
+      "signInHint": "Run claude and choose an Anthropic Console or Claude account.",
+      "installCommand": "curl -fsSL https://claude.ai/install.sh | bash"
     },
     "statusAuthority": "hooks",
     "binary": "claude",

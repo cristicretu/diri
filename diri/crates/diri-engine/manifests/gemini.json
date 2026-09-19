@@ -17,7 +17,9 @@
     "setup": {
       "url": "https://github.com/google-gemini/gemini-cli",
       "installHint": "Follow Google's Gemini CLI installation guide.",
-      "signInHint": "Run gemini and choose an available Google or API-key authentication method."
+      "signInHint": "Run gemini and choose an available Google or API-key authentication method.",
+      "installCommand": "npm install -g @google/gemini-cli",
+      "installRequirement": "Node.js"
     },
     "statusAuthority": "screen",
     "binary": "gemini",

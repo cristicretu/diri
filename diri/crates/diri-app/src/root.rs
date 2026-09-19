@@ -4560,6 +4560,11 @@ impl Render for RootView {
                     });
                 }
             }))
+            .on_action(cx.listener(|this, _: &commands::ShowAgentSettings, _, cx| {
+                if let Some(surfaces) = &this.utility_surfaces {
+                    surfaces.update(cx, |surfaces, cx| surfaces.open_agent_settings(None, cx));
+                }
+            }))
             .on_action(cx.listener(|this, _: &ToggleSidebar, window, cx| {
                 this.run_command(CommandId::ToggleSidebar, window, cx);
             }))

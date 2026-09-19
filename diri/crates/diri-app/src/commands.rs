@@ -62,6 +62,8 @@ actions!(
         // Palette destination: open Settings even when it is already visible.
         // OpenSettings retains the Cmd+, toggle behavior.
         ShowSettings,
+        // Setup surfaces: open Settings on the Agents page for this Mac.
+        ShowAgentSettings,
         ToggleSidebar,
         ToggleTabOrientation,
         HorizontalTabs,
