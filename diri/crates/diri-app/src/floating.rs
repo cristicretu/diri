@@ -294,6 +294,16 @@ fn register_host<T: 'static>(window: &mut Window, cx: &mut Context<T>) {
         cx.global_mut::<Registry>()
             .watchers
             .insert(id, subscription);
+        // Hosts come and go with sessions and windows; without this the
+        // registry keeps an entry for every host that ever opened a panel.
+        cx.on_release(move |_, cx| {
+            if cx.has_global::<Registry>() {
+                let registry = cx.global_mut::<Registry>();
+                registry.mains.remove(&id);
+                registry.watchers.remove(&id);
+            }
+        })
+        .detach();
     }
 }
 
@@ -613,6 +623,33 @@ mod tests {
             .unwrap();
         cx.run_until_parked();
         assert_eq!(out.get().unwrap(), px(150.0));
+    }
+
+    #[gpui::test]
+    fn released_hosts_leave_the_registry(cx: &mut gpui::TestAppContext) {
+        struct Host;
+        impl Render for Host {
+            fn render(&mut self, _: &mut Window, _: &mut gpui::Context<Self>) -> impl IntoElement {
+                div()
+            }
+        }
+        cx.update(enable);
+        let (_root, cx) = cx.add_window_view(|_, _| Host);
+        let host = cx.new(|_| Host);
+        let id = host.entity_id();
+        cx.update(|window, cx| host.update(cx, |_, cx| register_host(window, cx)));
+        cx.update(|_, cx| {
+            let registry = cx.global::<Registry>();
+            assert!(registry.mains.contains_key(&id) && registry.watchers.contains_key(&id));
+        });
+        drop(host);
+        // Dropped entities are released when the next update flushes effects.
+        cx.update(|_, _| {});
+        cx.update(|_, cx| {
+            let registry = cx.global::<Registry>();
+            assert!(!registry.mains.contains_key(&id));
+            assert!(!registry.watchers.contains_key(&id));
+        });
     }
 
     fn main() -> Bounds<Pixels> {
