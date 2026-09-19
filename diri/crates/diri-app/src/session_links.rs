@@ -59,7 +59,7 @@ fn pr_state(pr: &PullRequestStatus) -> &'static str {
         _ => "Open",
     }
 }
-fn pr_summary(pr: &PullRequestStatus) -> (String, gpui::Rgba) {
+pub(super) fn pr_summary(pr: &PullRequestStatus) -> (String, gpui::Rgba) {
     match pr.state.as_str() {
         "MERGED" => ("Merged".into(), rgba(0xaf7cf7ff)),
         "CLOSED" => ("Closed".into(), Ink::DANGER),
@@ -318,6 +318,25 @@ fn detail_rows(pr: &PullRequestStatus) -> Vec<LinkRow> {
                 "{}#discussion_bucket",
                 pr.url.trim_end_matches('/')
             )),
+        });
+    }
+    if !matches!(pr.state.as_str(), "MERGED" | "CLOSED") {
+        let ready = pull_request_can_merge(pr);
+        rows.push(LinkRow {
+            title: "Merge".into(),
+            subtitle: if ready {
+                "Ready to merge".into()
+            } else {
+                merge_blocker_label(pr).into()
+            },
+            icon: IconName::Merge,
+            status: Some(if ready {
+                ("Ready".into(), Ink::FRESH)
+            } else {
+                ("Blocked".into(), Ink::ATTENTION)
+            }),
+            details: None,
+            action: LinkAction::Open(pr.url.clone()),
         });
     }
     rows
@@ -994,6 +1013,39 @@ pub(super) const LINKS_PANEL: crate::floating::Target<TerminalPane> = crate::flo
     dismiss: |pane, window, cx| pane.close_session_links(window, cx),
 };
 
+/// GitHub's own gate, read from the status fields it reports.
+fn pull_request_can_merge(pull_request: &PullRequestStatus) -> bool {
+    pull_request.state == "OPEN"
+        && !pull_request.is_draft
+        && pull_request.mergeable.as_deref() != Some("CONFLICTING")
+        && pull_request.checks_failed == 0
+        && pull_request.checks_pending == 0
+        && !matches!(
+            pull_request.review_decision.as_deref(),
+            Some("CHANGES_REQUESTED") | Some("REVIEW_REQUIRED")
+        )
+        && !matches!(
+            pull_request.merge_state_status.as_deref(),
+            Some("BLOCKED") | Some("DIRTY") | Some("DRAFT")
+        )
+}
+
+fn merge_blocker_label(pull_request: &PullRequestStatus) -> &'static str {
+    if pull_request.checks_failed > 0 {
+        "Checks are failing"
+    } else if pull_request.checks_pending > 0 {
+        "Checks are still running"
+    } else if pull_request.mergeable.as_deref() == Some("CONFLICTING") {
+        "Resolve merge conflicts"
+    } else if pull_request.review_decision.as_deref() == Some("CHANGES_REQUESTED") {
+        "Changes were requested"
+    } else if pull_request.review_decision.as_deref() == Some("REVIEW_REQUIRED") {
+        "Review is required"
+    } else {
+        "GitHub is blocking the merge"
+    }
+}
+
 fn pr_number(url: &str) -> Option<String> {
     let parts: Vec<_> = url.split('/').filter(|part| !part.is_empty()).collect();
     if let Some(index) = parts.iter().position(|part| *part == "pull") {
@@ -1154,6 +1206,39 @@ mod tests {
             LinkAction::Open("https://github.com/diri/app/pull/180/checks".into())
         );
     }
+    #[test]
+    fn merge_gate_waits_for_checks_and_review_blockers() {
+        let mut pull_request = pull_request("https://github.com/diri/app/pull/181");
+        pull_request.checks_failed = 0;
+        pull_request.checks_pending = 1;
+        assert!(!pull_request_can_merge(&pull_request));
+        assert_eq!(
+            merge_blocker_label(&pull_request),
+            "Checks are still running"
+        );
+        let rows = detail_rows(&pull_request);
+        let merge = rows.last().expect("merge row");
+        assert_eq!(merge.title, "Merge");
+        assert_eq!(merge.subtitle, "Checks are still running");
+        assert_eq!(merge.status.as_ref().map(|s| s.0.as_str()), Some("Blocked"));
+
+        let mut ready = pull_request.clone();
+        ready.checks_pending = 0;
+        ready.checks_passed = 3;
+        assert!(pull_request_can_merge(&ready));
+        assert_eq!(
+            detail_rows(&ready).last().map(|row| row.subtitle.as_str()),
+            Some("Ready to merge")
+        );
+
+        let mut merged = ready;
+        merged.state = "MERGED".into();
+        assert!(
+            detail_rows(&merged).iter().all(|row| row.title != "Merge"),
+            "a merged PR offers no merge row"
+        );
+    }
+
     #[test]
     fn merged_state_takes_priority_over_old_checks() {
         let mut session = fixture();

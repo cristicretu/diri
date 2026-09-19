@@ -527,6 +527,7 @@ impl RootView {
                 TerminalPaneEvent::ExternalDropFeedback { message } => {
                     this.show_quote_feedback("Dropped files", message.clone(), cx);
                 }
+                TerminalPaneEvent::OpenPreview { url } => this.open_preview_url(url.clone(), cx),
             })
             .detach();
         }
@@ -1460,6 +1461,9 @@ impl RootView {
                         crate::workspace_workbench::WorkspaceWorkbenchEvent::Terminal(
                             TerminalPaneEvent::ExternalDropFeedback { message },
                         ) => this.show_quote_feedback("Dropped files", message.clone(), cx),
+                        crate::workspace_workbench::WorkspaceWorkbenchEvent::Terminal(
+                            TerminalPaneEvent::OpenPreview { url },
+                        ) => this.open_preview_url(url.clone(), cx),
                         crate::workspace_workbench::WorkspaceWorkbenchEvent::Terminal(
                             TerminalPaneEvent::ContinueAccount(id),
                         ) => {
@@ -2888,11 +2892,25 @@ impl RootView {
         self.set_inspector_open(!self.inspector_open, cx);
     }
 
-    /// Source navigation is an explicit destination, so it must not be lost
-    /// behind the short debounce that protects repeated panel toggles.
+    /// An explicit destination must not be lost behind the short debounce
+    /// that protects repeated panel toggles.
     fn reveal_inspector(&mut self, cx: &mut Context<Self>) {
         self.inspector_toggled_at = None;
         self.set_inspector_open(true, cx);
+    }
+
+    /// A strip chip's preview belongs in the panel's Preview surface; hosts
+    /// without the native page fall back to the default browser.
+    fn open_preview_url(&mut self, url: String, cx: &mut Context<Self>) {
+        #[cfg(target_os = "macos")]
+        if let Some(inspector) = self.inspector.clone()
+            && !self.preview
+        {
+            self.reveal_inspector(cx);
+            inspector.update(cx, |inspector, cx| inspector.open_preview_url(url, cx));
+            return;
+        }
+        cx.open_url(&url);
     }
 
     fn inspector_resize_handle(&self, cx: &mut Context<Self>) -> AnyElement {

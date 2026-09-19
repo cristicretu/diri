@@ -2116,6 +2116,17 @@ impl WorkbenchInspector {
         true
     }
 
+    /// Show `url` in a Preview tab: the active one when Preview is up,
+    /// otherwise the conversation's first Preview, created if needed.
+    pub(crate) fn open_preview_url(&mut self, url: String, cx: &mut Context<Self>) {
+        self.select_workspace(WorkspaceSurface::Browser, cx);
+        self.browser_query.clear();
+        self.browser_query.insert(&url);
+        self.browser_address_focused = false;
+        cx.emit(InspectorEvent::Browser(BrowserAction::Navigate(url)));
+        cx.notify();
+    }
+
     fn navigate_browser(&mut self, cx: &mut Context<Self>) {
         let Some(url) = self.browser_url() else {
             return;
