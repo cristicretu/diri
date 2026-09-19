@@ -31,6 +31,10 @@ pub(super) struct FrameQueue {
     /// Signals both directions: room appeared, or a frame did.
     changed: Condvar,
     capacity: usize,
+    /// Every return from the reader's wait, so a test can prove an idle
+    /// subscriber stays parked.
+    #[cfg(test)]
+    pub(super) wakeups: std::sync::atomic::AtomicUsize,
 }
 
 impl FrameQueue {
@@ -42,6 +46,8 @@ impl FrameQueue {
             }),
             changed: Condvar::new(),
             capacity,
+            #[cfg(test)]
+            wakeups: std::sync::atomic::AtomicUsize::new(0),
         })
     }
 
@@ -73,12 +79,13 @@ impl FrameQueue {
         true
     }
 
-    /// Takes the next frame, waiting up to `patience` for one to arrive.
+    /// Takes the next frame, waiting for as long as it takes one to arrive.
     ///
-    /// `None` means the queue closed, or nothing came in time; the caller can
-    /// tell the difference with [`FrameQueue::is_closed`].
-    pub(super) fn pop(&self, patience: Duration) -> Option<Frame> {
-        let deadline = Instant::now() + patience;
+    /// There is no deadline on purpose: a silent session must leave its
+    /// subscribers parked, not ticking. `None` means the queue closed, which
+    /// is how every reason to stop waiting — the child exiting, the pump
+    /// giving up, the peer hanging up — reaches the reader.
+    pub(super) fn pop(&self) -> Option<Frame> {
         let mut state = self.state.lock().expect("frame queue");
         loop {
             if let Some(frame) = state.frames.pop_front() {
@@ -89,16 +96,18 @@ impl FrameQueue {
             if state.closed {
                 return None;
             }
-            let remaining = deadline.saturating_duration_since(Instant::now());
-            if remaining.is_zero() {
-                return None;
-            }
-            let (guard, _) = self
-                .changed
-                .wait_timeout(state, remaining)
-                .expect("frame queue");
-            state = guard;
+            state = self.changed.wait(state).expect("frame queue");
+            #[cfg(test)]
+            self.wakeups
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         }
+    }
+
+    /// Takes a frame only if one is already waiting.
+    pub(super) fn try_pop(&self) -> Option<Frame> {
+        let frame = self.state.lock().expect("frame queue").frames.pop_front()?;
+        self.changed.notify_all();
+        Some(frame)
     }
 
     /// Marks the subscriber gone and wakes anyone waiting on it.
@@ -107,6 +116,7 @@ impl FrameQueue {
         self.changed.notify_all();
     }
 
+    #[cfg(test)]
     pub(super) fn is_closed(&self) -> bool {
         self.state.lock().expect("frame queue").closed
     }
@@ -129,7 +139,7 @@ mod tests {
             let queue = Arc::clone(&queue);
             std::thread::spawn(move || {
                 std::thread::sleep(Duration::from_millis(20));
-                queue.pop(Duration::from_secs(1))
+                queue.pop()
             })
         };
         // Room appears only once the drainer runs, so this push must wait for
@@ -151,11 +161,28 @@ mod tests {
     }
 
     #[test]
+    fn a_parked_reader_wakes_only_for_a_frame_or_a_close() {
+        let queue = FrameQueue::new(1);
+        let reader = {
+            let queue = Arc::clone(&queue);
+            std::thread::spawn(move || (queue.pop().map(|f| f.0), queue.pop().map(|f| f.0)))
+        };
+        // Longer than several of the old 100 ms idle ticks.
+        std::thread::sleep(Duration::from_millis(350));
+        assert_eq!(queue.wakeups.load(std::sync::atomic::Ordering::SeqCst), 0);
+
+        assert!(queue.push(frame(7), Duration::from_millis(10)));
+        queue.close();
+        assert_eq!(reader.join().expect("reader"), (Some(7), None));
+    }
+
+    #[test]
     fn closing_releases_both_ends() {
         let queue = FrameQueue::new(1);
         queue.close();
         assert!(!queue.push(frame(0), Duration::from_secs(5)));
-        assert!(queue.pop(Duration::from_secs(5)).is_none());
+        assert!(queue.pop().is_none());
+        assert!(queue.try_pop().is_none());
         assert!(queue.is_closed());
     }
 }
