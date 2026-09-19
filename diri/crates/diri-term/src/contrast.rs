@@ -66,28 +66,45 @@ const PRIMARIES: [(usize, LinearRgb); 6] = [
 pub(crate) fn applies(cell: GridCell) -> bool {
     let defaults = is_default(cell.fg) && is_default(cell.bg);
     let authored = !is_theme_owned(cell.fg) && !is_theme_owned(cell.bg);
-    !defaults
-        && !authored
-        && !cell.style.contains(TermStyle::INVISIBLE)
-        && !is_powerline(cell.scalar)
+    !defaults && !authored && can_recolor(cell)
+}
+
+/// Whether this cell's glyph may change color at all. Under a selection or
+/// find tint the theme has supplied the background of every other cell, in
+/// every theme, whatever colors the program chose.
+pub(crate) fn can_recolor(cell: GridCell) -> bool {
+    !cell.style.contains(TermStyle::INVISIBLE) && !is_powerline(cell.scalar)
+}
+
+/// Whether a tint above this cell bears on its glyph. Block elements are
+/// fills, not text: they cover the tint they would be judged against, and a
+/// progress bar must not change color where a find match crosses it.
+pub(crate) fn tint_applies(cell: GridCell) -> bool {
+    can_recolor(cell) && !matches!(cell.scalar, 0x2580..=0x259f)
 }
 
 /// The readable foreground for `cell`, given its resolved colors.
 ///
 /// `foreground` and `background` are the colors after inverse video swapped
-/// them. The result is the color as painted, SGR faint included.
+/// them. `own` is whether the cell is corrected against its own background
+/// (see [`applies`]); `tint` is the selection or find overlay painted between
+/// the background and the glyph. The result is the color as painted, SGR
+/// faint included.
 pub(crate) fn painted_foreground(
     theme: &TermTheme,
     cell: GridCell,
     foreground: Rgba,
     background: Rgba,
+    own: bool,
+    tint: Option<Rgba>,
 ) -> Rgba {
     let inverse = cell.style.contains(TermStyle::INVERSE);
     let dim = cell.style.contains(TermStyle::DIM);
     let key = CacheKey {
         colors: (u64::from(cell.fg.packed()) << 32) | u64::from(cell.bg.packed()),
         theme: theme_key(theme),
-        flags: u8::from(inverse) | (u8::from(dim) << 1),
+        tint: tint.map_or(0, packed),
+        flags: u8::from(inverse) | (u8::from(dim) << 1) | (u8::from(own) << 2),
     };
     CACHE.with_borrow_mut(|cache| {
         let set = &mut cache[key.set()];
@@ -99,20 +116,97 @@ pub(crate) fn painted_foreground(
             set[..=way].rotate_right(1);
             return set[0].map_or(foreground, |(_, color)| color);
         }
-        let on_paper = !inverse && is_default(cell.bg);
-        let color = correct(theme, foreground, background, on_paper, dim);
+        let mut color = if dim {
+            foreground.opacity(DIM_OPACITY)
+        } else {
+            foreground
+        };
+        let floor = if dim {
+            MINIMUM_DIM_CONTRAST
+        } else {
+            MINIMUM_TEXT_CONTRAST
+        };
+        if own {
+            let on_paper = !inverse && is_default(cell.bg);
+            color = correct(theme, color, background, on_paper, dim, floor);
+        }
+        if let Some(tint) = tint {
+            // A tint gives back the legibility it took and no more: a color
+            // the theme left below the floor on its own background is held to
+            // what it had there, so selecting text never restyles it. Starting
+            // from the color the cell already wears keeps text that is still
+            // readable under the tint exactly as it was.
+            let untinted = contrast_of(composite(color, background), background);
+            let tinted = composite(tint, background);
+            color = correct(theme, color, tinted, false, dim, floor.min(untinted));
+        }
         set.rotate_right(1);
         set[0] = Some((key, color));
         color
     })
 }
 
-#[cfg(test)]
-pub(crate) fn contrast_ratio(left: Rgba, right: Rgba) -> f32 {
+/// Cursor fill and the color of the glyph inside it, for a cursor sitting on
+/// `background`. The theme's pair is kept wherever the block stands out from
+/// the cell beneath it; on a cell the cursor would vanish into (an inverse
+/// status bar, a program panel in the cursor's own color) the block takes
+/// whichever of the theme's ink and paper is visible there.
+pub(crate) fn cursor_colors(theme: &TermTheme, background: Rgba) -> (Rgba, Rgba) {
+    let stands_out = |fill: Rgba| contrast_of(composite(fill, background), background);
+    let mut fill = theme.cursor;
+    if stands_out(fill) < MINIMUM_DIM_CONTRAST {
+        let ink = theme.foreground.alpha(theme.cursor.a);
+        let paper = theme.background.alpha(theme.cursor.a);
+        fill = if stands_out(ink) >= stands_out(paper) {
+            ink
+        } else {
+            paper
+        };
+    }
+    let seen = composite(fill, background);
+    let mut text = theme.cursor_text;
+    if contrast_of(text, seen) < MINIMUM_TEXT_CONTRAST {
+        text = if contrast_of(theme.foreground, seen) >= contrast_of(theme.background, seen) {
+            theme.foreground
+        } else {
+            theme.background
+        };
+    }
+    (fill, text)
+}
+
+/// `top` painted over `bottom`, both translucent.
+pub(crate) fn over(top: Rgba, bottom: Rgba) -> Rgba {
+    let alpha = top.a + bottom.a * (1.0 - top.a);
+    if alpha <= 0.0 {
+        return Rgba::default();
+    }
+    let blend = |top_channel: f32, bottom_channel: f32| {
+        (top_channel * top.a + bottom_channel * bottom.a * (1.0 - top.a)) / alpha
+    };
+    Rgba {
+        r: blend(top.r, bottom.r),
+        g: blend(top.g, bottom.g),
+        b: blend(top.b, bottom.b),
+        a: alpha,
+    }
+}
+
+fn packed(color: Rgba) -> u32 {
+    let byte = |channel: f32| (channel.clamp(0.0, 1.0) * 255.0).round() as u32;
+    (byte(color.r) << 24) | (byte(color.g) << 16) | (byte(color.b) << 8) | byte(color.a)
+}
+
+fn contrast_of(left: Rgba, right: Rgba) -> f32 {
     ratio(
         relative_luminance(linear(left)),
         relative_luminance(linear(right)),
     )
+}
+
+#[cfg(test)]
+pub(crate) fn contrast_ratio(left: Rgba, right: Rgba) -> f32 {
+    contrast_of(left, right)
 }
 
 const fn is_default(color: TermColor) -> bool {
@@ -140,13 +234,17 @@ const CACHE_WAYS: usize = 4;
 struct CacheKey {
     colors: u64,
     theme: u64,
+    tint: u32,
     flags: u8,
 }
 
 impl CacheKey {
     fn set(self) -> usize {
-        let mixed = (self.colors ^ self.theme.rotate_left(17) ^ u64::from(self.flags))
-            .wrapping_mul(0x9e37_79b9_7f4a_7c15);
+        let mixed = (self.colors
+            ^ self.theme.rotate_left(17)
+            ^ u64::from(self.tint).rotate_left(29)
+            ^ u64::from(self.flags))
+        .wrapping_mul(0x9e37_79b9_7f4a_7c15);
         (mixed >> 40) as usize % CACHE_SETS
     }
 }
@@ -232,27 +330,20 @@ fn correct(
     background: Rgba,
     on_paper: bool,
     dim: bool,
+    target: f32,
 ) -> Rgba {
-    // Faint text is judged as it composites: GPUI blends the faded glyph into
-    // the background in gamma space. Holding a half-transparent ink to a
-    // contrast floor would drive every faint color to the same near-black, so
-    // an unreadable composite is corrected itself and painted opaque.
-    let (painted, target) = if dim {
-        let faded = foreground.opacity(DIM_OPACITY);
-        (composite(faded, background), MINIMUM_DIM_CONTRAST)
-    } else {
-        (foreground, MINIMUM_TEXT_CONTRAST)
-    };
+    // Faint text arrives already faded and is judged as it composites: GPUI
+    // blends the glyph into the background in gamma space. Holding a
+    // half-transparent ink to a contrast floor would drive every faint color
+    // to the same near-black, so an unreadable composite is corrected itself
+    // and painted opaque.
+    let painted = composite(foreground, background);
     let surface = Surface {
         luminance: relative_luminance(linear(background)),
         target,
     };
     if surface.reads(linear(painted)) {
-        return if dim {
-            foreground.opacity(DIM_OPACITY)
-        } else {
-            foreground
-        };
+        return foreground;
     }
     let foreground = painted;
 
@@ -749,6 +840,186 @@ mod tests {
         }
     }
 
+    /// The best contrast any opaque color can reach on `background`.
+    fn ceiling(background: Rgba) -> f32 {
+        let black = Rgba {
+            r: 0.0,
+            g: 0.0,
+            b: 0.0,
+            a: 1.0,
+        };
+        let white = Rgba {
+            r: 1.0,
+            g: 1.0,
+            b: 1.0,
+            a: 1.0,
+        };
+        contrast_ratio(black, background).max(contrast_ratio(white, background))
+    }
+
+    #[test]
+    fn text_under_selection_and_find_tints_is_readable_in_every_theme() {
+        for theme in TermTheme::CATALOG {
+            for (name, tint) in [
+                ("selection", theme.selection),
+                ("find match", theme.find_match),
+                ("current find match", theme.find_match_current),
+            ] {
+                let foregrounds = [TermColor::Default, TermColor::Rgb(255, 255, 255)]
+                    .into_iter()
+                    .chain((0..16).map(TermColor::Ansi));
+                for fg in foregrounds {
+                    let probe = cell(fg, TermColor::Default, TermStyle::empty());
+                    let plain = theme.resolve_cell(probe);
+                    let untinted = contrast_ratio(plain.foreground, plain.background);
+                    let resolved = theme.resolve_cell_under(probe, Some(tint));
+                    let seen = composite(tint, resolved.background);
+                    let contrast = contrast_ratio(resolved.foreground, seen);
+                    let owed = MINIMUM_TEXT_CONTRAST.min(untinted).min(ceiling(seen));
+                    assert!(
+                        contrast >= owed - 0.01,
+                        "{fg:?} under {}'s {name} reads at {contrast}",
+                        theme.id
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn a_tint_never_restyles_a_color_the_theme_left_below_the_floor() {
+        // Dirijor Dark's red reads at about 3.9:1 on its own background, and
+        // dark themes are not corrected. The selection lifts the background
+        // slightly; the red is owed back what it lost, not promoted to 4.5.
+        let theme = TermTheme::DIRIJOR_DARK;
+        let probe = cell(TermColor::Ansi(1), TermColor::Default, TermStyle::empty());
+        let plain = theme.resolve_cell(probe);
+        let untinted = contrast_ratio(plain.foreground, plain.background);
+        assert!(untinted < MINIMUM_TEXT_CONTRAST);
+        let tinted = theme.resolve_cell_under(probe, Some(theme.selection));
+        let seen = composite(theme.selection, tinted.background);
+        let contrast = contrast_ratio(tinted.foreground, seen);
+        assert!(contrast >= untinted - 0.01 && contrast < untinted + 0.1);
+    }
+
+    #[test]
+    fn text_that_stays_readable_under_a_tint_keeps_its_color() {
+        let theme = TermTheme::DIRIJOR_DARK;
+        let probe = cell(TermColor::Default, TermColor::Default, TermStyle::empty());
+        assert_eq!(
+            theme.resolve_cell_under(probe, Some(theme.selection)),
+            theme.resolve_cell(probe)
+        );
+    }
+
+    #[test]
+    fn a_tint_recolors_even_program_authored_pairs_but_never_fills() {
+        let theme = TermTheme::DIRIJOR_DARK;
+        let authored = cell(
+            TermColor::Rgb(230, 230, 230),
+            TermColor::Rgb(20, 20, 20),
+            TermStyle::empty(),
+        );
+        let tinted = theme.resolve_cell_under(authored, Some(theme.find_match_current));
+        assert_ne!(tinted.foreground, theme.resolve_cell(authored).foreground);
+        assert_eq!(tinted.background, theme.resolve_cell(authored).background);
+
+        for fill in [0xe0b0, 0x2588, 0x2591] {
+            let cell = GridCell::new(
+                fill,
+                TermColor::Rgb(230, 230, 230),
+                TermColor::Default,
+                TermStyle::empty(),
+            );
+            assert_eq!(
+                theme.resolve_cell_under(cell, Some(theme.find_match_current)),
+                theme.resolve_cell(cell),
+                "U+{fill:04X} is a fill, not text"
+            );
+        }
+    }
+
+    #[test]
+    fn the_cursor_keeps_the_theme_pair_wherever_it_is_visible() {
+        for theme in TermTheme::CATALOG {
+            let probe = cell(TermColor::Default, TermColor::Default, TermStyle::empty());
+            let (fill, _) = theme.cursor_colors(probe, None);
+            assert_eq!(fill, theme.cursor, "{}", theme.id);
+        }
+    }
+
+    #[test]
+    fn the_cursor_never_vanishes_into_the_cell_beneath_it() {
+        for theme in TermTheme::CATALOG {
+            let cursor = theme.cursor;
+            let byte = |channel: f32| (channel * 255.0).round() as u8;
+            let cursor_colored = TermColor::Rgb(byte(cursor.r), byte(cursor.g), byte(cursor.b));
+            for probe in [
+                cell(TermColor::Default, TermColor::Default, TermStyle::INVERSE),
+                cell(TermColor::Default, cursor_colored, TermStyle::empty()),
+                cell(
+                    TermColor::Default,
+                    TermColor::Rgb(128, 128, 128),
+                    TermStyle::empty(),
+                ),
+            ] {
+                let background = theme.resolve_cell(probe).background;
+                let (fill, text) = theme.cursor_colors(probe, None);
+                let seen = composite(fill, background);
+                let stands_out = contrast_ratio(seen, background);
+                let best = contrast_ratio(
+                    composite(theme.foreground.alpha(cursor.a), background),
+                    background,
+                )
+                .max(contrast_ratio(
+                    composite(theme.background.alpha(cursor.a), background),
+                    background,
+                ))
+                .max(contrast_ratio(composite(cursor, background), background));
+                assert!(
+                    stands_out >= MINIMUM_DIM_CONTRAST.min(best) - 0.01,
+                    "{}: cursor on {background:?} stands out at {stands_out}",
+                    theme.id
+                );
+                let legible = contrast_ratio(text, seen);
+                let best_text = contrast_ratio(theme.foreground, seen)
+                    .max(contrast_ratio(theme.background, seen))
+                    .max(contrast_ratio(theme.cursor_text, seen));
+                assert!(
+                    legible >= MINIMUM_TEXT_CONTRAST.min(best_text) - 0.01,
+                    "{}: glyph in cursor reads at {legible}",
+                    theme.id
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn stacked_tints_composite_in_paint_order() {
+        let below = Rgba {
+            r: 1.0,
+            g: 0.0,
+            b: 0.0,
+            a: 0.5,
+        };
+        let above = Rgba {
+            r: 0.0,
+            g: 0.0,
+            b: 1.0,
+            a: 0.5,
+        };
+        let paper = TermTheme::GITHUB_LIGHT.background;
+        let stacked = composite(over(above, below), paper);
+        let sequential = composite(above, composite(below, paper));
+        for (left, right) in [
+            (stacked.r, sequential.r),
+            (stacked.g, sequential.g),
+            (stacked.b, sequential.b),
+        ] {
+            assert!((left - right).abs() < 0.000_1);
+        }
+    }
+
     #[test]
     fn cached_answers_match_fresh_ones_across_themes() {
         let fg = TermColor::Rgb(255, 255, 0);
@@ -761,6 +1032,7 @@ mod tests {
                     theme.background,
                     true,
                     false,
+                    MINIMUM_TEXT_CONTRAST,
                 );
                 assert_eq!(theme.resolve_cell(probe).foreground, fresh, "{}", theme.id);
             }
@@ -786,6 +1058,7 @@ mod tests {
                 theme.background,
                 true,
                 false,
+                MINIMUM_TEXT_CONTRAST,
             );
             let resolved = theme.resolve_cell(cell(fg, TermColor::Default, TermStyle::empty()));
             assert_eq!(resolved.foreground, fresh, "{fg:?}");
