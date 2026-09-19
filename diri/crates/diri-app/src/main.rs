@@ -405,6 +405,11 @@ fn main() {
         if std::env::var_os("DIRI_FLOATING_PANELS").is_none_or(|value| value != "0") {
             floating::enable(cx);
         }
+        // Headless previews and screenshot fixtures want the theme they asked
+        // for on their first frame, so only the running application fades.
+        if !preview {
+            app_theme::live::enable();
+        }
         // Confirmations are the system's alert sheets on macOS.
         #[cfg(target_os = "macos")]
         alerts::enable(cx);

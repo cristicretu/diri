@@ -1305,7 +1305,7 @@ impl TerminalPane {
             .store
             .read()
             .expect("session store lock poisoned");
-        crate::app_theme::colors_for(store.preferences())
+        crate::app_theme::colors_in(&store)
     }
 
     fn handle_pane_event(&mut self, event: PaneEvent, window: &mut Window, cx: &mut Context<Self>) {
@@ -1872,7 +1872,7 @@ impl TerminalPane {
             .store
             .read()
             .expect("session store lock poisoned");
-        crate::app_theme::sidebar_colors_for(store.preferences())
+        crate::app_theme::sidebar_colors_in(&store)
     }
 
     /// Runs `f` against the pane's own window even from a panel handler.
@@ -3913,12 +3913,11 @@ impl Render for TerminalPane {
                 .store
                 .read()
                 .expect("session store lock poisoned");
-            let prefs = store.preferences();
             (
-                crate::app_theme::terminal_theme(&prefs.terminal_theme),
-                crate::app_theme::colors_for(prefs),
-                crate::app_theme::sidebar_colors_for(prefs),
-                prefs.terminal_font_size,
+                crate::app_theme::terminal_theme_in(&store),
+                crate::app_theme::colors_in(&store),
+                crate::app_theme::sidebar_colors_in(&store),
+                store.preferences().terminal_font_size,
             )
         };
         self.sync_status_glyphs(colors, window, cx);

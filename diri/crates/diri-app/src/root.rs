@@ -1519,7 +1519,7 @@ impl RootView {
             .window_store
             .read()
             .expect("session store lock poisoned");
-        crate::app_theme::colors_for(store.preferences())
+        crate::app_theme::colors_in(&store)
     }
 
     /// Pushes the preferred window material to the platform window when it
@@ -3220,7 +3220,7 @@ impl RootView {
                     .window_store
                     .read()
                     .expect("session store lock poisoned");
-                crate::app_theme::sidebar_colors_for(store.preferences())
+                crate::app_theme::sidebar_colors_in(&store)
             };
             let trailing = hosts_pane_actions
                 .then_some(self.terminal.as_ref())
@@ -4164,6 +4164,8 @@ impl Render for RootView {
         {
             self.open_notification(session, event, window, cx);
         }
+        // Before anything reads a color: this frame's sample of a theme fade.
+        crate::app_theme::follow(&self.window_store.read().expect("store"), window, cx);
         let colors = self.colors();
         self.sync_window_material(window);
         let launcher_open = self.launcher.read(cx).is_open();
@@ -6220,6 +6222,72 @@ mod tests {
                 });
             }
         }
+    }
+
+    #[gpui::test]
+    fn a_theme_preview_fades_the_whole_window_then_stops_painting(cx: &mut gpui::TestAppContext) {
+        use std::time::Duration;
+
+        use diri_term::theme::TermTheme;
+
+        let _fades = crate::app_theme::live::testing::enable_with_manual_clock();
+        let services = test_services();
+        let store = services.store.clone();
+        let (root, cx) = cx.add_window_view(move |window, cx| {
+            RootView::new(services, false, PreviewScenario::Empty, window, cx)
+        });
+        cx.simulate_resize(size(px(1000.0), px(700.0)));
+        cx.run_until_parked();
+        let saved = TermTheme::CATALOG
+            .into_iter()
+            .find(|theme| theme.id == store.store.read().unwrap().theme_id())
+            .unwrap();
+        let shown = |cx: &mut gpui::VisualTestContext| {
+            let store = store.store.read().unwrap();
+            let _ = cx;
+            (
+                crate::app_theme::terminal_theme_in(&store),
+                crate::app_theme::colors_in(&store),
+                crate::app_theme::sidebar_colors_in(&store),
+            )
+        };
+        assert_eq!(shown(cx).0, saved);
+
+        store
+            .store
+            .write()
+            .unwrap()
+            .preview_theme(Some(TermTheme::GITHUB_LIGHT.id.into()));
+        root.update_in(cx, |_, window, _| window.refresh());
+        cx.run_until_parked();
+
+        crate::app_theme::live::testing::advance(Duration::from_millis(70));
+        root.update_in(cx, |_, window, cx| {
+            assert_eq!(window.simulate_next_frame(cx), 1);
+        });
+        cx.run_until_parked();
+        let (terminal, chrome, sidebar) = shown(cx);
+        assert_ne!(terminal.background, saved.background);
+        assert_ne!(terminal.background, TermTheme::GITHUB_LIGHT.background);
+        // One source: the terminal, the chrome and the sidebar are the same
+        // frame of the fade, never one theme each.
+        assert_eq!(chrome.background, terminal.background);
+        assert_eq!(chrome.primary, terminal.foreground);
+        assert_eq!(sidebar.primary, terminal.foreground);
+
+        crate::app_theme::live::testing::advance(Duration::from_millis(400));
+        root.update_in(cx, |_, window, cx| {
+            assert_eq!(window.simulate_next_frame(cx), 1);
+        });
+        cx.run_until_parked();
+        assert_eq!(shown(cx).0, TermTheme::GITHUB_LIGHT);
+        root.update_in(cx, |_, window, cx| {
+            assert_eq!(
+                window.simulate_next_frame(cx),
+                0,
+                "a landed fade paints no more"
+            );
+        });
     }
 
     #[gpui::test]

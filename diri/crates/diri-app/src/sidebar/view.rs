@@ -1260,7 +1260,7 @@ impl Sidebar {
 
     fn colors(&self) -> SemanticColors {
         let store = self.store.read().expect("session store lock poisoned");
-        crate::app_theme::sidebar_colors_for(store.preferences())
+        crate::app_theme::sidebar_colors_in(&store)
     }
 
     fn begin_rename(

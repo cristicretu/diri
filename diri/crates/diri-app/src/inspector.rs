@@ -389,7 +389,7 @@ impl WorkbenchInspector {
             let store = runtime.store.read().expect("session store lock poisoned");
             (
                 store.preferences().inspector_tab,
-                crate::app_theme::sidebar_colors_for(store.preferences()),
+                crate::app_theme::sidebar_colors_in(&store),
                 store.selected_session_id().cloned(),
             )
         };
@@ -809,7 +809,7 @@ impl WorkbenchInspector {
                 .store
                 .read()
                 .expect("session store lock poisoned");
-            crate::app_theme::sidebar_colors_for(store.preferences())
+            crate::app_theme::sidebar_colors_in(&store)
         };
         self.code_viewer
             .update(cx, |viewer, cx| viewer.set_colors(colors, cx));
@@ -3570,7 +3570,7 @@ impl WorkbenchInspector {
             .store
             .read()
             .expect("session store lock poisoned");
-        crate::app_theme::sidebar_colors_for(store.preferences())
+        crate::app_theme::sidebar_colors_in(&store)
     }
 
     /// The file navigator's pixels for its floating panel.
@@ -4661,7 +4661,7 @@ impl Render for WorkbenchInspector {
                 .store
                 .read()
                 .expect("session store lock poisoned");
-            crate::app_theme::sidebar_colors_for(store.preferences())
+            crate::app_theme::sidebar_colors_in(&store)
         };
         let session = self.selected_session();
         let body = match self.workspace_selected {

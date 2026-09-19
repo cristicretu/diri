@@ -113,14 +113,18 @@ pub(crate) fn painted_foreground(
             set[..=way].rotate_right(1);
             return set[0].map_or(foreground, |(_, color)| color);
         }
-        let mut color = if dim {
+        // What the cell paints when nothing corrects it: SGR faint already
+        // faded. A theme fading toward light blends from here.
+        let authored = if dim {
             faint::faded(theme, foreground, background)
         } else {
             foreground
         };
+        let mut color = authored;
         if own {
             let on_paper = !inverse && is_default(cell.bg);
-            color = correct(theme, color, background, on_paper, dim);
+            let corrected = correct(theme, authored, background, on_paper, dim);
+            color = phased_in(theme, authored, corrected);
         }
         set.rotate_right(1);
         set[0] = Some((key, color));
@@ -128,6 +132,32 @@ pub(crate) fn painted_foreground(
     });
     LAST.set(Some((key, color)));
     color
+}
+
+/// Paper lightness, in Oklab, below which a light theme corrects nothing and
+/// at which it corrects in full. Below the lower bound white still reads on
+/// the paper, so the solver may answer on either side of it and its answer
+/// can swap sides from one frame to the next; above it every answer is darker
+/// than the paper and moves continuously. Every catalog light theme sits far
+/// above the upper bound and is unaffected.
+const PHASE_IN_FROM: f32 = 0.65;
+const PHASE_IN_FULL: f32 = 0.85;
+
+/// A theme fading between dark and light is light for the whole fade (see
+/// `TermTheme::mix`) while its paper is anywhere in between. Correction
+/// arrives with the paper's lightness instead of with the flag, so the dark
+/// end of a fade paints exactly what the dark theme paints and nothing pops
+/// on the first or last frame. Only a cache miss pays for this.
+fn phased_in(theme: &TermTheme, authored: Rgba, corrected: Rgba) -> Rgba {
+    let paper = oklch(linear(theme.background)).lightness;
+    if paper >= PHASE_IN_FULL {
+        return corrected;
+    }
+    crate::crossfade::mix_color(
+        authored,
+        corrected,
+        ramp(paper, PHASE_IN_FROM, PHASE_IN_FULL),
+    )
 }
 
 pub(crate) fn contrast_ratio(left: Rgba, right: Rgba) -> f32 {
@@ -181,8 +211,11 @@ thread_local! {
 }
 
 /// Identifies everything in a theme the solver reads, cheaply enough to
-/// compute per cell. Catalog themes are distinguished by their static id;
-/// the default colors guard a theme value rebuilt under the same id.
+/// compute per cell: the static id, the default colors, and the six accent
+/// slots `harmonized` steers by. A theme fading into another keeps one id
+/// while its palette moves every frame, so the accents are part of the key
+/// rather than implied by the id. The pairs hash in independent lanes to keep
+/// the dependency chain as short as it was with the defaults alone.
 fn theme_key(theme: &TermTheme) -> u64 {
     let mut key = theme.id.as_ptr() as u64;
     for color in [theme.background, theme.foreground] {
@@ -190,7 +223,17 @@ fn theme_key(theme: &TermTheme) -> u64 {
             key = key.rotate_left(11) ^ u64::from(channel.to_bits());
         }
     }
-    key
+    // Slots 1..=6 are the chromatic accents. Each channel folds into its own
+    // word so the loop has no dependency on the chain above.
+    let mut accents = [0_u32; 3];
+    for (slot, color) in theme.ansi[1..7].iter().enumerate() {
+        let turn = slot as u32 * 5 + 1;
+        accents[0] ^= color.r.to_bits().rotate_left(turn);
+        accents[1] ^= color.g.to_bits().rotate_left(turn);
+        accents[2] ^= color.b.to_bits().rotate_left(turn);
+    }
+    key ^ (u64::from(accents[0]) << 32 | u64::from(accents[1])).rotate_left(7)
+        ^ u64::from(accents[2]).rotate_left(47)
 }
 
 pub(crate) type LinearRgb = [f32; 3];
@@ -792,6 +835,26 @@ mod tests {
                 assert_eq!(theme.resolve_cell(probe).foreground, fresh, "{}", theme.id);
             }
         }
+    }
+
+    #[test]
+    fn a_theme_in_transit_never_answers_from_another_palette() {
+        // Two frames of a fade share an id, and may share default colors,
+        // while their accents differ. White on cream travels far enough to be
+        // pulled onto the theme's accents... so does this saturated yellow.
+        let theme = TermTheme::DIRIJOR_LIGHT;
+        let mut moved = theme;
+        moved.ansi[3] = theme.ansi[5];
+        let yellow = cell(
+            TermColor::Rgb(255, 255, 0),
+            TermColor::Default,
+            TermStyle::empty(),
+        );
+        let first = theme.resolve_cell(yellow).foreground;
+        let second = moved.resolve_cell(yellow).foreground;
+        assert_ne!(theme_key(&theme), theme_key(&moved));
+        assert_ne!(first, second);
+        assert_eq!(theme.resolve_cell(yellow).foreground, first);
     }
 
     #[test]
