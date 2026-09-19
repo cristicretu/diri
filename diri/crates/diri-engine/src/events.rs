@@ -23,7 +23,7 @@ use serde_json::json;
 /// The synthetic hole marker. Its seq is 0 — outside the published seq space,
 /// which starts at 1 — so a consumer tracking `lastSeq` for gapless resume
 /// can ignore it without special-casing.
-pub const EVENTS_DROPPED: &str = "events.dropped";
+pub const EVENTS_DROPPED: &str = diri_proto::EventName::EVENTS_DROPPED;
 
 /// One published event, as a subscriber receives it.
 #[derive(Clone, Debug)]

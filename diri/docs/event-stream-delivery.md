@@ -11,3 +11,5 @@ If `sinceSeq` is older than the retained replay ring, the first read likewise re
 This stream is bounded, not a durable journal. Sequence numbers are local to one Engine lifetime; clients must resynchronize after Engine replacement. This change does not add new terminal event kinds or claim exactly-once delivery across reconnects.
 
 `HelloResult.engineInstanceId` lets a client tell one Engine lifetime from the next; see [engine-event-cursors.md](engine-event-cursors.md) for how the Rust client scopes its replay cursor to it.
+
+The desktop treats both an `events.dropped` marker and a lag on its local broadcast as a coverage gap: it requests one authoritative `session.list` snapshot (requests coalesce while one is in flight), replaces sessions and projects from it, and refreshes the workspace catalog through its own revision gate. Lost notification bodies are not reconstructed; only current state is repaired.

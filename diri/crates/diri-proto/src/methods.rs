@@ -96,6 +96,9 @@ impl EventName {
     pub const WORKSPACE_UPDATED: &'static str = "workspace.updated";
     pub const SESSION_NOTIFICATION: &'static str = "session.notification";
     pub const SESSION_UPDATED: &'static str = "session.updated";
+    /// Coverage-gap marker: the Engine evicted events this subscriber never
+    /// saw. Sequence zero; `dropped`, `fromSeq`, `toSeq` in the params.
+    pub const EVENTS_DROPPED: &'static str = "events.dropped";
     pub const SESSION_RESOURCES: &'static str = "session.resources";
     pub const SESSION_REMOVED: &'static str = "session.removed";
     pub const PROJECT_UPDATED: &'static str = "project.updated";

@@ -78,6 +78,36 @@ enum StoreEventChange {
     Model,
 }
 
+/// How many times a gap resynchronization asks the Engine before giving up
+/// until the next gap or reconnect, and how long it waits between asks.
+const RESYNC_ATTEMPTS: u32 = 3;
+const RESYNC_RETRY: Duration = Duration::from_millis(500);
+
+/// Events that report a coverage gap instead of carrying state. They must
+/// never be applied as state; they only request a fresh snapshot.
+fn event_requires_resync(name: &str) -> bool {
+    name == EventName::EVENTS_DROPPED
+}
+
+#[cfg(test)]
+mod resync_tests {
+    use super::*;
+
+    #[test]
+    fn only_the_dropped_marker_requests_a_resync() {
+        assert!(event_requires_resync(EventName::EVENTS_DROPPED));
+        for name in [
+            EventName::SESSION_UPDATED,
+            EventName::SESSION_NOTIFICATION,
+            EventName::WORKSPACE_UPDATED,
+            "session.removed",
+            "",
+        ] {
+            assert!(!event_requires_resync(name), "{name}");
+        }
+    }
+}
+
 impl StoreEventChange {
     fn merge(self, other: Self) -> Self {
         if self == Self::Model || other == Self::Model {
@@ -2952,12 +2982,23 @@ impl StoreRuntime {
             }
         }));
 
+        // A coverage gap, whether the Engine evicted events this subscriber
+        // never saw or the local broadcast lagged, leaves the model stale in
+        // ways later events cannot repair (a removal or a status change may
+        // be among the lost ones). Every gap requests one resynchronization
+        // from the Engine's authoritative snapshot; requests coalesce.
+        let (resync_tx, mut resync_rx) = mpsc::channel::<()>(1);
         let mut events = client.events();
         let event_store = Arc::clone(&store);
+        let event_resync = resync_tx.clone();
         tasks.push(tokio::spawn(async move {
             loop {
                 match events.recv().await {
                     Ok(event) => {
+                        if event_requires_resync(&event.name) {
+                            let _ = event_resync.try_send(());
+                            continue;
+                        }
                         let changed = event_store
                             .write()
                             .expect("session store lock poisoned")
@@ -2967,12 +3008,44 @@ impl StoreRuntime {
                         }
                     }
                     Err(broadcast::error::RecvError::Lagged(_)) => {
-                        event_store
-                            .write()
-                            .expect("session store lock poisoned")
-                            .refresh_workspaces();
+                        let _ = event_resync.try_send(());
                     }
                     Err(broadcast::error::RecvError::Closed) => break,
+                }
+            }
+        }));
+
+        let resync_client = Arc::clone(&client);
+        let resync_store = Arc::clone(&store);
+        let resync_changes = change_tx.clone();
+        let resync_snapshots = snapshot_tx.clone();
+        tasks.push(tokio::spawn(async move {
+            while resync_rx.recv().await.is_some() {
+                // One authoritative snapshot repairs everything at once;
+                // further gaps while it is in flight are covered by it.
+                let mut attempts = 0;
+                loop {
+                    attempts += 1;
+                    match resync_client.sessions().await {
+                        Ok(list) => {
+                            let snapshot = {
+                                let mut store =
+                                    resync_store.write().expect("session store lock poisoned");
+                                store.hydrate(list);
+                                store.refresh_workspaces();
+                                store.snapshot()
+                            };
+                            resync_snapshots.send_replace(snapshot);
+                            let _ = resync_changes.send(());
+                            break;
+                        }
+                        Err(_) if attempts < RESYNC_ATTEMPTS => {
+                            tokio::time::sleep(RESYNC_RETRY).await;
+                        }
+                        // Disconnected or persistently failing: the reconnect
+                        // path hydrates on its own when the Engine is back.
+                        Err(_) => break,
+                    }
                 }
             }
         }));
