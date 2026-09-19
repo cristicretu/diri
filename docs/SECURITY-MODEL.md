@@ -50,6 +50,15 @@ tools. PR monitoring, remote hosts, and third-party agents can send data to thei
 own services. Diri itself has no account, analytics, or telemetry service; see
 [PRIVACY.md](../PRIVACY.md).
 
+A password typed at a prompt that turns terminal echo off (`sudo`, `ssh`,
+`read -s`) is never echoed, so it does not reach the replay log, scrollback, or
+exports. While a local session is at such a prompt, Diri does not use typed
+input to name the session, hides clipboard text in the paste review, and on
+macOS holds Secure Keyboard Entry for the focused terminal so other apps cannot
+observe the keystrokes. Remote sessions do not report this state yet, and a
+program that reads secrets in raw mode and draws its own mask cannot be told
+from any other full-screen program.
+
 ## Security assumptions
 
 Diri assumes:

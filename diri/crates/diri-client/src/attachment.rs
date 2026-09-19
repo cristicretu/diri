@@ -41,6 +41,9 @@ pub enum TerminalChunk {
         alt_screen: bool,
         bracketed_paste: bool,
         mouse: MouseModes,
+        /// The child is reading a secret: a line prompt with echo off, as
+        /// `sudo` and `ssh` use. False from an engine that cannot tell.
+        secret_input: bool,
     },
     Pong,
 }
@@ -550,6 +553,7 @@ async fn process_incoming(
                     alt_screen,
                     bracketed_paste,
                     mouse,
+                    secret_input: frame.secret_input_payload().unwrap_or(false),
                 })
                 .await
                 .map_err(|_| ())?;
@@ -863,6 +867,27 @@ mod tests {
                 alt_screen: true,
                 bracketed_paste: true,
                 mouse,
+                secret_input: false,
+            }),
+            "a frame without the bit, as every older engine sends, is not secret"
+        );
+
+        process_incoming(
+            Frame::modes_with_bracketed_paste(false, false, MouseModes::OFF)
+                .with_secret_input(true),
+            &mut stream,
+            &tx,
+        )
+        .await
+        .expect("valid modes frame");
+        assert_eq!(
+            rx.recv().await,
+            Some(TerminalChunk::Modes {
+                keyboard: None,
+                alt_screen: false,
+                bracketed_paste: false,
+                mouse: MouseModes::OFF,
+                secret_input: true,
             })
         );
     }

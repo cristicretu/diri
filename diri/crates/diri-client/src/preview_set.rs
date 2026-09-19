@@ -264,6 +264,9 @@ async fn read_previews(
                                 alt_screen,
                                 bracketed_paste,
                                 mouse,
+                                // A preview takes no keyboard input, so it
+                                // has nothing to protect.
+                                secret_input: false,
                             }
                         }
                         _ => return Err(invalid("unexpected preview frame before seed")),

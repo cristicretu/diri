@@ -126,9 +126,10 @@ async fn main() {
                 alt_screen,
                 bracketed_paste,
                 mouse,
+                secret_input,
             } => {
                 eprintln!(
-                    "[{:>7.1?}] modes alt={alt_screen} bp={bracketed_paste} mouse={mouse:?} keyboard={keyboard:?}",
+                    "[{:>7.1?}] modes alt={alt_screen} bp={bracketed_paste} secret={secret_input} mouse={mouse:?} keyboard={keyboard:?}",
                     start.elapsed()
                 );
             }

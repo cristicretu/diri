@@ -74,6 +74,7 @@ pub enum IconName {
     Folder,
     Grid,
     Keyboard,
+    Lock,
     LocalAgents,
     Merge,
     Monitor,
@@ -111,7 +112,7 @@ pub enum IconName {
 }
 
 impl IconName {
-    pub const ALL: [Self; 62] = [
+    pub const ALL: [Self; 63] = [
         Self::Account,
         Self::Activity,
         Self::Archive,
@@ -140,6 +141,7 @@ impl IconName {
         Self::Folder,
         Self::Grid,
         Self::Keyboard,
+        Self::Lock,
         Self::LocalAgents,
         Self::Merge,
         Self::Monitor,
@@ -206,6 +208,7 @@ impl IconName {
             Self::Folder => "icons/folder.svg",
             Self::Grid => "icons/grid.svg",
             Self::Keyboard => "icons/keyboard.svg",
+            Self::Lock => "icons/lock.svg",
             Self::LocalAgents => "icons/local-agents.svg",
             Self::Merge => "icons/merge.svg",
             Self::Monitor => "icons/monitor.svg",
@@ -275,6 +278,7 @@ impl IconName {
             "folder" | "folder.fill" => Self::Folder,
             "square.grid.2x2" | "terminal.grid" => Self::Grid,
             "keyboard" => Self::Keyboard,
+            "lock" | "lock.fill" => Self::Lock,
             "person.crop.circle" => Self::LocalAgents,
             "account.circle" => Self::Account,
             "arrow.triangle.merge" => Self::Merge,
@@ -406,6 +410,7 @@ fn embedded_svg(path: &str) -> Option<&'static [u8]> {
         "icons/folder.svg" => include_bytes!("../assets/icons/folder.svg"),
         "icons/grid.svg" => include_bytes!("../assets/icons/grid.svg"),
         "icons/keyboard.svg" => include_bytes!("../assets/icons/keyboard.svg"),
+        "icons/lock.svg" => include_bytes!("../assets/icons/lock.svg"),
         "icons/local-agents.svg" => include_bytes!("../assets/icons/local-agents.svg"),
         "icons/merge.svg" => include_bytes!("../assets/icons/merge.svg"),
         "icons/monitor.svg" => include_bytes!("../assets/icons/monitor.svg"),
@@ -527,6 +532,7 @@ mod tests {
             "folder.fill",
             "gearshape",
             "link",
+            "lock.fill",
             "magnifyingglass",
             "network",
             "person.crop.circle",
