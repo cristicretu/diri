@@ -1028,11 +1028,40 @@ impl TerminalElement {
         }
     }
 
+    /// How many leading cells of `row` reach the shaper.
+    ///
+    /// Blanks paint no glyph, yet each one was shaped, stored and looked up in
+    /// the glyph cache on every paint, and most rows are mostly trailing
+    /// blanks. Their backgrounds and decorations are quads built from the
+    /// cells, not from this text. Glyphs are positioned left to right from the
+    /// ones before them, so dropping the tail cannot move what remains; one
+    /// blank is kept so the last glyph still shapes as followed by a space.
+    /// A row with right-to-left text is positioned from the whole line and is
+    /// shaped whole.
+    fn shaped_cells(&self, row: &[GridCell], graphemes: &[(u16, String)]) -> usize {
+        let reorders = row.iter().any(|cell| is_bidi_sensitive(cell.scalar))
+            || graphemes
+                .iter()
+                .any(|(_, text)| text.chars().any(|ch| is_bidi_sensitive(u32::from(ch))));
+        if reorders {
+            return row.len();
+        }
+        let last_glyph = row.iter().enumerate().rposition(|(column, cell)| {
+            let visible = self.theme.resolve_cell(*cell).visible;
+            render_char(*cell, visible) != ' '
+                || (visible
+                    && cell.scalar != 0
+                    && graphemes.iter().any(|(col, _)| usize::from(*col) == column))
+        });
+        last_glyph.map_or(1, |last| last + 2).min(row.len())
+    }
+
     fn row_text_and_runs(
         &self,
         row: &[GridCell],
         graphemes: &[(u16, String)],
     ) -> (String, Vec<TextRun>) {
+        let row = &row[..self.shaped_cells(row, graphemes)];
         let mut text = String::with_capacity(row.len());
         let mut runs = Vec::<TextRun>::new();
 
@@ -1966,6 +1995,22 @@ fn styled_font(base: &Font, style: ResolvedCellStyle) -> Font {
     } else {
         base.clone()
     }
+}
+
+/// Strong right-to-left scalars and explicit bidi controls: the presence of
+/// one makes glyph order and position a property of the entire line.
+fn is_bidi_sensitive(scalar: u32) -> bool {
+    matches!(
+        scalar,
+        0x0590..=0x08FF
+            | 0x200F
+            | 0x202A..=0x202E
+            | 0x2066..=0x2069
+            | 0xFB1D..=0xFDFF
+            | 0xFE70..=0xFEFF
+            | 0x10800..=0x10FFF
+            | 0x1E800..=0x1EFFF
+    )
 }
 
 fn render_char(cell: GridCell, visible: bool) -> char {
@@ -3233,6 +3278,30 @@ mod grapheme_paint_tests {
             terminal.row_text_and_runs(grid.row(0).unwrap(), &grid.annotations[0].graphemes);
         assert!(!hidden.contains('\u{301}'));
         assert!(hidden.starts_with(' '));
+    }
+
+    #[test]
+    fn trailing_blanks_are_not_shaped_unless_the_line_reorders() {
+        let shaped = |text: &str, graphemes: &[(u16, String)]| {
+            let mut row: Vec<_> = text
+                .chars()
+                .map(|ch| GridCell {
+                    scalar: u32::from(ch),
+                    ..GridCell::BLANK
+                })
+                .collect();
+            row.resize(12, GridCell::BLANK);
+            TerminalElement::with_buffer(GridBuffer::default())
+                .row_text_and_runs(&row, graphemes)
+                .0
+        };
+        assert_eq!(shaped("ab  c", &[]), "ab  c ");
+        assert_eq!(shaped("", &[]), " ");
+        assert_eq!(shaped("full  width!", &[]), "full  width!");
+        // Block elements are quads; a mark on a blank cell is still a glyph.
+        assert_eq!(shaped("a█", &[]), "a ");
+        assert_eq!(shaped("a", &[(3, "\u{301}".into())]), "a   \u{301} ");
+        assert_eq!(shaped("שלום", &[]).chars().count(), 12);
     }
 
     #[test]

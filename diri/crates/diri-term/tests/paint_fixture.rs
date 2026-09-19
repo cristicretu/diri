@@ -205,6 +205,9 @@ fn rows() -> Vec<Vec<GridCell>> {
         .concat(),
         plain("find match here and here"),
         fg("   X cursor sits on the X", 2),
+        // Right-to-left text: its glyph positions depend on the whole line,
+        // trailing blanks included.
+        [fg("שלום", 3), plain(" rtl "), fg("مرحبا", 6)].concat(),
     ];
     for row in &mut rows {
         row.resize(usize::from(COLS), GridCell::BLANK);
