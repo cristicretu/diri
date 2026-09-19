@@ -63,6 +63,10 @@ const OUTPUT_WRITE_BUFFER: usize = 256 << 10;
 /// how promptly it notices the queue closing.
 const OUTPUT_IDLE_WAIT: Duration = Duration::from_millis(100);
 
+/// Live holders, so a test can inspect the state `run` builds for itself.
+#[cfg(test)]
+static RUNNING: Mutex<Vec<Weak<Shared>>> = Mutex::new(Vec::new());
+
 pub struct HolderServer;
 
 struct Shared {
@@ -77,6 +81,15 @@ struct Shared {
     /// incarnations' bytes and bytes attributable to THIS child.
     epoch_offset: u64,
     finished: AtomicBool,
+    /// Self-pipe the exit path writes to once `finished` is set. It is what
+    /// lets the pump wait on the PTY without a deadline: a silent session
+    /// costs no wakeups, and the exit is still noticed at once. Both ends live
+    /// here so the write can never meet a closed pipe.
+    pump_wake: (std::io::PipeReader, std::io::PipeWriter),
+    /// Every return from the pump's wait, so a test can prove a silent
+    /// session leaves it parked.
+    #[cfg(test)]
+    pump_wakeups: std::sync::atomic::AtomicUsize,
     listen_fd: AtomicI32,
     /// Weak handles let the exit path interrupt blocking input reads without
     /// making idle Holder streams wake on a timer.
@@ -170,6 +183,9 @@ impl HolderServer {
             listener.into_raw_fd()
         };
 
+        let pump_wake =
+            std::io::pipe().map_err(|error| HolderError::io("create pump wake pipe", error))?;
+
         let shared = Arc::new(Shared {
             child_pid,
             child_identity: pty.child_identity(),
@@ -177,6 +193,9 @@ impl HolderServer {
             log: Mutex::new(log),
             epoch_offset,
             finished: AtomicBool::new(false),
+            pump_wake,
+            #[cfg(test)]
+            pump_wakeups: std::sync::atomic::AtomicUsize::new(0),
             listen_fd: AtomicI32::new(listen_fd),
             input_streams: Mutex::new(Vec::new()),
             output: Mutex::new(OutputFanout {
@@ -186,6 +205,12 @@ impl HolderServer {
             }),
             spec,
         });
+
+        #[cfg(test)]
+        RUNNING
+            .lock()
+            .expect("running")
+            .push(Arc::downgrade(&shared));
 
         write_pid_file(&shared.spec.pid_file_path)?;
 
@@ -294,9 +319,10 @@ fn open_log(spec: &HolderLaunchSpec) -> HolderResult<OutputLog> {
 
 /// Drains PTY output into the log until the child is gone.
 ///
-/// The loop polls with a timeout rather than blocking so it also notices
-/// `finished` — after the exit marker is written, nothing more may be
-/// appended, or straggling grandchild output would land beyond the marker.
+/// The loop has to notice `finished` as well as output — after the exit marker
+/// is written, nothing more may be appended, or straggling grandchild output
+/// would land beyond the marker — so it waits on the PTY and the exit path's
+/// wake pipe together, with no deadline.
 fn pump_pty(shared: &Arc<Shared>, reader: &mut crate::pty::PtyStream) {
     // The log is also the transport: the daemon reads this session's output by
     // tailing the spill file. Appending on this thread therefore made draining
@@ -345,7 +371,10 @@ fn pump_pty(shared: &Arc<Shared>, reader: &mut crate::pty::PtyStream) {
         if shared.finished.load(Ordering::SeqCst) {
             break;
         }
-        match reader.wait_readable(Duration::from_millis(100)) {
+        let readable = wait_for_output(reader.as_raw_fd(), &shared.pump_wake.0);
+        #[cfg(test)]
+        shared.pump_wakeups.fetch_add(1, Ordering::SeqCst);
+        match readable {
             Ok(false) => continue,
             Ok(true) => {}
             Err(_) => break,
@@ -406,6 +435,41 @@ fn pump_pty(shared: &Arc<Shared>, reader: &mut crate::pty::PtyStream) {
     drop(queue.take());
     if let Some(writer) = writer {
         let _ = writer.join();
+    }
+}
+
+/// Parks the pump until the PTY has something for it, or the exit path says
+/// the child is gone. Returns whether the PTY is what woke it.
+///
+/// The wake pipe is never drained: it is written once, when `finished` is
+/// set, and the pump stops on seeing that.
+fn wait_for_output(pty_fd: i32, wake: &std::io::PipeReader) -> std::io::Result<bool> {
+    use std::os::fd::AsRawFd;
+    let mut descriptors = [
+        libc::pollfd {
+            fd: pty_fd,
+            events: libc::POLLIN,
+            revents: 0,
+        },
+        libc::pollfd {
+            fd: wake.as_raw_fd(),
+            events: libc::POLLIN,
+            revents: 0,
+        },
+    ];
+    loop {
+        // SAFETY: two initialized poll descriptors stay writable throughout
+        // the call; both fds outlive it. A negative timeout waits forever.
+        let ready = unsafe { libc::poll(descriptors.as_mut_ptr(), 2, -1) };
+        if ready >= 0 {
+            // Any event at all, errors included: the read that follows turns
+            // a broken PTY into EOF, where ignoring it would spin here.
+            return Ok(descriptors[0].revents != 0);
+        }
+        let error = std::io::Error::last_os_error();
+        if error.raw_os_error() != Some(libc::EINTR) {
+            return Err(error);
+        }
     }
 }
 
@@ -523,6 +587,8 @@ fn watch_exit(shared: &Shared, pump: std::thread::JoinHandle<()>) {
     if shared.finished.swap(true, Ordering::SeqCst) {
         return;
     }
+    // The pump waits with no deadline, so it has to be told.
+    let _ = (&shared.pump_wake.1).write_all(&[1]);
     for stream in shared
         .input_streams
         .lock()
@@ -820,6 +886,65 @@ fn set_nonblocking(fd: i32) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn wait_until(what: &str, mut check: impl FnMut() -> bool) {
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while !check() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "timed out waiting for {what}"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    fn running(session_id: &str) -> Arc<Shared> {
+        RUNNING
+            .lock()
+            .expect("running")
+            .iter()
+            .filter_map(Weak::upgrade)
+            .find(|shared| shared.spec.session_id == session_id)
+            .expect("holder is running")
+    }
+
+    #[test]
+    fn a_silent_session_never_wakes_the_pump() {
+        let root = tempfile::tempdir().unwrap();
+        let spec = HolderLaunchSpec {
+            session_id: "s_idle".into(),
+            socket_path: root.path().join("h.sock").to_string_lossy().into_owned(),
+            pid_file_path: root.path().join("h.pid").to_string_lossy().into_owned(),
+            log_file_path: root
+                .path()
+                .join("s_idle.bin")
+                .to_string_lossy()
+                .into_owned(),
+            // Echo is the only output cat ever produces, and nothing is typed.
+            argv: vec!["/bin/cat".into()],
+            cwd: "/tmp".into(),
+            environment: Default::default(),
+            cols: 80,
+            rows: 24,
+            disk_capacity: 4096,
+        };
+        let client = HolderClient::new(&spec.socket_path);
+        let server = std::thread::spawn(move || HolderServer::run(spec));
+        wait_until("holder ready", || client.is_alive());
+
+        let shared = running("s_idle");
+
+        // Several of the old 100 ms ticks.
+        let pump_before = shared.pump_wakeups.load(Ordering::SeqCst);
+        std::thread::sleep(Duration::from_millis(500));
+        assert_eq!(shared.pump_wakeups.load(Ordering::SeqCst), pump_before);
+
+        // A pump parked without a deadline still has to see the child exit.
+        drop(shared);
+        client.kill_tree().expect("kill-tree");
+        wait_until("holder finished", || server.is_finished());
+        server.join().expect("join").expect("clean holder exit");
+    }
 
     #[test]
     fn holder_log_retains_no_duplicate_output_and_replays_from_disk() {
