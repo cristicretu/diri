@@ -355,8 +355,9 @@ impl NavigationOverlay {
     /// one of these several times a second while any session is producing
     /// output. Rebuilding on each would take a write lock, clone every project
     /// and session record, and re-rank the whole list — reordering rows under a
-    /// highlight index that is not re-anchored. Rebuild only when readiness or
-    /// displayed preference values change, retaining the highlighted command.
+    /// highlight index that is not re-anchored. Rebuild only when readiness,
+    /// displayed preference values, or the session facts a row shows change,
+    /// retaining the highlighted command.
     fn handle_store_change(&mut self, cx: &mut Context<Self>) {
         let mut changed = {
             let store = self.store.read().expect("session store lock poisoned");
@@ -845,11 +846,23 @@ impl NavigationOverlay {
     ) {
         match selection {
             CommandSelection::Session(id) => {
-                self.store
-                    .write()
-                    .expect("session store lock poisoned")
-                    .select(id);
-                self.close_overlay(window, cx);
+                let selected = {
+                    let mut store = self.store.write().expect("session store lock poisoned");
+                    let exists = store.sessions().contains_key(&id);
+                    if exists {
+                        store.select(id);
+                    }
+                    exists
+                };
+                if selected {
+                    self.close_overlay(window, cx);
+                } else {
+                    // The row outlived its session. Dismissing would look like
+                    // a navigation that went nowhere; show the current rows.
+                    self.refresh_command_items();
+                    self.restore_highlight(None);
+                    cx.notify();
+                }
             }
             CommandSelection::Action(command) => self.run_palette_command(command, window, cx),
         }
@@ -2085,6 +2098,25 @@ fn palette_context_fingerprint(
     store.preferences().shortcut_overrides.hash(&mut hasher);
     store.preferences().default_agent.id().hash(&mut hasher);
     store.default_spawn_host().hash(&mut hasher);
+    // Session rows: membership plus what a row prints or is matched on. Summed
+    // so the map's order is irrelevant, and blind to the output and resource
+    // fields a record is republished with on every tick.
+    store
+        .sessions()
+        .values()
+        .fold(0_u64, |sum, session| {
+            let mut row = DefaultHasher::new();
+            session.id.hash(&mut row);
+            session.title.hash(&mut row);
+            session.cwd.hash(&mut row);
+            session.git_branch.hash(&mut row);
+            session.host.hash(&mut row);
+            session.effective_kind().id().hash(&mut row);
+            session.is_archived().hash(&mut row);
+            std::mem::discriminant(&status_state(session, false)).hash(&mut row);
+            sum.wrapping_add(row.finish())
+        })
+        .hash(&mut hasher);
     let mut targets: Vec<_> = store.agent_catalogs().iter().collect();
     targets.sort_by_key(|(target, _)| *target);
     for (target, catalog) in targets {
@@ -2643,6 +2675,162 @@ mod tests {
         overlay.read_with(cx, |overlay, _| {
             assert_eq!(pool_names(overlay), ["old-folder"]);
             assert_eq!(overlay.ranked_items.len(), 1);
+        });
+    }
+
+    fn typical_runtime() -> (Arc<StoreRuntime>, Vec<SessionRecord>) {
+        let runtime = Arc::new(StoreRuntime::inert());
+        let fixture = SidebarPreviewFixture::make(PreviewScenario::Typical);
+        let sessions = {
+            let mut store = runtime.store.write().expect("session store lock poisoned");
+            store.hydrate(fixture.list);
+            if let Some(selected) = fixture.selected_session_id {
+                store.select(selected);
+            }
+            store.ordered_sessions()
+        };
+        (runtime, sessions)
+    }
+
+    fn palette_titles(overlay: &NavigationOverlay) -> Vec<String> {
+        overlay
+            .ranked_sessions
+            .iter()
+            .map(|ranked| ranked.item.title.clone())
+            .collect()
+    }
+
+    #[gpui::test]
+    fn an_open_palette_follows_session_renames_additions_and_removals(cx: &mut TestAppContext) {
+        let (runtime, sessions) = typical_runtime();
+        // The selected session already feeds the palette's context, so prove
+        // the refresh with rows that are not selected: one to remove, and one
+        // below it that stays highlighted.
+        let selected = runtime.store.read().unwrap().selected_session_id().cloned();
+        let mut others = sessions
+            .iter()
+            .enumerate()
+            .filter(|(_, session)| Some(&session.id) != selected.as_ref());
+        let (_, removed) = others.next().expect("a row to remove");
+        let (row, kept) = others.next().expect("a row to keep highlighted");
+        assert!(row < CHAT_PREVIEW_LIMIT);
+        let (removed, kept) = (removed.clone(), kept.clone());
+        let runtime_for_view = Arc::clone(&runtime);
+        let (overlay, cx) = cx.add_window_view(move |_, cx| {
+            let mut overlay = NavigationOverlay::opened_for_test(runtime_for_view, cx);
+            overlay.refresh_command_items();
+            overlay.highlight = row;
+            overlay
+        });
+        let highlighted = overlay.read_with(cx, |overlay, _| overlay.highlighted_command());
+        assert_eq!(
+            highlighted,
+            Some(CommandSelection::Session(kept.id.clone()))
+        );
+
+        // Output and resource ticks republish the record without changing
+        // anything a palette row shows: no rebuild, no moved highlight.
+        let before = overlay.read_with(cx, |overlay, _| overlay.palette_context_fingerprint);
+        {
+            let mut tick = kept.clone();
+            tick.updated_at.0 += 1.0;
+            runtime.store.write().unwrap().upsert_session(tick);
+        }
+        overlay.update(cx, |overlay, cx| overlay.handle_store_change(cx));
+        assert_eq!(
+            overlay.read_with(cx, |overlay, _| (
+                overlay.palette_context_fingerprint,
+                overlay.highlight
+            )),
+            (before, row)
+        );
+
+        // Rename.
+        {
+            let mut renamed = kept.clone();
+            renamed.title = "Renamed while the palette was open".into();
+            runtime.store.write().unwrap().upsert_session(renamed);
+        }
+        overlay.update(cx, |overlay, cx| overlay.handle_store_change(cx));
+        overlay.read_with(cx, |overlay, _| {
+            assert!(
+                palette_titles(overlay).contains(&"Renamed while the palette was open".to_owned())
+            );
+            assert_eq!(overlay.highlighted_command(), highlighted);
+        });
+
+        // Removal of the row above the highlight: the highlight follows its
+        // session rather than inheriting the index.
+        runtime
+            .store
+            .write()
+            .unwrap()
+            .remove_session_record(&removed.id);
+        overlay.update(cx, |overlay, cx| overlay.handle_store_change(cx));
+        overlay.read_with(cx, |overlay, _| {
+            assert!(
+                overlay
+                    .ranked_sessions
+                    .iter()
+                    .all(|ranked| ranked.item.id != removed.id)
+            );
+            assert_eq!(overlay.highlighted_command(), highlighted);
+        });
+
+        // Addition, under a query so the landing page's chat limit cannot
+        // hide the new row.
+        overlay.update(cx, |overlay, _| {
+            overlay.query.insert("while the palette was open");
+            overlay.refresh_command_items();
+            overlay.restore_highlight(highlighted.as_ref());
+        });
+        assert_eq!(
+            overlay.read_with(cx, |overlay, _| palette_titles(overlay)),
+            ["Renamed while the palette was open"]
+        );
+        {
+            let mut added = kept.clone();
+            added.id = SessionId::new("added-while-open");
+            added.title = "Added while the palette was open".into();
+            runtime.store.write().unwrap().upsert_session(added);
+        }
+        overlay.update(cx, |overlay, cx| overlay.handle_store_change(cx));
+        overlay.read_with(cx, |overlay, _| {
+            assert!(
+                overlay
+                    .ranked_sessions
+                    .iter()
+                    .any(|ranked| ranked.item.id == SessionId::new("added-while-open"))
+            );
+            assert_eq!(overlay.highlighted_command(), highlighted);
+        });
+    }
+
+    #[gpui::test]
+    fn activating_a_vanished_session_row_keeps_the_palette_open(cx: &mut TestAppContext) {
+        let (runtime, sessions) = typical_runtime();
+        let runtime_for_view = Arc::clone(&runtime);
+        let (overlay, cx) = cx.add_window_view(move |_, cx| {
+            let mut overlay = NavigationOverlay::opened_for_test(runtime_for_view, cx);
+            overlay.refresh_command_items();
+            overlay
+        });
+        let gone = sessions[0].id.clone();
+        runtime.store.write().unwrap().remove_session_record(&gone);
+
+        // The store notification has not been delivered yet, so the row is
+        // still on screen when it is clicked.
+        overlay.update_in(cx, |overlay, window, cx| {
+            overlay.run_command_selection(CommandSelection::Session(gone.clone()), window, cx);
+        });
+        overlay.read_with(cx, |overlay, _| {
+            assert!(overlay.is_open(), "a dead row must not dismiss the palette");
+            assert!(
+                overlay
+                    .ranked_sessions
+                    .iter()
+                    .all(|ranked| ranked.item.id != gone)
+            );
         });
     }
 
