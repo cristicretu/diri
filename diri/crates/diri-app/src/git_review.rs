@@ -791,16 +791,16 @@ fn require_fields(
 }
 
 #[cfg(unix)]
-fn path_from_bytes(bytes: &[u8]) -> PathBuf {
+pub(crate) fn path_from_bytes(bytes: &[u8]) -> PathBuf {
     PathBuf::from(OsString::from_vec(bytes.to_vec()))
 }
 
 #[cfg(not(unix))]
-fn path_from_bytes(bytes: &[u8]) -> PathBuf {
+pub(crate) fn path_from_bytes(bytes: &[u8]) -> PathBuf {
     PathBuf::from(String::from_utf8_lossy(bytes).into_owned())
 }
 
-fn path_from_output_line(bytes: &[u8]) -> PathBuf {
+pub(crate) fn path_from_output_line(bytes: &[u8]) -> PathBuf {
     path_from_bytes(trim_line_ending(bytes))
 }
 

@@ -1413,6 +1413,7 @@ impl WorkbenchInspector {
         self.review_feedback = None;
         self.discard_armed = false;
         self.armed_hunk = None;
+        let is_commit = matches!(action, ReviewAction::Commit(_));
         cx.notify();
         self.review_action_task = Some(cx.spawn(async move |this, cx| {
             let result = cx
@@ -1453,8 +1454,13 @@ impl WorkbenchInspector {
                 match result {
                     Ok(message) => {
                         this.review_feedback = Some((true, message));
-                        this.commit_open = false;
-                        this.commit_query.clear();
+                        // Staging, unstaging, and discarding share this path
+                        // with the composer open; only a landed commit
+                        // consumes the draft message.
+                        if is_commit {
+                            this.commit_open = false;
+                            this.commit_query.clear();
+                        }
                     }
                     Err(message) => this.review_feedback = Some((false, message)),
                 }
@@ -7217,6 +7223,109 @@ mod tests {
         }));
         // Cancel any leftover refresh/review tasks on this thread before the
         // TestAppContext tears the window down.
+        inspector.update(cx, |inspector, _| {
+            inspector.refresh_task = None;
+            inspector.review_task = None;
+            inspector.transcript_task = None;
+            inspector.poll_task = None;
+        });
+        cx.run_until_parked();
+    }
+
+    /// The commit composer shares `run_review_action` with staging, unstaging,
+    /// and discarding. Only a commit that actually landed may consume the
+    /// draft message; every other outcome leaves it for the user.
+    #[gpui::test]
+    fn commit_draft_is_cleared_only_by_a_successful_commit(cx: &mut TestAppContext) {
+        fn git(root: &std::path::Path, arguments: &[&str]) {
+            let output = std::process::Command::new("git")
+                .current_dir(root)
+                .args(arguments)
+                .output()
+                .expect("git command");
+            assert!(
+                output.status.success(),
+                "git {arguments:?}: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+
+        let repository = tempfile::tempdir().expect("temporary repository");
+        let root = repository.path();
+        git(root, &["init", "--quiet"]);
+        git(root, &["config", "user.name", "diri tests"]);
+        git(root, &["config", "user.email", "diri@example.invalid"]);
+        std::fs::write(root.join("one.txt"), "one\n").unwrap();
+        std::fs::write(root.join("two.txt"), "two\n").unwrap();
+        git(root, &["add", "one.txt", "two.txt"]);
+
+        let runtime = Arc::new(StoreRuntime::inert());
+        let mut fixture = SidebarPreviewFixture::make(PreviewScenario::Typical);
+        fixture.list.sessions[0].cwd = root.to_string_lossy().into_owned();
+        fixture.list.sessions[0].host = None;
+        let id = fixture.list.sessions[0].id.clone();
+        {
+            let mut store = runtime.store.write().unwrap();
+            store.hydrate(fixture.list);
+            store.select(id);
+        }
+        let tokio = Arc::new(
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap(),
+        );
+        let inspector = cx.new(|cx| WorkbenchInspector::new(runtime.clone(), tokio, cx));
+        inspector.update(cx, |inspector, cx| inspector.set_visible(true, cx));
+        cx.run_until_parked();
+
+        inspector.update(cx, |inspector, cx| {
+            inspector.commit_open = true;
+            inspector.commit_query.insert("Add the first file");
+            inspector.run_review_action(ReviewAction::Unstage(vec![PathBuf::from("two.txt")]), cx);
+        });
+        cx.run_until_parked();
+        inspector.read_with(cx, |inspector, _| {
+            assert_eq!(
+                inspector.review_feedback.as_ref().map(|(ok, _)| *ok),
+                Some(true)
+            );
+            assert!(
+                inspector.commit_open,
+                "unstaging must not close the composer"
+            );
+            assert_eq!(inspector.commit_query.text(), "Add the first file");
+        });
+
+        inspector.update(cx, |inspector, cx| inspector.submit_commit(cx));
+        cx.run_until_parked();
+        inspector.read_with(cx, |inspector, _| {
+            assert_eq!(
+                inspector.review_feedback.as_ref().map(|(ok, _)| *ok),
+                Some(true)
+            );
+            assert!(!inspector.commit_open);
+            assert!(inspector.commit_query.is_empty());
+        });
+
+        // Nothing is staged any more, so this commit fails and keeps its draft.
+        inspector.update(cx, |inspector, cx| {
+            inspector.commit_open = true;
+            inspector.commit_query.insert("Add the second file");
+            inspector.submit_commit(cx);
+        });
+        cx.run_until_parked();
+        inspector.read_with(cx, |inspector, _| {
+            assert_eq!(
+                inspector.review_feedback.as_ref().map(|(ok, _)| *ok),
+                Some(false)
+            );
+            assert!(inspector.commit_open);
+            assert_eq!(inspector.commit_query.text(), "Add the second file");
+        });
+
+        // Cancel any leftover refresh/review tasks on this thread before the
+        // TestAppContext tears the entity down.
         inspector.update(cx, |inspector, _| {
             inspector.refresh_task = None;
             inspector.review_task = None;
