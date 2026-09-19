@@ -834,9 +834,15 @@ impl WorkbenchInspector {
         {
             let store = self.runtime.store.read().expect("store");
             self.session_workspaces.retain(|id, workspace| {
-                let keep = id
-                    .as_ref()
-                    .is_none_or(|id| store.sessions().contains_key(id));
+                // Archived records stay in the store, so membership alone
+                // would keep their viewers, indexes and web pages for good.
+                // Unarchiving starts from a fresh workspace.
+                let keep = id.as_ref().is_none_or(|id| {
+                    store
+                        .sessions()
+                        .get(id)
+                        .is_some_and(|session| !session.is_archived())
+                });
                 if !keep {
                     #[cfg(target_os = "macos")]
                     if let Some(browser) = &self.native_browser {
@@ -6729,6 +6735,59 @@ mod tests {
                 !i.session_workspaces.contains_key(&Some(ids[1].clone())),
                 "closing B releases its hidden tabs"
             );
+        });
+    }
+
+    #[gpui::test]
+    fn archiving_a_session_releases_its_hidden_workspace(cx: &mut TestAppContext) {
+        let runtime = Arc::new(StoreRuntime::inert());
+        let fixture = SidebarPreviewFixture::make(PreviewScenario::Typical);
+        let sessions = fixture.list.sessions.clone();
+        let ids: Vec<_> = sessions.iter().map(|s| s.id.clone()).collect();
+        {
+            let mut store = runtime.store.write().unwrap();
+            store.hydrate(fixture.list);
+            store.select(ids[0].clone());
+        }
+        let tokio = Arc::new(
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap(),
+        );
+        let inspector = cx.new(|cx| WorkbenchInspector::new(runtime.clone(), tokio, cx));
+        inspector.update(cx, |i, cx| {
+            i.refresh_if_context_changed(cx);
+            i.add_workspace(WorkspaceSurface::Browser, cx);
+        });
+        runtime.store.write().unwrap().select(ids[1].clone());
+        inspector.update(cx, |i, cx| {
+            i.refresh_if_context_changed(cx);
+            assert!(i.session_workspaces.contains_key(&Some(ids[0].clone())));
+        });
+        let mut archived = sessions[0].clone();
+        archived.archived_at = Some(DateMillis(1.0));
+        runtime.store.write().unwrap().upsert_session(archived);
+        inspector.update(cx, |i, cx| {
+            i.sync_workspace_session(cx);
+            assert!(
+                !i.session_workspaces.contains_key(&Some(ids[0].clone())),
+                "an archived session keeps no hidden tabs"
+            );
+        });
+        // Unarchived and reselected, it starts from the default workspace.
+        let mut restored = sessions[0].clone();
+        restored.archived_at = None;
+        {
+            let mut store = runtime.store.write().unwrap();
+            store.upsert_session(restored);
+            store.select(ids[0].clone());
+        }
+        inspector.update(cx, |i, cx| {
+            i.refresh_if_context_changed(cx);
+            assert_eq!(i.workspace_session, Some(ids[0].clone()));
+            assert_eq!(i.workspace_tabs.len(), 1);
+            assert_eq!(i.workspace_tabs[0].surface, WorkspaceSurface::Details);
         });
     }
 
