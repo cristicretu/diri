@@ -302,6 +302,7 @@ fn sweep(
             wanted.push((record.id.0.clone(), urls));
         }
     }
+    prune_unreferenced(&wanted, cache, refresh, last_thread_attempt);
     if targets.is_empty() {
         forced_urls.clear();
         return IDLE_RECONCILE_INTERVAL;
@@ -363,7 +364,7 @@ fn sweep(
             let changed = guard.apply_pull_request_statuses(&id, statuses);
             if changed {
                 let _ = guard.persist();
-                guard.records().into_iter().find(|record| record.id.0 == id)
+                guard.record(&id)
             } else {
                 None
             }
@@ -374,6 +375,28 @@ fn sweep(
     }
 
     next_refresh_delay(&targets, refresh, forced_urls, Instant::now())
+}
+
+/// Forgets pull requests no record mentions any more.
+///
+/// The maps are keyed by URL and were only ever added to, so a long-lived
+/// Engine kept a status, a backoff state and a timestamp for every pull
+/// request any removed session had ever linked. Anything still on a record —
+/// an archived one included — is kept: its cached status is what that record
+/// is reconciled against, and its backoff is what spares `gh` a refetch.
+fn prune_unreferenced(
+    wanted: &[(String, Vec<String>)],
+    cache: &mut HashMap<String, PullRequestStatus>,
+    refresh: &mut HashMap<String, RefreshState>,
+    last_thread_attempt: &mut HashMap<String, Instant>,
+) {
+    let referenced: HashSet<&str> = wanted
+        .iter()
+        .flat_map(|(_, urls)| urls.iter().map(String::as_str))
+        .collect();
+    cache.retain(|url, _| referenced.contains(url.as_str()));
+    refresh.retain(|url, _| referenced.contains(url.as_str()));
+    last_thread_attempt.retain(|url, _| referenced.contains(url.as_str()));
 }
 
 fn next_refresh_delay(
@@ -668,6 +691,34 @@ fn now() -> DateMillis {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn pull_requests_no_record_mentions_are_forgotten() {
+        let kept = "https://github.com/o/r/pull/1";
+        let gone = "https://github.com/o/r/pull/2";
+        let mut cache = HashMap::new();
+        let mut refresh: HashMap<String, RefreshState> = HashMap::new();
+        let mut last_thread_attempt = HashMap::new();
+        for url in [kept, gone] {
+            let status = parse(br#"{"number":1,"state":"OPEN"}"#, url, DateMillis(0.0)).unwrap();
+            cache.insert(url.to_owned(), status);
+            refresh.entry(url.to_owned()).or_default().last_attempt = Some(Instant::now());
+            last_thread_attempt.insert(url.to_owned(), Instant::now());
+        }
+
+        // The session that linked `gone` was removed; an archived record
+        // still links `kept`.
+        let wanted = vec![("archived".to_owned(), vec![kept.to_owned()])];
+        prune_unreferenced(&wanted, &mut cache, &mut refresh, &mut last_thread_attempt);
+
+        assert_eq!(cache.keys().collect::<Vec<_>>(), [kept]);
+        assert_eq!(last_thread_attempt.keys().collect::<Vec<_>>(), [kept]);
+        assert!(
+            refresh[kept].last_attempt.is_some(),
+            "a kept pull request keeps its backoff"
+        );
+        assert!(!refresh.contains_key(gone));
+    }
 
     #[test]
     fn refresh_updates_status_only_prs_and_every_session_sharing_the_url() {
