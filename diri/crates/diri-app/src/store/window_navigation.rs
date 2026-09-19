@@ -1001,6 +1001,9 @@ impl WindowWrite<'_> {
         if ids.is_empty() {
             return;
         }
+        // Decide on everything the close terminates, not only the clicked
+        // rows: an exited parent can still own a running auxiliary terminal.
+        let ids = self.closure_set(ids);
         let has_running = ids.iter().any(|id| {
             self.sessions
                 .get(id)
@@ -1322,6 +1325,63 @@ mod tests {
         first.write().unwrap().cancel_pending_close();
         assert!(Arc::ptr_eq(&first.canonical, &second.canonical));
         assert_ne!(first.owner(), second.owner());
+    }
+
+    #[test]
+    fn closing_an_exited_parent_confirms_for_its_running_auxiliary_terminal() {
+        let (first, _, ids) = windows();
+        let exited = |record: &mut SessionRecord| {
+            record.status = SessionStatus::Exited(diri_proto::ExitInfo {
+                reason: diri_proto::ExitReason::Exited,
+                code: Some(1),
+                signal: None,
+            });
+        };
+        let terminal_id = SessionId::new("auxiliary-terminal");
+        {
+            let mut canonical = first.canonical.write().unwrap();
+            let mut parent = (**canonical.sessions().get(&ids[0]).unwrap()).clone();
+            let mut terminal = parent.clone();
+            exited(&mut parent);
+            terminal.id = terminal_id.clone();
+            terminal.kind = AgentKind::SHELL;
+            terminal.parent = Some(ids[0].clone());
+            terminal.status = SessionStatus::Idle;
+            canonical.upsert_session(parent);
+            canonical.upsert_session(terminal);
+        }
+        first
+            .write()
+            .unwrap()
+            .update_preferences(|prefs| prefs.confirm_before_closing_session = true)
+            .unwrap();
+
+        first.write().unwrap().request_close(vec![ids[0].clone()]);
+        assert_eq!(
+            first
+                .read()
+                .unwrap()
+                .pending_close()
+                .map(|pending| pending.ids.clone()),
+            Some(vec![ids[0].clone(), terminal_id.clone()]),
+            "the confirmation must cover every session the close terminates"
+        );
+        first.write().unwrap().cancel_pending_close();
+        assert!(first.canonical.read().unwrap().closing.is_empty());
+
+        // Once the terminal has exited too, nothing running is at stake.
+        {
+            let mut canonical = first.canonical.write().unwrap();
+            let mut terminal = (**canonical.sessions().get(&terminal_id).unwrap()).clone();
+            exited(&mut terminal);
+            canonical.upsert_session(terminal);
+        }
+        first.write().unwrap().request_close(vec![ids[0].clone()]);
+        assert!(first.read().unwrap().pending_close().is_none());
+        assert_eq!(
+            first.canonical.read().unwrap().closing,
+            HashSet::from([ids[0].clone(), terminal_id])
+        );
     }
 
     #[test]

@@ -105,6 +105,23 @@ pub struct TerminalDamageObserver {
     shared: Arc<ElementSharedState>,
 }
 
+/// Moves the reading view, dropping a selection that returning to live would
+/// leave attached to rows the next frame replaces.
+fn set_view_offset(
+    shared: &ElementSharedState,
+    buffer: &SharedGridBuffer,
+    offset: i64,
+    visible_rows: usize,
+) -> bool {
+    let mut viewport = mutex_lock(&shared.viewport);
+    let changed = viewport.set_view_offset(offset, visible_rows);
+    viewport.hold_reading_view(&read_lock(buffer));
+    if changed && !viewport.is_reading() {
+        mutex_lock(&shared.selection).clear();
+    }
+    changed
+}
+
 impl TerminalDamageObserver {
     pub fn prepare(&self, update: &GridUpdate) {
         // Absolute rows keep a selection attached while the viewport moves,
@@ -167,12 +184,17 @@ impl TerminalImeState {
 struct TerminalInputHandler {
     text_input: TextInputCallback,
     ime_state: Arc<Mutex<TerminalImeState>>,
+    /// Reading state only, so the handler can show the prompt it types into
+    /// without retaining the element that owns its callback.
+    view: TerminalDamageObserver,
     cursor_bounds: Bounds<Pixels>,
     cell_width: Pixels,
 }
 
 impl TerminalInputHandler {
-    fn commit_text(&self, text: &str) {
+    /// Forwards committed text and reports whether doing so brought a reading
+    /// view back to live, which the caller has to repaint.
+    fn commit_text(&self, text: &str) -> bool {
         let mut state = mutex_lock(&self.ime_state);
         state.marked_text.clear();
         let enabled = state.enabled;
@@ -183,9 +205,16 @@ impl TerminalInputHandler {
         // foreground process if forwarded to the PTY. Control keys have their
         // own key-down encoder, so dropping them here cannot remove a valid
         // terminal command.
-        if enabled && !text.chars().any(char::is_control) {
-            (self.text_input)(text);
+        if !enabled || text.chars().any(char::is_control) {
+            return false;
         }
+        // Committed text is typing like any key: it lands at the live prompt,
+        // which a held reading view would keep off screen with no cursor. The
+        // target offset is zero, so the visible row count cannot clamp it.
+        let returned =
+            !text.is_empty() && set_view_offset(&self.view.shared, &self.view.buffer, 0, 0);
+        (self.text_input)(text);
+        returned
     }
 
     fn mark_text(&self, text: &str) {
@@ -234,7 +263,9 @@ impl InputHandler for TerminalInputHandler {
         window: &mut Window,
         _cx: &mut App,
     ) {
-        self.commit_text(text);
+        if self.commit_text(text) {
+            window.refresh();
+        }
         window.invalidate_character_coordinates();
     }
 
@@ -686,13 +717,7 @@ impl TerminalElement {
     }
 
     pub fn set_view_offset(&self, offset: i64, visible_rows: usize) -> bool {
-        let mut viewport = mutex_lock(&self.shared.viewport);
-        let changed = viewport.set_view_offset(offset, visible_rows);
-        viewport.hold_reading_view(&read_lock(&self.buffer));
-        if changed && !viewport.is_reading() {
-            mutex_lock(&self.shared.selection).clear();
-        }
-        changed
+        set_view_offset(&self.shared, &self.buffer, offset, visible_rows)
     }
 
     /// Keep the displayed text stable while keyboard selection owns input.
@@ -1619,6 +1644,7 @@ impl Element for TerminalElement {
                 TerminalInputHandler {
                     text_input: Arc::clone(text_input),
                     ime_state: Arc::clone(&self.ime_state),
+                    view: self.damage_observer(),
                     cursor_bounds,
                     cell_width,
                 },
@@ -2653,6 +2679,7 @@ mod link_tests {
                 mutex_lock(&sink).push(text.to_owned());
             }),
             ime_state: Arc::clone(&state),
+            view: terminal_with_rows(&["test"]).damage_observer(),
             cursor_bounds: Bounds::new(point(px(0.0), px(0.0)), size(px(8.0), px(16.0))),
             cell_width: px(8.0),
         };
@@ -2672,6 +2699,7 @@ mod link_tests {
         let handler = TerminalInputHandler {
             text_input: Arc::new(move |text| mutex_lock(&sink).push(text.to_owned())),
             ime_state: Arc::new(Mutex::new(TerminalImeState::default())),
+            view: terminal_with_rows(&["test"]).damage_observer(),
             cursor_bounds: Bounds::new(point(px(0.0), px(0.0)), size(px(8.0), px(16.0))),
             cell_width: px(8.0),
         };
@@ -2691,6 +2719,7 @@ mod link_tests {
         let handler = TerminalInputHandler {
             text_input: Arc::new(move |text| mutex_lock(&sink).push(text.to_owned())),
             ime_state: Arc::clone(&terminal.ime_state),
+            view: terminal.damage_observer(),
             cursor_bounds: Bounds::new(point(px(0.0), px(0.0)), size(px(8.0), px(16.0))),
             cell_width: px(8.0),
         };
@@ -2703,6 +2732,52 @@ mod link_tests {
         terminal.set_text_input_enabled(true);
         handler.commit_text("terminal");
         assert_eq!(&*mutex_lock(&committed), &["terminal"]);
+    }
+
+    #[test]
+    fn committed_text_returns_a_reading_view_to_live_unless_an_overlay_owns_input() {
+        let terminal = terminal_with_rows(&["one", "two"]);
+        let committed = Arc::new(Mutex::new(Vec::<String>::new()));
+        let sink = Arc::clone(&committed);
+        let handler = TerminalInputHandler {
+            text_input: Arc::new(move |text| mutex_lock(&sink).push(text.to_owned())),
+            ime_state: Arc::clone(&terminal.ime_state),
+            view: terminal.damage_observer(),
+            cursor_bounds: Bounds::new(point(px(0.0), px(0.0)), size(px(8.0), px(16.0))),
+            cell_width: px(8.0),
+        };
+        terminal.adopt_history_geometry(100, 102, 1, 2);
+        let read_history = || {
+            terminal.set_view_offset(5, 2);
+            assert_eq!(terminal.view_offset(), 5);
+        };
+
+        // Composing is not input yet, and neither is the ETX AppKit commits
+        // after Command-C: copying while reading must not lose the place.
+        read_history();
+        handler.mark_text("ni");
+        assert!(!handler.commit_text("\u{3}"));
+        assert_eq!(terminal.view_offset(), 5);
+
+        // Find owns text while it is open; its query is not PTY input.
+        terminal.set_text_input_enabled(false);
+        assert!(!handler.commit_text("你"));
+        assert_eq!(terminal.view_offset(), 5);
+        assert!(mutex_lock(&committed).is_empty());
+
+        terminal.set_text_input_enabled(true);
+        assert!(
+            handler.commit_text("你"),
+            "the view moved and owes a repaint"
+        );
+        assert_eq!(terminal.view_offset(), 0);
+        assert_eq!(&*mutex_lock(&committed), &["你"]);
+
+        assert!(
+            !handler.commit_text("好"),
+            "already live: nothing to repaint"
+        );
+        assert_eq!(&*mutex_lock(&committed), &["你", "好"]);
     }
 
     #[test]
