@@ -2731,7 +2731,13 @@ fn pump_remote_connection(
         }
         scan_artifacts_if_due(shared, &mut last_scan_at, &mut last_scan_seq);
 
-        if last_tick.elapsed().unwrap_or_default() >= TICK_INTERVAL {
+        // The timeout below only paces reducer timers: Helper output and
+        // queued input each have a descriptor in the poll and wake it at once,
+        // and a stop closes the Bridge, which does too. So an idle, untouched
+        // session takes the same stretched tick a held one does, instead of
+        // ten wakeups a second per Forge tab for as long as the Engine runs.
+        let tick = shared.quiet_tick();
+        if last_tick.elapsed().unwrap_or_default() >= tick {
             last_tick = SystemTime::now();
             let outcome = shared
                 .reducer
@@ -2768,7 +2774,7 @@ fn pump_remote_connection(
             libc::poll(
                 descriptors.as_mut_ptr(),
                 descriptors.len() as _,
-                TICK_INTERVAL.as_millis() as i32,
+                tick.as_millis() as i32,
             )
         };
         if ready < 0 {
@@ -4389,6 +4395,46 @@ pub fn authority_for(manifest_id: &str, engine: &ManifestEngine) -> Authority {
         .manifest(manifest_id)
         .and_then(|manifest| manifest.agent.as_ref())
         .map_or(Authority::ProcessOnly, |agent| agent.authority())
+}
+
+#[cfg(test)]
+mod quiet_tick_tests {
+    use super::*;
+
+    #[test]
+    fn only_an_idle_untouched_session_takes_the_stretched_tick() {
+        let temp = tempfile::tempdir().unwrap();
+        let (engine, _) = ManifestEngine::load_dir(&crate::detect::bundled_manifest_dir()).unwrap();
+        let spec = SessionSpec {
+            id: "tick".into(),
+            pty: PtySpec::new(vec!["/bin/sh".into()], "/tmp"),
+            manifest_id: "generic".into(),
+            authority: Authority::ProcessOnly,
+            logs_dir: temp.path().to_path_buf(),
+            holder: None,
+            remote: None,
+            defer_launch: false,
+        };
+        let log = OutputLog::writer(temp.path(), &spec.id).unwrap();
+        let shared = new_shared(&spec, log, &engine, true);
+        let wakeups_per_minute = |tick: Duration| 60_000 / tick.as_millis();
+
+        // Starting and Working run debounce timers: fast.
+        assert_eq!(shared.quiet_tick(), TICK_INTERVAL);
+        *shared.status.lock().unwrap() = SessionStatus::Working;
+        assert_eq!(shared.quiet_tick(), TICK_INTERVAL);
+
+        // Idle and never touched: what a background remote tab is, and what
+        // the remote pump polled at the fast interval regardless.
+        *shared.status.lock().unwrap() = SessionStatus::Idle;
+        assert_eq!(shared.quiet_tick(), IDLE_TICK_INTERVAL);
+        assert_eq!(wakeups_per_minute(TICK_INTERVAL), 600, "before");
+        assert_eq!(wakeups_per_minute(shared.quiet_tick()), 60, "after");
+
+        // Input or an attach makes it interactive again at once.
+        shared.note_hot();
+        assert_eq!(shared.quiet_tick(), TICK_INTERVAL);
+    }
 }
 
 #[cfg(test)]
