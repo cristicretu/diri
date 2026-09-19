@@ -73,6 +73,10 @@ pub struct TermTheme {
     pub find_match: Rgba,
     pub find_match_current: Rgba,
     pub ansi: [Rgba; 16],
+    /// Zero for a theme as authored. [`TermTheme::mix`] stamps the palette it
+    /// produced here, so a per-cell cache can tell two frames of a fade apart
+    /// without hashing sixteen colors for every cell.
+    pub(crate) blend: u64,
 }
 
 impl TermTheme {
@@ -108,6 +112,7 @@ impl TermTheme {
             hex(0x29b8db),
             hex(0xffffff),
         ],
+        blend: 0,
     };
 
     pub const SOLARIZED_DARK: Self = dark_theme(
@@ -215,6 +220,7 @@ impl TermTheme {
             hex(0x99ffe4),
             hex(0xffffff),
         ],
+        blend: 0,
     };
 
     pub const NORD: Self = dark_theme(
@@ -520,6 +526,7 @@ const fn palette_theme(
             hex(ansi_values[14]),
             hex(ansi_values[15]),
         ],
+        blend: 0,
     }
 }
 

@@ -148,6 +148,8 @@ const PHASE_IN_FULL: f32 = 0.85;
 /// arrives with the paper's lightness instead of with the flag, so the dark
 /// end of a fade paints exactly what the dark theme paints and nothing pops
 /// on the first or last frame. Only a cache miss pays for this.
+#[cold]
+#[inline(never)]
 fn phased_in(theme: &TermTheme, authored: Rgba, corrected: Rgba) -> Rgba {
     let paper = oklch(linear(theme.background)).lightness;
     if paper >= PHASE_IN_FULL {
@@ -211,29 +213,19 @@ thread_local! {
 }
 
 /// Identifies everything in a theme the solver reads, cheaply enough to
-/// compute per cell: the static id, the default colors, and the six accent
-/// slots `harmonized` steers by. A theme fading into another keeps one id
-/// while its palette moves every frame, so the accents are part of the key
-/// rather than implied by the id. The pairs hash in independent lanes to keep
-/// the dependency chain as short as it was with the defaults alone.
+/// compute per cell. Catalog themes are distinguished by their static id;
+/// the default colors guard a theme value rebuilt under the same id. A theme
+/// fading into another keeps one id while its palette moves every frame, and
+/// two frames can share default colors, so `TermTheme::mix` stamps each
+/// palette it produces and the stamp stands in for the accents here.
 fn theme_key(theme: &TermTheme) -> u64 {
-    let mut key = theme.id.as_ptr() as u64;
+    let mut key = theme.id.as_ptr() as u64 ^ theme.blend;
     for color in [theme.background, theme.foreground] {
         for channel in [color.r, color.g, color.b] {
             key = key.rotate_left(11) ^ u64::from(channel.to_bits());
         }
     }
-    // Slots 1..=6 are the chromatic accents. Each channel folds into its own
-    // word so the loop has no dependency on the chain above.
-    let mut accents = [0_u32; 3];
-    for (slot, color) in theme.ansi[1..7].iter().enumerate() {
-        let turn = slot as u32 * 5 + 1;
-        accents[0] ^= color.r.to_bits().rotate_left(turn);
-        accents[1] ^= color.g.to_bits().rotate_left(turn);
-        accents[2] ^= color.b.to_bits().rotate_left(turn);
-    }
-    key ^ (u64::from(accents[0]) << 32 | u64::from(accents[1])).rotate_left(7)
-        ^ u64::from(accents[2]).rotate_left(47)
+    key
 }
 
 pub(crate) type LinearRgb = [f32; 3];
@@ -839,22 +831,27 @@ mod tests {
 
     #[test]
     fn a_theme_in_transit_never_answers_from_another_palette() {
-        // Two frames of a fade share an id, and may share default colors,
-        // while their accents differ. White on cream travels far enough to be
-        // pulled onto the theme's accents... so does this saturated yellow.
-        let theme = TermTheme::DIRIJOR_LIGHT;
-        let mut moved = theme;
-        moved.ansi[3] = theme.ansi[5];
+        // Two frames of one fade: the same id and, because the endpoints
+        // agree on them, the same default colors, under different accents.
+        let to = TermTheme::DIRIJOR_LIGHT;
+        let mut from = to;
+        from.ansi[3] = to.ansi[5];
+        let (early, late) = (from.mix(&to, 0.2), from.mix(&to, 0.8));
+        assert_eq!(
+            (early.id, early.background, early.foreground),
+            (late.id, late.background, late.foreground)
+        );
+        assert_ne!(theme_key(&early), theme_key(&late));
+
+        // A saturated yellow travels far enough to be pulled onto the accent.
         let yellow = cell(
             TermColor::Rgb(255, 255, 0),
             TermColor::Default,
             TermStyle::empty(),
         );
-        let first = theme.resolve_cell(yellow).foreground;
-        let second = moved.resolve_cell(yellow).foreground;
-        assert_ne!(theme_key(&theme), theme_key(&moved));
-        assert_ne!(first, second);
-        assert_eq!(theme.resolve_cell(yellow).foreground, first);
+        let first = early.resolve_cell(yellow).foreground;
+        assert_ne!(late.resolve_cell(yellow).foreground, first);
+        assert_eq!(early.resolve_cell(yellow).foreground, first);
     }
 
     #[test]

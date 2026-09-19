@@ -97,6 +97,7 @@ impl TermTheme {
             find_match,
             find_match_current,
             ansi,
+            blend: _,
         } = *other;
         let light =
             self.appearance == ThemeAppearance::Light || appearance == ThemeAppearance::Light;
@@ -120,8 +121,20 @@ impl TermTheme {
             find_match: mix_color(self.find_match, find_match, t),
             find_match_current: mix_color(self.find_match_current, find_match_current, t),
             ansi: palette,
+            blend: stamp(&palette),
         }
     }
+}
+
+/// Never zero, which is what an authored theme carries.
+fn stamp(palette: &[Rgba; 16]) -> u64 {
+    let mut hash = 0xcbf2_9ce4_8422_2325_u64;
+    for color in palette {
+        for channel in [color.r, color.g, color.b] {
+            hash = (hash ^ u64::from(channel.to_bits())).wrapping_mul(0x0000_0100_0000_01b3);
+        }
+    }
+    hash | 1
 }
 
 /// Decelerating cubic: the change answers the keypress at full speed and
@@ -449,7 +462,10 @@ mod tests {
         let now = start + Duration::from_millis(60);
         let shown = fade.sample(now);
         let chased = fade.retarget(TermTheme::SOLARIZED_DARK, now);
-        assert_eq!(chased.sample(now), shown);
+        // The colors do not move; only the identity is the new target's.
+        let first = chased.sample(now);
+        assert_eq!(first.signature(), shown.signature());
+        assert_eq!(first.id, TermTheme::SOLARIZED_DARK.id);
         let next = chased.sample(now + Duration::from_millis(8));
         assert_eq!(next.id, TermTheme::SOLARIZED_DARK.id);
         assert!(distance(next.background, shown.background) < 0.02);
