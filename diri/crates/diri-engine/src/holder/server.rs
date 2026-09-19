@@ -915,6 +915,9 @@ fn current_stat_without_identity(shared: &Shared) -> HolderStat {
         cols: size.map(|(cols, _)| cols),
         rows: size.map(|(_, rows)| rows),
         epoch_offset: Some(shared.epoch_offset),
+        // Sampled on request, from the owner: the holder itself never polls,
+        // and an idle one still costs no wakeups.
+        secret_input: Some(pty.secret_input()),
     }
 }
 
@@ -1021,6 +1024,67 @@ mod tests {
 
         // A pump parked without a deadline still has to see the child exit.
         drop(shared);
+        client.kill_tree().expect("kill-tree");
+        wait_until("holder finished", || server.is_finished());
+        server.join().expect("join").expect("clean holder exit");
+    }
+
+    #[test]
+    fn stat_reports_secret_input_only_for_a_silenced_line_prompt() {
+        let root = tempfile::tempdir().unwrap();
+        // Each marker follows its `stty`, so reading it from the log means
+        // the mode it names is already in force.
+        let script = "stty -echo; printf hidden; read secret; \
+            stty echo; printf shown; read a; \
+            stty raw -echo; printf rawmode; read b";
+        let spec = HolderLaunchSpec {
+            session_id: "s_secret".into(),
+            socket_path: root.path().join("h.sock").to_string_lossy().into_owned(),
+            pid_file_path: root.path().join("h.pid").to_string_lossy().into_owned(),
+            log_file_path: root
+                .path()
+                .join("s_secret.bin")
+                .to_string_lossy()
+                .into_owned(),
+            argv: vec!["/bin/sh".into(), "-c".into(), script.into()],
+            cwd: "/tmp".into(),
+            environment: [("PATH".to_string(), "/usr/bin:/bin".to_string())].into(),
+            cols: 80,
+            rows: 24,
+            disk_capacity: 4096,
+        };
+        let client = HolderClient::new(&spec.socket_path);
+        let server = std::thread::spawn(move || HolderServer::run(spec));
+        wait_until("holder ready", || client.is_alive());
+
+        let logged = |marker: &[u8]| {
+            OutputLog::reader(root.path(), "s_secret").is_ok_and(|mut log| {
+                log.refresh_from_disk();
+                let (_, bytes) = log.read(0, 4096);
+                bytes.windows(marker.len()).any(|window| window == marker)
+            })
+        };
+        let secret = || client.stat().expect("stat").secret_input;
+
+        wait_until("password prompt", || logged(b"hidden"));
+        assert_eq!(secret(), Some(true));
+        let pump_before = running("s_secret").pump_wakeups.load(Ordering::SeqCst);
+        std::thread::sleep(Duration::from_millis(300));
+        assert_eq!(
+            running("s_secret").pump_wakeups.load(Ordering::SeqCst),
+            pump_before,
+            "a holder parked at a password prompt must not poll its termios"
+        );
+
+        client.write(b"hunter2\n").expect("answer the prompt");
+        wait_until("echo restored", || logged(b"shown"));
+        assert_eq!(secret(), Some(false));
+        assert!(!logged(b"hunter2"), "a silenced line never reaches the log");
+
+        client.write(b"\n").expect("continue");
+        wait_until("raw mode", || logged(b"rawmode"));
+        assert_eq!(secret(), Some(false), "raw mode without echo is a TUI");
+
         client.kill_tree().expect("kill-tree");
         wait_until("holder finished", || server.is_finished());
         server.join().expect("join").expect("clean holder exit");

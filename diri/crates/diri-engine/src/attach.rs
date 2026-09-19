@@ -238,12 +238,15 @@ impl AttachHub {
         else {
             return Admission::Unavailable;
         };
-        let Ok(modes) = encoded(&Frame::modes_with_keyboard(
-            seed.modes.0,
-            seed.modes.1,
-            seed.modes.2,
-            seed.signature.keyboard,
-        )) else {
+        let Ok(modes) = encoded(
+            &Frame::modes_with_keyboard(
+                seed.modes.0,
+                seed.modes.1,
+                seed.modes.2,
+                seed.signature.keyboard,
+            )
+            .with_secret_input(seed.secret_input),
+        ) else {
             return Admission::Unavailable;
         };
         match sink.seed(&[grid, modes]) {
@@ -434,13 +437,16 @@ impl AttachHub {
                 grid
             };
             output.enqueue(Arc::from(grid));
-            let Ok(modes) = encoded(&Frame::modes_with_keyboard_capability(
-                seed.modes.0,
-                seed.modes.1,
-                seed.modes.2,
-                seed.signature.keyboard,
-                enhanced_keyboard,
-            )) else {
+            let Ok(modes) = encoded(
+                &Frame::modes_with_keyboard_capability(
+                    seed.modes.0,
+                    seed.modes.1,
+                    seed.modes.2,
+                    seed.signature.keyboard,
+                    enhanced_keyboard,
+                )
+                .with_secret_input(seed.secret_input),
+            ) else {
                 return;
             };
             output.enqueue(modes);
@@ -830,7 +836,7 @@ impl AttachHub {
     /// one bounded wait after the last sink.
     fn pump(&self, registry: &Arc<Mutex<Registry>>, session_id: &str, seed: AttachmentSeed) {
         let mut signature = seed.signature;
-        let mut last_modes = Some((seed.modes, seed.signature.keyboard));
+        let mut last_modes = Some((seed.modes, seed.signature.keyboard, seed.secret_input));
         let mut wake = seed.wake;
         let mut wake_generation = seed.wake_generation;
         let mut last_emission = Instant::now()
@@ -905,7 +911,11 @@ impl AttachHub {
             let mut eligible_sinks = Vec::new();
             if let Some((publication, sinks, requires_capability)) = observed {
                 eligible_sinks = sinks;
-                let modes = (publication.modes, publication.keyboard);
+                let modes = (
+                    publication.modes,
+                    publication.keyboard,
+                    publication.secret_input,
+                );
                 requires_enhanced = requires_capability;
                 if let Some(update) = publication.grid
                     && let Ok(frame) = Frame::grid(&update)
@@ -915,13 +925,17 @@ impl AttachHub {
                 // Fresh sinks get their initial modes at seed time; the pump
                 // only broadcasts changes.
                 if last_modes != Some(modes) {
-                    enhanced_modes = encoded(&Frame::modes_with_keyboard_capability(
-                        modes.0.0, modes.0.1, modes.0.2, modes.1, true,
-                    ))
+                    enhanced_modes = encoded(
+                        &Frame::modes_with_keyboard_capability(
+                            modes.0.0, modes.0.1, modes.0.2, modes.1, true,
+                        )
+                        .with_secret_input(modes.2),
+                    )
                     .ok();
-                    frames.push(Frame::modes_with_keyboard(
-                        modes.0.0, modes.0.1, modes.0.2, modes.1,
-                    ));
+                    frames.push(
+                        Frame::modes_with_keyboard(modes.0.0, modes.0.1, modes.0.2, modes.1)
+                            .with_secret_input(modes.2),
+                    );
                 }
                 last_modes = Some(modes);
             }

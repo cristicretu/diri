@@ -1568,6 +1568,8 @@ refactor work:
 - cross-host handoff and checkpoint migration;
 - cross-host or post-reboot process recovery;
 - multiple read-only observers;
+- remote secret-input (password prompt) reporting; see "Secret input
+  awareness" below;
 - deeper, explicitly configured `diri-node` integration.
 
 Adding any of these requires an explicit proposal update. They must not enlarge
@@ -1802,3 +1804,36 @@ replacing an existing run artifact, remove only their nonce and sync the directo
 A failed fsync returns an error even if publication became visible; visibility is
 not evidence of a completed durability acknowledgement. No worker, timer, watcher,
 Holder or manager is created by this primitive.
+
+## Secret input awareness (local sessions)
+
+A child reading a password silences echo while the kernel still assembles
+lines. The PTY owner observes that with one `tcgetattr` on the master:
+`ECHO` off with `ICANON` (or `ECHONL`) on. Raw-mode programs such as editors and
+agent TUIs also run without echo but without canonical input, so they never
+match, and the Engine additionally vetoes the sample while the emulator is on
+the alternate screen. An unreadable termios, an exited child and a Holder that
+predates the field all read as "not secret".
+
+Nothing polls for this. The local Holder answers on request: `stat` additively
+carries `secretInput`, sampled when the request is served, and a parked Holder
+still takes no wakeups. The Engine asks at points it already visits: after a
+processed output batch, around an input write, and on the quiet ticks that
+already sample a shell's foreground group (every tick for one second after
+output or input, then the two-second liveness cadence). Shell sessions reuse
+that same stat, so they make no additional Holder connections.
+Other sessions are asked only while the emulator shows neither the alternate
+screen nor bracketed paste, so an agent composer costs no round trip.
+
+The Engine publishes the result to attached clients as bit 6 of the Modes
+frame's first byte. Older clients ignore the bit and older Engines never set it.
+While it is set the Engine does not fold typed input into the first-prompt
+title. The macOS app holds Secure Keyboard Entry only while the focused pane of
+the active window shows a live session with the bit set, and releases it on
+blur, window deactivation or close, deselection, a non-live attachment and quit.
+
+Remote sessions always report `false`. `diri-remote` does not sample termios in
+this revision and no Remote Helper protocol, capability or minor changed. A
+later revision may add it only as a capability-negotiated additive message that
+is never required for attach, close, kill or restore, so Holders from older
+Helper builds keep working unchanged.
