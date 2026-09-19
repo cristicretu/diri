@@ -4,13 +4,13 @@
 //! One manager per holders directory hosts a [`HolderServer`] thread per
 //! session. The manager exits only after every hosted child has exited and an
 //! idle grace period has elapsed, so daemon crashes and upgrades never take a
-//! PTY with them. While any session is hosted there is no timer at all — an
-//! active manager has no polling wakeup beyond its watchdog's parked sleep.
+//! PTY with them. While any session is hosted there is no timer at all: the
+//! watchdog parks on a condvar and only counts down once the last session ends.
 
 use std::collections::HashSet;
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
 use super::client::HolderClient;
@@ -33,8 +33,43 @@ struct State {
     /// became idle (or was last pinged while idle). The watchdog exits the
     /// process once `idle_timeout` passes with this unchanged.
     idle_since: Mutex<Option<Instant>>,
+    /// Wakes the watchdog when the last session ends or the manager stops.
+    /// Signalled with `idle_since` held, so a wakeup cannot slip between the
+    /// watchdog's check and its wait.
+    idle_changed: Condvar,
     shutting_down: AtomicBool,
     listen_fd: AtomicI32,
+    /// Every return from a watchdog wait, so a test can prove it stays parked.
+    #[cfg(test)]
+    watchdog_wakeups: std::sync::atomic::AtomicUsize,
+}
+
+impl State {
+    fn new(listen_fd: i32) -> Self {
+        Self {
+            active: Mutex::new(HashSet::new()),
+            idle_since: Mutex::new(Some(Instant::now())),
+            idle_changed: Condvar::new(),
+            shutting_down: AtomicBool::new(false),
+            listen_fd: AtomicI32::new(listen_fd),
+            #[cfg(test)]
+            watchdog_wakeups: std::sync::atomic::AtomicUsize::new(0),
+        }
+    }
+
+    /// Records the hosted set becoming empty or not, and tells the watchdog.
+    fn set_idle(&self, since: Option<Instant>) {
+        *self.idle_since.lock().expect("idle") = since;
+        self.idle_changed.notify_all();
+    }
+
+    fn stop_watchdog(&self) {
+        self.shutting_down.store(true, Ordering::SeqCst);
+        // Taking the lock orders this after the watchdog's own check of the
+        // flag; without it the notify could land before the wait and be lost.
+        let _idle = self.idle_since.lock().expect("idle");
+        self.idle_changed.notify_all();
+    }
 }
 
 impl HolderManagerServer {
@@ -56,12 +91,7 @@ impl HolderManagerServer {
             listener.into_raw_fd()
         };
 
-        let state = Arc::new(State {
-            active: Mutex::new(HashSet::new()),
-            idle_since: Mutex::new(Some(Instant::now())),
-            shutting_down: AtomicBool::new(false),
-            listen_fd: AtomicI32::new(listen_fd),
-        });
+        let state = Arc::new(State::new(listen_fd));
 
         write_pid_file(&self.paths.pid_file())?;
 
@@ -101,7 +131,7 @@ impl HolderManagerServer {
             }
         }
 
-        state.shutting_down.store(true, Ordering::SeqCst);
+        state.stop_watchdog();
         let _ = watchdog.join();
         self.cleanup_control_files();
         result
@@ -150,7 +180,7 @@ impl HolderManagerServer {
                     if !active.insert(spec.session_id.clone()) {
                         return Ok(HolderManagerResponse::success(std::process::id() as i32));
                     }
-                    *state.idle_since.lock().expect("idle") = None;
+                    state.set_idle(None);
                 }
 
                 let state = Arc::clone(state);
@@ -164,7 +194,7 @@ impl HolderManagerServer {
                         let mut active = state.active.lock().expect("active");
                         active.remove(&session_id);
                         if active.is_empty() {
-                            *state.idle_since.lock().expect("idle") = Some(Instant::now());
+                            state.set_idle(Some(Instant::now()));
                         }
                     })
                     .map_err(|error| HolderError::io("spawn session holder", error))?;
@@ -220,24 +250,37 @@ impl HolderManagerServer {
 }
 
 /// Exits the process's accept loop once the manager has been idle for the
-/// grace period. Checks four times a second; the idle window is seconds.
+/// grace period.
+///
+/// While a session is hosted there is nothing to time, so the wait has no
+/// deadline. Once idle it sleeps exactly until the grace period would end and
+/// then looks again, which is what lets a ping push the deadline out without
+/// having to wake anyone.
 fn watch_idle(state: &State, idle_timeout: Duration) {
+    let mut idle = state.idle_since.lock().expect("idle");
     loop {
-        std::thread::sleep(Duration::from_millis(250));
         if state.shutting_down.load(Ordering::SeqCst) {
             return;
         }
-        let expired = state
-            .idle_since
-            .lock()
-            .expect("idle")
-            .is_some_and(|since| since.elapsed() >= idle_timeout);
-        if !expired {
-            continue;
-        }
-        stop_listener(state);
-        return;
+        idle = match *idle {
+            None => state.idle_changed.wait(idle).expect("idle"),
+            Some(since) => {
+                let remaining = idle_timeout.saturating_sub(since.elapsed());
+                if remaining.is_zero() {
+                    break;
+                }
+                state
+                    .idle_changed
+                    .wait_timeout(idle, remaining)
+                    .expect("idle")
+                    .0
+            }
+        };
+        #[cfg(test)]
+        state.watchdog_wakeups.fetch_add(1, Ordering::SeqCst);
     }
+    drop(idle);
+    stop_listener(state);
 }
 
 fn stop_listener(state: &State) {
@@ -269,10 +312,53 @@ fn write_pid_file(path: &Path) -> HolderResult<()> {
 
 #[cfg(test)]
 mod tests {
-    use std::time::Duration;
+    use std::sync::Arc;
+    use std::sync::atomic::Ordering;
+    use std::time::{Duration, Instant};
 
-    use super::HolderManagerServer;
+    use super::{HolderManagerServer, State, watch_idle};
     use crate::holder::{HolderManagerClient, HolderManagerPaths};
+
+    /// A watchdog over a manager with no listener to close.
+    fn watchdog(state: &Arc<State>, idle_timeout: Duration) -> std::thread::JoinHandle<()> {
+        let state = Arc::clone(state);
+        std::thread::spawn(move || watch_idle(&state, idle_timeout))
+    }
+
+    #[test]
+    fn the_watchdog_never_wakes_while_a_session_is_hosted() {
+        let idle_timeout = Duration::from_millis(100);
+        let state = Arc::new(State::new(-1));
+        state.set_idle(None);
+        let watchdog = watchdog(&state, idle_timeout);
+
+        // Several grace periods, and several of the old 250 ms ticks.
+        std::thread::sleep(Duration::from_millis(600));
+        assert_eq!(state.watchdog_wakeups.load(Ordering::SeqCst), 0);
+        assert!(!watchdog.is_finished());
+
+        // The last session ending starts the countdown, in full.
+        let ended = Instant::now();
+        state.set_idle(Some(ended));
+        watchdog.join().expect("watchdog");
+        assert!(ended.elapsed() >= idle_timeout);
+        assert!(state.shutting_down.load(Ordering::SeqCst));
+    }
+
+    #[test]
+    fn a_new_session_cancels_the_idle_countdown() {
+        let idle_timeout = Duration::from_millis(150);
+        let state = Arc::new(State::new(-1));
+        let watchdog = watchdog(&state, idle_timeout);
+        state.set_idle(None);
+
+        std::thread::sleep(idle_timeout * 3);
+        assert!(!watchdog.is_finished());
+        assert!(!state.shutting_down.load(Ordering::SeqCst));
+
+        state.stop_watchdog();
+        watchdog.join().expect("watchdog");
+    }
 
     #[test]
     fn an_idle_manager_accepts_immediate_graceful_shutdown() {
