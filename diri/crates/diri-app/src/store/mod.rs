@@ -2130,6 +2130,9 @@ impl SessionStore {
         if ids.is_empty() {
             return;
         }
+        // Decide on everything the close terminates, not only the clicked
+        // rows: an exited parent can still own a running auxiliary terminal.
+        let ids = self.closure_set(ids);
         let has_running = ids.iter().any(|id| {
             self.sessions
                 .get(id)
@@ -2152,23 +2155,32 @@ impl SessionStore {
         self.pending_close = None;
     }
 
-    pub fn remove_sessions(&mut self, ids: Vec<SessionId>) {
+    /// Every session that closing `ids` terminates: the rows themselves and
+    /// their auxiliary terminals, which never outlive their parent.
+    pub(crate) fn closure_set(&self, ids: Vec<SessionId>) -> Vec<SessionId> {
         let mut ids = ids;
         let parents: HashSet<_> = ids.iter().cloned().collect();
-        ids.extend(
-            self.sessions
-                .values()
-                .filter(|session| {
-                    session
-                        .parent
-                        .as_ref()
-                        .is_some_and(|parent| parents.contains(parent))
-                        && is_auxiliary_terminal(session)
-                })
-                .map(|session| session.id.clone()),
-        );
+        let mut children: Vec<_> = self
+            .sessions
+            .values()
+            .filter(|session| {
+                session
+                    .parent
+                    .as_ref()
+                    .is_some_and(|parent| parents.contains(parent))
+                    && is_auxiliary_terminal(session)
+            })
+            .map(|session| session.id.clone())
+            .collect();
+        children.sort_by(|left, right| left.0.cmp(&right.0));
+        ids.extend(children);
         let mut unique = HashSet::new();
         ids.retain(|id| unique.insert(id.clone()));
+        ids
+    }
+
+    pub fn remove_sessions(&mut self, ids: Vec<SessionId>) {
+        let ids = self.closure_set(ids);
         let excluded: HashSet<_> = ids.iter().cloned().collect();
         if self
             .selected_session_id

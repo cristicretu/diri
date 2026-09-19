@@ -1113,6 +1113,82 @@ fn close_confirmation_only_gates_running_sessions() {
     assert!(drain(&mut effects).contains(&StoreEffect::Remove(id("running"))));
 }
 
+fn exited_parent_with_terminal(terminal_running: bool) -> Vec<SessionRecord> {
+    let exit = SessionStatus::Exited(ExitInfo {
+        reason: ExitReason::Exited,
+        code: Some(1),
+        signal: None,
+    });
+    let mut parent = session("parent", "p", 2.0);
+    parent.status = exit.clone();
+    let mut terminal = session("terminal", "p", 1.0);
+    terminal.kind = AgentKind::SHELL;
+    terminal.parent = Some(id("parent"));
+    if !terminal_running {
+        terminal.status = exit;
+    }
+    vec![parent, terminal]
+}
+
+fn removed_ids(effects: &mut mpsc::UnboundedReceiver<StoreEffect>) -> HashSet<SessionId> {
+    drain(effects)
+        .into_iter()
+        .filter_map(|effect| match effect {
+            StoreEffect::Remove(id) => Some(id),
+            _ => None,
+        })
+        .collect()
+}
+
+/// Closing a row also terminates its auxiliary terminal, so a build still
+/// running there has to raise the confirmation even though the parent exited.
+#[test]
+fn closing_an_exited_parent_confirms_for_its_running_auxiliary_terminal() {
+    let (mut store, mut effects) = hydrated(
+        exited_parent_with_terminal(true),
+        vec![project("p", "P")],
+        Prefs::default(),
+    );
+    drain(&mut effects);
+
+    store.request_close(vec![id("parent")]);
+    assert_eq!(
+        store.pending_close.as_ref().map(|pending| &pending.ids),
+        Some(&vec![id("parent"), id("terminal")]),
+        "the confirmation must cover every session the close terminates"
+    );
+    assert!(removed_ids(&mut effects).is_empty());
+
+    store.cancel_pending_close();
+    assert!(removed_ids(&mut effects).is_empty());
+    assert_eq!(store.ordered_sessions().len(), 1);
+    assert!(store.auxiliary_terminal_for(&id("parent")).is_some());
+
+    store.request_close(vec![id("parent")]);
+    store.confirm_pending_close();
+    assert_eq!(
+        removed_ids(&mut effects),
+        HashSet::from([id("parent"), id("terminal")])
+    );
+}
+
+#[test]
+fn closing_an_exited_parent_with_an_exited_terminal_needs_no_confirmation() {
+    let (mut store, mut effects) = hydrated(
+        exited_parent_with_terminal(false),
+        vec![project("p", "P")],
+        Prefs::default(),
+    );
+    drain(&mut effects);
+
+    store.request_close(vec![id("parent")]);
+    assert!(store.pending_close.is_none());
+    assert_eq!(
+        removed_ids(&mut effects),
+        HashSet::from([id("parent"), id("terminal")])
+    );
+}
+
 #[test]
 fn a_real_process_exit_immediately_detaches_and_removes_the_agent() {
     let (mut store, mut effects) = hydrated(
