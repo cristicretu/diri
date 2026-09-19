@@ -89,6 +89,9 @@ pub struct DiffSnapshot {
     pub deletions: usize,
     pub max_text_columns: usize,
     pub truncated: bool,
+    /// Untracked files left out by the preview's file-count limit. They are
+    /// still part of Git status, so status-driven bulk actions include them.
+    pub omitted_untracked: usize,
 }
 
 /// A review-surface selection. A plain click selects one source line, a shift
@@ -386,12 +389,14 @@ fn load_diff_from_repository(
         }
     }
 
-    if matches!(
+    let omitted_untracked = if matches!(
         source,
         LocalDiffSource::DefaultBranch | LocalDiffSource::Head | LocalDiffSource::Working
     ) {
-        append_untracked_diffs(repo_root, &mut patch)?;
-    }
+        append_untracked_diffs(repo_root, &mut patch)?
+    } else {
+        0
+    };
 
     let truncated = patch.len() > MAX_DIFF_BYTES;
     patch.truncate(MAX_DIFF_BYTES);
@@ -399,13 +404,31 @@ fn load_diff_from_repository(
     snapshot.repo_root = repo_root.to_path_buf();
     snapshot.base_ref = base_ref;
     snapshot.layer = layer;
-    snapshot.truncated = truncated;
+    snapshot.truncated = truncated || omitted_untracked > 0;
+    snapshot.omitted_untracked = omitted_untracked;
     if truncated {
         snapshot.rows.push(DiffRow {
             kind: DiffRowKind::Meta,
             old_line: None,
             new_line: None,
             text: "Diff truncated at 16 MB".to_owned(),
+        });
+    }
+    if omitted_untracked > 0 {
+        // Stage all takes its paths from Git status, not from this preview,
+        // so the notice has to say the hidden files are still in its scope.
+        let (files, them) = if omitted_untracked == 1 {
+            ("file", "it")
+        } else {
+            ("files", "them")
+        };
+        snapshot.rows.push(DiffRow {
+            kind: DiffRowKind::Meta,
+            old_line: None,
+            new_line: None,
+            text: format!(
+                "{omitted_untracked} more untracked {files} not shown (limit {MAX_UNTRACKED_FILES}); Stage all still includes {them}"
+            ),
         });
     }
     Ok(snapshot)
@@ -438,7 +461,9 @@ fn append_working_diff(repo_root: &Path, patch: &mut Vec<u8>) -> Result<(), Diff
     )
 }
 
-fn append_untracked_diffs(repo_root: &Path, patch: &mut Vec<u8>) -> Result<(), DiffError> {
+/// Appends a creation diff for each untracked file, up to the preview's file
+/// limit, and returns how many files that limit left out.
+fn append_untracked_diffs(repo_root: &Path, patch: &mut Vec<u8>) -> Result<usize, DiffError> {
     let untracked = git(
         repo_root,
         ["ls-files", "--others", "--exclude-standard", "-z"],
@@ -446,12 +471,13 @@ fn append_untracked_diffs(repo_root: &Path, patch: &mut Vec<u8>) -> Result<(), D
     if !untracked.status.success() {
         return Err(git_failure(&untracked));
     }
-    for path in untracked
-        .stdout
-        .split(|byte| *byte == 0)
-        .filter(|path| !path.is_empty())
-        .take(MAX_UNTRACKED_FILES)
-    {
+    let paths = || {
+        untracked
+            .stdout
+            .split(|byte| *byte == 0)
+            .filter(|path| !path.is_empty())
+    };
+    for path in paths().take(MAX_UNTRACKED_FILES) {
         if patch.len() >= MAX_DIFF_BYTES {
             break;
         }
@@ -477,7 +503,7 @@ fn append_untracked_diffs(repo_root: &Path, patch: &mut Vec<u8>) -> Result<(), D
         }
         append_bytes(patch, &output.stdout);
     }
-    Ok(())
+    Ok(paths().count().saturating_sub(MAX_UNTRACKED_FILES))
 }
 
 pub fn parse_unified_diff(patch: &str) -> DiffSnapshot {
@@ -1334,6 +1360,49 @@ mod tests {
                 .files,
             0
         );
+    }
+
+    #[test]
+    fn untracked_file_limit_is_reported_separately_from_the_byte_limit() {
+        for (count, omitted) in [(199, 0), (200, 0), (201, 1)] {
+            let directory = tempfile::tempdir().expect("temporary repository");
+            let root = directory.path();
+            init_with_baseline(root);
+            for index in 0..count {
+                fs::write(root.join(format!("new-{index:03}.txt")), "new\n").unwrap();
+            }
+
+            let snapshot = load_local_diff(root, DiffLayer::Working).expect("working lane");
+
+            assert_eq!(snapshot.files, count - omitted, "{count} untracked files");
+            assert_eq!(
+                snapshot.omitted_untracked, omitted,
+                "{count} untracked files"
+            );
+            assert_eq!(snapshot.truncated, omitted > 0, "{count} untracked files");
+            let notices: Vec<_> = snapshot
+                .rows
+                .iter()
+                .filter(|row| row.kind == DiffRowKind::Meta && row.text.contains("not shown"))
+                .map(|row| row.text.as_str())
+                .collect();
+            if omitted == 0 {
+                assert!(notices.is_empty(), "{count} untracked files: {notices:?}");
+            } else {
+                assert_eq!(
+                    notices,
+                    ["1 more untracked file not shown (limit 200); Stage all still includes it"]
+                );
+            }
+            // Tiny files never approach the byte limit, so its notice must not
+            // be the one explaining the omission.
+            assert!(
+                snapshot
+                    .rows
+                    .iter()
+                    .all(|row| row.text != "Diff truncated at 16 MB")
+            );
+        }
     }
 
     fn init_with_baseline(root: &Path) {
