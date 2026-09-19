@@ -119,6 +119,9 @@ pub(crate) struct WorkspaceWorkbench {
     external_owner: Option<SessionId>,
     mounted: HashMap<PaneId, MountedPane>,
     recent: VecDeque<PaneId>,
+    /// Panes of the tab on screen. Warm panes of other tabs keep streaming,
+    /// and only these may turn their output into a window repaint.
+    visible: HashSet<PaneId>,
     catalog_revision: Option<u64>,
     viewport: TerminalViewport,
     pending_focus: Option<PaneId>,
@@ -181,6 +184,7 @@ impl WorkspaceWorkbench {
             external_owner: None,
             mounted: HashMap::new(),
             recent: VecDeque::new(),
+            visible: HashSet::new(),
             catalog_revision: None,
             viewport: TerminalViewport::default(),
             pending_focus: None,
@@ -321,6 +325,7 @@ impl WorkspaceWorkbench {
             .iter()
             .map(|pane| pane.pane.clone())
             .collect::<HashSet<_>>();
+        self.visible.clone_from(&required_ids);
         for pane in &required {
             self.recent.retain(|id| *id != pane.pane);
             self.recent.push_back(pane.pane.clone());
@@ -363,7 +368,15 @@ impl WorkspaceWorkbench {
             let events = cx.subscribe(&terminal, |_, _, event: &TerminalPaneEvent, cx| {
                 cx.emit(WorkspaceWorkbenchEvent::Terminal(event.clone()));
             });
-            let output = cx.observe(&terminal, |_, _, cx| cx.notify());
+            let output_pane = identity.pane.clone();
+            let output = cx.observe(&terminal, move |this, _, cx| {
+                // A hidden pane's own notify invalidates nothing, but this
+                // one repaints the whole window: up to eight warm panes of
+                // another tab would each buy a frame nobody can see.
+                if this.visible.contains(&output_pane) {
+                    cx.notify();
+                }
+            });
             self.mounted.insert(
                 identity.pane,
                 MountedPane {
@@ -1000,6 +1013,8 @@ mod tests {
     use super::*;
     use diri_proto::workspace::{WorkspaceId, WorkspaceRecord, WorkspaceSnapshot};
     use gpui::TestAppContext;
+    use std::cell::Cell;
+    use std::rc::Rc;
 
     fn tab(duplicate: bool) -> WorkspaceTab {
         WorkspaceTab {
@@ -1400,6 +1415,77 @@ mod tests {
             assert!(owners(workbench,cx).is_empty(),"background warm views remain passive");
             window.remove_window();
         }).unwrap();
+        cx.run_until_parked();
+    }
+    #[gpui::test]
+    fn output_in_a_warm_hidden_pane_does_not_repaint_the_window(cx: &mut TestAppContext) {
+        let (runtime, tokio, _) = fixture(false);
+        let original =
+            runtime.store.read().unwrap().sessions()[&SessionId::new("preview-claude")].clone();
+        let mut tabs = Vec::new();
+        for index in 0..2 {
+            let mut session = (*original).clone();
+            session.id = SessionId::new(format!("session-{index}"));
+            runtime
+                .store
+                .write()
+                .unwrap()
+                .upsert_session(session.clone());
+            let pane = PaneId::new(format!("pane-{index}"));
+            tabs.push(WorkspaceTab {
+                id: TabId::new(format!("tab-{index}")),
+                title: None,
+                focused_pane: pane.clone(),
+                zoomed_pane: None,
+                layout: LayoutNode::Pane {
+                    id: pane,
+                    session_id: session.id,
+                },
+            });
+        }
+        seed(&runtime, tabs.clone(), 1);
+        let handle =
+            cx.add_window(|window, cx| WorkspaceWorkbench::new(runtime.clone(), tokio, window, cx));
+        let repaints = Rc::new(Cell::new(0usize));
+        let (hidden, shown, _observer) = handle
+            .update(cx, |workbench, window, cx| {
+                workbench.set_tab(tabs[0].clone(), viewport(), window, cx);
+                workbench.set_tab(tabs[1].clone(), viewport(), window, cx);
+                assert_eq!(workbench.mounted.len(), 2, "the first tab stays warm");
+                let hidden = workbench.mounted[&PaneId::new("pane-0")].terminal.clone();
+                let shown = workbench.mounted[&PaneId::new("pane-1")].terminal.clone();
+                let count = repaints.clone();
+                let observer = cx.observe(&cx.entity(), move |_, _, _| {
+                    count.set(count.get() + 1);
+                });
+                (hidden, shown, observer)
+            })
+            .unwrap();
+        cx.run_until_parked();
+        repaints.set(0);
+
+        hidden.update(cx, |_, cx| cx.notify());
+        cx.run_until_parked();
+        assert_eq!(repaints.get(), 0, "a hidden pane's output buys no frame");
+
+        shown.update(cx, |_, cx| cx.notify());
+        cx.run_until_parked();
+        assert_eq!(repaints.get(), 1, "the pane on screen still repaints");
+
+        handle
+            .update(cx, |workbench, window, cx| {
+                workbench.set_tab(tabs[0].clone(), viewport(), window, cx);
+            })
+            .unwrap();
+        cx.run_until_parked();
+        repaints.set(0);
+        hidden.update(cx, |_, cx| cx.notify());
+        cx.run_until_parked();
+        assert_eq!(repaints.get(), 1, "switching back makes it live again");
+
+        handle
+            .update(cx, |_, window, _| window.remove_window())
+            .unwrap();
         cx.run_until_parked();
     }
     #[gpui::test]
