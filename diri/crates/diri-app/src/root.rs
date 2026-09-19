@@ -3230,7 +3230,7 @@ impl RootView {
                     })
                 });
             let strip = self.sidebar.update(cx, |sidebar, cx| {
-                sidebar.render_horizontal_tabs(card_width, trailing, window, cx)
+                sidebar.render_horizontal_tabs(card_width, trailing, cx)
             });
             card = card.child(
                 div()

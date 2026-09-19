@@ -586,7 +586,6 @@ impl Sidebar {
         &mut self,
         available_width: f32,
         trailing: Option<AnyElement>,
-        window: &mut Window,
         cx: &mut Context<Self>,
     ) -> AnyElement {
         // While horizontal tabs hide the panel this strip is the sidebar's
@@ -600,7 +599,7 @@ impl Sidebar {
             self.activity_frame = 0;
         }
         let strip = self.horizontal_strip(available_width, trailing, cx);
-        self.schedule_activity_tick(window, cx);
+        self.schedule_activity_tick(cx);
         strip
     }
 
@@ -746,11 +745,11 @@ mod tests {
         sidebar: Entity<Sidebar>,
     }
     impl Render for StripOnly {
-        fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
             div()
                 .size_full()
                 .child(self.sidebar.update(cx, |sidebar, cx| {
-                    sidebar.render_horizontal_tabs(900.0, None, window, cx)
+                    sidebar.render_horizontal_tabs(900.0, None, cx)
                 }))
         }
     }
@@ -858,6 +857,45 @@ mod tests {
             assert!(!sidebar.working_row_rendered);
             assert!(sidebar.activity_tick.is_none());
         });
+    }
+
+    /// A floating menu is its own window and reads the sidebar while it
+    /// draws, so GPUI comes to regard that window as the sidebar's. Closing
+    /// it leaves the sidebar with no window until the main one draws again,
+    /// and a tick landing in that gap must not strand the working marks.
+    #[gpui::test]
+    fn working_mark_keeps_ticking_after_a_floating_window_closes(cx: &mut TestAppContext) {
+        struct Panel {
+            sidebar: Entity<Sidebar>,
+        }
+        impl Render for Panel {
+            fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+                let _ = self.sidebar.read(cx).is_visible();
+                div()
+            }
+        }
+        let (sidebar, cx) = strip_harness(cx, false);
+        cx.update(|window, _| window.activate_window());
+        cx.run_until_parked();
+        let panel = cx.update(|_, cx| {
+            let sidebar = sidebar.clone();
+            cx.open_window(Default::default(), |_, cx| cx.new(|_| Panel { sidebar }))
+                .unwrap()
+        });
+        cx.run_until_parked();
+        panel
+            .update(cx, |_, window, _| window.remove_window())
+            .unwrap();
+        cx.run_until_parked();
+        for _ in 0..3 {
+            let frame = sidebar.read_with(cx, |sidebar, _| sidebar.activity_frame);
+            cx.executor().advance_clock(Duration::from_millis(125));
+            cx.run_until_parked();
+            assert_eq!(
+                sidebar.read_with(cx, |sidebar, _| sidebar.activity_frame),
+                (frame + 1) % 8,
+            );
+        }
     }
 
     #[gpui::test]

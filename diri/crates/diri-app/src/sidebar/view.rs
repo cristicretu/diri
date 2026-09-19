@@ -4099,23 +4099,24 @@ impl Sidebar {
         Some(pill.into_any_element())
     }
 
-    fn ensure_number_flow_tick(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+    /// Window-free for the same reason as `schedule_activity_tick`.
+    fn ensure_number_flow_tick(&mut self, cx: &mut Context<Self>) {
         if self.number_tick.is_some() {
             return;
         }
-        self.number_tick = Some(cx.spawn_in(window, async move |this, cx| {
+        self.number_tick = Some(cx.spawn(async move |this, cx| {
             loop {
                 cx.background_executor()
                     .timer(Duration::from_millis(16))
                     .await;
                 let done = this
-                    .update_in(cx, |this, _, cx| {
+                    .update(cx, |this, cx| {
                         cx.notify();
                         !this.number_flows.running()
                     })
                     .unwrap_or(true);
                 if done {
-                    let _ = this.update_in(cx, |this, _, _| this.number_tick = None);
+                    let _ = this.update(cx, |this, _| this.number_tick = None);
                     break;
                 }
             }
@@ -6227,7 +6228,12 @@ impl Sidebar {
     /// Visibility/occlusion is GPUI's job (display-link stops when the
     /// window is truly hidden). `is_window_active` is only OS focus, so
     /// gating on it freezes a still-visible window on another monitor.
-    fn schedule_activity_tick(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+    ///
+    /// The wake updates the entity, never `update_in`: that resolves the
+    /// window that last drew the sidebar, which can be a floating menu. Once
+    /// that menu closes the sidebar has no window until the main one draws
+    /// again, the update fails, and the spent task would block every rearm.
+    fn schedule_activity_tick(&mut self, cx: &mut Context<Self>) {
         let animate = self.working_row_rendered
             && self.activity_marks_painted()
             && self.settings_nav.is_none()
@@ -6235,11 +6241,11 @@ impl Sidebar {
         if !animate {
             self.activity_tick = None;
         } else if self.activity_tick.is_none() {
-            self.activity_tick = Some(cx.spawn_in(window, async move |this, cx| {
+            self.activity_tick = Some(cx.spawn(async move |this, cx| {
                 cx.background_executor()
                     .timer(Duration::from_millis(125))
                     .await;
-                let _ = this.update_in(cx, |this, _window, cx| {
+                let _ = this.update(cx, |this, cx| {
                     this.activity_tick = None;
                     if this.activity_marks_painted()
                         && this.settings_nav.is_none()
@@ -7629,17 +7635,17 @@ impl Render for Sidebar {
             // A covered native window can stop delivering display-link
             // callbacks. Like the activity mark, explicitly invalidate the
             // cached sidebar; this one-shot ends with the finite disclosure.
-            self.disclosure_tick = Some(cx.spawn_in(window, async move |this, cx| {
+            self.disclosure_tick = Some(cx.spawn(async move |this, cx| {
                 cx.background_executor()
                     .timer(Duration::from_millis(16))
                     .await;
-                let _ = this.update_in(cx, |this, _, cx| {
+                let _ = this.update(cx, |this, cx| {
                     this.disclosure_tick = None;
                     cx.notify();
                 });
             }));
         }
-        self.schedule_activity_tick(window, cx);
+        self.schedule_activity_tick(cx);
 
         let mut root = div()
             .id("sidebar")
@@ -7764,7 +7770,7 @@ impl Render for Sidebar {
         }
         root = root.child(self.account_footer(colors, cx));
         if self.number_flows.running() {
-            self.ensure_number_flow_tick(window, cx);
+            self.ensure_number_flow_tick(cx);
         }
         // Paint the edge without reducing the shared sidebar content width.
         root = root.when(!self.surface_in_parent, |root| {
