@@ -1,0 +1,9 @@
+# `WeakEntity::update_in` runs in the last window that drew the entity, not the
+# window its task was spawned in. A floating panel renders its host, so closing
+# one leaves the host with no window and the call failing; a loop that reads the
+# failure as "view gone" then stops for good. That froze a terminal on its last
+# frame until something else repainted it. Tests drive an `Entity`, whose
+# `update_in` names its window explicitly and is unaffected.
+disallowed-methods = [
+    { path = "gpui::WeakEntity::update_in", reason = "resolves GPUI's current window, which a closed floating panel leaves empty; use crate::floating::update_in_owner" },
+]

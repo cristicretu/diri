@@ -22,10 +22,10 @@ use std::rc::Rc;
 
 use diri_ui::{Glass, Radius, SemanticColors};
 use gpui::{
-    Anchor, AnyElement, AnyWindowHandle, App, Bounds, BoxShadow, Context, DisplayId, Div, Entity,
-    EntityId, Global, Pixels, Point, Render, Size, Subscription, WeakEntity, Window,
-    WindowBackgroundAppearance, WindowBounds, WindowKind, WindowOptions, div, point, prelude::*,
-    px, size,
+    Anchor, AnyElement, AnyWindowHandle, App, AsyncApp, AsyncWindowContext, Bounds, BoxShadow,
+    Context, DisplayId, Div, Entity, EntityId, Global, Pixels, Point, Render, Size, Subscription,
+    WeakEntity, Window, WindowBackgroundAppearance, WindowBounds, WindowKind, WindowOptions, div,
+    point, prelude::*, px, size,
 };
 
 /// Present once the running app may open panels. Tests and previews never set
@@ -335,6 +335,35 @@ pub(crate) fn in_main_window<T: 'static>(
         }
         _ => f(this, window, cx),
     }
+}
+
+/// `WeakEntity::update_in` for a task that must outlive panels. GPUI runs
+/// `update_in` in the last window that *drew* the entity, not the one the task
+/// was spawned in. A panel renders its host, so the host belongs to the panel
+/// until the main window draws again, and to no window at all once the panel
+/// closes; an update landing in that gap fails, and a loop that treats the
+/// failure as "view gone" stops for good (a terminal that no longer repaints
+/// on output). This runs in the host's registered main window, else the
+/// window the task was spawned in, and so returns `None` only when that window
+/// or the entity really is gone.
+pub(crate) fn update_in_owner<T: 'static, R>(
+    this: &WeakEntity<T>,
+    cx: &mut AsyncWindowContext,
+    update: impl FnOnce(&mut T, &mut Window, &mut Context<T>) -> R,
+) -> Option<R> {
+    let entity = this.upgrade()?;
+    let spawned_in = cx.window_handle();
+    let app: &AsyncApp = cx;
+    app.update(|cx| {
+        let owner = cx
+            .try_global::<Registry>()
+            .and_then(|registry| registry.mains.get(&entity.entity_id()).copied())
+            .unwrap_or(spawned_in);
+        cx.update_window(owner, |_, window, cx| {
+            entity.update(cx, |this, cx| update(this, window, cx))
+        })
+        .ok()
+    })
 }
 
 /// Opens, moves, or closes `target`'s panel to match `frame`. Runs at App
@@ -650,6 +679,51 @@ mod tests {
             assert!(!registry.mains.contains_key(&id));
             assert!(!registry.watchers.contains_key(&id));
         });
+    }
+
+    /// A handler inside a panel spawns its tasks in the panel's window, which
+    /// is gone by the time most of them finish.
+    #[gpui::test]
+    fn owner_updates_outlive_the_panel_they_were_spawned_in(cx: &mut gpui::TestAppContext) {
+        struct Host {
+            updated_in: Option<AnyWindowHandle>,
+        }
+        impl Render for Host {
+            fn render(&mut self, _: &mut Window, _: &mut gpui::Context<Self>) -> impl IntoElement {
+                div()
+            }
+        }
+        cx.update(enable);
+        let (host, cx) = cx.add_window_view(|_, _| Host { updated_in: None });
+        let main = cx.update(|window, cx| {
+            host.update(cx, |_, cx| register_host(window, cx));
+            window.window_handle()
+        });
+        let panel = cx.update(|_, cx| {
+            cx.open_window(Default::default(), |_, cx| {
+                cx.new(|_| Host { updated_in: None })
+            })
+            .unwrap()
+        });
+        let (release, released) = tokio::sync::oneshot::channel::<()>();
+        panel
+            .update(cx, |_, window, cx| {
+                let host = host.downgrade();
+                window
+                    .spawn(cx, async move |cx| {
+                        let _ = released.await;
+                        update_in_owner(&host, cx, |host, window, _| {
+                            host.updated_in = Some(window.window_handle());
+                        })
+                    })
+                    .detach();
+                window.remove_window();
+            })
+            .unwrap();
+        cx.run_until_parked();
+        release.send(()).unwrap();
+        cx.run_until_parked();
+        assert_eq!(host.read_with(cx, |host, _| host.updated_in), Some(main));
     }
 
     fn main() -> Bounds<Pixels> {

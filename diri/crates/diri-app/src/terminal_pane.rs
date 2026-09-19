@@ -731,13 +731,12 @@ impl TerminalPane {
         let pane_events = cx.spawn_in(window, async move |this, cx| {
             let mut batch = Vec::new();
             while pane_rx.recv_batch(&mut batch).await {
-                if this
-                    .update_in(cx, |this, window, cx| {
-                        for event in batch.drain(..) {
-                            this.handle_pane_event(event, window, cx);
-                        }
-                    })
-                    .is_err()
+                if crate::floating::update_in_owner(&this, cx, |this, window, cx| {
+                    for event in batch.drain(..) {
+                        this.handle_pane_event(event, window, cx);
+                    }
+                })
+                .is_none()
                 {
                     return;
                 }
@@ -749,11 +748,10 @@ impl TerminalPane {
             loop {
                 match changes.recv().await {
                     Ok(()) | Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
-                        if this
-                            .update_in(cx, |this, window, cx| {
-                                this.reconcile_store_change(window, cx);
-                            })
-                            .is_err()
+                        if crate::floating::update_in_owner(&this, cx, |this, window, cx| {
+                            this.reconcile_store_change(window, cx);
+                        })
+                        .is_none()
                         {
                             return;
                         }
@@ -1607,7 +1605,9 @@ impl TerminalPane {
     ) {
         cx.spawn_in(window, async move |this, cx| {
             cx.background_executor().timer(delay).await;
-            let _ = this.update_in(cx, |this, _window, _cx| this.start_due_find(&id));
+            let _ = crate::floating::update_in_owner(&this, cx, |this, _window, _cx| {
+                this.start_due_find(&id)
+            });
         })
         .detach();
     }
@@ -5572,6 +5572,90 @@ mod tests {
                 window.remove_window();
             })
             .unwrap();
+    }
+
+    /// The links panel is its own window and renders the pane while it draws,
+    /// so GPUI comes to regard that window as the pane's. Closing it leaves
+    /// the pane with no window until the main one draws again, and only
+    /// terminal output asks for that draw: output landing in the gap must
+    /// still repaint, or the session stays frozen until something else does.
+    #[gpui::test]
+    fn output_keeps_repainting_after_a_floating_window_closes(cx: &mut TestAppContext) {
+        struct Panel {
+            pane: Entity<TerminalPane>,
+        }
+        impl Render for Panel {
+            fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+                let _ = self.pane.read(cx).selected_id();
+                div()
+            }
+        }
+        let runtime = Arc::new(StoreRuntime::inert());
+        let tokio = Arc::new(
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap(),
+        );
+        let mut session = fixture_session();
+        session.host = None;
+        let id = session.id.clone();
+        {
+            let mut store = runtime.store.write().unwrap();
+            store.upsert_session(session);
+            store.select(id.clone());
+        }
+        let (pane, cx) = cx.add_window_view({
+            let runtime = runtime.clone();
+            move |window, cx| TerminalPane::new(runtime, tokio, window, cx)
+        });
+        cx.run_until_parked();
+        let (sender, generation) = pane.read_with(cx, |pane, _| {
+            (
+                pane.pane_tx.clone(),
+                pane.residents[&id].attachment_generation,
+            )
+        });
+
+        let panel = cx.update(|_, cx| {
+            let pane = pane.clone();
+            cx.open_window(Default::default(), |_, cx| cx.new(|_| Panel { pane }))
+                .unwrap()
+        });
+        cx.run_until_parked();
+        panel
+            .update(cx, |_, window, _| window.remove_window())
+            .unwrap();
+        cx.run_until_parked();
+
+        for _ in 0..3 {
+            let before = pane.read_with(cx, |pane, _| pane.render_count);
+            sender
+                .send(PaneEvent::ControllerDamage(id.clone(), generation, true))
+                .expect("the pane still listens for output");
+            cx.run_until_parked();
+            assert!(
+                pane.read_with(cx, |pane, _| pane.render_count) > before,
+                "terminal output must repaint the pane"
+            );
+        }
+
+        // Selection changes reach the pane through the same kind of loop.
+        let mut other = fixture_session();
+        other.host = None;
+        other.id = SessionId::new("after-the-panel");
+        let other_id = other.id.clone();
+        {
+            let mut store = runtime.store.write().unwrap();
+            store.upsert_session(other);
+            store.select(other_id.clone());
+        }
+        runtime.publish_local_change();
+        cx.run_until_parked();
+        assert_eq!(
+            pane.read_with(cx, |pane, _| pane.observed_selected_id.clone()),
+            Some(other_id)
+        );
     }
 
     #[gpui::test]

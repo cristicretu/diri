@@ -20,6 +20,8 @@ struct ReplayDemo {
 }
 
 impl ReplayDemo {
+    // One window and no floating panels, so the view's window never changes.
+    #[allow(clippy::disallowed_methods)]
     fn new(window: &mut Window, cx: &mut Context<Self>) -> Self {
         let focus = cx.focus_handle();
         window.focus(&focus, cx);

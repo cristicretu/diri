@@ -181,7 +181,7 @@ impl TerminalPane {
         cx.notify();
         self.qol.feedback_timer = Some(cx.spawn_in(window, async move |this, cx| {
             cx.background_executor().timer(Duration::from_secs(3)).await;
-            let _ = this.update_in(cx, |this, _, cx| {
+            let _ = crate::floating::update_in_owner(&this, cx, |this, _, cx| {
                 if this.selected_id() == session && this.qol.feedback_generation == generation {
                     this.qol.feedback = None;
                     cx.notify();
@@ -384,41 +384,38 @@ impl TerminalPane {
                 cx.background_executor()
                     .timer(Duration::from_millis(32))
                     .await;
-                let keep = this
-                    .update_in(cx, |this, window, cx| {
-                        let Some((id, col, row, delta)) = this.qol.drag.clone() else {
-                            return false;
-                        };
-                        if this.selected_id().as_ref() != Some(&id)
-                            || !this.focus.is_focused(window)
-                        {
-                            this.qol.drag = None;
-                            return false;
-                        }
-                        let Some(resident) = this.residents.get(&id) else {
-                            return false;
-                        };
-                        if resident.pointer_owner
-                            != Some((MouseButton::Left, PointerOwner::LocalSelection))
-                        {
-                            return false;
-                        }
-                        let rows = usize::from(resident.last_size.1);
-                        resident.element.set_view_offset(
-                            resident.element.view_offset().saturating_add(delta),
-                            rows,
-                        );
-                        resident.element.drag_selection(col, row);
-                        this.pump_scrollback_fetch(&id, rows);
-                        cx.notify();
-                        true
-                    })
-                    .unwrap_or(false);
+                let keep = crate::floating::update_in_owner(&this, cx, |this, window, cx| {
+                    let Some((id, col, row, delta)) = this.qol.drag.clone() else {
+                        return false;
+                    };
+                    if this.selected_id().as_ref() != Some(&id) || !this.focus.is_focused(window) {
+                        this.qol.drag = None;
+                        return false;
+                    }
+                    let Some(resident) = this.residents.get(&id) else {
+                        return false;
+                    };
+                    if resident.pointer_owner
+                        != Some((MouseButton::Left, PointerOwner::LocalSelection))
+                    {
+                        return false;
+                    }
+                    let rows = usize::from(resident.last_size.1);
+                    resident.element.set_view_offset(
+                        resident.element.view_offset().saturating_add(delta),
+                        rows,
+                    );
+                    resident.element.drag_selection(col, row);
+                    this.pump_scrollback_fetch(&id, rows);
+                    cx.notify();
+                    true
+                })
+                .unwrap_or(false);
                 if !keep {
                     break;
                 }
             }
-            let _ = this.update_in(cx, |this, _, _| {
+            let _ = crate::floating::update_in_owner(&this, cx, |this, _, _| {
                 this.qol.autoscroll = None;
             });
         }));
@@ -688,7 +685,7 @@ impl TerminalPane {
         self.show_terminal_feedback("Reading retained terminal output…", window, cx);
         cx.spawn_in(window, async move |this, cx| {
             let result = task.await;
-            let _ = this.update_in(cx, |this, window, cx| {
+            let _ = crate::floating::update_in_owner(&this, cx, |this, window, cx| {
                 if this.selected_id().as_ref() != Some(&id) { return; }
                 this.qol.busy = false;
                 if !this.residents.get(&id).is_some_and(|resident| resident.attachment_generation == generation) {

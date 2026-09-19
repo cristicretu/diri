@@ -139,7 +139,7 @@ impl NavigationOverlay {
                 Ok(result) => result.map_err(|error| error.to_string()),
                 Err(error) => Err(error.to_string()),
             };
-            let _ = this.update_in(cx, |this, window, cx| {
+            let _ = crate::floating::update_in_owner(&this, cx, |this, window, cx| {
                 this.history_resuming = None;
                 match result {
                     Ok(id) => {

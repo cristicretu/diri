@@ -2101,7 +2101,7 @@ impl LauncherOverlay {
                 Ok(Ok(Some(mut paths))) => paths.pop(),
                 _ => None,
             };
-            let _ = this.update_in(cx, |this, window, cx| {
+            let _ = crate::floating::update_in_owner(&this, cx, |this, window, cx| {
                 if apply_folder_choice(&mut this.selected_root, selected.as_deref()) {
                     this.pending_recipe_activation = None;
                     this.selected_host = None;

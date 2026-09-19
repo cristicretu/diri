@@ -859,7 +859,7 @@ impl Sidebar {
             cx.background_executor()
                 .timer(Duration::from_millis(240))
                 .await;
-            let _ = this.update_in(cx, |this, window, cx| {
+            let _ = crate::floating::update_in_owner(&this, cx, |this, window, cx| {
                 this.peek_close = None;
                 if this.peek_open
                     && !this.peek_hovered
@@ -1112,7 +1112,7 @@ impl Sidebar {
             let Some(path) = paths.pop() else {
                 return;
             };
-            let _ = this.update_in(cx, |this, _window, cx| {
+            let _ = crate::floating::update_in_owner(&this, cx, |this, _window, cx| {
                 this.apply_browsed_local_folder(&requested_by, path.to_string_lossy().into_owned());
                 cx.notify();
             });
@@ -1664,7 +1664,7 @@ impl Sidebar {
             cx.background_executor()
                 .timer(Duration::from_millis(700))
                 .await;
-            let _ = this.update_in(cx, |this, window, cx| {
+            let _ = crate::floating::update_in_owner(&this, cx, |this, window, cx| {
                 this.hover_task = None;
                 if this.ui.hovered_session.as_ref() == Some(&id) && this.can_show_hover_card(window)
                 {

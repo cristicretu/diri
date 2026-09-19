@@ -1026,110 +1026,109 @@ impl RootView {
             loop {
                 match workbench_changes.recv().await {
                     Ok(()) | Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
-                        if this
-                            .update_in(cx, |this, window, cx| {
-                                let launched = {
-                                    let mut store = this.window_store.write().expect("store");
-                                    let before = store.selected_session_id().cloned();
-                                    store.accept_completed_launches(true);
-                                    (store.selected_session_id() != before.as_ref())
-                                        .then(|| store.selected_session_id().cloned())
-                                        .flatten()
-                                };
-                                if let Some(id) = launched {
-                                    this.open_workspace_launch_session(id, window, cx);
-                                }
-                                let actions = this
-                                    .window_store
-                                    .write()
-                                    .expect("store")
-                                    .take_window_actions();
-                                for action in actions {
-                                    window.activate_window();
-                                    match action {
-                                        crate::store::WindowAction::Focus => {}
-                                        crate::store::WindowAction::OpenNotification {
-                                            session,
-                                            notification,
-                                        } => this.open_notification(
-                                            session,
-                                            Some(notification),
-                                            window,
-                                            cx,
-                                        ),
-                                        crate::store::WindowAction::Select(id) => {
-                                            this.open_workspace_launch_session(id, window, cx);
-                                        }
-                                        crate::store::WindowAction::Close(id) => this
-                                            .window_store
-                                            .write()
-                                            .expect("store")
-                                            .request_close(vec![id]),
-                                        crate::store::WindowAction::OpenLauncher => {
-                                            this.open_launcher(&OpenLauncher, window, cx)
-                                        }
-                                        crate::store::WindowAction::OpenSettings => {
-                                            this.run_command(CommandId::OpenSettings, window, cx)
-                                        }
-                                        crate::store::WindowAction::Spawn(kind) => {
-                                            this.spawn(kind);
-                                        }
+                        if crate::floating::update_in_owner(&this, cx, |this, window, cx| {
+                            let launched = {
+                                let mut store = this.window_store.write().expect("store");
+                                let before = store.selected_session_id().cloned();
+                                store.accept_completed_launches(true);
+                                (store.selected_session_id() != before.as_ref())
+                                    .then(|| store.selected_session_id().cloned())
+                                    .flatten()
+                            };
+                            if let Some(id) = launched {
+                                this.open_workspace_launch_session(id, window, cx);
+                            }
+                            let actions = this
+                                .window_store
+                                .write()
+                                .expect("store")
+                                .take_window_actions();
+                            for action in actions {
+                                window.activate_window();
+                                match action {
+                                    crate::store::WindowAction::Focus => {}
+                                    crate::store::WindowAction::OpenNotification {
+                                        session,
+                                        notification,
+                                    } => this.open_notification(
+                                        session,
+                                        Some(notification),
+                                        window,
+                                        cx,
+                                    ),
+                                    crate::store::WindowAction::Select(id) => {
+                                        this.open_workspace_launch_session(id, window, cx);
                                     }
-                                }
-                                // This loop runs on every store change; probe under
-                                // a read lock so only the rare menu-bar request
-                                // pays for exclusive access.
-                                let pending = this
-                                    .window_store
-                                    .read()
-                                    .expect("session store lock poisoned")
-                                    .has_pending_ui_request();
-                                let (open_launcher, open_settings) = if pending {
-                                    let mut store = this
+                                    crate::store::WindowAction::Close(id) => this
                                         .window_store
                                         .write()
-                                        .expect("session store lock poisoned");
-                                    (
-                                        store.take_open_launcher_request(),
-                                        store.take_open_settings_request(),
-                                    )
-                                } else {
-                                    (false, false)
-                                };
-                                if open_launcher {
-                                    this.open_launcher(&OpenLauncher, window, cx);
-                                }
-                                if open_settings && let Some(surfaces) = &this.utility_surfaces {
-                                    surfaces.update(cx, |surfaces, cx| surfaces.open_settings(cx));
-                                }
-                                if let Some(inspector) = &this.inspector {
-                                    inspector.update(cx, |inspector, cx| {
-                                        inspector.sync_workspace_session(cx)
-                                    });
-                                }
-                                this.sync_workspace_spawn_context(cx);
-                                this.sync_inspector_context(cx);
-                                this.sync_auxiliary_terminal(window, cx);
-                                let error = this
-                                    .window_store
-                                    .read()
-                                    .expect("store")
-                                    .workspace_catalog()
-                                    .error
-                                    .clone();
-                                if error != this.workspace_error {
-                                    this.workspace_error = error.clone();
-                                    if let Some(error) = error {
-                                        this.show_quote_feedback(
-                                            "Workspace change was not saved",
-                                            error,
-                                            cx,
-                                        );
+                                        .expect("store")
+                                        .request_close(vec![id]),
+                                    crate::store::WindowAction::OpenLauncher => {
+                                        this.open_launcher(&OpenLauncher, window, cx)
+                                    }
+                                    crate::store::WindowAction::OpenSettings => {
+                                        this.run_command(CommandId::OpenSettings, window, cx)
+                                    }
+                                    crate::store::WindowAction::Spawn(kind) => {
+                                        this.spawn(kind);
                                     }
                                 }
-                                cx.notify();
-                            })
-                            .is_err()
+                            }
+                            // This loop runs on every store change; probe under
+                            // a read lock so only the rare menu-bar request
+                            // pays for exclusive access.
+                            let pending = this
+                                .window_store
+                                .read()
+                                .expect("session store lock poisoned")
+                                .has_pending_ui_request();
+                            let (open_launcher, open_settings) = if pending {
+                                let mut store = this
+                                    .window_store
+                                    .write()
+                                    .expect("session store lock poisoned");
+                                (
+                                    store.take_open_launcher_request(),
+                                    store.take_open_settings_request(),
+                                )
+                            } else {
+                                (false, false)
+                            };
+                            if open_launcher {
+                                this.open_launcher(&OpenLauncher, window, cx);
+                            }
+                            if open_settings && let Some(surfaces) = &this.utility_surfaces {
+                                surfaces.update(cx, |surfaces, cx| surfaces.open_settings(cx));
+                            }
+                            if let Some(inspector) = &this.inspector {
+                                inspector.update(cx, |inspector, cx| {
+                                    inspector.sync_workspace_session(cx)
+                                });
+                            }
+                            this.sync_workspace_spawn_context(cx);
+                            this.sync_inspector_context(cx);
+                            this.sync_auxiliary_terminal(window, cx);
+                            let error = this
+                                .window_store
+                                .read()
+                                .expect("store")
+                                .workspace_catalog()
+                                .error
+                                .clone();
+                            if error != this.workspace_error {
+                                this.workspace_error = error.clone();
+                                if let Some(error) = error {
+                                    this.show_quote_feedback(
+                                        "Workspace change was not saved",
+                                        error,
+                                        cx,
+                                    );
+                                }
+                            }
+                            cx.notify();
+                        })
+                        .is_none()
                         {
                             return;
                         }
@@ -1180,19 +1179,18 @@ impl RootView {
         #[cfg(target_os = "macos")]
         let browser_state_sync = cx.spawn_in(window, async move |this, cx| {
             while browser_events.recv().await.is_some() {
-                if this
-                    .update_in(cx, |this, _window, cx| {
-                        if let Some(inspector) = this.inspector.clone() {
-                            let states = this.browser.borrow().tab_states();
-                            inspector.update(cx, |inspector, cx| {
-                                for (id, state) in states {
-                                    inspector.set_browser_tab_state(id, state, cx);
-                                }
-                            });
-                            cx.notify();
-                        }
-                    })
-                    .is_err()
+                if crate::floating::update_in_owner(&this, cx, |this, _window, cx| {
+                    if let Some(inspector) = this.inspector.clone() {
+                        let states = this.browser.borrow().tab_states();
+                        inspector.update(cx, |inspector, cx| {
+                            for (id, state) in states {
+                                inspector.set_browser_tab_state(id, state, cx);
+                            }
+                        });
+                        cx.notify();
+                    }
+                })
+                .is_none()
                 {
                     return;
                 }
@@ -1376,7 +1374,7 @@ impl RootView {
             cx.background_executor()
                 .timer(WINDOW_BOUNDS_SAVE_DELAY)
                 .await;
-            let _ = this.update_in(cx, |this, _window, _cx| {
+            let _ = crate::floating::update_in_owner(&this, cx, |this, _window, _cx| {
                 this.window_bounds_save.take();
                 if let Err(error) = this
                     .window_store
@@ -4760,13 +4758,17 @@ impl Render for RootView {
                             this.sidebar_peek_dwell =
                                 Some(cx.spawn_in(window, async move |this, cx| {
                                     cx.background_executor().timer(SIDEBAR_PEEK_DWELL).await;
-                                    let _ = this.update_in(cx, |this, window, cx| {
-                                        this.sidebar_peek_dwell = None;
-                                        this.sidebar.update(cx, |sidebar, cx| {
-                                            sidebar.hover_peek_region(true, window, cx);
-                                            sidebar.peek(window, cx);
-                                        });
-                                    });
+                                    let _ = crate::floating::update_in_owner(
+                                        &this,
+                                        cx,
+                                        |this, window, cx| {
+                                            this.sidebar_peek_dwell = None;
+                                            this.sidebar.update(cx, |sidebar, cx| {
+                                                sidebar.hover_peek_region(true, window, cx);
+                                                sidebar.peek(window, cx);
+                                            });
+                                        },
+                                    );
                                 }));
                         }
                     })),

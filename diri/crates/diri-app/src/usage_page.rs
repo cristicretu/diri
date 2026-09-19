@@ -1497,14 +1497,15 @@ impl UtilitySurfaces {
                 cx.background_executor()
                     .timer(Duration::from_millis(16))
                     .await;
-                let done = this
-                    .update_in(cx, |this, _, cx| {
-                        cx.notify();
-                        this.usage_chart_window.finished() && !this.usage_numbers.running()
-                    })
-                    .unwrap_or(true);
+                let done = crate::floating::update_in_owner(&this, cx, |this, _, cx| {
+                    cx.notify();
+                    this.usage_chart_window.finished() && !this.usage_numbers.running()
+                })
+                .unwrap_or(true);
                 if done {
-                    let _ = this.update_in(cx, |this, _, _| this.usage_chart_tick = None);
+                    let _ = crate::floating::update_in_owner(&this, cx, |this, _, _| {
+                        this.usage_chart_tick = None
+                    });
                     break;
                 }
             }

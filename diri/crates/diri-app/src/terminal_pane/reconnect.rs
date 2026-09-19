@@ -74,7 +74,7 @@ impl TerminalPane {
                 .await
                 .map_err(|error| error.to_string())
                 .and_then(|result| result.map_err(|error| error.to_string()));
-            let _ = this.update_in(cx, |this, window, cx| {
+            let _ = crate::floating::update_in_owner(&this, cx, |this, window, cx| {
                 // Session events remain authoritative. A delayed RPC response
                 // must not overwrite a newer Connected/Exited projection.
                 if this.selected_id().as_ref() != Some(&id) {

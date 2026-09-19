@@ -842,7 +842,7 @@ impl UtilitySurfaces {
                 Ok(Ok(Some(paths))) => paths,
                 _ => Vec::new(),
             };
-            let _ = this.update_in(cx, |this, window, cx| {
+            let _ = crate::floating::update_in_owner(&this, cx, |this, window, cx| {
                 if !selected.is_empty() {
                     this.consume_root_picks(selected, cx);
                 }
@@ -3513,7 +3513,7 @@ impl UtilitySurfaces {
                             let Some(path) = paths.pop() else {
                                 return;
                             };
-                            let _ = this.update_in(cx, |this, _, cx| {
+                            let _ = crate::floating::update_in_owner(&this, cx, |this, _, cx| {
                                 this.store
                                     .write()
                                     .expect("session store lock poisoned")
