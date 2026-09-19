@@ -13,20 +13,23 @@
 //! pair is returned bit-for-bit unchanged. Solved pairs live in a bounded
 //! cache because the renderer resolves every cell several times per paint.
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 
 use diri_proto::grid::{GridCell, TermColor, TermStyle};
 use gpui::Rgba;
 
 use crate::theme::TermTheme;
 
+mod faint;
+
 /// WCAG AA for body text.
 pub(crate) const MINIMUM_TEXT_CONTRAST: f32 = 4.5;
 /// SGR faint text is meant to recede, so it is held to the WCAG floor for
 /// large text and interface components.
 pub(crate) const MINIMUM_DIM_CONTRAST: f32 = 3.0;
-/// Opacity the renderer gives SGR faint text.
-pub(crate) const DIM_OPACITY: f32 = 0.5;
+/// The half-opacity blend SGR faint text used to be, and still the measure of
+/// how far faint text recedes; see [`faint`].
+const DIM_OPACITY: f32 = 0.5;
 
 /// Below this Oklch chroma a color has no hue worth preserving.
 const NEUTRAL_CHROMA: f32 = 0.02;
@@ -75,21 +78,32 @@ pub(crate) fn applies(cell: GridCell) -> bool {
 /// The readable foreground for `cell`, given its resolved colors.
 ///
 /// `foreground` and `background` are the colors after inverse video swapped
-/// them. The result is the color as painted, SGR faint included.
+/// them. `own` is whether the cell is corrected against its own background
+/// (see [`applies`]); without it only SGR faint changes the color. The result
+/// is the color as painted, SGR faint included.
 pub(crate) fn painted_foreground(
     theme: &TermTheme,
     cell: GridCell,
     foreground: Rgba,
     background: Rgba,
+    own: bool,
 ) -> Rgba {
     let inverse = cell.style.contains(TermStyle::INVERSE);
     let dim = cell.style.contains(TermStyle::DIM);
     let key = CacheKey {
         colors: (u64::from(cell.fg.packed()) << 32) | u64::from(cell.bg.packed()),
         theme: theme_key(theme),
-        flags: u8::from(inverse) | (u8::from(dim) << 1),
+        flags: u8::from(inverse) | (u8::from(dim) << 1) | (u8::from(own) << 2),
     };
-    CACHE.with_borrow_mut(|cache| {
+    // Text comes in runs of one style, and the reading view resolves every
+    // visible cell on every frame: answering a repeat of the previous key
+    // without touching the table is what keeps faint rows at their old cost.
+    if let Some((cached, color)) = LAST.get()
+        && cached == key
+    {
+        return color;
+    }
+    let color = CACHE.with_borrow_mut(|cache| {
         let set = &mut cache[key.set()];
         if let Some(way) = set
             .iter()
@@ -99,12 +113,21 @@ pub(crate) fn painted_foreground(
             set[..=way].rotate_right(1);
             return set[0].map_or(foreground, |(_, color)| color);
         }
-        let on_paper = !inverse && is_default(cell.bg);
-        let color = correct(theme, foreground, background, on_paper, dim);
+        let mut color = if dim {
+            faint::faded(theme, foreground, background)
+        } else {
+            foreground
+        };
+        if own {
+            let on_paper = !inverse && is_default(cell.bg);
+            color = correct(theme, color, background, on_paper, dim);
+        }
         set.rotate_right(1);
         set[0] = Some((key, color));
         color
-    })
+    });
+    LAST.set(Some((key, color)));
+    color
 }
 
 #[cfg(test)]
@@ -154,6 +177,7 @@ impl CacheKey {
 type CacheSet = [Option<(CacheKey, Rgba)>; CACHE_WAYS];
 
 thread_local! {
+    static LAST: Cell<Option<(CacheKey, Rgba)>> = const { Cell::new(None) };
     static CACHE: RefCell<Vec<CacheSet>> = RefCell::new(vec![[None; CACHE_WAYS]; CACHE_SETS]);
 }
 
@@ -233,28 +257,20 @@ fn correct(
     on_paper: bool,
     dim: bool,
 ) -> Rgba {
-    // Faint text is judged as it composites: GPUI blends the faded glyph into
-    // the background in gamma space. Holding a half-transparent ink to a
-    // contrast floor would drive every faint color to the same near-black, so
-    // an unreadable composite is corrected itself and painted opaque.
-    let (painted, target) = if dim {
-        let faded = foreground.opacity(DIM_OPACITY);
-        (composite(faded, background), MINIMUM_DIM_CONTRAST)
+    // Faint text arrives already faded, as the opaque color it paints, and
+    // is held to the lower floor for text that is meant to recede.
+    let target = if dim {
+        MINIMUM_DIM_CONTRAST
     } else {
-        (foreground, MINIMUM_TEXT_CONTRAST)
+        MINIMUM_TEXT_CONTRAST
     };
     let surface = Surface {
         luminance: relative_luminance(linear(background)),
         target,
     };
-    if surface.reads(linear(painted)) {
-        return if dim {
-            foreground.opacity(DIM_OPACITY)
-        } else {
-            foreground
-        };
+    if surface.reads(linear(foreground)) {
+        return foreground;
     }
-    let foreground = painted;
 
     let authored = oklch(linear(foreground));
     let Some(minimal) = surface.readable_lightness(authored, authored.chroma, authored.hue) else {
@@ -291,7 +307,7 @@ fn correct(
         let paper = oklch(linear(theme.background)).lightness;
         // Faint grays settle against faint default text, not full ink.
         let ink = if dim {
-            composite(theme.foreground.opacity(DIM_OPACITY), theme.background)
+            faint::faded(theme, theme.foreground, theme.background)
         } else {
             theme.foreground
         };
@@ -552,14 +568,12 @@ mod tests {
     }
 
     #[test]
-    fn faint_text_stays_readable_as_it_composites() {
+    fn faint_text_stays_readable() {
         for theme in light_themes() {
             for fg in program_foregrounds() {
                 let resolved = theme.resolve_cell(cell(fg, TermColor::Default, TermStyle::DIM));
-                let contrast = contrast_ratio(
-                    composite(resolved.foreground, resolved.background),
-                    resolved.background,
-                );
+                assert_eq!(resolved.foreground.a, 1.0, "faint paints opaque");
+                let contrast = contrast_ratio(resolved.foreground, resolved.background);
                 assert!(
                     contrast >= MINIMUM_DIM_CONTRAST - 0.01,
                     "faint {fg:?} on {} reads at {contrast}",
@@ -648,7 +662,7 @@ mod tests {
         for theme in light_themes() {
             let lightness = |fg, style| {
                 let resolved = theme.resolve_cell(cell(fg, TermColor::Default, style));
-                oklch(linear(composite(resolved.foreground, resolved.background))).lightness
+                oklch(linear(resolved.foreground)).lightness
             };
             let faint_white = lightness(TermColor::Rgb(255, 255, 255), TermStyle::DIM);
             let white = lightness(TermColor::Rgb(255, 255, 255), TermStyle::empty());
@@ -656,7 +670,7 @@ mod tests {
             assert!(faint_white > white, "{}: faint must recede", theme.id);
             // Where the theme's own faint text clears the floor, faint white
             // joins it; where it does not, the floor decides.
-            let faded = composite(theme.foreground.opacity(DIM_OPACITY), theme.background);
+            let faded = faint::faded(&theme, theme.foreground, theme.background);
             if contrast_ratio(faded, theme.background) >= MINIMUM_DIM_CONTRAST {
                 assert!(
                     (faint_white - faint_default).abs() < 0.05,

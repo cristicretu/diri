@@ -372,10 +372,11 @@ impl TermTheme {
         let visible = !cell.style.contains(TermStyle::INVISIBLE);
         // Programs pick colors for dark terminals; see `contrast` for which
         // pairs a light theme answers for and how they are corrected.
-        if self.appearance == ThemeAppearance::Light && contrast::applies(cell) {
-            foreground = contrast::painted_foreground(self, cell, foreground, background);
-        } else if cell.style.contains(TermStyle::DIM) {
-            foreground = foreground.opacity(contrast::DIM_OPACITY);
+        // SGR faint is an opaque color of its own in every theme, solved and
+        // cached along the same path.
+        let own = self.appearance == ThemeAppearance::Light && contrast::applies(cell);
+        if own || (visible && cell.style.contains(TermStyle::DIM)) {
+            foreground = contrast::painted_foreground(self, cell, foreground, background, own);
         }
         if !visible {
             foreground = foreground.alpha(0.0);
@@ -663,7 +664,17 @@ mod tests {
             TermStyle::INVERSE | TermStyle::DIM,
         );
         let resolved = theme.resolve_cell(cell);
-        assert_rgba(resolved.foreground, theme.ansi[4].opacity(0.5));
+        // Faint is an opaque step from the painted foreground toward the
+        // painted background; the background itself never fades.
+        let normal = theme.resolve_cell(GridCell::new(
+            u32::from('x'),
+            TermColor::Ansi(1),
+            TermColor::Ansi(4),
+            TermStyle::INVERSE,
+        ));
+        assert_rgba(normal.foreground, theme.ansi[4]);
+        assert_eq!(resolved.foreground.a, 1.0);
+        assert_ne!(resolved.foreground, theme.ansi[4]);
         assert_rgba(resolved.background, theme.ansi[1]);
     }
 
