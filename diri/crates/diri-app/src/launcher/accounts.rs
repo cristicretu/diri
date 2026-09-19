@@ -10,6 +10,10 @@ impl LauncherOverlay {
             self.selected_account = None;
         }
     }
+    /// An explicit profile that the cached catalog lacks is only missing once
+    /// the catalog is authoritative. While the request is in flight the answer
+    /// is "not yet"; a failed request leaves the profile unverifiable, which
+    /// fails closed exactly like a removed one. No other profile is ever used.
     pub(super) fn validate_recipe_account(&self, recipe: &LaunchRecipe) -> Result<(), RecipeIssue> {
         if let Some(id) = recipe
             .account_profile_id
@@ -21,7 +25,11 @@ impl LauncherOverlay {
                 .iter()
                 .any(|p| p.id == id && p.agent == recipe.agent.id() && p.host == recipe.host)
         {
-            return Err(RecipeIssue::AccountUnavailable);
+            return Err(if self.accounts_loading {
+                RecipeIssue::AccountsLoading
+            } else {
+                RecipeIssue::AccountUnavailable
+            });
         }
         Ok(())
     }
@@ -43,16 +51,23 @@ impl LauncherOverlay {
             let result = result
                 .map_err(|e| e.to_string())
                 .and_then(|r| r.map_err(|e| e.to_string()));
-            let _ = this.update(cx, |this, cx| {
-                this.accounts_loading = false;
-                match result {
-                    Ok(catalog) => this.accounts = catalog,
-                    Err(error) => this.accounts_error = Some(error),
-                }
-                cx.notify();
-            });
+            let _ = this.update(cx, |this, cx| this.finish_account_refresh(result, cx));
         })
         .detach();
+    }
+
+    pub(super) fn finish_account_refresh(
+        &mut self,
+        result: Result<diri_proto::AgentAccountCatalog, String>,
+        cx: &mut Context<Self>,
+    ) {
+        self.accounts_loading = false;
+        match result {
+            Ok(catalog) => self.accounts = catalog,
+            Err(error) => self.accounts_error = Some(error),
+        }
+        self.resume_pending_recipe_activation(cx);
+        cx.notify();
     }
 
     pub(super) fn account_choices(&self) -> Vec<(Option<String>, String)> {
