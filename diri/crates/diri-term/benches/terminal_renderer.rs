@@ -24,8 +24,19 @@ impl Render for TerminalBenchView {
 
 #[gpui::bench(fps = 120)]
 fn terminal_build_log_scroll(cx: &mut BenchAppContext) {
-    let initial = build_frame(0, true);
-    let frames = [build_frame(1, false), build_frame(0, false)];
+    scroll(cx, plain_row);
+}
+
+/// An agent TUI rather than a build log: coloured words, syntax-coloured code
+/// whose glyphs change colour without a gap, and block-element bars.
+#[gpui::bench(fps = 120)]
+fn terminal_styled_tui_scroll(cx: &mut BenchAppContext) {
+    scroll(cx, styled_row);
+}
+
+fn scroll(cx: &mut BenchAppContext, row: fn(usize) -> Vec<GridCell>) {
+    let initial = build_frame(0, true, row);
+    let frames = [build_frame(1, false, row), build_frame(0, false, row)];
     let terminal = TerminalElement::with_buffer(GridBuffer::new(COLS, ROWS)).focused(true);
     terminal.apply_damage(initial);
 
@@ -76,24 +87,65 @@ fn terminal_build_log_scroll(cx: &mut BenchAppContext) {
     }
 }
 
-fn build_frame(offset: usize, is_full_snapshot: bool) -> GridUpdate {
+fn cells(text: &str, fg: TermColor) -> impl Iterator<Item = GridCell> + '_ {
+    text.chars().map(move |ch| {
+        GridCell::new(
+            u32::from(ch),
+            fg,
+            TermColor::DefaultInverted,
+            TermStyle::empty(),
+        )
+    })
+}
+
+fn plain_row(line_id: usize) -> Vec<GridCell> {
+    let line = format!(
+        "[{line_id:02}] Compiling terminal renderer target {line_id:05} with cached dependencies",
+    );
+    cells(&line, TermColor::Default).collect()
+}
+
+fn styled_row(line_id: usize) -> Vec<GridCell> {
+    let id = format!("{line_id:05}");
+    match line_id % 3 {
+        0 => [
+            "Updated",
+            &id,
+            "files",
+            "in",
+            "crates/diri-term",
+            "with",
+            "cached",
+            "shapes",
+        ]
+        .into_iter()
+        .enumerate()
+        .flat_map(|(word, text)| {
+            cells(text, TermColor::Ansi(1 + (word % 6) as u8)).chain(cells(" ", TermColor::Default))
+        })
+        .collect(),
+        1 => [
+            "let", " ", "row", "_", &id, "=", "cache", ".", "get", "(", "absolute", ")", "?", ";",
+        ]
+        .into_iter()
+        .enumerate()
+        .flat_map(|(token, text)| cells(text, TermColor::Ansi(1 + (token % 6) as u8)))
+        .collect(),
+        _ => cells(&"█".repeat(40 + line_id % 20), TermColor::Ansi(2))
+            .chain(cells(&"░".repeat(20), TermColor::Ansi(8)))
+            .chain(cells(&format!(" {id}%"), TermColor::Default))
+            .collect(),
+    }
+}
+
+fn build_frame(
+    offset: usize,
+    is_full_snapshot: bool,
+    content: fn(usize) -> Vec<GridCell>,
+) -> GridUpdate {
     let changed_rows = (0..ROWS)
         .map(|row| {
-            let line_id = usize::from(row) + offset;
-            let line = format!(
-                "[{line_id:02}] Compiling terminal renderer target {line_id:05} with cached dependencies",
-            );
-            let mut cells = line
-                .chars()
-                .map(|ch| {
-                    GridCell::new(
-                        u32::from(ch),
-                        TermColor::Default,
-                        TermColor::DefaultInverted,
-                        TermStyle::empty(),
-                    )
-                })
-                .collect::<Vec<_>>();
+            let mut cells = content(usize::from(row) + offset);
             cells.resize(usize::from(COLS), GridCell::BLANK);
             ChangedRow::new(row, cells)
         })
@@ -109,5 +161,9 @@ fn build_frame(offset: usize, is_full_snapshot: bool) -> GridUpdate {
     }
 }
 
-gpui::bench_group!(benches, terminal_build_log_scroll);
+gpui::bench_group!(
+    benches,
+    terminal_build_log_scroll,
+    terminal_styled_tui_scroll
+);
 gpui::bench_main!(benches);
