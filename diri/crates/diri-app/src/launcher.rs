@@ -983,6 +983,22 @@ impl LauncherOverlay {
                 window.focus(&self.focus, cx);
                 cx.notify();
             }
+            Err(RecipeIssue::AccountsLoading) if !self.preview => {
+                // The profile request from opening the launcher is still in
+                // flight; its completion resumes this exact recipe.
+                self.preview_recipe(&recipe);
+                self.pending_recipe_activation = Some(recipe.id.clone());
+                self.fallback_notice = Some(RecipeIssue::AccountsLoading.message());
+                self.services
+                    .store
+                    .store
+                    .write()
+                    .expect("session store lock poisoned")
+                    .request_agent_catalog(recipe.host.clone(), false);
+                self.picker = None;
+                window.focus(&self.focus, cx);
+                cx.notify();
+            }
             result => {
                 self.preview_recipe(&recipe);
                 self.fallback_notice = result.err().map(|issue| issue.message()).or_else(|| {
@@ -1041,6 +1057,7 @@ impl LauncherOverlay {
         }
         match self.resolve_recipe(&recipe) {
             Ok(resolved) if !self.preview => self.complete_recipe_activation(resolved, cx),
+            Err(RecipeIssue::AccountsLoading) => {}
             Err(RecipeIssue::AgentsLoading) => {
                 let (error, still_loading) = {
                     let store = self
@@ -5049,6 +5066,142 @@ mod tests {
             );
             assert!(launcher.pending_recipe_activation.is_none());
             assert_eq!(launcher.prompt.text(), "Review the change");
+        });
+    }
+
+    /// A launcher whose only unresolved dependency is the account catalog:
+    /// the saved recipe names the `work` profile, Codex is ready locally, and
+    /// the profile request started by `open` has not answered.
+    fn launcher_waiting_for_accounts(
+        cx: &mut TestAppContext,
+    ) -> (
+        LaunchRecipe,
+        gpui::Entity<LauncherOverlay>,
+        &mut gpui::VisualTestContext,
+    ) {
+        let runtime = Arc::new(StoreRuntime::inert());
+        let stored = {
+            let mut store = runtime.store.write().expect("store lock");
+            store.set_agent_catalog(diri_proto::AgentReadinessResult {
+                host: None,
+                agents: vec![diri_proto::AgentReadinessItem {
+                    kind: AgentKind::CODEX,
+                    binary: "codex".into(),
+                    path: Some("/usr/bin/codex".into()),
+                    ..diri_proto::AgentReadinessItem::default()
+                }],
+                ..diri_proto::AgentReadinessResult::default()
+            });
+            let mut recipe = LaunchRecipe::draft(
+                "Work review",
+                AgentKind::CODEX,
+                RecipeProject::Path {
+                    path: "/tmp".into(),
+                },
+                None,
+                "Review the change",
+            );
+            recipe.account_profile_id = Some("work".into());
+            store
+                .update_preferences(|prefs| {
+                    prefs.launch_recipes.add(recipe).expect("add recipe");
+                })
+                .expect("save fixture");
+            store.preferences().launch_recipes.items()[0].clone()
+        };
+        let services = test_services(runtime);
+        let (launcher, cx) =
+            cx.add_window_view(move |_window, cx| LauncherOverlay::new(services, false, cx));
+        launcher.update_in(cx, |launcher, window, cx| {
+            launcher.open(window, cx);
+            assert!(launcher.accounts_loading);
+            launcher.activate_recipe(&stored.id, window, cx);
+        });
+        (stored, launcher, cx)
+    }
+
+    #[gpui::test]
+    fn a_recipe_run_waits_for_the_account_catalog_and_launches_once(cx: &mut TestAppContext) {
+        let (stored, launcher, cx) = launcher_waiting_for_accounts(cx);
+        launcher.update(cx, |launcher, cx| {
+            assert!(launcher.open && !launcher.delivery.is_sending());
+            assert_eq!(
+                launcher.pending_recipe_activation.as_deref(),
+                Some(stored.id.as_str())
+            );
+            assert_ne!(
+                launcher.fallback_notice,
+                Some(RecipeIssue::AccountUnavailable.message())
+            );
+
+            launcher.finish_account_refresh(
+                Ok(diri_proto::AgentAccountCatalog {
+                    profiles: vec![
+                        account_fixture("personal", "codex", None, true),
+                        account_fixture("work", "codex", None, false),
+                    ],
+                }),
+                cx,
+            );
+            assert!(launcher.delivery.is_sending());
+            assert!(launcher.pending_recipe_activation.is_none());
+            assert_eq!(launcher.selected_account.as_deref(), Some("work"));
+        });
+    }
+
+    #[gpui::test]
+    fn a_waiting_recipe_fails_closed_when_its_account_is_gone_or_unknowable(
+        cx: &mut TestAppContext,
+    ) {
+        for result in [
+            Ok(diri_proto::AgentAccountCatalog {
+                profiles: vec![account_fixture("personal", "codex", None, true)],
+            }),
+            Err("daemon unavailable".to_owned()),
+        ] {
+            let (_, launcher, cx) = launcher_waiting_for_accounts(cx);
+            launcher.update(cx, |launcher, cx| {
+                assert!(launcher.pending_recipe_activation.is_some());
+                launcher.finish_account_refresh(result, cx);
+                assert!(launcher.open && !launcher.delivery.is_sending());
+                assert!(launcher.pending_recipe_activation.is_none());
+                assert_eq!(
+                    launcher.fallback_notice,
+                    Some(RecipeIssue::AccountUnavailable.message())
+                );
+                // The saved identity stays on screen for repair; no other
+                // profile is substituted.
+                assert_eq!(launcher.selected_account.as_deref(), Some("work"));
+            });
+        }
+    }
+
+    #[gpui::test]
+    fn cancelling_a_recipe_that_waits_for_accounts_prevents_the_delayed_launch(
+        cx: &mut TestAppContext,
+    ) {
+        let (stored, launcher, cx) = launcher_waiting_for_accounts(cx);
+        let catalog = diri_proto::AgentAccountCatalog {
+            profiles: vec![account_fixture("work", "codex", None, true)],
+        };
+        launcher.update_in(cx, |launcher, window, cx| {
+            assert!(launcher.pending_recipe_activation.is_some());
+            launcher.handle_key_down(&key("shift-enter"), window, cx);
+            assert!(launcher.pending_recipe_activation.is_none());
+            launcher.finish_account_refresh(Ok(catalog.clone()), cx);
+            assert!(launcher.open && !launcher.delivery.is_sending());
+        });
+
+        // An edited saved definition is a different run as well.
+        let (stored_again, launcher, cx) = launcher_waiting_for_accounts(cx);
+        assert_eq!(stored.name, stored_again.name);
+        launcher.update(cx, |launcher, cx| {
+            launcher
+                .update_recipe_book(|book| book.rename(&stored_again.id, "Changed task"))
+                .unwrap();
+            launcher.finish_account_refresh(Ok(catalog), cx);
+            assert!(launcher.pending_recipe_activation.is_none());
+            assert!(launcher.open && !launcher.delivery.is_sending());
         });
     }
 

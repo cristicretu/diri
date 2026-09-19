@@ -500,6 +500,7 @@ pub struct ResolvedRecipe {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum RecipeIssue {
+    AccountsLoading,
     AccountUnavailable,
     EmptyPrompt,
     PromptTooLong,
@@ -520,6 +521,7 @@ pub enum RecipeIssue {
 impl RecipeIssue {
     pub fn message(&self) -> String {
         match self {
+            Self::AccountsLoading => "Checking account profiles…".to_owned(),
             Self::AccountUnavailable => {
                 "Account profile is unavailable on this Agent or host — choose an account"
                     .to_owned()
