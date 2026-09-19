@@ -99,8 +99,9 @@ fn require(
 /// Phase 1 — code state, safe while the source agent is still alive and
 /// idempotent throughout: snapshot-commit a dirty source tree on its CURRENT
 /// branch, push the real commits (never the snapshot, never force), fetch +
-/// hard-sync the target checkout — refusing a dirty target, and giving a
-/// linked source worktree its own worktree next to the target clone — then
+/// hard-sync the target checkout — refusing a dirty target or a target branch
+/// holding commits origin has never seen, and giving a linked source worktree
+/// its own worktree next to the target clone — then
 /// re-apply the snapshot's changes to the target tree as uncommitted state.
 pub fn prepare(
     source_cwd: &str,
@@ -219,8 +220,9 @@ pub fn prepare(
             "git fetch on the target failed",
             two_minutes,
         )?;
+        refuse_unpublished_commits(target_host, target_repo_root, &branch)?;
         // create-or-reset + checkout in one idempotent command (the tree was
-        // verified clean above).
+        // verified clean and the branch verified published above).
         require(
             target_host,
             &format!(
@@ -300,6 +302,42 @@ fn carry_dirty_state(
     applied.map(|_| ())
 }
 
+/// Guards every `-B` reset of the target's `branch` to the just-fetched
+/// `origin/<branch>`: a clean tree says nothing about commits the target never
+/// pushed, and the reset would drop them from the branch. Only diri's own
+/// snapshot commits may be left behind — their changes already traveled as
+/// dirty state, which is what lets a session bounce back into the checkout it
+/// left. Anything else is a hard stop before the target is mutated. A branch
+/// the target does not have yet has nothing to lose.
+fn refuse_unpublished_commits(
+    target_host: Option<&HostEntry>,
+    repo: &str,
+    branch: &str,
+) -> Result<(), MigrateError> {
+    let repo_q = shell_quote(repo);
+    let local_ref = format!("refs/heads/{branch}");
+    let unpublished = require(
+        target_host,
+        &format!(
+            "if git -C {repo_q} show-ref --verify --quiet {}; then git -C {repo_q} log --format=%s {}; fi",
+            shell_quote(&local_ref),
+            shell_quote(&format!("refs/remotes/origin/{branch}..{local_ref}"))
+        ),
+        &format!("could not compare {branch} in {repo} with origin"),
+        Duration::from_secs(30),
+    )?;
+    let count = unpublished
+        .lines()
+        .filter(|subject| !subject.starts_with(HANDOFF_SUBJECT_PREFIX))
+        .count();
+    if count > 0 {
+        return Err(MigrateError::BadRequest(format!(
+            "{branch} in {repo} has {count} commit(s) that are not on origin/{branch} — push them or move them to another branch there first"
+        )));
+    }
+    Ok(())
+}
+
 /// Creates or re-syncs the dedicated worktree for `branch` next to the
 /// target's main clone. Idempotent; a dirty existing worktree is a hard stop.
 fn ensure_target_worktree(
@@ -354,6 +392,7 @@ fn ensure_target_worktree(
             "git fetch on the target failed",
             two_minutes,
         )?;
+        refuse_unpublished_commits(target_host, &path, branch)?;
         require(
             target_host,
             &format!("git -C {path_q} checkout -B {branch_q} {origin_ref}"),
@@ -367,6 +406,7 @@ fn ensure_target_worktree(
             "git fetch on the target failed",
             two_minutes,
         )?;
+        refuse_unpublished_commits(target_host, main_clone, branch)?;
         require(
             target_host,
             &format!("git -C {main_q} worktree add -B {branch_q} {path_q} {origin_ref}"),
@@ -778,6 +818,122 @@ mod tests {
             "wt dirt\n"
         );
         assert!(!git_out(landed, &["status", "--porcelain"]).is_empty());
+    }
+
+    fn commit_file(dir: &Path, name: &str, subject: &str) -> String {
+        std::fs::write(dir.join(name), "valuable work\n").unwrap();
+        git(dir, &["add", "."]);
+        git(dir, &["commit", "-q", "-m", subject]);
+        git_out(dir, &["rev-parse", "HEAD"])
+    }
+
+    fn prepare_local(source: &Path, target: &Path) -> Result<Prepared, MigrateError> {
+        prepare(
+            source.to_str().unwrap(),
+            None,
+            None,
+            target.to_str().unwrap(),
+            "target",
+        )
+    }
+
+    fn assert_refused_as_unpublished(result: Result<Prepared, MigrateError>) {
+        match result {
+            Err(MigrateError::BadRequest(message)) => {
+                assert!(message.contains("not on origin"), "{message}");
+            }
+            other => panic!("unsafe destination must be rejected: {other:?}"),
+        }
+    }
+
+    /// A clean working tree says nothing about commits the destination never
+    /// pushed; resetting its branch would silently drop them.
+    #[test]
+    fn a_destination_ahead_of_origin_is_a_hard_stop() {
+        let temp = tempfile::tempdir().expect("temp");
+        let (source, target) = seeded_repos(temp.path());
+        let before = commit_file(&target, "destination-only.txt", "unpushed destination work");
+        assert!(git_out(&target, &["status", "--porcelain"]).is_empty());
+
+        assert_refused_as_unpublished(prepare_local(&source, &target));
+        assert_eq!(git_out(&target, &["rev-parse", "HEAD"]), before);
+        assert!(target.join("destination-only.txt").exists());
+    }
+
+    #[test]
+    fn a_destination_diverged_from_origin_is_a_hard_stop() {
+        let temp = tempfile::tempdir().expect("temp");
+        let (source, target) = seeded_repos(temp.path());
+        commit_file(&source, "source-only.txt", "source work");
+        let before = commit_file(&target, "destination-only.txt", "unpushed destination work");
+
+        assert_refused_as_unpublished(prepare_local(&source, &target));
+        assert_eq!(git_out(&target, &["rev-parse", "HEAD"]), before);
+    }
+
+    /// The branch does not have to be checked out to be reset by
+    /// `checkout -B`.
+    #[test]
+    fn an_unpublished_branch_the_destination_has_parked_is_a_hard_stop() {
+        let temp = tempfile::tempdir().expect("temp");
+        let (source, target) = seeded_repos(temp.path());
+        let before = commit_file(&target, "destination-only.txt", "unpushed destination work");
+        git(&target, &["checkout", "-q", "-b", "parking", "origin/main"]);
+
+        assert_refused_as_unpublished(prepare_local(&source, &target));
+        assert_eq!(git_out(&target, &["rev-parse", "refs/heads/main"]), before);
+        assert_eq!(
+            git_out(&target, &["rev-parse", "--abbrev-ref", "HEAD"]),
+            "parking"
+        );
+    }
+
+    fn feature_worktree(temp: &Path, source: &Path) -> PathBuf {
+        let worktree = temp.join("source-feature");
+        git(
+            source,
+            &[
+                "worktree",
+                "add",
+                "-q",
+                "-b",
+                "Feature/X",
+                worktree.to_str().unwrap(),
+            ],
+        );
+        std::fs::write(worktree.join("wip.txt"), "wt dirt\n").unwrap();
+        worktree
+    }
+
+    #[test]
+    fn a_new_target_worktree_never_resets_an_unpublished_branch() {
+        let temp = tempfile::tempdir().expect("temp");
+        let (source, target) = seeded_repos(temp.path());
+        let worktree = feature_worktree(temp.path(), &source);
+        git(&target, &["checkout", "-q", "-b", "Feature/X"]);
+        let before = commit_file(&target, "destination-only.txt", "unpushed destination work");
+        git(&target, &["checkout", "-q", "main"]);
+
+        assert_refused_as_unpublished(prepare_local(&worktree, &target));
+        assert_eq!(
+            git_out(&target, &["rev-parse", "refs/heads/Feature/X"]),
+            before
+        );
+        assert!(!temp.path().join("target-feature-x").exists());
+    }
+
+    #[test]
+    fn an_existing_target_worktree_never_resets_an_unpublished_branch() {
+        let temp = tempfile::tempdir().expect("temp");
+        let (source, target) = seeded_repos(temp.path());
+        let worktree = feature_worktree(temp.path(), &source);
+        let out = prepare_local(&worktree, &target).expect("first move");
+        let landed = PathBuf::from(out.target_repo_root);
+        let before = commit_file(&landed, "destination-only.txt", "unpushed destination work");
+        assert!(git_out(&landed, &["status", "--porcelain"]).is_empty());
+
+        assert_refused_as_unpublished(prepare_local(&worktree, &target));
+        assert_eq!(git_out(&landed, &["rev-parse", "HEAD"]), before);
     }
 
     #[test]
