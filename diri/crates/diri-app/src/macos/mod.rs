@@ -67,6 +67,61 @@ pub(crate) fn observe_scroller_style(cx: &mut gpui::App) {
     .detach();
 }
 
+/// Whether the user asked macOS to reduce motion.
+fn system_reduce_motion() -> bool {
+    use objc2_app_kit::NSWorkspace;
+    let workspace = NSWorkspace::sharedWorkspace();
+    // SAFETY: a BOOL property getter on NSWorkspace, available since
+    // macOS 10.12. Sent by hand because the typed accessor sits behind a
+    // crate feature nothing else here needs.
+    unsafe { objc2::msg_send![&*workspace, accessibilityDisplayShouldReduceMotion] }
+}
+
+/// Follows System Settings → Accessibility → Reduce Motion, now and whenever
+/// it changes. Every animation in the app already asks `cx.reduce_motion()`,
+/// but nothing ever set it outside the tests, so the system setting did
+/// nothing here.
+pub(crate) fn observe_reduce_motion(cx: &mut gpui::App) {
+    use objc2::MainThreadMarker;
+    use objc2_app_kit::NSWorkspace;
+    use objc2_foundation::{NSNotification, NSOperationQueue, NSString};
+
+    if MainThreadMarker::new().is_none() {
+        return;
+    }
+    cx.set_reduce_motion(system_reduce_motion());
+
+    let (changed, mut changes) = tokio::sync::mpsc::channel::<()>(1);
+    let handler = block2::RcBlock::new(move |_: std::ptr::NonNull<NSNotification>| {
+        let _ = changed.try_send(());
+    });
+    // The name is the constant's own spelling; AppKit posts it on the
+    // workspace's centre, not the default one.
+    let name = NSString::from_str("NSWorkspaceAccessibilityDisplayOptionsDidChangeNotification");
+    // SAFETY: the block captures only a channel sender, and the main queue
+    // delivers it on the thread AppKit already runs the app on.
+    let observer = unsafe {
+        NSWorkspace::sharedWorkspace()
+            .notificationCenter()
+            .addObserverForName_object_queue_usingBlock(
+                Some(&name),
+                None,
+                Some(&NSOperationQueue::mainQueue()),
+                &handler,
+            )
+    };
+    // The observation lasts as long as the process.
+    std::mem::forget(observer);
+
+    cx.spawn(async move |cx| {
+        while changes.recv().await.is_some() {
+            let reduce = system_reduce_motion();
+            cx.update(|cx| cx.set_reduce_motion(reduce));
+        }
+    })
+    .detach();
+}
+
 /// AppKit respects the current trackpad and the user's haptic preferences.
 pub(crate) fn pinch_feedback() {
     use objc2_app_kit::{
@@ -77,4 +132,16 @@ pub(crate) fn pinch_feedback() {
         NSHapticFeedbackPattern::Alignment,
         NSHapticFeedbackPerformanceTime::Now,
     );
+}
+
+#[cfg(test)]
+mod reduce_motion_tests {
+    /// The getter is sent by hand, so a misspelt selector would only show up
+    /// as an abort at launch. This machine's setting is whatever it is; the
+    /// point is that the message is understood and answers a BOOL.
+    #[test]
+    fn the_system_setting_is_readable() {
+        let first = super::system_reduce_motion();
+        assert_eq!(first, super::system_reduce_motion());
+    }
 }

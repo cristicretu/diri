@@ -1411,10 +1411,11 @@ impl HeadlessScreen {
         // FNV-1a is sufficient for change detection and much cheaper than
         // constructing SipHash state for every damaged row. Grid publication
         // still compares the actual cells, so this fingerprint never decides
-        // wire correctness. Style bits still belong in the digest: Cursor
-        // paints its composer caret as inverse video without changing glyphs,
-        // and those frames must advance `content_seq` or the attach pump
-        // suppresses them.
+        // wire correctness. Style bits and both colors still belong in the
+        // digest: Cursor paints its composer caret as inverse video, and
+        // Claude Code moves a menu highlight or a mouse selection by
+        // recoloring cells, all without changing glyphs. Those frames must
+        // advance `content_seq` or the attach pump suppresses them.
         let mut digest = 0xcbf2_9ce4_8422_2325u64;
         let mut filled = 0;
         let mut previous_link = None;
@@ -1443,6 +1444,10 @@ impl HeadlessScreen {
             digest ^= u64::from(character);
             digest = digest.wrapping_mul(0x0000_0100_0000_01b3);
             digest ^= u64::from(wire_style(cell.flags).bits());
+            digest = digest.wrapping_mul(0x0000_0100_0000_01b3);
+            digest ^= u64::from(wire_color(cell.fg).packed());
+            digest = digest.wrapping_mul(0x0000_0100_0000_01b3);
+            digest ^= u64::from(wire_color(cell.bg).packed());
             digest = digest.wrapping_mul(0x0000_0100_0000_01b3);
             if character != ' ' && character != '\0' {
                 filled += 1;
@@ -1948,6 +1953,39 @@ mod tests {
             first.style.contains(TermStyle::INVERSE),
             "the restyled cell must reach the wire"
         );
+    }
+
+    #[test]
+    fn a_color_only_repaint_advances_content_seq() {
+        // Claude Code moves its `/` menu highlight by recoloring the same
+        // glyphs, and paints a mouse selection as a background change. Neither
+        // touches a glyph, a style bit or the parked cursor, so `content_seq`
+        // is the only thing that can tell the attach pump a frame is owed.
+        let mut screen = HeadlessScreen::new(80, 24);
+        screen.feed(b"/help\r\n/clear\x1b[H");
+        let _ = screen.grid_update(true);
+
+        let before = screen.content_seq();
+        screen.feed(b"\x1b[38;2;177;185;249m/help\x1b[39m\x1b[H");
+        let after_foreground = screen.content_seq();
+        assert!(
+            after_foreground > before,
+            "a foreground-only highlight must look like new content"
+        );
+        let update = screen.grid_update(false);
+        assert_eq!(
+            update.changed_rows[0].cells[0].fg,
+            TermColor::Rgb(177, 185, 249)
+        );
+
+        screen.feed(b"\x1b[2H\x1b[48;5;4m/clear\x1b[49m\x1b[H");
+        assert!(
+            screen.content_seq() > after_foreground,
+            "a background-only selection must look like new content"
+        );
+        let update = screen.grid_update(false);
+        assert_eq!(update.changed_rows[0].cells[0].bg, TermColor::Ansi(4));
+        assert_eq!(screen.lines()[..2], ["/help", "/clear"]);
     }
 
     #[test]

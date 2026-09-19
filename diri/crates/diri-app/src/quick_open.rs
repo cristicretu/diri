@@ -54,6 +54,8 @@ pub struct DirectoryIndex {
     entries: Vec<DirectoryEntry>,
     is_scanning: bool,
     scanned_at: Option<Instant>,
+    /// The entries are a finished scan's result, not a cache or a release.
+    holds_scan: bool,
     scanned_includes: Option<String>,
     scanned_roots: Option<Vec<PathBuf>>,
 }
@@ -90,13 +92,21 @@ impl DirectoryIndex {
     /// Adopt a disk-cached index without claiming it is freshly scanned, so the
     /// next open still revalidates. Returns whether the cache was taken: a
     /// finished scan is the truth even when it found nothing, and the caller
-    /// must then keep the snapshot built from it as well.
+    /// must then keep the snapshot built from it as well. Entries released on
+    /// close are gone, so the cache that scan persisted may refill them.
     pub fn adopt_cached(&mut self, entries: Vec<DirectoryEntry>) -> bool {
-        if self.scanned_at.is_some() || !self.entries.is_empty() {
+        if self.holds_scan || !self.entries.is_empty() {
             return false;
         }
         self.entries = entries;
         true
+    }
+
+    /// Drops the entries but keeps the scan bookkeeping, so releasing the
+    /// index on close does not by itself force a filesystem walk on reopen.
+    pub fn release_entries(&mut self) {
+        self.entries = Vec::new();
+        self.holds_scan = false;
     }
 
     pub fn finish_scan(
@@ -109,6 +119,7 @@ impl DirectoryIndex {
         self.entries = entries;
         self.is_scanning = false;
         self.scanned_at = Some(now);
+        self.holds_scan = true;
         self.scanned_includes = Some(includes);
         self.scanned_roots = Some(roots);
     }
@@ -975,6 +986,16 @@ mod tests {
             "an empty scan is still newer than the cache"
         );
         assert!(index.entries().is_empty());
+
+        // Closing releases the entries but keeps the scan fresh, so the
+        // reopen has nothing but the cache to show until a rescan is due.
+        index.release_entries();
+        assert!(
+            !index.needs_scan(now, "", roots),
+            "release is not staleness"
+        );
+        assert!(index.adopt_cached(vec![fixture_entry("cached")]));
+        assert_eq!(index.entries()[0].name, "cached");
     }
 
     #[test]
