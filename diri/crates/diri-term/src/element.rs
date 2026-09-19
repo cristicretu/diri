@@ -95,6 +95,40 @@ pub struct TerminalElement {
     focus_override: Option<bool>,
     suspended: bool,
     hovered_reference: Option<ReferenceHit>,
+    seen_marker: Option<SeenMarker>,
+}
+
+/// Where the reader stopped looking: a hairline is drawn above `row`, the
+/// first absolute row they have not seen.
+///
+/// The client learns absolute rows only from scrollback reads, so the live
+/// view cannot place the line from its own state. `live_start_row` is the
+/// live grid's first absolute row as of the read that produced this marker;
+/// the host refreshes it once output settles. A reading view places the line
+/// from its pinned viewport instead.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct SeenMarker {
+    pub row: i64,
+    pub live_start_row: i64,
+}
+
+impl SeenMarker {
+    /// Still inside the live grid, where output moves it and `live_start_row`
+    /// goes stale. Once it has scrolled into history it never returns.
+    #[must_use]
+    pub const fn is_live(&self) -> bool {
+        self.row >= self.live_start_row
+    }
+
+    /// The window row the line sits above. Row zero is excluded: a line on
+    /// the top edge separates nothing.
+    fn window_row(&self, top: i64, visible_rows: usize) -> Option<u16> {
+        let row = usize::try_from(self.row.checked_sub(top)?).ok()?;
+        (1..visible_rows)
+            .contains(&row)
+            .then(|| u16::try_from(row).ok())
+            .flatten()
+    }
 }
 
 /// Selection and reading state only: deliberately does not retain an input
@@ -507,6 +541,7 @@ impl TerminalElement {
             focus_override: None,
             suspended: false,
             hovered_reference: None,
+            seen_marker: None,
         }
     }
 
@@ -565,6 +600,12 @@ impl TerminalElement {
     #[must_use]
     pub fn hovered_reference(mut self, hit: Option<ReferenceHit>) -> Self {
         self.hovered_reference = hit;
+        self
+    }
+
+    #[must_use]
+    pub fn seen_marker(mut self, marker: Option<SeenMarker>) -> Self {
+        self.seen_marker = marker;
         self
     }
 
@@ -1437,6 +1478,25 @@ impl Element for TerminalElement {
                 &mut overlay_quads,
             );
         }
+        if let Some(marker) = self.seen_marker
+            && !mutex_lock(&self.shared.modes).alt_screen
+        {
+            let top = if viewport.is_reading() {
+                viewport.geometry_known().then(|| viewport.absolute_row(0))
+            } else {
+                Some(marker.live_start_row)
+            };
+            if let Some(row) = top.and_then(|top| marker.window_row(top, visible_rows)) {
+                // The palette's red is the theme's own "unread" color.
+                overlay_quads.push(fill(
+                    Bounds::new(
+                        point(bounds.left(), bounds.top() + metrics.y_for_row(row)),
+                        size(bounds.size.width, px(1.0)),
+                    ),
+                    self.theme.ansi[1].opacity(0.7),
+                ));
+            }
+        }
         if let Some(hit) = &self.hovered_reference {
             let top = viewport.absolute_row(0);
             for &(row, start, end) in &hit.spans {
@@ -2305,6 +2365,41 @@ fn read_lock<T>(lock: &RwLock<T>) -> RwLockReadGuard<'_, T> {
 fn write_lock<T>(lock: &RwLock<T>) -> RwLockWriteGuard<'_, T> {
     lock.write()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+#[cfg(test)]
+mod seen_marker_tests {
+    use super::SeenMarker;
+
+    #[test]
+    fn the_line_sits_between_seen_and_unseen_rows_or_not_at_all() {
+        let marker = SeenMarker {
+            row: 110,
+            live_start_row: 100,
+        };
+        assert_eq!(marker.window_row(100, 24), Some(10));
+        assert_eq!(marker.window_row(109, 24), Some(1));
+        assert_eq!(
+            marker.window_row(110, 24),
+            None,
+            "everything on screen is new"
+        );
+        assert_eq!(marker.window_row(111, 24), None, "scrolled past");
+        assert_eq!(marker.window_row(80, 24), None, "still below the window");
+        assert_eq!(marker.window_row(87, 24), Some(23));
+    }
+
+    #[test]
+    fn a_marker_that_scrolled_into_history_is_no_longer_live() {
+        let mut marker = SeenMarker {
+            row: 110,
+            live_start_row: 100,
+        };
+        assert!(marker.is_live());
+        marker.live_start_row = 111;
+        assert!(!marker.is_live());
+        assert_eq!(marker.window_row(marker.live_start_row, 24), None);
+    }
 }
 
 #[cfg(test)]
