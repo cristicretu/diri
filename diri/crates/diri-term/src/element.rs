@@ -1592,10 +1592,6 @@ impl Element for TerminalElement {
         };
 
         window.with_content_mask(Some(ContentMask { bounds }), |window| {
-            for quad in prepaint.background_quads.drain(..) {
-                window.paint_quad(quad);
-            }
-
             // Live path: rows come straight from the shared cache. Quads are
             // plain structs (a stack copy each) and `ShapedLine::paint` takes
             // a reference, so nothing per-row is heap-cloned per frame.
@@ -1603,17 +1599,32 @@ impl Element for TerminalElement {
                 .paint_from_cache
                 .then(|| mutex_lock(&self.shared.row_cache));
 
-            if let Some(cache) = &cache {
-                for prepared in cache.iter().flatten() {
-                    for quad in &prepared.background_quads {
-                        window.paint_quad(quad.clone());
+            // Outside a layer every quad is inserted into the scene's bounds
+            // tree to be given its own draw order; a row of block elements
+            // pays that per cell. A layer gives its contents one order, and
+            // the scene's stable sort keeps quads of equal order in insertion
+            // order, which is the order overlapping quads already had. Each
+            // layer spans the terminal, so the passes stack as they did:
+            // backgrounds, overlays, text, decorations, cursor.
+            //
+            // Glyphs stay outside: sprites of equal order are drawn sorted by
+            // atlas tile, which reorders overlapping ink, and measured no
+            // faster than per-glyph ordering.
+            window.paint_layer(bounds, |window| {
+                for quad in prepaint.background_quads.drain(..) {
+                    window.paint_quad(quad);
+                }
+                if let Some(cache) = &cache {
+                    for prepared in cache.iter().flatten() {
+                        for quad in &prepared.background_quads {
+                            window.paint_quad(quad.clone());
+                        }
                     }
                 }
-            }
-
-            for quad in prepaint.overlay_quads.drain(..) {
-                window.paint_quad(quad);
-            }
+                for quad in prepaint.overlay_quads.drain(..) {
+                    window.paint_quad(quad);
+                }
+            });
 
             if let Some(cache) = &cache {
                 for (row_index, prepared) in cache.iter().enumerate() {
@@ -1646,11 +1657,13 @@ impl Element for TerminalElement {
                         );
                     }
                 }
-                for prepared in cache.iter().flatten() {
-                    for quad in &prepared.decoration_quads {
-                        window.paint_quad(quad.clone());
+                window.paint_layer(bounds, |window| {
+                    for prepared in cache.iter().flatten() {
+                        for quad in &prepared.decoration_quads {
+                            window.paint_quad(quad.clone());
+                        }
                     }
-                }
+                });
             }
 
             for (row, line) in &prepaint.lines {
@@ -1674,9 +1687,11 @@ impl Element for TerminalElement {
                 }
             }
 
-            for quad in prepaint.decoration_quads.drain(..) {
-                window.paint_quad(quad);
-            }
+            window.paint_layer(bounds, |window| {
+                for quad in prepaint.decoration_quads.drain(..) {
+                    window.paint_quad(quad);
+                }
+            });
 
             if let Some(cursor) = prepaint.cursor.take() {
                 window.paint_quad(cursor.quad);
