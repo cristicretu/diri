@@ -12,7 +12,7 @@ use std::process::Command;
 
 use diri_proto::{SessionDiffBase, SessionId, SessionReadDiffResult};
 
-use crate::git_review::path_from_output_line;
+use crate::git_review::{path_from_bytes, path_from_output_line};
 use crate::quote::{Quote, QuoteSource};
 
 #[cfg(unix)]
@@ -496,11 +496,11 @@ fn parse_unified_diff_bytes(patch: &[u8]) -> DiffSnapshot {
         let line_bytes = trim_patch_line(raw_line);
         let line = String::from_utf8_lossy(line_bytes);
 
-        if let Some(header) = line.strip_prefix("diff --git ") {
+        if let Some(header) = line_bytes.strip_prefix(b"diff --git ") {
             finish_hunk(&mut snapshot, &mut current_hunk);
             finish_file(&mut snapshot, &mut current_file);
 
-            let path = PathBuf::from(diff_path(header));
+            let path = diff_path(header);
             let row_start = snapshot.rows.len();
             snapshot.files += 1;
             snapshot.file_diffs.push(DiffFile {
@@ -807,14 +807,79 @@ fn git_failure(output: &std::process::Output) -> DiffError {
     })
 }
 
-fn diff_path(header: &str) -> String {
-    header
-        .rsplit_once(" b/")
-        .map(|(_, path)| path)
-        .or_else(|| header.rsplit_once(" \"b/").map(|(_, path)| path))
-        .unwrap_or(header)
-        .trim_matches('"')
-        .to_owned()
+/// Extracts the new-side path from the text after `diff --git `.
+///
+/// Git C-quotes a side whose name holds non-ASCII bytes, quotes, backslashes,
+/// or control characters, so the header is read as bytes and unquoted rather
+/// than lossily decoded. An unquoted name may itself contain ` b/`; when both
+/// sides name the same file the header splits exactly in half, and only a
+/// rename falls back to the last separator.
+fn diff_path(header: &[u8]) -> PathBuf {
+    if header.ends_with(b"\"") {
+        // An embedded quote is always escaped, so a space directly followed
+        // by a quote can only open the new side.
+        if let Some(start) = rfind(header, b" \"b/") {
+            return path_from_bytes(&unquote_c_style(&header[start + 4..header.len() - 1]));
+        }
+    }
+    if let Some(sides) = header.strip_prefix(b"a/")
+        && sides.len() >= 3
+    {
+        let (old, new) = sides.split_at((sides.len() - 3) / 2);
+        if new.strip_prefix(b" b/") == Some(old) {
+            return path_from_bytes(old);
+        }
+    }
+    let path = rfind(header, b" b/").map_or(header, |start| &header[start + 3..]);
+    path_from_bytes(path)
+}
+
+fn rfind(haystack: &[u8], needle: &[u8]) -> Option<usize> {
+    haystack
+        .windows(needle.len())
+        .rposition(|window| window == needle)
+}
+
+/// Decodes the body of a Git C-quoted path: the named escapes and three-digit
+/// octal bytes written by `quote_c_style`. Unknown escapes are kept verbatim.
+fn unquote_c_style(quoted: &[u8]) -> Vec<u8> {
+    let mut bytes = Vec::with_capacity(quoted.len());
+    let mut rest = quoted;
+    while let Some((&byte, tail)) = rest.split_first() {
+        rest = tail;
+        if byte != b'\\' {
+            bytes.push(byte);
+            continue;
+        }
+        let Some((&escape, tail)) = rest.split_first() else {
+            bytes.push(byte);
+            break;
+        };
+        rest = tail;
+        let decoded = match escape {
+            b'a' => 0x07,
+            b'b' => 0x08,
+            b'f' => 0x0c,
+            b'n' => b'\n',
+            b'r' => b'\r',
+            b't' => b'\t',
+            b'v' => 0x0b,
+            b'"' | b'\\' => escape,
+            b'0'..=b'3'
+                if rest.len() >= 2 && rest[..2].iter().all(|b| (b'0'..=b'7').contains(b)) =>
+            {
+                let value = (escape - b'0') << 6 | (rest[0] - b'0') << 3 | (rest[1] - b'0');
+                rest = &rest[2..];
+                value
+            }
+            _ => {
+                bytes.push(byte);
+                escape
+            }
+        };
+        bytes.push(decoded);
+    }
+    bytes
 }
 
 fn parse_hunk_start(header: &str) -> (Option<u32>, Option<u32>) {
@@ -1148,6 +1213,77 @@ mod tests {
         assert_eq!(dirty.files, 1);
         assert_eq!(dirty.additions, 1);
         assert_eq!(dirty.deletions, 1);
+    }
+
+    /// Git C-quotes header paths holding non-ASCII bytes, quotes, backslashes,
+    /// or control characters. The parsed path is the file's identity for
+    /// per-file actions, so it must be the real name, not the escaped form.
+    #[test]
+    fn quoted_header_paths_decode_to_real_filenames() {
+        let snapshot = parse_unified_diff(concat!(
+            "diff --git \"a/caf\\303\\251.txt\" \"b/caf\\303\\251.txt\"\n",
+            "diff --git \"a/q\\\"uote\\\\slash.txt\" \"b/q\\\"uote\\\\slash.txt\"\n",
+            "diff --git \"a/tab\\there.txt\" \"b/tab\\there.txt\"\n",
+            "diff --git a/old name.txt \"b/new\\tname.txt\"\n",
+            "diff --git a/dir b/two words.txt b/dir b/two words.txt\n",
+        ));
+
+        let paths: Vec<_> = snapshot
+            .file_diffs
+            .iter()
+            .map(|file| file.path.as_path())
+            .collect();
+        assert_eq!(
+            paths,
+            [
+                Path::new("café.txt"),
+                Path::new("q\"uote\\slash.txt"),
+                Path::new("tab\there.txt"),
+                Path::new("new\tname.txt"),
+                Path::new("dir b/two words.txt"),
+            ]
+        );
+        assert_eq!(snapshot.rows[0].text, "café.txt");
+    }
+
+    #[test]
+    fn quoted_untracked_paths_stage_by_their_parsed_name() {
+        let directory = tempfile::tempdir().expect("temporary repository");
+        let root = directory.path();
+        init_with_baseline(root);
+        // A developer's global `core.quotePath=false` must not mask the
+        // default quoting this test exists to cover.
+        run(root, &["config", "core.quotePath", "true"]);
+        let names = ["café.txt", "q\"uote\\slash.txt", "tab\tand space .txt"];
+        for name in names {
+            fs::write(root.join(name), "new\n").unwrap();
+        }
+
+        let working = load_local_diff(root, DiffLayer::Working).expect("working lane");
+        let mut parsed: Vec<_> = working
+            .file_diffs
+            .iter()
+            .map(|file| file.path.clone())
+            .collect();
+        parsed.sort();
+        let mut expected: Vec<_> = names.iter().map(PathBuf::from).collect();
+        expected.sort();
+        assert_eq!(parsed, expected);
+
+        let repository = crate::git_review::GitRepository::discover(root).expect("repository");
+        for path in &parsed {
+            repository
+                .stage_paths(std::slice::from_ref(path))
+                .unwrap_or_else(|error| panic!("stage {path:?}: {error}"));
+        }
+        let staged = load_local_diff(root, DiffLayer::Staged).expect("staged lane");
+        let mut staged: Vec<_> = staged
+            .file_diffs
+            .iter()
+            .map(|file| file.path.clone())
+            .collect();
+        staged.sort();
+        assert_eq!(staged, expected);
     }
 
     /// A checkout directory may legitimately end in whitespace. Trimming the
