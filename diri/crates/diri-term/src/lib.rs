@@ -10,3 +10,4 @@ pub mod metrics;
 pub mod scrollback;
 pub mod selection;
 pub mod theme;
+pub mod tints;

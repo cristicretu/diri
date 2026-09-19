@@ -7,12 +7,20 @@ const fn rgba_f32(r: f32, g: f32, b: f32, a: f32) -> Rgba {
     Rgba { r, g, b, a }
 }
 
-const fn hex(value: u32) -> Rgba {
+pub(crate) const fn hex(value: u32) -> Rgba {
     Rgba {
         r: ((value >> 16) & 0xff) as f32 / 255.0,
         g: ((value >> 8) & 0xff) as f32 / 255.0,
         b: (value & 0xff) as f32 / 255.0,
         a: 1.0,
+    }
+}
+
+/// `0xRRGGBBAA`, the form the derived overlays are stored in.
+const fn hex_alpha(value: u32) -> Rgba {
+    Rgba {
+        a: (value & 0xff) as f32 / 255.0,
+        ..hex(value >> 8)
     }
 }
 
@@ -77,8 +85,11 @@ impl TermTheme {
         cursor: rgba_f32(0.90, 0.90, 0.90, 0.85),
         cursor_text: rgba_f32(0.05, 0.05, 0.05, 1.0),
         selection: rgba_f32(0.28, 0.42, 0.62, 0.35),
-        find_match: rgba_f32(1.0, 0.8, 0.0, 0.35),
-        find_match_current: rgba_f32(1.0, 0.8, 0.0, 0.65),
+        // Hand-authored, held to the same checks as the derived themes (see
+        // `tints`): at 0.65 the current match left default text at 2.6:1, and
+        // at the 0.44 that reads, a 0.35 match sat too close beneath it.
+        find_match: rgba_f32(1.0, 0.8, 0.0, 0.28),
+        find_match_current: rgba_f32(1.0, 0.8, 0.0, 0.44),
         ansi: [
             hex(0x000000),
             hex(0xcd3131),
@@ -104,7 +115,7 @@ impl TermTheme {
         "Solarized Dark",
         0x002b36,
         0x839496,
-        0x586e75,
+        [0x27444e80, 0x6e4e004d, 0x795d0073],
         [
             0x073642, 0xdc322f, 0x859900, 0xb58900, 0x268bd2, 0xd33682, 0x2aa198, 0xeee8d5,
             0x002b36, 0xcb4b16, 0x586e75, 0x657b83, 0x839496, 0x6c71c4, 0x93a1a1, 0xfdf6e3,
@@ -116,7 +127,7 @@ impl TermTheme {
         "Dracula",
         0x282a36,
         0xf8f8f2,
-        0x44475a,
+        [0x595c7580, 0xb9930040, 0xebbc0066],
         [
             0x21222c, 0xff5555, 0x50fa7b, 0xf1fa8c, 0xbd93f9, 0xff79c6, 0x8be9fd, 0xf8f8f2,
             0x6272a4, 0xff6e6e, 0x69ff94, 0xffffa5, 0xd6acff, 0xff92df, 0xa4ffff, 0xffffff,
@@ -128,7 +139,7 @@ impl TermTheme {
         "One Dark",
         0x282c34,
         0xabb2bf,
-        0x3e4451,
+        [0x555d7080, 0x764c004d, 0x8b5c0073],
         [
             0x282c34, 0xe06c75, 0x98c379, 0xe5c07b, 0x61afef, 0xc678dd, 0x56b6c2, 0xabb2bf,
             0x5c6370, 0xe06c75, 0x98c379, 0xe5c07b, 0x61afef, 0xc678dd, 0x56b6c2, 0xffffff,
@@ -140,7 +151,7 @@ impl TermTheme {
         "Gruvbox Dark",
         0x282828,
         0xebdbb2,
-        0x504945,
+        [0x63595380, 0xcd7e0040, 0xffa60866],
         [
             0x282828, 0xcc241d, 0x98971a, 0xd79921, 0x458588, 0xb16286, 0x689d6a, 0xa89984,
             0x928374, 0xfb4934, 0xb8bb26, 0xfabd2f, 0x83a598, 0xd3869b, 0x8ec07c, 0xebdbb2,
@@ -152,7 +163,7 @@ impl TermTheme {
         "Tokyo Night",
         0x1a1b26,
         0xc0caf5,
-        0x33467c,
+        [0x364a8280, 0xc26d0040, 0xf6920066],
         [
             0x15161e, 0xf7768e, 0x9ece6a, 0xe0af68, 0x7aa2f7, 0xbb9af7, 0x7dcfff, 0xa9b1d6,
             0x414868, 0xf7768e, 0x9ece6a, 0xe0af68, 0x7aa2f7, 0xbb9af7, 0x7dcfff, 0xc0caf5,
@@ -164,7 +175,7 @@ impl TermTheme {
         "Catppuccin Mocha",
         0x1e1e2e,
         0xcdd6f4,
-        0x585b70,
+        [0x4d506480, 0xb97d0040, 0xeca30066],
         [
             0x45475a, 0xf38ba8, 0xa6e3a1, 0xf9e2af, 0x89b4fa, 0xf5c2e7, 0x94e2d5, 0xbac2de,
             0x585b70, 0xf38ba8, 0xa6e3a1, 0xf9e2af, 0x89b4fa, 0xf5c2e7, 0x94e2d5, 0xa6adc8,
@@ -184,7 +195,8 @@ impl TermTheme {
         cursor_text: hex(0x101010),
         selection: with_alpha(hex(0xf8feff), 0.247_058_82),
         find_match: with_alpha(hex(0xffc799), 0.35),
-        find_match_current: with_alpha(hex(0xffc799), 0.65),
+        // 0.65 left white text at 3.3:1 over the peach; see `tints`.
+        find_match_current: with_alpha(hex(0xffc799), 0.52),
         ansi: [
             hex(0x101010),
             hex(0xff8080),
@@ -210,7 +222,7 @@ impl TermTheme {
         "Nord",
         0x2e3440,
         0xd8dee9,
-        0x4c566a,
+        [0x5d698180, 0xab72004d, 0xffad0159],
         [
             0x3b4252, 0xbf616a, 0xa3be8c, 0xebcb8b, 0x81a1c1, 0xb48ead, 0x88c0d0, 0xe5e9f0,
             0x4c566a, 0xbf616a, 0xa3be8c, 0xebcb8b, 0x81a1c1, 0xb48ead, 0x8fbcbb, 0xeceff4,
@@ -222,7 +234,7 @@ impl TermTheme {
         "Rosé Pine",
         0x191724,
         0xe0def4,
-        0x403d52,
+        [0x49465d80, 0xe57c0033, 0xf48b0066],
         [
             0x26233a, 0xeb6f92, 0x31748f, 0xf6c177, 0x9ccfd8, 0xc4a7e7, 0xe0def4, 0xe0def4,
             0x6e6a86, 0xeb6f92, 0x31748f, 0xf6c177, 0x9ccfd8, 0xc4a7e7, 0xe0def4, 0xffffff,
@@ -234,7 +246,7 @@ impl TermTheme {
         "Kanagawa Wave",
         0x1f1f28,
         0xdcd7ba,
-        0x2d4f67,
+        [0x32567080, 0xbe780040, 0xf19f0066],
         [
             0x16161d, 0xc34043, 0x76946a, 0xc0a36e, 0x7e9cd8, 0x957fb8, 0x6a9589, 0xc8c093,
             0x727169, 0xe82424, 0x98bb6c, 0xe6c384, 0x7fb4ca, 0x938aa9, 0x7aa89f, 0xdcd7ba,
@@ -246,7 +258,7 @@ impl TermTheme {
         "Everforest Dark",
         0x2d353b,
         0xd3c6aa,
-        0x475258,
+        [0x5d6b7180, 0x8b5f004d, 0xa6730073],
         [
             0x475258, 0xe67e80, 0xa7c080, 0xdbbc7f, 0x7fbbb3, 0xd699b6, 0x83c092, 0xd3c6aa,
             0x859289, 0xe67e80, 0xa7c080, 0xdbbc7f, 0x7fbbb3, 0xd699b6, 0x83c092, 0xffffff,
@@ -258,7 +270,7 @@ impl TermTheme {
         "Dirijor Light",
         0xf7f5f0,
         0x25221d,
-        0xb8d1e8,
+        [0x8fb9e380, 0xdd9d0066, 0xb48100a6],
         [
             0x2b2a27, 0xb34234, 0x4d7c3f, 0x9b6a18, 0x356c9a, 0x8a4f8d, 0x2f7d79, 0xe8e4dc,
             0x6d6860, 0xd05a47, 0x669955, 0xc18426, 0x4b83b5, 0xa467a6, 0x449793, 0xffffff,
@@ -270,7 +282,7 @@ impl TermTheme {
         "Solarized Light",
         0xfdf6e3,
         0x657b83,
-        0xeee8d5,
+        [0xdad5c280, 0xffb91040, 0xf8b20080],
         [
             0x073642, 0xdc322f, 0x859900, 0xb58900, 0x268bd2, 0xd33682, 0x2aa198, 0xeee8d5,
             0x002b36, 0xcb4b16, 0x586e75, 0x657b83, 0x839496, 0x6c71c4, 0x93a1a1, 0xfdf6e3,
@@ -282,7 +294,7 @@ impl TermTheme {
         "GitHub Light",
         0xffffff,
         0x24292f,
-        0xbddfff,
+        [0x88c5ff80, 0xeaa60066, 0xc08a00a6],
         [
             0x24292f, 0xcf222e, 0x116329, 0x4d2d00, 0x0969da, 0x8250df, 0x1b7c83, 0x6e7781,
             0x57606a, 0xa40e26, 0x1a7f37, 0x633c01, 0x218bff, 0xa475f9, 0x3192aa, 0xffffff,
@@ -294,7 +306,7 @@ impl TermTheme {
         "Gruvbox Light",
         0xfbf1c7,
         0x3c3836,
-        0xd5c4a1,
+        [0xc0ab8c80, 0xcf990066, 0xa87e00a6],
         [
             0x3c3836, 0xcc241d, 0x98971a, 0xd79921, 0x458588, 0xb16286, 0x689d6a, 0x7c6f64,
             0x928374, 0x9d0006, 0x79740e, 0xb57614, 0x076678, 0x8f3f71, 0x427b58, 0xffffff,
@@ -306,7 +318,7 @@ impl TermTheme {
         "Catppuccin Latte",
         0xeff1f5,
         0x4c4f69,
-        0xacb0be,
+        [0xabafbd80, 0xf7af0059, 0xdc9e0099],
         [
             0x5c5f77, 0xd20f39, 0x40a02b, 0xdf8e1d, 0x1e66f5, 0x8839ef, 0x179299, 0xacb0be,
             0x6c6f85, 0xd20f39, 0x40a02b, 0xdf8e1d, 0x1e66f5, 0xea76cb, 0x179299, 0xffffff,
@@ -432,7 +444,7 @@ const fn dark_theme(
     name: &'static str,
     background: u32,
     foreground: u32,
-    selection: u32,
+    tints: [u32; 3],
     ansi_values: [u32; 16],
 ) -> TermTheme {
     palette_theme(
@@ -441,7 +453,7 @@ const fn dark_theme(
         name,
         background,
         foreground,
-        selection,
+        tints,
         ansi_values,
     )
 }
@@ -451,7 +463,7 @@ const fn light_theme(
     name: &'static str,
     background: u32,
     foreground: u32,
-    selection: u32,
+    tints: [u32; 3],
     ansi_values: [u32; 16],
 ) -> TermTheme {
     palette_theme(
@@ -460,18 +472,21 @@ const fn light_theme(
         name,
         background,
         foreground,
-        selection,
+        tints,
         ansi_values,
     )
 }
 
+/// `tints` are the selection, find-match, and current-find-match overlays as
+/// `0xRRGGBBAA`. They are not picked by hand: `tints::derive` solves them
+/// from the palette, and its golden test prints the literals to paste here.
 const fn palette_theme(
     appearance: ThemeAppearance,
     id: &'static str,
     name: &'static str,
     background: u32,
     foreground: u32,
-    selection: u32,
+    tints: [u32; 3],
     ansi_values: [u32; 16],
 ) -> TermTheme {
     let fg = hex(foreground);
@@ -483,9 +498,9 @@ const fn palette_theme(
         foreground: fg,
         cursor: with_alpha(fg, 0.85),
         cursor_text: hex(background),
-        selection: with_alpha(hex(selection), 0.60),
-        find_match: rgba_f32(1.0, 0.8, 0.0, 0.35),
-        find_match_current: rgba_f32(1.0, 0.8, 0.0, 0.65),
+        selection: hex_alpha(tints[0]),
+        find_match: hex_alpha(tints[1]),
+        find_match_current: hex_alpha(tints[2]),
         ansi: [
             hex(ansi_values[0]),
             hex(ansi_values[1]),

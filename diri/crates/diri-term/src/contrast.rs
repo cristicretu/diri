@@ -29,7 +29,7 @@ pub(crate) const MINIMUM_DIM_CONTRAST: f32 = 3.0;
 pub(crate) const DIM_OPACITY: f32 = 0.5;
 
 /// Below this Oklch chroma a color has no hue worth preserving.
-const NEUTRAL_CHROMA: f32 = 0.02;
+pub(crate) const NEUTRAL_CHROMA: f32 = 0.02;
 /// At and above this chroma a color is treated as fully chromatic.
 const CHROMATIC_CHROMA: f32 = 0.08;
 /// Lightness travel below which a color keeps its authored hue and chroma.
@@ -42,7 +42,7 @@ const HUE_PULL: f32 = 0.75;
 const CHROMA_PULL: f32 = 0.5;
 /// A palette slot further than this from its primary's hue was repurposed by
 /// the theme and does not steer anything.
-const ACCENT_REACH_DEGREES: f32 = 60.0;
+pub(crate) const ACCENT_REACH_DEGREES: f32 = 60.0;
 /// The chromatic ANSI slots with the primaries they name, in hue order.
 const PRIMARIES: [(usize, LinearRgb); 6] = [
     (1, [1.0, 0.0, 0.0]),
@@ -107,7 +107,6 @@ pub(crate) fn painted_foreground(
     })
 }
 
-#[cfg(test)]
 pub(crate) fn contrast_ratio(left: Rgba, right: Rgba) -> f32 {
     ratio(
         relative_luminance(linear(left)),
@@ -170,14 +169,14 @@ fn theme_key(theme: &TermTheme) -> u64 {
     key
 }
 
-type LinearRgb = [f32; 3];
+pub(crate) type LinearRgb = [f32; 3];
 
 #[derive(Clone, Copy)]
-struct Oklch {
-    lightness: f32,
-    chroma: f32,
+pub(crate) struct Oklch {
+    pub(crate) lightness: f32,
+    pub(crate) chroma: f32,
     /// Radians.
-    hue: f32,
+    pub(crate) hue: f32,
 }
 
 /// The background a foreground is judged against.
@@ -367,12 +366,12 @@ fn harmonized(theme: &TermTheme, authored: Oklch, strength: f32, neutrality: f32
 }
 
 /// Signed shortest rotation from `from` to `to`, in radians.
-fn hue_delta(from: f32, to: f32) -> f32 {
+pub(crate) fn hue_delta(from: f32, to: f32) -> f32 {
     use std::f32::consts::{PI, TAU};
     (to - from + PI).rem_euclid(TAU) - PI
 }
 
-fn composite(foreground: Rgba, background: Rgba) -> Rgba {
+pub(crate) fn composite(foreground: Rgba, background: Rgba) -> Rgba {
     let blend = |ink: f32, paper: f32| paper + (ink - paper) * foreground.a;
     Rgba {
         r: blend(foreground.r, background.r),
@@ -410,11 +409,11 @@ fn encode(channel: f32) -> f32 {
     }
 }
 
-fn linear(color: Rgba) -> LinearRgb {
+pub(crate) fn linear(color: Rgba) -> LinearRgb {
     [decode(color.r), decode(color.g), decode(color.b)]
 }
 
-fn rgba(color: LinearRgb, alpha: f32) -> Rgba {
+pub(crate) fn rgba(color: LinearRgb, alpha: f32) -> Rgba {
     Rgba {
         r: encode(color[0]),
         g: encode(color[1]),
@@ -424,7 +423,7 @@ fn rgba(color: LinearRgb, alpha: f32) -> Rgba {
 }
 
 // Björn Ottosson's Oklab, https://bottosson.github.io/posts/oklab/.
-fn oklch([r, g, b]: LinearRgb) -> Oklch {
+pub(crate) fn oklch([r, g, b]: LinearRgb) -> Oklch {
     let l = (0.412_221_46 * r + 0.536_332_55 * g + 0.051_445_995 * b).cbrt();
     let m = (0.211_903_5 * r + 0.680_699_5 * g + 0.107_396_96 * b).cbrt();
     let s = (0.088_302_46 * r + 0.281_718_85 * g + 0.629_978_7 * b).cbrt();
@@ -453,7 +452,7 @@ fn unclipped(color: Oklch) -> LinearRgb {
 /// `color` as displayable linear sRGB. Out-of-gamut colors shed chroma at
 /// constant lightness and hue, which is what keeps a darkened yellow yellow
 /// instead of clipping a channel and sliding toward green.
-fn in_gamut(color: Oklch) -> LinearRgb {
+pub(crate) fn in_gamut(color: Oklch) -> LinearRgb {
     fn displayable(rgb: LinearRgb) -> bool {
         rgb.iter()
             .all(|channel| (-0.000_5..=1.000_5).contains(channel))
