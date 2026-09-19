@@ -2374,6 +2374,205 @@ async fn deferred_client_start_keeps_first_paint_in_connecting_state() {
     runtime.shutdown().await;
 }
 
+/// How the fake Engine answers `session.remove`.
+#[derive(Clone, Copy)]
+enum FakeRemove {
+    /// A definitive rejection: the session is retained and the reply says so.
+    Reject,
+    /// The session is removed, but neither a usable reply nor the
+    /// `session.removed` event reaches the app.
+    LoseReply,
+}
+
+/// A control-socket Engine that stays connected across a failed removal.
+struct FakeRemoveEngine {
+    _home: tempfile::TempDir,
+    socket: std::path::PathBuf,
+    removes: Arc<std::sync::atomic::AtomicUsize>,
+}
+
+impl FakeRemoveEngine {
+    fn start(sessions: Vec<SessionRecord>, behavior: FakeRemove) -> Self {
+        use std::io::{BufRead as _, Write as _};
+        use std::sync::atomic::Ordering;
+
+        use diri_proto::{ControlError, ControlMessage, Method};
+
+        let home = tempdir().expect("temporary socket home");
+        let socket = home.path().join("engine.sock");
+        let listener = std::os::unix::net::UnixListener::bind(&socket).expect("bind fake Engine");
+        let removes = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let sessions = Arc::new(std::sync::Mutex::new(sessions));
+        let remove_count = Arc::clone(&removes);
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(stream) = stream else { return };
+                let mut writer = stream.try_clone().expect("clone fake Engine stream");
+                let mut reader = std::io::BufReader::new(stream);
+                let mut line = String::new();
+                while reader.read_line(&mut line).is_ok_and(|read| read > 0) {
+                    let message = serde_json::from_str(&line).expect("control request");
+                    line.clear();
+                    let ControlMessage::Request { id, method, params } = message else {
+                        continue;
+                    };
+                    let result = match method.as_str() {
+                        Method::HELLO => Ok(serde_json::to_value(diri_proto::HelloResult {
+                            proto: diri_proto::WIRE_VERSION,
+                            build: "fake-engine".to_owned(),
+                            pid: std::process::id() as i32,
+                            engine_instance_id: None,
+                            engine_kind: Some(diri_proto::RUST_ENGINE_KIND.to_owned()),
+                            executable_hash: None,
+                        })
+                        .expect("hello")),
+                        Method::EVENTS_SUBSCRIBE => Ok(serde_json::json!({ "subscribed": true })),
+                        Method::SESSION_LIST => Ok(serde_json::to_value(SessionListResult {
+                            sessions: sessions.lock().expect("fake sessions").clone(),
+                            projects: vec![project("p", "P")],
+                        })
+                        .expect("session list")),
+                        Method::SESSION_REMOVE => {
+                            remove_count.fetch_add(1, Ordering::SeqCst);
+                            match behavior {
+                                FakeRemove::Reject => Err(ControlError::internal(
+                                    "session state file is not editable",
+                                )),
+                                FakeRemove::LoseReply => {
+                                    let params: diri_proto::SessionIdParams =
+                                        serde_json::from_value(params.expect("remove params"))
+                                            .expect("remove params");
+                                    sessions
+                                        .lock()
+                                        .expect("fake sessions")
+                                        .retain(|session| session.id != params.session_id);
+                                    // Not a `session.remove` result: the app
+                                    // cannot tell what the Engine did.
+                                    Ok(serde_json::json!("garbled"))
+                                }
+                            }
+                        }
+                        _ => Err(ControlError::bad_request("unsupported by the fake Engine")),
+                    };
+                    let mut bytes = serde_json::to_vec(&ControlMessage::Response { id, result })
+                        .expect("encode response");
+                    bytes.push(b'\n');
+                    if writer.write_all(&bytes).is_err() {
+                        break;
+                    }
+                }
+            }
+        });
+        Self {
+            _home: home,
+            socket,
+            removes,
+        }
+    }
+
+    async fn runtime(&self) -> StoreRuntime {
+        let client = Arc::new(DaemonClient::with_socket_path(&self.socket));
+        let (store, effects) = SessionStore::headless(Prefs {
+            confirm_before_closing_session: false,
+            ..Prefs::default()
+        });
+        let runtime =
+            StoreRuntime::start_with_store(client, store, effects, ClientStartup::Immediate);
+        runtime.client.connect();
+        let store = Arc::clone(&runtime.store);
+        eventually("the fake Engine's sessions hydrate", move || {
+            store.read().unwrap().has_hydrated_sessions()
+        })
+        .await;
+        runtime
+    }
+}
+
+async fn eventually(what: &str, mut condition: impl FnMut() -> bool) {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while !condition() {
+        assert!(Instant::now() < deadline, "timed out waiting until {what}");
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+}
+
+fn visible_ids(store: &mut SessionStore) -> Vec<SessionId> {
+    store
+        .ordered_sessions()
+        .iter()
+        .map(|session| session.id.clone())
+        .collect()
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_rejected_close_restores_the_retained_session_and_allows_a_retry() {
+    use std::sync::atomic::Ordering;
+
+    let engine = FakeRemoveEngine::start(
+        vec![session("one", "p", 2.0), session("two", "p", 1.0)],
+        FakeRemove::Reject,
+    );
+    let runtime = engine.runtime().await;
+    let store = Arc::clone(&runtime.store);
+
+    let listed = visible_ids(&mut store.write().unwrap());
+    assert_eq!(listed.len(), 2);
+    store.write().unwrap().request_close(vec![id("one")]);
+    assert_eq!(visible_ids(&mut store.write().unwrap()), vec![id("two")]);
+
+    eventually("the rejection is reported", || {
+        store.read().unwrap().action_failure().is_some()
+    })
+    .await;
+    {
+        let mut store = store.write().unwrap();
+        assert_eq!(
+            visible_ids(&mut store),
+            listed,
+            "the Engine kept the session, so its row has to come back"
+        );
+        assert!(matches!(
+            runtime.client.connection_state().borrow().clone(),
+            ConnectionState::Connected(_)
+        ));
+        // Usable again: selectable, attachable, and closable.
+        store.select(id("one"));
+        assert_eq!(store.selected_session_id(), Some(&id("one")));
+        assert!(store.terminal_residency.contains(&id("one")));
+        store.request_close(vec![id("one")]);
+    }
+    eventually("the second close reaches the Engine", || {
+        engine.removes.load(Ordering::SeqCst) == 2
+    })
+    .await;
+
+    runtime.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_lost_close_reply_is_settled_by_the_engine_not_assumed_to_have_failed() {
+    let engine = FakeRemoveEngine::start(
+        vec![session("one", "p", 2.0), session("two", "p", 1.0)],
+        FakeRemove::LoseReply,
+    );
+    let runtime = engine.runtime().await;
+    let store = Arc::clone(&runtime.store);
+
+    store.write().unwrap().request_close(vec![id("one")]);
+    eventually("the authoritative list drops the removed session", || {
+        let mut store = store.write().unwrap();
+        assert_eq!(
+            visible_ids(&mut store),
+            vec![id("two")],
+            "an unknown outcome must not resurrect the row"
+        );
+        !store.sessions().contains_key(&id("one")) && store.closing.is_empty()
+    })
+    .await;
+
+    runtime.shutdown().await;
+}
+
 #[test]
 fn action_retry_policy_only_replays_idempotent_operations() {
     let rename = StoreEffect::Rename {
