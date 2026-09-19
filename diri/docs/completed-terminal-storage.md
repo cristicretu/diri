@@ -72,7 +72,15 @@ handling must inspect exact existing content before claiming idempotent success.
    resize and process facts remain impossible for such records.
 5. **Removal.** `Registry::remove` discards the record's artifact with its
    binding, so nothing can resolve it afterwards.
-6. **Retention.** After every publication the watcher applies
+6. **Attachment.** `AttachHub::serve` (and the preview path) finds no live
+   Session for a completed local record and serves the retained terminal
+   instead: one full grid seed plus its modes, then the connection is held
+   open with pings answered and every other frame swallowed, because there is
+   no child to receive input, resize or scroll. No publisher is registered and
+   nothing is published again. The desktop pane therefore shows the last
+   screen under its exit pill after an Engine replacement, exactly as it does
+   for a session that exited under a still-running Engine.
+7. **Retention.** After every publication the watcher applies
    `Registry::completed_retention()` off the lock: artifacts no current local
    record binds are removed, then the oldest bound artifacts are evicted until
    the directory holds at most 256 artifacts and 256 MiB. `load` re-seeds the
@@ -80,10 +88,9 @@ handling must inspect exact existing content before claiming idempotent success.
    can still read. Nonce files and foreign files are never touched. An evicted
    record's output becomes explicitly unavailable; nothing else changes.
 
-Still unwired: pane attachment (the attach stream still requires a live
-Session, so the desktop does not yet show a retained terminal), remote records (a separate
-authenticated Helper operation), and an explicit reservation of the *next* run
-before launch. A resume of a completed
+Still unwired: remote records (a separate authenticated Helper operation) and
+an explicit reservation of the *next* run before launch. Native desktop
+evidence of the retained pane after an app update has not been captured yet. A resume of a completed
 record replaces the binding when the new Holder reports its identity.
 
 ## Acceptance still required

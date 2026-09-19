@@ -361,6 +361,23 @@ impl AttachHub {
         };
         output.enhanced_keyboard = enhanced_keyboard;
         output.preview = preview;
+        // A completed local session whose Engine has since been replaced has
+        // no live Session to attach to, but its final terminal may have been
+        // retained. Serve that as a read-only seed on this connection.
+        let completed = {
+            let Ok(guard) = registry.lock() else {
+                return;
+            };
+            if guard.get(session_id).is_some() {
+                None
+            } else {
+                guard.completed_run(session_id)
+            }
+        };
+        if let Some(handle) = completed {
+            self.serve_completed(handle, output, reader, buffered, session_id, preview);
+            return;
+        }
         // Snapshot, seed queueing and registration share the publisher's
         // Registry sequencing boundary. No update can slip between a new
         // sink's snapshot and admission, and no socket write holds this lock.
@@ -481,6 +498,96 @@ impl AttachHub {
             }
         }
         self.deregister(session_id, sink_id);
+    }
+
+    /// Seeds one connection from a retained terminal and then holds it open:
+    /// pings are answered, every other frame is swallowed because there is no
+    /// child to receive it, and nothing is ever published again. The pane
+    /// sees the same thing a live exited session shows, its last screen.
+    fn serve_completed(
+        &self,
+        handle: crate::registry::CompletedRunHandle,
+        mut output: SinkOutput,
+        mut reader: UnixStream,
+        buffered: Vec<u8>,
+        session_id: &str,
+        preview: bool,
+    ) {
+        let Ok(Some(terminal)) = handle.load() else {
+            return;
+        };
+        let Some(mut screen) = terminal.screen() else {
+            return;
+        };
+        let Ok(grid) = Frame::grid(&screen.grid_update(true))
+            .ok()
+            .and_then(|frame| FrameCodec::encode(&frame).ok())
+            .ok_or(())
+        else {
+            return;
+        };
+        let grid = if preview {
+            let ready = diri_proto::preview::PreviewReady {
+                preview: diri_proto::SessionId(session_id.to_owned()),
+                version: diri_proto::preview::PREVIEW_VERSION,
+            };
+            let Ok(mut bytes) = serde_json::to_vec(&ready) else {
+                return;
+            };
+            bytes.push(b'\n');
+            bytes.extend_from_slice(&grid);
+            bytes
+        } else {
+            grid
+        };
+        if !output.enqueue(Arc::from(grid)) {
+            return;
+        }
+        let Ok(modes) = encoded(&Frame::modes_with_keyboard_capability(
+            screen.is_alt_screen(),
+            screen.bracketed_paste(),
+            screen.mouse_modes(),
+            terminal.checkpoint.keyboard,
+            output.enhanced_keyboard,
+        )) else {
+            return;
+        };
+        if !output.enqueue(modes) || !drain_output(&mut output) {
+            return;
+        }
+        let mut codec = FrameCodec::new();
+        let mut chunk = [0u8; 4096];
+        let mut pending = buffered;
+        'serve: while let Ok(frames) = codec.feed(&pending) {
+            pending.clear();
+            for frame in frames {
+                match frame.frame_type {
+                    FrameType::Ping => {
+                        let Ok(pong) = encoded(&Frame::pong()) else {
+                            break 'serve;
+                        };
+                        if !output.enqueue(pong) || !drain_output(&mut output) {
+                            break 'serve;
+                        }
+                    }
+                    FrameType::Pong => {}
+                    _ if preview => break 'serve,
+                    _ => {} // no child: input, resize and scroll go nowhere
+                }
+            }
+            match reader.read(&mut chunk) {
+                Ok(0) => break,
+                Ok(count) => pending.extend_from_slice(&chunk[..count]),
+                Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    if !wait_readable(&reader) {
+                        break;
+                    }
+                }
+                Err(_) => break,
+            }
+        }
+        output.close();
     }
 
     fn handle_frame(
@@ -868,6 +975,44 @@ impl AttachHub {
     }
 }
 
+/// Writes everything queued on a sink whose only writer is this thread,
+/// waiting for the socket between bounded write budgets.
+fn drain_output(output: &mut SinkOutput) -> bool {
+    loop {
+        if !output.flush() {
+            return false;
+        }
+        if output.frames.is_empty() {
+            return true;
+        }
+        if !wait_writable(&output.stream) {
+            return false;
+        }
+    }
+}
+
+fn wait_writable(stream: &UnixStream) -> bool {
+    let mut descriptor = libc::pollfd {
+        fd: stream.as_raw_fd(),
+        events: libc::POLLOUT,
+        revents: 0,
+    };
+    loop {
+        // SAFETY: one valid pollfd for a live socket. A hangup or error wakes
+        // the poll so the caller's next write fails instead of spinning.
+        let result = unsafe { libc::poll(&mut descriptor, 1, WRITE_RETRY.as_millis() as i32) };
+        if result > 0 {
+            return descriptor.revents & (libc::POLLNVAL | libc::POLLERR) == 0;
+        }
+        if result == 0 {
+            return true; // timed out; let flush judge progress and stalls
+        }
+        if std::io::Error::last_os_error().kind() != std::io::ErrorKind::Interrupted {
+            return false;
+        }
+    }
+}
+
 /// Blocking readiness wait used only by the existing input reader thread.
 fn wait_readable(stream: &UnixStream) -> bool {
     let mut descriptor = libc::pollfd {
@@ -910,6 +1055,166 @@ mod tests {
         );
         reader.set_nonblocking(true).unwrap();
         (SinkOutput::new(writer).unwrap(), reader)
+    }
+
+    fn retained_registry(temp: &std::path::Path) -> Arc<Mutex<Registry>> {
+        use diri_proto::process::{BootId, ProcessBirth, ProcessIdentity};
+        use std::os::unix::fs::PermissionsExt;
+        let exit = diri_proto::ExitInfo {
+            reason: diri_proto::ExitReason::Exited,
+            code: Some(0),
+            signal: None,
+        };
+        let record = diri_proto::SessionRecord {
+            attention_state: None,
+            id: diri_proto::SessionId("finished".into()),
+            kind: diri_proto::AgentKind::SHELL,
+            cwd: "/tmp".into(),
+            project_id: diri_proto::ProjectId("p".into()),
+            worktree_path: None,
+            git_branch: None,
+            title: "test".into(),
+            title_source: diri_proto::TitleSource::Placeholder,
+            account_profile: None,
+            originating_prompt: None,
+            agent_session_id: None,
+            transcript_path: None,
+            status: diri_proto::SessionStatus::Exited(exit.clone()),
+            status_evidence: None,
+            needs_input: None,
+            resumability: diri_proto::Resumability::NotResumable,
+            capabilities: None,
+            parent: None,
+            created_at: diri_proto::DateMillis(1_700_000_000_000.0),
+            updated_at: diri_proto::DateMillis(1_700_000_000_000.0),
+            last_turn_completed_at: None,
+            last_seen_at: None,
+            pinned: false,
+            archived_at: None,
+            host: None,
+            remote_persistence: None,
+            remote_connection: None,
+            hibernation: None,
+            memory_bytes: None,
+            artifacts: None,
+            pull_requests: None,
+            listening_ports: None,
+            foreground_agent: None,
+        };
+        let child = ProcessIdentity::new(
+            4321,
+            ProcessBirth::Macos {
+                boot_session: BootId::parse("0f0e0d0c-0b0a-0908-0706-050403020100").unwrap(),
+                start_seconds: 1_700_000_000,
+                start_microseconds: 1,
+            },
+        )
+        .unwrap();
+        let key = crate::completed_terminal::CompletedRunKey::bind(&record, child, 10).unwrap();
+        let mut screen = diri_terminal_state::HeadlessScreen::new(40, 4);
+        screen.feed(b"old line\r\nretained screen\x1b[?2004h");
+        let checkpoint = crate::checkpoint::ScreenCheckpoint {
+            keyboard_snapshot: screen.keyboard_snapshot(),
+            keyboard: Some(screen.keyboard_state()),
+            log_offset: 64,
+            history: screen.history_snapshot(),
+            history_metadata: screen.history_metadata(),
+            grid: screen.grid_update(true),
+            marker_buffer: Vec::new(),
+            alt_screen: false,
+            bracketed_paste: true,
+            mouse: Default::default(),
+        };
+        let dir = temp.join(crate::registry::COMPLETED_TERMINALS_DIR_NAME);
+        std::fs::create_dir(&dir).unwrap();
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+        crate::completed_terminal::CompletedTerminalStore::open(&dir)
+            .unwrap()
+            .publish(&record, &key, &checkpoint, &exit)
+            .unwrap();
+        let mut registry = Registry::new(
+            Arc::new(crate::ManifestEngine::new(Vec::new())),
+            temp.join("state.json"),
+        );
+        registry.insert_record(record);
+        let recovery = registry.recovery_directory("finished");
+        std::fs::create_dir_all(&recovery).unwrap();
+        diri_proto::recovery::SessionRecoveryStore::new(recovery)
+            .write_completed_run(&key)
+            .unwrap();
+        Arc::new(Mutex::new(registry))
+    }
+
+    fn read_frames(codec: &mut FrameCodec, stream: &mut UnixStream, want: usize) -> Vec<Frame> {
+        let mut frames = Vec::new();
+        let mut chunk = [0u8; 64 << 10];
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while frames.len() < want {
+            assert!(Instant::now() < deadline, "timed out with {frames:?}");
+            match stream.read(&mut chunk) {
+                Ok(0) => panic!("stream closed with {frames:?}"),
+                Ok(count) => frames.extend(codec.feed(&chunk[..count]).unwrap()),
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+                Err(error) => panic!("{error}"),
+            }
+        }
+        frames
+    }
+
+    #[test]
+    fn attaching_to_a_completed_session_seeds_its_retained_terminal_read_only() {
+        let temp = tempfile::tempdir().unwrap();
+        let registry = retained_registry(temp.path());
+        let hub = AttachHub::new();
+        let (mut client, server) = UnixStream::pair().unwrap();
+        let writer = Arc::new(Mutex::new(server.try_clone().unwrap()));
+        let serve = {
+            let registry = Arc::clone(&registry);
+            let hub = hub.clone();
+            std::thread::spawn(move || hub.serve(&registry, "finished", server, Vec::new(), writer))
+        };
+        client
+            .set_read_timeout(Some(Duration::from_millis(50)))
+            .unwrap();
+        let mut codec = FrameCodec::new();
+        let frames = read_frames(&mut codec, &mut client, 2);
+        let grid = frames[0]
+            .grid_payload()
+            .unwrap()
+            .expect("a grid seed first");
+        assert!(grid.is_full_snapshot);
+        assert_eq!((grid.cols, grid.rows), (40, 4));
+        let text: String = grid.changed_rows[1]
+            .cells
+            .iter()
+            .map(|cell| char::from_u32(cell.scalar).unwrap_or(' '))
+            .collect();
+        assert!(text.starts_with("retained screen"), "{text:?}");
+        let (alt_screen, bracketed_paste, _) = frames[1].terminal_modes_payload().expect("modes");
+        assert!(!alt_screen);
+        assert!(bracketed_paste, "the retained modes travel with the grid");
+
+        // The connection stays open: pings are answered, input goes nowhere,
+        // and nothing else is ever published.
+        for _ in 0..2 {
+            client
+                .write_all(&FrameCodec::encode(&Frame::input(b"typed".to_vec())).unwrap())
+                .unwrap();
+            client
+                .write_all(&FrameCodec::encode(&Frame::ping()).unwrap())
+                .unwrap();
+            let frames = read_frames(&mut codec, &mut client, 1);
+            assert_eq!(frames.len(), 1);
+            assert_eq!(frames[0].frame_type, FrameType::Pong);
+        }
+        assert!(
+            !hub.has_sinks("finished"),
+            "a retained terminal registers no publisher"
+        );
+        drop(client);
+        serve.join().unwrap();
     }
 
     #[test]
