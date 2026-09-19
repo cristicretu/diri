@@ -9,4 +9,6 @@ pub mod keys;
 pub mod metrics;
 pub mod scrollback;
 pub mod selection;
+mod selection_shape;
+pub mod selection_shimmer;
 pub mod theme;

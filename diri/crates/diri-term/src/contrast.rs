@@ -486,6 +486,20 @@ fn in_gamut(color: Oklch) -> LinearRgb {
     }))
 }
 
+/// `color` moved by `delta` in Oklab lightness and scaled in chroma, keeping
+/// hue and alpha. Used for highlights derived from a theme color.
+pub(crate) fn relit(color: Rgba, delta: f32, chroma_scale: f32) -> Rgba {
+    let authored = oklch(linear(color));
+    rgba(
+        in_gamut(Oklch {
+            lightness: authored.lightness + delta,
+            chroma: authored.chroma * chroma_scale,
+            ..authored
+        }),
+        color.a,
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

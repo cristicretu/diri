@@ -24,7 +24,12 @@ use crate::scrollback::{
     TerminalModes, WheelEvent, WheelRoute,
 };
 use crate::selection::{SelectionPoint, TerminalSelection};
+use crate::selection_shimmer::SelectionShimmer;
 use crate::theme::{ResolvedCellStyle, TermTheme, is_default_background};
+
+mod selection_paint;
+
+use selection_paint::SelectionPaint;
 
 static NEXT_ELEMENT_ID: AtomicU64 = AtomicU64::new(1);
 
@@ -127,6 +132,14 @@ impl TerminalDamageObserver {
         // Absolute rows keep a selection attached while the viewport moves,
         // but not when the daemon replaces cells at those rows. Damage is
         // row-granular, so unrelated live output and history remain selected.
+        mutex_lock(&self.shared.selection_shimmer).yield_to_output(
+            if update.is_full_snapshot {
+                usize::from(update.rows)
+            } else {
+                update.changed_rows.len()
+            },
+            usize::from(update.rows),
+        );
         let mut viewport = mutex_lock(&self.shared.viewport);
         let live_start_row = viewport.live_start_row();
         let buffer = read_lock(&self.buffer);
@@ -323,6 +336,7 @@ struct ElementSharedState {
     stats: Mutex<RendererStats>,
     viewport: Mutex<ScrollbackViewport>,
     selection: Mutex<TerminalSelection>,
+    selection_shimmer: Mutex<SelectionShimmer>,
     find_highlights: Mutex<FindHighlights>,
     modes: Mutex<TerminalModes>,
     scroll_router: Mutex<ScrollRouter>,
@@ -488,6 +502,7 @@ pub struct TerminalPrepaintState {
     background_quads: Vec<PaintQuad>,
     decoration_quads: Vec<PaintQuad>,
     overlay_quads: Vec<PaintQuad>,
+    selection: SelectionPaint,
     /// Reading path: window row and the absolute row whose shape paint reads
     /// from the history cache, as the live path reads the row cache.
     lines: Vec<(u16, i64)>,
@@ -522,6 +537,7 @@ impl TerminalElement {
                 stats: Mutex::new(RendererStats::default()),
                 viewport: Mutex::new(ScrollbackViewport::default()),
                 selection: Mutex::new(TerminalSelection::default()),
+                selection_shimmer: Mutex::new(SelectionShimmer::default()),
                 find_highlights: Mutex::new(FindHighlights::default()),
                 modes: Mutex::new(TerminalModes::default()),
                 scroll_router: Mutex::new(ScrollRouter::default()),
@@ -830,6 +846,28 @@ impl TerminalElement {
         let viewport = mutex_lock(&self.shared.viewport);
         let buffer = read_lock(&self.buffer);
         mutex_lock(&self.shared.selection).select_line(&viewport, &buffer, window_row);
+    }
+
+    /// The user finished a selection gesture: a drag was released, or a word
+    /// or line was picked by a multi-click. Starts the one-time sheen over the
+    /// selection and returns whether there is anything to repaint for.
+    /// Programmatic selection changes must not call this.
+    pub fn complete_selection(&self) -> bool {
+        let range = mutex_lock(&self.shared.selection).range();
+        mutex_lock(&self.shared.selection_shimmer).begin(range)
+    }
+
+    /// Whether the sheen still has frames to draw. It is false again on the
+    /// same prepaint that finds the sweep over, cancelled, or disallowed.
+    #[must_use]
+    pub fn selection_shimmer_running(&self) -> bool {
+        mutex_lock(&self.shared.selection_shimmer).is_running()
+    }
+
+    /// Test and offline-render seam: the sheen reads this instant instead of
+    /// the wall clock, so a frame is a pure function of the time given here.
+    pub fn pin_selection_shimmer_clock(&self, now: Option<Instant>) {
+        mutex_lock(&self.shared.selection_shimmer).pin_clock(now);
     }
 
     pub fn clear_selection(&self) {
@@ -1248,7 +1286,7 @@ impl Element for TerminalElement {
         bounds: Bounds<Pixels>,
         _request_layout: &mut Self::RequestLayoutState,
         window: &mut Window,
-        _cx: &mut App,
+        cx: &mut App,
     ) -> Self::PrepaintState {
         if self.suspended {
             mutex_lock(&self.shared.find_highlights).current_bounds = None;
@@ -1260,6 +1298,7 @@ impl Element for TerminalElement {
                 background_quads: Vec::new(),
                 decoration_quads: Vec::new(),
                 overlay_quads: Vec::new(),
+                selection: SelectionPaint::default(),
                 lines: Vec::new(),
                 metrics: None,
                 cursor: None,
@@ -1282,6 +1321,7 @@ impl Element for TerminalElement {
                 background_quads: Vec::new(),
                 decoration_quads: Vec::new(),
                 overlay_quads: Vec::new(),
+                selection: SelectionPaint::default(),
                 lines: Vec::new(),
                 metrics: None,
                 cursor: None,
@@ -1449,19 +1489,15 @@ impl Element for TerminalElement {
             paint_from_cache = true;
         }
 
-        let selection =
-            mutex_lock(&self.shared.selection).visible_spans(&viewport, visible_rows, visible_cols);
-        for span in selection {
-            append_overlay_quad(
-                span.row,
-                span.start_col,
-                span.end_col_exclusive,
-                bounds.origin,
-                metrics,
-                self.theme.selection,
-                &mut overlay_quads,
-            );
-        }
+        let selection = self.prepare_selection(
+            &viewport,
+            visible_rows,
+            visible_cols,
+            bounds,
+            metrics,
+            &mut overlay_quads,
+            cx,
+        );
         if let Some(hit) = &self.hovered_reference {
             let top = viewport.absolute_row(0);
             for &(row, start, end) in &hit.spans {
@@ -1599,6 +1635,7 @@ impl Element for TerminalElement {
             background_quads,
             decoration_quads,
             overlay_quads,
+            selection,
             lines,
             metrics: Some(metrics),
             cursor,
@@ -1674,6 +1711,7 @@ impl Element for TerminalElement {
             // Glyphs stay outside: sprites of equal order are drawn sorted by
             // atlas tile, which reorders overlapping ink, and measured no
             // faster than per-glyph ordering.
+            let selection_path = prepaint.selection.take_path();
             window.paint_layer(bounds, |window| {
                 for quad in prepaint.background_quads.drain(..) {
                     window.paint_quad(quad);
@@ -1685,10 +1723,25 @@ impl Element for TerminalElement {
                         }
                     }
                 }
-                for quad in prepaint.overlay_quads.drain(..) {
-                    window.paint_quad(quad);
+                if selection_path.is_none() {
+                    for quad in prepaint.overlay_quads.drain(..) {
+                        window.paint_quad(quad);
+                    }
                 }
             });
+            // A stepped selection is one path, so its translucent tint covers
+            // every pixel once. Paths sort after the quads of their layer, so
+            // the remaining overlays move to a layer of their own to stay on
+            // top of it.
+            if let Some(path) = selection_path {
+                window.paint_path(path, self.theme.selection);
+                window.paint_layer(bounds, |window| {
+                    for quad in prepaint.overlay_quads.drain(..) {
+                        window.paint_quad(quad);
+                    }
+                });
+            }
+            prepaint.selection.request_frame(window);
 
             if let Some(cache) = &cache {
                 for (row_index, prepared) in cache.iter().enumerate() {

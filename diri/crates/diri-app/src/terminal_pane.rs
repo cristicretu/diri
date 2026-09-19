@@ -2182,6 +2182,12 @@ impl TerminalPane {
             return;
         }
         if owner == Some(PointerOwner::LocalSelection) {
+            // The one place every local selection gesture ends: a released
+            // drag and a double or triple click alike. The element ignores an
+            // empty selection and stays static under Reduce Motion.
+            if event.button == MouseButton::Left && resident.element.complete_selection() {
+                cx.notify();
+            }
             if copy_on_select {
                 self.copy_selection(&CopySelection, window, cx);
             }
@@ -6418,6 +6424,112 @@ mod tests {
         assert!(cx.debug_bounds("terminal-context-menu").is_some());
         cx.simulate_mouse_down(outside, MouseButton::Left, Modifiers::default());
         pane.read_with(cx, |pane, _| assert!(pane.qol.menu.is_none()));
+    }
+
+    fn selection_shimmer_pane(
+        cx: &mut TestAppContext,
+    ) -> (
+        Entity<TerminalPane>,
+        &mut gpui::VisualTestContext,
+        SessionId,
+    ) {
+        let runtime = Arc::new(StoreRuntime::inert());
+        let tokio = Arc::new(
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap(),
+        );
+        let session = fixture_session();
+        let id = session.id.clone();
+        {
+            let mut store = runtime.store.write().unwrap();
+            store.upsert_session(session);
+            store.select(id.clone());
+        }
+        let (pane, cx) =
+            cx.add_window_view(move |window, cx| TerminalPane::new(runtime, tokio, window, cx));
+        pane.update_in(cx, |pane, window, cx| {
+            pane.reconcile_store_change(window, cx);
+            pane.set_viewport(
+                TerminalViewport {
+                    x: 0.0,
+                    y: 0.0,
+                    width: 800.0,
+                    height: 600.0,
+                },
+                cx,
+            );
+            let resident = pane.residents.get_mut(&id).unwrap();
+            resident.attachment_state = AttachmentState::Live;
+            resident.last_size = (80, 40);
+            resident.element.apply_damage(grid_frame(80, true));
+            cx.notify();
+        });
+        (pane, cx, id)
+    }
+
+    #[gpui::test]
+    fn releasing_a_selection_starts_one_shimmer_that_ends_on_its_own(cx: &mut TestAppContext) {
+        let (pane, cx, id) = selection_shimmer_pane(cx);
+        let element = pane.read_with(cx, |pane, _| pane.residents[&id].element.clone());
+        let started = std::time::Instant::now();
+        element.pin_selection_shimmer_clock(Some(started));
+        let bounds = cx
+            .debug_bounds("terminal-grid-surface")
+            .expect("terminal surface");
+        let release = bounds.center() + gpui::point(px(120.0), px(45.0));
+
+        // A bare click selects nothing, so there is nothing to confirm.
+        // A bare click selects nothing, so there is nothing to confirm.
+        cx.simulate_mouse_down(bounds.center(), MouseButton::Left, Modifiers::default());
+        cx.simulate_mouse_up(bounds.center(), MouseButton::Left, Modifiers::default());
+        assert!(!element.selection_shimmer_running());
+
+        cx.simulate_mouse_down(bounds.center(), MouseButton::Left, Modifiers::default());
+        cx.simulate_mouse_move(release, MouseButton::Left, Modifiers::default());
+        assert!(element.selection_range().is_some());
+        assert!(
+            !element.selection_shimmer_running(),
+            "the sheen waits for the release"
+        );
+        cx.simulate_mouse_up(release, MouseButton::Left, Modifiers::default());
+        assert!(element.selection_shimmer_running());
+        // Frame requests are counted against a bare element in diri-term; in
+        // this window the scrollbar's own fade also asks for frames.
+        for elapsed in [150, 300] {
+            element.pin_selection_shimmer_clock(Some(
+                started + std::time::Duration::from_millis(elapsed),
+            ));
+            pane.update(cx, |_, cx| cx.notify());
+            cx.run_until_parked();
+            assert!(
+                element.selection_shimmer_running(),
+                "running at {elapsed} ms"
+            );
+        }
+        element.pin_selection_shimmer_clock(Some(started + diri_term::selection_shimmer::DURATION));
+        pane.update(cx, |_, cx| cx.notify());
+        cx.run_until_parked();
+        assert!(!element.selection_shimmer_running());
+        assert!(element.selection_range().is_some());
+    }
+
+    #[gpui::test]
+    fn reduce_motion_keeps_a_finished_selection_static(cx: &mut TestAppContext) {
+        let (pane, cx, id) = selection_shimmer_pane(cx);
+        cx.update(|_, cx| cx.set_reduce_motion(true));
+        let element = pane.read_with(cx, |pane, _| pane.residents[&id].element.clone());
+        let bounds = cx
+            .debug_bounds("terminal-grid-surface")
+            .expect("terminal surface");
+        let release = bounds.center() + gpui::point(px(120.0), px(45.0));
+        cx.simulate_mouse_down(bounds.center(), MouseButton::Left, Modifiers::default());
+        cx.simulate_mouse_move(release, MouseButton::Left, Modifiers::default());
+        cx.simulate_mouse_up(release, MouseButton::Left, Modifiers::default());
+        cx.run_until_parked();
+        assert!(element.selection_range().is_some());
+        assert!(!element.selection_shimmer_running());
     }
 
     #[gpui::test]
