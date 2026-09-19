@@ -473,7 +473,21 @@ impl NavigationOverlay {
         self.ranked_actions.clear();
         self.ranked_sessions.clear();
         self.rank_task = None;
+        self.release_page_indexes();
         cx.notify();
+    }
+
+    /// A closed overlay paints none of its indexes, and together they are
+    /// several megabytes. Each is a read of local data that a reopen redoes
+    /// off the main thread. The history scanner stays: it holds the per-file
+    /// parse cache, without which a reopen re-reads every transcript on disk.
+    fn release_page_indexes(&mut self) {
+        self.history = Vec::new();
+        self.history_matches = Vec::new();
+        self.history_search = crate::history::HistorySearch::default();
+        self.ranked_items = Vec::new();
+        self.quick_snapshot = QuickOpenSnapshot::default();
+        self.directory_index.release_entries();
     }
 
     fn close_overlay(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -540,9 +554,17 @@ impl NavigationOverlay {
                 return;
             };
             this.update(cx, |this, cx| {
-                this.directory_index.adopt_cached(entries);
-                this.quick_snapshot = snapshot;
-                cx.notify();
+                // A scan that landed first is newer than this cache.
+                if this.quick_snapshot.pool.is_empty() {
+                    this.directory_index.adopt_cached(entries);
+                    this.quick_snapshot = snapshot;
+                    if this.overlay == Some(Overlay::QuickOpen)
+                        && !this.query.text().trim().is_empty()
+                    {
+                        this.schedule_rank(cx);
+                    }
+                    cx.notify();
+                }
             })
             .ok();
         }));
@@ -1044,7 +1066,14 @@ impl NavigationOverlay {
         self.ranked_items.clear();
         match page {
             Overlay::CommandPalette => self.refresh_command_items(),
-            Overlay::QuickOpen => self.refresh_directory_index(cx),
+            Overlay::QuickOpen => {
+                // Closing released the index. The disk cache repopulates it
+                // in one file read while any due rescan runs behind it.
+                if self.quick_snapshot.pool.is_empty() {
+                    self.load_cached_index(cx);
+                }
+                self.refresh_directory_index(cx);
+            }
             Overlay::History => {
                 self.filter_history();
                 self.refresh_history(cx);

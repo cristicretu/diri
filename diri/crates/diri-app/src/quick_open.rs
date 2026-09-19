@@ -95,6 +95,12 @@ impl DirectoryIndex {
         }
     }
 
+    /// Drops the entries but keeps the scan bookkeeping, so releasing the
+    /// index on close does not by itself force a filesystem walk on reopen.
+    pub fn release_entries(&mut self) {
+        self.entries = Vec::new();
+    }
+
     pub fn finish_scan(
         &mut self,
         entries: Vec<DirectoryEntry>,

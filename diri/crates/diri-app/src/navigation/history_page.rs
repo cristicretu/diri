@@ -57,6 +57,12 @@ impl NavigationOverlay {
                         entries.retain(|entry| !tracked.contains(&entry.id));
                         let selected_id = this.highlighted_history().map(|entry| entry.id.clone());
                         this.history_scanner = Some(scanner);
+                        if this.overlay.is_none() {
+                            // Closed mid-scan: keep the warm scanner, not
+                            // entries nothing will paint.
+                            cx.notify();
+                            return;
+                        }
                         this.history = entries;
                         this.history_search.rebuild(&this.history);
                         if this.overlay == Some(Overlay::History) {
