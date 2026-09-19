@@ -532,13 +532,21 @@ struct ResidentTerminal {
 impl ResidentTerminal {
     /// Delivers input the user aimed at the PTY: typing, line navigation and
     /// paste. A reading view hides the cursor and holds still under output, so
-    /// the prompt comes back on screen before the bytes go out. Returns whether
-    /// the view moved and the pane owes a repaint.
+    /// the prompt comes back on screen before the bytes go out. The cursor is
+    /// told too: it stays solid while the user acts, and only a move that
+    /// follows their input may glide. Printable text reaches the element
+    /// through its own input handler; everything encoded by the pane comes
+    /// through here. Returns whether the pane owes a repaint, because the view
+    /// moved or a dimmed cursor has to come back solid.
     fn send_user_input(&self, bytes: Vec<u8>) -> bool {
-        let returned =
-            !bytes.is_empty() && self.element.scroll_to_live(usize::from(self.last_size.1));
+        if bytes.is_empty() {
+            self.attachment.input(bytes);
+            return false;
+        }
+        let returned = self.element.scroll_to_live(usize::from(self.last_size.1));
+        let solid = self.element.note_user_input();
         self.attachment.input(bytes);
-        returned
+        returned || solid
     }
 }
 
@@ -3240,6 +3248,7 @@ impl TerminalPane {
             })
             .font_size(px(font_size))
             .focus_handle(self.focus.clone())
+            .reduce_motion(cx.reduce_motion())
             .hovered_reference(self.qol.hit.clone());
         let element = if self.qol.copy_mode.is_some()
             || self.qol.paste.is_some()

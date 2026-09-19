@@ -14,6 +14,7 @@ use gpui::{
 
 use crate::blocks::BlockGlyph;
 use crate::buffer::{ApplySummary, ChangedRenderRow, GridBuffer};
+use crate::cursor_motion::{CursorCell, CursorDamage, CursorDriver, CursorFrame, CursorSchedule};
 use crate::find::{
     FindSnapshot, FindSpan, NavigationTarget, SearchJob, SearchRequest, SearchResult,
     TerminalFindModel,
@@ -100,6 +101,7 @@ pub struct TerminalElement {
     focus_override: Option<bool>,
     suspended: bool,
     hovered_reference: Option<ReferenceHit>,
+    reduce_motion: bool,
 }
 
 /// Selection and reading state only: deliberately does not retain an input
@@ -148,6 +150,7 @@ impl TerminalDamageObserver {
         drop(viewport);
         let replaces_grid =
             update.is_full_snapshot || buffer.cols != update.cols || buffer.rows != update.rows;
+        note_cursor_damage(&self.shared.cursor, &buffer, update, replaces_grid);
         let damaged_cols = usize::from(if replaces_grid {
             buffer.cols.max(update.cols)
         } else {
@@ -202,11 +205,13 @@ struct TerminalInputHandler {
     view: TerminalDamageObserver,
     cursor_bounds: Bounds<Pixels>,
     cell_width: Pixels,
+    cursor: Arc<Mutex<CursorDriver>>,
 }
 
 impl TerminalInputHandler {
-    /// Forwards committed text and reports whether doing so brought a reading
-    /// view back to live, which the caller has to repaint.
+    /// Forwards committed text and reports whether the caller has to repaint:
+    /// either it brought a reading view back to live, or a dimmed cursor has
+    /// to come back solid.
     fn commit_text(&self, text: &str) -> bool {
         let mut state = mutex_lock(&self.ime_state);
         state.marked_text.clear();
@@ -226,8 +231,9 @@ impl TerminalInputHandler {
         // target offset is zero, so the visible row count cannot clamp it.
         let returned =
             !text.is_empty() && set_view_offset(&self.view.shared, &self.view.buffer, 0, 0);
+        let solid = note_keystroke(&self.cursor);
         (self.text_input)(text);
-        returned
+        returned || solid
     }
 
     fn mark_text(&self, text: &str) {
@@ -342,6 +348,9 @@ struct ElementSharedState {
     scroll_router: Mutex<ScrollRouter>,
     history_lines: Mutex<HistoryLineCache>,
     metrics: Mutex<Option<(Font, u32, CellMetrics)>>,
+    /// Behind its own `Arc` so the input handler and the blink wake can hold
+    /// it without holding the rest of the view's state.
+    cursor: Arc<Mutex<CursorDriver>>,
 }
 
 #[derive(Default)]
@@ -521,6 +530,26 @@ struct CursorPaint {
     quad: PaintQuad,
     glyph: Option<ShapedLine>,
     block: Option<BlockGlyph>,
+    frame: CursorFrame,
+    /// While the block is between cells it inverts whatever it covers: these
+    /// are the covered cells' glyphs in the cursor's text color, painted
+    /// clipped to the block so the glyphs stay put and only the block moves.
+    covered: Vec<CoveredGlyph>,
+}
+
+struct CoveredGlyph {
+    col: u16,
+    row: u16,
+    glyph: Option<ShapedLine>,
+    block: Option<BlockGlyph>,
+}
+
+impl CursorPaint {
+    /// The static cursor replaces its cell's text; a moving or translucent
+    /// one is painted over the row's own text instead.
+    fn replaces_text_at(&self, row: u16) -> bool {
+        self.row == row && self.frame.is_static()
+    }
 }
 
 impl TerminalElement {
@@ -543,6 +572,7 @@ impl TerminalElement {
                 scroll_router: Mutex::new(ScrollRouter::default()),
                 history_lines: Mutex::new(HistoryLineCache::default()),
                 metrics: Mutex::new(None),
+                cursor: Arc::new(Mutex::new(CursorDriver::default())),
             }),
             theme: TermTheme::default(),
             background_opacity: 1.0,
@@ -554,6 +584,7 @@ impl TerminalElement {
             focus_override: None,
             suspended: false,
             hovered_reference: None,
+            reduce_motion: false,
         }
     }
 
@@ -647,6 +678,35 @@ impl TerminalElement {
     pub fn focused(mut self, focused: bool) -> Self {
         self.focus_override = Some(focused);
         self
+    }
+
+    /// Holds the cursor static: no blink, no glide.
+    #[must_use]
+    pub fn reduce_motion(mut self, reduce_motion: bool) -> Self {
+        self.reduce_motion = reduce_motion;
+        self
+    }
+
+    /// A key went to the program through the host rather than through
+    /// committed text. Keeps the cursor solid and marks the next short cursor
+    /// move as the user's, which is what lets it glide. Returns true when the
+    /// cursor is dimmed on screen and the host should repaint it solid.
+    #[must_use]
+    pub fn note_user_input(&self) -> bool {
+        note_keystroke(&self.shared.cursor)
+    }
+
+    /// Drives cursor motion from a caller-owned clock instead of the wall
+    /// clock, and schedules no frames. For tests and frame-by-frame renders.
+    pub fn set_cursor_clock(&self, now: Option<Instant>) {
+        mutex_lock(&self.shared.cursor).set_clock(now);
+    }
+
+    /// What the last painted frame asked for next. `Rest` means the cursor
+    /// will not cause another frame.
+    #[must_use]
+    pub fn cursor_schedule(&self) -> Option<CursorSchedule> {
+        mutex_lock(&self.shared.cursor).last_schedule()
     }
 
     #[must_use]
@@ -1185,6 +1245,17 @@ impl TerminalElement {
         metrics: CellMetrics,
         window: &mut Window,
     ) -> Option<ShapedLine> {
+        self.shape_glyph_under_cursor(cell, combining, self.theme.cursor_text, metrics, window)
+    }
+
+    fn shape_glyph_under_cursor(
+        &self,
+        cell: GridCell,
+        combining: &str,
+        color: gpui::Rgba,
+        metrics: CellMetrics,
+        window: &mut Window,
+    ) -> Option<ShapedLine> {
         let resolved = self.theme.resolve_cell(cell);
         let ch = render_char(cell, resolved.visible);
         if !resolved.visible || (ch == ' ' && combining.is_empty()) {
@@ -1194,7 +1265,7 @@ impl TerminalElement {
         let run = TextRun {
             len: text.len(),
             font: styled_font(&self.font, resolved),
-            color: self.theme.cursor_text.into(),
+            color: color.into(),
             background_color: None,
             underline: None,
             strikethrough: None,
@@ -1206,6 +1277,217 @@ impl TerminalElement {
             Some(metrics.cell_width),
         ))
     }
+
+    /// Applies blink and glide to the static cursor. A static frame returns
+    /// the cursor untouched, so rest paints exactly what it always has.
+    fn animate_cursor(
+        &self,
+        cursor: Option<CursorPaint>,
+        metrics: CellMetrics,
+        visible_cols: usize,
+        window: &mut Window,
+    ) -> Option<CursorPaint> {
+        let mut driver = mutex_lock(&self.shared.cursor);
+        let Some(mut cursor) = cursor else {
+            driver.rest();
+            return None;
+        };
+        let cell = CursorCell {
+            col: cursor.col,
+            row: cursor.row,
+        };
+        cursor.frame = driver.sample(cell, self.reduce_motion);
+        drop(driver);
+        let frame = cursor.frame;
+        if frame.is_static() {
+            return Some(cursor);
+        }
+        cursor.quad.bounds.origin.x += metrics.cell_width * frame.offset_cols;
+        cursor.quad.bounds.origin.y += metrics.line_height * frame.offset_rows;
+        cursor.quad.background = cursor.quad.background.opacity(frame.opacity);
+        let cache = mutex_lock(&self.shared.row_cache);
+        if !frame.is_gliding() {
+            // Fading in place: the row's own text shows through the block and
+            // the inverted glyph fades with it.
+            if cursor.glyph.is_some()
+                && let Some(prepared) = cache.get(usize::from(cursor.row)).and_then(Option::as_ref)
+                && let Some(cell) = prepared.cells.get(usize::from(cursor.col)).copied()
+            {
+                let combining = prepared
+                    .graphemes
+                    .iter()
+                    .find(|(col, _)| *col == cursor.col)
+                    .map_or("", |(_, text)| text.as_str());
+                let color = faded(self.theme.cursor_text, frame.opacity);
+                cursor.glyph =
+                    self.shape_glyph_under_cursor(cell, combining, color, metrics, window);
+            }
+            drop(cache);
+            return Some(cursor);
+        }
+        // The block overlaps at most two columns and two rows.
+        let col = f32::from(cursor.col) + frame.offset_cols;
+        let row = f32::from(cursor.row) + frame.offset_rows;
+        for covered_row in [row.floor(), row.ceil()] {
+            for covered_col in [col.floor(), col.ceil()] {
+                let (covered_col, covered_row) = (covered_col as u16, covered_row as u16);
+                if usize::from(covered_col) >= visible_cols
+                    || cursor
+                        .covered
+                        .iter()
+                        .any(|seen| (seen.col, seen.row) == (covered_col, covered_row))
+                {
+                    continue;
+                }
+                let Some(prepared) = cache.get(usize::from(covered_row)).and_then(Option::as_ref)
+                else {
+                    continue;
+                };
+                let Some(cell) = prepared.cells.get(usize::from(covered_col)).copied() else {
+                    continue;
+                };
+                let combining = prepared
+                    .graphemes
+                    .iter()
+                    .find(|(col, _)| *col == covered_col)
+                    .map_or("", |(_, text)| text.as_str());
+                cursor.covered.push(CoveredGlyph {
+                    col: covered_col,
+                    row: covered_row,
+                    glyph: self.shape_cursor_glyph(cell, combining, metrics, window),
+                    block: self
+                        .theme
+                        .resolve_cell(cell)
+                        .visible
+                        .then(|| BlockGlyph::from_scalar(cell.scalar))
+                        .flatten(),
+                });
+            }
+        }
+        Some(cursor)
+    }
+
+    fn paint_moving_cursor(
+        &self,
+        cursor: CursorPaint,
+        bounds: Bounds<Pixels>,
+        metrics: CellMetrics,
+        window: &mut Window,
+        cx: &mut App,
+    ) {
+        let block_bounds = cursor.quad.bounds;
+        window.paint_quad(cursor.quad);
+        if cursor.frame.is_gliding() {
+            let mask = ContentMask {
+                bounds: block_bounds.intersect(&bounds),
+            };
+            window.with_content_mask(Some(mask), |window| {
+                for covered in cursor.covered {
+                    paint_cursor_glyph(
+                        covered.glyph.as_ref(),
+                        covered.block,
+                        (covered.col, covered.row),
+                        self.theme.cursor_text,
+                        bounds,
+                        metrics,
+                        window,
+                        cx,
+                    );
+                }
+            });
+            return;
+        }
+        paint_cursor_glyph(
+            cursor.glyph.as_ref(),
+            cursor.block,
+            (cursor.col, cursor.row),
+            faded(self.theme.cursor_text, cursor.frame.opacity),
+            bounds,
+            metrics,
+            window,
+            cx,
+        );
+    }
+}
+
+fn faded(color: gpui::Rgba, opacity: f32) -> gpui::Rgba {
+    gpui::Rgba {
+        a: color.a * opacity,
+        ..color
+    }
+}
+
+/// The inverted glyph of one cell: block elements as rectangles, everything
+/// else as shaped text, both at the cell's own origin.
+#[allow(clippy::too_many_arguments)]
+fn paint_cursor_glyph(
+    glyph: Option<&ShapedLine>,
+    block: Option<BlockGlyph>,
+    (col, row): (u16, u16),
+    color: gpui::Rgba,
+    bounds: Bounds<Pixels>,
+    metrics: CellMetrics,
+    window: &mut Window,
+    cx: &mut App,
+) {
+    if let Some(block) = block {
+        for rect in block.rectangles(bounds.origin, metrics, usize::from(col), row) {
+            window.paint_quad(fill(rect, color));
+        }
+    }
+    if let Some(glyph) = glyph {
+        let origin = point(
+            bounds.left() + metrics.x_for_col(col),
+            bounds.top() + metrics.y_for_row(row),
+        );
+        let _ = glyph.paint(
+            origin,
+            metrics.line_height,
+            TextAlign::Left,
+            None,
+            window,
+            cx,
+        );
+    }
+}
+
+fn note_keystroke(cursor: &Mutex<CursorDriver>) -> bool {
+    mutex_lock(cursor).note_keystroke()
+}
+
+fn note_cursor_damage(
+    cursor: &Mutex<CursorDriver>,
+    buffer: &GridBuffer,
+    update: &GridUpdate,
+    replaces_grid: bool,
+) {
+    let previous = buffer.cursor.visible.then_some(CursorCell {
+        col: buffer.cursor.col,
+        row: buffer.cursor.row,
+    });
+    let next = update.cursor_visible.then_some(CursorCell {
+        col: update.cursor_col,
+        row: update.cursor_row,
+    });
+    let mut cursor = mutex_lock(cursor);
+    let now = cursor.now();
+    cursor.motion.note_damage(
+        CursorDamage {
+            previous,
+            next,
+            rows_damaged: if replaces_grid {
+                usize::MAX
+            } else {
+                update.changed_rows.len()
+            },
+            touches_cursor_row: replaces_grid
+                || update
+                    .changed_rows
+                    .iter()
+                    .any(|changed| changed.y == update.cursor_row),
+        },
+        now,
+    );
 }
 
 #[cfg(target_os = "macos")]
@@ -1625,10 +1907,13 @@ impl Element for TerminalElement {
                     .visible
                     .then(|| BlockGlyph::from_scalar(cell.scalar))
                     .flatten(),
+                frame: CursorFrame::REST,
+                covered: Vec::new(),
             })
         } else {
             None
         };
+        let cursor = self.animate_cursor(cursor, metrics, visible_cols, window);
 
         TerminalPrepaintState {
             started_at: Some(started_at),
@@ -1684,6 +1969,7 @@ impl Element for TerminalElement {
                     view: self.damage_observer(),
                     cursor_bounds,
                     cell_width,
+                    cursor: Arc::clone(&self.shared.cursor),
                 },
                 cx,
             );
@@ -1751,7 +2037,7 @@ impl Element for TerminalElement {
                     if prepaint
                         .cursor
                         .as_ref()
-                        .is_some_and(|cursor| cursor.row == row)
+                        .is_some_and(|cursor| cursor.replaces_text_at(row))
                     {
                         let cursor = prepaint.cursor.as_ref().unwrap();
                         paint_line_around_cursor(
@@ -1797,7 +2083,7 @@ impl Element for TerminalElement {
                 if prepaint
                     .cursor
                     .as_ref()
-                    .is_some_and(|cursor| cursor.row == *row)
+                    .is_some_and(|cursor| cursor.replaces_text_at(*row))
                 {
                     let cursor = prepaint.cursor.as_ref().unwrap();
                     paint_line_around_cursor(line, origin, bounds, metrics, cursor.col, window, cx);
@@ -1819,6 +2105,22 @@ impl Element for TerminalElement {
                 }
             });
 
+            let cursor_schedule = prepaint
+                .cursor
+                .as_ref()
+                .map_or(CursorSchedule::Rest, |cursor| cursor.frame.schedule);
+            let moving_cursor = prepaint.cursor.take_if(|cursor| !cursor.frame.is_static());
+            if let Some(cursor) = moving_cursor {
+                self.paint_moving_cursor(cursor, bounds, metrics, window, cx);
+            }
+            if cursor_schedule != CursorSchedule::Rest {
+                crate::cursor_motion::request_frame(
+                    &self.shared.cursor,
+                    cursor_schedule,
+                    window,
+                    cx,
+                );
+            }
             if let Some(cursor) = prepaint.cursor.take() {
                 window.paint_quad(cursor.quad);
                 if let Some(block) = cursor.block {
@@ -2705,6 +3007,83 @@ mod link_tests {
             !source.contains(&periodic_timer),
             "the terminal cursor must not own a periodic frame timer"
         );
+        // The blink's wake is the one timer in the renderer. It is one-shot,
+        // armed only by a painted frame, and `CursorSchedule::Rest` ends the
+        // chain (`an_idle_cursor_paints_a_bounded_number_of_frames_then_none`).
+        let motion = include_str!("cursor_motion.rs");
+        assert_eq!(motion.matches(&periodic_timer).count(), 1);
+        assert_eq!(motion.matches(&foreground_task).count(), 1);
+    }
+
+    fn cursor_update(col: u16, row: u16, rows: &[u16], full: bool) -> super::GridUpdate {
+        super::GridUpdate {
+            cols: 8,
+            rows: 4,
+            cursor_col: col,
+            cursor_row: row,
+            cursor_visible: true,
+            is_full_snapshot: full,
+            changed_rows: rows
+                .iter()
+                .map(|y| diri_proto::grid::ChangedRow::new(*y, vec![super::GridCell::BLANK; 8]))
+                .collect(),
+        }
+    }
+
+    fn cursor_frame(terminal: &super::TerminalElement, col: u16, row: u16) -> super::CursorFrame {
+        mutex_lock(&terminal.shared.cursor).sample(super::CursorCell { col, row }, false)
+    }
+
+    #[test]
+    fn typed_cursor_moves_glide_and_redraws_snap() {
+        let terminal = super::TerminalElement::with_buffer(crate::buffer::GridBuffer::new(8, 4));
+        let start = std::time::Instant::now();
+        let at = |ms: u64| Some(start + std::time::Duration::from_millis(ms));
+        terminal.set_cursor_clock(at(0));
+        terminal.apply_damage(cursor_update(2, 1, &[0, 1, 2, 3], true));
+        assert!(cursor_frame(&terminal, 2, 1).is_static());
+
+        // A key, then its echo moves the cursor one cell on one damaged row.
+        terminal.set_cursor_clock(at(1_000));
+        assert!(!terminal.note_user_input());
+        terminal.set_cursor_clock(at(1_006));
+        terminal.apply_damage(cursor_update(3, 1, &[1], false));
+        let frame = cursor_frame(&terminal, 3, 1);
+        assert_eq!((frame.offset_cols, frame.offset_rows), (-1.0, 0.0));
+        assert_eq!(frame.schedule, super::CursorSchedule::NextFrame);
+
+        // The same move without a keystroke is the program's: it snaps.
+        terminal.set_cursor_clock(at(3_000));
+        terminal.apply_damage(cursor_update(4, 1, &[1], false));
+        assert!(!cursor_frame(&terminal, 4, 1).is_gliding());
+
+        // A keystroke whose echo repaints the screen snaps too.
+        terminal.set_cursor_clock(at(4_000));
+        let _ = terminal.note_user_input();
+        terminal.apply_damage(cursor_update(5, 1, &[0, 1, 2], false));
+        assert!(!cursor_frame(&terminal, 5, 1).is_gliding());
+        let _ = terminal.note_user_input();
+        terminal.set_cursor_clock(at(4_100));
+        terminal.apply_damage(cursor_update(6, 1, &[1], true));
+        assert!(!cursor_frame(&terminal, 6, 1).is_gliding());
+    }
+
+    #[test]
+    fn a_keystroke_asks_for_a_repaint_only_while_the_cursor_is_dimmed() {
+        let terminal = super::TerminalElement::with_buffer(crate::buffer::GridBuffer::new(8, 4));
+        let start = std::time::Instant::now();
+        terminal.set_cursor_clock(Some(start));
+        terminal.apply_damage(cursor_update(2, 1, &[1], true));
+        assert_eq!(cursor_frame(&terminal, 2, 1).opacity, 1.0);
+        assert!(!terminal.note_user_input());
+
+        let low = crate::cursor_motion::BLINK_IDLE_DELAY + crate::cursor_motion::BLINK_FADE;
+        terminal.set_cursor_clock(Some(start + low));
+        assert!(cursor_frame(&terminal, 2, 1).opacity < 1.0);
+        assert!(terminal.note_user_input());
+        // Once asked, the repaint is on its way.
+        assert!(!terminal.note_user_input());
+        assert_eq!(cursor_frame(&terminal, 2, 1).opacity, 1.0);
     }
 
     #[test]
@@ -2735,6 +3114,7 @@ mod link_tests {
             view: terminal_with_rows(&["test"]).damage_observer(),
             cursor_bounds: Bounds::new(point(px(0.0), px(0.0)), size(px(8.0), px(16.0))),
             cell_width: px(8.0),
+            cursor: Arc::default(),
         };
 
         handler.mark_text("ni");
@@ -2755,6 +3135,7 @@ mod link_tests {
             view: terminal_with_rows(&["test"]).damage_observer(),
             cursor_bounds: Bounds::new(point(px(0.0), px(0.0)), size(px(8.0), px(16.0))),
             cell_width: px(8.0),
+            cursor: Arc::default(),
         };
 
         // AppKit may commit ETX after handling Command-C. ETX is Ctrl-C to a
@@ -2775,6 +3156,7 @@ mod link_tests {
             view: terminal.damage_observer(),
             cursor_bounds: Bounds::new(point(px(0.0), px(0.0)), size(px(8.0), px(16.0))),
             cell_width: px(8.0),
+            cursor: Arc::default(),
         };
         handler.mark_text("old");
         terminal.set_text_input_enabled(false);
@@ -2798,6 +3180,7 @@ mod link_tests {
             view: terminal.damage_observer(),
             cursor_bounds: Bounds::new(point(px(0.0), px(0.0)), size(px(8.0), px(16.0))),
             cell_width: px(8.0),
+            cursor: Arc::clone(&terminal.shared.cursor),
         };
         terminal.adopt_history_geometry(100, 102, 1, 2);
         let read_history = || {

@@ -529,9 +529,21 @@ not recreate the retired burst (204.8 MB). This isolated continuous decorative
 frames as the condition preventing Metal from retiring resize-era resources.
 
 That historical fix paused decorative repainting after geometry settled. The
-current implementation goes further: status glyphs and the terminal cursor are
-static, so they never create autonomous frame tasks. Real status changes and
-terminal grid damage still repaint immediately. The window and root surface
+current implementation goes further: status glyphs are static, so they never
+create autonomous frame tasks. Real status changes and terminal grid damage
+still repaint immediately.
+
+The terminal cursor is the one bounded exception (`diri-term/src/cursor_motion.rs`).
+It is solid while in use, and only a focused, visible cursor that has been idle
+for 500 ms blinks: ten eased 1.2 s cycles, then it rests solid and schedules
+nothing, so a terminal left alone still paints zero frames. Fades repaint in
+33 ms steps from a one-shot wake instead of the display link: 12 frames per
+cycle, 121 frames in total over the 12 s after the last activity (measured
+headlessly against the element's `RendererStats`; the static cursor painted 1).
+A glide is 80 ms of display-rate frames after a keystroke that was going to
+repaint the row anyway. Neither invalidates the row cache: the cursor is
+sampled after rows are prepared and painted last. Under Reduce Motion the
+cursor is the static block it was before. The window and root surface
 are opaque, avoiding a persistent WindowServer backdrop/blur composition pass.
 
 ### CPU allocation retention

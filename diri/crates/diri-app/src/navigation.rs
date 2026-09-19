@@ -1971,8 +1971,8 @@ fn session_shortcut(index: usize) -> Option<String> {
 }
 
 /// A static caret. Blinking would need an autonomous frame timer, which is
-/// exactly what PERF.md's idle-CPU budget forbids; the terminal cursor is
-/// static for the same reason.
+/// exactly what PERF.md's idle-CPU budget forbids. (The terminal cursor does
+/// blink, but only for a bounded spell after going idle; see PERF.md.)
 pub(crate) const CARET: &str = "▏";
 
 /// Draw a query field's contents: caret at the cursor, or the selection washed

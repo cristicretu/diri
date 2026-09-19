@@ -3,6 +3,7 @@
 mod blocks;
 pub mod buffer;
 mod contrast;
+pub mod cursor_motion;
 pub mod element;
 pub mod find;
 pub mod keys;
