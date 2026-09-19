@@ -64,9 +64,12 @@ pub(crate) fn render_workspace_preview(
             if !std::sync::Arc::ptr_eq(&element.buffer(), &source) {
                 *element = TerminalElement::new(source);
             }
-            let font_size = ((bounds.width - 4.0) / (f32::from(buffer.grid_cols().max(1)) * 0.65))
-                .min((bounds.height - 4.0) / (f32::from(buffer.grid_rows().max(1)) * 1.5))
-                .max(0.1);
+            let font_size = preview_font_size(
+                bounds.width - 4.0,
+                bounds.height - 4.0,
+                buffer.grid_cols(),
+                buffer.grid_rows(),
+            );
             view = view.child(
                 element
                     .clone()
@@ -85,6 +88,18 @@ pub(crate) fn render_workspace_preview(
     root.into_any_element()
 }
 
+/// The glyph atlas keys every rasterized glyph by font size and never evicts,
+/// so a size derived continuously from pane geometry left a whole new glyph
+/// set behind for each width a preview was ever shown at. Sizes snap down to a
+/// fixed ladder: down, so the grid still fits its pane.
+const PREVIEW_FONT_STEP: f32 = 0.25;
+
+fn preview_font_size(width: f32, height: f32, cols: u16, rows: u16) -> f32 {
+    let fit =
+        (width / (f32::from(cols.max(1)) * 0.65)).min(height / (f32::from(rows.max(1)) * 1.5));
+    ((fit / PREVIEW_FONT_STEP).floor() * PREVIEW_FONT_STEP).max(PREVIEW_FONT_STEP)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -92,6 +107,20 @@ mod tests {
     use diri_proto::workspace::{LayoutAxis, LayoutNode, PaneId, SplitId, TabId, WorkspaceTab};
     use diri_term::buffer::GridBuffer;
     use gpui::{Context, Render, Window, size};
+
+    #[test]
+    fn preview_font_sizes_come_from_a_small_ladder_and_never_overflow_the_pane() {
+        let mut sizes = std::collections::BTreeSet::new();
+        for width in 40..1400 {
+            let (width, height) = (width as f32 * 0.5, width as f32 * 0.31);
+            let exact = (width / (160.0 * 0.65)).min(height / (50.0 * 1.5));
+            let size = preview_font_size(width, height, 160, 50);
+            assert!(size <= exact.max(PREVIEW_FONT_STEP) && exact - size < PREVIEW_FONT_STEP);
+            sizes.insert(size.to_bits());
+        }
+        // 1360 distinct pane widths used to mean 1360 glyph sets in the atlas.
+        assert!(sizes.len() <= 28, "{} sizes", sizes.len());
+    }
 
     struct PreviewHarness {
         geometry: WorkspaceGeometry,
