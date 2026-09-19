@@ -679,6 +679,9 @@ fn resolve_daemon_path_from(
 /// child: the daemon is meant to run independently.
 fn spawn_detached(daemon: &Path, boot_log: Option<&Path>) -> io::Result<()> {
     let mut command = Command::new(daemon);
+    // We ask the Engine to leave when we quit, but only a clean quit gets to
+    // ask. With this it also retires by itself once nothing needs it.
+    command.arg(diri_proto::paths::EXIT_WHEN_ORPHANED_FLAG);
     command.stdin(Stdio::null());
 
     match boot_log {

@@ -1419,14 +1419,18 @@ impl PlatformWindow for MacWindow {
         // NSAlert's first button keeps Return and Cancel keeps Escape, but the keyboard
         // focus (and therefore Space) defaults to Cancel, leaving the middle button of
         // prompts like "Save / Don't Save / Cancel" unreachable from the keyboard. Move
-        // the initial focus onto the last non-cancel, non-default button instead.
+        // the initial focus onto the last non-cancel, non-default button instead; with
+        // only a default and Cancel, put it on the default so Return and Space agree.
+        // (Diri: newer macOS routes Return to the focused button, which made Return
+        // cancel a two-button "Close / Cancel" alert.)
         let initial_focus_ix = answers
             .iter()
             .enumerate()
             .rev()
             .find(|(_, label)| !label.is_cancel())
             .map(|(ix, _)| ix)
-            .filter(|&ix| ix > 0);
+            .filter(|&ix| ix > 0)
+            .or_else(|| (!answers.is_empty() && !answers[0].is_cancel()).then_some(0));
 
         unsafe {
             let alert: id = msg_send![class!(NSAlert), alloc];

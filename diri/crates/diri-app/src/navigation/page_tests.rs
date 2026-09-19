@@ -101,6 +101,48 @@ fn history_virtualizes_and_aligns_shared_header(cx: &mut TestAppContext) {
 }
 
 #[gpui::test]
+fn closing_releases_page_indexes_but_keeps_scan_bookkeeping(cx: &mut TestAppContext) {
+    let (view, cx) = cx.add_window_view(|_, cx| {
+        let previous_focus = cx.focus_handle();
+        let overlay = cx.new(|cx| {
+            let mut overlay =
+                NavigationOverlay::opened_for_test(Arc::new(StoreRuntime::inert()), cx);
+            seed_history(&mut overlay);
+            overlay
+        });
+        Harness {
+            overlay,
+            previous_focus,
+        }
+    });
+    let overlay = view.read_with(cx, |view, _| view.overlay.clone());
+    overlay.update(cx, |overlay, cx| {
+        let entries = vec![quick_open::DirectoryEntry {
+            path: "/work/diri".into(),
+            name: "diri".into(),
+            is_git_repo: true,
+            depth: 1,
+        }];
+        overlay.quick_snapshot = quick_open::build_snapshot(&entries, &[], &[]);
+        let scanned = Instant::now();
+        overlay
+            .directory_index
+            .finish_scan(entries, scanned, String::new(), Vec::new());
+        assert!(!overlay.history_search.rank("").is_empty());
+
+        overlay.clear_overlay(cx);
+
+        assert!(overlay.history.is_empty());
+        assert!(overlay.history_matches.is_empty());
+        assert!(overlay.history_search.rank("").is_empty());
+        assert!(overlay.quick_snapshot.pool.is_empty());
+        assert!(overlay.directory_index.entries().is_empty());
+        // Releasing memory must not turn every reopen into a disk walk.
+        assert!(!overlay.directory_index.needs_scan(scanned, "", &[]));
+    });
+}
+
+#[gpui::test]
 fn pages_restore_query_selection_and_focus_and_theme_cancel(cx: &mut TestAppContext) {
     let runtime = Arc::new(StoreRuntime::inert());
     let saved = runtime.store.read().unwrap().theme_id().to_owned();
@@ -801,6 +843,13 @@ fn project_open_keeps_its_context_until_an_agent_can_launch(cx: &mut TestAppCont
     assert_eq!(terminal.cwd, "/work/project");
     overlay.update_in(cx, |overlay, window, cx| {
         overlay.overlay = Some(Overlay::QuickOpen);
+        // The spawn closed the overlay, which released the index; a real
+        // reopen reloads it from the disk cache.
+        overlay.quick_snapshot.folders.push(QuickOpenItem {
+            name: "project".into(),
+            path: PathBuf::from("/work/project"),
+            is_git_repo: false,
+        });
         overlay.focus_handle.focus(window, cx);
         cx.notify();
     });
