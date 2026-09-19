@@ -5349,6 +5349,7 @@ mod tests {
                         crate::empty_workbench::EmptyWorkbenchActions {
                             install: std::rc::Rc::new(|_, _, _| {}),
                             check_again: std::rc::Rc::new(|_, _| {}),
+                            start_in_folder: std::rc::Rc::new(|_, _| {}),
                         },
                         self.colors,
                     ))

@@ -1759,11 +1759,52 @@ impl TerminalPane {
                 .request_agent_catalog(None, true);
             cx.refresh_windows();
         });
+        // A direct launch, the same one the New Agent shortcut performs: the
+        // agent's own prompt takes the task, so there is nothing to compose
+        // or inject on the way in.
+        let canonical = Arc::clone(&self.runtime.store);
+        let window_store = self.window_store.clone();
+        let start_in_folder: crate::agent_setup::ActionHandler = Rc::new(move |_, cx| {
+            let paths = cx.prompt_for_paths(gpui::PathPromptOptions {
+                files: false,
+                directories: true,
+                multiple: false,
+                prompt: Some("Start Here".into()),
+            });
+            let canonical = Arc::clone(&canonical);
+            let window_store = window_store.clone();
+            cx.spawn(async move |cx| {
+                let Ok(Ok(Some(mut paths))) = paths.await else {
+                    return;
+                };
+                let Some(path) = paths.pop() else {
+                    return;
+                };
+                let options = crate::store::SpawnOptions {
+                    cwd: Some(path.to_string_lossy().into_owned()),
+                    ..crate::store::SpawnOptions::default()
+                };
+                if let Some(window_store) = &window_store {
+                    window_store
+                        .write()
+                        .expect("window navigation lock poisoned")
+                        .spawn_default(options);
+                } else {
+                    canonical
+                        .write()
+                        .expect("session store lock poisoned")
+                        .spawn_default(options);
+                }
+                let _ = cx.update(|cx| cx.refresh_windows());
+            })
+            .detach();
+        });
         crate::empty_workbench::render(
             state,
             crate::empty_workbench::EmptyWorkbenchActions {
                 install,
                 check_again,
+                start_in_folder,
             },
             colors,
         )

@@ -5,6 +5,10 @@
 //! "pick a coding agent installed on your computer" strands them, so the page
 //! reads detection facts and leads with whichever step is actually next:
 //! install an agent, or start a session.
+//!
+//! Starting is direct: choose a folder and the default agent opens in it, the
+//! same launch as the New Agent shortcut. The agent's own prompt is where the
+//! task gets typed, so nothing here composes or injects one.
 
 use std::rc::Rc;
 
@@ -15,7 +19,9 @@ use gpui::{Div, FontWeight, IntoElement, Role, div, prelude::*, px};
 use crate::agent_setup::{
     ActionHandler, AgentSetupState, InstallHandler, quiet_link, ready_line, setup_list,
 };
-use crate::commands::{CommandId, FocusSidebar, OpenLauncher, ShowAgentSettings, command};
+use crate::commands::{
+    CommandId, FocusSidebar, NewDefaultSession, NewTerminal, ShowAgentSettings, command,
+};
 use crate::icons::sf_symbol;
 
 pub(crate) struct EmptyWorkbench {
@@ -29,6 +35,8 @@ pub(crate) struct EmptyWorkbench {
 pub(crate) struct EmptyWorkbenchActions {
     pub install: InstallHandler,
     pub check_again: ActionHandler,
+    /// Pick a project folder, then open the default agent there.
+    pub start_in_folder: ActionHandler,
 }
 
 pub(crate) fn render(
@@ -37,7 +45,7 @@ pub(crate) fn render(
     colors: SemanticColors,
 ) -> impl IntoElement {
     let column = if state.has_sessions {
-        resting(colors)
+        resting(&actions, colors)
     } else {
         welcome(&state, &actions, colors)
     };
@@ -180,15 +188,11 @@ fn agents_section(
                 format!("Looking for coding agents on {machine}…"),
                 colors,
             ))
-            .child(start_button("Start a session", true, colors)),
+            .child(choose_folder(actions, colors)),
         AgentSetupState::Ready(ready) => section
             .child(eyebrow(format!("Ready on {machine}"), colors))
             .child(ready_line(ready, colors))
-            .child(
-                div()
-                    .pt(px(6.0))
-                    .child(start_button("Start your first session", true, colors)),
-            ),
+            .child(div().pt(px(6.0)).child(choose_folder(actions, colors))),
         AgentSetupState::Missing(candidates) => {
             let check_again = Rc::clone(&actions.check_again);
             section
@@ -251,14 +255,21 @@ fn agents_section(
                             "Open a terminal instead",
                             None,
                             colors,
-                            |window, cx| window.dispatch_action(Box::new(OpenLauncher), cx),
+                            |window, cx| window.dispatch_action(Box::new(NewTerminal), cx),
                         )),
                 )
         }
     }
 }
 
-fn start_button(label: &'static str, show_shortcut: bool, colors: SemanticColors) -> Div {
+/// The filled button a page leads with, and the shortcut that does the same.
+fn start_button(
+    label: &'static str,
+    symbol: &'static str,
+    shortcut: Option<CommandId>,
+    colors: SemanticColors,
+    on_click: ActionHandler,
+) -> Div {
     div()
         .flex()
         .items_center()
@@ -278,54 +289,88 @@ fn start_button(label: &'static str, show_shortcut: bool, colors: SemanticColors
                 .font_weight(FontWeight::MEDIUM)
                 .flex()
                 .items_center()
-                .gap(px(10.0))
+                .gap(px(9.0))
                 .cursor_pointer()
                 .hover(|button| button.opacity(0.88))
                 .active(|button| button.opacity(0.74))
-                .on_click(|_, window, cx| {
-                    window.dispatch_action(Box::new(OpenLauncher), cx);
-                })
-                .child(label)
-                .child(sf_symbol("chevron.right", 12.0, colors.background)),
+                .on_click(move |_, window, cx| on_click(window, cx))
+                .child(sf_symbol(symbol, 14.0, colors.background))
+                .child(label),
         )
-        .when(show_shortcut, |row| {
-            row.child(
-                div()
-                    .text_size(px(12.0))
-                    .text_color(colors.secondary)
-                    .child(
-                        command(CommandId::OpenLauncher)
-                            .shortcut_label()
-                            .unwrap_or_default(),
-                    ),
-            )
-        })
+        .when_some(
+            shortcut.and_then(|id| command(id).shortcut_label()),
+            |row, shortcut| {
+                row.child(
+                    div()
+                        .text_size(px(12.0))
+                        .text_color(colors.secondary)
+                        .child(shortcut),
+                )
+            },
+        )
+}
+
+/// Choosing the folder is the whole first step: the agent opens there.
+fn choose_folder(actions: &EmptyWorkbenchActions, colors: SemanticColors) -> Div {
+    div()
+        .flex()
+        .flex_col()
+        .gap(px(10.0))
+        .child(start_button(
+            "Choose a project folder",
+            "folder",
+            None,
+            colors,
+            Rc::clone(&actions.start_in_folder),
+        ))
+        .child(
+            div()
+                .text_size(px(12.0))
+                .line_height(px(18.0))
+                .text_color(colors.secondary)
+                .child(
+                    "Your agent opens in that folder. Tell it what you want done, in plain words.",
+                ),
+        )
 }
 
 /// Sessions exist but none is open in this pane.
-fn resting(colors: SemanticColors) -> Div {
+fn resting(actions: &EmptyWorkbenchActions, colors: SemanticColors) -> Div {
+    let start_in_folder = Rc::clone(&actions.start_in_folder);
     column()
         .gap(px(24.0))
         .child(mark())
         .child(headline(
             "Ready for your next task?",
-            "Pick up a session from the sidebar, or start something new.",
+            "Pick up a session from the sidebar, or start a new one.",
             colors,
         ))
-        .child(start_button("Start a session", true, colors))
+        .child(start_button(
+            "New session",
+            "plus",
+            Some(CommandId::NewDefaultSession),
+            colors,
+            Rc::new(|window, cx| window.dispatch_action(Box::new(NewDefaultSession), cx)),
+        ))
         .child(
             div()
-                .id("empty-browse-sessions")
-                .role(Role::Button)
-                .aria_label("Show sessions")
-                .py(px(6.0))
-                .text_size(px(13.0))
-                .text_color(colors.secondary)
-                .cursor_pointer()
-                .hover(move |button| button.text_color(colors.primary))
-                .on_click(|_, window, cx| {
-                    window.dispatch_action(Box::new(FocusSidebar), cx);
-                })
-                .child("Show sessions in the sidebar"),
+                .flex()
+                .flex_wrap()
+                .items_center()
+                .gap(px(18.0))
+                .child(quiet_link(
+                    "empty-start-in-folder",
+                    "Start in another folder…",
+                    None,
+                    colors,
+                    move |window, cx| start_in_folder(window, cx),
+                ))
+                .child(quiet_link(
+                    "empty-browse-sessions",
+                    "Show sessions in the sidebar",
+                    None,
+                    colors,
+                    |window, cx| window.dispatch_action(Box::new(FocusSidebar), cx),
+                )),
         )
 }
