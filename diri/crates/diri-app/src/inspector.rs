@@ -530,9 +530,35 @@ impl WorkbenchInspector {
             self.ask_draft = None;
             self.ask_feedback = None;
             self.ask_query.clear();
+            self.release_hidden_state();
         }
         self.reconcile_diff_polling(cx);
         cx.notify();
+    }
+
+    /// A hidden panel paints none of this, and the diff and transcript are
+    /// its largest allocations. Becoming visible forces a full refresh, so
+    /// holding them only kept megabytes alive for a closed panel.
+    fn release_hidden_state(&mut self) {
+        self.refresh_task = None;
+        self.review_task = None;
+        self.transcript_task = None;
+        self.loading = false;
+        // Row indices and the transcript version describe the dropped
+        // snapshots; a kept version would turn the reload into a no-op.
+        self.diff_selection.clear();
+        self.selected_turn = None;
+        self.transcript_version = None;
+        self.state = LoadState::NoSession;
+        self.review_state = ReviewLoadState::NoSession;
+        self.transcript_state = TranscriptLoadState::Unavailable;
+        self.markdown_cache = HashMap::new();
+    }
+
+    /// The transcript is only painted by Details → Info.
+    fn transcript_showing(&self) -> bool {
+        self.workspace_selected == Some(WorkspaceSurface::Details)
+            && self.selected_tab == InspectorTab::Info
     }
 
     pub fn set_terminal_surface(
@@ -807,8 +833,11 @@ impl WorkbenchInspector {
         } else {
             // Info and Artifacts are projections of the live session record,
             // so same-session store changes repaint and schedule one bounded
-            // transcript mtime check without installing an idle poll.
-            if let Some(context) = self.context.clone() {
+            // transcript mtime check without installing an idle poll. Other
+            // tabs skip it: activating Info performs its own version check.
+            if self.transcript_showing()
+                && let Some(context) = self.context.clone()
+            {
                 self.refresh_transcript(&context, true, cx);
             }
             cx.notify();
@@ -7300,6 +7329,38 @@ mod tests {
         });
         assert_eq!(appended_turns.len(), 2);
         assert_eq!(appended_turns[1].text, "The appended turn is visible");
+
+        // Off Info, a same-session store change arms no transcript read.
+        inspector.update(cx, |inspector, cx| {
+            inspector.selected_tab = InspectorTab::Artifacts;
+            let generation = inspector.transcript_generation;
+            inspector.refresh_if_context_changed(cx);
+            assert_eq!(inspector.transcript_generation, generation);
+            inspector.selected_tab = InspectorTab::Info;
+        });
+
+        // Hiding releases the loaded documents; the next load is a full
+        // read rather than a version no-op against the dropped snapshot.
+        inspector.update(cx, |inspector, cx| {
+            inspector.set_visible(false, cx);
+            assert!(matches!(inspector.state, LoadState::NoSession));
+            assert!(matches!(
+                inspector.transcript_state,
+                TranscriptLoadState::Unavailable
+            ));
+            assert!(inspector.transcript_version.is_none());
+            assert!(inspector.markdown_cache.is_empty());
+            let context = inspector.selected_context().expect("selected context");
+            inspector.visible = true;
+            inspector.refresh_transcript(&context, false, cx);
+        });
+        cx.run_until_parked();
+        inspector.read_with(cx, |inspector, _| {
+            let TranscriptLoadState::Ready(document) = &inspector.transcript_state else {
+                panic!("transcript did not reload after the panel was shown again");
+            };
+            assert_eq!(document.turns.len(), 2);
+        });
 
         inspector.update(cx, |inspector, _| {
             inspector.refresh_task = None;
