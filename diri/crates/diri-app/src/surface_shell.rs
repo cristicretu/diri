@@ -5331,7 +5331,8 @@ impl UtilitySurfaces {
                                 .text_color(colors.secondary)
                                 .whitespace_normal()
                                 .child(wrappable_setting_copy(report.clone().into())),
-                        ),
+                        )
+                        .child(self.render_session_status_section(colors, cx)),
                 )
                 .child(HairlineDivider::horizontal(colors))
                 .child(
@@ -5374,6 +5375,204 @@ impl UtilitySurfaces {
                 ),
         )
     }
+}
+
+impl UtilitySurfaces {
+    /// Why Diri reports the selected session's status: the matched rule,
+    /// signal age, grace and anti-flicker windows, with the same copy button
+    /// the inspector used to carry. It follows the active session on every
+    /// paint and is the only place this evidence is shown.
+    fn render_session_status_section(
+        &self,
+        colors: SemanticColors,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let session = self
+            .store
+            .read()
+            .expect("session store lock poisoned")
+            .selected_session()
+            .cloned();
+        let section = div().mt(px(16.0)).flex().flex_col().gap(px(8.0)).child(
+            div()
+                .flex()
+                .flex_col()
+                .gap(px(2.0))
+                .child(
+                    div()
+                        .text_size(px(Typo::ROW_EMPHASIZED.size))
+                        .font_weight(Typo::ROW_EMPHASIZED.weight)
+                        .child("Session status"),
+                )
+                .child(
+                    div()
+                        .text_size(px(Typo::META.size))
+                        .text_color(colors.tertiary)
+                        .child(
+                            "Why Diri reports the active session's status. Follows the selection.",
+                        ),
+                ),
+        );
+        let Some(session) = session else {
+            return section
+                .child(
+                    div()
+                        .debug_selector(|| "diagnostics-session-status-empty".into())
+                        .text_size(px(Typo::META.size))
+                        .text_color(colors.tertiary)
+                        .child("Select a session to see its status evidence."),
+                )
+                .into_any_element();
+        };
+        let evidence = session
+            .status_evidence
+            .as_ref()
+            .filter(|evidence| evidence.status == session.status);
+        let selector = format!("diagnostics-session-status-{}", session.id.0);
+        let mut card = div()
+            .debug_selector(move || selector.clone())
+            .p(px(14.0))
+            .flex()
+            .flex_col()
+            .gap(px(7.0))
+            .rounded(px(Radius::CARD))
+            .bg(colors.primary.alpha(0.035))
+            .border_1()
+            .border_color(colors.primary.alpha(0.065))
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap(px(8.0))
+                    .child(
+                        div()
+                            .min_w(px(0.0))
+                            .flex_1()
+                            .truncate()
+                            .text_size(px(Typo::ROW.size))
+                            .font_weight(FontWeight::MEDIUM)
+                            .child(session.title.clone()),
+                    )
+                    .child(
+                        div()
+                            .flex_none()
+                            .text_size(px(Typo::META.size))
+                            .text_color(colors.secondary)
+                            .child(crate::status_debug::status_name(&session.status)),
+                    ),
+            )
+            .child(
+                div()
+                    .text_size(px(Typo::META.size))
+                    .line_height(px(16.0))
+                    .text_color(colors.secondary)
+                    .child(evidence.map_or(
+                        "This session record predates decision evidence; its normal status is still shown.",
+                        |evidence| crate::status_debug::source_explanation(evidence.source),
+                    )),
+            );
+        if let Some(evidence) = evidence {
+            card = card
+                .child(status_evidence_row(
+                    "Source",
+                    crate::status_debug::source_name(evidence.source).to_owned(),
+                    colors,
+                ))
+                .child(status_evidence_row(
+                    "Signal",
+                    crate::status_debug::signal_age(evidence.signal_at.0),
+                    colors,
+                ));
+            if let Some(manifest) =
+                crate::status_debug::safe_identifier(evidence.manifest_id.as_deref())
+            {
+                let version =
+                    crate::status_debug::safe_identifier(evidence.manifest_version.as_deref());
+                card = card.child(status_evidence_row(
+                    "Manifest",
+                    version.map_or(manifest.clone(), |version| format!("{manifest}@{version}")),
+                    colors,
+                ));
+            }
+            if let Some(rule) =
+                crate::status_debug::safe_identifier(evidence.matched_rule_id.as_deref())
+            {
+                card = card.child(status_evidence_row("Matched rule", rule, colors));
+            }
+            if evidence.startup_grace_active {
+                card = card.child(status_evidence_row(
+                    "Startup grace",
+                    "Active — holding weak early signals".to_owned(),
+                    colors,
+                ));
+            }
+            if evidence.anti_flicker_active {
+                card = card.child(status_evidence_row(
+                    "Anti-flicker",
+                    "Active — waiting for confirmation".to_owned(),
+                    colors,
+                ));
+            }
+            if let Some(reason) = evidence.fallback_reason {
+                card = card.child(status_evidence_row(
+                    "Fallback",
+                    crate::status_debug::fallback_name(reason).to_owned(),
+                    colors,
+                ));
+            }
+        }
+        let report = crate::status_debug::StatusDebugInfo::from_session(&session)
+            .as_str()
+            .to_owned();
+        card = card.child(
+            div()
+                .id("copy-status-debug-info")
+                .debug_selector(|| "copy-status-debug-info".into())
+                .mt(px(3.0))
+                .h(px(28.0))
+                .px(px(9.0))
+                .self_start()
+                .flex()
+                .items_center()
+                .gap(px(6.0))
+                .rounded(px(Radius::ROW))
+                .cursor_pointer()
+                .bg(colors.primary.alpha(0.065))
+                .hover(move |button| button.bg(colors.primary.alpha(0.10)))
+                .text_size(px(Typo::META.size))
+                .font_weight(FontWeight::MEDIUM)
+                .child(sf_symbol("doc.on.doc", 10.5, colors.secondary))
+                .child("Copy status debug info")
+                .on_click(cx.listener(move |_, _, _, cx| {
+                    cx.write_to_clipboard(gpui::ClipboardItem::new_string(report.clone()));
+                    cx.stop_propagation();
+                })),
+        );
+        section.child(card).into_any_element()
+    }
+}
+
+fn status_evidence_row(label: &'static str, value: String, colors: SemanticColors) -> AnyElement {
+    div()
+        .flex()
+        .items_start()
+        .gap(px(8.0))
+        .text_size(px(Typo::META.size))
+        .child(
+            div()
+                .w(px(86.0))
+                .flex_none()
+                .text_color(colors.tertiary)
+                .child(label),
+        )
+        .child(
+            div()
+                .min_w(px(0.0))
+                .flex_1()
+                .text_color(colors.secondary)
+                .child(value),
+        )
+        .into_any_element()
 }
 
 fn build_diagnostics_report(store: &SessionStore) -> String {
@@ -6936,6 +7135,105 @@ mod tests {
                     .cached(StyleRefinement::default().absolute().inset_0()),
             )
         }
+    }
+
+    struct DiagnosticsHarness {
+        surfaces: Entity<UtilitySurfaces>,
+    }
+
+    impl Render for DiagnosticsHarness {
+        fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+            div().size_full().child(self.surfaces.clone())
+        }
+    }
+
+    /// Status evidence left the inspector for Diagnostics, where it follows
+    /// whichever session is selected and keeps its copy button.
+    #[gpui::test]
+    fn diagnostics_follow_the_active_session_status_evidence(cx: &mut TestAppContext) {
+        use diri_proto::{DateMillis, StatusEvidence, StatusEvidenceSource};
+        let runtime = Arc::new(StoreRuntime::inert());
+        let fixture =
+            crate::sidebar::SidebarPreviewFixture::make(crate::sidebar::PreviewScenario::Typical);
+        let ids: Vec<_> = fixture
+            .list
+            .sessions
+            .iter()
+            .map(|session| session.id.clone())
+            .collect();
+        {
+            let mut store = runtime.store.write().expect("session store lock poisoned");
+            store.hydrate(fixture.list);
+            let mut session = (*store
+                .sessions()
+                .get(&ids[0])
+                .expect("fixture session")
+                .clone())
+            .clone();
+            session.status_evidence = Some(StatusEvidence {
+                status: session.status.clone(),
+                source: StatusEvidenceSource::ScreenRule,
+                signal_at: DateMillis(0.0),
+                matched_rule_id: Some("working-spinner".to_owned()),
+                startup_grace_active: false,
+                anti_flicker_active: true,
+                manifest_id: Some("codex".to_owned()),
+                manifest_version: Some("3".to_owned()),
+                fallback_reason: None,
+            });
+            store.upsert_session(session);
+            store.select(ids[0].clone());
+        }
+        let tokio = Arc::new(
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("test runtime"),
+        );
+        let updates = crate::updates::inert();
+        let surfaces_runtime = Arc::clone(&runtime);
+        let (harness, cx) = cx.add_window_view(move |window, cx| {
+            let surfaces = cx.new(|cx| {
+                let mut surfaces =
+                    UtilitySurfaces::new(surfaces_runtime, tokio, updates, window, cx);
+                surfaces.surface = Surface::Diagnostics;
+                surfaces.diagnostics_report = Some("# Diri diagnostics".to_owned());
+                surfaces
+            });
+            DiagnosticsHarness { surfaces }
+        });
+        cx.simulate_resize(size(px(1100.0), px(700.0)));
+        cx.run_until_parked();
+        let first: &'static str =
+            Box::leak(format!("diagnostics-session-status-{}", ids[0].0).into_boxed_str());
+        let second: &'static str =
+            Box::leak(format!("diagnostics-session-status-{}", ids[1].0).into_boxed_str());
+        assert!(
+            cx.debug_bounds(first).is_some(),
+            "evidence for the selection"
+        );
+        assert!(cx.debug_bounds(second).is_none());
+        assert!(cx.debug_bounds("copy-status-debug-info").is_some());
+
+        let surfaces = harness.read_with(cx, |harness, _| harness.surfaces.clone());
+        surfaces.update(cx, |surfaces, cx| {
+            surfaces
+                .store
+                .write()
+                .expect("session store lock poisoned")
+                .select(ids[1].clone());
+            cx.notify();
+        });
+        cx.run_until_parked();
+        assert!(cx.debug_bounds(first).is_none());
+        assert!(
+            cx.debug_bounds(second).is_some(),
+            "the section follows the active session"
+        );
+        assert!(
+            cx.debug_bounds("copy-status-debug-info").is_some(),
+            "the copy button exists even without decision evidence"
+        );
     }
 
     /// Regenerates the issue/PR screenshot without Screen Recording access or
