@@ -24,18 +24,11 @@ DIRI_VISUAL_OUTPUT=$OUT/inspector-browser-after.png DIRI_VISUAL_BROWSER=1 DIRI_V
 # The 300pt minimum width, where the Preview placeholder keeps only its icon.
 DIRI_VISUAL_OUTPUT=$OUT/inspector-header-narrow.png DIRI_VISUAL_WIDTH=300 DIRI_VISUAL_REVIEW_COUNT=1 \
   cargo test -p diri-app render_workspace_preview_screenshot -- --ignored
-# Terminal header with the session strip.
-DIRI_QOL_SCREENSHOT=$OUT/terminal-strip-after.png DIRI_QOL_SCENE=strip \
-  cargo test -p diri-app render_terminal_qol_screenshot -- --ignored
 # Settings › Diagnostics with the Session status section.
 DIRI_VISUAL_OUTPUT=$OUT/diagnostics-after.png \
   cargo test -p diri-app render_diagnostics_preview_screenshot -- --ignored
-# Sidebar hover card (host and memory rows appear when the session has them).
-DIRI_VISUAL_OUTPUT=$OUT/hover-card-after.png \
-  cargo test -p diri-app render_session_hover_card_screenshot -- --ignored
 ```
 
 The before images used the same fixtures on `main`: no switches for the
 surface chooser, `DIRI_VISUAL_FILES=1` for the Files surface,
-`DIRI_VISUAL_BROWSER=1 DIRI_VISUAL_BROWSER_TABS=1` for browser tabs, and no
-scene for the plain terminal header.
+`DIRI_VISUAL_BROWSER=1 DIRI_VISUAL_BROWSER_TABS=1` for browser tabs.

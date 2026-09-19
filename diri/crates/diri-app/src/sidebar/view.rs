@@ -6108,15 +6108,11 @@ impl Sidebar {
     ) -> Option<(gpui::Stateful<gpui::Div>, Bounds<Pixels>)> {
         let id = self.ui.hover_card.as_ref()?;
         let row = *self.row_bounds.borrow().get(id)?;
-        let (session, project, host) = {
+        let (session, project) = {
             let store = self.store.read().expect("session store lock poisoned");
             let session = store.sessions().get(id)?.clone();
             let project = store.projects().get(&session.project_id).cloned();
-            let host = session
-                .host
-                .as_deref()
-                .map(|host| store.host_display_name(host));
-            (session, project, host)
+            (session, project)
         };
         let mut details = div().flex().flex_col().gap(px(5.0));
         if session.hibernation.is_some() {
@@ -6150,18 +6146,6 @@ impl Sidebar {
                     .join(", "),
                 false,
                 colors,
-            ));
-        }
-        if let Some(host) = &host {
-            details = details.child(
-                div()
-                    .debug_selector(|| "hover-card-host".into())
-                    .child(hover_detail("server.rack", host, false, colors)),
-            );
-        }
-        if let Some(bytes) = session.memory_bytes {
-            details = details.child(div().debug_selector(|| "hover-card-memory".into()).child(
-                hover_detail("chart.bar.xaxis", &format_bytes(bytes), false, colors),
             ));
         }
         let card = div()
@@ -8495,16 +8479,6 @@ fn account_action_row(
         .into_any_element()
 }
 
-fn format_bytes(bytes: u64) -> String {
-    const GIB: f64 = 1_073_741_824.0;
-    const MIB: f64 = 1_048_576.0;
-    if bytes >= 1_073_741_824 {
-        format!("{:.1} GB", bytes as f64 / GIB)
-    } else {
-        format!("{:.0} MB", bytes as f64 / MIB)
-    }
-}
-
 fn hover_detail(icon: &str, text: &str, mono: bool, colors: SemanticColors) -> AnyElement {
     div()
         .flex()
@@ -9612,44 +9586,6 @@ mod tests {
             Modifiers::default(),
         );
         assert_eq!(cx.debug_bounds("session-hover-card"), Some(card));
-    }
-
-    /// Host and memory used to live only in the inspector's Details surface;
-    /// the hover card is their home now, beside project, branch, and ports.
-    #[gpui::test]
-    fn hover_card_shows_host_and_memory_when_the_session_has_them(cx: &mut TestAppContext) {
-        let (view, cx) = cx.add_window_view(|_, cx| {
-            let sidebar = cx.new(|cx| Sidebar::new(None, true, PreviewScenario::Typical, cx));
-            SidebarPopoverHarness { sidebar }
-        });
-        let sidebar = view.read_with(cx, |harness, _| harness.sidebar.clone());
-        sidebar.update(cx, |sidebar, _| {
-            let mut store = sidebar.store.write().expect("session store lock poisoned");
-            let mut session = store
-                .sessions()
-                .get(&SessionId::new("preview-codex"))
-                .cloned()
-                .map(|session| (*session).clone())
-                .expect("fixture session");
-            session.host = Some("forge".into());
-            session.memory_bytes = Some(3 * 1_073_741_824);
-            store.upsert_session(session);
-        });
-        cx.update(|window, _| window.activate_window());
-        cx.run_until_parked();
-        let row = row_bounds(&sidebar, cx, "preview-codex");
-        cx.simulate_mouse_move(row.center(), None, Modifiers::default());
-        sidebar.update_in(cx, |sidebar, window, cx| {
-            sidebar.schedule_hover_card(SessionId::new("preview-codex"), true, window, cx);
-        });
-        cx.run_until_parked();
-        cx.executor().advance_clock(Duration::from_millis(800));
-        cx.run_until_parked();
-        assert!(cx.debug_bounds("session-hover-card").is_some());
-        assert!(cx.debug_bounds("hover-card-host").is_some(), "host row");
-        assert!(cx.debug_bounds("hover-card-memory").is_some(), "memory row");
-        assert_eq!(format_bytes(3 * 1_073_741_824), "3.0 GB");
-        assert_eq!(format_bytes(512 * 1_048_576), "512 MB");
     }
 
     #[gpui::test]

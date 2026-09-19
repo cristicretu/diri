@@ -2102,17 +2102,6 @@ impl WorkbenchInspector {
         true
     }
 
-    /// Show `url` in a Preview tab: the active one when Preview is up,
-    /// otherwise the conversation's first Preview, created if needed.
-    pub(crate) fn open_preview_url(&mut self, url: String, cx: &mut Context<Self>) {
-        self.select_workspace(WorkspaceSurface::Browser, cx);
-        self.browser_query.clear();
-        self.browser_query.insert(&url);
-        self.browser_address_focused = false;
-        cx.emit(InspectorEvent::Browser(BrowserAction::Navigate(url)));
-        cx.notify();
-    }
-
     fn navigate_browser(&mut self, cx: &mut Context<Self>) {
         let Some(url) = self.browser_url() else {
             return;
@@ -4294,7 +4283,9 @@ impl Render for WorkbenchInspector {
             .overflow_hidden()
             .track_focus(&self.focus)
             .on_key_down(cx.listener(Self::handle_key_down))
-            .bg(colors.sidebar_surface())
+            // The inspector belongs to the work area: it paints on the
+            // terminal's surface, not the sidebar's lighter material.
+            .bg(colors.work_surface())
             .text_color(colors.primary)
             .child(self.render_workspace_header(colors, cx))
             .child(div().min_h(px(0.0)).flex_1().overflow_hidden().child(body))
@@ -6717,7 +6708,7 @@ mod tests {
     fn light_review_rows_keep_readable_contrast() {
         for theme in ["dirijor-light", "solarized-light", "github-light"] {
             let colors = crate::app_theme::sidebar_colors(theme);
-            let inspector_surface = composite(colors.sidebar_surface(), colors.background);
+            let inspector_surface = composite(colors.work_surface(), colors.background);
 
             for kind in [
                 DiffRowKind::Addition,

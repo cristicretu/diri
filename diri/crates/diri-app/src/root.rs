@@ -527,7 +527,6 @@ impl RootView {
                 TerminalPaneEvent::ExternalDropFeedback { message } => {
                     this.show_quote_feedback("Dropped files", message.clone(), cx);
                 }
-                TerminalPaneEvent::OpenPreview { url } => this.open_preview_url(url.clone(), cx),
             })
             .detach();
         }
@@ -1462,9 +1461,6 @@ impl RootView {
                             TerminalPaneEvent::ExternalDropFeedback { message },
                         ) => this.show_quote_feedback("Dropped files", message.clone(), cx),
                         crate::workspace_workbench::WorkspaceWorkbenchEvent::Terminal(
-                            TerminalPaneEvent::OpenPreview { url },
-                        ) => this.open_preview_url(url.clone(), cx),
-                        crate::workspace_workbench::WorkspaceWorkbenchEvent::Terminal(
                             TerminalPaneEvent::ContinueAccount(id),
                         ) => {
                             if let Some(surfaces) = &this.utility_surfaces {
@@ -2079,7 +2075,6 @@ impl RootView {
                     });
                 }
             }
-            CommandId::OpenInEditor => self.open_project_in_editor(cx),
             CommandId::ReviewLaunches => {
                 self.launches_expanded = true;
                 window.focus(&self.launches_focus, cx);
@@ -2893,59 +2888,11 @@ impl RootView {
         self.set_inspector_open(!self.inspector_open, cx);
     }
 
-    /// An explicit destination must not be lost behind the short debounce
-    /// that protects repeated panel toggles.
+    /// Source navigation is an explicit destination, so it must not be lost
+    /// behind the short debounce that protects repeated panel toggles.
     fn reveal_inspector(&mut self, cx: &mut Context<Self>) {
         self.inspector_toggled_at = None;
         self.set_inspector_open(true, cx);
-    }
-
-    /// Files have no viewer in Diri: the palette hands the active session's
-    /// project (its worktree when it has one) to the user's editor.
-    fn open_project_in_editor(&mut self, cx: &mut Context<Self>) {
-        let session = self.active_session_id(cx).and_then(|id| {
-            self.window_store
-                .read()
-                .expect("session store lock poisoned")
-                .sessions()
-                .get(&id)
-                .cloned()
-        });
-        let Some(session) = session else {
-            self.show_quote_feedback("Editor", "Select a session first".to_owned(), cx);
-            return;
-        };
-        if session.host.is_some() {
-            self.show_quote_feedback(
-                "Editor",
-                "Remote projects open on their host".to_owned(),
-                cx,
-            );
-            return;
-        }
-        let path =
-            std::path::PathBuf::from(session.worktree_path.as_deref().unwrap_or(&session.cwd));
-        let launch = cx.background_spawn(async move { crate::editor::open_in_editor(&path) });
-        cx.spawn(async move |this, cx| {
-            if let Err(error) = launch.await {
-                let _ = this.update(cx, |this, cx| this.show_quote_feedback("Editor", error, cx));
-            }
-        })
-        .detach();
-    }
-
-    /// A strip chip's preview belongs in the panel's Preview surface; hosts
-    /// without the native page fall back to the default browser.
-    fn open_preview_url(&mut self, url: String, cx: &mut Context<Self>) {
-        #[cfg(target_os = "macos")]
-        if let Some(inspector) = self.inspector.clone()
-            && !self.preview
-        {
-            self.reveal_inspector(cx);
-            inspector.update(cx, |inspector, cx| inspector.open_preview_url(url, cx));
-            return;
-        }
-        cx.open_url(&url);
     }
 
     fn inspector_resize_handle(&self, cx: &mut Context<Self>) -> AnyElement {
