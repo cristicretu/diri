@@ -310,7 +310,8 @@ struct FindHighlights {
     current_bounds: Option<Bounds<Pixels>>,
 }
 
-/// Shaped lines for history rows, keyed by absolute row and content-addressed
+/// Shaped lines for every row of a reading view (history and the held live
+/// rows under it), keyed by absolute row and content-addressed
 /// by a digest of the row's cells and combining text, so shaping survives across scrolled frames
 /// instead of being redone per frame.
 ///
@@ -447,7 +448,9 @@ pub struct TerminalPrepaintState {
     background_quads: Vec<PaintQuad>,
     decoration_quads: Vec<PaintQuad>,
     overlay_quads: Vec<PaintQuad>,
-    lines: Vec<(u16, ShapedLine)>,
+    /// Reading path: window row and the absolute row whose shape paint reads
+    /// from the history cache, as the live path reads the row cache.
+    lines: Vec<(u16, i64)>,
     metrics: Option<CellMetrics>,
     cursor: Option<CursorPaint>,
     cache_hits: u64,
@@ -1280,9 +1283,10 @@ impl Element for TerminalElement {
             let mut history = mutex_lock(&self.shared.history_lines);
             history.validate(key, viewport.absolute_row(0));
             let mut hits = 0u64;
+            let mut cells = Vec::with_capacity(usize::from(grid_cols));
             for row_index in 0..visible_rows {
                 let absolute = viewport.absolute_row(row_index);
-                let mut cells = viewport.window_row(&buffer, row_index);
+                viewport.window_row_into(&buffer, row_index, &mut cells);
                 cells.truncate(visible_cols);
                 append_row_quads(
                     &cells,
@@ -1293,26 +1297,21 @@ impl Element for TerminalElement {
                     &mut background_quads,
                     &mut decoration_quads,
                 );
-                let is_history = absolute < viewport.live_start_row();
                 let graphemes = viewport.row_graphemes(&buffer, absolute);
                 let digest = digest_row(&cells, graphemes);
-                let line = if let Some(line) =
-                    is_history.then(|| history.get(absolute, digest)).flatten()
-                {
+                if history.get(absolute, digest).is_some() {
                     hits += 1;
-                    line.clone()
                 } else {
-                    let line = self.shape_row(&cells, graphemes, metrics, window);
                     // A row the viewport has not fetched yet composes as
                     // blank. Caching it is safe now that entries are content
                     // addressed: the blank's digest stops matching the moment
-                    // the fetch lands.
-                    if is_history {
-                        history.insert(absolute, digest, line.clone());
-                    }
-                    line
-                };
-                lines.push((row_index as u16, line));
+                    // the fetch lands. The same holds for the held live rows
+                    // under the history, which used to be reshaped and copied
+                    // every frame.
+                    let line = self.shape_row(&cells, graphemes, metrics, window);
+                    history.insert(absolute, digest, line);
+                }
+                lines.push((row_index as u16, absolute));
             }
             cache_hits = hits;
             cache_misses = (visible_rows as u64).saturating_sub(hits);
@@ -1666,7 +1665,16 @@ impl Element for TerminalElement {
                 });
             }
 
-            for (row, line) in &prepaint.lines {
+            // Reading path: shapes stay in the history cache, which only
+            // prepaint evicts, so a frame copies no `ShapedLine` (about 3 KB
+            // each, inline).
+            let history =
+                (!prepaint.lines.is_empty()).then(|| mutex_lock(&self.shared.history_lines));
+            let lines = prepaint.lines.iter().filter_map(|(row, absolute)| {
+                let (_, line) = history.as_ref()?.lines.get(absolute)?;
+                Some((row, line))
+            });
+            for (row, line) in lines {
                 let origin = point(bounds.left(), bounds.top() + metrics.y_for_row(*row));
                 if prepaint
                     .cursor

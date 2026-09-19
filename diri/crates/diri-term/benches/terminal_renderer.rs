@@ -1,4 +1,5 @@
-use diri_proto::grid::{ChangedRow, GridCell, GridUpdate, TermColor, TermStyle};
+use diri_proto::grid::{ChangedRow, GridCell, GridRowCodec, GridUpdate, TermColor, TermStyle};
+use diri_proto::methods::ReadScrollbackCellsResult;
 use diri_term::{buffer::GridBuffer, element::TerminalElement};
 use gpui::{
     AppContext as _, BenchAppContext, Context, IntoElement, ParentElement, Render, Styled, Window,
@@ -32,6 +33,67 @@ fn terminal_build_log_scroll(cx: &mut BenchAppContext) {
 #[gpui::bench(fps = 120)]
 fn terminal_styled_tui_scroll(cx: &mut BenchAppContext) {
     scroll(cx, styled_row);
+}
+
+/// A reader scrolled 30 rows into history while output keeps arriving under
+/// the held view: every frame recomposes the same 50 rows.
+#[gpui::bench(fps = 120)]
+fn terminal_reading_view_redraw(cx: &mut BenchAppContext) {
+    const HISTORY_ROWS: u16 = 30;
+    let frames = [
+        build_frame(1, false, plain_row),
+        build_frame(0, false, plain_row),
+    ];
+    let terminal = TerminalElement::with_buffer(GridBuffer::new(COLS, ROWS)).focused(true);
+    terminal.apply_damage(build_frame(0, true, plain_row));
+    assert!(terminal.set_view_offset(i64::from(HISTORY_ROWS), usize::from(ROWS)));
+    let history = (0..HISTORY_ROWS)
+        .map(|row| {
+            let mut cells = styled_row(usize::from(row));
+            cells.resize(usize::from(COLS), GridCell::BLANK);
+            cells
+        })
+        .collect::<Vec<_>>();
+    terminal
+        .complete_scrollback_fetch(
+            ReadScrollbackCellsResult {
+                metadata: Vec::new(),
+                payload: GridRowCodec::encode_rows(&history).unwrap(),
+                first_row: 1000 - i64::from(HISTORY_ROWS),
+                row_count: i64::from(HISTORY_ROWS),
+                live_start_row: 1000,
+                total_rows: 1000 + i64::from(ROWS),
+                cols: i64::from(COLS),
+                content_seq: 1,
+            },
+            usize::from(ROWS),
+        )
+        .unwrap();
+
+    let mut window = cx.add_empty_window();
+    let view = window.update(|window, cx| {
+        window.replace_root(cx, |_window, _cx| TerminalBenchView {
+            terminal,
+            frames,
+            next_frame: 0,
+        })
+    });
+    cx.bench_renderer(view.clone(), |view, _window, cx| {
+        view.terminal
+            .apply_damage(view.frames[view.next_frame].clone());
+        view.next_frame ^= 1;
+        cx.notify();
+    });
+    let stats = cx.read_entity(&view, |view, _cx| view.terminal.stats());
+    if stats.frames >= MIN_GATED_FRAMES {
+        eprintln!(
+            "terminal-reading: frames={}, average={:?}, shape-cache={}/{}",
+            stats.frames,
+            stats.average_frame_time(),
+            stats.shape_cache_hits,
+            stats.shape_cache_hits + stats.shape_cache_misses,
+        );
+    }
 }
 
 fn scroll(cx: &mut BenchAppContext, row: fn(usize) -> Vec<GridCell>) {
@@ -164,6 +226,7 @@ fn build_frame(
 gpui::bench_group!(
     benches,
     terminal_build_log_scroll,
-    terminal_styled_tui_scroll
+    terminal_styled_tui_scroll,
+    terminal_reading_view_redraw
 );
 gpui::bench_main!(benches);

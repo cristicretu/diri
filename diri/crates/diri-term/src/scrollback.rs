@@ -360,9 +360,17 @@ impl ScrollbackViewport {
 
     #[must_use]
     pub fn row_at_absolute(&self, buffer: &GridBuffer, absolute_row: i64) -> Vec<GridCell> {
-        let cols = usize::from(buffer.cols);
+        normalized_row(
+            self.row_source(buffer, absolute_row),
+            usize::from(buffer.cols),
+        )
+    }
+
+    /// The stored cells behind `absolute_row`, before padding to the grid
+    /// width. Empty when the row has not been fetched.
+    fn row_source<'a>(&'a self, buffer: &'a GridBuffer, absolute_row: i64) -> &'a [GridCell] {
         if let Some(source) = &self.find_source {
-            return normalized_row(source.row(absolute_row).unwrap_or_default(), cols);
+            return source.row(absolute_row).unwrap_or_default();
         }
         if self.is_reading()
             && let Some(held) = &self.held_live
@@ -371,7 +379,7 @@ impl ScrollbackViewport {
             )
             && let Some(cells) = held.row(row)
         {
-            return normalized_row(cells, cols);
+            return cells;
         }
         let source = if absolute_row >= self.live_start_row {
             usize::try_from(absolute_row - self.live_start_row)
@@ -380,18 +388,28 @@ impl ScrollbackViewport {
         } else {
             self.cache.get(&absolute_row).map(Vec::as_slice)
         };
-        normalized_row(source.unwrap_or_default(), cols)
+        source.unwrap_or_default()
     }
 
     #[must_use]
     pub fn window_row(&self, buffer: &GridBuffer, window_row: usize) -> Vec<GridCell> {
-        if !self.is_reading() {
-            return normalized_row(
-                buffer.row(window_row).unwrap_or_default(),
-                usize::from(buffer.cols),
-            );
-        }
-        self.row_at_absolute(buffer, self.absolute_row(window_row))
+        let mut row = Vec::new();
+        self.window_row_into(buffer, window_row, &mut row);
+        row
+    }
+
+    /// [`Self::window_row`] into a caller-owned buffer, so a reading frame
+    /// composes all of its rows through one allocation instead of one each.
+    pub fn window_row_into(&self, buffer: &GridBuffer, window_row: usize, row: &mut Vec<GridCell>) {
+        let source = if self.is_reading() {
+            self.row_source(buffer, self.absolute_row(window_row))
+        } else {
+            buffer.row(window_row).unwrap_or_default()
+        };
+        let copied = source.len().min(usize::from(buffer.cols));
+        row.clear();
+        row.extend_from_slice(&source[..copied]);
+        row.resize(usize::from(buffer.cols), GridCell::BLANK);
     }
 
     #[must_use]
