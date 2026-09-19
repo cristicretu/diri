@@ -285,6 +285,9 @@ struct Shared {
     /// handed to the Registry exactly once for durable publication.
     completed: Mutex<Option<CompletedCapture>>,
     keyboard_known: AtomicBool,
+    /// The PTY owner's last answer to "is the child reading a secret?",
+    /// already vetoed by the alternate screen. See [`record_secret_input`].
+    secret_input: AtomicBool,
     id: String,
     find_owner: String,
     find_capture_revision: AtomicU64,
@@ -534,11 +537,13 @@ pub(crate) struct TerminalPublication {
     pub grid: Option<diri_proto::grid::GridUpdate>,
     pub modes: (bool, bool, MouseModes),
     pub keyboard: Option<diri_proto::terminal_input::KeyboardState>,
+    pub secret_input: bool,
 }
 
 pub(crate) struct AttachmentSeed {
     pub grid: diri_proto::grid::GridUpdate,
     pub modes: (bool, bool, MouseModes),
+    pub secret_input: bool,
     pub signature: GridSignature,
     pub wake: GridWake,
     pub wake_generation: u64,
@@ -1661,6 +1666,7 @@ impl Session {
                 return AttachmentSeed {
                     grid: sampled.0,
                     modes: sampled.1,
+                    secret_input: self.secret_input(),
                     signature: sampled.2,
                     wake,
                     wake_generation,
@@ -1724,6 +1730,8 @@ impl Session {
                 grid,
                 modes,
                 keyboard: current.keyboard,
+                // A remote Holder does not report termios yet.
+                secret_input: false,
             };
         }
         let mut screen = self.shared.screen.lock().expect("screen");
@@ -1752,10 +1760,42 @@ impl Session {
             *signature = current;
             Some(screen.grid_update(false))
         };
+        drop(screen);
         TerminalPublication {
             grid,
             modes,
             keyboard: current.keyboard,
+            secret_input: self.secret_input(),
+        }
+    }
+
+    /// Whether the child is reading a secret from a line prompt with echo
+    /// off, as last sampled from the PTY owner. Always `false` for a remote
+    /// session and for a child that has exited.
+    pub fn secret_input(&self) -> bool {
+        self.shared.secret_input.load(Ordering::SeqCst)
+            && !self.shared.exited.load(Ordering::SeqCst)
+    }
+
+    /// Asks the PTY owner now, for a caller about to record typed input. The
+    /// pump's samples trail the child by up to a tick, which is fine for a
+    /// lock icon and not for deciding whether a keystroke may be remembered.
+    fn refresh_secret_input(&self) -> bool {
+        match &self.transport {
+            Transport::Direct(pty) => {
+                let reading = pty.lock().expect("pty").secret_input();
+                record_secret_input(&self.shared, reading)
+            }
+            Transport::Held(client) => {
+                if !secret_input_plausible(&self.shared) {
+                    return record_secret_input(&self.shared, false);
+                }
+                match client.stat() {
+                    Ok(stat) => record_secret_input(&self.shared, stat.secret_input == Some(true)),
+                    Err(_) => self.secret_input(),
+                }
+            }
+            Transport::Remote(_) => false,
         }
     }
 
@@ -2029,7 +2069,10 @@ impl Session {
                 InputModesUnavailable,
             ));
         }
-        self.capture_prompt_title(text);
+        // Text answering a password prompt must not become the session's name.
+        if self.manifest_id != "shell" && !self.refresh_secret_input() {
+            self.capture_prompt_title(text);
+        }
         let framed = if self.bracketed_paste() {
             format!("\x1b[200~{}\x1b[201~", sanitize_paste_text(text))
         } else {
@@ -2106,24 +2149,22 @@ impl Session {
         } else {
             StatusSignal::UserKeystroke
         });
-        self.sample_shell_foreground();
+        self.sample_pty_facts();
         Ok(())
     }
 
-    fn sample_shell_foreground(&self) {
-        if self.manifest_id != "shell" {
-            return;
-        }
+    fn sample_pty_facts(&self) {
         match &self.transport {
             Transport::Direct(pty) => {
-                let (child_pid, pgid) = {
+                let (child_pid, pgid, reading_secret) = {
                     let pty = pty.lock().expect("pty");
-                    (pty.pid() as i32, pty.foreground_pgid())
+                    (pty.pid() as i32, pty.foreground_pgid(), pty.secret_input())
                 };
                 apply_foreground_sample(&self.shared, &self.manifest_id, child_pid, pgid);
+                record_secret_input(&self.shared, reading_secret);
             }
             Transport::Held(client) => {
-                sample_held_foreground(&self.shared, client, &self.manifest_id);
+                sample_held_pty_facts(&self.shared, client, &self.manifest_id);
             }
             Transport::Remote(_) => {}
         }
@@ -2138,6 +2179,17 @@ impl Session {
                 .expect("prompt title")
                 .is_some()
         {
+            return;
+        }
+        if self.refresh_secret_input() {
+            // A password is not a conversation name either, and nothing typed
+            // before the prompt may be joined to what is typed after it.
+            self.shared
+                .prompt_input
+                .lock()
+                .expect("prompt input")
+                .draft
+                .clear();
             return;
         }
         if !matches!(
@@ -2413,6 +2465,7 @@ fn new_shared(
         reset_generation: AtomicU64::new(0),
         completed: Mutex::new(None),
         keyboard_known: AtomicBool::new(true),
+        secret_input: AtomicBool::new(false),
         id: spec.id.clone(),
         find_owner: {
             static NEXT: AtomicU64 = AtomicU64::new(1);
@@ -2617,21 +2670,58 @@ fn apply_foreground_sample(
     apply(shared, &outcome);
 }
 
+/// One Holder stat answers both questions the pump has about the PTY itself:
+/// which job is in the foreground, and whether the child is reading a secret.
+///
+/// A shell is asked whenever it is due, as it already was for its foreground
+/// job. Other sessions are asked only while a password prompt is possible at
+/// all, so an agent's composer never pays for the round trip.
+///
 /// Returns what the holder said about its own liveness, when it was asked: a
 /// stat is the same request the liveness probe makes, so a caller that just
 /// sampled need not connect a second time to learn it.
-fn sample_held_foreground(
+fn sample_held_pty_facts(
     shared: &Shared,
     client: &HolderClient,
     manifest_id: &str,
 ) -> Option<bool> {
-    if manifest_id != "shell" {
+    let shell = manifest_id == "shell";
+    if !shell && !secret_input_plausible(shared) {
+        record_secret_input(shared, false);
         return None;
     }
     let stat = client.stat().ok()?;
-    shared.child_pid.store(stat.child_pid, Ordering::SeqCst);
-    apply_foreground_sample(shared, manifest_id, stat.child_pid, stat.foreground_pid);
+    if shell {
+        shared.child_pid.store(stat.child_pid, Ordering::SeqCst);
+        apply_foreground_sample(shared, manifest_id, stat.child_pid, stat.foreground_pid);
+    }
+    // A Holder that predates the field omits it: not known to be secret.
+    record_secret_input(shared, stat.secret_input == Some(true));
     Some(stat.alive)
+}
+
+/// A line-mode password prompt cannot coexist with the alternate screen or
+/// with bracketed paste: the first is a full-screen program, the second a
+/// composer that reads raw. Both are already known to the emulator, so
+/// neither is worth asking the Holder about.
+fn secret_input_plausible(shared: &Shared) -> bool {
+    let screen = shared.screen.lock().expect("screen");
+    !screen.is_alt_screen() && !screen.bracketed_paste()
+}
+
+/// Stores the PTY owner's termios sample, and wakes the attach pump when it
+/// changed so the mode reaches the client although no cell did.
+///
+/// Editors and agent TUIs silence echo too, but in raw mode, which the owner
+/// already excludes. The alternate screen is vetoed here as well, where the
+/// emulator lives: whatever a full-screen program does to its line
+/// discipline, it is not a password prompt.
+fn record_secret_input(shared: &Shared, reading_secret: bool) -> bool {
+    let secret = reading_secret && !shared.screen.lock().expect("screen").is_alt_screen();
+    if shared.secret_input.swap(secret, Ordering::SeqCst) != secret {
+        shared.grid_wake.notify();
+    }
+    secret
 }
 
 /// Whether a quiet tick should ask the holder for the shell's foreground
@@ -2641,6 +2731,10 @@ fn sample_held_foreground(
 /// they arrive. What is left is the settle after output or input, and a slow
 /// backstop for a change that moved no bytes at all (a job started with echo
 /// off), which is late by at most [`LIVENESS_INTERVAL`].
+///
+/// Secret input rides the same samples and has the same shape: a password
+/// prompt is printed as echo goes off, and the newline that answers it is
+/// echoed just before echo comes back, which the settle then catches.
 fn held_foreground_sample_due(
     since_activity: Option<Duration>,
     since_sample: Option<Duration>,
@@ -3425,6 +3519,11 @@ fn pump(
                         let _ = writer.flush();
                     }
                 }
+                // A password prompt is printed beside the termios change that
+                // hides its answer, so output is when the answer can differ.
+                // Sampled before the wake so one publication carries both.
+                let reading_secret = pty.lock().is_ok_and(|pty| pty.secret_input());
+                record_secret_input(&shared, reading_secret);
                 shared.grid_wake.notify();
 
                 let now = SystemTime::now();
@@ -3466,6 +3565,11 @@ fn pump(
                     pgid,
                 );
             }
+            // Echo is usually restored just after the newline that ends a
+            // password, with no output to mark it; the tick this loop already
+            // takes is what notices.
+            let reading_secret = pty.lock().is_ok_and(|pty| pty.secret_input());
+            record_secret_input(&shared, reading_secret);
         }
     }
 
@@ -3984,7 +4088,7 @@ fn pump_held(
                 last_foreground_sample.map(|at| at.elapsed()),
             ) {
                 last_foreground_sample = Some(Instant::now());
-                if sample_held_foreground(&shared, &client, &manifest_id) == Some(true) {
+                if sample_held_pty_facts(&shared, &client, &manifest_id) == Some(true) {
                     last_liveness = Instant::now();
                 }
             }
@@ -4128,7 +4232,7 @@ fn pump_held(
             if !replaying {
                 last_activity = Some(Instant::now());
                 last_foreground_sample = Some(Instant::now());
-                sample_held_foreground(&shared, &client, &manifest_id);
+                sample_held_pty_facts(&shared, &client, &manifest_id);
             }
         }
     }

@@ -9,6 +9,9 @@ use std::fmt;
 use crate::grid::{GridCodecError, GridUpdate};
 use crate::terminal::MouseModes;
 
+/// Bit of a Modes frame's first byte that reports secret input.
+const MODES_SECRET_INPUT: u8 = 1 << 6;
+
 /// A single frame larger than this indicates a corrupt stream.
 pub const MAX_FRAME_BYTES: usize = 16 * 1024 * 1024;
 
@@ -151,6 +154,32 @@ impl Frame {
             | (mouse.detail_bits() << 2)
             | (u8::from(bracketed_paste) << 5);
         Self::new(FrameType::Modes, vec![bits])
+    }
+
+    /// Marks a Modes frame as sent while the child reads a secret: a line
+    /// prompt with echo off, as `sudo` and `ssh` use. Bit 6 was unused, so a
+    /// client that predates it ignores the bit and one that knows it reads
+    /// every older frame as "not secret".
+    #[must_use]
+    pub fn with_secret_input(mut self, secret_input: bool) -> Self {
+        if self.frame_type == FrameType::Modes
+            && let Some(bits) = self.payload.first_mut()
+        {
+            *bits = (*bits & !MODES_SECRET_INPUT) | (u8::from(secret_input) << 6);
+        }
+        self
+    }
+
+    /// Whether this Modes frame reports secret input. `None` for any other
+    /// frame; an absent bit is `false`, which is also the fail-safe reading.
+    #[must_use]
+    pub fn secret_input_payload(&self) -> Option<bool> {
+        if self.frame_type != FrameType::Modes {
+            return None;
+        }
+        self.payload
+            .first()
+            .map(|bits| bits & MODES_SECRET_INPUT != 0)
     }
 
     pub fn grid_payload(&self) -> Result<Option<GridUpdate>, GridCodecError> {
@@ -606,6 +635,43 @@ mod tests {
             Frame::new(FrameType::Modes, vec![0b11]).terminal_modes_payload(),
             Some((true, false, MouseModes::UNKNOWN))
         );
+    }
+
+    #[test]
+    fn secret_input_rides_an_unused_modes_bit_without_disturbing_the_rest() {
+        let mouse = MouseModes::new(
+            crate::terminal::MouseTrackingMode::AnyMotion,
+            crate::terminal::MouseEncoding::Sgr,
+        );
+        let keyboard = Some(crate::terminal_input::KeyboardState {
+            enhancements: None,
+            application_cursor_keys: true,
+            application_keypad: false,
+        });
+        let plain = Frame::modes_with_keyboard(false, true, mouse, keyboard);
+        let secret = plain.clone().with_secret_input(true);
+
+        assert_eq!(plain.secret_input_payload(), Some(false));
+        assert_eq!(secret.secret_input_payload(), Some(true));
+        assert_eq!(secret.payload[0], plain.payload[0] | 0b100_0000);
+        // Everything a client that predates the bit decodes is unchanged.
+        assert_eq!(
+            secret.terminal_modes_payload(),
+            plain.terminal_modes_payload()
+        );
+        assert_eq!(
+            secret.keyboard_state_payload(),
+            plain.keyboard_state_payload()
+        );
+        assert_eq!(secret.with_secret_input(false), plain);
+
+        // Frames from an engine that predates the bit read as not secret.
+        assert_eq!(
+            Frame::new(FrameType::Modes, vec![0b11]).secret_input_payload(),
+            Some(false)
+        );
+        assert_eq!(Frame::ping().with_secret_input(true), Frame::ping());
+        assert_eq!(Frame::ping().secret_input_payload(), None);
     }
 
     #[test]

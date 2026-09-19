@@ -875,6 +875,7 @@ mod tests {
             cols: Some(20),
             rows: Some(3),
             epoch_offset,
+            secret_input: None,
         }
     }
 

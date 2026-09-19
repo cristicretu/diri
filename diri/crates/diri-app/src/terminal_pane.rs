@@ -152,6 +152,13 @@ fn bracketed_paste_after_attachment_state(current: bool, state: AttachmentState)
     }
 }
 
+/// Secure Keyboard Entry silences event taps in every app, so it is wanted
+/// only while keys typed right now are the secret: the child is reading one,
+/// and this pane is where the keyboard is pointed.
+fn secure_input_wanted(secret_input: bool, focused: bool, window_active: bool) -> bool {
+    secret_input && focused && window_active
+}
+
 fn terminal_paste(text: &str, bracketed_paste: bool) -> Vec<u8> {
     paste(text, bracketed_paste)
 }
@@ -515,6 +522,9 @@ struct ResidentTerminal {
     /// Last mode advertised by this attachment generation. Reset while the
     /// transport is not live so paste never trusts state from a dead child.
     bracketed_paste: bool,
+    /// The child is reading a secret (a line prompt with echo off). Reset with
+    /// `bracketed_paste`: a dead transport says nothing about the child.
+    secret_input: bool,
     find: Option<TerminalFindModel>,
     /// Single flight across both the daemon history read and blocking scan.
     /// One newer request may replace the dirty follow-up; snapshots never
@@ -645,6 +655,11 @@ pub struct TerminalPane {
     navigation: Option<Entity<NavigationOverlay>>,
     utility_surfaces: Option<Entity<UtilitySurfaces>>,
     local_clipboard_images: Vec<StagedClipboardImage>,
+    /// Secure Keyboard Entry, held only while this pane is where a password
+    /// is being typed. See [`Self::reconcile_secure_input`].
+    secure_input: crate::secure_input::SecureInputLease,
+    _secure_input_quit: gpui::Subscription,
+    _secure_input_close: gpui::Subscription,
     _focus_owner: gpui::Subscription,
     _find_blur: gpui::Subscription,
     _find_focus_change: gpui::Subscription,
@@ -726,10 +741,16 @@ impl TerminalPane {
             if window.is_window_active() {
                 this.claim_selected_control();
             }
+            this.reconcile_secure_input(window);
             cx.notify();
         });
         let find_blur = cx.on_blur(&focus, window, |this, window, cx| {
             this.cancel_find_composition(window, cx);
+            // A pane that lost focus may never render again, so the release
+            // cannot wait for one.
+            if this.reconcile_secure_input(window) {
+                cx.notify();
+            }
         });
         let find_focus_change = cx.observe_pending_input(window, |this, window, cx| {
             if !this.focus.is_focused(window)
@@ -742,11 +763,29 @@ impl TerminalPane {
             }
         });
         let window_owner = cx.observe_window_activation(window, |this, window, cx| {
+            if this.reconcile_secure_input(window) {
+                cx.notify();
+            }
             if window.is_window_active() && this.focus.is_focused(window) {
                 this.claim_selected_control();
                 cx.notify();
             }
         });
+        // Neither quitting nor closing a window reliably drops this entity, so
+        // the lease's own drop is a backstop and these are the release.
+        let secure_input_quit = cx.on_app_quit(|this, _| {
+            this.secure_input.set(false);
+            async {}
+        });
+        let secure_input_close = {
+            let pane = cx.weak_entity();
+            let window_id = window.window_handle().window_id();
+            cx.on_window_closed(move |cx, closed| {
+                if closed == window_id {
+                    let _ = pane.update(cx, |this, _| this.secure_input.set(false));
+                }
+            })
+        };
         let (pane_tx, mut pane_rx) = pane_event_channel();
         let pane_events = cx.spawn_in(window, async move |this, cx| {
             let mut batch = Vec::new();
@@ -832,6 +871,9 @@ impl TerminalPane {
             navigation: None,
             utility_surfaces: None,
             local_clipboard_images: Vec::new(),
+            secure_input: crate::secure_input::SecureInputLease::system(),
+            _secure_input_quit: secure_input_quit,
+            _secure_input_close: secure_input_close,
             _focus_owner: focus_owner,
             _find_blur: find_blur,
             _find_focus_change: find_focus_change,
@@ -941,6 +983,7 @@ impl TerminalPane {
                     attachment_generation: generation,
                     attachment_state: AttachmentState::Attaching,
                     bracketed_paste: false,
+                    secret_input: false,
                     find: None,
                     find_scheduler: FindSearchScheduler::default(),
                     find_query: QueryEditor::default(),
@@ -987,7 +1030,35 @@ impl TerminalPane {
         if selection_changed && selected_id.is_some() {
             self.focus(window, cx);
         }
+        self.reconcile_secure_input(window);
         cx.notify();
+    }
+
+    /// Holds macOS Secure Keyboard Entry exactly while keystrokes typed here
+    /// are a secret on their way to the child: this pane has keyboard focus
+    /// in the active window, and its selected, live session reports a line
+    /// prompt with echo off.
+    ///
+    /// Every input to that condition calls this when it changes (modes,
+    /// attachment state, focus, blur, window activation, selection and
+    /// residency), and so does every render, so a missed edge heals on the
+    /// next frame. The lease is idempotent, which is what makes calling this
+    /// freely safe: however often it runs, one enable is outstanding at most
+    /// and each is released once. Returns whether the lease changed hands,
+    /// which the lock badge's wording follows.
+    fn reconcile_secure_input(&mut self, window: &Window) -> bool {
+        let secret_input = self.selected_id().is_some_and(|id| {
+            self.residents.get(&id).is_some_and(|resident| {
+                resident.secret_input && resident.attachment_state == AttachmentState::Live
+            })
+        });
+        let was_held = self.secure_input.is_held();
+        self.secure_input.set(secure_input_wanted(
+            secret_input,
+            self.focus.is_focused(window),
+            window.is_window_active(),
+        ));
+        was_held != self.secure_input.is_held()
     }
 
     /// Paint-only previews must not reconcile residency or acquire a controller.
@@ -1263,6 +1334,7 @@ impl TerminalPane {
                 if let Some(resident) = self.residents.get_mut(&id) {
                     resident.bracketed_paste =
                         bracketed_paste_after_attachment_state(resident.bracketed_paste, state);
+                    resident.secret_input = resident.secret_input && state == AttachmentState::Live;
                     if resident.attachment_state != state {
                         resident.pointer_owner = None;
                         resident.mouse_motion.reset();
@@ -1272,6 +1344,7 @@ impl TerminalPane {
                     }
                     resident.attachment_state = state;
                 }
+                self.reconcile_secure_input(window);
                 if self.selected_id().as_ref() == Some(&id) {
                     cx.notify();
                 }
@@ -1296,6 +1369,7 @@ impl TerminalPane {
                     alt_screen,
                     bracketed_paste,
                     mouse,
+                    secret_input,
                 },
             ) => {
                 if !self.attachment_is_current(&id, generation) {
@@ -1308,8 +1382,10 @@ impl TerminalPane {
                     }
                     resident.keyboard = keyboard;
                     resident.bracketed_paste = bracketed_paste;
+                    resident.secret_input = secret_input;
                     resident.element.set_modes(alt_screen, mouse);
                 }
+                self.reconcile_secure_input(window);
                 if self.selected_id().as_ref() == Some(&id) {
                     cx.notify();
                 }
@@ -3251,6 +3327,7 @@ impl TerminalPane {
         };
         let view_offset = resident.element.view_offset();
         let attachment_state = resident.attachment_state;
+        let secret_input = resident.secret_input && attachment_state == AttachmentState::Live;
         let overflow = self.grid_row_overflow(resident.element.grid_rows(), font_size, window);
         let scroll_target = TerminalScrollTarget {
             element: resident.element.clone(),
@@ -3406,11 +3483,44 @@ impl TerminalPane {
         }
         if exited {
             body = body.child(self.render_exit_pill(session, colors, cx));
+        } else if secret_input {
+            body = body.child(self.render_secret_input_badge(colors));
         }
         if let Some(status) = self.render_remote_connection(session, colors, cx) {
             body = body.child(status);
         }
         body.child(self.render_qol(colors, cx)).into_any_element()
+    }
+
+    /// Quiet lock in the corner away from the prompt line while the child
+    /// reads a password. It names Secure Keyboard Entry only when this pane
+    /// really holds it, which an unfocused pane, or a platform without the
+    /// facility, does not.
+    fn render_secret_input_badge(&self, colors: SemanticColors) -> AnyElement {
+        let label = if self.secure_input.is_held() {
+            "Secure input"
+        } else {
+            "Password prompt"
+        };
+        div()
+            .debug_selector(|| "terminal-secret-input".into())
+            .absolute()
+            .top(px(8.0))
+            .right(px(18.0))
+            .rounded(px(999.0))
+            .px(px(9.0))
+            .py(px(4.0))
+            .bg(colors.floating_surface())
+            .border_1()
+            .border_color(colors.floating_stroke())
+            .flex()
+            .items_center()
+            .gap(px(5.0))
+            .text_size(px(11.5))
+            .text_color(colors.secondary)
+            .child(sf_symbol("lock.fill", 11.0, colors.tertiary))
+            .child(label)
+            .into_any_element()
     }
 
     /// Slim status pill over an exited session's last screen: says what happened
@@ -3771,6 +3881,7 @@ impl Render for TerminalPane {
         if window.is_window_active() && self.focus.is_focused(window) {
             self.claim_selected_control();
         }
+        self.reconcile_secure_input(window);
         let (theme, colors, sidebar_colors, font_size) = {
             let store = self
                 .runtime
@@ -5315,6 +5426,8 @@ mod tests {
                     resident.last_size = (80, 28);
                     resident.attachment_state = AttachmentState::Live;
                     resident.controller.seed_live_for_test();
+                    // "secret-paste": pasted while the child reads a password.
+                    resident.secret_input = scene == "secret-paste";
                     if scene == "scrolled" {
                         // Six hundred rows of history, read a third of the
                         // way up: enough for the scroller to show a knob.
@@ -5332,7 +5445,7 @@ mod tests {
                             window,
                             cx,
                         ),
-                        "paste" => {
+                        "paste" | "secret-paste" => {
                             pane.stage_paste_if_needed(
                                 &id,
                                 &std::env::var("DIRI_QOL_PASTE").unwrap_or_else(|_| {
@@ -5351,6 +5464,18 @@ mod tests {
             })
             .expect("preview window");
         cx.run_until_parked();
+        if scene == "secret" {
+            // The fixture's own attachment has reported Live by now; a mode
+            // set any earlier is dropped with the state that preceded it.
+            window
+                .update(&mut cx, |pane, _, cx| {
+                    let id = pane.selected_id().expect("selected session");
+                    pane.residents.get_mut(&id).unwrap().secret_input = true;
+                    cx.notify();
+                })
+                .unwrap();
+            cx.run_until_parked();
+        }
         cx.capture_screenshot(window.into())
             .expect("screenshot")
             .save(output)
@@ -6713,6 +6838,168 @@ mod tests {
             pane.reconcile_store_change(window, cx);
             assert!(pane.is_focused(window));
         });
+    }
+
+    #[test]
+    fn secure_input_needs_a_secret_a_focused_pane_and_an_active_window() {
+        assert!(secure_input_wanted(true, true, true));
+        assert!(!secure_input_wanted(false, true, true));
+        assert!(!secure_input_wanted(true, false, true));
+        assert!(!secure_input_wanted(true, true, false));
+    }
+
+    #[gpui::test]
+    fn secure_input_is_released_on_every_way_out_of_a_password_prompt(cx: &mut TestAppContext) {
+        let runtime = Arc::new(StoreRuntime::inert());
+        let tokio = Arc::new(
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("test runtime"),
+        );
+        let prompting = fixture_session();
+        let mut other = fixture_session();
+        other.id = SessionId::new("other");
+        {
+            let mut store = runtime.store.write().expect("session store lock poisoned");
+            store.upsert_session(prompting.clone());
+            store.upsert_session(other.clone());
+            store.select(prompting.id.clone());
+        }
+        let runtime_for_view = Arc::clone(&runtime);
+        let (pane, cx) = cx.add_window_view(move |window, cx| {
+            TerminalPane::new(runtime_for_view, tokio, window, cx)
+        });
+        let recorder = crate::secure_input::testing::Recorder::default();
+        pane.update_in(cx, |pane, window, cx| {
+            pane.secure_input = crate::secure_input::SecureInputLease::new(recorder.clone());
+            window.activate_window();
+            pane.focus(window, cx);
+        });
+        cx.run_until_parked();
+
+        // What the engine sends when `sudo` silences echo, and when it is done.
+        let modes = |pane: &mut TerminalPane,
+                     secret_input: bool,
+                     window: &mut Window,
+                     cx: &mut Context<TerminalPane>| {
+            let id = pane.selected_id().expect("selected session");
+            let resident = pane.residents.get_mut(&id).expect("resident");
+            resident.attachment_state = AttachmentState::Live;
+            let generation = resident.attachment_generation;
+            pane.handle_pane_event(
+                PaneEvent::Chunk(
+                    id,
+                    generation,
+                    TerminalChunk::Modes {
+                        keyboard: None,
+                        alt_screen: false,
+                        bracketed_paste: false,
+                        mouse: MouseModes::OFF,
+                        secret_input,
+                    },
+                ),
+                window,
+                cx,
+            );
+        };
+
+        pane.update_in(cx, |pane, window, cx| {
+            assert!(pane.is_focused(window) && window.is_window_active());
+            modes(pane, true, window, cx);
+            // Rendering and further mode frames reconcile again; none of
+            // that may take a second reference.
+            modes(pane, true, window, cx);
+        });
+        cx.run_until_parked();
+        assert_eq!(
+            recorder.outstanding(),
+            1,
+            "held at a focused password prompt"
+        );
+
+        pane.update_in(cx, |pane, window, cx| modes(pane, false, window, cx));
+        assert_eq!(recorder.outstanding(), 0, "the child restored echo");
+
+        // Focus leaves the pane while the prompt is still up.
+        pane.update_in(cx, |pane, window, cx| modes(pane, true, window, cx));
+        assert_eq!(recorder.outstanding(), 1);
+        let elsewhere = pane.update_in(cx, |_, window, cx| {
+            let elsewhere = cx.focus_handle();
+            window.focus(&elsewhere, cx);
+            elsewhere
+        });
+        cx.run_until_parked();
+        assert_eq!(recorder.outstanding(), 0, "the pane lost focus");
+        pane.update_in(cx, |pane, window, cx| pane.focus(window, cx));
+        cx.run_until_parked();
+        assert_eq!(recorder.outstanding(), 1, "focus came back to the prompt");
+        drop(elsewhere);
+
+        // The window stops being the one the keyboard is pointed at.
+        cx.deactivate_window();
+        cx.run_until_parked();
+        assert_eq!(recorder.outstanding(), 0, "the window deactivated");
+        pane.update_in(cx, |_, window, _| window.activate_window());
+        cx.run_until_parked();
+        assert_eq!(recorder.outstanding(), 1, "the window is active again");
+
+        // The transport drops: nothing is known about the child any more.
+        pane.update_in(cx, |pane, window, cx| {
+            let id = pane.selected_id().expect("selected session");
+            let generation = pane.residents[&id].attachment_generation;
+            pane.handle_pane_event(
+                PaneEvent::AttachmentState(id, generation, AttachmentState::Reconnecting),
+                window,
+                cx,
+            );
+        });
+        assert_eq!(recorder.outstanding(), 0, "the attachment is not live");
+        pane.update_in(cx, |pane, window, cx| modes(pane, true, window, cx));
+        assert_eq!(recorder.outstanding(), 1);
+
+        // Another session is selected; the prompting one is no longer typed into.
+        runtime
+            .store
+            .write()
+            .expect("session store lock poisoned")
+            .select(other.id.clone());
+        pane.update_in(cx, |pane, window, cx| {
+            pane.reconcile_store_change(window, cx);
+        });
+        cx.run_until_parked();
+        assert_eq!(recorder.outstanding(), 0, "the session was deselected");
+
+        // The window closes with a prompt still up. The pane outlives it
+        // here, as a leaked or still-referenced entity would in the app.
+        runtime
+            .store
+            .write()
+            .expect("session store lock poisoned")
+            .select(prompting.id.clone());
+        pane.update_in(cx, |pane, window, cx| {
+            pane.reconcile_store_change(window, cx);
+        });
+        // Let the fresh attachment report its own state before the prompt.
+        cx.run_until_parked();
+        pane.update_in(cx, |pane, window, cx| modes(pane, true, window, cx));
+        assert_eq!(recorder.outstanding(), 1);
+        pane.update_in(cx, |_, window, _| window.remove_window());
+        cx.run_until_parked();
+        assert_eq!(recorder.outstanding(), 0, "the window closed");
+        assert_eq!(recorder.enables(), 6, "one reference per entry, never two");
+    }
+
+    #[test]
+    fn paste_review_never_shows_text_staged_at_a_password_prompt() {
+        let text = "hunter2\n";
+        assert_eq!(
+            qol::paste_review_preview(&mut text.chars(), false),
+            "hunter2\n"
+        );
+        let hidden = qol::paste_review_preview(&mut text.chars(), true);
+        assert!(!hidden.contains("hunter2"), "{hidden}");
+        assert!(hidden.starts_with("8 characters"), "{hidden}");
     }
 
     #[gpui::test]

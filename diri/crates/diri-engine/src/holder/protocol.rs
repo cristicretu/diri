@@ -105,6 +105,16 @@ pub struct HolderStat {
         skip_serializing_if = "Option::is_none"
     )]
     pub epoch_offset: Option<u64>,
+    /// Whether the PTY's line discipline is reading a secret, sampled from
+    /// the master when this stat was taken (see `Pty::secret_input`). `None`
+    /// from a holder built before this field existed, which consumers must
+    /// read as "not known to be secret", never as a reason to refuse it.
+    #[serde(
+        rename = "secretInput",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub secret_input: Option<bool>,
 }
 
 impl HolderStat {
@@ -536,6 +546,18 @@ mod tests {
             serde_json::from_str(r#"{"childPID":9,"alive":false,"logOffset":0}"#).expect("sparse");
         assert_eq!(sparse.foreground_pid, None);
         assert_eq!(sparse.child_identity, None);
+        // A holder that predates the field is never taken to be reading a
+        // secret, and the field it does not know stays off its wire.
+        assert_eq!(sparse.secret_input, None);
+        assert!(
+            !serde_json::to_string(&sparse)
+                .expect("encode")
+                .contains("secretInput")
+        );
+        let prompting: HolderStat =
+            serde_json::from_str(r#"{"childPID":9,"alive":true,"logOffset":0,"secretInput":true}"#)
+                .expect("secret stat");
+        assert_eq!(prompting.secret_input, Some(true));
         assert_eq!(sparse.verified_child_identity(), None);
         let mut inconsistent = sparse.clone();
         inconsistent.child_identity = Some(

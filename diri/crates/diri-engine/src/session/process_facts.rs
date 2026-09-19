@@ -188,6 +188,7 @@ mod tests {
             cols: Some(80),
             rows: Some(24),
             epoch_offset: Some(epoch),
+            secret_input: None,
         };
         capture_holder(&shared, &stat);
         (

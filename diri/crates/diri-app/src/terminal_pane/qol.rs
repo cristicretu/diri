@@ -42,6 +42,9 @@ pub(super) struct PendingPaste {
     id: SessionId,
     generation: AttachmentGeneration,
     bracketed: bool,
+    /// Staged at a password prompt: the review must not show on screen what
+    /// the terminal itself is hiding.
+    secret: bool,
     cancel_selected: bool,
 }
 
@@ -314,6 +317,7 @@ impl TerminalPane {
                 id: id.clone(),
                 generation: resident.attachment_generation,
                 bracketed: resident.bracketed_paste,
+                secret: resident.secret_input,
                 cancel_selected: false,
             });
             self.qol.copy_mode = None;
@@ -850,18 +854,8 @@ impl TerminalPane {
             };
             // Keep layout work bounded, and make any omitted content explicit.
             let mut chars = paste.text.chars();
-            let preview: String = chars
-                .by_ref()
-                .take(4_000)
-                .map(|ch| {
-                    if ch.is_control() && !matches!(ch, '\n' | '\r' | '\t') {
-                        ' '
-                    } else {
-                        ch
-                    }
-                })
-                .collect();
-            let truncated = chars.next().is_some();
+            let preview = paste_review_preview(&mut chars, paste.secret);
+            let truncated = !paste.secret && chars.next().is_some();
             let viewport = self.viewport.unwrap_or_default();
             let panel_width = (viewport.width - 40.0).clamp(0.0, 480.0);
             let preview_height = (viewport.height - 300.0).clamp(40.0, 200.0);
@@ -1018,6 +1012,28 @@ impl TerminalPane {
         }
         overlay.into_any_element()
     }
+}
+
+/// What the paste review shows of the clipboard. At a password prompt that
+/// is only its size: the text is most likely the password itself.
+pub(super) fn paste_review_preview(chars: &mut std::str::Chars<'_>, secret: bool) -> String {
+    if secret {
+        return format!(
+            "{} characters, hidden while the terminal reads a password.",
+            chars.by_ref().count()
+        );
+    }
+    chars
+        .by_ref()
+        .take(4_000)
+        .map(|ch| {
+            if ch.is_control() && !matches!(ch, '\n' | '\r' | '\t') {
+                ' '
+            } else {
+                ch
+            }
+        })
+        .collect()
 }
 
 fn append_export_row(text: &mut String, row: &[GridCell], metadata: Option<&RowMetadata>) {

@@ -472,3 +472,106 @@ fn a_slow_reader_does_not_delay_an_active_reader() {
     );
     assert!(samples[samples.len() * 9 / 10] < Duration::from_millis(150));
 }
+
+#[test]
+fn a_password_prompt_reaches_the_client_as_a_mode_and_never_as_cells() {
+    let temp = tempfile::tempdir().expect("temp");
+    let registry = Arc::new(Mutex::new(Registry::new(
+        engine(),
+        temp.path().join("state.json"),
+    )));
+    let server = Arc::new(
+        ControlServer::new(Arc::clone(&registry), temp.path().join("daemon.sock"))
+            .with_logs_dir(temp.path().join("logs")),
+    );
+    let listener = server.bind().expect("bind");
+    {
+        let server = Arc::clone(&server);
+        std::thread::spawn(move || {
+            while let Ok((stream, _)) = listener.accept() {
+                let server = Arc::clone(&server);
+                std::thread::spawn(move || {
+                    let _ = server.serve(stream);
+                });
+            }
+        });
+    }
+
+    let control = UnixStream::connect(server.socket_path()).expect("connect control");
+    let mut request = serde_json::to_vec(&ControlMessage::Request {
+        id: 1,
+        method: "session.spawn".into(),
+        params: Some(json!({
+            "kind": { "shell": {} },
+            "cwd": "/tmp",
+            // The first read echoes, so the seed is taken outside the prompt.
+            "argv": [
+                "/bin/sh",
+                "-c",
+                "printf ready; read a; stty -echo; printf 'Password:'; read secret; stty echo; printf accepted; exec cat"
+            ],
+        })),
+    })
+    .expect("encode");
+    request.push(b'\n');
+    (&control).write_all(&request).expect("spawn");
+    let id = {
+        use std::io::BufRead;
+        let mut line = String::new();
+        std::io::BufReader::new(control.try_clone().expect("clone"))
+            .read_line(&mut line)
+            .expect("spawn reply");
+        match serde_json::from_str(&line).expect("decode") {
+            ControlMessage::Response {
+                result: Ok(result), ..
+            } => result["id"].as_str().expect("id").to_string(),
+            other => panic!("spawn failed: {other:?}"),
+        }
+    };
+
+    let mut data = UnixStream::connect(server.socket_path()).expect("connect data");
+    let mut attach_line = serde_json::to_vec(&json!({ "attach": id })).expect("encode");
+    attach_line.push(b'\n');
+    data.write_all(&attach_line).expect("attach");
+    let mut frames = FrameReader::new(data.try_clone().expect("clone data"));
+    let seed = frames.until("initial modes", |frame| {
+        frame.frame_type == FrameType::Modes
+    });
+    assert_eq!(seed.secret_input_payload(), Some(false));
+
+    let mut painted = String::new();
+    let watch = |frame: &Frame, painted: &mut String| {
+        if let Ok(Some(grid)) = frame.grid_payload() {
+            painted.push_str(&grid_text(&grid));
+        }
+    };
+    data.write_all(&FrameCodec::encode(&Frame::input(b"\n".to_vec())).unwrap())
+        .expect("reach the prompt");
+    let prompting = frames.until("secret input on", |frame| {
+        watch(frame, &mut painted);
+        frame.secret_input_payload() == Some(true)
+    });
+    assert_eq!(
+        prompting.terminal_modes_payload(),
+        Some((false, false, MouseModes::OFF)),
+        "the bit travels beside the other modes, not instead of them"
+    );
+
+    data.write_all(&FrameCodec::encode(&Frame::input(b"hunter2\n".to_vec())).unwrap())
+        .expect("answer the prompt");
+    // The banner and the mode may arrive in either order, and nothing follows
+    // them, so both are awaited by one predicate.
+    let mut echoing = false;
+    frames.until("echo restored after the banner", |frame| {
+        watch(frame, &mut painted);
+        if let Some(secret) = frame.secret_input_payload() {
+            echoing = !secret;
+        }
+        echoing && painted.contains("accepted")
+    });
+    assert!(painted.contains("Password:"));
+    assert!(
+        !painted.contains("hunter2"),
+        "echo was off, so the secret never became cells: {painted:?}"
+    );
+}

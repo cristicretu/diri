@@ -150,6 +150,28 @@ impl Pty {
         foreground_pgid(self.master.as_raw_fd()).or_else(|| proc_tpgid(self.child.id()))
     }
 
+    /// Whether the line discipline is collecting a secret: echo is off while
+    /// the kernel still assembles lines. `sudo`, `ssh`, `read -s` and
+    /// `getpass` all read this way.
+    ///
+    /// Full-screen programs also run without echo, but in raw mode, so
+    /// canonical input is what tells a password prompt from an editor. A
+    /// failed read reports `false`: an unknown terminal is not a secret one.
+    ///
+    /// Like [`Self::foreground_pgid`], ask the owner rather than a stream
+    /// clone that may already be closed.
+    #[must_use]
+    pub fn secret_input(&self) -> bool {
+        // SAFETY: zero is a valid initialization for `termios`; the kernel
+        // fills it through the valid, owned master fd.
+        let mut termios: libc::termios = unsafe { std::mem::zeroed() };
+        // SAFETY: `termios` is writable for the duration of the call.
+        if unsafe { libc::tcgetattr(self.master.as_raw_fd(), &mut termios) } != 0 {
+            return false;
+        }
+        lflag_reads_secret(termios.c_lflag)
+    }
+
     pub fn resize(&self, cols: u16, rows: u16) -> io::Result<()> {
         if cols == 0 || rows == 0 {
             return Err(io::Error::new(
@@ -373,6 +395,12 @@ impl ExitWatcher {
     pub fn as_raw_fd(&self) -> RawFd {
         self.0.as_raw_fd()
     }
+}
+
+/// `ECHONL` only has an effect in canonical mode and `cfmakeraw` clears it,
+/// so a silenced echo beside it is still a line prompt, never a raw-mode TUI.
+fn lflag_reads_secret(lflag: libc::tcflag_t) -> bool {
+    lflag & libc::ECHO == 0 && lflag & (libc::ICANON | libc::ECHONL) != 0
 }
 
 #[cfg(target_os = "linux")]
@@ -615,6 +643,83 @@ mod tests {
             }
             std::thread::sleep(Duration::from_millis(20));
         }
+    }
+
+    #[test]
+    fn secret_input_requires_a_silenced_echo_in_line_mode() {
+        let cooked = libc::ICANON | libc::ECHO | libc::ISIG;
+        assert!(!lflag_reads_secret(cooked));
+        assert!(lflag_reads_secret(cooked & !libc::ECHO));
+        // getpass(3) keeps the newline visible while hiding the line.
+        assert!(lflag_reads_secret((cooked & !libc::ECHO) | libc::ECHONL));
+        // vim, htop and every agent TUI: no echo, but no line assembly either.
+        assert!(!lflag_reads_secret(libc::ISIG));
+        assert!(!lflag_reads_secret(0));
+    }
+
+    #[test]
+    fn secret_input_follows_the_childs_termios() {
+        use std::time::{Duration, Instant};
+
+        fn wait_for(reader: &mut PtyStream, seen: &mut Vec<u8>, marker: &[u8]) {
+            let deadline = Instant::now() + Duration::from_secs(5);
+            let mut chunk = [0u8; 256];
+            while !seen.windows(marker.len()).any(|window| window == marker) {
+                assert!(
+                    Instant::now() < deadline,
+                    "never saw {:?} in {:?}",
+                    String::from_utf8_lossy(marker),
+                    String::from_utf8_lossy(seen)
+                );
+                if reader
+                    .wait_readable(Duration::from_millis(50))
+                    .unwrap_or(false)
+                    && let Ok(count) = reader.read(&mut chunk)
+                {
+                    seen.extend_from_slice(&chunk[..count]);
+                }
+            }
+        }
+
+        // Each marker is printed only after the preceding `stty` returned, so
+        // seeing it means the mode under test is already in force.
+        let script = "printf cooked; read a; \
+            stty -echo; printf hidden; read secret; \
+            stty echo; printf \"shown:$secret\"; read b; \
+            stty raw -echo; printf raw; read c";
+        let spec = PtySpec::new(vec!["/bin/sh".into(), "-c".into(), script.into()], "/")
+            .env("PATH", "/usr/bin:/bin");
+        let mut pty = Pty::spawn(&spec).expect("spawn");
+        let mut reader = pty.reader().expect("reader");
+        reader.set_nonblocking(true).expect("nonblocking");
+        let mut writer = pty.writer().expect("writer");
+        let mut seen = Vec::new();
+
+        wait_for(&mut reader, &mut seen, b"cooked");
+        assert!(!pty.secret_input(), "an echoing line prompt is not secret");
+        writer.write_all(b"\n").expect("answer");
+
+        wait_for(&mut reader, &mut seen, b"hidden");
+        assert!(pty.secret_input(), "`stty -echo` with line input is secret");
+        writer.write_all(b"hunter2\n").expect("secret");
+
+        // The sample is a read-only ioctl: the line typed after it still
+        // reaches the child whole, and was never echoed on the way.
+        wait_for(&mut reader, &mut seen, b"shown:hunter2");
+        assert_eq!(
+            seen.windows(7)
+                .filter(|window| window == b"hunter2")
+                .count(),
+            1,
+            "the secret reached the output only when the child printed it"
+        );
+        assert!(!pty.secret_input(), "restoring echo leaves secret mode");
+        writer.write_all(b"\n").expect("answer");
+
+        wait_for(&mut reader, &mut seen, b"raw");
+        assert!(!pty.secret_input(), "raw mode without echo is a TUI");
+        writer.write_all(b"\n").expect("finish");
+        let _ = pty.terminate(Duration::from_secs(1));
     }
 
     #[test]

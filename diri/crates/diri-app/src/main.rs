@@ -47,6 +47,7 @@ mod recovery;
 pub mod review_prompt;
 pub mod root;
 pub mod seam;
+mod secure_input;
 mod session_presentation;
 mod session_surfaces;
 pub mod settings;
