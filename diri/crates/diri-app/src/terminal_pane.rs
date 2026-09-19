@@ -6104,6 +6104,74 @@ mod tests {
     }
 
     #[gpui::test]
+    fn arrow_keys_follow_the_attachment_application_cursor_mode(cx: &mut TestAppContext) {
+        let runtime = Arc::new(StoreRuntime::inert());
+        let tokio = Arc::new(
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap(),
+        );
+        let session = fixture_session();
+        let id = session.id.clone();
+        {
+            let mut store = runtime.store.write().unwrap();
+            store.upsert_session(session);
+            store.select(id.clone());
+        }
+        let (pane, cx) =
+            cx.add_window_view(move |window, cx| TerminalPane::new(runtime, tokio, window, cx));
+        pane.update_in(cx, |pane, window, cx| {
+            pane.reconcile_store_change(window, cx);
+            let (tx, mut input) = mpsc::unbounded_channel();
+            let resident = pane.residents.get_mut(&id).unwrap();
+            resident.attachment.claim();
+            resident.attachment.input_observer = Some((id.clone(), tx));
+            let generation = resident.attachment_generation;
+            // DECCKM reaches the pane as the daemon's Modes frame, the same
+            // event an attach seed and every later ESC[?1h / ESC[?1l produce.
+            for (application_cursor_keys, up, shift_up) in [
+                (true, b"\x1bOA".as_slice(), b"\x1b[1;2A".as_slice()),
+                (false, b"\x1b[A", b"\x1b[1;2A"),
+            ] {
+                pane.handle_pane_event(
+                    PaneEvent::Chunk(
+                        id.clone(),
+                        generation,
+                        TerminalChunk::Modes {
+                            keyboard: Some(diri_proto::terminal_input::KeyboardState {
+                                application_cursor_keys,
+                                ..Default::default()
+                            }),
+                            alt_screen: false,
+                            bracketed_paste: false,
+                            mouse: Default::default(),
+                        },
+                    ),
+                    window,
+                    cx,
+                );
+                for (key, expected) in [("up", up), ("shift-up", shift_up)] {
+                    pane.handle_key_down(
+                        &KeyDownEvent {
+                            keystroke: Keystroke::parse(key).unwrap(),
+                            is_held: false,
+                            prefer_character_input: false,
+                        },
+                        window,
+                        cx,
+                    );
+                    assert_eq!(
+                        input.try_recv().unwrap(),
+                        (id.clone(), expected.to_vec()),
+                        "{key} with application cursor keys = {application_cursor_keys}"
+                    );
+                }
+            }
+        });
+    }
+
+    #[gpui::test]
     fn terminal_copy_mode_and_paste_review_keep_input_local(cx: &mut TestAppContext) {
         let runtime = Arc::new(StoreRuntime::inert());
         let tokio = Arc::new(
