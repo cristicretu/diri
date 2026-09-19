@@ -2102,6 +2102,16 @@ impl ControlServer {
         &self,
         session_id: &str,
     ) -> Result<Option<diri_terminal_state::HeadlessScreen>, ControlError> {
+        Ok(self
+            .completed_terminal(session_id)?
+            .map(|(screen, _)| screen))
+    }
+
+    /// The retained screen and the stable owner identity of its exact run.
+    fn completed_terminal(
+        &self,
+        session_id: &str,
+    ) -> Result<Option<(diri_terminal_state::HeadlessScreen, String)>, ControlError> {
         let handle = {
             let registry = self.registry.lock().map_err(poisoned)?;
             registry.completed_run(session_id)
@@ -2128,7 +2138,9 @@ impl ControlServer {
                 "the session changed while its retained terminal was being read",
             ));
         }
-        Ok(terminal.screen())
+        Ok(terminal
+            .screen()
+            .map(|screen| (screen, handle.key().owner_id())))
     }
 
     fn session_terminal_title(&self, params: Option<JsonValue>) -> Result<JsonValue, ControlError> {
@@ -2169,10 +2181,34 @@ impl ControlServer {
             let registry = self.registry.lock().map_err(poisoned)?;
             registry
                 .get(&p.session_id.0)
-                .ok_or_else(|| ControlError::not_found(p.session_id.0.clone()))?
-                .scrollback_reader()
+                .map(crate::session::Session::scrollback_reader)
         };
-        encode(&reader.capture_find()?)
+        if let Some(reader) = reader {
+            return encode(&reader.capture_find()?);
+        }
+        let (screen, owner) = self
+            .completed_terminal(&p.session_id.0)?
+            .ok_or_else(|| ControlError::not_found(p.session_id.0.clone()))?;
+        let (cols, visible_rows) = screen.size();
+        if cols.saturating_mul(visible_rows) > diri_proto::FIND_CAPTURE_MAX_CELLS {
+            return Err(ControlError::new(
+                "find_capture_too_large",
+                "This terminal is too large for a retained search view",
+            ));
+        }
+        let cells = screen
+            .find_capture_cells()
+            .map_err(|error| ControlError::new("find_capture_too_large", error))?;
+        encode(&diri_proto::CaptureFindResult {
+            owner,
+            // Immutable: a retained terminal never changes under a capture.
+            capture_revision: 0,
+            session_id: p.session_id,
+            is_alt_screen: screen.is_alt_screen(),
+            visible_rows,
+            partial: cells.first_row > 0,
+            cells,
+        })
     }
 
     fn session_read_scrollback(
@@ -2201,13 +2237,18 @@ impl ControlServer {
             let registry = self.registry.lock().map_err(poisoned)?;
             registry
                 .get(&p.session_id.0)
-                .ok_or_else(|| ControlError::not_found(p.session_id.0.clone()))?
-                .scrollback_reader()
+                .map(crate::session::Session::scrollback_reader)
         };
         // A remote history page takes a network round trip (up to the request
         // timeout). Attach input and grid publication also need the Registry;
         // neither may wait for this reply.
-        encode(&reader.read(p.first_row, p.max_rows))
+        if let Some(reader) = reader {
+            return encode(&reader.read(p.first_row, p.max_rows));
+        }
+        let (mut screen, _) = self
+            .completed_terminal(&p.session_id.0)?
+            .ok_or_else(|| ControlError::not_found(p.session_id.0.clone()))?;
+        encode(&screen.scrollback_cells(p.first_row, p.max_rows))
     }
 
     fn spawn_session_unlocked(
@@ -4656,6 +4697,24 @@ mod tests {
         ));
         let lines: Vec<String> = serde_json::from_value(scrollback["lines"].clone()).unwrap();
         assert!(lines.iter().any(|line| line == "line one"), "{lines:?}");
+
+        let cells = ok_of(call(
+            &server,
+            "session.read_scrollback_cells",
+            Some(json!({ "sessionID": "finished", "firstRow": 0, "maxRows": 10 })),
+        ));
+        assert!(cells["rowCount"].as_u64().unwrap() > 0, "{cells}");
+        let find = ok_of(call(
+            &server,
+            "session.capture_find",
+            Some(json!({ "sessionID": "finished" })),
+        ));
+        assert!(
+            find["owner"].as_str().unwrap().starts_with("completed-"),
+            "{find}"
+        );
+        assert_eq!(find["captureRevision"], 0);
+        assert_eq!(find["visibleRows"], 4);
 
         // Input against a retained terminal is impossible, not silently lost.
         assert!(matches!(

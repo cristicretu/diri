@@ -58,6 +58,9 @@ pub struct Registry {
     completed_dir: PathBuf,
     /// Runs already bound on disk, so the watcher writes each binding once.
     bound_runs: HashMap<String, (diri_proto::process::ProcessIdentity, u64)>,
+    /// Captures taken from Sessions that left the table (explicit Stop),
+    /// waiting for the watcher to publish them off the lock.
+    pending_publications: Vec<CompletedPublication>,
     /// Minimal per-session state used only to rediscover surviving local
     /// Holders when the global Registry file is unavailable.
     recovery_root: PathBuf,
@@ -157,6 +160,7 @@ impl Registry {
             state_file: JsonStateFile::new(state_path),
             completed_dir,
             bound_runs: HashMap::new(),
+            pending_publications: Vec::new(),
             recovery_root,
             dirty: false,
             last_persist: None,
@@ -402,7 +406,7 @@ impl Registry {
     /// everything needed to publish them. Storage happens after the lock is
     /// released; an unbound run is not published.
     pub fn take_completed_publications(&mut self) -> Vec<CompletedPublication> {
-        let mut publications = Vec::new();
+        let mut publications = std::mem::take(&mut self.pending_publications);
         let ids: Vec<String> = self
             .sessions
             .iter()
@@ -410,31 +414,22 @@ impl Registry {
             .map(|(id, _)| id.clone())
             .collect();
         for id in ids {
-            self.bind_completed_run(&id);
-            let Some(capture) = self
-                .sessions
-                .get(&id)
-                .and_then(Session::take_completed_capture)
-            else {
+            let Some((capture, run)) = self.sessions.get(&id).and_then(|session| {
+                Some((session.take_completed_capture()?, session.holder_run()?))
+            }) else {
                 continue;
             };
-            let Some(record) = self.record(&id).filter(|record| record.host.is_none()) else {
-                continue;
-            };
-            let Some(&(child, epoch_offset)) = self.bound_runs.get(&id) else {
-                continue;
-            };
-            let Ok(key) =
-                crate::completed_terminal::CompletedRunKey::bind(&record, child, epoch_offset)
-            else {
-                continue;
-            };
-            publications.push(CompletedPublication {
-                directory: self.completed_dir.clone(),
-                record,
-                key,
-                capture,
-            });
+            // Publish against the folded record so its status carries the
+            // exit the watcher is about to persist, not a stale Working.
+            let folded = self.record(&id);
+            if let Some(folded) = folded
+                && let Some(stored) = self.records.get_mut(&id)
+            {
+                stored.status = folded.status;
+            }
+            if let Some(publication) = self.publication_for(&id, capture, run) {
+                publications.push(publication);
+            }
         }
         publications
     }
@@ -1093,7 +1088,42 @@ impl Registry {
             }
         };
         self.record_exit(id, exit);
+        // An explicit stop is a completion too: the pump captured the final
+        // screen before confirming the exit, and this Session object is about
+        // to be dropped, so the capture must leave with the Registry now.
+        if let Some(capture) = session.take_completed_capture()
+            && let Some(run) = session.holder_run()
+            && let Some(publication) = self.publication_for(id, capture, run)
+        {
+            self.pending_publications.push(publication);
+        }
         Ok(Some(exit))
+    }
+
+    /// Binds the run on disk if that has not happened yet and pairs the
+    /// capture with the record it belongs to.
+    fn publication_for(
+        &mut self,
+        id: &str,
+        capture: crate::session::CompletedCapture,
+        (child, epoch_offset): (diri_proto::process::ProcessIdentity, u64),
+    ) -> Option<CompletedPublication> {
+        let record = self
+            .records
+            .get(id)
+            .filter(|record| record.host.is_none())?;
+        let key =
+            crate::completed_terminal::CompletedRunKey::bind(record, child, epoch_offset).ok()?;
+        if self.bound_runs.get(id) != Some(&(child, epoch_offset)) {
+            self.recovery_store(id).write_completed_run(&key).ok()?;
+            self.bound_runs.insert(id.to_owned(), (child, epoch_offset));
+        }
+        Some(CompletedPublication {
+            directory: self.completed_dir.clone(),
+            record: record.clone(),
+            key,
+            capture,
+        })
     }
 
     /// Drops a record entirely — the session is gone and not coming back.
@@ -2260,6 +2290,10 @@ pub struct CompletedRunHandle {
 impl CompletedRunHandle {
     pub fn record(&self) -> &SessionRecord {
         &self.record
+    }
+
+    pub fn key(&self) -> &crate::completed_terminal::CompletedRunKey {
+        &self.key
     }
 
     /// Loads outside the Registry. `None` means this exact run was never

@@ -55,23 +55,26 @@ handling must inspect exact existing content before claiming idempotent success.
    emulator once (the same sampler as the restart checkpoint) together with
    the marker's exit facts, and hands that `CompletedCapture` to the Registry
    exactly once. A partial marker retains nothing rather than a screen that
-   may be missing its tail. Detach/stop never captures.
+   may be missing its tail. Detach never captures; an explicit Stop does,
+   because the held terminate waits for the marker before dropping the
+   Session and `Registry::terminate` carries the capture out with it.
 3. **Publication.** The events watcher takes `take_completed_publications()`
    under the Registry lock and publishes each outside it. The directory is
    `completed-terminals/` beside the state file, created owner-only on first
    use. A duplicate run is refused by the store and logged.
 4. **Reading.** `Registry::completed_run(id)` returns a handle only for a local,
    exited record with no live Session, from the in-memory binding or the
-   persisted `completed-run.json`. `session.read_screen` and
-   `session.read_scrollback` load it after releasing the Registry, then
+   persisted `completed-run.json`. `session.read_screen`, `read_scrollback`,
+   `read_scrollback_cells` and `capture_find` (owner `completed-<digest>`,
+   revision 0) load it after releasing the Registry, then
    revalidate that the record is unchanged before answering; a resume or
    removal that raced the read answers `completed_terminal_stale`. Input,
    resize and process facts remain impossible for such records.
 5. **Removal.** `Registry::remove` discards the record's artifact with its
    binding, so nothing can resolve it afterwards.
 
-Still unwired: pane attachment and Find (`session.read_scrollback_cells` and
-the attach stream still require a live Session), remote records (a separate
+Still unwired: pane attachment (the attach stream still requires a live
+Session, so the desktop does not yet show a retained terminal), remote records (a separate
 authenticated Helper operation), artifact count/GC beyond removal, and an
 explicit reservation of the *next* run before launch. A resume of a completed
 record replaces the binding when the new Holder reports its identity.
@@ -94,7 +97,7 @@ no Holder to adopt, loads the exact run and removes it with the record. A contro
 test serves `session.read_screen`/`read_scrollback` from a retained artifact and
 refuses another exit of the same record.
 
-Still required before this counts as recovery acceptance: Stop (explicit) as a
-completion; exact Engine/app-upgrade reopen through the desktop; native pane
+Still required before this counts as recovery acceptance: exact Engine/app-upgrade
+reopen through the desktop; native pane
 presentation of a retained terminal; failed file/directory fsync; slow storage
 under live input; retention/GC beyond removal; and native before/after evidence.

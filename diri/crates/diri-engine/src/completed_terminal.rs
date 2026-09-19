@@ -123,6 +123,13 @@ impl CompletedRunKey {
         })
     }
 
+    /// Stable identity of this exact run's artifact, distinct from any live
+    /// Session owner so retained Find captures never collide with live ones.
+    pub fn owner_id(&self) -> String {
+        let bytes = serde_json::to_vec(self).unwrap_or_default();
+        format!("completed-{}", digest_hex(&bytes))
+    }
+
     pub fn is_run(&self, child: diri_proto::process::ProcessIdentity, epoch_offset: u64) -> bool {
         self.child == child && self.epoch_offset == epoch_offset
     }

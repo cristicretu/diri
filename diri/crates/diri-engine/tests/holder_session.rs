@@ -551,3 +551,63 @@ fn completed_terminal_survives_engine_replacement() {
         0
     );
 }
+
+/// An explicit Stop is a completion too: the Session object leaves the
+/// Registry immediately, so its final screen must travel with it.
+#[test]
+fn stopped_session_terminal_is_retained() {
+    let root = holders_dir("stopped");
+    let logs = root.join("logs");
+    std::fs::create_dir_all(&logs).unwrap();
+    let state = root.join("state.json");
+    let holder = holder_config(&root);
+    let id = "stopped-run";
+
+    let mut registry = Registry::new(engine(), &state);
+    registry
+        .spawn(
+            shell_spec(
+                id,
+                "printf 'still running'; IFS= read -r never",
+                &logs,
+                Some(holder.clone()),
+            ),
+            record(id),
+        )
+        .expect("spawn held");
+    let mut published = HashMap::new();
+    wait_until("the prompt on screen", Duration::from_secs(10), || {
+        registry.changed_since(&mut published);
+        registry
+            .get(id)
+            .is_some_and(|session| session.screen_lines().join("\n").contains("still running"))
+    });
+    let exit = registry
+        .terminate(id, Duration::from_millis(500))
+        .expect("stop")
+        .expect("a live child was stopped");
+    assert!(registry.get(id).is_none());
+    let mut publications = registry.take_completed_publications();
+    assert_eq!(publications.len(), 1, "the stop carried the capture out");
+    publications.pop().unwrap().publish().expect("publish");
+    registry.persist_for_shutdown().unwrap();
+    drop(registry);
+
+    let mut restored = Registry::new(engine(), &state);
+    restored.load().unwrap();
+    assert!(restored.restore(&holder, &logs).is_empty());
+    let handle = restored.completed_run(id).expect("bound stopped run");
+    let terminal = handle.load().unwrap().expect("retained");
+    match exit {
+        diri_engine::Exit::Signal(signal) => assert_eq!(terminal.exit.signal, Some(signal)),
+        diri_engine::Exit::Code(code) => assert_eq!(terminal.exit.code, Some(code)),
+    }
+    assert!(
+        terminal
+            .screen()
+            .unwrap()
+            .lines()
+            .join("\n")
+            .contains("still running")
+    );
+}
