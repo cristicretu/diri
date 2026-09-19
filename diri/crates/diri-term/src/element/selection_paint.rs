@@ -53,6 +53,31 @@ impl TerminalElement {
         (spans, selection.range(), clipping)
     }
 
+    /// [`Self::visible_selection`] with ragged ends moved off the middle of
+    /// double-width glyphs. Both the painted shape and the glyphs recolored
+    /// under it are built from these spans, so the two cannot disagree.
+    pub(super) fn snapped_selection(
+        &self,
+        viewport: &ScrollbackViewport,
+        visible_rows: usize,
+        visible_cols: usize,
+    ) -> (Vec<SelectionSpan>, Option<SelectionRange>, Clipping) {
+        let (mut spans, range, clipping) =
+            self.visible_selection(viewport, visible_rows, visible_cols);
+        let ragged =
+            |span: &SelectionSpan| span.start_col > 0 || span.end_col_exclusive < visible_cols;
+        if spans.iter().any(ragged) {
+            let buffer = read_lock(&self.buffer);
+            let mut cells = Vec::new();
+            for span in spans.iter_mut().filter(|span| ragged(span)) {
+                viewport.window_row_into(&buffer, span.row, &mut cells);
+                snap_to_wide_cells(span, &cells);
+                span.end_col_exclusive = span.end_col_exclusive.min(visible_cols);
+            }
+        }
+        (spans, range, clipping)
+    }
+
     /// Quads go first into `overlay_quads`, under the find highlights as the
     /// per-row rectangles were: the rounded rectangle when the selection is
     /// one, and the sheen's ramps while it runs.
@@ -67,24 +92,11 @@ impl TerminalElement {
         overlay_quads: &mut Vec<PaintQuad>,
         cx: &App,
     ) -> SelectionPaint {
-        let (mut spans, range, clipping) =
-            self.visible_selection(viewport, visible_rows, visible_cols);
+        let (spans, range, clipping) = self.snapped_selection(viewport, visible_rows, visible_cols);
         let mut shimmer = mutex_lock(&self.shared.selection_shimmer);
         if spans.is_empty() {
             shimmer.cancel();
             return SelectionPaint::default();
-        }
-
-        let ragged =
-            |span: &SelectionSpan| span.start_col > 0 || span.end_col_exclusive < visible_cols;
-        if spans.iter().any(ragged) {
-            let buffer = read_lock(&self.buffer);
-            let mut cells = Vec::new();
-            for span in spans.iter_mut().filter(|span| ragged(span)) {
-                viewport.window_row_into(&buffer, span.row, &mut cells);
-                snap_to_wide_cells(span, &cells);
-                span.end_col_exclusive = span.end_col_exclusive.min(visible_cols);
-            }
         }
 
         let shape = SelectionShape::from_spans(&spans, clipping, visible_rows, metrics);
