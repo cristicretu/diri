@@ -83,7 +83,7 @@ least.
 
 Cmd K, Cmd P, and Cmd Shift H are entry points into the same palette. Switching shortcuts goes directly to that page. The back button restores the previous page’s search and selection.
 
-Choose **Settings → Color theme**, or search for **Color theme** directly. Arrow keys and pointer hover preview the highlighted theme across the app. Enter or a click saves it; Escape, Back, or switching pages restores the saved theme. **All settings** opens the full settings workspace.
+Choose **Settings → Color theme**, or search for **Color theme** directly. Arrow keys and pointer hover preview the highlighted theme across the app. The whole window crossfades to it, and arrowing on before a fade finishes continues from the colors on screen; with Reduce Motion the theme switches at once. Enter or a click saves it; Escape, Back, or switching pages restores the saved theme. **All settings** opens the full settings workspace.
 
 Anything else edits the query through the [shared text keymap](#text-fields).
 

@@ -10,6 +10,8 @@
 //! `DIRI_FADE_TO=<id>` saves that theme instead of arrowing through the
 //! palette's preview, `DIRI_FADE_CADENCE_MS` spaces the arrow presses, and
 //! `DIRI_FADE_INSTANT=1` leaves fades off, which is what a hard cut paints.
+//! `DIRI_FADE_TIMING=1` under `--release` prints each frame's whole-window
+//! draw time instead of saving it.
 
 use std::time::Duration;
 
@@ -170,6 +172,8 @@ fn render_theme_fade_frames() {
     let cadence = Duration::from_millis(env_number("DIRI_FADE_CADENCE_MS", 150));
     let frame = Duration::from_micros(1_000_000 / env_number::<u64>("DIRI_FADE_FPS", 60));
     let instant = std::env::var_os("DIRI_FADE_INSTANT").is_some();
+    let timing = std::env::var_os("DIRI_FADE_TIMING").is_some();
+    let mut draws = Vec::new();
     std::fs::create_dir_all(&output).unwrap();
 
     let platform = gpui_platform::current_platform(true);
@@ -287,15 +291,27 @@ fn render_theme_fade_frames() {
             window.refresh();
         });
         cx.run_until_parked();
-        cx.capture_screenshot(window.into())
-            .unwrap()
-            .save(output.join(format!("frame_{index:04}.png")))
-            .unwrap();
+        if timing {
+            // Layout, prepaint and paint of the whole window, as a display
+            // link tick would run them. Only meaningful under `--release`.
+            let started = std::time::Instant::now();
+            cx.update_window(window.into(), |_, window, cx| window.draw(cx).clear())
+                .unwrap();
+            draws.push((elapsed, started.elapsed()));
+        } else {
+            cx.capture_screenshot(window.into())
+                .unwrap()
+                .save(output.join(format!("frame_{index:04}.png")))
+                .unwrap();
+        }
         index += 1;
         elapsed += frame;
         if !instant {
             crate::app_theme::live::testing::advance(frame);
         }
+    }
+    for (at, draw) in &draws {
+        println!("theme-fade-draw: at={at:?} draw={draw:?}");
     }
     cx.update_window(window.into(), |_, window, _| window.remove_window())
         .unwrap();
