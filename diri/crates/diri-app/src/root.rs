@@ -5924,6 +5924,105 @@ mod tests {
         );
     }
 
+    #[gpui::test]
+    fn fullscreen_notification_tray_tracks_drawable_size_with_windowed_restore_bounds(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        cx.update(|cx| cx.set_reduce_motion(true));
+        let services = test_services();
+        let fixture = SidebarPreviewFixture::make(PreviewScenario::Typical);
+        {
+            let mut store = services.store.store.write().unwrap();
+            store.hydrate(fixture.list.clone());
+            store.select(fixture.selected_session_id.unwrap());
+            let session = fixture
+                .list
+                .sessions
+                .iter()
+                .find(|session| Some(&session.id) != store.selected_session_id())
+                .unwrap();
+            // More than the seven-row cap, so only the viewport can shorten it.
+            for index in 0..9 {
+                assert!(
+                    store.handle_event(diri_client::EventEnvelope {
+                        name: diri_proto::EventName::SESSION_NOTIFICATION.into(),
+                        params: serde_json::to_value(diri_proto::SessionNotificationEvent {
+                            id: format!("tray-{index}"),
+                            session_id: session.id.clone(),
+                            session_created_at: session.created_at,
+                            occurred_at: diri_proto::DateMillis(10_000.0),
+                            title: "Build finished".into(),
+                            body: format!("Run {index}"),
+                        })
+                        .unwrap(),
+                        seq: index + 1,
+                    })
+                );
+            }
+        }
+        let (root, cx) = cx.add_window_view(move |window, cx| {
+            RootView::new(services, false, PreviewScenario::Empty, window, cx)
+        });
+        root.update_in(cx, |_, window, _| window.activate_window());
+        let tray = |cx: &mut gpui::VisualTestContext| {
+            cx.run_until_parked();
+            (
+                cx.debug_bounds("notification-panel").unwrap().size.width,
+                cx.debug_bounds("notification-list").unwrap().size.height,
+            )
+        };
+        // Saved restore bounds and the drawable deliberately differ; see the
+        // terminal test above for why `resize` follows `simulate_resize`.
+        let enter_fullscreen = |cx: &mut gpui::VisualTestContext,
+                                drawable: gpui::Size<gpui::Pixels>,
+                                saved: gpui::Size<gpui::Pixels>| {
+            cx.simulate_resize(drawable);
+            root.update_in(cx, |_, window, cx| {
+                window.toggle_fullscreen();
+                window.resize(saved);
+                assert_eq!(window.viewport_size(), drawable);
+                assert_eq!(window.inner_window_bounds().get_bounds().size, saved);
+                cx.notify();
+            });
+        };
+        let leave_fullscreen = |cx: &mut gpui::VisualTestContext,
+                                saved: gpui::Size<gpui::Pixels>| {
+            root.update_in(cx, |_, window, _| window.toggle_fullscreen());
+            cx.simulate_resize(saved);
+        };
+
+        let short = size(px(420.0), px(320.0));
+        let large = size(px(1600.0), px(1000.0));
+        let chrome = Metrics::TITLE_BAR + 6.0 + 74.0;
+        let constrained = (px(420.0 - 28.0), px(320.0 - chrome));
+        let capped = (px(440.0), px(52.0 * 7.0));
+
+        cx.simulate_resize(short);
+        root.update_in(cx, |root, window, cx| root.toggle_notifications(window, cx));
+        assert_eq!(tray(cx), constrained);
+
+        enter_fullscreen(cx, large, short);
+        assert_eq!(
+            tray(cx),
+            capped,
+            "a short saved window must not constrain the fullscreen tray"
+        );
+        leave_fullscreen(cx, short);
+        assert_eq!(tray(cx), constrained, "restoring must constrain it again");
+
+        // Fullscreen on a display smaller than the saved window.
+        cx.simulate_resize(large);
+        assert_eq!(tray(cx), capped);
+        enter_fullscreen(cx, short, large);
+        assert_eq!(
+            tray(cx),
+            constrained,
+            "the tray must fit the smaller fullscreen drawable"
+        );
+        leave_fullscreen(cx, large);
+        assert_eq!(tray(cx), capped);
+    }
+
     #[cfg(target_os = "macos")]
     #[gpui::test]
     fn switching_sidebar_conversations_keeps_terminal_focused(cx: &mut gpui::TestAppContext) {
