@@ -834,6 +834,7 @@ impl ControlServer {
             Method::SESSION_RESIZE => self.session_resize(params),
             Method::SESSION_READ_SCREEN => self.session_read_screen(params),
             Method::SESSION_TERMINAL_TITLE => self.session_terminal_title(params),
+            Method::SESSION_RESET_TERMINAL => self.session_reset_terminal(params),
             Method::SESSION_CAPTURE_FIND => self.session_capture_find(params),
             Method::SESSION_READ_SCROLLBACK => self.session_read_scrollback(params),
             Method::SESSION_READ_SCROLLBACK_CELLS => self.session_read_scrollback_cells(params),
@@ -2173,6 +2174,33 @@ impl ControlServer {
             session_id: p.session_id,
             title,
         })
+    }
+
+    fn session_reset_terminal(&self, params: Option<JsonValue>) -> Result<JsonValue, ControlError> {
+        let p: diri_proto::SessionIdParams = decode(params)?;
+        let registry = self.registry.lock().map_err(poisoned)?;
+        if registry.get(&p.session_id.0).is_none() {
+            return if registry.record(&p.session_id.0).is_some() {
+                Err(ControlError::new(
+                    "terminal_reset_unavailable",
+                    "the session has no live terminal to reset",
+                ))
+            } else {
+                Err(ControlError::not_found(p.session_id.0.clone()))
+            };
+        }
+        let session = registry
+            .get(&p.session_id.0)
+            .ok_or_else(|| ControlError::not_found(p.session_id.0.clone()))?;
+        session.reset_terminal().map_err(|error| {
+            let code = match error.kind() {
+                std::io::ErrorKind::Unsupported => "terminal_reset_unsupported",
+                std::io::ErrorKind::NotConnected => "terminal_reset_unavailable",
+                _ => "terminal_reset_failed",
+            };
+            ControlError::new(code, error.to_string())
+        })?;
+        Ok(json!({ "sessionID": p.session_id.0 }))
     }
 
     fn session_capture_find(&self, params: Option<JsonValue>) -> Result<JsonValue, ControlError> {
@@ -4724,6 +4752,24 @@ mod tests {
                 Some(json!({ "sessionID": "finished", "text": "x", "submit": false })),
             ),
             ControlMessage::Response { result: Err(_), .. }
+        ));
+
+        // There is no live emulator behind a retained terminal to reset.
+        assert!(matches!(
+            call(
+                &server,
+                "session.reset_terminal",
+                Some(json!({ "sessionID": "finished" })),
+            ),
+            ControlMessage::Response { result: Err(error), .. } if error.code == "terminal_reset_unavailable"
+        ));
+        assert!(matches!(
+            call(
+                &server,
+                "session.reset_terminal",
+                Some(json!({ "sessionID": "never-existed" })),
+            ),
+            ControlMessage::Response { result: Err(error), .. } if error.code == "not_found"
         ));
 
         // Another exit than the retained one is a different run: unavailable.

@@ -263,6 +263,12 @@ impl PromptInputState {
 /// The state the pump thread and the outside world share.
 struct Shared {
     holder_identity: std::sync::OnceLock<(diri_proto::process::ProcessIdentity, u64)>,
+    /// A local emulator reset the held pump owes on its next pass. The pump
+    /// applies it between chunks and persists the boundary checkpoint.
+    reset_requested: AtomicBool,
+    /// Advances on every applied local reset so attached clients receive a
+    /// full grid instead of a diff against pre-reset cells.
+    reset_generation: AtomicU64,
     /// The final retained terminal of a held child that genuinely exited,
     /// handed to the Registry exactly once for durable publication.
     completed: Mutex<Option<CompletedCapture>>,
@@ -1624,7 +1630,7 @@ impl Session {
                         screen.mouse_modes(),
                     ),
                     GridSignature {
-                        reset_generation: 0,
+                        reset_generation: self.shared.reset_generation.load(Ordering::SeqCst),
                         keyboard: self
                             .shared
                             .keyboard_known
@@ -1715,7 +1721,7 @@ impl Session {
             screen.mouse_modes(),
         );
         let current = GridSignature {
-            reset_generation: 0,
+            reset_generation: self.shared.reset_generation.load(Ordering::SeqCst),
             keyboard: self
                 .shared
                 .keyboard_known
@@ -2166,6 +2172,12 @@ impl Session {
         }
     }
 
+    /// Resets the emulator without touching the child: the PTY, process and
+    /// session identity stay, the screen, history, modes and title go. Remote
+    /// sessions ask their Holder; held local sessions queue the reset for
+    /// their pump, which applies it between log chunks and persists a
+    /// checkpoint at that exact offset so an Engine restart replays only
+    /// bytes after the boundary. Acceptance means queued, not applied.
     pub fn reset_terminal(&self) -> std::io::Result<()> {
         if self.shared.exited.load(Ordering::SeqCst) {
             return Err(std::io::Error::new(
@@ -2175,11 +2187,30 @@ impl Session {
         }
         match &self.transport {
             Transport::Remote(client) => client.reset_terminal(),
-            _ => Err(std::io::Error::new(
+            Transport::Held(_) => {
+                if self.pump.is_none() {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::NotConnected,
+                        "session has no terminal owner to apply a reset",
+                    ));
+                }
+                self.shared.reset_requested.store(true, Ordering::SeqCst);
+                // A reset is a user touch: keep the pump on its fast tick so
+                // the request is applied within it even for an idle session.
+                self.shared.note_hot();
+                Ok(())
+            }
+            Transport::Direct(_) => Err(std::io::Error::new(
                 std::io::ErrorKind::Unsupported,
-                "local emulator reset requires an ordered durable replay boundary",
+                "direct PTY sessions do not support an emulator reset",
             )),
         }
+    }
+
+    /// How many local resets this Session has applied; tests and callers
+    /// observing the boundary use it, clients see it through a full grid.
+    pub fn reset_generation(&self) -> u64 {
+        self.shared.reset_generation.load(Ordering::SeqCst)
     }
 
     pub fn resize(&self, cols: u16, rows: u16) -> std::io::Result<()> {
@@ -2366,6 +2397,8 @@ fn new_shared(
         .map(|event| event.occurred_at);
     Arc::new(Shared {
         holder_identity: std::sync::OnceLock::new(),
+        reset_requested: AtomicBool::new(false),
+        reset_generation: AtomicU64::new(0),
         completed: Mutex::new(None),
         keyboard_known: AtomicBool::new(true),
         id: spec.id.clone(),
@@ -3704,6 +3737,29 @@ fn pump_held(
     let mut drained = false;
 
     while !shared.stop.load(Ordering::SeqCst) && exit_status.is_none() {
+        if shared.reset_requested.swap(false, Ordering::SeqCst) {
+            // Between chunks every consumed byte has been fed, so the reset
+            // and the checkpoint below describe the same point in the log.
+            // The checkpoint is the durable replay boundary: a restart seeds
+            // from it and replays only bytes written after this offset,
+            // never the pre-reset output. Partial marker bytes travel with it.
+            {
+                let mut screen = shared.screen.lock().expect("screen");
+                screen.reset();
+                shared.keyboard_known.store(true, Ordering::SeqCst);
+            }
+            shared.reset_generation.fetch_add(1, Ordering::SeqCst);
+            shared.bump_state_version();
+            persist_checkpoint(
+                &shared,
+                &checkpoint_path,
+                offset,
+                &marker_buffer,
+                &mut last_checkpoint_key,
+            );
+            checkpoint_dirty_at = None;
+            shared.grid_wake.notify();
+        }
         scan_artifacts_if_due(&shared, &mut last_scan_at, &mut last_scan_seq);
         // Subscribe only from a standing start, with the log drained.
         //

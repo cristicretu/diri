@@ -1707,9 +1707,16 @@ Protocol minor 15 adds optional `terminal-reset-v1`. A reset is an emulator
 mutation owned by the Holder: it rebuilds the shared `HeadlessScreen` at the
 current dimensions and never sends `ESC c`, `clear` or any other bytes to the
 child. The PTY, process tree, session incarnation, controller lease and raw
-output log are untouched. Local sessions do not support this yet: the local
-pump replay would undo a memory-only reset after Engine replacement, so a
-local reset waits for an identity-bound durable replay boundary.
+output log are untouched.
+
+Local held sessions reset through their pump: `session.reset_terminal` queues
+the request, the pump applies it between log chunks, when every consumed byte
+has been fed, and immediately persists a checkpoint at that exact offset with
+any partial exit-marker bytes. That checkpoint is the durable replay boundary:
+a replacement Engine seeds from it and replays only bytes written after it, so
+pre-reset output never returns. The local reset generation forces the next
+publication to attached clients to be a full grid. Direct PTY sessions and
+completed records refuse; acceptance means queued, not applied.
 
 The Engine requests the capability only from Helpers at or above minor 15 and
 fails closed if the acknowledgement omits it. `TerminalReset` carries the
@@ -1735,9 +1742,9 @@ pre-reset history cannot return, and forces the next publication to the
 attached client to be a full grid rather than a diff against pre-reset cells.
 Old Holders never receive the request or the boundary and report unsupported.
 
-Not included: a control/CLI reset method, local session reset, and desktop
-invalidation of retained reading views, selections and Find captures by
-reset generation. Those remain open work for the reset API.
+Not included: desktop invalidation of retained reading views, selections and
+Find captures by reset generation; a reset currently reaches them the same way
+a program clearing its own screen does. That remains open work.
 
 ## Read-only output log ownership
 

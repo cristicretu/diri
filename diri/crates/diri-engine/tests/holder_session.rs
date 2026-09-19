@@ -611,3 +611,70 @@ fn stopped_session_terminal_is_retained() {
             .contains("still running")
     );
 }
+
+/// A local emulator reset survives Engine replacement: the pump persists a
+/// checkpoint at the reset offset, so the replacement Engine seeds from it
+/// instead of replaying the pre-reset output through a fresh emulator.
+#[test]
+fn local_reset_survives_engine_replacement() {
+    let root = holders_dir("reset");
+    let logs = root.join("logs");
+    std::fs::create_dir_all(&logs).unwrap();
+    let state = root.join("state.json");
+    let holder = holder_config(&root);
+    let id = "reset-run";
+
+    let mut registry = Registry::new(engine(), &state);
+    registry
+        .spawn(
+            shell_spec(
+                id,
+                "printf 'before reset\\n'; IFS= read -r value; printf 'after:%s\\n' \"$value\"; IFS= read -r done",
+                &logs,
+                Some(holder.clone()),
+            ),
+            record(id),
+        )
+        .expect("spawn held");
+    let mut published = HashMap::new();
+    let screen = |registry: &Registry| registry.get(id).unwrap().screen_lines().join("\n");
+    wait_until("pre-reset output", Duration::from_secs(10), || {
+        registry.changed_since(&mut published);
+        screen(&registry).contains("before reset")
+    });
+    assert_eq!(registry.get(id).unwrap().reset_generation(), 0);
+    registry.get(id).unwrap().reset_terminal().expect("queued");
+    wait_until("the reset to apply", Duration::from_secs(5), || {
+        registry.get(id).unwrap().reset_generation() == 1
+    });
+    assert!(
+        screen(&registry).trim().is_empty(),
+        "the grid is blank after a reset: {:?}",
+        screen(&registry)
+    );
+    let pid = registry.get(id).unwrap().child_pid();
+    assert!(pid > 0);
+
+    // The replacement Engine adopts the same Holder and child.
+    registry.persist_for_shutdown().unwrap();
+    drop(registry);
+    let mut restored = Registry::new(engine(), &state);
+    restored.load().unwrap();
+    assert_eq!(restored.restore(&holder, &logs), vec![id.to_string()]);
+    assert_eq!(restored.get(id).unwrap().child_pid(), pid);
+    // Give a replaying pump every chance to be wrong before asserting.
+    std::thread::sleep(Duration::from_millis(300));
+    assert!(
+        !screen(&restored).contains("before reset"),
+        "pre-reset output came back through replay: {:?}",
+        screen(&restored)
+    );
+    restored.get(id).unwrap().write_input(b"x\n").unwrap();
+    wait_until(
+        "post-reset output after adoption",
+        Duration::from_secs(10),
+        || screen(&restored).contains("after:x"),
+    );
+    assert!(!screen(&restored).contains("before reset"));
+    restored.terminate(id, Duration::from_millis(500)).unwrap();
+}
