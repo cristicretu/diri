@@ -850,6 +850,26 @@ impl Registry {
         records
     }
 
+    /// The records a resource sweep can act on: those with a live session,
+    /// and hibernated ones, whose frozen trees still hold memory. Exited and
+    /// archived records own no processes, and they are most of a long-lived
+    /// table — [`Registry::records`] clones and folds every one of them.
+    pub fn governed_records(&self) -> Vec<SessionRecord> {
+        let mut records: Vec<SessionRecord> = self
+            .records
+            .values()
+            .filter(|record| {
+                record.hibernation.is_some() || self.sessions.contains_key(&record.id.0)
+            })
+            .cloned()
+            .collect();
+        for record in &mut records {
+            self.fold_live(record);
+        }
+        records.sort_by(|a, b| a.id.0.cmp(&b.id.0));
+        records
+    }
+
     /// One record with live status folded in, without cloning the whole table.
     pub fn record(&self, id: &str) -> Option<SessionRecord> {
         let mut record = self.records.get(id)?.clone();
@@ -2521,6 +2541,34 @@ mod tests {
             .expect("manifests");
         let (engine, _) = ManifestEngine::load_dir(&dir).expect("load");
         Arc::new(engine)
+    }
+
+    #[test]
+    fn a_resource_sweep_is_not_handed_records_that_own_no_processes() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut registry = Registry::new(engine(), temp.path().join("state.json"));
+        for index in 0..200 {
+            let mut archived = record(&format!("archived-{index}"));
+            archived.archived_at = Some(DateMillis(1.0));
+            registry.records.insert(archived.id.0.clone(), archived);
+        }
+        let mut frozen = record("frozen");
+        frozen.hibernation = Some(diri_proto::HibernationInfo {
+            since: DateMillis(1.0),
+            reason: diri_proto::HibernationReason::Idle,
+            tree_pids: vec![1234],
+            tree_start_times: None,
+        });
+        registry.records.insert("frozen".into(), frozen);
+
+        assert_eq!(
+            registry.records().len(),
+            201,
+            "what the sweep used to clone"
+        );
+        let governed = registry.governed_records();
+        assert_eq!(governed.len(), 1, "what it clones now");
+        assert_eq!(governed[0].id.0, "frozen");
     }
 
     #[test]

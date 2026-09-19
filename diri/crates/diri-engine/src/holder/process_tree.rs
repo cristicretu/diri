@@ -37,7 +37,41 @@ pub fn enumerate(root: i32) -> Vec<HolderProcessSample> {
     if root <= 1 {
         return Vec::new();
     }
-    let all = platform::snapshot();
+    enumerate_in(&ProcessTable::capture(), root)
+}
+
+/// One observation of every process on the machine.
+///
+/// Listing the table is the expensive half of a walk — a syscall per process —
+/// and it does not depend on which tree is being walked. A caller walking many
+/// roots at once (the Engine's resource sweep) captures it once and walks each
+/// root against the same table. Signalling never does this: it wants the
+/// table as it is at the moment it acts.
+pub struct ProcessTable(Vec<Observed>);
+
+impl ProcessTable {
+    pub fn capture() -> Self {
+        #[cfg(test)]
+        CAPTURES.with(|captures| captures.set(captures.get() + 1));
+        Self(platform::snapshot())
+    }
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Tables captured on this thread, so a test can count them without
+    /// seeing another test's walks.
+    static CAPTURES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// [`enumerate`] against a table the caller already captured. Relations come
+/// from the table; each member's identity is still looked up afresh, so a
+/// table that has aged never vouches for a recycled pid.
+pub fn enumerate_in(table: &ProcessTable, root: i32) -> Vec<HolderProcessSample> {
+    if root <= 1 {
+        return Vec::new();
+    }
+    let all = &table.0;
     let holder_pid = std::process::id() as i32;
 
     let mut seen: HashSet<i32> = HashSet::new();
@@ -368,6 +402,49 @@ mod tests {
                 "pid {} survived kill_tree",
                 sample.pid
             );
+        }
+    }
+
+    #[test]
+    fn a_shared_table_is_captured_once_however_many_trees_are_walked() {
+        let mut children: Vec<_> = (0..4).map(|_| spawn_sleeper()).collect();
+        std::thread::sleep(Duration::from_millis(200));
+        let roots: Vec<i32> = children.iter().map(|child| child.id() as i32).collect();
+
+        let started = Instant::now();
+        let before = CAPTURES.with(std::cell::Cell::get);
+        let separate: Vec<HashSet<i32>> = roots
+            .iter()
+            .map(|&root| enumerate(root).iter().map(|sample| sample.pid).collect())
+            .collect();
+        let per_root = CAPTURES.with(std::cell::Cell::get) - before;
+        let per_root_took = started.elapsed();
+
+        let started = Instant::now();
+        let before = CAPTURES.with(std::cell::Cell::get);
+        let table = ProcessTable::capture();
+        let shared: Vec<HashSet<i32>> = roots
+            .iter()
+            .map(|&root| {
+                enumerate_in(&table, root)
+                    .iter()
+                    .map(|sample| sample.pid)
+                    .collect()
+            })
+            .collect();
+        let once = CAPTURES.with(std::cell::Cell::get) - before;
+        eprintln!(
+            "{} trees: {per_root_took:?} with a table each, {:?} sharing one",
+            roots.len(),
+            started.elapsed()
+        );
+
+        assert_eq!(per_root, roots.len(), "one table per root before");
+        assert_eq!(once, 1, "one table for every root after");
+        assert_eq!(separate, shared, "the walk finds the same trees");
+        for (child, root) in children.iter_mut().zip(roots) {
+            kill_tree(root);
+            let _ = child.wait();
         }
     }
 

@@ -233,12 +233,16 @@ fn sweep(
     let config = config.lock().expect("config").clone();
     let records = {
         let Ok(guard) = registry.lock() else { return };
-        guard.records()
+        guard.governed_records()
     };
     liveness.retain(records.iter().map(|record| record.id.0.as_str()));
 
     let mut total_footprint: u64 = 0;
     let mut idle_candidates: Vec<Candidate> = Vec::new();
+    // Listing every process costs a syscall each and is the same answer for
+    // every session, so one table serves the whole sweep. Captured on first
+    // need: a fleet that is entirely hibernated never lists anything.
+    let mut table: Option<process_tree::ProcessTable> = None;
 
     for record in &records {
         let id = record.id.0.clone();
@@ -280,7 +284,10 @@ fn sweep(
             continue;
         }
 
-        let tree = process_tree::enumerate(child_pid);
+        let tree = process_tree::enumerate_in(
+            table.get_or_insert_with(process_tree::ProcessTable::capture),
+            child_pid,
+        );
         let mut pids: Vec<i32> = tree.iter().map(|sample| sample.pid).collect();
         pids.sort_unstable();
         let footprint = footprint_of(&pids);
@@ -288,7 +295,13 @@ fn sweep(
 
         let attached = attach.has_sinks(&id);
         let ports = should_scan_ports(config.port_scan_enabled, attached, tick)
-            .then(|| listening_ports(&pids, Duration::from_secs(3)))
+            .then(|| {
+                // lsof can take seconds. The table has aged by that much, so
+                // the sessions after this one get a fresh one rather than
+                // trees that predate the wait.
+                table = None;
+                listening_ports(&pids, Duration::from_secs(3))
+            })
             .flatten();
 
         apply_sample(
@@ -464,7 +477,7 @@ fn hibernate(
             return false;
         }
         let _ = guard.persist();
-        guard.records().into_iter().find(|record| record.id.0 == id)
+        guard.record(id)
     };
     if let Some(record) = record {
         events.publish_encoded(diri_proto::EventName::SESSION_UPDATED, &record, Some(id));
