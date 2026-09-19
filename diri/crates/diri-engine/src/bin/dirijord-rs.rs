@@ -23,7 +23,16 @@ use diri_engine::registry::Registry;
 #[cfg(unix)]
 use diri_engine::session::HolderConfig;
 #[cfg(unix)]
-use diri_proto::paths::DirijorPaths;
+use diri_proto::paths::{DirijorPaths, EXIT_WHEN_ORPHANED_FLAG};
+
+/// How long the Engine must have had no live session and no client before it
+/// retires itself. Long enough that relaunching the App, or an Agent's hook
+/// reaching us between sessions, never races it.
+#[cfg(unix)]
+const ORPHAN_GRACE: std::time::Duration = std::time::Duration::from_secs(10 * 60);
+/// One wake a minute: the grace is ten, so precision buys nothing.
+#[cfg(unix)]
+const ORPHAN_WATCH_TICK: std::time::Duration = std::time::Duration::from_secs(60);
 
 #[cfg(not(unix))]
 fn main() {
@@ -213,6 +222,13 @@ fn main() {
         Arc::clone(&registry),
         Arc::new(AtomicBool::new(false)),
     );
+
+    // Opt-in from the launcher. A desktop App spawns us detached and asks us
+    // to go when it quits; one that was killed never asks. An Engine kept up
+    // by a service manager is not given the flag and stays up while idle.
+    if std::env::args().any(|arg| arg == EXIT_WHEN_ORPHANED_FLAG) {
+        server.spawn_orphan_watch(ORPHAN_GRACE, ORPHAN_WATCH_TICK);
+    }
 
     eprintln!("dirijord-rs: serving {}", server.socket_path().display());
     for stream in listener.incoming() {
