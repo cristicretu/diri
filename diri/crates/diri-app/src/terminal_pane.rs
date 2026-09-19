@@ -292,8 +292,15 @@ enum PaneEvent {
         Option<FindSnapshot>,
     ),
     FindResult(SessionId, AttachmentGeneration, SearchRequest, SearchResult),
-    ScrollbackCells(SessionId, diri_proto::ReadScrollbackCellsResult, usize),
-    ScrollbackFailed(SessionId),
+    /// A scrollback reply, tagged like grid frames: a session id outlives the
+    /// resident that asked, and a late reply must not reach its replacement.
+    ScrollbackCells(
+        SessionId,
+        AttachmentGeneration,
+        diri_proto::ReadScrollbackCellsResult,
+        usize,
+    ),
+    ScrollbackFailed(SessionId, AttachmentGeneration),
     /// The scroller knob moved the viewport; fetch whatever it now shows.
     ScrollbackPump(SessionId, usize),
     ClipboardUploadFinished(SessionId, Result<String, String>),
@@ -1369,7 +1376,10 @@ impl TerminalPane {
                     self.launch_find_read(id, generation, next);
                 }
             }
-            PaneEvent::ScrollbackCells(id, result, visible_rows) => {
+            PaneEvent::ScrollbackCells(id, generation, result, visible_rows) => {
+                if !self.attachment_is_current(&id, generation) {
+                    return;
+                }
                 if let Some(resident) = self.residents.get_mut(&id) {
                     let _ = resident
                         .element
@@ -1384,7 +1394,10 @@ impl TerminalPane {
                 self.pump_scrollback_fetch(&id, visible_rows);
                 cx.notify();
             }
-            PaneEvent::ScrollbackFailed(id) => {
+            PaneEvent::ScrollbackFailed(id, generation) => {
+                if !self.attachment_is_current(&id, generation) {
+                    return;
+                }
                 if let Some(resident) = self.residents.get_mut(&id) {
                     resident.element.fail_scrollback_fetch();
                 }
@@ -2689,6 +2702,7 @@ impl TerminalPane {
         let Some(request) = resident.element.begin_scrollback_fetch(visible_rows) else {
             return;
         };
+        let generation = resident.attachment_generation;
         let client = Arc::clone(self.runtime.client());
         let pane_tx = self.pane_tx.clone();
         let fetch_id = id.clone();
@@ -2698,11 +2712,15 @@ impl TerminalPane {
                 .await
             {
                 Ok(result) => {
-                    let _ =
-                        pane_tx.send(PaneEvent::ScrollbackCells(fetch_id, result, visible_rows));
+                    let _ = pane_tx.send(PaneEvent::ScrollbackCells(
+                        fetch_id,
+                        generation,
+                        result,
+                        visible_rows,
+                    ));
                 }
                 Err(_) => {
-                    let _ = pane_tx.send(PaneEvent::ScrollbackFailed(fetch_id));
+                    let _ = pane_tx.send(PaneEvent::ScrollbackFailed(fetch_id, generation));
                 }
             }
         });
@@ -4381,7 +4399,7 @@ mod tests {
         for _ in 0..PANE_EVENT_QUEUE_CAPACITY {
             assert!(
                 sender
-                    .send(PaneEvent::ScrollbackFailed(SessionId::new("pressure")))
+                    .send(PaneEvent::ScrollbackFailed(SessionId::new("pressure"), 0))
                     .is_ok()
             );
         }
@@ -6361,6 +6379,144 @@ mod tests {
                 resident.find_scheduler.finish_scan(&request).is_some(),
                 "stale result completed the new resident's active scan"
             );
+        });
+    }
+
+    fn scrollback_reply(first: i64, live: i64, seq: u64) -> diri_proto::ReadScrollbackCellsResult {
+        let rows: Vec<_> = (first..live)
+            .map(|_| vec![GridCell::default(); 8])
+            .collect();
+        diri_proto::ReadScrollbackCellsResult {
+            metadata: Vec::new(),
+            payload: diri_proto::grid::GridRowCodec::encode_rows(&rows).expect("encoded rows"),
+            first_row: first,
+            row_count: live - first,
+            live_start_row: live,
+            total_rows: live + 10,
+            cols: 8,
+            content_seq: seq,
+        }
+    }
+
+    #[gpui::test]
+    fn late_scrollback_replies_cannot_mutate_a_reselected_session(cx: &mut TestAppContext) {
+        const ROWS: usize = 10;
+        let runtime = Arc::new(StoreRuntime::inert());
+        // Never driven: every fetch this pane starts stays paused in flight,
+        // and the test delivers the replies by hand.
+        let tokio = Arc::new(
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("test runtime"),
+        );
+        let mut reselected = fixture_session();
+        reselected.id = SessionId::new("reselected");
+        let mut other = fixture_session();
+        other.id = SessionId::new("other");
+        {
+            let mut store = runtime.store.write().expect("session store lock poisoned");
+            store.upsert_session(reselected.clone());
+            store.upsert_session(other.clone());
+            store.select(reselected.id.clone());
+        }
+
+        let runtime_for_view = Arc::clone(&runtime);
+        let (pane, cx) = cx.add_window_view(move |window, cx| {
+            TerminalPane::new(runtime_for_view, tokio, window, cx)
+        });
+
+        // R1: the first resident scrolls into history and asks for rows.
+        let old_generation = pane.update(cx, |pane, _| {
+            let resident = &pane.residents[&reselected.id];
+            resident.element.adopt_history_geometry(100, 110, 1, ROWS);
+            assert!(resident.element.set_view_offset(10, ROWS));
+            let generation = resident.attachment_generation;
+            pane.pump_scrollback_fetch(&reselected.id, ROWS);
+            assert!(
+                pane.residents[&reselected.id]
+                    .element
+                    .begin_scrollback_fetch(ROWS)
+                    .is_none(),
+                "R1 is in flight"
+            );
+            generation
+        });
+
+        for id in [other.id.clone(), reselected.id.clone()] {
+            runtime
+                .store
+                .write()
+                .expect("session store lock poisoned")
+                .select(id);
+            pane.update_in(cx, |pane, window, cx| {
+                pane.reconcile_store_change(window, cx);
+            });
+        }
+
+        pane.update_in(cx, |pane, window, cx| {
+            // R2: the replacement resident reads a different stretch of a
+            // history that has since grown.
+            let resident = &pane.residents[&reselected.id];
+            let new_generation = resident.attachment_generation;
+            assert_ne!(new_generation, old_generation);
+            resident.element.adopt_history_geometry(200, 210, 2, ROWS);
+            assert!(resident.element.set_view_offset(10, ROWS));
+            pane.pump_scrollback_fetch(&reselected.id, ROWS);
+
+            // R1 fails late. Requeueing it here would let a second request
+            // start while R2 is still in flight.
+            pane.handle_pane_event(
+                PaneEvent::ScrollbackFailed(reselected.id.clone(), old_generation),
+                window,
+                cx,
+            );
+            let element = &pane.residents[&reselected.id].element;
+            assert!(
+                element.begin_scrollback_fetch(ROWS).is_none(),
+                "a stale failure cleared the replacement's in-flight request"
+            );
+
+            // R1 succeeds late, carrying the old geometry and rows.
+            pane.handle_pane_event(
+                PaneEvent::ScrollbackCells(
+                    reselected.id.clone(),
+                    old_generation,
+                    scrollback_reply(80, 100, 1),
+                    ROWS,
+                ),
+                window,
+                cx,
+            );
+            let element = &pane.residents[&reselected.id].element;
+            let viewport = element.viewport();
+            assert_eq!(
+                viewport.cached_row_count(),
+                0,
+                "a stale reply seeded the replacement's row cache"
+            );
+            assert_eq!(viewport.live_start_row(), 200);
+            assert_eq!(viewport.view_offset(), 10);
+            assert!(
+                element.begin_scrollback_fetch(ROWS).is_none(),
+                "a stale reply cleared the replacement's in-flight request"
+            );
+
+            // R2 still completes normally.
+            pane.handle_pane_event(
+                PaneEvent::ScrollbackCells(
+                    reselected.id.clone(),
+                    new_generation,
+                    scrollback_reply(180, 200, 2),
+                    ROWS,
+                ),
+                window,
+                cx,
+            );
+            let viewport = pane.residents[&reselected.id].element.viewport();
+            assert_eq!(viewport.cached_row_count(), 20);
+            assert_eq!(viewport.live_start_row(), 200);
+            assert_eq!(viewport.view_offset(), 10);
         });
     }
 
