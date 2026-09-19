@@ -233,6 +233,7 @@ impl Registry {
                 for (root, host) in locations {
                     self.ensure_session_project(&root, host.as_deref());
                 }
+                self.seed_completed_runs();
                 if !repaired.is_empty() {
                     self.persist_now()?;
                     for id in repaired {
@@ -374,6 +375,45 @@ impl Registry {
         self.sessions.insert(id.clone(), session);
         self.bind_completed_run(&id);
         Ok(id)
+    }
+
+    /// Re-learns which retained runs the loaded records bind, so retention
+    /// after a restart keeps every artifact a record can still read.
+    fn seed_completed_runs(&mut self) {
+        let ids: Vec<String> = self
+            .records
+            .values()
+            .filter(|record| record.host.is_none())
+            .map(|record| record.id.0.clone())
+            .collect();
+        for id in ids {
+            if let Ok(Some(key)) =
+                self.recovery_store(&id)
+                    .read_completed_run::<crate::completed_terminal::CompletedRunKey>()
+            {
+                self.bound_runs.insert(id, key.run());
+            }
+        }
+    }
+
+    /// Everything retention must keep: the artifact of every run a current
+    /// local record binds. Apply it after releasing the Registry.
+    pub fn completed_retention(&self) -> CompletedRetention {
+        let keep = self
+            .bound_runs
+            .iter()
+            .filter_map(|(id, &(child, epoch_offset))| {
+                let record = self.records.get(id)?;
+                crate::completed_terminal::CompletedRunKey::bind(record, child, epoch_offset)
+                    .ok()?
+                    .artifact_name()
+                    .ok()
+            })
+            .collect();
+        CompletedRetention {
+            directory: self.completed_dir.clone(),
+            keep,
+        }
     }
 
     /// Records, once per verified run, which child birth and Holder epoch a
@@ -2277,6 +2317,36 @@ impl CompletedPublication {
             &self.capture.checkpoint,
             &self.capture.exit,
         )
+    }
+}
+
+/// The set of artifacts retention must keep, captured under the Registry.
+pub struct CompletedRetention {
+    directory: PathBuf,
+    keep: std::collections::HashSet<String>,
+}
+
+impl CompletedRetention {
+    pub fn keeps(&self, name: &str) -> bool {
+        self.keep.contains(name)
+    }
+
+    /// Removes orphans and evicts beyond the store's bounds. A directory that
+    /// was never created has nothing to retain.
+    pub fn apply(
+        self,
+    ) -> Result<crate::completed_terminal::RetentionReport, crate::completed_terminal::StorageError>
+    {
+        let store = match crate::completed_terminal::CompletedTerminalStore::open(&self.directory) {
+            Ok(store) => store,
+            Err(crate::completed_terminal::StorageError::Io(error))
+                if error.kind() == std::io::ErrorKind::NotFound =>
+            {
+                return Ok(Default::default());
+            }
+            Err(error) => return Err(error),
+        };
+        store.retain(&self.keep)
     }
 }
 

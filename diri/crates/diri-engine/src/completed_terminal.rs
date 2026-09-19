@@ -25,6 +25,11 @@ const MAX_METADATA: usize = 4096;
 pub const MAX_CHECKPOINT_BYTES: usize = 16 << 20;
 pub const MAX_RETAINED_CELLS: usize = 1 << 20;
 const MAX_HISTORY_ROWS: usize = 10_000;
+/// Retention bounds for the whole directory. Orphans go first; beyond these,
+/// the oldest bound artifacts are evicted and their records lose retained
+/// output explicitly rather than the disk growing without limit.
+pub const MAX_RETAINED_ARTIFACTS: usize = 256;
+pub const MAX_RETAINED_BYTES: u64 = 256 << 20;
 static ACTIVE: AtomicUsize = AtomicUsize::new(0);
 
 #[derive(Debug)]
@@ -121,6 +126,16 @@ impl CompletedRunKey {
             child,
             epoch_offset,
         })
+    }
+
+    /// The verified run this key binds, for re-seeding in-memory bindings.
+    pub fn run(&self) -> (diri_proto::process::ProcessIdentity, u64) {
+        (self.child, self.epoch_offset)
+    }
+
+    /// The artifact file name this exact run publishes to.
+    pub fn artifact_name(&self) -> Result<String> {
+        Ok(self.name()?.to_string_lossy().into_owned())
     }
 
     /// Stable identity of this exact run's artifact, distinct from any live
@@ -223,21 +238,100 @@ impl Drop for Admission {
 /// already be a private, owned directory; neither opening nor loading creates it.
 pub struct CompletedTerminalStore {
     directory: File,
+    path: std::path::PathBuf,
 }
+
+/// What one retention pass did.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct RetentionReport {
+    pub removed_orphans: usize,
+    pub evicted: usize,
+    pub retained: usize,
+    pub retained_bytes: u64,
+}
+
 impl CompletedTerminalStore {
     pub fn open(directory: &Path) -> Result<Self> {
-        let directory = OpenOptions::new()
+        let file = OpenOptions::new()
             .read(true)
             .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC)
             .open(directory)?;
-        let metadata = directory.metadata()?;
+        let metadata = file.metadata()?;
         if !metadata.is_dir()
             || metadata.uid() != unsafe { libc::geteuid() }
             || metadata.mode() & 0o077 != 0
         {
             return Err(StorageError::Corrupt);
         }
-        Ok(Self { directory })
+        Ok(Self {
+            directory: file,
+            path: directory.to_path_buf(),
+        })
+    }
+
+    /// Removes every artifact no record binds, then evicts the oldest bound
+    /// artifacts until the directory fits the retention bounds. `keep` holds
+    /// the artifact names of every run some record still binds; eviction
+    /// beyond the bounds is by artifact age, oldest first.
+    pub fn retain(&self, keep: &std::collections::HashSet<String>) -> Result<RetentionReport> {
+        self.retain_within(keep, MAX_RETAINED_ARTIFACTS, MAX_RETAINED_BYTES)
+    }
+
+    pub fn retain_within(
+        &self,
+        keep: &std::collections::HashSet<String>,
+        max_artifacts: usize,
+        max_bytes: u64,
+    ) -> Result<RetentionReport> {
+        let _admission = Admission::acquire()?;
+        let mut report = RetentionReport::default();
+        let mut bound = Vec::new();
+        for entry in std::fs::read_dir(&self.path)? {
+            let entry = entry?;
+            let name = entry.file_name();
+            let Some(name) = name.to_str().map(str::to_owned) else {
+                continue;
+            };
+            if !is_artifact_name(&name) {
+                continue; // nonce files and anything foreign are not ours to judge
+            }
+            let metadata = std::fs::symlink_metadata(entry.path())?;
+            if !metadata.is_file() {
+                continue;
+            }
+            if keep.contains(&name) {
+                let modified = metadata.modified().unwrap_or(std::time::UNIX_EPOCH);
+                bound.push((modified, metadata.len(), name));
+            } else {
+                self.unlink(&name)?;
+                report.removed_orphans += 1;
+            }
+        }
+        bound.sort();
+        let mut total: u64 = bound.iter().map(|(_, len, _)| *len).sum();
+        let mut index = 0;
+        while index < bound.len() && (bound.len() - index > max_artifacts || total > max_bytes) {
+            let (_, len, name) = &bound[index];
+            self.unlink(name)?;
+            total -= len;
+            report.evicted += 1;
+            index += 1;
+        }
+        report.retained = bound.len() - index;
+        report.retained_bytes = total;
+        Ok(report)
+    }
+
+    fn unlink(&self, name: &str) -> Result<()> {
+        let name = CString::new(name).map_err(|_| StorageError::Corrupt)?;
+        // SAFETY: the owned directory fd and NUL-terminated name remain live.
+        if unsafe { libc::unlinkat(self.directory.as_raw_fd(), name.as_ptr(), 0) } != 0 {
+            let error = io::Error::last_os_error();
+            if error.kind() != io::ErrorKind::NotFound {
+                return Err(error.into());
+            }
+        }
+        Ok(())
     }
 
     /// Publish once after observed child exit AND complete PTY drain. Caller
@@ -677,6 +771,12 @@ impl Write for LimitedBytes {
     fn flush(&mut self) -> io::Result<()> {
         Ok(())
     }
+}
+
+fn is_artifact_name(name: &str) -> bool {
+    name.strip_prefix("completed-")
+        .and_then(|rest| rest.strip_suffix(".bin"))
+        .is_some_and(|hex| hex.len() == 64 && hex.bytes().all(|b| b.is_ascii_hexdigit()))
 }
 
 fn digest_hex(bytes: &[u8]) -> String {
@@ -1399,6 +1499,75 @@ mod tests {
                 .unwrap()
                 .next()
                 .is_none()
+        );
+    }
+
+    #[test]
+    fn retention_removes_orphans_first_then_the_oldest_bound_artifacts() {
+        let _serial = serial();
+        let temp = tempfile::tempdir().unwrap();
+        let dir = private_dir(temp.path());
+        let store = CompletedTerminalStore::open(&dir).unwrap();
+        let mut names = Vec::new();
+        for (index, id) in ["s1", "s2", "s3", "orphan"].iter().enumerate() {
+            let key = live_key(id);
+            let done = record(id, Some(exited(0)));
+            store
+                .publish(&done, &key, &checkpoint(900), &exited(0))
+                .unwrap();
+            let name = key.artifact_name().unwrap();
+            // Distinct ages, oldest first, independent of filesystem timing.
+            let file = std::fs::File::options()
+                .write(true)
+                .open(dir.join(&name))
+                .unwrap();
+            file.set_modified(
+                std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_000 + index as u64),
+            )
+            .unwrap();
+            names.push(name);
+        }
+        std::fs::write(dir.join(".completed-stale.tmp"), b"nonce").unwrap();
+        std::fs::write(dir.join("unrelated.txt"), b"not ours").unwrap();
+        let keep: std::collections::HashSet<String> = names[..3].iter().cloned().collect();
+
+        let report = store.retain(&keep).unwrap();
+        assert_eq!(report.removed_orphans, 1, "{report:?}");
+        assert_eq!(report.evicted, 0);
+        assert_eq!(report.retained, 3);
+        assert!(!dir.join(&names[3]).exists());
+        assert!(
+            dir.join("unrelated.txt").exists(),
+            "foreign files are never touched"
+        );
+        assert!(
+            dir.join(".completed-stale.tmp").exists(),
+            "nonces belong to writers"
+        );
+
+        let report = store.retain_within(&keep, 2, u64::MAX).unwrap();
+        assert_eq!(report.evicted, 1);
+        assert!(
+            !dir.join(&names[0]).exists(),
+            "the oldest bound artifact goes first"
+        );
+        assert!(dir.join(&names[1]).exists() && dir.join(&names[2]).exists());
+
+        let size = std::fs::metadata(dir.join(&names[2])).unwrap().len();
+        let report = store.retain_within(&keep, 10, size).unwrap();
+        assert_eq!(report.evicted, 1, "{report:?}");
+        assert_eq!(report.retained, 1);
+        assert_eq!(report.retained_bytes, size);
+        assert!(
+            dir.join(&names[2]).exists(),
+            "the newest survives a byte bound"
+        );
+        assert!(
+            store
+                .load(&record("s3", Some(exited(0))), &live_key("s3"))
+                .unwrap()
+                .is_some(),
+            "a retained artifact still loads exactly"
         );
     }
 

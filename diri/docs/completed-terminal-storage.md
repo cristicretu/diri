@@ -72,11 +72,18 @@ handling must inspect exact existing content before claiming idempotent success.
    resize and process facts remain impossible for such records.
 5. **Removal.** `Registry::remove` discards the record's artifact with its
    binding, so nothing can resolve it afterwards.
+6. **Retention.** After every publication the watcher applies
+   `Registry::completed_retention()` off the lock: artifacts no current local
+   record binds are removed, then the oldest bound artifacts are evicted until
+   the directory holds at most 256 artifacts and 256 MiB. `load` re-seeds the
+   bindings from `completed-run.json`, so a restart keeps everything a record
+   can still read. Nonce files and foreign files are never touched. An evicted
+   record's output becomes explicitly unavailable; nothing else changes.
 
 Still unwired: pane attachment (the attach stream still requires a live
 Session, so the desktop does not yet show a retained terminal), remote records (a separate
-authenticated Helper operation), artifact count/GC beyond removal, and an
-explicit reservation of the *next* run before launch. A resume of a completed
+authenticated Helper operation), and an explicit reservation of the *next* run
+before launch. A resume of a completed
 record replaces the binding when the new Holder reports its identity.
 
 ## Acceptance still required

@@ -472,12 +472,26 @@ pub fn spawn_registry_watcher(
                 };
                 // Retained terminals are written here, off the Registry lock,
                 // so a slow disk never stalls input or grid publication.
+                let published_any = !completed.is_empty();
                 for publication in completed {
                     let id = publication.session_id().to_owned();
                     if let Err(error) = publication.publish() {
                         eprintln!(
                             "diri-engine: completed terminal for {id} was not retained: {error}"
                         );
+                    }
+                }
+                // Growth happens only on publication, so that is the only
+                // moment the bounds need enforcing.
+                if published_any {
+                    let retention = registry
+                        .lock()
+                        .ok()
+                        .map(|registry| registry.completed_retention());
+                    if let Some(retention) = retention
+                        && let Err(error) = retention.apply()
+                    {
+                        eprintln!("diri-engine: completed terminal retention failed: {error}");
                     }
                 }
                 let cursor_refreshes = crate::registry::scan_cursor_refreshes(cursor_requests);
