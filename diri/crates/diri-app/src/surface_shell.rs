@@ -338,6 +338,10 @@ pub struct UtilitySurfaces {
     usage_tokens: bool,
     usage_share: Option<usage_share::SharePreview>,
     usage_share_theme_hover: Option<Task<()>>,
+    /// Share-card images no longer shown. GPUI keeps each decoded frame and
+    /// its atlas texture until told otherwise, and releasing needs a
+    /// `Window`, so they wait here for the next render.
+    retired_share_images: Vec<Arc<gpui::Image>>,
     usage_chart_split: Option<[bool; 3]>,
     usage_series_hover: u8,
     usage_series_menu_close: Option<Task<()>>,
@@ -529,6 +533,7 @@ impl UtilitySurfaces {
             usage_tokens: false,
             usage_share: None,
             usage_share_theme_hover: None,
+            retired_share_images: Vec::new(),
             usage_chart_split: None,
             usage_series_hover: 0,
             usage_series_menu_close: None,
@@ -1458,7 +1463,7 @@ impl UtilitySurfaces {
             self.surface = Surface::None;
             self.clear_account_continuation();
             self.usage_share_theme_hover = None;
-            self.usage_share = None;
+            self.discard_usage_share();
             self.settings_menu = None;
             self.host_editor = None;
             self.agent_path_editor = None;
@@ -1600,7 +1605,7 @@ impl UtilitySurfaces {
         self.settings_search_active = false;
         if tab != SettingsTab::Usage {
             self.usage_share_theme_hover = None;
-            self.usage_share = None;
+            self.discard_usage_share();
         }
         self.settings_menu = None;
         self.host_editor = None;
@@ -5417,6 +5422,7 @@ impl Focusable for UtilitySurfaces {
 
 impl Render for UtilitySurfaces {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        self.release_retired_share_images(window, cx);
         // Worktree delegation starts in the sidebar, so that one surface
         // deliberately leaves the visible sidebar interactive. The shaded
         // workspace and sheet remain modal once the pointer crosses the seam.
@@ -7413,6 +7419,50 @@ mod tests {
         cx.run_until_parked();
         surfaces.read_with(cx, |surfaces, _| {
             assert!(surfaces.usage_share.is_none());
+        });
+    }
+
+    #[gpui::test]
+    fn closing_the_share_preview_releases_its_images(cx: &mut TestAppContext) {
+        let (harness, cx) = open_settings_workbench(cx);
+        let surfaces = harness.read_with(cx, |harness, _| harness.surfaces.clone());
+        surfaces.update(cx, |surfaces, cx| {
+            surfaces.open_settings_tab(SettingsTab::Usage, cx);
+            surfaces.toggle_usage_share(cx);
+        });
+        cx.run_until_parked();
+        // The rasterizer is unavailable under the test harness; stand in two
+        // rendered variants, one of them on screen.
+        let rendered = surfaces.update(cx, |surfaces, _| {
+            let preview = surfaces.usage_share.as_mut().expect("share opens");
+            for tokens in [false, true] {
+                let mut options = preview.options.clone();
+                options.tokens = tokens;
+                let image = Arc::new(gpui::Image::from_bytes(gpui::ImageFormat::Png, vec![]));
+                preview.image = Some(Arc::clone(&image));
+                preview.cache.insert(
+                    usage_share::SharePreview::cache_key(&options.theme_id, &options),
+                    image,
+                );
+            }
+            preview.cache.len()
+        });
+        assert_eq!(rendered, 2);
+
+        surfaces.update(cx, |surfaces, cx| {
+            surfaces.dismiss_usage_share(cx);
+            assert!(surfaces.usage_share.is_none());
+            assert!(
+                surfaces.retired_share_images.len() >= rendered,
+                "every rendered card is queued for release"
+            );
+        });
+        cx.run_until_parked();
+        surfaces.read_with(cx, |surfaces, _| {
+            assert!(
+                surfaces.retired_share_images.is_empty(),
+                "the next render hands the images back to GPUI"
+            );
         });
     }
 

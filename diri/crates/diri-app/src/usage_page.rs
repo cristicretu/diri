@@ -37,7 +37,8 @@ impl UtilitySurfaces {
         if changed && let Some(preview) = self.usage_share.as_mut() {
             // Cached PNGs and the caption must describe the same report,
             // including variants revisited after a background usage refresh.
-            preview.cache.clear();
+            self.retired_share_images
+                .extend(preview.cache.drain().map(|(_, image)| image));
             preview.pending_theme = None;
             let options = preview.options.clone();
             self.usage_share_theme_hover = None;
@@ -77,7 +78,7 @@ impl UtilitySurfaces {
                     colors,
                 )
                 .on_click(cx.listener(move |this, _, window, cx| {
-                    this.usage_share = None;
+                    this.discard_usage_share();
                     this.set_usage_days(days, window, cx);
                 })),
             );
@@ -812,8 +813,30 @@ impl UtilitySurfaces {
 
     pub(super) fn dismiss_usage_share(&mut self, cx: &mut Context<Self>) {
         self.usage_share_theme_hover = None;
-        self.usage_share = None;
+        self.discard_usage_share();
         cx.notify();
+    }
+
+    /// Closes the share preview and queues every image it rendered for
+    /// release. Dropping the `Arc`s alone frees only the PNG bytes: GPUI's
+    /// asset cache still owns the decoded frame, several MB per variant.
+    pub(super) fn discard_usage_share(&mut self) {
+        let Some(preview) = self.usage_share.take() else {
+            return;
+        };
+        self.retired_share_images.extend(preview.image);
+        self.retired_share_images
+            .extend(preview.cache.into_values());
+    }
+
+    /// Drops the decoded frame and atlas texture of every retired image.
+    pub(super) fn release_retired_share_images(&mut self, window: &mut Window, cx: &mut App) {
+        for image in std::mem::take(&mut self.retired_share_images) {
+            if let Some(frame) = Arc::clone(&image).get_render_image(window, cx) {
+                cx.drop_image(frame, Some(window));
+            }
+            image.remove_asset(cx);
+        }
     }
 
     pub(super) fn close_share_theme_menu(&mut self, cx: &mut Context<Self>) {
