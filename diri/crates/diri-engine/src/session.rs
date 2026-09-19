@@ -101,6 +101,18 @@ const LAUNCH_DEBOUNCE: Duration = Duration::from_millis(120);
 /// Elapsed-based so the probe cadence is the same on fast and idle ticks.
 const LIVENESS_INTERVAL: Duration = Duration::from_secs(2);
 
+/// The probe cadence while the holder's output subscription is open. That
+/// socket is itself a liveness signal — a holder that dies closes it, and the
+/// pump probes the moment it does — so the probe is only a backstop here, for
+/// a holder that is up but has lost its child without writing a marker.
+const STREAMING_LIVENESS_INTERVAL: Duration = Duration::from_secs(10);
+
+/// How long after output or input a shell's foreground group is sampled on
+/// every tick. The echo of Enter reaches the pump before the shell has forked
+/// and handed the terminal to the job, so the sample taken with that output
+/// can still name the shell; the ticks that follow catch the job.
+const FOREGROUND_SETTLE: Duration = Duration::from_secs(1);
+
 /// How long a half-erased screen waits for the rest of its repaint.
 ///
 /// A TUI repaint is not one write. Ink, Ratatui and friends erase the old
@@ -2605,15 +2617,36 @@ fn apply_foreground_sample(
     apply(shared, &outcome);
 }
 
-fn sample_held_foreground(shared: &Shared, client: &HolderClient, manifest_id: &str) {
+/// Returns what the holder said about its own liveness, when it was asked: a
+/// stat is the same request the liveness probe makes, so a caller that just
+/// sampled need not connect a second time to learn it.
+fn sample_held_foreground(
+    shared: &Shared,
+    client: &HolderClient,
+    manifest_id: &str,
+) -> Option<bool> {
     if manifest_id != "shell" {
-        return;
+        return None;
     }
-    let Ok(stat) = client.stat() else {
-        return;
-    };
+    let stat = client.stat().ok()?;
     shared.child_pid.store(stat.child_pid, Ordering::SeqCst);
     apply_foreground_sample(shared, manifest_id, stat.child_pid, stat.foreground_pid);
+    Some(stat.alive)
+}
+
+/// Whether a quiet tick should ask the holder for the shell's foreground
+/// group. Each ask is a connection the holder has to wake for, and ten a
+/// second for as long as a job runs bought nothing: a job starting or ending
+/// moves bytes (the echoed newline, the next prompt), and those are sampled as
+/// they arrive. What is left is the settle after output or input, and a slow
+/// backstop for a change that moved no bytes at all (a job started with echo
+/// off), which is late by at most [`LIVENESS_INTERVAL`].
+fn held_foreground_sample_due(
+    since_activity: Option<Duration>,
+    since_sample: Option<Duration>,
+) -> bool {
+    since_activity.is_some_and(|since| since <= FOREGROUND_SETTLE)
+        || since_sample.is_none_or(|since| since >= LIVENESS_INTERVAL)
 }
 
 /// Rescans the visible screen for artifact URLs every ~2s, only when the
@@ -3681,6 +3714,11 @@ fn pump_held(
     let mut last_checkpoint_key: Option<CheckpointKey> = None;
     let mut checkpoint_dirty_at: Option<Instant> = None;
     let mut last_liveness = Instant::now();
+    // When this session's foreground group was last sampled, and when bytes
+    // last moved in either direction; see `held_foreground_sample_due`.
+    let mut last_foreground_sample: Option<Instant> = None;
+    let mut last_activity: Option<Instant> = None;
+    let mut last_interaction_seen = shared.last_interaction.load(Ordering::Relaxed);
     let mut last_eval_seq = 0u64;
     let mut last_eval_at: Option<Instant> = None;
     // Set when a chunk was fed without detection running, so the settle below
@@ -3818,8 +3856,14 @@ fn pump_held(
                     Ok(None) => (offset, &[][..]),
                     Err(_) => {
                         // Dropped for falling behind, or the child is gone.
-                        // The log has every byte; resume from it.
+                        // The log has every byte; resume from it. The open
+                        // socket was standing in for the liveness probe, so
+                        // the next quiet pass probes rather than waiting out
+                        // an interval.
                         live = None;
+                        last_liveness = Instant::now()
+                            .checked_sub(LIVENESS_INTERVAL)
+                            .unwrap_or(last_liveness);
                         continue;
                     }
                 }
@@ -3930,9 +3974,27 @@ fn pump_held(
                 .expect("reducer")
                 .reduce(StatusSignal::Tick, SystemTime::now());
             apply(&shared, &outcome);
-            sample_held_foreground(&shared, &client, &manifest_id);
+            let interaction = shared.last_interaction.load(Ordering::Relaxed);
+            if interaction != last_interaction_seen {
+                last_interaction_seen = interaction;
+                last_activity = Some(Instant::now());
+            }
+            if held_foreground_sample_due(
+                last_activity.map(|at| at.elapsed()),
+                last_foreground_sample.map(|at| at.elapsed()),
+            ) {
+                last_foreground_sample = Some(Instant::now());
+                if sample_held_foreground(&shared, &client, &manifest_id) == Some(true) {
+                    last_liveness = Instant::now();
+                }
+            }
 
-            if last_liveness.elapsed() >= LIVENESS_INTERVAL {
+            let liveness_interval = if streaming {
+                STREAMING_LIVENESS_INTERVAL
+            } else {
+                LIVENESS_INTERVAL
+            };
+            if last_liveness.elapsed() >= liveness_interval {
                 last_liveness = Instant::now();
                 if !client.is_alive() {
                     // One last look for a marker that raced the probe.
@@ -4064,6 +4126,8 @@ fn pump_held(
             }
             drop(reducer);
             if !replaying {
+                last_activity = Some(Instant::now());
+                last_foreground_sample = Some(Instant::now());
                 sample_held_foreground(&shared, &client, &manifest_id);
             }
         }
@@ -4490,6 +4554,42 @@ mod quiet_tick_tests {
         // Input or an attach makes it interactive again at once.
         shared.note_hot();
         assert_eq!(shared.quiet_tick(), TICK_INTERVAL);
+    }
+}
+
+#[cfg(test)]
+mod held_foreground_tests {
+    use super::*;
+
+    #[test]
+    fn a_quiet_shell_is_asked_for_its_foreground_group_on_a_slow_backstop() {
+        // Ten minutes of 100 ms ticks while a silent job runs: the old pump
+        // connected to the holder on every one of them.
+        let tick = Duration::from_millis(100);
+        let mut since_sample: Option<Duration> = None;
+        let mut samples = 0;
+        let ticks = 6_000;
+        for _ in 0..ticks {
+            since_sample = since_sample.map(|since| since + tick);
+            if held_foreground_sample_due(None, since_sample) {
+                samples += 1;
+                since_sample = Some(Duration::ZERO);
+            }
+        }
+        assert_eq!(samples, 300, "one per liveness interval, down from {ticks}");
+
+        // Output or input keeps every tick sampling until the job the echoed
+        // newline announced has had time to take the terminal.
+        assert!(held_foreground_sample_due(
+            Some(Duration::from_millis(900)),
+            Some(tick)
+        ));
+        assert!(!held_foreground_sample_due(
+            Some(Duration::from_millis(1100)),
+            Some(tick)
+        ));
+        // Never sampled yet: ask.
+        assert!(held_foreground_sample_due(None, None));
     }
 }
 
