@@ -88,11 +88,15 @@ impl DirectoryIndex {
     }
 
     /// Adopt a disk-cached index without claiming it is freshly scanned, so the
-    /// next open still revalidates.
-    pub fn adopt_cached(&mut self, entries: Vec<DirectoryEntry>) {
-        if self.entries.is_empty() {
-            self.entries = entries;
+    /// next open still revalidates. Returns whether the cache was taken: a
+    /// finished scan is the truth even when it found nothing, and the caller
+    /// must then keep the snapshot built from it as well.
+    pub fn adopt_cached(&mut self, entries: Vec<DirectoryEntry>) -> bool {
+        if self.scanned_at.is_some() || !self.entries.is_empty() {
+            return false;
         }
+        self.entries = entries;
+        true
     }
 
     pub fn finish_scan(
@@ -963,8 +967,14 @@ mod tests {
 
         // The disk cache lands asynchronously; if the scan won the race it
         // holds the truth and the cache must not roll it back.
-        index.adopt_cached(vec![fixture_entry("cached")]);
+        assert!(!index.adopt_cached(vec![fixture_entry("cached")]));
         assert_eq!(index.entries()[0].name, "scanned");
+        index.finish_scan(Vec::new(), now, String::new(), roots.to_vec());
+        assert!(
+            !index.adopt_cached(vec![fixture_entry("cached")]),
+            "an empty scan is still newer than the cache"
+        );
+        assert!(index.entries().is_empty());
     }
 
     #[test]

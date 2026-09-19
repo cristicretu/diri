@@ -540,12 +540,28 @@ impl NavigationOverlay {
                 return;
             };
             this.update(cx, |this, cx| {
-                this.directory_index.adopt_cached(entries);
-                this.quick_snapshot = snapshot;
-                cx.notify();
+                this.finish_cached_index(entries, snapshot, cx)
             })
             .ok();
         }));
+    }
+
+    fn finish_cached_index(
+        &mut self,
+        entries: Vec<quick_open::DirectoryEntry>,
+        snapshot: QuickOpenSnapshot,
+        cx: &mut Context<Self>,
+    ) {
+        // One decision for the index and the snapshot ranked from it: a scan
+        // that already finished must not be rolled back by the older cache.
+        if !self.directory_index.adopt_cached(entries) {
+            return;
+        }
+        self.quick_snapshot = snapshot;
+        if self.overlay == Some(Overlay::QuickOpen) && !self.query.text().trim().is_empty() {
+            self.schedule_rank(cx);
+        }
+        cx.notify();
     }
 
     fn refresh_directory_index(&mut self, cx: &mut Context<Self>) {
@@ -2545,6 +2561,89 @@ mod tests {
                         }
             })
         }));
+    }
+
+    fn directory(name: &str) -> quick_open::DirectoryEntry {
+        quick_open::DirectoryEntry {
+            path: PathBuf::from(format!("/work/{name}")),
+            name: name.to_owned(),
+            is_git_repo: true,
+            depth: 1,
+        }
+    }
+
+    fn pool_names(overlay: &NavigationOverlay) -> Vec<String> {
+        overlay
+            .quick_snapshot
+            .pool
+            .iter()
+            .map(|candidate| candidate.name.clone())
+            .collect()
+    }
+
+    #[gpui::test]
+    fn a_late_cache_load_cannot_roll_back_a_finished_directory_scan(cx: &mut TestAppContext) {
+        let runtime = Arc::new(StoreRuntime::inert());
+        let (overlay, cx) = cx.add_window_view(move |_, cx| {
+            let mut overlay = NavigationOverlay::opened_for_test(runtime, cx);
+            overlay.overlay = Some(Overlay::QuickOpen);
+            overlay
+        });
+        let cached = vec![directory("old-folder")];
+        let cached_snapshot = quick_open::build_snapshot(&cached, &[], &[]);
+
+        // The fresh scan wins the race; the cache completion arrives after it.
+        overlay.update(cx, |overlay, cx| {
+            let fresh = vec![directory("new-folder")];
+            overlay.quick_snapshot = quick_open::build_snapshot(&fresh, &[], &[]);
+            overlay
+                .directory_index
+                .finish_scan(fresh, Instant::now(), String::new(), Vec::new());
+            overlay.finish_cached_index(cached.clone(), cached_snapshot.clone(), cx);
+        });
+        overlay.read_with(cx, |overlay, _| {
+            assert_eq!(overlay.directory_index.entries()[0].name, "new-folder");
+            assert_eq!(pool_names(overlay), ["new-folder"]);
+            assert_eq!(overlay.quick_snapshot.folders[0].name, "new-folder");
+        });
+
+        // A scan that found nothing is still the truth.
+        overlay.update(cx, |overlay, cx| {
+            overlay.quick_snapshot = quick_open::build_snapshot(&[], &[], &[]);
+            overlay.directory_index.finish_scan(
+                Vec::new(),
+                Instant::now(),
+                String::new(),
+                Vec::new(),
+            );
+            overlay.finish_cached_index(cached.clone(), cached_snapshot.clone(), cx);
+        });
+        overlay.read_with(cx, |overlay, _| {
+            assert!(overlay.directory_index.entries().is_empty());
+            assert!(pool_names(overlay).is_empty());
+        });
+    }
+
+    #[gpui::test]
+    fn an_accepted_cache_load_reranks_the_active_quick_open_query(cx: &mut TestAppContext) {
+        let runtime = Arc::new(StoreRuntime::inert());
+        let (overlay, cx) = cx.add_window_view(move |_, cx| {
+            let mut overlay = NavigationOverlay::opened_for_test(runtime, cx);
+            overlay.overlay = Some(Overlay::QuickOpen);
+            overlay.query.insert("old");
+            overlay
+        });
+        let cached = vec![directory("old-folder")];
+        let cached_snapshot = quick_open::build_snapshot(&cached, &[], &[]);
+        overlay.update(cx, |overlay, cx| {
+            overlay.finish_cached_index(cached, cached_snapshot, cx);
+        });
+        cx.executor().advance_clock(RANK_DEBOUNCE * 2);
+        cx.run_until_parked();
+        overlay.read_with(cx, |overlay, _| {
+            assert_eq!(pool_names(overlay), ["old-folder"]);
+            assert_eq!(overlay.ranked_items.len(), 1);
+        });
     }
 
     struct WheelHarness {
