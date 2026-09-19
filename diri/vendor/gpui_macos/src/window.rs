@@ -1205,6 +1205,10 @@ impl Drop for MacWindow {
             this.native_window.setDelegate_(nil);
         }
         this.input_handler.take();
+        // The adapter retains the content view, whose GPUIView subview owns
+        // this state through its ivar. Left in place that cycle outlives the
+        // NSWindow and strands the renderer: Metal layer, drawables, atlases.
+        let accesskit_adapter = this.accesskit_adapter.take();
         this.foreground_executor
             .spawn(async move {
                 unsafe {
@@ -1216,6 +1220,10 @@ impl Drop for MacWindow {
                 }
             })
             .detach();
+        // Restoring the view's class releases the a11y handlers; do it
+        // without the state lock held.
+        drop(this);
+        drop(accesskit_adapter);
     }
 }
 
