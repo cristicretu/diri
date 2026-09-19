@@ -2130,6 +2130,9 @@ impl SessionStore {
         if ids.is_empty() {
             return;
         }
+        // Decide on everything the close terminates, not only the clicked
+        // rows: an exited parent can still own a running auxiliary terminal.
+        let ids = self.closure_set(ids);
         let has_running = ids.iter().any(|id| {
             self.sessions
                 .get(id)
@@ -2152,23 +2155,32 @@ impl SessionStore {
         self.pending_close = None;
     }
 
-    pub fn remove_sessions(&mut self, ids: Vec<SessionId>) {
+    /// Every session that closing `ids` terminates: the rows themselves and
+    /// their auxiliary terminals, which never outlive their parent.
+    pub(crate) fn closure_set(&self, ids: Vec<SessionId>) -> Vec<SessionId> {
         let mut ids = ids;
         let parents: HashSet<_> = ids.iter().cloned().collect();
-        ids.extend(
-            self.sessions
-                .values()
-                .filter(|session| {
-                    session
-                        .parent
-                        .as_ref()
-                        .is_some_and(|parent| parents.contains(parent))
-                        && is_auxiliary_terminal(session)
-                })
-                .map(|session| session.id.clone()),
-        );
+        let mut children: Vec<_> = self
+            .sessions
+            .values()
+            .filter(|session| {
+                session
+                    .parent
+                    .as_ref()
+                    .is_some_and(|parent| parents.contains(parent))
+                    && is_auxiliary_terminal(session)
+            })
+            .map(|session| session.id.clone())
+            .collect();
+        children.sort_by(|left, right| left.0.cmp(&right.0));
+        ids.extend(children);
         let mut unique = HashSet::new();
         ids.retain(|id| unique.insert(id.clone()));
+        ids
+    }
+
+    pub fn remove_sessions(&mut self, ids: Vec<SessionId>) {
+        let ids = self.closure_set(ids);
         let excluded: HashSet<_> = ids.iter().cloned().collect();
         if self
             .selected_session_id
@@ -2188,6 +2200,25 @@ impl SessionStore {
         }
         self.invalidate_projection();
         self.reconcile_navigation();
+    }
+
+    /// Settles a failed `session.remove`. A rejection is definitive: the
+    /// Engine kept the session, so its row returns and can be selected,
+    /// attached, or closed again. Any other failure (a lost reply, a timeout,
+    /// a session the Engine no longer knows) leaves the outcome unknown, so
+    /// the row stays hidden and this reports that the Engine's authoritative
+    /// list has to settle it.
+    fn finish_failed_remove(&mut self, id: &SessionId, error: &ClientError) -> bool {
+        let rejected =
+            matches!(error, ClientError::Control(control) if control.code != "not_found");
+        if !rejected {
+            return true;
+        }
+        if self.closing.remove(id) {
+            self.invalidate_projection();
+            self.reconcile_navigation();
+        }
+        false
     }
 
     pub fn archive_sessions(&mut self, ids: Vec<SessionId>) {
@@ -3170,6 +3201,7 @@ impl StoreRuntime {
             effect_changes,
             effect_snapshots,
             status_tx.clone(),
+            resync_tx,
         )));
 
         tasks.push(tokio::spawn(run_attention_settle(
@@ -3299,6 +3331,7 @@ async fn run_attention_settle(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn run_effects(
     mut effects: mpsc::UnboundedReceiver<StoreEffect>,
     client: Arc<DaemonClient>,
@@ -3307,6 +3340,7 @@ async fn run_effects(
     change_tx: broadcast::Sender<()>,
     snapshot_tx: tokio::sync::watch::Sender<StoreSnapshot>,
     status_tx: broadcast::Sender<StatusTransition>,
+    resync_tx: mpsc::Sender<()>,
 ) {
     let mut workspace_tasks = tokio::task::JoinSet::new();
     loop {
@@ -3355,7 +3389,18 @@ async fn run_effects(
                 Ok(())
             }
             StoreEffect::MarkSeen(id) => client.mark_seen(&id).await,
-            StoreEffect::Remove(id) => client.remove(&id).await,
+            StoreEffect::Remove(id) => {
+                let result = client.remove(&id).await;
+                if let Err(error) = &result
+                    && store
+                        .write()
+                        .expect("session store lock poisoned")
+                        .finish_failed_remove(&id, error)
+                {
+                    let _ = resync_tx.try_send(());
+                }
+                result
+            }
             StoreEffect::Resume { id, automatic } => {
                 let result = client.resume(&id).await.map(|_| ());
                 if automatic {

@@ -536,6 +536,7 @@ impl RootView {
             .child(HairlineDivider::horizontal(colors))
             .child(
                 div()
+                    .debug_selector(|| "notification-list".into())
                     .relative()
                     .my(px(6.0))
                     .h(px(list_height))
@@ -632,7 +633,9 @@ impl RootView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Option<AnyElement> {
-        let viewport = window.inner_window_bounds().get_bounds().size;
+        // The live drawable, not `inner_window_bounds`: in macOS fullscreen
+        // that still reports the windowed rectangle saved for restoration.
+        let viewport = window.viewport_size();
         let notification = self.notification_content(viewport, cx)?;
         let NotificationContent {
             content,

@@ -570,6 +570,16 @@ impl Service {
         let Some(release) = self.pending.clone() else {
             return;
         };
+        // Commands queue while a download runs, and `busy` has cleared by the
+        // time the next one is read: a second Download for the release that
+        // is already staged only answers Ready again. A failed download
+        // stages nothing, so it can still be retried.
+        if let Some(staged) = &self.staged
+            && staged.release.version == release.version
+        {
+            self.publish(UpdatePhase::Ready(staged.release.clone()), user_initiated);
+            return;
+        }
         if self.busy {
             return;
         }
@@ -1013,6 +1023,115 @@ mod tests {
             task.abort();
             assert_eq!(updater.downloads.load(Ordering::SeqCst), 0);
         });
+    }
+
+    /// Runs the production command loop over `commands` until it drains.
+    fn drain_service(updater: Arc<dyn UpdateBackend>, commands: Vec<UpdateCommand>) -> UpdatePhase {
+        Runtime::new().unwrap().block_on(async {
+            let (state, state_rx) = watch::channel(UpdateState::default());
+            let (tx, rx) = mpsc::unbounded_channel();
+            for command in commands {
+                tx.send(command).unwrap();
+            }
+            drop(tx);
+            service(
+                Some(updater),
+                false,
+                None,
+                state,
+                rx,
+                Arc::new(Mutex::new(None)),
+            )
+            .await;
+            state_rx.borrow().phase.clone()
+        })
+    }
+
+    /// Two clicks can queue before the UI repaints as Downloading, and the
+    /// loop reads the second one after the first download has cleared `busy`.
+    #[test]
+    fn queued_download_clicks_stage_only_once() {
+        let updater = Arc::new(FakeUpdater {
+            offered: release("0.8.0"),
+            downloads: AtomicUsize::new(0),
+            installs: Mutex::new(Vec::new()),
+        });
+        let phase = drain_service(
+            updater.clone(),
+            vec![
+                UpdateCommand::Check {
+                    user_initiated: true,
+                },
+                UpdateCommand::Download,
+                UpdateCommand::Download,
+            ],
+        );
+        assert_eq!(updater.downloads.load(Ordering::SeqCst), 1);
+        assert_eq!(phase, UpdatePhase::Ready(release("0.8.0")));
+
+        // The staged release still installs normally after the extra click.
+        let phase = drain_service(
+            updater.clone(),
+            vec![
+                UpdateCommand::Check {
+                    user_initiated: true,
+                },
+                UpdateCommand::Download,
+                UpdateCommand::Download,
+                UpdateCommand::Install,
+            ],
+        );
+        assert_eq!(updater.downloads.load(Ordering::SeqCst), 2);
+        assert_eq!(*updater.installs.lock().unwrap(), vec![true]);
+        assert_eq!(phase, UpdatePhase::Installing);
+    }
+
+    #[test]
+    fn a_failed_download_can_still_be_retried() {
+        struct FailsOnce(FakeUpdater);
+        impl UpdateBackend for FailsOnce {
+            fn clean_cache(&self) {}
+            fn check(&self, skipped: Option<&str>) -> UpdateResult<Option<Release>> {
+                self.0.check(skipped)
+            }
+            fn available_releases(&self) -> UpdateResult<Vec<Release>> {
+                self.0.available_releases()
+            }
+            fn release(&self, version: &str) -> UpdateResult<Option<Release>> {
+                self.0.release(version)
+            }
+            fn download_and_stage(
+                &self,
+                release: &Release,
+                on_progress: &mut dyn FnMut(f32),
+            ) -> UpdateResult<StagedUpdate> {
+                if self.0.downloads.load(Ordering::SeqCst) == 0 {
+                    self.0.downloads.fetch_add(1, Ordering::SeqCst);
+                    return Err(UpdateError::Network("interrupted".to_owned()));
+                }
+                self.0.download_and_stage(release, on_progress)
+            }
+            fn install(&self, staged: &StagedUpdate, relaunch: bool) -> UpdateResult<()> {
+                self.0.install(staged, relaunch)
+            }
+        }
+        let updater = Arc::new(FailsOnce(FakeUpdater {
+            offered: release("0.8.0"),
+            downloads: AtomicUsize::new(0),
+            installs: Mutex::new(Vec::new()),
+        }));
+        let phase = drain_service(
+            updater.clone(),
+            vec![
+                UpdateCommand::Check {
+                    user_initiated: true,
+                },
+                UpdateCommand::Download,
+                UpdateCommand::Download,
+            ],
+        );
+        assert_eq!(updater.0.downloads.load(Ordering::SeqCst), 2);
+        assert_eq!(phase, UpdatePhase::Ready(release("0.8.0")));
     }
 
     #[test]
