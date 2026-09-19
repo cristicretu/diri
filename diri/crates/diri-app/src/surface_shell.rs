@@ -769,22 +769,33 @@ impl UtilitySurfaces {
         cx.notify();
     }
 
-    fn persist_prefs(&mut self) -> bool {
+    /// Saves one settings action as an edit of the shared preferences as
+    /// they are now. `self.prefs` is only the copy this panel renders from:
+    /// the window keeps saving its placement and the notification tray its
+    /// own switches while Settings is open, so writing the copy back whole
+    /// would undo them. On success the copy is refreshed from what was stored.
+    fn update_prefs(&mut self, update: impl FnOnce(&mut Prefs)) -> bool {
         if self.include_editor.text() != self.include_persisted && !self.persist_include() {
             return false;
         }
-        self.prefs.quick_open_roots = self.roots_editor.text().to_owned();
-        self.prefs.normalize();
-        let prefs = self.prefs.clone();
-        if let Err(error) = self
-            .store
-            .write()
-            .expect("session store lock poisoned")
-            .update_preferences(|shared| *shared = prefs)
-        {
+        // The roots editor saves with every action, but only as its own field
+        // and only once it has been edited here.
+        let roots = self.roots_editor.text().to_owned();
+        let roots = (roots != self.prefs.quick_open_roots).then_some(roots);
+        let mut store = self.store.write().expect("session store lock poisoned");
+        let result = store.update_preferences(|shared| {
+            if let Some(roots) = roots {
+                shared.quick_open_roots = roots;
+            }
+            update(shared);
+        });
+        if let Err(error) = result {
+            drop(store);
             self.activity = format!("Could not save settings: {error}");
             false
         } else {
+            self.prefs = store.preferences().clone();
+            drop(store);
             self.store_runtime.publish_local_change();
             self.activity = "Settings saved for diri".to_owned();
             true
@@ -807,7 +818,7 @@ impl UtilitySurfaces {
     }
 
     fn persist_roots(&mut self) {
-        let _ = self.persist_prefs();
+        let _ = self.update_prefs(|_| {});
     }
 
     fn reload_include_editor(&mut self) {
@@ -1459,7 +1470,7 @@ impl UtilitySurfaces {
                 cx.notify();
                 return;
             }
-            let _ = self.persist_prefs();
+            let _ = self.update_prefs(|_| {});
             self.surface = Surface::None;
             self.clear_account_continuation();
             self.usage_share_theme_hover = None;
@@ -1673,22 +1684,14 @@ impl UtilitySurfaces {
         cx: &mut Context<Self>,
     ) -> bool {
         let stable_id = crate::commands::command(command).stable_id.to_owned();
-        let previous = match value {
-            Some(value) => self
-                .prefs
-                .shortcut_overrides
-                .insert(stable_id.clone(), value),
-            None => self.prefs.shortcut_overrides.remove(&stable_id),
-        };
-        if !self.persist_prefs() {
-            match previous {
-                Some(previous) => {
-                    self.prefs.shortcut_overrides.insert(stable_id, previous);
-                }
-                None => {
-                    self.prefs.shortcut_overrides.remove(&stable_id);
-                }
+        if !self.update_prefs(move |prefs| match value {
+            Some(value) => {
+                prefs.shortcut_overrides.insert(stable_id, value);
             }
+            None => {
+                prefs.shortcut_overrides.remove(&stable_id);
+            }
+        }) {
             return false;
         }
 
@@ -1737,14 +1740,11 @@ impl UtilitySurfaces {
         if self.prefs.shortcut_overrides.is_empty() {
             return;
         }
-        let previous = std::mem::take(&mut self.prefs.shortcut_overrides);
-        if self.persist_prefs() {
+        if self.update_prefs(|prefs| prefs.shortcut_overrides.clear()) {
             crate::commands::rebind_keys(cx, &self.prefs.shortcut_overrides);
             crate::refresh_app_menus(cx);
             self.shortcut_editor = None;
             self.activity = "Restored every keyboard shortcut".to_owned();
-        } else {
-            self.prefs.shortcut_overrides = previous;
         }
         cx.notify();
     }
@@ -2778,8 +2778,10 @@ impl UtilitySurfaces {
                                     colors,
                                     cx,
                                     |this, cx| {
-                                        this.prefs.start_at_login = !this.prefs.start_at_login;
-                                        this.persist_prefs();
+                                        let enabled = !this.prefs.start_at_login;
+                                        this.update_prefs(move |prefs| {
+                                            prefs.start_at_login = enabled;
+                                        });
                                         cx.notify();
                                     },
                                 ))
@@ -2793,9 +2795,10 @@ impl UtilitySurfaces {
                             colors,
                             cx,
                             |this, cx| {
-                                this.prefs.confirm_before_closing_session =
-                                    !this.prefs.confirm_before_closing_session;
-                                this.persist_prefs();
+                                let enabled = !this.prefs.confirm_before_closing_session;
+                                this.update_prefs(move |prefs| {
+                                    prefs.confirm_before_closing_session = enabled;
+                                });
                                 cx.notify();
                             },
                         ))
@@ -2808,8 +2811,8 @@ impl UtilitySurfaces {
                             colors,
                             cx,
                             |this, cx| {
-                                this.prefs.status_sounds = !this.prefs.status_sounds;
-                                this.persist_prefs();
+                                let enabled = !this.prefs.status_sounds;
+                                this.update_prefs(move |prefs| prefs.status_sounds = enabled);
                                 cx.notify();
                             },
                         )),
@@ -3791,9 +3794,9 @@ impl UtilitySurfaces {
                     .cursor_pointer()
                     .glass_menu_row(colors, false)
                     .on_click(cx.listener(move |this, _, _, cx| {
-                        this.prefs.default_agent = agent.clone();
+                        let agent = agent.clone();
                         this.settings_menu = None;
-                        this.persist_prefs();
+                        this.update_prefs(move |prefs| prefs.default_agent = agent);
                         cx.notify();
                     }))
                     .child(AgentLogo::new(ui_agent(&option.kind), 16.0, colors).badged(false))
@@ -3860,10 +3863,11 @@ impl UtilitySurfaces {
                         .cursor_pointer()
                         .glass_menu_row(colors, false)
                         .on_click(cx.listener(move |this, _, _, cx| {
-                            this.prefs.follow_system_theme = false;
-                            this.prefs.terminal_theme = candidate.id.to_owned();
                             this.settings_menu = None;
-                            this.persist_prefs();
+                            this.update_prefs(move |prefs| {
+                                prefs.follow_system_theme = false;
+                                prefs.terminal_theme = candidate.id.to_owned();
+                            });
                             cx.notify();
                         }))
                         .child(
@@ -3915,9 +3919,8 @@ impl UtilitySurfaces {
                 colors,
                 cx,
                 move |this, cx| {
-                    this.prefs.hibernate_after_minutes = value;
                     this.settings_menu = None;
-                    this.persist_prefs();
+                    this.update_prefs(move |prefs| prefs.hibernate_after_minutes = value);
                     cx.notify();
                 },
             ));
@@ -3937,9 +3940,8 @@ impl UtilitySurfaces {
                 colors,
                 cx,
                 move |this, cx| {
-                    this.prefs.memory_hard_limit_gb = value;
                     this.settings_menu = None;
-                    this.persist_prefs();
+                    this.update_prefs(move |prefs| prefs.memory_hard_limit_gb = value);
                     cx.notify();
                 },
             ));
@@ -4052,8 +4054,8 @@ impl UtilitySurfaces {
                 "Skip this version",
                 "Hide this release until a newer version is available.",
                 surface_button("Skip", "skip-update", colors, cx, move |this, cx| {
-                    this.prefs.skipped_update_version = version.clone();
-                    this.persist_prefs();
+                    let version = version.clone();
+                    this.update_prefs(move |prefs| prefs.skipped_update_version = version);
                     this.updates.send(UpdateCommand::Skip);
                     cx.notify();
                 }),
@@ -4074,10 +4076,9 @@ impl UtilitySurfaces {
                 colors,
                 cx,
                 |this, cx| {
-                    this.prefs.automatic_updates = !this.prefs.automatic_updates;
-                    this.persist_prefs();
-                    this.updates
-                        .send(UpdateCommand::SetAutomatic(this.prefs.automatic_updates));
+                    let enabled = !this.prefs.automatic_updates;
+                    this.update_prefs(move |prefs| prefs.automatic_updates = enabled);
+                    this.updates.send(UpdateCommand::SetAutomatic(enabled));
                     cx.notify();
                 },
             ));
@@ -4150,10 +4151,11 @@ impl UtilitySurfaces {
                     colors,
                     cx,
                     move |this, cx| {
-                        this.prefs.automatic_updates = false;
-                        this.prefs.skipped_update_version =
-                            crate::updates::CURRENT_VERSION.to_owned();
-                        this.persist_prefs();
+                        this.update_prefs(|prefs| {
+                            prefs.automatic_updates = false;
+                            prefs.skipped_update_version =
+                                crate::updates::CURRENT_VERSION.to_owned();
+                        });
                         this.updates.send(UpdateCommand::SetAutomatic(false));
                         this.updates
                             .send(UpdateCommand::InstallVersion(target.clone()));
@@ -4206,8 +4208,7 @@ impl UtilitySurfaces {
                             .hover(move |style| style.bg(colors.primary.alpha(0.08)))
                             .active(move |style| style.bg(colors.primary.alpha(0.12)))
                             .on_click(cx.listener(|this, _, _, cx| {
-                                this.prefs.zoom_terminal(-1.0);
-                                this.persist_prefs();
+                                this.update_prefs(|prefs| prefs.zoom_terminal(-1.0));
                                 cx.notify();
                             }))
                     })
@@ -4247,8 +4248,7 @@ impl UtilitySurfaces {
                             .hover(move |style| style.bg(colors.primary.alpha(0.08)))
                             .active(move |style| style.bg(colors.primary.alpha(0.12)))
                             .on_click(cx.listener(|this, _, _, cx| {
-                                this.prefs.zoom_terminal(1.0);
-                                this.persist_prefs();
+                                this.update_prefs(|prefs| prefs.zoom_terminal(1.0));
                                 cx.notify();
                             }))
                     })
@@ -4371,18 +4371,18 @@ impl UtilitySurfaces {
                         ))
                         .child(appearance_divider(colors))
                         .child(toggle_row("Copy on selection", "Copy selected text when you release the mouse.", self.prefs.terminal_copy_on_select, "terminal_copy_on_select", colors, cx, |this,cx| {
-                            this.prefs.terminal_copy_on_select = !this.prefs.terminal_copy_on_select;
-                            this.persist_prefs(); cx.notify();
+                            let enabled = !this.prefs.terminal_copy_on_select;
+                            this.update_prefs(move |prefs| prefs.terminal_copy_on_select = enabled); cx.notify();
                         }))
                         .child(appearance_divider(colors))
                         .child(toggle_row("Hide pointer while typing", "Show it again when you use the mouse.", self.prefs.terminal_hide_pointer, "terminal_hide_pointer", colors, cx, |this,cx| {
-                            this.prefs.terminal_hide_pointer = !this.prefs.terminal_hide_pointer;
-                            this.persist_prefs(); cx.notify();
+                            let enabled = !this.prefs.terminal_hide_pointer;
+                            this.update_prefs(move |prefs| prefs.terminal_hide_pointer = enabled); cx.notify();
                         }))
                         .child(appearance_divider(colors))
                         .child(toggle_row("Review command pastes", "Ask before pasting multiple lines into a shell or text with control characters.", self.prefs.terminal_paste_protection, "terminal_paste_protection", colors, cx, |this,cx| {
-                            this.prefs.terminal_paste_protection = !this.prefs.terminal_paste_protection;
-                            this.persist_prefs(); cx.notify();
+                            let enabled = !this.prefs.terminal_paste_protection;
+                            this.update_prefs(move |prefs| prefs.terminal_paste_protection = enabled); cx.notify();
                         })),
                 ),
             colors,
@@ -5783,6 +5783,7 @@ fn toggle_row(
 ) -> impl IntoElement {
     div()
         .id(id)
+        .debug_selector(move || id.into())
         .min_h(px(SETTINGS_ROW_HEIGHT))
         .px(px(12.0))
         .flex()
@@ -6424,8 +6425,8 @@ fn window_material_switch(
         .when(!enabled, |toggle| toggle.justify_start())
         .cursor_pointer()
         .on_click(cx.listener(|this, _, _, cx| {
-            this.prefs.window_material = this.prefs.window_material.toggled();
-            this.persist_prefs();
+            let material = this.prefs.window_material.toggled();
+            this.update_prefs(move |prefs| prefs.window_material = material);
             cx.notify();
         }))
         .child(div().size(px(14.0)).rounded(px(7.0)).bg(colors.primary))
@@ -6562,24 +6563,26 @@ fn appearance_mode_card(
         .aria_label(format!("Use {label} appearance"))
         .cursor_pointer()
         .on_click(cx.listener(move |this, _, window, cx| {
-            this.prefs.follow_system_theme = index == 0;
-            if index == 0 {
-                this.prefs.apply_system_theme(matches!(
-                    window.appearance(),
-                    gpui::WindowAppearance::Dark | gpui::WindowAppearance::VibrantDark
-                ));
-            } else if (theme(&this.prefs.terminal_theme).appearance == ThemeAppearance::Light)
-                != light
-            {
-                this.prefs.terminal_theme = if light {
-                    "dirijor-light"
-                } else {
-                    "dirijor-dark"
-                }
-                .into();
-            }
+            let system_is_dark = matches!(
+                window.appearance(),
+                gpui::WindowAppearance::Dark | gpui::WindowAppearance::VibrantDark
+            );
             this.settings_menu = None;
-            this.persist_prefs();
+            this.update_prefs(move |prefs| {
+                prefs.follow_system_theme = index == 0;
+                if index == 0 {
+                    prefs.apply_system_theme(system_is_dark);
+                } else if (theme(&prefs.terminal_theme).appearance == ThemeAppearance::Light)
+                    != light
+                {
+                    prefs.terminal_theme = if light {
+                        "dirijor-light"
+                    } else {
+                        "dirijor-dark"
+                    }
+                    .into();
+                }
+            });
             cx.notify();
         }))
         .child(
@@ -7715,8 +7718,8 @@ mod tests {
                         .update(cx, |sidebar, cx| sidebar.set_width(292.0, cx));
                     if let Some(theme_id) = &preview_theme {
                         harness.surfaces.update(cx, |surfaces, cx| {
-                            surfaces.prefs.terminal_theme.clone_from(theme_id);
-                            surfaces.persist_prefs();
+                            let theme_id = theme_id.clone();
+                            surfaces.update_prefs(move |prefs| prefs.terminal_theme = theme_id);
                             cx.notify();
                         });
                     }
@@ -8365,6 +8368,54 @@ mod tests {
             Surface::Settings
         );
         assert_eq!(background_events.load(Ordering::Relaxed), 0);
+    }
+
+    /// Settings stays open while the window moves and the notification tray
+    /// changes its own preferences. Saving a setting must not write the copy
+    /// taken when the panel opened over those newer values.
+    #[gpui::test]
+    fn saving_a_setting_keeps_preferences_changed_since_settings_opened(cx: &mut TestAppContext) {
+        let (harness, cx) = open_settings_workbench(cx);
+        let surfaces = harness.read_with(cx, |harness, _| harness.surfaces.clone());
+        let store = surfaces.read_with(cx, |surfaces, _| surfaces.store.clone());
+        let opened = store.read().unwrap().preferences().clone();
+        let placement = crate::store::WindowPlacement {
+            display_uuid: Some("studio".to_owned()),
+            mode: crate::store::WindowMode::Windowed,
+            x: 40.0,
+            y: 60.0,
+            width: 1200.0,
+            height: 800.0,
+        };
+        assert_ne!(opened.window_placement, Some(placement.clone()));
+
+        store
+            .write()
+            .unwrap()
+            .update_preferences(|prefs| {
+                prefs.window_placement = Some(placement.clone());
+                prefs.status_notifications = !opened.status_notifications;
+                prefs.muted_notification_sessions.insert("muted".to_owned());
+            })
+            .unwrap();
+
+        let toggle = cx
+            .debug_bounds("toggle-close-confirm")
+            .expect("close confirmation toggle");
+        cx.simulate_click(toggle.center(), Modifiers::default());
+        cx.run_until_parked();
+
+        let saved = store.read().unwrap().preferences().clone();
+        assert_eq!(
+            saved.confirm_before_closing_session, !opened.confirm_before_closing_session,
+            "the clicked setting must be saved"
+        );
+        assert_eq!(saved.window_placement, Some(placement));
+        assert_eq!(saved.status_notifications, !opened.status_notifications);
+        assert!(saved.muted_notification_sessions.contains("muted"));
+        // The panel now shows what is actually stored, so a second action
+        // cannot resurrect the stale copy either.
+        surfaces.read_with(cx, |surfaces, _| assert_eq!(surfaces.prefs, saved));
     }
 
     #[gpui::test]
