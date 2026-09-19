@@ -289,6 +289,21 @@ const INSPECTOR_FILES_MENU: crate::floating::Target<WorkbenchInspector> = crate:
     },
 };
 
+/// Corner radius of the "+" menu; the menu radius like every dropdown.
+const SURFACE_CATALOG_RADIUS: f32 = crate::floating::MENU_RADIUS;
+
+/// The "+" surface menu as a panel target.
+const INSPECTOR_SURFACE_CATALOG: crate::floating::Target<WorkbenchInspector> =
+    crate::floating::Target {
+        key: "inspector-surface-catalog",
+        radius: SURFACE_CATALOG_RADIUS,
+        content: WorkbenchInspector::surface_catalog_panel_content,
+        dismiss: |this, _, cx| {
+            this.workspace_chooser_open = false;
+            cx.notify();
+        },
+    };
+
 /// The comparison base menu as a panel target.
 const INSPECTOR_COMPARISON_MENU: crate::floating::Target<WorkbenchInspector> =
     crate::floating::Target {
@@ -1986,54 +2001,100 @@ impl WorkbenchInspector {
             );
 
         if self.workspace_chooser_open {
-            let mut catalog = div()
-                .id("workspace-surface-catalog")
+            header = header.child(self.surface_catalog_host(colors, cx));
+        }
+        header.into_any_element()
+    }
+
+    /// The rows of the "+" menu: one per surface kind the pane can add.
+    fn surface_catalog_items(
+        &self,
+        colors: SemanticColors,
+        cx: &mut Context<Self>,
+    ) -> gpui::Stateful<gpui::Div> {
+        let mut catalog = div()
+            .id("workspace-surface-catalog")
+            .p(px(5.0))
+            .flex()
+            .flex_col()
+            .gap(px(2.0));
+        for surface in WorkspaceSurface::CATALOG {
+            catalog = catalog.child(
+                div()
+                    .id(SharedString::from(format!(
+                        "workspace-catalog-{}",
+                        surface.label()
+                    )))
+                    .debug_selector(move || format!("workspace-catalog-{}", surface.label()))
+                    .h(px(32.0))
+                    .px(px(8.0))
+                    .flex()
+                    .items_center()
+                    .gap(px(8.0))
+                    .rounded(px(Radius::inner(SURFACE_CATALOG_RADIUS, 5.0)))
+                    .cursor_pointer()
+                    .glass_menu_row(colors, false)
+                    .child(sf_symbol(surface.icon(), 11.0, colors.secondary))
+                    .child(
+                        div()
+                            .flex_1()
+                            .text_size(px(11.5))
+                            .text_color(colors.primary)
+                            .child(surface.label()),
+                    )
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.add_workspace(surface, cx);
+                        cx.stop_propagation();
+                    })),
+            );
+        }
+        catalog
+    }
+
+    /// Mounts the "+" menu under its button: a blurred panel under glass,
+    /// otherwise the in-window surface.
+    fn surface_catalog_host(&self, colors: SemanticColors, cx: &mut Context<Self>) -> AnyElement {
+        let items = self.surface_catalog_items(colors, cx);
+        if crate::floating::uses_panels(false, colors, cx) {
+            return crate::floating::host_here(
+                INSPECTOR_SURFACE_CATALOG,
+                crate::floating::surface(colors, SURFACE_CATALOG_RADIUS, 196.0, items)
+                    .into_any_element(),
+                Some(196.0),
+                gpui::Anchor::TopRight,
+                8.0,
+                cx,
+            )
+            .absolute()
+            .top(px(Metrics::TITLE_BAR - 2.0))
+            .right(px(35.0))
+            .w(px(0.0))
+            .h(px(0.0))
+            .into_any_element();
+        }
+        deferred(
+            div()
                 .absolute()
                 .top(px(Metrics::TITLE_BAR - 2.0))
                 .right(px(35.0))
                 .w(px(196.0))
-                .p(px(5.0))
-                .flex()
-                .flex_col()
-                .gap(px(2.0))
-                .rounded(px(Radius::CARD))
-                .bg(colors.sidebar_surface())
-                .border_1()
-                .border_color(colors.primary.alpha(0.14))
-                .shadow_lg();
-            for surface in WorkspaceSurface::CATALOG {
-                catalog = catalog.child(
-                    div()
-                        .id(SharedString::from(format!(
-                            "workspace-catalog-{}",
-                            surface.label()
-                        )))
-                        .debug_selector(move || format!("workspace-catalog-{}", surface.label()))
-                        .h(px(32.0))
-                        .px(px(8.0))
-                        .flex()
-                        .items_center()
-                        .gap(px(8.0))
-                        .rounded(px(Radius::BADGE))
-                        .cursor_pointer()
-                        .hover(move |row| row.bg(colors.primary.alpha(0.07)))
-                        .child(sf_symbol(surface.icon(), 11.0, colors.secondary))
-                        .child(
-                            div()
-                                .flex_1()
-                                .text_size(px(11.5))
-                                .text_color(colors.primary)
-                                .child(surface.label()),
-                        )
-                        .on_click(cx.listener(move |this, _, _, cx| {
-                            this.add_workspace(surface, cx);
-                            cx.stop_propagation();
-                        })),
-                );
-            }
-            header = header.child(deferred(catalog.occlude()));
+                .occlude()
+                .child(FloatingSurface::new(colors, items).radius(SURFACE_CATALOG_RADIUS)),
+        )
+        .into_any_element()
+    }
+
+    /// The "+" menu's pixels for its floating panel.
+    fn surface_catalog_panel_content(&mut self, cx: &mut Context<Self>) -> Option<AnyElement> {
+        if !self.workspace_chooser_open {
+            return None;
         }
-        header.into_any_element()
+        let colors = self.panel_colors();
+        let items = self.surface_catalog_items(colors, cx);
+        Some(
+            crate::floating::surface(colors, SURFACE_CATALOG_RADIUS, 196.0, items)
+                .into_any_element(),
+        )
     }
 
     fn browser_url(&self) -> Option<String> {
