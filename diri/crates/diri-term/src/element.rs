@@ -370,6 +370,15 @@ impl HistoryLineCache {
     fn insert(&mut self, absolute_row: i64, digest: u64, line: ShapedLine) {
         self.lines.insert(absolute_row, (digest, line));
     }
+
+    /// Frees the table once the pane is back on the live grid. A `ShapedLine`
+    /// carries about 3 KB of inline decoration runs, so a long scroll leaves
+    /// a multi-megabyte table that `clear` and `retain` would keep allocated.
+    fn release(&mut self) {
+        if self.lines.capacity() != 0 {
+            *self = Self::default();
+        }
+    }
 }
 
 #[cfg(test)]
@@ -1317,6 +1326,7 @@ impl Element for TerminalElement {
             cache_hits = hits;
             cache_misses = (visible_rows as u64).saturating_sub(hits);
         } else {
+            mutex_lock(&self.shared.history_lines).release();
             let context = RowRenderContext {
                 theme_signature: self.theme.signature(),
                 font_id: metrics.font_id,
@@ -2710,6 +2720,26 @@ mod history_cache_tests {
         // The blank placeholder was cached before the fetch landed; the real
         // cells must not hit it.
         assert!(cache.get(7, digest_cells(&row("error[E0499]"))).is_none());
+    }
+
+    #[test]
+    fn returning_live_frees_the_table_not_just_its_entries() {
+        let digest = digest_cells(&row("x"));
+        let mut cache = HistoryLineCache::default();
+        cache.validate(key(), 0);
+        for absolute in 0..900 {
+            cache.insert(absolute, digest, ShapedLine::default());
+        }
+        assert!(cache.lines.capacity() >= 900);
+
+        cache.release();
+        assert_eq!(cache.lines.capacity(), 0);
+        assert!(cache.get(1, digest).is_none());
+
+        // Scrolling back again starts from a clean, valid cache.
+        cache.validate(key(), 0);
+        cache.insert(1, digest, ShapedLine::default());
+        assert!(cache.get(1, digest).is_some());
     }
 
     #[test]
