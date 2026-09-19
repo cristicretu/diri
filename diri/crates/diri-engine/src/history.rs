@@ -16,7 +16,7 @@
 //!
 //! Ported from the Swift `HistoryScanner`.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs::{File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
@@ -1104,14 +1104,118 @@ fn codex_indexed_titles(codex_home: &Path, thread_ids: &HashSet<&str>) -> HashMa
     if thread_ids.is_empty() {
         return HashMap::new();
     }
-    read_codex_indexed_titles(codex_home, thread_ids).unwrap_or_default()
+    let path = codex_home.join("session_index.jsonl");
+    let Some(handle) = open_regular_readonly(&path) else {
+        return HashMap::new();
+    };
+    let stamp = handle
+        .metadata()
+        .ok()
+        .and_then(|meta| IndexStamp::of(&meta));
+    let mut cache = CODEX_INDEX_CACHE
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let cached = cache
+        .get(&path)
+        .filter(|cached| Some(&cached.stamp) == stamp.as_ref());
+    if let Some(cached) = cached
+        && thread_ids.iter().all(|id| cached.asked.contains(*id))
+    {
+        return thread_ids
+            .iter()
+            .filter_map(|id| Some(((*id).to_owned(), cached.titles.get(*id)?.clone())))
+            .collect();
+    }
+    // Another caller's threads stay answerable from the same read, so two
+    // callers with different sessions do not evict each other every pass.
+    let mut asked: HashSet<String> = thread_ids.iter().map(|id| (*id).to_owned()).collect();
+    if let Some(cached) = cached
+        && cached.asked.len() + asked.len() <= CODEX_INDEX_CACHE_THREADS
+    {
+        asked.extend(cached.asked.iter().cloned());
+    }
+    let wanted: HashSet<&str> = asked.iter().map(String::as_str).collect();
+    let Some(titles) = read_codex_indexed_titles(handle, &wanted) else {
+        return HashMap::new();
+    };
+    let answer = thread_ids
+        .iter()
+        .filter_map(|id| Some(((*id).to_owned(), titles.get(*id)?.clone())))
+        .collect();
+    if let Some(stamp) = stamp {
+        if cache.len() >= CODEX_INDEX_CACHE_HOMES {
+            cache.clear();
+        }
+        cache.insert(
+            path,
+            CachedCodexIndex {
+                stamp,
+                asked,
+                titles,
+            },
+        );
+    }
+    answer
+}
+
+/// What the last read of each Codex home's title index found.
+///
+/// A live Codex session is asked for its title every second, and an unnamed
+/// one falls through to this index — a 4 MiB read and a line scan to learn,
+/// almost every time, that nothing was appended. The index is append-only, so
+/// an unchanged identity, length and modification time mean an unchanged
+/// answer, and that check is one `fstat` on a handle the trust checks open
+/// anyway.
+static CODEX_INDEX_CACHE: std::sync::Mutex<BTreeMap<PathBuf, CachedCodexIndex>> =
+    std::sync::Mutex::new(BTreeMap::new());
+
+/// One per account profile in practice; the bound is against pathological
+/// churn, not a working set.
+const CODEX_INDEX_CACHE_HOMES: usize = 16;
+const CODEX_INDEX_CACHE_THREADS: usize = 256;
+
+struct CachedCodexIndex {
+    stamp: IndexStamp,
+    /// Every thread the read looked for, including those it did not find: an
+    /// absent title is an answer too.
+    asked: HashSet<String>,
+    titles: HashMap<String, String>,
+}
+
+#[derive(PartialEq, Eq)]
+struct IndexStamp {
+    len: u64,
+    modified: SystemTime,
+    /// Device and inode, so a replaced file of the same size and time is
+    /// still a different file.
+    identity: (u64, u64),
+}
+
+impl IndexStamp {
+    fn of(metadata: &std::fs::Metadata) -> Option<Self> {
+        Some(Self {
+            len: metadata.len(),
+            modified: metadata.modified().ok()?,
+            #[cfg(unix)]
+            identity: (metadata.dev(), metadata.ino()),
+            #[cfg(not(unix))]
+            identity: (0, 0),
+        })
+    }
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Index reads made on this thread, for tests that count them.
+    static CODEX_INDEX_READS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
 fn read_codex_indexed_titles(
-    codex_home: &Path,
+    mut handle: File,
     thread_ids: &HashSet<&str>,
 ) -> Option<HashMap<String, String>> {
-    let mut handle = open_regular_readonly(&codex_home.join("session_index.jsonl"))?;
+    #[cfg(test)]
+    CODEX_INDEX_READS.with(|reads| reads.set(reads.get() + 1));
     let end = handle.seek(SeekFrom::End(0)).ok()?;
     let start = end.saturating_sub(CODEX_INDEX_BYTES as u64);
     handle.seek(SeekFrom::Start(start)).ok()?;
@@ -1570,6 +1674,58 @@ mod tests {
         assert_eq!(entries[0].id, "thread-9");
         assert_eq!(entries[0].kind, HistoryKind::Codex);
         assert_eq!(entries[0].cwd, "/tmp");
+    }
+
+    #[test]
+    fn an_unchanged_codex_index_is_read_once_and_an_append_is_seen() {
+        use std::io::Write as _;
+        let home = tempfile::tempdir().unwrap();
+        let config = home.path().join(".codex");
+        std::fs::create_dir_all(&config).unwrap();
+        let index = config.join("session_index.jsonl");
+        std::fs::write(
+            &index,
+            "{\"id\":\"thread-a\",\"thread_name\":\"First name\"}\n",
+        )
+        .unwrap();
+        let ids: HashSet<&str> = ["thread-a", "thread-b"].into_iter().collect();
+        let reads = || CODEX_INDEX_READS.with(std::cell::Cell::get);
+
+        let before = reads();
+        for _ in 0..60 {
+            let titles = codex_indexed_titles(&config, &ids);
+            assert_eq!(titles["thread-a"], "First name");
+            assert!(!titles.contains_key("thread-b"));
+        }
+        assert_eq!(reads() - before, 1, "sixty refreshes, one read");
+
+        // A subset is answered from the same read.
+        let subset: HashSet<&str> = ["thread-b"].into_iter().collect();
+        assert!(codex_indexed_titles(&config, &subset).is_empty());
+        assert_eq!(reads() - before, 1);
+
+        let mut file = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&index)
+            .unwrap();
+        file.write_all(b"{\"id\":\"thread-b\",\"thread_name\":\"Second name\"}\n")
+            .unwrap();
+        drop(file);
+        let titles = codex_indexed_titles(&config, &ids);
+        assert_eq!(
+            titles["thread-b"], "Second name",
+            "an append is never missed"
+        );
+        assert_eq!(reads() - before, 2);
+
+        // A thread nobody asked about before cannot be answered from cache.
+        let wider: HashSet<&str> = ["thread-a", "thread-c"].into_iter().collect();
+        let titles = codex_indexed_titles(&config, &wider);
+        assert_eq!(titles["thread-a"], "First name");
+        assert_eq!(reads() - before, 3);
+        // …and the earlier callers are still served without another read.
+        codex_indexed_titles(&config, &ids);
+        assert_eq!(reads() - before, 3);
     }
 
     #[test]
