@@ -260,6 +260,17 @@ impl SemanticColors {
         }
     }
 
+    /// Terminal-only tint, preserving the coverage seen before the renderer's
+    /// source-over alpha correction: 95% in dark themes and opaque in light
+    /// themes. Over the 40% dark window fill, 11/12 gives 95% combined coverage.
+    /// Keep other work surfaces and chrome on their existing glass material.
+    pub fn terminal_surface(self) -> Rgba {
+        match self.material {
+            Material::Opaque => self.background,
+            Material::Glass => self.background.alpha(self.glass_alpha(11.0 / 12.0, 1.0)),
+        }
+    }
+
     /// Fill for containers nested inside a work surface. Opaque windows keep
     /// painting the theme background there; under glass the tint is painted
     /// exactly once (by the innermost pane), because stacked translucent

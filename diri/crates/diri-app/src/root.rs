@@ -3155,7 +3155,7 @@ impl RootView {
                     .left(px(0.0))
                     .w_full()
                     .h(px(peek_offset))
-                    .bg(terminal.work_surface()),
+                    .bg(terminal.terminal_surface()),
             );
         }
 
@@ -3369,7 +3369,7 @@ impl RootView {
                         .flex()
                         .items_center()
                         .justify_center()
-                        .bg(terminal.work_surface())
+                        .bg(terminal.terminal_surface())
                         .text_size(px(12.0))
                         .text_color(terminal.secondary)
                         .child("Opening terminal…"),
