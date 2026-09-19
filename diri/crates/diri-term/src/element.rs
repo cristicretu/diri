@@ -384,21 +384,47 @@ impl HistoryLineCache {
 
 #[cfg(test)]
 fn digest_cells(cells: &[GridCell]) -> u64 {
-    digest_row(cells, &[])
+    digest_row(cells, &[], &[])
 }
 
-fn digest_row(cells: &[GridCell], graphemes: &[(u16, String)]) -> u64 {
+fn digest_row(cells: &[GridCell], graphemes: &[(u16, String)], tints: &[Tint]) -> u64 {
     use std::hash::{Hash, Hasher};
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
     cells.hash(&mut hasher);
     graphemes.hash(&mut hasher);
+    for tint in tints {
+        (tint.start, tint.end).hash(&mut hasher);
+        for channel in [tint.color.r, tint.color.g, tint.color.b, tint.color.a] {
+            channel.to_bits().hash(&mut hasher);
+        }
+    }
     hasher.finish()
+}
+
+/// A selection or find overlay across part of one row. It is painted between
+/// the cells' backgrounds and their glyphs, so the glyphs under it are colored
+/// to stay readable against it and a row's shaped line depends on its tints.
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct Tint {
+    start: usize,
+    end: usize,
+    color: gpui::Rgba,
+}
+
+/// The combined overlay above `column`, later tints painted over earlier ones.
+fn tint_at(tints: &[Tint], column: usize) -> Option<gpui::Rgba> {
+    tints
+        .iter()
+        .filter(|tint| (tint.start..tint.end).contains(&column))
+        .map(|tint| tint.color)
+        .reduce(|below, above| crate::contrast::over(above, below))
 }
 
 #[derive(Clone)]
 struct CachedRow {
     cells: Vec<GridCell>,
     graphemes: Vec<(u16, String)>,
+    tints: Vec<Tint>,
     background_quads: Vec<PaintQuad>,
     decoration_quads: Vec<PaintQuad>,
     line: ShapedLine,
@@ -473,6 +499,8 @@ struct CursorPaint {
     row: u16,
     col: u16,
     quad: PaintQuad,
+    /// Color of the glyph or block element drawn inside the cursor.
+    text: gpui::Rgba,
     glyph: Option<ShapedLine>,
     block: Option<BlockGlyph>,
 }
@@ -995,10 +1023,11 @@ impl TerminalElement {
         &self,
         row: &[GridCell],
         graphemes: &[(u16, String)],
+        tints: &[Tint],
         metrics: CellMetrics,
         window: &mut Window,
     ) -> ShapedLine {
-        let (text, runs) = self.row_text_and_runs(row, graphemes);
+        let (text, runs) = self.row_text_and_runs(row, graphemes, tints);
         window.text_system().shape_line(
             SharedString::from(text),
             self.font_size,
@@ -1007,10 +1036,12 @@ impl TerminalElement {
         )
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn prepare_row(
         &self,
         cells: Vec<GridCell>,
         graphemes: Vec<(u16, String)>,
+        tints: Vec<Tint>,
         row: u16,
         origin: Point<Pixels>,
         metrics: CellMetrics,
@@ -1024,13 +1055,15 @@ impl TerminalElement {
             origin,
             metrics,
             self.theme,
+            &tints,
             &mut background_quads,
             &mut decoration_quads,
         );
-        let line = self.shape_row(&cells, &graphemes, metrics, window);
+        let line = self.shape_row(&cells, &graphemes, &tints, metrics, window);
         CachedRow {
             cells,
             graphemes,
+            tints,
             background_quads,
             decoration_quads,
             line,
@@ -1069,6 +1102,7 @@ impl TerminalElement {
         &self,
         row: &[GridCell],
         graphemes: &[(u16, String)],
+        tints: &[Tint],
     ) -> (String, Vec<TextRun>) {
         let row = &row[..self.shaped_cells(row, graphemes)];
         let mut text = String::with_capacity(row.len());
@@ -1076,7 +1110,7 @@ impl TerminalElement {
 
         let mut graphemes = graphemes.iter().peekable();
         for (column, cell) in row.iter().enumerate() {
-            let resolved = self.theme.resolve_cell(*cell);
+            let resolved = self.theme.resolve_cell_under(*cell, tint_at(tints, column));
             let ch = render_char(*cell, resolved.visible);
             let mut byte_len = ch.len_utf8();
             text.push(ch);
@@ -1118,6 +1152,7 @@ impl TerminalElement {
     fn shape_cursor_glyph(
         &self,
         cell: GridCell,
+        color: gpui::Rgba,
         combining: &str,
         metrics: CellMetrics,
         window: &mut Window,
@@ -1131,7 +1166,7 @@ impl TerminalElement {
         let run = TextRun {
             len: text.len(),
             font: styled_font(&self.font, resolved),
-            color: self.theme.cursor_text.into(),
+            color: color.into(),
             background_color: None,
             underline: None,
             strikethrough: None,
@@ -1303,6 +1338,65 @@ impl Element for TerminalElement {
         let cache_misses;
         let mut paint_from_cache = false;
 
+        // Tints are gathered before any row is shaped: a glyph under a
+        // selection or find highlight is colored to stay readable against it.
+        let selection =
+            mutex_lock(&self.shared.selection).visible_spans(&viewport, visible_rows, visible_cols);
+        let mut row_tints = vec![Vec::new(); visible_rows];
+        for span in &selection {
+            if let Some(tints) = row_tints.get_mut(span.row) {
+                tints.push(Tint {
+                    start: span.start_col,
+                    end: span.end_col_exclusive,
+                    color: self.theme.selection,
+                });
+            }
+        }
+        {
+            let buffer = read_lock(&self.buffer);
+            let mut highlights = mutex_lock(&self.shared.find_highlights);
+            if let Some((source, matches, current)) = &highlights.retained {
+                let pinned = viewport.has_find_source(source);
+                let top = if pinned {
+                    viewport.absolute_row(0)
+                } else {
+                    source.live_start_row
+                };
+                highlights.spans = matches
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(index, item)| {
+                        if !pinned
+                            && (!source.matches_live_row(item.absolute_row, &buffer)
+                                || viewport.is_reading())
+                        {
+                            return None;
+                        }
+                        let row = usize::try_from(item.absolute_row.checked_sub(top)?).ok()?;
+                        (row < visible_rows).then_some(FindSpan {
+                            row,
+                            start_col: item.start_col,
+                            end_col_exclusive: item.end_col_exclusive,
+                            is_current: index == *current,
+                        })
+                    })
+                    .collect();
+            }
+            for span in &highlights.spans {
+                if let Some(tints) = row_tints.get_mut(span.row) {
+                    tints.push(Tint {
+                        start: span.start_col,
+                        end: span.end_col_exclusive,
+                        color: if span.is_current {
+                            self.theme.find_match_current
+                        } else {
+                            self.theme.find_match
+                        },
+                    });
+                }
+            }
+        }
+
         if viewport.is_reading() {
             // History browsing composes owned rows per frame; quads are cheap
             // arithmetic, but shaping is not, so shaped lines are reused from
@@ -1322,7 +1416,7 @@ impl Element for TerminalElement {
             history.validate(key, viewport.absolute_row(0));
             let mut hits = 0u64;
             let mut cells = Vec::with_capacity(usize::from(grid_cols));
-            for row_index in 0..visible_rows {
+            for (row_index, tints) in row_tints.iter().enumerate() {
                 let absolute = viewport.absolute_row(row_index);
                 viewport.window_row_into(&buffer, row_index, &mut cells);
                 cells.truncate(visible_cols);
@@ -1332,11 +1426,12 @@ impl Element for TerminalElement {
                     bounds.origin,
                     metrics,
                     self.theme,
+                    tints,
                     &mut background_quads,
                     &mut decoration_quads,
                 );
                 let graphemes = viewport.row_graphemes(&buffer, absolute);
-                let digest = digest_row(&cells, graphemes);
+                let digest = digest_row(&cells, graphemes, tints);
                 if history.get(absolute, digest).is_some() {
                     hits += 1;
                 } else {
@@ -1346,7 +1441,7 @@ impl Element for TerminalElement {
                     // the fetch lands. The same holds for the held live rows
                     // under the history, which used to be reshaped and copied
                     // every frame.
-                    let line = self.shape_row(&cells, graphemes, metrics, window);
+                    let line = self.shape_row(&cells, graphemes, tints, metrics, window);
                     history.insert(absolute, digest, line);
                 }
                 lines.push((row_index as u16, absolute));
@@ -1396,6 +1491,7 @@ impl Element for TerminalElement {
                     && let Some(prepared) = cache[changed.row].as_mut()
                     && prepared.cells == changed.cells
                     && prepared.graphemes == changed.graphemes
+                    && prepared.tints == row_tints[changed.row]
                 {
                     // Shapes are independent of row position. Backgrounds and
                     // decorations carry absolute bounds and must move with it.
@@ -1409,7 +1505,29 @@ impl Element for TerminalElement {
                 cache[changed.row] = Some(self.prepare_row(
                     changed.cells,
                     changed.graphemes,
+                    row_tints[changed.row].clone(),
                     changed.row as u16,
+                    bounds.origin,
+                    metrics,
+                    window,
+                ));
+            }
+            // A selection drag or find step changes tints on rows whose cells
+            // did not change; only those rows are prepared again.
+            for (row, tints) in row_tints.into_iter().enumerate() {
+                let Some(prepared) = cache[row].as_ref() else {
+                    continue;
+                };
+                if prepared.tints == tints {
+                    continue;
+                }
+                misses += 1;
+                let (cells, graphemes) = (prepared.cells.clone(), prepared.graphemes.clone());
+                cache[row] = Some(self.prepare_row(
+                    cells,
+                    graphemes,
+                    tints,
+                    row as u16,
                     bounds.origin,
                     metrics,
                     window,
@@ -1424,8 +1542,6 @@ impl Element for TerminalElement {
             paint_from_cache = true;
         }
 
-        let selection =
-            mutex_lock(&self.shared.selection).visible_spans(&viewport, visible_rows, visible_cols);
         for span in selection {
             append_overlay_quad(
                 span.row,
@@ -1459,36 +1575,7 @@ impl Element for TerminalElement {
                 ));
             }
         }
-        let buffer = read_lock(&self.buffer);
         let mut highlights = mutex_lock(&self.shared.find_highlights);
-        if let Some((source, matches, current)) = &highlights.retained {
-            let pinned = viewport.has_find_source(source);
-            let top = if pinned {
-                viewport.absolute_row(0)
-            } else {
-                source.live_start_row
-            };
-            highlights.spans = matches
-                .iter()
-                .enumerate()
-                .filter_map(|(index, item)| {
-                    if !pinned
-                        && (!source.matches_live_row(item.absolute_row, &buffer)
-                            || viewport.is_reading())
-                    {
-                        return None;
-                    }
-                    let row = usize::try_from(item.absolute_row.checked_sub(top)?).ok()?;
-                    (row < visible_rows).then_some(FindSpan {
-                        row,
-                        start_col: item.start_col,
-                        end_col_exclusive: item.end_col_exclusive,
-                        is_current: index == *current,
-                    })
-                })
-                .collect();
-        }
-        drop(buffer);
         highlights.current_bounds = highlights.spans.iter().find_map(|span| {
             if !span.is_current || span.row >= visible_rows {
                 return None;
@@ -1542,15 +1629,21 @@ impl Element for TerminalElement {
                 bounds.left() + metrics.x_for_col(cursor.col),
                 bounds.top() + metrics.y_for_row(cursor.row),
             );
+            let cursor_tint = cache[usize::from(cursor.row)]
+                .as_ref()
+                .and_then(|row| tint_at(&row.tints, usize::from(cursor.col)));
+            let (cursor_fill, cursor_text) = self.theme.cursor_colors(cell, cursor_tint);
             Some(CursorPaint {
                 row: cursor.row,
                 col: cursor.col,
                 quad: fill(
                     Bounds::new(origin, size(metrics.cell_width, metrics.line_height)),
-                    self.theme.cursor,
+                    cursor_fill,
                 ),
+                text: cursor_text,
                 glyph: self.shape_cursor_glyph(
                     cell,
+                    cursor_text,
                     cache[usize::from(cursor.row)]
                         .as_ref()
                         .and_then(|row| row.graphemes.iter().find(|(col, _)| *col == cursor.col))
@@ -1749,7 +1842,7 @@ impl Element for TerminalElement {
                         usize::from(cursor.col),
                         cursor.row,
                     ) {
-                        window.paint_quad(fill(rect, self.theme.cursor_text));
+                        window.paint_quad(fill(rect, cursor.text));
                     }
                 }
                 if let Some(glyph) = cursor.glyph {
@@ -1828,12 +1921,14 @@ fn append_background_quads(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn append_row_quads(
     row: &[GridCell],
     row_index: u16,
     origin: Point<Pixels>,
     metrics: CellMetrics,
     theme: TermTheme,
+    tints: &[Tint],
     background_quads: &mut Vec<PaintQuad>,
     decoration_quads: &mut Vec<PaintQuad>,
 ) {
@@ -1863,7 +1958,7 @@ fn append_row_quads(
         let Some(block) = BlockGlyph::from_scalar(cell.scalar) else {
             continue;
         };
-        let style = theme.resolve_cell(cell);
+        let style = theme.resolve_cell_under(cell, tint_at(tints, start));
         if !style.visible {
             continue;
         }
@@ -1873,13 +1968,13 @@ fn append_row_quads(
         {
             // A progress bar is one block repeated; paint the run as one quad
             // for as long as that is provably the same pixels.
-            let continues = |next: &GridCell| {
-                let next_style = theme.resolve_cell(*next);
+            let continues = |(next, column): (&GridCell, usize)| {
+                let next_style = theme.resolve_cell_under(*next, tint_at(tints, column));
                 next.scalar == cell.scalar
                     && next_style.visible
                     && next_style.foreground == style.foreground
             };
-            while row.get(col).is_some_and(continues)
+            while row.get(col).map(|next| (next, col)).is_some_and(continues)
                 && let Some(joined) = block
                     .rectangles(origin, metrics, col, row_index)
                     .next()
@@ -1893,7 +1988,15 @@ fn append_row_quads(
             decoration_quads.extend(rectangles.map(|bounds| fill(bounds, style.foreground)));
         }
     }
-    append_decoration_quads(row, row_index, origin, metrics, theme, decoration_quads);
+    append_decoration_quads(
+        row,
+        row_index,
+        origin,
+        metrics,
+        theme,
+        tints,
+        decoration_quads,
+    );
 }
 
 fn append_decoration_quads(
@@ -1902,18 +2005,19 @@ fn append_decoration_quads(
     origin: Point<Pixels>,
     metrics: CellMetrics,
     theme: TermTheme,
+    tints: &[Tint],
     quads: &mut Vec<PaintQuad>,
 ) {
     let mut col = 0;
     while col < row.len() {
-        let style = theme.resolve_cell(row[col]);
+        let style = theme.resolve_cell_under(row[col], tint_at(tints, col));
         if !style.underline && !style.strikethrough {
             col += 1;
             continue;
         }
         let mut end = col + 1;
         while end < row.len() {
-            let next = theme.resolve_cell(row[end]);
+            let next = theme.resolve_cell_under(row[end], tint_at(tints, end));
             if next.foreground != style.foreground
                 || next.underline != style.underline
                 || next.strikethrough != style.strikethrough
@@ -2331,6 +2435,7 @@ mod block_tests {
                 point(px(2.0), px(3.0)),
                 metrics,
                 TermTheme::default(),
+                &[],
                 &mut backgrounds,
                 &mut foregrounds,
             );
@@ -2349,6 +2454,7 @@ mod block_tests {
                     cell,
                     GridCell::new('A' as u32, cell.fg, cell.bg, cell.style),
                 ],
+                &[],
                 &[],
             );
             assert_eq!(
@@ -2385,6 +2491,7 @@ mod block_tests {
             point(px(0.0), px(0.0)),
             metrics,
             TermTheme::DIRIJOR_DARK,
+            &[],
             &mut backgrounds,
             &mut foregrounds,
         );
@@ -2422,6 +2529,7 @@ mod block_tests {
                     Point::default(),
                     metrics,
                     theme,
+                    &[],
                     &mut backgrounds,
                     &mut foregrounds,
                 );
@@ -2793,15 +2901,15 @@ mod history_cache_tests {
         let cells = row("e");
         let mut cache = HistoryLineCache::default();
         cache.validate(key(), 0);
-        let original = digest_row(&cells, &[(0, "\u{301}".into())]);
+        let original = digest_row(&cells, &[(0, "\u{301}".into())], &[]);
         cache.insert(3, original, ShapedLine::default());
         assert!(cache.get(3, original).is_some());
         assert!(
             cache
-                .get(3, digest_row(&cells, &[(0, "\u{308}".into())]))
+                .get(3, digest_row(&cells, &[(0, "\u{308}".into())], &[]))
                 .is_none()
         );
-        assert!(cache.get(3, digest_row(&cells, &[])).is_none());
+        assert!(cache.get(3, digest_row(&cells, &[], &[])).is_none());
     }
 
     fn key() -> HistoryShapeKey {
@@ -2819,7 +2927,7 @@ mod history_cache_tests {
             .map(|ch| {
                 GridCell::new(
                     u32::from(ch),
-                    TermColor::Default,
+                    diri_proto::grid::TermColor::Default,
                     TermColor::DefaultInverted,
                     TermStyle::empty(),
                 )
@@ -3274,6 +3382,7 @@ mod live_scroll_cache_tests {
                 Some(CachedRow {
                     cells: cells(ch),
                     graphemes: Vec::new(),
+                    tints: Vec::new(),
                     background_quads: vec![fill(
                         Bounds::new(point(px(3.), px(row as f32 * 20.)), size(px(80.), px(20.))),
                         gpui::black(),
@@ -3364,14 +3473,80 @@ mod grapheme_paint_tests {
         grid.apply(parser.full_snapshot());
         let terminal = TerminalElement::with_buffer(grid.clone());
         let (text, runs) =
-            terminal.row_text_and_runs(grid.row(0).unwrap(), &grid.annotations[0].graphemes);
+            terminal.row_text_and_runs(grid.row(0).unwrap(), &grid.annotations[0].graphemes, &[]);
         assert!(text.starts_with("e\u{301} A🙂 B"));
         assert_eq!(runs.iter().map(|run| run.len).sum::<usize>(), text.len());
         grid.cells[0].style = TermStyle::INVISIBLE;
         let (hidden, _) =
-            terminal.row_text_and_runs(grid.row(0).unwrap(), &grid.annotations[0].graphemes);
+            terminal.row_text_and_runs(grid.row(0).unwrap(), &grid.annotations[0].graphemes, &[]);
         assert!(!hidden.contains('\u{301}'));
         assert!(hidden.starts_with(' '));
+    }
+
+    #[test]
+    fn glyphs_under_a_tint_are_colored_against_it_and_the_rest_are_not() {
+        // Light text on the bright current-match highlight of a dark theme is
+        // the unreadable case: 2.6:1 on Dirijor Dark, 1.0:1 on Solarized Dark.
+        let theme = TermTheme::SOLARIZED_DARK;
+        let terminal = TerminalElement::with_buffer(GridBuffer::default()).theme(theme);
+        let row: Vec<_> = "find me here"
+            .chars()
+            .map(|ch| {
+                GridCell::new(
+                    u32::from(ch),
+                    diri_proto::grid::TermColor::Default,
+                    diri_proto::grid::TermColor::Default,
+                    TermStyle::empty(),
+                )
+            })
+            .collect();
+        let tints = [Tint {
+            start: 5,
+            end: 7,
+            color: theme.find_match_current,
+        }];
+
+        let (_, plain) = terminal.row_text_and_runs(&row, &[], &[]);
+        assert_eq!(plain.len(), 1);
+
+        let (_, runs) = terminal.row_text_and_runs(&row, &[], &tints);
+        assert_eq!(
+            runs.iter().map(|run| run.len).collect::<Vec<_>>(),
+            [5, 2, 5],
+            "only the glyphs under the tint change run"
+        );
+        assert_eq!(runs[0].color, plain[0].color);
+        assert_eq!(runs[2].color, plain[0].color);
+        assert_ne!(runs[1].color, plain[0].color);
+
+        assert_ne!(
+            digest_row(&row, &[], &tints),
+            digest_row(&row, &[], &[]),
+            "a history line shaped without the tint must not be reused under it"
+        );
+    }
+
+    #[test]
+    fn overlapping_tints_combine_and_columns_outside_have_none() {
+        let selection = Tint {
+            start: 2,
+            end: 6,
+            color: TermTheme::DIRIJOR_DARK.selection,
+        };
+        let find = Tint {
+            start: 4,
+            end: 8,
+            color: TermTheme::DIRIJOR_DARK.find_match,
+        };
+        let tints = [selection, find];
+        assert_eq!(tint_at(&tints, 1), None);
+        assert_eq!(tint_at(&tints, 2), Some(selection.color));
+        assert_eq!(tint_at(&tints, 7), Some(find.color));
+        assert_eq!(
+            tint_at(&tints, 5),
+            Some(crate::contrast::over(find.color, selection.color))
+        );
+        assert_eq!(tint_at(&tints, 8), None);
     }
 
     #[test]
@@ -3386,7 +3561,7 @@ mod grapheme_paint_tests {
                 .collect();
             row.resize(12, GridCell::BLANK);
             TerminalElement::with_buffer(GridBuffer::default())
-                .row_text_and_runs(&row, graphemes)
+                .row_text_and_runs(&row, graphemes, &[])
                 .0
         };
         assert_eq!(shaped("ab  c", &[]), "ab  c ");
@@ -3424,7 +3599,7 @@ mod grapheme_paint_tests {
         let changed = &damage.changed_rows[0];
         assert!(
             terminal
-                .row_text_and_runs(&changed.cells, &changed.graphemes)
+                .row_text_and_runs(&changed.cells, &changed.graphemes, &[])
                 .0
                 .starts_with("e\u{301}")
         );
