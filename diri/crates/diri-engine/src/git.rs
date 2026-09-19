@@ -474,23 +474,40 @@ pub fn working_diff(
     base: Option<&diri_proto::SessionDiffBase>,
 ) -> std::io::Result<diri_proto::SessionReadDiffResult> {
     let input = working_diff_input(&cwd.to_string_lossy(), base)?;
-    let mut child = Command::new("/bin/sh")
+    let child = Command::new("/bin/sh")
         .args(["-c", WORKING_DIFF_SCRIPT])
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()?;
-    use std::io::Write as _;
-    child
-        .stdin
-        .take()
-        .ok_or_else(|| std::io::Error::other("git diff stdin is unavailable"))?
-        .write_all(&input)?;
-    let output = child.wait_with_output()?;
+    let output = feed_and_collect(child, &input)?;
     if !output.status.success() {
         return Err(diff_failure(&output.stderr));
     }
     parse_working_diff(output.stdout)
+}
+
+/// Writes `input` to the child's stdin, closes it, and collects the output.
+///
+/// A child that stops reading fails the write, and returning there would drop
+/// a process nobody ever waits for: still running, then a zombie for as long
+/// as the Engine lives. It is killed and reaped before the error goes back.
+fn feed_and_collect(
+    mut child: std::process::Child,
+    input: &[u8],
+) -> std::io::Result<std::process::Output> {
+    use std::io::Write as _;
+    let written = child
+        .stdin
+        .take()
+        .ok_or_else(|| std::io::Error::other("git diff stdin is unavailable"))
+        .and_then(|mut stdin| stdin.write_all(input));
+    if let Err(error) = written {
+        let _ = child.kill();
+        let _ = child.wait();
+        return Err(error);
+    }
+    child.wait_with_output()
 }
 
 pub fn working_diff_remote(
@@ -575,6 +592,26 @@ fn diff_failure(stderr: &[u8]) -> std::io::Error {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn a_child_that_stops_reading_is_reaped_before_the_error_returns() {
+        // Closes stdin and lingers, so the write fails while it still runs.
+        let child = Command::new("/bin/sh")
+            .args(["-c", "exec <&-; sleep 30"])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let pid = child.id() as i32;
+        // Larger than any pipe buffer: the write cannot complete unread.
+        let input = vec![b'x'; 4 << 20];
+        assert!(feed_and_collect(child, &input).is_err());
+        // A zombie still answers signal 0; only a reaped pid is gone.
+        // SAFETY: existence probe of a pid this test owned.
+        assert_eq!(unsafe { libc::kill(pid, 0) }, -1);
+    }
 
     fn main_and_feature_repo() -> (tempfile::TempDir, PathBuf) {
         let temp = tempfile::tempdir().unwrap();

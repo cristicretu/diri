@@ -43,6 +43,9 @@ struct PoolInner {
     last_activity: Instant,
     open_browser_sessions: HashSet<String>,
     idle_sweeper_running: bool,
+    /// Which launch `child` and `stdin` belong to. A reader thread outlives
+    /// the sidecar it was started for, and must not clear its successor's.
+    incarnation: u64,
 }
 
 impl BrowserPool {
@@ -57,6 +60,7 @@ impl BrowserPool {
                     last_activity: Instant::now(),
                     open_browser_sessions: HashSet::new(),
                     idle_sweeper_running: false,
+                    incarnation: 0,
                 }),
             }),
             artifact_dir: logs_dir.join("test-artifacts"),
@@ -114,7 +118,7 @@ impl BrowserPool {
         params: Value,
         timeout: Option<Duration>,
     ) -> Result<Value, String> {
-        let receiver = {
+        let (id, receiver) = {
             let mut inner = self.shared.inner.lock().expect("pool");
             self.ensure_running(&mut inner)?;
             inner.last_activity = Instant::now();
@@ -137,19 +141,30 @@ impl BrowserPool {
                 inner.pending.remove(&id);
                 return Err(format!("sidecar write failed: {error}"));
             }
-            receiver
+            (id, receiver)
         };
         match receiver.recv_timeout(timeout.unwrap_or(REQUEST_TIMEOUT)) {
             Ok(result) => result,
-            Err(_) => Err("sidecar timed out".into()),
+            Err(_) => {
+                // Nobody is waiting any more. Left in place, the entry makes
+                // the pool look busy for ever, and the idle sweep would never
+                // reclaim the sidecar that just proved itself wedged.
+                forget_request(&self.shared, id);
+                Err("sidecar timed out".into())
+            }
         }
     }
 
     fn ensure_running(&self, inner: &mut PoolInner) -> Result<(), String> {
-        if let Some(child) = inner.child.as_mut()
-            && child.try_wait().ok().flatten().is_none()
-        {
-            return Ok(());
+        if let Some(child) = inner.child.as_mut() {
+            if child.try_wait().ok().flatten().is_none() {
+                return Ok(());
+            }
+            // That wait reaped it, so its pid is free to be reused. Let go of
+            // the handle now: every other path that finds one here signals its
+            // process group, which is only safe while the pid is still ours.
+            inner.child = None;
+            inner.stdin = None;
         }
         let node =
             resolve_node().ok_or("node not found on PATH — install Node.js to use test_run")?;
@@ -179,6 +194,8 @@ impl BrowserPool {
             .map_err(|error| format!("failed to launch sidecar: {error}"))?;
         inner.stdin = child.stdin.take();
         let stdout = child.stdout.take();
+        inner.incarnation += 1;
+        let incarnation = inner.incarnation;
 
         // Route each response line to its waiting request.
         if let Some(stdout) = stdout {
@@ -208,15 +225,8 @@ impl BrowserPool {
                             let _ = sender.send(outcome);
                         }
                     }
-                    // Sidecar gone: fail whatever was still waiting.
-                    if let Some(pool) = pool.upgrade()
-                        && let Ok(mut inner) = pool.inner.lock()
-                    {
-                        for (_, sender) in inner.pending.drain() {
-                            let _ = sender.send(Err("sidecar exited".into()));
-                        }
-                        inner.child = None;
-                        inner.stdin = None;
+                    if let Some(pool) = pool.upgrade() {
+                        sidecar_gone(&pool, incarnation);
                     }
                 });
         }
@@ -262,6 +272,40 @@ impl Drop for PoolShared {
         if let Ok(inner) = self.inner.get_mut() {
             terminate_sidecar(inner, "browser pool dropped");
         }
+    }
+}
+
+fn forget_request(pool: &PoolShared, id: u64) {
+    if let Ok(mut inner) = pool.inner.lock() {
+        inner.pending.remove(&id);
+    }
+}
+
+/// The reader for launch `incarnation` reached the end of the sidecar's
+/// output: fail whatever was still waiting on it, and reap it.
+///
+/// Forgetting the child is not enough — an exited process nobody waits for is
+/// a zombie for the rest of the Engine's life, and the browsers it started
+/// share its group. A later launch may already have replaced it (a recycle
+/// closes the old pipe and a request can relaunch before this thread sees the
+/// end of it), in which case that launch's state is not this thread's to touch.
+fn sidecar_gone(pool: &PoolShared, incarnation: u64) {
+    let child = {
+        let Ok(mut inner) = pool.inner.lock() else {
+            return;
+        };
+        if inner.incarnation != incarnation {
+            return;
+        }
+        for (_, sender) in inner.pending.drain() {
+            let _ = sender.send(Err("sidecar exited".into()));
+        }
+        inner.stdin = None;
+        inner.child.take()
+    };
+    // Off the lock: the group gets up to half a second to go quietly.
+    if let Some(mut child) = child {
+        terminate_child_group(&mut child);
     }
 }
 
@@ -428,6 +472,62 @@ mod tests {
         assert!(receiver.recv().expect("shutdown result").is_err());
         pool.shutdown();
         assert!(pool.shared.inner.lock().expect("pool").child.is_none());
+    }
+
+    #[cfg(unix)]
+    fn exited_fixture() -> Child {
+        use std::os::unix::process::CommandExt as _;
+        let child = Command::new("true")
+            .process_group(0)
+            .spawn()
+            .expect("sidecar fixture");
+        // Let it exit without reaping it: this is the zombie the reader left.
+        std::thread::sleep(Duration::from_millis(100));
+        child
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_sidecar_that_exits_is_reaped_and_a_stale_reader_spares_its_successor() {
+        let temp = tempfile::tempdir().expect("temp");
+        let pool = BrowserPool::new(temp.path());
+        let first = exited_fixture();
+        let first_pid = first.id() as i32;
+        {
+            let mut inner = pool.shared.inner.lock().expect("pool");
+            inner.child = Some(first);
+            inner.incarnation = 1;
+        }
+        // SAFETY: existence probes of pids this test owns.
+        assert_eq!(
+            unsafe { libc::kill(first_pid, 0) },
+            0,
+            "a zombie until reaped"
+        );
+        sidecar_gone(&pool.shared, 1);
+        assert_eq!(unsafe { libc::kill(first_pid, 0) }, -1, "reaped");
+        assert!(pool.shared.inner.lock().expect("pool").child.is_none());
+
+        // The first launch's reader arriving late must not touch the second.
+        let (sender, receiver) = mpsc::channel();
+        {
+            let mut inner = pool.shared.inner.lock().expect("pool");
+            inner.child = Some(exited_fixture());
+            inner.incarnation = 2;
+            inner.pending.insert(7, sender);
+        }
+        sidecar_gone(&pool.shared, 1);
+        {
+            let inner = pool.shared.inner.lock().expect("pool");
+            assert!(inner.child.is_some());
+            assert!(inner.pending.contains_key(&7));
+        }
+        assert!(receiver.try_recv().is_err(), "its requests were not failed");
+
+        // A request that gave up waiting leaves nothing behind.
+        forget_request(&pool.shared, 7);
+        assert!(pool.shared.inner.lock().expect("pool").pending.is_empty());
+        pool.shutdown();
     }
 
     #[cfg(unix)]

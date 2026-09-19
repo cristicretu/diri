@@ -152,26 +152,57 @@ fn security(args: &[&str], stdin: Option<&str>) -> Result<(i32, String), Control
     let mut child = command.spawn().map_err(|_| failure())?;
     if let Some(input) = stdin
         && let Some(mut pipe) = child.stdin.take()
+        && pipe.write_all(input.as_bytes()).is_err()
     {
-        pipe.write_all(input.as_bytes()).map_err(|_| failure())?;
+        drop(pipe);
+        kill_and_reap(&mut child);
+        return Err(failure());
     }
     let deadline = Instant::now() + Duration::from_secs(8);
-    loop {
-        if let Some(status) = child.try_wait().map_err(|_| failure())? {
+    match wait_until(&mut child, deadline, Duration::from_millis(25)) {
+        Ok(Some(status)) => {
             let mut out = String::new();
             if let Some(mut stdout) = child.stdout.take() {
                 let _ = stdout.read_to_string(&mut out);
             }
-            return Ok((status.code().unwrap_or(1), out));
+            Ok((status.code().unwrap_or(1), out))
         }
-        if Instant::now() > deadline {
-            let _ = child.kill();
-            return Err(ControlError::bad_request(
-                "The Keychain did not answer. Unlock the login keychain and retry.",
-            ));
-        }
-        std::thread::sleep(Duration::from_millis(25));
+        Ok(None) => Err(ControlError::bad_request(
+            "The Keychain did not answer. Unlock the login keychain and retry.",
+        )),
+        Err(_) => Err(failure()),
     }
+}
+
+/// Waits for `child` until `deadline`. `Ok(None)` is a timeout.
+///
+/// Whatever the outcome, the child has been reaped by the time this returns:
+/// the Engine lives for days, and a helper that was killed but never waited
+/// for stays in the process table as a zombie for all of them.
+fn wait_until(
+    child: &mut std::process::Child,
+    deadline: Instant,
+    poll: Duration,
+) -> std::io::Result<Option<std::process::ExitStatus>> {
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => return Ok(Some(status)),
+            Ok(None) if Instant::now() > deadline => {
+                kill_and_reap(child);
+                return Ok(None);
+            }
+            Ok(None) => std::thread::sleep(poll),
+            Err(error) => {
+                kill_and_reap(child);
+                return Err(error);
+            }
+        }
+    }
+}
+
+fn kill_and_reap(child: &mut std::process::Child) {
+    let _ = child.kill();
+    let _ = child.wait();
 }
 
 /// Whether `store` holds a login, without reading any secret. Claude Code
@@ -639,16 +670,7 @@ impl ControlServer {
             .spawn()
             .ok()?;
         let deadline = Instant::now() + Duration::from_secs(10);
-        let status = loop {
-            if let Some(status) = child.try_wait().ok()? {
-                break status;
-            }
-            if Instant::now() > deadline {
-                let _ = child.kill();
-                return None;
-            }
-            std::thread::sleep(Duration::from_millis(50));
-        };
+        let status = wait_until(&mut child, deadline, Duration::from_millis(50)).ok()??;
         if !status.success() {
             return None;
         }
@@ -683,6 +705,22 @@ impl ControlServer {
 mod tests {
     use super::*;
     use std::os::unix::fs::PermissionsExt;
+
+    #[test]
+    fn a_helper_that_outlives_its_deadline_is_killed_and_reaped() {
+        let mut child = Command::new("/bin/sleep")
+            .arg("30")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .spawn()
+            .unwrap();
+        let pid = child.id() as i32;
+        let waited = wait_until(&mut child, Instant::now(), Duration::from_millis(5));
+        assert!(matches!(waited, Ok(None)), "a timeout, not a status");
+        // A zombie still answers signal 0; only a reaped pid is gone.
+        // SAFETY: existence probe of a pid this test owned.
+        assert_eq!(unsafe { libc::kill(pid, 0) }, -1, "the child was reaped");
+    }
 
     #[test]
     fn keychain_service_matches_claude_derivation() {
