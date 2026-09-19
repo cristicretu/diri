@@ -398,6 +398,19 @@ impl WorkspaceWorkbench {
             .collect()
     }
     #[cfg(all(test, target_os = "macos"))]
+    pub(crate) fn seed_pane_grids_for_test(
+        &self,
+        grid: &diri_term::buffer::GridBuffer,
+        cx: &mut Context<Self>,
+    ) {
+        for pane in self.mounted.values() {
+            pane.terminal.update(cx, |terminal, cx| {
+                terminal.seed_preview_grid_for_test(grid.clone(), cx)
+            });
+        }
+    }
+
+    #[cfg(all(test, target_os = "macos"))]
     pub(crate) fn seed_panes_for_test(&self, cx: &mut Context<Self>) {
         let mut seeded = HashSet::new();
         for pane in self.mounted.values() {

@@ -140,6 +140,11 @@ pub struct SemanticColors {
     sidebar_surface: Rgba,
     floating_surface: Rgba,
     material: Material,
+    /// How far the palette is from dark (0) to light (1). Every real theme
+    /// sits at an end. A fade between a dark and a light theme passes through
+    /// the middle, and the values that differ by appearance travel with it
+    /// instead of switching sides on one frame.
+    lightness: f32,
 }
 
 impl SemanticColors {
@@ -154,6 +159,7 @@ impl SemanticColors {
             sidebar_surface: rgba_f32(0.949, 0.953, 0.941, 0.89),
             floating_surface: rgba_f32(0.949, 0.953, 0.941, 1.0),
             material: Material::Opaque,
+            lightness: 1.0,
         }
     }
 
@@ -168,6 +174,7 @@ impl SemanticColors {
             sidebar_surface: rgba_f32(0.141, 0.161, 0.196, 0.89),
             floating_surface: rgba_f32(0.141, 0.161, 0.196, 1.0),
             material: Material::Opaque,
+            lightness: 0.0,
         }
     }
 
@@ -220,7 +227,41 @@ impl SemanticColors {
             sidebar_surface,
             floating_surface,
             material: Material::Opaque,
+            lightness: match appearance {
+                Appearance::Dark => 0.0,
+                Appearance::Light => 1.0,
+            },
         }
+    }
+
+    /// Places the palette between dark and light while a theme fade crosses
+    /// from one to the other. `appearance` follows the nearer end.
+    pub const fn with_lightness(mut self, lightness: f32) -> Self {
+        self.lightness = lightness.clamp(0.0, 1.0);
+        self.appearance = if self.lightness < 0.5 {
+            Appearance::Dark
+        } else {
+            Appearance::Light
+        };
+        self
+    }
+
+    /// `dark` or `light` exactly at the ends, so a settled theme paints the
+    /// authored constant; in proportion in between.
+    const fn between(self, dark: Rgba, light: Rgba) -> Rgba {
+        let t = self.lightness;
+        if t <= 0.0 {
+            return dark;
+        }
+        if t >= 1.0 {
+            return light;
+        }
+        rgba_f32(
+            dark.r + (light.r - dark.r) * t,
+            dark.g + (light.g - dark.g) * t,
+            dark.b + (light.b - dark.b) * t,
+            dark.a + (light.a - dark.a) * t,
+        )
     }
 
     /// Chooses how translucent every surface paints. Glass only changes the
@@ -235,10 +276,11 @@ impl SemanticColors {
     }
 
     fn glass_alpha(self, dark: f32, light: f32) -> f32 {
-        match self.appearance {
-            Appearance::Dark => dark,
-            Appearance::Light => light,
-        }
+        self.between(
+            rgba_f32(0.0, 0.0, 0.0, dark),
+            rgba_f32(0.0, 0.0, 0.0, light),
+        )
+        .a
     }
 
     /// The window's own fill: the base every panel composes over. Under glass
@@ -302,10 +344,9 @@ impl SemanticColors {
     pub const fn floating_stroke(self) -> Rgba {
         match self.material {
             Material::Glass => Glass::stroke(self),
-            Material::Opaque => match self.appearance {
-                Appearance::Dark => rgba_f32(1.0, 1.0, 1.0, 0.08),
-                Appearance::Light => rgba_f32(0.0, 0.0, 0.0, 0.10),
-            },
+            Material::Opaque => {
+                self.between(rgba_f32(1.0, 1.0, 1.0, 0.08), rgba_f32(0.0, 0.0, 0.0, 0.10))
+            }
         }
     }
 
@@ -313,10 +354,10 @@ impl SemanticColors {
     /// It follows the active theme's foreground hue and stays quieter than a
     /// floating menu outline because the panel already has tonal separation.
     pub const fn sidebar_stroke(self) -> Rgba {
-        match self.appearance {
-            Appearance::Dark => rgba_f32(self.primary.r, self.primary.g, self.primary.b, 0.075),
-            Appearance::Light => rgba_f32(self.primary.r, self.primary.g, self.primary.b, 0.095),
-        }
+        self.between(
+            rgba_f32(self.primary.r, self.primary.g, self.primary.b, 0.075),
+            rgba_f32(self.primary.r, self.primary.g, self.primary.b, 0.095),
+        )
     }
 
     /// Denser material for transient UI layered over live content.
@@ -337,10 +378,8 @@ impl SemanticColors {
         match self.material {
             Material::Opaque => self.floating_surface,
             Material::Glass => {
-                let lift = match self.appearance {
-                    Appearance::Dark => rgba_f32(1.0, 1.0, 1.0, 0.05),
-                    Appearance::Light => rgba_f32(1.0, 1.0, 1.0, 0.30),
-                };
+                let lift =
+                    self.between(rgba_f32(1.0, 1.0, 1.0, 0.05), rgba_f32(1.0, 1.0, 1.0, 0.30));
                 composite(lift, self.floating_surface).alpha(0.97)
             }
         }
@@ -429,17 +468,11 @@ pub struct Glass;
 
 impl Glass {
     pub fn fill(colors: SemanticColors) -> Rgba {
-        match colors.appearance {
-            Appearance::Dark => rgba_f32(1.0, 1.0, 1.0, 0.18),
-            Appearance::Light => rgba_f32(1.0, 1.0, 1.0, 0.72),
-        }
+        colors.between(rgba_f32(1.0, 1.0, 1.0, 0.18), rgba_f32(1.0, 1.0, 1.0, 0.72))
     }
 
     pub const fn stroke(colors: SemanticColors) -> Rgba {
-        match colors.appearance {
-            Appearance::Dark => rgba_f32(1.0, 1.0, 1.0, 0.12),
-            Appearance::Light => rgba_f32(0.0, 0.0, 0.0, 0.12),
-        }
+        colors.between(rgba_f32(1.0, 1.0, 1.0, 0.12), rgba_f32(0.0, 0.0, 0.0, 0.12))
     }
 
     /// Fill for a menu that is its own blurred window: the sidebar's settled
@@ -453,10 +486,7 @@ impl Glass {
     /// surface (menus, palettes, popovers). Pills sit flush on their panel
     /// and do not carry it; a lifted panel does.
     pub const fn rim(colors: SemanticColors) -> Rgba {
-        match colors.appearance {
-            Appearance::Dark => rgba_f32(1.0, 1.0, 1.0, 0.10),
-            Appearance::Light => rgba_f32(1.0, 1.0, 1.0, 0.65),
-        }
+        colors.between(rgba_f32(1.0, 1.0, 1.0, 0.10), rgba_f32(1.0, 1.0, 1.0, 0.65))
     }
 
     /// No shadows: on a blurred backdrop they read as smudges. Kept as the
@@ -570,6 +600,23 @@ impl MemoryFormat {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn appearance_constants_are_exact_at_the_ends_and_travel_in_between() {
+        let dark = SemanticColors::dark();
+        let light = SemanticColors::light();
+        assert_eq!(dark.with_lightness(0.0), dark);
+        assert_eq!(Glass::fill(dark).a, 0.18);
+        assert_eq!(Glass::fill(light).a, 0.72);
+        assert_eq!(Glass::fill(dark.with_lightness(1.0)).a, 0.72);
+
+        let dusk = dark.with_lightness(0.25);
+        assert_eq!(dusk.appearance, Appearance::Dark);
+        assert!(Glass::fill(dusk).a > 0.18 && Glass::fill(dusk).a < 0.45);
+        assert_eq!(dark.with_lightness(0.75).appearance, Appearance::Light);
+        let stroke = dark.with_lightness(0.5).floating_stroke();
+        assert!((stroke.r - 0.5).abs() < 0.001 && (stroke.a - 0.09).abs() < 0.001);
+    }
 
     #[test]
     fn semantic_opacities_match_swift_conventions() {

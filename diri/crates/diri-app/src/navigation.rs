@@ -755,6 +755,18 @@ impl NavigationOverlay {
         cx.notify();
     }
 
+    /// Opens the color theme page on the saved theme, as Settings does.
+    #[cfg(all(test, target_os = "macos"))]
+    pub(crate) fn open_themes_for_test(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.open_overlay(Overlay::Settings, window, cx);
+        self.push_page(Overlay::Themes, window, cx);
+    }
+
+    #[cfg(all(test, target_os = "macos"))]
+    pub(crate) fn arrow_for_test(&mut self, delta: isize, cx: &mut Context<Self>) {
+        self.move_highlight(delta, cx);
+    }
+
     fn move_highlight(&mut self, delta: isize, cx: &mut Context<Self>) {
         let count = self.visible_count();
         if count == 0 {

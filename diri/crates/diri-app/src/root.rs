@@ -4,6 +4,8 @@ mod peek_profile;
 #[cfg(all(test, target_os = "macos"))]
 mod project_agent_tests;
 #[cfg(all(test, target_os = "macos"))]
+mod theme_fade_frames;
+#[cfg(all(test, target_os = "macos"))]
 mod window_navigation_tests;
 mod workspace_launches;
 #[cfg(all(test, target_os = "macos"))]

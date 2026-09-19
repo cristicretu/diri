@@ -1,7 +1,7 @@
 use diri_proto::grid::{ChangedRow, GridCell, GridRowCodec, GridUpdate, TermColor, TermStyle};
 use diri_proto::methods::ReadScrollbackCellsResult;
 use diri_term::scrollback::{WheelDelta, WheelEvent};
-use diri_term::{buffer::GridBuffer, element::TerminalElement};
+use diri_term::{buffer::GridBuffer, element::TerminalElement, theme::TermTheme};
 use gpui::{
     AppContext as _, BenchAppContext, Context, IntoElement, ParentElement, Render, Styled, Window,
     div,
@@ -190,6 +190,78 @@ fn terminal_trackpad_fling(cx: &mut BenchAppContext) {
     }
 }
 
+struct ThemeFadeBenchView {
+    terminal: TerminalElement,
+    step: u16,
+}
+
+impl Render for ThemeFadeBenchView {
+    fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+        // A triangle wave over the fade, so no two consecutive frames share a
+        // theme and nothing colored survives in a cache.
+        const STEPS: u16 = 24;
+        let phase = self.step % (2 * STEPS);
+        let t = f32::from(if phase < STEPS {
+            phase
+        } else {
+            2 * STEPS - phase
+        }) / f32::from(STEPS);
+        let theme = TermTheme::TOKYO_NIGHT.mix(&TermTheme::GRUVBOX_LIGHT, t.clamp(0.01, 0.99));
+        div().size_full().child(self.terminal.clone().theme(theme))
+    }
+}
+
+/// The worst frame a theme crossfade can ask for: a full 200x60 screen of
+/// colored text with nothing else changing, recolored on every frame. Colors
+/// are part of a shaped run, so each frame reshapes every row.
+#[gpui::bench(fps = 120)]
+fn terminal_theme_fade_redraw(cx: &mut BenchAppContext) {
+    const FADE_COLS: u16 = 200;
+    const FADE_ROWS: u16 = 60;
+    let changed_rows = (0..FADE_ROWS)
+        .map(|row| {
+            let mut cells = styled_row(usize::from(row));
+            cells.resize(usize::from(FADE_COLS), GridCell::BLANK);
+            ChangedRow::new(row, cells)
+        })
+        .collect();
+    let terminal =
+        TerminalElement::with_buffer(GridBuffer::new(FADE_COLS, FADE_ROWS)).focused(true);
+    terminal.apply_damage(GridUpdate {
+        cols: FADE_COLS,
+        rows: FADE_ROWS,
+        cursor_col: 0,
+        cursor_row: FADE_ROWS - 1,
+        cursor_visible: true,
+        is_full_snapshot: true,
+        changed_rows,
+    });
+
+    let mut window = cx.add_empty_window();
+    let view = window.update(|window, cx| {
+        window.replace_root(cx, |_window, _cx| ThemeFadeBenchView { terminal, step: 0 })
+    });
+    cx.bench_renderer(view.clone(), |view, _window, cx| {
+        view.step = view.step.wrapping_add(1);
+        cx.notify();
+    });
+    let stats = cx.read_entity(&view, |view, _cx| view.terminal.stats());
+    if stats.frames >= MIN_GATED_FRAMES {
+        eprintln!(
+            "terminal-theme-fade: frames={}, average={:?}, max={:?}",
+            stats.frames,
+            stats.average_frame_time(),
+            stats.max_frame_time,
+        );
+        assert!(
+            stats.average_frame_time() < FRAME_BUDGET,
+            "a theme fade must fit the {:?} frame budget: {:?}",
+            FRAME_BUDGET,
+            stats.average_frame_time(),
+        );
+    }
+}
+
 fn scroll(cx: &mut BenchAppContext, row: fn(usize) -> Vec<GridCell>) {
     let initial = build_frame(0, true, row);
     let frames = [build_frame(1, false, row), build_frame(0, false, row)];
@@ -322,6 +394,7 @@ gpui::bench_group!(
     terminal_build_log_scroll,
     terminal_styled_tui_scroll,
     terminal_reading_view_redraw,
-    terminal_trackpad_fling
+    terminal_trackpad_fling,
+    terminal_theme_fade_redraw
 );
 gpui::bench_main!(benches);
