@@ -515,16 +515,18 @@ const FADE_IN: Duration = Duration::from_millis(120);
 const FADE_OUT: Duration = Duration::from_millis(300);
 /// Overlay hit region and expanded track width, matching `NSScroller`.
 const OVERLAY_STRIP: f32 = 16.0;
-/// Knob width at rest and while the pointer is on the strip.
-const THUMB_REST: f32 = 7.0;
-const THUMB_EXPANDED: f32 = 11.0;
+/// Knob width at rest and while the pointer is on the strip. Thinner than
+/// `NSScroller`'s 7 and 11: the knob rides over glass and text, and a
+/// slimmer one reads as a hint rather than a control until it is hovered.
+const THUMB_REST: f32 = 4.0;
+const THUMB_EXPANDED: f32 = 7.0;
 /// Trailing inset of the knob from the viewport edge.
-const THUMB_INSET_REST: f32 = 3.0;
-const THUMB_INSET_EXPANDED: f32 = 2.5;
+const THUMB_INSET_REST: f32 = 4.0;
+const THUMB_INSET_EXPANDED: f32 = 3.0;
 /// Space between the knob's travel and the viewport's top and bottom.
 const TRAVEL_INSET: f32 = 3.0;
 /// Legacy knob width inside its 15pt track.
-const LEGACY_THUMB: f32 = 9.0;
+const LEGACY_THUMB: f32 = 7.0;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Pin {
