@@ -377,6 +377,30 @@ fn removing_a_session_prunes_it_from_the_persisted_order() {
     assert!(store.preferences().sidebar_collapsed_sessions.is_empty());
 }
 
+/// Per-session bookkeeping outside the record map must leave with the record,
+/// or a long-lived app keeps one entry per session it ever showed.
+#[test]
+fn removing_a_session_drops_its_resume_and_auxiliary_bookkeeping() {
+    let (mut store, _) = hydrated(
+        vec![session("one", "a", 1.0), session("two", "a", 2.0)],
+        vec![project("a", "Alpha")],
+        Prefs::default(),
+    );
+    store.auto_resume_attempted.insert(id("one"));
+    store.auxiliary_slots.insert((id("one"), 0), id("aux"));
+    store.auxiliary_pending.insert((id("one"), 1));
+    store.auxiliary_slots.insert((id("two"), 0), id("other"));
+
+    store.remove_session_record(&id("one"));
+
+    assert!(store.auto_resume_attempted.is_empty());
+    assert!(store.auxiliary_pending.is_empty());
+    assert_eq!(
+        store.auxiliary_slots.keys().collect::<Vec<_>>(),
+        vec![&(id("two"), 0)]
+    );
+}
+
 /// An MCP-spawned agent hangs off the session that spawned it, and a new child
 /// arrives at the bottom of its own sibling run rather than the project's.
 #[test]

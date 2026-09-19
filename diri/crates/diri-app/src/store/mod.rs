@@ -1768,7 +1768,12 @@ impl SessionStore {
         self.sidebar_selection.remove(id);
         self.mru_order.retain(|candidate| candidate != id);
         self.auto_resuming.remove(id);
+        self.auto_resume_attempted.remove(id);
         self.migrating.remove(id);
+        // Only the departed parent's bindings. A binding to a departed child
+        // stays: it is what keeps slot 0 from adopting an unrelated terminal.
+        self.auxiliary_slots.retain(|(parent, _), _| parent != id);
+        self.auxiliary_pending.retain(|(parent, _)| parent != id);
         if self.terminal_residency.remove(id) {
             self.emit(StoreEffect::DetachAttachment(id.clone()));
         }
