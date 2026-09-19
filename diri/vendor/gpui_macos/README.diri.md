@@ -33,3 +33,9 @@ and never alters GPUI's logical Keystroke or IME text. Diri's terminal alone use
 this metadata for DEC numeric-keypad identity; ordinary text fields and global
 shortcuts retain their existing behavior. The app adds a direct edge to this
 already-pinned crate, avoiding an unsafe ABI shim or another event monitor.
+
+The alert patch (`MacWindow::prompt`) also moves the initial keyboard focus
+onto the default button when an alert has only a default and a Cancel
+button. Upstream leaves focus on Cancel there, and newer macOS routes Return
+to the focused button, so Return cancelled a "Close / Cancel" alert instead
+of closing. Three-button alerts keep upstream's focus on the middle button.

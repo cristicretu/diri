@@ -1,6 +1,8 @@
 use diri_proto::grid::{GridCell, TermColor, TermStyle};
 use gpui::Rgba;
 
+use crate::contrast;
+
 const fn rgba_f32(r: f32, g: f32, b: f32, a: f32) -> Rgba {
     Rgba { r, g, b, a }
 }
@@ -16,72 +18,6 @@ const fn hex(value: u32) -> Rgba {
 
 const fn with_alpha(color: Rgba, alpha: f32) -> Rgba {
     Rgba { a: alpha, ..color }
-}
-
-const MINIMUM_TEXT_CONTRAST: f32 = 4.5;
-
-fn relative_luminance(color: Rgba) -> f32 {
-    fn linear(channel: f32) -> f32 {
-        if channel <= 0.04045 {
-            channel / 12.92
-        } else {
-            ((channel + 0.055) / 1.055).powf(2.4)
-        }
-    }
-
-    0.2126 * linear(color.r) + 0.7152 * linear(color.g) + 0.0722 * linear(color.b)
-}
-
-fn contrast_ratio(left: Rgba, right: Rgba) -> f32 {
-    let left = relative_luminance(left);
-    let right = relative_luminance(right);
-    (left.max(right) + 0.05) / (left.min(right) + 0.05)
-}
-
-fn mix(left: Rgba, right: Rgba, amount: f32) -> Rgba {
-    Rgba {
-        r: left.r + (right.r - left.r) * amount,
-        g: left.g + (right.g - left.g) * amount,
-        b: left.b + (right.b - left.b) * amount,
-        a: left.a + (right.a - left.a) * amount,
-    }
-}
-
-/// Pull an explicit dark-oriented terminal color toward the theme foreground
-/// only as far as needed to remain readable on a light default background.
-///
-/// Programs such as Claude Code emit truecolor syntax palettes chosen by their
-/// own theme. A light Diri theme cannot replace those colors through its ANSI
-/// palette, so white and neon tokens otherwise disappear into the terminal's
-/// light background. Explicit block backgrounds are intentionally excluded by
-/// the caller: a program's own diff/error panels keep their authored colors.
-fn readable_explicit_foreground(foreground: Rgba, background: Rgba, fallback: Rgba) -> Rgba {
-    if contrast_ratio(foreground, background) >= MINIMUM_TEXT_CONTRAST {
-        return foreground;
-    }
-    let fallback = if contrast_ratio(fallback, background) >= MINIMUM_TEXT_CONTRAST {
-        fallback
-    } else {
-        let black = rgba_f32(0.0, 0.0, 0.0, 1.0);
-        let white = rgba_f32(1.0, 1.0, 1.0, 1.0);
-        if contrast_ratio(black, background) >= contrast_ratio(white, background) {
-            black
-        } else {
-            white
-        }
-    };
-
-    let mut unreadable = 0.0;
-    let mut readable = 1.0;
-    for _ in 0..12 {
-        let amount = (unreadable + readable) * 0.5;
-        if contrast_ratio(mix(foreground, fallback, amount), background) >= MINIMUM_TEXT_CONTRAST {
-            readable = amount;
-        } else {
-            unreadable = amount;
-        }
-    }
-    mix(foreground, fallback, readable)
 }
 
 /// Concrete rendering attributes after terminal colors and SGR flags resolve.
@@ -433,16 +369,13 @@ impl TermTheme {
         } else {
             self.resolve_color(cell.bg, true)
         };
-        if self.appearance == ThemeAppearance::Light
-            && !inverse
-            && is_default_background(cell.bg)
-            && !matches!(cell.fg, TermColor::Default | TermColor::DefaultInverted)
-        {
-            foreground = readable_explicit_foreground(foreground, background, self.foreground);
-        }
         let visible = !cell.style.contains(TermStyle::INVISIBLE);
-        if cell.style.contains(TermStyle::DIM) {
-            foreground = foreground.opacity(0.5);
+        // Programs pick colors for dark terminals; see `contrast` for which
+        // pairs a light theme answers for and how they are corrected.
+        if self.appearance == ThemeAppearance::Light && contrast::applies(cell) {
+            foreground = contrast::painted_foreground(self, cell, foreground, background);
+        } else if cell.style.contains(TermStyle::DIM) {
+            foreground = foreground.opacity(contrast::DIM_OPACITY);
         }
         if !visible {
             foreground = foreground.alpha(0.0);
@@ -600,6 +533,7 @@ fn xterm_extended(index: u8) -> Rgba {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::contrast::contrast_ratio;
 
     fn assert_rgba(actual: Rgba, expected: Rgba) {
         assert!((actual.r - expected.r).abs() < 0.000_01);

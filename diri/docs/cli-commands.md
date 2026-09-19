@@ -55,3 +55,14 @@ output, wait before/after completion, explicit removal, invalid argv and a remot
 launch rejection. Unit tests cover option boundaries and argument limits.
 A successful remote run remains covered by the existing remote Engine/Helper
 fixtures; this test does not claim a new real-host end-to-end measurement.
+
+## `dirijor session reset-terminal ID`
+
+Resets the session's emulator: both screens, scrollback, terminal modes and the
+OSC title are cleared at the current dimensions. The PTY, process and session
+identity are untouched and nothing is sent to the child. Held local sessions
+apply it on their pump and persist a checkpoint at that exact offset, so an
+Engine restart replays only output written after the reset; remote sessions
+ask their Holder (`terminal-reset-v1`). Completed sessions return
+`terminal_reset_unavailable`; direct-PTY sessions `terminal_reset_unsupported`.
+Success means the reset was queued; attached terminals receive a full grid.

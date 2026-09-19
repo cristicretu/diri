@@ -44,6 +44,13 @@ pub use params::{Params, ParamsIter};
 const MAX_INTERMEDIATES: usize = 2;
 const MAX_OSC_PARAMS: usize = 16;
 const MAX_OSC_RAW: usize = 1024;
+/// Diri patch: the heap-backed OSC buffer is bounded too. It matches the
+/// synchronized-output limit, which leaves room for a large OSC 52 copy.
+#[cfg(feature = "std")]
+const MAX_OSC_RAW_STD: usize = 2 * 1024 * 1024;
+/// Capacity the heap-backed OSC buffer keeps between sequences.
+#[cfg(feature = "std")]
+const IDLE_OSC_CAPACITY: usize = 64 * 1024;
 
 /// Parser for raw _VTE_ protocol which delegates actions to a [`Perform`]
 ///
@@ -62,6 +69,10 @@ pub struct Parser<const OSC_RAW_BUF_SIZE: usize = MAX_OSC_RAW> {
     osc_raw: ArrayVec<u8, OSC_RAW_BUF_SIZE>,
     #[cfg(feature = "std")]
     osc_raw: Vec<u8>,
+    /// The current OSC outgrew `MAX_OSC_RAW_STD` and will not be dispatched:
+    /// a truncated title, hyperlink or clipboard payload is worse than none.
+    #[cfg(feature = "std")]
+    osc_overflowed: bool,
     osc_params: [(usize, usize); MAX_OSC_PARAMS],
     osc_num_params: usize,
     ignoring: bool,
@@ -372,6 +383,10 @@ impl<const OSC_RAW_BUF_SIZE: usize> Parser<OSC_RAW_BUF_SIZE> {
             0x5D => {
                 self.osc_raw.clear();
                 self.osc_num_params = 0;
+                #[cfg(feature = "std")]
+                {
+                    self.osc_overflowed = false;
+                }
                 self.state = State::OscString
             },
             0x5E..=0x5F => self.state = State::SosPmApcString,
@@ -425,6 +440,12 @@ impl<const OSC_RAW_BUF_SIZE: usize> Parser<OSC_RAW_BUF_SIZE> {
                 #[cfg(not(feature = "std"))]
                 {
                     if self.osc_raw.is_full() {
+                        return;
+                    }
+                }
+                #[cfg(feature = "std")]
+                {
+                    if self.osc_overflowed {
                         return;
                     }
                 }
@@ -548,13 +569,41 @@ impl<const OSC_RAW_BUF_SIZE: usize> Parser<OSC_RAW_BUF_SIZE> {
                 return;
             }
         }
+        #[cfg(feature = "std")]
+        {
+            if self.osc_overflowed {
+                return;
+            }
+            if self.osc_raw.len() >= MAX_OSC_RAW_STD {
+                // An unterminated `ESC ]` would otherwise buffer everything
+                // the program prints until a terminator happens to arrive.
+                self.osc_overflowed = true;
+                self.osc_raw = Vec::new();
+                self.osc_num_params = 0;
+                return;
+            }
+        }
         self.osc_raw.push(byte);
     }
 
     fn osc_end<P: Perform>(&mut self, performer: &mut P, byte: u8) {
+        #[cfg(feature = "std")]
+        {
+            if self.osc_overflowed {
+                self.osc_overflowed = false;
+                self.osc_num_params = 0;
+                return;
+            }
+        }
         self.action_osc_put_param();
         self.osc_dispatch(performer, byte);
         self.osc_raw.clear();
+        #[cfg(feature = "std")]
+        {
+            if self.osc_raw.capacity() > IDLE_OSC_CAPACITY {
+                self.osc_raw.shrink_to(IDLE_OSC_CAPACITY);
+            }
+        }
         self.osc_num_params = 0;
     }
 
@@ -1013,6 +1062,53 @@ mod tests {
             },
             _ => panic!("expected osc sequence"),
         }
+    }
+
+    #[cfg(feature = "std")]
+    #[test]
+    fn an_osc_past_the_heap_limit_is_dropped_and_frees_its_buffer() {
+        let mut dispatcher = Dispatcher::default();
+        let mut parser = Parser::new();
+
+        parser.advance(&mut dispatcher, b"\x1b]52;s");
+        let chunk = [b'a'; 64 * 1024];
+        for _ in 0..(MAX_OSC_RAW_STD / chunk.len() + 2) {
+            parser.advance(&mut dispatcher, &chunk);
+        }
+        assert!(parser.osc_overflowed);
+        assert_eq!(parser.osc_raw.capacity(), 0, "the oversized buffer is released");
+        parser.advance(&mut dispatcher, b";more;params\x07");
+        assert!(dispatcher.dispatched.is_empty(), "a truncated OSC is never acted on");
+
+        // The parser is back in ground state and the next OSC is whole.
+        parser.advance(&mut dispatcher, b"\x1b]2;title\x07");
+        assert_eq!(dispatcher.dispatched.len(), 1);
+        match &dispatcher.dispatched[0] {
+            Sequence::Osc(params, _) => {
+                assert_eq!(params.len(), 2);
+                assert_eq!(params[1], b"title");
+            },
+            _ => panic!("expected osc sequence"),
+        }
+    }
+
+    #[cfg(feature = "std")]
+    #[test]
+    fn a_large_osc_under_the_limit_is_whole_and_its_capacity_is_returned() {
+        let mut dispatcher = Dispatcher::default();
+        let mut parser = Parser::new();
+
+        parser.advance(&mut dispatcher, b"\x1b]52;c;");
+        let payload = vec![b'Q'; 1024 * 1024];
+        parser.advance(&mut dispatcher, &payload);
+        parser.advance(&mut dispatcher, b"\x07");
+
+        assert_eq!(dispatcher.dispatched.len(), 1);
+        match &dispatcher.dispatched[0] {
+            Sequence::Osc(params, _) => assert_eq!(params[2].len(), payload.len()),
+            _ => panic!("expected osc sequence"),
+        }
+        assert!(parser.osc_raw.capacity() <= IDLE_OSC_CAPACITY);
     }
 
     #[test]

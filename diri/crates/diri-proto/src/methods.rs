@@ -38,6 +38,9 @@ impl Method {
     pub const SESSION_RESIZE: &'static str = "session.resize";
     pub const SESSION_READ_SCREEN: &'static str = "session.read_screen";
     pub const SESSION_TERMINAL_TITLE: &'static str = "session.terminal_title";
+    /// Resets the emulator (screens, history, modes, title) without touching
+    /// the PTY or process. Acceptance means queued to the terminal owner.
+    pub const SESSION_RESET_TERMINAL: &'static str = "session.reset_terminal";
     pub const SESSION_CAPTURE_FIND: &'static str = "session.capture_find";
     pub const SESSION_READ_SCROLLBACK: &'static str = "session.read_scrollback";
     pub const SESSION_READ_SCROLLBACK_CELLS: &'static str = "session.read_scrollback_cells";

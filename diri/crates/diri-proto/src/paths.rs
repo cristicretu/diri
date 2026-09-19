@@ -36,6 +36,11 @@ pub const ENV_APP_SUPPORT: &str = "DIRIJOR_APP_SUPPORT";
 /// so macOS and XDG layouts share one contract and tests never need HOME.
 pub const ENV_SESSION_RECOVERY_DIR: &str = "DIRIJOR_SESSION_RECOVERY_DIR";
 
+/// Passed by a launcher that spawns the Engine detached and expects to ask it
+/// to leave when it quits. With it, an Engine left with no live session and no
+/// client retires itself; without it, as under a service manager, it stays up.
+pub const EXIT_WHEN_ORPHANED_FLAG: &str = "--exit-when-orphaned";
+
 pub struct DirijorPaths;
 
 impl DirijorPaths {
