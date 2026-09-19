@@ -93,7 +93,7 @@ struct Archived {
 
 impl Archived {
     fn storage_bytes(&self) -> usize {
-        self.name.len() + self.params.len() + self.session_id.as_ref().map_or(0, String::len) + 16
+        storage_bytes(&self.name, self.session_id.as_deref(), self.params.len())
     }
 
     fn event(&self) -> Event {
@@ -106,6 +106,14 @@ impl Archived {
     }
 }
 
+/// What one event is charged against a byte bound: its encoded params plus
+/// its envelope. The ring holds exactly these bytes. A subscriber queue holds
+/// the parsed object graph, which is larger, but by a factor and not without
+/// limit — so the same charge bounds it too.
+fn storage_bytes(name: &str, session_id: Option<&str>, encoded_params: usize) -> usize {
+    name.len() + encoded_params + session_id.map_or(0, str::len) + 16
+}
+
 /// One live subscription's queue, shared between the bus and its stream.
 struct SubscriberQueue {
     state: Mutex<QueueState>,
@@ -113,9 +121,12 @@ struct SubscriberQueue {
 }
 
 struct QueueState {
-    queue: VecDeque<Event>,
+    /// Each event with what it was charged, so eviction refunds exactly that.
+    queue: VecDeque<(Event, usize)>,
+    queued_bytes: usize,
     filter: Filter,
     capacity: usize,
+    byte_capacity: usize,
     dropped: u64,
     first_dropped_seq: u64,
     last_dropped_seq: u64,
@@ -148,24 +159,38 @@ impl QueueState {
             self.dropped = 0;
             return Some(marker);
         }
-        self.queue.pop_front()
+        let (event, bytes) = self.queue.pop_front()?;
+        self.queued_bytes -= bytes;
+        Some(event)
     }
 }
 
 impl SubscriberQueue {
-    /// Enqueues without consumer I/O. Overflow evicts the oldest data event;
+    /// Enqueues without consumer I/O. Overflow evicts the oldest data events;
     /// the next read reports the hole before delivering surviving events.
-    fn push(&self, event: &Event) {
+    ///
+    /// The count alone is no bound on memory: a `session.updated` carries a
+    /// whole record, and a client that is connected but not reading — a
+    /// suspended App, a wedged socket — would hold thousands of them. `bytes`
+    /// is the event's [`storage_bytes`]. An event larger than the whole
+    /// allowance is still delivered, alone: the reader must be able to make
+    /// progress, and one event is its own bound.
+    fn push(&self, event: &Event, bytes: usize) {
         let mut state = self.state.lock().expect("queue");
         if state.closed || !state.filter.admits(event) {
             return;
         }
-        if state.queue.len() >= state.capacity
-            && let Some(evicted) = state.queue.pop_front()
+        while state.queue.len() >= state.capacity
+            || (!state.queue.is_empty() && state.queued_bytes + bytes > state.byte_capacity)
         {
+            let Some((evicted, refund)) = state.queue.pop_front() else {
+                break;
+            };
+            state.queued_bytes -= refund;
             state.note_gap(evicted.seq, evicted.seq, 1);
         }
-        state.queue.push_back(event.clone());
+        state.queued_bytes += bytes;
+        state.queue.push_back((event.clone(), bytes));
         drop(state);
         self.ready.notify_all();
     }
@@ -188,6 +213,7 @@ pub struct EventBus {
     ring_capacity: usize,
     ring_byte_capacity: usize,
     subscriber_capacity: usize,
+    subscriber_byte_capacity: usize,
 }
 
 impl Default for EventBus {
@@ -203,7 +229,9 @@ impl EventBus {
 
     /// `subscriber_capacity` defaults to twice the ring, so a full `sinceSeq`
     /// replay — which lands before the consumer reads a single event — can
-    /// never itself trigger a drop.
+    /// never itself trigger a drop. A subscriber's byte allowance is twice the
+    /// ring's for the same reason; a bus with no ring has no byte bound to
+    /// take it from and keeps the count alone.
     pub fn with_capacities(
         ring_capacity: usize,
         ring_byte_capacity: usize,
@@ -223,6 +251,10 @@ impl EventBus {
             subscriber_capacity: subscriber_capacity
                 .unwrap_or(ring_capacity.max(1) * 2)
                 .max(1),
+            subscriber_byte_capacity: match ring_byte_capacity {
+                0 => usize::MAX,
+                bytes => bytes.saturating_mul(2),
+            },
         }
     }
 
@@ -236,9 +268,15 @@ impl EventBus {
         };
         inner.next_seq += 1;
 
+        let encoded = serde_json::to_vec(&event.params).ok();
+        let bytes = storage_bytes(
+            &event.name,
+            event.session_id.as_deref(),
+            encoded.as_ref().map_or(0, Vec::len),
+        );
         if self.ring_capacity > 0
             && self.ring_byte_capacity > 0
-            && let Ok(encoded) = serde_json::to_vec(&event.params)
+            && let Some(encoded) = encoded
         {
             let archived = Archived {
                 name: event.name.clone(),
@@ -264,7 +302,7 @@ impl EventBus {
         // publisher overtake us. Subscribe uses this same lock, so replay
         // and the following live tail share that order. Queues never do I/O.
         for queue in inner.subscribers.values() {
-            queue.push(&event);
+            queue.push(&event, bytes);
         }
     }
 
@@ -327,8 +365,10 @@ impl EventBus {
         let queue = Arc::new(SubscriberQueue {
             state: Mutex::new(QueueState {
                 queue: VecDeque::new(),
+                queued_bytes: 0,
                 filter,
                 capacity: self.subscriber_capacity,
+                byte_capacity: self.subscriber_byte_capacity,
                 dropped: 0,
                 first_dropped_seq: 0,
                 last_dropped_seq: 0,
@@ -350,7 +390,7 @@ impl EventBus {
                 );
             }
             for archived in inner.ring.iter().filter(|archived| archived.seq > since) {
-                queue.push(&archived.event());
+                queue.push(&archived.event(), archived.storage_bytes());
             }
         }
         let id = inner.next_subscriber;
@@ -614,6 +654,63 @@ mod tests {
 
         bus.publish("after", json!({}), None);
         assert_eq!(event_names(&stream), ["after"]);
+    }
+
+    #[test]
+    fn a_subscriber_that_stops_reading_is_bounded_by_bytes_not_only_count() {
+        // Room for thousands of events by count, and 4 KiB by bytes (twice
+        // the 2 KiB ring). Each event below is charged a little over 1 KiB.
+        let bus = EventBus::with_capacities(4096, 2 << 10, None);
+        let stream = bus.subscribe(None, Filter::all());
+        let body = "x".repeat(1 << 10);
+        for _ in 0..100 {
+            bus.publish("session.updated", json!({ "record": body }), None);
+        }
+        {
+            let state = stream.queue.state.lock().unwrap();
+            assert_eq!(state.queue.len(), 3, "100 by count alone");
+            assert!(state.queued_bytes <= 4 << 10);
+        }
+        // The reader learns of the hole first, then gets the newest events.
+        let marker = stream.try_recv().expect("marker");
+        assert_eq!(marker.name, EVENTS_DROPPED);
+        assert_eq!(marker.params["dropped"], 97);
+        assert_eq!(marker.params["fromSeq"], 1);
+        assert_eq!(marker.params["toSeq"], 97);
+        let survivors: Vec<u64> = std::iter::from_fn(|| stream.try_recv())
+            .map(|event| event.seq)
+            .collect();
+        assert_eq!(survivors, [98, 99, 100]);
+        assert_eq!(stream.queue.state.lock().unwrap().queued_bytes, 0);
+
+        // One event over the whole allowance still gets through, alone.
+        bus.publish("small", json!({}), None);
+        bus.publish("huge", json!({ "record": "x".repeat(8 << 10) }), None);
+        assert_eq!(event_names(&stream), [EVENTS_DROPPED, "huge"]);
+    }
+
+    #[test]
+    fn a_full_replay_fits_a_new_subscriber_without_a_drop() {
+        let bus = EventBus::with_capacities(4096, 2 << 10, None);
+        for _ in 0..100 {
+            bus.publish(
+                "session.updated",
+                json!({ "record": "x".repeat(256) }),
+                None,
+            );
+        }
+        let replayed = event_names(&bus.subscribe(Some(0), Filter::all()));
+        // The ring already dropped what it could not hold: one marker for
+        // that, and then everything it retained, none of it evicted again.
+        assert_eq!(
+            replayed
+                .iter()
+                .filter(|name| *name == EVENTS_DROPPED)
+                .count(),
+            1
+        );
+        assert!(replayed.len() > 2);
+        assert_eq!(replayed[0], EVENTS_DROPPED);
     }
 
     #[test]
