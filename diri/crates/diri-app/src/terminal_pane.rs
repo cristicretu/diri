@@ -1427,7 +1427,16 @@ impl TerminalPane {
                         cx.notify();
                     }
                 }
-                Err(error) => eprintln!("diri: clipboard image upload failed: {error}"),
+                Err(error) => {
+                    // scp's stderr can name hosts, users and key paths; it
+                    // stays in the developer log and out of the app.
+                    eprintln!("diri: clipboard image upload failed: {error}");
+                    self.show_terminal_feedback(
+                        "Couldn't copy the clipboard image to the session's host",
+                        window,
+                        cx,
+                    );
+                }
             },
             PaneEvent::DroppedFilesUploaded(id, result) => match result {
                 Ok(remote_paths) => {
@@ -2377,6 +2386,64 @@ impl TerminalPane {
         quote_from_terminal_element(id, &resident.element)
     }
 
+    /// Pastes a clipboard image as the path of its staged file, copying it to
+    /// the session's host first when that is not this machine.
+    fn paste_staged_clipboard_image(
+        &mut self,
+        id: &SessionId,
+        staged: std::io::Result<StagedClipboardImage>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let staged = match staged {
+            Ok(staged) => staged,
+            Err(error) => {
+                eprintln!("diri: could not stage clipboard image: {error}");
+                // The kind says what went wrong ("storage full") without the
+                // temp path the full error may carry.
+                self.show_terminal_feedback(
+                    format!("Couldn't paste the clipboard image: {}", error.kind()),
+                    window,
+                    cx,
+                );
+                return;
+            }
+        };
+        let ssh = {
+            let store = self
+                .runtime
+                .store
+                .read()
+                .expect("session store lock poisoned");
+            store
+                .sessions()
+                .get(id)
+                .and_then(|session| session.host.as_deref())
+                .and_then(|host_id| store.host(host_id))
+                .map(|host| host.ssh.clone())
+        };
+
+        if let Some(ssh) = ssh {
+            let pane_tx = self.pane_tx.clone();
+            let upload_id = id.clone();
+            self.tokio.spawn(async move {
+                let result = tokio::task::spawn_blocking(move || staged.upload(&ssh))
+                    .await
+                    .unwrap_or_else(|error| Err(format!("upload task failed: {error}")));
+                let _ = pane_tx.send(PaneEvent::ClipboardUploadFinished(upload_id, result));
+            });
+        } else {
+            let local_path = staged.path().to_string_lossy().into_owned();
+            if let Some(resident) = self.residents.get(id) {
+                resident.send_user_input(terminal_paste(&local_path, resident.bracketed_paste));
+            }
+            self.local_clipboard_images.push(staged);
+            if self.local_clipboard_images.len() > 32 {
+                self.local_clipboard_images.remove(0);
+            }
+        }
+    }
+
     fn paste(&mut self, _: &Paste, window: &mut Window, cx: &mut Context<Self>) {
         if self.qol.copy_mode.is_some() {
             self.show_terminal_feedback("Exit copy mode before pasting", window, cx);
@@ -2399,46 +2466,8 @@ impl TerminalPane {
                 return;
             }
 
-            let staged = match StagedClipboardImage::stage(bytes, extension) {
-                Ok(staged) => staged,
-                Err(error) => {
-                    eprintln!("diri: could not stage clipboard image: {error}");
-                    return;
-                }
-            };
-            let ssh = {
-                let store = self
-                    .runtime
-                    .store
-                    .read()
-                    .expect("session store lock poisoned");
-                store
-                    .sessions()
-                    .get(&id)
-                    .and_then(|session| session.host.as_deref())
-                    .and_then(|host_id| store.host(host_id))
-                    .map(|host| host.ssh.clone())
-            };
-
-            if let Some(ssh) = ssh {
-                let pane_tx = self.pane_tx.clone();
-                let upload_id = id.clone();
-                self.tokio.spawn(async move {
-                    let result = tokio::task::spawn_blocking(move || staged.upload(&ssh))
-                        .await
-                        .unwrap_or_else(|error| Err(format!("upload task failed: {error}")));
-                    let _ = pane_tx.send(PaneEvent::ClipboardUploadFinished(upload_id, result));
-                });
-            } else {
-                let local_path = staged.path().to_string_lossy().into_owned();
-                if let Some(resident) = self.residents.get(&id) {
-                    resident.send_user_input(terminal_paste(&local_path, resident.bracketed_paste));
-                }
-                self.local_clipboard_images.push(staged);
-                if self.local_clipboard_images.len() > 32 {
-                    self.local_clipboard_images.remove(0);
-                }
-            }
+            let staged = StagedClipboardImage::stage(bytes, extension);
+            self.paste_staged_clipboard_image(&id, staged, window, cx);
             cx.stop_propagation();
             cx.notify();
             return;
@@ -5977,6 +6006,101 @@ mod tests {
 
             assert!(input.try_recv().is_err(), "a local gesture reached the PTY");
         });
+    }
+
+    #[gpui::test]
+    fn clipboard_image_failures_are_shown_and_paste_nothing(cx: &mut TestAppContext) {
+        let runtime = Arc::new(StoreRuntime::inert());
+        let tokio = Arc::new(
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap(),
+        );
+        let session = fixture_session();
+        let id = session.id.clone();
+        {
+            let mut store = runtime.store.write().unwrap();
+            store.upsert_session(session);
+            store.select(id.clone());
+        }
+        let (pane, cx) =
+            cx.add_window_view(move |window, cx| TerminalPane::new(runtime, tokio, window, cx));
+        let shown = Arc::new(Mutex::new(Vec::<String>::new()));
+        let sink = Arc::clone(&shown);
+        cx.update(|_, cx| {
+            cx.subscribe(&pane, move |_, event: &TerminalPaneEvent, _| {
+                if let TerminalPaneEvent::Feedback { message } = event {
+                    sink.lock().unwrap().push(message.clone());
+                }
+            })
+            .detach();
+        });
+        let mut input = pane.update_in(cx, |pane, window, cx| {
+            pane.reconcile_store_change(window, cx);
+            let (tx, mut input) = mpsc::unbounded_channel();
+            let resident = pane.residents.get_mut(&id).unwrap();
+            resident.attachment.claim();
+            resident.attachment.input_observer = Some((id.clone(), tx));
+
+            // The staging seam fails with a detail only a developer can use.
+            pane.paste_staged_clipboard_image(
+                &id,
+                Err(std::io::Error::new(
+                    std::io::ErrorKind::PermissionDenied,
+                    "open /private/var/folders/secret/T/dirijor-clipboard-x.png",
+                )),
+                window,
+                cx,
+            );
+            assert!(input.try_recv().is_err(), "a failed staging pasted a path");
+
+            // The uploader fails with whatever scp wrote to stderr.
+            pane.handle_pane_event(
+                PaneEvent::ClipboardUploadFinished(
+                    id.clone(),
+                    Err("scp failed: deploy@forge.internal: Permission denied (publickey)".into()),
+                ),
+                window,
+                cx,
+            );
+            assert!(input.try_recv().is_err(), "a failed upload pasted a path");
+            input
+        });
+        assert_eq!(
+            &*shown.lock().unwrap(),
+            &[
+                "Couldn't paste the clipboard image: permission denied",
+                "Couldn't copy the clipboard image to the session's host",
+            ],
+            "each failure is shown once, without paths, hosts or subprocess output"
+        );
+
+        pane.update_in(cx, |pane, window, cx| {
+            let staged = StagedClipboardImage::stage(b"png bytes", "png").unwrap();
+            let local_path = staged.path().to_string_lossy().into_owned();
+            pane.paste_staged_clipboard_image(&id, Ok(staged), window, cx);
+            assert_eq!(
+                input.try_recv().unwrap(),
+                (id.clone(), local_path.into_bytes())
+            );
+            assert!(input.try_recv().is_err(), "the local path was pasted once");
+
+            pane.handle_pane_event(
+                PaneEvent::ClipboardUploadFinished(
+                    id.clone(),
+                    Ok("/tmp/dirijor-clipboard-x.png".into()),
+                ),
+                window,
+                cx,
+            );
+            assert_eq!(
+                input.try_recv().unwrap(),
+                (id.clone(), b"/tmp/dirijor-clipboard-x.png".to_vec())
+            );
+            assert!(input.try_recv().is_err(), "the remote path was pasted once");
+        });
+        assert_eq!(shown.lock().unwrap().len(), 2, "success shows no failure");
     }
 
     #[gpui::test]
