@@ -263,6 +263,9 @@ impl PromptInputState {
 /// The state the pump thread and the outside world share.
 struct Shared {
     holder_identity: std::sync::OnceLock<(diri_proto::process::ProcessIdentity, u64)>,
+    /// The final retained terminal of a held child that genuinely exited,
+    /// handed to the Registry exactly once for durable publication.
+    completed: Mutex<Option<CompletedCapture>>,
     keyboard_known: AtomicBool,
     id: String,
     find_owner: String,
@@ -1511,6 +1514,25 @@ impl Session {
         self.shared.screen.lock().expect("screen").lines()
     }
 
+    /// The verified child birth and Holder epoch this Session was bound to
+    /// at launch or adoption, if the Holder provided them. Local held
+    /// sessions only; never refreshed from a later inspection.
+    pub fn holder_run(&self) -> Option<(diri_proto::process::ProcessIdentity, u64)> {
+        matches!(self.transport, Transport::Held(_))
+            .then(|| self.shared.holder_identity.get().copied())
+            .flatten()
+    }
+
+    /// Takes the final retained terminal of a genuinely exited held child.
+    /// Returns it once; storage work must happen outside the Registry lock.
+    pub(crate) fn take_completed_capture(&self) -> Option<CompletedCapture> {
+        self.shared
+            .completed
+            .lock()
+            .expect("completed capture")
+            .take()
+    }
+
     /// Reads the local emulator's title without using the conversation name.
     pub fn terminal_title(&self) -> std::io::Result<Option<String>> {
         if matches!(&self.transport, Transport::Remote(_)) {
@@ -2344,6 +2366,7 @@ fn new_shared(
         .map(|event| event.occurred_at);
     Arc::new(Shared {
         holder_identity: std::sync::OnceLock::new(),
+        completed: Mutex::new(None),
         keyboard_known: AtomicBool::new(true),
         id: spec.id.clone(),
         find_owner: {
@@ -4016,6 +4039,29 @@ fn pump_held(
         (code, None) => Exit::Code(code.unwrap_or(-1)),
     });
     *shared.exit.lock().expect("exit") = exit;
+    // The marker is the last thing the Holder writes after draining the PTY,
+    // so reaching it with nothing buffered means the retained screen is the
+    // whole run. A partial marker means the drain is not proven; retain
+    // nothing rather than something that may be missing its tail.
+    if let Some(exit) = exit
+        && marker_buffer.is_empty()
+    {
+        let (_, checkpoint) = capture_checkpoint(&shared, offset, &marker_buffer);
+        let exit = match exit {
+            Exit::Code(code) => diri_proto::ExitInfo {
+                reason: diri_proto::ExitReason::Exited,
+                code: Some(code),
+                signal: None,
+            },
+            Exit::Signal(signal) => diri_proto::ExitInfo {
+                reason: diri_proto::ExitReason::Signaled,
+                code: None,
+                signal: Some(signal),
+            },
+        };
+        *shared.completed.lock().expect("completed capture") =
+            Some(CompletedCapture { checkpoint, exit });
+    }
     let (code, signal) = match exit {
         Some(Exit::Code(code)) => (Some(code), None),
         Some(Exit::Signal(signal)) => (None, Some(signal)),
@@ -4079,6 +4125,13 @@ struct CheckpointKey {
     mouse: MouseModes,
 }
 
+/// The final terminal of a held child that genuinely exited, with the exit
+/// facts the same marker carried. Built only after the log was drained to it.
+pub(crate) struct CompletedCapture {
+    pub checkpoint: crate::checkpoint::ScreenCheckpoint,
+    pub exit: diri_proto::ExitInfo,
+}
+
 /// Writes the current screen as a durable checkpoint, skipping the write when
 /// nothing observable changed since the last one.
 fn persist_checkpoint(
@@ -4088,6 +4141,22 @@ fn persist_checkpoint(
     marker_buffer: &[u8],
     last_key: &mut Option<CheckpointKey>,
 ) {
+    let (key, checkpoint) = capture_checkpoint(shared, offset, marker_buffer);
+    if last_key.as_ref() == Some(&key) {
+        return;
+    }
+    // A failed write must not stop the session; the checkpoint is a cache.
+    if checkpoint.write_atomically(path).is_ok() {
+        *last_key = Some(key);
+    }
+}
+
+/// Samples the emulator into a checkpoint and the key that identifies it.
+fn capture_checkpoint(
+    shared: &Shared,
+    offset: u64,
+    marker_buffer: &[u8],
+) -> (CheckpointKey, crate::checkpoint::ScreenCheckpoint) {
     let (
         history,
         history_metadata,
@@ -4130,9 +4199,6 @@ fn persist_checkpoint(
         bracketed_paste,
         mouse,
     };
-    if last_key.as_ref() == Some(&key) {
-        return;
-    }
     let checkpoint = crate::checkpoint::ScreenCheckpoint {
         keyboard_snapshot,
         keyboard,
@@ -4145,10 +4211,7 @@ fn persist_checkpoint(
         bracketed_paste,
         mouse,
     };
-    // A failed write must not stop the session; the checkpoint is a cache.
-    if checkpoint.write_atomically(path).is_ok() {
-        *last_key = Some(key);
-    }
+    (key, checkpoint)
 }
 
 /// Wakes the held pump the moment the holder appends to the log, instead of

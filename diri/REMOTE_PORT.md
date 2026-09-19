@@ -1754,10 +1754,17 @@ still fails. Adoption continues to require an existing valid log.
 
 ## Completed local terminal storage groundwork
 
-The Engine provides an unconnected storage primitive for completed local terminal
-views. It does not yet save terminals during exit, change launch or adoption,
-restore a pane, or add a public control API. Remote records are rejected; the
-Remote Helper protocol, ownership and persistence baseline are unchanged.
+The Engine retains the final terminal of a completed local held session so its
+screen and history survive Engine replacement. The Registry binds each record to
+its verified child birth and Holder epoch once (recovery-directory
+`completed-run.json`); the held pump captures the emulator once after draining
+the log to the exit marker; the events watcher publishes the artifact outside
+the Registry lock into `completed-terminals/` beside the state file;
+`session.read_screen` and `session.read_scrollback` serve it, revalidated, when
+no live Session backs an exited local record; removal discards it. Pane
+attachment, Find, remote records and GC beyond removal are not covered. Remote
+records are rejected; the Remote Helper protocol, ownership and persistence
+baseline are unchanged. See [completed terminal storage](docs/completed-terminal-storage.md).
 
 A storage key captures the local SessionRecord identity/creation time and the
 actual Holder's verified native child birth and epoch offset while it is alive.

@@ -41,24 +41,40 @@ inside `StorageError::Io`; it never overwrites the first artifact. A post-public
 sync failure reports failure rather than claiming crash durability. Future retry
 handling must inspect exact existing content before claiming idempotent success.
 
-## Exact remaining integration seams
+## Lifecycle integration (current state)
 
-1. `Session::spawn_held` and `spawn_held_deferred`: reserve a durable new run before
-   launch effects, without deleting the prior immutable artifact. Resolve known
-   failure vs uncertain launch outcomes; never restore stale current-run authority.
-2. `Session::attach` / `process_facts::capture_holder`: bind the verified birth and
-   epoch to the reserved record run before exposing it. Missing old-Holder identity
-   remains unsupported. Adoption must check the persisted binding, not replace it.
-3. `pump_held` final drain/exit: capture and publish this run's retained checkpoint
-   outside Registry, including an observed matching exit. Background/crash durability
-   needs an explicit resource policy; no extra worker was added in this slice.
-4. Registry persistence/load: preserve the run binding, capture a read handle under
-   lock, load outside it, then reject replacement/removal/resume races.
-5. Attach/read_screen/scrollback/Find and pane presentation: share a read-only source;
-   reject input and process mutation against completed views. Remote support remains
-   a separate authenticated Helper operation, not a local-file fallback.
-6. Resource retention/GC: bound the number of immutable artifacts before enabling
-   publication. Never delete the artifact currently being inspected.
+1. **Binding.** `Registry::bind_completed_run` writes `completed-run.json` in
+   the session's recovery directory the first time a local held Session
+   reports a verified child birth and Holder epoch (`Session::holder_run`,
+   captured only from an alive verified stat at launch/adoption). It runs from
+   spawn, adoption and the events watcher fold, once per run. A Holder that
+   never reported a verified identity leaves the run unbound and its output
+   explicitly unavailable; nothing is inferred from PIDs, timestamps or logs.
+2. **Final capture.** `pump_held` reaches the Holder's exit marker only after
+   the log was drained to it. With an empty marker buffer it samples the
+   emulator once (the same sampler as the restart checkpoint) together with
+   the marker's exit facts, and hands that `CompletedCapture` to the Registry
+   exactly once. A partial marker retains nothing rather than a screen that
+   may be missing its tail. Detach/stop never captures.
+3. **Publication.** The events watcher takes `take_completed_publications()`
+   under the Registry lock and publishes each outside it. The directory is
+   `completed-terminals/` beside the state file, created owner-only on first
+   use. A duplicate run is refused by the store and logged.
+4. **Reading.** `Registry::completed_run(id)` returns a handle only for a local,
+   exited record with no live Session, from the in-memory binding or the
+   persisted `completed-run.json`. `session.read_screen` and
+   `session.read_scrollback` load it after releasing the Registry, then
+   revalidate that the record is unchanged before answering; a resume or
+   removal that raced the read answers `completed_terminal_stale`. Input,
+   resize and process facts remain impossible for such records.
+5. **Removal.** `Registry::remove` discards the record's artifact with its
+   binding, so nothing can resolve it afterwards.
+
+Still unwired: pane attachment and Find (`session.read_scrollback_cells` and
+the attach stream still require a live Session), remote records (a separate
+authenticated Helper operation), artifact count/GC beyond removal, and an
+explicit reservation of the *next* run before launch. A resume of a completed
+record replaces the binding when the new Holder reports its identity.
 
 ## Acceptance still required
 
@@ -72,8 +88,13 @@ tampered, truncated and oversized files; RLE expansion bombs rejected before cel
 allocation; symlink, FIFO, group-readable and shared-directory refusal; and the
 two-operation admission bound.
 
-Still required before this counts as recovery acceptance: actual PTY natural exit
-and Stop; exact Engine/app-upgrade reopen; pending resume races; input queries and
-OSC notification suppression on completed views; failed file/directory fsync;
-failed launch preserving prior artifacts; slow storage not blocking Registry/live
-input; immutable-artifact retention/GC; and native before/after pane evidence.
+`tests/holder_session.rs::completed_terminal_survives_engine_replacement` runs a
+real Holder to exit, publishes off the lock, replaces the Registry, restores with
+no Holder to adopt, loads the exact run and removes it with the record. A control
+test serves `session.read_screen`/`read_scrollback` from a retained artifact and
+refuses another exit of the same record.
+
+Still required before this counts as recovery acceptance: Stop (explicit) as a
+completion; exact Engine/app-upgrade reopen through the desktop; native pane
+presentation of a retained terminal; failed file/directory fsync; slow storage
+under live input; retention/GC beyond removal; and native before/after evidence.

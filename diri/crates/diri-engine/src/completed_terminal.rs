@@ -100,6 +100,33 @@ impl CompletedRunKey {
         })
     }
 
+    /// Binds a record to a run whose identity the Engine captured from an
+    /// alive, verified Holder stat at launch or adoption and retained in
+    /// memory. This is the same evidence `capture` demands, kept past the
+    /// point where the Holder can still be asked.
+    pub fn bind(
+        record: &SessionRecord,
+        child: diri_proto::process::ProcessIdentity,
+        epoch_offset: u64,
+    ) -> Result<Self> {
+        if record.host.is_some() {
+            return Err(StorageError::UnsupportedRecord);
+        }
+        if !record.created_at.0.is_finite() || record.id.0.len() > 256 {
+            return Err(StorageError::Corrupt);
+        }
+        Ok(Self {
+            session_id: record.id.clone(),
+            record_created_at: record.created_at,
+            child,
+            epoch_offset,
+        })
+    }
+
+    pub fn is_run(&self, child: diri_proto::process::ProcessIdentity, epoch_offset: u64) -> bool {
+        self.child == child && self.epoch_offset == epoch_offset
+    }
+
     fn check_record(&self, record: &SessionRecord) -> Result<()> {
         if record.host.is_some() {
             return Err(StorageError::UnsupportedRecord);
@@ -127,6 +154,30 @@ pub struct CompletedTerminal {
     pub coverage: CompletedCoverage,
     pub checkpoint: ScreenCheckpoint,
     pub exit: ExitInfo,
+}
+
+impl CompletedTerminal {
+    /// A read-only emulator holding the retained grid and history. It accepts
+    /// no input and answers no queries; replies it would owe are discarded.
+    pub fn screen(&self) -> Option<diri_terminal_state::HeadlessScreen> {
+        let checkpoint = &self.checkpoint;
+        let mut screen = diri_terminal_state::HeadlessScreen::new(
+            usize::from(checkpoint.grid.cols),
+            usize::from(checkpoint.grid.rows),
+        );
+        if !screen.restore(
+            &checkpoint.history,
+            &checkpoint.grid,
+            checkpoint.alt_screen,
+            checkpoint.bracketed_paste,
+            checkpoint.mouse,
+        ) {
+            return None;
+        }
+        screen.restore_history_metadata(&checkpoint.history_metadata);
+        let _ = screen.take_replies();
+        Some(screen)
+    }
 }
 
 #[derive(Deserialize, Serialize)]
@@ -301,6 +352,20 @@ impl CompletedTerminalStore {
             self.directory.sync_all()?;
         }
         result
+    }
+
+    /// Removes the artifact for one exact run, for example when its record is
+    /// deleted. Absence is not an error; nothing else in the directory is touched.
+    pub fn discard(&self, key: &CompletedRunKey) -> Result<()> {
+        let name = key.name()?;
+        // SAFETY: the owned directory fd and NUL-terminated name remain live.
+        if unsafe { libc::unlinkat(self.directory.as_raw_fd(), name.as_ptr(), 0) } != 0 {
+            let error = io::Error::last_os_error();
+            if error.kind() != io::ErrorKind::NotFound {
+                return Err(error.into());
+            }
+        }
+        Ok(())
     }
 
     /// Returns None only for an absent exact-run artifact. The expected key must
@@ -1293,6 +1358,40 @@ mod tests {
                 Err(StorageError::Io(_))
             ),
             "the store never creates its directory"
+        );
+    }
+
+    #[test]
+    fn bind_reuses_the_captured_run_and_discard_removes_only_that_artifact() {
+        let _serial = serial();
+        let (temp, store, key, _checkpoint, done) = published();
+        let bound = CompletedRunKey::bind(&record("s1", None), identity(4242), 100).unwrap();
+        assert_eq!(
+            bound, key,
+            "a retained verified run binds to the same artifact"
+        );
+        assert!(bound.is_run(identity(4242), 100));
+        assert!(!bound.is_run(identity(4242), 101));
+        let mut remote = record("s1", None);
+        remote.host = Some("forge".into());
+        assert!(matches!(
+            CompletedRunKey::bind(&remote, identity(4242), 100),
+            Err(StorageError::UnsupportedRecord)
+        ));
+        let other = CompletedRunKey::bind(&record("s1", None), identity(4242), 400).unwrap();
+        store.discard(&other).unwrap();
+        assert!(
+            store.load(&done, &key).unwrap().is_some(),
+            "another run's discard is a no-op"
+        );
+        store.discard(&key).unwrap();
+        assert!(store.load(&done, &key).unwrap().is_none());
+        store.discard(&key).unwrap();
+        assert!(
+            std::fs::read_dir(temp.path().join("completed"))
+                .unwrap()
+                .next()
+                .is_none()
         );
     }
 

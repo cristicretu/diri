@@ -54,6 +54,10 @@ pub struct Registry {
     /// Sessions the user closed, newest last — the "reopen closed tab" stack.
     recently_closed: Vec<SessionRecord>,
     state_file: JsonStateFile,
+    /// Owner-only directory of immutable completed-terminal artifacts.
+    completed_dir: PathBuf,
+    /// Runs already bound on disk, so the watcher writes each binding once.
+    bound_runs: HashMap<String, (diri_proto::process::ProcessIdentity, u64)>,
     /// Minimal per-session state used only to rediscover surviving local
     /// Holders when the global Registry file is unavailable.
     recovery_root: PathBuf,
@@ -139,6 +143,10 @@ impl Registry {
             .parent()
             .map(|parent| parent.join(diri_proto::paths::SESSION_RECOVERY_DIR_NAME))
             .unwrap_or_else(|| PathBuf::from(diri_proto::paths::SESSION_RECOVERY_DIR_NAME));
+        let completed_dir = state_path
+            .parent()
+            .map(|parent| parent.join(COMPLETED_TERMINALS_DIR_NAME))
+            .unwrap_or_else(|| PathBuf::from(COMPLETED_TERMINALS_DIR_NAME));
         Self {
             engine,
             sessions: HashMap::new(),
@@ -147,6 +155,8 @@ impl Registry {
             projects: Vec::new(),
             recently_closed: Vec::new(),
             state_file: JsonStateFile::new(state_path),
+            completed_dir,
+            bound_runs: HashMap::new(),
             recovery_root,
             dirty: false,
             last_persist: None,
@@ -358,7 +368,105 @@ impl Registry {
         };
         self.records.insert(id.clone(), record);
         self.sessions.insert(id.clone(), session);
+        self.bind_completed_run(&id);
         Ok(id)
+    }
+
+    /// Records, once per verified run, which child birth and Holder epoch a
+    /// local record belongs to, so its completed terminal can be found after
+    /// this Engine is gone. A launch whose Holder never reported a verified
+    /// identity is left unbound: its output stays explicitly unavailable.
+    fn bind_completed_run(&mut self, id: &str) {
+        let Some(session) = self.sessions.get(id) else {
+            return;
+        };
+        let Some((child, epoch_offset)) = session.holder_run() else {
+            return;
+        };
+        if self.bound_runs.get(id) == Some(&(child, epoch_offset)) {
+            return;
+        }
+        let Some(record) = self.records.get(id) else {
+            return;
+        };
+        let Ok(key) = crate::completed_terminal::CompletedRunKey::bind(record, child, epoch_offset)
+        else {
+            return;
+        };
+        if self.recovery_store(id).write_completed_run(&key).is_ok() {
+            self.bound_runs.insert(id.to_owned(), (child, epoch_offset));
+        }
+    }
+
+    /// Final terminals of held children that exited since the last call, with
+    /// everything needed to publish them. Storage happens after the lock is
+    /// released; an unbound run is not published.
+    pub fn take_completed_publications(&mut self) -> Vec<CompletedPublication> {
+        let mut publications = Vec::new();
+        let ids: Vec<String> = self
+            .sessions
+            .iter()
+            .filter(|(_, session)| session.view().exited)
+            .map(|(id, _)| id.clone())
+            .collect();
+        for id in ids {
+            self.bind_completed_run(&id);
+            let Some(capture) = self
+                .sessions
+                .get(&id)
+                .and_then(Session::take_completed_capture)
+            else {
+                continue;
+            };
+            let Some(record) = self.record(&id).filter(|record| record.host.is_none()) else {
+                continue;
+            };
+            let Some(&(child, epoch_offset)) = self.bound_runs.get(&id) else {
+                continue;
+            };
+            let Ok(key) =
+                crate::completed_terminal::CompletedRunKey::bind(&record, child, epoch_offset)
+            else {
+                continue;
+            };
+            publications.push(CompletedPublication {
+                directory: self.completed_dir.clone(),
+                record,
+                key,
+                capture,
+            });
+        }
+        publications
+    }
+
+    /// The retained run of a completed local record that no live Session
+    /// backs. The caller loads it after releasing the Registry and must
+    /// revalidate the record afterwards; a live, remote or unbound record
+    /// has no completed terminal to read.
+    pub fn completed_run(&self, id: &str) -> Option<CompletedRunHandle> {
+        if self.sessions.contains_key(id) || self.pending_launches.contains(id) {
+            return None;
+        }
+        let record = self.records.get(id)?;
+        if record.host.is_some() || !matches!(record.status, SessionStatus::Exited(_)) {
+            return None;
+        }
+        let key: crate::completed_terminal::CompletedRunKey = match self.bound_runs.get(id) {
+            Some(&(child, epoch_offset)) => {
+                crate::completed_terminal::CompletedRunKey::bind(record, child, epoch_offset)
+                    .ok()?
+            }
+            None => self
+                .recovery_store(id)
+                .read_completed_run()
+                .ok()
+                .flatten()?,
+        };
+        Some(CompletedRunHandle {
+            directory: self.completed_dir.clone(),
+            record: record.clone(),
+            key,
+        })
     }
 
     pub(crate) fn reserve_launch(&mut self, id: &str, new_record: bool) -> std::io::Result<()> {
@@ -626,6 +734,7 @@ impl Registry {
                         let _ = session.set_hibernated(true);
                     }
                     self.sessions.insert(session_id.clone(), session);
+                    self.bind_completed_run(&session_id);
                     if let Ok(Some(seed)) = self.recovery_store(&session_id).read_activity()
                         && (recovered_from_capsule
                             || seed.occurred_at_ms as f64 >= record_updated_at)
@@ -753,6 +862,7 @@ impl Registry {
         let mut exit_observed = false;
         for (id, version, view) in changed_views {
             published.insert(id.clone(), version);
+            self.bind_completed_run(&id);
             if let Some(record) = self.records.get_mut(&id) {
                 // Final exit facts must reach disk even when no title or
                 // Agent-turn timestamp changes (for example, a quiet shell
@@ -1019,6 +1129,20 @@ impl Registry {
         }
         if plan.delete_output_log {
             let _ = std::fs::remove_file(logs_dir.join(format!("{id}.bin")));
+        }
+        // The retained terminal belongs to this record; nothing else may
+        // find it once the binding below is gone, so remove it too.
+        if let Some(key) = self
+            .bound_runs
+            .remove(id)
+            .and_then(|(child, epoch)| {
+                crate::completed_terminal::CompletedRunKey::bind(&record, child, epoch).ok()
+            })
+            .or_else(|| self.recovery_store(id).read_completed_run().ok().flatten())
+            && let Ok(store) =
+                crate::completed_terminal::CompletedTerminalStore::open(&self.completed_dir)
+        {
+            let _ = store.discard(&key);
         }
         let _ = self.recovery_store(id).remove_owned_files();
         Ok(())
@@ -2093,6 +2217,80 @@ fn recovered_record(capsule: diri_proto::recovery::SessionRecoveryCapsule) -> Se
         pull_requests: None,
         listening_ports: None,
         foreground_agent: None,
+    }
+}
+
+/// Directory beside the state file holding immutable completed terminals.
+pub const COMPLETED_TERMINALS_DIR_NAME: &str = "completed-terminals";
+
+/// One exited run ready to be retained. Publish after releasing the Registry.
+pub struct CompletedPublication {
+    directory: PathBuf,
+    record: SessionRecord,
+    key: crate::completed_terminal::CompletedRunKey,
+    capture: crate::session::CompletedCapture,
+}
+
+impl CompletedPublication {
+    pub fn session_id(&self) -> &str {
+        &self.record.id.0
+    }
+
+    /// Creates the owner-only directory on first use, then publishes exactly
+    /// this run. A second publication of the same run is refused by the store.
+    pub fn publish(self) -> Result<(), crate::completed_terminal::StorageError> {
+        ensure_private_dir(&self.directory)?;
+        let store = crate::completed_terminal::CompletedTerminalStore::open(&self.directory)?;
+        store.publish(
+            &self.record,
+            &self.key,
+            &self.capture.checkpoint,
+            &self.capture.exit,
+        )
+    }
+}
+
+/// A completed record's retained run, captured under the Registry lock.
+pub struct CompletedRunHandle {
+    directory: PathBuf,
+    record: SessionRecord,
+    key: crate::completed_terminal::CompletedRunKey,
+}
+
+impl CompletedRunHandle {
+    pub fn record(&self) -> &SessionRecord {
+        &self.record
+    }
+
+    /// Loads outside the Registry. `None` means this exact run was never
+    /// retained; the caller must then revalidate the record it captured.
+    pub fn load(
+        &self,
+    ) -> Result<
+        Option<crate::completed_terminal::CompletedTerminal>,
+        crate::completed_terminal::StorageError,
+    > {
+        let store = match crate::completed_terminal::CompletedTerminalStore::open(&self.directory) {
+            Ok(store) => store,
+            Err(crate::completed_terminal::StorageError::Io(error))
+                if error.kind() == std::io::ErrorKind::NotFound =>
+            {
+                return Ok(None);
+            }
+            Err(error) => return Err(error),
+        };
+        store.load(&self.record, &self.key)
+    }
+}
+
+fn ensure_private_dir(directory: &Path) -> std::io::Result<()> {
+    use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
+    match std::fs::DirBuilder::new().mode(0o700).create(directory) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+            std::fs::set_permissions(directory, std::fs::Permissions::from_mode(0o700))
+        }
+        Err(error) => Err(error),
     }
 }
 

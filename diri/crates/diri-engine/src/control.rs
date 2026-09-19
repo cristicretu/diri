@@ -2072,16 +2072,63 @@ impl ControlServer {
 
     fn session_read_screen(&self, params: Option<JsonValue>) -> Result<JsonValue, ControlError> {
         let p: diri_proto::SessionIdParams = decode(params)?;
-        let registry = self.registry.lock().map_err(poisoned)?;
-        let session = registry
-            .get(&p.session_id.0)
+        {
+            let registry = self.registry.lock().map_err(poisoned)?;
+            if let Some(session) = registry.get(&p.session_id.0) {
+                let (cols, rows) = session.screen_size();
+                return encode(&diri_proto::ReadScreenResult {
+                    text: session.screen_lines().join("\n"),
+                    cols: cols as i64,
+                    rows: rows as i64,
+                });
+            }
+        }
+        let screen = self
+            .completed_terminal_screen(&p.session_id.0)?
             .ok_or_else(|| ControlError::not_found(p.session_id.0.clone()))?;
-        let (cols, rows) = session.screen_size();
+        let (cols, rows) = screen.size();
         encode(&diri_proto::ReadScreenResult {
-            text: session.screen_lines().join("\n"),
+            text: screen.lines().join("\n"),
             cols: cols as i64,
             rows: rows as i64,
         })
+    }
+
+    /// The retained terminal of a completed local session that no live
+    /// Session backs. Captured under the Registry, loaded outside it, and
+    /// revalidated afterwards so a resume or removal that raced the read
+    /// cannot hand back another run's screen. Input is never possible here.
+    fn completed_terminal_screen(
+        &self,
+        session_id: &str,
+    ) -> Result<Option<diri_terminal_state::HeadlessScreen>, ControlError> {
+        let handle = {
+            let registry = self.registry.lock().map_err(poisoned)?;
+            registry.completed_run(session_id)
+        };
+        let Some(handle) = handle else {
+            return Ok(None);
+        };
+        let terminal = handle.load().map_err(|error| {
+            ControlError::new("completed_terminal_unavailable", error.to_string())
+        })?;
+        let Some(terminal) = terminal else {
+            return Ok(None);
+        };
+        let unchanged = {
+            let registry = self.registry.lock().map_err(poisoned)?;
+            registry.completed_run(session_id).is_some_and(|current| {
+                current.record().status == handle.record().status
+                    && current.record().created_at == handle.record().created_at
+            })
+        };
+        if !unchanged {
+            return Err(ControlError::new(
+                "completed_terminal_stale",
+                "the session changed while its retained terminal was being read",
+            ));
+        }
+        Ok(terminal.screen())
     }
 
     fn session_terminal_title(&self, params: Option<JsonValue>) -> Result<JsonValue, ControlError> {
@@ -2133,11 +2180,16 @@ impl ControlServer {
         params: Option<JsonValue>,
     ) -> Result<JsonValue, ControlError> {
         let p: diri_proto::SessionIdParams = decode(params)?;
-        let registry = self.registry.lock().map_err(poisoned)?;
-        let session = registry
-            .get(&p.session_id.0)
+        {
+            let registry = self.registry.lock().map_err(poisoned)?;
+            if let Some(session) = registry.get(&p.session_id.0) {
+                return encode(&session.read_scrollback());
+            }
+        }
+        let mut screen = self
+            .completed_terminal_screen(&p.session_id.0)?
             .ok_or_else(|| ControlError::not_found(p.session_id.0.clone()))?;
-        encode(&session.read_scrollback())
+        encode(&screen.scrollback())
     }
 
     fn session_read_scrollback_cells(
@@ -4525,6 +4577,115 @@ mod tests {
         let server = server(temp.path());
         let result = ok_of(call(&server, "account.profiles.list", None));
         assert_eq!(result["profiles"], json!([]));
+    }
+
+    #[test]
+    fn read_screen_serves_a_retained_terminal_for_a_completed_session() {
+        use diri_proto::process::{BootId, ProcessBirth, ProcessIdentity};
+        let temp = tempfile::tempdir().expect("temp");
+        let server = server(temp.path());
+        let mut record = test_record("finished");
+        let exit = diri_proto::ExitInfo {
+            reason: diri_proto::ExitReason::Exited,
+            code: Some(0),
+            signal: None,
+        };
+        record.status = diri_proto::SessionStatus::Exited(exit.clone());
+        let child = ProcessIdentity::new(
+            4321,
+            ProcessBirth::Macos {
+                boot_session: BootId::parse("0f0e0d0c-0b0a-0908-0706-050403020100").unwrap(),
+                start_seconds: 1_700_000_000,
+                start_microseconds: 1,
+            },
+        )
+        .unwrap();
+        let key = crate::completed_terminal::CompletedRunKey::bind(&record, child, 10).unwrap();
+        let mut screen = diri_terminal_state::HeadlessScreen::new(40, 4);
+        screen.feed(b"line one\r\nline two\r\nline three\r\nline four\r\nline five");
+        let checkpoint = crate::checkpoint::ScreenCheckpoint {
+            keyboard_snapshot: screen.keyboard_snapshot(),
+            keyboard: Some(screen.keyboard_state()),
+            log_offset: 64,
+            history: screen.history_snapshot(),
+            history_metadata: screen.history_metadata(),
+            grid: screen.grid_update(true),
+            marker_buffer: Vec::new(),
+            alt_screen: false,
+            bracketed_paste: false,
+            mouse: Default::default(),
+        };
+        let completed_dir = temp
+            .path()
+            .join(crate::registry::COMPLETED_TERMINALS_DIR_NAME);
+        std::fs::create_dir(&completed_dir).unwrap();
+        std::fs::set_permissions(
+            &completed_dir,
+            std::os::unix::fs::PermissionsExt::from_mode(0o700),
+        )
+        .unwrap();
+        crate::completed_terminal::CompletedTerminalStore::open(&completed_dir)
+            .unwrap()
+            .publish(&record, &key, &checkpoint, &exit)
+            .unwrap();
+        {
+            let mut registry = server.registry.lock().expect("registry");
+            registry.insert_record(record.clone());
+            let recovery = registry.recovery_directory("finished");
+            std::fs::create_dir_all(&recovery).unwrap();
+            diri_proto::recovery::SessionRecoveryStore::new(recovery)
+                .write_completed_run(&key)
+                .unwrap();
+        }
+
+        let result = ok_of(call(
+            &server,
+            "session.read_screen",
+            Some(json!({ "sessionID": "finished" })),
+        ));
+        assert_eq!(result["cols"], 40);
+        assert_eq!(result["rows"], 4);
+        assert!(
+            result["text"].as_str().unwrap().contains("line five"),
+            "{result}"
+        );
+        let scrollback = ok_of(call(
+            &server,
+            "session.read_scrollback",
+            Some(json!({ "sessionID": "finished" })),
+        ));
+        let lines: Vec<String> = serde_json::from_value(scrollback["lines"].clone()).unwrap();
+        assert!(lines.iter().any(|line| line == "line one"), "{lines:?}");
+
+        // Input against a retained terminal is impossible, not silently lost.
+        assert!(matches!(
+            call(
+                &server,
+                "session.send_text",
+                Some(json!({ "sessionID": "finished", "text": "x", "submit": false })),
+            ),
+            ControlMessage::Response { result: Err(_), .. }
+        ));
+
+        // Another exit than the retained one is a different run: unavailable.
+        {
+            let mut registry = server.registry.lock().expect("registry");
+            let mut other = record.clone();
+            other.status = diri_proto::SessionStatus::Exited(diri_proto::ExitInfo {
+                reason: diri_proto::ExitReason::DaemonRestart,
+                code: None,
+                signal: None,
+            });
+            registry.insert_record(other);
+        }
+        assert!(matches!(
+            call(
+                &server,
+                "session.read_screen",
+                Some(json!({ "sessionID": "finished" })),
+            ),
+            ControlMessage::Response { result: Err(_), .. }
+        ));
     }
 
     #[test]

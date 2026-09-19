@@ -465,3 +465,89 @@ fn a_held_shell_is_working_while_a_foreground_job_runs() {
         .expect("terminate");
     let _ = std::fs::remove_dir_all(root);
 }
+
+/// The confirmed recovery gap: a session that completed while the Engine was
+/// alive must keep its final screen after the Engine is replaced, even though
+/// its Holder is gone and no live Session can be adopted.
+#[test]
+fn completed_terminal_survives_engine_replacement() {
+    let root = holders_dir("completed");
+    let logs = root.join("logs");
+    std::fs::create_dir_all(&logs).unwrap();
+    let state = root.join("state.json");
+    let holder = holder_config(&root);
+    let id = "completed-run";
+    let mut record = record(id);
+
+    let mut registry = Registry::new(engine(), &state);
+    registry
+        .spawn(
+            shell_spec(
+                id,
+                "printf 'retained line\\n'; printf 'final prompt'; exit 3",
+                &logs,
+                Some(holder.clone()),
+            ),
+            record.clone(),
+        )
+        .expect("spawn held");
+    let mut published = HashMap::new();
+    let mut publications = Vec::new();
+    wait_until(
+        "the exit and its retained terminal",
+        Duration::from_secs(10),
+        || {
+            registry.changed_since(&mut published);
+            publications.extend(registry.take_completed_publications());
+            !publications.is_empty()
+        },
+    );
+    assert_eq!(publications.len(), 1);
+    assert!(
+        registry.completed_run(id).is_none(),
+        "a live Session object still owns the record; no fallback yet"
+    );
+    publications
+        .pop()
+        .unwrap()
+        .publish()
+        .expect("publish outside the lock");
+    let artifacts = std::fs::read_dir(root.join("completed-terminals"))
+        .unwrap()
+        .count();
+    assert_eq!(artifacts, 1);
+    registry.persist_for_shutdown().unwrap();
+    drop(registry);
+
+    // The replacement Engine finds no Holder socket to adopt, only the record.
+    let mut restored = Registry::new(engine(), &state);
+    restored.load().unwrap();
+    assert!(restored.restore(&holder, &logs).is_empty());
+    assert!(restored.get(id).is_none());
+    let handle = restored
+        .completed_run(id)
+        .expect("a bound, exited local record has a retained run");
+    record.status = handle.record().status.clone();
+    assert!(matches!(
+        &record.status,
+        SessionStatus::Exited(exit) if exit.code == Some(3)
+    ));
+    let terminal = handle.load().unwrap().expect("the exact run was retained");
+    assert_eq!(terminal.exit.code, Some(3));
+    let screen = terminal.screen().unwrap();
+    let text = screen.lines().join("\n");
+    assert!(
+        text.contains("retained line") && text.contains("final prompt"),
+        "{text}"
+    );
+
+    // Removing the record removes its retained terminal with it.
+    restored.remove(id, &logs).unwrap();
+    assert!(restored.completed_run(id).is_none());
+    assert_eq!(
+        std::fs::read_dir(root.join("completed-terminals"))
+            .unwrap()
+            .count(),
+        0
+    );
+}

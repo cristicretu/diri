@@ -459,7 +459,7 @@ pub fn spawn_registry_watcher(
             // every pass, all under the registry lock.
             let mut published: HashMap<String, u64> = HashMap::new();
             while !stop.load(Ordering::SeqCst) {
-                let (mut changed, cursor_requests, native_title_requests) = {
+                let (mut changed, cursor_requests, native_title_requests, completed) = {
                     let Ok(mut registry) = registry.lock() else {
                         break;
                     };
@@ -467,8 +467,19 @@ pub fn spawn_registry_watcher(
                         registry.changed_since(&mut published),
                         registry.cursor_refresh_requests(),
                         registry.native_title_refresh_requests(),
+                        registry.take_completed_publications(),
                     )
                 };
+                // Retained terminals are written here, off the Registry lock,
+                // so a slow disk never stalls input or grid publication.
+                for publication in completed {
+                    let id = publication.session_id().to_owned();
+                    if let Err(error) = publication.publish() {
+                        eprintln!(
+                            "diri-engine: completed terminal for {id} was not retained: {error}"
+                        );
+                    }
+                }
                 let cursor_refreshes = crate::registry::scan_cursor_refreshes(cursor_requests);
                 let native_title_refreshes =
                     crate::registry::scan_native_title_refreshes(native_title_requests);

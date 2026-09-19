@@ -24,6 +24,8 @@ use crate::{DateMillis, SessionId};
 
 pub const RECOVERY_CAPSULE_FILE: &str = "recovery.json";
 pub const LAST_ACTIVITY_FILE: &str = "last-activity.json";
+/// Identity binding for the run whose completed terminal may be retained.
+const COMPLETED_RUN_FILE: &str = "completed-run.json";
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -137,10 +139,24 @@ impl SessionRecoveryStore {
         read_json(&self.directory.join(LAST_ACTIVITY_FILE))
     }
 
-    /// Removes only the two files this module owns, then the directory if it
+    /// Persists the Engine's binding of this record to one verified child run.
+    /// The value is Engine-owned; this store only keeps it beside the capsule.
+    pub fn write_completed_run<T: Serialize>(&self, binding: &T) -> io::Result<()> {
+        write_json_atomic(&self.directory, COMPLETED_RUN_FILE, binding)
+    }
+
+    pub fn read_completed_run<T: for<'de> Deserialize<'de>>(&self) -> io::Result<Option<T>> {
+        read_json(&self.directory.join(COMPLETED_RUN_FILE))
+    }
+
+    /// Removes only the files this module owns, then the directory if it
     /// became empty. Provider-specific durable storage may live beside them.
     pub fn remove_owned_files(&self) -> io::Result<()> {
-        for name in [RECOVERY_CAPSULE_FILE, LAST_ACTIVITY_FILE] {
+        for name in [
+            RECOVERY_CAPSULE_FILE,
+            LAST_ACTIVITY_FILE,
+            COMPLETED_RUN_FILE,
+        ] {
             match std::fs::remove_file(self.directory.join(name)) {
                 Ok(()) => {}
                 Err(error) if error.kind() == io::ErrorKind::NotFound => {}
