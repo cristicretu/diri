@@ -10,6 +10,8 @@ use tokio::task::JoinHandle;
 use crate::client::{ClientCore, ClientError};
 
 const WRITE_QUEUE_CAPACITY: usize = 256;
+/// Capacity the control-line buffer keeps between messages.
+const IDLE_LINE_CAPACITY: usize = 64 * 1024;
 
 /// The live read/write halves of one control socket.
 ///
@@ -39,6 +41,11 @@ impl ActiveConnection {
             let mut line = Vec::new();
             loop {
                 line.clear();
+                // One scrollback or find-capture reply can be megabytes; do
+                // not carry that capacity for the rest of the connection.
+                if line.capacity() > IDLE_LINE_CAPACITY {
+                    line.shrink_to(IDLE_LINE_CAPACITY);
+                }
                 let read_result = loop {
                     let available = match reader.fill_buf().await {
                         Ok(available) => available,
