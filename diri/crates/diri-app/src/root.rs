@@ -42,6 +42,7 @@ use crate::commands::{
     ToggleSidebar, ToggleTabPeek,
 };
 use crate::external_drop::ExternalDropAction;
+use crate::haptics::{self, Haptic};
 use crate::icons::{SymbolWeight, sf_symbol, sf_symbol_weighted};
 use crate::inspector::{BrowserAction, InspectorEvent, WorkbenchInspector};
 use crate::launcher::{LauncherEvent, LauncherOverlay};
@@ -280,6 +281,8 @@ pub struct RootView {
     inspector_width: f32,
     inspector_max_width: f32,
     inspector_resize_origin: Option<(f32, f32)>,
+    /// Which end of its travel the seam being dragged is held against.
+    seam_limit: haptics::Crossing,
     /// The inspector's mirror of `sidebar_slide` / `sidebar_seam`.
     inspector_slide: Option<SeamSlide>,
     inspector_seam: f32,
@@ -1297,6 +1300,7 @@ impl RootView {
             inspector_seam,
             inspector_toggled_at: None,
             inspector_resize_origin: None,
+            seam_limit: haptics::Crossing::default(),
             window_bounds_save: None,
             status_banner: None,
             status_banner_generation: 0,
@@ -2815,6 +2819,21 @@ impl RootView {
         let width = base_width + pointer_x - origin_x;
         self.sidebar
             .update(cx, |sidebar, cx| sidebar.set_width(width, cx));
+        let applied = self.sidebar.read(cx).width();
+        self.seam_met_limit("sidebar-seam", width, applied, pointer_x);
+    }
+
+    /// One tick when a dragged seam stops following the pointer because it
+    /// reached the end of its travel. The seams have no snap points, so the
+    /// ends are the only thresholds a resize crosses.
+    fn seam_met_limit(&mut self, seam: &'static str, requested: f32, applied: f32, pointer: f32) {
+        let limit = (requested != applied).then(|| haptics::key(seam, requested > applied));
+        if let Some(target) = self
+            .seam_limit
+            .moved_to(limit, gpui::point(px(pointer), px(0.0)))
+        {
+            haptics::perform(Haptic::Limit, target);
+        }
     }
 
     fn drag_terminal_resize(&mut self, pointer_y: f32, cx: &mut Context<Self>) {
@@ -2822,10 +2841,11 @@ impl RootView {
             return;
         };
         let previous = self.workbench_layout;
-        self.workbench_layout.resize_primary(
-            base_height + pointer_y - origin_y,
-            self.terminal_available_height,
-        );
+        let height = base_height + pointer_y - origin_y;
+        self.workbench_layout
+            .resize_primary(height, self.terminal_available_height);
+        let applied = WorkbenchLayout::clamped_primary(height, self.terminal_available_height);
+        self.seam_met_limit("terminal-seam", height, applied, pointer_y);
         if self.workbench_layout != previous {
             cx.notify();
         }
@@ -2835,6 +2855,7 @@ impl RootView {
         if self.terminal_resize_origin.take().is_none() {
             return;
         }
+        self.seam_limit.reset();
         let fraction = self.workbench_layout.primary_fraction();
         if let Err(error) = self
             .window_store
@@ -2851,6 +2872,7 @@ impl RootView {
     /// state, so write it through to preferences now.
     fn finish_resize(&mut self, cx: &mut Context<Self>) {
         if self.resize_origin.take().is_some() {
+            self.seam_limit.reset();
             self.sidebar
                 .update(cx, |sidebar, cx| sidebar.commit_width(cx));
             // Width persistence does not notify the sidebar. Retire the drag
@@ -2963,10 +2985,12 @@ impl RootView {
         let Some((origin_x, base_width)) = self.inspector_resize_origin else {
             return;
         };
-        let width = (base_width - pointer_x + origin_x).clamp(
+        let requested = base_width - pointer_x + origin_x;
+        let width = requested.clamp(
             300.0_f32.min(self.inspector_max_width),
             self.inspector_max_width,
         );
+        self.seam_met_limit("inspector-seam", requested, width, pointer_x);
         if self.inspector_width == width {
             return;
         }
@@ -2978,6 +3002,7 @@ impl RootView {
         if self.inspector_resize_origin.take().is_none() {
             return;
         }
+        self.seam_limit.reset();
         let width = self.inspector_width;
         if let Err(error) = self
             .window_store
@@ -4140,8 +4165,8 @@ impl RootView {
         let position = surfaces.update(cx, |surfaces, _| surfaces.tab_peek_position(now));
         let frame = self.tab_pinch.sample(event, position, now);
         if self.tab_pinch.take_feedback() {
-            #[cfg(target_os = "macos")]
-            crate::macos::pinch_feedback();
+            // The pinch crossed between the strip and the overview.
+            haptics::perform(Haptic::LevelChange, haptics::key("tab-pinch", ()));
         }
         if let Some(frame) = frame {
             surfaces.update(cx, |surfaces, cx| {
@@ -8612,6 +8637,118 @@ mod tests {
             // exercises painting and hit testing with an actual WKWebView.
             root.browser.borrow_mut().clear();
         });
+    }
+
+    #[gpui::test]
+    fn a_seam_ticks_once_as_it_meets_the_end_of_its_travel(cx: &mut gpui::TestAppContext) {
+        // The sidebar's own clamp.
+        const MIN_SIDEBAR_WIDTH: f32 = 200.0;
+        const MAX_SIDEBAR_WIDTH: f32 = 400.0;
+        let services = test_services();
+        let (root, cx) = cx.add_window_view(move |window, cx| {
+            RootView::new(services, true, PreviewScenario::Typical, window, cx)
+        });
+        root.update(cx, |root, cx| {
+            let _ = haptics::testing::take();
+            root.resize_origin = Some((300.0, 300.0));
+            // Free travel, then well past the minimum, then resting there.
+            for x in ((MIN_SIDEBAR_WIDTH as i32 - 60)..300).rev() {
+                root.drag_resize(x as f32, cx);
+            }
+            root.drag_resize(MIN_SIDEBAR_WIDTH - 60.0, cx);
+            assert_eq!(
+                haptics::testing::take(),
+                [(Haptic::Limit, haptics::key("sidebar-seam", false))]
+            );
+            for x in (MIN_SIDEBAR_WIDTH as i32 - 60)..(MAX_SIDEBAR_WIDTH as i32 + 60) {
+                root.drag_resize(x as f32, cx);
+            }
+            assert_eq!(
+                haptics::testing::take(),
+                [(Haptic::Limit, haptics::key("sidebar-seam", true))]
+            );
+            root.finish_resize(cx);
+
+            // The inspector grows leftwards and shares the same rule.
+            root.inspector_max_width = 600.0;
+            root.inspector_width = 440.0;
+            root.inspector_resize_origin = Some((700.0, 440.0));
+            for x in (400..700).rev() {
+                root.drag_inspector_resize(x as f32, cx);
+            }
+            assert_eq!(
+                haptics::testing::take(),
+                [(Haptic::Limit, haptics::key("inspector-seam", true))]
+            );
+            root.finish_inspector_resize(cx);
+
+            // A width set by the app, with no drag behind it, is silent.
+            root.sidebar
+                .update(cx, |sidebar, cx| sidebar.set_width(10.0, cx));
+            assert_eq!(haptics::testing::take(), []);
+        });
+    }
+
+    #[gpui::test]
+    fn the_terminal_split_ticks_at_the_end_of_its_travel(cx: &mut gpui::TestAppContext) {
+        let services = test_services();
+        let (root, cx) = cx.add_window_view(move |window, cx| {
+            RootView::new(services, true, PreviewScenario::Typical, window, cx)
+        });
+        root.update(cx, |root, cx| {
+            let _ = haptics::testing::take();
+            root.terminal_available_height = 800.0;
+            root.terminal_resize_origin = Some((400.0, 400.0));
+            for y in (0..400).rev() {
+                root.drag_terminal_resize(y as f32, cx);
+            }
+            assert_eq!(
+                haptics::testing::take(),
+                [(Haptic::Limit, haptics::key("terminal-seam", false))]
+            );
+            root.finish_terminal_resize(cx);
+        });
+    }
+
+    #[gpui::test]
+    fn the_pinch_keeps_its_one_tick_as_a_level_change(cx: &mut gpui::TestAppContext) {
+        let services = test_services();
+        let (root, cx) = cx.add_window_view(move |window, cx| {
+            RootView::new(services, false, PreviewScenario::Typical, window, cx)
+        });
+        cx.update(|window, _| window.activate_window());
+        cx.run_until_parked();
+        let _ = haptics::testing::take();
+        root.update_in(cx, |root, window, cx| {
+            assert!(root.session_surfaces.is_some() && window.is_window_active());
+            let mut pinch = |delta: f32, phase| {
+                let event = gpui::PinchEvent {
+                    position: gpui::point(px(400.0), px(300.0)),
+                    delta,
+                    modifiers: Modifiers::default(),
+                    phase,
+                };
+                root.handle_tab_pinch(&event, window, cx);
+            };
+            pinch(0.0, gpui::TouchPhase::Started);
+            assert_eq!(
+                haptics::testing::take(),
+                [],
+                "starting a pinch is not a threshold"
+            );
+            // In past the strip, back out across it, and in again.
+            for _ in 0..3 {
+                for _ in 0..5 {
+                    pinch(-0.08, gpui::TouchPhase::Moved);
+                }
+                pinch(0.4, gpui::TouchPhase::Moved);
+            }
+        });
+        assert_eq!(
+            haptics::testing::take(),
+            [(Haptic::LevelChange, haptics::key("tab-pinch", ()))],
+            "one boundary, one tick per gesture"
+        );
     }
 
     #[test]

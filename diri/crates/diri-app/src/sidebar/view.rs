@@ -32,6 +32,7 @@ use tokio::sync::mpsc;
 use crate::commands::{CommandId, OpenSettings, ToggleHistory};
 use crate::delegation::{HandoffProposal, handoff_proposal, sibling_proposal, validate_handoff};
 use crate::external_drop::{ExternalDropPlan, ExternalDropTarget, plan_external_drop};
+use crate::haptics::{self, Haptic};
 use crate::icons::{SymbolWeight, sf_symbol, sf_symbol_weighted};
 use crate::navigation::query_label;
 use crate::query_editor::{self, ClipboardEdit, Edit};
@@ -546,6 +547,9 @@ pub struct Sidebar {
     /// Window-space row bounds from the latest prepaint. Keyboard navigation
     /// uses these to reveal only rows that actually crossed the viewport edge.
     row_bounds: Rc<RefCell<HashMap<SessionId, Bounds<Pixels>>>>,
+    /// The gap the insertion marker was last drawn in during a session drag.
+    insertion_haptic: RefCell<haptics::Crossing>,
+    insertion_line: Cell<Option<f32>>,
     /// Window-space bounds of rows that are not sessions (project headers)
     /// from the latest prepaint, so they can take part in the edge fade.
     fade_bounds: Rc<RefCell<HashMap<SharedString, Bounds<Pixels>>>>,
@@ -722,6 +726,8 @@ impl Sidebar {
             filter_focus: cx.focus_handle(),
             filter_generation: 0,
             row_bounds: Rc::new(RefCell::new(HashMap::new())),
+            insertion_haptic: RefCell::new(haptics::Crossing::default()),
+            insertion_line: Cell::new(None),
             fade_bounds: Rc::new(RefCell::new(HashMap::new())),
             section_bounds: Rc::new(RefCell::new(HashMap::new())),
             section_shift: Shift::default(),
@@ -2141,6 +2147,7 @@ impl Sidebar {
         let plan = plan_external_drop(paths.paths(), target);
         self.external_drop_feedback = plan.feedback();
         if plan.action.is_some() {
+            haptics::perform(Haptic::Accepted, haptics::key("sidebar-drop", ()));
             cx.emit(SidebarEvent::ExternalDrop(plan));
         }
         cx.notify();
@@ -2465,6 +2472,10 @@ impl Sidebar {
                             let target = format!("project:{}", id.0);
                             let moved_now = this.pointer_crossed_header(moved, &id, window)
                                 && this.reorder_project(moved, &id, cx.reduce_motion());
+                            if moved_now {
+                                // The held project traded places with this one.
+                                haptics::perform(Haptic::Snap, haptics::key("project-slot", &id));
+                            }
                             if moved_now || this.ui.drag_target.as_deref() != Some(&target) {
                                 this.ui.drag_target = Some(target);
                                 cx.notify();
@@ -3097,6 +3108,50 @@ impl Sidebar {
     /// under the pointer pays for the store lookup; every other row gets
     /// `None` from the bounds check.
     fn row_drop_feedback(
+        &self,
+        row: &crate::store::SidebarRow,
+        window: &Window,
+        cx: &App,
+    ) -> Option<RowDrop> {
+        let drop = self.row_drop_under_pointer(row, window, cx)?;
+        self.insertion_marker_moved(&drop, row, window);
+        Some(drop)
+    }
+
+    /// One tick as the insertion marker appears in a new gap. The lower band
+    /// of one row and the upper band of the next mark the same gap, so the
+    /// gap is named by where its line is drawn. Rows that would take the session
+    /// as a handoff stay silent: every row is one, and a tick per row passed
+    /// would be a rattle.
+    fn insertion_marker_moved(
+        &self,
+        drop: &RowDrop,
+        row: &crate::store::SidebarRow,
+        window: &Window,
+    ) {
+        let gap = match drop {
+            RowDrop::Insert(zone) => self.row_bounds.borrow().get(row.id()).map(|bounds| {
+                let line = f32::from(if *zone == DropZone::Before {
+                    bounds.top()
+                } else {
+                    bounds.bottom()
+                });
+                let line = same_insertion_gap(self.insertion_line.get(), line);
+                self.insertion_line.set(Some(line));
+                haptics::key("sidebar-insertion", line.round() as i32)
+            }),
+            _ => None,
+        };
+        let entered = self
+            .insertion_haptic
+            .borrow_mut()
+            .moved_to(gap, window.mouse_position());
+        if let Some(target) = entered {
+            haptics::perform(Haptic::Snap, target);
+        }
+    }
+
+    fn row_drop_under_pointer(
         &self,
         row: &crate::store::SidebarRow,
         window: &Window,
@@ -6818,6 +6873,8 @@ impl Sidebar {
     /// Ends a drag gesture: clears the visual state and writes any staged
     /// reorder to disk exactly once.
     fn finish_drag(&mut self) {
+        self.insertion_haptic.borrow_mut().reset();
+        self.insertion_line.set(None);
         self.ui.drag = None;
         self.ui.drag_target = None;
         self.ui.project_order_at_drag_start = None;
@@ -7872,6 +7929,17 @@ fn sibling_run(projection: &crate::store::SidebarProjection, id: &SessionId) -> 
         .filter(|row| row.session.parent == parent)
         .map(|row| row.id().clone())
         .collect()
+}
+
+/// Rows sit a couple of pixels apart, so the marker under one row and the
+/// marker over the next are drawn that far apart while meaning one gap.
+/// Returns the line that names the gap: the previous one when `line` is the
+/// same gap seen from its other side. Rows are far taller than the slop.
+fn same_insertion_gap(previous: Option<f32>, line: f32) -> f32 {
+    const SLOP: f32 = 6.0;
+    previous
+        .filter(|previous| (previous - line).abs() <= SLOP)
+        .unwrap_or(line)
 }
 
 /// The insertion line an outline view draws between rows: a hollow dot at
@@ -10164,6 +10232,137 @@ mod tests {
         assert_eq!(
             top_level_run(&sidebar, cx),
             ["preview-claude", "preview-codex", "preview-shell"]
+        );
+    }
+
+    #[gpui::test]
+    fn the_insertion_marker_ticks_once_per_gap_and_handoff_rows_stay_silent(
+        cx: &mut TestAppContext,
+    ) {
+        let (sidebar, _, cx) = drag_harness(cx);
+        let claude = row_bounds(&sidebar, cx, "preview-claude");
+        let codex = row_bounds(&sidebar, cx, "preview-codex");
+        let shell = row_bounds(&sidebar, cx, "preview-shell");
+        let x = shell.center().x;
+        let move_to = |cx: &mut VisualTestContext, to: Point<Pixels>| {
+            cx.simulate_mouse_move(to, MouseButton::Left, Modifiers::default());
+            cx.run_until_parked();
+        };
+        let _ = haptics::testing::take();
+
+        // Lifting the row and crossing a pinned cousin's bands and another
+        // row's core offers handoffs only: every row is one, so none ticks.
+        drag_to(cx, codex.center(), claude.center());
+        move_to(cx, point(x, claude.bottom() - px(2.0)));
+        move_to(cx, shell.center());
+        assert_eq!(haptics::testing::take(), []);
+
+        // The marker appears under the last row: one tick, and none for
+        // moving on inside the same band or for holding still there.
+        let below = point(x, shell.bottom() - px(2.0));
+        move_to(cx, below);
+        assert!(cx.debug_bounds("insertion-marker:After").is_some());
+        let ticks = haptics::testing::take();
+        assert_eq!(ticks.len(), 1);
+        assert_eq!(ticks[0].0, Haptic::Snap);
+        move_to(cx, below - point(px(0.0), px(1.0)));
+        move_to(cx, below - point(px(0.0), px(1.0)));
+        assert_eq!(haptics::testing::take(), []);
+
+        // Back onto the core the marker goes away, silently; a different
+        // gap is a different slot, and ticks at once.
+        move_to(cx, shell.center());
+        assert_eq!(haptics::testing::take(), []);
+        move_to(cx, point(x, shell.top() + px(2.0)));
+        assert!(cx.debug_bounds("insertion-marker:Before").is_some());
+        let above = haptics::testing::take();
+        assert_eq!(above.len(), 1);
+        assert_ne!(above[0].1, ticks[0].1, "each gap is its own target");
+
+        // Releasing into the slot adds nothing: the hand already felt it.
+        cx.simulate_mouse_up(
+            point(x, shell.top() + px(2.0)),
+            MouseButton::Left,
+            Modifiers::default(),
+        );
+        cx.run_until_parked();
+        assert_eq!(haptics::testing::take(), []);
+    }
+
+    #[test]
+    fn both_sides_of_one_gap_are_one_insertion_slot() {
+        assert_eq!(same_insertion_gap(None, 248.0), 248.0);
+        // Under one row, then over the next: the same gap.
+        assert_eq!(same_insertion_gap(Some(248.0), 250.0), 248.0);
+        assert_eq!(same_insertion_gap(Some(250.0), 248.0), 250.0);
+        // The far side of a row is another gap.
+        assert_eq!(same_insertion_gap(Some(250.0), 280.0), 280.0);
+    }
+
+    #[gpui::test]
+    fn a_project_trading_places_ticks_once_and_a_keyboard_reorder_never_does(
+        cx: &mut TestAppContext,
+    ) {
+        let (sidebar, _, cx) = drag_harness(cx);
+        let dirijor = cx.debug_bounds("PROJECT_preview-dirijor").unwrap();
+        let anara = cx.debug_bounds("PROJECT_preview-anara").unwrap();
+        let x = anara.center().x;
+        let _ = haptics::testing::take();
+
+        drag_to(cx, dirijor.center(), point(x, anara.top() + px(3.0)));
+        assert_eq!(
+            haptics::testing::take(),
+            [],
+            "reaching a header's near edge is not yet a crossing"
+        );
+        let below_midline = point(x, anara.bottom() - px(3.0));
+        cx.simulate_mouse_move(below_midline, MouseButton::Left, Modifiers::default());
+        assert_eq!(
+            haptics::testing::take(),
+            [(
+                Haptic::Snap,
+                haptics::key("project-slot", ProjectId::new("preview-anara"))
+            )]
+        );
+        // Still over the header that has not slid away yet.
+        cx.simulate_mouse_move(
+            below_midline - point(px(0.0), px(1.0)),
+            MouseButton::Left,
+            Modifiers::default(),
+        );
+        cx.simulate_mouse_up(below_midline, MouseButton::Left, Modifiers::default());
+        assert_eq!(haptics::testing::take(), []);
+
+        // The same reorder from the keyboard is not the trackpad's business.
+        sidebar.update(cx, |sidebar, cx| {
+            sidebar.reorder_selected(1, cx);
+        });
+        assert_eq!(haptics::testing::take(), []);
+    }
+
+    #[gpui::test]
+    fn a_finder_drop_ticks_only_when_the_sidebar_takes_it(cx: &mut TestAppContext) {
+        let (sidebar, _, cx) = drag_harness(cx);
+        let folder = tempfile::tempdir().unwrap();
+        let _ = haptics::testing::take();
+
+        sidebar.update(cx, |sidebar, cx| {
+            let missing = ExternalPaths(smallvec::smallvec![folder.path().join("gone")]);
+            sidebar.external_drop(&missing, ExternalDropTarget::EmptySpace, cx);
+        });
+        assert_eq!(
+            haptics::testing::take(),
+            [],
+            "a refused drop is answered by the notice alone"
+        );
+
+        sidebar.update(cx, |sidebar, cx| {
+            let paths = ExternalPaths(smallvec::smallvec![folder.path().to_path_buf()]);
+            sidebar.external_drop(&paths, ExternalDropTarget::EmptySpace, cx);
+        });
+        assert_eq!(
+            haptics::testing::take(),
+            [(Haptic::Accepted, haptics::key("sidebar-drop", ()))]
         );
     }
 

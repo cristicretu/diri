@@ -22,6 +22,7 @@ pub mod fuzzy;
 #[cfg(test)]
 mod gesture_delivery;
 mod git_review;
+mod haptics;
 pub mod history;
 mod icons;
 mod inspector;

@@ -122,16 +122,24 @@ pub(crate) fn observe_reduce_motion(cx: &mut gpui::App) {
     .detach();
 }
 
-/// AppKit respects the current trackpad and the user's haptic preferences.
-pub(crate) fn pinch_feedback() {
+/// Plays one haptic pattern on the trackpad, now. AppKit respects the
+/// current trackpad and the user's haptic preferences, and does nothing when
+/// the user is not touching a Force Touch trackpad. Go through
+/// `crate::haptics`, which decides when a moment deserves one.
+#[cfg_attr(test, allow(dead_code))]
+pub(crate) fn perform_haptic(pattern: crate::haptics::Pattern) {
+    use crate::haptics::Pattern;
     use objc2_app_kit::{
         NSHapticFeedbackManager, NSHapticFeedbackPattern, NSHapticFeedbackPerformanceTime,
         NSHapticFeedbackPerformer,
     };
-    NSHapticFeedbackManager::defaultPerformer().performFeedbackPattern_performanceTime(
-        NSHapticFeedbackPattern::Alignment,
-        NSHapticFeedbackPerformanceTime::Now,
-    );
+    let pattern = match pattern {
+        Pattern::Alignment => NSHapticFeedbackPattern::Alignment,
+        Pattern::LevelChange => NSHapticFeedbackPattern::LevelChange,
+        Pattern::Generic => NSHapticFeedbackPattern::Generic,
+    };
+    NSHapticFeedbackManager::defaultPerformer()
+        .performFeedbackPattern_performanceTime(pattern, NSHapticFeedbackPerformanceTime::Now);
 }
 
 #[cfg(test)]

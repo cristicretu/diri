@@ -391,6 +391,8 @@ impl Sidebar {
                                 if this.pointer_crossed_tab(&dragged.0, &id)
                                     && this.reorder_tab(&dragged.0, &id, cx.reduce_motion())
                                 {
+                                    // The held tab traded places with this one.
+                                    haptics::perform(Haptic::Snap, haptics::key("tab-slot", &id));
                                     cx.notify();
                                 }
                             });
@@ -737,7 +739,7 @@ mod tests {
     use diri_proto::workspace::{
         LayoutNode, PaneId, TabId, WorkspaceId, WorkspaceRecord, WorkspaceSnapshot, WorkspaceTab,
     };
-    use gpui::{TestAppContext, VisualTestContext};
+    use gpui::{Modifiers, TestAppContext, VisualTestContext};
 
     /// Only the strip paints, exactly as the app does while horizontal tabs
     /// hide the sidebar panel.
@@ -770,6 +772,75 @@ mod tests {
             StripOnly { sidebar }
         });
         (view.read_with(cx, |view, _| view.sidebar.clone()), cx)
+    }
+
+    #[gpui::test]
+    fn a_tab_trading_places_ticks_once_per_slot(cx: &mut TestAppContext) {
+        let (sidebar, cx) = strip_harness(cx, true);
+        let order = sidebar.update(cx, |sidebar, _| sidebar.visible_tab_order());
+        let bounds = |cx: &mut VisualTestContext, id: &SessionId| {
+            cx.debug_bounds(Box::leak(
+                format!("horizontal-tab-{}", id.0).into_boxed_str(),
+            ))
+            .expect("tab")
+        };
+        // Only siblings on the same side of the pin boundary trade places.
+        let (moved, target) = order
+            .iter()
+            .enumerate()
+            .flat_map(|(index, moved)| {
+                order[index + 1..]
+                    .iter()
+                    .map(move |target| (moved.clone(), target.clone()))
+            })
+            .find(|(moved, target)| {
+                sidebar.update(cx, |sidebar, _| {
+                    let before = sidebar.visible_tab_order();
+                    let traded = sidebar.reorder_tab(moved, target, true);
+                    if traded {
+                        assert!(sidebar.reorder_tab(moved, target, true));
+                        assert_eq!(sidebar.visible_tab_order(), before);
+                    }
+                    traded
+                })
+            })
+            .expect("the preview strip has two tabs that can trade places");
+        cx.run_until_parked();
+        let from = bounds(cx, &moved);
+        let over = bounds(cx, &target);
+        let _ = haptics::testing::take();
+
+        cx.simulate_mouse_down(from.center(), MouseButton::Left, Modifiers::default());
+        cx.simulate_mouse_move(
+            from.center() + point(px(6.0), px(0.0)),
+            MouseButton::Left,
+            Modifiers::default(),
+        );
+        // Over the neighbour but short of its midline: hover, not a slot.
+        cx.simulate_mouse_move(
+            point(over.left() + px(4.0), over.center().y),
+            MouseButton::Left,
+            Modifiers::default(),
+        );
+        assert_eq!(haptics::testing::take(), []);
+
+        let past_midline = point(over.center().x + px(4.0), over.center().y);
+        cx.simulate_mouse_move(past_midline, MouseButton::Left, Modifiers::default());
+        assert_eq!(
+            haptics::testing::take(),
+            [(Haptic::Snap, haptics::key("tab-slot", &target))]
+        );
+        cx.simulate_mouse_move(
+            past_midline + point(px(1.0), px(0.0)),
+            MouseButton::Left,
+            Modifiers::default(),
+        );
+        cx.simulate_mouse_up(past_midline, MouseButton::Left, Modifiers::default());
+        assert_eq!(
+            haptics::testing::take(),
+            [],
+            "holding the new slot and letting go add nothing"
+        );
     }
 
     #[gpui::test]

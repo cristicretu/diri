@@ -60,6 +60,7 @@ use crate::commands::{
     ToggleInspector, ToggleSidebar, ZoomIn, ZoomOut,
 };
 use crate::external_drop::{TerminalDropAction, plan_terminal_drop, terminal_drop_text};
+use crate::haptics::{self, Haptic};
 use crate::icons::{SymbolWeight, sf_symbol, sf_symbol_weighted};
 use crate::navigation::NavigationOverlay;
 use crate::query_editor::{self, ClipboardEdit, Edit, QueryEditor};
@@ -696,6 +697,8 @@ pub struct TerminalPane {
     /// Secure Keyboard Entry, held only while this pane is where a password
     /// is being typed. See [`Self::reconcile_secure_input`].
     secure_input: crate::secure_input::SecureInputLease,
+    /// Whether the files being dragged are over this pane as its drop target.
+    external_drag: haptics::Crossing,
     _secure_input_quit: gpui::Subscription,
     _secure_input_close: gpui::Subscription,
     _focus_owner: gpui::Subscription,
@@ -910,6 +913,7 @@ impl TerminalPane {
             utility_surfaces: None,
             local_clipboard_images: Vec::new(),
             secure_input: crate::secure_input::SecureInputLease::system(),
+            external_drag: haptics::Crossing::default(),
             _secure_input_quit: secure_input_quit,
             _secure_input_close: secure_input_close,
             _focus_owner: focus_owner,
@@ -1619,25 +1623,18 @@ impl TerminalPane {
         if !self.residents.contains_key(&id) {
             return;
         }
-        let ssh = {
-            let store = self
-                .runtime
-                .store
-                .read()
-                .expect("session store lock poisoned");
-            store
-                .sessions()
-                .get(&id)
-                .and_then(|session| session.host.as_deref())
-                .and_then(|host_id| store.host(host_id))
-                .map(|host| host.ssh.clone())
-        };
+        let ssh = self.drop_destination(&id);
 
         let plan = plan_terminal_drop(paths.paths(), ssh.is_some());
         if let Some(message) = plan.feedback() {
             cx.emit(TerminalPaneEvent::ExternalDropFeedback { message });
         }
+        self.external_drag.reset();
         if plan.action.is_some() {
+            // The release is the user's moment, for remote sessions too: the
+            // upload finishing later is the app's doing and stays silent. A
+            // refused drop is answered by the toast alone.
+            haptics::perform(Haptic::Accepted, haptics::key("terminal-drop", &id));
             // A Finder drop is an explicit interaction even when macOS has
             // not activated this window. Claim synchronously: focus callbacks
             // run after this handler, too late to admit the dropped paths.
@@ -1672,6 +1669,47 @@ impl TerminalPane {
         cx.notify();
     }
 
+    /// Where a drop on `id` has to be copied to first, for a session on
+    /// another host.
+    fn drop_destination(&self, id: &SessionId) -> Option<String> {
+        let store = self
+            .runtime
+            .store
+            .read()
+            .expect("session store lock poisoned");
+        store
+            .sessions()
+            .get(id)
+            .and_then(|session| session.host.as_deref())
+            .and_then(|host_id| store.host(host_id))
+            .map(|host| host.ssh.clone())
+    }
+
+    /// One tick as dragged files arrive over this pane, if releasing them
+    /// here would do something: the moment the pane lights as the target.
+    /// Files nothing here can take light the same border but stay silent.
+    fn track_external_drag(
+        &mut self,
+        paths: &ExternalPaths,
+        over_pane: bool,
+        pointer: gpui::Point<gpui::Pixels>,
+    ) {
+        let target = self
+            .selected_id()
+            .filter(|id| over_pane && self.residents.contains_key(id))
+            .filter(|id| {
+                // Staging stats every path, so decide once, on the way in.
+                self.external_drag.is_over_target()
+                    || plan_terminal_drop(paths.paths(), self.drop_destination(id).is_some())
+                        .action
+                        .is_some()
+            })
+            .map(|id| haptics::key("terminal-drop", &id));
+        if let Some(target) = self.external_drag.moved_to(target, pointer) {
+            haptics::perform(Haptic::Snap, target);
+        }
+    }
+
     /// Present only while a drag is in flight, so it never sits between the
     /// pointer and the grid during normal use. Styled only when what is being
     /// dragged is a set of desktop files: other in-app drags pass through it.
@@ -1687,6 +1725,13 @@ impl TerminalPane {
                     .border_2()
                     .border_color(Ink::FRESH.alpha(0.5))
             })
+            .on_drag_move(
+                cx.listener(|this, event: &gpui::DragMoveEvent<ExternalPaths>, _, cx| {
+                    let pointer = event.event.position;
+                    let paths = event.drag(cx).clone();
+                    this.track_external_drag(&paths, event.bounds.contains(&pointer), pointer);
+                }),
+            )
             .on_drop(cx.listener(|this, paths: &ExternalPaths, window, cx| {
                 cx.stop_propagation();
                 this.external_drop(paths, window, cx);
@@ -4182,6 +4227,9 @@ impl Render for TerminalPane {
         let has_resident = self
             .selected_id()
             .is_some_and(|id| self.residents.contains_key(&id));
+        if !cx.has_active_drag() {
+            self.external_drag.reset();
+        }
         let drop_overlay =
             (has_resident && cx.has_active_drag()).then(|| self.external_drop_overlay(cx));
         div()
@@ -6192,6 +6240,113 @@ mod tests {
                 "the previous view must lose input authority"
             );
         });
+    }
+
+    /// A pane on a local session, filling a window, ready to take a drop.
+    fn drop_target_pane(
+        cx: &mut TestAppContext,
+    ) -> (
+        Entity<TerminalPane>,
+        SessionId,
+        &mut gpui::VisualTestContext,
+    ) {
+        let runtime = Arc::new(StoreRuntime::inert());
+        let tokio = Arc::new(
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap(),
+        );
+        let mut session = fixture_session();
+        session.host = None;
+        let id = session.id.clone();
+        {
+            let mut store = runtime.store.write().unwrap();
+            store.upsert_session(session);
+            store.select(id.clone());
+        }
+        let (pane, cx) =
+            cx.add_window_view(move |window, cx| TerminalPane::new(runtime, tokio, window, cx));
+        pane.update_in(cx, |pane, window, cx| {
+            pane.reconcile_store_change(window, cx);
+            assert!(pane.residents.contains_key(&id));
+        });
+        cx.run_until_parked();
+        (pane, id, cx)
+    }
+
+    #[gpui::test]
+    fn files_dragged_over_a_pane_tick_on_arrival_and_again_when_taken(cx: &mut TestAppContext) {
+        use gpui::FileDropEvent;
+        let (_pane, id, cx) = drop_target_pane(cx);
+        let image = tempfile::Builder::new().suffix(".png").tempfile().unwrap();
+        let paths = ExternalPaths(smallvec::smallvec![image.path().to_path_buf()]);
+        let target = haptics::key("terminal-drop", &id);
+        let inside = gpui::point(px(200.0), px(150.0));
+        let outside = gpui::point(px(-20.0), px(150.0));
+        let _ = haptics::testing::take();
+
+        cx.simulate_event(FileDropEvent::Entered {
+            position: outside,
+            paths: paths.clone(),
+        });
+        cx.simulate_event(FileDropEvent::Pending { position: outside });
+        assert_eq!(
+            haptics::testing::take(),
+            [],
+            "in the window is not yet over the pane"
+        );
+
+        cx.simulate_event(FileDropEvent::Pending { position: inside });
+        assert_eq!(haptics::testing::take(), [(Haptic::Snap, target)]);
+
+        // Moving on inside the pane is hover, and macOS keeps reporting a
+        // pointer that is holding still.
+        cx.simulate_event(FileDropEvent::Pending {
+            position: inside + gpui::point(px(30.0), px(10.0)),
+        });
+        for _ in 0..3 {
+            cx.simulate_event(FileDropEvent::Pending { position: inside });
+        }
+        assert_eq!(haptics::testing::take(), []);
+
+        // Out and straight back in is one boundary crossed twice in a
+        // hurry; coming back later is a new arrival.
+        cx.simulate_event(FileDropEvent::Pending { position: outside });
+        cx.simulate_event(FileDropEvent::Pending { position: inside });
+        assert_eq!(haptics::testing::take(), []);
+        cx.simulate_event(FileDropEvent::Pending { position: outside });
+        haptics::testing::advance(haptics::REPEAT_WINDOW * 2);
+        cx.simulate_event(FileDropEvent::Pending { position: inside });
+        assert_eq!(haptics::testing::take(), [(Haptic::Snap, target)]);
+
+        cx.simulate_event(FileDropEvent::Submit { position: inside });
+        assert_eq!(
+            haptics::testing::take(),
+            [(Haptic::Accepted, target)],
+            "the release is confirmed with its own pattern"
+        );
+    }
+
+    #[gpui::test]
+    fn files_a_pane_cannot_take_are_met_with_silence(cx: &mut TestAppContext) {
+        use gpui::FileDropEvent;
+        let (_pane, _, cx) = drop_target_pane(cx);
+        let folder = tempfile::tempdir().unwrap();
+        let paths = ExternalPaths(smallvec::smallvec![folder.path().join("gone.png")]);
+        let inside = gpui::point(px(200.0), px(150.0));
+        let _ = haptics::testing::take();
+
+        cx.simulate_event(FileDropEvent::Entered {
+            position: gpui::point(px(-20.0), px(150.0)),
+            paths,
+        });
+        cx.simulate_event(FileDropEvent::Pending { position: inside });
+        cx.simulate_event(FileDropEvent::Pending {
+            position: inside + gpui::point(px(5.0), px(0.0)),
+        });
+        cx.simulate_event(FileDropEvent::Submit { position: inside });
+        assert_eq!(haptics::testing::take(), []);
     }
 
     #[gpui::test]

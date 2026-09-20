@@ -6,6 +6,7 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Arc;
 
 use crate::{
+    haptics::{self, Haptic},
     icons::sf_symbol,
     store::StoreRuntime,
     terminal_pane::{TerminalPane, TerminalPaneEvent, TerminalViewport},
@@ -127,6 +128,9 @@ pub(crate) struct WorkspaceWorkbench {
     pending_focus: Option<PaneId>,
     sent_focus: Option<PaneId>,
     resize: Option<ResizeDraft>,
+    /// What the drag in flight last snapped to: the pane a moved pane would
+    /// land on, or the end of a divider's travel.
+    drag_haptic: haptics::Crossing,
     _activation: Subscription,
 }
 impl EventEmitter<WorkspaceWorkbenchEvent> for WorkspaceWorkbench {}
@@ -190,6 +194,7 @@ impl WorkspaceWorkbench {
             pending_focus: None,
             sent_focus: None,
             resize: None,
+            drag_haptic: haptics::Crossing::default(),
             _activation: activation,
         }
     }
@@ -615,7 +620,15 @@ impl WorkspaceWorkbench {
         if available <= 0.0 {
             return;
         }
-        resize.fraction = (position / available).clamp(0.1, 0.9);
+        let requested = position / available;
+        resize.fraction = requested.clamp(0.1, 0.9);
+        // A divider has no snap points; the ends of its travel are the only
+        // thresholds a resize crosses.
+        let limit = (requested != resize.fraction)
+            .then(|| haptics::key("workspace-divider", (&resize.split, requested > 0.5)));
+        if let Some(target) = self.drag_haptic.moved_to(limit, gpui::point(px(x), px(y))) {
+            haptics::perform(Haptic::Limit, target);
+        }
         if let Some(tab) = &mut self.tab {
             set_fraction(&mut tab.layout, &resize.split, resize.fraction);
         }
@@ -662,6 +675,36 @@ impl WorkspaceWorkbench {
             && let Some(tab) = &mut self.tab
         {
             tab.layout = resize.original;
+        }
+    }
+
+    /// One tick as a pane being moved arrives over a pane that would take
+    /// it, the moment that pane's border lights. The dock zones inside a
+    /// pane are not drawn, so crossing between them stays silent.
+    fn track_pane_drag(
+        &mut self,
+        dragged: &PaneId,
+        local: gpui::Point<gpui::Pixels>,
+        pointer: gpui::Point<gpui::Pixels>,
+    ) {
+        let (x, y) = (f32::from(local.x), f32::from(local.y));
+        let target = self.geometry().and_then(|geometry| {
+            geometry
+                .panes
+                .iter()
+                .find(|pane| {
+                    let bounds = pane.bounds;
+                    x >= bounds.x
+                        && x < bounds.x + bounds.width
+                        && y >= bounds.y
+                        && y < bounds.y + bounds.height
+                })
+                .map(|pane| pane.identity.pane.clone())
+                .filter(|pane| pane != dragged)
+                .map(|pane| haptics::key("workspace-pane", pane))
+        });
+        if let Some(target) = self.drag_haptic.moved_to(target, pointer) {
+            haptics::perform(Haptic::Snap, target);
         }
     }
 
@@ -714,6 +757,9 @@ impl Render for WorkspaceWorkbench {
             let store = self.runtime.store.read().expect("store");
             crate::app_theme::colors_in(&store)
         };
+        if !cx.has_active_drag() {
+            self.drag_haptic.reset();
+        }
         let mut root = div()
             .id("workspace-workbench")
             .debug_selector(|| "workspace-workbench".into())
@@ -729,6 +775,13 @@ impl Render for WorkspaceWorkbench {
                         f32::from(event.event.position.y),
                         cx,
                     );
+                },
+            ))
+            .on_drag_move(cx.listener(
+                |this, event: &DragMoveEvent<DraggedWorkspacePane>, _, cx| {
+                    let dragged = event.drag(cx).pane.clone();
+                    let pointer = event.event.position;
+                    this.track_pane_drag(&dragged, pointer - event.bounds.origin, pointer);
                 },
             ))
             .on_key_down(cx.listener(|this, event: &gpui::KeyDownEvent, _, cx| {
@@ -1357,6 +1410,88 @@ mod tests {
                 workbench.finish_resize(cx);
                 assert_eq!(workbench.tab.as_ref().unwrap().layout, external.layout);
                 assert!(runtime.store.read().unwrap().workspace_catalog().can_edit());
+                window.remove_window();
+            })
+            .unwrap();
+        cx.run_until_parked();
+    }
+    #[gpui::test]
+    fn a_divider_ticks_once_at_each_end_of_its_travel(cx: &mut TestAppContext) {
+        let (runtime, tokio, tab) = fixture(false);
+        let handle =
+            cx.add_window(|window, cx| WorkspaceWorkbench::new(runtime, tokio, window, cx));
+        handle
+            .update(cx, |workbench, window, cx| {
+                workbench.set_tab(tab, viewport(), window, cx);
+                let divider = workbench.geometry().unwrap().dividers[0].clone();
+                workbench.begin_resize(divider);
+                let _ = haptics::testing::take();
+
+                // Free travel is silent; the near end ticks once, however
+                // far past it the pointer goes and however long it stays.
+                for x in (-40..500).rev() {
+                    workbench.drag_resize(x as f32, 0.0, cx);
+                }
+                workbench.drag_resize(-40.0, 0.0, cx);
+                let near = haptics::testing::take();
+                assert_eq!(near.len(), 1);
+                assert_eq!(near[0].0, Haptic::Limit);
+
+                for x in -40..1000 {
+                    workbench.drag_resize(x as f32, 0.0, cx);
+                }
+                let far = haptics::testing::take();
+                assert_eq!(far.len(), 1, "the far end is its own limit");
+                assert_ne!(far[0].1, near[0].1);
+                window.remove_window();
+            })
+            .unwrap();
+        cx.run_until_parked();
+    }
+    #[gpui::test]
+    fn a_moved_pane_ticks_as_it_arrives_over_another_pane_and_not_over_itself(
+        cx: &mut TestAppContext,
+    ) {
+        let (runtime, tokio, tab) = fixture(false);
+        let handle =
+            cx.add_window(|window, cx| WorkspaceWorkbench::new(runtime, tokio, window, cx));
+        handle
+            .update(cx, |workbench, window, cx| {
+                workbench.set_tab(tab, viewport(), window, cx);
+                let geometry = workbench.geometry().unwrap();
+                let center = |id: &str| {
+                    let bounds = geometry
+                        .panes
+                        .iter()
+                        .find(|pane| pane.identity.pane == PaneId::new(id))
+                        .unwrap()
+                        .bounds;
+                    gpui::point(
+                        px(bounds.x + bounds.width / 2.0),
+                        px(bounds.y + bounds.height / 2.0),
+                    )
+                };
+                let dragged = PaneId::new("a");
+                let move_to = |workbench: &mut WorkspaceWorkbench, to| {
+                    workbench.track_pane_drag(&dragged, to, to);
+                    haptics::testing::take()
+                };
+                let _ = haptics::testing::take();
+
+                assert_eq!(move_to(workbench, center("a")), [], "its own pane");
+                let arrived = [(
+                    Haptic::Snap,
+                    haptics::key("workspace-pane", PaneId::new("b")),
+                )];
+                assert_eq!(move_to(workbench, center("b")), arrived);
+                // Across the pane, through every undrawn dock zone: silent.
+                let step = gpui::point(px(40.0), px(60.0));
+                assert_eq!(move_to(workbench, center("b") + step), []);
+                assert_eq!(move_to(workbench, center("b") - step), []);
+                assert_eq!(move_to(workbench, center("b") - step), []);
+                assert_eq!(move_to(workbench, center("a")), []);
+                haptics::testing::advance(haptics::REPEAT_WINDOW * 2);
+                assert_eq!(move_to(workbench, center("b")), arrived);
                 window.remove_window();
             })
             .unwrap();

@@ -69,9 +69,17 @@ impl WorkbenchLayout {
         if available_height <= MIN_PRIMARY_HEIGHT + MIN_AUXILIARY_HEIGHT {
             return;
         }
-        let clamped =
-            primary_height.clamp(MIN_PRIMARY_HEIGHT, available_height - MIN_AUXILIARY_HEIGHT);
-        self.primary_fraction = clamped / available_height;
+        self.primary_fraction =
+            Self::clamped_primary(primary_height, available_height) / available_height;
+    }
+
+    /// The primary height `resize_primary` settles on for a request: the
+    /// request itself, until a pane would drop below its minimum.
+    pub fn clamped_primary(primary_height: f32, available_height: f32) -> f32 {
+        if available_height <= MIN_PRIMARY_HEIGHT + MIN_AUXILIARY_HEIGHT {
+            return primary_height;
+        }
+        primary_height.clamp(MIN_PRIMARY_HEIGHT, available_height - MIN_AUXILIARY_HEIGHT)
     }
 
     pub fn reset(&mut self) {
