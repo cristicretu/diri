@@ -92,6 +92,19 @@ pub struct DiffSnapshot {
     /// Untracked files left out by the preview's file-count limit. They are
     /// still part of Git status, so status-driven bulk actions include them.
     pub omitted_untracked: usize,
+    /// Repository-relative names of those files, in Git's listing order. Only
+    /// the names are kept: their contents are never read, so the preview stays
+    /// bounded while the review can still say which files it left out.
+    pub omitted_untracked_paths: Vec<PathBuf>,
+}
+
+impl DiffSnapshot {
+    /// The row of the "not shown" notice, which the review expands into the
+    /// omitted names. The loader always pushes that notice last.
+    #[must_use]
+    pub fn omitted_untracked_notice_row(&self) -> Option<usize> {
+        (!self.omitted_untracked_paths.is_empty()).then(|| self.rows.len().saturating_sub(1))
+    }
 }
 
 /// A review-surface selection. A plain click selects one source line, a shift
@@ -389,14 +402,15 @@ fn load_diff_from_repository(
         }
     }
 
-    let omitted_untracked = if matches!(
+    let omitted_untracked_paths = if matches!(
         source,
         LocalDiffSource::DefaultBranch | LocalDiffSource::Head | LocalDiffSource::Working
     ) {
         append_untracked_diffs(repo_root, &mut patch)?
     } else {
-        0
+        Vec::new()
     };
+    let omitted_untracked = omitted_untracked_paths.len();
 
     let truncated = patch.len() > MAX_DIFF_BYTES;
     patch.truncate(MAX_DIFF_BYTES);
@@ -406,6 +420,7 @@ fn load_diff_from_repository(
     snapshot.layer = layer;
     snapshot.truncated = truncated || omitted_untracked > 0;
     snapshot.omitted_untracked = omitted_untracked;
+    snapshot.omitted_untracked_paths = omitted_untracked_paths;
     if truncated {
         snapshot.rows.push(DiffRow {
             kind: DiffRowKind::Meta,
@@ -462,8 +477,11 @@ fn append_working_diff(repo_root: &Path, patch: &mut Vec<u8>) -> Result<(), Diff
 }
 
 /// Appends a creation diff for each untracked file, up to the preview's file
-/// limit, and returns how many files that limit left out.
-fn append_untracked_diffs(repo_root: &Path, patch: &mut Vec<u8>) -> Result<usize, DiffError> {
+/// limit, and returns the names of the files that limit left out.
+fn append_untracked_diffs(
+    repo_root: &Path,
+    patch: &mut Vec<u8>,
+) -> Result<Vec<PathBuf>, DiffError> {
     let untracked = git(
         repo_root,
         ["ls-files", "--others", "--exclude-standard", "-z"],
@@ -503,7 +521,10 @@ fn append_untracked_diffs(repo_root: &Path, patch: &mut Vec<u8>) -> Result<usize
         }
         append_bytes(patch, &output.stdout);
     }
-    Ok(paths().count().saturating_sub(MAX_UNTRACKED_FILES))
+    Ok(paths()
+        .skip(MAX_UNTRACKED_FILES)
+        .map(path_from_bytes)
+        .collect())
 }
 
 pub fn parse_unified_diff(patch: &str) -> DiffSnapshot {
@@ -1380,6 +1401,20 @@ mod tests {
                 "{count} untracked files"
             );
             assert_eq!(snapshot.truncated, omitted > 0, "{count} untracked files");
+            // The skipped files stay inspectable by name; their contents are
+            // never read, so the preview remains bounded.
+            let expected: Vec<PathBuf> = (MAX_UNTRACKED_FILES..count)
+                .map(|index| PathBuf::from(format!("new-{index:03}.txt")))
+                .collect();
+            assert_eq!(
+                snapshot.omitted_untracked_paths, expected,
+                "{count} untracked files"
+            );
+            assert_eq!(
+                snapshot.omitted_untracked_notice_row(),
+                (omitted > 0).then(|| snapshot.rows.len() - 1),
+                "{count} untracked files"
+            );
             let notices: Vec<_> = snapshot
                 .rows
                 .iter()
