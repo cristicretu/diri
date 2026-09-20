@@ -26,6 +26,7 @@ use crate::scrollback::{
 };
 use crate::selection::{SelectionPoint, TerminalSelection};
 use crate::selection_shimmer::SelectionShimmer;
+use crate::sprites::{AntialiasedShape, Sprite, SpriteGrid};
 use crate::theme::{ResolvedCellStyle, TermTheme, is_default_background};
 
 mod selection_paint;
@@ -481,11 +482,22 @@ struct CachedRow {
     tints: Vec<Tint>,
     background_quads: Vec<PaintQuad>,
     decoration_quads: Vec<PaintQuad>,
+    sprite_shapes: Vec<AntialiasedShape>,
     line: ShapedLine,
 }
 
 impl CachedRow {
-    fn move_vertically(&mut self, dy: Pixels) {
+    /// Whether the row moved. Sprites are laid out on whole device pixels, so
+    /// a row holding any moves only by a whole number of them.
+    fn move_vertically(&mut self, dy: Pixels, grid: SpriteGrid) -> bool {
+        if !grid.keeps_snapping(dy)
+            && self
+                .cells
+                .iter()
+                .any(|cell| Sprite::from_scalar(cell.scalar).is_some())
+        {
+            return false;
+        }
         for quad in self
             .background_quads
             .iter_mut()
@@ -493,6 +505,10 @@ impl CachedRow {
         {
             quad.bounds.origin.y += dy;
         }
+        for shape in &mut self.sprite_shapes {
+            shape.move_vertically(dy);
+        }
+        true
     }
 }
 
@@ -528,6 +544,7 @@ struct RowRenderContext {
     line_height_bits: u32,
     origin_x_bits: u32,
     origin_y_bits: u32,
+    scale_bits: u32,
     visible_cols: usize,
     visible_rows: usize,
 }
@@ -536,6 +553,7 @@ pub struct TerminalPrepaintState {
     started_at: Option<Instant>,
     background_quads: Vec<PaintQuad>,
     decoration_quads: Vec<PaintQuad>,
+    sprite_shapes: Vec<AntialiasedShape>,
     overlay_quads: Vec<PaintQuad>,
     selection: SelectionPaint,
     /// Reading path: window row and the absolute row whose shape paint reads
@@ -573,6 +591,7 @@ struct CursorPaint {
     text: gpui::Rgba,
     glyph: Option<ShapedLine>,
     block: Option<BlockGlyph>,
+    sprite: Option<Sprite>,
     frame: CursorFrame,
     /// While the block is between cells it inverts whatever it covers: these
     /// are the covered cells' glyphs in the cursor's text color, painted
@@ -585,6 +604,7 @@ struct CoveredGlyph {
     row: u16,
     glyph: Option<ShapedLine>,
     block: Option<BlockGlyph>,
+    sprite: Option<Sprite>,
 }
 
 impl CursorPaint {
@@ -1239,29 +1259,30 @@ impl TerminalElement {
         graphemes: Vec<(u16, String)>,
         tints: Vec<Tint>,
         row: u16,
-        origin: Point<Pixels>,
-        metrics: CellMetrics,
+        grid: SpriteGrid,
         window: &mut Window,
     ) -> CachedRow {
         let mut background_quads = Vec::new();
         let mut decoration_quads = Vec::new();
+        let mut sprite_shapes = Vec::new();
         append_row_quads(
             &cells,
             row,
-            origin,
-            metrics,
+            grid,
             self.theme,
             &tints,
             &mut background_quads,
             &mut decoration_quads,
+            &mut sprite_shapes,
         );
-        let line = self.shape_row(&cells, &graphemes, &tints, metrics, window);
+        let line = self.shape_row(&cells, &graphemes, &tints, grid.metrics(), window);
         CachedRow {
             cells,
             graphemes,
             tints,
             background_quads,
             decoration_quads,
+            sprite_shapes,
             line,
         }
     }
@@ -1469,6 +1490,12 @@ impl TerminalElement {
                         .visible
                         .then(|| BlockGlyph::from_scalar(cell.scalar))
                         .flatten(),
+                    sprite: self
+                        .theme
+                        .resolve_cell(cell)
+                        .visible
+                        .then(|| Sprite::from_scalar(cell.scalar))
+                        .flatten(),
                 });
             }
         }
@@ -1494,6 +1521,7 @@ impl TerminalElement {
                     paint_cursor_glyph(
                         covered.glyph.as_ref(),
                         covered.block,
+                        covered.sprite,
                         (covered.col, covered.row),
                         cursor.text,
                         bounds,
@@ -1508,6 +1536,7 @@ impl TerminalElement {
         paint_cursor_glyph(
             cursor.glyph.as_ref(),
             cursor.block,
+            cursor.sprite,
             (cursor.col, cursor.row),
             faded(cursor.text, cursor.frame.opacity),
             bounds,
@@ -1525,12 +1554,13 @@ fn faded(color: gpui::Rgba, opacity: f32) -> gpui::Rgba {
     }
 }
 
-/// The inverted glyph of one cell: block elements as rectangles, everything
-/// else as shaped text, both at the cell's own origin.
+/// The inverted glyph of one cell: block elements and sprites as geometry,
+/// everything else as shaped text, all at the cell's own origin.
 #[allow(clippy::too_many_arguments)]
 fn paint_cursor_glyph(
     glyph: Option<&ShapedLine>,
     block: Option<BlockGlyph>,
+    sprite: Option<Sprite>,
     (col, row): (u16, u16),
     color: gpui::Rgba,
     bounds: Bounds<Pixels>,
@@ -1542,6 +1572,10 @@ fn paint_cursor_glyph(
         for rect in block.rectangles(bounds.origin, metrics, usize::from(col), row) {
             window.paint_quad(fill(rect, color));
         }
+    }
+    if let Some(sprite) = sprite {
+        let grid = SpriteGrid::new(bounds.origin, metrics, window.scale_factor());
+        grid.paint(sprite, grid.cell(usize::from(col), row), color, window);
     }
     if let Some(glyph) = glyph {
         let origin = point(
@@ -1687,6 +1721,7 @@ impl Element for TerminalElement {
                 started_at: None,
                 background_quads: Vec::new(),
                 decoration_quads: Vec::new(),
+                sprite_shapes: Vec::new(),
                 overlay_quads: Vec::new(),
                 selection: SelectionPaint::default(),
                 lines: Vec::new(),
@@ -1711,6 +1746,7 @@ impl Element for TerminalElement {
                 started_at: None,
                 background_quads: Vec::new(),
                 decoration_quads: Vec::new(),
+                sprite_shapes: Vec::new(),
                 overlay_quads: Vec::new(),
                 selection: SelectionPaint::default(),
                 lines: Vec::new(),
@@ -1759,8 +1795,10 @@ impl Element for TerminalElement {
             self.theme.background.alpha(self.background_opacity),
         )];
         let mut decoration_quads = Vec::new();
+        let mut sprite_shapes = Vec::new();
         let mut overlay_quads = Vec::new();
         let mut lines = Vec::with_capacity(visible_rows);
+        let grid = SpriteGrid::new(bounds.origin, metrics, window.scale_factor());
         let cursor;
         let cache_hits;
         let cache_misses;
@@ -1853,12 +1891,12 @@ impl Element for TerminalElement {
                 append_row_quads(
                     &cells,
                     row_index as u16,
-                    bounds.origin,
-                    metrics,
+                    grid,
                     self.theme,
                     tints,
                     &mut background_quads,
                     &mut decoration_quads,
+                    &mut sprite_shapes,
                 );
                 let graphemes = viewport.row_graphemes(&buffer, absolute);
                 let digest = digest_row(&cells, graphemes, tints);
@@ -1888,6 +1926,7 @@ impl Element for TerminalElement {
                 line_height_bits: f32::from(metrics.line_height).to_bits(),
                 origin_x_bits: f32::from(bounds.origin.x).to_bits(),
                 origin_y_bits: f32::from(bounds.origin.y).to_bits(),
+                scale_bits: window.scale_factor().to_bits(),
                 visible_cols,
                 visible_rows,
             };
@@ -1928,8 +1967,9 @@ impl Element for TerminalElement {
                     let old_row = (changed.row + offset) % visible_rows;
                     let dy =
                         metrics.y_for_row(changed.row as u16) - metrics.y_for_row(old_row as u16);
-                    prepared.move_vertically(dy);
-                    continue;
+                    if prepared.move_vertically(dy, grid) {
+                        continue;
+                    }
                 }
                 misses += 1;
                 cache[changed.row] = Some(self.prepare_row(
@@ -1937,8 +1977,7 @@ impl Element for TerminalElement {
                     changed.graphemes,
                     row_tints[changed.row].clone(),
                     changed.row as u16,
-                    bounds.origin,
-                    metrics,
+                    grid,
                     window,
                 ));
             }
@@ -1953,15 +1992,8 @@ impl Element for TerminalElement {
                 }
                 misses += 1;
                 let (cells, graphemes) = (prepared.cells.clone(), prepared.graphemes.clone());
-                cache[row] = Some(self.prepare_row(
-                    cells,
-                    graphemes,
-                    tints,
-                    row as u16,
-                    bounds.origin,
-                    metrics,
-                    window,
-                ));
+                cache[row] =
+                    Some(self.prepare_row(cells, graphemes, tints, row as u16, grid, window));
             }
             cache_misses = misses;
             cache_hits = visible_rows as u64 - misses;
@@ -2063,6 +2095,7 @@ impl Element for TerminalElement {
                 .as_ref()
                 .and_then(|row| tint_at(&row.tints, usize::from(cursor.col)));
             let (cursor_fill, cursor_text) = self.theme.cursor_colors(cell, cursor_tint);
+            let visible = self.theme.resolve_cell(cell).visible;
             Some(CursorPaint {
                 row: cursor.row,
                 col: cursor.col,
@@ -2081,12 +2114,10 @@ impl Element for TerminalElement {
                     metrics,
                     window,
                 ),
-                block: self
-                    .theme
-                    .resolve_cell(cell)
-                    .visible
+                block: visible
                     .then(|| BlockGlyph::from_scalar(cell.scalar))
                     .flatten(),
+                sprite: visible.then(|| Sprite::from_scalar(cell.scalar)).flatten(),
                 frame: CursorFrame::REST,
                 covered: Vec::new(),
             })
@@ -2103,6 +2134,9 @@ impl Element for TerminalElement {
                 .chain(&mut decoration_quads)
             {
                 quad.bounds.origin.y -= scroll_shift;
+            }
+            for shape in &mut sprite_shapes {
+                shape.move_vertically(-scroll_shift);
             }
             // A stepped selection is a path rather than a quad, so it is not
             // in the vectors above; its sheen ramps are.
@@ -2121,6 +2155,7 @@ impl Element for TerminalElement {
             started_at: Some(started_at),
             background_quads,
             decoration_quads,
+            sprite_shapes,
             overlay_quads,
             selection,
             lines,
@@ -2281,6 +2316,9 @@ impl Element for TerminalElement {
                         for quad in &prepared.decoration_quads {
                             window.paint_quad(quad.clone());
                         }
+                        for shape in &prepared.sprite_shapes {
+                            shape.paint(window);
+                        }
                     }
                 });
             }
@@ -2322,6 +2360,9 @@ impl Element for TerminalElement {
                 for quad in prepaint.decoration_quads.drain(..) {
                     window.paint_quad(quad);
                 }
+                for shape in prepaint.sprite_shapes.drain(..) {
+                    shape.paint(window);
+                }
             });
 
             let cursor_schedule = prepaint
@@ -2351,6 +2392,11 @@ impl Element for TerminalElement {
                     ) {
                         window.paint_quad(fill(rect, cursor.text));
                     }
+                }
+                if let Some(sprite) = cursor.sprite {
+                    let grid = SpriteGrid::new(bounds.origin, metrics, window.scale_factor());
+                    let cell = grid.cell(usize::from(cursor.col), cursor.row);
+                    grid.paint(sprite, cell, cursor.text, window);
                 }
                 if let Some(glyph) = cursor.glyph {
                     let origin = point(
@@ -2432,13 +2478,14 @@ fn append_background_quads(
 fn append_row_quads(
     row: &[GridCell],
     row_index: u16,
-    origin: Point<Pixels>,
-    metrics: CellMetrics,
+    grid: SpriteGrid,
     theme: TermTheme,
     tints: &[Tint],
     background_quads: &mut Vec<PaintQuad>,
     decoration_quads: &mut Vec<PaintQuad>,
+    sprite_shapes: &mut Vec<AntialiasedShape>,
 ) {
+    let (origin, metrics) = (grid.origin(), grid.metrics());
     // Plain terminal output is overwhelmingly default-background text with
     // no decorations. Recognize the entire row in one cheap pass instead of
     // scanning it once for backgrounds and again for decorations.
@@ -2449,38 +2496,61 @@ fn append_row_quads(
             && !cell
                 .style
                 .contains(diri_proto::grid::TermStyle::CROSSED_OUT)
-            && BlockGlyph::from_scalar(cell.scalar).is_none()
+            && !is_procedural(cell.scalar)
     });
     if is_plain {
         return;
     }
     append_background_quads(row, row_index, origin, metrics, theme, background_quads);
-    // Keep blocks in the foreground layer, above selection/search backgrounds
-    // and below the cursor. The same path serves cached live rows and history.
+    // Keep blocks and sprites in the foreground layer, above selection/search
+    // backgrounds and below the cursor. The same path serves cached live rows
+    // and history.
     let mut col = 0;
     while col < row.len() {
         let cell = row[col];
         let start = col;
         col += 1;
-        let Some(block) = BlockGlyph::from_scalar(cell.scalar) else {
+        if !is_procedural(cell.scalar) {
             continue;
-        };
+        }
         let style = theme.resolve_cell_under(cell, tint_at(tints, start));
         if !style.visible {
             continue;
         }
+        let continues = |(next, column): (&GridCell, usize)| {
+            let next_style = theme.resolve_cell_under(*next, tint_at(tints, column));
+            next.scalar == cell.scalar
+                && next_style.visible
+                && next_style.foreground == style.foreground
+        };
+        let Some(block) = BlockGlyph::from_scalar(cell.scalar) else {
+            let Some(sprite) = Sprite::from_scalar(cell.scalar) else {
+                continue;
+            };
+            let mut bounds = grid.cell(start, row_index);
+            if sprite.spans_cell_width() {
+                // A rule is one stroke repeated: the run is the same strokes
+                // across one wider cell, on the same snapped edges.
+                while row.get(col).map(|next| (next, col)).is_some_and(continues) {
+                    col += 1;
+                }
+                bounds.right = grid.x(col);
+            }
+            grid.append(
+                sprite,
+                bounds,
+                style.foreground,
+                decoration_quads,
+                sprite_shapes,
+            );
+            continue;
+        };
         let mut rectangles = block.rectangles(origin, metrics, start, row_index);
         if block.spans_cell_width()
             && let Some(mut bar) = rectangles.next()
         {
             // A progress bar is one block repeated; paint the run as one quad
             // for as long as that is provably the same pixels.
-            let continues = |(next, column): (&GridCell, usize)| {
-                let next_style = theme.resolve_cell_under(*next, tint_at(tints, column));
-                next.scalar == cell.scalar
-                    && next_style.visible
-                    && next_style.foreground == style.foreground
-            };
             while row.get(col).map(|next| (next, col)).is_some_and(continues)
                 && let Some(joined) = block
                     .rectangles(origin, metrics, col, row_index)
@@ -2660,8 +2730,15 @@ fn is_bidi_sensitive(scalar: u32) -> bool {
     )
 }
 
+/// Whether the cell is painted as geometry rather than as a font glyph. Both
+/// families lie above U+2500, so text is answered by the first comparison.
+fn is_procedural(scalar: u32) -> bool {
+    scalar >= 0x2500
+        && (BlockGlyph::from_scalar(scalar).is_some() || Sprite::from_scalar(scalar).is_some())
+}
+
 fn render_char(cell: GridCell, visible: bool) -> char {
-    if !visible || cell.scalar == 0 || BlockGlyph::from_scalar(cell.scalar).is_some() {
+    if !visible || cell.scalar == 0 || is_procedural(cell.scalar) {
         return ' ';
     }
     char::from_u32(cell.scalar)
@@ -2939,12 +3016,12 @@ mod block_tests {
             append_row_quads(
                 &[cell],
                 1,
-                point(px(2.0), px(3.0)),
-                metrics,
+                SpriteGrid::new(point(px(2.0), px(3.0)), metrics, 1.0),
                 TermTheme::default(),
                 &[],
                 &mut backgrounds,
                 &mut foregrounds,
+                &mut Vec::new(),
             );
             assert_eq!(
                 foregrounds.len(),
@@ -2995,12 +3072,12 @@ mod block_tests {
         append_row_quads(
             &row,
             0,
-            point(px(0.0), px(0.0)),
-            metrics,
+            SpriteGrid::new(point(px(0.0), px(0.0)), metrics, 1.0),
             TermTheme::DIRIJOR_DARK,
             &[],
             &mut backgrounds,
             &mut foregrounds,
+            &mut Vec::new(),
         );
         let widths: Vec<_> = foregrounds
             .iter()
@@ -3008,6 +3085,140 @@ mod block_tests {
             .collect();
         // Colour, glyph, and partial-width blocks each end a run.
         assert_eq!(widths, [4.0, 2.0, 2.0, 1.0, 0.5, 0.5]);
+    }
+
+    fn sprite_row(
+        row: &[GridCell],
+        grid: SpriteGrid,
+        theme: TermTheme,
+    ) -> (Vec<PaintQuad>, Vec<PaintQuad>, Vec<AntialiasedShape>) {
+        let (mut backgrounds, mut foregrounds, mut shapes) = (Vec::new(), Vec::new(), Vec::new());
+        append_row_quads(
+            row,
+            2,
+            grid,
+            theme,
+            &[],
+            &mut backgrounds,
+            &mut foregrounds,
+            &mut shapes,
+        );
+        (backgrounds, foregrounds, shapes)
+    }
+
+    fn colored(text: &str, fg: TermColor, bg: TermColor) -> impl Iterator<Item = GridCell> + '_ {
+        text.chars()
+            .map(move |ch| GridCell::new(ch as u32, fg, bg, TermStyle::empty()))
+    }
+
+    #[test]
+    fn a_rule_of_one_stroke_in_one_colour_is_one_quad() {
+        let metrics =
+            CellMetrics::from_measurements(px(7.8265624), px(12.0), px(3.0), px(0.0), FontId(0));
+        let default_bg = TermColor::DefaultInverted;
+        for scale in [1.0, 2.0] {
+            let grid = SpriteGrid::new(point(px(13.1), px(3.5)), metrics, scale);
+            let row: Vec<_> = colored(&"─".repeat(120), TermColor::Ansi(4), default_bg)
+                .chain(colored("──", TermColor::Ansi(2), default_bg))
+                .chain(colored("━━━", TermColor::Ansi(2), default_bg))
+                .chain(colored("══", TermColor::Ansi(2), default_bg))
+                .chain(colored("─┬─", TermColor::Ansi(2), default_bg))
+                .collect();
+            let (_, foregrounds, shapes) = sprite_row(&row, grid, TermTheme::DIRIJOR_DARK);
+            assert!(shapes.is_empty());
+            // Colour and glyph each end a run; ═ is two strokes, ┬ three.
+            let cells: Vec<_> = foregrounds
+                .iter()
+                .map(|quad| (f32::from(quad.bounds.size.width) / 7.8265624).round())
+                .collect();
+            assert_eq!(cells[..5], [120.0, 2.0, 3.0, 2.0, 2.0]);
+            assert_eq!(foregrounds.len(), 5 + 1 + 2 + 1);
+            // The run ends on the device pixels its first and last cells own.
+            let rule = foregrounds[0].bounds;
+            assert_eq!(f32::from(rule.left()) * scale, grid.x(0));
+            assert_eq!((f32::from(rule.right()) * scale).round(), grid.x(120));
+        }
+    }
+
+    #[test]
+    fn a_separator_starts_on_the_pixel_where_the_background_it_continues_ends() {
+        for (width, origin_x) in [(7.25, 0.0), (7.8265624, 13.1), (8.5, 2.25)] {
+            let metrics =
+                CellMetrics::from_measurements(px(width), px(12.0), px(3.0), px(0.0), FontId(0));
+            for scale in [1.0_f32, 2.0] {
+                let grid = SpriteGrid::new(point(px(origin_x), px(3.5)), metrics, scale);
+                let row: Vec<_> = colored(" main ", TermColor::Ansi(0), TermColor::Ansi(4))
+                    .chain(colored(
+                        "\u{e0b0}",
+                        TermColor::Ansi(4),
+                        TermColor::DefaultInverted,
+                    ))
+                    .collect();
+                let (backgrounds, foregrounds, shapes) =
+                    sprite_row(&row, grid, TermTheme::DIRIJOR_DARK);
+                assert!(foregrounds.is_empty());
+                let [AntialiasedShape::Polygon { path, color }] = &shapes[..] else {
+                    panic!("a solid separator is one polygon");
+                };
+                assert_eq!(*color, backgrounds[0].background);
+                // GPUI rounds the quad's edge half toward zero.
+                let edge = f32::from(backgrounds[0].bounds.right()) * scale;
+                let snapped = (edge.abs() - 0.5).ceil();
+                assert_eq!(f32::from(path.bounds.left()) * scale, snapped);
+                assert_eq!(f32::from(path.bounds.right()) * scale, grid.x(7));
+            }
+        }
+    }
+
+    #[test]
+    fn sprites_preserve_terminal_colors_styles_and_their_text_column() {
+        let metrics =
+            CellMetrics::from_measurements(px(8.0), px(12.0), px(4.0), px(0.0), FontId(0));
+        let grid = SpriteGrid::new(Point::default(), metrics, 2.0);
+        for theme in [TermTheme::DIRIJOR_DARK, TermTheme::DIRIJOR_LIGHT] {
+            for style in [
+                TermStyle::empty(),
+                TermStyle::DIM,
+                TermStyle::INVERSE,
+                TermStyle::BOLD | TermStyle::ITALIC,
+                TermStyle::INVISIBLE,
+            ] {
+                for ch in ['┼', '╭', '⣿', '╳', '\u{e0b1}'] {
+                    let cell =
+                        GridCell::new(ch as u32, TermColor::Ansi(2), TermColor::Ansi(0), style);
+                    let (_, foregrounds, shapes) = sprite_row(&[cell], grid, theme);
+                    if style.contains(TermStyle::INVISIBLE) {
+                        assert!(foregrounds.is_empty() && shapes.is_empty());
+                        continue;
+                    }
+                    assert!(!foregrounds.is_empty() || !shapes.is_empty());
+                    let foreground = theme.resolve_cell(cell).foreground;
+                    for quad in &foregrounds {
+                        assert_eq!(quad.background, fill(quad.bounds, foreground).background);
+                    }
+                    for shape in &shapes {
+                        match shape {
+                            AntialiasedShape::Arc { quad, .. } => {
+                                assert_eq!(quad.border_color, gpui::Hsla::from(foreground));
+                            }
+                            AntialiasedShape::Polygon { color, .. } => {
+                                assert_eq!(*color, foreground.into());
+                            }
+                        }
+                    }
+                    let terminal = TerminalElement::with_buffer(GridBuffer::default());
+                    let (text, _) = terminal.row_text_and_runs(
+                        &[
+                            cell,
+                            GridCell::new('A' as u32, cell.fg, cell.bg, cell.style),
+                        ],
+                        &[],
+                        &[],
+                    );
+                    assert_eq!(text, " A", "{ch} must not also paint a font glyph");
+                }
+            }
+        }
     }
 
     #[test]
@@ -3033,12 +3244,12 @@ mod block_tests {
                 append_row_quads(
                     &[cell],
                     0,
-                    Point::default(),
-                    metrics,
+                    SpriteGrid::new(Point::default(), metrics, 1.0),
                     theme,
                     &[],
                     &mut backgrounds,
                     &mut foregrounds,
+                    &mut Vec::new(),
                 );
                 assert_eq!(backgrounds.len(), 1);
                 if style.contains(TermStyle::INVISIBLE) {
@@ -4113,6 +4324,7 @@ mod live_scroll_cache_tests {
                         ),
                         gpui::white(),
                     )],
+                    sprite_shapes: Vec::new(),
                     line: ShapedLine::default(),
                 })
             })
@@ -4146,7 +4358,10 @@ mod live_scroll_cache_tests {
                 let prepared = cache[row].as_mut().unwrap();
                 assert_eq!(prepared.cells, damage[row].cells);
                 let previous = (row + offset) % 4;
-                prepared.move_vertically(px((row as f32 - previous as f32) * 20.));
+                let metrics =
+                    CellMetrics::from_measurements(px(10.), px(16.), px(4.), px(0.), FontId(0));
+                let grid = SpriteGrid::new(point(px(3.), px(0.)), metrics, 2.0);
+                assert!(prepared.move_vertically(px((row as f32 - previous as f32) * 20.), grid));
                 assert_eq!(
                     prepared.background_quads[0].bounds.origin,
                     point(px(3.), px(row as f32 * 20.))
