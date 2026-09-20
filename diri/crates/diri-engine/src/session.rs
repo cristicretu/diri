@@ -1286,12 +1286,17 @@ impl Session {
                         mark_launch_failed(&shared);
                         return;
                     };
-                    let stat = stat.or_else(|| {
-                        client
-                            .stat()
-                            .ok()
-                            .filter(|stat| stat.epoch_offset == Some(floor))
-                    });
+                    let stat = stat
+                        .or_else(|| {
+                            client
+                                .stat()
+                                .ok()
+                                .filter(|stat| stat.epoch_offset == Some(floor))
+                        })
+                        // A child that exits within a millisecond is gone,
+                        // Holder and socket with it, before the first stat
+                        // lands. The Holder recorded what it forked at spawn.
+                        .or_else(|| child_record_stat(&paths, floor));
                     if let Some(stat) = stat {
                         process_facts::capture_holder(&shared, &stat);
                     }
@@ -1396,6 +1401,14 @@ impl Session {
                 .stat()
                 .ok()
                 .filter(|stat| stat.epoch_offset == Some(exit_marker_floor))
+                .or_else(|| {
+                    spec.holder.as_ref().and_then(|holder| {
+                        child_record_stat(
+                            &HolderPaths::new(&holder.holders_dir, &spec.id),
+                            exit_marker_floor,
+                        )
+                    })
+                })
         } else {
             None
         };
@@ -2513,6 +2526,15 @@ fn new_shared(
 /// holder has *already cleaned up* is attached by evidence instead: the log
 /// advancing past the pre-spawn tail proves the holder ran and wrote a
 /// marker.
+/// The Holder's spawn-time child record for this incarnation, as a stat that
+/// can bind the run but never claims the child is alive. A record from an
+/// earlier incarnation (a relaunch under the same session id) starts at a
+/// different log offset and is ignored.
+fn child_record_stat(paths: &HolderPaths, floor: u64) -> Option<HolderStat> {
+    let record = crate::holder::protocol::HolderChildRecord::read(&paths.child_record()).ok()?;
+    (record.epoch_offset == floor && record.child_identity.is_some()).then(|| record.as_stat())
+}
+
 fn wait_for_holder(
     client: &HolderClient,
     logs_dir: &Path,

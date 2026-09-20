@@ -359,6 +359,83 @@ impl HolderManagerResponse {
     }
 }
 
+/// What a Holder forked, written beside its pid file the moment the child
+/// exists and before any output is pumped. The socket and pid file vanish
+/// with the Holder; this stays, so an Engine whose first stat arrives after a
+/// millisecond-long child has already exited can still bind the run to the
+/// same verified birth identity a live stat would have carried.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct HolderChildRecord {
+    #[serde(rename = "childPID")]
+    pub child_pid: i32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub child_identity: Option<diri_proto::process::ProcessIdentity>,
+    pub epoch_offset: u64,
+}
+
+impl HolderChildRecord {
+    const MAX_BYTES: u64 = 4096;
+
+    /// Owner-only and atomic; a torn record must never be read as a run.
+    pub fn write(&self, path: &std::path::Path) -> std::io::Result<()> {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        let temp = path.with_extension(format!("child.{}", std::process::id()));
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .mode(0o600)
+            .open(&temp)?;
+        let result = serde_json::to_writer(&mut file, self)
+            .map_err(std::io::Error::other)
+            .and_then(|()| file.sync_all())
+            .and_then(|()| std::fs::rename(&temp, path));
+        if result.is_err() {
+            let _ = std::fs::remove_file(&temp);
+        }
+        result
+    }
+
+    pub fn read(path: &std::path::Path) -> std::io::Result<Self> {
+        use std::io::Read as _;
+        use std::os::unix::fs::{MetadataExt as _, OpenOptionsExt as _};
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NOFOLLOW)
+            .open(path)?;
+        let metadata = file.metadata()?;
+        // SAFETY: geteuid has no preconditions.
+        if !metadata.is_file()
+            || metadata.uid() != unsafe { libc::geteuid() }
+            || metadata.len() > Self::MAX_BYTES
+        {
+            return Err(std::io::Error::other(
+                "child record is not a private regular file",
+            ));
+        }
+        let mut bytes = Vec::new();
+        file.take(Self::MAX_BYTES).read_to_end(&mut bytes)?;
+        serde_json::from_slice(&bytes).map_err(std::io::Error::other)
+    }
+
+    /// The stat an Engine would have seen had it asked while this child was
+    /// still alive, minus liveness: enough to bind, never enough to inspect.
+    pub fn as_stat(&self) -> HolderStat {
+        HolderStat {
+            child_identity: self.child_identity,
+            child_pid: self.child_pid,
+            alive: false,
+            log_offset: self.epoch_offset,
+            foreground_pid: None,
+            cols: None,
+            rows: None,
+            epoch_offset: Some(self.epoch_offset),
+            secret_input: None,
+        }
+    }
+}
+
 /// The in-band exit record: an OSC sequence that is invisible to terminal
 /// clients but remains part of the monotonic byte stream, so an exit that
 /// happens while no daemon is running is still observed later. The daemon
