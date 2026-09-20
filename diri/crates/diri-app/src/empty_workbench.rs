@@ -266,3 +266,104 @@ fn resting(actions: &EmptyWorkbenchActions, colors: SemanticColors) -> Div {
         )
         .child(start_controls("New session", actions, colors))
 }
+
+#[cfg(test)]
+mod tests {
+    use diri_ui::SemanticColors;
+    use gpui::{Context, IntoElement, Render, Window, div, prelude::*, px};
+
+    use super::*;
+
+    /// The pane's pages on their own, in both themes, without a daemon or
+    /// personal state. `render_first_run_window_screenshots` in `root.rs`
+    /// shows the same pages inside the whole window.
+    #[cfg(target_os = "macos")]
+    #[test]
+    #[ignore = "writes first-experience visual review artifacts"]
+    fn render_first_experience_screenshots() {
+        use gpui::AppContext as _;
+
+        struct Page {
+            colors: SemanticColors,
+            installed: &'static [&'static str],
+            installing: Option<AgentKind>,
+            has_sessions: bool,
+        }
+        impl Render for Page {
+            fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+                let catalog = crate::agent_setup::bundled_catalog(self.installed);
+                div()
+                    .size_full()
+                    .bg(self.colors.background)
+                    .font_family(crate::fonts::ui_family())
+                    .flex()
+                    .flex_col()
+                    .child(render(
+                        EmptyWorkbench {
+                            has_sessions: self.has_sessions,
+                            agents: AgentSetupState::from_catalog(Some(&catalog)),
+                            installing: self.installing.clone(),
+                            scanning: false,
+                        },
+                        EmptyWorkbenchActions {
+                            install: Rc::new(|_, _| {}),
+                            check_again: Rc::new(|_, _| {}),
+                            start_in_folder: Rc::new(|_, _| {}),
+                        },
+                        self.colors,
+                    ))
+            }
+        }
+
+        let output = std::path::PathBuf::from(
+            std::env::var_os("DIRI_VISUAL_OUTPUT").expect("set DIRI_VISUAL_OUTPUT directory"),
+        );
+        std::fs::create_dir_all(&output).unwrap();
+        let ready: &[&str] = &["claude-code", "codex"];
+        for (theme, width, height) in [
+            ("dirijor-dark", 1100.0, 700.0),
+            ("dirijor-light", 760.0, 560.0),
+        ] {
+            let platform = gpui_platform::current_platform(true);
+            let mut cx = gpui::HeadlessAppContext::with_platform(
+                platform.text_system(),
+                std::sync::Arc::new(diri_ui::IconAssets),
+                gpui_platform::current_headless_renderer,
+            );
+            cx.update(|cx| {
+                crate::fonts::init(cx);
+                cx.set_reduce_motion(true);
+            });
+            for (name, installed, installing, has_sessions) in [
+                ("welcome", &[][..], None, false),
+                (
+                    "welcome-installing",
+                    &[][..],
+                    Some(AgentKind::CLAUDE_CODE),
+                    false,
+                ),
+                ("welcome-ready", ready, None, false),
+                ("resting", ready, None, true),
+            ] {
+                let page = cx
+                    .open_window(gpui::size(px(width), px(height)), |_, cx| {
+                        cx.new(|_| Page {
+                            colors: crate::app_theme::colors(theme),
+                            installed,
+                            installing,
+                            has_sessions,
+                        })
+                    })
+                    .unwrap();
+                cx.run_until_parked();
+                cx.capture_screenshot(page.into())
+                    .unwrap()
+                    .save(output.join(format!("{theme}-{name}.png")))
+                    .unwrap();
+                page.update(&mut cx, |_, window, _| window.remove_window())
+                    .unwrap();
+                cx.run_until_parked();
+            }
+        }
+    }
+}

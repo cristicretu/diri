@@ -31,7 +31,7 @@ use crate::AppServices;
 use crate::commands::{
     self, APP_CONTEXT, ArchiveSelectedSession, CheckForUpdates, CloseSession, CommandId,
     DelegateSelectedSession, FocusSidebar, MoveSelectedSessionDown, MoveSelectedSessionUp,
-    NewCodexSession, NewDefaultSession, NewTerminal, OpenLauncher, OpenSettings, OpenWorktrees,
+    NewCodexSession, NewDefaultSession, NewSession, NewTerminal, OpenSettings, OpenWorktrees,
     QuoteSelection, QuoteSelectionToSession, RenameSelectedSession, ReopenSession,
     SESSION_NAVIGATION_CONTEXT, SelectLastSession, SelectNextAttentionSession, SelectNextSession,
     SelectPreviousSession, SelectSession1, SelectSession2, SelectSession3, SelectSession4,
@@ -480,11 +480,7 @@ impl RootView {
             )
             .detach();
         }
-        let launcher = cx.new(|cx| {
-            let mut launcher = LauncherOverlay::new(Arc::clone(&services), preview, cx);
-            launcher.set_window_store(window_store.clone());
-            launcher
-        });
+        let launcher = cx.new(|cx| LauncherOverlay::new(Arc::clone(&services), preview, cx));
         let inspector = (!preview || preview_scenario == PreviewScenario::Artifacts).then(|| {
             let runtime = Arc::clone(&services.store);
             let tokio = Arc::clone(&services.tokio);
@@ -605,10 +601,14 @@ impl RootView {
             {
                 let notice = plan.feedback();
                 match action {
-                    ExternalDropAction::OpenLauncher { root } => {
-                        this.launcher.update(cx, |launcher, cx| {
-                            launcher.open_at_directory(root.clone(), notice, window, cx);
-                        });
+                    ExternalDropAction::StartSession { root } => {
+                        // A dropped folder is the whole request: the default
+                        // agent opens there, as the New Agent shortcut would.
+                        this.spawn_default_in(root.clone());
+                        if let Some(notice) = notice {
+                            this.show_quote_feedback("Some items were skipped", notice, cx);
+                        }
+                        return;
                     }
                     ExternalDropAction::OpenSessionComposer {
                         session_id,
@@ -625,7 +625,7 @@ impl RootView {
                         });
                     }
                 }
-                // Like Command-N, a drop swaps the main-pane branch. Focus
+                // A drop onto a session swaps the main-pane branch. Focus
                 // once more after GPUI mounts the composer so the insertion
                 // caret is ready without a click.
                 let launcher = this.launcher.clone();
@@ -748,25 +748,7 @@ impl RootView {
         cx.subscribe_in(
             &launcher,
             window,
-            |this, _, event: &LauncherEvent, window, cx| {
-                if matches!(event, LauncherEvent::ManageAccounts)
-                    && let Some(surfaces) = &this.utility_surfaces
-                {
-                    surfaces.update(cx, |surfaces, cx| {
-                        surfaces.open_settings(cx);
-                        surfaces.open_settings_tab(crate::settings::SettingsTab::Accounts, cx);
-                        surfaces.focus_handle(cx).focus(window, cx);
-                    });
-                    cx.notify();
-                    return;
-                }
-                if let LauncherEvent::ManageAgents(host) = event
-                    && let Some(surfaces) = &this.utility_surfaces
-                {
-                    surfaces.update(cx, |surfaces, cx| {
-                        surfaces.open_agent_settings(host.clone(), cx);
-                    });
-                }
+            |this, _, _: &LauncherEvent, window, cx| {
                 if let Some(terminal) = &this.terminal {
                     terminal.update(cx, |terminal, cx| terminal.focus(window, cx));
                 } else {
@@ -1065,8 +1047,12 @@ impl RootView {
                                             .write()
                                             .expect("store")
                                             .request_close(vec![id]),
-                                        crate::store::WindowAction::OpenLauncher => {
-                                            this.open_launcher(&OpenLauncher, window, cx)
+                                        crate::store::WindowAction::NewSession => {
+                                            this.run_command(
+                                                CommandId::NewDefaultSession,
+                                                window,
+                                                cx,
+                                            );
                                         }
                                         crate::store::WindowAction::OpenSettings => {
                                             this.run_command(CommandId::OpenSettings, window, cx)
@@ -1084,21 +1070,12 @@ impl RootView {
                                     .read()
                                     .expect("session store lock poisoned")
                                     .has_pending_ui_request();
-                                let (open_launcher, open_settings) = if pending {
-                                    let mut store = this
+                                let open_settings = pending
+                                    && this
                                         .window_store
                                         .write()
-                                        .expect("session store lock poisoned");
-                                    (
-                                        store.take_open_launcher_request(),
-                                        store.take_open_settings_request(),
-                                    )
-                                } else {
-                                    (false, false)
-                                };
-                                if open_launcher {
-                                    this.open_launcher(&OpenLauncher, window, cx);
-                                }
+                                        .expect("session store lock poisoned")
+                                        .take_open_settings_request();
                                 if open_settings && let Some(surfaces) = &this.utility_surfaces {
                                     surfaces.update(cx, |surfaces, cx| surfaces.open_settings(cx));
                                 }
@@ -1957,7 +1934,6 @@ impl RootView {
             return;
         }
         if self.launcher.read(cx).is_open() {
-            let reopen = commands::matches_keystroke(CommandId::OpenLauncher, &event.keystroke);
             let focus_sidebar =
                 commands::matches_keystroke(CommandId::FocusSidebar, &event.keystroke);
             if !focus_sidebar {
@@ -1965,7 +1941,7 @@ impl RootView {
                     launcher.handle_key_down(event, window, cx);
                 });
             }
-            if !reopen && !focus_sidebar {
+            if !focus_sidebar {
                 cx.stop_propagation();
             }
             return;
@@ -2038,20 +2014,21 @@ impl RootView {
             return;
         }
         match command {
-            // A spawn the catalog vetoes falls back to the launcher, where the
-            // unavailability is visible and another Agent is one keystroke
-            // away, instead of a shortcut that silently does nothing.
-            CommandId::NewDefaultSession => {
-                if !self.spawn_default() {
-                    self.open_launcher(&OpenLauncher, window, cx);
-                }
+            // A vetoed default spawn already reports why ("checking which
+            // Agents are installed") and rearms the scan. A named Agent that
+            // is not installed lands on its Install row instead of doing
+            // nothing.
+            CommandId::NewDefaultSession | CommandId::NewSession => {
+                self.spawn_default();
             }
             CommandId::NewTerminal => {
                 self.spawn(None);
             }
             CommandId::NewCodexSession => {
-                if !self.spawn(Some(AgentKind::CODEX)) {
-                    self.open_launcher(&OpenLauncher, window, cx);
+                if !self.spawn(Some(AgentKind::CODEX))
+                    && let Some(surfaces) = &self.utility_surfaces
+                {
+                    surfaces.update(cx, |surfaces, cx| surfaces.open_agent_settings(None, cx));
                 }
             }
             CommandId::ToggleCommandPalette => {
@@ -2276,6 +2253,22 @@ impl RootView {
             }),
         }
         true
+    }
+
+    /// The default agent in a folder the user just pointed at.
+    fn spawn_default_in(&self, cwd: String) -> bool {
+        if self.preview {
+            return false;
+        }
+        let workspace_target = self.workspace_spawn_target();
+        self.window_store
+            .write()
+            .expect("session store lock poisoned")
+            .spawn_default(SpawnOptions {
+                workspace_target,
+                cwd: Some(cwd),
+                ..SpawnOptions::default()
+            })
     }
 
     fn spawn_default(&self) -> bool {
@@ -2532,35 +2525,6 @@ impl RootView {
     ) {
         self.sidebar
             .update(cx, |sidebar, cx| sidebar.reopen_last(cx));
-    }
-
-    fn open_launcher(&mut self, _: &OpenLauncher, window: &mut Window, cx: &mut Context<Self>) {
-        self.sync_workspace_spawn_context(cx);
-        self.launcher
-            .update(cx, |launcher, cx| launcher.open(window, cx));
-        // Opening changes which main-pane branch RootView renders.
-        cx.notify();
-        // The launcher was not mounted while the terminal branch was active.
-        // Focus it on the next frame, after GPUI has installed its focus node.
-        let launcher = self.launcher.clone();
-        cx.defer_in(window, move |_, window, cx| {
-            launcher.update(cx, |launcher, cx| launcher.focus(window, cx));
-        });
-    }
-
-    fn toggle_launcher(&mut self, _: &OpenLauncher, window: &mut Window, cx: &mut Context<Self>) {
-        self.sync_workspace_spawn_context(cx);
-        let opens = self
-            .launcher
-            .update(cx, |launcher, cx| launcher.toggle(window, cx));
-        cx.notify();
-        if !opens {
-            return;
-        }
-        let launcher = self.launcher.clone();
-        cx.defer_in(window, move |_, window, cx| {
-            launcher.update(cx, |launcher, cx| launcher.focus(window, cx));
-        });
     }
 
     fn on_key_up(&mut self, event: &KeyUpEvent, window: &mut Window, cx: &mut Context<Self>) {
@@ -4410,7 +4374,9 @@ impl Render for RootView {
                 }),
             )
             .on_action(cx.listener(Self::reopen_last_session))
-            .on_action(cx.listener(Self::toggle_launcher))
+            .on_action(cx.listener(|this, _: &NewSession, window, cx| {
+                this.run_command(CommandId::NewSession, window, cx);
+            }))
             .on_action(cx.listener(|this, _: &NewDefaultSession, window, cx| {
                 this.run_command(CommandId::NewDefaultSession, window, cx);
             }))
@@ -4681,9 +4647,8 @@ impl Render for RootView {
             .child(div().flex_none().h_full().w(px(seam)))
             .when(seam > 0.0, |root| root.child(self.resize_handle(cx)));
         if launcher_open {
-            // Command-N behaves like an unsaved new tab: preserve the app
-            // shell, but replace the live session pane instead of floating a
-            // dialog above it or manufacturing another session/tab up front.
+            // The composer replaces the live session pane and keeps the app
+            // shell, instead of floating a dialog above it.
             root = root.child(
                 div()
                     .relative()

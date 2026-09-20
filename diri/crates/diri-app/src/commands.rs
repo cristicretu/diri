@@ -26,7 +26,7 @@ actions!(
     [
         CloseSession,
         ReopenSession,
-        OpenLauncher,
+        NewSession,
         NewDefaultSession,
         NewTerminal,
         NewCodexSession,
@@ -126,7 +126,7 @@ pub enum CommandId {
     NewWindow,
     CloseSession,
     ReopenSession,
-    OpenLauncher,
+    NewSession,
     NewDefaultSession,
     NewTerminal,
     NewCodexSession,
@@ -335,8 +335,10 @@ pub const COMMANDS: &[CommandSpec] = &[
         Some("⇧⌘T"),
         Some(APP_CONTEXT)
     ),
+    // The id predates the removal of the Command-N composer; it stays so a
+    // saved shortcut override keeps pointing at "New session".
     spec!(
-        OpenLauncher,
+        NewSession,
         "open-launcher",
         Some("cmd-n"),
         Some("⌘N"),
@@ -1139,7 +1141,7 @@ impl CommandSpec {
             CommandId::NewWindow => KeyBinding::new(key, NewWindow, context),
             CommandId::CloseSession => KeyBinding::new(key, CloseSession, context),
             CommandId::ReopenSession => KeyBinding::new(key, ReopenSession, context),
-            CommandId::OpenLauncher => KeyBinding::new(key, OpenLauncher, context),
+            CommandId::NewSession => KeyBinding::new(key, NewSession, context),
             CommandId::NewDefaultSession => KeyBinding::new(key, NewDefaultSession, context),
             CommandId::NewTerminal => KeyBinding::new(key, NewTerminal, context),
             CommandId::NewCodexSession => KeyBinding::new(key, NewCodexSession, context),
@@ -1416,9 +1418,9 @@ impl CommandId {
                 description: "Restore the most recently closed session",
                 category: Sessions,
             },
-            Self::OpenLauncher => ShortcutMetadata {
+            Self::NewSession => ShortcutMetadata {
                 title: "New session",
-                description: "Open the new session picker",
+                description: "Start a session with the default agent",
                 category: Sessions,
             },
             Self::NewDefaultSession => ShortcutMetadata {
@@ -1796,7 +1798,7 @@ impl CommandId {
             Self::NewWindow => Box::new(NewWindow),
             Self::CloseSession => Box::new(CloseSession),
             Self::ReopenSession => Box::new(ReopenSession),
-            Self::OpenLauncher => Box::new(OpenLauncher),
+            Self::NewSession => Box::new(NewSession),
             Self::NewDefaultSession => Box::new(NewDefaultSession),
             Self::NewTerminal => Box::new(NewTerminal),
             Self::NewCodexSession => Box::new(NewCodexSession),
@@ -1984,7 +1986,7 @@ mod tests {
             assert_eq!(command(id).shortcut_label_for(&overrides), None);
         }
         assert_eq!(
-            command(CommandId::OpenLauncher).effective_keystrokes(&overrides),
+            command(CommandId::NewSession).effective_keystrokes(&overrides),
             vec![test_chords("cmd-shift-n")]
         );
         assert_eq!(
@@ -1995,10 +1997,10 @@ mod tests {
             )
             .unwrap()
             .id,
-            CommandId::OpenLauncher
+            CommandId::NewSession
         );
         assert_eq!(
-            command(CommandId::OpenLauncher).effective_keystrokes(&ShortcutOverrides::new()),
+            command(CommandId::NewSession).effective_keystrokes(&ShortcutOverrides::new()),
             vec![test_chords("cmd-n")]
         );
         assert_eq!(
@@ -2171,9 +2173,8 @@ mod tests {
     #[test]
     fn conflicts_include_alternate_bindings() {
         let overrides = ShortcutOverrides::new();
-        let conflict =
-            shortcut_conflict(CommandId::OpenLauncher, &test_chords("cmd-["), &overrides)
-                .expect("navigation alternate should be reserved");
+        let conflict = shortcut_conflict(CommandId::NewSession, &test_chords("cmd-["), &overrides)
+            .expect("navigation alternate should be reserved");
         assert_eq!(conflict.id, CommandId::SelectPreviousSession);
     }
 
@@ -2193,7 +2194,7 @@ mod tests {
         #[cfg(not(target_os = "macos"))]
         let (launcher, previous, other) = ("ctrl-n", "ctrl-[", "ctrl-t");
         assert!(matches_keystroke(
-            CommandId::OpenLauncher,
+            CommandId::NewSession,
             &Keystroke::parse(launcher).unwrap()
         ));
         assert!(matches_keystroke(
@@ -2201,7 +2202,7 @@ mod tests {
             &Keystroke::parse(previous).unwrap()
         ));
         assert!(!matches_keystroke(
-            CommandId::OpenLauncher,
+            CommandId::NewSession,
             &Keystroke::parse(other).unwrap()
         ));
     }

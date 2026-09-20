@@ -16,8 +16,8 @@ continue to take precedence.
 
 | Shortcut | Keys | Action |
 | --- | --- | --- |
-| ⌘N | Command-N | Show or hide the launcher: pick a project and agent, then type the first prompt |
-| ⌘T | Command-T | Start a session with the default agent immediately, no launcher |
+| ⌘N | Command-N | Start a session with the default agent |
+| ⌘T | Command-T | Start a session with the default agent (same as ⌘N) |
 | ⌥⌘T | Option-Command-T | Start a plain shell session |
 | ⇧⌘N | Shift-Command-N | Start a Codex session |
 | ⌘R | Command-R | Rename the selected session in place |
@@ -87,23 +87,23 @@ Choose **Settings → Color theme**, or search for **Color theme** directly. Arr
 
 Anything else edits the query through the [shared text keymap](#text-fields).
 
-### Inside the launcher
+### Inside the prompt composer
+
+The composer opens when you quote text or drop files onto a session, and when
+you review a handoff. It never starts a session: ⌘N and ⌘T launch the default
+agent directly, and the agent's own prompt takes the first task.
 
 | Shortcut | Keys | Action |
 | --- | --- | --- |
-| ⇥ / ⇧⇥ | Tab / Shift-Tab | Cycle the agent forward or backward |
-| ↵ | Return | Submit and start the session |
+| ↵ | Return | Send to the session |
 | ⇧↵ | Shift-Return | Insert a newline in the prompt |
 | ↑ / ↓ | Arrow keys | Move within the prompt; ⇧ extends the selection |
-| Esc | Escape | Close the launcher |
-
-When the agent or project picker is open it takes the arrows first: ↑ ↓ move the
-highlight, ↵ commits it, and Esc closes the picker without closing the launcher.
+| Esc | Escape | Close the composer; the draft stays with its session |
 
 A handoff opens in the same surface with the complete generated context editable.
 The source and target remain visible, remote targets carry a Remote badge, and
 nothing is sent until you activate **Send handoff** or press Return. Esc cancels
-without sending and restores any unfinished Command-N draft.
+without sending and restores any unfinished draft for the session underneath.
 
 ### Inside the overview
 
@@ -182,8 +182,9 @@ falling back to the terminal:
 - **A global shortcut that is not handled is not swallowed.** ⌘R or ⌘J with
   nothing selected, and ⌘9 with no sessions, leave the keystroke alone rather
   than eating it.
-- **The launcher takes everything while it is open**, except ⌘N, which stays
-  available.
+- **The prompt composer takes everything while it is open.** It opens for text
+  quoted or dropped onto a session and for reviewing a handoff, never to start a
+  session.
 - **Settings and worktrees take everything** except ⇧⌘H, ⌘K, ⌘P and ⌘,.
 - **The switcher and the overview own the arrow keys** while they are visible, so
   ⌥⌘↑, ⌘[ and ⌃⌘↑ stand down for as long as either is up.

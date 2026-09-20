@@ -115,7 +115,7 @@ pub(crate) enum WindowAction {
             reason = "Produced by the macOS menu; exercised by portable navigation tests"
         )
     )]
-    OpenLauncher,
+    NewSession,
     #[cfg_attr(
         not(target_os = "macos"),
         allow(
@@ -1424,12 +1424,12 @@ mod tests {
         assert!(
             WindowStore::focused(&first.canonical)
                 .unwrap()
-                .enqueue(WindowAction::OpenLauncher)
+                .enqueue(WindowAction::NewSession)
         );
         assert!(first.write().unwrap().take_window_actions().is_empty());
         assert!(matches!(
             second.write().unwrap().take_window_actions().as_slice(),
-            [WindowAction::OpenLauncher]
+            [WindowAction::NewSession]
         ));
         second.close_context();
         assert_eq!(
