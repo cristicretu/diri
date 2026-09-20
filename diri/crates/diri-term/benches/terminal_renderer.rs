@@ -36,6 +36,13 @@ fn terminal_styled_tui_scroll(cx: &mut BenchAppContext) {
     scroll(cx, styled_row);
 }
 
+/// A dashboard rather than a transcript: framed panes whose rules, junctions,
+/// braille graphs and powerline segments are all drawn as sprites.
+#[gpui::bench(fps = 120)]
+fn terminal_framed_tui_scroll(cx: &mut BenchAppContext) {
+    scroll(cx, framed_row);
+}
+
 /// A reader scrolled 30 rows into history while output keeps arriving under
 /// the held view: every frame recomposes the same 50 rows.
 #[gpui::bench(fps = 120)]
@@ -366,6 +373,45 @@ fn styled_row(line_id: usize) -> Vec<GridCell> {
     }
 }
 
+fn framed_row(line_id: usize) -> Vec<GridCell> {
+    let id = format!("{line_id:05}");
+    let frame = TermColor::Ansi(4);
+    match line_id % 4 {
+        0 => cells(
+            &format!("├─┤ {id} ├{}┬{}┤", "─".repeat(90), "─".repeat(40)),
+            frame,
+        )
+        .collect(),
+        1 => cells("│ ", frame)
+            .chain(cells(
+                &format!("session {id} running cargo test"),
+                TermColor::Default,
+            ))
+            .chain(cells(&" ".repeat(69), TermColor::Default))
+            .chain(cells("│", frame))
+            .chain(cells(&format!(" cpu {id}% "), TermColor::Ansi(2)))
+            .collect(),
+        2 => {
+            let graph: String = (0..96)
+                .map(|col| {
+                    char::from_u32(0x2800 + ((line_id * 7 + col * 13) % 256) as u32).unwrap()
+                })
+                .collect();
+            cells("│", frame)
+                .chain(cells(&graph, TermColor::Ansi(2)))
+                .chain(cells("│", frame))
+                .chain(cells(&format!(" {id} "), TermColor::Default))
+                .collect()
+        }
+        _ => cells(&format!("╰{}┴{}╯ ", "─".repeat(98), "─".repeat(30)), frame)
+            .chain(cells(
+                &format!("\u{e0b2} {id} \u{e0b3} main \u{e0b0}"),
+                TermColor::Ansi(5),
+            ))
+            .collect(),
+    }
+}
+
 fn build_frame(
     offset: usize,
     is_full_snapshot: bool,
@@ -393,6 +439,7 @@ gpui::bench_group!(
     benches,
     terminal_build_log_scroll,
     terminal_styled_tui_scroll,
+    terminal_framed_tui_scroll,
     terminal_reading_view_redraw,
     terminal_trackpad_fling,
     terminal_theme_fade_redraw
