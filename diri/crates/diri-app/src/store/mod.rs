@@ -70,6 +70,10 @@ const UI_PUBLISH_INTERVAL: Duration = Duration::from_millis(50);
 // that, repeated Refresh clicks would queue daemon-side scans that each hold a
 // thread behind the same per-target single-flight lock.
 const MAX_AGENT_CATALOG_SCANS: u32 = 2;
+/// Repository lookups on the wire at once. Each can sit on an unreachable host
+/// until the client's timeout, and reopening the launcher asks again, so the
+/// rest wait for a permit instead of piling onto the daemon.
+const MAX_REPO_LOOKUPS: usize = 4;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum StoreEventChange {
@@ -3343,6 +3347,7 @@ async fn run_effects(
     resync_tx: mpsc::Sender<()>,
 ) {
     let mut workspace_tasks = tokio::task::JoinSet::new();
+    let repo_lookups = Arc::new(tokio::sync::Semaphore::new(MAX_REPO_LOOKUPS));
     loop {
         // Reap completed handles before admitting another effect, so a burst
         // of fast launches cannot retain an unbounded completed task set.
@@ -3510,29 +3515,46 @@ async fn run_effects(
                 host,
                 session_id,
             } => {
-                let result = client
-                    .locate_repo(diri_proto::HostLocateRepoParams {
-                        host,
-                        origin_url: None,
-                        session_id: Some(session_id),
-                    })
-                    .await;
-                let target = match &result {
-                    Ok(found) => match (&found.path, &found.origin_url) {
-                        (Some(path), _) => RepoTarget::Resolved(path.clone()),
-                        (None, Some(_)) => RepoTarget::NotCloned,
-                        (None, None) => RepoTarget::NoOrigin,
-                    },
-                    // Resolution is best-effort UI sugar: fall back to the
-                    // default directory instead of surfacing an error.
-                    Err(_) => RepoTarget::NoOrigin,
-                };
-                let mut store = store.write().expect("session store lock poisoned");
-                if let Some((owner, generation)) = owner {
-                    store.finish_window_repo_target(owner, generation, key, target);
-                } else {
-                    store.set_repo_target(key, target);
-                }
+                // A read that mutates no session, and can take as long as a
+                // slow host does: it must not sit between a close and the
+                // daemon, so it leaves the serial loop like the listings below.
+                let client = Arc::clone(&client);
+                let store = Arc::clone(&store);
+                let change_tx = change_tx.clone();
+                let repo_lookups = Arc::clone(&repo_lookups);
+                tokio::spawn(async move {
+                    let Ok(_permit) = repo_lookups.acquire_owned().await else {
+                        return;
+                    };
+                    let result = client
+                        .locate_repo(diri_proto::HostLocateRepoParams {
+                            host,
+                            origin_url: None,
+                            session_id: Some(session_id.clone()),
+                        })
+                        .await;
+                    let target = match &result {
+                        Ok(found) => match (&found.path, &found.origin_url) {
+                            (Some(path), _) => RepoTarget::Resolved(path.clone()),
+                            (None, Some(_)) => RepoTarget::NotCloned,
+                            (None, None) => RepoTarget::NoOrigin,
+                        },
+                        // Resolution is best-effort UI sugar: fall back to the
+                        // default directory instead of surfacing an error.
+                        Err(_) => RepoTarget::NoOrigin,
+                    };
+                    let mut store = store.write().expect("session store lock poisoned");
+                    if let Some((owner, generation)) = owner {
+                        store.finish_window_repo_target(owner, generation, key, target);
+                    } else if store.repo_target_session.as_ref() == Some(&session_id) {
+                        // Lookups finish in any order now: one for a session
+                        // the launcher has since left must not land on top of
+                        // its successor's answer. Windows check a generation.
+                        store.set_repo_target(key, target);
+                    }
+                    drop(store);
+                    let _ = change_tx.send(());
+                });
                 Ok(())
             }
             StoreEffect::ListDirectories {
