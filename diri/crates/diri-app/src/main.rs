@@ -62,6 +62,7 @@ mod tab_navigation;
 mod tab_peek;
 mod tab_preview;
 pub mod terminal_pane;
+mod text_input;
 pub mod transcript;
 pub mod updates;
 pub mod usage;

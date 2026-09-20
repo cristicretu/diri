@@ -16,6 +16,8 @@ use gpui::{
     Render, Role, ScrollHandle, Task, Window, div, prelude::*, px, rgba,
 };
 
+mod prompt_input;
+
 use crate::AppServices;
 use crate::agent_catalog::{AgentOption, quick_agent_options, title_case_id};
 use crate::composer::{PointerHit, PromptComposer};
@@ -137,6 +139,10 @@ pub(crate) struct LauncherOverlay {
     prompt: PromptComposer,
     /// A press on the prompt text is being dragged into a selection.
     prompt_selecting: bool,
+    /// AppKit's input context holds marked text for the prompt. When the
+    /// composition ends from this side — an edit, a cancel, a new draft —
+    /// the next render tells AppKit to let go of it too.
+    prompt_marked_natively: bool,
     target: LauncherTarget,
     new_session_draft: String,
     session_drafts: HashMap<SessionId, String>,
@@ -381,6 +387,7 @@ impl LauncherOverlay {
             focus,
             prompt: PromptComposer::default(),
             prompt_selecting: false,
+            prompt_marked_natively: false,
             target: LauncherTarget::NewSession,
             new_session_draft: String::new(),
             session_drafts: HashMap::new(),
@@ -1546,6 +1553,10 @@ impl LauncherOverlay {
         if !self.can_submit() {
             return false;
         }
+        // What is sent is what is on screen: text still marked when the send
+        // button is clicked goes as typed rather than staying half-owned by
+        // the input method while the editor is frozen.
+        self.prompt.finish_composition();
         if let Some(command) = handoff_command(&self.mode, self.prompt.text()) {
             let Some(ticket) = self.delivery.begin() else {
                 return false;
@@ -2151,6 +2162,31 @@ impl LauncherOverlay {
         let caret = self.focus.is_focused(window).then_some(CARET);
         self.prompt
             .hit_test(position, px(COMPOSER_LINE_HEIGHT), caret, window)
+    }
+
+    /// Whether text from the input method belongs to the prompt right now.
+    /// The folder step has no editor and the recipe editor reads keys through
+    /// the same focus handle; neither may collect text meant for a field the
+    /// user cannot see.
+    fn prompt_accepts_input(&self) -> bool {
+        self.open
+            && !self.delivery.is_sending()
+            && self.recipe_editor.is_none()
+            && !self.needs_folder()
+    }
+
+    /// Bookkeeping every change the input method makes to the prompt shares
+    /// with the ones the keyboard makes.
+    fn prompt_text_changed(&mut self) {
+        self.pending_recipe_activation = None;
+        self.prompt_marked_natively = self.prompt.is_composing();
+        self.forget_local_paths_of_an_empty_draft();
+    }
+
+    fn cancel_prompt_composition(&mut self, cx: &mut Context<Self>) {
+        if self.prompt.cancel_composition() {
+            cx.notify();
+        }
     }
 
     fn forget_local_paths_of_an_empty_draft(&mut self) {
@@ -3305,6 +3341,7 @@ impl LauncherOverlay {
                             .line_height(px(COMPOSER_LINE_HEIGHT))
                             .text_color(colors.primary)
                             .on_mouse_down(MouseButton::Left, cx.listener(Self::prompt_mouse_down))
+                            .child(prompt_input::register(self, cx))
                             .child(prompt),
                     )
                     .child(
@@ -3689,6 +3726,7 @@ impl LauncherOverlay {
                             .line_height(px(COMPOSER_LINE_HEIGHT))
                             .text_color(colors.primary)
                             .on_mouse_down(MouseButton::Left, cx.listener(Self::prompt_mouse_down))
+                            .child(prompt_input::register(self, cx))
                             .child(prompt),
                     )
                     .child(
@@ -3925,6 +3963,7 @@ impl LauncherOverlay {
                             .line_height(px(COMPOSER_LINE_HEIGHT))
                             .text_color(colors.primary)
                             .on_mouse_down(MouseButton::Left, cx.listener(Self::prompt_mouse_down))
+                            .child(prompt_input::register(self, cx))
                             .child(prompt),
                     )
                     .child(
@@ -4164,8 +4203,22 @@ impl Render for LauncherOverlay {
             .key_context("DiriLauncher")
             .track_focus(&self.focus)
             .on_key_down(cx.listener(|this, event, window, cx| {
-                this.handle_key_down(event, window, cx);
+                // A claimed key must not fall through to the input handler as
+                // well, or every typed character would arrive twice.
+                if this.handle_key_down(event, window, cx) {
+                    cx.stop_propagation();
+                }
             }));
+        // An unfinished composition is cancelled when focus leaves, never
+        // committed on the user's behalf. However a composition ended on this
+        // side, AppKit still holds its marked text and has to drop it.
+        if !self.open || !self.focus.is_focused(window) {
+            self.prompt.cancel_composition();
+        }
+        if self.prompt_marked_natively && !self.prompt.is_composing() {
+            self.prompt_marked_natively = false;
+            crate::text_input::discard_native(window, cx);
+        }
         if !self.open {
             return root.size(px(0.0));
         }
@@ -4860,6 +4913,224 @@ mod tests {
         launcher.read_with(cx, |launcher, _| {
             assert_eq!(launcher.prompt.editor().selected_text(), Some("naïve"));
         });
+    }
+
+    fn input_handler(
+        launcher: &gpui::Entity<LauncherOverlay>,
+        cx: &mut gpui::VisualTestContext,
+    ) -> prompt_input::PromptInputHandler {
+        let origin = cx
+            .debug_bounds("launcher-prompt-input")
+            .expect("the prompt registers its input handler")
+            .origin;
+        prompt_input::PromptInputHandler {
+            launcher: launcher.downgrade(),
+            epoch: launcher.read_with(cx, |launcher, _| launcher.prompt.composition_epoch()),
+            origin,
+        }
+    }
+
+    #[gpui::test]
+    fn typed_text_reaches_the_prompt_once_and_native_input_reaches_it_at_all(
+        cx: &mut TestAppContext,
+    ) {
+        let services = test_services(Arc::new(StoreRuntime::inert()));
+        let (launcher, cx) =
+            cx.add_window_view(move |_window, cx| LauncherOverlay::new(services, false, cx));
+        launcher.update_in(cx, |launcher, window, cx| {
+            launcher.open(window, cx);
+            launcher.selected_root = "/tmp".into();
+            cx.notify();
+        });
+        cx.run_until_parked();
+        // Keys the launcher claims stop there; with a handler registered they
+        // would otherwise be delivered a second time as native text.
+        cx.simulate_input("ab");
+        launcher.read_with(cx, |launcher, _| assert_eq!(launcher.prompt.text(), "ab"));
+        // Text no key-down produces — a character picker, a committed
+        // composition — has only the registered handler to arrive through.
+        cx.update(|window, cx| {
+            window.dispatch_keystroke(
+                Keystroke {
+                    modifiers: Modifiers::function(),
+                    key: "f19".into(),
+                    key_char: Some("界".into()),
+                },
+                cx,
+            );
+        });
+        cx.run_until_parked();
+        launcher.read_with(cx, |launcher, _| assert_eq!(launcher.prompt.text(), "ab界"));
+    }
+
+    #[gpui::test]
+    fn compositions_commit_once_keep_shortcuts_working_and_cancel_on_focus_change(
+        cx: &mut TestAppContext,
+    ) {
+        use gpui::InputHandler as _;
+        let services = test_services(Arc::new(StoreRuntime::inert()));
+        let (launcher, cx) =
+            cx.add_window_view(move |_window, cx| LauncherOverlay::new(services, false, cx));
+        launcher.update_in(cx, |launcher, window, cx| {
+            launcher.open(window, cx);
+            launcher.selected_root = "/tmp".into();
+            launcher.prompt.reset("fix 😀 ");
+            cx.notify();
+        });
+        cx.run_until_parked();
+
+        let mut handler = input_handler(&launcher, cx);
+        cx.update(|window, cx| {
+            assert!(handler.prefers_ime_for_printable_keys(window, cx));
+            handler.replace_and_mark_text_in_range(None, "ni", Some(2..2), window, cx);
+            assert_eq!(handler.marked_text_range(window, cx), Some(7..9));
+            handler.replace_and_mark_text_in_range(None, "你", Some(1..1), window, cx);
+            handler.replace_text_in_range(None, "你好", window, cx);
+            assert_eq!(handler.marked_text_range(window, cx), None);
+            let mut adjusted = None;
+            assert_eq!(
+                handler
+                    .text_for_range(4..9, &mut adjusted, window, cx)
+                    .as_deref(),
+                Some("😀 你好")
+            );
+            assert_eq!(adjusted, Some(4..9));
+        });
+        launcher.read_with(cx, |launcher, _| {
+            assert_eq!(launcher.prompt.text(), "fix 😀 你好");
+            assert!(!launcher.prompt_marked_natively);
+        });
+
+        // ⌘A arrives mid-composition: the marked text is accepted as typed,
+        // the shortcut does its job, and ⌘Z takes the composition back out.
+        launcher.update_in(cx, |launcher, window, cx| {
+            press(launcher, "cmd-right", window, cx); // ends the typing run
+        });
+        cx.update(|window, cx| {
+            handler.replace_and_mark_text_in_range(None, "ma", Some(2..2), window, cx);
+        });
+        launcher.update_in(cx, |launcher, window, cx| {
+            assert!(launcher.prompt.is_composing() && launcher.prompt_marked_natively);
+            press(launcher, "cmd-a", window, cx);
+            assert!(!launcher.prompt.is_composing());
+            assert_eq!(
+                launcher.prompt.editor().selected_text(),
+                Some("fix 😀 你好ma")
+            );
+            press(launcher, "cmd-z", window, cx);
+            assert_eq!(launcher.prompt.text(), "fix 😀 你好");
+        });
+        cx.run_until_parked();
+        launcher.read_with(cx, |launcher, _| assert!(!launcher.prompt_marked_natively));
+
+        // Focus leaves with preedit on screen: it is dropped, not committed,
+        // and the handler registered for it can no longer write.
+        let mut handler = input_handler(&launcher, cx);
+        cx.update(|window, cx| {
+            handler.replace_and_mark_text_in_range(None, "ka", Some(2..2), window, cx);
+        });
+        launcher.read_with(cx, |launcher, _| {
+            assert_eq!(launcher.prompt.text(), "fix 😀 你好ka");
+        });
+        let elsewhere = cx.update(|window, cx| {
+            let elsewhere = cx.focus_handle();
+            window.focus(&elsewhere, cx);
+            elsewhere
+        });
+        cx.run_until_parked();
+        launcher.read_with(cx, |launcher, _| {
+            assert_eq!(launcher.prompt.text(), "fix 😀 你好");
+            assert!(!launcher.prompt.is_composing());
+        });
+        cx.update(|window, cx| {
+            handler.replace_text_in_range(None, "late", window, cx);
+            assert!(handler.selected_text_range(false, window, cx).is_none());
+        });
+        launcher.update_in(cx, |launcher, window, cx| {
+            assert_eq!(launcher.prompt.text(), "fix 😀 你好");
+            window.focus(&launcher.focus, cx);
+            // The recipe editor reads keys through the same focus handle.
+            launcher.prompt.insert_multiline(" task");
+            launcher.edit_launch_details(cx);
+            assert!(launcher.recipe_editor.is_some());
+        });
+        drop(elsewhere);
+        cx.run_until_parked();
+        let mut handler = input_handler(&launcher, cx);
+        cx.update(|window, cx| {
+            assert!(!handler.prefers_ime_for_printable_keys(window, cx));
+            handler.replace_text_in_range(None, "hidden", window, cx);
+        });
+        launcher.read_with(cx, |launcher, _| {
+            assert_eq!(launcher.prompt.text(), "fix 😀 你好 task");
+        });
+    }
+
+    #[gpui::test]
+    fn the_candidate_window_follows_the_marked_text_through_scroll_and_wrap(
+        cx: &mut TestAppContext,
+    ) {
+        use gpui::InputHandler as _;
+        let services = test_services(Arc::new(StoreRuntime::inert()));
+        let (launcher, cx) =
+            cx.add_window_view(move |_window, cx| LauncherOverlay::new(services, false, cx));
+        let rows: Vec<String> = (0..14).map(|row| format!("row {row:02} 😀 界")).collect();
+        launcher.update_in(cx, |launcher, window, cx| {
+            launcher.open(window, cx);
+            launcher.selected_root = "/tmp".into();
+            cx.notify();
+        });
+        cx.run_until_parked();
+        // An empty draft has no lines yet; candidates open at the text origin.
+        let mut handler = input_handler(&launcher, cx);
+        let origin = handler.origin;
+        let empty = cx
+            .update(|window, cx| handler.bounds_for_range(0..0, window, cx))
+            .expect("bounds for an empty draft");
+        assert_eq!(empty.origin, origin);
+        assert_eq!(empty.size.height, px(COMPOSER_LINE_HEIGHT));
+
+        launcher.update_in(cx, |launcher, window, cx| {
+            launcher.prompt.reset(&rows.join("\n"));
+            press(launcher, "end", window, cx);
+        });
+        cx.run_until_parked();
+        launcher.update_in(cx, |launcher, window, cx| {
+            press(launcher, "end", window, cx)
+        });
+        cx.run_until_parked();
+        // The field grew, so the panel re-centred: the origin is per frame.
+        let mut handler = input_handler(&launcher, cx);
+        let origin = handler.origin;
+        let scroll = launcher.read_with(cx, |launcher, _| {
+            let scroll = launcher.prompt.scroll_handle();
+            assert_eq!(scroll.bounds().origin, origin, "one origin for both paths");
+            scroll.offset().y
+        });
+        assert!(scroll < px(0.0), "the caret row is only visible scrolled");
+
+        let units = rows.join("\n").encode_utf16().count();
+        let (caret, marked, clicked) = cx.update(|window, cx| {
+            let caret = handler.bounds_for_range(units..units, window, cx).unwrap();
+            handler.replace_and_mark_text_in_range(None, "にほん", Some(3..3), window, cx);
+            let marked = handler
+                .bounds_for_range(units..units + 3, window, cx)
+                .unwrap();
+            let clicked = handler.character_index_for_point(marked.center(), window, cx);
+            (caret, marked, clicked)
+        });
+        // The last of 14 rows, drawn in the last of the 9 visible ones.
+        let last_row = origin.y + px((COMPOSER_MAX_LINES - 1) as f32 * COMPOSER_LINE_HEIGHT);
+        assert_eq!(caret.origin.y, last_row);
+        assert_eq!(caret.size.width, px(1.0));
+        assert!(caret.left() > origin.x);
+        assert_eq!(marked.origin.y, last_row);
+        assert!(marked.left() >= caret.left() - px(0.5));
+        assert!(marked.size.width > px(20.0), "three wide characters");
+        assert!(
+            clicked.is_some_and(|index| (units + 1..=units + 2).contains(&index)),
+            "{clicked:?}"
+        );
     }
 
     #[gpui::test]

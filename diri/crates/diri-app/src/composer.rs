@@ -20,11 +20,13 @@
 use std::ops::Range;
 
 use gpui::{
-    AnyElement, Pixels, Point, ScrollHandle, SharedString, TextRun, Window, div, prelude::*, px,
+    AnyElement, Bounds, HighlightStyle, Pixels, Point, ScrollHandle, ShapedLine, SharedString,
+    TextRun, UTF16Selection, UnderlineStyle, Window, div, point, prelude::*, px, size,
 };
 use unicode_segmentation::UnicodeSegmentation;
 
 use crate::query_editor::{self, EditHistory, EditKind, LocalEdit, Motion, QueryEditor};
+use crate::text_input::{Composition, byte_range, utf16_range};
 
 /// One soft-wrapped display line: a byte range of the buffer, plus whether it
 /// ended because the text wrapped rather than because the user pressed Return.
@@ -46,6 +48,10 @@ pub struct PromptComposer {
     /// another one through [`Self::reset`] starts over, so ⌘Z can never pull
     /// one session's text into another's prompt.
     history: EditHistory,
+    /// Marked (IME preedit) text. It lives in `editor` while it is being
+    /// composed so it wraps and scrolls like any other text, but it is not
+    /// part of the draft until the input method commits it.
+    composition: Composition,
     scroll: ScrollHandle,
     lines: Vec<VisualLine>,
     /// The (text, width) the cached `lines` were computed from.
@@ -65,6 +71,7 @@ impl Default for PromptComposer {
         Self {
             editor: QueryEditor::default(),
             history: EditHistory::default(),
+            composition: Composition::multiline(),
             scroll: ScrollHandle::new(),
             lines: Vec::new(),
             wrapped_from: None,
@@ -89,6 +96,7 @@ impl PromptComposer {
     }
 
     pub fn clear(&mut self) {
+        self.composition.cancel(&mut self.editor);
         self.editor.clear();
         self.history.clear();
         self.lines.clear();
@@ -109,6 +117,7 @@ impl PromptComposer {
     /// changed the text. An edit that only moved the caret or the selection
     /// ends the open typing run instead.
     fn record<T>(&mut self, kind: EditKind, edit: impl FnOnce(&mut QueryEditor) -> T) -> T {
+        self.finish_composition();
         let before = self.editor.clone();
         let result = edit(&mut self.editor);
         if self.editor.text() == before.text() {
@@ -123,6 +132,7 @@ impl PromptComposer {
 
     /// ⌘Z. Restores the text, caret and selection from before the last step.
     pub fn undo(&mut self) -> bool {
+        self.finish_composition();
         self.goal_column = None;
         self.reveal_caret = true;
         self.history.undo(&mut self.editor)
@@ -130,6 +140,7 @@ impl PromptComposer {
 
     /// ⇧⌘Z.
     pub fn redo(&mut self) -> bool {
+        self.finish_composition();
         self.goal_column = None;
         self.reveal_caret = true;
         self.history.redo(&mut self.editor)
@@ -192,6 +203,172 @@ impl PromptComposer {
         self.move_vertically(1, extend);
     }
 
+    pub fn is_composing(&self) -> bool {
+        self.composition.is_composing()
+    }
+
+    /// Changes whenever a composition is cancelled from this side. An input
+    /// handler carries the epoch it was registered under, so a native
+    /// callback that arrives late cannot write into a draft that moved on.
+    pub fn composition_epoch(&self) -> u64 {
+        self.composition.epoch
+    }
+
+    /// Text from the input method. `range` and `selected` count UTF-16 units,
+    /// as Cocoa does. While `composing`, the text is marked: it is drawn
+    /// underlined and replaced wholesale by the next update. Otherwise it is
+    /// committed, and everything since the composition began becomes one
+    /// undo step that continues a typing run the way a typed key would.
+    pub fn replace_from_input(
+        &mut self,
+        range: Option<Range<usize>>,
+        text: &str,
+        selected: Option<Range<usize>>,
+        composing: bool,
+    ) {
+        let before = self
+            .composition
+            .original()
+            .cloned()
+            .unwrap_or_else(|| self.editor.clone());
+        self.composition
+            .replace(&mut self.editor, range, text, selected, composing);
+        if !self.composition.is_composing() {
+            self.commit_input(before);
+        }
+        self.goal_column = None;
+        self.reveal_caret = true;
+    }
+
+    /// Accepts the marked text as it stands. Any edit that does not come from
+    /// the input method does this first: a marked range cannot survive the
+    /// text moving underneath it.
+    pub fn finish_composition(&mut self) {
+        if let Some(before) = self.composition.original().cloned() {
+            self.composition.finish();
+            self.commit_input(before);
+        }
+    }
+
+    /// Drops the marked text and restores the draft from before it, as when
+    /// focus leaves mid-composition. Returns whether there was one.
+    pub fn cancel_composition(&mut self) -> bool {
+        let composing = self.composition.is_composing();
+        if composing {
+            self.composition.cancel(&mut self.editor);
+            self.goal_column = None;
+            self.reveal_caret = true;
+        }
+        composing
+    }
+
+    fn commit_input(&mut self, before: QueryEditor) {
+        if self.editor.text() == before.text() {
+            self.history.break_run();
+        } else {
+            self.history.record(EditKind::Typing, before, &self.editor);
+        }
+    }
+
+    /// The selection as Cocoa asks for it.
+    pub fn utf16_selection(&self) -> UTF16Selection {
+        let cursor = self.editor.cursor();
+        let range = self.editor.selection().unwrap_or(cursor..cursor);
+        UTF16Selection {
+            reversed: cursor == range.start && !range.is_empty(),
+            range: utf16_range(self.editor.text(), range),
+        }
+    }
+
+    pub fn utf16_marked_range(&self) -> Option<Range<usize>> {
+        self.composition
+            .marked()
+            .map(|range| utf16_range(self.editor.text(), range))
+    }
+
+    /// The text in a UTF-16 range, and the range it was actually taken from
+    /// once widened to whole characters.
+    pub fn text_for_utf16_range(&self, range: Range<usize>) -> (String, Range<usize>) {
+        let text = self.editor.text();
+        let range = byte_range(text, range);
+        (text[range.clone()].to_owned(), utf16_range(text, range))
+    }
+
+    /// Where a UTF-16 range is drawn, in window coordinates, for the input
+    /// method's candidate window. `origin` is where the first visual line
+    /// starts when nothing is scrolled. A range that runs past its first row
+    /// is reported up to that row's end, which is where candidates belong.
+    ///
+    /// AppKit asks straight after handing over marked text, before any frame
+    /// has wrapped it, so the lines are brought up to date first.
+    pub fn bounds_for_utf16_range(
+        &mut self,
+        range: Range<usize>,
+        origin: Point<Pixels>,
+        line_height: Pixels,
+        caret: Option<&str>,
+        window: &Window,
+    ) -> Option<Bounds<Pixels>> {
+        if let (Some((_, width)), Some((font, font_size))) = (&self.wrapped_from, &self.font) {
+            self.layout(*width, font.clone(), *font_size, window);
+        }
+        let range = byte_range(self.editor.text(), range);
+        let row = self
+            .lines
+            .iter()
+            .rposition(|line| line.range.start <= range.start)
+            .unwrap_or(0);
+        // An empty draft draws its placeholder instead of the scrolled lines,
+        // and the handle may still hold the offset of the text before it.
+        let scrolled = if self.editor.is_empty() {
+            px(0.0)
+        } else {
+            self.scroll.offset().y
+        };
+        let top = origin.y + line_height * row as f32 + scrolled;
+        let Some(line) = self.lines.get(row) else {
+            // Nothing laid out yet: an empty draft, whose text starts at the
+            // origin.
+            return Some(Bounds::new(origin, size(px(1.0), line_height)));
+        };
+        let (shaped, splice) = self.shape_row(row, caret, window)?;
+        let x = |offset: usize| {
+            let local = offset.clamp(line.range.start, line.range.end) - line.range.start;
+            shaped.x_for_index(display_index(local, splice))
+        };
+        let (left, right) = (x(range.start), x(range.end));
+        Some(Bounds::new(
+            point(origin.x + left, top),
+            size((right - left).max(px(1.0)), line_height),
+        ))
+    }
+
+    /// Visual line `row` shaped the way it was drawn, plus the caret glyph
+    /// `(at, len)` spliced into it, if any.
+    fn shape_row(
+        &self,
+        row: usize,
+        caret: Option<&str>,
+        window: &Window,
+    ) -> Option<(ShapedLine, Option<(usize, usize)>)> {
+        let (font, font_size) = self.font.clone()?;
+        let line = self.lines.get(row)?;
+        let splice = self.caret_splice(row, caret);
+        let mut display = self.editor.text()[line.range.clone()].to_owned();
+        if let (Some(at), Some(caret)) = (splice, caret) {
+            display.insert_str(at, caret);
+        }
+        let run = TextRun {
+            len: display.len(),
+            font,
+            ..TextRun::default()
+        };
+        let shaped = window
+            .text_system()
+            .shape_line(display.into(), font_size, &[run], None);
+        Some((shaped, splice.zip(caret.map(str::len))))
+    }
+
     /// Where a pointer lands in the buffer. Resolved against the visual lines
     /// the last render drew — the same ranges, the same font, the caret glyph
     /// spliced in where it was drawn — and against the scroll handle those
@@ -204,7 +381,6 @@ impl PromptComposer {
         caret: Option<&str>,
         window: &Window,
     ) -> Option<PointerHit> {
-        let (font, font_size) = self.font.clone()?;
         if self.editor.is_empty() {
             // The placeholder is drawn instead of the lines; there is only
             // one place to be.
@@ -219,21 +395,8 @@ impl PromptComposer {
             self.lines.len(),
         )?;
         let line = &self.lines[row];
-        let splice = self.caret_splice(row, caret);
-        let mut display = self.editor.text()[line.range.clone()].to_owned();
-        if let (Some(at), Some(caret)) = (splice, caret) {
-            display.insert_str(at, caret);
-        }
-        let splice = splice.zip(caret.map(str::len));
-        let run = TextRun {
-            len: display.len(),
-            font,
-            ..TextRun::default()
-        };
+        let (shaped, splice) = self.shape_row(row, caret, window)?;
         let x = position.x - bounds.left();
-        let shaped = window
-            .text_system()
-            .shape_line(display.into(), font_size, &[run], None);
         let text = self.editor.text();
         // Past the end of a row there is no character under the pointer; the
         // row's last one stands in, so a double-click there takes the last
@@ -256,6 +419,7 @@ impl PromptComposer {
     /// A press. One click places the caret (⇧ extends the selection from
     /// where it was anchored); a second selects the word under the pointer.
     pub fn pointer_down(&mut self, hit: PointerHit, extend: bool, click_count: usize) {
+        self.finish_composition();
         if click_count >= 2 {
             self.editor.select_word_at(hit.character);
         } else {
@@ -266,6 +430,7 @@ impl PromptComposer {
 
     /// A drag with the button held: the anchor stays where the press put it.
     pub fn pointer_drag(&mut self, hit: PointerHit) {
+        self.finish_composition();
         self.editor.set_cursor(hit.caret, true);
         self.pointer_moved();
     }
@@ -340,6 +505,7 @@ impl PromptComposer {
     }
 
     fn move_vertically(&mut self, delta: isize, extend: bool) {
+        self.finish_composition();
         self.reveal_caret = true;
         self.history.break_run();
         let Some(current) = self.caret_line() else {
@@ -415,36 +581,58 @@ impl PromptComposer {
         &self,
         line_height: Pixels,
         caret: Option<&str>,
-        selection_style: gpui::HighlightStyle,
+        selection_style: HighlightStyle,
     ) -> Vec<AnyElement> {
         if self.lines.is_empty() {
             return vec![div().h(line_height).into_any_element()];
         }
         let text = self.editor.text();
         let selection = self.editor.selection();
+        // Marked text is underlined, the way every macOS field shows that
+        // the input method still owns it.
+        let marked = self.composition.marked();
+        let marked_style = HighlightStyle {
+            underline: Some(UnderlineStyle {
+                thickness: px(1.0),
+                ..UnderlineStyle::default()
+            }),
+            ..HighlightStyle::default()
+        };
 
         self.lines
             .iter()
             .enumerate()
             .map(|(index, line)| {
                 let mut display = text[line.range.clone()].to_owned();
-                let mut highlights = selection
-                    .as_ref()
-                    .and_then(|range| intersect(range, &line.range))
-                    .map(|range| range.start - line.range.start..range.end - line.range.start);
                 // The caret is spliced into the string rather than positioned,
                 // matching the single-line fields; a real positioned caret
                 // would need per-line text layout on every frame.
-                if let (Some(caret), Some(at)) = (caret, self.caret_splice(index, caret)) {
+                let splice = self.caret_splice(index, caret);
+                if let (Some(caret), Some(at)) = (caret, splice) {
                     display.insert_str(at, caret);
-                    highlights = None;
                 }
+                let splice = splice.zip(caret.map(str::len));
+                let drawn = |range: &Option<Range<usize>>| {
+                    range
+                        .as_ref()
+                        .and_then(|range| intersect(range, &line.range))
+                        .map(|range| {
+                            display_index(range.start - line.range.start, splice)
+                                ..display_index(range.end - line.range.start, splice)
+                        })
+                };
+                let highlights: Vec<_> = gpui::combine_highlights(
+                    drawn(&selection).map(|range| (range, selection_style)),
+                    drawn(&marked).map(|range| (range, marked_style)),
+                )
+                .collect();
                 let text: SharedString = display.into();
-                let line = div().h(line_height).child(match highlights {
-                    Some(range) => gpui::StyledText::new(text)
-                        .with_highlights([(range, selection_style)])
-                        .into_any_element(),
-                    None => text.into_any_element(),
+                let line = div().h(line_height).child(if highlights.is_empty() {
+                    text.into_any_element()
+                } else {
+                    gpui::StyledText::new(text)
+                        .with_highlights(highlights)
+                        .into_any_element()
                 });
                 line.into_any_element()
             })
@@ -521,6 +709,16 @@ fn row_at(
     let last = rows.checked_sub(1)?;
     let row = ((y - top - scroll_y) / line_height).floor().max(0.0) as usize;
     Some(row.min(last))
+}
+
+/// Where byte `local` of a line's own text ends up once the caret glyph
+/// `(at, len)` has been spliced into the drawn line. The inverse of
+/// [`buffer_index`].
+fn display_index(local: usize, splice: Option<(usize, usize)>) -> usize {
+    match splice {
+        Some((at, len)) if local > at => local + len,
+        _ => local,
+    }
 }
 
 /// Maps an index into a DRAWN line back into the line's own text by taking
@@ -800,6 +998,92 @@ mod tests {
         composer.apply(LocalEdit::Insert("b".into()));
         assert!(composer.undo());
         assert_eq!(composer.text(), "a");
+    }
+
+    #[test]
+    fn a_composition_is_marked_until_committed_and_then_is_one_undo_step() {
+        let mut composer = PromptComposer::default();
+        composer.apply(LocalEdit::Insert("a".into()));
+        composer.apply(LocalEdit::Insert("😀".into()));
+        composer.replace_from_input(None, "ni", Some(2..2), true);
+        assert_eq!(composer.text(), "a😀ni");
+        assert!(composer.is_composing());
+        // Cocoa counts UTF-16 units: the emoji before the marked text is two.
+        assert_eq!(composer.utf16_marked_range(), Some(3..5));
+        assert_eq!(composer.utf16_selection().range, 5..5);
+        composer.replace_from_input(None, "你", Some(1..1), true);
+        assert_eq!(composer.text(), "a😀你");
+        composer.replace_from_input(None, "你好", None, false);
+        assert_eq!(composer.text(), "a😀你好", "committed exactly once");
+        assert!(!composer.is_composing());
+        assert_eq!(composer.utf16_marked_range(), None);
+
+        // Committed text continues the typing run it landed in, and no
+        // intermediate preedit is ever an undo step.
+        assert!(composer.undo());
+        assert_eq!(composer.text(), "");
+        assert!(composer.redo());
+        assert_eq!(composer.text(), "a😀你好");
+
+        // A replacement range from the input method (press-and-hold accents,
+        // reconversion) is UTF-16 too, and is its own way back.
+        composer.pointer_down(PointerHit::default(), false, 1);
+        composer.replace_from_input(Some(1..3), "é", None, false);
+        assert_eq!(composer.text(), "aé你好");
+        assert!(composer.undo());
+        assert_eq!(composer.text(), "a😀你好");
+    }
+
+    #[test]
+    fn a_cancelled_composition_leaves_no_trace_and_an_edit_accepts_it_as_typed() {
+        let mut composer = PromptComposer::default();
+        composer.insert_multiline("draft ");
+        composer.apply(LocalEdit::SelectAll);
+        let epoch = composer.composition_epoch();
+        composer.replace_from_input(None, "k", Some(1..1), true);
+        assert_eq!(composer.text(), "k");
+        assert!(composer.cancel_composition());
+        assert_eq!(composer.text(), "draft ");
+        assert_eq!(composer.editor.selected_text(), Some("draft "));
+        assert_ne!(composer.composition_epoch(), epoch);
+        assert!(!composer.cancel_composition());
+        assert!(composer.undo(), "the cancelled preedit recorded nothing");
+        assert_eq!(composer.text(), "");
+        assert!(composer.redo());
+
+        // ⌘A, ⌘V, ⌘Z and the pointer all act on real text: whatever is
+        // marked when they arrive is accepted first, as one step.
+        composer.apply(LocalEdit::MoveRight(Motion::Character, false));
+        composer.replace_from_input(None, "ka", Some(2..2), true);
+        composer.apply(LocalEdit::SelectAll);
+        assert!(!composer.is_composing());
+        assert_eq!(composer.editor.selected_text(), Some("draft ka"));
+        assert!(composer.undo());
+        assert_eq!(composer.text(), "draft ");
+    }
+
+    #[test]
+    fn text_for_a_utf16_range_widens_to_whole_characters() {
+        let composer = composer("a😀界", &[(0, 8, false)]);
+        assert_eq!(
+            composer.text_for_utf16_range(2..4),
+            ("😀界".to_owned(), 1..4)
+        );
+        assert_eq!(
+            composer.text_for_utf16_range(0..99),
+            ("a😀界".to_owned(), 0..4)
+        );
+    }
+
+    #[test]
+    fn highlights_step_over_the_spliced_caret_glyph() {
+        let caret = Some((2, 3));
+        assert_eq!(display_index(1, caret), 1);
+        assert_eq!(display_index(2, caret), 2);
+        assert_eq!(display_index(3, caret), 6);
+        for local in 0..6 {
+            assert_eq!(buffer_index(display_index(local, caret), caret), local);
+        }
     }
 
     #[test]
