@@ -238,7 +238,7 @@ pub struct AgentSetup {
     pub sign_in_hint: Option<String>,
     /// The vendor's documented one-line installer. Neither the Engine nor a
     /// client runs it on its own: a client may type it into a visible
-    /// Terminal session only after the user chose an install control that
+    /// Terminal session only after the user confirmed a prompt that
     /// displayed this exact text. Additive; older peers ignore or omit it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub install_command: Option<String>,

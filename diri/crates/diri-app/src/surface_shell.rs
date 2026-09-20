@@ -3527,12 +3527,20 @@ impl UtilitySurfaces {
                     .bg(colors.primary)
                     .cursor_pointer()
                     .hover(|button| button.opacity(0.88))
-                    .on_click(cx.listener(move |this, _, _, cx| {
-                        this.store
-                            .write()
-                            .expect("session store lock poisoned")
-                            .install_agent(&option);
-                        cx.notify();
+                    .on_click(cx.listener(move |this, _, window, cx| {
+                        let store = this.store.clone();
+                        crate::agent_setup::confirm_install(
+                            &option,
+                            window,
+                            cx,
+                            std::rc::Rc::new(move |option, cx| {
+                                store
+                                    .write()
+                                    .expect("session store lock poisoned")
+                                    .install_agent(option);
+                                cx.refresh_windows();
+                            }),
+                        );
                     }))
                     .flex()
                     .items_center()

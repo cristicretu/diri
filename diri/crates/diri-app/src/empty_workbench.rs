@@ -22,12 +22,8 @@ use diri_proto::AgentKind;
 use diri_ui::{Radius, SemanticColors, Typo};
 use gpui::{AnyElement, Div, IntoElement, Role, SharedString, div, prelude::*, px};
 
-use crate::agent_setup::{
-    ActionHandler, AgentSetupState, InstallHandler, quiet_link, ready_names, setup_list,
-};
-use crate::commands::{
-    CommandId, FocusSidebar, NewDefaultSession, NewTerminal, ShowAgentSettings, command,
-};
+use crate::agent_setup::{ActionHandler, AgentSetupState, InstallHandler, quiet_link, setup_list};
+use crate::commands::{CommandId, NewDefaultSession, ShowAgentSettings, command};
 use crate::icons::sf_symbol;
 
 pub(crate) struct EmptyWorkbench {
@@ -75,7 +71,7 @@ pub(crate) fn render(
 fn column() -> Div {
     div()
         .w_full()
-        .max_w(px(380.0))
+        .max_w(px(320.0))
         .flex_none()
         .flex()
         .flex_col()
@@ -122,105 +118,62 @@ fn heading(
 }
 
 fn welcome(state: &EmptyWorkbench, actions: &EmptyWorkbenchActions, colors: SemanticColors) -> Div {
-    let machine = crate::platform::local_machine_label_lowercase();
     // Not the sidebar's stack: on a first launch the two empty states sit
     // side by side, and twin symbols read as a rendering mistake.
-    let page = column().gap(px(20.0)).child(heading(
-        "rectangle.split.2x1",
-        "Run coding agents side by side",
-        "Diri is a workspace for AI coding agents like Claude Code and Codex. \
-         Give each task its own session, keep several going at once, and get a \
-         heads-up when one finishes or needs you.",
-        colors,
-    ));
-    match &state.agents {
-        AgentSetupState::Checking => page
-            .child(start_controls("Start a session", actions, colors))
-            .child(meta(
-                format!("Looking for coding agents on {machine}…"),
+    const SYMBOL: &str = "rectangle.split.2x1";
+    const TITLE: &str = "Run coding agents side by side";
+    let AgentSetupState::Missing(candidates) = &state.agents else {
+        return column()
+            .gap(px(18.0))
+            .child(heading(
+                SYMBOL,
+                TITLE,
+                "Each task gets its own session. Diri tells you when one needs you.",
                 colors,
-            )),
-        AgentSetupState::Ready(ready) => page
-            .child(start_controls("Start a session", actions, colors))
-            .child(meta(format!("{} on {machine}", ready_names(ready)), colors)),
-        AgentSetupState::Missing(candidates) => {
-            let check_again = Rc::clone(&actions.check_again);
-            page.child(
-                div()
-                    .w_full()
-                    .flex()
-                    .flex_col()
-                    .gap(px(8.0))
-                    .child(
-                        div()
-                            .px(px(2.0))
-                            .text_size(px(Typo::SECTION_HEADER.size))
-                            .font_weight(Typo::SECTION_HEADER.weight)
-                            .text_color(colors.secondary)
-                            .child(format!("No coding agent on {machine} yet. Install one:")),
-                    )
-                    .child(setup_list(
-                        "welcome",
-                        candidates,
-                        state.installing.as_ref(),
-                        colors,
-                        &actions.install,
-                    ))
-                    .child(
-                        div()
-                            .px(px(2.0))
-                            .text_size(px(Typo::META.size))
-                            .line_height(px(16.0))
-                            .text_color(colors.tertiary)
-                            .child("Each installer runs in a tab you can watch."),
-                    ),
-            )
-            .child(
-                div()
-                    .flex()
-                    .flex_wrap()
-                    .justify_center()
-                    .items_center()
-                    .gap_x(px(16.0))
-                    .gap_y(px(6.0))
-                    .child(quiet_link(
-                        "welcome-check-again",
-                        if state.scanning {
-                            "Checking…"
-                        } else {
-                            "Check again"
-                        },
-                        Some("arrow.counterclockwise"),
-                        colors,
-                        move |window, cx| check_again(window, cx),
-                    ))
-                    .child(quiet_link(
-                        "welcome-agent-settings",
-                        "More agents…",
-                        None,
-                        colors,
-                        |window, cx| window.dispatch_action(Box::new(ShowAgentSettings), cx),
-                    ))
-                    .child(quiet_link(
-                        "welcome-skip",
-                        "Open a terminal instead",
-                        None,
-                        colors,
-                        |window, cx| window.dispatch_action(Box::new(NewTerminal), cx),
-                    )),
-            )
-        }
-    }
-}
-
-fn meta(text: impl Into<SharedString>, colors: SemanticColors) -> Div {
-    div()
-        .max_w(px(340.0))
-        .text_center()
-        .text_size(px(Typo::META.size))
-        .line_height(px(16.0))
-        .text_color(colors.tertiary)
-        .child(text.into())
+            ))
+            .child(start_controls("Start a session", actions, colors));
+    };
+    let check_again = Rc::clone(&actions.check_again);
+    column()
+        .gap(px(18.0))
+        .child(heading(
+            SYMBOL,
+            TITLE,
+            "Install a coding agent to get started.",
+            colors,
+        ))
+        .child(setup_list(
+            "welcome",
+            candidates,
+            state.installing.as_ref(),
+            colors,
+            &actions.install,
+        ))
+        .child(
+            div()
+                .flex()
+                .justify_center()
+                .items_center()
+                .gap(px(16.0))
+                .child(quiet_link(
+                    "welcome-check-again",
+                    if state.scanning {
+                        "Checking…"
+                    } else {
+                        "Check again"
+                    },
+                    Some("arrow.counterclockwise"),
+                    colors,
+                    move |window, cx| check_again(window, cx),
+                ))
+                .child(quiet_link(
+                    "welcome-agent-settings",
+                    "More agents…",
+                    None,
+                    colors,
+                    |window, cx| window.dispatch_action(Box::new(ShowAgentSettings), cx),
+                )),
+        )
 }
 
 /// The app's standard bordered control, with the shortcut that does the same
@@ -293,19 +246,21 @@ fn start_controls(
 /// Sessions exist but none is open in this pane.
 fn resting(actions: &EmptyWorkbenchActions, colors: SemanticColors) -> Div {
     column()
-        .gap(px(18.0))
-        .child(heading(
-            "square.stack.3d.up",
-            "No session open",
-            "Pick one from the sidebar, or start a new one.",
-            colors,
-        ))
+        .gap(px(16.0))
+        .child(
+            div()
+                .flex()
+                .flex_col()
+                .items_center()
+                .gap(px(12.0))
+                .child(sf_symbol("square.stack.3d.up", 28.0, colors.tertiary))
+                .child(
+                    div()
+                        .text_size(px(Typo::DISPLAY_TITLE.size))
+                        .font_weight(Typo::DISPLAY_TITLE.weight)
+                        .text_color(colors.primary)
+                        .child("No session open"),
+                ),
+        )
         .child(start_controls("New session", actions, colors))
-        .child(quiet_link(
-            "empty-browse-sessions",
-            "Show sessions in the sidebar",
-            None,
-            colors,
-            |window, cx| window.dispatch_action(Box::new(FocusSidebar), cx),
-        ))
 }

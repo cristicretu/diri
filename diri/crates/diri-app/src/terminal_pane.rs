@@ -1737,7 +1737,7 @@ impl TerminalPane {
         };
         let canonical = Arc::clone(&self.runtime.store);
         let window_store = self.window_store.clone();
-        let install: crate::agent_setup::InstallHandler = Rc::new(move |option, _, cx| {
+        let install: crate::agent_setup::InstallHandler = Rc::new(move |option, cx| {
             if let Some(window_store) = &window_store {
                 window_store
                     .write()
@@ -5228,6 +5228,22 @@ mod tests {
             .debug_bounds("welcome-install-claude-code")
             .expect("the shortest path to a first session is one button");
         cx.simulate_click(install.center(), gpui::Modifiers::default());
+        cx.run_until_parked();
+
+        // Nothing runs on the click: the system sheet shows the exact command
+        // first, and Cancel leaves the Mac untouched.
+        let (_, detail) = cx.pending_prompt().expect("install asks before running");
+        assert!(
+            detail.contains("curl -fsSL https://claude.ai/install.sh | bash"),
+            "the sheet must show the command it is about to type: {detail}"
+        );
+        cx.simulate_prompt_answer("Cancel");
+        cx.run_until_parked();
+        assert_eq!(store.read().unwrap().installing_agent(), None);
+
+        cx.simulate_click(install.center(), gpui::Modifiers::default());
+        cx.run_until_parked();
+        cx.simulate_prompt_answer("Install");
         cx.run_until_parked();
 
         assert_eq!(

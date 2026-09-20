@@ -3435,7 +3435,7 @@ impl LauncherOverlay {
             .when_some(agent_setup, |panel, (candidates, installing)| {
                 let launcher = cx.weak_entity();
                 let install: crate::agent_setup::InstallHandler =
-                    std::rc::Rc::new(move |option, _, cx| {
+                    std::rc::Rc::new(move |option, cx| {
                         let _ = launcher.update(cx, |this, cx| this.install_agent(option, cx));
                     });
                 panel.child(
@@ -5347,7 +5347,7 @@ mod tests {
                             scanning: false,
                         },
                         crate::empty_workbench::EmptyWorkbenchActions {
-                            install: std::rc::Rc::new(|_, _, _| {}),
+                            install: std::rc::Rc::new(|_, _| {}),
                             check_again: std::rc::Rc::new(|_, _| {}),
                             start_in_folder: std::rc::Rc::new(|_, _| {}),
                         },

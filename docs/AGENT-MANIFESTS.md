@@ -132,9 +132,10 @@ hint or open its URL without an explicit user action.
 `installCommand` is the publisher's documented one-line installer, such as
 `curl -fsSL https://claude.ai/install.sh | bash`. It powers the Install button
 on the welcome screen, the launcher, and Settings for an agent that is not on
-this Mac. The Engine never runs it. The app types it into a Terminal session
-in the home folder only after the user presses an Install control that showed
-the full text, and then rescans until the agent appears. Rules:
+this Mac. The Engine never runs it. Pressing Install raises the system alert
+sheet with the full command; only confirming it makes the app type that text
+into a Terminal session in the home folder, and then rescan until the agent
+appears. Rules:
 
 - Copy it verbatim from the publisher's own install page and prefer the
   self-contained installer over one that needs a toolchain. When it does need
