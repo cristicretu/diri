@@ -373,6 +373,9 @@ pub struct SessionStore {
     auxiliary_slots: HashMap<(SessionId, usize), SessionId>,
     auxiliary_pending: HashSet<(SessionId, usize)>,
     projects: HashMap<ProjectId, Project>,
+    /// Projects in the order the Engine first saw them. Its list is
+    /// append-only, which makes this the one order here that never reshuffles.
+    project_seniority: Vec<ProjectId>,
     selected_session_id: Option<SessionId>,
     sidebar_selection: HashSet<SessionId>,
     pending_close: Option<PendingClose>,
@@ -487,6 +490,7 @@ impl SessionStore {
                 auxiliary_slots: HashMap::new(),
                 auxiliary_pending: HashSet::new(),
                 projects: HashMap::new(),
+                project_seniority: Vec::new(),
                 selected_session_id: selected_session_id.clone(),
                 sidebar_selection: HashSet::new(),
                 pending_close: None,
@@ -968,6 +972,10 @@ impl SessionStore {
         if let Some(id) = id {
             self.auxiliary_slots.insert((parent, slot), id);
         }
+    }
+
+    pub(crate) fn project_seniority(&self) -> &[ProjectId] {
+        &self.project_seniority
     }
 
     pub fn projects(&self) -> &HashMap<ProjectId, Project> {
@@ -1522,6 +1530,11 @@ impl SessionStore {
             .into_iter()
             .map(|session| (session.id.clone(), Arc::new(session)))
             .collect();
+        self.project_seniority = result
+            .projects
+            .iter()
+            .map(|project| project.id.clone())
+            .collect();
         self.projects = result
             .projects
             .into_iter()
@@ -1710,6 +1723,9 @@ impl SessionStore {
                 if let Ok(project) = serde_json::from_value::<Project>(event.params) {
                     if self.projects.get(&project.id) == Some(&project) {
                         return StoreEventChange::None;
+                    }
+                    if !self.projects.contains_key(&project.id) {
+                        self.project_seniority.push(project.id.clone());
                     }
                     self.projects.insert(project.id.clone(), project);
                     self.invalidate_projection();

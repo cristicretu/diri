@@ -3456,6 +3456,7 @@ impl RootView {
             PreviewScenario::Empty => "Empty",
             PreviewScenario::Artifacts => "Artifacts",
             PreviewScenario::Fleet => "30 working sessions",
+            PreviewScenario::Projects => "Six projects",
         };
         div()
             .size_full()
@@ -7981,11 +7982,19 @@ mod tests {
             ),
         ] {
             let services = test_services();
-            let fixture = SidebarPreviewFixture::make(PreviewScenario::Typical);
+            // `DIRI_VISUAL_SCENARIO`, `DIRI_VISUAL_SELECT=<session id>` and
+            // `DIRI_VISUAL_THEME=<theme id>` choose what the strip shows.
+            let fixture = SidebarPreviewFixture::make(PreviewScenario::from_env(
+                std::env::var("DIRI_VISUAL_SCENARIO").ok().as_deref(),
+            ));
             {
                 let mut store = services.store.store.write().unwrap();
                 store.hydrate(fixture.list);
-                store.select(fixture.selected_session_id.unwrap());
+                store.select(
+                    std::env::var("DIRI_VISUAL_SELECT")
+                        .map(diri_proto::SessionId::new)
+                        .unwrap_or_else(|_| fixture.selected_session_id.unwrap()),
+                );
                 store
                     .update_preferences(|prefs| {
                         prefs.sidebar_visible = true;
@@ -7994,7 +8003,10 @@ mod tests {
                         } else {
                             "dirijor-dark"
                         }
-                        .into()
+                        .into();
+                        if let Ok(theme) = std::env::var("DIRI_VISUAL_THEME") {
+                            prefs.terminal_theme = theme;
+                        }
                     })
                     .unwrap();
             }

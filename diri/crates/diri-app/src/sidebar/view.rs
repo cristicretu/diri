@@ -1,5 +1,7 @@
 mod accounts;
 mod filter;
+#[cfg(test)]
+mod hue_tests;
 mod project_picker;
 mod tabs;
 mod workspaces;
@@ -576,6 +578,8 @@ pub struct Sidebar {
     /// panel paints it elsewhere.
     main_viewport: Size<Pixels>,
     working_row_rendered: bool,
+    /// Project hues for the list being rendered.
+    hues: crate::project_hue::ProjectHues,
     /// Rebuilt once per projection render. Looking up ⌘1…⌘9 inside every row
     /// previously re-locked the store and scanned the full session list N times.
     shortcut_ranks: HashMap<SessionId, usize>,
@@ -738,6 +742,7 @@ impl Sidebar {
             activity_activation: None,
             main_viewport: Size::default(),
             working_row_rendered: false,
+            hues: Default::default(),
             shortcut_ranks: HashMap::new(),
             focus_handle: cx.focus_handle(),
             hover_task: None,
@@ -2528,7 +2533,12 @@ impl Sidebar {
                         let id = id.clone();
                         move || format!("PROJECT_DISCLOSURE_{}", id.0)
                     })
-                    .child(project_disclosure(collapsed, colors)),
+                    .child(disclosure_tile(
+                        collapsed,
+                        // The header is where a project's hue is learned.
+                        self.hues.color(&id, colors).unwrap_or(colors.secondary),
+                        colors,
+                    )),
             )
             .child(
                 div()
@@ -2906,6 +2916,22 @@ impl Sidebar {
                 let id = row.id().clone();
                 let drop = self.row_drop_feedback(row, window, cx);
                 let rendered = self.session_row(row, shortcut, drop, false, colors, window, cx);
+                // Buckets interleave every project and the row names none of
+                // them, so here the row wears its project's hue.
+                let rendered = match self.hues.color(&row.session.project_id, colors) {
+                    Some(hue) => div()
+                        .relative()
+                        .child(rendered)
+                        .child(
+                            crate::project_hue::row_tick(hue, SIDEBAR_NAV_ROW_HEIGHT)
+                                .debug_selector({
+                                    let id = id.clone();
+                                    move || format!("PROJECT_HUE_{}", id.0)
+                                }),
+                        )
+                        .into_any_element(),
+                    None => rendered,
+                };
                 section = section.child(self.track_row_bounds(id, rendered, None));
             }
             sections.push(section.into_any_element());
@@ -7473,6 +7499,8 @@ impl Render for Sidebar {
                 .collect();
             let recency_archives_expanded = store.preferences().sidebar_recency_archives_expanded
                 || !self.filter_query.text().trim().is_empty();
+            // From the unfiltered list: a filter must not recolor anything.
+            self.hues = store.project_hues();
             (
                 super::filter::filter_projection(
                     store.sidebar_projection(),
@@ -8001,6 +8029,10 @@ fn trailing_remote_mark(colors: SemanticColors) -> AnyElement {
 /// the folder badge used to have, so titles keep their column against
 /// session rows and the fold still reads as a folder tile, not a stray glyph.
 fn project_disclosure(collapsed: bool, colors: SemanticColors) -> AnyElement {
+    disclosure_tile(collapsed, colors.secondary, colors)
+}
+
+fn disclosure_tile(collapsed: bool, ink: gpui::Rgba, colors: SemanticColors) -> AnyElement {
     div()
         .flex_none()
         .size(px(18.0))
@@ -8019,7 +8051,7 @@ fn project_disclosure(collapsed: bool, colors: SemanticColors) -> AnyElement {
             },
             9.0,
             SymbolWeight::Bold,
-            colors.secondary,
+            ink,
         ))
         .into_any_element()
 }
@@ -10599,7 +10631,8 @@ mod tests {
 
     /// Produces the sidebar layout variants used for material and hierarchy
     /// review without touching a running Diri instance. Set
-    /// `DIRI_VISUAL_GROUPING=recency`, `DIRI_VISUAL_LIGHT=1`, or
+    /// `DIRI_VISUAL_GROUPING=recency`, `DIRI_VISUAL_LIGHT=1`,
+    /// `DIRI_VISUAL_THEME=<theme id>`, or
     /// `DIRI_VISUAL_POPOVER=none|project|session` to select the state to
     /// capture (the default opens the grouping menu).
     /// `DIRI_VISUAL_BACKDROP=62616e` supplies a fixed RGB backdrop under glass;
@@ -10673,11 +10706,14 @@ mod tests {
                     }
                     let now = wall_clock_millis();
                     let mut store = sidebar.store.write().expect("preview session store");
-                    let sessions: Vec<_> = store
+                    let mut sessions: Vec<_> = store
                         .sessions()
                         .values()
                         .map(|session| (**session).clone())
                         .collect();
+                    // Map order would hand out the ages below differently on
+                    // every run.
+                    sessions.sort_by(|left, right| left.id.0.cmp(&right.id.0));
                     for (index, mut session) in sessions.into_iter().enumerate() {
                         let age = [
                             2.0 * 60.0 * 60.0 * 1_000.0,
@@ -10700,6 +10736,9 @@ mod tests {
                             } else {
                                 "dirijor-dark".into()
                             };
+                            if let Ok(theme) = std::env::var("DIRI_VISUAL_THEME") {
+                                prefs.terminal_theme = theme;
+                            }
                             prefs.sidebar_grouping = if recency {
                                 SidebarGrouping::Recency
                             } else {

@@ -7,6 +7,8 @@ use diri_proto::{
 
 use crate::store::{InspectorTab, Prefs, SessionStore};
 
+mod projects;
+
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum PreviewScenario {
     #[default]
@@ -15,6 +17,8 @@ pub enum PreviewScenario {
     Empty,
     Artifacts,
     Fleet,
+    /// Several projects at once, for judging how they are told apart.
+    Projects,
 }
 
 impl PreviewScenario {
@@ -24,6 +28,7 @@ impl PreviewScenario {
             Some("empty") => Self::Empty,
             Some("artifacts") => Self::Artifacts,
             Some("fleet") => Self::Fleet,
+            Some("projects") => Self::Projects,
             _ => Self::Typical,
         }
     }
@@ -54,6 +59,9 @@ impl SidebarPreviewFixture {
         // A stable clock makes screenshot output deterministic while retaining
         // the exact relative intervals used by the Swift fixture.
         let now = 1_750_000_000_000.0;
+        if scenario == PreviewScenario::Projects {
+            return projects::make(now);
+        }
         let dirijor = project(
             "preview-dirijor",
             "/Users/preview/Projects/dirijor",

@@ -398,6 +398,8 @@ impl SessionSurfaces {
                 })
                 .collect()
         };
+        // Cards span every project, and a card names none of them.
+        let hues = self.store.write().unwrap().project_hues();
         self.sync_peek_scroll(width, height, reduced);
         let visible = visible_card_indices(
             &self.peek,
@@ -530,6 +532,9 @@ impl SessionSurfaces {
                             .overflow_hidden()
                             .whitespace_nowrap()
                             .gap(px(6.0))
+                            .when_some(hues.color(&session.project_id, colors), |row, hue| {
+                                row.child(crate::project_hue::tick(hue))
+                            })
                             .child(Self::peek_agent_icon(Some(session), colors))
                             .child(div().flex_1().min_w(px(0.0)).truncate().child(title))
                             .when_some(status, |row, status| {

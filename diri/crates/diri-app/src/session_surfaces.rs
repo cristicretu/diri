@@ -2411,9 +2411,12 @@ mod tests {
         let window=cx.open_window(size(px(1100.0),px(700.0)),|_,cx| {
             let runtime=Arc::new(StoreRuntime::inert());
             { let mut store=runtime.store.write().unwrap();
-              store.hydrate(SessionListResult{sessions:(0..4).map(session).collect(),projects:vec![]});
+              // `DIRI_VISUAL_PROJECTS=1` spreads the cards over four projects.
+              let spread=std::env::var_os("DIRI_VISUAL_PROJECTS").is_some();
+              store.hydrate(SessionListResult{sessions:(0..4).map(|i| { let mut s=session(i); if spread { s.project_id=diri_proto::ProjectId::new(["preview-api","preview-web","preview-ios","preview-api"][i]); } s }).collect(),projects:vec![]});
               store.select(session(0).id);
               if std::env::var_os("DIRI_VISUAL_LIGHT").is_some() { store.update_preferences(|p|p.terminal_theme="dirijor-light".into()).unwrap(); }
+              if let Ok(theme)=std::env::var("DIRI_VISUAL_THEME") { store.update_preferences(|p|p.terminal_theme=theme).unwrap(); }
             }
             let surfaces=cx.new(|cx| {
                 let mut surfaces=SessionSurfaces::new(runtime,None,cx);

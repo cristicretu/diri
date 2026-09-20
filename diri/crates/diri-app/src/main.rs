@@ -41,6 +41,7 @@ mod palette_workspace;
 mod peek_settle;
 mod phone_access;
 mod platform;
+mod project_hue;
 pub mod query_editor;
 pub mod quick_open;
 pub mod quote;

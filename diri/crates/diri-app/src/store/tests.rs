@@ -1807,6 +1807,18 @@ fn synthetic_events_upsert_project_and_remove_with_neighbor_focus() {
         store.sidebar_projection().projects[0].project.name,
         "Renamed"
     );
+    // A rename keeps the project's seniority; a new project joins the end.
+    let seniority = store.project_seniority().to_vec();
+    assert_eq!(seniority.iter().filter(|known| known.0 == "p").count(), 1);
+    store.handle_event(EventEnvelope {
+        name: diri_proto::EventName::PROJECT_UPDATED.to_owned(),
+        seq: 2,
+        params: serde_json::to_value(project("newest", "Newest")).unwrap(),
+    });
+    assert_eq!(
+        store.project_seniority(),
+        [seniority, vec![pid("newest")]].concat()
+    );
 
     store.handle_event(EventEnvelope {
         name: diri_proto::EventName::SESSION_REMOVED.to_owned(),

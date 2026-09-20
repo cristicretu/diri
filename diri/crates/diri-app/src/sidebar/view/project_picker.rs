@@ -126,6 +126,15 @@ impl Sidebar {
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let anchor = Rc::clone(&self.project_picker.anchor);
+        // The strip shows one project's tabs and never names it; the glyph
+        // wears that project's hue instead.
+        let hue = {
+            let mut store = self.store.write().expect("store");
+            let tabs = selected_project_tabs(&mut store);
+            let hues = store.project_hues();
+            tabs.project
+                .and_then(|project| hues.color(&project, colors))
+        };
         div()
             .id("horizontal-tab-project")
             .debug_selector(|| "horizontal-tab-project".into())
@@ -143,7 +152,11 @@ impl Sidebar {
                 .primary
                 .alpha(if self.project_picker.open { 0.08 } else { 0.0 }))
             .hover(move |row| row.bg(colors.primary.alpha(0.06)))
-            .child(sf_symbol("rectangle.stack", 16.0, colors.secondary))
+            .child(sf_symbol(
+                "rectangle.stack",
+                16.0,
+                hue.unwrap_or(colors.secondary),
+            ))
             .child(
                 gpui::canvas(
                     move |bounds, _, _| {
@@ -549,6 +562,7 @@ impl Sidebar {
             .expect("store")
             .selected_session()
             .map(|session| session.project_id.clone());
+        let hues = self.store.write().expect("store").project_hues();
         let mut list = div()
             .id("project-picker-list")
             .track_scroll(&self.project_picker.scroll)
@@ -581,7 +595,11 @@ impl Sidebar {
                     .gap(px(9.0))
                     .cursor_pointer()
                     .glass_menu_row(colors, index == self.project_picker.highlighted)
-                    .child(sf_symbol("folder", 13.0, colors.secondary))
+                    .child(sf_symbol(
+                        "folder",
+                        13.0,
+                        hues.color(&project.id, colors).unwrap_or(colors.secondary),
+                    ))
                     .child(
                         div()
                             .flex_1()
