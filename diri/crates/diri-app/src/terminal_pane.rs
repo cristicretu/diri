@@ -1795,7 +1795,7 @@ impl TerminalPane {
                         .expect("session store lock poisoned")
                         .spawn_default(options);
                 }
-                let _ = cx.update(|cx| cx.refresh_windows());
+                cx.update(|cx| cx.refresh_windows());
             })
             .detach();
         });

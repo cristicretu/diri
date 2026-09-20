@@ -121,7 +121,7 @@ pub(crate) fn confirm_install(
     let option = option.clone();
     cx.spawn(async move |cx| {
         if answer.await.ok() == Some(0) {
-            let _ = cx.update(|cx| on_install(&option, cx));
+            cx.update(|cx| on_install(&option, cx));
         }
     })
     .detach();
