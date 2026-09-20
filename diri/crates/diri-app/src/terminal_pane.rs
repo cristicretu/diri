@@ -308,6 +308,9 @@ enum PaneEvent {
         usize,
     ),
     ScrollbackFailed(SessionId, AttachmentGeneration),
+    /// A history-length probe answered with the row where the live grid
+    /// starts, or `None` when the read failed.
+    HistoryExtent(SessionId, AttachmentGeneration, Option<i64>),
     /// The scroller knob moved the viewport; fetch whatever it now shows.
     ScrollbackPump(SessionId, usize),
     ClipboardUploadFinished(SessionId, Result<String, String>),
@@ -537,6 +540,32 @@ struct ResidentTerminal {
     last_size: (u16, u16),
     pointer_owner: Option<(MouseButton, PointerOwner)>,
     mouse_motion: MouseMotionLimiter,
+    extent_probe: HistoryExtentProbe,
+}
+
+/// How often a knob shown over streaming output may re-ask how long the
+/// history is.
+const HISTORY_EXTENT_PROBE_INTERVAL: Duration = Duration::from_millis(250);
+
+/// Single flight for the one-row reads that size the scroller knob at the
+/// live edge, where grid updates say nothing about the history above them.
+#[derive(Debug, Default)]
+struct HistoryExtentProbe {
+    in_flight: bool,
+    /// Content generation the last probe was sent against: an unchanged
+    /// screen has the same history, so an idle session never asks twice.
+    generation: Option<u64>,
+    sent_at: Option<Instant>,
+}
+
+impl HistoryExtentProbe {
+    fn should_send(&self, generation: u64, now: Instant) -> bool {
+        !self.in_flight
+            && self.generation != Some(generation)
+            && self
+                .sent_at
+                .is_none_or(|at| now.saturating_duration_since(at) >= HISTORY_EXTENT_PROBE_INTERVAL)
+    }
 }
 
 impl ResidentTerminal {
@@ -999,6 +1028,7 @@ impl TerminalPane {
                     last_size: (0, 0),
                     pointer_owner: None,
                     mouse_motion: MouseMotionLimiter::default(),
+                    extent_probe: HistoryExtentProbe::default(),
                 },
             );
         }
@@ -1495,6 +1525,22 @@ impl TerminalPane {
                 }
                 if let Some(resident) = self.residents.get_mut(&id) {
                     resident.element.fail_scrollback_fetch();
+                }
+                if self.selected_id().as_ref() == Some(&id) {
+                    cx.notify();
+                }
+            }
+            PaneEvent::HistoryExtent(id, generation, live_start_row) => {
+                if !self.attachment_is_current(&id, generation) {
+                    return;
+                }
+                if let Some(resident) = self.residents.get_mut(&id) {
+                    resident.extent_probe.in_flight = false;
+                    match live_start_row {
+                        Some(row) => resident.element.note_history_rows(row),
+                        // Let the next frame that shows the knob ask again.
+                        None => resident.extent_probe.generation = None,
+                    }
                 }
                 if self.selected_id().as_ref() == Some(&id) {
                     cx.notify();
@@ -2874,6 +2920,49 @@ impl TerminalPane {
         });
     }
 
+    /// Learns how much history sits above a live view whose scroller knob is
+    /// showing. Live grid updates carry no history geometry, so without this
+    /// the knob is sized from a one-screen guess (or a figure from the last
+    /// time the session was scrolled) and jumps to its real size on the first
+    /// scroll. Only a visible knob asks, and only when the screen has changed
+    /// since it last did.
+    fn probe_history_extent(&mut self, id: &SessionId) {
+        if !self.scroller.is_revealed() {
+            return;
+        }
+        let Some(resident) = self.residents.get_mut(id) else {
+            return;
+        };
+        let Some(generation) = resident.element.indicator_probe_generation() else {
+            return;
+        };
+        let now = Instant::now();
+        if !resident.extent_probe.should_send(generation, now) {
+            return;
+        }
+        resident.extent_probe = HistoryExtentProbe {
+            in_flight: true,
+            generation: Some(generation),
+            sent_at: Some(now),
+        };
+        let attachment_generation = resident.attachment_generation;
+        let client = Arc::clone(self.runtime.client());
+        let pane_tx = self.pane_tx.clone();
+        let probe_id = id.clone();
+        self.tokio.spawn(async move {
+            let live_start_row = client
+                .read_scrollback_cells(&probe_id, 0, 1)
+                .await
+                .ok()
+                .map(|result| result.live_start_row);
+            let _ = pane_tx.send(PaneEvent::HistoryExtent(
+                probe_id,
+                attachment_generation,
+                live_start_row,
+            ));
+        });
+    }
+
     fn handle_scroll(
         &mut self,
         event: &ScrollWheelEvent,
@@ -3322,6 +3411,7 @@ impl TerminalPane {
         if exited && let Some(takeover) = self.render_exited_takeover(session, colors, cx) {
             return takeover;
         }
+        self.probe_history_extent(&session.id);
         let Some(resident) = self.residents.get(&session.id) else {
             return centered_message("Preparing terminal…", "", colors).into_any_element();
         };
@@ -4494,7 +4584,9 @@ impl TerminalScrollTarget {
         if self.element.alt_screen() {
             0
         } else {
-            self.element.max_view_offset(self.visible_rows)
+            // The indicator's range, not the navigable one: following live,
+            // the viewport can only navigate a guessed screen of history.
+            self.element.indicator_max_view_offset(self.visible_rows)
         }
     }
 }
@@ -5460,6 +5552,14 @@ mod tests {
                         // way up: enough for the scroller to show a knob.
                         resident.element.adopt_history_geometry(600, 628, 1, 28);
                         resident.element.set_view_offset(180, 28);
+                    }
+                    if scene == "returned-live" {
+                        // The same history, read and then followed back to
+                        // the live edge: the knob rests at the bottom of its
+                        // track at the size it had on the way down.
+                        resident.element.adopt_history_geometry(600, 628, 1, 28);
+                        resident.element.set_view_offset(180, 28);
+                        resident.element.scroll_to_live(28);
                     }
                     pane.focus(window, cx);
                     pane.reset_qol_session(&id);
@@ -7262,6 +7362,95 @@ mod tests {
                 resident.find_scheduler.finish_scan(&request).is_some(),
                 "stale result completed the new resident's active scan"
             );
+        });
+    }
+
+    #[test]
+    fn history_extent_probes_are_single_flight_and_need_new_content() {
+        let start = Instant::now();
+        let mut probe = HistoryExtentProbe::default();
+        assert!(probe.should_send(7, start));
+        probe = HistoryExtentProbe {
+            in_flight: true,
+            generation: Some(7),
+            sent_at: Some(start),
+        };
+        let later = start + HISTORY_EXTENT_PROBE_INTERVAL;
+        assert!(!probe.should_send(8, later), "one read at a time");
+        probe.in_flight = false;
+        assert!(
+            !probe.should_send(7, later),
+            "an unchanged screen never re-asks"
+        );
+        assert!(
+            !probe.should_send(8, start),
+            "streaming output is rate limited"
+        );
+        assert!(probe.should_send(8, later));
+    }
+
+    #[gpui::test]
+    fn the_scroller_knob_keeps_its_size_at_the_live_edge(cx: &mut TestAppContext) {
+        const ROWS: usize = 10;
+        let runtime = Arc::new(StoreRuntime::inert());
+        let tokio = Arc::new(
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("test runtime"),
+        );
+        let session = fixture_session();
+        let id = session.id.clone();
+        {
+            let mut store = runtime.store.write().expect("session store lock poisoned");
+            store.upsert_session(session);
+            store.select(id.clone());
+        }
+        let (pane, cx) =
+            cx.add_window_view(move |window, cx| TerminalPane::new(runtime, tokio, window, cx));
+
+        pane.update_in(cx, |pane, window, cx| {
+            let resident = &pane.residents[&id];
+            let generation = resident.attachment_generation;
+            let target = TerminalScrollTarget {
+                element: resident.element.clone(),
+                visible_rows: ROWS,
+                line_height: 10.0,
+                session: id.clone(),
+                pane_tx: pane.pane_tx.clone(),
+            };
+            let range = |target: &TerminalScrollTarget| {
+                f32::from(diri_ui::ScrollTarget::max_offset(target).y)
+            };
+
+            // Read 500 rows of history, then follow output back to the live
+            // edge, where the viewport forgets its geometry.
+            resident.element.adopt_history_geometry(500, 510, 1, ROWS);
+            assert!(resident.element.set_view_offset(40, ROWS));
+            assert_eq!(range(&target), 5_000.0);
+            assert!(resident.element.scroll_to_live(ROWS));
+            assert_eq!(
+                range(&target),
+                5_000.0,
+                "the knob was sized for one screen of history at the bottom"
+            );
+
+            // A probe sent while the knob shows tracks output that has
+            // scrolled more rows into history since.
+            pane.handle_pane_event(
+                PaneEvent::HistoryExtent(id.clone(), generation, Some(800)),
+                window,
+                cx,
+            );
+            assert_eq!(range(&target), 8_000.0);
+
+            // A reply addressed to a predecessor is dropped.
+            pane.handle_pane_event(
+                PaneEvent::HistoryExtent(id.clone(), generation.wrapping_add(1), Some(5)),
+                window,
+                cx,
+            );
+            assert_eq!(range(&target), 8_000.0);
         });
     }
 

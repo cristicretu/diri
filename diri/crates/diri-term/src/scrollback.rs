@@ -161,6 +161,11 @@ pub struct ScrollbackViewport {
     live_start_row: i64,
     total_rows: i64,
     geometry_known: bool,
+    /// History length as the daemon last reported it. Survives following
+    /// live, where `geometry_known` does not: stale by whatever output
+    /// arrived since, it still sizes a scroll indicator far better than no
+    /// figure at all. Never an origin for rows or anchors.
+    history_rows: Option<i64>,
     cache_seq: Option<u64>,
     cache: BTreeMap<i64, Vec<GridCell>>,
     annotations: BTreeMap<i64, RowMetadata>,
@@ -190,6 +195,7 @@ impl ScrollbackViewport {
         self.total_rows = source.first_row + source.row_count() as i64;
         self.cache_seq = Some(source.capture_revision);
         self.geometry_known = true;
+        self.history_rows = Some(self.live_start_row.max(0));
         self.find_source = Some(source);
         self.queued = None;
         self.in_flight = None;
@@ -286,6 +292,40 @@ impl ScrollbackViewport {
             self.view_offset
                 .saturating_add(i64::try_from(visible_rows).unwrap_or(i64::MAX))
                 .max(0)
+        }
+    }
+
+    /// The scroll range an indicator should depict. While following live the
+    /// navigable range is a one-screen guess, and a knob sized from it fills
+    /// half its track over any amount of history, then collapses the moment
+    /// a scroll fetches the real geometry. The last reported history length
+    /// stands in until then.
+    #[must_use]
+    pub fn indicator_max_offset(&self, visible_rows: usize) -> i64 {
+        let navigable = self.max_offset(visible_rows);
+        if self.geometry_known || self.find_source.is_some() {
+            return navigable;
+        }
+        // Never under the navigable range: a range of zero reads as "already
+        // at the top", and the rubber band would swallow the first scroll.
+        self.history_rows
+            .map_or(navigable, |rows| rows.max(navigable))
+    }
+
+    /// True while an indicator would be drawn from a guess or a figure that
+    /// predates following live.
+    #[must_use]
+    pub fn indicator_extent_is_estimated(&self) -> bool {
+        !self.geometry_known && self.find_source.is_none()
+    }
+
+    /// Records the history length from a read made only to learn it. Unlike
+    /// [`Self::apply_rows`] this leaves `geometry_known` alone: the live edge
+    /// keeps moving under a live view, and a reading view must take its
+    /// origin from the reply to its own fetch.
+    pub fn note_history_rows(&mut self, live_start_row: i64) {
+        if self.indicator_extent_is_estimated() {
+            self.history_rows = Some(live_start_row.max(0));
         }
     }
 
@@ -606,6 +646,7 @@ impl ScrollbackViewport {
         self.live_start_row = live_start_row;
         self.total_rows = total_rows.max(0);
         self.geometry_known = true;
+        self.history_rows = Some(live_start_row.max(0));
         // Output that scrolls lines into history moves the live edge, not the
         // content being read: hold the anchored row in place and let the
         // distance to live grow instead. Without this the window slides onto
@@ -942,6 +983,52 @@ mod tests {
             546,
             "scrolling clamps at the oldest retained row"
         );
+    }
+
+    #[test]
+    fn the_indicator_keeps_the_history_length_after_returning_to_live() {
+        // Back at the live edge the viewport forgets its geometry, and the
+        // navigable range falls back to a one-screen guess. A knob sized from
+        // that guess filled half its track over ten thousand rows of history,
+        // then collapsed to its real size on the next scroll.
+        let mut viewport = ScrollbackViewport::default();
+        viewport.scroll_by(5, 40);
+        viewport.apply_geometry(10_000, 10_040, 1, 40);
+        assert_eq!(viewport.indicator_max_offset(40), 10_000);
+
+        viewport.scroll_to_live(40);
+        assert!(!viewport.geometry_known());
+        assert_eq!(viewport.max_offset(40), 40, "navigation is still a guess");
+        assert_eq!(viewport.indicator_max_offset(40), 10_000);
+    }
+
+    #[test]
+    fn a_probe_sizes_the_indicator_without_becoming_geometry() {
+        let mut viewport = ScrollbackViewport::default();
+        assert!(viewport.indicator_extent_is_estimated());
+        assert_eq!(viewport.indicator_max_offset(40), 40);
+
+        viewport.note_history_rows(2_500);
+        assert_eq!(viewport.indicator_max_offset(40), 2_500);
+        // A reading view must still take its origin from its own fetch.
+        assert!(!viewport.geometry_known());
+        assert_eq!(viewport.max_offset(40), 40);
+
+        // Known geometry is newer than any probe sent before it.
+        viewport.scroll_by(5, 40);
+        viewport.apply_geometry(3_000, 3_040, 1, 40);
+        viewport.note_history_rows(2_500);
+        assert_eq!(viewport.indicator_max_offset(40), 3_000);
+    }
+
+    #[test]
+    fn the_indicator_range_never_falls_below_the_navigable_one() {
+        // A range of zero tells the scroller the view is already at the top,
+        // and its rubber band would claim the first scroll into history that
+        // arrived after an empty probe.
+        let mut viewport = ScrollbackViewport::default();
+        viewport.note_history_rows(0);
+        assert_eq!(viewport.indicator_max_offset(40), 40);
     }
 
     #[test]

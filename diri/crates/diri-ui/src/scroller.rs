@@ -598,6 +598,15 @@ impl ScrollerState {
         self.0.borrow().overscroll.offset()
     }
 
+    /// True while the knob is on screen: shown by recent movement, held by
+    /// the pointer, or always there in the legacy style. Callers that pay to
+    /// learn their content's length only need it while this holds.
+    #[must_use]
+    pub fn is_revealed(&self) -> bool {
+        let inner = self.0.borrow();
+        inner.revealed_since.is_some() || inner.hovered || inner.drag.is_some()
+    }
+
     /// True while the pointer is on the scroller strip or dragging the knob.
     #[must_use]
     pub fn is_engaged(&self) -> bool {

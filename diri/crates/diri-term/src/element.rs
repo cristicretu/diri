@@ -822,6 +822,27 @@ impl TerminalElement {
         mutex_lock(&self.shared.viewport).max_offset(visible_rows)
     }
 
+    /// [`Self::max_view_offset`] as a scroll indicator should depict it:
+    /// following live, the last reported history length rather than the
+    /// one-screen navigation guess.
+    #[must_use]
+    pub fn indicator_max_view_offset(&self, visible_rows: usize) -> i64 {
+        mutex_lock(&self.shared.viewport).indicator_max_offset(visible_rows)
+    }
+
+    /// The content generation to stamp a history-length probe with, when the
+    /// indicator is drawn from an estimate that a probe could correct.
+    #[must_use]
+    pub fn indicator_probe_generation(&self) -> Option<u64> {
+        let estimated = mutex_lock(&self.shared.viewport).indicator_extent_is_estimated();
+        (estimated && !self.alt_screen()).then(|| read_lock(&self.buffer).generation())
+    }
+
+    /// Adopts the history length a probe read reported.
+    pub fn note_history_rows(&self, live_start_row: i64) {
+        mutex_lock(&self.shared.viewport).note_history_rows(live_start_row);
+    }
+
     /// True while the foreground program owns the whole screen, when there is
     /// no scrollback to indicate.
     #[must_use]
