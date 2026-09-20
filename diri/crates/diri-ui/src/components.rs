@@ -6,6 +6,7 @@ use gpui::{
     prelude::*, px, svg,
 };
 
+use crate::title_fade::title_fade;
 use crate::{Chip, Fill, Glass, IconName, Ink, Material, Radius, SemanticColors, Typo, rgba_f32};
 
 /// Shared, platform-independent activity mark for bounded asynchronous work.
@@ -180,7 +181,7 @@ impl RenderOnce for HoverMarquee {
             .font_weight(self.font_weight)
             .text_color(self.color);
         if !self.active || cx.reduce_motion() || text_width <= self.available_width {
-            return base.text_ellipsis().child(self.text).into_any_element();
+            return base.child(title_fade(self.text)).into_any_element();
         }
 
         const GAP: f32 = 24.0;

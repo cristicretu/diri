@@ -9,4 +9,6 @@ license.workspace = true
 gpui.workspace = true
 
 [dev-dependencies]
-gpui_platform.workspace = true
+# Headless rendering for the title fade pixel tests.
+gpui = { workspace = true, features = ["test-support"] }
+gpui_platform = { workspace = true, features = ["test-support"] }

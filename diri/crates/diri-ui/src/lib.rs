@@ -13,6 +13,7 @@ pub mod motion;
 pub mod scroller;
 mod status;
 mod svg;
+pub mod title_fade;
 mod tokens;
 
 pub use brand::{
@@ -32,6 +33,7 @@ pub use status::{
     AnimationPhase, AttentionDot, AttentionLevel, StatusGlyph, StatusState, wall_clock_seconds,
 };
 pub use svg::{PathCommand, SvgPath, SvgPathError};
+pub use title_fade::{TitleFade, title_fade};
 pub use tokens::{
     Appearance, Chip, Fill, Glass, Ink, Material, MemoryFormat, Metrics, Motion, Palette, Radius,
     SemanticColors, Space, Spring, TextRole, TextTone, TypeStyle, Typo, composite, rgba_f32,

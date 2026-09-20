@@ -1,6 +1,7 @@
 use super::*;
 use crate::store::TabOrientation;
 use crate::tab_navigation::{TAB_STRIP_HEIGHT, selected_project_tabs};
+use diri_ui::title_fade;
 
 const TAB_WIDTH: f32 = 164.0;
 const TAB_GAP: f32 = 4.0;
@@ -46,14 +47,13 @@ pub(super) fn session_tab_face(
                 .flex_1()
                 .min_w(px(0.0))
                 .overflow_hidden()
-                .text_ellipsis()
                 .text_size(px(Typo::ROW.size))
                 .text_color(if active {
                     colors.primary
                 } else {
                     colors.secondary
                 })
-                .child(title),
+                .child(title_fade(title)),
         )
 }
 
