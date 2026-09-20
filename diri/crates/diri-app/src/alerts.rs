@@ -12,6 +12,10 @@ struct NativeAlerts;
 
 impl Global for NativeAlerts {}
 
+// Only the macOS launch path and the tests turn native alerts on. Kept on
+// every platform, so `NativeAlerts` stays constructed, and excused from the
+// dead-code lint where nothing calls it.
+#[cfg_attr(not(any(target_os = "macos", test)), allow(dead_code))]
 pub(crate) fn enable(cx: &mut App) {
     cx.set_global(NativeAlerts);
 }
