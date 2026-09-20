@@ -2345,7 +2345,7 @@ impl Session {
             return Ok(Exit::Signal(libc::SIGKILL));
         }
         let exit = match &self.transport {
-            Transport::Direct(pty) => pty.lock().expect("pty").terminate(grace)?,
+            Transport::Direct(pty) => terminate_direct(pty, grace)?,
             Transport::Held(client) => {
                 // The holder escalates TERM → KILL itself; wait for the exit
                 // marker to land in the log so the recorded exit is the real
@@ -3574,7 +3574,7 @@ fn pump(
     }
 
     // The stream ended: reap the child and record how it died.
-    let exit = pty.lock().expect("pty").wait().ok();
+    let exit = reap_direct(&shared, &pty, &mut reader, &mut buffer);
     *shared.exit.lock().expect("exit") = exit;
     let (code, signal) = match exit {
         Some(Exit::Code(code)) => (Some(code), None),
@@ -3588,6 +3588,95 @@ fn pump(
     apply(&shared, &outcome);
     shared.exited.store(true, Ordering::SeqCst);
     let _ = shared.log.lock().expect("log").flush();
+}
+
+/// Stops a directly owned child: SIGTERM, then SIGKILL after `grace`.
+///
+/// The PTY lock is taken only for each signal and each reap attempt, never
+/// across the wait. The pump needs that lock after every batch of output, and
+/// on macOS a dying session leader is not reapable until the pump has read
+/// what it left in the terminal: holding the lock while waiting for the exit
+/// made the two wait on each other forever, under the Registry lock (#461).
+fn terminate_direct(pty: &Mutex<Pty>, grace: Duration) -> std::io::Result<Exit> {
+    let wait = |timeout: Duration| -> std::io::Result<Option<Exit>> {
+        let deadline = Instant::now() + timeout;
+        loop {
+            if let Some(exit) = pty.lock().expect("pty").try_wait()? {
+                return Ok(Some(exit));
+            }
+            if Instant::now() >= deadline {
+                return Ok(None);
+            }
+            std::thread::sleep(crate::pty::REAP_POLL_INTERVAL);
+        }
+    };
+    pty.lock().expect("pty").kill_group(libc::SIGTERM)?;
+    if let Some(exit) = wait(grace)? {
+        return Ok(exit);
+    }
+    pty.lock().expect("pty").kill_group(libc::SIGKILL)?;
+    wait(crate::pty::KILL_REAP_TIMEOUT)?.ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::TimedOut,
+            "the Agent did not exit after SIGKILL; the session remains tracked",
+        )
+    })
+}
+
+/// Reaps the direct child once the pump has left its loop.
+///
+/// The pump is the terminal's only reader, so it keeps reading (and
+/// discarding) here: a child killed mid-output cannot finish exiting on macOS
+/// until its output has been read. The PTY lock is held only per attempt, so
+/// `terminate` can still signal a child that closed its terminal and lived on.
+/// A stopped session gives up after [`crate::pty::KILL_REAP_TIMEOUT`] instead
+/// of pinning the thread that joins this pump.
+fn reap_direct(
+    shared: &Shared,
+    pty: &Mutex<Pty>,
+    reader: &mut crate::pty::PtyStream,
+    scratch: &mut [u8],
+) -> Option<Exit> {
+    let started = Instant::now();
+    let mut stopped_at = None;
+    let mut open = true;
+    loop {
+        if let Some(exit) = pty.lock().expect("pty").try_wait().ok()? {
+            return Some(exit);
+        }
+        if shared.stop.load(Ordering::SeqCst)
+            && stopped_at.get_or_insert_with(Instant::now).elapsed()
+                >= crate::pty::KILL_REAP_TIMEOUT
+        {
+            return None;
+        }
+        // Prompt while an exit is imminent, then no more than a slow tick for
+        // a child that outlives its terminal.
+        let step = if started.elapsed() < Duration::from_secs(1) {
+            crate::pty::REAP_POLL_INTERVAL
+        } else {
+            TICK_INTERVAL
+        };
+        if !open {
+            std::thread::sleep(step);
+            continue;
+        }
+        open = match reader.wait_readable(step) {
+            Ok(true) => {
+                use std::io::Read;
+                match reader.read(scratch) {
+                    Ok(0) => false,
+                    Ok(_) => true,
+                    Err(error) => matches!(
+                        error.kind(),
+                        std::io::ErrorKind::Interrupted | std::io::ErrorKind::WouldBlock
+                    ),
+                }
+            }
+            Ok(false) => true,
+            Err(error) => error.kind() == std::io::ErrorKind::Interrupted,
+        };
+    }
 }
 
 /// Feeds one batch of PTY output: the read the caller already made, plus every
