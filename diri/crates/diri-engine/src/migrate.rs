@@ -9,6 +9,10 @@
 //! and a host without leaving `WIP:` commits on the branch. A snapshot commit
 //! of the dirty state is left behind on the source as a recovery net.
 //!
+//! The slow transfer runs while the source agent is still alive and writing,
+//! so it moves a snapshot, not the final state: once the agent is stopped,
+//! `reconcile` carries whatever changed since, before anything resumes.
+//!
 //! Ported from `SessionMigrator`. Both sides run through the same bounded
 //! shell, so "source" and "target" can each be the local machine or a remote
 //! host. The control server owns orchestration (preconditions, kill,
@@ -53,6 +57,10 @@ pub struct Prepared {
     /// Uncommitted source changes traveled as a patch and arrived
     /// uncommitted.
     pub carried_dirty: bool,
+    /// The source commit whose tree the target checkout now holds. The agent
+    /// was still alive while it traveled, so `reconcile` measures everything
+    /// the source gained afterwards against it.
+    pub source_tip: String,
 }
 
 pub struct TranscriptShuttle {
@@ -103,6 +111,8 @@ fn require(
 /// holding commits origin has never seen, and giving a linked source worktree
 /// its own worktree next to the target clone — then
 /// re-apply the snapshot's changes to the target tree as uncommitted state.
+/// The agent may keep writing throughout; `reconcile` picks that up once it
+/// has been stopped.
 pub fn prepare(
     source_cwd: &str,
     source_host: Option<&HostEntry>,
@@ -158,36 +168,30 @@ pub fn prepare(
     // A snapshot tip means dirty state should travel as dirty state — whether
     // the commit was made just above or by an earlier run that failed later
     // (idempotent retry).
-    let tip_subject = require(
-        source_host,
-        &format!("git -C {root_q} log -1 --format=%s"),
-        "could not read the source tip commit",
-        thirty,
-    )?;
+    let (source_tip, tip_subject) = source_tip(source_host, &root)?;
     let carry_dirty = tip_subject.starts_with(HANDOFF_SUBJECT_PREFIX);
 
     // Push only real commits; the snapshot stays behind on the source. When
     // the branch already matches origin this is a no-op, and a genuinely
-    // diverged origin still fails loudly here, before anything mutates.
-    if carry_dirty {
-        require(
-            source_host,
-            &format!(
-                "git -C {root_q} push origin {} && git -C {root_q} branch --set-upstream-to {} {branch_q}",
-                shell_quote(&format!("HEAD~1:refs/heads/{branch}")),
-                shell_quote(&format!("origin/{branch}"))
-            ),
-            "git push to origin failed",
-            two_minutes,
-        )?;
+    // diverged origin still fails loudly here, before anything mutates. The
+    // push names the commit read above rather than `HEAD`: the agent is still
+    // alive and a commit it makes meanwhile must neither publish the snapshot
+    // nor reach the target behind `reconcile`'s back.
+    let published = if carry_dirty {
+        format!("{source_tip}~1")
     } else {
-        require(
-            source_host,
-            &format!("git -C {root_q} push -u origin {branch_q}"),
-            "git push to origin failed",
-            two_minutes,
-        )?;
-    }
+        source_tip.clone()
+    };
+    require(
+        source_host,
+        &format!(
+            "git -C {root_q} push origin {} && git -C {root_q} branch --set-upstream-to {} {branch_q}",
+            shell_quote(&format!("{published}:refs/heads/{branch}")),
+            shell_quote(&format!("origin/{branch}"))
+        ),
+        "git push to origin failed",
+        two_minutes,
+    )?;
 
     // A linked source worktree gets its own worktree next to the target
     // clone; parallel worktree agents would otherwise fight over the one
@@ -236,7 +240,14 @@ pub fn prepare(
     };
 
     if carry_dirty {
-        carry_dirty_state(source_host, &root, target_host, &final_target_root)?;
+        carry_dirty_state(
+            source_host,
+            &root,
+            &published,
+            &source_tip,
+            target_host,
+            &final_target_root,
+        )?;
     }
 
     Ok(Prepared {
@@ -246,18 +257,110 @@ pub fn prepare(
         wip_committed,
         target_is_worktree: source_is_worktree,
         carried_dirty: carry_dirty,
+        source_tip,
     })
 }
 
-/// Ships the snapshot commit's changes to the target as uncommitted state: a
-/// binary diff generated beside the source repo, copied across, applied to
-/// the just-synced (and verified clean) target tree, and removed on both
-/// sides. The target tree sits at exactly the commit the diff is against, so
-/// a failure here means plumbing, not conflicts — and the source snapshot
-/// commit still holds everything.
+/// The source tip's commit id and subject, read in one round trip.
+fn source_tip(
+    source_host: Option<&HostEntry>,
+    source_root: &str,
+) -> Result<(String, String), MigrateError> {
+    let tip = require(
+        source_host,
+        &format!(
+            "git -C {} log -1 --format='%H %s'",
+            shell_quote(source_root)
+        ),
+        "could not read the source tip commit",
+        Duration::from_secs(30),
+    )?;
+    let (id, subject) = tip.split_once(' ').unwrap_or((tip.as_str(), ""));
+    Ok((id.to_string(), subject.to_string()))
+}
+
+/// Phase 1b — runs once the source agent is confirmed stopped, so the source
+/// tree is finally still. `prepare` moved a snapshot taken while the agent was
+/// alive; whatever it wrote afterwards (tracked edits, new files, deletions,
+/// even commits) is folded into the source's snapshot commit and carried to
+/// the target the same way, as uncommitted state on top of what `prepare`
+/// left there. Returns whether anything had to travel.
+///
+/// Any error means the target is known to be missing work: the caller must
+/// not cut over. The source keeps every change, committed in its snapshot.
+pub fn reconcile(
+    prepared: &Prepared,
+    source_host: Option<&HostEntry>,
+    target_host: Option<&HostEntry>,
+    target_name: &str,
+) -> Result<bool, MigrateError> {
+    let thirty = Duration::from_secs(30);
+    let root_q = shell_quote(&prepared.source_repo_root);
+
+    let branch = require(
+        source_host,
+        &format!("git -C {root_q} rev-parse --abbrev-ref HEAD"),
+        "could not re-read the source branch",
+        thirty,
+    )?;
+    if branch != prepared.branch {
+        return Err(MigrateError::BadRequest(format!(
+            "the source checkout left {} for {branch} while the session was moving",
+            prepared.branch
+        )));
+    }
+    let status = require(
+        source_host,
+        &format!("git -C {root_q} status --porcelain"),
+        "could not re-read the source checkout status",
+        thirty,
+    )?;
+    if !status.is_empty() {
+        // Grow the existing snapshot instead of stacking a second one: a
+        // retried `prepare` publishes everything below a snapshot tip.
+        let (_, tip_subject) = source_tip(source_host, &prepared.source_repo_root)?;
+        let commit = if tip_subject.starts_with(HANDOFF_SUBJECT_PREFIX) {
+            "commit -q --amend --no-edit --allow-empty".to_string()
+        } else {
+            format!(
+                "commit -q -m {}",
+                shell_quote(&wip_commit_message(target_name))
+            )
+        };
+        require(
+            source_host,
+            &format!("git -C {root_q} add -A && git -C {root_q} {commit}"),
+            "could not snapshot the changes made while the session was moving",
+            thirty,
+        )?;
+    }
+    let (final_tip, _) = source_tip(source_host, &prepared.source_repo_root)?;
+    if final_tip == prepared.source_tip {
+        return Ok(false);
+    }
+    carry_dirty_state(
+        source_host,
+        &prepared.source_repo_root,
+        &prepared.source_tip,
+        &final_tip,
+        target_host,
+        &prepared.target_repo_root,
+    )?;
+    Ok(true)
+}
+
+/// Ships the changes between two source commits to the target as uncommitted
+/// state: a binary diff generated beside the source repo, copied across,
+/// applied to the target tree, and removed on both sides. The target tree
+/// holds exactly the content of `base` (just synced and verified clean for
+/// `prepare`, left behind by `prepare` for `reconcile`), so a failure here
+/// means plumbing, not conflicts — and the source snapshot commit still holds
+/// everything.
 fn carry_dirty_state(
     source_host: Option<&HostEntry>,
     source_root: &str,
+    base: &str,
+    tip: &str,
     target_host: Option<&HostEntry>,
     target_root: &str,
 ) -> Result<(), MigrateError> {
@@ -266,7 +369,9 @@ fn carry_dirty_state(
     let source_patch = require(
         source_host,
         &format!(
-            "t=$(mktemp -t diri-handoff.XXXXXX) && git -C {root_q} diff --binary --full-index 'HEAD~1' HEAD > \"$t\" && echo \"$t\""
+            "t=$(mktemp -t diri-handoff.XXXXXX) && git -C {root_q} diff --binary --full-index {} {} > \"$t\" && echo \"$t\"",
+            shell_quote(base),
+            shell_quote(tip)
         ),
         "could not capture the uncommitted changes",
         thirty,
@@ -291,8 +396,10 @@ fn carry_dirty_state(
     let patch_q = shell_quote(&target_patch);
     let applied = require(
         target_host,
+        // `git apply` rejects an empty patch; commits that differ only in
+        // identity have nothing to restore.
         &format!(
-            "git -C {} apply --whitespace=nowarn {patch_q}",
+            "[ ! -s {patch_q} ] || git -C {} apply --whitespace=nowarn {patch_q}",
             shell_quote(target_root)
         ),
         "could not restore the uncommitted changes on the target",
@@ -934,6 +1041,187 @@ mod tests {
 
         assert_refused_as_unpublished(prepare_local(&worktree, &target));
         assert_eq!(git_out(&landed, &["rev-parse", "HEAD"]), before);
+    }
+
+    /// Installs a fixture-only pre-push hook: a deterministic stand-in for an
+    /// agent that keeps working while the slow transfer is under way.
+    fn work_during_transfer(source: &Path, script: &str) {
+        use std::os::unix::fs::PermissionsExt;
+        let hook = source.join(".git/hooks/pre-push");
+        git(source, &["config", "core.hooksPath", ".git/hooks"]);
+        std::fs::write(&hook, format!("#!/bin/sh\n{script}\n")).unwrap();
+        std::fs::set_permissions(&hook, std::fs::Permissions::from_mode(0o700)).unwrap();
+    }
+
+    fn assert_same_file(source: &Path, target: &Path, name: &str) {
+        assert_eq!(
+            std::fs::read(target.join(name)).ok(),
+            std::fs::read(source.join(name)).ok(),
+            "{name} differs between source and target"
+        );
+    }
+
+    /// The agent is alive while `prepare` snapshots and transfers, so the
+    /// snapshot can be stale by the time it is stopped. A tracked edit, a new
+    /// untracked file and a deletion made in that window must all be on the
+    /// target before anything resumes there.
+    #[test]
+    fn work_done_while_the_session_was_moving_reaches_the_target() {
+        let temp = tempfile::tempdir().expect("temp");
+        let (source, target) = seeded_repos(temp.path());
+        std::fs::write(source.join("file.txt"), "snapshot-time edit\n").unwrap();
+        std::fs::write(source.join("notes.md"), "scratch\n").unwrap();
+        work_during_transfer(
+            &source,
+            "printf 'late agent edit\\n' > file.txt\nprintf 'late file\\n' > late.txt\nrm notes.md",
+        );
+
+        let prepared = prepare_local(&source, &target).expect("prepare");
+        assert!(reconcile(&prepared, None, None, "target").expect("reconcile"));
+
+        assert_eq!(
+            std::fs::read_to_string(target.join("file.txt")).unwrap(),
+            "late agent edit\n"
+        );
+        assert_eq!(
+            std::fs::read_to_string(target.join("late.txt")).unwrap(),
+            "late file\n"
+        );
+        assert!(!target.join("notes.md").exists(), "deletions travel too");
+        for name in ["file.txt", "late.txt", "notes.md"] {
+            assert_same_file(&source, &target, name);
+        }
+        assert_eq!(
+            git_out(&target, &["log", "-1", "--format=%s", "origin/main"]),
+            "root",
+            "origin never sees the snapshot"
+        );
+        // The late work joined the one recovery snapshot, so the source is
+        // clean again and the session can still bounce back into it.
+        assert!(git_out(&source, &["status", "--porcelain"]).is_empty());
+        let unpublished = git_out(&source, &["log", "--format=%s", "origin/main..HEAD"]);
+        assert_eq!(unpublished.lines().count(), 1, "{unpublished}");
+        assert!(unpublished.starts_with(HANDOFF_SUBJECT_PREFIX));
+
+        std::fs::write(target.join("late.txt"), "late file v2\n").unwrap();
+        prepare_local(&target, &source).expect("back home");
+        assert_eq!(
+            std::fs::read_to_string(source.join("file.txt")).unwrap(),
+            "late agent edit\n"
+        );
+        assert_eq!(
+            std::fs::read_to_string(source.join("late.txt")).unwrap(),
+            "late file v2\n"
+        );
+        assert!(!source.join("notes.md").exists());
+    }
+
+    /// A source that was clean at snapshot time has no snapshot commit to
+    /// grow; late work still travels, and still as uncommitted state.
+    #[test]
+    fn a_clean_source_that_changed_while_moving_is_reconciled() {
+        let temp = tempfile::tempdir().expect("temp");
+        let (source, target) = seeded_repos(temp.path());
+        work_during_transfer(&source, "printf 'late file\\n' > late.txt");
+
+        let prepared = prepare_local(&source, &target).expect("prepare");
+        assert!(!prepared.wip_committed && !prepared.carried_dirty);
+        assert!(reconcile(&prepared, None, None, "target").expect("reconcile"));
+
+        assert_same_file(&source, &target, "late.txt");
+        assert!(target.join("late.txt").exists());
+        assert!(!git_out(&target, &["status", "--porcelain"]).is_empty());
+        assert!(
+            git_out(&source, &["log", "-1", "--format=%s"]).starts_with(HANDOFF_SUBJECT_PREFIX)
+        );
+        assert_eq!(
+            git_out(&target, &["log", "-1", "--format=%s", "origin/main"]),
+            "root"
+        );
+    }
+
+    /// A commit the agent makes on top of the snapshot mid-transfer must not
+    /// drag the snapshot onto origin, and its content must still arrive.
+    #[test]
+    fn a_commit_made_while_moving_arrives_without_publishing_the_snapshot() {
+        let temp = tempfile::tempdir().expect("temp");
+        let (source, target) = seeded_repos(temp.path());
+        std::fs::write(source.join("file.txt"), "snapshot-time edit\n").unwrap();
+        work_during_transfer(
+            &source,
+            "printf 'late agent edit\\n' > file.txt\ngit add -A\ngit commit -q -m 'late commit'",
+        );
+
+        let prepared = prepare_local(&source, &target).expect("prepare");
+        assert_eq!(
+            git_out(&target, &["log", "-1", "--format=%s", "origin/main"]),
+            "root",
+            "the push is pinned below the snapshot"
+        );
+        assert_eq!(
+            std::fs::read_to_string(target.join("file.txt")).unwrap(),
+            "snapshot-time edit\n"
+        );
+        assert!(reconcile(&prepared, None, None, "target").expect("reconcile"));
+        assert_same_file(&source, &target, "file.txt");
+        assert_eq!(
+            std::fs::read_to_string(target.join("file.txt")).unwrap(),
+            "late agent edit\n"
+        );
+    }
+
+    #[test]
+    fn a_source_that_stayed_still_has_nothing_to_reconcile() {
+        let temp = tempfile::tempdir().expect("temp");
+        let (source, target) = seeded_repos(temp.path());
+        std::fs::write(source.join("file.txt"), "snapshot-time edit\n").unwrap();
+
+        let prepared = prepare_local(&source, &target).expect("prepare");
+        assert!(!reconcile(&prepared, None, None, "target").expect("reconcile"));
+        assert_eq!(
+            git_out(&source, &["rev-parse", "HEAD"]),
+            prepared.source_tip
+        );
+        assert_same_file(&source, &target, "file.txt");
+    }
+
+    /// Late work that cannot be carried is an error, never a quiet cutover —
+    /// and the source still holds all of it.
+    #[test]
+    fn a_failed_reconcile_is_an_error_and_the_source_keeps_the_late_work() {
+        let temp = tempfile::tempdir().expect("temp");
+        let (source, target) = seeded_repos(temp.path());
+        std::fs::write(source.join("file.txt"), "snapshot-time edit\n").unwrap();
+        let prepared = prepare_local(&source, &target).expect("prepare");
+
+        std::fs::write(source.join("file.txt"), "late agent edit\n").unwrap();
+        std::fs::write(source.join("late.txt"), "late file\n").unwrap();
+        // Something else touched the target: the delta no longer applies.
+        std::fs::write(target.join("file.txt"), "unrelated target edit\n").unwrap();
+
+        let error = reconcile(&prepared, None, None, "target").expect_err("must fail closed");
+        assert!(error.to_string().contains("could not restore"), "{error}");
+        assert!(!target.join("late.txt").exists(), "apply is all-or-nothing");
+        assert_eq!(
+            git_out(&source, &["show", "HEAD:file.txt"]),
+            "late agent edit"
+        );
+        assert_eq!(git_out(&source, &["show", "HEAD:late.txt"]), "late file");
+        assert_eq!(
+            std::fs::read_to_string(source.join("file.txt")).unwrap(),
+            "late agent edit\n"
+        );
+    }
+
+    #[test]
+    fn a_source_that_switched_branches_while_moving_is_refused() {
+        let temp = tempfile::tempdir().expect("temp");
+        let (source, target) = seeded_repos(temp.path());
+        let prepared = prepare_local(&source, &target).expect("prepare");
+        git(&source, &["checkout", "-q", "-b", "elsewhere"]);
+
+        let error = reconcile(&prepared, None, None, "target").expect_err("must refuse");
+        assert!(error.to_string().contains("elsewhere"), "{error}");
     }
 
     #[test]

@@ -1627,21 +1627,48 @@ impl ControlServer {
             })?;
 
         // Phase 1 (source agent still alive, everything retryable).
+        let target_name = target_host
+            .as_ref()
+            .map(|host| host.display_name())
+            .unwrap_or("local");
         let prepared = crate::migrate::prepare(
             &record.cwd,
             source_host.as_ref(),
             target_host.as_ref(),
             &target_repo,
-            target_host
-                .as_ref()
-                .map(|host| host.display_name())
-                .unwrap_or("local"),
+            target_name,
         )
         .map_err(migrate_control_error)?;
 
-        // Point of no return: stop the source agent.
+        // Stop the source agent. Phase 1 ran while it was still writing, so
+        // the target only becomes the truth once everything it changed since
+        // has been carried across too. Until then the source holds all the
+        // work: a failure leaves the stopped session where it was, resumable.
         let mut warnings: Vec<String> = Vec::new();
         self.terminate_session_unlocked(&id, Duration::from_secs(3))?;
+        if let Err(error) = crate::migrate::reconcile(
+            &prepared,
+            source_host.as_ref(),
+            target_host.as_ref(),
+            target_name,
+        ) {
+            // The same bookkeeping as `session.kill`: that is all that has
+            // happened to this session.
+            let mut registry = self.registry.lock().map_err(poisoned)?;
+            let _ = registry.persist();
+            if let Some(store) = &self.remote_bindings {
+                let _ = store.remove(&id);
+            }
+            self.publish_updated(&registry, &id);
+            return Err(ControlError::new(
+                "migrate_reconcile_failed",
+                format!(
+                    "session {id} was stopped but not moved: changes made while it was moving could not be carried to the target ({error}). All work is still in {}; resume the session there.",
+                    prepared.source_repo_root
+                ),
+            ));
+        }
+        // Point of no return.
         // Phase 2: transcript shuttle (source stopped ⇒ the jsonl is final).
         let shuttle = crate::migrate::shuttle_transcript(
             &record.cwd,
