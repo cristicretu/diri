@@ -71,7 +71,7 @@ pub(crate) fn render(
 fn column() -> Div {
     div()
         .w_full()
-        .max_w(px(320.0))
+        .max_w(px(440.0))
         .flex_none()
         .flex()
         .flex_col()
@@ -107,7 +107,7 @@ fn heading(
                 )
                 .child(
                     div()
-                        .max_w(px(340.0))
+                        .max_w(px(440.0))
                         .text_center()
                         .text_size(px(Typo::ROW.size))
                         .line_height(px(19.0))
@@ -142,13 +142,15 @@ fn welcome(state: &EmptyWorkbench, actions: &EmptyWorkbenchActions, colors: Sema
             "Install a coding agent to get started.",
             colors,
         ))
-        .child(setup_list(
+        // The sentence above may run wide; the list stays the width of a
+        // Settings group so its Install buttons sit near their names.
+        .child(div().w_full().max_w(px(320.0)).child(setup_list(
             "welcome",
             candidates,
             state.installing.as_ref(),
             colors,
             &actions.install,
-        ))
+        )))
         .child(
             div()
                 .flex()
