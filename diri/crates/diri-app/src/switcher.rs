@@ -522,14 +522,19 @@ impl SessionOverviewState {
 
 #[must_use]
 pub fn display_title(session: &SessionRecord) -> String {
+    display_title_str(session).to_owned()
+}
+
+/// [`display_title`] without the allocation, for per-frame comparisons.
+pub fn display_title_str(session: &SessionRecord) -> &str {
     if session.title_source == TitleSource::Placeholder {
         if matches!(session.status, SessionStatus::Exited(_)) {
-            "Ended".to_owned()
+            "Ended"
         } else {
-            "Untitled".to_owned()
+            "Untitled"
         }
     } else {
-        session.title.clone()
+        &session.title
     }
 }
 

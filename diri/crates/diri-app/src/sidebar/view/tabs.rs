@@ -4,6 +4,9 @@ use crate::tab_navigation::{TAB_STRIP_HEIGHT, selected_project_tabs};
 
 const TAB_WIDTH: f32 = 164.0;
 const TAB_GAP: f32 = 4.0;
+/// What a tab leaves its title: the width less the border, padding, mark
+/// slot, close button and the two gaps between them.
+const TAB_TITLE_WIDTH: f32 = TAB_WIDTH - 2.0 - 20.0 - 18.0 - 7.0 - 18.0 - 7.0;
 
 /// A session tab picked up in the horizontal strip. It carries no ghost:
 /// the tab itself is lifted by the strip, locked to the strip's axis.
@@ -22,7 +25,7 @@ impl Render for DraggedTab {
 /// does; both sit in one fixed slot so the title never shifts between them.
 pub(super) fn session_tab_face(
     mark: AnyElement,
-    title: SharedString,
+    title: impl IntoElement,
     active: bool,
     colors: SemanticColors,
 ) -> gpui::Div {
@@ -338,7 +341,11 @@ impl Sidebar {
             if shift.is_none() {
                 self.tab_shift.applied.borrow_mut().remove(&id);
             }
-            let tab = session_tab_face(mark, title.clone().into(), active, colors)
+            let face = match self.settling_title(&id, TAB_TITLE_WIDTH) {
+                Some(settling) => settling.into_any_element(),
+                None => SharedString::from(title.clone()).into_any_element(),
+            };
+            let tab = session_tab_face(mark, face, active, colors)
                 .id(SharedString::from(format!("horizontal-tab-{}", id.0)))
                 .debug_selector(move || format!("horizontal-tab-{}", debug_id))
                 .role(Role::Tab)
@@ -595,11 +602,13 @@ impl Sidebar {
         // working marks' 8 Hz tick alive only while one is on screen.
         self.reconcile_workspace_navigation(cx);
         self.working_row_rendered = false;
+        self.observe_titles(cx);
         if cx.reduce_motion() {
             self.activity_frame = 0;
         }
         let strip = self.horizontal_strip(available_width, trailing, cx);
         self.schedule_activity_tick(cx);
+        self.schedule_title_tick(cx);
         strip
     }
 

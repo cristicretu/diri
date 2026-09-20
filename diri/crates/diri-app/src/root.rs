@@ -6,6 +6,8 @@ mod project_agent_tests;
 #[cfg(all(test, target_os = "macos"))]
 mod theme_fade_frames;
 #[cfg(all(test, target_os = "macos"))]
+mod title_settle_frames;
+#[cfg(all(test, target_os = "macos"))]
 mod window_navigation_tests;
 mod workspace_launches;
 #[cfg(all(test, target_os = "macos"))]
@@ -4168,6 +4170,10 @@ impl Render for RootView {
         }
         // Before anything reads a color: this frame's sample of a theme fade.
         crate::app_theme::follow(&self.window_store.read().expect("store"), window, cx);
+        // Also while the sidebar and strip are both hidden, so a title that
+        // changed out of sight does not crossfade when they come back.
+        self.sidebar
+            .update(cx, |sidebar, cx| sidebar.observe_titles(cx));
         let colors = self.colors();
         self.sync_window_material(window);
         let launcher_open = self.launcher.read(cx).is_open();

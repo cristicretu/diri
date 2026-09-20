@@ -2,7 +2,11 @@ mod accounts;
 mod filter;
 mod project_picker;
 mod tabs;
+mod titles;
 mod workspaces;
+
+#[cfg(test)]
+pub(crate) use titles::testing as title_clock_for_test;
 
 use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, HashSet};
@@ -48,6 +52,7 @@ use crate::usage::{UsageFormat, UsageSnapshot};
 use crate::session_presentation::{activity_mark, is_loading, status_state, ui_agent_kind};
 
 use super::disclosure::{Disclosure, Frame as DisclosureFrame};
+use super::title_settle::{SettlingLabel, TitleSettles};
 
 use super::{
     CursorMove, DragItem, DropZone, Popover, PreviewScenario, SidebarPreviewFixture,
@@ -613,6 +618,13 @@ pub struct Sidebar {
     recency_disclosure: Option<Disclosure>,
     disclosure_animating: bool,
     disclosure_tick: Option<Task<()>>,
+    /// Titles an agent changed crossfade instead of snapping. Shared by the
+    /// rows and the horizontal strip, which show the same sessions.
+    title_settles: TitleSettles,
+    title_clock: fn() -> Instant,
+    /// The instant every title in this pass is sampled at.
+    title_now: Instant,
+    title_tick: Option<Task<()>>,
 }
 
 /// The sidebar state that asked for a native folder pick, captured when the
@@ -759,6 +771,10 @@ impl Sidebar {
             recency_disclosure: None,
             disclosure_animating: false,
             disclosure_tick: None,
+            title_settles: TitleSettles::default(),
+            title_clock: Instant::now,
+            title_now: Instant::now(),
+            title_tick: None,
         };
         sidebar.ui.preview_account = preview;
         // Opens a popover at launch: headless screenshots verify its layout,
@@ -3211,6 +3227,13 @@ impl Sidebar {
             })
         .max(36.0);
         let title_marquee_id = format!("session-title-marquee:{}", id.0);
+        let title_color = if selected {
+            colors.primary
+        } else if archived || hibernated {
+            colors.secondary
+        } else {
+            colors.primary.alpha(0.90)
+        };
         let fill = if selected {
             RowFill::Selected
         } else if multi {
@@ -3480,6 +3503,18 @@ impl Sidebar {
                             },
                         )]))
                         .into_any_element()
+                } else if let Some(settling) = self.settling_title(&id, title_available_width) {
+                    // The marquee's own box, so the title stays where it is.
+                    div()
+                        .min_w(px(0.0))
+                        .flex_1()
+                        .overflow_hidden()
+                        .whitespace_nowrap()
+                        .text_size(px(Typo::ROW.size))
+                        .font_weight(Typo::ROW.weight)
+                        .text_color(title_color)
+                        .child(settling)
+                        .into_any_element()
                 } else {
                     HoverMarquee::new(
                         title_marquee_id,
@@ -3487,13 +3522,7 @@ impl Sidebar {
                         hovered,
                         title_available_width,
                         Typo::ROW.size,
-                        if selected {
-                            colors.primary
-                        } else if archived || hibernated {
-                            colors.secondary
-                        } else {
-                            colors.primary.alpha(0.90)
-                        },
+                        title_color,
                     )
                     .font_weight(Typo::ROW.weight)
                     .into_any_element()
@@ -7434,6 +7463,7 @@ impl Render for Sidebar {
         self.fade_glass = self.colors().material() == diri_ui::Material::Glass;
         self.working_row_rendered = false;
         self.disclosure_animating = false;
+        self.observe_titles(cx);
         if cx.reduce_motion() {
             self.activity_frame = 0;
         }
@@ -7610,6 +7640,7 @@ impl Render for Sidebar {
             }));
         }
         self.schedule_activity_tick(cx);
+        self.schedule_title_tick(cx);
 
         let mut root = div()
             .id("sidebar")

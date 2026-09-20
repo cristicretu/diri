@@ -4,6 +4,7 @@ mod disclosure;
 mod filter;
 mod fixture;
 mod state;
+mod title_settle;
 mod view;
 
 pub use fixture::{PreviewScenario, SidebarPreviewFixture};
@@ -14,3 +15,5 @@ pub use state::{
 pub(crate) use view::DraggedSidebarItem;
 pub use view::Sidebar;
 pub(crate) use view::SidebarEvent;
+#[cfg(test)]
+pub(crate) use view::title_clock_for_test;
