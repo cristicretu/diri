@@ -484,13 +484,25 @@ fn completed_terminal_survives_engine_replacement() {
         .spawn(
             shell_spec(
                 id,
-                "printf 'retained line\\n'; printf 'final prompt'; exit 3",
+                // The child stays until it is told to go. A run is retained
+                // only if the launch handshake bound it to the Holder's
+                // verified child, and a child that exits inside that
+                // handshake is legitimately unbound and unpublished: on a
+                // loaded runner an instant `exit 3` lost that race and this
+                // test then waited for a publication that was never due.
+                "printf 'retained line\\n'; printf 'final prompt'; read _; exit 3",
                 &logs,
                 Some(holder.clone()),
             ),
             record.clone(),
         )
         .expect("spawn held");
+    let session = registry.get(id).expect("the spawned session");
+    assert!(
+        session.holder_run().is_some(),
+        "a live held child is bound to its Holder run at launch"
+    );
+    session.write_input(b"\n").expect("release the child");
     let mut published = HashMap::new();
     let mut publications = Vec::new();
     wait_until(

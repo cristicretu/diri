@@ -17,7 +17,9 @@ fn find_capture_is_bounded_atomic_and_pinned_to_the_original_session_owner() {
         }, test_record("find-fixture")).unwrap();
     };
     spawn();
-    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    // Readiness is not what this test measures; the budget only has to
+    // outlast 6000 lines through a debug-build parser on a loaded machine.
+    let deadline = std::time::Instant::now() + Duration::from_secs(30);
     loop {
         let ready = server
             .registry
@@ -32,7 +34,10 @@ fn find_capture_is_bounded_atomic_and_pinned_to_the_original_session_owner() {
         if ready {
             break;
         }
-        assert!(std::time::Instant::now() < deadline);
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the fixture never printed CAPTURE READY into retained history"
+        );
         std::thread::sleep(Duration::from_millis(2));
     }
     let value = server
