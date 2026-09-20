@@ -7,8 +7,6 @@ use diri_proto::paths::DirijorPaths;
 use diri_proto::{AgentKind, ProjectId, SessionId};
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
-use crate::launch_recipe::{LaunchRecipeBook, deserialize_recipe_book};
-
 const DEFAULT_THEME: &str = "dirijor-dark";
 
 #[derive(Clone, Copy, Debug, Default, Deserialize, PartialEq, Eq, Serialize)]
@@ -257,8 +255,11 @@ pub struct Prefs {
     pub sidebar_collapsed_sessions: Vec<SessionId>,
     pub sidebar_expanded_archives: Vec<ProjectId>,
     /// Versioned, locally owned one-action Agent workflows.
-    #[serde(default, deserialize_with = "deserialize_recipe_book")]
-    pub launch_recipes: LaunchRecipeBook,
+    /// Launch recipes lived in the Command-N composer, which is gone. A saved
+    /// book is carried through untouched instead of being erased by the next
+    /// preferences write, so whatever replaces recipes can still read it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub launch_recipes: Option<serde_json::Value>,
     /// Per-command keyboard overrides keyed by the command registry's stable
     /// id. A missing entry uses the shipped binding, `null` leaves the command
     /// unassigned, and a string contains a GPUI keystroke such as `cmd-shift-p`.
@@ -314,7 +315,7 @@ impl Default for Prefs {
             sidebar_collapsed_workspaces: Vec::new(),
             sidebar_collapsed_sessions: Vec::new(),
             sidebar_expanded_archives: Vec::new(),
-            launch_recipes: LaunchRecipeBook::default(),
+            launch_recipes: None,
             shortcut_overrides: BTreeMap::new(),
             last_selected_session: None,
         }
@@ -445,14 +446,12 @@ impl Prefs {
         if self.terminal_theme.is_empty() {
             self.terminal_theme = DEFAULT_THEME.to_owned();
         }
-        self.launch_recipes.normalize();
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::launch_recipe::{LaunchRecipe, RecipeProject};
 
     #[test]
     fn system_appearance_is_opt_in_persisted_and_only_changes_with_the_os() {
@@ -563,14 +562,17 @@ mod tests {
     }
 
     #[test]
-    fn older_preferences_migrate_to_an_empty_recipe_book() {
+    fn a_saved_recipe_book_survives_a_preferences_round_trip_untouched() {
         let mut value = serde_json::to_value(Prefs::default()).expect("serialize prefs");
-        value
-            .as_object_mut()
-            .expect("prefs object")
-            .remove("launchRecipes");
-        let prefs: Prefs = serde_json::from_value(value).expect("old preferences remain readable");
-        assert!(prefs.launch_recipes.items().is_empty());
+        assert!(
+            value.get("launchRecipes").is_none(),
+            "nothing is written for users who never saved a recipe"
+        );
+        let book = serde_json::json!({"version": 1, "items": [{"name": "Review", "odd": true}]});
+        value["launchRecipes"] = book.clone();
+        let prefs: Prefs = serde_json::from_value(value).expect("saved recipes stay readable");
+        let rewritten = serde_json::to_value(&prefs).expect("serialize prefs");
+        assert_eq!(rewritten["launchRecipes"], book);
     }
 
     #[test]
@@ -582,42 +584,5 @@ mod tests {
             .remove("shortcutOverrides");
         let prefs: Prefs = serde_json::from_value(value).expect("old preferences remain readable");
         assert!(prefs.shortcut_overrides.is_empty());
-    }
-
-    #[test]
-    fn malformed_recipe_data_does_not_discard_other_preferences() {
-        let mut value = serde_json::to_value(Prefs {
-            status_sounds: false,
-            ..Prefs::default()
-        })
-        .expect("serialize prefs");
-        value["launchRecipes"] = serde_json::json!({"version": 1, "items": "broken"});
-        let prefs: Prefs =
-            serde_json::from_value(value).expect("malformed recipe field is isolated");
-        assert!(!prefs.status_sounds);
-        assert!(prefs.launch_recipes.items().is_empty());
-    }
-
-    #[test]
-    fn recipe_book_round_trips_through_preferences() {
-        let mut prefs = Prefs::default();
-        prefs
-            .launch_recipes
-            .add(LaunchRecipe::draft(
-                "Review",
-                AgentKind::CODEX,
-                RecipeProject::Path {
-                    path: "/tmp".into(),
-                },
-                None,
-                "Review this branch",
-            ))
-            .expect("add recipe");
-        let json = serde_json::to_vec(&prefs).expect("serialize prefs");
-        let restored: Prefs = serde_json::from_slice(&json).expect("deserialize prefs");
-        assert_eq!(
-            restored.launch_recipes.items(),
-            prefs.launch_recipes.items()
-        );
     }
 }

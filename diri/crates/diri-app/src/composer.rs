@@ -1,8 +1,8 @@
-//! The multi-line prompt field behind Command-N.
+//! The multi-line prompt field of the session and handoff composer.
 //!
 //! [`QueryEditor`](crate::query_editor::QueryEditor) is a buffer: it knows
 //! where the caret is in BYTES and nothing about where that lands on screen.
-//! That is all a one-line search field needs, and the Command-N composer
+//! That is all a one-line search field needs, and the prompt composer
 //! inherited it — which is why a prompt longer than the box scrolled out of
 //! sight with no way to follow it, why ↑/↓ did nothing, and why ⌘← jumped to
 //! the top of the whole prompt instead of the start of the line you were on.

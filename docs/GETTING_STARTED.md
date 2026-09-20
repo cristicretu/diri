@@ -50,7 +50,7 @@ drop does nothing.
 
 ## Working from the keyboard
 
-⌘N opens the launcher, ⌘T starts a session with the default agent, ⌘K is the
+⌘N or ⌘T starts a session with the default agent, ⌘K is the
 command palette, and ⌃⇥ switches between running sessions. ⌘P goes straight to
 the palette’s project page; ⇧⌘H searches past chats. In the palette, choose
 Settings → Color theme to preview themes with the arrow keys and save with Enter. The

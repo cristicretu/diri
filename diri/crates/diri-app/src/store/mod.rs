@@ -414,7 +414,6 @@ pub struct SessionStore {
     cached_menu_projection: Option<(u64, Arc<SidebarProjection>)>,
     prefs_path: Option<PathBuf>,
     /// Set by the menu bar's New Agent action; drained by Root on UI sync.
-    pending_open_launcher: bool,
     /// Set by the menu bar's Settings action; drained by Root on UI sync.
     pending_open_settings: bool,
     /// Remote host catalog from hosts.json. Empty when the file is absent or
@@ -517,7 +516,6 @@ impl SessionStore {
                 cached_projection: None,
                 cached_menu_projection: None,
                 prefs_path,
-                pending_open_launcher: false,
                 pending_open_settings: false,
                 hosts: Vec::new(),
                 agents: HashMap::new(),
@@ -2338,19 +2336,6 @@ impl SessionStore {
         });
     }
 
-    /// Menu bar can ask for the launcher while another app still owns focus.
-    /// `PublishSnapshot` already forces a publish on its own, so this never
-    /// claims `app_is_active` — that flag gates banner suppression, and lying
-    /// about it would silence notifications for a still-background app.
-    pub fn request_open_launcher(&mut self) {
-        self.pending_open_launcher = true;
-        self.emit(StoreEffect::PublishSnapshot);
-    }
-
-    pub fn take_open_launcher_request(&mut self) -> bool {
-        std::mem::take(&mut self.pending_open_launcher)
-    }
-
     pub fn request_open_settings(&mut self) {
         self.pending_open_settings = true;
         self.emit(StoreEffect::PublishSnapshot);
@@ -2363,7 +2348,7 @@ impl SessionStore {
     /// Cheap read-lock probe so the UI sync loop only takes a write lock on the
     /// rare tick that actually has a menu-bar request to drain.
     pub fn has_pending_ui_request(&self) -> bool {
-        self.pending_open_launcher || self.pending_open_settings
+        self.pending_open_settings
     }
 
     pub fn rename(&mut self, id: SessionId, title: impl Into<String>) {

@@ -1,5 +1,12 @@
 # Reusable recipes and scheduled tasks
 
+> **Status:** launch recipes lived inside the Command-N new-session composer,
+> which has been removed. Nothing in the app reads or edits recipes now. A
+> recipe book already saved in `prefs.json` is carried through untouched
+> (`launchRecipes`), so a future home for recipes can pick it up. The text
+> below describes the removed implementation and the scheduling proposal that
+> depended on it.
+
 ## Implemented in this branch
 
 An empty new-session composer exposes the first three saved recipes as Run

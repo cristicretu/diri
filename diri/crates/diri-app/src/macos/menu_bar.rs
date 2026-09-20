@@ -151,7 +151,7 @@ define_class!(
 
         #[unsafe(method(newAgent:))]
         fn new_agent(&self, _sender: Option<&AnyObject>) {
-            self.dispatch(WindowAction::OpenLauncher);
+            self.dispatch(WindowAction::NewSession);
         }
 
         #[unsafe(method(spawnAgent:))]

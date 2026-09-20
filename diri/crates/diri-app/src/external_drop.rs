@@ -75,7 +75,7 @@ pub(crate) enum ExternalDropTarget {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum ExternalDropAction {
-    OpenLauncher {
+    StartSession {
         root: String,
     },
     OpenSessionComposer {
@@ -358,7 +358,7 @@ fn launcher_plan(
         }
     }
     ExternalDropPlan {
-        action: root.map(|root| ExternalDropAction::OpenLauncher { root }),
+        action: root.map(|root| ExternalDropAction::StartSession { root }),
         rejected,
     }
 }
@@ -555,7 +555,7 @@ mod tests {
             );
             assert_eq!(
                 plan.action,
-                Some(ExternalDropAction::OpenLauncher {
+                Some(ExternalDropAction::StartSession {
                     root: "/tmp/first".into()
                 })
             );
