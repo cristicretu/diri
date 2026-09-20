@@ -2278,6 +2278,9 @@ impl Sidebar {
             .into_any_element()
     }
 
+    /// Names the place and the shortcut, and leaves the button to the main
+    /// pane: with no sessions its empty state is always beside this one, and
+    /// two "Start a session" controls a few hundred points apart read as a bug.
     fn empty_state(&self, colors: SemanticColors, cx: &mut Context<Self>) -> AnyElement {
         div()
             .id("sidebar-empty-state")
@@ -2321,30 +2324,11 @@ impl Sidebar {
                             .text_size(px(Typo::META.size))
                             .text_color(colors.tertiary)
                             .child(
-                                crate::commands::command(CommandId::OpenLauncher)
+                                crate::commands::command(CommandId::NewDefaultSession)
                                     .shortcut_label()
                                     .unwrap_or_default(),
                             ),
                     ),
-            )
-            .child(
-                div()
-                    .id("empty-new-agent")
-                    .px(px(10.0))
-                    .h(px(SIDEBAR_NAV_ROW_HEIGHT))
-                    .flex()
-                    .items_center()
-                    .rounded(px(SIDEBAR_ROW_RADIUS))
-                    .text_size(px(Typo::ROW.size))
-                    .text_color(colors.secondary)
-                    .cursor_pointer()
-                    .hover(move |element| element.bg(colors.primary.alpha(0.06)))
-                    .on_click(|_, window, cx| {
-                        window.dispatch_action(Box::new(crate::commands::OpenLauncher), cx);
-                    })
-                    .gap(px(7.0))
-                    .child(sf_symbol("square.and.pencil", 13.0, colors.secondary))
-                    .child("Start a session"),
             )
             .into_any_element()
     }

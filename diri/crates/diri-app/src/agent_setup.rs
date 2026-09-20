@@ -68,7 +68,7 @@ pub(crate) fn setup_list(
         .flex_col()
         .rounded(px(Radius::CARD))
         .border_1()
-        .border_color(colors.primary.alpha(0.08))
+        .border_color(colors.primary.alpha(0.07))
         .bg(colors.primary.alpha(0.025))
         .overflow_hidden();
     for (index, option) in candidates.iter().enumerate() {
@@ -124,8 +124,8 @@ fn setup_row(
                     .min_w(px(0.0))
                     .whitespace_normal()
                     .font_family(crate::fonts::mono_family())
-                    .text_size(px(10.5))
-                    .line_height(px(15.0))
+                    .text_size(px(10.0))
+                    .line_height(px(14.0))
                     .text_color(colors.tertiary)
                     .child(install.command.clone()),
             )
@@ -147,12 +147,12 @@ fn setup_row(
                 })
                 .role(Role::Button)
                 .aria_label(format!("Open the {} setup guide", option.display_name))
-                .h(px(26.0))
-                .px(px(9.0))
-                .rounded(px(Radius::BADGE))
+                .h(px(24.0))
+                .px(px(7.0))
+                .rounded(px(Radius::CHIP))
                 .flex()
                 .items_center()
-                .text_size(px(12.0))
+                .text_size(px(11.0))
                 .text_color(colors.secondary)
                 .cursor_pointer()
                 .hover(move |button| {
@@ -176,30 +176,21 @@ fn setup_row(
                 })
                 .role(Role::Button)
                 .aria_label(format!("Install {}", option.display_name))
-                .h(px(26.0))
-                .px(px(11.0))
-                .rounded(px(Radius::BADGE))
-                // One filled button per list: the first row is the shortest
-                // path, the rest stay available without competing with it.
-                .map(|button| {
-                    if recommended {
-                        button
-                            .bg(colors.primary)
-                            .text_color(colors.background)
-                            .hover(|button| button.opacity(0.88))
-                    } else {
-                        button
-                            .border_1()
-                            .border_color(colors.primary.alpha(0.14))
-                            .text_color(colors.primary)
-                            .hover(move |button| button.bg(colors.primary.alpha(0.06)))
-                    }
-                })
-                .text_size(px(12.0))
+                // The Settings control, not a call-to-action slab. The first
+                // row is the shortest path, so it alone gets the stronger fill.
+                .h(px(24.0))
+                .px(px(9.0))
+                .rounded(px(Radius::CHIP))
+                .border_1()
+                .border_color(colors.primary.alpha(if recommended { 0.16 } else { 0.10 }))
+                .bg(colors.primary.alpha(if recommended { 0.10 } else { 0.04 }))
+                .text_color(colors.primary)
+                .text_size(px(11.0))
                 .font_weight(FontWeight::MEDIUM)
                 .flex()
                 .items_center()
                 .cursor_pointer()
+                .hover(move |button| button.bg(colors.primary.alpha(0.14)))
                 .active(|button| button.opacity(0.74))
                 .on_click(move |_, window, cx| handler(&target, window, cx))
                 .child("Install"),
@@ -207,13 +198,13 @@ fn setup_row(
     }
 
     div()
-        .px(px(12.0))
-        .py(px(9.0))
+        .px(px(11.0))
+        .py(px(7.0))
         .flex()
-        .gap(px(11.0))
+        .gap(px(10.0))
         .child(
-            div().h(px(26.0)).flex_none().flex().items_center().child(
-                AgentLogo::new(crate::surface_shell::ui_agent(&option.kind), 20.0, colors)
+            div().h(px(24.0)).flex_none().flex().items_center().child(
+                AgentLogo::new(crate::surface_shell::ui_agent(&option.kind), 18.0, colors)
                     .badged(false),
             ),
         )
@@ -226,14 +217,14 @@ fn setup_row(
                 .gap(px(1.0))
                 .child(
                     div()
-                        .h(px(26.0))
+                        .h(px(24.0))
                         .flex()
                         .items_center()
                         .justify_between()
                         .gap(px(8.0))
                         .child(
                             div()
-                                .text_size(px(13.0))
+                                .text_size(px(12.0))
                                 .font_weight(FontWeight::MEDIUM)
                                 .text_color(colors.primary)
                                 .child(option.display_name.clone()),
@@ -245,37 +236,21 @@ fn setup_row(
         .into_any_element()
 }
 
-/// Installed Agents as one quiet line of marks and names.
-pub(crate) fn ready_line(ready: &[AgentOption], colors: SemanticColors) -> Div {
-    const SHOWN: usize = 4;
-    let mut line = div().flex().flex_wrap().items_center().gap(px(14.0));
-    for option in ready.iter().take(SHOWN) {
-        line = line.child(
-            div()
-                .flex()
-                .items_center()
-                .gap(px(7.0))
-                .child(
-                    AgentLogo::new(crate::surface_shell::ui_agent(&option.kind), 16.0, colors)
-                        .badged(false),
-                )
-                .child(
-                    div()
-                        .text_size(px(13.0))
-                        .text_color(colors.primary)
-                        .child(option.display_name.clone()),
-                ),
-        );
+/// "Claude Code and Codex are ready", for a line of meta text. The page is
+/// an empty state, so installed Agents are a fact to mention, not a gallery.
+pub(crate) fn ready_names(ready: &[AgentOption]) -> String {
+    const NAMED: usize = 2;
+    let names: Vec<_> = ready
+        .iter()
+        .take(NAMED)
+        .map(|option| option.display_name.as_str())
+        .collect();
+    match (names.as_slice(), ready.len().saturating_sub(NAMED)) {
+        ([], _) => "No agent is ready".to_owned(),
+        ([only], 0) => format!("{only} is ready"),
+        ([first, second], 0) => format!("{first} and {second} are ready"),
+        (shown, more) => format!("{} and {more} more are ready", shown.join(", ")),
     }
-    if ready.len() > SHOWN {
-        line = line.child(
-            div()
-                .text_size(px(13.0))
-                .text_color(colors.secondary)
-                .child(format!("+{} more", ready.len() - SHOWN)),
-        );
-    }
-    line
 }
 
 /// A text-weight control for the quiet actions under a setup list.
@@ -294,13 +269,13 @@ pub(crate) fn quiet_link(
         .flex()
         .items_center()
         .gap(px(5.0))
-        .text_size(px(12.0))
+        .text_size(px(11.0))
         .text_color(colors.secondary)
         .cursor_pointer()
         .hover(move |link| link.text_color(colors.primary))
         .on_click(move |_, window, cx| on_click(window, cx))
         .when_some(symbol, |link, symbol| {
-            link.child(sf_symbol(symbol, 11.0, colors.secondary))
+            link.child(sf_symbol(symbol, 10.0, colors.secondary))
         })
         .child(label)
         .into_any_element()
