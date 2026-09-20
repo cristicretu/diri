@@ -230,28 +230,116 @@ impl Pty {
         })?;
         // SAFETY: the child called `setsid`, therefore `-pid` names the
         // process group created by this object. No pointer memory is involved.
-        let result = unsafe { libc::kill(-pid, signal) };
-        if result < 0 {
-            let error = io::Error::last_os_error();
-            if error.raw_os_error() != Some(libc::ESRCH) {
-                return Err(error);
-            }
+        if unsafe { libc::kill(-pid, signal) } == 0 {
+            return Ok(());
         }
-        Ok(())
+        let error = io::Error::last_os_error();
+        match error.raw_os_error() {
+            Some(libc::ESRCH) => Ok(()),
+            // Darwin answers EPERM, not ESRCH, when the group still exists
+            // but every member is already exiting: a session leader killed a
+            // moment ago stays in that state until its terminal output has
+            // been read. That is not a permission failure. The leader is this
+            // object's own child, so ask about it directly; only a leader
+            // that cannot be signalled either is a real EPERM.
+            Some(libc::EPERM) => {
+                // SAFETY: integer arguments only.
+                if unsafe { libc::kill(pid, signal) } == 0 {
+                    return Ok(());
+                }
+                let direct = io::Error::last_os_error();
+                if direct.raw_os_error() == Some(libc::ESRCH) {
+                    Ok(())
+                } else {
+                    Err(direct)
+                }
+            }
+            _ => Err(error),
+        }
     }
 
+    /// Stops the child: SIGTERM, then SIGKILL after `grace`.
+    ///
+    /// Terminal output is read and discarded while waiting. On macOS a dying
+    /// session leader does not become reapable until the output it left in
+    /// the terminal has been read, so waiting without reading can wait
+    /// forever. A caller with its own reader on another thread must not hold
+    /// that reader back for the duration of this call; signal with
+    /// [`Self::kill_group`] and poll [`Self::try_wait`] instead.
+    ///
+    /// The wait after SIGKILL is bounded: a child that still cannot be reaped
+    /// is reported as `TimedOut` rather than blocking the caller for good.
     pub fn terminate(&mut self, grace: std::time::Duration) -> io::Result<Exit> {
         self.kill_group(libc::SIGTERM)?;
-        let deadline = std::time::Instant::now() + grace;
-        while std::time::Instant::now() < deadline {
-            if let Some(exit) = self.try_wait()? {
-                return Ok(exit);
-            }
-            std::thread::sleep(std::time::Duration::from_millis(20));
+        if let Some(exit) = self.wait_draining(grace)? {
+            return Ok(exit);
         }
         self.kill_group(libc::SIGKILL)?;
-        self.wait()
+        self.wait_draining(KILL_REAP_TIMEOUT)?.ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::TimedOut,
+                "the child did not exit after SIGKILL",
+            )
+        })
     }
+
+    /// Waits up to `timeout` for the child to exit, discarding terminal
+    /// output meanwhile so an exiting child is never held by unread output.
+    pub fn wait_draining(&mut self, timeout: std::time::Duration) -> io::Result<Option<Exit>> {
+        let deadline = std::time::Instant::now() + timeout;
+        let mut scratch = [0u8; 16 << 10];
+        let mut open = true;
+        loop {
+            if let Some(exit) = self.try_wait()? {
+                return Ok(Some(exit));
+            }
+            let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+            if remaining.is_zero() {
+                return Ok(None);
+            }
+            let step = remaining.min(REAP_POLL_INTERVAL);
+            if open {
+                open = discard_readable(self.master.as_raw_fd(), step, &mut scratch);
+            } else {
+                std::thread::sleep(step);
+            }
+        }
+    }
+}
+
+/// How long a SIGKILLed child may take to become reapable.
+pub const KILL_REAP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// How often a bounded wait looks for the child's exit.
+pub const REAP_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(20);
+
+/// Waits up to `timeout` for terminal output and throws one read of it away.
+/// Returns whether the terminal can still produce more.
+fn discard_readable(fd: RawFd, timeout: std::time::Duration, scratch: &mut [u8]) -> bool {
+    let mut descriptor = libc::pollfd {
+        fd,
+        events: libc::POLLIN,
+        revents: 0,
+    };
+    let millis = timeout.as_millis().clamp(1, libc::c_int::MAX as u128) as libc::c_int;
+    // SAFETY: one initialized poll descriptor, writable for the call.
+    let ready = unsafe { libc::poll(&mut descriptor, 1, millis) };
+    if ready <= 0 {
+        // Quiet, or interrupted: either way there is nothing to discard yet.
+        return ready == 0 || io::Error::last_os_error().kind() == io::ErrorKind::Interrupted;
+    }
+    // SAFETY: `scratch` is writable for its whole length.
+    let count = unsafe { libc::read(fd, scratch.as_mut_ptr().cast(), scratch.len()) };
+    if count > 0 {
+        return true;
+    }
+    // Zero (macOS) or EIO (Linux) is the closed terminal; a transient error
+    // leaves it open.
+    count < 0
+        && matches!(
+            io::Error::last_os_error().kind(),
+            io::ErrorKind::Interrupted | io::ErrorKind::WouldBlock
+        )
 }
 
 fn exit_from(status: std::process::ExitStatus) -> Exit {
@@ -720,6 +808,45 @@ mod tests {
         assert!(!pty.secret_input(), "raw mode without echo is a TUI");
         writer.write_all(b"\n").expect("finish");
         let _ = pty.terminate(Duration::from_secs(1));
+    }
+
+    /// A child killed while the terminal still holds its unread output stays
+    /// in exit on macOS until that output is read: the group kill then
+    /// answers EPERM and a plain `wait` never returns (#461).
+    #[test]
+    fn terminate_reaps_a_child_whose_output_nobody_reads() {
+        use std::time::Duration;
+        let (done, finished) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            for _ in 0..20 {
+                let spec = PtySpec::new(
+                    vec![
+                        "/bin/sh".into(),
+                        "-c".into(),
+                        "while :; do printf '0123456789012345678901234567890123456789\\r\\n'; done"
+                            .into(),
+                    ],
+                    "/",
+                );
+                let mut pty = Pty::spawn(&spec).expect("spawn");
+                // Let the child fill the terminal's output queue and block.
+                assert!(
+                    pty.reader()
+                        .expect("reader")
+                        .wait_readable(Duration::from_secs(10))
+                        .expect("poll")
+                );
+                std::thread::sleep(Duration::from_millis(20));
+                let exit = pty
+                    .terminate(Duration::from_millis(200))
+                    .expect("terminate");
+                assert!(matches!(exit, Exit::Signal(_)), "{exit:?}");
+            }
+            let _ = done.send(());
+        });
+        finished
+            .recv_timeout(Duration::from_secs(60))
+            .expect("terminate must not wait forever on a child with unread output");
     }
 
     #[test]
