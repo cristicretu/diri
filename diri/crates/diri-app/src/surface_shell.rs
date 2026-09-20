@@ -7427,6 +7427,9 @@ mod tests {
 
     #[gpui::test]
     fn closing_the_share_preview_releases_its_images(cx: &mut TestAppContext) {
+        if !usage_share::SUPPORTED {
+            return;
+        }
         let (harness, cx) = open_settings_workbench(cx);
         let surfaces = harness.read_with(cx, |harness, _| harness.surfaces.clone());
         surfaces.update(cx, |surfaces, cx| {
