@@ -12,13 +12,13 @@ use diri_ui::{
 };
 use gpui::{
     AnyElement, App, Context, EventEmitter, FocusHandle, Focusable, FontWeight, HighlightStyle,
-    KeyDownEvent, MouseButton, PathPromptOptions, Render, Role, ScrollHandle, Task, Window, div,
-    prelude::*, px, rgba,
+    KeyDownEvent, MouseButton, MouseDownEvent, MouseMoveEvent, PathPromptOptions, Pixels, Point,
+    Render, Role, ScrollHandle, Task, Window, div, prelude::*, px, rgba,
 };
 
 use crate::AppServices;
 use crate::agent_catalog::{AgentOption, quick_agent_options, title_case_id};
-use crate::composer::PromptComposer;
+use crate::composer::{PointerHit, PromptComposer};
 use crate::delegation::HandoffProposal;
 use crate::icons::{SymbolWeight, sf_symbol, sf_symbol_weighted};
 use crate::launch_recipe::{
@@ -135,6 +135,8 @@ pub(crate) struct LauncherOverlay {
     services: Arc<AppServices>,
     focus: FocusHandle,
     prompt: PromptComposer,
+    /// A press on the prompt text is being dragged into a selection.
+    prompt_selecting: bool,
     target: LauncherTarget,
     new_session_draft: String,
     session_drafts: HashMap<SessionId, String>,
@@ -378,6 +380,7 @@ impl LauncherOverlay {
             services,
             focus,
             prompt: PromptComposer::default(),
+            prompt_selecting: false,
             target: LauncherTarget::NewSession,
             new_session_draft: String::new(),
             session_drafts: HashMap::new(),
@@ -2100,6 +2103,56 @@ impl LauncherOverlay {
         true
     }
 
+    /// A press on the prompt text: place the caret (⇧ extends, a second click
+    /// takes the word) and start a drag selection. The press still bubbles to
+    /// the composer box, which is what focuses the field.
+    fn prompt_mouse_down(
+        &mut self,
+        event: &MouseDownEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.delivery.is_sending() {
+            return;
+        }
+        if let Some(hit) = self.prompt_hit(event.position, window) {
+            self.prompt
+                .pointer_down(hit, event.modifiers.shift, event.click_count);
+            self.prompt_selecting = true;
+            cx.notify();
+        }
+    }
+
+    /// The drag outlives the text's own bounds — the pointer may leave the
+    /// field while selecting — so the launcher's root listens for it, and a
+    /// move without the button held means the release happened elsewhere.
+    fn prompt_mouse_move(
+        &mut self,
+        event: &MouseMoveEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if !self.prompt_selecting {
+            return;
+        }
+        if event.pressed_button != Some(MouseButton::Left) || self.delivery.is_sending() {
+            self.prompt_selecting = false;
+            return;
+        }
+        if let Some(hit) = self.prompt_hit(event.position, window) {
+            self.prompt.pointer_drag(hit);
+            cx.notify();
+        }
+    }
+
+    fn prompt_hit(&self, position: Point<Pixels>, window: &Window) -> Option<PointerHit> {
+        // The caret glyph takes up room in the line it is drawn in, and it is
+        // drawn only while the field has focus.
+        let caret = self.focus.is_focused(window).then_some(CARET);
+        self.prompt
+            .hit_test(position, px(COMPOSER_LINE_HEIGHT), caret, window)
+    }
+
     fn forget_local_paths_of_an_empty_draft(&mut self) {
         if self.prompt.text().is_empty()
             && let LauncherTarget::Session(id) = &self.target
@@ -3251,6 +3304,7 @@ impl LauncherOverlay {
                             .text_size(px(COMPOSER_FONT_SIZE))
                             .line_height(px(COMPOSER_LINE_HEIGHT))
                             .text_color(colors.primary)
+                            .on_mouse_down(MouseButton::Left, cx.listener(Self::prompt_mouse_down))
                             .child(prompt),
                     )
                     .child(
@@ -3634,6 +3688,7 @@ impl LauncherOverlay {
                             .text_size(px(COMPOSER_FONT_SIZE))
                             .line_height(px(COMPOSER_LINE_HEIGHT))
                             .text_color(colors.primary)
+                            .on_mouse_down(MouseButton::Left, cx.listener(Self::prompt_mouse_down))
                             .child(prompt),
                     )
                     .child(
@@ -3869,6 +3924,7 @@ impl LauncherOverlay {
                             .text_size(px(COMPOSER_FONT_SIZE))
                             .line_height(px(COMPOSER_LINE_HEIGHT))
                             .text_color(colors.primary)
+                            .on_mouse_down(MouseButton::Left, cx.listener(Self::prompt_mouse_down))
                             .child(prompt),
                     )
                     .child(
@@ -4158,6 +4214,11 @@ impl Render for LauncherOverlay {
                     window.focus(&this.focus, cx);
                     cx.notify();
                 }),
+            )
+            .on_mouse_move(cx.listener(Self::prompt_mouse_move))
+            .on_mouse_up(
+                MouseButton::Left,
+                cx.listener(|this, _, _, _| this.prompt_selecting = false),
             )
             // Command-N is a high-frequency keyboard action; the destination
             // appears immediately rather than making the user wait on motion.
@@ -4677,6 +4738,127 @@ mod tests {
             assert_eq!(launcher.prompt.text(), "draft\n2");
             press(launcher, "cmd-shift-z", window, cx);
             assert_eq!(launcher.prompt.text(), "draft\n2");
+        });
+    }
+
+    /// Where byte `index` of a drawn line sits, measured the way the text
+    /// system draws it rather than the way the composer resolves a pointer.
+    fn drawn_x(display: &str, index: usize, window: &Window) -> Pixels {
+        let run = gpui::TextRun {
+            len: display.len(),
+            font: gpui::font(crate::fonts::ui_family()),
+            ..gpui::TextRun::default()
+        };
+        window
+            .text_system()
+            .shape_line(
+                display.to_owned().into(),
+                px(COMPOSER_FONT_SIZE),
+                &[run],
+                None,
+            )
+            .x_for_index(index)
+    }
+
+    #[gpui::test]
+    fn clicking_and_dragging_scrolled_prompt_text_moves_the_caret_and_selects(
+        cx: &mut TestAppContext,
+    ) {
+        let services = test_services(Arc::new(StoreRuntime::inert()));
+        let (launcher, cx) =
+            cx.add_window_view(move |_window, cx| LauncherOverlay::new(services, false, cx));
+        // More rows than the field shows, so the caret at the end scrolls the
+        // first ones away and every position below is a scrolled one.
+        let rows: Vec<String> = (0..14)
+            .map(|row| format!("row {row:02} naïve 界 end"))
+            .collect();
+        let row_len = rows[0].len();
+        let start_of = |row: usize| row * (row_len + 1);
+        launcher.update_in(cx, |launcher, window, cx| {
+            launcher.open(window, cx);
+            launcher.selected_root = "/tmp".into();
+            launcher.prompt.reset(&rows.join("\n"));
+            cx.notify();
+        });
+        cx.run_until_parked();
+        // The first frame had no rows to scroll to yet; any key reveals the
+        // caret against the ones it laid out.
+        launcher.update_in(cx, |launcher, window, cx| {
+            press(launcher, "end", window, cx)
+        });
+        cx.run_until_parked();
+
+        let (bounds, scrolled) = launcher.read_with(cx, |launcher, _| {
+            let scroll = launcher.prompt.scroll_handle();
+            (scroll.bounds(), scroll.offset().y)
+        });
+        let first_visible = (-scrolled.as_f32() / COMPOSER_LINE_HEIGHT).round() as usize;
+        assert_eq!(first_visible, 14 - COMPOSER_MAX_LINES);
+        let at = |cx: &mut gpui::VisualTestContext, row: usize, display: &str, index: usize| {
+            let x = cx.update(|window, _| drawn_x(display, index, window));
+            gpui::point(
+                bounds.left() + x + px(0.5),
+                bounds.top() + px((row - first_visible) as f32 * COMPOSER_LINE_HEIGHT + 9.0),
+            )
+        };
+
+        // A click in the middle of a scrolled row, then a character typed there.
+        let target = at(cx, 6, &rows[6], 9);
+        cx.simulate_click(target, Modifiers::default());
+        launcher.update_in(cx, |launcher, window, cx| {
+            assert_eq!(launcher.prompt.editor().cursor(), start_of(6) + 9);
+            assert_eq!(launcher.prompt.editor().selection(), None);
+            press(launcher, "x", window, cx);
+            assert_eq!(
+                launcher.prompt.text().lines().nth(6),
+                Some("row 06 naxïve 界 end")
+            );
+            press(launcher, "cmd-z", window, cx);
+        });
+        cx.run_until_parked();
+
+        // The caret glyph now sits in row 6 and pushes the text after it
+        // along; a Shift-click beyond it still lands on the drawn boundary.
+        let drawn = format!("{}{CARET}{}", &rows[6][..9], &rows[6][9..]);
+        let beyond = at(cx, 6, &drawn, 13 + CARET.len());
+        cx.simulate_click(beyond, Modifiers::shift());
+        launcher.read_with(cx, |launcher, _| {
+            assert_eq!(launcher.prompt.editor().selected_text(), Some("ïve"));
+        });
+        cx.run_until_parked();
+
+        // A drag across rows, released outside the text, selects between the
+        // two points and stops following the pointer once the button is up.
+        let (from, to) = (at(cx, 7, &rows[7], 4), at(cx, 9, &rows[9], 6));
+        cx.simulate_mouse_down(from, MouseButton::Left, Modifiers::default());
+        cx.simulate_mouse_move(to, Some(MouseButton::Left), Modifiers::default());
+        launcher.read_with(cx, |launcher, _| {
+            assert_eq!(
+                launcher.prompt.editor().selection(),
+                Some(start_of(7) + 4..start_of(9) + 6)
+            );
+        });
+        cx.simulate_mouse_up(to, MouseButton::Left, Modifiers::default());
+        cx.simulate_mouse_move(from, None, Modifiers::default());
+        launcher.read_with(cx, |launcher, _| {
+            assert!(!launcher.prompt_selecting);
+            assert_eq!(
+                launcher.prompt.editor().selection(),
+                Some(start_of(7) + 4..start_of(9) + 6)
+            );
+        });
+
+        // A double-click takes the word under the pointer, multibyte and all.
+        let word = at(cx, 8, &rows[8], 10);
+        cx.simulate_event(MouseDownEvent {
+            button: MouseButton::Left,
+            position: word,
+            modifiers: Modifiers::default(),
+            click_count: 2,
+            first_mouse: false,
+        });
+        launcher.read_with(cx, |launcher, _| {
+            assert_eq!(launcher.prompt.editor().selected_text(), Some("naïve"));
         });
     }
 

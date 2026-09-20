@@ -19,7 +19,9 @@
 
 use std::ops::Range;
 
-use gpui::{AnyElement, Pixels, ScrollHandle, SharedString, Window, div, prelude::*, px};
+use gpui::{
+    AnyElement, Pixels, Point, ScrollHandle, SharedString, TextRun, Window, div, prelude::*, px,
+};
 use unicode_segmentation::UnicodeSegmentation;
 
 use crate::query_editor::{self, EditHistory, EditKind, LocalEdit, Motion, QueryEditor};
@@ -48,6 +50,9 @@ pub struct PromptComposer {
     lines: Vec<VisualLine>,
     /// The (text, width) the cached `lines` were computed from.
     wrapped_from: Option<(String, Pixels)>,
+    /// The font the lines were wrapped in, which is the one they are drawn
+    /// in. A pointer is resolved against lines shaped with it again.
+    font: Option<(gpui::Font, Pixels)>,
     /// Set by any edit; cleared once render has scrolled the caret into view.
     reveal_caret: bool,
     /// Column the caret returns to when vertical motion passes through a
@@ -63,6 +68,7 @@ impl Default for PromptComposer {
             scroll: ScrollHandle::new(),
             lines: Vec::new(),
             wrapped_from: None,
+            font: None,
             reveal_caret: false,
             goal_column: None,
         }
@@ -186,6 +192,107 @@ impl PromptComposer {
         self.move_vertically(1, extend);
     }
 
+    /// Where a pointer lands in the buffer. Resolved against the visual lines
+    /// the last render drew — the same ranges, the same font, the caret glyph
+    /// spliced in where it was drawn — and against the scroll handle those
+    /// lines are children of, so a scrolled field answers for the rows that
+    /// are actually under the pointer. `None` before the first layout.
+    pub fn hit_test(
+        &self,
+        position: Point<Pixels>,
+        line_height: Pixels,
+        caret: Option<&str>,
+        window: &Window,
+    ) -> Option<PointerHit> {
+        let (font, font_size) = self.font.clone()?;
+        if self.editor.is_empty() {
+            // The placeholder is drawn instead of the lines; there is only
+            // one place to be.
+            return Some(PointerHit::default());
+        }
+        let bounds = self.scroll.bounds();
+        let row = row_at(
+            position.y,
+            bounds.top(),
+            self.scroll.offset().y,
+            line_height,
+            self.lines.len(),
+        )?;
+        let line = &self.lines[row];
+        let splice = self.caret_splice(row, caret);
+        let mut display = self.editor.text()[line.range.clone()].to_owned();
+        if let (Some(at), Some(caret)) = (splice, caret) {
+            display.insert_str(at, caret);
+        }
+        let splice = splice.zip(caret.map(str::len));
+        let run = TextRun {
+            len: display.len(),
+            font,
+            ..TextRun::default()
+        };
+        let x = position.x - bounds.left();
+        let shaped = window
+            .text_system()
+            .shape_line(display.into(), font_size, &[run], None);
+        let text = self.editor.text();
+        // Past the end of a row there is no character under the pointer; the
+        // row's last one stands in, so a double-click there takes the last
+        // word instead of the line break.
+        let character = shaped.index_for_x(x).map_or_else(
+            || {
+                text[line.range.clone()]
+                    .grapheme_indices(true)
+                    .next_back()
+                    .map_or(0, |(index, _)| index)
+            },
+            |index| buffer_index(index, splice).min(line.range.len()),
+        );
+        Some(PointerHit {
+            caret: caret_offset(text, line, shaped.closest_index_for_x(x), splice),
+            character: line.range.start + character,
+        })
+    }
+
+    /// A press. One click places the caret (⇧ extends the selection from
+    /// where it was anchored); a second selects the word under the pointer.
+    pub fn pointer_down(&mut self, hit: PointerHit, extend: bool, click_count: usize) {
+        if click_count >= 2 {
+            self.editor.select_word_at(hit.character);
+        } else {
+            self.editor.set_cursor(hit.caret, extend);
+        }
+        self.pointer_moved();
+    }
+
+    /// A drag with the button held: the anchor stays where the press put it.
+    pub fn pointer_drag(&mut self, hit: PointerHit) {
+        self.editor.set_cursor(hit.caret, true);
+        self.pointer_moved();
+    }
+
+    fn pointer_moved(&mut self) {
+        self.history.break_run();
+        self.goal_column = None;
+        self.reveal_caret = true;
+    }
+
+    /// Where in visual line `index` the caret glyph is spliced, as a byte
+    /// offset into that line. `None` when the caret is elsewhere, hidden by a
+    /// selection, or not drawn at all because the field has no focus.
+    fn caret_splice(&self, index: usize, caret: Option<&str>) -> Option<usize> {
+        caret?;
+        if self.editor.selection().is_some() || self.caret_line() != Some(index) {
+            return None;
+        }
+        let line = &self.lines[index].range;
+        Some(
+            self.editor
+                .cursor()
+                .saturating_sub(line.start)
+                .min(line.len()),
+        )
+    }
+
     /// A paste or a ⇧↵ line break: always an undo step of its own.
     pub fn insert_multiline(&mut self, text: &str) {
         self.record(EditKind::Other, |editor| {
@@ -271,6 +378,7 @@ impl PromptComposer {
     /// if an edit asked for it. Call once per render, before building the
     /// element — [`Self::line_count`] is only meaningful afterwards.
     pub fn layout(&mut self, width: Pixels, font: gpui::Font, font_size: Pixels, window: &Window) {
+        self.font = Some((font.clone(), font_size));
         let text = self.editor.text();
         if self
             .wrapped_from
@@ -313,9 +421,7 @@ impl PromptComposer {
             return vec![div().h(line_height).into_any_element()];
         }
         let text = self.editor.text();
-        let cursor = self.editor.cursor();
         let selection = self.editor.selection();
-        let caret_line = self.caret_line();
 
         self.lines
             .iter()
@@ -329,11 +435,7 @@ impl PromptComposer {
                 // The caret is spliced into the string rather than positioned,
                 // matching the single-line fields; a real positioned caret
                 // would need per-line text layout on every frame.
-                if let (Some(caret), Some(caret_line)) = (caret, caret_line)
-                    && caret_line == index
-                    && selection.is_none()
-                {
-                    let at = cursor.saturating_sub(line.range.start).min(display.len());
+                if let (Some(caret), Some(at)) = (caret, self.caret_splice(index, caret)) {
                     display.insert_str(at, caret);
                     highlights = None;
                 }
@@ -392,6 +494,65 @@ fn wrap(
         });
     }
     lines
+}
+
+/// What a pointer position resolves to.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct PointerHit {
+    /// The nearest place a caret can be: what a click or a drag moves to.
+    pub caret: usize,
+    /// The start of the character under the pointer: what a double-click
+    /// asks about. The nearest caret position would pick the neighbouring
+    /// word from the right half of a word's last letter.
+    pub character: usize,
+}
+
+/// The visual row under a pointer at `y`. `top` is where the scroll container
+/// starts and `scroll_y` its offset, which GPUI counts negative once content
+/// has moved up. A pointer above or below the text takes the first or last
+/// row, so dragging out of the field keeps selecting towards that edge.
+fn row_at(
+    y: Pixels,
+    top: Pixels,
+    scroll_y: Pixels,
+    line_height: Pixels,
+    rows: usize,
+) -> Option<usize> {
+    let last = rows.checked_sub(1)?;
+    let row = ((y - top - scroll_y) / line_height).floor().max(0.0) as usize;
+    Some(row.min(last))
+}
+
+/// Maps an index into a DRAWN line back into the line's own text by taking
+/// out the caret glyph `(at, len)` that was spliced into it. A position
+/// inside the glyph is the caret's own position.
+fn buffer_index(display_index: usize, splice: Option<(usize, usize)>) -> usize {
+    match splice {
+        Some((at, len)) if display_index >= at + len => display_index - len,
+        Some((at, _)) if display_index > at => at,
+        _ => display_index,
+    }
+}
+
+/// The buffer offset for a caret placed at `display_index` of `line`. At the
+/// end of a soft-wrapped line the offset would equal the next line's start,
+/// which is where [`PromptComposer::caret_line`] draws it; stopping one
+/// grapheme short keeps the caret on the row that was clicked.
+fn caret_offset(
+    text: &str,
+    line: &VisualLine,
+    display_index: usize,
+    splice: Option<(usize, usize)>,
+) -> usize {
+    let local = buffer_index(display_index, splice).min(line.range.len());
+    let offset = line.range.start + local;
+    if line.soft_wrapped && offset == line.range.end {
+        return text[line.range.clone()]
+            .grapheme_indices(true)
+            .next_back()
+            .map_or(offset, |(index, _)| line.range.start + index);
+    }
+    offset
 }
 
 fn grapheme_count(text: &str) -> usize {
@@ -560,6 +721,85 @@ mod tests {
         assert_eq!(composer.text(), "draft for session two");
         assert!(!composer.undo(), "session one's text is out of reach");
         assert_eq!(composer.text(), "draft for session two");
+    }
+
+    #[test]
+    fn the_row_under_the_pointer_accounts_for_scroll_and_clamps_to_the_text() {
+        let (top, height) = (px(100.0), px(19.0));
+        let row = |y: f32, scroll: f32| row_at(px(y), top, px(scroll), height, 12);
+        assert_eq!(row(100.0, 0.0), Some(0));
+        assert_eq!(row(118.9, 0.0), Some(0));
+        assert_eq!(row(119.0, 0.0), Some(1));
+        // Three rows scrolled away: the same pixel is now the fourth row.
+        assert_eq!(row(100.0, -57.0), Some(3));
+        assert_eq!(row(110.0, -66.5), Some(4));
+        // Out of the field: the nearest edge row, not a panic or a wrap.
+        assert_eq!(row(20.0, -57.0), Some(0));
+        assert_eq!(row(4000.0, -57.0), Some(11));
+        assert_eq!(row_at(px(100.0), top, px(0.0), height, 0), None);
+    }
+
+    #[test]
+    fn a_drawn_index_maps_back_past_the_spliced_caret_glyph() {
+        let caret = Some((3, "▏".len()));
+        assert_eq!(buffer_index(2, caret), 2);
+        assert_eq!(buffer_index(3, caret), 3);
+        assert_eq!(buffer_index(3 + "▏".len(), caret), 3);
+        assert_eq!(buffer_index(4 + "▏".len(), caret), 4);
+        assert_eq!(buffer_index(7, None), 7);
+    }
+
+    #[test]
+    fn a_click_past_a_soft_wrap_stays_on_the_clicked_row_and_on_a_boundary() {
+        // "ab界" wrapped before "cd"; the first row ends in a 3-byte character.
+        let text = "ab界cd\nef";
+        let rows = lines(&[(0, 5, true), (5, 7, false), (8, 10, false)]);
+        assert_eq!(caret_offset(text, &rows[0], 5, None), 2);
+        assert_eq!(caret_offset(text, &rows[0], 2, None), 2);
+        // A hard break has a real end-of-line position.
+        assert_eq!(caret_offset(text, &rows[1], 2, None), 7);
+        assert_eq!(caret_offset(text, &rows[2], 99, None), 10);
+    }
+
+    #[test]
+    fn click_shift_click_drag_and_double_click_drive_the_selection() {
+        let mut composer = composer("fix naïve 界 parser", &[(0, 21, false)]);
+        let hit = |caret: usize, character: usize| PointerHit { caret, character };
+        composer.pointer_down(hit(4, 4), false, 1);
+        assert_eq!(composer.editor.cursor(), 4);
+        assert_eq!(composer.editor.selection(), None);
+        composer.pointer_down(hit(10, 9), true, 1);
+        assert_eq!(composer.editor.selected_text(), Some("naïve"));
+        // A drag keeps the anchor of the press, in either direction.
+        composer.pointer_down(hit(11, 11), false, 1);
+        composer.pointer_drag(hit(14, 11));
+        assert_eq!(composer.editor.selected_text(), Some("界"));
+        composer.pointer_drag(hit(4, 4));
+        assert_eq!(composer.editor.selected_text(), Some("naïve "));
+        // The nearest caret position is after "naïve"; the character under
+        // the pointer is still its last letter.
+        composer.pointer_down(hit(10, 9), false, 2);
+        assert_eq!(composer.editor.selected_text(), Some("naïve"));
+        // An offset inside a multibyte character cannot split it.
+        composer.pointer_down(hit(12, 12), false, 1);
+        assert_eq!(composer.editor.cursor(), 11);
+    }
+
+    #[test]
+    fn a_click_between_two_typed_characters_ends_the_typing_run() {
+        let mut composer = PromptComposer::default();
+        composer.apply(LocalEdit::Insert("a".into()));
+        composer.pointer_down(
+            PointerHit {
+                caret: 1,
+                character: 0,
+            },
+            false,
+            1,
+        );
+        composer.apply(LocalEdit::Insert("b".into()));
+        assert!(composer.undo());
+        assert_eq!(composer.text(), "a");
     }
 
     #[test]

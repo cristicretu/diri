@@ -61,6 +61,27 @@ impl QueryEditor {
         }
     }
 
+    /// Selects the word — or the run of whitespace or punctuation — that
+    /// contains the character starting at `offset`: a double-click.
+    pub fn select_word_at(&mut self, offset: usize) {
+        let offset = self.floor_boundary(offset);
+        let Some((start, word)) = self
+            .text
+            .split_word_bound_indices()
+            .take_while(|(start, _)| *start <= offset)
+            .last()
+        else {
+            return;
+        };
+        if word.contains(['\n', '\r']) {
+            // A line break is not something to select on its own.
+            self.set_cursor(offset, false);
+            return;
+        }
+        self.anchor = start;
+        self.cursor = start + word.len();
+    }
+
     /// The selected byte range, or `None` when the selection is empty.
     pub fn selection(&self) -> Option<Range<usize>> {
         (self.cursor != self.anchor).then(|| {
@@ -665,6 +686,25 @@ mod tests {
 
         editor.set_cursor(editor.text().len(), true);
         assert_eq!(editor.selected_text(), Some("猫b"));
+    }
+
+    #[test]
+    fn double_click_selects_the_word_under_the_pointer_on_unicode_boundaries() {
+        let mut editor = QueryEditor::default();
+        editor.insert_multiline("naïve 界面 can't 👩‍👩‍👧\nnext");
+        let select = |editor: &mut QueryEditor, needle: &str, within: usize| {
+            let at = editor.text().find(needle).unwrap() + within;
+            editor.select_word_at(at);
+            editor.selected_text().map(str::to_owned)
+        };
+        assert_eq!(select(&mut editor, "naïve", 3).as_deref(), Some("naïve"));
+        assert_eq!(select(&mut editor, "can't", 4).as_deref(), Some("can't"));
+        assert_eq!(select(&mut editor, " 界", 0).as_deref(), Some(" "));
+        assert_eq!(select(&mut editor, "👩", 5).as_deref(), Some("👩‍👩‍👧"));
+        assert_eq!(select(&mut editor, "next", 4).as_deref(), Some("next"));
+        // The line break itself only takes the caret.
+        assert_eq!(select(&mut editor, "\n", 0), None);
+        assert_eq!(editor.cursor(), editor.text().find('\n').unwrap());
     }
 
     fn keystroke(key: &str, modifiers: &str) -> Keystroke {
