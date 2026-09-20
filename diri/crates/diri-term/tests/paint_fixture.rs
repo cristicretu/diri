@@ -2,8 +2,9 @@
 //!
 //! Renderer optimizations must not move a pixel. This renders one screen that
 //! exercises every paint layer (backgrounds, selection and find overlays, text
-//! in adjacent colors and styles, decorations, block elements, the cursor) in
-//! both the live and the reading path, and dumps the RGBA bytes so two builds
+//! in adjacent colors and styles, decorations, block elements, box-drawing,
+//! braille and powerline sprites, the cursor) in both the live and the reading
+//! path, and dumps the RGBA bytes so two builds
 //! can be compared with `cmp`:
 //!
 //! ```sh
@@ -22,7 +23,7 @@ use diri_term::{buffer::GridBuffer, element::TerminalElement, find::FindSpan};
 use gpui::{AppContext as _, Context, IntoElement, ParentElement, Render, Styled, Window, div, px};
 
 const COLS: u16 = 60;
-const ROWS: u16 = 22;
+const ROWS: u16 = 25;
 
 struct Fixture(TerminalElement);
 
@@ -208,6 +209,74 @@ fn rows() -> Vec<Vec<GridCell>> {
         // Right-to-left text: its glyph positions depend on the whole line,
         // trailing blanks included.
         [fg("שלום", 3), plain(" rtl "), fg("مرحبا", 6)].concat(),
+        // Sprites, the antialiased ones first so the reading view keeps them.
+        // Powerline separators continue the background of the cell beside
+        // them, theme-owned and program-authored alike.
+        [
+            styled(" main ", TermColor::Ansi(0), TermColor::Ansi(4), none),
+            styled("\u{e0b0}", TermColor::Ansi(4), TermColor::Ansi(3), none),
+            styled(" ok ", TermColor::Ansi(0), TermColor::Ansi(3), none),
+            styled("\u{e0b0}", TermColor::Ansi(3), default_bg, none),
+            plain(" a \u{e0b1} b \u{e0b3} c "),
+            styled("\u{e0b2}", TermColor::Rgb(200, 180, 40), default_bg, none),
+            styled(
+                " rgb \u{e0b3} ",
+                TermColor::Rgb(10, 20, 30),
+                TermColor::Rgb(200, 180, 40),
+                none,
+            ),
+            styled(
+                "\u{e0b2}",
+                TermColor::Ansi(5),
+                TermColor::Rgb(200, 180, 40),
+                none,
+            ),
+            styled(" end ", TermColor::Ansi(15), TermColor::Ansi(5), none),
+            styled("\u{e0b0}", TermColor::Ansi(5), default_bg, TermStyle::DIM),
+        ]
+        .concat(),
+        [
+            fg("⠁⠂⠄⡀⠈⠐⠠⢀", 6),
+            fg("⣀⣤⣶⣿⣷⣦⣄⡀⢸⡇", 2),
+            styled("⣿⣶⣤⣀", TermColor::Ansi(2), default_bg, TermStyle::DIM),
+            styled("⣿⣶⣤⣀", TermColor::Ansi(2), default_bg, TermStyle::INVERSE),
+            styled("⣿┼╭", TermColor::Ansi(2), default_bg, TermStyle::INVISIBLE),
+            styled("⣿⣶", TermColor::Rgb(250, 120, 40), TermColor::Ansi(4), none),
+        ]
+        .concat(),
+        // Dashes, half lines and weight changes, the uneven junctions, and the
+        // diagonals; a rule changing color mid-run.
+        [
+            fg("┄┄┅┅┈┈┉┉╌╌╍╍┆┇┊┋╎╏", 6),
+            fg("╴╵╶╷╸╹╺╻╼╽╾╿", 1),
+            fg("╃╄╅╆╇╈╉╊┞┟┡┢", 5),
+            fg("╱╲╳╳", 2),
+            fg("───", 4),
+            fg("───", 1),
+            styled("───", TermColor::Ansi(1), default_bg, TermStyle::DIM),
+        ]
+        .concat(),
+        // Junctions of every weight, stacked so each arm meets the
+        // cell above, below and beside it: light, rounded, heavy, double, and
+        // the four mixes.
+        [
+            fg("┌─┬─┐╭─╮", 4),
+            fg("┏━┳━┓╔═╦═╗", 2),
+            fg("┍━┯━┑╒═╤═╕╓─╥─╖┎─┰─┒", 3),
+        ]
+        .concat(),
+        [
+            fg("├─┼─┤│ │", 4),
+            fg("┣━╋━┫╠═╬═╣", 2),
+            fg("┝━┿━┥╞═╪═╡╟─╫─╢┠─╂─┨", 3),
+        ]
+        .concat(),
+        [
+            fg("└─┴─┘╰─╯", 4),
+            fg("┗━┻━┛╚═╩═╝", 2),
+            fg("┕━┷━┙╘═╧═╛╙─╨─╜┖─┸─┚", 3),
+        ]
+        .concat(),
     ];
     for row in &mut rows {
         row.resize(usize::from(COLS), GridCell::BLANK);
@@ -258,7 +327,7 @@ fn capture(element: TerminalElement, output: PathBuf) {
         gpui_platform::current_headless_renderer,
     );
     let window = cx
-        .open_window(gpui::size(px(520.0), px(400.0)), |_, cx| {
+        .open_window(gpui::size(px(520.0), px(460.0)), |_, cx| {
             cx.new(|_| Fixture(element))
         })
         .expect("headless window");
@@ -312,6 +381,13 @@ fn render_live(element: TerminalElement, name: &str) {
         FindSpan {
             row: 6,
             start_col: 4,
+            end_col_exclusive: 14,
+            is_current: false,
+        },
+        // Sprites paint above a highlight as block elements do.
+        FindSpan {
+            row: 19,
+            start_col: 6,
             end_col_exclusive: 14,
             is_current: false,
         },
