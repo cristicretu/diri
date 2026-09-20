@@ -27,7 +27,7 @@ use crate::launch_recipe::{
 };
 use crate::navigation::CARET;
 use crate::notifications::SendTextCommand;
-use crate::query_editor::{self, ClipboardEdit, Edit, QueryEditor};
+use crate::query_editor::{self, ClipboardEdit, Edit, HistoryEdit, QueryEditor};
 mod accounts;
 
 const PANEL_WIDTH: f32 = 540.0;
@@ -618,10 +618,7 @@ impl LauncherOverlay {
             &mut self.new_session_draft,
             &mut self.session_drafts,
         );
-        self.prompt.clear();
-        if !saved.is_empty() {
-            self.prompt.insert_multiline(&saved);
-        }
+        self.prompt.reset(&saved);
         self.target = target;
         self.picker = None;
     }
@@ -640,8 +637,7 @@ impl LauncherOverlay {
         }
         self.restore_new_prompt();
         self.saved_new_prompt = Some(self.prompt.text().to_owned());
-        self.prompt.clear();
-        self.prompt.insert_multiline(&proposal.summary);
+        self.prompt.reset(&proposal.summary);
         self.mode = LauncherMode::Handoff(proposal);
         self.delivery.invalidate();
         self.fallback_notice = None;
@@ -679,12 +675,8 @@ impl LauncherOverlay {
             return;
         }
         self.delivery.invalidate();
-        self.prompt.clear();
-        if let Some(prompt) = self.saved_new_prompt.take()
-            && !prompt.is_empty()
-        {
-            self.prompt.insert_multiline(&prompt);
-        }
+        self.prompt
+            .reset(&self.saved_new_prompt.take().unwrap_or_default());
         self.mode = LauncherMode::NewSession;
     }
 
@@ -1117,8 +1109,7 @@ impl LauncherOverlay {
                 .map_or_else(|| last_known_root.clone(), |project| project.root.clone()),
             RecipeProject::Path { path } => path.clone(),
         };
-        self.prompt.clear();
-        self.prompt.insert_multiline(&recipe.initial_prompt);
+        self.prompt.reset(&recipe.initial_prompt);
         self.active_recipe = Some(recipe.clone());
         self.recipe_project_edited = false;
     }
@@ -2067,6 +2058,21 @@ impl LauncherOverlay {
     }
 
     fn edit_prompt(&mut self, event: &KeyDownEvent, cx: &mut Context<Self>) -> bool {
+        if let Some(edit) = query_editor::history_edit_for(&event.keystroke) {
+            // Claimed even when there is nothing left to undo: ⌘Z belongs to
+            // the draft while the composer owns focus, never to what is
+            // behind it.
+            let changed = match edit {
+                HistoryEdit::Undo => self.prompt.undo(),
+                HistoryEdit::Redo => self.prompt.redo(),
+            };
+            if changed {
+                self.pending_recipe_activation = None;
+            }
+            self.forget_local_paths_of_an_empty_draft();
+            cx.notify();
+            return true;
+        }
         let Some(edit) = query_editor::edit_for(&event.keystroke) else {
             return false;
         };
@@ -2080,7 +2086,7 @@ impl LauncherOverlay {
             }
             Edit::Clipboard(ClipboardEdit::Cut) => {
                 self.pending_recipe_activation = None;
-                query_editor::cut_selection(self.prompt.editor_mut(), cx);
+                self.prompt.cut_selection(cx);
             }
             Edit::Clipboard(ClipboardEdit::Paste) => {
                 if let Some(text) = cx.read_from_clipboard().and_then(|item| item.text()) {
@@ -2089,16 +2095,23 @@ impl LauncherOverlay {
                 }
             }
         }
+        self.forget_local_paths_of_an_empty_draft();
+        cx.notify();
+        true
+    }
+
+    fn forget_local_paths_of_an_empty_draft(&mut self) {
         if self.prompt.text().is_empty()
             && let LauncherTarget::Session(id) = &self.target
         {
             // A remote user can recover from a rejected Finder drop by
             // clearing the draft, without weakening provenance while any of
-            // the local insertion remains.
-            self.session_drafts_with_local_paths.remove(id);
+            // the local insertion remains. The history goes with it: undo
+            // must not bring the paths back once their restriction is gone.
+            if self.session_drafts_with_local_paths.remove(id) {
+                self.prompt.forget_history();
+            }
         }
-        cx.notify();
-        true
     }
 
     fn choose_folder(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -4611,6 +4624,88 @@ mod tests {
                     .contains("Recipe changed")
             );
         });
+    }
+
+    #[gpui::test]
+    fn command_z_restores_destructive_edits_and_each_draft_keeps_its_own_history(
+        cx: &mut TestAppContext,
+    ) {
+        let services = test_services(Arc::new(StoreRuntime::inert()));
+        let (launcher, cx) =
+            cx.add_window_view(move |_window, cx| LauncherOverlay::new(services, false, cx));
+        launcher.update_in(cx, |launcher, window, cx| {
+            launcher.open(window, cx);
+            launcher.selected_root = "/tmp".into();
+            for character in ["d", "r", "a", "f", "t"] {
+                press(launcher, character, window, cx);
+            }
+            press(launcher, "shift-enter", window, cx);
+            press(launcher, "2", window, cx);
+            assert_eq!(launcher.prompt.text(), "draft\n2");
+
+            // The accident from the report: select everything, type over it.
+            press(launcher, "cmd-a", window, cx);
+            press(launcher, "x", window, cx);
+            assert_eq!(launcher.prompt.text(), "x");
+            press(launcher, "cmd-z", window, cx);
+            assert_eq!(launcher.prompt.text(), "draft\n2");
+            assert_eq!(launcher.prompt.editor().selected_text(), Some("draft\n2"));
+            press(launcher, "cmd-shift-z", window, cx);
+            assert_eq!(launcher.prompt.text(), "x");
+            press(launcher, "cmd-z", window, cx);
+
+            // Cut and paste are each one step.
+            press(launcher, "cmd-x", window, cx);
+            assert!(launcher.prompt.is_empty());
+            press(launcher, "cmd-z", window, cx);
+            assert_eq!(launcher.prompt.text(), "draft\n2");
+            press(launcher, "right", window, cx);
+            press(launcher, "cmd-v", window, cx);
+            assert_eq!(launcher.prompt.text(), "draft\n2draft\n2");
+            press(launcher, "cmd-z", window, cx);
+            assert_eq!(launcher.prompt.text(), "draft\n2");
+
+            // Another session's draft cannot reach this one's steps, and
+            // coming back does not make the restored draft undoable to blank.
+            launcher.open_for_session(SessionId::new("other"), "", None, window, cx);
+            press(launcher, "cmd-z", window, cx);
+            assert!(launcher.prompt.is_empty());
+            press(launcher, "b", window, cx);
+            launcher.open(window, cx);
+            assert_eq!(launcher.prompt.text(), "draft\n2");
+            press(launcher, "cmd-z", window, cx);
+            assert_eq!(launcher.prompt.text(), "draft\n2");
+            press(launcher, "cmd-shift-z", window, cx);
+            assert_eq!(launcher.prompt.text(), "draft\n2");
+        });
+    }
+
+    #[gpui::test]
+    fn undo_cannot_return_local_paths_to_a_remote_draft_once_it_was_cleared(
+        cx: &mut TestAppContext,
+    ) {
+        let services = test_services(Arc::new(StoreRuntime::inert()));
+        let (launcher, cx) =
+            cx.add_window_view(move |_window, cx| LauncherOverlay::new(services, false, cx));
+        launcher.update_in(cx, |launcher, window, cx| {
+            let id = SessionId::new("remote");
+            launcher.open_local_paths_for_session(id.clone(), "'/tmp/a.rs'", None, window, cx);
+            assert!(launcher.session_drafts_with_local_paths.contains(&id));
+            launcher.handle_key_down(&key("cmd-a"), window, cx);
+            launcher.handle_key_down(&key("backspace"), window, cx);
+            assert!(!launcher.session_drafts_with_local_paths.contains(&id));
+            launcher.handle_key_down(&key("cmd-z"), window, cx);
+            assert!(launcher.prompt.is_empty());
+        });
+    }
+
+    fn press(
+        launcher: &mut LauncherOverlay,
+        value: &str,
+        window: &mut Window,
+        cx: &mut Context<LauncherOverlay>,
+    ) {
+        assert!(launcher.handle_key_down(&key(value), window, cx), "{value}");
     }
 
     fn key(value: &str) -> KeyDownEvent {

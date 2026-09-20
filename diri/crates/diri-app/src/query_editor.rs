@@ -8,6 +8,7 @@
 //!
 //! Offsets are byte indices into `text` and always land on `char` boundaries.
 
+use std::collections::VecDeque;
 use std::ops::Range;
 
 use gpui::Keystroke;
@@ -417,6 +418,130 @@ impl QueryEditor {
     }
 }
 
+/// What produced a change, which decides whether it joins the undo step
+/// before it. Only contiguous runs of the same character-granular kind
+/// coalesce; everything else — paste, cut, a word or line deletion, a
+/// replaced selection — is a step of its own.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum EditKind {
+    Typing,
+    DeleteBackward,
+    DeleteForward,
+    Other,
+}
+
+impl EditKind {
+    pub const fn of(edit: &LocalEdit) -> Self {
+        match edit {
+            LocalEdit::Insert(_) => Self::Typing,
+            LocalEdit::DeleteBackward(Motion::Character) => Self::DeleteBackward,
+            LocalEdit::DeleteForward(Motion::Character) => Self::DeleteForward,
+            _ => Self::Other,
+        }
+    }
+}
+
+/// ⌘Z / ⇧⌘Z. Kept off [`edit_for`] for the reason ↑/↓ are: only a field that
+/// keeps an [`EditHistory`] can answer them, and the single-line query fields
+/// do not.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum HistoryEdit {
+    Undo,
+    Redo,
+}
+
+pub fn history_edit_for(keystroke: &Keystroke) -> Option<HistoryEdit> {
+    let modifiers = keystroke.modifiers;
+    if keystroke.key != "z" || !modifiers.platform || modifiers.control || modifiers.alt {
+        return None;
+    }
+    Some(if modifiers.shift {
+        HistoryEdit::Redo
+    } else {
+        HistoryEdit::Undo
+    })
+}
+
+/// How many undo steps a draft keeps, and how much text they may hold between
+/// them. The oldest steps fall off first; a pasted log cannot pin megabytes
+/// per keystroke behind a prompt field.
+const HISTORY_STEPS: usize = 200;
+const HISTORY_BYTES: usize = 4 << 20;
+
+/// Undo/redo for one draft. Steps are whole editor snapshots — text, caret
+/// and selection — so undoing a replaced selection brings the selection back
+/// with the text. The owner records each change after applying it; the
+/// history never edits on its own.
+#[derive(Clone, Debug, Default)]
+pub struct EditHistory {
+    undo: VecDeque<QueryEditor>,
+    redo: Vec<QueryEditor>,
+    /// The open run: its kind and where it left the caret. The next change
+    /// joins it only when it is the same kind and starts exactly there.
+    run: Option<(EditKind, usize)>,
+}
+
+impl EditHistory {
+    /// Records that `before` became `after`. Call only when the text changed.
+    pub fn record(&mut self, kind: EditKind, before: QueryEditor, after: &QueryEditor) {
+        let plain = before.selection().is_none();
+        if !(plain && self.run == Some((kind, before.cursor()))) {
+            self.undo.push_back(before);
+        }
+        self.redo.clear();
+        // A deleted selection is its own step, so it never opens a run;
+        // typing over a selection does, so ⌘A + a replacement undoes at once.
+        self.run = match kind {
+            EditKind::Typing => Some((kind, after.cursor())),
+            EditKind::DeleteBackward | EditKind::DeleteForward if plain => {
+                Some((kind, after.cursor()))
+            }
+            _ => None,
+        };
+        self.trim();
+    }
+
+    /// Ends the open run. Moving the caret or the selection calls this, so
+    /// typing resumed at the same offset later is still a separate step.
+    pub fn break_run(&mut self) {
+        self.run = None;
+    }
+
+    pub fn clear(&mut self) {
+        self.undo.clear();
+        self.redo.clear();
+        self.run = None;
+    }
+
+    pub fn undo(&mut self, editor: &mut QueryEditor) -> bool {
+        let Some(previous) = self.undo.pop_back() else {
+            return false;
+        };
+        self.redo.push(std::mem::replace(editor, previous));
+        self.run = None;
+        true
+    }
+
+    pub fn redo(&mut self, editor: &mut QueryEditor) -> bool {
+        let Some(next) = self.redo.pop() else {
+            return false;
+        };
+        self.undo.push_back(std::mem::replace(editor, next));
+        self.run = None;
+        true
+    }
+
+    fn trim(&mut self) {
+        let mut bytes: usize = self.undo.iter().map(|step| step.text.len()).sum();
+        while self.undo.len() > HISTORY_STEPS || (bytes > HISTORY_BYTES && self.undo.len() > 1) {
+            let Some(dropped) = self.undo.pop_front() else {
+                break;
+            };
+            bytes -= dropped.text.len();
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -621,6 +746,171 @@ mod tests {
         assert_eq!(edit_for(&keystroke("escape", "")), None);
         assert_eq!(edit_for(&keystroke("n", "^")), None);
         assert_eq!(edit_for(&keystroke("p", "^")), None);
+    }
+
+    /// Apply an edit the way a field with a history does: change, then record.
+    fn edit(
+        editor: &mut QueryEditor,
+        history: &mut EditHistory,
+        kind: EditKind,
+        change: impl FnOnce(&mut QueryEditor),
+    ) {
+        let before = editor.clone();
+        change(editor);
+        if editor.text() == before.text() {
+            history.break_run();
+        } else {
+            history.record(kind, before, editor);
+        }
+    }
+
+    fn type_text(editor: &mut QueryEditor, history: &mut EditHistory, text: &str) {
+        for character in text.chars() {
+            edit(editor, history, EditKind::Typing, |editor| {
+                editor.insert(&character.to_string());
+            });
+        }
+    }
+
+    #[test]
+    fn command_z_is_a_history_key_and_not_a_text_edit() {
+        assert_eq!(
+            history_edit_for(&keystroke("z", "@")),
+            Some(HistoryEdit::Undo)
+        );
+        assert_eq!(
+            history_edit_for(&keystroke("z", "@$")),
+            Some(HistoryEdit::Redo)
+        );
+        assert_eq!(history_edit_for(&keystroke("z", "")), None);
+        assert_eq!(history_edit_for(&keystroke("z", "^")), None);
+        assert_eq!(edit_for(&keystroke("z", "@")), None);
+    }
+
+    #[test]
+    fn a_typing_run_undoes_as_one_step_and_redoes_back() {
+        let (mut editor, mut history) = (QueryEditor::default(), EditHistory::default());
+        type_text(&mut editor, &mut history, "fix the parser");
+        assert!(history.undo(&mut editor));
+        assert_eq!(editor.text(), "");
+        assert!(!history.undo(&mut editor), "one run, one step");
+        assert!(history.redo(&mut editor));
+        assert_eq!(editor.text(), "fix the parser");
+        assert_eq!(editor.cursor(), 14);
+        assert!(!history.redo(&mut editor));
+    }
+
+    #[test]
+    fn replacing_a_selection_restores_the_text_and_the_selection() {
+        let (mut editor, mut history) = (QueryEditor::default(), EditHistory::default());
+        type_text(&mut editor, &mut history, "a long draft");
+        edit(&mut editor, &mut history, EditKind::Other, |editor| {
+            editor.select_all();
+        });
+        type_text(&mut editor, &mut history, "oops");
+        assert_eq!(editor.text(), "oops");
+        // The replacement and the typing that continued it are one step.
+        assert!(history.undo(&mut editor));
+        assert_eq!(editor.text(), "a long draft");
+        assert_eq!(editor.selected_text(), Some("a long draft"));
+        assert!(history.redo(&mut editor));
+        assert_eq!(editor.text(), "oops");
+        assert_eq!(editor.selection(), None);
+    }
+
+    #[test]
+    fn a_deleted_selection_a_paste_and_a_moved_caret_each_end_the_run() {
+        let (mut editor, mut history) = (QueryEditor::default(), EditHistory::default());
+        type_text(&mut editor, &mut history, "one two");
+        edit(&mut editor, &mut history, EditKind::Other, |editor| {
+            editor.insert_multiline(" three\nfour");
+        });
+        type_text(&mut editor, &mut history, "!");
+        // The caret leaves and comes back to the same offset: still a new run.
+        edit(&mut editor, &mut history, EditKind::Other, |editor| {
+            editor.move_left(Motion::Character, false);
+            editor.move_right(Motion::Character, false);
+        });
+        type_text(&mut editor, &mut history, "?");
+        edit(&mut editor, &mut history, EditKind::Other, |editor| {
+            editor.move_left(Motion::Character, true);
+        });
+        edit(
+            &mut editor,
+            &mut history,
+            EditKind::DeleteBackward,
+            |editor| {
+                editor.delete_backward(Motion::Character);
+            },
+        );
+        for _ in 0..2 {
+            edit(
+                &mut editor,
+                &mut history,
+                EditKind::DeleteBackward,
+                |editor| {
+                    editor.delete_backward(Motion::Character);
+                },
+            );
+        }
+        assert_eq!(editor.text(), "one two three\nfou");
+
+        let mut seen = Vec::new();
+        while history.undo(&mut editor) {
+            seen.push(editor.text().to_owned());
+        }
+        assert_eq!(
+            seen,
+            [
+                "one two three\nfour!",  // the two backspaces, together
+                "one two three\nfour!?", // the deleted selection, alone
+                "one two three\nfour!",  // the run typed after the caret moved
+                "one two three\nfour",
+                "one two",
+                "",
+            ]
+        );
+        assert_eq!(editor.selection(), None);
+    }
+
+    #[test]
+    fn a_new_edit_after_undo_discards_the_redo_branch() {
+        let (mut editor, mut history) = (QueryEditor::default(), EditHistory::default());
+        type_text(&mut editor, &mut history, "kept");
+        edit(&mut editor, &mut history, EditKind::Other, |editor| {
+            editor.insert_multiline(" pasted");
+        });
+        assert!(history.undo(&mut editor));
+        type_text(&mut editor, &mut history, "!");
+        assert!(!history.redo(&mut editor));
+        assert_eq!(editor.text(), "kept!");
+    }
+
+    #[test]
+    fn history_is_bounded_by_steps_and_by_bytes() {
+        let (mut editor, mut history) = (QueryEditor::default(), EditHistory::default());
+        for _ in 0..HISTORY_STEPS + 50 {
+            edit(&mut editor, &mut history, EditKind::Other, |editor| {
+                editor.insert_multiline("x");
+            });
+        }
+        let mut steps = 0;
+        while history.undo(&mut editor) {
+            steps += 1;
+        }
+        assert_eq!(steps, HISTORY_STEPS);
+        assert_eq!(editor.text().len(), 50, "the oldest steps fell off");
+
+        let (mut editor, mut history) = (QueryEditor::default(), EditHistory::default());
+        let block = "y".repeat(HISTORY_BYTES / 16);
+        for _ in 0..8 {
+            edit(&mut editor, &mut history, EditKind::Other, |editor| {
+                editor.insert_multiline(&block);
+            });
+        }
+        let held: usize = history.undo.iter().map(|step| step.text.len()).sum();
+        assert!(held <= HISTORY_BYTES);
+        assert!(history.undo(&mut editor), "the newest step always survives");
     }
 
     #[test]

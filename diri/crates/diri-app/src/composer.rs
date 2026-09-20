@@ -22,7 +22,7 @@ use std::ops::Range;
 use gpui::{AnyElement, Pixels, ScrollHandle, SharedString, Window, div, prelude::*, px};
 use unicode_segmentation::UnicodeSegmentation;
 
-use crate::query_editor::{LocalEdit, Motion, QueryEditor};
+use crate::query_editor::{self, EditHistory, EditKind, LocalEdit, Motion, QueryEditor};
 
 /// One soft-wrapped display line: a byte range of the buffer, plus whether it
 /// ended because the text wrapped rather than because the user pressed Return.
@@ -40,6 +40,10 @@ pub struct VisualLine {
 /// multi-line field.
 pub struct PromptComposer {
     editor: QueryEditor,
+    /// Undo/redo for the draft in `editor`, and only that draft: loading
+    /// another one through [`Self::reset`] starts over, so ⌘Z can never pull
+    /// one session's text into another's prompt.
+    history: EditHistory,
     scroll: ScrollHandle,
     lines: Vec<VisualLine>,
     /// The (text, width) the cached `lines` were computed from.
@@ -55,6 +59,7 @@ impl Default for PromptComposer {
     fn default() -> Self {
         Self {
             editor: QueryEditor::default(),
+            history: EditHistory::default(),
             scroll: ScrollHandle::new(),
             lines: Vec::new(),
             wrapped_from: None,
@@ -79,10 +84,61 @@ impl PromptComposer {
 
     pub fn clear(&mut self) {
         self.editor.clear();
+        self.history.clear();
         self.lines.clear();
         self.wrapped_from = None;
         self.goal_column = None;
         self.reveal_caret = true;
+    }
+
+    /// Replaces the draft with another one — a saved draft, a recipe, a
+    /// handoff summary. Loading is not an edit: the history starts empty, so
+    /// the first ⌘Z cannot blank a draft the user only just came back to.
+    pub fn reset(&mut self, text: &str) {
+        self.clear();
+        self.editor.insert_multiline(text);
+    }
+
+    /// Runs an edit against the buffer and records it as one undo step if it
+    /// changed the text. An edit that only moved the caret or the selection
+    /// ends the open typing run instead.
+    fn record<T>(&mut self, kind: EditKind, edit: impl FnOnce(&mut QueryEditor) -> T) -> T {
+        let before = self.editor.clone();
+        let result = edit(&mut self.editor);
+        if self.editor.text() == before.text() {
+            self.history.break_run();
+        } else {
+            self.history.record(kind, before, &self.editor);
+        }
+        self.goal_column = None;
+        self.reveal_caret = true;
+        result
+    }
+
+    /// ⌘Z. Restores the text, caret and selection from before the last step.
+    pub fn undo(&mut self) -> bool {
+        self.goal_column = None;
+        self.reveal_caret = true;
+        self.history.undo(&mut self.editor)
+    }
+
+    /// ⇧⌘Z.
+    pub fn redo(&mut self) -> bool {
+        self.goal_column = None;
+        self.reveal_caret = true;
+        self.history.redo(&mut self.editor)
+    }
+
+    /// Drops every undo and redo step while keeping the draft as it is.
+    pub fn forget_history(&mut self) {
+        self.history.clear();
+    }
+
+    /// ⌘X. Returns whether there was a selection to cut.
+    pub fn cut_selection(&mut self, cx: &mut gpui::App) -> bool {
+        self.record(EditKind::Other, |editor| {
+            query_editor::cut_selection(editor, cx)
+        })
     }
 
     /// How many visual lines the prompt currently occupies, as last wrapped.
@@ -97,28 +153,26 @@ impl PromptComposer {
     /// which is right for a search field and wrong for a prompt — so ⌘⌫ on
     /// the third line of a prompt deletes that line and not the prompt.
     pub fn apply(&mut self, edit: LocalEdit) {
-        self.goal_column = None;
-        self.reveal_caret = true;
         let line = self
             .caret_line()
             .map(|index| self.lines[index].range.clone());
-        match (edit, line) {
+        self.record(EditKind::of(&edit), |editor| match (edit, line) {
             (LocalEdit::MoveLeft(Motion::Line, extend), Some(line)) => {
-                self.editor.move_to(line.start, extend);
+                editor.move_to(line.start, extend);
             }
             (LocalEdit::MoveRight(Motion::Line, extend), Some(line)) => {
-                self.editor.move_to(line.end, extend);
+                editor.move_to(line.end, extend);
             }
             (LocalEdit::DeleteBackward(Motion::Line), Some(line)) => {
-                self.editor.delete_to(line.start);
+                editor.delete_to(line.start);
             }
             (LocalEdit::DeleteForward(Motion::Line), Some(line)) => {
-                self.editor.delete_to(line.end);
+                editor.delete_to(line.end);
             }
             (edit, _) => {
-                self.editor.apply(edit);
+                editor.apply(edit);
             }
-        }
+        });
     }
 
     /// ↑ / ↓. Kept off the shared key map on purpose: in the palette and
@@ -132,10 +186,11 @@ impl PromptComposer {
         self.move_vertically(1, extend);
     }
 
+    /// A paste or a ⇧↵ line break: always an undo step of its own.
     pub fn insert_multiline(&mut self, text: &str) {
-        self.editor.insert_multiline(text);
-        self.goal_column = None;
-        self.reveal_caret = true;
+        self.record(EditKind::Other, |editor| {
+            editor.insert_multiline(text);
+        });
     }
 
     /// Append staged context without replacing a draft the user already
@@ -147,25 +202,18 @@ impl PromptComposer {
         if context.is_empty() {
             return;
         }
-        if !self.editor.is_empty()
-            && !self
-                .editor
-                .text()
-                .chars()
-                .next_back()
-                .is_some_and(char::is_whitespace)
-        {
-            self.editor.insert_context("\n");
-        }
-        self.editor.insert_context(context);
-        self.goal_column = None;
-        self.reveal_caret = true;
-    }
-
-    pub fn editor_mut(&mut self) -> &mut QueryEditor {
-        self.reveal_caret = true;
-        self.goal_column = None;
-        &mut self.editor
+        self.record(EditKind::Other, |editor| {
+            if !editor.is_empty()
+                && !editor
+                    .text()
+                    .chars()
+                    .next_back()
+                    .is_some_and(char::is_whitespace)
+            {
+                editor.insert_context("\n");
+            }
+            editor.insert_context(context);
+        });
     }
 
     /// Index of the visual line the caret sits on. `None` before the first
@@ -186,6 +234,7 @@ impl PromptComposer {
 
     fn move_vertically(&mut self, delta: isize, extend: bool) {
         self.reveal_caret = true;
+        self.history.break_run();
         let Some(current) = self.caret_line() else {
             return;
         };
@@ -452,6 +501,65 @@ mod tests {
         assert_eq!(intersect(&(2..9), &(0..5)), Some(2..5));
         assert_eq!(intersect(&(2..9), &(5..12)), Some(5..9));
         assert_eq!(intersect(&(2..9), &(12..14)), None);
+    }
+
+    #[test]
+    fn undo_walks_back_through_typing_line_edits_and_cut_with_the_selection() {
+        let mut composer = PromptComposer::default();
+        for character in "first".chars() {
+            composer.apply(LocalEdit::Insert(character.to_string()));
+        }
+        composer.insert_multiline("\n"); // ⇧↵
+        for character in "second".chars() {
+            composer.apply(LocalEdit::Insert(character.to_string()));
+        }
+        composer.lines = lines(&[(0, 5, false), (6, 12, false)]);
+        composer.apply(LocalEdit::DeleteBackward(Motion::Line));
+        assert_eq!(composer.text(), "first\n");
+
+        assert!(composer.undo());
+        assert_eq!(composer.text(), "first\nsecond");
+        assert_eq!(composer.editor.cursor(), 12);
+        assert!(composer.undo());
+        assert_eq!(composer.text(), "first\n");
+        assert!(composer.undo());
+        assert_eq!(composer.text(), "first");
+        assert!(composer.redo());
+        assert!(composer.redo());
+        assert_eq!(composer.text(), "first\nsecond");
+
+        // Select-all + Backspace is the accident the history exists for.
+        composer.apply(LocalEdit::SelectAll);
+        composer.apply(LocalEdit::DeleteBackward(Motion::Character));
+        assert!(composer.is_empty());
+        assert!(composer.undo());
+        assert_eq!(composer.text(), "first\nsecond");
+        assert_eq!(composer.editor.selected_text(), Some("first\nsecond"));
+    }
+
+    #[test]
+    fn vertical_motion_ends_a_typing_run() {
+        let mut composer = composer("ab\ncd", &[(0, 2, false), (3, 5, false)]);
+        composer.apply(LocalEdit::Insert("e".into()));
+        composer.move_up(false);
+        composer.move_down(false);
+        composer.editor.move_to(6, false);
+        composer.apply(LocalEdit::Insert("f".into()));
+        assert!(composer.undo());
+        assert_eq!(composer.text(), "ab\ncde");
+    }
+
+    #[test]
+    fn loading_another_draft_starts_a_history_of_its_own() {
+        let mut composer = PromptComposer::default();
+        composer.insert_multiline("draft for session one");
+        composer.reset("draft for session two");
+        assert!(!composer.undo(), "loading a draft is not an edit");
+        composer.apply(LocalEdit::Insert("!".into()));
+        assert!(composer.undo());
+        assert_eq!(composer.text(), "draft for session two");
+        assert!(!composer.undo(), "session one's text is out of reach");
+        assert_eq!(composer.text(), "draft for session two");
     }
 
     #[test]
