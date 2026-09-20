@@ -6,9 +6,10 @@
 //! reads detection facts and leads with whichever step is actually next:
 //! install an agent, or start a session.
 //!
-//! Starting is direct: choose a folder and the default agent opens in it, the
-//! same launch as the New Agent shortcut. The agent's own prompt is where the
-//! task gets typed, so nothing here composes or injects one.
+//! Starting is direct: the default agent opens in the home folder, the same
+//! launch as the New Agent shortcut, and a project folder is optional. The
+//! agent's own prompt is where the task gets typed, so nothing here composes
+//! or injects one.
 
 use std::rc::Rc;
 
@@ -124,7 +125,7 @@ fn welcome(state: &EmptyWorkbench, actions: &EmptyWorkbenchActions, colors: Sema
                 [
                     (
                         "rectangle.stack",
-                        "One session per task, in any project folder",
+                        "One session per task, as many at once as you like",
                     ),
                     (
                         "bell",
@@ -188,11 +189,11 @@ fn agents_section(
                 format!("Looking for coding agents on {machine}…"),
                 colors,
             ))
-            .child(choose_folder(actions, colors)),
+            .child(start_session(actions, colors)),
         AgentSetupState::Ready(ready) => section
             .child(eyebrow(format!("Ready on {machine}"), colors))
             .child(ready_line(ready, colors))
-            .child(div().pt(px(6.0)).child(choose_folder(actions, colors))),
+            .child(div().pt(px(6.0)).child(start_session(actions, colors))),
         AgentSetupState::Missing(candidates) => {
             let check_again = Rc::clone(&actions.check_again);
             section
@@ -310,26 +311,44 @@ fn start_button(
         )
 }
 
-/// Choosing the folder is the whole first step: the agent opens there.
-fn choose_folder(actions: &EmptyWorkbenchActions, colors: SemanticColors) -> Div {
+/// One press starts working: the default agent opens in the home folder,
+/// exactly as the New Agent shortcut does. A project folder is an option, not
+/// a gate, because plenty of first tasks have no project yet.
+fn start_session(actions: &EmptyWorkbenchActions, colors: SemanticColors) -> Div {
+    let start_in_folder = Rc::clone(&actions.start_in_folder);
     div()
         .flex()
         .flex_col()
-        .gap(px(10.0))
-        .child(start_button(
-            "Choose a project folder",
-            "folder",
-            None,
-            colors,
-            Rc::clone(&actions.start_in_folder),
-        ))
+        .gap(px(12.0))
+        .child(
+            div()
+                .flex()
+                .flex_wrap()
+                .items_center()
+                .gap_x(px(18.0))
+                .gap_y(px(10.0))
+                .child(start_button(
+                    "Start a session",
+                    "plus",
+                    Some(CommandId::NewDefaultSession),
+                    colors,
+                    Rc::new(|window, cx| window.dispatch_action(Box::new(NewDefaultSession), cx)),
+                ))
+                .child(quiet_link(
+                    "empty-start-in-folder",
+                    "Start in a project folder…",
+                    Some("folder"),
+                    colors,
+                    move |window, cx| start_in_folder(window, cx),
+                )),
+        )
         .child(
             div()
                 .text_size(px(12.0))
                 .line_height(px(18.0))
                 .text_color(colors.secondary)
                 .child(
-                    "Your agent opens in that folder. Tell it what you want done, in plain words.",
+                    "It opens in your home folder. Tell the agent what you want done, in plain words.",
                 ),
         )
 }

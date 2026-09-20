@@ -1572,6 +1572,24 @@ fn installing_an_agent_types_the_shown_command_into_a_home_terminal_and_watches_
 }
 
 #[test]
+fn a_first_session_needs_no_project_and_opens_the_default_agent_at_home() {
+    let (mut store, mut effects) = SessionStore::headless(Prefs::default());
+    store.set_agent_catalog(crate::agent_setup::bundled_catalog(&["claude-code"]));
+    assert!(store.sessions().is_empty() && store.projects().is_empty());
+
+    assert!(store.spawn_default(crate::store::SpawnOptions::default()));
+    let Ok(StoreEffect::Spawn(params)) = effects.try_recv() else {
+        panic!("the welcome's Start a session must launch without a folder step");
+    };
+    assert_eq!(params.kind, AgentKind::CLAUDE_CODE);
+    assert_eq!(params.cwd, std::env::var("HOME").expect("HOME"));
+    assert_eq!(
+        params.initial_prompt, None,
+        "the agent's own prompt takes the task"
+    );
+}
+
+#[test]
 fn an_agent_without_a_bundled_installer_is_never_run() {
     let (mut store, mut effects) = SessionStore::headless(Prefs::default());
     let catalog = crate::agent_setup::bundled_catalog(&[]);
