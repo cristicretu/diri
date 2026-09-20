@@ -3882,6 +3882,9 @@ impl Render for TerminalPane {
             self.claim_selected_control();
         }
         self.reconcile_secure_input(window);
+        if crate::alerts::enabled(cx) {
+            self.sync_paste_prompt(window, cx);
+        }
         let (theme, colors, sidebar_colors, font_size) = {
             let store = self
                 .runtime
@@ -6361,6 +6364,7 @@ mod tests {
                             alt_screen: false,
                             bracketed_paste: false,
                             mouse: Default::default(),
+                            secret_input: false,
                         },
                     ),
                     window,
@@ -6988,6 +6992,60 @@ mod tests {
         cx.run_until_parked();
         assert_eq!(recorder.outstanding(), 0, "the window closed");
         assert_eq!(recorder.enables(), 6, "one reference per entry, never two");
+    }
+
+    #[gpui::test]
+    fn the_running_app_reviews_a_paste_with_the_system_alert(cx: &mut TestAppContext) {
+        let runtime = Arc::new(StoreRuntime::inert());
+        let tokio = Arc::new(
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap(),
+        );
+        let session = fixture_session();
+        let id = session.id.clone();
+        {
+            let mut store = runtime.store.write().unwrap();
+            store.upsert_session(session);
+            store.select(id.clone());
+        }
+        cx.update(crate::alerts::enable);
+        let (pane, cx) =
+            cx.add_window_view(move |window, cx| TerminalPane::new(runtime, tokio, window, cx));
+        let stage = |pane: &mut TerminalPane, cx: &mut Context<TerminalPane>| {
+            assert!(pane.stage_paste_if_needed(&id, "make build\nmake install\n", cx));
+        };
+        pane.update_in(cx, |pane, window, cx| {
+            pane.reconcile_store_change(window, cx);
+            pane.residents.get_mut(&id).unwrap().attachment_state = AttachmentState::Live;
+            pane.runtime
+                .store
+                .write()
+                .unwrap()
+                .update_preferences(|prefs| prefs.terminal_paste_protection = true)
+                .unwrap();
+            stage(pane, cx);
+        });
+        cx.run_until_parked();
+        assert!(cx.has_pending_prompt(), "the system alert asks");
+        assert!(
+            cx.debug_bounds("terminal-paste-review").is_none(),
+            "and the in-window panel stays out of its way"
+        );
+
+        cx.simulate_prompt_answer("Cancel");
+        cx.run_until_parked();
+        assert!(pane.read_with(cx, |pane, _| pane.qol.paste.is_none()));
+        assert!(!cx.has_pending_prompt());
+
+        pane.update_in(cx, |pane, _, cx| stage(pane, cx));
+        cx.run_until_parked();
+        assert!(cx.has_pending_prompt(), "a second paste asks again");
+        cx.simulate_prompt_answer("Paste");
+        cx.run_until_parked();
+        assert!(pane.read_with(cx, |pane, _| pane.qol.paste.is_none()));
+        assert!(!cx.has_pending_prompt());
     }
 
     #[test]

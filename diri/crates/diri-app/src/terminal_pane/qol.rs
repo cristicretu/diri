@@ -15,6 +15,8 @@ pub(super) struct QolState {
     pub menu: Option<TerminalMenu>,
     pub copy_mode: Option<CopyMode>,
     pub paste: Option<PendingPaste>,
+    /// The system alert asking about `paste`, while it is up.
+    paste_prompt: Option<Task<()>>,
     /// Last toast message, retained briefly to suppress repeated rejections.
     pub feedback: Option<String>,
     pub(super) feedback_generation: u64,
@@ -327,6 +329,44 @@ impl TerminalPane {
         } else {
             false
         }
+    }
+
+    /// Raises the system alert for a staged paste, once, and applies its
+    /// answer. Called from render like the root's close prompt, because
+    /// staging has no window. A paste that is withdrawn while the alert is up
+    /// (the session changed) makes its answer a no-op: `confirm_terminal_paste`
+    /// finds nothing staged.
+    pub(super) fn sync_paste_prompt(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(paste) = &self.qol.paste else {
+            self.qol.paste_prompt = None;
+            return;
+        };
+        if self.qol.paste_prompt.is_some() {
+            return;
+        }
+        let message = native_paste_review_message(&paste.text, paste.secret);
+        let answer = window.prompt(
+            gpui::PromptLevel::Warning,
+            PASTE_REVIEW_TITLE,
+            Some(&message),
+            &[
+                gpui::PromptButton::ok("Paste"),
+                gpui::PromptButton::cancel("Cancel"),
+            ],
+            cx,
+        );
+        self.qol.paste_prompt = Some(cx.spawn_in(window, async move |this, cx| {
+            let choice = answer.await.ok();
+            let _ = crate::floating::update_in_owner(&this, cx, |this, window, cx| {
+                this.qol.paste_prompt = None;
+                if choice == Some(0) {
+                    this.confirm_terminal_paste(window, cx);
+                } else {
+                    this.qol.paste = None;
+                    cx.notify();
+                }
+            });
+        }));
     }
 
     fn confirm_terminal_paste(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -842,16 +882,15 @@ impl TerminalPane {
             }
             overlay = overlay.child(items);
         }
-        if let Some(paste) = &self.qol.paste {
-            let has_controls = paste
-                .text
-                .chars()
-                .any(|ch| ch.is_control() && !matches!(ch, '\n' | '\r' | '\t'));
-            let message = if has_controls {
-                "This text contains control characters. They’ll be replaced with spaces before pasting."
-            } else {
-                "This terminal may run each line as a command when you paste."
-            };
+        // In the running app the review is the system alert raised by
+        // `sync_paste_prompt`; this panel is what tests and previews inspect.
+        if let Some(paste) = self
+            .qol
+            .paste
+            .as_ref()
+            .filter(|_| !crate::alerts::enabled(cx))
+        {
+            let message = paste_review_message(&paste.text);
             // Keep layout work bounded, and make any omitted content explicit.
             let mut chars = paste.text.chars();
             let preview = paste_review_preview(&mut chars, paste.secret);
@@ -882,7 +921,7 @@ impl TerminalPane {
                                     div()
                                         .text_size(px(Typo::DISPLAY_TITLE.size))
                                         .font_weight(Typo::DISPLAY_TITLE.weight)
-                                        .child("Paste into terminal?"),
+                                        .child(PASTE_REVIEW_TITLE),
                                 )
                                 .child(
                                     div()
@@ -1014,6 +1053,53 @@ impl TerminalPane {
     }
 }
 
+const PASTE_REVIEW_TITLE: &str = "Paste into terminal?";
+
+fn paste_review_message(text: &str) -> &'static str {
+    let has_controls = text
+        .chars()
+        .any(|ch| ch.is_control() && !matches!(ch, '\n' | '\r' | '\t'));
+    if has_controls {
+        "This text contains control characters. They’ll be replaced with spaces before pasting."
+    } else {
+        "This terminal may run each line as a command when you paste."
+    }
+}
+
+/// Informative text for the system alert: the warning, then as much of the
+/// clipboard as an alert can show without growing past the screen. What is
+/// left out is counted, so a long paste never looks like a short one.
+pub(super) fn native_paste_review_message(text: &str, secret: bool) -> String {
+    const LINES: usize = 8;
+    const LINE_CHARS: usize = 72;
+    let warning = paste_review_message(text);
+    if secret {
+        return format!(
+            "{warning}\n\n{}",
+            paste_review_preview(&mut text.chars(), true)
+        );
+    }
+    let cleaned = paste_review_preview(&mut text.chars(), false);
+    let total = text.lines().count();
+    let mut shown = String::new();
+    for line in cleaned.lines().take(LINES) {
+        let mut chars = line.chars();
+        shown.extend(chars.by_ref().take(LINE_CHARS));
+        if chars.next().is_some() {
+            shown.push('…');
+        }
+        shown.push('\n');
+    }
+    let hidden = total.saturating_sub(LINES);
+    if hidden > 0 {
+        shown.push_str(&format!(
+            "… and {hidden} more line{}",
+            if hidden == 1 { "" } else { "s" }
+        ));
+    }
+    format!("{warning}\n\n{}", shown.trim_end())
+}
+
 /// What the paste review shows of the clipboard. At a password prompt that
 /// is only its size: the text is most likely the password itself.
 pub(super) fn paste_review_preview(chars: &mut std::str::Chars<'_>, secret: bool) -> String {
@@ -1061,5 +1147,49 @@ fn append_export_row(text: &mut String, row: &[GridCell], metadata: Option<&RowM
     } else {
         text.push_str(line.trim_end_matches(' '));
         text.push('\n');
+    }
+}
+
+#[cfg(test)]
+mod native_paste_review_tests {
+    use super::native_paste_review_message;
+
+    #[test]
+    fn a_short_paste_is_shown_whole_under_the_warning() {
+        let message = native_paste_review_message("make build\nmake test", false);
+        assert!(message.starts_with("This terminal may run each line"));
+        assert!(message.ends_with("make build\nmake test"));
+    }
+
+    #[test]
+    fn a_long_paste_is_bounded_and_says_what_it_left_out() {
+        let text = (1..=30)
+            .map(|n| format!("echo {n}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let message = native_paste_review_message(&text, false);
+        assert!(message.contains("echo 8\n"));
+        assert!(!message.contains("echo 9"));
+        assert!(message.ends_with("… and 22 more lines"));
+
+        let wide = "x".repeat(500);
+        let message = native_paste_review_message(&format!("{wide}\nsecond"), false);
+        let first = message.lines().nth(2).unwrap();
+        assert_eq!(first.chars().count(), 73, "72 characters and an ellipsis");
+        assert!(message.ends_with("second"));
+    }
+
+    #[test]
+    fn control_characters_change_the_warning_and_never_reach_the_alert() {
+        let message = native_paste_review_message("ls\u{1b}[2J\nrm -rf x", false);
+        assert!(message.starts_with("This text contains control characters"));
+        assert!(!message.contains('\u{1b}'));
+    }
+
+    #[test]
+    fn a_paste_at_a_password_prompt_shows_only_its_size() {
+        let message = native_paste_review_message("hunter2\nhunter2", true);
+        assert!(!message.contains("hunter2"));
+        assert!(message.ends_with("15 characters, hidden while the terminal reads a password."));
     }
 }
