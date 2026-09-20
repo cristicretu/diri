@@ -160,6 +160,38 @@ fn a_holder_owns_a_session_end_to_end() {
 }
 
 #[test]
+fn a_holder_records_what_it_forked_before_a_fast_child_can_vanish() {
+    let root = holders_dir("child-record");
+    let logs = root.join("logs");
+    let paths = HolderPaths::new(&root, "s_child_record");
+    // Exits within a millisecond: the socket and pid file are gone before a
+    // client could ever ask, which is exactly when the record must exist.
+    let launch = spec(&paths, &logs, &["/bin/sh", "-c", "exit 3"]);
+    let server = std::thread::spawn(move || HolderServer::run(launch));
+    server
+        .join()
+        .expect("join")
+        .expect("the holder run ends cleanly after its child exits");
+    assert!(!paths.socket().exists() && !paths.pid_file().exists());
+
+    let record = diri_engine::holder::protocol::HolderChildRecord::read(&paths.child_record())
+        .expect("the child record outlives the Holder");
+    assert!(record.child_pid > 1);
+    assert_eq!(
+        record.epoch_offset, 0,
+        "a fresh log starts this incarnation at zero"
+    );
+    let identity = record
+        .child_identity
+        .expect("the Holder recorded the child's birth identity at spawn");
+    assert_eq!(identity.pid(), record.child_pid as u32);
+    let stat = record.as_stat();
+    assert!(!stat.alive, "a record never claims the child is alive");
+    assert_eq!(stat.verified_child_identity(), Some(identity));
+    assert_eq!(stat.epoch_offset, Some(0));
+}
+
+#[test]
 #[ignore = "release-only local UDS input latency benchmark"]
 fn holder_input_latency_is_reported() {
     let root = holders_dir("lat");

@@ -33,6 +33,19 @@ impl HolderPaths {
     pub fn pid_file(&self) -> PathBuf {
         self.directory.join(format!("{}.pid", self.session_id))
     }
+
+    /// The child record the Holder writes at spawn: which process it forked
+    /// and the log offset its incarnation starts at. Unlike the socket and
+    /// pid file it outlives the Holder, so an Engine that arrives after a
+    /// child exited in a millisecond can still bind the run. Derived from the
+    /// pid file's path so a Holder given only that path finds the same file.
+    pub fn child_record(&self) -> PathBuf {
+        Self::child_record_beside(&self.pid_file())
+    }
+
+    pub fn child_record_beside(pid_file: &Path) -> PathBuf {
+        pid_file.with_extension("child")
+    }
 }
 
 /// Endpoints of the one manager process shared by every session in a registry.
