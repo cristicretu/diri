@@ -114,12 +114,23 @@ pub struct TerminalDamageObserver {
 
 /// Moves the reading view, dropping a selection that returning to live would
 /// leave attached to rows the next frame replaces.
+/// Moves a view that is pinned to a find capture. The capture holds every row
+/// on the way, so nothing is fetched and the pin is kept.
+fn place_glide(viewport: &mut ScrollbackViewport, rows: f64, visible_rows: usize) {
+    let position =
+        crate::smooth_scroll::ScrollPosition::from_rows(rows, viewport.max_offset(visible_rows));
+    viewport.set_scroll_position(position, visible_rows);
+}
+
 fn set_view_offset(
     shared: &ElementSharedState,
     buffer: &SharedGridBuffer,
     offset: i64,
     visible_rows: usize,
 ) -> bool {
+    // Keys, typing back to live, and the scroller all come through here:
+    // whoever moves the view owns it, and a find glide lets go.
+    mutex_lock(&shared.scroll_glide).glide = None;
     let mut viewport = mutex_lock(&shared.viewport);
     let changed = viewport.set_view_offset(offset, visible_rows);
     viewport.hold_reading_view(&read_lock(buffer));
@@ -351,6 +362,21 @@ struct ElementSharedState {
     /// Behind its own `Arc` so the input handler and the blink wake can hold
     /// it without holding the rest of the view's state.
     cursor: Arc<Mutex<CursorDriver>>,
+    scroll_glide: Mutex<GlideState>,
+}
+
+/// The glide to a find match, if one is running, and the clock it reads.
+#[derive(Default)]
+struct GlideState {
+    glide: Option<crate::scroll_glide::ScrollGlide>,
+    /// Pinned by tests and frame-by-frame renders; the wall clock otherwise.
+    clock: Option<Instant>,
+}
+
+impl GlideState {
+    fn now(&self) -> Instant {
+        self.clock.unwrap_or_else(Instant::now)
+    }
 }
 
 #[derive(Default)]
@@ -616,6 +642,7 @@ impl TerminalElement {
                 history_lines: Mutex::new(HistoryLineCache::default()),
                 metrics: Mutex::new(None),
                 cursor: Arc::new(Mutex::new(CursorDriver::default())),
+                scroll_glide: Mutex::new(GlideState::default()),
             }),
             theme: TermTheme::default(),
             background_opacity: 1.0,
@@ -907,6 +934,7 @@ impl TerminalElement {
     /// Resolves a wheel event and applies local scrollback movement. Daemon
     /// routes are returned for the app to pass to `SessionAttachment::scroll`.
     pub fn route_wheel(&self, event: WheelEvent) -> Option<WheelRoute> {
+        self.cancel_scroll_glide();
         let modes = *mutex_lock(&self.shared.modes);
         if let WheelDelta::PrecisePoints(points) = event.delta
             && ScrollRouter::is_local(modes)
@@ -960,6 +988,7 @@ impl TerminalElement {
     /// [`Self::set_view_offset`] for a fractional position, as a dragged
     /// scroller knob produces.
     pub fn set_scroll_position(&self, rows: f64, visible_rows: usize) -> bool {
+        self.cancel_scroll_glide();
         let mut viewport = mutex_lock(&self.shared.viewport);
         let position = crate::smooth_scroll::ScrollPosition::from_rows(
             rows,
@@ -1187,19 +1216,88 @@ impl TerminalElement {
     }
 
     pub fn find_next(&self, model: &mut TerminalFindModel) -> Option<NavigationTarget> {
-        model.navigate_with_live(
-            false,
-            &mut mutex_lock(&self.shared.viewport),
-            &read_lock(&self.buffer),
-        )
+        self.navigate_find(model, false)
     }
 
     pub fn find_previous(&self, model: &mut TerminalFindModel) -> Option<NavigationTarget> {
-        model.navigate_with_live(
-            true,
-            &mut mutex_lock(&self.shared.viewport),
-            &read_lock(&self.buffer),
-        )
+        self.navigate_find(model, true)
+    }
+
+    /// Steps to a match and, when that moves a history view, carries the view
+    /// there instead of cutting to it (see [`crate::scroll_glide`]). Navigation
+    /// has already pinned the capture and chosen the resting row; the glide
+    /// only decides what is painted on the way. A match on the live grid
+    /// returns to live at once, because the live edge is where the terminal
+    /// is, not a place in the capture.
+    fn navigate_find(
+        &self,
+        model: &mut TerminalFindModel,
+        backwards: bool,
+    ) -> Option<NavigationTarget> {
+        let mut viewport = mutex_lock(&self.shared.viewport);
+        let buffer = read_lock(&self.buffer);
+        let mut state = mutex_lock(&self.shared.scroll_glide);
+        // Mid-glide, what is on screen is the sample, not the last target.
+        let shown = viewport.scroll_position().as_rows();
+        let target = model.navigate_with_live(backwards, &mut viewport, &buffer);
+        state.glide = None;
+        if matches!(target, Some(NavigationTarget::History { .. })) {
+            let visible_rows = usize::from(buffer.rows);
+            let resting = viewport.scroll_position().as_rows();
+            let now = state.now();
+            if let Some(glide) =
+                crate::scroll_glide::ScrollGlide::new(shown, resting, visible_rows, now)
+            {
+                place_glide(&mut viewport, glide.start(), visible_rows);
+                state.glide = Some(glide);
+            }
+        }
+        target
+    }
+
+    /// Drives the find glide from a caller-owned clock and schedules no
+    /// frames. For tests and frame-by-frame renders.
+    pub fn set_scroll_glide_clock(&self, now: Option<Instant>) {
+        mutex_lock(&self.shared.scroll_glide).clock = now;
+    }
+
+    /// Whether a find glide still has frames to paint.
+    #[must_use]
+    pub fn scroll_glide_running(&self) -> bool {
+        mutex_lock(&self.shared.scroll_glide).glide.is_some()
+    }
+
+    /// Places the view for this frame: one sample per painted frame, and
+    /// Reduce Motion lands it at once. Returns whether another frame should
+    /// be requested, which is only while the glide runs on the wall clock.
+    fn step_scroll_glide(&self, viewport: &mut ScrollbackViewport, visible_rows: usize) -> bool {
+        let mut state = mutex_lock(&self.shared.scroll_glide);
+        let Some(glide) = state.glide else {
+            return false;
+        };
+        let now = state.now();
+        let finished = self.reduce_motion || glide.is_finished(now);
+        let position = if finished {
+            glide.target()
+        } else {
+            glide.sample(now)
+        };
+        place_glide(viewport, position, visible_rows);
+        if finished {
+            state.glide = None;
+        }
+        !finished && state.clock.is_none()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn step_scroll_glide_for_test(&self, visible_rows: usize) {
+        let mut viewport = mutex_lock(&self.shared.viewport);
+        self.step_scroll_glide(&mut viewport, visible_rows);
+    }
+
+    /// Anything else that moves the view owns it from then on.
+    fn cancel_scroll_glide(&self) {
+        mutex_lock(&self.shared.scroll_glide).glide = None;
     }
 
     pub fn sync_find_highlights(&self, model: &TerminalFindModel) {
@@ -1224,6 +1322,7 @@ impl TerminalElement {
     }
 
     pub fn clear_find_source(&self) {
+        self.cancel_scroll_glide();
         mutex_lock(&self.shared.viewport).clear_find_source();
     }
 
@@ -1768,7 +1867,11 @@ impl Element for TerminalElement {
         // Hold the viewport lock for the whole prepaint instead of deep-cloning
         // it: every party that touches these mutexes runs on the main thread,
         // and the clone copied the entire fetched-history cell cache per frame.
-        let viewport = mutex_lock(&self.shared.viewport);
+        let mut viewport = mutex_lock(&self.shared.viewport);
+        if self.step_scroll_glide(&mut viewport, visible_rows) {
+            window.request_animation_frame();
+        }
+        let viewport = viewport;
         // Zero on the live grid and on a reading view resting on a whole row,
         // where `painted_rows` is `visible_rows` and nothing below differs.
         let scroll_shift = px(viewport

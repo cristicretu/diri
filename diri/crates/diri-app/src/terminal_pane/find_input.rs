@@ -8,7 +8,7 @@ use gpui::{
     ShapedLine, TextAlign, TextRun, UTF16Selection, WeakEntity, Window, canvas, fill, font, point,
     prelude::*, px, size,
 };
-use std::{ops::Range, time::Duration};
+use std::ops::Range;
 
 #[derive(Default)]
 pub(super) struct Composition {
@@ -153,7 +153,7 @@ impl Owner {
             ) {
                 resident.element.set_find_highlights(Vec::new());
             }
-            pane.schedule_find(self.session.clone(), Duration::from_millis(200), window, cx);
+            pane.schedule_query_search(self.session.clone(), window, cx);
             window.invalidate_character_coordinates();
             cx.notify();
         });

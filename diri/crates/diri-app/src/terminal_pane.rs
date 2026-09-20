@@ -1765,6 +1765,20 @@ impl TerminalPane {
         cx.notify();
     }
 
+    /// Schedules the search a query change just armed, after the delay the
+    /// model chose: none when it can scan the capture it already holds, a
+    /// short pause when the terminal has to be captured again.
+    fn schedule_query_search(&self, id: SessionId, window: &mut Window, cx: &mut Context<Self>) {
+        let delay = self
+            .residents
+            .get(&id)
+            .and_then(|resident| resident.find.as_ref())
+            .map_or(Duration::ZERO, |find| {
+                find.search_delay(self.started_at.elapsed())
+            });
+        self.schedule_find(id, delay, window, cx);
+    }
+
     fn schedule_find(
         &self,
         id: SessionId,
@@ -1806,7 +1820,7 @@ impl TerminalPane {
             .map(|find| {
                 (
                     find.uses_retained_capture(),
-                    find.paused_source(),
+                    find.reusable_source(),
                     if find.uses_retained_capture() {
                         find.reservation()
                     } else {
@@ -1814,6 +1828,14 @@ impl TerminalPane {
                     },
                 )
             });
+        let remote = self
+            .runtime
+            .store
+            .read()
+            .expect("session store lock poisoned")
+            .sessions()
+            .get(&id)
+            .is_some_and(|session| session.host.is_some());
         let client = Arc::clone(self.runtime.client());
         let pane_tx = self.pane_tx.clone();
         self.tokio.spawn(async move {
@@ -1849,6 +1871,11 @@ impl TerminalPane {
                                 .unwrap_or_else(|_| FindSnapshot::failure("Search interrupted")),
                             ),
                             Ok(_) => Some(FindSnapshot::failure("Search session changed")),
+                            // A remote Helper that cannot serve its history
+                            // still has a screen to search; see `apply_result`.
+                            Err(_) if remote => {
+                                client.read_scrollback(&id).await.ok().map(Into::into)
+                            }
                             Err(_) => Some(FindSnapshot::failure(
                                 "Search unavailable. Refresh results to retry",
                             )),
@@ -2041,20 +2068,16 @@ impl TerminalPane {
         let Some(id) = self.selected_id() else {
             return;
         };
-        let local = self
-            .selected_session()
-            .is_some_and(|session| session.host.is_none());
         let Some(resident) = self.residents.get_mut(&id) else {
             return;
         };
         if resident.find.is_none() {
             resident.find_composition.cancel(&mut resident.find_query);
             resident.element.set_text_input_enabled(false);
-            let mut find = if local {
-                TerminalFindModel::retained()
-            } else {
-                TerminalFindModel::default()
-            };
+            // Local and remote sessions both search a capture of their
+            // history; a remote host that cannot provide one falls back to its
+            // screen on the first answer.
+            let mut find = TerminalFindModel::retained();
             find.set_query(
                 resident.find_query.text().to_owned(),
                 self.started_at.elapsed(),
@@ -2064,7 +2087,7 @@ impl TerminalPane {
             // starts a new search while ⌘F then ⏎ repeats the old one.
             resident.find_query.select_all();
         }
-        self.schedule_find(id, Duration::from_millis(200), window, cx);
+        self.schedule_query_search(id, window, cx);
         window.focus(&self.focus, cx);
         cx.stop_propagation();
         cx.notify();
@@ -2118,7 +2141,7 @@ impl TerminalPane {
             }
         }
         for id in changed {
-            self.schedule_find(id, Duration::from_millis(200), window, cx);
+            self.schedule_query_search(id, window, cx);
         }
         if owns_input {
             find_input::discard_native(window, cx);
@@ -2741,7 +2764,7 @@ impl TerminalPane {
             if find.set_query(query, now) {
                 resident.element.set_find_highlights(Vec::new());
             }
-            self.schedule_find(id, Duration::from_millis(200), window, cx);
+            self.schedule_query_search(id, window, cx);
         } else {
             resident.send_user_input(terminal_paste(&text, resident.bracketed_paste));
         }
@@ -2885,7 +2908,7 @@ impl TerminalPane {
                         if find.set_query(query, now) {
                             resident.element.set_find_highlights(Vec::new());
                         }
-                        self.schedule_find(id, Duration::from_millis(200), window, cx);
+                        self.schedule_query_search(id, window, cx);
                     }
                 }
             }

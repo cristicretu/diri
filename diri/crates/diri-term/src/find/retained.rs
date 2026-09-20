@@ -237,8 +237,194 @@ mod tests {
         }
     }
 
+    /// The retained-view budget is process wide and one test asserts its exact
+    /// value, so every test that takes a reservation runs under this lock.
+    static BUDGET: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    fn budget() -> std::sync::MutexGuard<'static, ()> {
+        BUDGET
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    /// A retained model that has searched `screen` for "needle".
+    fn searched(screen: &HeadlessScreen) -> (TerminalFindModel, GridBuffer, ScrollbackViewport) {
+        let mut model = TerminalFindModel::retained();
+        let reservation = model.reservation().unwrap();
+        let source = RetainedFindSnapshot::decode(capture(screen, 1), reservation).unwrap();
+        let mut live = GridBuffer::default();
+        live.apply(screen.full_snapshot());
+        let mut viewport = ScrollbackViewport::default();
+        model.set_query("needle", Duration::ZERO);
+        let request = model.take_due_search(SEARCH_DEBOUNCE).unwrap();
+        let result = model
+            .prepare_search(&request, FindSnapshot::from(source), &live)
+            .unwrap()
+            .run();
+        assert!(model.apply_result(result, &mut viewport));
+        (model, live, viewport)
+    }
+
+    #[test]
+    fn stepping_to_an_off_screen_match_glides_there_and_a_scroll_takes_over() {
+        let _budget = budget();
+        use crate::element::TerminalElement;
+        use crate::scroll_glide::DURATION;
+        use std::time::Instant;
+
+        // 200 rows of history above a 10-row screen, a needle every 25 rows.
+        let mut screen = HeadlessScreen::new(24, 10);
+        for row in 0..210 {
+            let text = if row % 25 == 0 { "needle" } else { "filler" };
+            screen.feed(format!("{text} {row}\r\n").as_bytes());
+        }
+        let mut live = GridBuffer::default();
+        live.apply(screen.full_snapshot());
+        let element = TerminalElement::with_buffer(live.clone());
+        let start = Instant::now();
+        element.set_scroll_glide_clock(Some(start));
+
+        let mut model = TerminalFindModel::retained();
+        let reservation = model.reservation().unwrap();
+        let source = RetainedFindSnapshot::decode(capture(&screen, 1), reservation).unwrap();
+        model.set_query("needle", Duration::ZERO);
+        let request = model.take_due_search(SEARCH_DEBOUNCE).unwrap();
+        let result = model
+            .prepare_search(&request, FindSnapshot::from(source), &live)
+            .unwrap()
+            .run();
+        assert!(element.apply_find_result(&mut model, result));
+
+        // Walk backwards into history until a step has to move the view.
+        let mut glided = None;
+        for _ in 0..model.matches().len() {
+            let before = element.scroll_position();
+            element.find_previous(&mut model);
+            if element.scroll_glide_running() {
+                glided = Some(before);
+                break;
+            }
+        }
+        let before = glided.expect("some match is off screen");
+        // The first frame is where the reader was, or nearer the match when
+        // the trip was shortened; never already at rest.
+        let shown = element.scroll_position();
+        let reach = 10.0 * crate::scroll_glide::MAX_TRAVEL;
+
+        // Land: exactly the row navigation chose, and nothing left to paint.
+        element.set_scroll_glide_clock(Some(start + DURATION / 2));
+        element.step_scroll_glide_for_test(10);
+        let halfway = element.scroll_position();
+        element.set_scroll_glide_clock(Some(start + DURATION));
+        element.step_scroll_glide_for_test(10);
+        let resting = element.scroll_position();
+        assert!(!element.scroll_glide_running());
+        assert_eq!(resting.fract(), 0.0, "rests on a whole row: {resting}");
+        assert_ne!(resting, shown, "the view had to move");
+        assert!(
+            (resting - shown).abs() <= reach + f64::EPSILON,
+            "a glide travels at most {reach} rows: {shown} -> {resting}"
+        );
+        if (resting - before).abs() <= reach {
+            assert_eq!(shown, before, "a short trip starts where the reader was");
+        }
+        assert!(
+            (shown..=resting).contains(&halfway) || (resting..=shown).contains(&halfway),
+            "{shown} -> {halfway} -> {resting}"
+        );
+        assert_ne!(halfway, shown, "halfway through, the view has moved");
+
+        // A wheel event mid-glide cancels it where it is.
+        element.set_scroll_glide_clock(Some(start));
+        element.find_previous(&mut model);
+        if element.scroll_glide_running() {
+            let held = element.scroll_position();
+            element.set_view_offset(held.ceil() as i64, 10);
+            assert!(!element.scroll_glide_running());
+        }
+    }
+
+    #[test]
+    fn typing_on_searches_the_held_capture_at_once_until_the_terminal_prints_again() {
+        let _budget = budget();
+        let mut screen = HeadlessScreen::new(24, 3);
+        screen.feed("old needle one\r\nneedle two\r\nthird\r\nlive".as_bytes());
+        let (mut model, live, mut viewport) = searched(&screen);
+        assert_eq!(model.matches().len(), 2);
+        let held = model.reusable_source().expect("nothing printed since");
+
+        // The next keystroke is answered from memory: no debounce, and the
+        // host is handed the same capture instead of taking a new one.
+        let now = Duration::from_secs(1);
+        assert!(model.set_query("needle t", now));
+        assert_eq!(model.search_delay(now), Duration::ZERO);
+        let request = model.take_due_search(now).expect("due immediately");
+        let result = model
+            .prepare_search(&request, FindSnapshot::from(held.clone()), &live)
+            .unwrap()
+            .run();
+        assert!(model.apply_result(result, &mut viewport));
+        assert_eq!(model.matches().len(), 1);
+        assert!(Arc::ptr_eq(&model.reusable_source().unwrap(), &held));
+
+        // Output makes the capture stale: the next query waits for a new one.
+        let now = Duration::from_secs(2);
+        model.on_output(now);
+        assert!(model.reusable_source().is_none());
+        assert!(model.set_query("needle tw", now));
+        assert_eq!(model.search_delay(now), SEARCH_DEBOUNCE);
+    }
+
+    #[test]
+    fn a_host_that_answers_with_its_screen_gets_a_live_screen_search() {
+        let _budget = budget();
+        let mut screen = HeadlessScreen::new(24, 3);
+        screen.feed("needle".as_bytes());
+        let mut live = GridBuffer::default();
+        live.apply(screen.full_snapshot());
+        let plain = || FindSnapshot {
+            error: None,
+            retained: None,
+            lines: Vec::new(),
+            text_cells: Default::default(),
+            first_row: 0,
+            visible_start_row: 0,
+            cols: 24,
+            rows: 3,
+            content_seq: 1,
+            is_alt_screen: false,
+        };
+
+        // Never held a capture: follow the host down to its screen.
+        let mut model = TerminalFindModel::retained();
+        let mut viewport = ScrollbackViewport::default();
+        model.set_query("needle", Duration::ZERO);
+        let request = model.take_due_search(SEARCH_DEBOUNCE).unwrap();
+        let result = model
+            .prepare_search(&request, plain(), &live)
+            .unwrap()
+            .run();
+        assert!(model.apply_result(result, &mut viewport));
+        assert!(!model.uses_retained_capture());
+        assert_eq!(model.matches().len(), 1);
+
+        // Holds a capture: a lesser answer from a transient failure is ignored.
+        let (mut model, live, mut viewport) = searched(&screen);
+        let before = model.matches().to_vec();
+        model.refresh(Duration::from_secs(1));
+        let request = model.take_due_search(Duration::from_secs(1)).unwrap();
+        let result = model
+            .prepare_search(&request, plain(), &live)
+            .unwrap()
+            .run();
+        assert!(!model.apply_result(result, &mut viewport));
+        assert!(model.uses_retained_capture());
+        assert_eq!(model.matches(), before);
+    }
+
     #[test]
     fn retained_rows_keep_identity_through_output_reflow_and_query_change_and_release_budget() {
+        let _budget = budget();
         // All budget assertions stay in one test so parallel tests cannot
         // consume this process-wide admission allowance halfway through it.
         let base_views = VIEWS.load(Ordering::Acquire);

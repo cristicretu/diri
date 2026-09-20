@@ -16,7 +16,12 @@ mod search;
 pub use scheduler::{FindSearchScheduler, ReadCompletion, ScanCompletion};
 pub use search::{SearchJob, SearchResult};
 
-pub const SEARCH_DEBOUNCE: Duration = Duration::from_millis(200);
+/// How long typing must pause before a query that needs a NEW capture of the
+/// terminal is searched. A capture is an RPC plus a decode of up to
+/// [`diri_proto::FIND_CAPTURE_MAX_CELLS`] cells, so it is not taken per
+/// keystroke. A query that can be answered from the capture already held
+/// (see [`TerminalFindModel::reusable_source`]) does not wait at all.
+pub const SEARCH_DEBOUNCE: Duration = Duration::from_millis(120);
 pub const OUTPUT_RESCAN_DELAY: Duration = Duration::from_millis(100);
 pub const MATCH_CAP: usize = 500;
 pub const HISTORY_ANCHOR: f32 = 0.33;
@@ -174,6 +179,23 @@ impl TerminalFindModel {
     pub fn paused_source(&self) -> Option<Arc<RetainedFindSnapshot>> {
         self.paused.then(|| self.source.clone()).flatten()
     }
+
+    /// The held capture, when searching it gives the same answer a fresh one
+    /// would: the reader is parked on it, or nothing has been printed since
+    /// it was taken. Typing a longer query then scans memory instead of
+    /// capturing the terminal again, so results follow each keystroke.
+    pub fn reusable_source(&self) -> Option<Arc<RetainedFindSnapshot>> {
+        (self.paused || !self.newer_output)
+            .then(|| self.source.clone())
+            .flatten()
+    }
+
+    /// How long the host should wait before asking for the due search.
+    #[must_use]
+    pub fn search_delay(&self, now: Duration) -> Duration {
+        self.search_due
+            .map_or(Duration::ZERO, |due| due.saturating_sub(now))
+    }
     pub fn refresh(&mut self, now: Duration) {
         self.paused = false;
         self.error = None;
@@ -229,7 +251,12 @@ impl TerminalFindModel {
         if self.query.is_empty() {
             self.search_due = None;
         } else {
-            self.search_due = Some(now.saturating_add(SEARCH_DEBOUNCE));
+            let debounce = if self.reusable_source().is_some() {
+                Duration::ZERO
+            } else {
+                SEARCH_DEBOUNCE
+            };
+            self.search_due = Some(now.saturating_add(debounce));
         }
         true
     }
@@ -325,6 +352,18 @@ impl TerminalFindModel {
         }
         if self.paused && self.source.as_ref() != result.source.as_ref() {
             return false;
+        }
+        if self.retained_mode && result.source.is_none() {
+            // The host answered with its screen instead of a capture: a remote
+            // Helper that cannot serve history. A search that never held a
+            // capture becomes a live-screen search, which is what such a host
+            // always had; one that holds a capture keeps it over a lesser
+            // answer from a transient failure.
+            if self.source.is_some() {
+                return false;
+            }
+            self.retained_mode = false;
+            self.reservation = None;
         }
         self.error = None;
         if !self.paused {
@@ -545,14 +584,17 @@ mod tests {
     #[test]
     fn search_and_rescan_deadlines_are_debounced_and_coalesced() {
         let mut model = TerminalFindModel::default();
-        model.set_query("needle", Duration::from_millis(10));
-        assert!(model.take_due_search(Duration::from_millis(209)).is_none());
+        let typed = Duration::from_millis(10);
+        model.set_query("needle", typed);
+        // Nothing is held yet, so the terminal has to be captured: debounced.
+        assert_eq!(model.search_delay(typed), SEARCH_DEBOUNCE);
+        let due = typed + SEARCH_DEBOUNCE;
         assert!(
-            !model
-                .take_due_search(Duration::from_millis(210))
-                .unwrap()
-                .is_rescan
+            model
+                .take_due_search(due - Duration::from_millis(1))
+                .is_none()
         );
+        assert!(!model.take_due_search(due).unwrap().is_rescan);
 
         model.on_output(Duration::from_millis(300));
         model.on_output(Duration::from_millis(350));

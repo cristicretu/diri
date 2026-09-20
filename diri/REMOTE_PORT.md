@@ -843,6 +843,19 @@ the existing annotations and the same `unicode-width` 0.2.2 width rules as the
 shared parser; making that existing transitive dependency direct in `diri-term`
 avoids a separate, inconsistent width table.
 
+Find over a remote session's history (September 2026) uses the same rule. The
+local Engine answers `session.capture_find` for a remote session by reading the
+newest rows the capture budget allows through the existing on-demand
+`ScrollbackRequest`, at most 1024 rows per request, and assembling one
+contiguous tail that ends at the visible grid. Absolute rows never renumber, so
+output arriving between reads only adds rows that a further read picks up; a
+bounded number of reads keeps a fast-printing terminal from being chased, and a
+resize or reset between reads fails the capture. There is no Helper protocol,
+capability, controller, snapshot, or history-budget change, and nothing new is
+retained on the remote host. A Helper that cannot serve the rows makes the
+capture fail, and the client falls back to searching the mirrored screen, which
+is what every remote session did before.
+
 The shared terminal parser additionally retains OSC 8 targets, soft-wrap facts,
 wide-cell continuation facts, combining characters, and OSC 133 A prompt-start
 marks. These are terminal screen facts; the Holder does not infer commands,

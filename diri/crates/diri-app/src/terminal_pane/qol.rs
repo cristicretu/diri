@@ -291,7 +291,7 @@ impl TerminalPane {
         resident.element.set_find_highlights(Vec::new());
         resident.element.pin_keyboard_selection(false);
         self.qol.copy_mode = None;
-        self.schedule_find(id, Duration::from_millis(200), window, cx);
+        self.schedule_query_search(id, window, cx);
         cx.notify();
     }
 
