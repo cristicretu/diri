@@ -12,6 +12,7 @@ struct NativeAlerts;
 
 impl Global for NativeAlerts {}
 
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 pub(crate) fn enable(cx: &mut App) {
     cx.set_global(NativeAlerts);
 }

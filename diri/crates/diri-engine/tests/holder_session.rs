@@ -493,9 +493,13 @@ fn completed_terminal_survives_engine_replacement() {
         .expect("spawn held");
     let mut published = HashMap::new();
     let mut publications = Vec::new();
+    // The Holder drains its log and takes the final capture before it exposes
+    // the exit; on a loaded CI runner that has taken longer than ten seconds
+    // (two releases' bump PRs failed here and passed on rerun). The wait is a
+    // ceiling, not the expected time, so give it real headroom.
     wait_until(
         "the exit and its retained terminal",
-        Duration::from_secs(10),
+        Duration::from_secs(45),
         || {
             registry.changed_since(&mut published);
             publications.extend(registry.take_completed_publications());
