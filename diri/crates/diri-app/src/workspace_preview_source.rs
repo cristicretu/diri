@@ -79,7 +79,9 @@ impl WorkspacePreviews {
         self.sources.retain(|id, _| wanted.contains(id));
         for id in &wanted {
             self.sources.entry(id.clone()).or_insert_with(|| {
-                let element = TerminalElement::with_buffer(GridBuffer::new(0, 0)).focused(false);
+                let element = TerminalElement::with_buffer(GridBuffer::new(0, 0))
+                    .focused(false)
+                    .without_cursor();
                 let (state_tx, state) = watch::channel(PreviewState::Loading);
                 Preview {
                     target: Target {

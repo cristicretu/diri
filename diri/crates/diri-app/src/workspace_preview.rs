@@ -74,6 +74,7 @@ pub(crate) fn render_workspace_preview(
                 element
                     .clone()
                     .focused(false)
+                    .without_cursor()
                     .font(gpui::font(crate::fonts::mono_family()))
                     .font_size(px(font_size))
                     .theme(theme),

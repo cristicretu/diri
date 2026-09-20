@@ -8,6 +8,8 @@
 
 use std::time::{Duration, Instant};
 
+use crate::cursor_focus::{CursorFocus, FocusFrame};
+
 /// The cursor holds solid for this long after the last keystroke, cursor move
 /// or output on its row. A cursor that blinks while it is being used is the
 /// thing that makes blinking annoying.
@@ -383,6 +385,7 @@ impl CursorMotion {
 #[derive(Debug)]
 pub(crate) struct CursorDriver {
     pub(crate) motion: CursorMotion,
+    focus: CursorFocus,
     /// Frame renders and tests step time by hand. With a clock injected the
     /// driver records what it would schedule and schedules nothing.
     clock: Option<Instant>,
@@ -396,6 +399,7 @@ impl Default for CursorDriver {
     fn default() -> Self {
         Self {
             motion: CursorMotion::default(),
+            focus: CursorFocus::default(),
             clock: None,
             wake_at: None,
             last_schedule: None,
@@ -411,6 +415,11 @@ impl CursorDriver {
 
     pub(crate) fn set_clock(&mut self, clock: Option<Instant>) {
         self.clock = clock;
+    }
+
+    #[cfg(test)]
+    pub(crate) fn painted_focused(&self) -> Option<bool> {
+        self.focus.painted_focused()
     }
 
     pub(crate) fn last_schedule(&self) -> Option<CursorSchedule> {
@@ -430,7 +439,40 @@ impl CursorDriver {
     pub(crate) fn rest(&mut self) {
         self.painted_opacity = 1.0;
         self.motion.note_hidden();
+        self.focus.note_hidden();
         self.last_schedule = Some(CursorSchedule::Rest);
+    }
+
+    /// The frame for a cursor in a pane that does or does not hold the
+    /// keyboard. Unfocused, the blink and glide model is put to rest, so a
+    /// hollow cursor arms no wake and returns solid when focus comes back;
+    /// the only frames it asks for are the few that empty the block.
+    pub(crate) fn sample_in_pane(
+        &mut self,
+        cell: CursorCell,
+        focused: bool,
+        reduce_motion: bool,
+    ) -> (CursorFrame, FocusFrame) {
+        let focus = self.focus.sample(focused, self.now(), reduce_motion);
+        let mut frame = if focused {
+            self.sample(cell, reduce_motion)
+        } else {
+            self.motion.note_hidden();
+            self.painted_opacity = 1.0;
+            CursorFrame::REST
+        };
+        if frame.is_gliding() {
+            self.focus.settle();
+            self.focus.note_painted(frame.opacity);
+            return (frame, FocusFrame::FILLED);
+        }
+        frame.opacity *= focus.fill;
+        if focus.morphing {
+            frame.schedule = CursorSchedule::NextFrame;
+        }
+        self.focus.note_painted(frame.opacity);
+        self.last_schedule = Some(frame.schedule);
+        (frame, focus)
     }
 
     pub(crate) fn sample(&mut self, cell: CursorCell, reduce_motion: bool) -> CursorFrame {
@@ -689,6 +731,76 @@ mod tests {
         // At rest, every later sample is static and schedules nothing.
         let later = motion.sample(cell(0, 0), start + Duration::from_secs(60), false);
         assert_eq!(later, CursorFrame::REST);
+    }
+
+    #[test]
+    fn a_hollow_cursor_neither_blinks_nor_wakes() {
+        let start = Instant::now();
+        let mut driver = CursorDriver::default();
+        driver.set_clock(Some(start));
+        let (frame, focus) = driver.sample_in_pane(cell(2, 1), false, false);
+        assert_eq!((frame.opacity, frame.schedule), (0.0, CursorSchedule::Rest));
+        assert!(focus.outlined() && !focus.morphing);
+        // Long past the idle delay, in the middle of what would be a blink.
+        for idle in [ms(700), ms(1_500), Duration::from_secs(600)] {
+            driver.set_clock(Some(start + idle));
+            let (frame, _) = driver.sample_in_pane(cell(2, 1), false, false);
+            assert_eq!((frame.opacity, frame.schedule), (0.0, CursorSchedule::Rest));
+            assert_eq!(driver.last_schedule(), Some(CursorSchedule::Rest));
+            assert_eq!(
+                driver.motion.wake(driver.painted_opacity, start + idle),
+                Wake::Stop
+            );
+        }
+    }
+
+    #[test]
+    fn a_blur_mid_blink_ends_the_blink_and_focus_returns_solid() {
+        let start = Instant::now();
+        let mut driver = CursorDriver::default();
+        driver.set_clock(Some(start));
+        let _ = driver.sample_in_pane(cell(0, 0), true, false);
+        let low = start + BLINK_IDLE_DELAY + BLINK_FADE;
+        driver.set_clock(Some(low));
+        let (dimmed, _) = driver.sample_in_pane(cell(0, 0), true, false);
+        assert_eq!(dimmed.opacity, BLINK_FLOOR);
+
+        // The block empties from the dimmed opacity, at the display rate.
+        let (first, focus) = driver.sample_in_pane(cell(0, 0), false, false);
+        assert_eq!(first.opacity, BLINK_FLOOR);
+        assert_eq!(first.schedule, CursorSchedule::NextFrame);
+        assert!(focus.morphing);
+        assert_eq!(driver.motion.wake(driver.painted_opacity, low), Wake::Stop);
+        let mut frames = 0;
+        let mut now = low;
+        while driver.last_schedule() == Some(CursorSchedule::NextFrame) {
+            now += Duration::from_micros(16_667);
+            driver.set_clock(Some(now));
+            let _ = driver.sample_in_pane(cell(0, 0), false, false);
+            frames += 1;
+            assert!(frames < 100, "the block never emptied");
+        }
+        // 120 ms at 60 Hz, then nothing.
+        assert_eq!(frames, 8);
+        assert_eq!(driver.last_schedule(), Some(CursorSchedule::Rest));
+
+        // Focus returns: filling, solid underneath, and the blink's idle
+        // delay starts over once the block is full.
+        let back = now + Duration::from_secs(5);
+        driver.set_clock(Some(back));
+        let (frame, _) = driver.sample_in_pane(cell(0, 0), true, false);
+        assert_eq!(
+            (frame.opacity, frame.schedule),
+            (0.0, CursorSchedule::NextFrame)
+        );
+        driver.set_clock(Some(back + crate::cursor_focus::FOCUS_MORPH));
+        let (frame, focus) = driver.sample_in_pane(cell(0, 0), true, false);
+        assert_eq!(frame.opacity, 1.0);
+        assert!(!focus.outlined());
+        assert_eq!(
+            frame.schedule,
+            CursorSchedule::After(BLINK_IDLE_DELAY - crate::cursor_focus::FOCUS_MORPH + BLINK_STEP)
+        );
     }
 
     fn type_one_cell(motion: &mut CursorMotion, from: CursorCell, now: Instant) -> CursorCell {

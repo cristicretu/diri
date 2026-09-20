@@ -102,6 +102,7 @@ pub struct TerminalElement {
     suspended: bool,
     hovered_reference: Option<ReferenceHit>,
     reduce_motion: bool,
+    cursor_hidden: bool,
 }
 
 /// Selection and reading state only: deliberately does not retain an input
@@ -568,7 +569,12 @@ struct ScrollPaint {
 struct CursorPaint {
     row: u16,
     col: u16,
+    /// Cells the block spans: two on a double-width glyph.
+    cols: u16,
     quad: PaintQuad,
+    /// Set while the pane does not hold the keyboard. Painted over the row's
+    /// own text, after whatever is left of the fill.
+    outline: Option<PaintQuad>,
     /// Color of the glyph or block element drawn inside the cursor.
     text: gpui::Rgba,
     glyph: Option<ShapedLine>,
@@ -628,6 +634,7 @@ impl TerminalElement {
             suspended: false,
             hovered_reference: None,
             reduce_motion: false,
+            cursor_hidden: false,
         }
     }
 
@@ -723,6 +730,14 @@ impl TerminalElement {
         self
     }
 
+    /// A picture of a terminal rather than a pane: thumbnails and peeks have
+    /// no insertion point to mark, so they draw no cursor, not a hollow one.
+    #[must_use]
+    pub fn without_cursor(mut self) -> Self {
+        self.cursor_hidden = true;
+        self
+    }
+
     /// Holds the cursor static: no blink, no glide.
     #[must_use]
     pub fn reduce_motion(mut self, reduce_motion: bool) -> Self {
@@ -743,6 +758,12 @@ impl TerminalElement {
     /// clock, and schedules no frames. For tests and frame-by-frame renders.
     pub fn set_cursor_clock(&self, now: Option<Instant>) {
         mutex_lock(&self.shared.cursor).set_clock(now);
+    }
+
+    /// Whether the cursor was last painted filled (`true`) or hollow.
+    #[cfg(test)]
+    pub(crate) fn cursor_painted_focused(&self) -> Option<bool> {
+        mutex_lock(&self.shared.cursor).painted_focused()
     }
 
     /// What the last painted frame asked for next. `Rest` means the cursor
@@ -1412,6 +1433,7 @@ impl TerminalElement {
     fn animate_cursor(
         &self,
         cursor: Option<CursorPaint>,
+        focused: bool,
         metrics: CellMetrics,
         visible_cols: usize,
         window: &mut Window,
@@ -1425,11 +1447,25 @@ impl TerminalElement {
             col: cursor.col,
             row: cursor.row,
         };
-        cursor.frame = driver.sample(cell, self.reduce_motion);
+        let (frame, focus) = driver.sample_in_pane(cell, focused, self.reduce_motion);
         drop(driver);
-        let frame = cursor.frame;
+        cursor.frame = frame;
         if frame.is_static() {
             return Some(cursor);
+        }
+        if focus.outlined() {
+            cursor.outline = Some(crate::cursor_focus::outline_quad(
+                cursor.quad.bounds,
+                window.scale_factor(),
+                cursor.quad.background.as_solid().unwrap_or_default(),
+            ));
+            if frame.opacity <= 0.0 {
+                // Hollow at rest: the row paints its own text and the fill
+                // and inverted glyph are not there to paint.
+                cursor.glyph = None;
+                cursor.block = None;
+                return Some(cursor);
+            }
         }
         cursor.quad.bounds.origin.x += metrics.cell_width * frame.offset_cols;
         cursor.quad.bounds.origin.y += metrics.line_height * frame.offset_rows;
@@ -1505,7 +1541,9 @@ impl TerminalElement {
         cx: &mut App,
     ) {
         let block_bounds = cursor.quad.bounds;
-        window.paint_quad(cursor.quad);
+        if cursor.frame.opacity > 0.0 {
+            window.paint_quad(cursor.quad);
+        }
         if cursor.frame.is_gliding() {
             let mask = ContentMask {
                 bounds: block_bounds.intersect(&bounds),
@@ -1536,6 +1574,9 @@ impl TerminalElement {
             window,
             cx,
         );
+        if let Some(outline) = cursor.outline {
+            window.paint_quad(outline);
+        }
     }
 }
 
@@ -2064,8 +2105,7 @@ impl Element for TerminalElement {
 
         drop(highlights);
 
-        let cursor_visible = cursor_should_render(focused, cursor.visible);
-        let cursor = if cursor_visible
+        let cursor = if cursor_should_render(!self.cursor_hidden, cursor.visible)
             && !viewport.is_reading()
             && usize::from(cursor.row) < visible_rows
             && usize::from(cursor.col) < visible_cols
@@ -2076,6 +2116,9 @@ impl Element for TerminalElement {
                 .and_then(|row| row.cells.get(usize::from(cursor.col)))
                 .copied()
                 .unwrap_or(GridCell::BLANK);
+            let cursor_cols = cache[usize::from(cursor.row)].as_ref().map_or(1, |row| {
+                crate::cursor_focus::cursor_cols(&row.cells, cursor.col)
+            });
             let origin = point(
                 bounds.left() + metrics.x_for_col(cursor.col),
                 bounds.top() + metrics.y_for_row(cursor.row),
@@ -2087,10 +2130,18 @@ impl Element for TerminalElement {
             Some(CursorPaint {
                 row: cursor.row,
                 col: cursor.col,
+                cols: cursor_cols,
                 quad: fill(
-                    Bounds::new(origin, size(metrics.cell_width, metrics.line_height)),
+                    Bounds::new(
+                        origin,
+                        size(
+                            metrics.cell_width * f32::from(cursor_cols),
+                            metrics.line_height,
+                        ),
+                    ),
                     cursor_fill,
                 ),
+                outline: None,
                 text: cursor_text,
                 glyph: self.shape_cursor_glyph(
                     cell,
@@ -2114,7 +2165,7 @@ impl Element for TerminalElement {
         } else {
             None
         };
-        let cursor = self.animate_cursor(cursor, metrics, visible_cols, window);
+        let cursor = self.animate_cursor(cursor, focused, metrics, visible_cols, window);
 
         let scroll = (scroll_shift > px(0.0)).then(|| {
             let backdrop = background_quads.remove(0);
@@ -2282,7 +2333,7 @@ impl Element for TerminalElement {
                             origin,
                             bounds,
                             metrics,
-                            cursor.col,
+                            (cursor.col, cursor.cols),
                             window,
                             cx,
                         );
@@ -2326,7 +2377,15 @@ impl Element for TerminalElement {
                     .is_some_and(|cursor| cursor.replaces_text_at(*row))
                 {
                     let cursor = prepaint.cursor.as_ref().unwrap();
-                    paint_line_around_cursor(line, origin, bounds, metrics, cursor.col, window, cx);
+                    paint_line_around_cursor(
+                        line,
+                        origin,
+                        bounds,
+                        metrics,
+                        (cursor.col, cursor.cols),
+                        window,
+                        cx,
+                    );
                 } else {
                     let _ = line.paint(
                         origin,
@@ -2404,8 +2463,11 @@ impl Element for TerminalElement {
     }
 }
 
-const fn cursor_should_render(focused: bool, protocol_visible: bool) -> bool {
-    focused && protocol_visible
+/// Focus no longer decides whether the cursor is painted, only how: filled in
+/// the pane that holds the keyboard, outlined in every other. A cursor the
+/// program hid (DECTCEM) stays hidden in both, and a thumbnail has none.
+const fn cursor_should_render(host_shows_cursor: bool, protocol_visible: bool) -> bool {
+    host_shows_cursor && protocol_visible
 }
 
 fn append_background_quads(
@@ -2614,12 +2676,12 @@ fn paint_line_around_cursor(
     origin: Point<Pixels>,
     terminal_bounds: Bounds<Pixels>,
     metrics: CellMetrics,
-    cursor_col: u16,
+    (cursor_col, cursor_cols): (u16, u16),
     window: &mut Window,
     cx: &mut App,
 ) {
     let cursor_left = origin.x + metrics.x_for_col(cursor_col);
-    let cursor_right = cursor_left + metrics.cell_width;
+    let cursor_right = cursor_left + metrics.cell_width * f32::from(cursor_cols);
     let row_top = origin.y;
     if cursor_left > terminal_bounds.left() {
         let mask = Bounds::from_corners(
@@ -3472,10 +3534,10 @@ mod link_tests {
     }
 
     #[test]
-    fn static_cursor_follows_focus_and_protocol_visibility() {
+    fn the_cursor_follows_the_host_and_protocol_visibility() {
         assert!(super::cursor_should_render(true, true));
-        assert!(!super::cursor_should_render(false, true));
         assert!(!super::cursor_should_render(true, false));
+        assert!(!super::cursor_should_render(false, true));
         assert!(!super::cursor_should_render(false, false));
     }
 

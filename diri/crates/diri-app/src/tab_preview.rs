@@ -135,7 +135,9 @@ impl LivePreview {
         cx: &mut gpui::Context<crate::session_surfaces::SessionSurfaces>,
     ) -> Self {
         use diri_term::{buffer::GridBuffer, element::TerminalElement};
-        let element = TerminalElement::with_buffer(GridBuffer::new(0, 0)).focused(false);
+        let element = TerminalElement::with_buffer(GridBuffer::new(0, 0))
+            .focused(false)
+            .without_cursor();
         let buffer = element.buffer();
         let (updates, state) = tokio::sync::watch::channel(PreviewState::Loading);
         let mut changes = state.clone();

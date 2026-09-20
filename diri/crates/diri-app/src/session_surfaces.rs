@@ -197,8 +197,10 @@ impl SessionSurfaces {
     /// separate painter/cache renders it into switcher and overview thumbnails
     /// without reading back the onscreen Metal layer.
     pub(crate) fn set_resident_buffer(&mut self, id: SessionId, buffer: SharedGridBuffer) {
-        self.resident_previews
-            .insert(id, TerminalElement::new(buffer).focused(false));
+        self.resident_previews.insert(
+            id,
+            TerminalElement::new(buffer).focused(false).without_cursor(),
+        );
     }
 
     pub(crate) fn remove_resident_buffer(&mut self, id: &SessionId) {
