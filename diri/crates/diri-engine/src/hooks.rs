@@ -278,12 +278,52 @@ pub fn permission_summary(tool: Option<&str>, input_summary: Option<&str>) -> St
 pub(crate) fn title_from_prompt(prompt: &str) -> String {
     let first_line = prompt
         .lines()
-        .map(str::trim)
+        .map(without_leading_paths)
         .find(|line| !line.is_empty())
         .unwrap_or("");
     let cleaned = redact(first_line);
     let trimmed: String = cleaned.chars().take(60).collect();
     trimmed.trim().to_string()
+}
+
+/// Drops file paths at the start of a prompt line. A pasted clipboard image
+/// or a Finder drop reaches the PTY as a path the Agent turns into an
+/// attachment (`[Image #1]`); it names a temp file, not the conversation.
+/// Paths may be quoted or carry Terminal.app-style `\ ` escapes. A slash
+/// command (`/review`) has a single separator and is kept.
+fn without_leading_paths(line: &str) -> &str {
+    let mut rest = line.trim();
+    loop {
+        let token_end = path_token_end(rest);
+        let token = rest[..token_end].trim_matches(|c| c == '\'' || c == '"');
+        let is_path =
+            (token.starts_with('/') || token.starts_with("~/")) && token.matches('/').count() >= 2;
+        if !is_path {
+            return rest;
+        }
+        rest = rest[token_end..].trim_start();
+    }
+}
+
+/// End of the first whitespace-separated token, honouring quotes and
+/// backslash-escaped spaces.
+fn path_token_end(text: &str) -> usize {
+    let mut quote = None;
+    let mut escaped = false;
+    for (index, character) in text.char_indices() {
+        if escaped {
+            escaped = false;
+        } else if character == '\\' && quote.is_none() {
+            escaped = true;
+        } else if Some(character) == quote {
+            quote = None;
+        } else if quote.is_none() && (character == '\'' || character == '"') && index == 0 {
+            quote = Some(character);
+        } else if quote.is_none() && character.is_whitespace() {
+            return index;
+        }
+    }
+    text.len()
 }
 
 fn short_path(path: Option<&str>) -> String {
@@ -598,5 +638,25 @@ mod tests {
         assert_eq!(metadata.agent_session_id.as_deref(), Some("conversation"));
         let detail = metadata.needs_input.expect("generic permission detail");
         assert_eq!(detail.summary, "wants to run `a command`");
+    }
+
+    #[test]
+    fn pasted_attachment_paths_do_not_name_the_conversation() {
+        assert_eq!(
+            title_from_prompt(
+                "/var/folders/2y/w5660/T/dirijor-clipboard-BcoRjF.png Can you investigate this?"
+            ),
+            "Can you investigate this?"
+        );
+        assert_eq!(
+            title_from_prompt("'/Users/me/Desktop/Screen Shot.png' /Users/me/My\\ Shot.png fix it"),
+            "fix it"
+        );
+        assert_eq!(title_from_prompt("/tmp/dirijor-clipboard-a1.png"), "");
+        assert_eq!(title_from_prompt("/review the diff"), "/review the diff");
+        assert_eq!(
+            title_from_prompt("explain /Users/me/project/main.rs"),
+            "explain /Users/me/project/main.rs"
+        );
     }
 }
