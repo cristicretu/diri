@@ -7,7 +7,7 @@ mod tabs;
 mod titles;
 mod workspaces;
 
-#[cfg(test)]
+#[cfg(all(test, target_os = "macos"))]
 pub(crate) use titles::testing as title_clock_for_test;
 
 use std::cell::{Cell, RefCell};

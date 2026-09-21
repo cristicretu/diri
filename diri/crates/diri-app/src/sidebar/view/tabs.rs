@@ -56,7 +56,7 @@ pub(super) fn session_tab_face(
                 } else {
                     colors.secondary
                 })
-                .child(title_fade(title)),
+                .child(title),
         )
 }
 
@@ -341,9 +341,11 @@ impl Sidebar {
             if shift.is_none() {
                 self.tab_shift.applied.borrow_mut().remove(&id);
             }
+            // At rest the title fades out where it overflows; while it settles
+            // the crossfading label owns the box.
             let face = match self.settling_title(&id, TAB_TITLE_WIDTH) {
                 Some(settling) => settling.into_any_element(),
-                None => SharedString::from(title.clone()).into_any_element(),
+                None => title_fade(title.clone()).into_any_element(),
             };
             let tab = session_tab_face(mark, face, active, colors)
                 .id(SharedString::from(format!("horizontal-tab-{}", id.0)))
