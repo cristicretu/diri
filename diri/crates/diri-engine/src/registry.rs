@@ -1242,9 +1242,20 @@ impl Registry {
     /// remote cwd can't be checked locally, so it always qualifies) and
     /// re-lists it. The caller drives the resume path from there.
     pub fn reopen_last_closed(&mut self) -> Option<SessionRecord> {
-        while let Some(record) = self.recently_closed.pop() {
+        while let Some(mut record) = self.recently_closed.pop() {
             if record.host.is_none() && !Path::new(&record.cwd).exists() {
                 continue; // the folder is gone; try the next candidate
+            }
+            // The stack holds the record as it was before the close, so it
+            // still claims its last live status. Nothing runs under it now;
+            // re-listing it live would leave clients attaching to no PTY.
+            if !matches!(record.status, SessionStatus::Exited(_)) {
+                record.status = SessionStatus::Exited(diri_proto::ExitInfo {
+                    reason: diri_proto::ExitReason::Exited,
+                    code: None,
+                    signal: None,
+                });
+                record.needs_input = None;
             }
             self.records.insert(record.id.0.clone(), record.clone());
             return Some(record);

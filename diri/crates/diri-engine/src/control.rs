@@ -3166,16 +3166,31 @@ impl ControlServer {
         })
     }
 
-    /// Pops the most recently closed session whose folder still exists and
-    /// re-lists it (exited), ready for the resume path.
+    /// Pops the most recently closed session whose folder still exists,
+    /// re-lists it (exited), and relaunches it through the resume path. An
+    /// Agent that cannot resume stays listed as exited rather than failing
+    /// the reopen.
     fn session_reopen_last(&self) -> Result<JsonValue, ControlError> {
-        let mut registry = self.registry.lock().map_err(poisoned)?;
-        let record = registry
-            .reopen_last_closed()
-            .ok_or_else(|| ControlError::bad_request("no recently closed session"))?;
-        let _ = registry.persist();
-        self.publish_updated(&registry, &record.id.0);
-        serde_json::to_value(&record).map_err(|error| ControlError::internal(error.to_string()))
+        let record = {
+            let mut registry = self.registry.lock().map_err(poisoned)?;
+            let record = registry
+                .reopen_last_closed()
+                .ok_or_else(|| ControlError::bad_request("no recently closed session"))?;
+            let _ = registry.persist();
+            self.publish_updated(&registry, &record.id.0);
+            record
+        };
+        match self.session_resume(Some(serde_json::json!({ "sessionID": record.id.0 }))) {
+            Ok(resumed) => Ok(resumed),
+            Err(error) => {
+                eprintln!(
+                    "diri-engine: reopened session {} could not relaunch: {}",
+                    record.id.0, error.message
+                );
+                serde_json::to_value(&record)
+                    .map_err(|error| ControlError::internal(error.to_string()))
+            }
+        }
     }
 
     /// Manifest catalog plus executable facts for one execution target. The
@@ -5887,12 +5902,85 @@ mod tests {
 
         let reopened = ok_of(call(&server, "session.reopen_last", None));
         assert_eq!(reopened["id"], "s_gone");
+        // A shell cannot resume; it must come back exited, never still
+        // claiming the live status it had when closed.
+        assert!(
+            reopened["status"].get("exited").is_some(),
+            "a reopened session with nothing running must read as exited: {}",
+            reopened["status"]
+        );
         let list = ok_of(call(&server, "session.list", None));
         assert_eq!(list["sessions"].as_array().map(Vec::len), Some(1));
 
         // The stack is spent.
         let empty = err_of(call(&server, "session.reopen_last", None));
         assert_eq!(empty.code, "bad_request");
+    }
+
+    #[test]
+    fn reopening_a_resumable_session_relaunches_it() {
+        let temp = tempfile::tempdir().expect("temp");
+        let manifests = temp.path().join("manifests");
+        std::fs::create_dir_all(&manifests).expect("manifests dir");
+        std::fs::write(
+            manifests.join("probe.json"),
+            json!({
+                "schemaVersion": 2,
+                "id": "probe",
+                "version": "test",
+                "statusModel": "full",
+                "agent": {
+                    "binary": "/bin/sh",
+                    "spawnArgs": ["-c", "read line"],
+                    "resume": { "style": "flag", "token": "--resume" },
+                },
+                "rules": [],
+            })
+            .to_string(),
+        )
+        .expect("write manifest");
+        let (probe, _) = ManifestEngine::load_dir(&manifests).expect("load");
+        let registry = Arc::new(Mutex::new(Registry::new(
+            Arc::new(probe),
+            temp.path().join("state.json"),
+        )));
+        {
+            let mut record = test_record("s_closed");
+            record.kind = diri_proto::AgentKind::new("probe");
+            record.agent_session_id = Some("conv-1".into());
+            record.resumability = diri_proto::Resumability::Resumable;
+            registry.lock().expect("registry").insert_record(record);
+        }
+        let server = Arc::new(ControlServer::new(
+            Arc::clone(&registry),
+            temp.path().join("daemon.sock"),
+        ));
+
+        ok_of(call(
+            &server,
+            "session.remove",
+            Some(json!({ "sessionID": "s_closed" })),
+        ));
+        let reopened = ok_of(call(&server, "session.reopen_last", None));
+
+        assert_eq!(reopened["id"], "s_closed");
+        assert!(
+            reopened["status"].get("exited").is_none(),
+            "reopen must relaunch, not re-list a record with no PTY: {}",
+            reopened["status"]
+        );
+        assert!(
+            registry
+                .lock()
+                .expect("registry")
+                .get("s_closed")
+                .is_some_and(|session| !session.view().exited),
+            "the reopened session must be a live one"
+        );
+        let _ = registry
+            .lock()
+            .expect("registry")
+            .terminate("s_closed", Duration::from_millis(500));
     }
 
     #[test]
