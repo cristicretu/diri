@@ -3009,7 +3009,9 @@ fn wrapped_url_at(
                     let row_number = start_row.checked_add(ahead as i64)?;
                     let next = read_row(row_number);
                     let mut next_start = if at_edge { 0 } else { lane_start };
-                    if closer.is_some() {
+                    // Apps that hard-wrap at the edge (Claude Code, Codex)
+                    // indent the continuation under their own gutter.
+                    if closer.is_some() || at_edge {
                         while next_start < next.len() && next[next_start].is_whitespace() {
                             next_start += 1;
                         }
@@ -3020,8 +3022,11 @@ fn wrapped_url_at(
                         }
                         break;
                     }
-                    // Do not jump to another table column across an empty cell.
-                    if !at_edge && next_start != lane_start {
+                    // Do not jump to another table column across an empty cell,
+                    // nor to text indented past where the URL itself began.
+                    if (!at_edge && next_start != lane_start)
+                        || (at_edge && closer.is_none() && next_start > start)
+                    {
                         break;
                     }
                     let next_end = reference_run_end(&next, next_start);
@@ -3524,6 +3529,42 @@ mod link_tests {
             );
         }
         assert_eq!(terminal.link_at(16, 1), None);
+    }
+
+    #[test]
+    fn wrapped_url_with_indented_continuation_rows_opens_full_url() {
+        // Claude Code hard-wraps at the terminal edge and indents every
+        // continuation row under its `⏺ ` gutter.
+        let terminal = terminal_with_rows(&[
+            "⏺ Explore https://exampl",
+            "  e.com/search?q=laptop&",
+            "  color=silver to filter",
+            "                        ",
+        ]);
+        for (col, row) in [(12, 0), (2, 1), (23, 1), (4, 2)] {
+            assert_eq!(
+                terminal.link_at(col, row).as_deref(),
+                Some("https://example.com/search?q=laptop&color=silver"),
+                "click at row {row}, col {col}"
+            );
+        }
+        assert_eq!(terminal.link_at(15, 2), None);
+
+        let prose = terminal_with_rows(&[
+            "  See https://example.com/a ",
+            "  to filter by budget.      ",
+        ]);
+        assert_eq!(
+            prose.link_at(8, 0).as_deref(),
+            Some("https://example.com/a")
+        );
+        assert_eq!(prose.link_at(2, 1), None);
+
+        let outdented = terminal_with_rows(&["  https://example.com/", "        more text"]);
+        assert_eq!(
+            outdented.link_at(4, 0).as_deref(),
+            Some("https://example.com/")
+        );
     }
 
     #[test]
