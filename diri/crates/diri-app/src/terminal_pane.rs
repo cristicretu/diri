@@ -4334,6 +4334,11 @@ fn pointer_owner(
             PointerOwner::Ignored
         };
     }
+    // Control-click opens references too. Only the left button is claimed so
+    // Control with other buttons still reaches a mouse-reporting child.
+    if modifiers.control && button == MouseButton::Left {
+        return PointerOwner::LocalReference;
+    }
     // Option must claim the press, not merely the first move; otherwise the
     // child would receive an unmatched press before a local selection began.
     if modifiers.alt {
@@ -5124,6 +5129,10 @@ mod tests {
             platform: true,
             ..Modifiers::default()
         };
+        let control = Modifiers {
+            control: true,
+            ..Modifiers::default()
+        };
         let reporting = MouseModes::new(
             diri_proto::terminal::MouseTrackingMode::AnyMotion,
             diri_proto::terminal::MouseEncoding::Sgr,
@@ -5156,6 +5165,20 @@ mod tests {
             pointer_owner(reporting, MouseButton::Right, &command),
             PointerOwner::Ignored,
             "no Command-modified button is forwarded"
+        );
+        assert_eq!(
+            pointer_owner(reporting, MouseButton::Left, &control),
+            PointerOwner::LocalReference,
+            "Control-click opens references like Command-click"
+        );
+        assert_eq!(
+            pointer_owner(MouseModes::OFF, MouseButton::Left, &control),
+            PointerOwner::LocalReference
+        );
+        assert_eq!(
+            pointer_owner(reporting, MouseButton::Right, &control),
+            PointerOwner::Terminal,
+            "Control with other buttons still reaches the child"
         );
         assert_eq!(
             pointer_owner(MouseModes::UNKNOWN, MouseButton::Left, &plain),
