@@ -1,6 +1,8 @@
 //! One contextual home for session links. Status is always attached by URL.
 use super::*;
+use crate::fuzzy::{FuzzyMatcher, FuzzyQuery, PreparedText};
 use crate::palette_chrome::{PaletteTooltip, scroll_fades};
+use crate::query_editor::{self, ClipboardEdit, Edit, QueryEditor};
 use diri_proto::{ArtifactKind, PrCheck, PullRequestStatus, SessionArtifact};
 use diri_ui::{Icon, IconName};
 use gpui::{
@@ -12,6 +14,8 @@ const ROW_HEIGHT: f32 = 44.0;
 pub(super) struct SessionLinks {
     open: bool,
     pull_request: Option<String>,
+    /// Filters the home page only; a PR's detail page is short and fixed.
+    query: QueryEditor,
     selected: usize,
     parent_selection: usize,
     focus: FocusHandle,
@@ -23,6 +27,7 @@ impl SessionLinks {
         Self {
             open: false,
             pull_request: None,
+            query: QueryEditor::default(),
             selected: 0,
             parent_selection: 0,
             focus: cx.focus_handle(),
@@ -33,6 +38,7 @@ impl SessionLinks {
     pub(super) fn close(&mut self) {
         self.open = false;
         self.pull_request = None;
+        self.query.clear();
         self.selected = 0;
     }
 }
@@ -261,6 +267,30 @@ fn session_rows(session: &SessionRecord) -> Vec<LinkRow> {
     }
     rows
 }
+/// Rows matching `query` across what the row shows and where it goes, best
+/// match first; ties keep the chat's order.
+fn filter_rows(rows: Vec<LinkRow>, query: &str) -> Vec<LinkRow> {
+    let query = FuzzyQuery::new(query);
+    if query.is_empty() {
+        return rows;
+    }
+    let mut matcher = FuzzyMatcher::text();
+    let mut scored: Vec<_> = rows
+        .into_iter()
+        .filter_map(|row| {
+            let url = match &row.action {
+                LinkAction::Open(url) | LinkAction::PullRequest(url) => url.as_str(),
+                LinkAction::Account => "",
+            };
+            let haystack = PreparedText::new(&format!("{} {} {url}", row.title, row.subtitle));
+            query
+                .score(&haystack, &mut matcher)
+                .map(|score| (score, row))
+        })
+        .collect();
+    scored.sort_by_key(|(score, _)| std::cmp::Reverse(*score));
+    scored.into_iter().map(|(_, row)| row).collect()
+}
 fn detail_rows(pr: &PullRequestStatus) -> Vec<LinkRow> {
     let mut rows = vec![LinkRow {
         title: "Open on GitHub".into(),
@@ -334,7 +364,35 @@ impl TerminalPane {
         {
             return detail_rows(pr);
         }
-        session_rows(session)
+        filter_rows(session_rows(session), self.session_links.query.text())
+    }
+    /// The account row is a context action, not a link, so a search hides it.
+    fn links_has_account(&self, session: &SessionRecord) -> bool {
+        self.session_links.pull_request.is_none()
+            && self.session_links.query.is_empty()
+            && session.account_profile.is_some()
+    }
+    /// Applies a keystroke to the search field when it is a text edit.
+    fn links_edit_query(&mut self, event: &KeyDownEvent, cx: &mut Context<Self>) {
+        let Some(edit) = query_editor::edit_for(&event.keystroke) else {
+            return;
+        };
+        let query = &mut self.session_links.query;
+        let changed = match edit {
+            Edit::Local(local) => query.apply(local),
+            Edit::Clipboard(ClipboardEdit::Copy) => {
+                query_editor::copy_selection(query, cx);
+                false
+            }
+            Edit::Clipboard(ClipboardEdit::Cut) => query_editor::cut_selection(query, cx),
+            Edit::Clipboard(ClipboardEdit::Paste) => cx
+                .read_from_clipboard()
+                .and_then(|item| item.text())
+                .is_some_and(|text| query.insert(&text)),
+        };
+        if changed {
+            self.session_links.selected = 0;
+        }
     }
     pub(super) fn close_session_links(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.session_links.close();
@@ -392,10 +450,18 @@ impl TerminalPane {
             return;
         };
         let rows = self.links_rows(&session);
-        let has_account =
-            self.session_links.pull_request.is_none() && session.account_profile.is_some();
+        let has_account = self.links_has_account(&session);
         let action_count = rows.len() + usize::from(has_account);
+        let searching = self.session_links.pull_request.is_none();
+        let query = &self.session_links.query;
+        // → drills into a PR only once the caret has nowhere left to go.
+        let caret_at_end = query.selection().is_none() && query.cursor() == query.text().len();
+        let plain = !event.keystroke.modifiers.modified();
         match event.keystroke.key.as_str() {
+            "escape" if searching && !self.session_links.query.is_empty() => {
+                self.session_links.query.clear();
+                self.session_links.selected = 0;
+            }
             "escape" => self.close_session_links(window, cx),
             "left" | "backspace" if self.session_links.pull_request.is_some() => {
                 self.links_back(cx)
@@ -406,9 +472,11 @@ impl TerminalPane {
             }
             "up" => self.session_links.selected = self.session_links.selected.saturating_sub(1),
             "right"
-                if rows
-                    .get(self.session_links.selected)
-                    .is_some_and(|row| row.details.is_some()) =>
+                if plain
+                    && (!searching || caret_at_end)
+                    && rows
+                        .get(self.session_links.selected)
+                        .is_some_and(|row| row.details.is_some()) =>
             {
                 let url = rows[self.session_links.selected].details.as_ref().unwrap();
                 self.activate_link(&LinkAction::PullRequest(url.clone()), false, window, cx);
@@ -420,6 +488,7 @@ impl TerminalPane {
                     self.activate_link(&LinkAction::Account, false, window, cx);
                 }
             }
+            _ if searching => self.links_edit_query(event, cx),
             _ => {}
         }
         self.session_links
@@ -667,10 +736,8 @@ impl TerminalPane {
             self.session_links.selected = self.session_links.parent_selection;
         }
         let rows = self.links_rows(session);
-        let action_count = rows.len()
-            + usize::from(
-                self.session_links.pull_request.is_none() && session.account_profile.is_some(),
-            );
+        let has_account = self.links_has_account(session);
+        let action_count = rows.len() + usize::from(has_account);
         self.session_links.selected = self
             .session_links
             .selected
@@ -684,10 +751,25 @@ impl TerminalPane {
                 .iter()
                 .find(|pr| &pr.url == url)
         });
-        let title = pr.map_or_else(
-            || "Links".into(),
-            |pr| format!("Pull request #{}", pr.number),
-        );
+        let query = &self.session_links.query;
+        let title = match pr {
+            Some(pr) => div()
+                .truncate()
+                .font_weight(FontWeight::MEDIUM)
+                .text_color(colors.secondary)
+                .child(format!("Pull request #{}", pr.number))
+                .into_any_element(),
+            None if query.is_empty() => div()
+                .truncate()
+                .text_color(colors.tertiary)
+                .child("Search links")
+                .into_any_element(),
+            None => div()
+                .truncate()
+                .text_color(colors.primary)
+                .child(crate::navigation::query_label(query))
+                .into_any_element(),
+        };
         let header = div()
             .h(px(34.0))
             .pl(px(14.0))
@@ -695,6 +777,16 @@ impl TerminalPane {
             .flex()
             .items_center()
             .gap(px(6.0))
+            .when(pr.is_none(), |el| {
+                el.child(
+                    div()
+                        .w(px(20.0))
+                        .flex_none()
+                        .flex()
+                        .justify_center()
+                        .child(Icon::new(IconName::Search, 12.0, colors.tertiary)),
+                )
+            })
             .when(pr.is_some(), |el| {
                 el.child(
                     div()
@@ -716,13 +808,16 @@ impl TerminalPane {
             })
             .child(
                 div()
+                    .id("session-links-search")
+                    .debug_selector(|| "session-links-search".into())
                     .min_w(px(0.0))
                     .flex_1()
-                    .truncate()
+                    .h_full()
+                    .flex()
+                    .items_center()
+                    .when(pr.is_none(), |el| el.cursor_text())
                     .text_size(px(Typo::META.size))
                     .line_height(px(14.0))
-                    .font_weight(FontWeight::MEDIUM)
-                    .text_color(colors.secondary)
                     .child(title),
             )
             .child(
@@ -750,13 +845,18 @@ impl TerminalPane {
             .min(364.0)
             .min((f32::from(self.main_viewport.height) - 230.0).max(ROW_HEIGHT));
         let body = if rows.is_empty() {
+            let empty = if query.is_empty() || pr.is_some() {
+                "Links shared in this chat appear here.".to_owned()
+            } else {
+                format!("No links match \u{201c}{}\u{201d}", query.text().trim())
+            };
             div()
                 .px(px(14.0))
                 .pt(px(6.0))
                 .pb(px(14.0))
                 .text_size(px(13.0))
                 .text_color(colors.secondary)
-                .child("Links shared in this chat appear here.")
+                .child(empty)
                 .into_any_element()
         } else {
             let entity = cx.entity();
@@ -811,7 +911,7 @@ impl TerminalPane {
             .flex_col()
             .child(header)
             .child(div().pb(px(6.0)).child(body));
-        if pr.is_none() {
+        if pr.is_none() && query.is_empty() {
             let host = session
                 .host
                 .as_ref()
@@ -1259,6 +1359,52 @@ mod tests {
     }
 
     #[test]
+    fn search_matches_titles_and_urls_and_hides_the_rest() {
+        let session = fixture();
+        let rows = filter_rows(session_rows(&session), "notion");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].title, "Notion page");
+        // The PR row's title says nothing about the repo; its URL does.
+        let rows = filter_rows(session_rows(&session), "pull/180");
+        assert_eq!(
+            rows[0].action,
+            LinkAction::Open("https://github.com/diri/app/pull/180".into())
+        );
+        assert!(filter_rows(session_rows(&session), "zzzz-nothing").is_empty());
+        assert_eq!(filter_rows(session_rows(&session), "  ").len(), 4);
+    }
+    #[gpui::test]
+    fn typing_filters_links_and_escape_clears_before_closing(cx: &mut TestAppContext) {
+        cx.update(|cx| cx.set_reduce_motion(true));
+        let (runtime, tokio) = runtime(fixture());
+        let (pane, cx) =
+            cx.add_window_view(move |window, cx| TerminalPane::new(runtime, tokio, window, cx));
+        cx.simulate_resize(size(px(900.0), px(700.0)));
+        cx.run_until_parked();
+        let trigger = cx.debug_bounds("session-links-trigger").unwrap().center();
+        cx.simulate_click(trigger, Modifiers::default());
+        cx.run_until_parked();
+        cx.simulate_keystrokes("p r e v i e w");
+        cx.run_until_parked();
+        assert!(cx.debug_bounds("session-link-0").is_some());
+        assert!(cx.debug_bounds("session-link-1").is_none());
+        cx.simulate_keystrokes("escape");
+        cx.run_until_parked();
+        assert!(pane.read_with(cx, |p, _| p.session_links.open
+            && p.session_links.query.is_empty()));
+        assert!(cx.debug_bounds("session-link-3").is_some());
+        cx.simulate_keystrokes("n o t i o n enter");
+        assert_eq!(
+            cx.opened_url().as_deref(),
+            Some("https://www.notion.so/Workspace-notes")
+        );
+        assert!(!pane.read_with(cx, |p, _| p.session_links.open));
+        cx.simulate_click(trigger, Modifiers::default());
+        cx.run_until_parked();
+        assert!(pane.read_with(cx, |p, _| p.session_links.query.is_empty()));
+    }
+
+    #[test]
     fn closed_toolbar_only_flags_active_pull_requests() {
         let mut session = fixture();
         assert_eq!(link_count(&session), 4);
@@ -1397,6 +1543,9 @@ mod tests {
                 cx.new(|cx| {
                     let mut pane = TerminalPane::new(runtime, tokio, window, cx);
                     pane.session_links.open = true;
+                    if let Some(query) = std::env::var_os("DIRI_VISUAL_QUERY") {
+                        pane.session_links.query.insert(&query.to_string_lossy());
+                    }
                     if std::env::var_os("DIRI_VISUAL_DETAIL").is_some() {
                         pane.session_links.pull_request =
                             Some("https://github.com/diri/app/pull/181".into());
