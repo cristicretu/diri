@@ -1081,7 +1081,7 @@ impl ControlServer {
         // A linked worktree is an execution cwd inside the project selected
         // by the user; it does not become a new first-level sidebar project.
         record.project_id = crate::registry::session_project_id(&p.cwd, None);
-        registry.ensure_session_project(&p.cwd, None);
+        self.ensure_published_project(&mut registry, &p.cwd, None);
         if let Some(title) = &p.title {
             record.title = title.clone();
             record.title_source = diri_proto::TitleSource::DirijorAssigned;
@@ -1424,7 +1424,7 @@ impl ControlServer {
         };
         self.spawn_session_with_intent(spec, Some(record), tracked)?;
         let mut registry = self.registry.lock().map_err(poisoned)?;
-        registry.ensure_session_project(&captured.cwd, Some(&host.id));
+        self.ensure_published_project(&mut registry, &captured.cwd, Some(&host.id));
         if tracked {
             registry.persist_for_shutdown().map_err(io_control_error)?;
         } else {
@@ -1693,7 +1693,7 @@ impl ControlServer {
             let worktree = prepared.target_is_worktree.then(|| cwd.clone());
             let transcript = shuttle.local_target_path.clone();
             let local = target_host.is_none();
-            registry.ensure_session_project(&cwd, target_id.as_deref());
+            self.ensure_published_project(&mut registry, &cwd, target_id.as_deref());
             registry.update_record(&id, |record| {
                 record.host = target_id;
                 record.cwd = cwd;
@@ -2809,7 +2809,7 @@ impl ControlServer {
                 .map_err(io_control_error)?;
         }
         let mut registry = self.registry.lock().map_err(poisoned)?;
-        registry.ensure_session_project(&source.cwd, source.host.as_deref());
+        self.ensure_published_project(&mut registry, &source.cwd, source.host.as_deref());
         let _ = registry.persist();
         self.publish_updated(&registry, &id);
         let record = registry
@@ -3004,7 +3004,7 @@ impl ControlServer {
             record.title_source = diri_proto::TitleSource::FirstPrompt;
         }
         let spec = self.resume_spec(&registry, &id, &kind, &p.entry.cwd, Some(&p.entry.id))?;
-        registry.ensure_session_project(&p.entry.cwd, None);
+        self.ensure_published_project(&mut registry, &p.entry.cwd, None);
         registry
             .spawn(spec, record)
             .map_err(|error| ControlError::internal(error.to_string()))?;
@@ -3684,6 +3684,23 @@ impl ControlServer {
             std::process::exit(0);
         });
         Ok(json!({}))
+    }
+
+    /// Inserts the session root when it is not already a project, and tells
+    /// live clients. Hydrate only learns projects from `session.list`, so a
+    /// folder that first appears from a spawn stays out of the sidebar order
+    /// until this `project.updated`.
+    fn ensure_published_project(&self, registry: &mut Registry, root: &str, host: Option<&str>) {
+        let id = crate::registry::session_project_id(root, host).0;
+        let inserted = !registry
+            .projects_raw()
+            .iter()
+            .any(|project| project.get("id").and_then(|value| value.as_str()) == Some(id.as_str()));
+        let project = registry.ensure_session_project(root, host);
+        if inserted {
+            self.events
+                .publish(diri_proto::EventName::PROJECT_UPDATED, project, None);
+        }
     }
 
     /// Publishes `session.updated` with the session's current record.

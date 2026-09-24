@@ -1829,6 +1829,144 @@ fn synthetic_events_upsert_project_and_remove_with_neighbor_focus() {
     assert!(!store.sessions.contains_key(&id("one")));
 }
 
+/// A cwd the app has not hydrated still has to land in the sidebar order.
+/// The folder draws from the session either way; drag only sees ids that
+/// `reconcile_sidebar_order` copied out of the project map.
+#[cfg(unix)]
+#[test]
+fn spawned_project_is_published_into_sidebar_order() {
+    use std::io::{BufRead, BufReader, Write};
+    use std::os::unix::net::UnixStream;
+    use std::sync::Mutex;
+
+    use diri_proto::{ControlMessage, EventName, Project};
+
+    let root = tempdir().unwrap();
+    let cwd = root.path().join("fresh");
+    std::fs::create_dir(&cwd).unwrap();
+    let cwd = cwd.to_string_lossy().into_owned();
+    let (manifests, _) =
+        diri_engine::ManifestEngine::load_dir(&diri_engine::detect::bundled_manifest_dir())
+            .unwrap();
+    let registry = Arc::new(Mutex::new(diri_engine::Registry::new(
+        Arc::new(manifests),
+        root.path().join("state.json"),
+    )));
+    let server = Arc::new(diri_engine::ControlServer::new(
+        Arc::clone(&registry),
+        root.path().join("daemon.sock"),
+    ));
+    let bus = server.events().subscribe(
+        None,
+        diri_engine::events::Filter::new(
+            None,
+            Some(vec![
+                EventName::PROJECT_UPDATED.into(),
+                EventName::SESSION_UPDATED.into(),
+            ]),
+        ),
+    );
+    let listener = server.bind().unwrap();
+    let serving = {
+        let server = Arc::clone(&server);
+        std::thread::spawn(move || {
+            if let Ok((stream, _)) = listener.accept() {
+                let _ = server.serve(stream);
+            }
+        })
+    };
+    let client = UnixStream::connect(server.socket_path()).unwrap();
+    client
+        .set_read_timeout(Some(Duration::from_secs(10)))
+        .unwrap();
+    let mut writer = client.try_clone().unwrap();
+    let mut reader = BufReader::new(client);
+    {
+        let mut call = |request_id: u64, method: &str, params: serde_json::Value| {
+            let message = ControlMessage::Request {
+                id: request_id,
+                method: method.to_owned(),
+                params: Some(params),
+            };
+            let mut bytes = serde_json::to_vec(&message).unwrap();
+            bytes.push(b'\n');
+            writer.write_all(&bytes).unwrap();
+            writer.flush().unwrap();
+            let mut line = String::new();
+            reader.read_line(&mut line).unwrap();
+            match serde_json::from_str::<ControlMessage>(&line).unwrap() {
+                ControlMessage::Response {
+                    result: Ok(value), ..
+                } => value,
+                other => panic!("expected success, got {other:?}"),
+            }
+        };
+        let spawn_params = serde_json::json!({
+            "kind": { "shell": {} },
+            "cwd": cwd,
+            "argv": ["/bin/sh", "-c", "sleep 30"],
+        });
+
+        let first = call(1, "session.spawn", spawn_params.clone());
+        let session_id = first["id"].as_str().unwrap().to_owned();
+        let published = drain_ready(&bus);
+        let project_events: Vec<_> = published
+            .iter()
+            .filter(|event| event.name == EventName::PROJECT_UPDATED)
+            .collect();
+        assert_eq!(project_events.len(), 1, "a new cwd publishes one project");
+        assert!(project_events[0].params.get("pinnedOrder").is_none());
+        let inserted: Project = serde_json::from_value(project_events[0].params.clone()).unwrap();
+        assert_eq!(inserted.root, cwd);
+
+        let (mut store, _) = hydrated(
+            vec![session("kept", "kept", 1.0)],
+            vec![project("kept", "Kept")],
+            Prefs::default(),
+        );
+        for event in &published {
+            store.handle_event(EventEnvelope {
+                name: event.name.clone(),
+                seq: event.seq,
+                params: event.params.clone(),
+            });
+        }
+        let order = store.sidebar_project_order();
+        assert!(
+            order.contains(&pid("kept")) && order.contains(&inserted.id),
+            "reorder needs both project ids in the sidebar order: {order:?}"
+        );
+        assert_eq!(
+            store
+                .sessions
+                .get(&id(&session_id))
+                .map(|session| session.project_id.clone()),
+            Some(inserted.id)
+        );
+
+        let _second = call(2, "session.spawn", spawn_params);
+        let again = drain_ready(&bus);
+        assert!(
+            again
+                .iter()
+                .all(|event| event.name != EventName::PROJECT_UPDATED),
+            "an existing project is not published again: {again:?}"
+        );
+    }
+    let _ = writer.shutdown(std::net::Shutdown::Write);
+    drop(reader);
+    serving.join().unwrap();
+}
+
+#[cfg(unix)]
+fn drain_ready(events: &diri_engine::events::EventStream) -> Vec<diri_engine::events::Event> {
+    let mut found = Vec::new();
+    while let Some(event) = events.recv(Duration::ZERO) {
+        found.push(event);
+    }
+    found
+}
+
 #[test]
 fn identical_or_unrelated_daemon_events_do_not_publish_ui_changes() {
     let existing = session("one", "p", 1.0);

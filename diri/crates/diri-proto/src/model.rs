@@ -879,7 +879,9 @@ pub struct Project {
     pub id: ProjectId,
     pub root: String,
     pub name: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    /// Absent when the engine inserts a project from a root. That record is
+    /// unpinned; without `default` the app drops `project.updated`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pinned_order: Option<i64>,
     /// `None` means the root is local; a host id means that remote machine
     /// owns it. Absent from records persisted by older daemons — readers fall
