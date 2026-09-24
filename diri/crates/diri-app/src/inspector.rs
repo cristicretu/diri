@@ -15,8 +15,8 @@ use diri_proto::{
     SessionArtifact, SessionDiffBase, SessionId, SessionRecord, SessionStatus,
 };
 use diri_ui::{
-    AgentKind, AgentLogo, Appearance, Fill, FloatingSurface, GlassMenuRow, GlassPill, Ink,
-    LoadingIndicator, Metrics, Radius, SemanticColors, Typo,
+    AgentKind, Appearance, Fill, FloatingSurface, GlassMenuRow, GlassPill, Ink, LoadingIndicator,
+    Metrics, Radius, SemanticColors, Typo,
 };
 use gpui::{
     Animation, AnimationExt, AnyElement, App, Context, DragMoveEvent, Entity, EventEmitter,
@@ -35,6 +35,7 @@ use crate::git_review::{GitRepository, GitReviewError, PatchMutation, ReviewStat
 use crate::icons::{SymbolWeight, sf_symbol, sf_symbol_weighted};
 use crate::markdown::MarkdownDocument;
 use crate::markdown_view::render_markdown;
+use crate::palette_chrome::PaletteTooltip;
 use crate::query_editor::{self, ClipboardEdit, Edit, QueryEditor};
 use crate::quote::{Quote, QuoteSource};
 use crate::review_prompt::{ReviewEvidence, ReviewLayer, ReviewPrompt};
@@ -110,32 +111,12 @@ pub struct BrowserState {
 }
 
 impl InspectorTab {
-    const DETAILS: [Self; 2] = [Self::Info, Self::Artifacts];
-
-    const fn label(self) -> &'static str {
-        match self {
-            Self::Info => "Info",
-            Self::Changes => "Review",
-            Self::Code => "Code",
-            Self::Artifacts => "Artifacts",
-        }
-    }
-
     const fn index(self) -> i8 {
         match self {
             Self::Info => 0,
             Self::Changes => 1,
             Self::Code => 2,
             Self::Artifacts => 3,
-        }
-    }
-
-    const fn debug_selector(self) -> &'static str {
-        match self {
-            Self::Info => "INSPECTOR_TAB_INFO",
-            Self::Changes => "INSPECTOR_TAB_CHANGES",
-            Self::Code => "INSPECTOR_TAB_CODE",
-            Self::Artifacts => "INSPECTOR_TAB_ARTIFACTS",
         }
     }
 }
@@ -152,21 +133,37 @@ pub enum WorkspaceSurface {
 }
 
 impl WorkspaceSurface {
-    const CATALOG: [Self; 5] = [
-        Self::Browser,
-        Self::Terminal,
-        Self::Files,
-        Self::Review,
-        Self::Details,
-    ];
+    /// What the overflow menu offers. Review is always open, so it is not
+    /// listed; Preview is, because a second Preview is a new tab.
+    const OVERFLOW: [Self; 4] = [Self::Browser, Self::Files, Self::Terminal, Self::Details];
 
     const fn label(self) -> &'static str {
         match self {
             Self::Details => "Details",
-            Self::Browser => "Browser",
+            Self::Browser => "Preview",
             Self::Terminal => "Terminal",
             Self::Files => "Files",
             Self::Review => "Review",
+        }
+    }
+
+    const fn hint(self) -> &'static str {
+        match self {
+            Self::Details => "Facts, PRs, links",
+            Self::Browser => "Local app or URL",
+            Self::Terminal => "Shell beside agent",
+            Self::Files => "Browse the tree",
+            Self::Review => "File changes",
+        }
+    }
+
+    const fn debug_selector(self) -> &'static str {
+        match self {
+            Self::Details => "INSPECTOR_SURFACE_DETAILS",
+            Self::Browser => "INSPECTOR_SURFACE_PREVIEW",
+            Self::Terminal => "INSPECTOR_SURFACE_TERMINAL",
+            Self::Files => "INSPECTOR_SURFACE_FILES",
+            Self::Review => "INSPECTOR_SURFACE_REVIEW",
         }
     }
 
@@ -289,6 +286,23 @@ const INSPECTOR_FILES_MENU: crate::floating::Target<WorkbenchInspector> = crate:
     },
 };
 
+/// The overflow menu that opens Files, Terminal, Details, or another Preview.
+const INSPECTOR_SURFACE_MENU: crate::floating::Target<WorkbenchInspector> =
+    crate::floating::Target {
+        key: "inspector-surfaces",
+        radius: crate::floating::MENU_RADIUS,
+        content: WorkbenchInspector::surface_menu_panel_content,
+        dismiss: |this, _, cx| {
+            this.workspace_chooser_open = false;
+            cx.notify();
+        },
+    };
+const SURFACE_MENU_WIDTH: f32 = 236.0;
+/// Below this tab-row width the Preview placeholder shows only its icon.
+const COMPACT_PREVIEW_ROW_WIDTH: f32 = 270.0;
+/// One height for every row in Details, from facts to artifacts.
+const INFO_ROW_HEIGHT: f32 = 40.0;
+
 /// The comparison base menu as a panel target.
 const INSPECTOR_COMPARISON_MENU: crate::floating::Target<WorkbenchInspector> =
     crate::floating::Target {
@@ -344,7 +358,6 @@ pub struct WorkbenchInspector {
     review_action_task: Option<Task<()>>,
     review_action_busy: bool,
     review_feedback: Option<(bool, String)>,
-    status_evidence_open: bool,
     ask_draft: Option<AskDraft>,
     ask_query: QueryEditor,
     ask_task: Option<Task<()>>,
@@ -412,23 +425,15 @@ impl WorkbenchInspector {
                 }
             }
         });
-        let initial_surface = match selected_tab {
-            InspectorTab::Changes => WorkspaceSurface::Review,
-            InspectorTab::Code => WorkspaceSurface::Files,
-            InspectorTab::Info | InspectorTab::Artifacts => WorkspaceSurface::Details,
-        };
-        let mut workspace_tabs = vec![WorkspaceTab::new(0, WorkspaceSurface::Details)];
-        if initial_surface != WorkspaceSurface::Details {
+        // Review is always open. The remembered tab reopens beside it.
+        let initial_surface = remembered_surface(selected_tab);
+        let mut workspace_tabs = vec![WorkspaceTab::new(0, WorkspaceSurface::Review)];
+        if initial_surface != WorkspaceSurface::Review {
             workspace_tabs.push(WorkspaceTab::new(1, initial_surface));
         }
         if initial_surface == WorkspaceSurface::Files {
             workspace_tabs.last_mut().unwrap().viewer = Some(code_viewer.clone());
         }
-        workspace_tabs[0].details_tab = if selected_tab == InspectorTab::Artifacts {
-            InspectorTab::Artifacts
-        } else {
-            InspectorTab::Info
-        };
         let workspace_active = workspace_tabs.last().map(|tab| tab.id);
         Self {
             runtime,
@@ -478,7 +483,6 @@ impl WorkbenchInspector {
             review_action_task: None,
             review_action_busy: false,
             review_feedback: None,
-            status_evidence_open: false,
             ask_draft: None,
             ask_query: QueryEditor::default(),
             ask_task: None,
@@ -597,7 +601,6 @@ impl WorkbenchInspector {
         self.workspace_chooser_open
             || self.comparison_menu_open
             || self.files_open
-            || self.status_evidence_open
             || self.ask_draft.is_some()
             || self.commit_open
     }
@@ -908,16 +911,19 @@ impl WorkbenchInspector {
             .insert(self.workspace_session.take(), previous);
         self.prune_session_workspaces();
         self.workspace_session = session.clone();
+        let mut fresh = false;
         let next = self.session_workspaces.remove(&session).unwrap_or_else(|| {
+            fresh = true;
             let id = self.next_workspace_id;
             self.next_workspace_id += 1;
             SessionWorkspace {
-                tabs: vec![WorkspaceTab::new(id, WorkspaceSurface::Details)],
+                tabs: vec![WorkspaceTab::new(id, WorkspaceSurface::Review)],
                 active: Some(id),
                 visible: self.visible,
                 next_terminal_slot: 0,
             }
         });
+        let mut active = next.active;
         self.workspace_tabs = next.tabs;
         self.next_terminal_slot = next.next_terminal_slot;
         self.visible = next.visible;
@@ -925,7 +931,6 @@ impl WorkbenchInspector {
         self.workspace_chooser_open = false;
         self.comparison_menu_open = false;
         self.files_open = false;
-        self.status_evidence_open = false;
         self.commit_open = false;
         self.ask_draft = None;
         self.ask_feedback = None;
@@ -951,7 +956,17 @@ impl WorkbenchInspector {
         self.state = LoadState::NoSession;
         self.review_state = ReviewLoadState::NoSession;
         self.transcript_state = TranscriptLoadState::Unavailable;
-        if let Some(id) = next.active
+        if fresh {
+            // A conversation seen for the first time reopens the remembered
+            // surface beside Review, as a new window does.
+            let remembered = remembered_surface(self.selected_tab);
+            if remembered != WorkspaceSurface::Review {
+                let tab = self.new_tab(remembered, cx);
+                active = Some(tab.id);
+                self.workspace_tabs.push(tab);
+            }
+        }
+        if let Some(id) = active
             && let Some(surface) = self.load_workspace(id, cx)
         {
             cx.emit(InspectorEvent::WorkspaceRestored(surface));
@@ -1041,7 +1056,27 @@ impl WorkbenchInspector {
         }
     }
 
+    /// Review is one tab per conversation; every other surface may open more
+    /// than once.
     fn add_workspace(&mut self, surface: WorkspaceSurface, cx: &mut Context<Self>) {
+        self.workspace_chooser_open = false;
+        if surface == WorkspaceSurface::Review
+            && let Some(existing) = self
+                .workspace_tabs
+                .iter()
+                .find(|tab| tab.surface == WorkspaceSurface::Review)
+        {
+            self.activate_workspace(existing.id, cx);
+            return;
+        }
+        let tab = self.new_tab(surface, cx);
+        let id = tab.id;
+        self.workspace_tabs.push(tab);
+        self.activate_workspace(id, cx);
+    }
+
+    /// A tab with its own viewer or shell slot, not yet in the row.
+    fn new_tab(&mut self, surface: WorkspaceSurface, cx: &mut Context<Self>) -> WorkspaceTab {
         let id = self.next_workspace_id;
         self.next_workspace_id += 1;
         let mut tab = WorkspaceTab::new(id, surface);
@@ -1061,8 +1096,7 @@ impl WorkbenchInspector {
             tab.terminal_slot = Some(self.next_terminal_slot);
             self.next_terminal_slot += 1;
         }
-        self.workspace_tabs.push(tab);
-        self.activate_workspace(id, cx);
+        tab
     }
 
     fn activate_workspace(&mut self, id: u64, cx: &mut Context<Self>) {
@@ -1107,7 +1141,6 @@ impl WorkbenchInspector {
         self.workspace_selected = Some(surface);
         self.comparison_menu_open = false;
         self.files_open = false;
-        self.status_evidence_open = false;
         self.commit_open = false;
         self.ask_draft = None;
         self.browser_address_focused = false;
@@ -1143,10 +1176,15 @@ impl WorkbenchInspector {
         Some(surface)
     }
 
+    /// Review is the conversation's floor: it never closes, and the panel
+    /// falls back to it when the last other tab goes.
     fn close_workspace(&mut self, id: u64, cx: &mut Context<Self>) {
         let Some(index) = self.workspace_tabs.iter().position(|tab| tab.id == id) else {
             return;
         };
+        if self.workspace_tabs[index].surface == WorkspaceSurface::Review {
+            return;
+        }
         let tab = self.workspace_tabs.remove(index);
         self.workspace_chooser_open = false;
         if self.workspace_active == Some(id) {
@@ -1235,7 +1273,6 @@ impl WorkbenchInspector {
             self.ask_draft = None;
             self.ask_feedback = None;
             self.ask_query.clear();
-            self.status_evidence_open = false;
             self.transcript_version = None;
             let workspace = (!context.remote).then(|| context.cwd.clone());
             for tab in &self.workspace_tabs {
@@ -1600,189 +1637,74 @@ impl WorkbenchInspector {
         document
     }
 
-    fn render_header(
-        &self,
-        session: Option<&SessionRecord>,
-        colors: SemanticColors,
-        cx: &mut Context<Self>,
-    ) -> impl IntoElement {
-        let changes_count = match &self.state {
-            LoadState::Ready(snapshot) if snapshot.files > 0 => Some(snapshot.files),
-            _ => None,
-        };
-        let artifacts_count = session.map(artifact_count).filter(|count| *count > 0);
-        let selected_tab = self.selected_tab;
-        let mut tabs = div()
-            .min_w(px(0.0))
-            .flex_1()
-            .flex()
-            .items_center()
-            .gap(px(2.0));
-
-        for tab in InspectorTab::DETAILS {
-            let count = match tab {
-                InspectorTab::Info => None,
-                InspectorTab::Changes => changes_count,
-                InspectorTab::Code => None,
-                InspectorTab::Artifacts => artifacts_count,
-            };
-            let active = tab == selected_tab;
-            tabs = tabs.child(
+    /// The rows of the overflow menu, without host chrome.
+    fn surface_menu_items(&self, colors: SemanticColors, cx: &mut Context<Self>) -> gpui::Div {
+        let mut menu = div().py(px(4.0)).overflow_hidden();
+        for surface in WorkspaceSurface::OVERFLOW {
+            menu = menu.child(
                 div()
-                    .id(SharedString::from(format!("inspector-tab-{}", tab.label())))
-                    .debug_selector(move || tab.debug_selector().to_owned())
-                    .h(px(28.0))
-                    .px(px(6.0))
+                    .id(SharedString::from(format!(
+                        "workspace-catalog-{}",
+                        surface.label()
+                    )))
+                    .debug_selector(move || format!("workspace-catalog-{}", surface.label()))
+                    .h(px(34.0))
+                    .mx(px(4.0))
+                    .px(px(8.0))
                     .flex()
                     .items_center()
-                    .justify_center()
-                    .gap(px(5.0))
-                    .rounded(px(Radius::BADGE))
+                    .gap(px(8.0))
                     .cursor_pointer()
-                    .bg(if active {
-                        colors.primary.alpha(0.09)
-                    } else {
-                        colors.primary.alpha(0.0)
-                    })
-                    .hover(move |button| {
-                        button.bg(colors.primary.alpha(if active { 0.11 } else { 0.055 }))
-                    })
-                    .text_size(px(12.0))
-                    .font_weight(if active {
-                        FontWeight::SEMIBOLD
-                    } else {
-                        FontWeight::MEDIUM
-                    })
-                    .text_color(if active {
-                        colors.primary
-                    } else {
-                        colors.secondary
-                    })
-                    .child(tab.label())
-                    // Counts are useful context once a destination is open,
-                    // but four always-visible badges make the 300pt compact
-                    // inspector overlap its close control.
-                    .when_some(count.filter(|_| active), |tab, count| {
-                        tab.child(
-                            div()
-                                .min_w(px(16.0))
-                                .h(px(16.0))
-                                .px(px(4.0))
-                                .flex()
-                                .items_center()
-                                .justify_center()
-                                .rounded_full()
-                                .bg(colors.primary.alpha(if active { 0.10 } else { 0.06 }))
-                                .text_size(px(9.5))
-                                .font_weight(FontWeight::SEMIBOLD)
-                                .text_color(if active {
-                                    colors.secondary
-                                } else {
-                                    colors.tertiary
-                                })
-                                .child(count.to_string()),
-                        )
-                    })
-                    .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                    .rounded(px(Radius::inner(crate::floating::MENU_RADIUS, 4.0)))
+                    .glass_menu_row(colors, false)
+                    .child(sf_symbol(surface.icon(), 11.0, colors.secondary))
+                    .child(
+                        div()
+                            .flex_none()
+                            .whitespace_nowrap()
+                            .text_size(px(Typo::ROW.size))
+                            .text_color(colors.primary)
+                            .child(surface.label()),
+                    )
+                    .child(
+                        div()
+                            .min_w(px(0.0))
+                            .flex_1()
+                            .truncate()
+                            .text_align(gpui::TextAlign::Right)
+                            .text_size(px(Typo::META.size))
+                            .text_color(colors.tertiary)
+                            .child(surface.hint()),
+                    )
                     .on_click(cx.listener(move |this, _, _, cx| {
-                        this.select_tab(tab, cx);
+                        this.add_workspace(surface, cx);
                         cx.stop_propagation();
                     })),
             );
         }
-
-        div()
-            .h(px(Metrics::TITLE_BAR))
-            .flex_none()
-            .pl(px(8.0))
-            .pr(px(Metrics::TOOLBAR_EDGE_INSET))
-            .flex()
-            .items_center()
-            .gap(px(Metrics::TOOLBAR_COMPACT_GAP))
-            .child(tabs)
+        menu
     }
 
-    fn render_surface_chooser(&self, colors: SemanticColors, cx: &mut Context<Self>) -> AnyElement {
-        let choices = [
-            (WorkspaceSurface::Browser, "Open a local app or URL"),
-            (
-                WorkspaceSurface::Terminal,
-                "Start a shell in this workspace",
-            ),
-            (WorkspaceSurface::Files, "Browse workspace files"),
-            (WorkspaceSurface::Review, "Review file changes"),
-        ];
-        let mut cards = div().w_full().flex().flex_col().gap(px(8.0));
-        for pair in choices.chunks_exact(2) {
-            let mut row = div().w_full().flex().gap(px(8.0));
-            for &(surface, description) in pair {
-                row = row.child(
-                    div()
-                        .id(SharedString::from(format!(
-                            "workspace-open-{}",
-                            surface.label()
-                        )))
-                        .min_w(px(115.0))
-                        .flex_1()
-                        .p(px(14.0))
-                        .flex()
-                        .flex_col()
-                        .gap(px(7.0))
-                        .rounded(px(Radius::CARD))
-                        .border_1()
-                        .border_color(colors.primary.alpha(0.12))
-                        .bg(colors.primary.alpha(0.025))
-                        .cursor_pointer()
-                        .hover(move |card| {
-                            card.bg(colors.primary.alpha(0.055))
-                                .border_color(colors.primary.alpha(0.22))
-                        })
-                        .child(sf_symbol(surface.icon(), 17.0, colors.secondary))
-                        .child(
-                            div()
-                                .mt(px(8.0))
-                                .text_size(px(12.0))
-                                .font_weight(FontWeight::MEDIUM)
-                                .child(surface.label()),
-                        )
-                        .child(
-                            div()
-                                .text_size(px(11.0))
-                                .text_color(colors.tertiary)
-                                .child(description),
-                        )
-                        .on_click(
-                            cx.listener(move |this, _, _, cx| this.select_workspace(surface, cx)),
-                        ),
-                );
-            }
-            cards = cards.child(row);
+    fn surface_menu_panel_content(&mut self, cx: &mut Context<Self>) -> Option<AnyElement> {
+        if !self.workspace_chooser_open {
+            return None;
         }
-        div()
-            .size_full()
-            .p(px(20.0))
-            .flex()
-            .flex_col()
-            .justify_center()
-            .items_center()
-            .gap(px(10.0))
-            .child(
-                div()
-                    .text_size(px(14.0))
-                    .font_weight(FontWeight::MEDIUM)
-                    .child("Open a surface"),
+        let colors = self.panel_colors();
+        let items = self.surface_menu_items(colors, cx);
+        Some(
+            crate::floating::surface(
+                colors,
+                crate::floating::MENU_RADIUS,
+                SURFACE_MENU_WIDTH,
+                items,
             )
-            .child(
-                div()
-                    .mb(px(14.0))
-                    .text_size(px(11.0))
-                    .text_color(colors.tertiary)
-                    .child("Choose what to show in the right panel"),
-            )
-            .child(cards)
-            .into_any_element()
+            .into_any_element(),
+        )
     }
 
+    /// Review and Preview are the visible tabs; Files, Terminal, and Details
+    /// open from one overflow control at the trailing edge and then take a
+    /// tab of their own. Every tab but Review can be closed.
     fn render_workspace_header(
         &self,
         colors: SemanticColors,
@@ -1796,15 +1718,22 @@ impl WorkbenchInspector {
         let scroll = self.workspace_tab_scroll.clone();
         let previous_width = self.workspace_tab_width.clone();
         let inspector = cx.entity().downgrade();
+        let changes_count = match &self.state {
+            LoadState::Ready(snapshot) if snapshot.files > 0 => Some(snapshot.files),
+            _ => None,
+        };
         let mut tabs = div()
             .on_children_prepainted(move |_, window, _| {
                 let width = f32::from(scroll.bounds().size.width);
-                if previous_width.replace(width) != width
-                    && let Some(tab) = active_index.and_then(|index| scroll.bounds_for_item(index))
-                {
-                    // The first reveal can precede measured scroll bounds.
-                    // Reconcile after layout, including dock resizes, without
-                    // snapping back during ordinary horizontal scrolling.
+                if previous_width.replace(width) == width {
+                    return;
+                }
+                // The first reveal can precede measured scroll bounds.
+                // Reconcile after layout, including dock resizes, without
+                // snapping back during ordinary horizontal scrolling. The
+                // Preview placeholder also reads this width, so a changed
+                // width always earns one more frame.
+                if let Some(tab) = active_index.and_then(|index| scroll.bounds_for_item(index)) {
                     let viewport = scroll.bounds();
                     let mut offset = scroll.offset();
                     if tab.left() + offset.x < viewport.left() {
@@ -1814,13 +1743,13 @@ impl WorkbenchInspector {
                     }
                     if offset != scroll.offset() {
                         scroll.set_offset(offset);
-                        let inspector = inspector.clone();
-                        window.on_next_frame(move |_, cx| {
-                            let _ = inspector.update(cx, |_, cx| cx.notify());
-                        });
-                        window.request_animation_frame();
                     }
                 }
+                let inspector = inspector.clone();
+                window.on_next_frame(move |_, cx| {
+                    let _ = inspector.update(cx, |_, cx| cx.notify());
+                });
+                window.request_animation_frame();
             })
             .id("workspace-surface-tabs")
             .overflow_x_scroll()
@@ -1831,20 +1760,70 @@ impl WorkbenchInspector {
             .items_center()
             .gap(px(3.0));
 
+        let pill = |id: SharedString, active: bool| {
+            div()
+                .id(id)
+                .h(px(29.0))
+                .flex_none()
+                .max_w(px(160.0))
+                .min_w(px(0.0))
+                .px(px(7.0))
+                .flex()
+                .items_center()
+                .gap(px(5.0))
+                .rounded(px(Radius::BADGE))
+                .border_1()
+                .border_color(colors.primary.alpha(0.0))
+                .glass_pill(colors, active)
+                .text_color(if active {
+                    colors.primary
+                } else {
+                    colors.secondary
+                })
+                .cursor_pointer()
+                .hover(move |tab| {
+                    if active {
+                        tab
+                    } else {
+                        tab.bg(colors.primary.alpha(0.055))
+                    }
+                })
+                .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+        };
+        let pill_label = |label: String, active: bool| {
+            div()
+                .min_w(px(0.0))
+                .flex_1()
+                .truncate()
+                .text_size(px(11.0))
+                .font_weight(if active {
+                    FontWeight::SEMIBOLD
+                } else {
+                    FontWeight::MEDIUM
+                })
+                .child(label)
+        };
+
         for tab in &self.workspace_tabs {
             let surface = tab.surface;
             let id = tab.id;
             let active = selected == Some(id);
+            let tint = if active {
+                colors.primary
+            } else {
+                colors.tertiary
+            };
+            let state = if active {
+                &self.browser_state
+            } else {
+                &tab.browser_state
+            };
             let label = if surface == WorkspaceSurface::Browser {
-                (if active {
-                    &self.browser_state
-                } else {
-                    &tab.browser_state
-                })
-                .title
-                .clone()
-                .filter(|title| !title.is_empty())
-                .unwrap_or_else(|| surface.label().into())
+                state
+                    .title
+                    .clone()
+                    .filter(|title| !title.is_empty())
+                    .unwrap_or_else(|| surface.label().into())
             } else if let Some(label) = tab
                 .viewer
                 .as_ref()
@@ -1870,104 +1849,110 @@ impl WorkbenchInspector {
                     surface.label().into()
                 }
             };
-            tabs = tabs.child(
-                div()
-                    .id(SharedString::from(format!("workspace-tab-{}", id)))
-                    .debug_selector(move || format!("workspace-tab-{id}"))
-                    .h(px(29.0))
+            let icon = if surface == WorkspaceSurface::Browser && state.is_loading {
+                sf_symbol("arrow.triangle.2.circlepath", 10.5, tint)
+            } else if surface == WorkspaceSurface::Browser
+                && let Some(favicon) = &state.favicon
+            {
+                use gpui::StyledImage;
+                gpui::img(favicon.clone())
+                    .size(px(13.0))
                     .flex_none()
-                    .max_w(px(160.0))
-                    .min_w(px(0.0))
-                    .px(px(7.0))
-                    .flex()
-                    .items_center()
-                    .gap(px(5.0))
-                    .rounded(px(Radius::BADGE))
-                    .border_1()
-                    .border_color(colors.primary.alpha(0.0))
-                    .glass_pill(colors, active)
-                    .text_color(if active {
-                        colors.primary
-                    } else {
-                        colors.secondary
-                    })
-                    .cursor_pointer()
-                    .hover(move |tab| {
-                        if active {
-                            tab
-                        } else {
-                            tab.bg(colors.primary.alpha(0.055))
-                        }
-                    })
-                    .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
-                    .child({
-                        let state = if active {
-                            &self.browser_state
-                        } else {
-                            &tab.browser_state
-                        };
-                        let tint = if active {
-                            colors.primary
-                        } else {
-                            colors.tertiary
-                        };
-                        if surface == WorkspaceSurface::Browser && state.is_loading {
-                            sf_symbol("arrow.triangle.2.circlepath", 10.5, tint)
-                        } else if surface == WorkspaceSurface::Browser
-                            && let Some(favicon) = &state.favicon
-                        {
-                            use gpui::StyledImage;
-                            gpui::img(favicon.clone())
-                                .size(px(13.0))
-                                .flex_none()
-                                .with_fallback(move || sf_symbol("network", 10.5, tint))
-                                .into_any_element()
-                        } else {
-                            sf_symbol(surface.icon(), 10.5, tint)
-                        }
-                    })
-                    .child(
+                    .with_fallback(move || sf_symbol("network", 10.5, tint))
+                    .into_any_element()
+            } else {
+                sf_symbol(surface.icon(), 10.5, tint)
+            };
+            let mut element = pill(SharedString::from(format!("workspace-tab-{id}")), active)
+                .debug_selector(move || format!("workspace-tab-{id}"))
+                .child(
+                    div()
+                        .debug_selector(move || surface.debug_selector().to_owned())
+                        .flex_none()
+                        .child(icon),
+                )
+                .child(pill_label(label, active));
+            if surface == WorkspaceSurface::Review {
+                element = element.when_some(changes_count.filter(|_| active), |pill, count| {
+                    pill.child(
                         div()
-                            .min_w(px(0.0))
-                            .flex_1()
-                            .truncate()
-                            .text_size(px(11.0))
-                            .font_weight(if active {
-                                FontWeight::SEMIBOLD
-                            } else {
-                                FontWeight::MEDIUM
-                            })
-                            .child(label),
-                    )
-                    .child(
-                        div()
-                            .id(SharedString::from(format!("close-workspace-{}", id)))
-                            .debug_selector(move || format!("close-workspace-{id}"))
-                            .size(px(16.0))
-                            .flex_none()
+                            .min_w(px(16.0))
+                            .h(px(16.0))
+                            .px(px(4.0))
                             .flex()
                             .items_center()
                             .justify_center()
                             .rounded_full()
-                            .text_color(colors.tertiary)
-                            .hover(move |button| {
-                                button
-                                    .bg(colors.primary.alpha(0.09))
-                                    .text_color(colors.secondary)
-                            })
-                            .on_click(cx.listener(move |this, _, _, cx| {
-                                this.close_workspace(id, cx);
-                                cx.stop_propagation();
-                            }))
-                            .child(sf_symbol("xmark", 8.5, colors.tertiary)),
+                            .bg(colors.primary.alpha(0.10))
+                            .text_size(px(9.5))
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .text_color(colors.secondary)
+                            .child(count.to_string()),
                     )
+                });
+            } else {
+                element = element.child(
+                    div()
+                        .id(SharedString::from(format!("close-workspace-{id}")))
+                        .debug_selector(move || format!("close-workspace-{id}"))
+                        .size(px(16.0))
+                        .flex_none()
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .rounded_full()
+                        .text_color(colors.tertiary)
+                        .hover(move |button| {
+                            button
+                                .bg(colors.primary.alpha(0.09))
+                                .text_color(colors.secondary)
+                        })
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            this.close_workspace(id, cx);
+                            cx.stop_propagation();
+                        }))
+                        .child(sf_symbol("xmark", 8.5, colors.tertiary)),
+                );
+            }
+            tabs = tabs.child(element.on_click(cx.listener(move |this, _, _, cx| {
+                this.activate_workspace(id, cx);
+                cx.stop_propagation();
+            })));
+        }
+
+        let has_preview = self
+            .workspace_tabs
+            .iter()
+            .any(|tab| tab.surface == WorkspaceSurface::Browser);
+        if !has_preview {
+            // In a narrow panel with other tabs open, the placeholder keeps
+            // only its icon so the row never scrolls just to offer Preview.
+            let row_width = self.workspace_tab_width.get();
+            let compact = row_width > 0.0
+                && row_width < COMPACT_PREVIEW_ROW_WIDTH
+                && self.workspace_tabs.len() > 1;
+            let surface = WorkspaceSurface::Browser;
+            tabs = tabs.child(
+                pill("workspace-open-preview".into(), false)
+                    .debug_selector(|| surface.debug_selector().to_owned())
+                    .child(sf_symbol(surface.icon(), 10.5, colors.tertiary))
+                    .when(!compact, |pill| {
+                        pill.child(pill_label(surface.label().into(), false))
+                    })
+                    .when(compact, |pill| {
+                        pill.tooltip(move |_, cx| {
+                            cx.new(|_| PaletteTooltip("Preview".to_owned(), colors))
+                                .into()
+                        })
+                    })
                     .on_click(cx.listener(move |this, _, _, cx| {
-                        this.activate_workspace(id, cx);
+                        this.select_workspace(surface, cx);
                         cx.stop_propagation();
                     })),
             );
         }
 
+        let chooser_open = self.workspace_chooser_open;
         let mut header = div()
             .id("workspace-surface-header")
             .relative()
@@ -1983,8 +1968,8 @@ impl WorkbenchInspector {
             .child(tabs)
             .child(
                 div()
-                    .id("workspace-add-surface")
-                    .debug_selector(|| "workspace-add-surface".into())
+                    .id("workspace-more-surfaces")
+                    .debug_selector(|| "workspace-more-surfaces".into())
                     .size(px(Metrics::TOOLBAR_CONTROL_SIZE))
                     .flex_none()
                     .flex()
@@ -1992,8 +1977,9 @@ impl WorkbenchInspector {
                     .justify_center()
                     .rounded(px(Radius::BADGE))
                     .cursor_pointer()
+                    .when(chooser_open, |button| button.bg(Fill::subtle(colors)))
                     .hover(move |button| button.bg(Fill::subtle(colors)))
-                    .child(sf_symbol("plus", 13.0, colors.secondary))
+                    .child(sf_symbol("ellipsis", 13.0, colors.secondary))
                     .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
                     .on_click(cx.listener(|this, _, _, cx| {
                         this.workspace_chooser_open = !this.workspace_chooser_open;
@@ -2026,57 +2012,57 @@ impl WorkbenchInspector {
                     })),
             );
 
-        if self.workspace_chooser_open {
-            let mut catalog = div()
-                .id("workspace-surface-catalog")
-                .absolute()
-                .top(px(Metrics::TITLE_BAR - 2.0))
-                .right(px(35.0))
-                .w(px(196.0))
-                .p(px(5.0))
-                .flex()
-                .flex_col()
-                .gap(px(2.0))
-                .rounded(px(Radius::CARD))
-                .bg(colors.sidebar_surface())
-                .border_1()
-                .border_color(colors.primary.alpha(0.14))
-                .shadow_lg();
-            for surface in WorkspaceSurface::CATALOG {
-                catalog = catalog.child(
-                    div()
-                        .id(SharedString::from(format!(
-                            "workspace-catalog-{}",
-                            surface.label()
-                        )))
-                        .debug_selector(move || format!("workspace-catalog-{}", surface.label()))
-                        .h(px(32.0))
-                        .px(px(8.0))
-                        .flex()
-                        .items_center()
-                        .gap(px(8.0))
-                        .rounded(px(Radius::BADGE))
-                        .cursor_pointer()
-                        .hover(move |row| row.bg(colors.primary.alpha(0.07)))
-                        .child(sf_symbol(surface.icon(), 11.0, colors.secondary))
-                        .child(
-                            div()
-                                .flex_1()
-                                .text_size(px(11.5))
-                                .text_color(colors.primary)
-                                .child(surface.label()),
+        if chooser_open {
+            let top = Metrics::TITLE_BAR - 2.0;
+            let right = Metrics::TOOLBAR_EDGE_INSET + Metrics::TOOLBAR_CONTROL_SIZE + 4.0;
+            if crate::floating::uses_panels(false, colors, cx) {
+                let items = self.surface_menu_items(colors, cx);
+                header = header.child(
+                    crate::floating::host_here(
+                        INSPECTOR_SURFACE_MENU,
+                        crate::floating::surface(
+                            colors,
+                            crate::floating::MENU_RADIUS,
+                            SURFACE_MENU_WIDTH,
+                            items,
                         )
-                        .on_click(cx.listener(move |this, _, _, cx| {
-                            this.add_workspace(surface, cx);
-                            cx.stop_propagation();
-                        })),
+                        .into_any_element(),
+                        Some(SURFACE_MENU_WIDTH),
+                        gpui::Anchor::TopRight,
+                        8.0,
+                        cx,
+                    )
+                    .absolute()
+                    .top(px(top))
+                    .right(px(right))
+                    .w(px(0.0))
+                    .h(px(0.0)),
                 );
+            } else {
+                let items = self.surface_menu_items(colors, cx);
+                header = header.child(deferred(
+                    div()
+                        .id("workspace-surface-catalog")
+                        .debug_selector(|| "workspace-surface-catalog".into())
+                        .absolute()
+                        .top(px(top))
+                        .right(px(right))
+                        .w(px(SURFACE_MENU_WIDTH))
+                        .occlude()
+                        .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                        .on_mouse_down_out(cx.listener(|this, _, _, cx| {
+                            this.workspace_chooser_open = false;
+                            cx.notify();
+                        }))
+                        .child(
+                            FloatingSurface::new(colors, items)
+                                .radius(crate::floating::MENU_RADIUS),
+                        ),
+                ));
             }
-            header = header.child(deferred(catalog.occlude()));
         }
         header.into_any_element()
     }
-
     fn browser_url(&self) -> Option<String> {
         let typed = self.browser_query.text().trim();
         if typed.is_empty() {
@@ -2361,6 +2347,9 @@ impl WorkbenchInspector {
         )
     }
 
+    /// One scroll of session facts, densest first: the fact block, pull
+    /// requests, an open question, other artifacts and ports, the working
+    /// tree, and the latest turns of the conversation.
     fn render_info(
         &mut self,
         session: Option<&SessionRecord>,
@@ -2373,7 +2362,7 @@ impl WorkbenchInspector {
                     colors,
                     "sidebar.left",
                     "Select a session",
-                    "Info follows the active agent.",
+                    "Details follow the active agent.",
                 )
                 .into_any_element();
         };
@@ -2395,75 +2384,42 @@ impl WorkbenchInspector {
                 .map(|host| store.host_display_name(host));
             (project_name, host_name)
         };
-        let kind = ui_agent_kind(session.effective_kind());
-        let (status_label, status_color) = session_status(session, colors);
-        let artifact_total = artifact_count(session);
+        let (status_label, _) = session_status(session, colors);
 
-        let hero = div()
-            .p(px(14.0))
-            .flex()
-            .flex_col()
-            .gap(px(12.0))
+        let mut facts = div()
+            .id("inspector-facts")
+            .debug_selector(|| "INSPECTOR_FACTS".to_owned())
             .rounded(px(Radius::CARD))
-            .bg(colors.primary.alpha(0.035))
+            .bg(colors.primary.alpha(0.025))
             .border_1()
-            .border_color(colors.primary.alpha(0.065))
-            .child(
-                div()
-                    .flex()
-                    .items_start()
-                    .gap(px(11.0))
-                    .child(AgentLogo::new(kind, 36.0, colors))
-                    .child(
-                        div()
-                            .min_w(px(0.0))
-                            .flex_1()
-                            .flex()
-                            .flex_col()
-                            .gap(px(3.0))
-                            .child(
-                                div()
-                                    .text_size(px(Typo::DISPLAY_TITLE.size))
-                                    .font_weight(Typo::DISPLAY_TITLE.weight)
-                                    .text_color(colors.primary)
-                                    .child(session.title.clone()),
-                            )
-                            .child(
-                                div()
-                                    .flex()
-                                    .items_center()
-                                    .gap(px(5.0))
-                                    .text_size(px(Typo::META.size))
-                                    .text_color(colors.tertiary)
-                                    .child(kind.label())
-                                    .child("·")
-                                    .child(project_name.clone()),
-                            ),
-                    ),
-            )
-            .child(
-                div()
-                    .flex()
-                    .items_center()
-                    .justify_between()
-                    .child(
-                        div()
-                            .flex()
-                            .items_center()
-                            .gap(px(7.0))
-                            .text_size(px(Typo::META.size))
-                            .font_weight(FontWeight::MEDIUM)
-                            .text_color(status_color)
-                            .child(div().size(px(7.0)).rounded_full().bg(status_color))
-                            .child(status_label),
-                    )
-                    .child(
-                        div()
-                            .text_size(px(Typo::META.size))
-                            .text_color(colors.tertiary)
-                            .child(format!("Updated {}", relative_time(session.updated_at.0))),
-                    ),
-            );
+            .border_color(colors.primary.alpha(0.055))
+            .overflow_hidden()
+            .child(detail_row(
+                "Status",
+                format!(
+                    "{status_label} · {}",
+                    ui_agent_kind(session.effective_kind()).label()
+                ),
+                false,
+                colors,
+            ))
+            .child(detail_row("Project", project_name, false, colors))
+            .child(detail_row("Directory", session.cwd.clone(), true, colors));
+        if let Some(host) = host_name {
+            facts = facts.child(detail_row("Host", host, false, colors));
+        }
+        if let Some(branch) = &session.git_branch {
+            facts = facts.child(detail_row("Branch", branch.clone(), true, colors));
+        }
+        if let Some(bytes) = session.memory_bytes {
+            facts = facts.child(detail_row("Memory", format_bytes(bytes), false, colors));
+        }
+        facts = facts.child(detail_row(
+            "Updated",
+            relative_time(session.updated_at.0),
+            false,
+            colors,
+        ));
 
         let mut content = div()
             .id("inspector-info-scroll")
@@ -2474,76 +2430,13 @@ impl WorkbenchInspector {
             .pb(px(18.0))
             .flex()
             .flex_col()
-            .gap(px(14.0))
+            .gap(px(10.0))
             .overflow_y_scroll()
-            .child(hero);
+            .child(facts);
 
-        content = content.child(self.render_status_evidence(session, colors, cx));
-
-        if let Some(transcript) = self.render_transcript(session, colors, cx) {
-            content = content
-                .child(section_label("Recent conversation", colors))
-                .child(transcript);
-        }
-
-        if let Some(detail) = &session.needs_input {
-            let risk_color = if detail.risk_hint == diri_proto::RiskHint::Destructive {
-                Ink::DANGER
-            } else {
-                Ink::ATTENTION
-            };
-            content = content.child(
-                div()
-                    .p(px(12.0))
-                    .flex()
-                    .items_start()
-                    .gap(px(9.0))
-                    .rounded(px(Radius::CARD))
-                    .bg(risk_color.alpha(0.10))
-                    .border_1()
-                    .border_color(risk_color.alpha(0.22))
-                    .child(sf_symbol("questionmark.bubble", 15.0, risk_color))
-                    .child(
-                        div()
-                            .min_w(px(0.0))
-                            .flex_1()
-                            .flex()
-                            .flex_col()
-                            .gap(px(3.0))
-                            .child(
-                                div()
-                                    .text_size(px(Typo::ROW_EMPHASIZED.size))
-                                    .font_weight(Typo::ROW_EMPHASIZED.weight)
-                                    .text_color(colors.primary)
-                                    .child("Needs your input"),
-                            )
-                            .child(
-                                div()
-                                    .text_size(px(Typo::META.size))
-                                    .text_color(colors.secondary)
-                                    .child(detail.summary.clone()),
-                            ),
-                    ),
-            );
-        }
-
-        content = content
-            .child(section_label("Git status", colors))
-            .child(self.render_git_summary(colors, cx));
-
-        if let Some(pull_requests) = session.pull_requests.as_deref()
-            && !pull_requests.is_empty()
-        {
-            content = content.child(section_label(
-                if pull_requests.len() == 1 {
-                    "Pull request"
-                } else {
-                    "Pull requests"
-                },
-                colors,
-            ));
+        if let Some(pull_requests) = session.pull_requests.as_deref() {
             let inspector = cx.entity();
-            for pull_request in pull_requests.iter().take(2) {
+            for pull_request in pull_requests {
                 let body = pull_request
                     .body
                     .as_deref()
@@ -2560,66 +2453,75 @@ impl WorkbenchInspector {
             }
         }
 
-        if artifact_total > 0 {
-            content = content.child(section_label("Artifacts", colors)).child(
+        if let Some(detail) = &session.needs_input {
+            let risk_color = if detail.risk_hint == diri_proto::RiskHint::Destructive {
+                Ink::DANGER
+            } else {
+                Ink::ATTENTION
+            };
+            content = content.child(
                 div()
-                    .id("inspector-artifacts-summary")
-                    .h(px(44.0))
+                    .min_h(px(INFO_ROW_HEIGHT))
                     .px(px(11.0))
+                    .py(px(8.0))
                     .flex()
                     .items_center()
                     .gap(px(9.0))
                     .rounded(px(Radius::ROW))
-                    .bg(colors.primary.alpha(0.035))
+                    .bg(risk_color.alpha(0.10))
                     .border_1()
-                    .border_color(colors.primary.alpha(0.06))
-                    .cursor_pointer()
-                    .hover(move |row| row.bg(colors.primary.alpha(0.065)))
-                    .child(sf_symbol("shippingbox", 14.0, colors.secondary))
+                    .border_color(risk_color.alpha(0.22))
+                    .child(sf_symbol("bubble.left", 14.0, risk_color))
                     .child(
                         div()
                             .min_w(px(0.0))
                             .flex_1()
-                            .text_size(px(Typo::ROW.size))
-                            .text_color(colors.primary)
-                            .child(format!(
-                                "{artifact_total} {} discovered",
-                                if artifact_total == 1 {
-                                    "artifact"
-                                } else {
-                                    "artifacts"
-                                }
-                            )),
-                    )
-                    .child(sf_symbol("chevron.right", 11.0, colors.tertiary))
-                    .on_click(cx.listener(|this, _, _, cx| {
-                        this.select_tab(InspectorTab::Artifacts, cx);
-                        cx.stop_propagation();
-                    })),
+                            .flex()
+                            .flex_col()
+                            .gap(px(2.0))
+                            .child(
+                                div()
+                                    .text_size(px(Typo::ROW_EMPHASIZED.size))
+                                    .font_weight(Typo::ROW_EMPHASIZED.weight)
+                                    .text_color(colors.primary)
+                                    .child("Needs your input"),
+                            )
+                            .child(
+                                div()
+                                    .truncate()
+                                    .text_size(px(Typo::META.size))
+                                    .text_color(colors.secondary)
+                                    .child(detail.summary.clone()),
+                            ),
+                    ),
             );
         }
 
-        let mut details = div()
-            .rounded(px(Radius::CARD))
-            .bg(colors.primary.alpha(0.025))
-            .border_1()
-            .border_color(colors.primary.alpha(0.055))
-            .overflow_hidden()
-            .child(detail_row("Project", project_name, false, colors))
-            .child(detail_row("Directory", session.cwd.clone(), true, colors));
-        if let Some(branch) = &session.git_branch {
-            details = details.child(detail_row("Branch", branch.clone(), true, colors));
+        if let Some(artifacts) = session.artifacts.as_deref() {
+            for artifact in artifacts {
+                let represented_by_status = artifact.kind == ArtifactKind::PullRequest
+                    && session.pull_requests.as_deref().is_some_and(|statuses| {
+                        statuses.iter().any(|status| status.url == artifact.url)
+                    });
+                if !represented_by_status {
+                    content = content.child(render_artifact_row(artifact, colors));
+                }
+            }
         }
-        if let Some(host) = host_name {
-            details = details.child(detail_row("Host", host, false, colors));
+        if let Some(ports) = session.listening_ports.as_deref() {
+            for port in ports {
+                content = content.child(render_port_row(port, colors));
+            }
         }
-        if let Some(bytes) = session.memory_bytes {
-            details = details.child(detail_row("Memory", format_bytes(bytes), false, colors));
+
+        content = content.child(self.render_git_summary(colors, cx));
+
+        if let Some(transcript) = self.render_transcript(session, colors, cx) {
+            content = content
+                .child(section_label("Recent conversation", colors))
+                .child(transcript);
         }
-        content
-            .child(section_label("Details", colors))
-            .child(details)
-            .into_any_element()
+        content.into_any_element()
     }
 
     fn render_transcript(
@@ -2706,180 +2608,6 @@ impl WorkbenchInspector {
         Some(list.into_any_element())
     }
 
-    fn render_status_evidence(
-        &self,
-        session: &SessionRecord,
-        colors: SemanticColors,
-        cx: &mut Context<Self>,
-    ) -> AnyElement {
-        let evidence = session
-            .status_evidence
-            .as_ref()
-            .filter(|evidence| evidence.status == session.status);
-        let open = self.status_evidence_open;
-        let mut disclosure = div()
-            .rounded(px(Radius::CARD))
-            .bg(colors.primary.alpha(0.025))
-            .border_1()
-            .border_color(colors.primary.alpha(0.055))
-            .overflow_hidden()
-            .child(
-                div()
-                    .id("toggle-status-evidence")
-                    .debug_selector(|| "STATUS_EVIDENCE_TOGGLE".to_owned())
-                    .min_h(px(42.0))
-                    .px(px(11.0))
-                    .flex()
-                    .items_center()
-                    .gap(px(8.0))
-                    .cursor_pointer()
-                    .hover(move |row| row.bg(colors.primary.alpha(0.04)))
-                    .child(sf_symbol(
-                        if open {
-                            "chevron.down"
-                        } else {
-                            "chevron.right"
-                        },
-                        9.5,
-                        colors.tertiary,
-                    ))
-                    .child(
-                        div()
-                            .min_w(px(0.0))
-                            .flex_1()
-                            .flex()
-                            .flex_col()
-                            .gap(px(2.0))
-                            .child(
-                                div()
-                                    .text_size(px(Typo::ROW.size))
-                                    .font_weight(FontWeight::MEDIUM)
-                                    .text_color(colors.primary)
-                                    .child("Why Diri thinks this"),
-                            )
-                            .child(
-                                div()
-                                    .text_size(px(Typo::META.size))
-                                    .text_color(colors.tertiary)
-                                    .child(evidence.map_or(
-                                        "No decision evidence from this daemon build",
-                                        |evidence| {
-                                            crate::status_debug::source_name(evidence.source)
-                                        },
-                                    )),
-                            ),
-                    )
-                    .on_click(cx.listener(|this, _, _, cx| {
-                        this.status_evidence_open = !this.status_evidence_open;
-                        cx.notify();
-                        cx.stop_propagation();
-                    })),
-            );
-
-        if !open {
-            return disclosure.into_any_element();
-        }
-
-        let mut details = div()
-            .px(px(11.0))
-            .pb(px(11.0))
-            .flex()
-            .flex_col()
-            .gap(px(7.0))
-            .border_t_1()
-            .border_color(colors.primary.alpha(0.055));
-        if let Some(evidence) = evidence {
-            details = details
-                .pt(px(10.0))
-                .child(
-                    div()
-                        .text_size(px(Typo::META.size))
-                        .line_height(px(16.0))
-                        .text_color(colors.secondary)
-                        .child(status_evidence_explanation(evidence.source)),
-                )
-                .child(status_evidence_row(
-                    "Signal",
-                    relative_time(evidence.signal_at.0),
-                    colors,
-                ));
-            if let Some(manifest) =
-                crate::status_debug::safe_identifier(evidence.manifest_id.as_deref())
-            {
-                let version =
-                    crate::status_debug::safe_identifier(evidence.manifest_version.as_deref());
-                details = details.child(status_evidence_row(
-                    "Manifest",
-                    version.map_or(manifest.clone(), |version| format!("{manifest}@{version}")),
-                    colors,
-                ));
-            }
-            if let Some(rule) =
-                crate::status_debug::safe_identifier(evidence.matched_rule_id.as_deref())
-            {
-                details = details.child(status_evidence_row("Matched rule", rule, colors));
-            }
-            if evidence.startup_grace_active {
-                details = details.child(status_evidence_row(
-                    "Startup grace",
-                    "Active — holding weak early signals".to_owned(),
-                    colors,
-                ));
-            }
-            if evidence.anti_flicker_active {
-                details = details.child(status_evidence_row(
-                    "Anti-flicker",
-                    "Active — waiting for confirmation".to_owned(),
-                    colors,
-                ));
-            }
-            if let Some(reason) = evidence.fallback_reason {
-                details = details.child(status_evidence_row(
-                    "Fallback",
-                    crate::status_debug::fallback_name(reason).to_owned(),
-                    colors,
-                ));
-            }
-        } else {
-            details = details.pt(px(10.0)).child(
-                div()
-                    .text_size(px(Typo::META.size))
-                    .line_height(px(16.0))
-                    .text_color(colors.secondary)
-                    .child("This session record predates decision evidence. Its normal status remains available above."),
-            );
-        }
-
-        let report = crate::status_debug::StatusDebugInfo::from_session(session)
-            .as_str()
-            .to_owned();
-        details = details.child(
-            div()
-                .id("copy-status-debug-info")
-                .mt(px(3.0))
-                .h(px(28.0))
-                .px(px(9.0))
-                .self_start()
-                .flex()
-                .items_center()
-                .gap(px(6.0))
-                .rounded(px(Radius::ROW))
-                .cursor_pointer()
-                .bg(colors.primary.alpha(0.065))
-                .hover(move |button| button.bg(colors.primary.alpha(0.10)))
-                .text_size(px(Typo::META.size))
-                .font_weight(FontWeight::MEDIUM)
-                .child(sf_symbol("doc.on.doc", 10.5, colors.secondary))
-                .child("Copy status debug info")
-                .on_click(move |_, _, cx| {
-                    cx.write_to_clipboard(gpui::ClipboardItem::new_string(report.clone()));
-                    cx.stop_propagation();
-                }),
-        );
-        disclosure = disclosure.child(details);
-        disclosure.into_any_element()
-    }
-
     fn render_git_summary(&self, colors: SemanticColors, cx: &mut Context<Self>) -> AnyElement {
         let (symbol, title, detail, accent, can_open) = match &self.state {
             LoadState::Ready(snapshot) if snapshot.files > 0 => (
@@ -2951,9 +2679,9 @@ impl WorkbenchInspector {
         );
         div()
             .id("inspector-git-summary")
-            .min_h(px(52.0))
+            .min_h(px(INFO_ROW_HEIGHT))
             .px(px(11.0))
-            .py(px(9.0))
+            .py(px(6.0))
             .flex()
             .items_center()
             .gap(px(10.0))
@@ -2996,124 +2724,6 @@ impl WorkbenchInspector {
                 row.child(sf_symbol("chevron.right", 11.0, colors.tertiary))
             })
             .into_any_element()
-    }
-
-    fn render_artifacts(
-        &mut self,
-        session: Option<&SessionRecord>,
-        colors: SemanticColors,
-        cx: &mut Context<Self>,
-    ) -> AnyElement {
-        let Some(session) = session else {
-            return self
-                .render_message(
-                    colors,
-                    "sidebar.left",
-                    "Select a session",
-                    "Artifacts follow the active agent.",
-                )
-                .into_any_element();
-        };
-        if artifact_count(session) == 0 {
-            return self
-                .render_message(
-                    colors,
-                    "shippingbox",
-                    "No artifacts yet",
-                    "Pull requests, previews, Linear issues, links, and local ports appear here as they’re discovered.",
-                )
-                .into_any_element();
-        }
-
-        let mut content = div()
-            .id("inspector-artifacts-scroll")
-            .size_full()
-            .min_h(px(0.0))
-            .px(px(12.0))
-            .pt(px(8.0))
-            .pb(px(18.0))
-            .flex()
-            .flex_col()
-            .gap(px(10.0))
-            .overflow_y_scroll();
-
-        if let Some(pull_requests) = session.pull_requests.as_deref() {
-            let inspector = cx.entity();
-            for pull_request in pull_requests {
-                let body = pull_request
-                    .body
-                    .as_deref()
-                    .filter(|body| !body.trim().is_empty())
-                    .map(|body| self.markdown_document(body));
-                content = content.child(render_pull_request(
-                    pull_request,
-                    session.id.clone(),
-                    colors,
-                    inspector.clone(),
-                    body,
-                    self.selected_turn_key().map(str::to_owned),
-                ));
-            }
-        }
-        if let Some(artifacts) = session.artifacts.as_deref() {
-            for artifact in artifacts {
-                let represented_by_status = artifact.kind == ArtifactKind::PullRequest
-                    && session.pull_requests.as_deref().is_some_and(|statuses| {
-                        statuses.iter().any(|status| status.url == artifact.url)
-                    });
-                if !represented_by_status {
-                    content = content.child(render_artifact_row(artifact, colors));
-                }
-            }
-        }
-        if let Some(ports) = session.listening_ports.as_deref() {
-            for port in ports {
-                let url = format!("http://localhost:{}", port.port);
-                let activation = url.clone();
-                content = content.child(
-                    div()
-                        .id(SharedString::from(format!("inspector-port-{}", port.port)))
-                        .min_h(px(54.0))
-                        .px(px(11.0))
-                        .py(px(9.0))
-                        .flex()
-                        .items_center()
-                        .gap(px(10.0))
-                        .rounded(px(Radius::ROW))
-                        .bg(colors.primary.alpha(0.035))
-                        .border_1()
-                        .border_color(colors.primary.alpha(0.06))
-                        .cursor_pointer()
-                        .hover(move |row| row.bg(colors.primary.alpha(0.065)))
-                        .child(artifact_icon("network", colors))
-                        .child(
-                            div()
-                                .min_w(px(0.0))
-                                .flex_1()
-                                .flex()
-                                .flex_col()
-                                .gap(px(2.0))
-                                .child(
-                                    div()
-                                        .text_size(px(Typo::ROW_EMPHASIZED.size))
-                                        .font_weight(Typo::ROW_EMPHASIZED.weight)
-                                        .text_color(colors.primary)
-                                        .child(format!("localhost:{}", port.port)),
-                                )
-                                .child(
-                                    div()
-                                        .truncate()
-                                        .text_size(px(Typo::META.size))
-                                        .text_color(colors.tertiary)
-                                        .child(port.process_name.clone()),
-                                ),
-                        )
-                        .child(sf_symbol("arrow.up.right", 11.0, colors.tertiary))
-                        .on_click(move |_, _, cx| cx.open_url(&activation)),
-                );
-            }
-        }
-        content.into_any_element()
     }
 
     fn scrollbar_metrics(&self) -> Option<ScrollbarMetrics> {
@@ -4665,33 +4275,18 @@ impl Render for WorkbenchInspector {
         };
         let session = self.selected_session();
         let body = match self.workspace_selected {
-            Some(WorkspaceSurface::Details) => {
-                let detail = match self.selected_tab {
-                    InspectorTab::Info => self.render_info(session.as_ref(), colors, cx),
-                    InspectorTab::Artifacts => self.render_artifacts(session.as_ref(), colors, cx),
-                    InspectorTab::Changes => self.render_changes(colors, window, cx),
-                    InspectorTab::Code => self.code_viewer.clone().into_any_element(),
-                };
-                div()
-                    .id("workspace-details")
-                    .size_full()
-                    .flex()
-                    .flex_col()
-                    .child(self.render_header(session.as_ref(), colors, cx))
-                    .child(
-                        div()
-                            .min_h(px(0.0))
-                            .flex_1()
-                            .overflow_hidden()
-                            .child(detail),
-                    )
-                    .into_any_element()
-            }
+            Some(WorkspaceSurface::Details) => match self.selected_tab {
+                InspectorTab::Info | InspectorTab::Artifacts => {
+                    self.render_info(session.as_ref(), colors, cx)
+                }
+                InspectorTab::Changes => self.render_changes(colors, window, cx),
+                InspectorTab::Code => self.code_viewer.clone().into_any_element(),
+            },
             Some(WorkspaceSurface::Browser) => self.render_browser(colors, cx),
             Some(WorkspaceSurface::Terminal) => self.render_terminal(colors),
             Some(WorkspaceSurface::Files) => self.code_viewer.clone().into_any_element(),
             Some(WorkspaceSurface::Review) => self.render_changes(colors, window, cx),
-            None => self.render_surface_chooser(colors, cx),
+            None => self.render_changes(colors, window, cx),
         };
         let transition_id = SharedString::from(format!(
             "inspector-tab-transition-{}",
@@ -4729,7 +4324,9 @@ impl Render for WorkbenchInspector {
             .overflow_hidden()
             .track_focus(&self.focus)
             .on_key_down(cx.listener(Self::handle_key_down))
-            .bg(colors.sidebar_surface())
+            // The inspector belongs to the work area: it paints on the
+            // terminal's surface, not the sidebar's lighter material.
+            .bg(colors.work_surface())
             .text_color(colors.primary)
             .child(self.render_workspace_header(colors, cx))
             .child(div().min_h(px(0.0)).flex_1().overflow_hidden().child(body))
@@ -4737,52 +4334,56 @@ impl Render for WorkbenchInspector {
     }
 }
 
-fn status_evidence_explanation(source: diri_proto::StatusEvidenceSource) -> &'static str {
-    match source {
-        diri_proto::StatusEvidenceSource::Hook => {
-            "A structured lifecycle hook from the agent drove this status."
-        }
-        diri_proto::StatusEvidenceSource::Notify => {
-            "A structured completion notification from the agent drove this status."
-        }
-        diri_proto::StatusEvidenceSource::ScreenRule => {
-            "A privacy-safe manifest rule matched the terminal state; no screen content is included."
-        }
-        diri_proto::StatusEvidenceSource::ProcessLiveness => {
-            "The agent exposes process-only status, so process activity or exit is authoritative."
-        }
-        diri_proto::StatusEvidenceSource::Staleness => {
-            "Authoritative signals stopped arriving, so Diri fell back to unknown instead of guessing."
-        }
-        diri_proto::StatusEvidenceSource::Transport => {
-            "The remote transport failed; the agent process exit has not been confirmed."
-        }
-        diri_proto::StatusEvidenceSource::Unknown => {
-            "This daemon reported an evidence source this app does not recognize yet."
-        }
+/// The surface a remembered inspector tab stands for.
+const fn remembered_surface(tab: InspectorTab) -> WorkspaceSurface {
+    match tab {
+        InspectorTab::Changes => WorkspaceSurface::Review,
+        InspectorTab::Code => WorkspaceSurface::Files,
+        InspectorTab::Info | InspectorTab::Artifacts => WorkspaceSurface::Details,
     }
 }
 
-fn status_evidence_row(label: &'static str, value: String, colors: SemanticColors) -> AnyElement {
+fn render_port_row(port: &diri_proto::PortInfo, colors: SemanticColors) -> AnyElement {
+    let url = format!("http://localhost:{}", port.port);
     div()
+        .id(SharedString::from(format!("inspector-port-{}", port.port)))
+        .min_h(px(INFO_ROW_HEIGHT))
+        .px(px(11.0))
+        .py(px(6.0))
         .flex()
-        .items_start()
-        .gap(px(8.0))
-        .text_size(px(Typo::META.size))
-        .child(
-            div()
-                .w(px(86.0))
-                .flex_none()
-                .text_color(colors.tertiary)
-                .child(label),
-        )
+        .items_center()
+        .gap(px(10.0))
+        .rounded(px(Radius::ROW))
+        .bg(colors.primary.alpha(0.035))
+        .border_1()
+        .border_color(colors.primary.alpha(0.06))
+        .cursor_pointer()
+        .hover(move |row| row.bg(colors.primary.alpha(0.065)))
+        .child(artifact_icon("network", colors))
         .child(
             div()
                 .min_w(px(0.0))
                 .flex_1()
-                .text_color(colors.secondary)
-                .child(value),
+                .flex()
+                .flex_col()
+                .gap(px(2.0))
+                .child(
+                    div()
+                        .text_size(px(Typo::ROW_EMPHASIZED.size))
+                        .font_weight(Typo::ROW_EMPHASIZED.weight)
+                        .text_color(colors.primary)
+                        .child(format!("localhost:{}", port.port)),
+                )
+                .child(
+                    div()
+                        .truncate()
+                        .text_size(px(Typo::META.size))
+                        .text_color(colors.tertiary)
+                        .child(port.process_name.clone()),
+                ),
         )
+        .child(sf_symbol("arrow.up.right", 11.0, colors.tertiary))
+        .on_click(move |_, _, cx| cx.open_url(&url))
         .into_any_element()
 }
 
@@ -4803,7 +4404,7 @@ fn detail_row(
     colors: SemanticColors,
 ) -> AnyElement {
     div()
-        .min_h(px(38.0))
+        .min_h(px(INFO_ROW_HEIGHT))
         .px(px(11.0))
         .flex()
         .items_center()
@@ -5723,9 +5324,9 @@ fn render_artifact_row(artifact: &SessionArtifact, colors: SemanticColors) -> An
             "inspector-artifact-{}",
             artifact.url
         )))
-        .min_h(px(54.0))
+        .min_h(px(INFO_ROW_HEIGHT))
         .px(px(11.0))
-        .py(px(9.0))
+        .py(px(6.0))
         .flex()
         .items_center()
         .gap(px(10.0))
@@ -5775,23 +5376,6 @@ fn artifact_icon(symbol: &'static str, colors: SemanticColors) -> AnyElement {
         .bg(Fill::subtle(colors))
         .child(sf_symbol(symbol, 13.0, colors.secondary))
         .into_any_element()
-}
-
-fn artifact_count(session: &SessionRecord) -> usize {
-    let artifacts = session.artifacts.as_deref().unwrap_or_default();
-    let ports = session.listening_ports.as_deref().unwrap_or_default();
-    let status_only_pull_requests = session
-        .pull_requests
-        .as_deref()
-        .unwrap_or_default()
-        .iter()
-        .filter(|status| {
-            !artifacts.iter().any(|artifact| {
-                artifact.kind == ArtifactKind::PullRequest && artifact.url == status.url
-            })
-        })
-        .count();
-    artifacts.len() + ports.len() + status_only_pull_requests
 }
 
 fn ui_agent_kind(kind: &ProtoAgentKind) -> AgentKind {
@@ -6553,10 +6137,37 @@ mod tests {
                             .unwrap(),
                     );
                     cx.new(|cx| {
-                        let mut inspector = WorkbenchInspector::new(runtime, tokio, cx);
-                        inspector.workspace_tabs.clear();
-                        inspector.workspace_active = None;
-                        inspector.workspace_selected = None;
+                        let mut inspector = WorkbenchInspector::new(runtime.clone(), tokio, cx);
+                        inspector.select_workspace(WorkspaceSurface::Review, cx);
+                        if std::env::var_os("DIRI_VISUAL_REVIEW_COUNT").is_some() {
+                            inspector.state = LoadState::Ready(Arc::new(DiffSnapshot {
+                                files: 3,
+                                additions: 41,
+                                deletions: 9,
+                                ..DiffSnapshot::default()
+                            }));
+                        }
+                        if std::env::var_os("DIRI_VISUAL_DETAILS").is_some() {
+                            let fixture = SidebarPreviewFixture::make(PreviewScenario::Artifacts);
+                            let selected = fixture.selected_session_id.clone();
+                            {
+                                let mut store = runtime.store.write().unwrap();
+                                store.hydrate(fixture.list);
+                                if let Some(selected) = selected {
+                                    store.select(selected);
+                                }
+                            }
+                            inspector.select_workspace(WorkspaceSurface::Details, cx);
+                            inspector.state = LoadState::Ready(Arc::new(DiffSnapshot {
+                                files: 3,
+                                additions: 41,
+                                deletions: 9,
+                                ..DiffSnapshot::default()
+                            }));
+                        }
+                        if std::env::var_os("DIRI_VISUAL_MENU").is_some() {
+                            inspector.workspace_chooser_open = true;
+                        }
                         if std::env::var_os("DIRI_VISUAL_FILES").is_some() {
                             inspector.add_workspace(WorkspaceSurface::Files, cx);
                             inspector.add_workspace(WorkspaceSurface::Files, cx);
@@ -6565,7 +6176,6 @@ mod tests {
                                 .update(cx, |viewer, cx| viewer.seed_explorer_preview(cx));
                         }
                         if std::env::var_os("DIRI_VISUAL_BROWSER").is_some() {
-                            inspector.select_workspace(WorkspaceSurface::Review, cx);
                             inspector.select_workspace(WorkspaceSurface::Browser, cx);
                             if std::env::var_os("DIRI_VISUAL_BROWSER_TABS").is_some() {
                                 inspector.browser_state.title = Some("Local preview".into());
@@ -6605,9 +6215,7 @@ mod tests {
     }
 
     #[gpui::test]
-    fn workspace_surfaces_are_closable_without_rewriting_inspector_preferences(
-        cx: &mut TestAppContext,
-    ) {
+    fn closing_every_other_tab_lands_on_review(cx: &mut TestAppContext) {
         let runtime = Arc::new(StoreRuntime::inert());
         let tokio = Arc::new(
             tokio::runtime::Builder::new_current_thread()
@@ -6618,14 +6226,27 @@ mod tests {
         let inspector = cx.new(|cx| WorkbenchInspector::new(runtime.clone(), tokio, cx));
 
         inspector.update(cx, |inspector, cx| {
+            let review = inspector.workspace_tabs[0].id;
+            assert_eq!(
+                inspector.workspace_tabs[0].surface,
+                WorkspaceSurface::Review
+            );
             inspector.select_workspace(WorkspaceSurface::Browser, cx);
             inspector.close_workspace(inspector.workspace_active.unwrap(), cx);
-            inspector.close_workspace(0, cx);
-        });
-
-        inspector.read_with(cx, |inspector, _| {
-            assert!(inspector.workspace_tabs.is_empty());
-            assert_eq!(inspector.workspace_selected, None);
+            let others: Vec<_> = inspector
+                .workspace_tabs
+                .iter()
+                .filter(|tab| tab.id != review)
+                .map(|tab| tab.id)
+                .collect();
+            for id in others {
+                inspector.close_workspace(id, cx);
+            }
+            inspector.close_workspace(review, cx);
+            assert_eq!(inspector.workspace_tabs.len(), 1, "review never closes");
+            assert_eq!(inspector.workspace_selected, Some(WorkspaceSurface::Review));
+            inspector.add_workspace(WorkspaceSurface::Review, cx);
+            assert_eq!(inspector.workspace_tabs.len(), 1, "review never duplicates");
         });
         assert_eq!(
             runtime
@@ -6634,7 +6255,8 @@ mod tests {
                 .expect("session store lock poisoned")
                 .preferences()
                 .inspector_tab,
-            InspectorTab::Info
+            InspectorTab::Changes,
+            "landing on Review is remembered like any other choice"
         );
     }
 
@@ -6731,8 +6353,8 @@ mod tests {
             i.refresh_if_context_changed(cx);
             assert_eq!(
                 i.workspace_selected,
-                Some(WorkspaceSurface::Details),
-                "session B must start with its own sidebar"
+                Some(WorkspaceSurface::Files),
+                "session B reopens the remembered surface beside Review"
             );
             assert!(i.workspace_tabs.iter().all(|tab| tab.id != first));
             i.add_workspace(WorkspaceSurface::Browser, cx);
@@ -6949,6 +6571,90 @@ mod tests {
         inspector.read_with(cx, |i, _| assert_eq!(i.workspace_active, Some(original)));
     }
 
+    /// Review and Preview are the only tabs a fresh panel shows; Files,
+    /// Terminal, and Details open from the overflow menu and then take a
+    /// closable tab each, and closing the last of them lands on Review.
+    #[gpui::test]
+    fn overflow_menu_opens_the_other_surfaces_as_closable_tabs(cx: &mut TestAppContext) {
+        let runtime = Arc::new(StoreRuntime::inert());
+        runtime
+            .store
+            .write()
+            .unwrap()
+            .update_preferences(|prefs| prefs.inspector_tab = InspectorTab::Changes)
+            .unwrap();
+        let tokio = Arc::new(
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap(),
+        );
+        let (inspector, cx) =
+            cx.add_window_view(move |_, cx| WorkbenchInspector::new(runtime, tokio, cx));
+        cx.simulate_resize(gpui::size(px(600.0), px(500.0)));
+        cx.run_until_parked();
+        assert!(cx.debug_bounds("INSPECTOR_SURFACE_REVIEW").is_some());
+        assert!(cx.debug_bounds("INSPECTOR_SURFACE_PREVIEW").is_some());
+        for surface in ["Files", "Terminal", "Details"] {
+            assert!(
+                cx.debug_bounds(match surface {
+                    "Files" => "INSPECTOR_SURFACE_FILES",
+                    "Terminal" => "INSPECTOR_SURFACE_TERMINAL",
+                    _ => "INSPECTOR_SURFACE_DETAILS",
+                })
+                .is_none(),
+                "{surface} is not a visible tab by default"
+            );
+        }
+        assert!(cx.debug_bounds("workspace-surface-catalog").is_none());
+
+        let more = cx.debug_bounds("workspace-more-surfaces").unwrap();
+        cx.simulate_click(more.center(), Modifiers::default());
+        cx.run_until_parked();
+        assert!(cx.debug_bounds("workspace-surface-catalog").is_some());
+        for label in ["Preview", "Files", "Terminal", "Details"] {
+            assert!(
+                cx.debug_bounds(match label {
+                    "Preview" => "workspace-catalog-Preview",
+                    "Files" => "workspace-catalog-Files",
+                    "Terminal" => "workspace-catalog-Terminal",
+                    _ => "workspace-catalog-Details",
+                })
+                .is_some(),
+                "{label} row"
+            );
+        }
+        let files = cx.debug_bounds("workspace-catalog-Files").unwrap();
+        cx.simulate_click(files.center(), Modifiers::default());
+        cx.run_until_parked();
+        assert!(
+            cx.debug_bounds("workspace-surface-catalog").is_none(),
+            "choosing closes the menu"
+        );
+        inspector.read_with(cx, |inspector, _| {
+            assert_eq!(inspector.workspace_selected, Some(WorkspaceSurface::Files));
+        });
+        let files_id = inspector.read_with(cx, |inspector, _| inspector.workspace_active.unwrap());
+        let files_id: &'static str =
+            Box::leak(format!("close-workspace-{files_id}").into_boxed_str());
+        assert!(cx.debug_bounds(files_id).is_some(), "Files tab is closable");
+        let review_id = inspector.read_with(cx, |inspector, _| inspector.workspace_tabs[0].id);
+        let review_close: &'static str =
+            Box::leak(format!("close-workspace-{review_id}").into_boxed_str());
+        assert!(
+            cx.debug_bounds(review_close).is_none(),
+            "Review has no close"
+        );
+
+        let close = cx.debug_bounds(files_id).unwrap();
+        cx.simulate_click(close.center(), Modifiers::default());
+        cx.run_until_parked();
+        inspector.read_with(cx, |inspector, _| {
+            assert_eq!(inspector.workspace_selected, Some(WorkspaceSurface::Review));
+            assert_eq!(inspector.workspace_tabs.len(), 1);
+        });
+    }
+
     #[gpui::test]
     fn add_menu_creates_independent_same_kind_tabs(cx: &mut TestAppContext) {
         let runtime = Arc::new(StoreRuntime::inert());
@@ -6963,7 +6669,7 @@ mod tests {
         cx.simulate_resize(gpui::size(px(600.0), px(500.0)));
         for _ in 0..2 {
             cx.run_until_parked();
-            let add = cx.debug_bounds("workspace-add-surface").unwrap();
+            let add = cx.debug_bounds("workspace-more-surfaces").unwrap();
             cx.simulate_click(add.center(), Modifiers::default());
             cx.run_until_parked();
             let files = cx.debug_bounds("workspace-catalog-Files").unwrap();
@@ -6994,7 +6700,6 @@ mod tests {
             for surface in [
                 WorkspaceSurface::Browser,
                 WorkspaceSurface::Terminal,
-                WorkspaceSurface::Review,
                 WorkspaceSurface::Details,
             ] {
                 let before = inspector.workspace_tabs.len();
@@ -7097,7 +6802,7 @@ mod tests {
     fn light_review_rows_keep_readable_contrast() {
         for theme in ["dirijor-light", "solarized-light", "github-light"] {
             let colors = crate::app_theme::sidebar_colors(theme);
-            let inspector_surface = composite(colors.sidebar_surface(), colors.background);
+            let inspector_surface = composite(colors.work_surface(), colors.background);
 
             for kind in [
                 DiffRowKind::Addition,
@@ -7523,7 +7228,7 @@ mod tests {
     }
 
     #[gpui::test]
-    fn tabs_fit_and_switch_at_the_minimum_inspector_width(cx: &mut TestAppContext) {
+    fn surfaces_fit_and_switch_at_the_minimum_inspector_width(cx: &mut TestAppContext) {
         let runtime = Arc::new(StoreRuntime::inert());
         let mut fixture = SidebarPreviewFixture::make(PreviewScenario::Artifacts);
         let selected = fixture.selected_session_id.clone();
@@ -7572,16 +7277,37 @@ mod tests {
         });
         cx.run_until_parked();
 
-        let info = cx.debug_bounds("INSPECTOR_TAB_INFO").expect("Info tab");
-        let artifacts = cx
-            .debug_bounds("INSPECTOR_TAB_ARTIFACTS")
-            .expect("Artifacts tab");
+        // Default preferences reopen Details beside Review; both pills, the
+        // Preview placeholder, the overflow control, and close must fit. The
+        // placeholder reads the row width from the previous frame.
+        cx.refresh().unwrap();
+        cx.run_until_parked();
+        let review = cx
+            .debug_bounds("INSPECTOR_SURFACE_REVIEW")
+            .expect("Review pill");
+        let details = cx
+            .debug_bounds("INSPECTOR_SURFACE_DETAILS")
+            .expect("Details tab");
+        let preview = cx
+            .debug_bounds("INSPECTOR_SURFACE_PREVIEW")
+            .expect("Preview placeholder");
+        let more = cx
+            .debug_bounds("workspace-more-surfaces")
+            .expect("overflow control");
         let close = cx.debug_bounds("INSPECTOR_CLOSE").expect("close button");
-        assert!(info.right() <= artifacts.left());
-        assert!(artifacts.right() <= px(300.0));
+        assert!(review.right() <= details.left());
+        assert!(details.right() <= preview.left());
+        assert!(
+            preview.right() <= more.left(),
+            "preview={preview:?} more={more:?} review={review:?} details={details:?}"
+        );
+        assert!(more.right() <= close.left());
         assert!(close.right() <= px(300.0));
-        assert!(cx.debug_bounds("INSPECTOR_TAB_CHANGES").is_none());
-        assert!(cx.debug_bounds("INSPECTOR_TAB_CODE").is_none());
+        assert!(
+            cx.debug_bounds("INSPECTOR_SURFACE_FILES").is_none()
+                && cx.debug_bounds("INSPECTOR_SURFACE_TERMINAL").is_none(),
+            "Files and Terminal stay behind the overflow until opened"
+        );
         let inspector = harness.read_with(cx, |harness, _| harness.inspector.clone());
         inspector.update(cx, |inspector, cx| {
             inspector.select_tab(InspectorTab::Changes, cx)
@@ -7606,17 +7332,13 @@ mod tests {
             DiffLayer::Working
         );
 
-        inspector.update(cx, |inspector, cx| {
-            inspector.select_workspace(WorkspaceSurface::Details, cx)
-        });
-        cx.run_until_parked();
-        let artifacts = cx
-            .debug_bounds("INSPECTOR_TAB_ARTIFACTS")
-            .expect("Artifacts tab restored");
-        cx.simulate_click(artifacts.center(), Modifiers::none());
+        let details = cx
+            .debug_bounds("INSPECTOR_SURFACE_DETAILS")
+            .expect("Details tab");
+        cx.simulate_click(details.center(), Modifiers::none());
         assert_eq!(
-            inspector.read_with(cx, |inspector, _| inspector.selected_tab),
-            InspectorTab::Artifacts
+            inspector.read_with(cx, |inspector, _| inspector.workspace_selected),
+            Some(WorkspaceSurface::Details)
         );
         assert_eq!(
             runtime
@@ -7625,10 +7347,11 @@ mod tests {
                 .expect("session store lock poisoned")
                 .preferences()
                 .inspector_tab,
-            InspectorTab::Artifacts
+            InspectorTab::Info
         );
 
         cx.run_until_parked();
+        assert!(cx.debug_bounds("INSPECTOR_FACTS").is_some());
         assert!(cx.debug_bounds("INSPECTOR_PR_MERGE").is_some());
         assert!(cx.debug_bounds("INSPECTOR_PR_CHECK_0").is_some());
         assert!(cx.debug_bounds("INSPECTOR_PR_COMMENT_0").is_some());
