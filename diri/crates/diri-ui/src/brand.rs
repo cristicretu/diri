@@ -229,8 +229,12 @@ pub struct AgentLogo {
     kind: AgentKind,
     size: f32,
     badged: bool,
+    inset: f32,
     colors: SemanticColors,
 }
+
+/// Room left around the mark for the badge to read as a tile.
+const BADGE_MARK_INSET: f32 = 0.28;
 
 impl AgentLogo {
     pub fn new(kind: AgentKind, size: f32, colors: SemanticColors) -> Self {
@@ -238,6 +242,7 @@ impl AgentLogo {
             kind,
             size,
             badged: true,
+            inset: BADGE_MARK_INSET,
             colors,
         }
     }
@@ -246,11 +251,19 @@ impl AgentLogo {
         self.badged = badged;
         self
     }
+
+    /// Fraction of `size` kept clear on each side of the mark. The default
+    /// leaves room for the badge; a bare logo standing in for a session-row
+    /// status glyph wants that glyph's 0.08 so the two read at the same size.
+    pub fn inset(mut self, ratio: f32) -> Self {
+        self.inset = ratio;
+        self
+    }
 }
 
 impl RenderOnce for AgentLogo {
     fn render(self, _window: &mut Window, _cx: &mut App) -> impl IntoElement {
-        let mark_size = self.size * (1.0 - 2.0 * 0.28);
+        let mark_size = self.size * (1.0 - 2.0 * self.inset);
         let fill = match self.kind {
             AgentKind::ClaudeCode => Palette::CLAY,
             AgentKind::Codex | AgentKind::Cursor => self.colors.primary.alpha(0.82),
@@ -276,7 +289,11 @@ impl RenderOnce for AgentLogo {
         if let Some(mark) = self.kind.brand_mark() {
             container.child(BrandMark::solid(mark, mark_size, fill))
         } else {
-            container.child(Icon::new(IconName::Terminal, self.size * 0.54, fill))
+            container.child(Icon::new(
+                IconName::Terminal,
+                mark_size.max(self.size * 0.54),
+                fill,
+            ))
         }
     }
 }

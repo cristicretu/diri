@@ -1871,7 +1871,11 @@ impl Sidebar {
                                 .child(host),
                         )
                     })
-                    .child(AgentLogo::new(agent_kind, 16.0, colors).badged(false)),
+                    .child(
+                        AgentLogo::new(agent_kind, 16.0, colors)
+                            .badged(false)
+                            .inset(0.08),
+                    ),
             )
             .into_any_element()
     }
