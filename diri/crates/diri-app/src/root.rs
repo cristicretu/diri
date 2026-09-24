@@ -2306,9 +2306,26 @@ impl RootView {
             return false;
         }
         self.sync_inspector_context(cx);
-        if let Some(inspector) = &self.inspector
+        if let Some(inspector) = self.inspector.clone()
             && (self.active_workspace.is_some() || inspector.read(cx).workspace_needs_terminal())
         {
+            // ⌘J closes only the focused inspector terminal. A just-opened panel
+            // still has its toggle stamp, so clear it the way the Close control does.
+            if self.inspector_open
+                && inspector.read(cx).is_terminal_tab()
+                && self
+                    .auxiliary_terminal
+                    .as_ref()
+                    .is_some_and(|terminal| terminal.read(cx).is_focused(window))
+            {
+                self.inspector_toggled_at = None;
+                self.set_inspector_open(false, cx);
+                self.inspector_toggled_at = None;
+                if !self.inspector_open {
+                    window.focus(&self.focus, cx);
+                }
+                return true;
+            }
             inspector.update(cx, |inspector, cx| {
                 inspector.select_workspace(crate::inspector::WorkspaceSurface::Terminal, cx);
             });
@@ -8517,6 +8534,73 @@ mod tests {
                     .unwrap()
                     .auxiliary_terminal_for(&parent)
                     .is_some()
+            );
+        });
+    }
+
+    #[gpui::test]
+    fn auxiliary_terminal_shortcut_closes_focused_inspector_terminal(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let services = test_services();
+        let mut parent = SidebarPreviewFixture::make(PreviewScenario::Typical)
+            .list
+            .sessions[0]
+            .clone();
+        parent.parent = None;
+        let parent_id = parent.id.clone();
+        let mut auxiliary = parent.clone();
+        auxiliary.id = SessionId::new("auxiliary-terminal");
+        auxiliary.kind = AgentKind::SHELL;
+        auxiliary.parent = Some(parent_id.clone());
+        auxiliary.title = crate::store::AUXILIARY_TERMINAL_TITLE.to_owned();
+        {
+            let mut store = services.store.store.write().expect("store");
+            store.upsert_session(parent);
+            store.upsert_session(auxiliary);
+            store.select(parent_id);
+        }
+        let (root, cx) = cx.add_window_view(move |window, cx| {
+            RootView::new(services, false, PreviewScenario::Empty, window, cx)
+        });
+        cx.simulate_resize(size(px(1_000.0), px(700.0)));
+        cx.run_until_parked();
+
+        root.update_in(cx, |root, window, cx| {
+            root.inspector
+                .as_ref()
+                .unwrap()
+                .update(cx, |inspector, cx| {
+                    inspector.select_workspace(crate::inspector::WorkspaceSurface::Terminal, cx);
+                });
+            root.run_command(CommandId::ToggleAuxiliaryTerminal, window, cx);
+            assert!(root.inspector_open);
+            assert!(
+                root.auxiliary_terminal
+                    .as_ref()
+                    .unwrap()
+                    .read(cx)
+                    .is_focused(window)
+            );
+            let shell = root.auxiliary_id.clone();
+
+            root.run_command(CommandId::ToggleAuxiliaryTerminal, window, cx);
+            assert!(!root.inspector_open);
+            assert!(root.focus.is_focused(window));
+            assert_eq!(root.auxiliary_id, shell);
+            assert!(root.auxiliary_terminal.is_some());
+
+            root.run_command(CommandId::ToggleAuxiliaryTerminal, window, cx);
+            assert!(root.inspector_open);
+            window.focus(&root.focus, cx);
+            root.run_command(CommandId::ToggleAuxiliaryTerminal, window, cx);
+            assert!(root.inspector_open);
+            assert!(
+                root.auxiliary_terminal
+                    .as_ref()
+                    .unwrap()
+                    .read(cx)
+                    .is_focused(window)
             );
         });
     }
