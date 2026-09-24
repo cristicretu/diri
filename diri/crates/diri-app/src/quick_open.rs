@@ -704,6 +704,36 @@ fn file_name(path: &Path) -> String {
         .unwrap_or_default()
 }
 
+/// The folder Quick Open offers to create for `query`, or `None` when the
+/// query already names something on disk or is not a plain folder path.
+/// Absolute and `~/` queries are taken as written; anything else is created
+/// under `base`, the parent of the most recent project.
+pub fn create_target(query: &str, base: &Path, home: &Path) -> Option<PathBuf> {
+    use std::path::Component;
+
+    let query = query.trim();
+    let path = if query.starts_with('/') || query == "~" || query.starts_with("~/") {
+        expand_tilde(Path::new(query), home)
+    } else if query.is_empty() || query.starts_with('~') {
+        return None;
+    } else {
+        base.join(query)
+    };
+    // `..` would let a name escape the folder the row says it creates in.
+    if !path.is_absolute()
+        || path
+            .components()
+            .any(|component| matches!(component, Component::ParentDir))
+    {
+        return None;
+    }
+    let path = lexical_standardize(&path);
+    if path.parent().is_none() || path.symlink_metadata().is_ok() {
+        return None;
+    }
+    Some(path)
+}
+
 /// Matching the folder's own name beats matching somewhere in its path; worth
 /// four matched characters so a deep path hit cannot outrank a name hit.
 const NAME_PRIORITY: Score = 64;
@@ -791,6 +821,54 @@ mod tests {
     use tempfile::tempdir;
 
     use super::*;
+
+    #[test]
+    fn create_target_resolves_names_under_the_base_and_paths_as_written() {
+        let dir = tempdir().unwrap();
+        let base = dir.path().join("fun");
+        let home = dir.path().join("home");
+        fs::create_dir_all(base.join("existing")).unwrap();
+        fs::create_dir_all(&home).unwrap();
+
+        assert_eq!(
+            create_target(" new-app ", &base, &home),
+            Some(base.join("new-app"))
+        );
+        assert_eq!(
+            create_target("client/site", &base, &home),
+            Some(base.join("client/site"))
+        );
+        assert_eq!(
+            create_target("~/scratch/", &base, &home),
+            Some(home.join("scratch"))
+        );
+        let absolute = dir.path().join("elsewhere/app");
+        assert_eq!(
+            create_target(&absolute.to_string_lossy(), &base, &home),
+            Some(absolute)
+        );
+    }
+
+    #[test]
+    fn create_target_declines_existing_escaping_and_empty_queries() {
+        let dir = tempdir().unwrap();
+        let base = dir.path().join("fun");
+        fs::create_dir_all(base.join("existing")).unwrap();
+        fs::write(base.join("notes.txt"), "").unwrap();
+
+        for query in [
+            "",
+            "   ",
+            "existing",
+            "notes.txt",
+            "../outside",
+            "~other",
+            "~",
+            "/",
+        ] {
+            assert_eq!(create_target(query, &base, dir.path()), None, "{query:?}");
+        }
+    }
 
     fn ranked_names(query: &str, pool: &[RankCandidate]) -> Vec<String> {
         rank(query, pool, RESULT_LIMIT)

@@ -131,6 +131,9 @@ pub struct NavigationOverlay {
     directory_index: DirectoryIndex,
     quick_snapshot: QuickOpenSnapshot,
     ranked_items: Vec<RankedFolder>,
+    /// The missing folder the query names, offered as the row after the
+    /// ranked folders so a new project is one ↑ away.
+    quick_create: Option<PathBuf>,
     /// Readiness and displayed preference identity. Terminal output does not
     /// rebuild ranked rows; orientation and shortcut changes do.
     palette_context_fingerprint: u64,
@@ -263,6 +266,7 @@ impl NavigationOverlay {
             directory_index: DirectoryIndex::default(),
             quick_snapshot: QuickOpenSnapshot::default(),
             ranked_items: Vec::new(),
+            quick_create: None,
             palette_context_fingerprint: 0,
             list_scroll: UniformListScrollHandle::new(),
             list_scroller: diri_ui::ScrollerState::new(),
@@ -321,6 +325,7 @@ impl NavigationOverlay {
             directory_index: DirectoryIndex::default(),
             quick_snapshot: QuickOpenSnapshot::default(),
             ranked_items: Vec::new(),
+            quick_create: None,
             palette_context_fingerprint: 0,
             list_scroll: UniformListScrollHandle::new(),
             list_scroller: diri_ui::ScrollerState::new(),
@@ -743,7 +748,10 @@ impl NavigationOverlay {
     fn query_changed(&mut self, cx: &mut Context<Self>) {
         self.reset_selection();
         match self.overlay {
-            Some(Overlay::QuickOpen) => self.schedule_rank(cx),
+            Some(Overlay::QuickOpen) => {
+                self.refresh_quick_create();
+                self.schedule_rank(cx);
+            }
             Some(Overlay::History) => self.filter_history(),
             Some(Overlay::Themes) => {
                 self.filter_themes();
@@ -789,7 +797,9 @@ impl NavigationOverlay {
             Some(Overlay::QuickOpen) if self.query.text().trim().is_empty() => {
                 self.quick_snapshot.recent.len() + self.quick_snapshot.folders.len()
             }
-            Some(Overlay::QuickOpen) => self.ranked_items.len(),
+            Some(Overlay::QuickOpen) => {
+                self.ranked_items.len() + usize::from(self.quick_create.is_some())
+            }
             Some(Overlay::History) => self.history_matches.len(),
             Some(Overlay::Settings) => self.settings_items().len(),
             Some(Overlay::Themes) => self.theme_matches.len(),
@@ -817,8 +827,12 @@ impl NavigationOverlay {
                 }
             }
             Some(Overlay::QuickOpen) => {
-                if let Some(item) = self.current_quick_item() {
-                    let cwd = item.path.to_string_lossy().into_owned();
+                let target = match self.current_quick_item() {
+                    Some(item) => Some(item.path),
+                    None => self.create_highlighted_folder(),
+                };
+                if let Some(path) = target {
+                    let cwd = path.to_string_lossy().into_owned();
                     let launched = {
                         let mut store = self.store.write().expect("session store lock poisoned");
                         let options = SpawnOptions {
@@ -1064,6 +1078,43 @@ impl NavigationOverlay {
         }
     }
 
+    fn quick_create_highlighted(&self) -> bool {
+        self.quick_create.is_some()
+            && !self.query.text().trim().is_empty()
+            && self.highlight == self.ranked_items.len()
+    }
+
+    /// One `stat` per keystroke: bare names land beside the most recent
+    /// project, so a new project sits with the ones already open.
+    fn refresh_quick_create(&mut self) {
+        let home = std::env::var_os("HOME")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from("/nonexistent"));
+        let base = self
+            .quick_snapshot
+            .recent
+            .first()
+            .and_then(|item| item.path.parent())
+            .map_or_else(|| home.clone(), Path::to_path_buf);
+        self.quick_create = quick_open::create_target(self.query.text(), &base, &home);
+    }
+
+    /// Creates the offered folder, or records why it could not be created and
+    /// keeps the page open on the row.
+    fn create_highlighted_folder(&mut self) -> Option<PathBuf> {
+        if !self.quick_create_highlighted() {
+            return None;
+        }
+        let path = self.quick_create.clone()?;
+        match std::fs::create_dir_all(&path) {
+            Ok(()) => Some(path),
+            Err(error) => {
+                self.page_error = Some(format!("Could not create {}: {error}", path.display()));
+                None
+            }
+        }
+    }
+
     pub(crate) fn toggle_history(
         &mut self,
         _: &ToggleHistory,
@@ -1097,6 +1148,7 @@ impl NavigationOverlay {
         self.query.clear();
         self.reset_selection();
         self.ranked_items.clear();
+        self.quick_create = None;
         match page {
             Overlay::CommandPalette => self.refresh_command_items(),
             Overlay::QuickOpen => {
@@ -1623,9 +1675,11 @@ impl NavigationOverlay {
                         .expect("visible project")
                         .clone();
                     self.render_quick_row(item, &[], index, colors, cx)
-                } else {
-                    let ranked = self.ranked_items[index].clone();
+                } else if let Some(ranked) = self.ranked_items.get(index).cloned() {
                     self.render_quick_row(ranked.item, &ranked.name_matches, index, colors, cx)
+                } else {
+                    let path = self.quick_create.clone().expect("visible create row");
+                    self.render_quick_create_row(path, index, colors, cx)
                 }
             }
             Some(Overlay::Settings | Overlay::Themes) => self.render_setting_row(index, colors, cx),
@@ -1840,6 +1894,67 @@ impl NavigationOverlay {
                 this.run_command_selection(CommandSelection::Session(id), window, cx);
             })
         }))
+        .into_any_element()
+    }
+
+    fn render_quick_create_row(
+        &mut self,
+        path: PathBuf,
+        index: usize,
+        colors: SemanticColors,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let name = path
+            .file_name()
+            .map(|name| name.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        let title = div()
+            .flex()
+            .items_center()
+            .gap(px(8.0))
+            .min_w_0()
+            .child(div().flex_none().child(format!("Create “{name}”")))
+            .child(
+                div()
+                    .min_w_0()
+                    .truncate()
+                    .text_size(px(11.0))
+                    .text_color(colors.tertiary)
+                    .child(relative_parent(&path)),
+            );
+        let detail = format!(
+            "{}\nEnter to create and open · {} for a terminal",
+            path.display(),
+            crate::commands::primary_shortcut_label("Enter")
+        );
+        palette_row(
+            title.into_any_element(),
+            sf_symbol("plus", 13.0, colors.secondary),
+            Vec::new(),
+            index == self.highlight,
+            index,
+            true,
+            colors,
+        )
+        .tooltip(move |_, cx| cx.new(|_| PaletteTooltip(detail.clone(), colors)).into())
+        .when(index == self.highlight, |row| {
+            row.child(keycap(colors).child(Icon::new(IconName::Return, 14.0, colors.secondary)))
+        })
+        .on_hover(cx.listener(move |this, hovered: &bool, _, cx| {
+            if *hovered && this.highlight != index {
+                this.highlight = index;
+                cx.notify();
+            }
+        }))
+        .on_click(
+            cx.listener(move |this, event: &gpui::ClickEvent, window, cx| {
+                let secondary = event.modifiers().platform;
+                this.in_main(window, cx, move |this, window, cx| {
+                    this.highlight = index;
+                    this.run_highlighted(secondary, window, cx);
+                })
+            }),
+        )
         .into_any_element()
     }
 
@@ -2494,6 +2609,21 @@ mod tests {
                                 is_git_repo: true,
                             })
                             .collect();
+                            overlay.quick_snapshot.pool = Arc::new(
+                                overlay
+                                    .quick_snapshot
+                                    .recent
+                                    .iter()
+                                    .map(|item| {
+                                        quick_open::RankCandidate::new(
+                                            item.path.clone(),
+                                            item.name.clone(),
+                                            true,
+                                            0,
+                                        )
+                                    })
+                                    .collect(),
+                            );
                         }
                         Ok("settings") => overlay.overlay = Some(Overlay::Settings),
                         Ok("themes") => {
@@ -2513,6 +2643,16 @@ mod tests {
                     if let Ok(query) = std::env::var("DIRI_VISUAL_QUERY") {
                         overlay.query.insert(&query);
                         overlay.query_changed(cx);
+                        // Rank now rather than after the debounce, and land on
+                        // the create row when the query offers one.
+                        if overlay.overlay == Some(Overlay::QuickOpen) {
+                            overlay.ranked_items = quick_open::rank(
+                                &query,
+                                &overlay.quick_snapshot.pool,
+                                RESULT_LIMIT,
+                            );
+                            overlay.highlight = overlay.visible_count().saturating_sub(1);
+                        }
                     }
                     overlay
                 });
@@ -2709,6 +2849,47 @@ mod tests {
             assert_eq!(pool_names(overlay), ["old-folder"]);
             assert_eq!(overlay.ranked_items.len(), 1);
         });
+    }
+
+    #[gpui::test]
+    fn quick_open_creates_a_missing_folder_beside_the_recent_project(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let recent = dir.path().join("fun/existing");
+        std::fs::create_dir_all(&recent).unwrap();
+        let runtime = Arc::new(StoreRuntime::inert());
+        let (overlay, cx) = cx.add_window_view(move |_, cx| {
+            let mut overlay = NavigationOverlay::opened_for_test(runtime, cx);
+            overlay.overlay = Some(Overlay::QuickOpen);
+            overlay.quick_snapshot =
+                quick_open::build_snapshot(&[], &[(recent, "existing".into())], &[]);
+            overlay
+        });
+        let created = dir.path().join("fun/brand-new");
+        overlay.update(cx, |overlay, cx| {
+            overlay.query.insert("existing");
+            overlay.query_changed(cx);
+            assert_eq!(
+                overlay.quick_create, None,
+                "an existing folder is opened, not created"
+            );
+            overlay.query.clear();
+            overlay.query.insert("brand-new");
+            overlay.query_changed(cx);
+        });
+        cx.executor().advance_clock(RANK_DEBOUNCE * 2);
+        cx.run_until_parked();
+        overlay.read_with(cx, |overlay, _| {
+            assert_eq!(overlay.quick_create.as_ref(), Some(&created));
+            assert_eq!(overlay.visible_count(), overlay.ranked_items.len() + 1);
+        });
+        cx.update(|window, cx| {
+            overlay.update(cx, |overlay, cx| {
+                overlay.highlight = overlay.ranked_items.len();
+                overlay.run_highlighted(true, window, cx);
+            });
+        });
+        assert!(created.is_dir());
+        overlay.read_with(cx, |overlay, _| assert_eq!(overlay.overlay, None));
     }
 
     fn typical_runtime() -> (Arc<StoreRuntime>, Vec<SessionRecord>) {
