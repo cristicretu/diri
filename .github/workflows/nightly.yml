@@ -313,6 +313,8 @@ jobs:
         run: |
           app="${RUNNER_TEMP}/diri-dist/diri.app"
           plutil -lint "${app}/Contents/Info.plist"
+          test -f "${app}/Contents/Resources/Assets.car"
+          test "$(plutil -extract CFBundleIconName raw "${app}/Contents/Info.plist")" = diri
           test -x "${app}/Contents/Resources/bin/dirijor"
           test -x "${app}/Contents/Resources/bin/dirijor-mcp"
           test -x "${app}/Contents/Resources/bin/dirijord-rs"

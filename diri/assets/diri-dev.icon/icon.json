@@ -1,0 +1,52 @@
+{
+  "fill" : {
+    "solid" : "srgb:0.04314,0.03922,0.04706,1.00000"
+  },
+  "groups" : [
+    {
+      "layers" : [
+        {
+          "glass" : false,
+          "image-name" : "ribbon.svg",
+          "name" : "ribbon",
+          "position" : {
+            "scale" : 1,
+            "translation-in-points" : [0, 0]
+          }
+        }
+      ],
+      "shadow" : {
+        "kind" : "neutral",
+        "opacity" : 0.4
+      },
+      "translucency" : {
+        "enabled" : false,
+        "value" : 0.5
+      }
+    },
+    {
+      "layers" : [
+        {
+          "glass" : false,
+          "image-name" : "glow.svg",
+          "name" : "glow",
+          "position" : {
+            "scale" : 1,
+            "translation-in-points" : [0, 0]
+          }
+        }
+      ],
+      "shadow" : {
+        "kind" : "none",
+        "opacity" : 0
+      },
+      "translucency" : {
+        "enabled" : false,
+        "value" : 0.5
+      }
+    }
+  ],
+  "supported-platforms" : {
+    "squares" : ["macOS"]
+  }
+}
