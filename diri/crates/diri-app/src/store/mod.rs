@@ -1,5 +1,6 @@
 //! Headless application state and the thin asynchronous daemon adapter.
 
+mod herdr;
 mod prefs;
 mod projection;
 mod residency;
@@ -166,6 +167,13 @@ pub enum StoreEffect {
         title: String,
     },
     Spawn(SessionSpawnParams),
+    /// Read herdr's saved sessions off the main thread.
+    ScanHerdr {
+        tracked: HashSet<String>,
+        imported: HashSet<String>,
+    },
+    /// Open every planned herdr pane as a Diri session, in herdr's order.
+    ImportHerdr(Vec<herdr::ImportStep>),
     /// Rescan this Mac until the Agent the user is installing appears.
     WatchAgentInstall {
         kind: AgentKind,
@@ -436,6 +444,7 @@ pub struct SessionStore {
     /// The Agent whose installer the user started from Diri. While set, the
     /// runtime rescans this Mac so setup surfaces flip to ready unprompted.
     agent_install: Option<AgentKind>,
+    herdr: herdr::HerdrState,
     /// Attention states serving out their settle window, newest arming wins.
     /// Drained by the settle task in `StoreHandle`, which is what turns one of
     /// these into a chime and a banner — see `drain_settled_attention`.
@@ -528,6 +537,7 @@ impl SessionStore {
                 agent_catalog_scans: HashMap::new(),
                 agent_catalog_errors: HashMap::new(),
                 agent_install: None,
+                herdr: herdr::HerdrState::default(),
                 notification_feed,
                 attention_wake: Arc::new(Notify::new()),
                 effects,
@@ -3210,6 +3220,7 @@ impl StoreRuntime {
                                 let mut store =
                                     state_store.write().expect("session store lock poisoned");
                                 store.hydrate(list);
+                                store.request_herdr_scan();
                                 store.snapshot()
                             };
                             state_snapshots.send_replace(snapshot);
@@ -3659,6 +3670,25 @@ async fn run_effects(
                 });
                 Ok(())
             }
+            StoreEffect::ScanHerdr { tracked, imported } => {
+                tokio::spawn(herdr::scan(
+                    tracked,
+                    imported,
+                    Arc::clone(&store),
+                    change_tx.clone(),
+                ));
+                Ok(())
+            }
+            StoreEffect::ImportHerdr(steps) => {
+                tokio::spawn(herdr::import(
+                    steps,
+                    Arc::clone(&client),
+                    Arc::clone(&store),
+                    change_tx.clone(),
+                    status_tx.clone(),
+                ));
+                Ok(())
+            }
             StoreEffect::WatchAgentInstall { kind, display_name } => {
                 let client = Arc::clone(&client);
                 let store = Arc::clone(&store);
@@ -3831,6 +3861,8 @@ fn action_context(effect: &StoreEffect) -> Option<ActionContext> {
         StoreEffect::RefreshAgents { .. }
         | StoreEffect::ConfigureAgent(_)
         | StoreEffect::WatchAgentInstall { .. } => return None,
+        // Import outcomes, failures included, arrive as one summary banner.
+        StoreEffect::ScanHerdr { .. } | StoreEffect::ImportHerdr(_) => return None,
     };
     Some(ActionContext { title, retry })
 }

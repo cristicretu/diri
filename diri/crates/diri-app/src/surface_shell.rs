@@ -20,6 +20,7 @@ use crate::query_editor::{self, ClipboardEdit, Edit, LocalEdit, QueryEditor};
 use crate::quick_open;
 use crate::settings::{HostDraft, SettingsNav, SettingsTab, theme};
 mod account_settings;
+mod import_settings;
 use crate::sidebar::DraggedSidebarItem;
 use crate::store::{Prefs, SessionStore, StoreRuntime, WindowMaterial};
 use crate::updates::{UpdateCommand, UpdateHandle, UpdatePhase};
@@ -1613,6 +1614,12 @@ impl UtilitySurfaces {
         if tab == SettingsTab::Accounts {
             self.refresh_accounts(cx);
         }
+        if tab == SettingsTab::General {
+            self.store
+                .write()
+                .expect("session store lock poisoned")
+                .request_herdr_scan();
+        }
         self.settings_search_active = false;
         if tab != SettingsTab::Usage {
             self.usage_share_theme_hover = None;
@@ -2834,6 +2841,7 @@ impl UtilitySurfaces {
                         )),
                     colors,
                 ))
+                .child(self.import_settings(cx))
                 .child(self.update_settings(cx))
                 .child(setting_section(
                     "Support",
@@ -5722,6 +5730,31 @@ fn surface_button_with_event(
         .child(label.into())
 }
 
+/// Like [`surface_button`] for handlers that present a sheet on the window.
+fn surface_button_with_window(
+    label: impl Into<SharedString>,
+    id: impl Into<SharedString>,
+    colors: SemanticColors,
+    cx: &mut Context<UtilitySurfaces>,
+    handler: impl Fn(&mut UtilitySurfaces, &mut Window, &mut Context<UtilitySurfaces>) + 'static,
+) -> impl IntoElement {
+    div()
+        .id(id.into())
+        .h(px(26.0))
+        .px(px(9.0))
+        .rounded(px(Radius::BADGE))
+        .border_1()
+        .border_color(colors.primary.alpha(0.10))
+        .bg(colors.primary.alpha(0.04))
+        .flex()
+        .items_center()
+        .text_size(px(11.0))
+        .cursor_pointer()
+        .hover(move |style| style.bg(colors.primary.alpha(0.09)))
+        .on_click(cx.listener(move |this, _, window, cx| handler(this, window, cx)))
+        .child(label.into())
+}
+
 fn settings_primary_button(
     label: &'static str,
     id: &'static str,
@@ -6293,7 +6326,7 @@ fn settings_tab_matches(tab: SettingsTab, query: &str) -> bool {
     }
     let searchable = match tab {
         SettingsTab::General => {
-            "general default startup login sessions close confirmation sounds chimes support diagnostics quick open search roots choose folder finder picker updates diri-include include gitignore worktrees hidden folders"
+            "general default startup login sessions close confirmation sounds chimes support diagnostics quick open search roots choose folder finder picker updates diri-include include gitignore worktrees hidden folders import herdr migrate move tmux"
         }
         SettingsTab::WhatsNew => {
             "what's new whats new release notes latest version changes features improvements"
@@ -7914,6 +7947,23 @@ mod tests {
                     .write()
                     .expect("preview store")
                     .set_agent_catalog(crate::agent_setup::bundled_catalog(&installed));
+            }
+            // `DIRI_VISUAL_HERDR=plan|none|done` seeds the General page's
+            // Import row with a herdr scan result.
+            if let Ok(herdr) = std::env::var("DIRI_VISUAL_HERDR") {
+                let plan = match herdr.as_str() {
+                    "none" => crate::herdr_import::HerdrPlan::default(),
+                    "done" => crate::herdr_import::HerdrPlan {
+                        found: true,
+                        ..Default::default()
+                    },
+                    _ => crate::herdr_import::preview_plan(),
+                };
+                runtime
+                    .store
+                    .write()
+                    .expect("preview store")
+                    .set_herdr_plan(Some(plan));
             }
             if std::env::var_os("DIRI_VISUAL_LIGHT").is_some() {
                 runtime

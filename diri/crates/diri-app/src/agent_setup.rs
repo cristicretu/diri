@@ -9,7 +9,7 @@ use std::rc::Rc;
 
 use diri_proto::AgentKind;
 use diri_ui::{AgentLogo, Radius, SemanticColors};
-use gpui::{AnyElement, App, Div, FontWeight, Role, Window, div, prelude::*, px};
+use gpui::{AnyElement, App, Div, FontWeight, Role, SharedString, Window, div, prelude::*, px};
 
 use crate::agent_catalog::AgentOption;
 use crate::icons::sf_symbol;
@@ -241,16 +241,17 @@ fn setup_row(
 /// A text-weight control for the quiet actions under a setup list.
 pub(crate) fn quiet_link(
     id: &'static str,
-    label: &'static str,
+    label: impl Into<SharedString>,
     symbol: Option<&'static str>,
     colors: SemanticColors,
     on_click: impl Fn(&mut Window, &mut App) + 'static,
 ) -> AnyElement {
+    let label = label.into();
     div()
         .id(id)
         .debug_selector(move || id.to_owned())
         .role(Role::Button)
-        .aria_label(label)
+        .aria_label(label.clone())
         .flex()
         .items_center()
         .gap(px(5.0))

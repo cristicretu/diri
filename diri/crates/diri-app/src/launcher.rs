@@ -5480,6 +5480,7 @@ mod tests {
             installed: &'static [&'static str],
             installing: Option<AgentKind>,
             has_sessions: bool,
+            herdr: Option<&'static str>,
         }
         impl Render for Welcome {
             fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
@@ -5498,11 +5499,14 @@ mod tests {
                             )),
                             installing: self.installing.clone(),
                             scanning: false,
+                            herdr: self.herdr.map(Into::into),
+                            importing_herdr: false,
                         },
                         crate::empty_workbench::EmptyWorkbenchActions {
                             install: std::rc::Rc::new(|_, _| {}),
                             check_again: std::rc::Rc::new(|_, _| {}),
                             start_in_folder: std::rc::Rc::new(|_, _| {}),
+                            import_herdr: std::rc::Rc::new(|_, _| {}),
                         },
                         self.colors,
                     ))
@@ -5527,16 +5531,24 @@ mod tests {
                 cx.set_reduce_motion(true);
             });
             let claude: &[&str] = &["claude-code", "codex"];
-            for (name, installed, installing, has_sessions) in [
-                ("welcome", &[][..], None, false),
+            for (name, installed, installing, has_sessions, herdr) in [
+                ("welcome", &[][..], None, false, None),
                 (
                     "welcome-installing",
                     &[][..],
                     Some(AgentKind::CLAUDE_CODE),
                     false,
+                    None,
                 ),
-                ("welcome-ready", claude, None, false),
-                ("resting", claude, None, true),
+                ("welcome-ready", claude, None, false, None),
+                (
+                    "welcome-herdr",
+                    claude,
+                    None,
+                    false,
+                    Some("6 sessions from herdr"),
+                ),
+                ("resting", claude, None, true, None),
             ] {
                 let welcome = cx
                     .open_window(gpui::size(px(width), px(height)), |_, cx| {
@@ -5545,6 +5557,7 @@ mod tests {
                             installed,
                             installing,
                             has_sessions,
+                            herdr,
                         })
                     })
                     .unwrap();

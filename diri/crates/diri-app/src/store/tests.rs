@@ -3146,3 +3146,170 @@ fn notification_pipeline_redraws_interrupt_once() {
     );
     assert_eq!(store.notifications().entries().len(), 1);
 }
+
+#[test]
+fn importing_herdr_resumes_conversations_and_spawns_the_rest_in_herdr_order() {
+    let (mut store, mut effects) = SessionStore::headless(Prefs::default());
+    assert!(
+        !store.import_herdr(),
+        "nothing to import before a scan answers"
+    );
+    let plan = crate::herdr_import::preview_plan();
+    store.set_herdr_plan(Some(plan.clone()));
+
+    assert!(store.import_herdr());
+    assert!(!store.import_herdr(), "one import at a time");
+    let Ok(StoreEffect::ImportHerdr(steps)) = effects.try_recv() else {
+        panic!("import emits one ordered effect");
+    };
+    assert_eq!(steps.len(), plan.items.len());
+    let calls = steps
+        .iter()
+        .map(|step| match &step.call {
+            super::herdr::ImportCall::Resume(entry) => format!("resume {}", entry.kind.id()),
+            super::herdr::ImportCall::Spawn(params) => {
+                assert_eq!(params.host, None, "herdr panes are local");
+                assert_eq!(params.initial_prompt, None, "nothing is typed");
+                format!("spawn {} {}", params.kind.id(), params.cwd)
+            }
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        calls,
+        [
+            "resume claude-code",
+            "resume codex",
+            "spawn shell /Users/you/checkout",
+            "resume claude-code",
+            "spawn opencode /Users/you/api",
+            "spawn shell /Users/you/api",
+        ]
+    );
+    assert!(
+        steps[0]
+            .remember
+            .contains(&crate::herdr_import::conversation_key("a"))
+    );
+}
+
+/// The runner against a fake Engine: conversations go through the resume
+/// RPC, the rest through spawn, in order; a pane that fails is reported and
+/// stays importable while the others are remembered.
+#[tokio::test]
+async fn herdr_import_runner_remembers_only_what_opened_and_reports_failures() {
+    use std::io::{BufRead as _, BufReader, Write as _};
+    use std::os::unix::net::UnixListener;
+
+    use diri_proto::{ControlMessage, HelloResult, Method, RUST_ENGINE_KIND, WIRE_VERSION};
+
+    let temp = tempdir().unwrap();
+    let socket = temp.path().join("daemon.sock");
+    let listener = UnixListener::bind(&socket).unwrap();
+    let server = std::thread::spawn(move || {
+        let (stream, _) = listener.accept().unwrap();
+        let mut writer = stream.try_clone().unwrap();
+        let mut reader = BufReader::new(stream);
+        let mut calls = Vec::new();
+        loop {
+            let mut line = String::new();
+            if reader.read_line(&mut line).unwrap() == 0 {
+                break;
+            }
+            let Ok(ControlMessage::Request { id, method, params }) =
+                serde_json::from_str::<ControlMessage>(&line)
+            else {
+                continue;
+            };
+            let result = if method == Method::HELLO {
+                Ok(serde_json::to_value(HelloResult {
+                    proto: WIRE_VERSION,
+                    build: "test-engine".to_owned(),
+                    pid: std::process::id() as i32,
+                    engine_instance_id: None,
+                    engine_kind: Some(RUST_ENGINE_KIND.to_owned()),
+                    executable_hash: None,
+                })
+                .unwrap())
+            } else {
+                let params = params.unwrap_or_default();
+                let kind = params
+                    .pointer("/entry/kind")
+                    .or_else(|| params.get("kind"))
+                    .and_then(|kind| serde_json::from_value::<AgentKind>(kind.clone()).ok())
+                    .map(|kind| kind.id().to_owned())
+                    .unwrap_or_default();
+                calls.push(format!("{method} {kind}"));
+                if kind == "opencode" {
+                    Err(diri_proto::ControlError::not_found(
+                        "no manifest for agent opencode",
+                    ))
+                } else {
+                    Ok(
+                        serde_json::to_value(session(&format!("s{}", calls.len()), "p", 1.0))
+                            .unwrap(),
+                    )
+                }
+            };
+            let mut bytes = serde_json::to_vec(&ControlMessage::Response { id, result }).unwrap();
+            bytes.push(b'\n');
+            writer.write_all(&bytes).unwrap();
+            writer.flush().unwrap();
+            if calls.len() == 6 {
+                break;
+            }
+        }
+        calls
+    });
+
+    let client = Arc::new(DaemonClient::with_socket_path(socket));
+    client.connect();
+    client
+        .wait_until_connected(Duration::from_secs(2))
+        .await
+        .unwrap();
+    let (mut store, mut effects) = SessionStore::headless(Prefs::default());
+    store.set_herdr_plan(Some(crate::herdr_import::preview_plan()));
+    assert!(store.import_herdr());
+    let Ok(StoreEffect::ImportHerdr(steps)) = effects.try_recv() else {
+        panic!("import effect");
+    };
+    let store = Arc::new(std::sync::RwLock::new(store));
+    let (change_tx, _) = tokio::sync::broadcast::channel(8);
+    let (status_tx, mut status_rx) = tokio::sync::broadcast::channel(8);
+
+    super::herdr::import(steps, client, Arc::clone(&store), change_tx, status_tx).await;
+
+    assert_eq!(
+        server.join().unwrap(),
+        [
+            "session.resume_from_history claude-code",
+            "session.resume_from_history codex",
+            "session.spawn shell",
+            "session.resume_from_history claude-code",
+            "session.spawn opencode",
+            "session.spawn shell",
+        ]
+    );
+    let locked = store.read().unwrap();
+    assert!(!locked.herdr().importing);
+    let remembered = &locked.preferences().herdr_imported;
+    assert!(remembered.contains(&crate::herdr_import::conversation_key("a")));
+    assert!(remembered.contains("default/w2/6//Users/you/api"));
+    assert_eq!(
+        remembered.len(),
+        8,
+        "3 conversations x 2 keys + 2 terminals; the failed agent is not remembered"
+    );
+    drop(locked);
+    let banner = status_rx
+        .try_recv()
+        .expect("summary banner")
+        .in_app_banner
+        .expect("in-app banner");
+    assert_eq!(banner.title, "Moved 5 of 6 sessions from herdr");
+    assert!(
+        banner.body.contains("no manifest for agent opencode"),
+        "{}",
+        banner.body
+    );
+}

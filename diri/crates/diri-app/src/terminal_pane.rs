@@ -2018,6 +2018,13 @@ impl TerminalPane {
                 ),
                 installing: store.installing_agent().cloned(),
                 scanning: store.agent_catalog_is_loading(None),
+                herdr: store
+                    .herdr()
+                    .plan
+                    .as_ref()
+                    .filter(|plan| !plan.is_empty())
+                    .map(|plan| plan.headline().into()),
+                importing_herdr: store.herdr().importing,
             }
         };
         let canonical = Arc::clone(&self.runtime.store);
@@ -2084,12 +2091,33 @@ impl TerminalPane {
             })
             .detach();
         });
+        let canonical = Arc::clone(&self.runtime.store);
+        let import_herdr: crate::agent_setup::ActionHandler = Rc::new(move |window, cx| {
+            let plan = canonical
+                .read()
+                .expect("session store lock poisoned")
+                .herdr()
+                .plan
+                .clone();
+            let Some(plan) = plan.filter(|plan| !plan.is_empty()) else {
+                return;
+            };
+            let canonical = Arc::clone(&canonical);
+            crate::herdr_import::confirm(&plan, window, cx, move |cx| {
+                canonical
+                    .write()
+                    .expect("session store lock poisoned")
+                    .import_herdr();
+                cx.refresh_windows();
+            });
+        });
         crate::empty_workbench::render(
             state,
             crate::empty_workbench::EmptyWorkbenchActions {
                 install,
                 check_again,
                 start_in_folder,
+                import_herdr,
             },
             colors,
         )
