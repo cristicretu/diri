@@ -82,6 +82,9 @@ pub enum InspectorEvent {
     WorkspaceClosed {
         surface: WorkspaceSurface,
         id: u64,
+        /// Slot of a closed terminal tab. The tab is already gone when the
+        /// event is handled, so the shell binding has to travel with it.
+        terminal_slot: Option<usize>,
     },
     RequestTerminal,
     Browser(BrowserAction),
@@ -578,6 +581,23 @@ impl WorkbenchInspector {
     }
 
     #[must_use]
+    pub(crate) fn has_active_workspace(&self) -> bool {
+        self.workspace_selected.is_some()
+    }
+
+    /// Land keyboard focus on the tab already selected. A blank browser gets
+    /// its address field; every other non-terminal surface uses this view.
+    pub(crate) fn focus_active_surface(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.workspace_selected == Some(WorkspaceSurface::Browser)
+            && self.browser_state.url.is_none()
+        {
+            self.focus_browser_address(window, cx);
+            return;
+        }
+        window.focus(&self.focus, cx);
+    }
+
+    #[must_use]
     #[cfg(target_os = "macos")]
     pub fn is_browser_tab(&self) -> bool {
         self.workspace_selected == Some(WorkspaceSurface::Browser)
@@ -1023,6 +1043,47 @@ impl WorkbenchInspector {
             .unwrap_or(0)
     }
 
+    /// ⌘W while this inspector is focused closes the tab in front, same as its X.
+    /// A focused browser page counts too: its web view is not this focus handle.
+    pub(crate) fn close_focused_workspace(
+        &mut self,
+        window: &Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        if !self.visible {
+            return false;
+        }
+        #[cfg(target_os = "macos")]
+        let browser_focused = self
+            .native_browser
+            .as_ref()
+            .is_some_and(|browser| browser.borrow().has_focus());
+        #[cfg(not(target_os = "macos"))]
+        let browser_focused = false;
+        if !self.is_focused(window) && !browser_focused {
+            return false;
+        }
+        self.close_active_workspace(cx)
+    }
+
+    /// ⌘W on the focused shell closes this tab. Leaving it open shows an empty
+    /// "Select a session" pane that cannot select anything.
+    pub(crate) fn close_active_terminal(&mut self, cx: &mut Context<Self>) -> bool {
+        if self.workspace_selected != Some(WorkspaceSurface::Terminal) {
+            return false;
+        }
+        self.close_active_workspace(cx)
+    }
+
+    /// ⌘W while this inspector is focused closes the tab in front, same as its X.
+    pub(crate) fn close_active_workspace(&mut self, cx: &mut Context<Self>) -> bool {
+        let Some(id) = self.workspace_active else {
+            return false;
+        };
+        self.close_workspace(id, cx);
+        true
+    }
+
     pub(crate) fn select_workspace(&mut self, surface: WorkspaceSurface, cx: &mut Context<Self>) {
         self.sync_workspace_session(cx);
         if self.workspace_selected == Some(surface) && self.workspace_active.is_some() {
@@ -1163,6 +1224,7 @@ impl WorkbenchInspector {
         cx.emit(InspectorEvent::WorkspaceClosed {
             surface: tab.surface,
             id,
+            terminal_slot: tab.terminal_slot,
         });
         cx.notify();
     }
@@ -6619,8 +6681,12 @@ mod tests {
 
         inspector.update(cx, |inspector, cx| {
             inspector.select_workspace(WorkspaceSurface::Browser, cx);
-            inspector.close_workspace(inspector.workspace_active.unwrap(), cx);
+            assert!(inspector.close_active_workspace(cx));
             inspector.close_workspace(0, cx);
+            assert!(!inspector.close_active_terminal(cx));
+            inspector.select_workspace(WorkspaceSurface::Terminal, cx);
+            assert!(inspector.close_active_terminal(cx));
+            assert!(!inspector.workspace_needs_terminal());
         });
 
         inspector.read_with(cx, |inspector, _| {

@@ -810,7 +810,15 @@ impl RootView {
                     | InspectorEvent::WorkspaceRestored(surface) => {
                         let focus_workspace = matches!(event, InspectorEvent::WorkspaceChanged(_));
                         if focus_workspace {
-                            window.focus(&this.focus, cx);
+                            // Terminal keeps the root focus until its pane exists.
+                            // Every other surface owns ⌘W, so focus lands here
+                            // instead of on the agent session behind it.
+                            if *surface == crate::inspector::WorkspaceSurface::Terminal {
+                                window.focus(&this.focus, cx);
+                            } else if let Some(inspector) = &this.inspector {
+                                let handle = inspector.read(cx).focus_handle(cx);
+                                window.focus(&handle, cx);
+                            }
                         }
                         #[cfg(target_os = "macos")]
                         if *surface == crate::inspector::WorkspaceSurface::Browser
@@ -838,21 +846,23 @@ impl RootView {
                     InspectorEvent::RequestTerminal => {
                         this.ensure_auxiliary_terminal(window, cx);
                     }
-                    InspectorEvent::WorkspaceClosed { surface, id } => {
+                    InspectorEvent::WorkspaceClosed {
+                        surface,
+                        id,
+                        terminal_slot,
+                    } => {
                         #[cfg(not(target_os = "macos"))]
                         let _ = id;
                         #[cfg(target_os = "macos")]
                         if *surface == crate::inspector::WorkspaceSurface::Browser {
                             this.browser.borrow_mut().close_tab(*id);
                         }
-                        if *surface == crate::inspector::WorkspaceSurface::Terminal
-                            && !this.inspector.as_ref().is_some_and(|inspector| {
-                                inspector.read(cx).workspace_needs_terminal()
-                            })
-                        {
-                            this.hide_auxiliary_terminal(window, cx);
+                        if *surface == crate::inspector::WorkspaceSurface::Terminal {
+                            this.close_workspace_terminal(*terminal_slot, window, cx);
                         }
-                        window.focus(&this.focus, cx);
+                        if !this.focus_remaining_workspace(window, cx) {
+                            window.focus(&this.focus, cx);
+                        }
                         cx.notify();
                     }
                     InspectorEvent::Browser(action) => {
@@ -2378,6 +2388,84 @@ impl RootView {
         spawned
     }
 
+    /// The workspace-tab X closes that slot's shell. Collapse stays on
+    /// `hide_auxiliary_terminal` and keeps the process.
+    fn close_workspace_terminal(
+        &mut self,
+        slot: Option<usize>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(slot) = slot else {
+            return;
+        };
+        let Some(parent) = self.active_session_id(cx) else {
+            return;
+        };
+        let removed = {
+            let mut store = self
+                .window_store
+                .write()
+                .expect("session store lock poisoned");
+            let Some(id) = store
+                .auxiliary_terminal_for_slot(&parent, slot)
+                .map(|session| session.id.clone())
+            else {
+                return;
+            };
+            store.remove_sessions(vec![id.clone()]);
+            id
+        };
+        // The next terminal tab is already selected. Point the pane at its
+        // shell instead of tearing it down and attaching again.
+        if self
+            .inspector
+            .as_ref()
+            .is_some_and(|inspector| inspector.read(cx).is_terminal_tab())
+        {
+            self.sync_auxiliary_terminal(window, cx);
+            return;
+        }
+        if self.auxiliary_id.as_ref() != Some(&removed) {
+            return;
+        }
+        self.auxiliary_terminal = None;
+        self.auxiliary_id = None;
+        self.auxiliary_parent = None;
+        self.auxiliary_spawn_parent = None;
+        if let Some(inspector) = &self.inspector {
+            inspector.update(cx, |inspector, cx| inspector.set_terminal_surface(None, cx));
+        }
+        let workspace_remains = self
+            .inspector
+            .as_ref()
+            .is_some_and(|inspector| inspector.read(cx).has_active_workspace());
+        if !workspace_remains && let Some(primary) = self.active_terminal(cx) {
+            primary.update(cx, |terminal, cx| terminal.focus(window, cx));
+        }
+        cx.notify();
+    }
+
+    /// After ⌘W, stay on the inspector tab that replaced the closed one.
+    fn focus_remaining_workspace(&mut self, window: &mut Window, cx: &mut Context<Self>) -> bool {
+        let Some(inspector) = &self.inspector else {
+            return false;
+        };
+        if !inspector.read(cx).has_active_workspace() {
+            return false;
+        }
+        if inspector.read(cx).is_terminal_tab() {
+            if let Some(terminal) = &self.auxiliary_terminal {
+                terminal.update(cx, |terminal, cx| terminal.focus(window, cx));
+            }
+            return true;
+        }
+        inspector.update(cx, |inspector, cx| {
+            inspector.focus_active_surface(window, cx)
+        });
+        true
+    }
+
     /// Hide the pane without starting or stopping the Engine-owned child shell.
     fn hide_auxiliary_terminal(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if let Some(parent) = self.active_session_id(cx) {
@@ -2447,6 +2535,26 @@ impl RootView {
                 && self.auxiliary_parent.as_ref() == Some(&parent)
             {
                 self.auxiliary_spawn_parent = None;
+                return;
+            }
+
+            if let Some(terminal) = &self.auxiliary_terminal {
+                let id = session.id.clone();
+                terminal.update(cx, |terminal, cx| terminal.show_session(id, window, cx));
+                let should_focus = self.auxiliary_spawn_parent.as_ref() == Some(&parent);
+                self.auxiliary_id = Some(session.id.clone());
+                self.auxiliary_parent = Some(parent);
+                self.auxiliary_spawn_parent = None;
+                if let Some(inspector) = &self.inspector {
+                    let terminal = terminal.clone();
+                    inspector.update(cx, |inspector, cx| {
+                        inspector.set_terminal_surface(Some(terminal), cx)
+                    });
+                }
+                if should_focus {
+                    terminal.update(cx, |terminal, cx| terminal.focus(window, cx));
+                }
+                cx.notify();
                 return;
             }
 
@@ -2526,15 +2634,28 @@ impl RootView {
             .auxiliary_terminal
             .as_ref()
             .is_some_and(|terminal| terminal.read(cx).is_focused(window))
-            && let Some(id) = self.auxiliary_id.clone()
+            && self.auxiliary_id.is_some()
         {
-            self.window_store
-                .write()
-                .expect("session store lock poisoned")
-                .remove_sessions(vec![id]);
-            if let Some(terminal) = &self.terminal {
-                terminal.update(cx, |terminal, cx| terminal.focus(window, cx));
+            let closed_tab = self.inspector.as_ref().is_some_and(|inspector| {
+                inspector.update(cx, |inspector, cx| inspector.close_active_terminal(cx))
+            });
+            if !closed_tab && let Some(id) = self.auxiliary_id.clone() {
+                self.window_store
+                    .write()
+                    .expect("session store lock poisoned")
+                    .remove_sessions(vec![id]);
+                if let Some(terminal) = &self.terminal {
+                    terminal.update(cx, |terminal, cx| terminal.focus(window, cx));
+                }
             }
+            return;
+        }
+        let closed_workspace = self.inspector.as_ref().is_some_and(|inspector| {
+            inspector.update(cx, |inspector, cx| {
+                inspector.close_focused_workspace(window, cx)
+            })
+        });
+        if closed_workspace {
             return;
         }
         let closed = self

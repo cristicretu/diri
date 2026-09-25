@@ -762,6 +762,29 @@ impl TerminalPane {
         )
     }
 
+    /// Point this pane at another shell without discarding its parked grids.
+    /// A freshly built pane has nothing to paint until a snapshot arrives.
+    pub(crate) fn show_session(
+        &mut self,
+        id: SessionId,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if matches!(&self.session_source, SessionSource::Fixed(current) if current == &id) {
+            return;
+        }
+        if let SessionSource::Fixed(previous) = &self.session_source
+            && let Some(resident) = self.residents.get(previous)
+        {
+            resident.attachment.release();
+        }
+        self.pending_resizes.clear();
+        self.session_source = SessionSource::Fixed(id);
+        self.reconcile_residency(cx);
+        self.sync_status_glyphs(self.current_colors(), window, cx);
+        cx.notify();
+    }
+
     pub(crate) fn set_window_store(&mut self, store: crate::store::WindowStore) {
         self.window_store = Some(store);
     }

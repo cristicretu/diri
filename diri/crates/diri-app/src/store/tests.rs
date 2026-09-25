@@ -1172,6 +1172,36 @@ fn closing_an_exited_parent_confirms_for_its_running_auxiliary_terminal() {
     );
 }
 
+/// Closing the inspector terminal tab removes that shell. The record stays
+/// until the engine drops it, so a later parent close must not count it.
+#[test]
+fn closed_terminal_tab_is_not_counted_when_closing_its_parent() {
+    let parent = session("parent", "p", 2.0);
+    let mut terminal = session("terminal", "p", 1.0);
+    terminal.kind = AgentKind::SHELL;
+    terminal.parent = Some(id("parent"));
+    let (mut store, mut effects) = hydrated(
+        vec![parent, terminal],
+        vec![project("p", "P")],
+        Prefs::default(),
+    );
+    drain(&mut effects);
+
+    store.remove_sessions(vec![id("terminal")]);
+    assert!(
+        store.sessions.contains_key(&id("terminal")),
+        "the engine has not dropped the shell record yet"
+    );
+    assert!(store.closing.contains(&id("terminal")));
+    drain(&mut effects);
+
+    store.request_close(vec![id("parent")]);
+    assert_eq!(
+        store.pending_close.as_ref().map(|pending| &pending.ids),
+        Some(&vec![id("parent")])
+    );
+}
+
 #[test]
 fn closing_an_exited_parent_with_an_exited_terminal_needs_no_confirmation() {
     let (mut store, mut effects) = hydrated(

@@ -2221,7 +2221,9 @@ impl SessionStore {
     }
 
     /// Every session that closing `ids` terminates: the rows themselves and
-    /// their auxiliary terminals, which never outlive their parent.
+    /// their auxiliary terminals, which never outlive their parent. A shell
+    /// already in `closing` was removed with its terminal tab; its record can
+    /// still be here until the engine drops it, and must not be counted again.
     pub(crate) fn closure_set(&self, ids: Vec<SessionId>) -> Vec<SessionId> {
         let mut ids = ids;
         let parents: HashSet<_> = ids.iter().cloned().collect();
@@ -2234,6 +2236,7 @@ impl SessionStore {
                     .as_ref()
                     .is_some_and(|parent| parents.contains(parent))
                     && is_auxiliary_terminal(session)
+                    && !self.closing.contains(&session.id)
             })
             .map(|session| session.id.clone())
             .collect();
