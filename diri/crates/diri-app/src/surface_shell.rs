@@ -379,6 +379,10 @@ pub struct UtilitySurfaces {
     host_initialization: Option<HostInitialization>,
     host_initialization_generation: u64,
     prefs: Prefs,
+    login_item: crate::login_item::LoginItem,
+    /// The registration macOS last reported, which is what the toggle shows;
+    /// `prefs.start_at_login` only mirrors it.
+    login_item_state: crate::login_item::LoginItemState,
     store: crate::store::WindowStore,
     store_runtime: Arc<StoreRuntime>,
     runtime: Arc<Runtime>,
@@ -421,6 +425,22 @@ impl UtilitySurfaces {
         include_editor.insert_multiline(&quick_open::load_include(&include_path));
         let include_persisted = include_editor.text().to_owned();
         let mut roots_editor = QueryEditor::default();
+        // App start: the user may have approved or removed the login item in
+        // System Settings since the preference was last saved.
+        let login_item = crate::login_item::LoginItem::system();
+        let login_item_state = login_item.observe();
+        {
+            let mut store = store_runtime
+                .store
+                .write()
+                .expect("session store lock poisoned");
+            let saved = store.preferences().start_at_login;
+            let actual = login_item_state.preference(saved);
+            if actual != saved {
+                // Best effort: Settings reconciles again whenever it opens.
+                let _ = store.update_preferences(|prefs| prefs.start_at_login = actual);
+            }
+        }
         let (prefs, hosts, agents_host) = {
             let store = store_runtime
                 .store
@@ -571,6 +591,8 @@ impl UtilitySurfaces {
             host_initialization: None,
             host_initialization_generation: 0,
             prefs,
+            login_item,
+            login_item_state,
             store: crate::store::WindowStore::from_canonical(Arc::clone(&store_runtime.store)),
             store_runtime,
             runtime,
@@ -800,6 +822,51 @@ impl UtilitySurfaces {
             self.activity = "Settings saved for diri".to_owned();
             true
         }
+    }
+
+    /// Shows `state` and brings the saved preference into line with it, so a
+    /// refused or still-unapproved registration is never stored as "on".
+    fn apply_login_item_state(&mut self, state: crate::login_item::LoginItemState) {
+        self.login_item_state = state;
+        let enabled = state.preference(self.prefs.start_at_login);
+        if enabled != self.prefs.start_at_login {
+            // Only this field: Settings may be opening, and `update_prefs`
+            // would also save whatever the editors still hold from last time.
+            let result = self
+                .store
+                .write()
+                .expect("session store lock poisoned")
+                .update_preferences(|prefs| prefs.start_at_login = enabled);
+            match result {
+                Ok(()) => {
+                    self.prefs.start_at_login = enabled;
+                    self.store_runtime.publish_local_change();
+                }
+                Err(error) => self.activity = format!("Could not save settings: {error}"),
+            }
+        }
+        if state.failed() {
+            self.activity = state.detail();
+        }
+    }
+
+    fn toggle_login_item(&mut self, cx: &mut Context<Self>) {
+        if !self.login_item_state.available() {
+            return;
+        }
+        let state = self.login_item.set(!self.login_item_state.enabled());
+        self.apply_login_item_state(state);
+        cx.notify();
+    }
+
+    #[cfg(test)]
+    fn set_login_item_backend(
+        &mut self,
+        backend: impl crate::login_item::LoginItemBackend + 'static,
+    ) {
+        self.login_item = crate::login_item::LoginItem::new(backend);
+        let state = self.login_item.observe();
+        self.apply_login_item_state(state);
     }
 
     fn persist_include(&mut self) -> bool {
@@ -1502,6 +1569,8 @@ impl UtilitySurfaces {
             .expect("session store lock poisoned")
             .preferences()
             .clone();
+        let login_item_state = self.login_item.observe();
+        self.apply_login_item_state(login_item_state);
         self.surface = Surface::Settings;
         self.settings_scroll.set_offset(point(px(0.0), px(0.0)));
         self.settings_search.clear();
@@ -2770,21 +2839,7 @@ impl UtilitySurfaces {
                         .flex_col()
                         .when(cfg!(target_os = "macos"), |behavior| {
                             behavior
-                                .child(toggle_row(
-                                    "Start diri at login",
-                                    "Open diri automatically after you sign in.",
-                                    self.prefs.start_at_login,
-                                    "toggle-login",
-                                    colors,
-                                    cx,
-                                    |this, cx| {
-                                        let enabled = !this.prefs.start_at_login;
-                                        this.update_prefs(move |prefs| {
-                                            prefs.start_at_login = enabled;
-                                        });
-                                        cx.notify();
-                                    },
-                                ))
+                                .child(login_item_row(self.login_item_state, colors, cx))
                                 .child(setting_divider(colors))
                         })
                         .child(toggle_row(
@@ -5898,6 +5953,87 @@ fn toggle_row(
         )
 }
 
+/// "Start diri at login". Unlike a plain preference toggle it shows what
+/// macOS reports, says why when that differs from what was asked, and is
+/// inert where there is no app bundle to register.
+fn login_item_row(
+    state: crate::login_item::LoginItemState,
+    colors: SemanticColors,
+    cx: &mut Context<UtilitySurfaces>,
+) -> impl IntoElement {
+    let enabled = state.enabled();
+    let available = state.available();
+    div()
+        .id("toggle-login")
+        .debug_selector(|| "toggle-login".into())
+        .min_h(px(SETTINGS_ROW_HEIGHT))
+        .px(px(12.0))
+        .flex()
+        .items_center()
+        .justify_between()
+        .gap(px(12.0))
+        .when(available, |row| {
+            row.cursor_pointer()
+                .hover(move |style| style.bg(colors.primary.alpha(0.025)))
+                .on_click(cx.listener(|this, _, _, cx| this.toggle_login_item(cx)))
+        })
+        .child(
+            div()
+                .flex_1()
+                .min_w(px(0.0))
+                .flex()
+                .flex_col()
+                .gap(px(2.0))
+                .child(
+                    div()
+                        .min_w(px(0.0))
+                        .w_full()
+                        .whitespace_normal()
+                        .text_size(px(Typo::ROW_EMPHASIZED.size))
+                        .font_weight(Typo::ROW_EMPHASIZED.weight)
+                        .text_color(if available {
+                            colors.primary
+                        } else {
+                            colors.secondary
+                        })
+                        .child("Start diri at login"),
+                )
+                .child(
+                    div()
+                        .debug_selector(|| "toggle-login-detail".into())
+                        .min_w(px(0.0))
+                        .w_full()
+                        .whitespace_normal()
+                        .text_size(px(Typo::META.size))
+                        .line_height(px(14.0))
+                        .text_color(if state.failed() {
+                            Ink::DANGER
+                        } else {
+                            colors.tertiary
+                        })
+                        .child(wrappable_setting_copy(state.detail().into())),
+                ),
+        )
+        .child(
+            div()
+                .flex_none()
+                .w(px(30.0))
+                .h(px(18.0))
+                .p(px(2.0))
+                .rounded(px(9.0))
+                .bg(if enabled {
+                    Ink::FRESH.alpha(0.72)
+                } else {
+                    colors.primary.alpha(0.14)
+                })
+                .when(!available, |toggle| toggle.opacity(0.45))
+                .flex()
+                .justify_end()
+                .when(!enabled, |toggle| toggle.justify_start())
+                .child(div().size(px(14.0)).rounded(px(7.0)).bg(colors.primary)),
+        )
+}
+
 fn setting_section(
     title: &'static str,
     content: impl IntoElement,
@@ -8514,6 +8650,154 @@ mod tests {
         // The panel now shows what is actually stored, so a second action
         // cannot resurrect the stale copy either.
         surfaces.read_with(cx, |surfaces, _| assert_eq!(surfaces.prefs, saved));
+    }
+
+    /// The toggle used to save `start_at_login` and stop. It now goes through
+    /// the login-item seam, and the preference follows what macOS reports.
+    #[cfg(target_os = "macos")]
+    #[gpui::test]
+    fn login_toggle_registers_with_the_system_and_mirrors_its_answer(cx: &mut TestAppContext) {
+        use crate::login_item::{LoginItemStatus, testing::Fake};
+
+        let (harness, cx) = open_settings_workbench(cx);
+        let surfaces = harness.read_with(cx, |harness, _| harness.surfaces.clone());
+        let store = surfaces.read_with(cx, |surfaces, _| surfaces.store.clone());
+        let saved = || store.read().unwrap().preferences().start_at_login;
+        let fake = Fake::with_status(LoginItemStatus::NotRegistered);
+        surfaces.update(cx, |surfaces, cx| {
+            surfaces.set_login_item_backend(fake.clone());
+            cx.notify();
+        });
+        cx.run_until_parked();
+
+        let toggle = cx.debug_bounds("toggle-login").expect("login toggle");
+        cx.simulate_click(toggle.center(), Modifiers::default());
+        cx.run_until_parked();
+        assert_eq!(fake.calls(), ["register"]);
+        assert!(saved());
+        surfaces.read_with(cx, |surfaces, _| {
+            assert!(surfaces.login_item_state.enabled());
+            assert!(surfaces.prefs.start_at_login);
+        });
+
+        // macOS refuses the removal: the item is still registered, so neither
+        // the switch nor the preference may claim otherwise.
+        fake.refuse(2);
+        cx.simulate_click(toggle.center(), Modifiers::default());
+        cx.run_until_parked();
+        assert_eq!(fake.calls(), ["register", "unregister"]);
+        assert!(saved());
+        surfaces.read_with(cx, |surfaces, _| {
+            assert!(surfaces.login_item_state.enabled());
+            assert_eq!(
+                surfaces.login_item_state.detail(),
+                "macOS could not update Login Items (error 2)."
+            );
+        });
+    }
+
+    #[cfg(target_os = "macos")]
+    #[gpui::test]
+    fn a_refused_or_unapproved_login_item_is_not_saved_as_on(cx: &mut TestAppContext) {
+        use crate::login_item::{LoginItemStatus, testing::Fake};
+
+        let (harness, cx) = open_settings_workbench(cx);
+        let surfaces = harness.read_with(cx, |harness, _| harness.surfaces.clone());
+        let store = surfaces.read_with(cx, |surfaces, _| surfaces.store.clone());
+        let saved = || store.read().unwrap().preferences().start_at_login;
+        let fake = Fake::with_status(LoginItemStatus::NotRegistered);
+        fake.refuse(3);
+        surfaces.update(cx, |surfaces, cx| {
+            surfaces.set_login_item_backend(fake.clone());
+            cx.notify();
+        });
+        cx.run_until_parked();
+
+        let toggle = cx.debug_bounds("toggle-login").expect("login toggle");
+        cx.simulate_click(toggle.center(), Modifiers::default());
+        cx.run_until_parked();
+        assert_eq!(fake.calls(), ["register"]);
+        assert!(!saved());
+        surfaces.read_with(cx, |surfaces, _| {
+            assert!(!surfaces.login_item_state.enabled());
+            assert!(surfaces.login_item_state.failed());
+            assert!(!surfaces.prefs.start_at_login);
+        });
+
+        let fake = Fake::with_status(LoginItemStatus::NotRegistered);
+        fake.hold_for_approval();
+        surfaces.update(cx, |surfaces, cx| {
+            surfaces.set_login_item_backend(fake.clone());
+            cx.notify();
+        });
+        cx.simulate_click(toggle.center(), Modifiers::default());
+        cx.run_until_parked();
+        assert_eq!(fake.calls(), ["register", "open_approval_settings"]);
+        assert!(!saved());
+        surfaces.read_with(cx, |surfaces, _| {
+            assert!(!surfaces.login_item_state.enabled());
+            assert!(
+                surfaces
+                    .login_item_state
+                    .detail()
+                    .contains("System Settings > General > Login Items")
+            );
+        });
+
+        // The user approves it in System Settings; reopening Settings notices.
+        fake.set_status(LoginItemStatus::Enabled);
+        surfaces.update(cx, |surfaces, cx| surfaces.open_settings(cx));
+        cx.run_until_parked();
+        assert!(saved());
+        surfaces.read_with(cx, |surfaces, _| {
+            assert!(surfaces.login_item_state.enabled())
+        });
+    }
+
+    /// Opening Settings trusts macOS over a stale preference, in both
+    /// directions, and an unbundled build offers nothing to click.
+    #[cfg(target_os = "macos")]
+    #[gpui::test]
+    fn opening_settings_reflects_the_actual_login_item(cx: &mut TestAppContext) {
+        use crate::login_item::{LoginItemStatus, testing::Fake};
+
+        let (harness, cx) = open_settings_workbench(cx);
+        let surfaces = harness.read_with(cx, |harness, _| harness.surfaces.clone());
+        let store = surfaces.read_with(cx, |surfaces, _| surfaces.store.clone());
+        let saved = || store.read().unwrap().preferences().start_at_login;
+
+        // Without a bundle the row is inert and says why; the preference the
+        // installed app saved is left alone.
+        store
+            .write()
+            .unwrap()
+            .update_preferences(|prefs| prefs.start_at_login = true)
+            .unwrap();
+        surfaces.update(cx, |surfaces, cx| surfaces.open_settings(cx));
+        cx.run_until_parked();
+        let toggle = cx.debug_bounds("toggle-login").expect("login toggle");
+        cx.simulate_click(toggle.center(), Modifiers::default());
+        cx.run_until_parked();
+        assert!(saved());
+        surfaces.read_with(cx, |surfaces, _| {
+            assert!(!surfaces.login_item_state.available());
+            assert!(!surfaces.login_item_state.enabled());
+            assert_eq!(
+                surfaces.login_item_state.detail(),
+                "Available when diri runs from the installed app."
+            );
+        });
+
+        // The preference says on, but the user removed the item in System
+        // Settings (or it was never registered, as before this fix).
+        let fake = Fake::with_status(LoginItemStatus::NotRegistered);
+        surfaces.update(cx, |surfaces, cx| {
+            surfaces.set_login_item_backend(fake.clone());
+            surfaces.open_settings(cx);
+        });
+        cx.run_until_parked();
+        assert!(!saved());
+        assert!(fake.calls().is_empty(), "looking must not register");
     }
 
     #[gpui::test]

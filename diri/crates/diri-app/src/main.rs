@@ -28,6 +28,7 @@ mod icons;
 mod inspector;
 mod launch_recipe;
 mod launcher;
+mod login_item;
 pub mod markdown;
 mod markdown_view;
 #[cfg(any(target_os = "macos", test))]

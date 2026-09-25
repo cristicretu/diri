@@ -1,5 +1,12 @@
 const DEV_BUNDLE_PREFIX: &str = "com.dirijor.diri.dev.";
 
+/// Whether `bundle_id` names a side-by-side development bundle, which must
+/// never install itself as the user's login item.
+#[cfg(all(target_os = "macos", not(test)))]
+pub(crate) fn is_dev_bundle(bundle_id: &str) -> bool {
+    bundle_id.starts_with(DEV_BUNDLE_PREFIX)
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct DevBuildIdentity {
     bundle_id: String,

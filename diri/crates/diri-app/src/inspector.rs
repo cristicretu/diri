@@ -6,7 +6,7 @@
 
 use std::collections::HashMap;
 use std::ops::Range;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -44,6 +44,10 @@ use crate::transcript::{TranscriptDocument, TranscriptVersion, load as load_tran
 
 const DIFF_ROW_HEIGHT: f32 = 20.0;
 const GUTTER_WIDTH: f32 = 68.0;
+/// Omitted file names sit under the notice text, past its disclosure chevron.
+const OMITTED_PATH_INDENT: f32 = 15.0;
+const OMITTED_PATH_INDENT_COLUMNS: usize = 3;
+const OMITTED_PATH_ROW_GROUP: &str = "omitted-untracked-row";
 const REFRESH_INTERVAL: Duration = Duration::from_millis(1400);
 const TRANSCRIPT_REFRESH_DEBOUNCE: Duration = Duration::from_millis(120);
 const SCROLLBAR_INSET: f32 = 4.0;
@@ -357,6 +361,8 @@ pub struct WorkbenchInspector {
     commit_query: QueryEditor,
     discard_armed: bool,
     armed_hunk: Option<u64>,
+    /// Whether the "not shown" notice is expanded into the omitted file names.
+    omitted_untracked_open: bool,
     diff_selection: DiffSelection,
     selected_turn: Option<SelectedTurn>,
     diff_layer: DiffLayer,
@@ -491,6 +497,7 @@ impl WorkbenchInspector {
             commit_query: QueryEditor::default(),
             discard_armed: false,
             armed_hunk: None,
+            omitted_untracked_open: false,
             diff_selection: DiffSelection::default(),
             selected_turn: None,
             diff_layer: DiffLayer::Branch,
@@ -953,6 +960,7 @@ impl WorkbenchInspector {
         self.commit_query.clear();
         self.discard_armed = false;
         self.armed_hunk = None;
+        self.omitted_untracked_open = false;
 
         self.browser_address_focused = false;
         self.browser_query.clear();
@@ -1236,6 +1244,7 @@ impl WorkbenchInspector {
             return;
         }
         self.comparison = comparison;
+        self.omitted_untracked_open = false;
         self.scroll = UniformListScrollHandle::new();
         self.scrollbar_interaction = ScrollbarInteraction::default();
         self.scrollbar_layout_primed = false;
@@ -1254,10 +1263,19 @@ impl WorkbenchInspector {
             return;
         }
         self.diff_layer = layer;
+        self.omitted_untracked_open = false;
         self.scroll = UniformListScrollHandle::new();
         self.scrollbar_interaction = ScrollbarInteraction::default();
         self.scrollbar_layout_primed = false;
         self.refresh(true, cx);
+    }
+
+    /// Expands or collapses the omitted-untracked notice. The open state
+    /// survives a Git refresh so staging one listed file keeps the list open.
+    fn toggle_omitted_untracked(&mut self, cx: &mut Context<Self>) {
+        self.omitted_untracked_open = !self.omitted_untracked_open;
+        self.scrollbar_layout_primed = false;
+        cx.notify();
     }
 
     fn jump_to_diff_row(&mut self, row: usize, cx: &mut Context<Self>) {
@@ -1292,6 +1310,7 @@ impl WorkbenchInspector {
             self.scrollbar_layout_primed = false;
             self.files_open = false;
             self.armed_hunk = None;
+            self.omitted_untracked_open = false;
             self.diff_selection.clear();
             self.selected_turn = None;
             self.ask_draft = None;
@@ -3315,9 +3334,28 @@ impl WorkbenchInspector {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
-        let row_count = snapshot.rows.len();
-        let content_width =
-            (GUTTER_WIDTH + 28.0 + snapshot.max_text_columns as f32 * 7.1).clamp(320.0, 3700.0);
+        // The omitted names are extra rows of the same virtualized list, so
+        // thousands of them cost only the handful that are on screen.
+        let omitted_notice = snapshot
+            .omitted_untracked_notice_row()
+            .map(|row| (row, self.omitted_untracked_open));
+        let omitted_open = omitted_notice.is_some_and(|(_, open)| open);
+        let row_count = snapshot.rows.len()
+            + if omitted_open {
+                snapshot.omitted_untracked_paths.len()
+            } else {
+                0
+            };
+        let text_columns = if omitted_open {
+            snapshot
+                .omitted_untracked_paths
+                .iter()
+                .map(|path| path.as_os_str().len() + OMITTED_PATH_INDENT_COLUMNS)
+                .fold(snapshot.max_text_columns, usize::max)
+        } else {
+            snapshot.max_text_columns
+        };
+        let content_width = (GUTTER_WIDTH + 28.0 + text_columns as f32 * 7.1).clamp(320.0, 3700.0);
         let inspector = cx.entity();
         let armed_hunk = self.armed_hunk;
         let selection = self.diff_selection.clone();
@@ -3329,6 +3367,7 @@ impl WorkbenchInspector {
                 colors,
                 inspector.clone(),
                 armed_hunk,
+                omitted_notice,
                 &selection,
             )
         })
@@ -6046,8 +6085,11 @@ struct DiffRowRenderContext {
     repo_root: PathBuf,
     layer: DiffLayer,
     armed_hunk: Option<u64>,
+    /// The omitted-untracked notice row and whether it is expanded.
+    omitted_notice: Option<(usize, bool)>,
 }
 
+#[allow(clippy::too_many_arguments)]
 fn render_rows(
     snapshot: &DiffSnapshot,
     range: Range<usize>,
@@ -6055,6 +6097,7 @@ fn render_rows(
     colors: SemanticColors,
     inspector: Entity<WorkbenchInspector>,
     armed_hunk: Option<u64>,
+    omitted_notice: Option<(usize, bool)>,
     selection: &DiffSelection,
 ) -> Vec<AnyElement> {
     let context = DiffRowRenderContext {
@@ -6064,9 +6107,19 @@ fn render_rows(
         repo_root: snapshot.repo_root.clone(),
         layer: snapshot.layer,
         armed_hunk,
+        omitted_notice,
     };
     range
         .map(|index| {
+            // Rows past the snapshot are the expanded notice's file names.
+            if let Some(ordinal) = index.checked_sub(snapshot.rows.len()) {
+                return render_omitted_path_row(
+                    index,
+                    ordinal,
+                    &snapshot.omitted_untracked_paths[ordinal],
+                    &context,
+                );
+            }
             let owning_file = snapshot
                 .file_diffs
                 .iter()
@@ -6145,18 +6198,11 @@ fn render_row(
         row.kind,
         DiffRowKind::Hunk | DiffRowKind::Context | DiffRowKind::Addition | DiffRowKind::Deletion
     );
-    let mut actions = div()
-        .absolute()
-        .right(px(6.0))
-        .top(px(2.0))
-        .h(px(16.0))
-        .flex()
-        .items_center()
-        .gap(px(2.0))
-        .rounded(px(Radius::CHIP))
-        .bg(colors.background.alpha(0.96))
-        .border_1()
-        .border_color(colors.primary.alpha(0.10));
+    let mut actions = diff_row_actions(colors);
+    let disclosure = context
+        .omitted_notice
+        .and_then(|(row, open)| (row == index).then_some(open));
+    let toggle_inspector = inspector.clone();
 
     if let Some(file) = file.as_ref() {
         let ask_inspector = inspector.clone();
@@ -6195,30 +6241,12 @@ fn render_row(
         );
         match layer {
             DiffLayer::Working => {
-                let stage_inspector = inspector.clone();
-                let path = file.path.clone();
-                actions = actions.child(
-                    div()
-                        .id(("stage-diff-file", index))
-                        .h_full()
-                        .px(px(5.0))
-                        .flex()
-                        .items_center()
-                        .rounded(px(Radius::CHIP))
-                        .cursor_pointer()
-                        .hover(move |button| button.bg(colors.primary.alpha(0.09)))
-                        .text_size(px(8.5))
-                        .font_weight(FontWeight::MEDIUM)
-                        .text_color(colors.secondary)
-                        .child("Stage")
-                        .on_click(move |_, _, cx| {
-                            stage_inspector.update(cx, |inspector, cx| {
-                                inspector
-                                    .run_review_action(ReviewAction::Stage(vec![path.clone()]), cx);
-                            });
-                            cx.stop_propagation();
-                        }),
-                );
+                actions = actions.child(stage_file_action(
+                    index,
+                    file.path.clone(),
+                    inspector.clone(),
+                    colors,
+                ));
             }
             DiffLayer::Staged => {
                 let unstage_inspector = inspector.clone();
@@ -6436,6 +6464,17 @@ fn render_row(
                     cx.stop_propagation();
                 })
         })
+        .when(disclosure.is_some(), |line| {
+            line.debug_selector(|| "INSPECTOR_OMITTED_UNTRACKED_NOTICE".to_owned())
+                .cursor_pointer()
+                .hover(move |line| line.bg(colors.primary.alpha(0.07)))
+                .on_click(move |_, _, cx| {
+                    toggle_inspector.update(cx, |inspector, cx| {
+                        inspector.toggle_omitted_untracked(cx);
+                    });
+                    cx.stop_propagation();
+                })
+        })
         .child(
             div()
                 .w(px(GUTTER_WIDTH))
@@ -6480,9 +6519,136 @@ fn render_row(
                         colors.secondary,
                     ))
                 })
+                .when_some(disclosure, |content, open| {
+                    content.child(sf_symbol(
+                        if open {
+                            "chevron.down"
+                        } else {
+                            "chevron.right"
+                        },
+                        9.0,
+                        foreground,
+                    ))
+                })
                 .child(text),
         )
         .when(has_actions, |line| line.child(actions))
+        .into_any_element()
+}
+
+/// The floating action strip at the right edge of a file, hunk, or omitted
+/// file-name row.
+fn diff_row_actions(colors: SemanticColors) -> gpui::Div {
+    div()
+        .absolute()
+        .right(px(6.0))
+        .top(px(2.0))
+        .h(px(16.0))
+        .flex()
+        .items_center()
+        .gap(px(2.0))
+        .rounded(px(Radius::CHIP))
+        .bg(colors.background.alpha(0.96))
+        .border_1()
+        .border_color(colors.primary.alpha(0.10))
+}
+
+fn stage_file_action(
+    index: usize,
+    path: PathBuf,
+    inspector: Entity<WorkbenchInspector>,
+    colors: SemanticColors,
+) -> impl IntoElement {
+    div()
+        .id(("stage-diff-file", index))
+        .h_full()
+        .px(px(5.0))
+        .flex()
+        .items_center()
+        .rounded(px(Radius::CHIP))
+        .cursor_pointer()
+        .hover(move |button| button.bg(colors.primary.alpha(0.09)))
+        .text_size(px(8.5))
+        .font_weight(FontWeight::MEDIUM)
+        .text_color(colors.secondary)
+        .child("Stage")
+        .on_click(move |_, _, cx| {
+            inspector.update(cx, |inspector, cx| {
+                inspector.run_review_action(ReviewAction::Stage(vec![path.clone()]), cx);
+            });
+            cx.stop_propagation();
+        })
+}
+
+/// One file name from the expanded omitted-untracked notice. It carries no
+/// diff body: clicking opens the file, and the Working lane can stage it.
+fn render_omitted_path_row(
+    index: usize,
+    ordinal: usize,
+    path: &Path,
+    context: &DiffRowRenderContext,
+) -> AnyElement {
+    let colors = context.colors;
+    let foreground = diff_row_style(DiffRowKind::Context, colors).foreground;
+    let reference = path.to_string_lossy().into_owned();
+    let cwd = context.repo_root.clone();
+    let open_inspector = context.inspector.clone();
+    let stageable = context.layer == DiffLayer::Working;
+    div()
+        .id(index)
+        .debug_selector(move || format!("INSPECTOR_OMITTED_UNTRACKED_PATH_{ordinal}"))
+        .group(OMITTED_PATH_ROW_GROUP)
+        .relative()
+        .h(px(DIFF_ROW_HEIGHT))
+        .min_w(px(context.content_width))
+        .w_full()
+        .flex()
+        .items_center()
+        .cursor_pointer()
+        .hover(move |line| line.bg(colors.primary.alpha(0.07)))
+        .on_click({
+            let reference = reference.clone();
+            move |_, _, cx| {
+                open_inspector.update(cx, |inspector, cx| {
+                    inspector.open_file_reference(cwd.clone(), reference.clone(), cx);
+                });
+                cx.stop_propagation();
+            }
+        })
+        .child(
+            div()
+                .w(px(GUTTER_WIDTH))
+                .h_full()
+                .flex_none()
+                .border_r_1()
+                .border_color(colors.primary.alpha(0.055)),
+        )
+        .child(
+            div()
+                .h_full()
+                .flex()
+                .items_center()
+                .pl(px(8.0 + OMITTED_PATH_INDENT))
+                .font_family(crate::fonts::mono_family())
+                .text_size(px(11.5))
+                .text_color(foreground)
+                .child(SharedString::from(reference)),
+        )
+        // A long run of names stays a plain list; Stage appears on the row
+        // under the pointer.
+        .when(stageable, |line| {
+            line.child(
+                diff_row_actions(colors)
+                    .invisible()
+                    .group_hover(OMITTED_PATH_ROW_GROUP, |actions| actions.visible())
+                    .child(stage_file_action(
+                        index,
+                        path.to_path_buf(),
+                        context.inspector.clone(),
+                        colors,
+                    )),
+            )
+        })
         .into_any_element()
 }
 
@@ -6570,6 +6736,28 @@ mod tests {
         }
     }
 
+    /// A Working-lane snapshot whose file-count notice has names to expand.
+    fn omitted_untracked_preview() -> DiffSnapshot {
+        const OMITTED: usize = 5_000;
+        let mut snapshot = crate::diff::parse_unified_diff(
+            "diff --git a/a.txt b/a.txt\n--- a/a.txt\n+++ b/a.txt\n@@ -1 +1 @@\n-old\n+new\n",
+        );
+        snapshot.layer = DiffLayer::Working;
+        snapshot.truncated = true;
+        snapshot.omitted_untracked = OMITTED;
+        snapshot.omitted_untracked_paths = (0..OMITTED)
+            .map(|index| PathBuf::from(format!("generated/file-{index:04}.txt")))
+            .collect();
+        snapshot.rows.push(DiffRow {
+            kind: DiffRowKind::Meta,
+            old_line: None,
+            new_line: None,
+            text: "5000 more untracked files not shown (limit 200); Stage all still includes them"
+                .to_owned(),
+        });
+        snapshot
+    }
+
     #[cfg(target_os = "macos")]
     #[test]
     #[ignore = "writes the isolated workspace-panel screenshot"]
@@ -6625,6 +6813,12 @@ mod tests {
                             inspector
                                 .code_viewer
                                 .update(cx, |viewer, cx| viewer.seed_explorer_preview(cx));
+                        }
+                        if std::env::var_os("DIRI_VISUAL_OMITTED").is_some() {
+                            inspector.select_workspace(WorkspaceSurface::Review, cx);
+                            inspector.state =
+                                LoadState::Ready(Arc::new(omitted_untracked_preview()));
+                            inspector.omitted_untracked_open = true;
                         }
                         if std::env::var_os("DIRI_VISUAL_BROWSER").is_some() {
                             inspector.select_workspace(WorkspaceSurface::Review, cx);
@@ -7713,6 +7907,73 @@ mod tests {
         cx.run_until_parked();
         assert!(cx.debug_bounds("INSPECTOR_ASK_COMPOSER").is_some());
         assert!(cx.debug_bounds("INSPECTOR_ASK_SEND").is_some());
+    }
+
+    /// The file-count notice is the only way to see what the bounded preview
+    /// left out, so it opens in place into the omitted names — as rows of the
+    /// same virtualized list, never one element per omitted file.
+    #[gpui::test]
+    fn omitted_untracked_notice_expands_into_a_virtualized_name_list(cx: &mut TestAppContext) {
+        let runtime = Arc::new(StoreRuntime::inert());
+        let fixture = SidebarPreviewFixture::make(PreviewScenario::Typical);
+        let selected = fixture.list.sessions[0].id.clone();
+        {
+            let mut store = runtime.store.write().expect("session store lock poisoned");
+            store.hydrate(fixture.list);
+            store.select(selected);
+        }
+        let tokio = Arc::new(
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("test runtime"),
+        );
+        let (harness, cx) = cx.add_window_view(move |_window, cx| {
+            let inspector = cx.new(|cx| WorkbenchInspector::new(runtime, tokio, cx));
+            InspectorHarness { inspector }
+        });
+        let inspector = harness.read_with(cx, |harness, _| harness.inspector.clone());
+        inspector.update(cx, |inspector, cx| {
+            inspector.select_tab(InspectorTab::Changes, cx)
+        });
+        cx.run_until_parked();
+        // The fixture session has no checkout; stand in for a loaded snapshot.
+        inspector.update(cx, |inspector, cx| {
+            inspector.state = LoadState::Ready(Arc::new(omitted_untracked_preview()));
+            cx.notify();
+        });
+        cx.run_until_parked();
+
+        let notice = cx
+            .debug_bounds("INSPECTOR_OMITTED_UNTRACKED_NOTICE")
+            .expect("omission notice");
+        assert!(
+            cx.debug_bounds("INSPECTOR_OMITTED_UNTRACKED_PATH_0")
+                .is_none()
+        );
+        cx.simulate_click(notice.center(), Modifiers::none());
+        cx.run_until_parked();
+
+        assert!(inspector.read_with(cx, |inspector, _| inspector.omitted_untracked_open));
+        let first = cx
+            .debug_bounds("INSPECTOR_OMITTED_UNTRACKED_PATH_0")
+            .expect("first omitted name");
+        assert!(first.top() >= notice.bottom());
+        assert!(
+            cx.debug_bounds("INSPECTOR_OMITTED_UNTRACKED_PATH_4999")
+                .is_none(),
+            "names outside the viewport must not be built"
+        );
+
+        let notice = cx
+            .debug_bounds("INSPECTOR_OMITTED_UNTRACKED_NOTICE")
+            .expect("omission notice");
+        cx.simulate_click(notice.center(), Modifiers::none());
+        cx.run_until_parked();
+        assert!(
+            cx.debug_bounds("INSPECTOR_OMITTED_UNTRACKED_PATH_0")
+                .is_none()
+        );
     }
 
     #[test]
