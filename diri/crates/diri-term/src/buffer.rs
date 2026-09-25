@@ -267,17 +267,19 @@ impl GridBuffer {
 
     /// Apply a full snapshot or patch rows from a diff.
     ///
-    /// Full snapshots always replace storage. A geometry-changing diff is
-    /// treated as a re-seed as a defensive measure, matching the protocol
-    /// helper's blank-fill behavior. Short rows are padded and long rows are
-    /// truncated to the daemon-provided column count.
+    /// A geometry change replaces storage. A same-size snapshot or diff writes
+    /// only the rows that differ, so reattaching an unchanged screen does not
+    /// repaint it. Short rows are padded and long rows are truncated to the
+    /// daemon-provided column count.
     pub fn apply(&mut self, update: GridUpdate) -> ApplySummary {
         let new_cols = usize::from(update.cols);
         let new_rows = usize::from(update.rows);
-        let size_changed = self.cols != update.cols || self.rows != update.rows;
-        let replace = update.is_full_snapshot || size_changed;
+        let size_changed = self.cols != update.cols
+            || self.rows != update.rows
+            || self.cells.len() != new_cols.saturating_mul(new_rows)
+            || self.annotations.len() != new_rows;
 
-        if replace {
+        if size_changed {
             self.cols = update.cols;
             self.rows = update.rows;
             // Reuse the allocation: a live resize re-seeds this buffer on every
@@ -292,6 +294,8 @@ impl GridBuffer {
         } else {
             // Damage belongs to one update/frame. Leaving old bits set caused
             // every later generation to mark the whole screen as changed.
+            // A same-size snapshot compares in place: wiping first made every
+            // row look new, so reattaching an unchanged screen repainted it.
             self.dirty_rows.fill(false);
             if self.dirty_rows.len() != new_rows {
                 self.dirty_rows.resize(new_rows, false);
@@ -299,13 +303,17 @@ impl GridBuffer {
             }
         }
 
-        let mut changed = replace;
+        let mut changed = size_changed;
+        let mut seen = update.is_full_snapshot.then(|| vec![false; new_rows]);
         for changed_row in update.changed_rows {
             let row = usize::from(changed_row.y);
             if row >= new_rows {
                 continue;
             }
 
+            if let Some(seen) = seen.as_mut() {
+                seen[row] = true;
+            }
             let start = row * new_cols;
             let end = start + new_cols;
             let target = &mut self.cells[start..end];
@@ -317,6 +325,25 @@ impl GridBuffer {
                 self.annotations[row] = changed_row.metadata;
                 target[..copied].copy_from_slice(&changed_row.cells[..copied]);
                 target[copied..].fill(GridCell::BLANK);
+                self.dirty_rows[row] = true;
+                changed = true;
+            }
+        }
+        if !size_changed && let Some(seen) = seen {
+            for (row, present) in seen.into_iter().enumerate() {
+                if present {
+                    continue;
+                }
+                let start = row * new_cols;
+                let end = start + new_cols;
+                let target = &mut self.cells[start..end];
+                let blank = self.annotations[row] == RowMetadata::default()
+                    && target.iter().all(|cell| *cell == GridCell::BLANK);
+                if blank {
+                    continue;
+                }
+                target.fill(GridCell::BLANK);
+                self.annotations[row] = RowMetadata::default();
                 self.dirty_rows[row] = true;
                 changed = true;
             }
@@ -499,6 +526,27 @@ mod tests {
         assert!(result.cursor_changed);
         assert_eq!(buffer.dirty_rows().collect::<Vec<_>>(), vec![0, 1, 2]);
         assert_eq!(buffer.row(2).unwrap(), &[cell('x'); 4]);
+    }
+
+    #[test]
+    fn identical_full_snapshot_does_not_repaint_the_screen() {
+        let mut buffer = GridBuffer::default();
+        let snapshot = update(
+            true,
+            (0..3)
+                .map(|row| ChangedRow::new(row, vec![cell('a'); 4]))
+                .collect(),
+        );
+        buffer.apply(snapshot.clone());
+        buffer.clear_dirty();
+        let generation = buffer.generation();
+
+        let result = buffer.apply(snapshot);
+
+        assert!(!result.changed);
+        assert_eq!(buffer.generation(), generation);
+        assert_eq!(buffer.dirty_rows().count(), 0);
+        assert_eq!(buffer.row(2).unwrap(), &[cell('a'); 4]);
     }
 
     #[test]

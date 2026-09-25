@@ -648,12 +648,16 @@ pub struct TerminalPane {
     _tokio_owner: Arc<tokio::runtime::Runtime>,
     tokio: Handle,
     residents: HashMap<SessionId, ResidentTerminal>,
-    /// Last-known grids of recently evicted sessions, most recent last.
-    /// Selecting a session paints its parked grid on the very first frame
-    /// while the fresh attachment round-trips; the attach's full snapshot
-    /// then overwrites the same buffer in place. This is what makes session
-    /// switching read as instant with a residency of one.
-    parked_grids: Vec<(SessionId, SharedGridBuffer)>,
+    /// Last painted terminal of recently evicted sessions, most recent last.
+    /// Selecting a session mounts that same element, so the row cache and
+    /// element identity survive the attachment round-trip instead of flashing
+    /// a freshly shaped screen. The attach snapshot then writes into the
+    /// same buffer.
+    parked_terminals: Vec<(SessionId, TerminalElement)>,
+    /// PTY size a session was already using when its resident was dropped.
+    /// `(0, 0)` on a new resident means "never sized", so this is what keeps
+    /// a switch-back from looking like a first measure.
+    known_pty_size: HashMap<SessionId, (u16, u16)>,
     pane_tx: PaneEventSender,
     /// Monotonic within this pane so replaced view residencies cannot receive
     /// stale UI/search completions from their predecessor.
@@ -908,7 +912,8 @@ impl TerminalPane {
             _tokio_owner: tokio_owner,
             tokio,
             residents: HashMap::new(),
-            parked_grids: Vec::new(),
+            parked_terminals: Vec::new(),
+            known_pty_size: HashMap::new(),
             pane_tx,
             next_attachment_generation: 1,
             focus,
@@ -982,26 +987,29 @@ impl TerminalPane {
             }
             SessionSource::Fixed(_) => HashSet::new(),
         };
-        // A parked grid for a session the store no longer lists is dead
+        // A parked terminal for a session the store no longer lists is dead
         // weight; one for a session that just became resident is superseded
         // below by promotion.
-        self.parked_grids
+        self.parked_terminals
             .retain(|(id, _)| store.sessions().contains_key(id));
         drop(store);
-        // Park the last-known grid of every session about to be evicted, so
-        // re-selecting it paints instantly instead of flashing blank while
-        // the fresh attachment round-trips.
+        // Park the painted terminal of every session about to be evicted, so
+        // re-selecting it paints the same element instead of flashing a new
+        // one while the fresh attachment round-trips.
         for (id, resident) in &self.residents {
             if resident_ids.contains(id) {
                 continue;
             }
-            self.parked_grids.retain(|(parked, _)| parked != id);
-            self.parked_grids
-                .push((id.clone(), resident.element.buffer()));
+            self.parked_terminals.retain(|(parked, _)| parked != id);
+            self.parked_terminals
+                .push((id.clone(), resident.element.clone()));
+            if resident.last_size != (0, 0) {
+                self.known_pty_size.insert(id.clone(), resident.last_size);
+            }
         }
-        if self.parked_grids.len() > PARKED_GRID_CAP {
-            let excess = self.parked_grids.len() - PARKED_GRID_CAP;
-            self.parked_grids.drain(..excess);
+        if self.parked_terminals.len() > PARKED_GRID_CAP {
+            let excess = self.parked_terminals.len() - PARKED_GRID_CAP;
+            self.parked_terminals.drain(..excess);
         }
         self.residents.retain(|id, _| resident_ids.contains(id));
         let socket = self.runtime.client().socket_path().to_path_buf();
@@ -1013,17 +1021,23 @@ impl TerminalPane {
             let generation = self.next_attachment_generation;
             self.next_attachment_generation = self.next_attachment_generation.wrapping_add(1);
             let parked = self
-                .parked_grids
+                .parked_terminals
                 .iter()
                 .position(|(parked, _)| parked == &id)
-                .map(|index| self.parked_grids.remove(index).1);
+                .map(|index| self.parked_terminals.remove(index).1);
+            let parked_buffer = parked.as_ref().map(TerminalElement::buffer);
+            let last_size = self
+                .known_pty_size
+                .get(&id)
+                .copied()
+                .unwrap_or_else(|| parked_grid_size(parked_buffer.as_ref()).unwrap_or((0, 0)));
             let (controller, attachment, buffer) = ControllerLease::mount(
                 socket.clone(),
                 id.clone(),
                 &self.tokio,
                 self.pane_tx.clone(),
                 generation,
-                parked,
+                parked_buffer,
                 cx,
             );
             #[cfg(test)]
@@ -1033,7 +1047,15 @@ impl TerminalPane {
                 attachment
             };
             let ime_attachment = attachment.clone();
-            let element = TerminalElement::new(buffer)
+            let reuse_parked = parked
+                .as_ref()
+                .is_some_and(|element| Arc::ptr_eq(&element.buffer(), &buffer));
+            let element = if reuse_parked {
+                parked.unwrap()
+            } else {
+                TerminalElement::new(buffer)
+            };
+            let element = element
                 .font(mono)
                 .focus_handle(self.focus.clone())
                 .on_text_input(move |text| ime_attachment.input(text.as_bytes().to_vec()));
@@ -1053,7 +1075,7 @@ impl TerminalPane {
                     find_scheduler: FindSearchScheduler::default(),
                     find_query: QueryEditor::default(),
                     find_composition: find_input::Composition::default(),
-                    last_size: (0, 0),
+                    last_size,
                     pointer_owner: None,
                     mouse_motion: MouseMotionLimiter::default(),
                     extent_probe: HistoryExtentProbe::default(),
@@ -3218,15 +3240,27 @@ impl TerminalPane {
             .expect("session store lock poisoned")
             .preferences()
             .terminal_font_size;
-        let viewport = self.viewport.unwrap_or_else(|| {
+        let already_sized = self
+            .residents
+            .get(&session.id)
+            .is_some_and(|resident| resident.last_size != (0, 0));
+        // The full-window fallback is a launch guess. An already-sized session
+        // waits for the real pane viewport so that guess cannot become a
+        // second PTY size.
+        let Some(viewport) = self.viewport.or_else(|| {
+            if already_sized {
+                return None;
+            }
             let size = window.viewport_size();
-            TerminalViewport {
+            Some(TerminalViewport {
                 x: 0.0,
                 y: 0.0,
                 width: f32::from(size.width),
                 height: f32::from(size.height),
-            }
-        });
+            })
+        }) else {
+            return;
+        };
         let metrics = CellMetrics::measure(
             window.text_system(),
             &font(crate::fonts::mono_family()),
@@ -3239,6 +3273,16 @@ impl TerminalPane {
             0.0,
             metrics,
         );
+        if let Some(resident) = self.residents.get_mut(&session.id)
+            && resident.attachment.is_controller()
+            && resident.last_size != (0, 0)
+            && resident.last_size == size
+        {
+            // The pane still matches the size this session was already using.
+            // An unchanged pane must not send a resize at all. Recording that
+            // size would let the next attach replay it.
+            return;
+        }
         if let Some(resident) = self.residents.get_mut(&session.id)
             && resident.attachment.is_controller()
             && (resident.last_size != size || resident.attachment.needs_resize(size))
@@ -3625,6 +3669,8 @@ impl TerminalPane {
         };
         let view_offset = resident.element.view_offset();
         let attachment_state = resident.attachment_state;
+        let show_attaching =
+            attachment_state == AttachmentState::Attaching && !resident.element.has_content();
         let secret_input = resident.secret_input && attachment_state == AttachmentState::Live;
         let overflow = self.grid_row_overflow(resident.element.grid_rows(), font_size, window);
         let scroll_target = TerminalScrollTarget {
@@ -3756,11 +3802,11 @@ impl TerminalPane {
                     })),
             );
         }
-        if attachment_state != AttachmentState::Live {
-            let message = match attachment_state {
-                AttachmentState::Attaching => "Attaching…",
-                AttachmentState::Reconnecting => "Reconnecting terminal…",
-                AttachmentState::Live => "",
+        if show_attaching || attachment_state == AttachmentState::Reconnecting {
+            let message = if attachment_state == AttachmentState::Reconnecting {
+                "Reconnecting terminal…"
+            } else {
+                "Attaching…"
             };
             body = body.child(
                 div()
@@ -4684,6 +4730,12 @@ fn plan_resize(first_measure: bool, since_sent: Option<Duration>, armed: bool) -
         return ResizePlan::Fold;
     }
     ResizePlan::Arm(RESIZE_CADENCE.saturating_sub(since_sent.unwrap_or_default()))
+}
+
+/// Columns and rows of a parked grid, when the engine has already published a size.
+fn parked_grid_size(parked: Option<&SharedGridBuffer>) -> Option<(u16, u16)> {
+    let grid = parked?.read().ok()?;
+    (grid.cols > 0 && grid.rows > 0).then_some((grid.cols, grid.rows))
 }
 
 /// Whether a geometry change should hold the grid still while it round-trips.
@@ -7559,6 +7611,127 @@ mod tests {
         let hidden = qol::paste_review_preview(&mut text.chars(), true);
         assert!(!hidden.contains("hunter2"), "{hidden}");
         assert!(hidden.starts_with("8 characters"), "{hidden}");
+    }
+
+    #[gpui::test]
+    fn switching_back_keeps_an_unchanged_pty_size_and_holds_a_real_column_change(
+        cx: &mut TestAppContext,
+    ) {
+        let runtime = Arc::new(StoreRuntime::inert());
+        let tokio = Arc::new(
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("test runtime"),
+        );
+        let mut cursor = fixture_session();
+        cursor.id = SessionId::new("cursor");
+        let mut other = fixture_session();
+        other.id = SessionId::new("other");
+        let cursor_id = cursor.id.clone();
+        let other_id = other.id.clone();
+        {
+            let mut store = runtime.store.write().expect("session store lock poisoned");
+            store.upsert_session(cursor);
+            store.upsert_session(other);
+            store.select(cursor_id.clone());
+        }
+        let runtime_for_view = Arc::clone(&runtime);
+        let (pane, cx) = cx.add_window_view(move |window, cx| {
+            TerminalPane::new(runtime_for_view, tokio, window, cx)
+        });
+        let viewport = TerminalViewport {
+            width: 900.0,
+            height: 600.0,
+            ..Default::default()
+        };
+        pane.update_in(cx, |pane, window, cx| {
+            pane.set_viewport(viewport, cx);
+            window.activate_window();
+            pane.focus(window, cx);
+            pane.update_selected_geometry(window, cx);
+        });
+        cx.run_until_parked();
+        let sized = pane.read_with(cx, |pane, _| {
+            let resident = &pane.residents[&cursor_id];
+            assert_ne!(resident.last_size, (0, 0), "first show still measures");
+            assert!(
+                resident.attachment.resize_sends_for_test() >= 1,
+                "a session with no size yet still resizes once"
+            );
+            resident.last_size
+        });
+
+        runtime
+            .store
+            .write()
+            .expect("session store lock poisoned")
+            .select(other_id);
+        pane.update_in(cx, |pane, window, cx| {
+            pane.reconcile_store_change(window, cx);
+        });
+        runtime
+            .store
+            .write()
+            .expect("session store lock poisoned")
+            .select(cursor_id.clone());
+        pane.update_in(cx, |pane, window, cx| {
+            pane.reconcile_store_change(window, cx);
+            let resident = pane.residents.get(&cursor_id).expect("remounted");
+            assert_eq!(
+                resident.last_size, sized,
+                "the new resident keeps the pty size"
+            );
+            assert_eq!(resident.attachment.resize_sends_for_test(), 0);
+            // No pane viewport yet: the full-window guess must not be sent.
+            pane.viewport = None;
+            pane.update_selected_geometry(window, cx);
+            let resident = &pane.residents[&cursor_id];
+            assert_eq!(resident.attachment.resize_sends_for_test(), 0);
+            assert_eq!(resident.last_size, sized);
+            pane.set_viewport(viewport, cx);
+            pane.focus(window, cx);
+            pane.update_selected_geometry(window, cx);
+            let resident = &pane.residents[&cursor_id];
+            assert_eq!(
+                resident.attachment.resize_sends_for_test(),
+                0,
+                "an unchanged pane must not resize"
+            );
+            assert_eq!(resident.last_size, sized);
+            assert!(
+                resident.attachment.needs_resize(sized),
+                "not sending must not record a size the next attach would replay"
+            );
+            pane.last_resize_sent = Some(Instant::now() - Duration::from_secs(3));
+            pane.set_viewport(
+                TerminalViewport {
+                    width: 1400.0,
+                    height: 600.0,
+                    ..Default::default()
+                },
+                cx,
+            );
+            pane.update_selected_geometry(window, cx);
+            let resident = &pane.residents[&cursor_id];
+            assert_ne!(
+                resident.last_size.0, sized.0,
+                "the hidden window change is real"
+            );
+            assert_eq!(resident.attachment.resize_sends_for_test(), 1);
+            assert!(
+                resident.controller.reflow_held_for_test(),
+                "previous is the last real size, so the column change is held"
+            );
+            pane.update_selected_geometry(window, cx);
+            assert_eq!(
+                pane.residents[&cursor_id]
+                    .attachment
+                    .resize_sends_for_test(),
+                1,
+                "the catch-up resize is sent once"
+            );
+        });
     }
 
     #[gpui::test]

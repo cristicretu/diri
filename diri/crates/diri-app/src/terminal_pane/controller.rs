@@ -56,6 +56,8 @@ struct ControlState {
     last_resize: Option<(u16, u16)>,
     pending_resize: Option<(u16, u16)>,
     resize_wake: Arc<Notify>,
+    #[cfg(test)]
+    resize_sends: u64,
 }
 
 /// Accepted means queued locally. There is no PTY delivery acknowledgement.
@@ -122,6 +124,11 @@ impl AttachmentControl {
         state.pending_resize.or(state.last_resize) != Some(size)
     }
 
+    #[cfg(test)]
+    pub(super) fn resize_sends_for_test(&self) -> u64 {
+        self.state.lock().unwrap().resize_sends
+    }
+
     pub(super) fn is_controller(&self) -> bool {
         self.state.lock().unwrap().owner == self.view
     }
@@ -151,6 +158,10 @@ impl AttachmentControl {
                 Ok(()) => {
                     state.last_resize = Some(size);
                     state.pending_resize = None;
+                    #[cfg(test)]
+                    {
+                        state.resize_sends = state.resize_sends.saturating_add(1);
+                    }
                 }
                 Err(_) => {
                     state.pending_resize = Some(size);
@@ -272,6 +283,8 @@ impl ControllerLease {
                 last_resize: None,
                 pending_resize: None,
                 resize_wake: Arc::new(Notify::new()),
+                #[cfg(test)]
+                resize_sends: 0,
             }));
             let session = Rc::new(RefCell::new(SessionController {
                 id: id.clone(),
@@ -375,6 +388,11 @@ impl ControllerLease {
         if let Some(view) = self.session.borrow_mut().views.get_mut(&self.view) {
             view.damage = Some(element.damage_observer());
         }
+    }
+
+    #[cfg(test)]
+    pub(super) fn reflow_held_for_test(&self) -> bool {
+        self.session.borrow().hold.is_some()
     }
 
     pub(super) fn hold_reflow(&self, cx: &mut App) {
@@ -762,6 +780,8 @@ mod tests {
                 last_resize: None,
                 pending_resize: None,
                 resize_wake: Arc::new(Notify::new()),
+                #[cfg(test)]
+                resize_sends: 0,
             }))
         };
         let (prior_done, prior) = watch::channel(false);
@@ -820,6 +840,8 @@ mod tests {
                 last_resize: None,
                 pending_resize: None,
                 resize_wake: Arc::new(Notify::new()),
+                #[cfg(test)]
+                resize_sends: 0,
             })),
             view: 1,
             events,
