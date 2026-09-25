@@ -266,6 +266,89 @@ fn terminating_a_session_kills_the_child() {
     assert!(session.view().exited);
 }
 
+/// Runs `body` on its own thread and fails, rather than hangs, when it does
+/// not finish: the defects these tests guard against are waits with no end.
+fn within(limit: Duration, what: &str, body: impl FnOnce() + Send + 'static) {
+    let (done, finished) = std::sync::mpsc::channel();
+    let worker = std::thread::spawn(move || {
+        body();
+        let _ = done.send(());
+    });
+    match finished.recv_timeout(limit) {
+        Ok(()) => worker.join().expect("worker"),
+        // The worker panicked: surface its message instead of a timeout.
+        Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+            std::panic::resume_unwind(worker.join().expect_err("worker panicked"))
+        }
+        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+            panic!("{what} did not finish within {limit:?}")
+        }
+    }
+}
+
+const FLOOD: &str = "while :; do printf '0123456789012345678901234567890123456789\\r\\n'; done";
+
+/// On macOS a session leader killed mid-output cannot finish exiting until
+/// the terminal has been read. `terminate` used to hold the PTY lock while it
+/// waited, which parked the pump (the only reader) on that lock: the group
+/// SIGKILL answered EPERM, or the wait never returned (#461).
+#[test]
+fn terminating_a_session_that_is_flooding_output_never_deadlocks() {
+    within(Duration::from_secs(120), "terminate", || {
+        let temp = tempfile::tempdir().expect("temp");
+        let engine = engine();
+        for round in 0..40u64 {
+            let mut session = Session::spawn(
+                spec(
+                    "s_flood",
+                    FLOOD,
+                    temp.path(),
+                    "shell",
+                    Authority::ProcessOnly,
+                ),
+                Arc::clone(&engine),
+            )
+            .expect("spawn");
+            // Vary where in the child's startup and output the stop lands.
+            std::thread::sleep(Duration::from_millis(round % 8 * 3));
+            let exit = session
+                .terminate(Duration::from_millis(500))
+                .unwrap_or_else(|error| panic!("round {round}: {error}"));
+            assert!(
+                matches!(exit, diri_engine::Exit::Signal(_)),
+                "round {round}: {exit:?}"
+            );
+            assert!(session.view().exited);
+        }
+    });
+}
+
+/// Dropping a session is the same race without a caller to return an error
+/// to: the pump stopped reading the moment it was told to stop, then waited
+/// on a child that could not exit until somebody read its output.
+#[test]
+fn dropping_a_session_that_is_flooding_output_never_deadlocks() {
+    within(Duration::from_secs(120), "drop", || {
+        let temp = tempfile::tempdir().expect("temp");
+        let engine = engine();
+        for round in 0..40u64 {
+            let session = Session::spawn(
+                spec(
+                    "s_flood_drop",
+                    FLOOD,
+                    temp.path(),
+                    "shell",
+                    Authority::ProcessOnly,
+                ),
+                Arc::clone(&engine),
+            )
+            .expect("spawn");
+            std::thread::sleep(Duration::from_millis(round % 8 * 3));
+            drop(session);
+        }
+    });
+}
+
 #[test]
 fn authority_is_derived_from_the_manifest_status_model() {
     let engine = engine();

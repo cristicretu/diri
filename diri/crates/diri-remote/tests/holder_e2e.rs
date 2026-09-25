@@ -1218,9 +1218,14 @@ fn environment_capture_tolerates_startup_noise_and_bounds_timeout_failures() {
     .expect("noisy shell");
     std::fs::set_permissions(&noisy_shell, std::fs::Permissions::from_mode(0o700))
         .expect("shell mode");
+    // This half is about startup noise, not speed. The budget applies to each
+    // of two login-shell layers, and 2 s was not always enough for `sh -l`
+    // (profile, `path_helper`) plus a Helper re-exec on a loaded machine
+    // (#461), so it takes the protocol's maximum. The bounded-timeout half
+    // below keeps its tight limits.
     let request = EnvironmentCaptureRequest {
         cwd: Some("/".into()),
-        timeout_millis: 2_000,
+        timeout_millis: 10_000,
     };
     let mut child = Command::new(helper())
         .args([

@@ -775,7 +775,16 @@ mod tests {
                 .exists()
         );
         // A live holder blocks the cosmetic update instead of racing it.
-        fs::create_dir(global_config_path(&home).with_extension("json.lock")).unwrap();
+        let lock = global_config_path(&home).with_extension("json.lock");
+        fs::create_dir(&lock).unwrap();
+        // A real holder keeps touching its lock; this one cannot, and a lock
+        // left untouched for 10 s is rightly stolen. Date it ahead so a test
+        // thread starved for seconds on a loaded machine still meets a live
+        // holder rather than a stale one (#461).
+        fs::File::open(&lock)
+            .unwrap()
+            .set_modified(SystemTime::now() + Duration::from_secs(3600))
+            .unwrap();
         install_identity(&home, serde_json::json!({"emailAddress":"c@example.test"}));
         assert_eq!(
             read_global_config(&home).unwrap()["oauthAccount"]["emailAddress"],
@@ -918,7 +927,10 @@ mod tests {
         let deadline = std::time::Instant::now() + Duration::from_secs(10);
         let launched = loop {
             let text = fs::read_to_string(&launches).unwrap_or_default();
-            if text.matches("launch\n").count() >= 2 {
+            // The fake appends one launch in several writes, so a record is
+            // complete only once its last line is there. Counting the first
+            // line raced the rest of the second record under load (#461).
+            if text.matches("config-dir=").count() >= 2 && text.ends_with('\n') {
                 break text;
             }
             assert!(

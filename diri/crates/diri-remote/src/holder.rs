@@ -647,7 +647,10 @@ impl Holder {
                 && let Some(status) = self.process_guard.take_unexpected_exit()?
             {
                 let _ = self.pty.kill_group(libc::SIGKILL);
-                let _ = self.pty.wait();
+                // This loop is the terminal's only reader and is about to
+                // return: keep reading while reaping, or a child killed
+                // mid-output never finishes exiting on macOS (#461).
+                let _ = self.pty.wait_draining(diri_pty::KILL_REAP_TIMEOUT);
                 return Err(io::Error::other(format!(
                     "Agent process guard exited unexpectedly with {status}"
                 )));

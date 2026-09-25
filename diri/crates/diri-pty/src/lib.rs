@@ -55,7 +55,7 @@ impl PtySpec {
 #[cfg(unix)]
 mod unix;
 #[cfg(unix)]
-pub use unix::{ExitWatcher, Pty, PtyStream};
+pub use unix::{ExitWatcher, KILL_REAP_TIMEOUT, Pty, PtyStream, REAP_POLL_INTERVAL};
 
 /// How a child ended.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
