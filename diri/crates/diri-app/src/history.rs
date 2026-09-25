@@ -196,6 +196,67 @@ impl HistorySearch {
     }
 }
 
+/// One conversation looked up by the agent's own id, for importers that know
+/// the id but not where the provider filed its transcript. Ids that could
+/// name anything but a single file are refused before touching the disk.
+pub(crate) fn conversation(
+    roots: &HistoryRoots,
+    kind: &AgentKind,
+    id: &str,
+) -> Option<HistoryEntry> {
+    if id.is_empty()
+        || id.len() > 128
+        || !id
+            .chars()
+            .all(|ch| ch.is_ascii_alphanumeric() || ch == '-' || ch == '_')
+    {
+        return None;
+    }
+    match kind.id() {
+        AgentKind::CLAUDE_CODE_ID => child_dirs(&roots.claude).into_iter().find_map(|project| {
+            let path = project.join(format!("{id}.jsonl"));
+            fs::symlink_metadata(&path)
+                .is_ok_and(|metadata| metadata.is_file() && metadata.len() > 0)
+                .then(|| claude_entry(&path))
+                .flatten()
+        }),
+        AgentKind::CODEX_ID => {
+            let suffix = format!("-{id}.jsonl");
+            let titles = provider_titles(roots.codex.parent().unwrap_or(&roots.codex));
+            // Newest days first: a conversation someone left open is recent.
+            let newest_first = |root: &Path| {
+                let mut dirs = child_dirs(root);
+                dirs.sort_by(|left, right| right.cmp(left));
+                dirs
+            };
+            for year in newest_first(&roots.codex) {
+                for month in newest_first(&year) {
+                    for day in newest_first(&month) {
+                        let Ok(files) = fs::read_dir(&day) else {
+                            continue;
+                        };
+                        for file in files.flatten() {
+                            let path = file.path();
+                            let named =
+                                path.file_name().and_then(|name| name.to_str()).is_some_and(
+                                    |name| name.starts_with("rollout-") && name.ends_with(&suffix),
+                                );
+                            if named
+                                && let Some(entry) = codex_entry(&path, &titles)
+                                && entry.id == id
+                            {
+                                return Some(entry);
+                            }
+                        }
+                    }
+                }
+            }
+            None
+        }
+        _ => None,
+    }
+}
+
 fn scan_claude(root: &Path, scanner: &mut HistoryScanner) -> Vec<HistoryEntry> {
     let mut result = Vec::new();
     for project in child_dirs(root) {

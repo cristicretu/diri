@@ -275,6 +275,9 @@ pub struct Prefs {
     pub shortcut_overrides: BTreeMap<String, Option<String>>,
     /// Session that should regain focus after the daemon's initial hydrate.
     pub last_selected_session: Option<SessionId>,
+    /// herdr panes and conversations already brought over, so importing
+    /// again only offers what is new. See `crate::herdr_import`.
+    pub herdr_imported: std::collections::BTreeSet<String>,
 }
 
 impl Default for Prefs {
@@ -326,6 +329,7 @@ impl Default for Prefs {
             launch_recipes: LaunchRecipeBook::default(),
             shortcut_overrides: BTreeMap::new(),
             last_selected_session: None,
+            herdr_imported: Default::default(),
         }
     }
 }

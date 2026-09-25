@@ -32,6 +32,9 @@ pub(crate) struct EmptyWorkbench {
     pub installing: Option<AgentKind>,
     /// A detection scan is in flight, so "Check again" reads as busy.
     pub scanning: bool,
+    /// herdr sessions this Mac could bring over, as "5 sessions from herdr".
+    pub herdr: Option<SharedString>,
+    pub importing_herdr: bool,
 }
 
 pub(crate) struct EmptyWorkbenchActions {
@@ -39,6 +42,8 @@ pub(crate) struct EmptyWorkbenchActions {
     pub check_again: ActionHandler,
     /// Pick a project folder, then open the default agent there.
     pub start_in_folder: ActionHandler,
+    /// Confirm, then open every herdr pane as a session.
+    pub import_herdr: ActionHandler,
 }
 
 pub(crate) fn render(
@@ -131,7 +136,10 @@ fn welcome(state: &EmptyWorkbench, actions: &EmptyWorkbenchActions, colors: Sema
                 "Each task gets its own session. Diri tells you when one needs you.",
                 colors,
             ))
-            .child(start_controls("Start a session", actions, colors));
+            .child(start_controls("Start a session", actions, colors))
+            .when_some(herdr_link(state, actions, colors), |column, link| {
+                column.child(link)
+            });
     };
     let check_again = Rc::clone(&actions.check_again);
     column()
@@ -176,6 +184,34 @@ fn welcome(state: &EmptyWorkbench, actions: &EmptyWorkbenchActions, colors: Sema
                     |window, cx| window.dispatch_action(Box::new(ShowAgentSettings), cx),
                 )),
         )
+}
+
+/// Someone arriving from herdr already has work in flight: one quiet line
+/// brings it over. It only appears once an agent is ready, because a
+/// resumed conversation needs its agent installed.
+fn herdr_link(
+    state: &EmptyWorkbench,
+    actions: &EmptyWorkbenchActions,
+    colors: SemanticColors,
+) -> Option<AnyElement> {
+    if state.importing_herdr {
+        return Some(quiet_link(
+            "empty-import-herdr",
+            "Importing from herdr…",
+            Some("arrow.down"),
+            colors,
+            |_, _| {},
+        ));
+    }
+    let headline = state.herdr.as_ref()?;
+    let import = Rc::clone(&actions.import_herdr);
+    Some(quiet_link(
+        "empty-import-herdr",
+        format!("Import {headline}…"),
+        Some("arrow.down"),
+        colors,
+        move |window, cx| import(window, cx),
+    ))
 }
 
 /// The app's standard bordered control, with the shortcut that does the same
