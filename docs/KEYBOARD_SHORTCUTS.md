@@ -83,6 +83,8 @@ least.
 
 Cmd K, Cmd P, and Cmd Shift H are entry points into the same palette. Switching shortcuts goes directly to that page. The back button restores the previous page’s search and selection.
 
+Results are final the moment a key lands: Return runs the new first row at once. Once the matches fit the list without scrolling, rows that outlast a keystroke slide up to close the gaps others left; longer lists, and everything under Reduce Motion, simply cut.
+
 Choose **Settings → Color theme**, or search for **Color theme** directly. Arrow keys and pointer hover preview the highlighted theme across the app. The whole window crossfades to it, and arrowing on before a fade finishes continues from the colors on screen; with Reduce Motion the theme switches at once. Enter or a click saves it; Escape, Back, or switching pages restores the saved theme. **All settings** opens the full settings workspace.
 
 Anything else edits the query through the [shared text keymap](#text-fields).

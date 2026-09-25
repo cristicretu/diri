@@ -1,6 +1,11 @@
 mod history_page;
 #[cfg(test)]
 mod page_tests;
+mod row_motion;
+#[cfg(all(test, target_os = "macos"))]
+mod row_motion_frames;
+#[cfg(test)]
+mod row_motion_tests;
 
 use std::cmp::Ordering;
 use std::collections::hash_map::DefaultHasher;
@@ -10,6 +15,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use self::row_motion::{RowKey, RowMotion, TRACKED_ROWS, row_key};
 use crate::commands::{
     CommandId, NAVIGATION_CONTEXT, ToggleCommandPalette, ToggleHistory, ToggleQuickOpen,
 };
@@ -139,6 +145,11 @@ pub struct NavigationOverlay {
     palette_context_fingerprint: u64,
     list_scroll: UniformListScrollHandle,
     list_scroller: diri_ui::ScrollerState,
+    /// Where rows are painted while they travel to the slots a keystroke gave
+    /// them. Presentation only: nothing reads it to decide what a row is.
+    row_motion: RowMotion,
+    /// Frame fixtures and tests step this; the app reads the wall clock.
+    motion_clock: Option<Instant>,
     tokio: Arc<tokio::runtime::Runtime>,
     history: Vec<diri_proto::HistoryEntry>,
     history_loading: bool,
@@ -270,6 +281,8 @@ impl NavigationOverlay {
             palette_context_fingerprint: 0,
             list_scroll: UniformListScrollHandle::new(),
             list_scroller: diri_ui::ScrollerState::new(),
+            row_motion: RowMotion::default(),
+            motion_clock: None,
             tokio,
             history: Vec::new(),
             history_loading: false,
@@ -329,6 +342,8 @@ impl NavigationOverlay {
             palette_context_fingerprint: 0,
             list_scroll: UniformListScrollHandle::new(),
             list_scroller: diri_ui::ScrollerState::new(),
+            row_motion: RowMotion::default(),
+            motion_clock: None,
             tokio,
             history: Vec::new(),
             history_loading: false,
@@ -686,8 +701,10 @@ impl NavigationOverlay {
                 {
                     return;
                 }
+                let before = this.rows_on_screen();
                 this.ranked_items = ranked;
                 this.reset_selection();
+                this.move_rows_from(before, cx);
                 cx.notify();
             })
             .ok();
@@ -746,6 +763,7 @@ impl NavigationOverlay {
     }
 
     fn query_changed(&mut self, cx: &mut Context<Self>) {
+        let before = self.rows_on_screen();
         self.reset_selection();
         match self.overlay {
             Some(Overlay::QuickOpen) => {
@@ -760,7 +778,94 @@ impl NavigationOverlay {
             Some(Overlay::CommandPalette) => self.refresh_command_items(),
             _ => {}
         }
+        self.move_rows_from(before, cx);
         cx.notify();
+    }
+
+    fn motion_now(&self) -> Instant {
+        self.motion_clock.unwrap_or_else(Instant::now)
+    }
+
+    /// The rows a change is about to move, or `None` when the list is
+    /// scrolled: the change snaps it back to the top, and a row's slot then
+    /// says nothing about where it was painted.
+    fn rows_on_screen(&self) -> Option<Vec<RowKey>> {
+        let scrolled = self.list_scroll.0.borrow().base_handle.offset().y != px(0.0);
+        (!scrolled).then(|| self.leading_row_keys())
+    }
+
+    /// Send the rows from where `before` had them to where they are now.
+    fn move_rows_from(&mut self, before: Option<Vec<RowKey>>, cx: &App) {
+        match before {
+            Some(before) if !cx.reduce_motion() => {
+                let after = self.leading_row_keys();
+                let now = self.motion_now();
+                let visible = (LIST_HEIGHT / ROW_HEIGHT) as usize;
+                self.row_motion
+                    .retarget(&before, &after, visible, ROW_HEIGHT, now);
+            }
+            _ => self.row_motion.snap(),
+        }
+    }
+
+    fn leading_row_keys(&self) -> Vec<RowKey> {
+        let page = self.overlay.map_or(0, |page| page as u8);
+        match self.overlay {
+            Some(Overlay::CommandPalette) => self
+                .ranked_sessions
+                .iter()
+                .map(|row| row_key(page, (0u8, &row.item.id)))
+                .chain(
+                    self.ranked_actions
+                        .iter()
+                        .map(|row| row_key(page, (1u8, &row.item.id))),
+                )
+                .take(TRACKED_ROWS)
+                .collect(),
+            Some(Overlay::QuickOpen) if self.query.text().trim().is_empty() => self
+                .quick_snapshot
+                .recent
+                .iter()
+                .chain(&self.quick_snapshot.folders)
+                .take(TRACKED_ROWS)
+                .map(|item| row_key(page, &item.path))
+                .collect(),
+            Some(Overlay::QuickOpen) => self
+                .ranked_items
+                .iter()
+                .take(TRACKED_ROWS)
+                .map(|row| row_key(page, &row.item.path))
+                .collect(),
+            Some(Overlay::History) => self
+                .history_matches
+                .iter()
+                .take(TRACKED_ROWS)
+                .filter_map(|index| self.history.get(*index))
+                .map(|entry| row_key(page, &entry.id))
+                .collect(),
+            Some(Overlay::Themes) => self
+                .theme_matches
+                .iter()
+                .take(TRACKED_ROWS)
+                .map(|theme| row_key(page, theme.id))
+                .collect(),
+            Some(Overlay::Settings) | None => Vec::new(),
+        }
+    }
+
+    /// `row` painted where its motion has it. The slot it occupies in the
+    /// list, and with it every index the rest of the view works in, is final.
+    fn posed(&self, index: usize, row: AnyElement, now: Instant, keys: &[RowKey]) -> AnyElement {
+        let offset = keys
+            .get(index)
+            .map_or(0.0, |key| self.row_motion.offset(*key, now));
+        if offset == 0.0 {
+            return row;
+        }
+        div()
+            .h(px(ROW_HEIGHT))
+            .child(div().relative().top(px(offset)).child(row))
+            .into_any_element()
     }
 
     /// Opens the color theme page on the saved theme, as Settings does.
@@ -1147,6 +1252,7 @@ impl NavigationOverlay {
         self.page_error = None;
         self.query.clear();
         self.reset_selection();
+        self.row_motion.snap();
         self.ranked_items.clear();
         self.quick_create = None;
         match page {
@@ -1323,6 +1429,8 @@ impl NavigationOverlay {
             .min(px(self.previous_page_rows as f32 * ROW_HEIGHT));
         let count = self.visible_count();
         let entity = cx.entity();
+        let now = self.motion_now();
+        let rows_moving = self.row_motion.is_moving(now);
         let page = self.overlay.expect("open palette");
         let placeholder = match page {
             Overlay::CommandPalette => "Search chats or run a command…",
@@ -1465,8 +1573,16 @@ impl NavigationOverlay {
                                 colors,
                                 uniform_list("palette-results", count, move |range, _, cx| {
                                     entity.update(cx, |this, cx| {
+                                        let keys = if rows_moving {
+                                            this.leading_row_keys()
+                                        } else {
+                                            Vec::new()
+                                        };
                                         range
-                                            .map(|index| this.render_result(index, colors, cx))
+                                            .map(|index| {
+                                                let row = this.render_result(index, colors, cx);
+                                                this.posed(index, row, now, &keys)
+                                            })
                                             .collect()
                                     })
                                 })
@@ -1479,6 +1595,20 @@ impl NavigationOverlay {
                         // blurred panel they read as bands, so the list clips.
                         .when(!panels, |view| {
                             view.child(scroll_fades(self.list_scroll.clone(), colors))
+                        })
+                        // Rows in flight are not where a click would land, and a
+                        // resting pointer must not light each one that passes.
+                        // Painting is what asks for the next frame, so the probe
+                        // a panel host only lays out never schedules one.
+                        .when(rows_moving, |view| {
+                            view.child(div().absolute().inset_0().occlude()).child(
+                                gpui::canvas(
+                                    |_, _, _| {},
+                                    |_, _, window, _| window.request_animation_frame(),
+                                )
+                                .absolute()
+                                .size_0(),
+                            )
                         })
                     })
                     .when(count == 0, |view| {
