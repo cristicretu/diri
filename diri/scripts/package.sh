@@ -99,6 +99,11 @@ cargo packager \
     --binaries-dir "${universal_dir}" \
     --out-dir "${dist_dir}"
 
+# cargo-packager only knows the legacy .icns. The compiled Icon Composer asset
+# catalog is what macOS 26+ draws; without it the system re-skins icon.icns
+# into a generic glass tile. Info.plist names it via CFBundleIconName.
+cp "${workspace_dir}/assets/Assets.car" "${app_path}/Contents/Resources/Assets.car"
+
 # Ship the same reviewed dependency disclosure that CI validates. The JSON is
 # also attached to GitHub Releases so users can inspect it without mounting the
 # app bundle.

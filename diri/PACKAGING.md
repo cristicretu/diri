@@ -78,8 +78,13 @@ scripts/install-local.sh
 
 With no signing environment, `package.sh` applies an ad-hoc hardened-runtime signature and verifies it. Set `DIRI_CREATE_DMG=1` to also create `dist/diri-<version>-universal.dmg`. `DIRI_DIST_DIR` changes the output directory, and `DIRI_VERSION` changes the DMG filename.
 
-The committed `assets/icon.icns` and `assets/dev-icon.icns` are the release and
-development icon inputs.
+The app icon's source of truth is the Icon Composer documents
+`assets/diri.icon` (release) and `assets/diri-dev.icon` (development builds). The
+compiled outputs are committed so packaging needs no Xcode 26+: `Assets.car` /
+`dev-Assets.car` are what macOS 26+ draws (light, dark, tinted and clear
+appearances, named by `CFBundleIconName`), `icon.icns` / `dev-icon.icns` are the
+macOS 15 fallback, and `icon.png` feeds the Linux packages. After editing either
+`.icon`, regenerate them all with `scripts/build-icons.sh`.
 
 ## Developer ID signing and notarization
 

@@ -180,6 +180,7 @@ contents="${app_path}/Contents"
 mkdir -p "${contents}/MacOS" "${contents}/Resources"
 cp "${binary}" "${contents}/MacOS/diri"
 cp "${workspace_dir}/assets/dev-icon.icns" "${contents}/Resources/dev-icon.icns"
+cp "${workspace_dir}/assets/dev-Assets.car" "${contents}/Resources/Assets.car"
 
 version="$(sed -n 's/^version = "\(.*\)"/\1/p' "${workspace_dir}/crates/diri-app/Cargo.toml" | head -1)"
 cat > "${contents}/Info.plist" <<PLIST
@@ -191,6 +192,7 @@ cat > "${contents}/Info.plist" <<PLIST
     <key>CFBundleDisplayName</key><string>${display_name}</string>
     <key>CFBundleExecutable</key><string>diri</string>
     <key>CFBundleIconFile</key><string>dev-icon.icns</string>
+    <key>CFBundleIconName</key><string>diri-dev</string>
     <key>CFBundleIdentifier</key><string>${bundle_id}</string>
     <key>CFBundleInfoDictionaryVersion</key><string>6.0</string>
     <key>CFBundleName</key><string>${display_name}</string>
