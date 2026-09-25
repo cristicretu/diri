@@ -12,7 +12,7 @@ unicode-width = "0.2.2"
 
 [dev-dependencies]
 diri-terminal-state.workspace = true
-criterion = "0.5.1"
+criterion = "0.8.2"
 gpui = { workspace = true, features = ["bench"] }
 gpui_platform = { workspace = true, features = ["test-support"] }
 
