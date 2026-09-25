@@ -317,6 +317,10 @@ pub struct RootView {
     /// Set when opening settings had to reveal a hidden sidebar to put its
     /// navigation somewhere, so closing settings can hide it again.
     sidebar_revealed_for_settings: bool,
+    /// The session that held keyboard focus when Settings opened, so closing
+    /// Settings can return there instead of leaving the hidden page focused.
+    settings_return_terminal: Option<Entity<TerminalPane>>,
+    settings_was_open: bool,
     preview: bool,
     preview_scenario: PreviewScenario,
     #[cfg(target_os = "macos")]
@@ -731,8 +735,26 @@ impl RootView {
             // Settings navigation is painted by the sidebar, so a settings
             // that opened onto a hidden sidebar has to bring it back -- and
             // give it up again on the way out.
-            cx.observe(surfaces, |this, surfaces, cx| {
+            cx.observe_in(surfaces, window, |this, surfaces, window, cx| {
                 let open = surfaces.read(cx).is_settings_open();
+                if open && !this.settings_was_open {
+                    this.settings_was_open = true;
+                    // Keyboard focus follows the page, so paste and dictation
+                    // land here instead of in the session underneath.
+                    this.settings_return_terminal = this.terminal_holding_focus(window, cx);
+                    surfaces.read(cx).focus_handle(cx).focus(window, cx);
+                } else if !open && this.settings_was_open {
+                    this.settings_was_open = false;
+                    let restore = this.settings_return_terminal.take();
+                    if surfaces
+                        .read(cx)
+                        .focus_handle(cx)
+                        .contains_focused(window, cx)
+                        && let Some(terminal) = restore.or_else(|| this.active_terminal(cx))
+                    {
+                        terminal.update(cx, |terminal, cx| terminal.focus(window, cx));
+                    }
+                }
                 if open && !this.sidebar.read(cx).is_visible() {
                     this.sidebar_revealed_for_settings = true;
                     this.sidebar.update(cx, |sidebar, cx| sidebar.reveal(cx));
@@ -1332,6 +1354,8 @@ impl RootView {
                     .into(),
             last_quote_surface: QuoteSurface::default(),
             sidebar_revealed_for_settings: false,
+            settings_return_terminal: None,
+            settings_was_open: false,
             preview,
             preview_scenario,
             #[cfg(target_os = "macos")]
@@ -1634,6 +1658,18 @@ impl RootView {
         } else {
             self.terminal.clone()
         }
+    }
+
+    /// The terminal that currently owns keyboard focus, including the shell
+    /// docked in the right sidebar. `None` when focus is already elsewhere.
+    fn terminal_holding_focus(&self, window: &Window, cx: &App) -> Option<Entity<TerminalPane>> {
+        if let Some(terminal) = &self.auxiliary_terminal
+            && terminal.read(cx).is_focused(window)
+        {
+            return Some(terminal.clone());
+        }
+        self.active_terminal(cx)
+            .filter(|terminal| terminal.read(cx).is_focused(window))
     }
 
     fn focused_quote_surface(&self, window: &Window, cx: &App) -> Option<QuoteSurface> {
@@ -2118,7 +2154,21 @@ impl RootView {
                     navigation.update(cx, |navigation, cx| navigation.dismiss(cx));
                 }
                 if let Some(surfaces) = &self.utility_surfaces {
+                    let opening = !surfaces.read(cx).is_settings_open();
+                    if opening {
+                        self.settings_return_terminal = self.terminal_holding_focus(window, cx);
+                        self.settings_was_open = true;
+                    }
                     surfaces.update(cx, |surfaces, cx| surfaces.toggle_settings(cx));
+                    if surfaces.read(cx).is_settings_open() {
+                        surfaces.read(cx).focus_handle(cx).focus(window, cx);
+                    } else {
+                        self.settings_was_open = false;
+                        let restore = self.settings_return_terminal.take();
+                        if let Some(terminal) = restore.or_else(|| self.active_terminal(cx)) {
+                            terminal.update(cx, |terminal, cx| terminal.focus(window, cx));
+                        }
+                    }
                 }
             }
             CommandId::ToggleTabOrientation
@@ -3069,6 +3119,7 @@ impl RootView {
             .child(deferred(
                 div()
                     .id("inspector-resize-handle")
+                    .debug_selector(|| "inspector-resize-handle".into())
                     .absolute()
                     .left(px(-4.5))
                     .top(px(0.0))
@@ -3367,9 +3418,13 @@ impl RootView {
                 terminal.set_viewport(
                     TerminalViewport {
                         x: sidebar_width + card_width,
+                        // The pane sits under the inspector header. Counting
+                        // that header in the height sizes the PTY past the
+                        // painted grid, so a wrapped line parks the prompt on
+                        // a row scrollback cannot reach.
                         y: Metrics::TITLE_BAR,
                         width: inspector_width,
-                        height: f32::from(viewport_size.height).max(0.0),
+                        height: (f32::from(viewport_size.height) - Metrics::TITLE_BAR).max(0.0),
                     },
                     cx,
                 );
@@ -4880,7 +4935,16 @@ impl Render for RootView {
             ));
         }
         if inspector_seam > 0.0 {
-            root = root.child(self.inspector_resize_handle(cx));
+            // The handle is deferred so it wins hit tests against the terminal.
+            // That also puts it above Settings, which covers this sidebar, so
+            // the page would resize the panel hidden behind it.
+            let settings_open = self
+                .utility_surfaces
+                .as_ref()
+                .is_some_and(|surfaces| surfaces.read(cx).is_settings_open());
+            if !settings_open {
+                root = root.child(self.inspector_resize_handle(cx));
+            }
             if let Some(inspector) = &self.inspector {
                 root = root.child(
                     div()
@@ -8379,6 +8443,64 @@ mod tests {
             assert!(
                 (occupied / width + floating - 1.0).abs() < 0.001,
                 "layout, inset, radius and shadow must share the same curve and clock"
+            );
+        });
+    }
+
+    #[gpui::test]
+    fn settings_hides_the_inspector_seam_and_takes_terminal_focus(cx: &mut gpui::TestAppContext) {
+        cx.update(|cx| cx.set_reduce_motion(true));
+        let services = test_services();
+        let fixture = SidebarPreviewFixture::make(PreviewScenario::Typical);
+        services.store.store.write().unwrap().hydrate(fixture.list);
+        let (root, cx) = cx.add_window_view(move |window, cx| {
+            RootView::new(services, false, PreviewScenario::Empty, window, cx)
+        });
+        cx.simulate_resize(size(px(1200.0), px(800.0)));
+        root.update(cx, |root, cx| {
+            root.inspector_open = true;
+            root.inspector_seam = 440.0;
+            cx.notify();
+        });
+        cx.run_until_parked();
+        assert!(
+            cx.debug_bounds("inspector-resize-handle").is_some(),
+            "the open sidebar exposes its resize handle"
+        );
+
+        root.update_in(cx, |root, window, cx| {
+            let terminal = root.terminal.as_ref().expect("terminal").clone();
+            terminal.update(cx, |terminal, cx| terminal.focus(window, cx));
+            assert!(terminal.read(cx).is_focused(window));
+            root.run_command(CommandId::OpenSettings, window, cx);
+            assert!(
+                !terminal.read(cx).is_focused(window),
+                "settings must take focus off the session behind it"
+            );
+            assert!(
+                root.utility_surfaces
+                    .as_ref()
+                    .expect("settings")
+                    .read(cx)
+                    .focus_handle(cx)
+                    .contains_focused(window, cx)
+            );
+        });
+        cx.run_until_parked();
+        assert!(
+            cx.debug_bounds("inspector-resize-handle").is_none(),
+            "settings covers the sidebar, so its seam must not stay hittable"
+        );
+
+        root.update_in(cx, |root, window, cx| {
+            root.run_command(CommandId::OpenSettings, window, cx);
+            assert!(
+                root.terminal
+                    .as_ref()
+                    .expect("terminal")
+                    .read(cx)
+                    .is_focused(window),
+                "closing settings returns focus to the session"
             );
         });
     }
