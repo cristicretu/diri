@@ -11,6 +11,7 @@ mod find_overlay;
 pub(crate) mod find_workflow_tests;
 mod qol;
 mod reconnect;
+mod seen;
 use qol::QolState;
 
 use std::collections::{HashMap, HashSet, VecDeque};
@@ -105,6 +106,10 @@ const RESIZE_GESTURE_GAP: Duration = Duration::from_millis(200);
 /// the intermediate frame entirely. The hold ends as soon as the program's
 /// repaint lands, so this bound only applies to one that is slow or absent.
 const REFLOW_HOLD: Duration = Duration::from_millis(140);
+/// How long output must be quiet before a last-seen marker still inside the
+/// live grid is placed again. Long enough to outlast the gaps in a streaming
+/// agent's output, short enough to read as immediate when it stops.
+const SEEN_SETTLE_DELAY: Duration = Duration::from_millis(150);
 /// Slack added to a bottom-anchored grid's height so layout rounding can never
 /// shave its last row off. See `TerminalPane::grid_row_overflow`.
 const ANCHOR_SLACK: f32 = 1.0;
@@ -313,6 +318,10 @@ enum PaneEvent {
     /// A history-length probe answered with the row where the live grid
     /// starts, or `None` when the read failed.
     HistoryExtent(SessionId, AttachmentGeneration, Option<i64>),
+    /// A one-row scrollback read answered with the live grid's first absolute
+    /// row; see [`seen::SeenMarks`]. Untagged on purpose: the mark belongs to
+    /// the session, not to the resident that happened to be mounted.
+    SeenProbe(SessionId, i64),
     /// The scroller knob moved the viewport; fetch whatever it now shows.
     ScrollbackPump(SessionId, usize),
     ClipboardUploadFinished(SessionId, Result<String, String>),
@@ -640,6 +649,10 @@ pub struct TerminalPane {
     #[cfg(test)]
     pub(crate) render_count: usize,
     qol: QolState,
+    seen: seen::SeenMarks,
+    /// Bumped by every output batch that moves a visible last-seen marker, so
+    /// only the probe scheduled by the latest one runs.
+    seen_settle: u64,
     /// Overlay scroller and rubber band over the grid's scrollback.
     scroller: diri_ui::ScrollerState,
     reconnect: reconnect::ReconnectUi,
@@ -921,6 +934,8 @@ impl TerminalPane {
             session_links: SessionLinks::new(cx),
             main_viewport: gpui::Size::default(),
             qol: QolState::default(),
+            seen: seen::SeenMarks::default(),
+            seen_settle: 0,
             scroller: diri_ui::ScrollerState::new(),
             reconnect: Default::default(),
             pending_resizes: HashMap::new(),
@@ -992,6 +1007,7 @@ impl TerminalPane {
         // below by promotion.
         self.parked_terminals
             .retain(|(id, _)| store.sessions().contains_key(id));
+        self.seen.retain(|id| store.sessions().contains_key(id));
         drop(store);
         // Park the painted terminal of every session about to be evicted, so
         // re-selecting it paints the same element instead of flashing a new
@@ -1091,16 +1107,23 @@ impl TerminalPane {
         let selection_changed = selected_id != self.observed_selected_id;
         if selection_changed {
             self.cancel_find_composition(window, cx);
-            if let Some(previous) = &self.observed_selected_id
-                && let Some(resident) = self.residents.get(previous)
-            {
-                resident.attachment.release();
+            if let Some(previous) = self.observed_selected_id.clone() {
+                if let Some(resident) = self.residents.get(&previous) {
+                    resident.attachment.release();
+                }
+                let cursor_row = self.cursor_row(&previous);
+                if self.seen.leave(&previous, cursor_row) {
+                    self.probe_seen(previous);
+                }
             }
             self.pending_resizes.clear();
         }
         self.observed_selected_id = selected_id.clone();
 
         self.reconcile_residency(cx);
+        if selection_changed && let Some(id) = &selected_id {
+            self.seen_arrive(id);
+        }
         if selection_changed {
             self.qol.clear_feedback();
             self.session_links.close();
@@ -1406,6 +1429,9 @@ impl TerminalPane {
                 if schedule {
                     self.schedule_find(id.clone(), self.find_rescan_delay(&id), window, cx);
                 }
+                if self.selected_id().as_ref() == Some(&id) {
+                    self.seen_output(&id, window, cx);
+                }
                 if terminal_damage_should_repaint(self.selected_id().as_ref(), &id, changed) {
                     self.request_terminal_repaint(window, cx);
                 }
@@ -1568,6 +1594,19 @@ impl TerminalPane {
             PaneEvent::ScrollbackPump(id, visible_rows) => {
                 self.pump_scrollback_fetch(&id, visible_rows);
                 cx.notify();
+            }
+            PaneEvent::SeenProbe(id, live_start_row) => {
+                let selected = self.selected_id().as_ref() == Some(&id);
+                let cursor_row = selected.then(|| self.cursor_row(&id)).flatten();
+                if selected && cursor_row.is_none() {
+                    // Selected but not resident yet: the first applied frame
+                    // probes again with a cursor to compare.
+                    return;
+                }
+                self.seen.probed(&id, live_start_row, cursor_row);
+                if selected {
+                    cx.notify();
+                }
             }
             PaneEvent::ScrollbackFailed(id, generation) => {
                 if !self.attachment_is_current(&id, generation) {
@@ -1826,6 +1865,9 @@ impl TerminalPane {
         // window is truly hidden). `is_window_active` is only OS focus, so
         // gating on it freezes a still-visible window on another monitor.
         let repaint = terminal_damage_should_repaint(selected.as_ref(), &id, changed);
+        if selected.as_ref() == Some(&id) {
+            self.seen_output(&id, window, cx);
+        }
         if schedule_find {
             let delay = self.find_rescan_delay(&id);
             self.schedule_find(id, delay, window, cx);
@@ -1842,9 +1884,69 @@ impl TerminalPane {
     /// resize (a hibernated tree, a session the phone owns) would otherwise
     /// leave the pane painting whatever was on screen before the first one.
     fn hold_reflow(&mut self, id: SessionId, _window: &mut Window, cx: &mut Context<Self>) {
+        // A column change rewraps history and renumbers every absolute row.
+        self.seen.forget(&id);
         if let Some(resident) = self.residents.get(&id) {
             resident.controller.hold_reflow(cx);
         }
+    }
+
+    /// The selected session's grid is current and its mark is waiting: ask
+    /// where the live grid starts now. A session that stayed resident is
+    /// current the moment it is selected; one that was evicted paints a parked
+    /// grid with the cursor where the reader left it, and is only current
+    /// once its first frame lands, which is the other caller.
+    fn seen_arrive(&mut self, id: &SessionId) {
+        let current = self
+            .residents
+            .get(id)
+            .is_some_and(|resident| resident.attachment_state == AttachmentState::Live);
+        if current && self.seen.arrive(id) {
+            self.probe_seen(id.clone());
+        }
+    }
+
+    /// Output reached the selected session.
+    fn seen_output(&mut self, id: &SessionId, window: &mut Window, cx: &mut Context<Self>) {
+        self.seen_arrive(id);
+        if self.seen.output(id) {
+            self.schedule_seen_settle(id.clone(), window, cx);
+        }
+    }
+
+    fn cursor_row(&self, id: &SessionId) -> Option<u16> {
+        let buffer = self.residents.get(id)?.element.buffer();
+        let row = buffer.read().ok()?.cursor.row;
+        Some(row)
+    }
+
+    /// Asks the engine where the live grid starts. One row is the smallest
+    /// read that reports it; the row itself is discarded.
+    fn probe_seen(&self, id: SessionId) {
+        let client = Arc::clone(self.runtime.client());
+        let pane_tx = self.pane_tx.clone();
+        self.tokio.spawn(async move {
+            if let Ok(result) = client.read_scrollback_cells(&id, 0, 1).await {
+                let _ = pane_tx.send(PaneEvent::SeenProbe(id, result.live_start_row));
+            }
+        });
+    }
+
+    /// Probes once output has been quiet for a moment. A marker inside the
+    /// live grid is hidden while output moves it, and a probe per frame of a
+    /// streaming agent would only place it on a row it has already left.
+    fn schedule_seen_settle(&mut self, id: SessionId, window: &mut Window, cx: &mut Context<Self>) {
+        self.seen_settle = self.seen_settle.wrapping_add(1);
+        let generation = self.seen_settle;
+        cx.spawn_in(window, async move |this, cx| {
+            cx.background_executor().timer(SEEN_SETTLE_DELAY).await;
+            let _ = crate::floating::update_in_owner(&this, cx, |this, _window, _cx| {
+                if this.seen_settle == generation {
+                    this.probe_seen(id);
+                }
+            });
+        })
+        .detach();
     }
 
     fn request_terminal_repaint(&mut self, _window: &mut Window, cx: &mut Context<Self>) {
@@ -3658,7 +3760,8 @@ impl TerminalPane {
             .font_size(px(font_size))
             .focus_handle(self.focus.clone())
             .reduce_motion(cx.reduce_motion())
-            .hovered_reference(self.qol.hit.clone());
+            .hovered_reference(self.qol.hit.clone())
+            .seen_marker(self.seen.marker(&session.id));
         let element = if self.qol.copy_mode.is_some()
             || self.qol.paste.is_some()
             || self.qol.menu.is_some()
