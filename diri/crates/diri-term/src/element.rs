@@ -755,6 +755,12 @@ impl TerminalElement {
         self
     }
 
+    /// Whether committed text and IME input currently reach the PTY.
+    #[must_use]
+    pub fn text_input_enabled(&self) -> bool {
+        mutex_lock(&self.ime_state).enabled
+    }
+
     /// Temporarily hands text ownership to an overlay. Existing native handlers
     /// observe the same gate, including callbacks delivered before the next paint.
     pub fn set_text_input_enabled(&self, enabled: bool) {

@@ -3,6 +3,7 @@
 //! The daemon remains authoritative: this module only composes
 //! `diri-client::SessionAttachment`, `diri-term`, and the T9 session store.
 
+mod autoscroll;
 mod controller;
 use controller::{AttachmentControl, ControllerLease};
 mod find_input;
@@ -691,6 +692,8 @@ pub struct TerminalPane {
     /// Space in the title bar reserved for workbench-owned controls painted
     /// above this pane, such as the auxiliary terminal's close button.
     header_trailing_inset: f32,
+    /// This frame's hold-⌘ hint opacity, sampled at render.
+    held_hint: f32,
     /// The workbench hosts this pane's title-bar actions elsewhere (the
     /// horizontal tab strip), so the pane paints no title bar of its own and
     /// the grid takes the reclaimed height.
@@ -801,6 +804,8 @@ impl TerminalPane {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
+        cx.observe_global::<crate::held_hints::HeldHintsState>(|_, cx| cx.notify())
+            .detach();
         let focus = cx.focus_handle();
         if matches!(session_source, SessionSource::FollowSelection) {
             window.focus(&focus, cx);
@@ -936,6 +941,7 @@ impl TerminalPane {
             sidebar_visible: true,
             inspector_open: false,
             header_trailing_inset: 0.0,
+            held_hint: 0.0,
             header_hidden: false,
             navigation: None,
             utility_surfaces: None,
@@ -992,6 +998,8 @@ impl TerminalPane {
         // below by promotion.
         self.parked_terminals
             .retain(|(id, _)| store.sessions().contains_key(id));
+        self.known_pty_size
+            .retain(|id, _| store.sessions().contains_key(id));
         drop(store);
         // Park the painted terminal of every session about to be evicted, so
         // re-selecting it paints the same element instead of flashing a new
@@ -1051,7 +1059,14 @@ impl TerminalPane {
                 .as_ref()
                 .is_some_and(|element| Arc::ptr_eq(&element.buffer(), &buffer));
             let element = if reuse_parked {
-                parked.unwrap()
+                // Clones share find and IME state, so the parked element still
+                // carries whatever Find left behind; the new resident starts
+                // with Find closed.
+                let element = parked.unwrap();
+                element.clear_find_source();
+                element.set_find_highlights(Vec::new());
+                element.set_text_input_enabled(true);
+                element
             } else {
                 TerminalElement::new(buffer)
             };
@@ -3305,10 +3320,12 @@ impl TerminalPane {
             && resident.attachment.is_controller()
             && resident.last_size != (0, 0)
             && resident.last_size == size
+            && resident.attachment.pty_may_be(size)
         {
             // The pane still matches the size this session was already using.
             // An unchanged pane must not send a resize at all. Recording that
-            // size would let the next attach replay it.
+            // size would let the next attach replay it. A view that regains
+            // the lease after another view resized the PTY still sends.
             return;
         }
         if let Some(resident) = self.residents.get_mut(&session.id)
@@ -3404,7 +3421,7 @@ impl TerminalPane {
             .when(self.occupies_window_titlebar(), |control| {
                 control.child(div().w(px(Metrics::TOOLBAR_TRAFFIC_LIGHT_LANE)).flex_none())
             })
-            .child(
+            .child(crate::held_hints::below(
                 div()
                     .id("show-sidebar")
                     .debug_selector(|| "show-sidebar".into())
@@ -3436,8 +3453,13 @@ impl TerminalPane {
                         this.focus(window, cx);
                         window.dispatch_action(Box::new(ToggleSidebar), cx);
                         cx.stop_propagation();
-                    })),
-            )
+                    }))
+                    .into_any_element(),
+                "show-sidebar",
+                crate::held_hints::label(crate::commands::CommandId::ToggleSidebar),
+                self.held_hint,
+                colors,
+            ))
             .into_any_element()
     }
 
@@ -3509,8 +3531,8 @@ impl TerminalPane {
                     .gap(px(Metrics::TOOLBAR_ITEM_GAP))
                     .when(shell_controls, |trailing| {
                         trailing
-                            .child(self.render_inspector_toggle(colors, cx))
-                            .child(self.render_notification_button(colors))
+                            .child(self.render_inspector_toggle(colors, self.held_hint, cx))
+                            .child(self.render_notification_button(colors, self.held_hint))
                     }),
             )
             .into_any_element()
@@ -3519,10 +3541,11 @@ impl TerminalPane {
     fn render_inspector_toggle(
         &self,
         colors: SemanticColors,
+        held_hint: f32,
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let inspector_open = self.inspector_open;
-        div()
+        let toggle = div()
             .id("toggle-inspector")
             .debug_selector(|| "toggle-inspector".into())
             .role(gpui::Role::Button)
@@ -3550,10 +3573,17 @@ impl TerminalPane {
                 window.dispatch_action(Box::new(ToggleInspector), cx);
                 cx.stop_propagation();
             }))
-            .into_any_element()
+            .into_any_element();
+        crate::held_hints::below(
+            toggle,
+            "toggle-inspector",
+            crate::held_hints::label(crate::commands::CommandId::ToggleInspector),
+            held_hint,
+            colors,
+        )
     }
 
-    fn render_notification_button(&self, colors: SemanticColors) -> AnyElement {
+    fn render_notification_button(&self, colors: SemanticColors, held_hint: f32) -> AnyElement {
         let unread = self
             .runtime
             .store
@@ -3561,7 +3591,7 @@ impl TerminalPane {
             .expect("session store lock poisoned")
             .notifications()
             .unread_count();
-        div()
+        let button = div()
             .id("notification-inbox-button")
             .debug_selector(|| "notification-inbox-button".into())
             .role(gpui::Role::Button)
@@ -3600,7 +3630,14 @@ impl TerminalPane {
                 window.dispatch_action(Box::new(crate::commands::ToggleNotifications), cx);
                 cx.stop_propagation();
             })
-            .into_any_element()
+            .into_any_element();
+        crate::held_hints::below(
+            button,
+            "notifications",
+            crate::held_hints::label(crate::commands::CommandId::ToggleNotifications),
+            held_hint,
+            colors,
+        )
     }
 
     /// The title-bar actions for a workbench that paints them itself, in the
@@ -3611,6 +3648,7 @@ impl TerminalPane {
     pub fn render_hosted_header_actions(
         &self,
         colors: SemanticColors,
+        held_hint: f32,
         cx: &mut Context<Self>,
     ) -> Option<AnyElement> {
         if !matches!(self.session_source, SessionSource::FollowSelection) {
@@ -3628,8 +3666,8 @@ impl TerminalPane {
                 .when_some(session, |actions, session| {
                     actions.child(self.render_session_links_trigger(&session, colors, cx))
                 })
-                .child(self.render_inspector_toggle(colors, cx))
-                .child(self.render_notification_button(colors))
+                .child(self.render_inspector_toggle(colors, held_hint, cx))
+                .child(self.render_notification_button(colors, held_hint))
                 .into_any_element(),
         )
     }
@@ -4273,6 +4311,7 @@ impl Render for TerminalPane {
         self.sync_status_glyphs(colors, window, cx);
         self.update_selected_geometry(window, cx);
         self.main_viewport = window.viewport_size();
+        self.held_hint = crate::held_hints::opacity(window, cx);
 
         let selected = self.selected_session();
 
@@ -6697,6 +6736,50 @@ mod tests {
         });
     }
 
+    /// Holding ⌘ to read the shortcut hints is not terminal input: nothing
+    /// reaches the PTY on press, through the hold, or on release.
+    #[gpui::test]
+    fn holding_command_alone_sends_nothing_to_the_pty(cx: &mut TestAppContext) {
+        let runtime = Arc::new(StoreRuntime::inert());
+        let tokio = Arc::new(
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap(),
+        );
+        let session = fixture_session();
+        let id = session.id.clone();
+        {
+            let mut store = runtime.store.write().unwrap();
+            store.upsert_session(session);
+            store.select(id.clone());
+        }
+        let (pane, cx) =
+            cx.add_window_view(move |window, cx| TerminalPane::new(runtime, tokio, window, cx));
+        let mut input = pane.update_in(cx, |pane, window, cx| {
+            pane.reconcile_store_change(window, cx);
+            let (tx, input) = mpsc::unbounded_channel();
+            let resident = pane.residents.get_mut(&id).unwrap();
+            resident.attachment.claim();
+            resident.attachment.input_observer = Some((id.clone(), tx));
+            pane.focus(window, cx);
+            input
+        });
+        cx.simulate_modifiers_change(Modifiers {
+            platform: true,
+            ..Modifiers::default()
+        });
+        cx.executor()
+            .advance_clock(crate::held_hints::HOLD_DELAY * 2);
+        cx.run_until_parked();
+        cx.simulate_modifiers_change(Modifiers::default());
+        cx.run_until_parked();
+        assert!(input.try_recv().is_err(), "a lone ⌘ reached the PTY");
+        // The channel is live: a real keystroke still arrives.
+        cx.simulate_keystrokes("a");
+        assert_eq!(input.try_recv().unwrap(), (id.clone(), b"a".to_vec()));
+    }
+
     #[gpui::test]
     fn explicit_terminal_input_returns_a_reading_view_to_live(cx: &mut TestAppContext) {
         const ROWS: usize = 10;
@@ -7639,6 +7722,125 @@ mod tests {
         let hidden = qol::paste_review_preview(&mut text.chars(), true);
         assert!(!hidden.contains("hunter2"), "{hidden}");
         assert!(hidden.starts_with("8 characters"), "{hidden}");
+    }
+
+    #[gpui::test]
+    fn switching_back_after_find_restores_typing(cx: &mut TestAppContext) {
+        let runtime = Arc::new(StoreRuntime::inert());
+        let tokio = Arc::new(
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("test runtime"),
+        );
+        let mut a = fixture_session();
+        a.id = SessionId::new("a");
+        let mut b = fixture_session();
+        b.id = SessionId::new("b");
+        let a_id = a.id.clone();
+        let b_id = b.id.clone();
+        {
+            let mut store = runtime.store.write().unwrap();
+            store.upsert_session(a);
+            store.upsert_session(b);
+            store.select(a_id.clone());
+        }
+        let rt = Arc::clone(&runtime);
+        let (pane, cx) =
+            cx.add_window_view(move |window, cx| TerminalPane::new(rt, tokio, window, cx));
+        pane.update_in(cx, |pane, window, cx| {
+            pane.set_viewport(
+                TerminalViewport {
+                    width: 900.0,
+                    height: 600.0,
+                    ..Default::default()
+                },
+                cx,
+            );
+            window.activate_window();
+            pane.focus(window, cx);
+            pane.update_selected_geometry(window, cx);
+            pane.open_find(&OpenFind, window, cx);
+            assert!(!pane.residents[&a_id].element.text_input_enabled());
+        });
+        runtime.store.write().unwrap().select(b_id);
+        pane.update_in(cx, |pane, window, cx| {
+            pane.reconcile_store_change(window, cx)
+        });
+        runtime.store.write().unwrap().select(a_id.clone());
+        pane.update_in(cx, |pane, window, cx| {
+            pane.reconcile_store_change(window, cx);
+            let resident = &pane.residents[&a_id];
+            assert!(
+                resident.find.is_none(),
+                "a remounted session starts with Find closed"
+            );
+            assert!(
+                resident.element.text_input_enabled(),
+                "Find is closed, so typed text must reach the PTY again"
+            );
+        });
+    }
+
+    #[gpui::test]
+    fn regaining_the_lease_resends_this_panes_pty_size(cx: &mut TestAppContext) {
+        let runtime = Arc::new(StoreRuntime::inert());
+        let tokio = Arc::new(
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("test runtime"),
+        );
+        let mut session = fixture_session();
+        session.id = SessionId::new("shared");
+        let id = session.id.clone();
+        {
+            let mut store = runtime.store.write().unwrap();
+            store.upsert_session(session);
+            store.select(id.clone());
+        }
+        let rt = Arc::clone(&runtime);
+        let tk = Arc::clone(&tokio);
+        let (pane_a, cx) =
+            cx.add_window_view(move |window, cx| TerminalPane::new(rt, tk, window, cx));
+        let rt = Arc::clone(&runtime);
+        let pane_b = cx.update(|window, cx| cx.new(|cx| TerminalPane::new(rt, tokio, window, cx)));
+        let wide = TerminalViewport {
+            width: 1400.0,
+            height: 600.0,
+            ..Default::default()
+        };
+        let narrow = TerminalViewport {
+            width: 700.0,
+            height: 600.0,
+            ..Default::default()
+        };
+        cx.update(|window, _| window.activate_window());
+        cx.run_until_parked();
+        let size_after = |pane: &Entity<TerminalPane>,
+                          viewport: TerminalViewport,
+                          cx: &mut gpui::VisualTestContext| {
+            pane.update_in(cx, |pane, window, cx| {
+                pane.set_viewport(viewport, cx);
+                pane.focus(window, cx);
+                pane.focus(window, cx);
+                pane.last_resize_sent = Some(Instant::now() - Duration::from_secs(3));
+                pane.update_selected_geometry(window, cx);
+                pane.residents[&id].last_size
+            })
+        };
+        let a_size = size_after(&pane_a, wide, cx);
+        pane_a.update_in(cx, |pane, _, _| pane.release_layout_control());
+        let b_size = size_after(&pane_b, narrow, cx);
+        pane_b.update_in(cx, |pane, _, _| pane.release_layout_control());
+        assert_ne!(a_size, b_size);
+        size_after(&pane_a, wide, cx);
+        pane_a.read_with(cx, |pane, _| {
+            assert!(
+                !pane.residents[&id].attachment.needs_resize(a_size),
+                "pane A owns the PTY again, so it must send its own size back"
+            );
+        });
     }
 
     #[gpui::test]

@@ -55,6 +55,10 @@ struct ControlState {
     writer: Option<SessionAttachmentHandle>,
     last_resize: Option<(u16, u16)>,
     pending_resize: Option<(u16, u16)>,
+    /// The size most recently asked of the PTY by any view. Unlike
+    /// `last_resize` it survives a lease change, so a view that regains the
+    /// lease can tell whether another view left the PTY at a different size.
+    requested_size: Option<(u16, u16)>,
     resize_wake: Arc<Notify>,
     #[cfg(test)]
     resize_sends: u64,
@@ -119,6 +123,16 @@ impl AttachmentControl {
         let _ = self.submit_at(AttachmentCommand::Resize(size.0, size.1), Some(revision));
     }
 
+    /// True when no view has sized this PTY yet, or the last size any view
+    /// asked for is `size`.
+    pub(super) fn pty_may_be(&self, size: (u16, u16)) -> bool {
+        self.state
+            .lock()
+            .unwrap()
+            .requested_size
+            .is_none_or(|requested| requested == size)
+    }
+
     pub(super) fn needs_resize(&self, size: (u16, u16)) -> bool {
         let state = self.state.lock().unwrap();
         state.pending_resize.or(state.last_resize) != Some(size)
@@ -150,6 +164,7 @@ impl AttachmentControl {
         }
         if let AttachmentCommand::Resize(cols, rows) = command {
             let size = (cols, rows);
+            state.requested_size = Some(size);
             let result = match &state.writer {
                 Some(writer) => writer.resize(cols, rows),
                 None => Ok(()), // Desired geometry survives connection setup.
@@ -282,6 +297,7 @@ impl ControllerLease {
                 writer: None,
                 last_resize: None,
                 pending_resize: None,
+                requested_size: None,
                 resize_wake: Arc::new(Notify::new()),
                 #[cfg(test)]
                 resize_sends: 0,
@@ -779,6 +795,7 @@ mod tests {
                 writer: None,
                 last_resize: None,
                 pending_resize: None,
+                requested_size: None,
                 resize_wake: Arc::new(Notify::new()),
                 #[cfg(test)]
                 resize_sends: 0,
@@ -839,6 +856,7 @@ mod tests {
                 writer: None,
                 last_resize: None,
                 pending_resize: None,
+                requested_size: None,
                 resize_wake: Arc::new(Notify::new()),
                 #[cfg(test)]
                 resize_sends: 0,

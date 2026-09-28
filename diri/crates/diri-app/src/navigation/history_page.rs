@@ -1,5 +1,6 @@
 //! Cached, virtualized conversation page of the command palette.
 use super::*;
+use crate::tooltip_warmth::WarmTooltip;
 use diri_proto::HistoryEntry;
 use diri_ui::{AgentLogo, Typo};
 use gpui::CursorStyle;
@@ -228,7 +229,9 @@ impl NavigationOverlay {
                     .when(!resumable, |row| {
                         row.cursor(CursorStyle::OperationNotAllowed)
                     })
-                    .tooltip(move |_, cx| cx.new(|_| PaletteTooltip(detail.clone(), colors)).into())
+                    .warm_tooltip(move |_, cx| {
+                        cx.new(|_| PaletteTooltip(detail.clone(), colors)).into()
+                    })
                     .on_click(cx.listener(move |this, _, window, cx| {
                         let entry = entry.clone();
                         this.in_main(window, cx, move |this, window, cx| {
