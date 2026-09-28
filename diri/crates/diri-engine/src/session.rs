@@ -2706,6 +2706,9 @@ impl Drop for Session {
     /// [`Session::adopt`].
     fn drop(&mut self) {
         self.shared.stop.store(true, Ordering::SeqCst);
+        // An attach pump idles on this wake source; a replacement Session has
+        // a new one, so tell the pump to go and look for it.
+        self.shared.grid_wake.notify();
         // A drop while the exec is still deferred wakes the launcher so the
         // join below is prompt; the child was never spawned.
         if let Some(deferred) = &self.deferred {

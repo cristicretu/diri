@@ -1,4 +1,5 @@
 //! Client-owned terminal interactions. No PTY parsing or remote execution here.
+use super::autoscroll;
 use super::*;
 use diri_proto::grid::{GridCell, GridRowCodec, RowMetadata, TermStyle};
 use diri_term::element::ReferenceHit;
@@ -21,7 +22,9 @@ pub(super) struct QolState {
     pub feedback: Option<String>,
     pub(super) feedback_generation: u64,
     feedback_timer: Option<Task<()>>,
-    pub drag: Option<(SessionId, usize, usize, i64)>,
+    /// Selection drag held past an edge: cell under the pointer and signed
+    /// pixels past the edge, positive above the top.
+    pub drag: Option<(SessionId, usize, usize, f32)>,
     pub autoscroll: Option<Task<()>>,
     export_files: Vec<tempfile::NamedTempFile>,
     busy: bool,
@@ -390,6 +393,10 @@ impl TerminalPane {
         cx.notify();
     }
 
+    /// Scrolls while a selection drag holds the pointer past the top or
+    /// bottom edge, at a speed set by how far past it is (see
+    /// [`autoscroll::lines_per_second`]). Pointer moves only update the
+    /// distance; one frame-rate task integrates it into sub-row scroll.
     pub(super) fn update_selection_autoscroll(
         &mut self,
         position: Point<Pixels>,
@@ -405,29 +412,33 @@ impl TerminalPane {
         let top = viewport.y + self.header_height() + 2.0;
         let bottom = viewport.y + viewport.height - 10.0;
         let y = f32::from(position.y);
-        let delta = if y < top {
-            ((top - y) / 16.0).ceil().clamp(1.0, 12.0) as i64
+        // Signed like the scroll position: positive is toward history.
+        let past = if y < top {
+            top - y
         } else if y > bottom {
-            -((y - bottom) / 16.0).ceil().clamp(1.0, 12.0) as i64
+            -(y - bottom)
         } else {
-            0
+            0.0
         };
-        if delta == 0 {
+        if autoscroll::lines_per_second(past.abs()) == 0.0 {
             self.qol.drag = None;
             self.qol.autoscroll = None;
             return;
         }
-        self.qol.drag = Some((id, col, row, delta));
+        self.qol.drag = Some((id, col, row, past));
         if self.qol.autoscroll.is_some() {
             return;
         }
         self.qol.autoscroll = Some(cx.spawn_in(window, async move |this, cx| {
+            let mut accumulator = autoscroll::Accumulator::default();
+            let mut last = Instant::now();
             loop {
-                cx.background_executor()
-                    .timer(Duration::from_millis(32))
-                    .await;
+                cx.background_executor().timer(autoscroll::TICK).await;
+                let now = Instant::now();
+                let elapsed = now.saturating_duration_since(last);
+                last = now;
                 let keep = crate::floating::update_in_owner(&this, cx, |this, window, cx| {
-                    let Some((id, col, row, delta)) = this.qol.drag.clone() else {
+                    let Some((id, col, row, past)) = this.qol.drag.clone() else {
                         return false;
                     };
                     if this.selected_id().as_ref() != Some(&id) || !this.focus.is_focused(window) {
@@ -442,11 +453,28 @@ impl TerminalPane {
                     {
                         return false;
                     }
+                    let velocity = autoscroll::lines_per_second(past.abs()).copysign(past);
+                    // Autoscroll is function, not decoration: reduced motion
+                    // still scrolls, but in whole rows with no sub-row glide.
+                    let whole_rows = cx.reduce_motion();
+                    let travel = accumulator.advance(velocity, elapsed, whole_rows);
+                    if travel == 0.0 {
+                        return true;
+                    }
                     let rows = usize::from(resident.last_size.1);
-                    resident.element.set_view_offset(
-                        resident.element.view_offset().saturating_add(delta),
-                        rows,
-                    );
+                    let mut before = resident.element.scroll_position();
+                    if whole_rows {
+                        // Settle a trackpad's leftover fraction onto the row
+                        // grid so every step lands on a whole row.
+                        before = before.round();
+                    }
+                    let moved = resident.element.set_scroll_position(before + travel, rows);
+                    if !moved {
+                        // Oldest retained row or the live edge: nothing more
+                        // to reveal until the pointer moves again.
+                        this.qol.drag = None;
+                        return false;
+                    }
                     resident.element.drag_selection(col, row);
                     this.pump_scrollback_fetch(&id, rows);
                     cx.notify();

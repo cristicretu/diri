@@ -84,36 +84,44 @@ impl Serialize for ControlMessage {
     where
         S: Serializer,
     {
-        let mut object = Map::new();
+        // Streamed field by field: a `session.list` reply or a record-bearing
+        // event is hundreds of kilobytes, and building an intermediate object
+        // first deep-cloned all of it on every write.
+        use serde::ser::SerializeMap;
         match self {
             Self::Request { id, method, params } => {
-                object.insert("id".into(), Value::from(*id));
-                object.insert("method".into(), Value::from(method.clone()));
+                let mut object =
+                    serializer.serialize_map(Some(2 + usize::from(params.is_some())))?;
+                object.serialize_entry("id", id)?;
+                object.serialize_entry("method", method)?;
                 if let Some(params) = params {
-                    object.insert("params".into(), params.clone());
+                    object.serialize_entry("params", params)?;
                 }
+                object.end()
             }
             Self::Response { id, result: Ok(ok) } => {
-                object.insert("id".into(), Value::from(*id));
-                object.insert("ok".into(), ok.clone());
+                let mut object = serializer.serialize_map(Some(2))?;
+                object.serialize_entry("id", id)?;
+                object.serialize_entry("ok", ok)?;
+                object.end()
             }
             Self::Response {
                 id,
                 result: Err(error),
             } => {
-                object.insert("id".into(), Value::from(*id));
-                object.insert(
-                    "err".into(),
-                    serde_json::to_value(error).map_err(serde::ser::Error::custom)?,
-                );
+                let mut object = serializer.serialize_map(Some(2))?;
+                object.serialize_entry("id", id)?;
+                object.serialize_entry("err", error)?;
+                object.end()
             }
             Self::Event { name, seq, params } => {
-                object.insert("event".into(), Value::from(name.clone()));
-                object.insert("seq".into(), Value::from(*seq));
-                object.insert("params".into(), params.clone());
+                let mut object = serializer.serialize_map(Some(3))?;
+                object.serialize_entry("event", name)?;
+                object.serialize_entry("seq", seq)?;
+                object.serialize_entry("params", params)?;
+                object.end()
             }
         }
-        Value::Object(object).serialize(serializer)
     }
 }
 

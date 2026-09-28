@@ -4,6 +4,7 @@
 //! This module owns only the presentation state: asynchronous opens, source
 //! history, line targeting, virtualization, and lightweight lexical color.
 
+use crate::tooltip_warmth::WarmTooltip;
 use std::collections::{HashMap, HashSet};
 use std::ops::Range;
 use std::path::PathBuf;
@@ -575,7 +576,7 @@ impl CodeViewer {
                                                 .text_color(colors.primary)
                                                 .child(format!("{name}{status}")),
                                         )
-                                        .tooltip(move |_, cx| {
+                                        .warm_tooltip(move |_, cx| {
                                             cx.new(|_| ExplorerTooltip(tooltip.clone(), colors))
                                                 .into()
                                         })

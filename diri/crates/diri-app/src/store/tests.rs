@@ -1945,8 +1945,8 @@ fn spawned_project_is_published_into_sidebar_order() {
             .filter(|event| event.name == EventName::PROJECT_UPDATED)
             .collect();
         assert_eq!(project_events.len(), 1, "a new cwd publishes one project");
-        assert!(project_events[0].params.get("pinnedOrder").is_none());
-        let inserted: Project = serde_json::from_value(project_events[0].params.clone()).unwrap();
+        assert!(project_events[0].params().get("pinnedOrder").is_none());
+        let inserted: Project = serde_json::from_value(project_events[0].params()).unwrap();
         assert_eq!(inserted.root, cwd);
 
         let (mut store, _) = hydrated(
@@ -1958,7 +1958,7 @@ fn spawned_project_is_published_into_sidebar_order() {
             store.handle_event(EventEnvelope {
                 name: event.name.clone(),
                 seq: event.seq,
-                params: event.params.clone(),
+                params: event.params(),
             });
         }
         let order = store.sidebar_project_order();
