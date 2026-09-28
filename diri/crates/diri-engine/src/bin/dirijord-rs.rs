@@ -152,10 +152,16 @@ fn main() {
     };
 
     let mut registry = Registry::new(Arc::clone(&engine), DirijorPaths::state_file(&home));
-    match registry.load() {
-        Ok(count) => eprintln!("dirijord-rs: loaded {count} session record(s)"),
-        Err(error) => eprintln!("dirijord-rs: state load: {error}"),
-    }
+    let state_loaded = match registry.load() {
+        Ok(count) => {
+            eprintln!("dirijord-rs: loaded {count} session record(s)");
+            true
+        }
+        Err(error) => {
+            eprintln!("dirijord-rs: state load: {error}");
+            false
+        }
+    };
     let adopted = registry.restore(&holder, &logs_dir);
     eprintln!(
         "dirijord-rs: adopted {} live holder session(s): {adopted:?}",
@@ -196,6 +202,43 @@ fn main() {
     // Only once the socket is accepting: remote adoption is SSH-bound and must
     // never be what a client waits behind.
     server.spawn_remote_restore();
+
+    // One-shot, off the accept path: reclaim per-session files no record,
+    // holder, or remote binding stands behind. Never repeated while idle.
+    {
+        let registry = Arc::clone(&registry);
+        let logs_dir = logs_dir.clone();
+        let holders_dir = app_support.join("holders");
+        let bindings_dir = DirijorPaths::socket(&home).parent().map_or_else(
+            || PathBuf::from("remote-bindings"),
+            |dir| dir.join("remote-bindings"),
+        );
+        let _ = std::thread::Builder::new()
+            .name("diri-orphan-sweep".into())
+            .spawn(move || {
+                let report = diri_engine::session_files::startup_sweep(
+                    &registry,
+                    state_loaded,
+                    &logs_dir,
+                    &holders_dir,
+                    &bindings_dir,
+                    &diri_engine::session_files::SweepOptions::default(),
+                );
+                match report {
+                    Some(report) => eprintln!(
+                        "dirijord-rs: orphan sweep removed {} file(s) ({} bytes) and {} recovery dir(s); kept {} referenced, {} recent; {} failed; {:?}",
+                        report.removed_files,
+                        report.removed_bytes,
+                        report.removed_recovery_dirs,
+                        report.kept_referenced,
+                        report.kept_recent,
+                        report.failed,
+                        report.elapsed,
+                    ),
+                    None => eprintln!("dirijord-rs: orphan sweep skipped (no loaded records)"),
+                }
+            });
+    }
 
     let _watcher = diri_engine::events::spawn_registry_watcher(
         Arc::clone(&registry),

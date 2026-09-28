@@ -23,7 +23,7 @@ use std::time::{Duration, Instant};
 use diri_proto::frames::{Frame, FrameCodec, FrameType};
 
 use crate::registry::Registry;
-use crate::session::{AttachmentSeed, GridSignature};
+use crate::session::{AttachmentSeed, GridSignature, GridWake};
 
 /// Background-output ceiling for grid emission. The first frame after quiet
 /// and the bounded response frames after interactive input go immediately;
@@ -68,6 +68,10 @@ const SINK_BACKLOG_BYTES: usize = 1024 * 1024;
 const SINK_BACKLOG_FRAMES: usize = 64;
 const WRITE_BUDGET_BYTES: usize = 256 * 1024;
 const WRITE_RETRY: Duration = Duration::from_millis(1);
+/// A safety ceiling for an idle pump, not its wake mechanism; see `pump`.
+const IDLE_PUMP_CEILING: Duration = Duration::from_secs(30);
+/// How often a pump looks for its Session while a restart has removed it.
+const ABSENT_SESSION_RETRY: Duration = Duration::from_secs(1);
 const STALLED_SINK_TIMEOUT: Duration = Duration::from_secs(2);
 
 struct SinkOutput {
@@ -179,6 +183,9 @@ fn encoded(frame: &Frame) -> std::io::Result<Arc<[u8]>> {
 struct SessionSinks {
     sinks: Vec<Sink>,
     pump_running: bool,
+    /// The wake source the pump is currently blocked on, so a departing sink
+    /// can wake it to notice it may be the last one.
+    wake: Option<GridWake>,
 }
 
 /// Routes attach connections to per-session pumps.
@@ -679,6 +686,7 @@ impl AttachHub {
         });
         if !entry.pump_running {
             entry.pump_running = true;
+            entry.wake = Some(seed.wake.clone());
             let hub = self.clone();
             let registry = Arc::clone(registry);
             let session_id = session_id.to_string();
@@ -709,6 +717,11 @@ impl AttachHub {
                     true
                 }
             });
+            // An idle pump waits on the grid alone; without this it would
+            // learn it has no sinks left only at its next output.
+            if let Some(wake) = &entry.wake {
+                wake.notify();
+            }
         }
     }
 
@@ -845,14 +858,21 @@ impl AttachHub {
         let stop = AtomicBool::new(false);
         let mut last_owner_check = Instant::now();
         let mut publication_pending = false;
+        let mut session_present = true;
         loop {
             let pending = self.flush_sinks(session_id);
             // A publication deadline must not suspend partially sent frames.
             // Remember dirty state while the loop services bounded write retries.
+            // Idle, the pump sleeps on the grid: output, a departing sink and
+            // the Session's own drop (a restart replacing it) all wake it. Only
+            // while the Session is absent mid-restart is there nothing that
+            // will, so that state retries on a short ceiling.
             let mut timeout = if publication_pending {
                 GRID_FLUSH_INTERVAL.saturating_sub(last_emission.elapsed())
+            } else if session_present {
+                IDLE_PUMP_CEILING
             } else {
-                Duration::from_secs(1)
+                ABSENT_SESSION_RETRY
             };
             if pending {
                 self.wait_for_writable(session_id, timeout.min(WRITE_RETRY));
@@ -866,17 +886,27 @@ impl AttachHub {
             // A restart can replace the Session (and therefore its wake
             // source) while sinks remain connected. The bounded wait above is
             // the recovery ceiling; re-seed from the replacement immediately.
-            let replacement_wake =
-                if changed || last_owner_check.elapsed() >= Duration::from_secs(1) {
-                    last_owner_check = Instant::now();
-                    let Ok(guard) = registry.lock() else { break };
-                    guard.get(session_id).map(|session| session.grid_wake())
-                } else {
-                    None
-                };
+            let replacement_wake = if changed || last_owner_check.elapsed() >= ABSENT_SESSION_RETRY
+            {
+                last_owner_check = Instant::now();
+                let Ok(guard) = registry.lock() else { break };
+                let current = guard.get(session_id).map(|session| session.grid_wake());
+                session_present = current.is_some();
+                current
+            } else {
+                None
+            };
             if let Some(replacement) = replacement_wake
                 && !wake.same_source(&replacement)
             {
+                if let Some(entry) = self
+                    .sessions
+                    .lock()
+                    .expect("attach hub")
+                    .get_mut(session_id)
+                {
+                    entry.wake = Some(replacement.clone());
+                }
                 wake = replacement;
                 wake_generation = wake.generation();
                 signature = GridSignature::default();
@@ -1319,6 +1349,7 @@ mod tests {
                     output: Arc::clone(&old).into(),
                 }],
                 pump_running: true,
+                wake: None,
             },
         );
         // A publisher captures its recipients along with an older grid. Delay
@@ -1359,6 +1390,77 @@ mod tests {
         );
         assert_eq!(new.lock().unwrap().frames.len(), 2);
         assert_eq!(old.lock().unwrap().frames.len(), 2);
+    }
+
+    #[test]
+    fn an_idle_pump_stops_as_soon_as_its_last_sink_leaves() {
+        let temp = tempfile::tempdir().unwrap();
+        let (engine, _) =
+            crate::detect::ManifestEngine::load_dir(&crate::detect::bundled_manifest_dir())
+                .unwrap();
+        let engine = Arc::new(engine);
+        let record: diri_proto::SessionRecord = serde_json::from_value(serde_json::json!({
+            "id":"s", "kind":diri_proto::AgentKind::new("generic"), "cwd":temp.path(),
+            "projectID":"p", "title":"fixture", "titleSource":diri_proto::TitleSource::Placeholder,
+            "status":diri_proto::SessionStatus::Idle, "resumability":diri_proto::Resumability::Live,
+            "createdAt":0.0,"updatedAt":0.0,"pinned":false
+        }))
+        .unwrap();
+        let mut registry = Registry::new(Arc::clone(&engine), temp.path().join("state.json"));
+        registry
+            .spawn(
+                crate::session::SessionSpec {
+                    id: "s".into(),
+                    pty: crate::pty::PtySpec::new(
+                        vec!["/bin/sh".into(), "-c".into(), "read line".into()],
+                        temp.path(),
+                    )
+                    .size(80, 24),
+                    manifest_id: "generic".into(),
+                    authority: crate::session::authority_for("generic", &engine),
+                    logs_dir: temp.path().join("logs"),
+                    holder: None,
+                    remote: None,
+                    defer_launch: false,
+                },
+                record,
+            )
+            .unwrap();
+        let registry = Arc::new(Mutex::new(registry));
+        let hub = AttachHub::new();
+        let (writer, mut reader) = UnixStream::pair().unwrap();
+        reader
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .unwrap();
+        let worker = {
+            let hub = hub.clone();
+            let registry = Arc::clone(&registry);
+            std::thread::spawn(move || {
+                hub.serve(
+                    &registry,
+                    "s",
+                    writer.try_clone().unwrap(),
+                    Vec::new(),
+                    Arc::new(Mutex::new(writer)),
+                );
+            })
+        };
+        let mut bytes = [0; 65536];
+        assert!(reader.read(&mut bytes).unwrap() > 0, "seeded");
+        // Let the pump settle into its idle wait on an unchanging grid.
+        std::thread::sleep(Duration::from_millis(300));
+        assert!(hub.sessions.lock().unwrap().contains_key("s"));
+
+        drop(reader);
+        worker.join().unwrap();
+        let left = Instant::now();
+        while hub.sessions.lock().unwrap().contains_key("s") {
+            assert!(
+                left.elapsed() < Duration::from_millis(300),
+                "an idle pump must be woken by its last sink leaving, not find out later"
+            );
+            std::thread::sleep(Duration::from_millis(5));
+        }
     }
 
     #[test]

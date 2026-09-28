@@ -2,6 +2,7 @@
 use super::*;
 use crate::palette_chrome::{PaletteTooltip, scroll_fades};
 use crate::query_editor::{self, ClipboardEdit, Edit, QueryEditor};
+use crate::tooltip_warmth::WarmTooltip;
 use diri_proto::{ArtifactKind, PrCheck, PullRequestStatus, SessionArtifact};
 use diri_ui::{Icon, IconName};
 use gpui::{
@@ -622,7 +623,7 @@ impl TerminalPane {
                         .child(count.to_string()),
                 )
             })
-            .tooltip(move |_, cx| cx.new(|_| PaletteTooltip(help.clone(), colors)).into())
+            .warm_tooltip(move |_, cx| cx.new(|_| PaletteTooltip(help.clone(), colors)).into())
             .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
             .on_click(cx.listener(|this, _, window, cx| {
                 if this.session_links.open {
@@ -744,7 +745,7 @@ impl TerminalPane {
                                             12.0,
                                             colors.secondary,
                                         ))
-                                        .tooltip(move |_, cx| {
+                                        .warm_tooltip(move |_, cx| {
                                             cx.new(|_| {
                                                 PaletteTooltip(
                                                     "Checks and discussion · →".into(),
@@ -777,7 +778,7 @@ impl TerminalPane {
                             }),
                     ),
             )
-            .tooltip(move |_, cx| cx.new(|_| PaletteTooltip(help.clone(), colors)).into())
+            .warm_tooltip(move |_, cx| cx.new(|_| PaletteTooltip(help.clone(), colors)).into())
             .on_click(cx.listener(move |this, event: &ClickEvent, window, cx| {
                 this.session_links.selected = index;
                 let (action, alt) = (action.clone(), event.modifiers().alt);
@@ -906,7 +907,7 @@ impl TerminalPane {
                     .cursor_pointer()
                     .hover(move |el| el.bg(Fill::subtle(colors)))
                     .child(Icon::new(IconName::Close, 12.0, colors.tertiary))
-                    .tooltip(move |_, cx| {
+                    .warm_tooltip(move |_, cx| {
                         cx.new(|_| PaletteTooltip("Close · Esc".into(), colors))
                             .into()
                     })
@@ -1033,7 +1034,7 @@ impl TerminalPane {
                                         .text_color(colors.secondary)
                                         .child(value.clone()),
                                 )
-                                .tooltip(move |_, cx| {
+                                .warm_tooltip(move |_, cx| {
                                     cx.new(|_| PaletteTooltip(format!("{label} · {value}"), colors))
                                         .into()
                                 }),

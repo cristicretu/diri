@@ -3,6 +3,7 @@
 mod disclosure;
 mod filter;
 mod fixture;
+mod row_motion;
 mod state;
 mod title_settle;
 mod view;

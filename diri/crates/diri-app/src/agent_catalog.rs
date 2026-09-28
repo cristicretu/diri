@@ -52,21 +52,16 @@ pub(crate) fn settings_agent_items(mut items: Vec<AgentReadinessItem>) -> Vec<Ag
     items
 }
 
-/// Settings and the launcher must expose the shell whenever default resolution
-/// can choose it. Available catalog extensions are valid explicit defaults,
-/// but they do not replace the first-class-or-shell repair policy for a removed
-/// preference.
+/// Every installed Agent plus Terminal: a plain shell is always a valid
+/// Command-T default, and it is also where default resolution lands when no
+/// first-class Agent is installed. Terminal sorts last so the installed
+/// Agents keep the Engine/catalog order.
 pub(crate) fn default_agent_options(catalog: &AgentReadinessResult) -> Vec<AgentOption> {
     let mut options: Vec<_> = agent_options(catalog)
         .into_iter()
         .filter(|option| option.available)
         .collect();
-    if !options
-        .iter()
-        .any(|option| option.available && option.first_class)
-    {
-        options.push(terminal_option());
-    }
+    options.push(terminal_option());
     options
 }
 
@@ -113,13 +108,17 @@ pub(crate) fn kind_spawnable(kind: &AgentKind, catalog: Option<&AgentReadinessRe
         .any(|option| option.available && option.kind == *kind)
 }
 
-/// Keep a saved default only while it is launchable. Removed/unknown ids fall
+/// Keep a saved default only while it is launchable. Terminal always is.
+/// Removed/unknown ids fall
 /// back to an installed first-class agent, and finally to a shell session so
 /// Command-T never becomes a dead shortcut.
 pub(crate) fn resolved_default_agent(
     saved: &AgentKind,
     catalog: &AgentReadinessResult,
 ) -> AgentKind {
+    if saved.is_terminal() {
+        return AgentKind::SHELL;
+    }
     let options = agent_options(catalog);
     if options
         .iter()
@@ -383,6 +382,28 @@ mod tests {
             .expect("launcher/settings options represent the repaired default");
         assert_eq!(selected.display_name, "Terminal");
         assert!(selected.available);
+    }
+
+    #[test]
+    fn terminal_is_a_sticky_default_beside_installed_agents() {
+        let catalog = AgentReadinessResult {
+            agents: vec![item("codex", true, true)],
+            ..AgentReadinessResult::default()
+        };
+        let kinds: Vec<_> = default_agent_options(&catalog)
+            .into_iter()
+            .map(|option| option.kind)
+            .collect();
+        assert_eq!(kinds, vec![AgentKind::CODEX, AgentKind::SHELL]);
+        // Catalog repair must not rewrite a chosen Terminal to an Agent.
+        assert_eq!(
+            resolved_default_agent(&AgentKind::SHELL, &catalog),
+            AgentKind::SHELL
+        );
+        assert_eq!(
+            resolved_target_agent(&AgentKind::SHELL, Some(&catalog)),
+            AgentKind::SHELL
+        );
     }
 
     #[test]

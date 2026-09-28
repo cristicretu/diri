@@ -9,7 +9,7 @@ use std::path::PathBuf;
 
 use diri_proto::workspace::*;
 use diri_proto::{ControlError, Project, ProjectId, SessionId};
-use serde_json::{Map, Value};
+use serde_json::value::RawValue;
 
 use crate::state_file::JsonStateFile;
 
@@ -33,8 +33,18 @@ impl WorkspaceStore {
         }
     }
 
+    /// Shares an existing handle (the Registry's) and so its cached image.
+    pub(crate) fn with_state_file(file: JsonStateFile) -> Self {
+        Self { file }
+    }
+
     pub fn snapshot(&self) -> Result<WorkspaceSnapshot, ControlError> {
-        decode(self.file.read().map_err(storage_error)?.as_ref())
+        decode(
+            self.file
+                .read_section(KEY)
+                .map_err(storage_error)?
+                .as_deref(),
+        )
     }
 
     /// Revision comparison, validation, and atomic replacement happen under
@@ -57,7 +67,7 @@ impl WorkspaceStore {
         let mut outcome = None;
         let written = self.file.update_durable(|document| {
             let result = (|| {
-                let mut next = decode(Some(document))?;
+                let mut next = decode(document.get(KEY))?;
                 if next.revision != params.expected_revision {
                     return Err(ControlError::new(
                         "workspace_revision_conflict",
@@ -74,9 +84,14 @@ impl WorkspaceStore {
                     .revision
                     .checked_add(1)
                     .ok_or_else(|| invalid("revision exhausted"))?;
-                let value = serde_json::to_value(&next)
+                // Through a JSON value, exactly as replies are encoded, so the
+                // stored text matches what clients were told: `f32` fractions
+                // print differently when serialized directly.
+                let encoded = serde_json::to_value(&next)
                     .map_err(|_| invalid("cannot encode workspace state"))?;
-                document.insert(KEY.into(), value);
+                document
+                    .insert(KEY, &encoded)
+                    .map_err(|_| invalid("cannot encode workspace state"))?;
                 Ok(next)
             })();
             let failed = result.is_err();
@@ -113,11 +128,11 @@ fn missing() -> ControlError {
         "workspace, tab, pane, or divider no longer exists",
     )
 }
-fn decode(document: Option<&Map<String, Value>>) -> Result<WorkspaceSnapshot, ControlError> {
-    let Some(value) = document.and_then(|document| document.get(KEY)) else {
+fn decode(section: Option<&RawValue>) -> Result<WorkspaceSnapshot, ControlError> {
+    let Some(section) = section else {
         return Ok(WorkspaceSnapshot::default());
     };
-    let state: WorkspaceSnapshot = serde_json::from_value(value.clone())
+    let state: WorkspaceSnapshot = serde_json::from_str(section.get())
         .map_err(|_| invalid("workspace state is corrupt or unsupported"))?;
     validate(&state)?;
     Ok(state)
@@ -664,6 +679,7 @@ fn mutate(
 mod tests {
     use super::*;
     use WorkspaceMutation::*;
+    use serde_json::Value;
 
     pub(super) struct Fixture {
         _temp: tempfile::TempDir,
