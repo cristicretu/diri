@@ -1,5 +1,20 @@
 # diri performance record
 
+## Settled pull requests (2026-09-28)
+
+The Engine's PR monitor refetches every pull request linked from an attached
+session once a minute while the App is in front, one `gh pr view` process
+(about 60 ms CPU, 1 s wall, one GitHub GraphQL call) per PR. On the installed
+App a session that had shipped 26 PRs kept that up for all of them: 51 `gh`
+processes in 90 s, nearly all for merged PRs whose state can no longer change.
+
+A PR whose cached state is `MERGED` or `CLOSED` now refreshes on the 30-minute
+background ceiling whatever its session's visibility. Selecting the session
+still forces an immediate refetch, exactly as before, and open PRs keep the
+60 s foreground cadence. For the observed session that is 26 `gh` calls a
+minute becoming fewer than one. `a_merged_or_closed_pr_on_screen_is_not_polled_every_minute`
+pins the cadences; it measures scheduling, not GitHub latency.
+
 ## Workspace terminal redraw isolation (2026-09-16)
 
 A live sample of installed Diri 0.7.4 reproduced 23–31% app CPU, with

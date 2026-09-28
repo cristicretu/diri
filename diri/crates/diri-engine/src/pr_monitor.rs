@@ -72,8 +72,23 @@ impl Default for RefreshState {
     }
 }
 
+/// A merged or closed pull request no longer moves on its own: its checks,
+/// mergeability and review state are final, and a late comment or a reopen
+/// is rare. Polling one every minute because its session is on screen spent a
+/// `gh` process and a GitHub API call per PR per minute — 26 a minute for one
+/// session that had shipped 26 PRs. Settled PRs refresh on the background
+/// ceiling instead; viewing the session still forces an immediate refetch.
+fn settled(status: Option<&PullRequestStatus>) -> bool {
+    status.is_some_and(|status| {
+        status.state.eq_ignore_ascii_case("MERGED") || status.state.eq_ignore_ascii_case("CLOSED")
+    })
+}
+
 impl RefreshState {
-    fn interval(&self, interest: PollInterest) -> Duration {
+    fn interval(&self, interest: PollInterest, settled: bool) -> Duration {
+        if settled {
+            return MAX_BACKGROUND_REFRESH_INTERVAL;
+        }
         match interest {
             PollInterest::Foreground => FOREGROUND_REFRESH_INTERVAL,
             PollInterest::Background => self.background_interval,
@@ -318,9 +333,10 @@ fn sweep(
         .filter_map(|(url, interest)| {
             let state = refresh.entry(url.clone()).or_default();
             let forced = forced_urls.contains(url);
+            let settled = settled(cache.get(url));
             let is_due = forced
                 || state.last_attempt.is_none_or(|at| {
-                    now.saturating_duration_since(at) >= state.interval(*interest)
+                    now.saturating_duration_since(at) >= state.interval(*interest, settled)
                 });
             is_due.then_some((url.clone(), *interest, state.last_attempt))
         })
@@ -374,7 +390,7 @@ fn sweep(
         }
     }
 
-    next_refresh_delay(&targets, refresh, forced_urls, Instant::now())
+    next_refresh_delay(&targets, refresh, cache, forced_urls, Instant::now())
 }
 
 /// Forgets pull requests no record mentions any more.
@@ -402,6 +418,7 @@ fn prune_unreferenced(
 fn next_refresh_delay(
     targets: &HashMap<String, PollInterest>,
     refresh: &HashMap<String, RefreshState>,
+    cache: &HashMap<String, PullRequestStatus>,
     forced_urls: &HashSet<String>,
     now: Instant,
 ) -> Duration {
@@ -418,7 +435,7 @@ fn next_refresh_delay(
                 return Duration::ZERO;
             };
             state
-                .interval(*interest)
+                .interval(*interest, settled(cache.get(url)))
                 .saturating_sub(now.saturating_duration_since(last_attempt))
         })
         .min()
@@ -809,34 +826,77 @@ mod tests {
     }
 
     #[test]
+    fn a_merged_or_closed_pr_on_screen_is_not_polled_every_minute() {
+        let status = |state: &str| {
+            parse(
+                serde_json::json!({ "number": 1, "state": state })
+                    .to_string()
+                    .as_bytes(),
+                "https://github.com/o/r/pull/1",
+                diri_proto::DateMillis(0.0),
+            )
+            .expect("status")
+        };
+        let url = "https://github.com/o/r/pull/1".to_string();
+        let targets = HashMap::from([(url.clone(), PollInterest::Foreground)]);
+        let now = Instant::now();
+        let refresh = HashMap::from([(
+            url.clone(),
+            RefreshState {
+                last_attempt: Some(now),
+                ..RefreshState::default()
+            },
+        )]);
+        let delay = |state: &str| {
+            let cache = HashMap::from([(url.clone(), status(state))]);
+            next_refresh_delay(&targets, &refresh, &cache, &HashSet::new(), now)
+        };
+        assert_eq!(delay("OPEN"), Duration::from_secs(60));
+        assert_eq!(delay("MERGED"), Duration::from_secs(30 * 60));
+        assert_eq!(delay("CLOSED"), Duration::from_secs(30 * 60));
+        // Viewing the session still refetches a settled PR at once.
+        let cache = HashMap::from([(url.clone(), status("MERGED"))]);
+        assert_eq!(
+            next_refresh_delay(
+                &targets,
+                &refresh,
+                &cache,
+                &HashSet::from([url.clone()]),
+                now
+            ),
+            Duration::ZERO
+        );
+    }
+
+    #[test]
     fn foreground_and_background_cadences_match_visible_pr_ui() {
         let mut state = RefreshState::default();
         assert_eq!(
-            state.interval(PollInterest::Foreground),
+            state.interval(PollInterest::Foreground, false),
             Duration::from_secs(60)
         );
         assert_eq!(
-            state.interval(PollInterest::Background),
+            state.interval(PollInterest::Background, false),
             Duration::from_secs(5 * 60)
         );
 
         state.record_result(PollInterest::Background, false);
         assert_eq!(
-            state.interval(PollInterest::Background),
+            state.interval(PollInterest::Background, false),
             Duration::from_secs(10 * 60)
         );
         state.record_result(PollInterest::Background, false);
         state.record_result(PollInterest::Background, false);
         state.record_result(PollInterest::Background, false);
         assert_eq!(
-            state.interval(PollInterest::Background),
+            state.interval(PollInterest::Background, false),
             Duration::from_secs(30 * 60),
             "background polling caps at thirty minutes"
         );
 
         state.record_result(PollInterest::Background, true);
         assert_eq!(
-            state.interval(PollInterest::Background),
+            state.interval(PollInterest::Background, false),
             Duration::from_secs(5 * 60),
             "activity resets the backoff"
         );
@@ -854,7 +914,13 @@ mod tests {
         let url = "https://github.com/o/r/pull/1".to_owned();
         let targets = HashMap::from([(url.clone(), PollInterest::Foreground)]);
         assert_eq!(
-            next_refresh_delay(&targets, &HashMap::new(), &HashSet::new(), Instant::now()),
+            next_refresh_delay(
+                &targets,
+                &HashMap::new(),
+                &HashMap::new(),
+                &HashSet::new(),
+                Instant::now()
+            ),
             Duration::ZERO
         );
 
@@ -866,7 +932,13 @@ mod tests {
             },
         )]);
         assert_eq!(
-            next_refresh_delay(&targets, &refresh, &HashSet::from([url]), Instant::now(),),
+            next_refresh_delay(
+                &targets,
+                &refresh,
+                &HashMap::new(),
+                &HashSet::from([url]),
+                Instant::now(),
+            ),
             Duration::ZERO
         );
     }
