@@ -164,7 +164,7 @@ impl HeldHints {
 
     /// The pending hold's generation and start, for fixtures that fire the
     /// timer on a stepped clock.
-    #[cfg(test)]
+    #[cfg(all(test, target_os = "macos"))]
     pub(crate) fn armed(&self) -> Option<(u64, Instant)> {
         self.armed
     }
@@ -265,7 +265,7 @@ impl HeldHintsState {
     /// Pins the hint clock, so a capture shows one exact moment of a fade.
     /// Setting it republishes, so every view carrying hints repaints at the
     /// new moment.
-    #[cfg(test)]
+    #[cfg(all(test, target_os = "macos"))]
     pub(crate) fn freeze_clock(now: Option<Instant>, cx: &mut App) {
         let (window, hints) = cx
             .try_global::<Self>()
