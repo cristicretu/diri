@@ -298,9 +298,17 @@ impl Sidebar {
             self.last_tab_selection = selected.clone();
             self.last_tab_available_width = available_width;
         }
-        for (session, state) in tabs.sessions.into_iter().zip(marks) {
+        let held_hint = self.strip_held_hint;
+        let tab_count = tabs.sessions.len();
+        for (index, (session, state)) in tabs.sessions.into_iter().zip(marks).enumerate() {
             let id = session.id.clone();
             let active = selected.as_ref() == Some(&id);
+            // The same rule the sidebar rows follow: ⌘1–⌘8, then ⌘9 = last.
+            let rank = if index < 8 {
+                Some(index + 1)
+            } else {
+                (index + 1 == tab_count).then_some(9)
+            };
             let title = display_title(&session);
             self.working_row_rendered |= state == StatusState::Working;
             let mark = match state {
@@ -326,6 +334,14 @@ impl Sidebar {
                     .child(activity_mark(state, self.activity_frame, colors))
                     .into_any_element(),
             };
+            let mark = crate::held_hints::in_leading_slot(
+                mark,
+                16.0,
+                format!("held-hint:tab:{}", id.0),
+                rank.and_then(crate::held_hints::session_label),
+                held_hint,
+                colors,
+            );
             let debug_id = id.0.clone();
             let close_id = id.clone();
             let probe_key = SharedString::from(format!("tab:{}", id.0));
@@ -409,7 +425,7 @@ impl Sidebar {
                         }
                     })
                 })
-                .child(
+                .child(crate::held_hints::below(
                     div()
                         .id(SharedString::from(format!(
                             "close-horizontal-tab-{}",
@@ -429,8 +445,16 @@ impl Sidebar {
                             this.close_sessions(vec![close_id.clone()], cx);
                             cx.stop_propagation();
                             cx.notify();
-                        })),
-                )
+                        }))
+                        .into_any_element(),
+                    "close-tab",
+                    // ⌘W closes the selected session, so only its ✕ says so.
+                    active
+                        .then(|| crate::held_hints::label(crate::commands::CommandId::CloseSession))
+                        .flatten(),
+                    held_hint,
+                    colors,
+                ))
                 .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
                 .on_mouse_down(
                     MouseButton::Right,
@@ -629,6 +653,7 @@ impl Sidebar {
             return self.workspace_strip(colors, cx);
         }
         let rows = self.render_project_tab_rows(available_width, cx);
+        let held_hint = self.strip_held_hint;
         div()
             .id("horizontal-tabs")
             .debug_selector(|| "horizontal-tabs".into())
@@ -668,7 +693,7 @@ impl Sidebar {
             .text_color(colors.primary)
             .child(self.project_control(colors, cx))
             .child(rows)
-            .child(
+            .child(crate::held_hints::below(
                 div()
                     .id("horizontal-peek-tabs")
                     .debug_selector(|| "horizontal-peek-tabs".into())
@@ -686,9 +711,14 @@ impl Sidebar {
                     .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
                     .on_click(|_, window, cx| {
                         window.dispatch_action(Box::new(crate::commands::ToggleTabPeek), cx)
-                    }),
-            )
-            .child(
+                    })
+                    .into_any_element(),
+                "peek-tabs",
+                crate::held_hints::label(crate::commands::CommandId::ToggleTabPeek),
+                held_hint,
+                colors,
+            ))
+            .child(crate::held_hints::below(
                 div()
                     .id("horizontal-new-tab")
                     .debug_selector(|| "horizontal-new-tab".into())
@@ -706,8 +736,13 @@ impl Sidebar {
                     .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
                     .on_click(|_, window, cx| {
                         window.dispatch_action(Box::new(crate::commands::NewDefaultSession), cx)
-                    }),
-            )
+                    })
+                    .into_any_element(),
+                "new-tab",
+                crate::held_hints::label(crate::commands::CommandId::NewDefaultSession),
+                held_hint,
+                colors,
+            ))
             .when_some(trailing, |strip, trailing| {
                 strip.child(
                     div()

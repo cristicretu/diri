@@ -20,6 +20,133 @@ will wake the pump, so that state keeps the 1 s retry.
 within 300 ms of an idle client leaving; with the departure wake removed it
 fails. Idle wakeups fall from one per second per attached session to one per
 30 s. No throughput, latency or protocol change is claimed or intended.
+## Engine state persistence against a 1.5 MB state.json (2026-09-28)
+
+A live sample of the installed Engine (51 sessions, `state.json` 1.5 MB, almost
+all of it `sessions` pull-request bodies and discussion) spent ~115 ms per 5 s
+in `Registry::persist_now`, plus ~30 ms in `workspace.mutate` and ~11 ms in
+`WorkspaceStore::snapshot`. Every persist re-read and parsed the whole file
+into a `serde_json::Value`, cloned the record table and the value tree,
+re-serialized everything and fsynced, even when nothing had changed.
+`session.mark_seen` and every attach did this on the control connection thread.
+
+`JsonStateFile` still does locked read-modify-write with atomic rename, because
+the Registry (`version`/`projects`/`sessions`), the workspace store
+(`workspaceState`) and any other compatible process share one file and must
+not clobber each other's keys. What changed:
+
+- The document is kept as top-level sections of raw JSON text. Sections a
+  writer does not own are carried byte for byte, never parsed into a tree.
+- The last image read or written is cached with an open handle to its file.
+  Under the lock, an update `stat`s the path; while device, inode, length and
+  mtime still match, the image is the file and nothing is re-read. Any other
+  writer's rename (or in-place write) misses and reloads as before. Holding
+  the handle keeps the inode allocated, so its number cannot be recycled. The
+  Registry and workspace store share one handle.
+- A persist whose sections are byte-identical does not write or fsync.
+- The Registry serializes records straight to text, one folded record at a
+  time, instead of `Vec<SessionRecord>` → `Value` → clone → bytes.
+- The flusher serializes under the Registry lock and writes after releasing
+  it. Per-owner sequence numbers stop an older snapshot from landing over a
+  newer synchronous one.
+- `session.mark_seen` and the attach path mark the Registry dirty instead of
+  persisting on the request thread; the flusher writes within 500 ms.
+  `publish_updated` folds one record instead of cloning the whole table, and
+  `workspace.mutate` reads session ids without cloning records.
+
+Durability is unchanged. `persist_now`, `persist_for_shutdown` and lifecycle
+persists still fsync the file before returning, and workspace mutations still
+fsync the directory entry too, including when the bytes are unchanged.
+`mark_seen` was already debounced, so it was never durable before reply. The
+on-disk format is the same JSON object with the same keys; key order is still
+sorted at the top level, and record fields now follow struct order.
+
+`statebench` (release, macOS 27, APFS, Apple silicon) builds a 1,528 KB fixture:
+50 sessions, 5 of them with 26 PRs each (2 KB body, six ~1.2 KB discussion
+items, 8 checks); 20 projects; a 63 KB `workspaceState` made through real
+mutations. Wall time includes F_FULLFSYNC. CPU is process user+system per
+operation. Medians of two runs each:
+
+| operation (n)               | before wall | after wall | before CPU | after CPU |
+|-----------------------------|------------:|-----------:|-----------:|----------:|
+| persist, unchanged (40)     | 16.2 ms     | 1.0 ms     | 7.4–8.6 ms | 1.0 ms    |
+| persist, one field (40)     | 13.0–16.2 ms| 8.1 ms     | 6.4–7.9 ms | 1.6 ms    |
+| `session.mark_seen` RPC (20)| 19.7–21.5 ms| 5.2–6.6 ms | 7.2–8.2 ms | 0.44 ms   |
+| `workspace.mutate` RPC (40) | 17.0–19.6 ms| 10.9–11.9 ms| 5.8–7.7 ms| 1.3–1.4 ms|
+| `workspace.snapshot` RPC (40)| 2.8–5.0 ms | 0.55 ms    | 2.9–4.4 ms | 0.60 ms   |
+
+What remains in a changed persist is the fsync. In `workspace.mutate` it is
+the file fsync plus the directory fsync. The remaining `mark_seen` wall time,
+with no disk I/O, is inside `EventBus::publish_encoded`. That path is being
+changed in the separate event-bus work and was not touched here.
+
+Not claimed: this does not measure the installed app's end-to-end CPU, and
+it does not measure real disks other than the local APFS volume. The
+"unchanged" row is a best case: a real change still pays serialization of
+all sessions (~1 ms here). Per-record serialization caching was not added.
+
+Reproduce from `diri/`:
+
+```sh
+cargo run --release -p diri-engine --example statebench -- 40
+cargo test -p diri-engine --lib -- state_file unchanged_persist sections_other_writers older_snapshot mark_seen_replies
+## Engine event delivery (2026-09-28)
+
+A 20-second capture of `dirijor events subscribe` on the installed app (51
+sessions, four agents working) carried 119 events and 10 MB of JSON. 83 of the
+98 `session.updated` events were byte-identical to the previous one for the
+same session: the status watcher, resource sweep, PR monitor and control
+mutations each publish a whole record, and most restate it unchanged. Records
+are large because tracked pull requests carry body, checks and discussion; one
+session with 26 PRs encodes to 272 KB and was republished 27 times.
+
+The App already discarded identical records, but only after decoding them.
+Each publication also cost the Engine a `Value` build, a clone, a re-decode
+into `SessionRecord` for the activity log, one encode for the replay ring, and,
+per subscriber, a deep clone plus a full re-encode, which
+`ControlMessage::serialize` itself preceded by another deep clone.
+
+Changes:
+
+- The bus drops a `session.updated` whose encoded bytes equal the last one
+  published for that session. The comparison is exact (bytes, not a hash); the
+  entry is forgotten on `session.removed`; no other event kind is affected.
+  A suppressed restatement takes no sequence number and no activity append.
+- Params are encoded once, at publish, straight from the typed payload. The
+  ring, every subscriber queue and the control writer share those bytes; the
+  writer splices them into the frame (byte-identical to the old line, pinned
+  by a test).
+- `ControlMessage` serializes field by field, without the intermediate object;
+  this applies to every response too, including `session.list`.
+- Eleven single-session lookups (`publish_updated`, `events.wait`, spawn,
+  resume, …) use `Registry::record(id)` instead of cloning, folding and
+  sorting every record to find one.
+
+`eventbench` replays that capture's publication mix with synthetic text of the
+same sizes through the production `ControlServer` over a socket pair, and the
+client decodes each frame as the App does. Release build, 20 rounds (each round
+= 20 s of live traffic), three runs each, Apple Silicon:
+
+| Per 20 s of live traffic | Before | After |
+| --- | ---: | ---: |
+| Engine CPU | 24.7–26.6 ms | 3.5–3.8 ms |
+| Client decode CPU | 14.8–17.2 ms | 1.2–1.4 ms |
+| Bytes delivered | 3.9–4.3 MB | 0.36 MB |
+
+With `distinct` (every publication a real change, so nothing is suppressed)
+Engine CPU per 20 s fell from 23.2–23.9 ms to 10.3–10.5 ms and client decode is
+unchanged in kind. The bench publishes flat out, far burstier than live
+traffic: both builds sometimes exceeded the 16 MiB subscriber bound and
+delivered an `events.dropped` marker (which makes the App resynchronize), so
+frame counts in those runs differ. At the recorded rate (~0.5 MB/s) neither is
+near the bound. This measures the event path only; the App's own rendering of a
+real change and state persistence are not covered here.
+
+```sh
+cargo build --release -p diri-engine --example eventbench
+target/release/examples/eventbench 20
+target/release/examples/eventbench 20 distinct
+```
 
 ## Workspace terminal redraw isolation (2026-09-16)
 

@@ -1,5 +1,6 @@
 //! Explicit recovery of the existing remote owner. This view never retries input.
 use super::*;
+use crate::tooltip_warmth::WarmTooltip;
 use diri_proto::RemoteConnectionState;
 
 #[derive(Default)]
@@ -173,7 +174,7 @@ impl TerminalPane {
                 .right(px(if short { 6.0 } else { 12.0 }))
                 .rounded(px(8.0))
                 .p(px(if short { 4.0 } else { 8.0 }))
-                .tooltip(move |_, cx| {
+                .warm_tooltip(move |_, cx| {
                     cx.new(|_| crate::palette_chrome::PaletteTooltip(details.clone(), colors))
                         .into()
                 })

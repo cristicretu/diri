@@ -11,29 +11,28 @@ impl ControlServer {
         // unavailable reference; no layout operation starts or kills a process.
         let (sessions, project_agent) = {
             let registry = self.registry.lock().map_err(poisoned)?;
-            let records = registry.records();
+            // Identity and project only: cloning and folding every record
+            // (pull-request bodies included) just to read ids is not free.
+            let session_projects = registry.session_projects();
             let project_agent =
                 if let diri_proto::workspace::WorkspaceMutation::OpenProjectAgent {
                     session_id,
                     ..
                 } = &params.mutation
                 {
-                    let record = records
-                        .iter()
-                        .find(|record| &record.id == session_id)
-                        .ok_or_else(|| {
-                            ControlError::new(
-                                "workspace_session_unavailable",
-                                "the session is absent from the Engine inventory",
-                            )
-                        })?;
+                    let project_id = session_projects.get(session_id).ok_or_else(|| {
+                        ControlError::new(
+                            "workspace_session_unavailable",
+                            "the session is absent from the Engine inventory",
+                        )
+                    })?;
                     let project = registry
                         .projects_raw()
                         .iter()
                         .filter_map(|project| {
                             serde_json::from_value::<diri_proto::Project>(project.clone()).ok()
                         })
-                        .find(|project| project.id == record.project_id)
+                        .find(|project| &project.id == project_id)
                         .ok_or_else(|| {
                             ControlError::new(
                                 "workspace_project_unavailable",
@@ -43,18 +42,12 @@ impl ControlServer {
                     Some(crate::workspace::ProjectAgentInventory {
                         session_id: session_id.clone(),
                         project,
-                        session_projects: records
-                            .iter()
-                            .map(|record| (record.id.clone(), record.project_id.clone()))
-                            .collect(),
+                        session_projects: session_projects.clone(),
                     })
                 } else {
                     None
                 };
-            (
-                records.into_iter().map(|record| record.id).collect(),
-                project_agent,
-            )
+            (session_projects.into_keys().collect(), project_agent)
         };
         let snapshot =
             self.workspaces
@@ -163,7 +156,7 @@ mod tests {
             .dispatch(Method::WORKSPACE_MUTATE, Some(params.clone()))
             .unwrap();
         let event = events.recv(Duration::from_millis(10)).unwrap();
-        assert_eq!(event.params["revision"], committed["revision"]);
+        assert_eq!(event.params()["revision"], committed["revision"]);
         assert_eq!(
             server.dispatch(Method::WORKSPACE_SNAPSHOT, None).unwrap(),
             committed

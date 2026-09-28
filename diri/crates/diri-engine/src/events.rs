@@ -33,7 +33,18 @@ pub struct Event {
     /// The session this event is about, when it is about one. Kept out of
     /// `params` so filtering never costs a JSON decode per publish.
     pub session_id: Option<String>,
-    pub params: JsonValue,
+    /// The params, JSON-encoded once at publish. The ring and every
+    /// subscriber queue share these bytes, and the control writer copies them
+    /// into its frame verbatim: a `session.updated` carries a whole record,
+    /// and cloning and re-encoding it per subscriber was most of its cost.
+    pub encoded: Arc<[u8]>,
+}
+
+impl Event {
+    /// The params as a JSON value, for in-process readers.
+    pub fn params(&self) -> JsonValue {
+        serde_json::from_slice(&self.encoded).unwrap_or(JsonValue::Null)
+    }
 }
 
 /// Server-side subscription filter. Filtering here rather than at the
@@ -82,36 +93,25 @@ impl Filter {
     }
 }
 
-/// A replay entry keeps the encoded params rather than the JSON object graph,
-/// so the ring's byte bound describes resident memory.
-struct Archived {
-    name: String,
-    seq: u64,
-    session_id: Option<String>,
-    params: Vec<u8>,
-}
-
-impl Archived {
-    fn storage_bytes(&self) -> usize {
-        storage_bytes(&self.name, self.session_id.as_deref(), self.params.len())
-    }
-
-    fn event(&self) -> Event {
-        Event {
-            name: self.name.clone(),
-            seq: self.seq,
-            session_id: self.session_id.clone(),
-            params: serde_json::from_slice(&self.params).unwrap_or(JsonValue::Null),
-        }
-    }
-}
-
 /// What one event is charged against a byte bound: its encoded params plus
-/// its envelope. The ring holds exactly these bytes. A subscriber queue holds
-/// the parsed object graph, which is larger, but by a factor and not without
-/// limit — so the same charge bounds it too.
+/// its envelope. The ring and the subscriber queues hold exactly these bytes
+/// (shared, so an event queued in several places is resident once).
 fn storage_bytes(name: &str, session_id: Option<&str>, encoded_params: usize) -> usize {
     name.len() + encoded_params + session_id.map_or(0, str::len) + 16
+}
+
+fn event_storage_bytes(event: &Event) -> usize {
+    storage_bytes(
+        &event.name,
+        event.session_id.as_deref(),
+        event.encoded.len(),
+    )
+}
+
+fn encode(params: &JsonValue) -> Arc<[u8]> {
+    serde_json::to_vec(params)
+        .unwrap_or_else(|_| b"null".to_vec())
+        .into()
 }
 
 /// One live subscription's queue, shared between the bus and its stream.
@@ -150,11 +150,11 @@ impl QueueState {
                 name: EVENTS_DROPPED.into(),
                 seq: 0,
                 session_id: None,
-                params: json!({
+                encoded: encode(&json!({
                     "dropped": self.dropped,
                     "fromSeq": self.first_dropped_seq,
                     "toSeq": self.last_dropped_seq,
-                }),
+                })),
             };
             self.dropped = 0;
             return Some(marker);
@@ -198,7 +198,7 @@ impl SubscriberQueue {
 
 struct BusInner {
     next_seq: u64,
-    ring: VecDeque<Archived>,
+    ring: VecDeque<Event>,
     ring_bytes: usize,
     subscribers: HashMap<u64, Arc<SubscriberQueue>>,
     next_subscriber: u64,
@@ -210,6 +210,12 @@ struct BusInner {
 pub struct EventBus {
     inner: Arc<Mutex<BusInner>>,
     activity: Arc<Mutex<Option<crate::activity::ActivityLog>>>,
+    /// The last `session.updated` bytes published per session. Several
+    /// producers (status watcher, resource sweep, PR monitor, control
+    /// mutations) publish a session's whole record, and most of those
+    /// publications restate what subscribers already have. An identical
+    /// restatement carries no information, so it is not published.
+    last_updates: Arc<Mutex<HashMap<String, Arc<[u8]>>>>,
     ring_capacity: usize,
     ring_byte_capacity: usize,
     subscriber_capacity: usize,
@@ -246,6 +252,7 @@ impl EventBus {
                 next_subscriber: 0,
             })),
             activity: Arc::new(Mutex::new(None)),
+            last_updates: Arc::new(Mutex::new(HashMap::new())),
             ring_capacity,
             ring_byte_capacity,
             subscriber_capacity: subscriber_capacity
@@ -259,38 +266,87 @@ impl EventBus {
     }
 
     pub fn publish(&self, name: &str, params: JsonValue, session_id: Option<&str>) {
+        self.publish_bytes(name, encode(&params), session_id, None);
+    }
+
+    /// Encodes and publishes a typed payload. An event that cannot serialize
+    /// is a daemon bug, never a reason to fail the caller's mutation.
+    pub fn publish_encoded<T: serde::Serialize + 'static>(
+        &self,
+        name: &str,
+        value: &T,
+        session_id: Option<&str>,
+    ) {
+        if let Ok(encoded) = serde_json::to_vec(value) {
+            let record = (value as &dyn std::any::Any).downcast_ref::<diri_proto::SessionRecord>();
+            self.publish_bytes(name, encoded.into(), session_id, record);
+        }
+    }
+
+    fn publish_bytes(
+        &self,
+        name: &str,
+        encoded: Arc<[u8]>,
+        session_id: Option<&str>,
+        record: Option<&diri_proto::SessionRecord>,
+    ) {
+        let updated = name == diri_proto::EventName::SESSION_UPDATED;
+        let (Some(id), true) = (session_id, updated) else {
+            if name == diri_proto::EventName::SESSION_REMOVED
+                && let Some(id) = session_id
+            {
+                self.last_updates.lock().expect("last updates").remove(id);
+            }
+            self.enqueue(name, encoded, session_id);
+            return;
+        };
+        // Held across the activity append and the enqueue, so two producers
+        // racing on one session cannot publish out of the order they were
+        // compared in. Lock order is always this, then the bus.
+        let mut last = self.last_updates.lock().expect("last updates");
+        if last.get(id).is_some_and(|previous| *previous == encoded) {
+            return;
+        }
+        let record = match record {
+            Some(record) => Some(std::borrow::Cow::Borrowed(record)),
+            None => serde_json::from_slice(&encoded)
+                .ok()
+                .map(std::borrow::Cow::Owned),
+        };
+        if let Some(record) = record
+            && let Ok(mut activity) = self.activity.lock()
+            && let Some(activity) = activity.as_mut()
+            && let Err(error) = activity.observe(&record)
+        {
+            eprintln!("diri-engine: activity log append failed: {error}");
+        }
+        last.insert(id.to_owned(), Arc::clone(&encoded));
+        self.enqueue(name, encoded, session_id);
+    }
+
+    fn enqueue(&self, name: &str, encoded: Arc<[u8]>, session_id: Option<&str>) {
         let mut inner = self.inner.lock().expect("bus");
         let event = Event {
             name: name.to_string(),
             seq: inner.next_seq,
             session_id: session_id.map(str::to_string),
-            params,
+            encoded,
         };
         inner.next_seq += 1;
 
-        let encoded = serde_json::to_vec(&event.params).ok();
         let bytes = storage_bytes(
             &event.name,
             event.session_id.as_deref(),
-            encoded.as_ref().map_or(0, Vec::len),
+            event.encoded.len(),
         );
-        if self.ring_capacity > 0
-            && self.ring_byte_capacity > 0
-            && let Some(encoded) = encoded
-        {
-            let archived = Archived {
-                name: event.name.clone(),
-                seq: event.seq,
-                session_id: event.session_id.clone(),
-                params: encoded,
-            };
-            inner.ring_bytes += archived.storage_bytes();
-            inner.ring.push_back(archived);
+        if self.ring_capacity > 0 && self.ring_byte_capacity > 0 {
+            inner.ring_bytes += bytes;
+            inner.ring.push_back(event.clone());
             while inner.ring.len() > self.ring_capacity
                 || inner.ring_bytes > self.ring_byte_capacity
             {
                 if let Some(oldest) = inner.ring.pop_front() {
-                    inner.ring_bytes -= oldest.storage_bytes();
+                    inner.ring_bytes -= event_storage_bytes(&oldest);
                 } else {
                     break;
                 }
@@ -303,28 +359,6 @@ impl EventBus {
         // and the following live tail share that order. Queues never do I/O.
         for queue in inner.subscribers.values() {
             queue.push(&event, bytes);
-        }
-    }
-
-    /// Encodes and publishes a typed payload. An event that cannot serialize
-    /// is a daemon bug, never a reason to fail the caller's mutation.
-    pub fn publish_encoded<T: serde::Serialize>(
-        &self,
-        name: &str,
-        value: &T,
-        session_id: Option<&str>,
-    ) {
-        if let Ok(params) = serde_json::to_value(value) {
-            if name == diri_proto::EventName::SESSION_UPDATED
-                && let Ok(record) =
-                    serde_json::from_value::<diri_proto::SessionRecord>(params.clone())
-                && let Ok(mut activity) = self.activity.lock()
-                && let Some(activity) = activity.as_mut()
-                && let Err(error) = activity.observe(&record)
-            {
-                eprintln!("diri-engine: activity log append failed: {error}");
-            }
-            self.publish(name, params, session_id);
         }
     }
 
@@ -390,7 +424,7 @@ impl EventBus {
                 );
             }
             for archived in inner.ring.iter().filter(|archived| archived.seq > since) {
-                queue.push(&archived.event(), archived.storage_bytes());
+                queue.push(archived, event_storage_bytes(archived));
             }
         }
         let id = inner.next_subscriber;
@@ -663,9 +697,9 @@ mod tests {
         let marker = stream.recv(Duration::from_secs(1)).expect("marker");
         assert_eq!(marker.name, EVENTS_DROPPED);
         assert_eq!(marker.seq, 0, "outside the published seq space");
-        assert_eq!(marker.params["dropped"], 3);
-        assert_eq!(marker.params["fromSeq"], 1);
-        assert_eq!(marker.params["toSeq"], 3);
+        assert_eq!(marker.params()["dropped"], 3);
+        assert_eq!(marker.params()["fromSeq"], 1);
+        assert_eq!(marker.params()["toSeq"], 3);
         let survivors: Vec<Event> = std::iter::from_fn(|| stream.try_recv()).collect();
         assert_eq!(survivors.len(), 2);
         assert_eq!(survivors[0].seq, 4);
@@ -693,9 +727,9 @@ mod tests {
         // The reader learns of the hole first, then gets the newest events.
         let marker = stream.try_recv().expect("marker");
         assert_eq!(marker.name, EVENTS_DROPPED);
-        assert_eq!(marker.params["dropped"], 97);
-        assert_eq!(marker.params["fromSeq"], 1);
-        assert_eq!(marker.params["toSeq"], 97);
+        assert_eq!(marker.params()["dropped"], 97);
+        assert_eq!(marker.params()["fromSeq"], 1);
+        assert_eq!(marker.params()["toSeq"], 97);
         let survivors: Vec<u64> = std::iter::from_fn(|| stream.try_recv())
             .map(|event| event.seq)
             .collect();
@@ -730,6 +764,67 @@ mod tests {
         );
         assert!(replayed.len() > 2);
         assert_eq!(replayed[0], EVENTS_DROPPED);
+    }
+
+    #[test]
+    fn an_identical_session_update_is_not_republished() {
+        let bus = EventBus::new();
+        let stream = bus.subscribe(None, Filter::all());
+        let record = json!({ "id": "s_1", "status": "working" });
+        bus.publish("session.updated", record.clone(), Some("s_1"));
+        bus.publish("session.updated", record.clone(), Some("s_1"));
+        // Another session's identical bytes are its own first statement.
+        bus.publish("session.updated", record.clone(), Some("s_2"));
+        bus.publish(
+            "session.updated",
+            json!({ "id": "s_1", "status": "idle" }),
+            Some("s_1"),
+        );
+        // Returning to an earlier state is a change from the last one.
+        bus.publish("session.updated", record.clone(), Some("s_1"));
+        let received: Vec<(Option<String>, JsonValue)> = std::iter::from_fn(|| stream.try_recv())
+            .map(|event| (event.session_id.clone(), event.params()))
+            .collect();
+        assert_eq!(
+            received,
+            [
+                (Some("s_1".into()), record.clone()),
+                (Some("s_2".into()), record.clone()),
+                (Some("s_1".into()), json!({ "id": "s_1", "status": "idle" })),
+                (Some("s_1".into()), record.clone()),
+            ]
+        );
+        assert_eq!(bus.current_seq(), 4, "a suppressed update takes no seq");
+
+        // A removed session that comes back states itself afresh.
+        bus.publish("session.removed", json!({ "id": "s_1" }), Some("s_1"));
+        bus.publish("session.updated", record.clone(), Some("s_1"));
+        assert_eq!(event_names(&stream), ["session.removed", "session.updated"]);
+
+        // Other events are never deduplicated, identical or not.
+        bus.publish("session.notification", json!({}), Some("s_1"));
+        bus.publish("session.notification", json!({}), Some("s_1"));
+        assert_eq!(event_names(&stream).len(), 2);
+    }
+
+    #[test]
+    fn subscribers_and_the_ring_share_one_encoding() {
+        let bus = EventBus::new();
+        let first = bus.subscribe(None, Filter::all());
+        let second = bus.subscribe(None, Filter::all());
+        bus.publish(
+            "session.updated",
+            json!({ "record": "x".repeat(4096) }),
+            Some("s_1"),
+        );
+        let a = first.try_recv().expect("first");
+        let b = second.try_recv().expect("second");
+        let replayed = bus
+            .subscribe(Some(0), Filter::all())
+            .try_recv()
+            .expect("replay");
+        assert!(Arc::ptr_eq(&a.encoded, &b.encoded));
+        assert!(Arc::ptr_eq(&a.encoded, &replayed.encoded));
     }
 
     #[test]
