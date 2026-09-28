@@ -26,6 +26,11 @@ struct Observed {
     stopped: bool,
 }
 
+/// Whether `sample` still names the process it was taken from.
+pub(crate) fn is_alive(sample: &HolderProcessSample) -> bool {
+    start_time(sample.pid) == Some(sample.start_sec)
+}
+
 /// The start time of `pid`, or `None` if it is gone. The identity check.
 fn start_time(pid: i32) -> Option<i64> {
     platform::observe(pid).map(|process| process.start_sec)
@@ -71,12 +76,17 @@ pub fn enumerate_in(table: &ProcessTable, root: i32) -> Vec<HolderProcessSample>
     if root <= 1 {
         return Vec::new();
     }
-    let all = &table.0;
+    walk(&table.0, vec![root])
+}
+
+/// Children transitively, plus every member of any process group a visited
+/// process belongs to, starting from `seeds`. The holder itself is excluded.
+fn walk(all: &[Observed], seeds: Vec<i32>) -> Vec<HolderProcessSample> {
     let holder_pid = std::process::id() as i32;
 
     let mut seen: HashSet<i32> = HashSet::new();
     let mut scanned_groups: HashSet<i32> = HashSet::new();
-    let mut frontier = vec![root];
+    let mut frontier = seeds;
 
     while let Some(pid) = frontier.pop() {
         if pid <= 1 || pid == holder_pid || !seen.insert(pid) {
@@ -152,6 +162,56 @@ pub fn signal(root: i32, signal: i32) -> Vec<HolderProcessSample> {
         }
     }
     tree
+}
+
+/// Kills whatever outlived the session leader. Call it after the leader has
+/// exited but BEFORE it is reaped: the unreaped zombie keeps its pid, and so
+/// the process-group id, from being reused, which is what makes signalling
+/// the group by id safe.
+///
+/// A leader can exit while the rest of its tree lives on: a hibernated tree
+/// is stopped, and on macOS a stopped process whose signal disposition is the
+/// default dies at once from the hangup the leader's exit delivers, while one
+/// that handles SIGHUP (Codex's node wrapper, Claude Code) stays stopped with
+/// the signal pending — forever, since nothing will ever continue it. Its
+/// children die, it never reaps them, and it holds a revoked terminal until
+/// the machine reboots.
+///
+/// Swept here: every member of the leader's process group, everything still
+/// descended from them, and each process in `frozen` — the members the
+/// holder itself stopped, which may have left the group and lost their parent
+/// since. Every pid is identity-checked before it is signalled. SIGKILL lands
+/// on a stopped process without a SIGCONT; the SIGCONT follows it only as
+/// [`kill_tree`]'s does.
+pub fn kill_stragglers(leader: i32, frozen: &[HolderProcessSample]) -> Vec<HolderProcessSample> {
+    if leader <= 1 {
+        return Vec::new();
+    }
+    let table = ProcessTable::capture();
+    let seeds: Vec<i32> = table
+        .0
+        .iter()
+        .filter(|process| process.pgid == leader && process.pid != leader)
+        .map(|process| process.pid)
+        .collect();
+    let mut stragglers: HashSet<HolderProcessSample> = walk(&table.0, seeds).into_iter().collect();
+    stragglers.extend(frozen.iter().copied());
+
+    // SAFETY: plain kill(2) on the group the leader created with setsid; the
+    // unreaped leader pins the id (see above).
+    unsafe { libc::kill(-leader, libc::SIGKILL) };
+    let mut killed = Vec::new();
+    for sample in stragglers {
+        if sample.pid != leader && start_time(sample.pid) == Some(sample.start_sec) {
+            // SAFETY: identity just re-verified; plain kill(2).
+            unsafe {
+                libc::kill(sample.pid, libc::SIGKILL);
+                libc::kill(sample.pid, libc::SIGCONT);
+            }
+            killed.push(sample);
+        }
+    }
+    killed
 }
 
 /// SIGTERM the tree (waking stopped members with SIGCONT so the TERM is

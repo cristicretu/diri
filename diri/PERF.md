@@ -1,5 +1,70 @@
 # diri performance record
 
+## Hibernated agents outliving their sessions (2026-09-28)
+
+A `ps` of the author's Mac found 33 stopped processes parented to launchd,
+6–13 days old, holding about 153 MB resident: 7 Codex node wrappers
+(`node …/bin/codex -c notify=[…dirijor notify] …`), 13 Claude Code
+processes, and 13 Chrome DevTools MCP telemetry watchdogs. Each wrapper and
+Claude process sat in state `T` in the process group of a leader that no
+longer existed (`fish -i -l -c codex …`), with its own children as unreaped
+zombies and fds 0–2 on a revoked terminal. Each watchdog was stopped in a
+session of its own. Nothing continues them, so they last until reboot.
+
+The shape is a hibernated (SIGSTOPped) tree whose leader died. On macOS a
+stopped process with default disposition dies at once from the hangup that
+follows, even while stopped, which is why the native Codex binary and the MCP
+servers are zombies. A stopped process that handles SIGHUP — Codex's node
+wrapper forwards it to its child, Claude Code handles it — keeps it pending
+forever. Two paths lead there: the leader dies while its holder lives (the
+holder reaped it and left the rest), or the holder manager process dies (a
+crash, `kill -9`, reinstall), which hangs every PTY up at once. The
+manager for the installed app was replaced on 2026-09-23, after every
+installed-app orphan was created; the dev-build orphans belong to dev
+managers that no longer exist.
+
+Fix, in the local Holder only:
+
+- The exit watcher waits for the leader's exit without reaping it (a kqueue
+  `NOTE_EXIT`/pidfd readiness fd; macOS `waitid(WNOWAIT)` also returns for a
+  stop, so it would read a hibernation as an exit), then SIGKILLs the
+  leader's process group, everything still descended from its members, and
+  every identity the holder's last SIGSTOP froze, re-verifying each pid's
+  start time. The zombie leader pins the group id until then.
+- A single `diri-holder --group-guard` per manager (about 1.3 MB phys
+  footprint, measured with `footprint`) reads `+pgid`/`-pgid` and
+  `s`/`c` frozen-identity lines from a pipe only the manager holds, and on
+  EOF kills what is still registered. It wakes only when a session starts,
+  ends, hibernates or wakes.
+
+Before/after, from deterministic fixtures of the Codex shape (`sh -c` leader
+forking a wrapper that traps TERM/HUP and waits on a `sleep` child, plus a
+`setsid` helper):
+
+| Scenario | Survivors before | After |
+| --- | --- | --- |
+| hibernated, leader SIGKILLed, holder alive | wrapper (`T`), setsid helper (`Ts`) | none |
+| running, leader exits, group member ignores HUP/TERM | that member | none |
+| hibernated, manager SIGKILLed | wrapper (`T`), setsid helper (`Ts`) | none |
+
+The before columns were produced by disabling the sweep and the guard in the
+same tests. Reproduce from `diri/`:
+
+```sh
+cargo test -p diri-engine --lib holder::server::tests::a_leader
+cargo test -p diri-engine --lib holder::guard
+cargo test -p diri-engine --test holder a_dead_manager_leaves_no_hibernated_agent_behind
+```
+
+Not claimed: this does not clean up processes that are already orphaned, and
+it does not cover a tree whose manager died before this build was running.
+It does not change explicit kill/close (`kill_tree` already escalated to
+SIGKILL) or the remote Helper, whose per-session guard already kills the
+Agent group before the leader is reaped. A group member that ignores the
+hangup no longer outlives a leader that exits normally; that matches the
+remote Helper. Out-of-group descendants of a leader that exits normally
+while running are still left to their own lifecycle.
+
 ## Workspace terminal redraw isolation (2026-09-16)
 
 A live sample of installed Diri 0.7.4 reproduced 23–31% app CPU, with

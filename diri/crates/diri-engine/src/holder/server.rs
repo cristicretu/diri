@@ -20,6 +20,7 @@ use crate::log::OutputLog;
 use crate::pty::{Pty, PtySpec};
 
 use super::client::HolderClient;
+use super::guard::GroupGuard;
 use super::process_tree;
 use super::protocol::{
     HOLDER_OUTPUT_STREAM_VERSION, HOLDER_STREAM_ACK, HOLDER_STREAM_INPUT,
@@ -69,6 +70,14 @@ struct Shared {
     spec: HolderLaunchSpec,
     child_pid: i32,
     child_identity: Option<diri_proto::process::ProcessIdentity>,
+    /// What the last SIGSTOP stopped, until a SIGCONT resumes it. If the
+    /// leader exits while these are still frozen they would stay stopped
+    /// forever, so the exit path kills them (see
+    /// [`process_tree::kill_stragglers`]).
+    frozen: Mutex<Vec<super::protocol::HolderProcessSample>>,
+    /// The manager's guard, told about the session's group and frozen
+    /// processes so they die with the manager too.
+    guard: Option<Arc<GroupGuard>>,
     /// The PTY, kept for write/resize/stat access. The master stays open for
     /// the holder's whole life; closing happens when `run` returns.
     pty: Mutex<Pty>,
@@ -123,6 +132,12 @@ impl HolderServer {
     /// requests, and returns after the child has exited and the exit marker
     /// is durably in the log.
     pub fn run(spec: HolderLaunchSpec) -> HolderResult<()> {
+        Self::run_guarded(spec, None)
+    }
+
+    /// [`Self::run`], registering the session's process group with the
+    /// manager's [`GroupGuard`] for as long as its leader is unreaped.
+    pub fn run_guarded(spec: HolderLaunchSpec, guard: Option<Arc<GroupGuard>>) -> HolderResult<()> {
         // Never double-run: a second holder for the same session would
         // interleave two writers into one output log and stack a second child.
         // If a live holder already serves this socket, defer to it — bail
@@ -160,6 +175,9 @@ impl HolderServer {
         };
         let pty = Pty::spawn(&pty_spec).map_err(|error| HolderError::io("PTY spawn", error))?;
         let child_pid = pty.pid() as i32;
+        // Armed at once: registering after the child has exited fails on
+        // macOS, which the exit path treats as "already exited".
+        let exit_watcher = diri_pty::ExitWatcher::new(child_pid as u32).ok();
 
         // Nonblocking master: the reader drains in bursts, and writes bound
         // their patience with poll rather than blocking the control loop.
@@ -185,6 +203,8 @@ impl HolderServer {
         let shared = Arc::new(Shared {
             child_pid,
             child_identity: pty.child_identity(),
+            frozen: Mutex::new(Vec::new()),
+            guard: guard.clone(),
             pty: Mutex::new(pty),
             log: Mutex::new(log),
             epoch_offset,
@@ -219,12 +239,22 @@ impl HolderServer {
                 .map_err(|error| HolderError::io("spawn pump", error))?
         };
 
+        // Registered only once the exit watcher, which alone releases it, is
+        // certain to run.
+        if let Some(guard) = &guard {
+            guard.register(child_pid);
+        }
         {
             let shared = Arc::clone(&shared);
             std::thread::Builder::new()
                 .name(format!("holder-exit-{}", shared.spec.session_id))
-                .spawn(move || watch_exit(&shared, pump))
-                .map_err(|error| HolderError::io("spawn exit watcher", error))?;
+                .spawn(move || watch_exit(&shared, pump, exit_watcher))
+                .map_err(|error| {
+                    if let Some(guard) = &guard {
+                        guard.release(child_pid);
+                    }
+                    HolderError::io("spawn exit watcher", error)
+                })?;
         }
 
         while let Some(mut client) =
@@ -615,9 +645,28 @@ fn write_output_frames(
     let _ = stream.flush();
 }
 
-/// Reaps the child, then finishes the holder: final drain, exit marker,
-/// control-file cleanup, listener shutdown.
-fn watch_exit(shared: &Shared, pump: std::thread::JoinHandle<()>) {
+/// Waits for the child to exit, kills whatever of its tree outlived it, reaps
+/// it, then finishes the holder: final drain, exit marker, control-file
+/// cleanup, listener shutdown.
+fn watch_exit(
+    shared: &Shared,
+    pump: std::thread::JoinHandle<()>,
+    exit_watcher: Option<diri_pty::ExitWatcher>,
+) {
+    // The leader stays an unreaped zombie until the sweep is done: that is
+    // what keeps its pid, and so the group id the sweep and the guard both
+    // name, from being handed to anyone else.
+    wait_for_exit_unreaped(exit_watcher.as_ref());
+    drop(exit_watcher);
+    let mut frozen = shared.frozen.lock().expect("frozen");
+    process_tree::kill_stragglers(shared.child_pid, &frozen);
+    if let Some(guard) = &shared.guard {
+        guard.thaw(&frozen);
+        guard.release(shared.child_pid);
+    }
+    frozen.clear();
+    drop(frozen);
+
     let mut status: libc::c_int = 0;
     // SAFETY: waitpid on our own child; EINTR retried.
     while unsafe { libc::waitpid(shared.child_pid, &mut status, 0) } < 0 {
@@ -747,10 +796,21 @@ fn handle(shared: &Shared, request: &HolderRequest) -> HolderResult<HolderRespon
                     "signal requires a valid sig".into(),
                 ));
             }
-            Ok(HolderResponse::with_tree(process_tree::signal(
-                shared.child_pid,
-                signal,
-            )))
+            let tree = process_tree::signal(shared.child_pid, signal);
+            if matches!(signal, libc::SIGSTOP | libc::SIGCONT) {
+                let mut frozen = shared.frozen.lock().expect("frozen");
+                if let Some(guard) = &shared.guard {
+                    guard.thaw(&frozen);
+                }
+                frozen.clear();
+                if signal == libc::SIGSTOP {
+                    frozen.clone_from(&tree);
+                    if let Some(guard) = &shared.guard {
+                        guard.freeze(&frozen);
+                    }
+                }
+            }
+            Ok(HolderResponse::with_tree(tree))
         }
 
         HolderOperation::KillTree => {
@@ -932,6 +992,25 @@ fn write_pid_file(path: &str) -> HolderResult<()> {
     Ok(())
 }
 
+/// Blocks until the watched child has exited, leaving it unreaped.
+///
+/// A readiness fd rather than `waitid(WEXITED | WNOWAIT)`: macOS's `waitid`
+/// also returns for a child that merely stopped, so a hibernation would read
+/// as an exit. Without a watcher the child had already exited when the holder
+/// tried to watch it, and is a zombie until this holder reaps it.
+fn wait_for_exit_unreaped(watcher: Option<&diri_pty::ExitWatcher>) {
+    let Some(watcher) = watcher else { return };
+    let mut descriptor = libc::pollfd {
+        fd: watcher.as_raw_fd(),
+        events: libc::POLLIN,
+        revents: 0,
+    };
+    // SAFETY: one valid pollfd; no timeout.
+    while unsafe { libc::poll(&mut descriptor, 1, -1) } < 0
+        && std::io::Error::last_os_error().raw_os_error() == Some(libc::EINTR)
+    {}
+}
+
 fn set_nonblocking(fd: i32) {
     // SAFETY: fcntl on an owned fd.
     unsafe {
@@ -1088,6 +1167,176 @@ mod tests {
         client.kill_tree().expect("kill-tree");
         wait_until("holder finished", || server.is_finished());
         server.join().expect("join").expect("clean holder exit");
+    }
+
+    /// The state letter `ps` reports, or `None` once the pid is gone.
+    fn process_state(pid: i32) -> Option<String> {
+        let output = std::process::Command::new("/bin/ps")
+            .args(["-o", "stat=", "-p", &pid.to_string()])
+            .output()
+            .expect("ps");
+        let state = String::from_utf8_lossy(&output.stdout).trim().to_owned();
+        (!state.is_empty()).then_some(state)
+    }
+
+    /// Gone, or a zombie waiting for init: either way nothing left running.
+    fn dead(pid: i32) -> bool {
+        process_state(pid).is_none_or(|state| state.starts_with('Z'))
+    }
+
+    fn read_pids(path: &Path) -> Option<Vec<i32>> {
+        let text = std::fs::read_to_string(path).ok()?;
+        let pids: Vec<i32> = text
+            .split_whitespace()
+            .filter_map(|word| word.parse().ok())
+            .collect();
+        (text.ends_with('\n') && !pids.is_empty()).then_some(pids)
+    }
+
+    fn held(root: &Path, session_id: &str, script: &str) -> HolderLaunchSpec {
+        HolderLaunchSpec {
+            session_id: session_id.into(),
+            socket_path: root.join("h.sock").to_string_lossy().into_owned(),
+            pid_file_path: root.join("h.pid").to_string_lossy().into_owned(),
+            log_file_path: root
+                .join(format!("{session_id}.bin"))
+                .to_string_lossy()
+                .into_owned(),
+            // Like `fish -c codex`: the leader forks the agent rather than
+            // exec'ing it, so the agent is a separate member of its group.
+            argv: vec!["/bin/sh".into(), "-c".into(), format!("{script}; true")],
+            cwd: "/tmp".into(),
+            environment: [(
+                "PATH".to_string(),
+                std::env::var("PATH").unwrap_or_else(|_| "/usr/bin:/bin".into()),
+            )]
+            .into(),
+            cols: 80,
+            rows: 24,
+            disk_capacity: 4096,
+        }
+    }
+
+    /// The Codex shape that leaked on a real machine: `fish -c codex` leads the
+    /// session, codex's node wrapper forwards TERM/HUP to the native binary and
+    /// waits for it, and the agent has a helper that left the group (Codex's
+    /// code-mode host, Chrome DevTools MCP's watchdog). Hibernated, then the
+    /// leader dies: on macOS the unhandled hangup kills the native child even
+    /// though it is stopped, but the wrapper, which handles SIGHUP, stays
+    /// stopped with it pending. Nothing ever continued it; it sat under
+    /// launchd, holding a revoked terminal, for weeks.
+    #[test]
+    fn a_leader_dying_while_hibernated_takes_its_frozen_tree_with_it() {
+        let root = tempfile::tempdir().unwrap();
+        let pids = root.path().join("pids");
+        let wrapper = root.path().join("codex.sh");
+        std::fs::write(
+            &wrapper,
+            format!(
+                "trap 'kill -TERM $child 2>/dev/null' TERM HUP INT\n\
+                 perl -e 'use POSIX; POSIX::setsid(); sleep 1000' &\n\
+                 helper=$!\n\
+                 sleep 1000 & child=$!\n\
+                 echo $$ $child $helper > {pids}.tmp && mv {pids}.tmp {pids}\n\
+                 wait $child; wait $child\n",
+                pids = pids.display()
+            ),
+        )
+        .unwrap();
+        let spec = held(
+            root.path(),
+            "s_frozen",
+            &format!("/bin/sh {}", wrapper.display()),
+        );
+        let client = HolderClient::new(&spec.socket_path);
+        let server = std::thread::spawn(move || HolderServer::run(spec));
+        wait_until("holder ready", || client.is_alive());
+        let mut agent = Vec::new();
+        wait_until("agent tree", || {
+            agent = read_pids(&pids).unwrap_or_default();
+            agent.len() == 3
+        });
+        // The setsid'd helper must have left the group before the freeze.
+        wait_until("helper in its own session", || {
+            // SAFETY: getpgid on a pid we started; read-only.
+            unsafe { libc::getpgid(agent[2]) == agent[2] }
+        });
+
+        let frozen = client.signal(libc::SIGSTOP).expect("hibernate");
+        for pid in &agent {
+            assert!(
+                frozen.iter().any(|sample| sample.pid == *pid),
+                "{pid} is part of the hibernated tree: {frozen:?}"
+            );
+        }
+        wait_until("tree stopped", || {
+            agent
+                .iter()
+                .all(|&pid| process_state(pid).is_some_and(|state| state.starts_with('T')))
+        });
+
+        // Whatever kills the leader — a hangup, memory pressure, the user —
+        // it goes without the holder's say-so.
+        let leader = running("s_frozen").child_pid;
+        // SAFETY: plain kill(2) on the holder's own child.
+        unsafe { libc::kill(leader, libc::SIGKILL) };
+        wait_until("holder finished", || server.is_finished());
+        server.join().expect("join").expect("clean holder exit");
+
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while std::time::Instant::now() < deadline && !agent.iter().all(|&pid| dead(pid)) {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        let survivors: Vec<(i32, String)> = agent
+            .iter()
+            .filter_map(|&pid| process_state(pid).map(|state| (pid, state)))
+            .filter(|(_, state)| !state.starts_with('Z'))
+            .collect();
+        for (pid, _) in &survivors {
+            // SAFETY: cleanup of this test's own leaked processes.
+            unsafe {
+                libc::kill(*pid, libc::SIGKILL);
+                libc::kill(*pid, libc::SIGCONT);
+            }
+        }
+        assert!(
+            survivors.is_empty(),
+            "the agent tree outlived its session: {survivors:?} of {agent:?}"
+        );
+    }
+
+    /// A member of the session's own group that ignores the hangup outlives a
+    /// leader that exits normally unless the holder sweeps the group, as the
+    /// remote Helper's guard does.
+    #[test]
+    fn a_leader_exiting_normally_leaves_nothing_in_its_group() {
+        let root = tempfile::tempdir().unwrap();
+        let pids = root.path().join("pids");
+        let script = format!(
+            "(trap '' HUP TERM; exec sleep 1000) & echo $! > {pids}.tmp && mv {pids}.tmp {pids}; sleep 0.3",
+            pids = pids.display()
+        );
+        let spec = held(root.path(), "s_group", &script);
+        let client = HolderClient::new(&spec.socket_path);
+        let server = std::thread::spawn(move || HolderServer::run(spec));
+        wait_until("holder ready", || client.is_alive());
+        let mut straggler = Vec::new();
+        wait_until("background job", || {
+            straggler = read_pids(&pids).unwrap_or_default();
+            !straggler.is_empty()
+        });
+        let straggler = straggler[0];
+
+        wait_until("holder finished", || server.is_finished());
+        server.join().expect("join").expect("clean holder exit");
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while std::time::Instant::now() < deadline && !dead(straggler) {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        let survived = !dead(straggler);
+        // SAFETY: cleanup of this test's own leaked process.
+        unsafe { libc::kill(straggler, libc::SIGKILL) };
+        assert!(!survived, "a group member outlived the session leader");
     }
 
     #[test]

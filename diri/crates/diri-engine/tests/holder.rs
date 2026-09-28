@@ -426,3 +426,95 @@ fn the_launcher_bootstraps_a_real_manager_process() {
         "an idle exit removes the manager endpoint"
     );
 }
+
+/// Gone, or a zombie waiting for init: either way nothing left running.
+fn process_dead(pid: i32) -> bool {
+    let output = std::process::Command::new("/bin/ps")
+        .args(["-o", "stat=", "-p", &pid.to_string()])
+        .output()
+        .expect("ps");
+    let state = String::from_utf8_lossy(&output.stdout).trim().to_owned();
+    state.is_empty() || state.starts_with('Z')
+}
+
+/// The manager dying takes a hibernated session's tree with it. Before the
+/// group guard, a crash, `kill -9` or reinstall of the manager hung the PTY up;
+/// the stopped leader died of the hangup, and so did any stopped member with
+/// default signal handling, but a member that handles SIGHUP — Codex's node
+/// wrapper, Claude Code — stayed stopped under launchd forever, and so did
+/// any stopped helper in a session of its own.
+#[test]
+fn a_dead_manager_leaves_no_hibernated_agent_behind() {
+    let root = holders_dir("guard");
+    let logs = root.join("logs");
+    let binary = PathBuf::from(env!("CARGO_BIN_EXE_diri-holder"));
+    let pids = root.join("pids");
+    let wrapper = root.join("codex.sh");
+    std::fs::write(
+        &wrapper,
+        format!(
+            "trap 'kill -TERM $child 2>/dev/null' TERM HUP INT\n\
+             perl -e 'use POSIX; POSIX::setsid(); sleep 1000' &\n\
+             helper=$!\n\
+             sleep 1000 & child=$!\n\
+             echo $$ $child $helper > {pids}.tmp && mv {pids}.tmp {pids}\n\
+             wait $child; wait $child\n",
+            pids = pids.display()
+        ),
+    )
+    .expect("write wrapper");
+
+    let paths = HolderPaths::new(&root, "s_guard");
+    let script = format!("/bin/sh {}; true", wrapper.display());
+    let launch = spec(&paths, &logs, &["/bin/sh", "-c", &script]);
+    let manager_pid = HolderLauncher::launch(&binary, &paths, &launch).expect("launch");
+    let client = HolderClient::new(paths.socket());
+    wait_until("session ready", Duration::from_secs(5), || {
+        client.is_alive()
+    });
+    let mut agent: Vec<i32> = Vec::new();
+    wait_until("agent tree", Duration::from_secs(5), || {
+        agent = std::fs::read_to_string(&pids)
+            .ok()
+            .filter(|text| text.ends_with('\n'))
+            .map(|text| {
+                text.split_whitespace()
+                    .filter_map(|w| w.parse().ok())
+                    .collect()
+            })
+            .unwrap_or_default();
+        agent.len() == 3
+    });
+    // The helper leaves the group, as Chrome DevTools MCP's watchdog does.
+    wait_until("helper in its own session", Duration::from_secs(5), || {
+        // SAFETY: read-only getpgid on a pid this test started.
+        unsafe { libc::getpgid(agent[2]) == agent[2] }
+    });
+
+    let frozen = client.signal(libc::SIGSTOP).expect("hibernate");
+    assert!(agent.iter().all(|pid| frozen.iter().any(|s| s.pid == *pid)));
+
+    // SAFETY: the manager this test launched.
+    unsafe { libc::kill(manager_pid, libc::SIGKILL) };
+
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while Instant::now() < deadline && !agent.iter().all(|&pid| process_dead(pid)) {
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    let survivors: Vec<i32> = agent
+        .iter()
+        .copied()
+        .filter(|&pid| !process_dead(pid))
+        .collect();
+    for pid in &survivors {
+        // SAFETY: cleanup of this test's own leaked processes.
+        unsafe {
+            libc::kill(*pid, libc::SIGKILL);
+            libc::kill(*pid, libc::SIGCONT);
+        }
+    }
+    assert!(
+        survivors.is_empty(),
+        "outlived the manager: {survivors:?} of {agent:?}"
+    );
+}

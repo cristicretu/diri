@@ -40,6 +40,19 @@ fn main() {
         }
         return;
     }
+    if arguments.len() == 2 && arguments[1] == diri_engine::holder::guard::GROUP_GUARD_FLAG {
+        // The manager's liveness guard. Termination requests are ignored so a
+        // `pkill diri-holder` that takes the manager down leaves the guard to
+        // clean up after it; the guard exits on its own once its pipe closes.
+        // SAFETY: process-level signal setup at startup.
+        unsafe {
+            libc::signal(libc::SIGHUP, libc::SIG_IGN);
+            libc::signal(libc::SIGINT, libc::SIG_IGN);
+            libc::signal(libc::SIGTERM, libc::SIG_IGN);
+        }
+        let _ = diri_engine::holder::guard::run_group_guard(std::io::stdin().lock());
+        return;
+    }
     // The daemon detaches us with setsid at spawn. Direct/manual launches
     // detach here as well; parent death never terminates a POSIX child, and
     // ignoring SIGHUP severs the last terminal coupling.
@@ -57,7 +70,9 @@ fn main() {
             .ok()
             .and_then(|raw| raw.parse::<f64>().ok())
             .map_or(Duration::from_secs(30), Duration::from_secs_f64);
-        HolderManagerServer::new(std::path::Path::new(&directory), idle).run()
+        HolderManagerServer::new(std::path::Path::new(&directory), idle)
+            .with_group_guard()
+            .run()
     } else if let Some(spec_path) = value_after(&arguments, "--spec") {
         match std::fs::read(&spec_path) {
             Ok(data) => {

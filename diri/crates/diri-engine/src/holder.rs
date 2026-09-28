@@ -8,6 +8,15 @@
 //! drives each one over a per-session unix socket and tails its output log
 //! from disk.
 //!
+//! A session's tree must not outlive it. When a leader exits, its holder
+//! kills what is left of its process group, their descendants, and anything
+//! it hibernated, before reaping the leader (see
+//! [`process_tree::kill_stragglers`]). When the manager itself dies, one
+//! [`guard::GroupGuard`] per manager does the same for every hosted session:
+//! the local counterpart of the remote Helper's per-session process guard,
+//! shared because a local manager hosts many sessions and each guard process
+//! costs about 1.3 MB.
+//!
 //! All holder processes and protocols in the active architecture are
 //! Rust-owned. The socket paths, NDJSON request/response shapes, pid-file
 //! contents and in-band OSC 777 exit marker are versioned internal contracts.
@@ -18,6 +27,8 @@
 //! receive the original one-request form.
 
 pub mod client;
+#[cfg(unix)]
+pub mod guard;
 pub mod launcher;
 pub mod manager;
 pub mod paths;

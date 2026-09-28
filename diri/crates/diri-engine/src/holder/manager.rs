@@ -14,6 +14,7 @@ use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
 use super::client::HolderClient;
+use super::guard::GroupGuard;
 use super::paths::{HolderManagerPaths, HolderPaths, MANAGER_PROTOCOL_VERSION};
 use super::protocol::{
     HolderLaunchSpec, HolderManagerOperation, HolderManagerRequest, HolderManagerResponse,
@@ -25,6 +26,7 @@ use super::{HolderError, HolderResult};
 pub struct HolderManagerServer {
     paths: HolderManagerPaths,
     idle_timeout: Duration,
+    group_guard: bool,
 }
 
 struct State {
@@ -77,12 +79,37 @@ impl HolderManagerServer {
         Self {
             paths: HolderManagerPaths::new(directory),
             idle_timeout: idle_timeout.max(Duration::from_millis(100)),
+            group_guard: false,
         }
+    }
+
+    /// Runs a [`GroupGuard`] beside the manager, spawned from this process's
+    /// own executable, so hosted process groups die with the manager rather
+    /// than outliving it stopped. Only the real `diri-holder` binary can do
+    /// this; an in-process test manager has no executable to re-run.
+    #[must_use]
+    pub fn with_group_guard(mut self) -> Self {
+        self.group_guard = true;
+        self
     }
 
     pub fn run(&self) -> HolderResult<()> {
         std::fs::create_dir_all(&self.paths.directory)
             .map_err(|error| HolderError::io("create holders directory", error))?;
+        // Before any PTY or listener exists, so the guard inherits nothing.
+        // A guard that fails to start costs only crash cleanup, not sessions.
+        let guard = self
+            .group_guard
+            .then(|| {
+                std::env::current_exe()
+                    .and_then(|executable| GroupGuard::spawn(&executable))
+                    .inspect_err(|error| {
+                        eprintln!("diri-holder manager: group guard unavailable: {error}");
+                    })
+                    .ok()
+            })
+            .flatten()
+            .map(Arc::new);
         let listener = socket::listen(&self.paths.socket())?;
         // Raw ownership: the idle watchdog closes this fd to end the accept
         // loop (see `socket::accept_raw`).
@@ -110,9 +137,11 @@ impl HolderManagerServer {
                 Ok(Some(mut client)) => {
                     let response = match socket::read_json_line::<HolderManagerRequest>(&mut client)
                     {
-                        Ok(request) => self.handle(&state, &request).unwrap_or_else(|error| {
-                            HolderManagerResponse::failure(error.to_string())
-                        }),
+                        Ok(request) => self
+                            .handle(&state, guard.as_ref(), &request)
+                            .unwrap_or_else(|error| {
+                                HolderManagerResponse::failure(error.to_string())
+                            }),
                         Err(error) => HolderManagerResponse::failure(error.to_string()),
                     };
                     let _ = socket::write_json_line(&mut client, &response);
@@ -134,12 +163,16 @@ impl HolderManagerServer {
         state.stop_watchdog();
         let _ = watchdog.join();
         self.cleanup_control_files();
+        if let Some(guard) = guard {
+            guard.finish();
+        }
         result
     }
 
     fn handle(
         &self,
         state: &Arc<State>,
+        guard: Option<&Arc<GroupGuard>>,
         request: &HolderManagerRequest,
     ) -> HolderResult<HolderManagerResponse> {
         if request.version != MANAGER_PROTOCOL_VERSION {
@@ -184,11 +217,12 @@ impl HolderManagerServer {
                 }
 
                 let state = Arc::clone(state);
+                let guard = guard.cloned();
                 let session_id = spec.session_id.clone();
                 std::thread::Builder::new()
                     .name(format!("holder-{session_id}"))
                     .spawn(move || {
-                        if let Err(error) = HolderServer::run(spec) {
+                        if let Err(error) = HolderServer::run_guarded(spec, guard) {
                             eprintln!("diri-holder manager: session {session_id}: {error}");
                         }
                         let mut active = state.active.lock().expect("active");
