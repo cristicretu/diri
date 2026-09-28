@@ -84,8 +84,13 @@ impl WorkspaceStore {
                     .revision
                     .checked_add(1)
                     .ok_or_else(|| invalid("revision exhausted"))?;
+                // Through a JSON value, exactly as replies are encoded, so the
+                // stored text matches what clients were told: `f32` fractions
+                // print differently when serialized directly.
+                let encoded = serde_json::to_value(&next)
+                    .map_err(|_| invalid("cannot encode workspace state"))?;
                 document
-                    .insert(KEY, &next)
+                    .insert(KEY, &encoded)
                     .map_err(|_| invalid("cannot encode workspace state"))?;
                 Ok(next)
             })();
