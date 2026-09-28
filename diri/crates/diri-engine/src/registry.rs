@@ -328,6 +328,28 @@ impl Registry {
         self.records.insert(record.id.0.clone(), record);
     }
 
+    /// Every session id something in this Registry still stands behind:
+    /// persisted records, live or launching sessions, and the in-memory
+    /// "reopen closed" stack. The startup orphan sweep keeps these ids' files.
+    pub fn referenced_session_ids(&self) -> std::collections::HashSet<String> {
+        self.records
+            .keys()
+            .chain(self.sessions.keys())
+            .chain(self.pending_launches.iter())
+            .cloned()
+            .chain(
+                self.recently_closed
+                    .iter()
+                    .map(|record| record.id.0.clone()),
+            )
+            .collect()
+    }
+
+    /// The `sessions/` directory holding each session's recovery files.
+    pub fn recovery_root(&self) -> &Path {
+        &self.recovery_root
+    }
+
     /// Exact directory exported to this session's hook/notify process.
     pub fn recovery_directory(&self, id: &str) -> PathBuf {
         self.recovery_root.join(id)
@@ -1228,7 +1250,10 @@ impl Registry {
             return Err(error);
         }
         if plan.delete_output_log {
-            let _ = std::fs::remove_file(logs_dir.join(format!("{id}.bin")));
+            // The log, its screen checkpoint and the attention store all die
+            // with the record; leaving the sidecars is how closed sessions
+            // accumulated hundreds of MB.
+            let _ = crate::session_files::remove_log_files(logs_dir, id);
         }
         // The retained terminal belongs to this record; nothing else may
         // find it once the binding below is gone, so remove it too.

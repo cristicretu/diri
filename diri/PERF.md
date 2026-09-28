@@ -1,5 +1,61 @@
 # diri performance record
 
+## Per-session files no longer leak; startup orphan sweep (2026-09-28)
+
+An installed Engine's `logs/` held 949 MB in 1,440 files while `state.json`
+held 30 session records. Only 90 files (256 MB) belonged to a record. The rest
+were 1,013 `s_<id>.screen.plist` checkpoints, 257 `s_<id>.attention.sqlite`
+stores, and 78 `s_<id>.bin` output logs up to 49 days old.
+
+Cause: `Registry::remove`, the only path that drops a record, unlinked
+`<id>.bin` and nothing else. The screen checkpoint and the attention store of
+every closed tab stayed forever, and nothing collected files orphaned by
+crashes, state loss, or older builds. Removal now calls one helper,
+`session_files::remove_log_files`, over one suffix list (`.bin`,
+`.screen.plist[.tmp]`, `.attention.sqlite[-journal|-wal|-shm]`). Recovery
+directories were already cleaned by `remove_owned_files`.
+
+The daemon also runs one bounded sweep per start, on its own thread after the
+socket is bound. It never repeats and never runs while idle. It keeps every id
+referenced by a loaded record, a live or launching session, the in-memory
+reopen-closed stack, a holder socket or pid file, or a remote binding file
+name. It only considers regular files named exactly `s_<12 lowercase hex>`
+plus a known suffix, never follows symlinks, and skips anything modified in
+the last 15 minutes. In `sessions/` it removes only the Engine-owned recovery
+files. The sweep is skipped when the state file failed to load or holds no
+records.
+
+Measured with `examples/logsweep.rs` (release, Apple silicon, APFS):
+
+| | files | bytes |
+|---|---:|---:|
+| installed `logs/` before | 1,438 | 974 MB |
+| dry run: would remove | 1,324 (+19 recovery dirs) | 701.7 MB |
+| kept (referenced / recent / foreign) | 138 / 4 / 2 | ~272 MB |
+
+Sweeping a replica with the same names, sizes, and mtimes (content not
+copied) took 48–68 ms when the files were sparse and 237–294 ms when they were
+dense (`LOGSWEEP_DENSE=1`). Both runs were off the accept path.
+
+Not claimed: the dry run is a snapshot of one machine at one moment. The
+dense replica approximates, but is not, the user's real extents. Bytes are
+logical sizes. The workspace layout still names 191 dead session ids. Those
+tabs have no record and are not treated as references, and that leak is not
+fixed here.
+
+Reproduce from `diri/`:
+
+```sh
+cargo test -p diri-engine --test session_files
+cargo run --release -p diri-engine --example logsweep -- dry-run \
+    "$HOME/Library/Application Support/Dirijor"
+LOGSWEEP_DENSE=1 cargo run --release -p diri-engine --example logsweep -- \
+    simulate "$HOME/Library/Application Support/Dirijor" /tmp/sweep-replica
+```
+
+`removing_a_held_session_deletes_every_sidecar` fails on the old removal path
+(`.screen.plist` and `.attention.sqlite` are left).
+
 ## Workspace terminal redraw isolation (2026-09-16)
 
 A live sample of installed Diri 0.7.4 reproduced 23–31% app CPU, with
