@@ -126,8 +126,9 @@ impl ControlServer {
         // updater can replace the bundle path underneath the live daemon.
         let _ = process_executable_hash();
         let socket_path = socket_path.into();
-        let workspaces =
-            crate::workspace::WorkspaceStore::new(registry.lock().expect("registry").state_file());
+        let workspaces = crate::workspace::WorkspaceStore::with_state_file(
+            registry.lock().expect("registry").state_file_handle(),
+        );
         let logs_dir = socket_path
             .parent()
             .map(|parent| parent.join("logs"))
@@ -517,7 +518,9 @@ impl ControlServer {
                         }
                         let _ = registry.ensure_session_awake(&attach.attach.0);
                         let _ = registry.mark_seen(&attach.attach.0);
-                        let _ = registry.persist();
+                        // Every tab switch attaches: leave the write to the
+                        // flusher instead of fsyncing on the attach path.
+                        registry.persist_deferred();
                         self.publish_updated(&registry, &attach.attach.0);
                     }
                     self.pr_monitor_wake.wake_session(attach.attach.0.clone());
@@ -2456,7 +2459,9 @@ impl ControlServer {
         registry
             .mark_seen(&p.session_id.0)
             .map_err(io_control_error)?;
-        let _ = registry.persist();
+        // Last-seen is a view hint, not an acknowledged edit: the flusher
+        // writes it within the debounce window, off this request's thread.
+        registry.persist_deferred();
         self.publish_updated(&registry, &p.session_id.0);
         self.pr_monitor_wake.wake_session(p.session_id.0);
         Ok(json!({}))
@@ -3705,11 +3710,8 @@ impl ControlServer {
 
     /// Publishes `session.updated` with the session's current record.
     fn publish_updated(&self, registry: &Registry, id: &str) {
-        if let Some(record) = registry
-            .records()
-            .into_iter()
-            .find(|record| record.id.0 == id)
-        {
+        // One folded record, not a folded copy of the whole table.
+        if let Some(record) = registry.record(id) {
             self.events
                 .publish_encoded(diri_proto::EventName::SESSION_UPDATED, &record, Some(id));
         }
@@ -5614,6 +5616,42 @@ mod tests {
             Some(json!({ "sessionID": "s_missing", "text": "hi", "submit": false })),
         ));
         assert_eq!(error.code, "not_found");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn mark_seen_replies_without_writing_and_the_flush_persists_it() {
+        use std::os::unix::fs::MetadataExt;
+        let temp = tempfile::tempdir().expect("temp");
+        let path = temp.path().join("state.json");
+        let registry = Arc::new(Mutex::new(Registry::new(engine(), &path)));
+        registry
+            .lock()
+            .expect("registry")
+            .insert_record(test_record("s_seen"));
+        registry.lock().expect("registry").persist_now().unwrap();
+        let identity = || {
+            let metadata = std::fs::metadata(&path).unwrap();
+            (metadata.ino(), metadata.mtime_nsec())
+        };
+        let before = identity();
+        // Past the debounce window, where a leading-edge persist would write.
+        std::thread::sleep(Duration::from_millis(600));
+        let server = Arc::new(ControlServer::new(
+            Arc::clone(&registry),
+            temp.path().join("daemon.sock"),
+        ));
+
+        ok_of(call(
+            &server,
+            "session.mark_seen",
+            Some(json!({ "sessionID": "s_seen" })),
+        ));
+        assert_eq!(identity(), before, "the request thread must not write");
+
+        registry.lock().expect("registry").flush_dirty().unwrap();
+        let state: JsonValue = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        assert!(state["sessions"][0]["lastSeenAt"].is_number());
     }
 
     #[test]

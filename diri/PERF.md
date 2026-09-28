@@ -1,5 +1,77 @@
 # diri performance record
 
+## Engine state persistence against a 1.5 MB state.json (2026-09-28)
+
+A live sample of the installed Engine (51 sessions, `state.json` 1.5 MB, almost
+all of it `sessions` pull-request bodies and discussion) spent ~115 ms per 5 s
+in `Registry::persist_now`, plus ~30 ms in `workspace.mutate` and ~11 ms in
+`WorkspaceStore::snapshot`. Every persist re-read and parsed the whole file
+into a `serde_json::Value`, cloned the record table and the value tree,
+re-serialized everything and fsynced, even when nothing had changed.
+`session.mark_seen` and every attach did this on the control connection thread.
+
+`JsonStateFile` still does locked read-modify-write with atomic rename, because
+the Registry (`version`/`projects`/`sessions`), the workspace store
+(`workspaceState`) and any other compatible process share one file and must
+not clobber each other's keys. What changed:
+
+- The document is kept as top-level sections of raw JSON text. Sections a
+  writer does not own are carried byte for byte, never parsed into a tree.
+- The last image read or written is cached with an open handle to its file.
+  Under the lock, an update `stat`s the path; while device, inode, length and
+  mtime still match, the image is the file and nothing is re-read. Any other
+  writer's rename (or in-place write) misses and reloads as before. Holding
+  the handle keeps the inode allocated, so its number cannot be recycled. The
+  Registry and workspace store share one handle.
+- A persist whose sections are byte-identical does not write or fsync.
+- The Registry serializes records straight to text, one folded record at a
+  time, instead of `Vec<SessionRecord>` → `Value` → clone → bytes.
+- The flusher serializes under the Registry lock and writes after releasing
+  it. Per-owner sequence numbers stop an older snapshot from landing over a
+  newer synchronous one.
+- `session.mark_seen` and the attach path mark the Registry dirty instead of
+  persisting on the request thread; the flusher writes within 500 ms.
+  `publish_updated` folds one record instead of cloning the whole table, and
+  `workspace.mutate` reads session ids without cloning records.
+
+Durability is unchanged. `persist_now`, `persist_for_shutdown` and lifecycle
+persists still fsync the file before returning, and workspace mutations still
+fsync the directory entry too, including when the bytes are unchanged.
+`mark_seen` was already debounced, so it was never durable before reply. The
+on-disk format is the same JSON object with the same keys; key order is still
+sorted at the top level, and record fields now follow struct order.
+
+`statebench` (release, macOS 27, APFS, Apple silicon) builds a 1,528 KB fixture:
+50 sessions, 5 of them with 26 PRs each (2 KB body, six ~1.2 KB discussion
+items, 8 checks); 20 projects; a 63 KB `workspaceState` made through real
+mutations. Wall time includes F_FULLFSYNC. CPU is process user+system per
+operation. Medians of two runs each:
+
+| operation (n)               | before wall | after wall | before CPU | after CPU |
+|-----------------------------|------------:|-----------:|-----------:|----------:|
+| persist, unchanged (40)     | 16.2 ms     | 1.0 ms     | 7.4–8.6 ms | 1.0 ms    |
+| persist, one field (40)     | 13.0–16.2 ms| 8.1 ms     | 6.4–7.9 ms | 1.6 ms    |
+| `session.mark_seen` RPC (20)| 19.7–21.5 ms| 5.2–6.6 ms | 7.2–8.2 ms | 0.44 ms   |
+| `workspace.mutate` RPC (40) | 17.0–19.6 ms| 10.9–11.9 ms| 5.8–7.7 ms| 1.3–1.4 ms|
+| `workspace.snapshot` RPC (40)| 2.8–5.0 ms | 0.55 ms    | 2.9–4.4 ms | 0.60 ms   |
+
+What remains in a changed persist is the fsync. In `workspace.mutate` it is
+the file fsync plus the directory fsync. The remaining `mark_seen` wall time,
+with no disk I/O, is inside `EventBus::publish_encoded`. That path is being
+changed in the separate event-bus work and was not touched here.
+
+Not claimed: this does not measure the installed app's end-to-end CPU, and
+it does not measure real disks other than the local APFS volume. The
+"unchanged" row is a best case: a real change still pays serialization of
+all sessions (~1 ms here). Per-record serialization caching was not added.
+
+Reproduce from `diri/`:
+
+```sh
+cargo run --release -p diri-engine --example statebench -- 40
+cargo test -p diri-engine --lib -- state_file unchanged_persist sections_other_writers older_snapshot mark_seen_replies
+```
+
 ## Workspace terminal redraw isolation (2026-09-16)
 
 A live sample of installed Diri 0.7.4 reproduced 23–31% app CPU, with
