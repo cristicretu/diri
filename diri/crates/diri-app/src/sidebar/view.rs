@@ -1,4 +1,5 @@
 mod accounts;
+mod arrivals;
 mod filter;
 #[cfg(test)]
 mod hue_tests;
@@ -629,9 +630,6 @@ pub struct Sidebar {
     /// session, or of the keyboard cursor while the sidebar is focused and
     /// nothing is hovered.
     lineage_roles: HashMap<SessionId, LineageRole>,
-    /// The session whose relatives are marked, set only while it has any.
-    /// Every other session row dims so the family stands out.
-    lineage_focus: Option<SessionId>,
     focus_handle: FocusHandle,
     hover_task: Option<Task<()>>,
     hover_keystrokes: Option<gpui::Subscription>,
@@ -642,6 +640,9 @@ pub struct Sidebar {
     update: UpdateState,
     /// When visibility last flipped, so a held ⌘B cannot outrun the slide.
     last_toggle: Option<Instant>,
+    /// Hold-⌘ hint opacity for the horizontal strip, which `RootView`
+    /// renders inline and so samples for it.
+    pub(crate) strip_held_hint: f32,
     preview: bool,
     /// Which face the New Agent menu shows. The remote directory listing
     /// itself lives in the Store so the daemon adapter can complete it
@@ -673,6 +674,9 @@ pub struct Sidebar {
     /// The instant every title in this pass is sampled at.
     title_now: Instant,
     title_tick: Option<Task<()>>,
+    /// Sessions that arrive grow into the list and ones that leave collapse
+    /// out of it, sampled on the title clock.
+    row_motion: super::row_motion::RowMotion<SessionId, crate::store::SidebarRow>,
 }
 
 /// The sidebar state that asked for a native folder pick, captured when the
@@ -707,6 +711,8 @@ impl Sidebar {
         scenario: PreviewScenario,
         cx: &mut Context<Self>,
     ) -> Self {
+        cx.observe_global::<crate::held_hints::HeldHintsState>(|_, cx| cx.notify())
+            .detach();
         let (store, preview_effects) = if preview {
             let fixture = SidebarPreviewFixture::make(scenario);
             let (mut store, effects) = SessionStore::headless(fixture.prefs);
@@ -802,8 +808,8 @@ impl Sidebar {
             working_row_rendered: false,
             hues: Default::default(),
             shortcut_ranks: HashMap::new(),
+            strip_held_hint: 0.0,
             lineage_roles: HashMap::new(),
-            lineage_focus: None,
             focus_handle: cx.focus_handle(),
             hover_task: None,
             hover_keystrokes: None,
@@ -828,6 +834,7 @@ impl Sidebar {
             title_clock: Instant::now,
             title_now: Instant::now(),
             title_tick: None,
+            row_motion: Default::default(),
         };
         sidebar.ui.preview_account = preview;
         // Opens a popover at launch: headless screenshots verify its layout,
@@ -1790,7 +1797,12 @@ impl Sidebar {
         .size_full()
     }
 
-    fn new_agent_row(&self, colors: SemanticColors, cx: &mut Context<Self>) -> AnyElement {
+    fn new_agent_row(
+        &self,
+        held_hint: f32,
+        colors: SemanticColors,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
         let hovering = self.ui.hovered_control == Some("new-agent");
         let (agent_kind, host_label) = {
             let store = self.store.read().expect("session store lock poisoned");
@@ -1871,16 +1883,27 @@ impl Sidebar {
                                 .child(host),
                         )
                     })
-                    .child(
+                    .child(crate::held_hints::in_slot(
                         AgentLogo::new(agent_kind, 16.0, colors)
                             .badged(false)
-                            .inset(0.08),
-                    ),
+                            .inset(0.08)
+                            .into_any_element(),
+                        16.0,
+                        "held-hint:new-agent".to_owned(),
+                        crate::held_hints::label(CommandId::NewDefaultSession),
+                        held_hint,
+                        colors,
+                    )),
             )
             .into_any_element()
     }
 
-    fn top_bar(&self, colors: SemanticColors, cx: &mut Context<Self>) -> AnyElement {
+    fn top_bar(
+        &self,
+        held_hint: f32,
+        colors: SemanticColors,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
         let in_settings = self.settings_nav.is_some();
         let primary_control = if in_settings { "settings" } else { "search" };
         let primary_hover = self.ui.hovered_control == Some(primary_control);
@@ -1906,20 +1929,26 @@ impl Sidebar {
                 }),
             )
         } else {
-            icon_button(
+            crate::held_hints::below(
+                icon_button(
+                    "sidebar-search",
+                    "Search sessions",
+                    "magnifyingglass",
+                    primary_hover,
+                    colors,
+                    cx.listener(|this, _, window, cx| {
+                        this.ui.popover = None;
+                        window.dispatch_action(Box::new(ToggleHistory), cx);
+                    }),
+                    cx.listener(|this, hovered: &bool, _, cx| {
+                        this.ui.hovered_control = hovered.then_some("search");
+                        cx.notify();
+                    }),
+                ),
                 "sidebar-search",
-                "Search sessions",
-                "magnifyingglass",
-                primary_hover,
+                crate::held_hints::label(CommandId::ToggleHistory),
+                held_hint,
                 colors,
-                cx.listener(|this, _, window, cx| {
-                    this.ui.popover = None;
-                    window.dispatch_action(Box::new(ToggleHistory), cx);
-                }),
-                cx.listener(|this, hovered: &bool, _, cx| {
-                    this.ui.hovered_control = hovered.then_some("search");
-                    cx.notify();
-                }),
             )
         };
         div()
@@ -1953,21 +1982,27 @@ impl Sidebar {
                 ))
             })
             .child(primary_button)
-            .child(icon_button(
+            .child(crate::held_hints::below(
+                icon_button(
+                    "sidebar-toggle",
+                    if self.peek_open {
+                        "Pin sidebar open"
+                    } else {
+                        "Hide sidebar"
+                    },
+                    "sidebar.left",
+                    toggle_hover,
+                    colors,
+                    cx.listener(|this, _, _, cx| this.toggle(cx)),
+                    cx.listener(|this, hovered: &bool, _, cx| {
+                        this.ui.hovered_control = hovered.then_some("sidebar-toggle");
+                        cx.notify();
+                    }),
+                ),
                 "sidebar-toggle",
-                if self.peek_open {
-                    "Pin sidebar open"
-                } else {
-                    "Hide sidebar"
-                },
-                "sidebar.left",
-                toggle_hover,
+                crate::held_hints::label(CommandId::ToggleSidebar),
+                held_hint,
                 colors,
-                cx.listener(|this, _, _, cx| this.toggle(cx)),
-                cx.listener(|this, hovered: &bool, _, cx| {
-                    this.ui.hovered_control = hovered.then_some("sidebar-toggle");
-                    cx.notify();
-                }),
             ))
             .into_any_element()
     }
@@ -2824,7 +2859,7 @@ impl Sidebar {
         // Keep the last visible rows only for the close animation. The Store
         // remains authoritative for keyboard navigation and selection.
         let now = Instant::now();
-        let (motion, retained) = self
+        let (_, retained) = self
             .project_disclosures
             .entry(id.clone())
             .or_insert_with(|| {
@@ -2843,23 +2878,35 @@ impl Sidebar {
             // A session removed while closing must not survive in the visual tail.
             retained.retain(|row| group.active.iter().any(|session| session.id == *row.id()));
         }
+        let rows = retained.clone();
+        // Arrivals and departures, while the folder is open; a folding
+        // project already moves by its own disclosure.
+        let slots = if collapsed {
+            None
+        } else {
+            self.arrange_rows(&id.0, &rows)
+        };
+        let count = slots.as_ref().map_or(rows.len(), Vec::len);
+        let (motion, retained) = self
+            .project_disclosures
+            .get_mut(&id)
+            .expect("inserted above");
         let frame = motion.update(
             !collapsed,
-            retained.len() + usize::from(!group.archived.is_empty()),
+            count + usize::from(!group.archived.is_empty()),
             now,
             cx.reduce_motion(),
         );
         self.disclosure_animating |= frame.animating;
-        let rows = retained.clone();
         if collapsed && !frame.animating {
             retained.clear();
         }
         if frame.reveal > 0.0 {
             let mut children = Vec::new();
-            for row in &rows {
-                let shortcut = self.shortcut_for(row.id());
+            for (row, presence, ghost) in super::row_motion::paint_order(&rows, &slots) {
+                let shortcut = (!ghost).then(|| self.shortcut_for(row.id())).flatten();
                 let id = row.id().clone();
-                let drop = if collapsed {
+                let drop = if collapsed || ghost {
                     None
                 } else {
                     self.row_drop_feedback(row, window, cx)
@@ -2868,6 +2915,7 @@ impl Sidebar {
                     Some(RowDrop::Insert(zone)) => Some((zone, row.depth)),
                     _ => None,
                 };
+                let working = self.working_row_rendered;
                 let rendered = self.session_row(
                     row,
                     shortcut,
@@ -2877,16 +2925,23 @@ impl Sidebar {
                     window,
                     cx,
                 );
-                let rendered = if collapsed {
+                // A leaving row does not keep the activity tick alive.
+                self.working_row_rendered &= !ghost || working;
+                let rendered = Self::row_slot(rendered, presence, ghost);
+                let rendered = if collapsed || ghost {
                     rendered
                 } else {
                     self.track_row_bounds(id, rendered, marker)
                 };
-                children.push((rendered, SIDEBAR_NAV_ROW_HEIGHT));
+                children.push((
+                    rendered,
+                    SIDEBAR_NAV_ROW_HEIGHT * presence.height,
+                    presence.height,
+                ));
             }
             if !group.archived.is_empty() {
                 let (bucket, height) = self.archived_bucket(group, !collapsed, colors, window, cx);
-                children.push((bucket, height));
+                children.push((bucket, height, 1.0));
             }
             section = section.child(disclosure_body(children, &frame, !collapsed));
         }
@@ -3035,7 +3090,7 @@ impl Sidebar {
             if bucket_rows.is_empty() {
                 continue;
             }
-            let mut section = div().flex().flex_col().gap(px(2.0)).child(
+            let mut section = div().flex().flex_col().child(
                 div()
                     .px(px(Space::ROW_H))
                     .h(px(24.0))
@@ -3046,11 +3101,17 @@ impl Sidebar {
                     .text_color(colors.tertiary)
                     .child(bucket.label()),
             );
-            for row in bucket_rows {
-                let shortcut = self.shortcut_for(row.id());
+            let bucket_rows: Vec<_> = bucket_rows.into_iter().cloned().collect();
+            let slots = self.arrange_rows(bucket.label(), &bucket_rows);
+            for (row, presence, ghost) in super::row_motion::paint_order(&bucket_rows, &slots) {
+                let shortcut = (!ghost).then(|| self.shortcut_for(row.id())).flatten();
                 let id = row.id().clone();
-                let drop = self.row_drop_feedback(row, window, cx);
+                let drop = (!ghost)
+                    .then(|| self.row_drop_feedback(row, window, cx))
+                    .flatten();
+                let working = self.working_row_rendered;
                 let rendered = self.session_row(row, shortcut, drop, false, colors, window, cx);
+                self.working_row_rendered &= !ghost || working;
                 // Buckets interleave every project and the row names none of
                 // them, so here the row wears its project's hue.
                 let rendered = match self.hues.color(&row.session.project_id, colors) {
@@ -3067,7 +3128,19 @@ impl Sidebar {
                         .into_any_element(),
                     None => rendered,
                 };
-                section = section.child(self.track_row_bounds(id, rendered, None));
+                let rendered = Self::row_slot(rendered, presence, ghost);
+                let rendered = if ghost {
+                    rendered
+                } else {
+                    self.track_row_bounds(id, rendered, None)
+                };
+                // The 2 px above each row closes with its slot.
+                section = section.child(
+                    div()
+                        .flex_none()
+                        .mt(px(2.0 * presence.height))
+                        .child(rendered),
+                );
             }
             sections.push(section.into_any_element());
         }
@@ -3161,7 +3234,7 @@ impl Sidebar {
                 } else {
                     rendered
                 };
-                children.push((rendered, SIDEBAR_NAV_ROW_HEIGHT));
+                children.push((rendered, SIDEBAR_NAV_ROW_HEIGHT, 1.0));
             }
             section = section.child(disclosure_body(children, &frame, expanded));
         }
@@ -3389,6 +3462,7 @@ impl Sidebar {
             && self.ui.renaming.is_none()
             && self.ui.focus_cursor.as_ref() == Some(&id);
         let lineage = self.lineage_roles.get(&id).copied();
+        let held_hint = crate::held_hints::opacity(window, cx);
         let archived = session.is_archived();
         let hibernated = session.hibernation.is_some();
         let loading = is_loading(session, migrating);
@@ -3434,7 +3508,6 @@ impl Sidebar {
             RowFill::Clear
         };
         let fill_color = fill.color(colors);
-        let dimmed = self.lineage_dims(&id);
 
         if self.ui.renaming.as_ref() == Some(&id) {
             return div()
@@ -3546,7 +3619,6 @@ impl Sidebar {
                 colors.primary.alpha(0.0)
             })
             .when(selected, |row| row.shadow(Glass::shadows(colors)))
-            .when(dimmed, |row| row.opacity(LINEAGE_DIM_OPACITY))
             .cursor_pointer()
             // This row lives inside the sidebar's tracked focus target. Keep a
             // plain pointer press from entering keyboard-navigation mode; the
@@ -3797,7 +3869,9 @@ impl Sidebar {
             // The hint belongs to the keyboard cursor. Pointer selection keeps
             // the trailing edge quiet (or shows the hover-only close control).
             .when_some(
-                (!hovered && focused).then_some(shortcut).flatten(),
+                (!hovered && focused && held_hint == 0.0)
+                    .then_some(shortcut)
+                    .flatten(),
                 |element, index| {
                     element.child(
                         div()
@@ -3811,16 +3885,23 @@ impl Sidebar {
             );
 
         let row = row.when(!hovered, |row| {
-            row.child(
-                div()
-                    .debug_selector({
-                        let id = id.clone();
-                        move || format!("session-agent-logo:{}", id.0)
-                    })
-                    .size(px(16.0))
-                    .flex_none()
-                    .child(self.status_glyph(session, migrating, colors, window, cx)),
-            )
+            let logo = div()
+                .debug_selector({
+                    let id = id.clone();
+                    move || format!("session-agent-logo:{}", id.0)
+                })
+                .size(px(16.0))
+                .flex_none()
+                .child(self.status_glyph(session, migrating, colors, window, cx))
+                .into_any_element();
+            row.child(crate::held_hints::in_slot(
+                logo,
+                16.0,
+                format!("held-hint:session:{}", id.0),
+                shortcut.and_then(crate::held_hints::session_label),
+                held_hint,
+                colors,
+            ))
         });
 
         // A selection fill arrives on ROW_SELECT instead of switching between
@@ -4004,7 +4085,7 @@ impl Sidebar {
                 } else {
                     rendered
                 };
-                children.push((rendered, SIDEBAR_NAV_ROW_HEIGHT));
+                children.push((rendered, SIDEBAR_NAV_ROW_HEIGHT, 1.0));
             }
             bucket = bucket.child(disclosure_body(children, &frame, expanded && interactive));
         }
@@ -4033,7 +4114,6 @@ impl Sidebar {
             .expect("session store lock poisoned")
             .selected_session_id()
             == Some(&id);
-        let dimmed = self.lineage_dims(&id);
         let fill_color = if selected {
             RowFill::Selected.color(colors)
         } else if hovered || focused {
@@ -4058,7 +4138,6 @@ impl Sidebar {
             .gap(px(8.0))
             .rounded(px(SIDEBAR_ROW_RADIUS))
             .bg(fill_color)
-            .when(dimmed, |row| row.opacity(LINEAGE_DIM_OPACITY))
             .border_1()
             .border_color(colors.primary.alpha(0.0))
             .cursor_pointer()
@@ -7664,13 +7743,6 @@ fn reveal_tracked_row(
 }
 
 impl Sidebar {
-    /// Whether a session row sits outside the marked family and fades back.
-    fn lineage_dims(&self, id: &SessionId) -> bool {
-        self.lineage_focus
-            .as_ref()
-            .is_some_and(|focus| focus != id && !self.lineage_roles.contains_key(id))
-    }
-
     /// The session whose direct parent and children are marked. The pointer
     /// wins while it rests on a row. A gap in the session list marks nothing,
     /// so leaving a row cannot fall through to the selected session. The
@@ -7697,6 +7769,7 @@ impl Render for Sidebar {
         self.working_row_rendered = false;
         self.disclosure_animating = false;
         self.observe_titles(cx);
+        self.observe_rows(cx);
         if cx.reduce_motion() {
             self.activity_frame = 0;
         }
@@ -7848,12 +7921,12 @@ impl Render for Sidebar {
                 lineage_marks(&listed, target)
             })
             .unwrap_or_default();
-        self.lineage_focus = lineage_target.filter(|_| !lineage_roles.is_empty());
         self.lineage_roles = lineage_roles;
         retain_live_glyphs(&mut self.glyphs, &projection.display_order);
         self.end_lift_if_released(cx);
         // The session list is the sidebar's most expensive frame work,
         // and settings has no use for it.
+        self.row_motion.begin_layout(self.title_now);
         let list = self.settings_nav.is_none().then(|| {
             let mut list = div()
                 .id("sidebar-list")
@@ -7887,6 +7960,8 @@ impl Render for Sidebar {
             list = list.child(self.empty_space_drop_target(colors, cx));
             list
         });
+        self.row_motion.end_layout();
+        self.disclosure_animating |= self.row_motion.is_animating(self.title_now);
 
         if !self.disclosure_animating {
             self.disclosure_tick = None;
@@ -7955,7 +8030,7 @@ impl Render for Sidebar {
                     cx.notify();
                 }
             }))
-            .child(self.top_bar(colors, cx));
+            .child(self.top_bar(crate::held_hints::opacity(window, cx), colors, cx));
         if let Some(nav) = self.settings_nav.clone() {
             root = root.child(self.settings_body(&nav, colors, cx));
         } else {
@@ -7965,7 +8040,7 @@ impl Render for Sidebar {
                 .min_h(px(0.0))
                 .flex()
                 .flex_col()
-                .child(self.new_agent_row(colors, cx));
+                .child(self.new_agent_row(crate::held_hints::opacity(window, cx), colors, cx));
             if projection.projects.is_empty() && !self.filter_query.text().trim().is_empty() {
                 body = body.child(
                     div()
@@ -8069,20 +8144,22 @@ impl Render for Sidebar {
 }
 
 /// Clip a naturally laid out list; moving the clip never compresses text.
+/// Each row is `(element, height, gap)`: `gap` scales the 2 px above it, so
+/// a row growing in or collapsing out takes its spacing with it.
 fn disclosure_body(
-    rows: Vec<(AnyElement, f32)>,
+    rows: Vec<(AnyElement, f32, f32)>,
     frame: &DisclosureFrame,
     interactive: bool,
 ) -> AnyElement {
-    let height: f32 = rows.iter().map(|(_, height)| height + 2.0).sum();
+    let height: f32 = rows.iter().map(|(_, height, gap)| height + 2.0 * gap).sum();
     let mut contents = div().absolute().top_0().left_0().w_full().flex().flex_col();
-    for (index, (row, height)) in rows.into_iter().enumerate() {
+    for (index, (row, height, gap)) in rows.into_iter().enumerate() {
         let progress = frame.rows.get(index).copied().unwrap_or(frame.reveal);
         contents = contents.child(
             div()
                 .relative()
                 .flex_none()
-                .mt(px(2.0))
+                .mt(px(2.0 * gap))
                 .h(px(height))
                 .top(px(-6.0 * (1.0 - progress)))
                 .opacity(progress)
@@ -9063,9 +9140,6 @@ fn agent_picker_shortcut(
         fallback.to_owned()
     }
 }
-
-/// Opacity of session rows outside the marked family.
-const LINEAGE_DIM_OPACITY: f32 = 0.4;
 
 /// A quiet ↰ on the parent or ↳ on a child of the marked session.
 fn lineage_glyph(id: &SessionId, role: LineageRole, colors: SemanticColors) -> AnyElement {
@@ -11794,15 +11868,11 @@ mod tests {
     }
 
     #[gpui::test]
-    fn hovering_a_session_marks_its_family_and_dims_the_rest(cx: &mut TestAppContext) {
-        let (view, cx) = cx.add_window_view(|_, cx| {
+    fn hovering_a_session_marks_its_family(cx: &mut TestAppContext) {
+        let (_view, cx) = cx.add_window_view(|_, cx| {
             let sidebar = cx.new(|cx| Sidebar::new(None, true, PreviewScenario::Typical, cx));
             SidebarPopoverHarness { sidebar }
         });
-        let sidebar = view.read_with(cx, |harness, _| harness.sidebar.clone());
-        let dims = |sidebar: &Entity<Sidebar>, id: &str, cx: &mut VisualTestContext| {
-            sidebar.read_with(cx, |sidebar, _| sidebar.lineage_dims(&SessionId::new(id)))
-        };
 
         // Typical tree: codex → cursor → spawned-deep.
         let cursor = cx
@@ -11825,26 +11895,14 @@ mod tests {
             cx.debug_bounds("session-lineage-parent:preview-cursor")
                 .is_none()
         );
-        assert!(
-            !dims(&sidebar, "preview-cursor", cx),
-            "the hovered row stays bright"
-        );
-        assert!(!dims(&sidebar, "preview-codex", cx));
-        assert!(!dims(&sidebar, "preview-spawned-deep", cx));
-        assert!(
-            dims(&sidebar, "preview-shell", cx),
-            "an unrelated row fades"
-        );
 
-        // A session with no relatives marks nothing and dims nothing.
+        // A session with no relatives marks nothing.
         let shell = cx.debug_bounds("SESSION_preview-shell").expect("shell row");
         cx.simulate_mouse_move(shell.center(), None, Modifiers::default());
         assert!(
             cx.debug_bounds("session-lineage-parent:preview-codex")
                 .is_none()
         );
-        assert!(!dims(&sidebar, "preview-codex", cx));
-        assert!(!dims(&sidebar, "preview-cursor", cx));
     }
 
     #[gpui::test]

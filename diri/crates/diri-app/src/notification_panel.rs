@@ -2,6 +2,7 @@
 use super::*;
 use crate::notification_feed::{NotificationEntry, NotificationKind};
 use crate::palette_chrome::{PaletteTooltip, keycap, scroll_fades};
+use crate::tooltip_warmth::WarmTooltip;
 use diri_ui::{Fill, HairlineDivider, Icon, IconName};
 use gpui::{ScrollStrategy, uniform_list};
 
@@ -247,7 +248,9 @@ impl RootView {
                         })
                     })
                     .active(move |style| style.bg(colors.primary.alpha(0.14)))
-                    .tooltip(move |_, cx| cx.new(|_| PaletteTooltip(detail.clone(), colors)).into())
+                    .warm_tooltip(move |_, cx| {
+                        cx.new(|_| PaletteTooltip(detail.clone(), colors)).into()
+                    })
                     .on_click(cx.listener(move |this, _, window, cx| {
                         let (session_id, id) = (entry.session_id.clone(), entry.id.clone());
                         this.in_main_window(window, cx, move |this, window, cx| {
@@ -465,7 +468,7 @@ impl RootView {
                             .text_size(px(Typo::META.size))
                             .text_color(colors.secondary)
                             .hover(move |style| style.bg(Fill::hover(colors, true)))
-                            .tooltip(move |_, cx| {
+                            .warm_tooltip(move |_, cx| {
                                 cx.new(|_| {
                                     PaletteTooltip(
                                         "Show unread or all notifications".into(),
@@ -726,7 +729,7 @@ impl RootView {
         let options = div().border_t_1().border_color(colors.floating_stroke()).h(px(44.0)).px(px(16.0))
             .flex().items_center().gap(px(8.0))
             .child(option_button("notification-alerts", if alerts { "Alerts on" } else { "Alerts off" }, colors)
-                .tooltip(move |_, cx| cx.new(|_| PaletteTooltip(health.clone(), colors)).into())
+                .warm_tooltip(move |_, cx| cx.new(|_| PaletteTooltip(health.clone(), colors)).into())
                 .on_click(cx.listener(|this, _, _, cx| { this.window_store.write().expect("store").toggle_notification_alerts(); cx.notify(); })))
             .child(option_button("notification-sounds", if sounds { "Sounds on" } else { "Sounds off" }, colors)
                 .on_click(cx.listener(|this, _, _, cx| {
@@ -781,7 +784,7 @@ fn action_button(
         .items_center()
         .justify_center()
         .hover(move |style| style.bg(Fill::hover(colors, true)))
-        .tooltip(move |_, cx| cx.new(|_| PaletteTooltip(label.into(), colors)).into())
+        .warm_tooltip(move |_, cx| cx.new(|_| PaletteTooltip(label.into(), colors)).into())
         .child(Icon::new(icon, 14.0, colors.secondary))
 }
 

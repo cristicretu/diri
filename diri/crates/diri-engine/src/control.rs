@@ -126,8 +126,9 @@ impl ControlServer {
         // updater can replace the bundle path underneath the live daemon.
         let _ = process_executable_hash();
         let socket_path = socket_path.into();
-        let workspaces =
-            crate::workspace::WorkspaceStore::new(registry.lock().expect("registry").state_file());
+        let workspaces = crate::workspace::WorkspaceStore::with_state_file(
+            registry.lock().expect("registry").state_file_handle(),
+        );
         let logs_dir = socket_path
             .parent()
             .map(|parent| parent.join("logs"))
@@ -517,7 +518,9 @@ impl ControlServer {
                         }
                         let _ = registry.ensure_session_awake(&attach.attach.0);
                         let _ = registry.mark_seen(&attach.attach.0);
-                        let _ = registry.persist();
+                        // Every tab switch attaches: leave the write to the
+                        // flusher instead of fsyncing on the attach path.
+                        registry.persist_deferred();
                         self.publish_updated(&registry, &attach.attach.0);
                     }
                     self.pr_monitor_wake.wake_session(attach.attach.0.clone());
@@ -683,12 +686,7 @@ impl ControlServer {
                         let Some(event) = stream.recv(std::time::Duration::from_millis(250)) else {
                             continue;
                         };
-                        let frame = ControlMessage::Event {
-                            name: event.name,
-                            seq: event.seq,
-                            params: event.params,
-                        };
-                        if write_message(&writer, &frame).is_err() {
+                        if write_event_frame(&writer, &event).is_err() {
                             break; // peer is gone; dropping the stream unsubscribes
                         }
                     }
@@ -724,10 +722,7 @@ impl ControlServer {
         );
 
         let current = |registry: &Registry| -> Option<diri_proto::SessionRecord> {
-            registry
-                .records()
-                .into_iter()
-                .find(|record| record.id.0 == p.session_id.0)
+            registry.record(&p.session_id.0)
         };
         let matches = |record: &diri_proto::SessionRecord| {
             p.until
@@ -1181,9 +1176,7 @@ impl ControlServer {
         let prompt = p.initial_prompt.clone().filter(|prompt| !prompt.is_empty());
         let accept_claude_workspace = kind == diri_proto::AgentKind::CLAUDE_CODE_ID;
         let record = registry
-            .records()
-            .into_iter()
-            .find(|record| record.id.0 == id)
+            .record(&id)
             .ok_or_else(|| ControlError::internal("the new session vanished"))?;
         drop(registry);
 
@@ -1435,9 +1428,7 @@ impl ControlServer {
         let prompt = p.initial_prompt.filter(|prompt| !prompt.is_empty());
         let accept_claude_workspace = kind == diri_proto::AgentKind::CLAUDE_CODE_ID;
         let record = registry
-            .records()
-            .into_iter()
-            .find(|record| record.id.0 == id)
+            .record(&id)
             .ok_or_else(|| ControlError::internal("the new remote session vanished"))?;
         drop(registry);
 
@@ -1553,9 +1544,7 @@ impl ControlServer {
         let record = {
             let registry = self.registry.lock().map_err(poisoned)?;
             registry
-                .records()
-                .into_iter()
-                .find(|record| record.id.0 == id)
+                .record(&id)
                 .ok_or_else(|| ControlError::not_found(id.clone()))?
         };
         if record.account_profile.is_some() {
@@ -1933,9 +1922,7 @@ impl ControlServer {
             let (cwd, source_host) = {
                 let registry = self.registry.lock().map_err(poisoned)?;
                 let record = registry
-                    .records()
-                    .into_iter()
-                    .find(|record| record.id.0 == session_id.0)
+                    .record(&session_id.0)
                     .ok_or_else(|| ControlError::not_found(session_id.0.clone()))?;
                 (record.cwd, record.host)
             };
@@ -2456,7 +2443,9 @@ impl ControlServer {
         registry
             .mark_seen(&p.session_id.0)
             .map_err(io_control_error)?;
-        let _ = registry.persist();
+        // Last-seen is a view hint, not an acknowledged edit: the flusher
+        // writes it within the debounce window, off this request's thread.
+        registry.persist_deferred();
         self.publish_updated(&registry, &p.session_id.0);
         self.pr_monitor_wake.wake_session(p.session_id.0);
         Ok(json!({}))
@@ -2645,9 +2634,7 @@ impl ControlServer {
         let record = {
             let mut registry = self.registry.lock().map_err(poisoned)?;
             let record = registry
-                .records()
-                .into_iter()
-                .find(|record| record.id.0 == p.session_id.0)
+                .record(&p.session_id.0)
                 .ok_or_else(|| ControlError::not_found(p.session_id.0.clone()))?;
             if record.remote_connection.is_some_and(|connection| {
                 connection.state == diri_proto::RemoteConnectionState::Failed
@@ -2704,9 +2691,7 @@ impl ControlServer {
         }
         let mut registry = self.registry.lock().map_err(poisoned)?;
         let record = registry
-            .records()
-            .into_iter()
-            .find(|record| record.id.0 == p.session_id.0)
+            .record(&p.session_id.0)
             .ok_or_else(|| ControlError::not_found(p.session_id.0.clone()))?;
         let exited = matches!(record.status, diri_proto::SessionStatus::Exited(_));
         if registry.get(&p.session_id.0).is_some() {
@@ -2756,9 +2741,7 @@ impl ControlServer {
         let source = {
             let registry = self.registry.lock().map_err(poisoned)?;
             registry
-                .records()
-                .into_iter()
-                .find(|record| record.id == p.session_id)
+                .record(&p.session_id.0)
                 .ok_or_else(|| ControlError::not_found(p.session_id.0.clone()))?
         };
         let kind = source.effective_kind().clone();
@@ -3011,9 +2994,7 @@ impl ControlServer {
         let _ = registry.persist();
         self.publish_updated(&registry, &id);
         let record = registry
-            .records()
-            .into_iter()
-            .find(|record| record.id.0 == id)
+            .record(&id)
             .ok_or_else(|| ControlError::internal("the resumed session vanished"))?;
         drop(registry);
         let accept_claude_workspace = kind == diri_proto::AgentKind::CLAUDE_CODE_ID;
@@ -3512,9 +3493,7 @@ impl ControlServer {
         let (cwd, host_id) = {
             let registry = self.registry.lock().map_err(poisoned)?;
             registry
-                .records()
-                .into_iter()
-                .find(|record| record.id.0 == p.session_id.0)
+                .record(&p.session_id.0)
                 .map(|record| (record.cwd, record.host))
                 .ok_or_else(|| ControlError::not_found(p.session_id.0.clone()))?
         };
@@ -3705,11 +3684,8 @@ impl ControlServer {
 
     /// Publishes `session.updated` with the session's current record.
     fn publish_updated(&self, registry: &Registry, id: &str) {
-        if let Some(record) = registry
-            .records()
-            .into_iter()
-            .find(|record| record.id.0 == id)
-        {
+        // One folded record, not a folded copy of the whole table.
+        if let Some(record) = registry.record(id) {
             self.events
                 .publish_encoded(diri_proto::EventName::SESSION_UPDATED, &record, Some(id));
         }
@@ -4034,6 +4010,28 @@ fn read_bounded_control_line<R: BufRead>(reader: &mut R) -> std::io::Result<Opti
 fn write_message(writer: &Arc<Mutex<UnixStream>>, message: &ControlMessage) -> std::io::Result<()> {
     let mut bytes = serde_json::to_vec(message)?;
     bytes.push(b'\n');
+    let mut stream = writer
+        .lock()
+        .map_err(|_| std::io::Error::other("writer poisoned"))?;
+    stream.write_all(&bytes)?;
+    stream.flush()
+}
+
+/// Writes the same line `ControlMessage::Event` serializes to, around params
+/// the bus encoded once, instead of decoding and re-encoding them for every
+/// subscriber.
+fn write_event_frame(
+    writer: &Arc<Mutex<UnixStream>>,
+    event: &crate::events::Event,
+) -> std::io::Result<()> {
+    let mut bytes = Vec::with_capacity(event.encoded.len() + event.name.len() + 48);
+    bytes.extend_from_slice(b"{\"event\":");
+    serde_json::to_writer(&mut bytes, &event.name)?;
+    bytes.extend_from_slice(b",\"seq\":");
+    bytes.extend_from_slice(event.seq.to_string().as_bytes());
+    bytes.extend_from_slice(b",\"params\":");
+    bytes.extend_from_slice(&event.encoded);
+    bytes.extend_from_slice(b"}\n");
     let mut stream = writer
         .lock()
         .map_err(|_| std::io::Error::other("writer poisoned"))?;
@@ -4532,6 +4530,34 @@ mod tests {
     mod find_capture_tests;
     mod reconnect_tests;
     mod send_key_tests;
+
+    #[test]
+    fn a_shared_event_frame_is_the_line_control_message_writes() {
+        let bus = crate::events::EventBus::new();
+        let stream = bus.subscribe(None, crate::events::Filter::all());
+        let params = json!({ "id": "s_1", "title": "quote \" and \\ and \n 界" });
+        bus.publish("session.\"updated\"", params.clone(), Some("s_1"));
+        let event = stream.try_recv().expect("event");
+
+        let (mut read, write) = UnixStream::pair().unwrap();
+        let writer = Arc::new(Mutex::new(write));
+        write_event_frame(&writer, &event).unwrap();
+        write_message(
+            &writer,
+            &ControlMessage::Event {
+                name: event.name.clone(),
+                seq: event.seq,
+                params,
+            },
+        )
+        .unwrap();
+        drop(writer);
+        let mut output = String::new();
+        std::io::Read::read_to_string(&mut read, &mut output).unwrap();
+        let lines: Vec<&str> = output.lines().collect();
+        assert_eq!(lines.len(), 2);
+        assert_eq!(lines[0], lines[1]);
+    }
 
     #[test]
     fn explicit_launch_argv_is_literal_and_never_silently_repaired() {
@@ -5614,6 +5640,42 @@ mod tests {
             Some(json!({ "sessionID": "s_missing", "text": "hi", "submit": false })),
         ));
         assert_eq!(error.code, "not_found");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn mark_seen_replies_without_writing_and_the_flush_persists_it() {
+        use std::os::unix::fs::MetadataExt;
+        let temp = tempfile::tempdir().expect("temp");
+        let path = temp.path().join("state.json");
+        let registry = Arc::new(Mutex::new(Registry::new(engine(), &path)));
+        registry
+            .lock()
+            .expect("registry")
+            .insert_record(test_record("s_seen"));
+        registry.lock().expect("registry").persist_now().unwrap();
+        let identity = || {
+            let metadata = std::fs::metadata(&path).unwrap();
+            (metadata.ino(), metadata.mtime_nsec())
+        };
+        let before = identity();
+        // Past the debounce window, where a leading-edge persist would write.
+        std::thread::sleep(Duration::from_millis(600));
+        let server = Arc::new(ControlServer::new(
+            Arc::clone(&registry),
+            temp.path().join("daemon.sock"),
+        ));
+
+        ok_of(call(
+            &server,
+            "session.mark_seen",
+            Some(json!({ "sessionID": "s_seen" })),
+        ));
+        assert_eq!(identity(), before, "the request thread must not write");
+
+        registry.lock().expect("registry").flush_dirty().unwrap();
+        let state: JsonValue = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        assert!(state["sessions"][0]["lastSeenAt"].is_number());
     }
 
     #[test]

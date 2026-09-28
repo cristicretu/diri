@@ -586,6 +586,8 @@ impl Motion {
     pub const FOOTER_PIN: Spring = Spring::new(0.32, 0.82);
     pub const ROW_SELECT: f32 = 0.16;
     pub const OVERLAY_FADE: f32 = 0.12;
+    /// The way out of an overlay fade: shorter, because the hand has moved on.
+    pub const OVERLAY_FADE_OUT: f32 = 0.08;
     /// Sidebar and inspector open/close. Longer than the fades above because
     /// the seam moves a whole panel width and pushes the workbench with it.
     pub const SEAM_SLIDE_MS: u64 = 260;

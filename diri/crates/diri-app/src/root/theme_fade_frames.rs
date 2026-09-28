@@ -47,7 +47,7 @@ fn faint(text: &'static str) -> Span {
 
 /// An agent session as it really looks: a prompt, a colored diff, a test run,
 /// and a status line.
-fn transcript() -> GridBuffer {
+pub(super) fn transcript() -> GridBuffer {
     let lines: Vec<Vec<Span>> = vec![
         vec![
             bold("~/work/diri", 4),

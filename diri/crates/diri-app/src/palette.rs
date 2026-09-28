@@ -88,6 +88,7 @@ pub fn actions_for_catalogs(
     let target_default = resolved_target_agent(&default_agent, default_catalog);
     let default_agents = quick_agent_options(default_catalog);
     let mut default_is_listed = false;
+    let mut default_is_terminal = false;
     for agent in default_agents {
         if agent.kind == AgentKind::SHELL {
             continue;
@@ -122,6 +123,7 @@ pub fn actions_for_catalogs(
             target_default.clone()
         };
         if kind.is_terminal() {
+            default_is_terminal = true;
             result.push(default_action(
                 terminal_title.clone(),
                 "terminal",
@@ -142,8 +144,15 @@ pub fn actions_for_catalogs(
             ));
         }
     }
+    // A Terminal default already heads the list as the ⌘T row; a second
+    // ⌥⌘T "New Terminal" beside it would read as a duplicate.
+    if !default_is_terminal {
+        result.push(registered_action_with_title(
+            CommandId::NewTerminal,
+            terminal_title,
+        ));
+    }
     result.extend([
-        registered_action_with_title(CommandId::NewTerminal, terminal_title),
         registered_action(CommandId::ToggleQuickOpen),
         registered_action(CommandId::ToggleOverview),
         registered_action(CommandId::ToggleTabPeek),
@@ -369,8 +378,15 @@ pub fn actions_for_default_host(
         || "New Terminal".to_owned(),
         |host| format!("New Terminal on {}", host.display_name()),
     );
+    // A Terminal default already heads the list as the ⌘T row; a second
+    // ⌥⌘T "New Terminal" beside it would read as a duplicate.
+    if !default_agent.is_terminal() {
+        result.push(registered_action_with_title(
+            CommandId::NewTerminal,
+            terminal_title,
+        ));
+    }
     result.extend([
-        registered_action_with_title(CommandId::NewTerminal, terminal_title),
         registered_action(CommandId::ToggleQuickOpen),
         registered_action(CommandId::ToggleOverview),
         registered_action(CommandId::ToggleTabPeek),

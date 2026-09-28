@@ -28,11 +28,22 @@ continue to take precedence.
 | ⌘Q | Command-Q | Quit Diri (the daemon keeps sessions alive) |
 | ⌘H | Command-H | Hide Diri |
 
+## Seeing shortcuts in place
+
+Hold ⌘ on its own for a moment (700 ms) and the ⌘ shortcuts appear on the
+controls they operate: ⌘1 … ⌘9 on session rows and tabs, ⌘T on New Agent and
+the new-tab button, ⌘B on the sidebar toggle, ⇧⌘D on the inspector toggle, ⇧⌘H
+on search and ⌘W under the selected tab's close button. Release ⌘ and they fade
+out. Pressing any key or clicking while ⌘ is down is treated as a shortcut, so
+the labels never flash during ⌘C or ⌘T. They follow your custom bindings, and a
+command rebound away from ⌘ shows nothing. With Reduce Motion they appear and
+disappear without a fade.
+
 ## Moving between sessions
 
 | Shortcut | Keys | Action |
 | --- | --- | --- |
-| ⌘1 … ⌘8 | Command-1 to Command-8 | Select the nth session, matching the row hints in the sidebar |
+| ⌘1 … ⌘8 | Command-1 to Command-8 | Select the nth session; hold ⌘ to see each row's number |
 | ⌘9 | Command-9 | Select the last session, the browser convention |
 | ⌘[ / ⌘] | Command-bracket | Previous / next session in sidebar order, wrapping |
 | ⌥⌘↑ / ⌥⌘↓ | Option-Command-arrow | Previous / next session |
