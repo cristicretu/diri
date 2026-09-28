@@ -143,7 +143,7 @@ impl TerminalPane {
         }
     }
 
-    #[cfg(test)]
+    #[cfg(all(test, target_os = "macos"))]
     pub(super) fn path_picker_query_for_test(&mut self, query: &str) {
         if let Some(state) = self.path_picker.as_mut() {
             state.picker.query.insert(query);
