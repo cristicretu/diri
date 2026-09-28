@@ -1,5 +1,26 @@
 # diri performance record
 
+## Idle attach pumps (2026-09-28)
+
+Every attached session has one Engine pump thread. Idle, it woke once a
+second, took the Registry lock and looked its Session up again. That tick was
+the only way it learned that a restart had replaced the Session, or that its
+last sink had gone. A 5 s `sample` of the installed Engine found 13 such
+threads, so an idle Engine woke 13 times a second for them, growing with every
+open tab.
+
+A pump now sleeps on its grid wake source alone. Output wakes it as before.
+Dropping a Session notifies its wake source, so a pump whose Session was
+replaced re-seeds immediately instead of within a second. A departing sink
+wakes the pump so it can see whether it was the last one. A 30 s ceiling
+remains as a safety net. While the Session is absent mid-restart, nothing else
+will wake the pump, so that state keeps the 1 s retry.
+
+`an_idle_pump_stops_as_soon_as_its_last_sink_leaves` requires the pump to exit
+within 300 ms of an idle client leaving; with the departure wake removed it
+fails. Idle wakeups fall from one per second per attached session to one per
+30 s. No throughput, latency or protocol change is claimed or intended.
+
 ## Workspace terminal redraw isolation (2026-09-16)
 
 A live sample of installed Diri 0.7.4 reproduced 23–31% app CPU, with
