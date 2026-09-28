@@ -311,7 +311,7 @@ impl<K: Eq + Hash + Clone, R: Clone> RowMotion<K, R> {
         Some(slots)
     }
 
-    #[cfg(test)]
+    #[cfg(all(test, target_os = "macos"))]
     pub fn is_idle_for_test(&self) -> bool {
         self.entries.is_empty()
     }
