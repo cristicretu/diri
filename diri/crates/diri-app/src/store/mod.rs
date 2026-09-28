@@ -2485,7 +2485,11 @@ impl SessionStore {
             options.host = self.default_spawn_host();
         }
         let target_host = options.host.clone();
-        if self.agent_catalog(target_host.as_deref()).is_none() {
+        // A Terminal default needs no readiness facts: a login shell is always
+        // launchable, so ⌘T must not wait on the Agent scan.
+        if !self.prefs.default_agent.is_terminal()
+            && self.agent_catalog(target_host.as_deref()).is_none()
+        {
             let target = target_host
                 .as_deref()
                 .map_or_else(|| "this Mac".to_owned(), |id| self.host_display_name(id));

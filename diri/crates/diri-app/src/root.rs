@@ -1,8 +1,14 @@
 #[cfg(all(test, target_os = "macos"))]
+mod held_hint_frames;
+#[cfg(test)]
+mod held_hint_tests;
+#[cfg(all(test, target_os = "macos"))]
 #[path = "root/peek_profile.rs"]
 mod peek_profile;
 #[cfg(all(test, target_os = "macos"))]
 mod project_agent_tests;
+#[cfg(all(test, target_os = "macos"))]
+mod row_motion_frames;
 #[cfg(all(test, target_os = "macos"))]
 mod theme_fade_frames;
 #[cfg(all(test, target_os = "macos"))]
@@ -18,6 +24,7 @@ mod gesture_acceptance_tests;
 #[cfg(all(test, target_os = "macos"))]
 mod gesture_schedule_profile;
 
+use crate::tooltip_warmth::WarmTooltip;
 use std::collections::HashSet;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -327,6 +334,9 @@ pub struct RootView {
     menu_bar: Option<NativeMenuBar>,
     #[cfg(target_os = "macos")]
     notifier: std::rc::Rc<NativeNotifier>,
+    /// Hold-⌘ shortcut hints for this window; published while it is key.
+    held_hints: crate::held_hints::HeldHints,
+    _held_hint_timer: Option<Task<()>>,
     _subscriptions: Vec<Subscription>,
     _service_events: Task<()>,
     _surface_sync: Option<Task<()>>,
@@ -667,12 +677,7 @@ impl RootView {
                 }
             }
             if matches!(event, SidebarEvent::FocusTerminal) {
-                if let Some(terminal) = this.active_terminal(cx) {
-                    terminal.update(cx, |terminal, cx| terminal.focus(window, cx));
-                    this.sync_auxiliary_terminal(window, cx);
-                } else {
-                    window.focus(&this.focus, cx);
-                }
+                this.focus_active_terminal(window, cx);
             }
             if let SidebarEvent::Update(command) = event {
                 this.services.updates.send(command.clone());
@@ -941,6 +946,8 @@ impl RootView {
 
         let activation = cx.observe_window_activation(window, move |this, window, cx| {
             if !window.is_window_active() {
+                let effect = this.held_hints.deactivated();
+                this.apply_held_hint_effect(effect, window, cx);
                 this.tab_pinch.cancel();
                 if let Some(surfaces) = &this.session_surfaces {
                     surfaces.update(cx, |s, cx| s.cancel_tab_peek_immediately(cx));
@@ -950,6 +957,25 @@ impl RootView {
                 .write()
                 .expect("session store lock poisoned")
                 .set_active(window.is_window_active());
+        });
+        // Every key in this window, before any binding runs: a key while ⌘ is
+        // held is a shortcut, so hold-⌘ hints must stand down for it.
+        let held_hint_root = cx.weak_entity();
+        let held_hint_window = window.window_handle();
+        let held_hint_keys = cx.intercept_keystrokes(move |event, window, cx| {
+            if window.window_handle() != held_hint_window
+                || matches!(
+                    event.keystroke.key.as_str(),
+                    "platform" | "shift" | "control" | "alt" | "function"
+                )
+            {
+                return;
+            }
+            let now = crate::held_hints::now(cx);
+            let _ = held_hint_root.update(cx, |this, cx| {
+                let effect = this.held_hints.key_down(now);
+                this.apply_held_hint_effect(effect, window, cx);
+            });
         });
         let bounds_observer = (!preview).then(|| {
             cx.observe_window_bounds(window, |this, window, cx| {
@@ -1362,7 +1388,10 @@ impl RootView {
             menu_bar,
             #[cfg(target_os = "macos")]
             notifier,
+            held_hints: crate::held_hints::HeldHints::default(),
+            _held_hint_timer: None,
             _subscriptions: std::iter::once(activation)
+                .chain(std::iter::once(held_hint_keys))
                 .chain(bounds_observer)
                 .chain(appearance_observer)
                 .chain(peek_observer)
@@ -2094,15 +2123,21 @@ impl RootView {
             // unavailability is visible and another Agent is one keystroke
             // away, instead of a shortcut that silently does nothing.
             CommandId::NewDefaultSession => {
-                if !self.spawn_default() {
+                if self.spawn_default() {
+                    self.focus_spawned_session(window, cx);
+                } else {
                     self.open_launcher(&OpenLauncher, window, cx);
                 }
             }
             CommandId::NewTerminal => {
-                self.spawn(None);
+                if self.spawn(None) {
+                    self.focus_spawned_session(window, cx);
+                }
             }
             CommandId::NewCodexSession => {
-                if !self.spawn(Some(AgentKind::CODEX)) {
+                if self.spawn(Some(AgentKind::CODEX)) {
+                    self.focus_spawned_session(window, cx);
+                } else {
                     self.open_launcher(&OpenLauncher, window, cx);
                 }
             }
@@ -2342,6 +2377,28 @@ impl RootView {
             }),
         }
         true
+    }
+
+    fn focus_active_terminal(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(terminal) = self.active_terminal(cx) {
+            terminal.update(cx, |terminal, cx| terminal.focus(window, cx));
+            self.sync_auxiliary_terminal(window, cx);
+        } else {
+            window.focus(&self.focus, cx);
+        }
+    }
+
+    /// A session the user just spawned owns the keyboard. The pane also
+    /// refocuses when the spawn reply selects the new id, but until then
+    /// whatever held focus (sidebar, ⌘J pane, inspector) kept swallowing
+    /// keys, and an open launcher kept covering the pane.
+    fn focus_spawned_session(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.launcher.read(cx).is_open() {
+            self.launcher
+                .update(cx, |launcher, cx| launcher.dismiss(cx));
+        }
+        self.focus_active_terminal(window, cx);
+        cx.notify();
     }
 
     fn spawn_default(&self) -> bool {
@@ -2779,10 +2836,42 @@ impl RootView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        let now = crate::held_hints::now(cx);
+        let effect = self.held_hints.modifiers_changed(event.modifiers, now);
+        self.apply_held_hint_effect(effect, window, cx);
         if let Some(surfaces) = &self.session_surfaces {
             surfaces.update(cx, |surfaces, cx| {
                 surfaces.handle_modifiers_changed(event, window, cx);
             });
+        }
+    }
+
+    /// Carries out what the hold-⌘ state machine asked for: start the one-shot
+    /// hold timer, or publish the new visibility to the views that paint hints.
+    fn apply_held_hint_effect(
+        &mut self,
+        effect: crate::held_hints::HintEffect,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        use crate::held_hints::{HOLD_DELAY, HeldHintsState, HintEffect};
+        match effect {
+            HintEffect::None => {}
+            HintEffect::Arm(generation) => {
+                self._held_hint_timer = Some(cx.spawn_in(window, async move |this, cx| {
+                    cx.background_executor().timer(HOLD_DELAY).await;
+                    let _ = crate::floating::update_in_owner(&this, cx, |this, window, cx| {
+                        this._held_hint_timer = None;
+                        let now = crate::held_hints::now(cx);
+                        let effect = this.held_hints.delay_elapsed(generation, now);
+                        this.apply_held_hint_effect(effect, window, cx);
+                    });
+                }));
+            }
+            HintEffect::Repaint => {
+                HeldHintsState::publish(window.window_handle().window_id(), self.held_hints, cx);
+                cx.notify();
+            }
         }
     }
 
@@ -3436,6 +3525,9 @@ impl RootView {
         // `set_header_hidden` below rather than with the slide.
         let hosts_pane_actions =
             tabs_height > 0.0 && self.active_workspace.is_none() && !self.preview;
+        // Sampled here because RootView paints the strip inline; this also
+        // keeps RootView drawing frames while a hint fade is moving.
+        let held_hint = crate::held_hints::opacity(window, cx);
         if self.tabs_seam > 0.0 {
             let sidebar_colors = {
                 let store = self
@@ -3449,10 +3541,11 @@ impl RootView {
                 .flatten()
                 .and_then(|primary| {
                     primary.update(cx, |terminal, cx| {
-                        terminal.render_hosted_header_actions(sidebar_colors, cx)
+                        terminal.render_hosted_header_actions(sidebar_colors, held_hint, cx)
                     })
                 });
             let strip = self.sidebar.update(cx, |sidebar, cx| {
+                sidebar.strip_held_hint = held_hint;
                 sidebar.render_horizontal_tabs(card_width, trailing, cx)
             });
             card = card.child(
@@ -4303,7 +4396,7 @@ impl RootView {
                     .justify_center()
                     .rounded(px(Radius::CHIP))
                     .cursor_pointer()
-                    .tooltip(move |_, cx| {
+                    .warm_tooltip(move |_, cx| {
                         cx.new(|_| crate::palette_chrome::PaletteTooltip("Dismiss".into(), colors))
                             .into()
                     })
@@ -4390,9 +4483,12 @@ impl Render for RootView {
         // Before anything reads a color: this frame's sample of a theme fade.
         crate::app_theme::follow(&self.window_store.read().expect("store"), window, cx);
         // Also while the sidebar and strip are both hidden, so a title that
-        // changed out of sight does not crossfade when they come back.
-        self.sidebar
-            .update(cx, |sidebar, cx| sidebar.observe_titles(cx));
+        // changed out of sight does not crossfade when they come back, and a
+        // session that came or went does not grow in or collapse out.
+        self.sidebar.update(cx, |sidebar, cx| {
+            sidebar.observe_titles(cx);
+            sidebar.observe_rows(cx);
+        });
         let colors = self.colors();
         self.sync_window_material(window);
         let launcher_open = self.launcher.read(cx).is_open();
@@ -4888,6 +4984,12 @@ impl Render for RootView {
                 this.run_command(CommandId::SelectLastSession, window, cx);
             }))
             .on_modifiers_changed(cx.listener(Self::on_modifiers_changed))
+            // ⌘-click is its own gesture; it must not leave hints behind.
+            .capture_any_mouse_down(cx.listener(|this, _, window, cx| {
+                let now = crate::held_hints::now(cx);
+                let effect = this.held_hints.pointer_down(now);
+                this.apply_held_hint_effect(effect, window, cx);
+            }))
             // Fires for every move once the seam drag starts, wherever the
             // pointer wanders -- unlike hover-gated move listeners.
             .on_drag_move(
@@ -5313,6 +5415,29 @@ mod tests {
         cx.update_window(window.into(), |_, window, _| window.remove_window())
             .unwrap();
         cx.run_until_parked();
+    }
+
+    #[gpui::test]
+    fn shortcut_spawn_hands_focus_to_the_active_terminal(cx: &mut gpui::TestAppContext) {
+        let services = test_services();
+        let (root, cx) = cx.add_window_view(move |window, cx| {
+            RootView::new(services, false, PreviewScenario::Empty, window, cx)
+        });
+        cx.simulate_resize(size(px(1_000.0), px(700.0)));
+        cx.run_until_parked();
+
+        root.update_in(cx, |root, window, cx| {
+            root.sidebar
+                .update(cx, |sidebar, cx| sidebar.focus(window, cx));
+            let terminal = root.active_terminal(cx).expect("active terminal");
+            assert!(!terminal.read(cx).is_focused(window));
+
+            root.run_command(CommandId::NewTerminal, window, cx);
+            assert!(
+                terminal.read(cx).is_focused(window),
+                "a new session must own the keyboard without waiting for the spawn reply"
+            );
+        });
     }
 
     #[gpui::test]

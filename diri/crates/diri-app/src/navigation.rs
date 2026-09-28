@@ -2,6 +2,7 @@ mod history_page;
 #[cfg(test)]
 mod page_tests;
 
+use crate::tooltip_warmth::WarmTooltip;
 use std::cmp::Ordering;
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
@@ -1361,7 +1362,7 @@ impl NavigationOverlay {
                                 button
                                     .cursor_pointer()
                                     .hover(move |style| style.bg(Fill::hover(colors, true)))
-                                    .tooltip(move |_, cx| {
+                                    .warm_tooltip(move |_, cx| {
                                         cx.new(|_| PaletteTooltip("Back · ⌘[".into(), colors))
                                             .into()
                                     })
@@ -1409,7 +1410,7 @@ impl NavigationOverlay {
                                 .rounded(px(Radius::CHIP))
                                 .cursor_pointer()
                                 .hover(move |style| style.bg(Fill::hover(colors, true)))
-                                .tooltip(move |_, cx| {
+                                .warm_tooltip(move |_, cx| {
                                     cx.new(|_| PaletteTooltip("Refresh chats".into(), colors))
                                         .into()
                                 })
@@ -1936,7 +1937,7 @@ impl NavigationOverlay {
             true,
             colors,
         )
-        .tooltip(move |_, cx| cx.new(|_| PaletteTooltip(detail.clone(), colors)).into())
+        .warm_tooltip(move |_, cx| cx.new(|_| PaletteTooltip(detail.clone(), colors)).into())
         .when(index == self.highlight, |row| {
             row.child(keycap(colors).child(Icon::new(IconName::Return, 14.0, colors.secondary)))
         })
@@ -2009,7 +2010,7 @@ impl NavigationOverlay {
             true,
             colors,
         )
-        .tooltip(move |_, cx| cx.new(|_| PaletteTooltip(detail.clone(), colors)).into())
+        .warm_tooltip(move |_, cx| cx.new(|_| PaletteTooltip(detail.clone(), colors)).into())
         .when(index == self.highlight, |row| {
             row.child(keycap(colors).child(Icon::new(IconName::Return, 14.0, colors.secondary)))
         })

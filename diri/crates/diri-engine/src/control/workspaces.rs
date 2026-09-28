@@ -156,7 +156,7 @@ mod tests {
             .dispatch(Method::WORKSPACE_MUTATE, Some(params.clone()))
             .unwrap();
         let event = events.recv(Duration::from_millis(10)).unwrap();
-        assert_eq!(event.params["revision"], committed["revision"]);
+        assert_eq!(event.params()["revision"], committed["revision"]);
         assert_eq!(
             server.dispatch(Method::WORKSPACE_SNAPSHOT, None).unwrap(),
             committed

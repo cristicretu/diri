@@ -3,6 +3,7 @@
 //! The daemon remains authoritative: this module only composes
 //! `diri-client::SessionAttachment`, `diri-term`, and the T9 session store.
 
+mod autoscroll;
 mod controller;
 use controller::{AttachmentControl, ControllerLease};
 mod find_input;
@@ -691,6 +692,8 @@ pub struct TerminalPane {
     /// Space in the title bar reserved for workbench-owned controls painted
     /// above this pane, such as the auxiliary terminal's close button.
     header_trailing_inset: f32,
+    /// This frame's hold-⌘ hint opacity, sampled at render.
+    held_hint: f32,
     /// The workbench hosts this pane's title-bar actions elsewhere (the
     /// horizontal tab strip), so the pane paints no title bar of its own and
     /// the grid takes the reclaimed height.
@@ -801,6 +804,8 @@ impl TerminalPane {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
+        cx.observe_global::<crate::held_hints::HeldHintsState>(|_, cx| cx.notify())
+            .detach();
         let focus = cx.focus_handle();
         if matches!(session_source, SessionSource::FollowSelection) {
             window.focus(&focus, cx);
@@ -936,6 +941,7 @@ impl TerminalPane {
             sidebar_visible: true,
             inspector_open: false,
             header_trailing_inset: 0.0,
+            held_hint: 0.0,
             header_hidden: false,
             navigation: None,
             utility_surfaces: None,
@@ -3415,7 +3421,7 @@ impl TerminalPane {
             .when(self.occupies_window_titlebar(), |control| {
                 control.child(div().w(px(Metrics::TOOLBAR_TRAFFIC_LIGHT_LANE)).flex_none())
             })
-            .child(
+            .child(crate::held_hints::below(
                 div()
                     .id("show-sidebar")
                     .debug_selector(|| "show-sidebar".into())
@@ -3447,8 +3453,13 @@ impl TerminalPane {
                         this.focus(window, cx);
                         window.dispatch_action(Box::new(ToggleSidebar), cx);
                         cx.stop_propagation();
-                    })),
-            )
+                    }))
+                    .into_any_element(),
+                "show-sidebar",
+                crate::held_hints::label(crate::commands::CommandId::ToggleSidebar),
+                self.held_hint,
+                colors,
+            ))
             .into_any_element()
     }
 
@@ -3520,8 +3531,8 @@ impl TerminalPane {
                     .gap(px(Metrics::TOOLBAR_ITEM_GAP))
                     .when(shell_controls, |trailing| {
                         trailing
-                            .child(self.render_inspector_toggle(colors, cx))
-                            .child(self.render_notification_button(colors))
+                            .child(self.render_inspector_toggle(colors, self.held_hint, cx))
+                            .child(self.render_notification_button(colors, self.held_hint))
                     }),
             )
             .into_any_element()
@@ -3530,10 +3541,11 @@ impl TerminalPane {
     fn render_inspector_toggle(
         &self,
         colors: SemanticColors,
+        held_hint: f32,
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let inspector_open = self.inspector_open;
-        div()
+        let toggle = div()
             .id("toggle-inspector")
             .debug_selector(|| "toggle-inspector".into())
             .role(gpui::Role::Button)
@@ -3561,10 +3573,17 @@ impl TerminalPane {
                 window.dispatch_action(Box::new(ToggleInspector), cx);
                 cx.stop_propagation();
             }))
-            .into_any_element()
+            .into_any_element();
+        crate::held_hints::below(
+            toggle,
+            "toggle-inspector",
+            crate::held_hints::label(crate::commands::CommandId::ToggleInspector),
+            held_hint,
+            colors,
+        )
     }
 
-    fn render_notification_button(&self, colors: SemanticColors) -> AnyElement {
+    fn render_notification_button(&self, colors: SemanticColors, held_hint: f32) -> AnyElement {
         let unread = self
             .runtime
             .store
@@ -3572,7 +3591,7 @@ impl TerminalPane {
             .expect("session store lock poisoned")
             .notifications()
             .unread_count();
-        div()
+        let button = div()
             .id("notification-inbox-button")
             .debug_selector(|| "notification-inbox-button".into())
             .role(gpui::Role::Button)
@@ -3611,7 +3630,14 @@ impl TerminalPane {
                 window.dispatch_action(Box::new(crate::commands::ToggleNotifications), cx);
                 cx.stop_propagation();
             })
-            .into_any_element()
+            .into_any_element();
+        crate::held_hints::below(
+            button,
+            "notifications",
+            crate::held_hints::label(crate::commands::CommandId::ToggleNotifications),
+            held_hint,
+            colors,
+        )
     }
 
     /// The title-bar actions for a workbench that paints them itself, in the
@@ -3622,6 +3648,7 @@ impl TerminalPane {
     pub fn render_hosted_header_actions(
         &self,
         colors: SemanticColors,
+        held_hint: f32,
         cx: &mut Context<Self>,
     ) -> Option<AnyElement> {
         if !matches!(self.session_source, SessionSource::FollowSelection) {
@@ -3639,8 +3666,8 @@ impl TerminalPane {
                 .when_some(session, |actions, session| {
                     actions.child(self.render_session_links_trigger(&session, colors, cx))
                 })
-                .child(self.render_inspector_toggle(colors, cx))
-                .child(self.render_notification_button(colors))
+                .child(self.render_inspector_toggle(colors, held_hint, cx))
+                .child(self.render_notification_button(colors, held_hint))
                 .into_any_element(),
         )
     }
@@ -4284,6 +4311,7 @@ impl Render for TerminalPane {
         self.sync_status_glyphs(colors, window, cx);
         self.update_selected_geometry(window, cx);
         self.main_viewport = window.viewport_size();
+        self.held_hint = crate::held_hints::opacity(window, cx);
 
         let selected = self.selected_session();
 
@@ -6706,6 +6734,50 @@ mod tests {
                 );
             }
         });
+    }
+
+    /// Holding ⌘ to read the shortcut hints is not terminal input: nothing
+    /// reaches the PTY on press, through the hold, or on release.
+    #[gpui::test]
+    fn holding_command_alone_sends_nothing_to_the_pty(cx: &mut TestAppContext) {
+        let runtime = Arc::new(StoreRuntime::inert());
+        let tokio = Arc::new(
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap(),
+        );
+        let session = fixture_session();
+        let id = session.id.clone();
+        {
+            let mut store = runtime.store.write().unwrap();
+            store.upsert_session(session);
+            store.select(id.clone());
+        }
+        let (pane, cx) =
+            cx.add_window_view(move |window, cx| TerminalPane::new(runtime, tokio, window, cx));
+        let mut input = pane.update_in(cx, |pane, window, cx| {
+            pane.reconcile_store_change(window, cx);
+            let (tx, input) = mpsc::unbounded_channel();
+            let resident = pane.residents.get_mut(&id).unwrap();
+            resident.attachment.claim();
+            resident.attachment.input_observer = Some((id.clone(), tx));
+            pane.focus(window, cx);
+            input
+        });
+        cx.simulate_modifiers_change(Modifiers {
+            platform: true,
+            ..Modifiers::default()
+        });
+        cx.executor()
+            .advance_clock(crate::held_hints::HOLD_DELAY * 2);
+        cx.run_until_parked();
+        cx.simulate_modifiers_change(Modifiers::default());
+        cx.run_until_parked();
+        assert!(input.try_recv().is_err(), "a lone ⌘ reached the PTY");
+        // The channel is live: a real keystroke still arrives.
+        cx.simulate_keystrokes("a");
+        assert_eq!(input.try_recv().unwrap(), (id.clone(), b"a".to_vec()));
     }
 
     #[gpui::test]

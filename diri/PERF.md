@@ -70,6 +70,62 @@ Reproduce from `diri/`:
 ```sh
 cargo run --release -p diri-engine --example statebench -- 40
 cargo test -p diri-engine --lib -- state_file unchanged_persist sections_other_writers older_snapshot mark_seen_replies
+## Engine event delivery (2026-09-28)
+
+A 20-second capture of `dirijor events subscribe` on the installed app (51
+sessions, four agents working) carried 119 events and 10 MB of JSON. 83 of the
+98 `session.updated` events were byte-identical to the previous one for the
+same session: the status watcher, resource sweep, PR monitor and control
+mutations each publish a whole record, and most restate it unchanged. Records
+are large because tracked pull requests carry body, checks and discussion; one
+session with 26 PRs encodes to 272 KB and was republished 27 times.
+
+The App already discarded identical records, but only after decoding them.
+Each publication also cost the Engine a `Value` build, a clone, a re-decode
+into `SessionRecord` for the activity log, one encode for the replay ring, and,
+per subscriber, a deep clone plus a full re-encode, which
+`ControlMessage::serialize` itself preceded by another deep clone.
+
+Changes:
+
+- The bus drops a `session.updated` whose encoded bytes equal the last one
+  published for that session. The comparison is exact (bytes, not a hash); the
+  entry is forgotten on `session.removed`; no other event kind is affected.
+  A suppressed restatement takes no sequence number and no activity append.
+- Params are encoded once, at publish, straight from the typed payload. The
+  ring, every subscriber queue and the control writer share those bytes; the
+  writer splices them into the frame (byte-identical to the old line, pinned
+  by a test).
+- `ControlMessage` serializes field by field, without the intermediate object;
+  this applies to every response too, including `session.list`.
+- Eleven single-session lookups (`publish_updated`, `events.wait`, spawn,
+  resume, …) use `Registry::record(id)` instead of cloning, folding and
+  sorting every record to find one.
+
+`eventbench` replays that capture's publication mix with synthetic text of the
+same sizes through the production `ControlServer` over a socket pair, and the
+client decodes each frame as the App does. Release build, 20 rounds (each round
+= 20 s of live traffic), three runs each, Apple Silicon:
+
+| Per 20 s of live traffic | Before | After |
+| --- | ---: | ---: |
+| Engine CPU | 24.7–26.6 ms | 3.5–3.8 ms |
+| Client decode CPU | 14.8–17.2 ms | 1.2–1.4 ms |
+| Bytes delivered | 3.9–4.3 MB | 0.36 MB |
+
+With `distinct` (every publication a real change, so nothing is suppressed)
+Engine CPU per 20 s fell from 23.2–23.9 ms to 10.3–10.5 ms and client decode is
+unchanged in kind. The bench publishes flat out, far burstier than live
+traffic: both builds sometimes exceeded the 16 MiB subscriber bound and
+delivered an `events.dropped` marker (which makes the App resynchronize), so
+frame counts in those runs differ. At the recorded rate (~0.5 MB/s) neither is
+near the bound. This measures the event path only; the App's own rendering of a
+real change and state persistence are not covered here.
+
+```sh
+cargo build --release -p diri-engine --example eventbench
+target/release/examples/eventbench 20
+target/release/examples/eventbench 20 distinct
 ```
 
 ## Workspace terminal redraw isolation (2026-09-16)
