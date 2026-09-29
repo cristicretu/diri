@@ -5477,6 +5477,122 @@ mod tests {
         cx.run_until_parked();
     }
 
+    /// What drawing one keystroke's echo costs in a whole workspace window:
+    /// the pane is a cached view, so the sidebar and strip should replay.
+    #[cfg(target_os = "macos")]
+    #[test]
+    #[ignore = "headless Metal CPU measurement; run explicitly on macOS"]
+    fn workspace_terminal_echo_redraw_cpu() {
+        use gpui::HeadlessAppContext;
+        let platform = gpui_platform::current_platform(true);
+        let mut cx = HeadlessAppContext::with_platform(
+            platform.text_system(),
+            Arc::new(diri_ui::IconAssets),
+            gpui_platform::current_headless_renderer,
+        );
+        cx.update(|cx| {
+            crate::fonts::init(cx);
+            cx.set_reduce_motion(true);
+        });
+        let (services, workspace) = workspace_cpu_fixture();
+        let window = cx
+            .open_window(size(px(1600.0), px(1000.0)), |window, cx| {
+                cx.new(|cx| {
+                    let root = RootView::new(services, false, PreviewScenario::Empty, window, cx);
+                    root.sidebar.update(cx, |sidebar, cx| {
+                        sidebar.activate_workspace(Some(workspace), cx)
+                    });
+                    root
+                })
+            })
+            .unwrap();
+        cx.run_until_parked();
+        let terminal = cx
+            .update_window(window.into(), |root, _, cx| {
+                let root = root.downcast::<RootView>().unwrap();
+                root.read(cx)
+                    .workspace_workbench
+                    .as_ref()
+                    .unwrap()
+                    .read(cx)
+                    .focused_terminal()
+                    .unwrap()
+            })
+            .unwrap();
+        cx.update(|cx| {
+            terminal.update(cx, |terminal, cx| {
+                let mut grid = diri_term::buffer::GridBuffer::new(160, 50);
+                for (index, cell) in grid.cells.iter_mut().enumerate() {
+                    cell.scalar = u32::from(b'a' + (index % 26) as u8);
+                }
+                terminal.seed_preview_grid_for_test(grid, cx);
+                cx.notify();
+            })
+        });
+        cx.run_until_parked();
+        let present = |cx: &mut HeadlessAppContext| {
+            cx.update_window(window.into(), |_, window, _| window.present_if_needed())
+                .unwrap();
+        };
+        let echo = |cx: &mut HeadlessAppContext, col: u16| {
+            cx.update_window(window.into(), |_, window, cx| {
+                terminal.update(cx, |terminal, cx| {
+                    terminal.land_echo_for_test(col, window, cx)
+                })
+            })
+            .unwrap();
+            cx.run_until_parked();
+        };
+        for col in 0..20 {
+            echo(&mut cx, col);
+            present(&mut cx);
+        }
+        fn cpu_seconds() -> f64 {
+            let mut usage = std::mem::MaybeUninit::<libc::rusage>::uninit();
+            assert_eq!(
+                unsafe { libc::getrusage(libc::RUSAGE_SELF, usage.as_mut_ptr()) },
+                0
+            );
+            let usage = unsafe { usage.assume_init() };
+            usage.ru_utime.tv_sec as f64
+                + usage.ru_utime.tv_usec as f64 / 1e6
+                + usage.ru_stime.tv_sec as f64
+                + usage.ru_stime.tv_usec as f64 / 1e6
+        }
+        const ECHOES: u16 = 300;
+        let before = cx.update(|cx| terminal.read(cx).render_count);
+        let mut draw = Vec::new();
+        let mut submit = Vec::new();
+        let start_cpu = cpu_seconds();
+        for index in 0..ECHOES {
+            let started = Instant::now();
+            echo(&mut cx, index % 150);
+            let drawn = Instant::now();
+            present(&mut cx);
+            draw.push(drawn - started);
+            submit.push(drawn.elapsed());
+        }
+        let cpu = cpu_seconds() - start_cpu;
+        let renders = cx.update(|cx| terminal.read(cx).render_count) - before;
+        draw.sort();
+        submit.sort();
+        let pick = |samples: &[Duration], q: f64| {
+            samples[((samples.len() - 1) as f64 * q).round() as usize].as_secs_f64() * 1000.0
+        };
+        eprintln!(
+            "workspace-echo: echoes={ECHOES} terminal_renders={renders} cpu_ms_per_echo={:.3} \
+             apply+draw p50={:.3}ms p95={:.3}ms metal-submit p50={:.3}ms p95={:.3}ms",
+            cpu * 1000.0 / f64::from(ECHOES),
+            pick(&draw, 0.5),
+            pick(&draw, 0.95),
+            pick(&submit, 0.5),
+            pick(&submit, 0.95),
+        );
+        cx.update_window(window.into(), |_, window, _| window.remove_window())
+            .unwrap();
+        cx.run_until_parked();
+    }
+
     /// Rows reused across activity ticks, no-op store publications and
     /// root-only frames paint exactly what a full re-render paints: after the
     /// ticks, a `window.refresh()` that rebuilds everything at the same mark

@@ -643,6 +643,16 @@ an uncertain asynchronous delivery fails the session transport explicitly.
 Wheel intent is ephemeral; resize retains the latest pending size. This needs
 no new writer thread or wire version and supports existing Helper builds.
 
+On the Helper side, input the Agent has not read yet is bounded to 1 MiB of
+pending PTY bytes (an empty queue accepts any single frame). Past that bound
+the Holder does not refuse the frame: it keeps that controller message and
+every later one in order, stops reading the controller socket, and resumes
+when the PTY has drained enough, so backpressure reaches the Engine's bounded
+queue through SSH. PTY output is read and published throughout. Destructive
+stop uses its own connection and is not delayed. Helper builds before
+2026-09-29 closed the attach with `protocol_error` instead; no wire change is
+involved.
+
 A Holder drains at most 64 KiB per owner-loop turn and yields when two
 milliseconds have elapsed between reads. Input, attach writes, and due grid
 publication are serviced between turns even if PTY output stays readable.

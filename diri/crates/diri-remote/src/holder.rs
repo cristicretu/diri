@@ -1,5 +1,6 @@
 //! One PTY, terminal parser, process tree and controller per Holder process.
 
+use std::collections::VecDeque;
 use std::fs::{self, File};
 use std::io::{self, Read, Write};
 use std::os::fd::AsRawFd;
@@ -34,6 +35,9 @@ const STARTUP_TIMEOUT: Duration = Duration::from_secs(5);
 const DIFF_COALESCE: Duration = Duration::from_millis(8);
 const INTERACTIVE_GRID_BUDGET: u8 = 2;
 const MAX_OUTBOUND_BYTES: usize = 20 << 20;
+/// Input waiting for the program to read it. Past this the Holder stops
+/// reading its controller until the program catches up, so the backpressure
+/// reaches the Engine through SSH instead of costing the attach.
 const MAX_PENDING_INPUT_BYTES: usize = 1 << 20;
 /// How much raw output may accumulate before it is framed for the client.
 const OUTPUT_FRAME_BYTES: usize = 64 << 10;
@@ -579,12 +583,17 @@ impl Holder {
                 let index = descriptors.len();
                 descriptors.push(libc::pollfd {
                     fd: connection.stream.as_raw_fd(),
-                    events: libc::POLLIN
-                        | if connection.outbound.is_empty() {
-                            0
-                        } else {
-                            libc::POLLOUT
-                        },
+                    // Deferred input means the program is behind: leave the
+                    // rest in the socket until it has read what it holds.
+                    events: if connection.deferred.is_empty() {
+                        libc::POLLIN
+                    } else {
+                        0
+                    } | if connection.outbound.is_empty() {
+                        0
+                    } else {
+                        libc::POLLOUT
+                    },
                     revents: 0,
                 });
                 index
@@ -636,6 +645,14 @@ impl Holder {
                 if events & libc::POLLOUT != 0 {
                     self.flush_input()?;
                 }
+            }
+            // The program made room: handle what waited for it, then read on.
+            if self.connection.as_ref().is_some_and(|connection| {
+                connection.deferred.front().is_some_and(|message| {
+                    input_length(message).is_none_or(|length| self.input_has_room(length))
+                })
+            }) {
+                self.read_connection()?;
             }
             if let Some(index) = exit_index
                 && descriptors[index].revents & (libc::POLLIN | libc::POLLHUP | libc::POLLERR) != 0
@@ -857,7 +874,68 @@ impl Holder {
         Ok(())
     }
 
+    /// Whether input of `length` bytes may be queued now. A queue with room
+    /// takes it; an empty queue takes any single frame, so a frame larger than
+    /// the bound can never wait forever.
+    fn input_has_room(&self, length: usize) -> bool {
+        self.pending_input.is_empty()
+            || self.pending_input.len().saturating_add(length) <= MAX_PENDING_INPUT_BYTES
+    }
+
+    /// Handles messages in order until one carries input the queue has no
+    /// room for. That one and everything after it wait in `deferred`, and the
+    /// socket is not read again until they are handled, so ordering is exact
+    /// and nothing the controller sent is ever refused for being early.
+    fn handle_in_order(
+        &mut self,
+        connection: &mut Connection,
+        messages: impl IntoIterator<Item = RemoteMessage>,
+    ) -> Option<io::Error> {
+        for message in messages {
+            if connection.deferred.is_empty()
+                && input_length(&message).is_none_or(|length| self.input_has_room(length))
+            {
+                if let Err(error) = self.handle_message(connection, message) {
+                    return Some(error);
+                }
+            } else {
+                connection.deferred.push_back(message);
+            }
+        }
+        None
+    }
+
+    /// Handles deferred messages the input queue now has room for.
+    fn resume_deferred(&mut self, connection: &mut Connection) -> Option<io::Error> {
+        while let Some(message) = connection.deferred.front() {
+            if input_length(message).is_some_and(|length| !self.input_has_room(length)) {
+                return None;
+            }
+            let message = connection.deferred.pop_front().expect("front");
+            if let Err(error) = self.handle_message(connection, message) {
+                return Some(error);
+            }
+        }
+        None
+    }
+
+    fn fail_connection(&self, connection: &mut Connection, error: &io::Error) {
+        let code = if self.stop.is_some() && error.kind() == io::ErrorKind::NotConnected {
+            "session_stopping"
+        } else {
+            "protocol_error"
+        };
+        connection.send_fatal(code, &error.to_string());
+    }
+
     fn read_messages(&mut self, connection: &mut Connection) -> io::Result<bool> {
+        if let Some(error) = self.resume_deferred(connection) {
+            self.fail_connection(connection, &error);
+            return Ok(true);
+        }
+        if !connection.deferred.is_empty() {
+            return Ok(false);
+        }
         let mut buffer = [0_u8; 64 * 1024];
         let mut closed = false;
         loop {
@@ -875,21 +953,14 @@ impl Holder {
                             break;
                         }
                     };
-                    for message in messages {
-                        if let Err(error) = self.handle_message(connection, message) {
-                            let code = if self.stop.is_some()
-                                && error.kind() == io::ErrorKind::NotConnected
-                            {
-                                "session_stopping"
-                            } else {
-                                "protocol_error"
-                            };
-                            connection.send_fatal(code, &error.to_string());
-                            closed = true;
-                            break;
-                        }
+                    if let Some(error) = self.handle_in_order(connection, messages) {
+                        self.fail_connection(connection, &error);
+                        closed = true;
+                        break;
                     }
-                    if closed {
+                    if !connection.deferred.is_empty() {
+                        // The program is behind on input: stop here and let
+                        // the socket, and SSH behind it, hold the rest.
                         break;
                     }
                 }
@@ -1226,7 +1297,7 @@ impl Holder {
         if bytes.is_empty() {
             return Ok(());
         }
-        if self.pending_input.len().saturating_add(bytes.len()) > MAX_PENDING_INPUT_BYTES {
+        if !self.input_has_room(bytes.len()) {
             return Err(io::Error::new(
                 io::ErrorKind::WouldBlock,
                 "pending input queue is full",
@@ -1592,6 +1663,9 @@ struct Connection {
     epoch: Option<u64>,
     outbound: Vec<u8>,
     sent: usize,
+    /// Messages received but not yet handled because the program has not
+    /// read earlier input. Bounded: nothing more is read while any wait.
+    deferred: VecDeque<RemoteMessage>,
 }
 
 impl Connection {
@@ -1607,6 +1681,7 @@ impl Connection {
             epoch: None,
             outbound: Vec::with_capacity(64 * 1024),
             sent: 0,
+            deferred: VecDeque::new(),
         }
     }
 
@@ -1749,6 +1824,20 @@ impl Connection {
     }
 }
 
+/// How many bytes of input `message` may put on the PTY queue, if any.
+fn input_length(message: &RemoteMessage) -> Option<usize> {
+    match message {
+        RemoteMessage::Terminal(frame)
+            if matches!(frame.frame_type, FrameType::Input | FrameType::Mouse) =>
+        {
+            Some(frame.payload.len())
+        }
+        // A wheel becomes a few bytes of arrow keys or mouse reports.
+        RemoteMessage::Terminal(frame) if frame.frame_type == FrameType::Scroll => Some(64),
+        _ => None,
+    }
+}
+
 #[derive(Default)]
 struct PendingBytes {
     bytes: Vec<u8>,
@@ -1759,6 +1848,11 @@ impl PendingBytes {
     fn push(&mut self, bytes: &[u8]) {
         if self.consumed == self.bytes.len() {
             self.bytes.clear();
+            self.consumed = 0;
+        } else if self.consumed >= self.bytes.len() / 2 {
+            // A queue that never quite empties must not grow by its consumed
+            // prefix forever.
+            self.bytes.drain(..self.consumed);
             self.consumed = 0;
         }
         self.bytes.extend_from_slice(bytes);

@@ -351,6 +351,9 @@ struct Shared {
     prompt_input: Mutex<PromptInputState>,
     log: Mutex<OutputLog>,
     screen: Mutex<HeadlessScreen>,
+    /// The newest size the PTY was given whose emulator reflow has not run
+    /// yet. See [`MirrorResize`].
+    requested_size: Mutex<Option<(u16, u16)>>,
     reducer: Mutex<StatusReducer>,
     /// How the child ended, once known (from `wait` or the exit marker).
     exit: Mutex<Option<Exit>>,
@@ -636,6 +639,7 @@ pub(crate) struct AttachmentSeed {
 }
 
 /// Who owns the PTY.
+#[derive(Clone)]
 enum Transport {
     /// This process does; dropping the session kills the child.
     Direct(Arc<Mutex<Pty>>),
@@ -648,12 +652,70 @@ enum Transport {
 }
 
 pub struct Session {
+    core: SessionCore,
+    pump: Option<JoinHandle<()>>,
+}
+
+/// Everything a Session is except the thread that pumps its output, cheap to
+/// clone. Input goes through a clone taken under the Registry lock and used
+/// after releasing it, so a program slow to take a paste delays only its own
+/// session. Per-session order is kept by the transport's own input lock, and
+/// every check `write_input` makes (exit, hibernation, keyboard modes, the
+/// remote controller lease) reads live shared state, so a clone decides
+/// exactly as the Session would. Dropping a clone ends nothing: the child's
+/// fate stays with [`Session`]'s drop.
+#[derive(Clone)]
+pub struct SessionCore {
     shared: Arc<Shared>,
     transport: Transport,
-    pump: Option<JoinHandle<()>>,
-    manifest_id: String,
+    manifest_id: Arc<str>,
     /// Present while the exec is deferred to the first settled client size.
     deferred: Option<Arc<DeferredLaunch>>,
+}
+
+impl std::ops::Deref for Session {
+    type Target = SessionCore;
+
+    fn deref(&self) -> &SessionCore {
+        &self.core
+    }
+}
+
+impl Session {
+    /// A handle for input and other live-state calls that outlives the
+    /// Registry lock it was taken under.
+    #[must_use]
+    pub fn core(&self) -> SessionCore {
+        self.core.clone()
+    }
+}
+
+/// An emulator reflow owed after [`Session::resize_pty`]. Applying it reflows
+/// to the newest size the PTY was given, not necessarily the one that
+/// created it: two resizes racing to the screen lock still leave the mirror
+/// at the PTY's size, and a reflow that finds a newer one already applied
+/// does nothing, so a burst of drag steps reflows once per lock turn rather
+/// than once per step.
+pub(crate) struct MirrorResize {
+    shared: Arc<Shared>,
+}
+
+impl MirrorResize {
+    pub(crate) fn apply(self) {
+        let mut screen = self.shared.screen.lock().expect("screen");
+        let Some((cols, rows)) = self
+            .shared
+            .requested_size
+            .lock()
+            .expect("requested size")
+            .take()
+        else {
+            return;
+        };
+        screen.resize(cols as usize, rows as usize);
+        drop(screen);
+        self.shared.grid_wake.notify();
+    }
 }
 
 /// A history read pinned to this Session's state and remote incarnation.
@@ -1388,11 +1450,13 @@ impl Session {
         };
 
         let session = Self {
-            shared,
-            transport: Transport::Remote(client),
+            core: SessionCore {
+                shared,
+                transport: Transport::Remote(client),
+                manifest_id: spec.manifest_id.into(),
+                deferred: None,
+            },
             pump: Some(pump),
-            manifest_id: spec.manifest_id,
-            deferred: None,
         };
         cleanup.disarm();
         Ok(session)
@@ -1423,7 +1487,7 @@ impl Session {
         engine: Arc<ManifestEngine>,
         inspected: diri_proto::remote_pty::RemoteProcessState,
     ) -> std::io::Result<(bool, bool)> {
-        let Transport::Remote(client) = &self.transport else {
+        let Transport::Remote(client) = &self.core.transport else {
             return Err(std::io::Error::other("session has no remote transport"));
         };
         if self.shared.exited.load(Ordering::SeqCst) {
@@ -1467,7 +1531,7 @@ impl Session {
                     mark_remote_transport_failed(&shared);
                     return;
                 }
-                pump_remote(shared, engine, client, manifest_id);
+                pump_remote(shared, engine, client, manifest_id.to_string());
             });
         match worker {
             Ok(worker) => {
@@ -1548,11 +1612,13 @@ impl Session {
                 .spawn(move || pump_remote(shared, engine, client, manifest_id))?
         };
         Ok(Self {
-            shared,
-            transport: Transport::Remote(client),
+            core: SessionCore {
+                shared,
+                transport: Transport::Remote(client),
+                manifest_id: spec.manifest_id.into(),
+                deferred: None,
+            },
             pump: Some(pump),
-            manifest_id: spec.manifest_id,
-            deferred: None,
         })
     }
 
@@ -1576,11 +1642,13 @@ impl Session {
         };
 
         Ok(Self {
-            shared,
-            transport: Transport::Direct(pty),
+            core: SessionCore {
+                shared,
+                transport: Transport::Direct(pty),
+                manifest_id: spec.manifest_id.into(),
+                deferred: None,
+            },
             pump: Some(pump),
-            manifest_id: spec.manifest_id,
-            deferred: None,
         })
     }
 
@@ -1747,11 +1815,13 @@ impl Session {
         };
 
         Ok(Self {
-            shared,
-            transport: Transport::Held(client),
+            core: SessionCore {
+                shared,
+                transport: Transport::Held(client),
+                manifest_id: spec.manifest_id.into(),
+                deferred: Some(deferred),
+            },
             pump: Some(pump),
-            manifest_id: spec.manifest_id,
-            deferred: Some(deferred),
         })
     }
 
@@ -1851,14 +1921,18 @@ impl Session {
         };
 
         Ok(Self {
-            shared,
-            transport: Transport::Held(client),
+            core: SessionCore {
+                shared,
+                transport: Transport::Held(client),
+                manifest_id: spec.manifest_id.into(),
+                deferred: None,
+            },
             pump: Some(pump),
-            manifest_id: spec.manifest_id,
-            deferred: None,
         })
     }
+}
 
+impl SessionCore {
     pub(crate) fn remote_stop(&self) -> Option<RemoteStop> {
         match &self.transport {
             Transport::Remote(client) => Some(RemoteStop {
@@ -2542,7 +2616,7 @@ impl Session {
             ));
         }
         // Text answering a password prompt must not become the session's name.
-        if self.manifest_id != "shell" && !self.refresh_secret_input() {
+        if &*self.manifest_id != "shell" && !self.refresh_secret_input() {
             self.capture_prompt_title(text);
         }
         let framed = if self.bracketed_paste() {
@@ -2645,7 +2719,7 @@ impl Session {
     }
 
     fn observe_prompt_input(&self, bytes: &[u8]) {
-        if self.manifest_id == "shell"
+        if &*self.manifest_id == "shell"
             || self
                 .shared
                 .prompt_title
@@ -2695,7 +2769,7 @@ impl Session {
     }
 
     fn capture_prompt_title(&self, prompt: &str) {
-        if self.manifest_id == "shell" {
+        if &*self.manifest_id == "shell" {
             return;
         }
         let title = crate::hooks::title_from_prompt(prompt);
@@ -2710,6 +2784,77 @@ impl Session {
         }
     }
 
+    /// How many local resets this Session has applied; tests and callers
+    /// observing the boundary use it, clients see it through a full grid.
+    pub fn reset_generation(&self) -> u64 {
+        self.shared.reset_generation.load(Ordering::SeqCst)
+    }
+
+    pub fn resize(&self, cols: u16, rows: u16) -> std::io::Result<()> {
+        if let Some(reflow) = self.resize_pty(cols, rows)? {
+            reflow.apply();
+        }
+        Ok(())
+    }
+
+    /// Resizes the PTY now and returns the emulator reflow still owed, for
+    /// the caller to run after releasing the Registry lock. The PTY half is
+    /// a syscall or one Holder stream write; the reflow re-wraps up to
+    /// 10,000 history rows and took 8–43 ms per drag step, during which the
+    /// Registry lock used to stall every other session's input.
+    pub(crate) fn resize_pty(&self, cols: u16, rows: u16) -> std::io::Result<Option<MirrorResize>> {
+        // Before the deferred exec, the FIRST client size decides the launch
+        // geometry — record it and push the exec back so the viewport can
+        // settle; the emulator is resized at launch, not per proposal.
+        if let Some(deferred) = &self.deferred
+            && deferred.propose_size(cols, rows)
+        {
+            return Ok(None);
+        }
+        match &self.transport {
+            Transport::Direct(pty) => pty.lock().expect("pty").resize(cols, rows)?,
+            Transport::Held(client) => client.resize(cols, rows).map_err(holder_io_error)?,
+            Transport::Remote(client) => client.resize(cols, rows)?,
+        }
+        // Recorded in PTY order: callers resize the PTY under the Registry
+        // lock, so the newest record is always the PTY's current size.
+        *self.shared.requested_size.lock().expect("requested size") = Some((cols, rows));
+        Ok(Some(MirrorResize {
+            shared: Arc::clone(&self.shared),
+        }))
+    }
+
+    /// Feeds an out-of-band signal — a hook callback, a notify — into the
+    /// reducer.
+    pub fn feed_signal(&self, signal: StatusSignal) -> ReducerOutcome {
+        self.feed_identified_signal(signal, Default::default())
+    }
+
+    pub fn feed_identified_signal(
+        &self,
+        signal: StatusSignal,
+        identity: crate::attention::SignalIdentity,
+    ) -> ReducerOutcome {
+        let outcome = self
+            .shared
+            .reducer
+            .lock()
+            .expect("reducer")
+            .reduce_identified(signal, identity, SystemTime::now());
+        apply(&self.shared, &outcome);
+        outcome
+    }
+
+    pub fn claude_hook(&self, hook: ClaudeHook, is_subagent: bool) -> ReducerOutcome {
+        self.feed_signal(StatusSignal::ClaudeHook {
+            hook,
+            is_subagent,
+            pending_work: None,
+        })
+    }
+}
+
+impl Session {
     /// Resets the emulator without touching the child: the PTY, process and
     /// session identity stay, the screen, history, modes and title go. Remote
     /// sessions ask their Holder; held local sessions queue the reset for
@@ -2743,64 +2888,6 @@ impl Session {
                 "direct PTY sessions do not support an emulator reset",
             )),
         }
-    }
-
-    /// How many local resets this Session has applied; tests and callers
-    /// observing the boundary use it, clients see it through a full grid.
-    pub fn reset_generation(&self) -> u64 {
-        self.shared.reset_generation.load(Ordering::SeqCst)
-    }
-
-    pub fn resize(&self, cols: u16, rows: u16) -> std::io::Result<()> {
-        // Before the deferred exec, the FIRST client size decides the launch
-        // geometry — record it and push the exec back so the viewport can
-        // settle; the emulator is resized at launch, not per proposal.
-        if let Some(deferred) = &self.deferred
-            && deferred.propose_size(cols, rows)
-        {
-            return Ok(());
-        }
-        match &self.transport {
-            Transport::Direct(pty) => pty.lock().expect("pty").resize(cols, rows)?,
-            Transport::Held(client) => client.resize(cols, rows).map_err(holder_io_error)?,
-            Transport::Remote(client) => client.resize(cols, rows)?,
-        }
-        self.shared
-            .screen
-            .lock()
-            .expect("screen")
-            .resize(cols as usize, rows as usize);
-        self.shared.grid_wake.notify();
-        Ok(())
-    }
-
-    /// Feeds an out-of-band signal — a hook callback, a notify — into the
-    /// reducer.
-    pub fn feed_signal(&self, signal: StatusSignal) -> ReducerOutcome {
-        self.feed_identified_signal(signal, Default::default())
-    }
-
-    pub fn feed_identified_signal(
-        &self,
-        signal: StatusSignal,
-        identity: crate::attention::SignalIdentity,
-    ) -> ReducerOutcome {
-        let outcome = self
-            .shared
-            .reducer
-            .lock()
-            .expect("reducer")
-            .reduce_identified(signal, identity, SystemTime::now());
-        apply(&self.shared, &outcome);
-        outcome
-    }
-
-    pub fn claude_hook(&self, hook: ClaudeHook, is_subagent: bool) -> ReducerOutcome {
-        self.feed_signal(StatusSignal::ClaudeHook {
-            hook,
-            is_subagent,
-            pending_work: None,
-        })
     }
 
     /// Ends the session, killing the child's whole tree.
@@ -2968,6 +3055,7 @@ fn new_shared(
             HeadlessScreen::new(spec.pty.cols as usize, spec.pty.rows as usize)
                 .with_notifications(),
         ),
+        requested_size: Mutex::new(None),
         reducer: Mutex::new(reducer),
         exit: Mutex::new(None),
         exited: AtomicBool::new(false),
@@ -3022,7 +3110,12 @@ fn wait_for_holder(
 }
 
 fn holder_io_error(error: crate::holder::HolderError) -> std::io::Error {
-    std::io::Error::other(error.to_string())
+    let kind = match error {
+        // Refused whole: the caller may retry once the program reads.
+        crate::holder::HolderError::InputQueueFull => std::io::ErrorKind::WouldBlock,
+        _ => std::io::ErrorKind::Other,
+    };
+    std::io::Error::new(kind, error.to_string())
 }
 
 /// Replaces control characters other than `\n`, `\r` and `\t` with a space,
@@ -5441,6 +5534,83 @@ mod held_foreground_tests {
 }
 
 #[cfg(test)]
+mod resize_tests {
+    use super::*;
+
+    fn session(temp: &Path) -> Session {
+        let (engine, _) = ManifestEngine::load_dir(&crate::detect::bundled_manifest_dir()).unwrap();
+        let spec = SessionSpec {
+            id: "resize".into(),
+            pty: PtySpec::new(
+                vec!["/bin/sh".into(), "-c".into(), "exec cat".into()],
+                "/tmp",
+            )
+            .env("PATH", "/usr/bin:/bin")
+            .size(80, 24),
+            manifest_id: "shell".into(),
+            authority: Authority::ProcessOnly,
+            logs_dir: temp.to_path_buf(),
+            holder: None,
+            remote: None,
+            defer_launch: false,
+        };
+        Session::spawn(spec, Arc::new(engine)).expect("spawn")
+    }
+
+    #[test]
+    fn the_pty_half_of_a_resize_never_waits_for_the_emulator() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut session = session(temp.path());
+        // A long reflow in progress: the screen lock is held elsewhere.
+        let screen = Arc::clone(&session.shared);
+        let (held_tx, held_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        let holder = std::thread::spawn(move || {
+            let _screen = screen.screen.lock().unwrap();
+            held_tx.send(()).unwrap();
+            let _ = release_rx.recv();
+        });
+        held_rx.recv().unwrap();
+        // Callers hold the Registry lock across this half; it must not block
+        // on the screen, or one terminal's reflow stalls every session.
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        std::thread::scope(|scope| {
+            scope.spawn(|| {
+                let reflow = session.resize_pty(100, 30).expect("resize");
+                done_tx.send(reflow.is_some()).unwrap();
+            });
+            let owed = done_rx
+                .recv_timeout(Duration::from_secs(5))
+                .expect("resize_pty waited for the emulator");
+            assert!(owed, "a live session owes its emulator the reflow");
+            release_tx.send(()).unwrap();
+        });
+        holder.join().unwrap();
+        assert_eq!(session.screen_size(), (80, 24), "not reflowed yet");
+        let _ = session.terminate(Duration::from_secs(2));
+    }
+
+    #[test]
+    fn an_owed_reflow_applies_the_newest_pty_size_once() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut session = session(temp.path());
+        let first = session.resize_pty(100, 30).unwrap().expect("owed");
+        let second = session.resize_pty(120, 40).unwrap().expect("owed");
+        // The older reflow wins the lock race but must not leave the
+        // emulator at a size the PTY no longer has.
+        first.apply();
+        assert_eq!(session.screen_size(), (120, 40));
+        // The newer one finds nothing left to do.
+        session.shared.screen.lock().unwrap().resize(90, 20);
+        second.apply();
+        assert_eq!(session.screen_size(), (90, 20), "a spent reflow is a no-op");
+        session.resize(132, 42).unwrap();
+        assert_eq!(session.screen_size(), (132, 42));
+        let _ = session.terminate(Duration::from_secs(2));
+    }
+}
+
+#[cfg(test)]
 mod prompt_title_tests {
     use super::*;
 
@@ -5472,16 +5642,18 @@ mod prompt_title_tests {
             // Keep the real Session input/reducer path, but hold input in the
             // pre-launch queue so a PTY pump cannot race our status timeline.
             let session = Session {
-                shared: new_shared(
-                    &spec,
-                    OutputLog::writer(temp.path(), &spec.id).unwrap(),
-                    &engine,
-                    true,
-                ),
-                transport: Transport::Held(HolderClient::new(temp.path().join("unused.sock"))),
+                core: SessionCore {
+                    shared: new_shared(
+                        &spec,
+                        OutputLog::writer(temp.path(), &spec.id).unwrap(),
+                        &engine,
+                        true,
+                    ),
+                    transport: Transport::Held(HolderClient::new(temp.path().join("unused.sock"))),
+                    manifest_id: spec.manifest_id.clone().into(),
+                    deferred: Some(Arc::new(DeferredLaunch::new())),
+                },
                 pump: None,
-                manifest_id: spec.manifest_id.clone(),
-                deferred: Some(Arc::new(DeferredLaunch::new())),
             };
             *session.shared.status.lock().unwrap() = initial.clone();
             for byte in b"Fix chat naming" {
@@ -5837,16 +6009,18 @@ mod preview_tests {
             defer_launch: true,
         };
         let session = Session {
-            shared: new_shared(
-                &spec,
-                OutputLog::writer(temp.path(), &spec.id).unwrap(),
-                &engine,
-                true,
-            ),
-            transport: Transport::Held(HolderClient::new(temp.path().join("unused.sock"))),
+            core: SessionCore {
+                shared: new_shared(
+                    &spec,
+                    OutputLog::writer(temp.path(), &spec.id).unwrap(),
+                    &engine,
+                    true,
+                ),
+                transport: Transport::Held(HolderClient::new(temp.path().join("unused.sock"))),
+                manifest_id: spec.manifest_id.clone().into(),
+                deferred: Some(Arc::new(DeferredLaunch::new())),
+            },
             pump: None,
-            manifest_id: spec.manifest_id.clone(),
-            deferred: Some(Arc::new(DeferredLaunch::new())),
         };
         session.shared.keyboard_known.store(false, Ordering::SeqCst);
         assert_eq!(session.keyboard_state(), None);
@@ -5936,16 +6110,18 @@ mod preview_tests {
             defer_launch: true,
         };
         let session = Session {
-            shared: new_shared(
-                &spec,
-                OutputLog::writer(temp.path(), &spec.id).unwrap(),
-                &engine,
-                true,
-            ),
-            transport: Transport::Held(HolderClient::new(temp.path().join("unused.sock"))),
+            core: SessionCore {
+                shared: new_shared(
+                    &spec,
+                    OutputLog::writer(temp.path(), &spec.id).unwrap(),
+                    &engine,
+                    true,
+                ),
+                transport: Transport::Held(HolderClient::new(temp.path().join("unused.sock"))),
+                manifest_id: spec.manifest_id.clone().into(),
+                deferred: Some(Arc::new(DeferredLaunch::new())),
+            },
             pump: None,
-            manifest_id: spec.manifest_id.clone(),
-            deferred: Some(Arc::new(DeferredLaunch::new())),
         };
         session.shared.last_hot.store(0, Ordering::Relaxed);
         session.shared.screen.lock().unwrap().feed(b"last received");

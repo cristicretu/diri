@@ -517,6 +517,19 @@ struct CachedRow {
 }
 
 impl CachedRow {
+    fn translate(&mut self, delta: Point<Pixels>) {
+        for quad in self
+            .background_quads
+            .iter_mut()
+            .chain(self.decoration_quads.iter_mut())
+        {
+            quad.bounds.origin += delta;
+        }
+        for shape in &mut self.sprite_shapes {
+            shape.translate(delta);
+        }
+    }
+
     /// Whether the row moved. Sprites are laid out on whole device pixels, so
     /// a row holding any moves only by a whole number of them.
     fn move_vertically(&mut self, dy: Pixels, grid: SpriteGrid) -> bool {
@@ -577,6 +590,24 @@ struct RowRenderContext {
     scale_bits: u32,
     visible_cols: usize,
     visible_rows: usize,
+}
+
+impl RowRenderContext {
+    /// How far the grid moved, when moving it is the only difference.
+    fn moved_to(self, next: &Self) -> Option<Point<Pixels>> {
+        let origin = |context: &Self| {
+            point(
+                px(f32::from_bits(context.origin_x_bits)),
+                px(f32::from_bits(context.origin_y_bits)),
+            )
+        };
+        let unmoved = Self {
+            origin_x_bits: next.origin_x_bits,
+            origin_y_bits: next.origin_y_bits,
+            ..self
+        };
+        (unmoved == *next && self != *next).then(|| origin(next) - origin(&self))
+    }
 }
 
 pub struct TerminalPrepaintState {
@@ -2124,13 +2155,25 @@ impl Element for TerminalElement {
                 visible_rows,
             };
             let mut remembered_context = mutex_lock(&self.shared.render_context);
-            let mut force = remembered_context.as_ref() != Some(&context);
+            // A seam or divider sliding past the terminal only moves it:
+            // shapes are position-independent, so the cached rows are
+            // translated instead of prepared again, as long as the move keeps
+            // device-pixel snapping exact.
+            let moved = remembered_context
+                .and_then(|previous| previous.moved_to(&context))
+                .filter(|delta| grid.keeps_snapping(delta.x) && grid.keeps_snapping(delta.y));
+            let mut force = remembered_context.as_ref() != Some(&context) && moved.is_none();
             *remembered_context = Some(context);
             drop(remembered_context);
             {
-                let cache = mutex_lock(&self.shared.row_cache);
+                let mut cache = mutex_lock(&self.shared.row_cache);
                 force |= cache.len() < visible_rows
                     || cache.iter().take(visible_rows).any(Option::is_none);
+                if let Some(delta) = moved.filter(|_| !force) {
+                    for row in cache.iter_mut().flatten() {
+                        row.translate(delta);
+                    }
+                }
             }
             let damage = {
                 let buffer = read_lock(&self.buffer);

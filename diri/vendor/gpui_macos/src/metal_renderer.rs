@@ -233,6 +233,37 @@ pub(crate) struct MetalRenderer {
     headless_render_target: Option<metal::Texture>,
 }
 
+/// Reports GPU completion when Metal calls back. Must precede the commit;
+/// only reached with a latency observer installed.
+fn observe_gpu_completion(command_buffer: &metal::CommandBufferRef, observer: gpui::FrameObserver) {
+    let block = ConcreteBlock::new(move |_: &metal::CommandBufferRef| {
+        observer(gpui::FrameStage::GpuCompleted, std::time::Instant::now());
+    });
+    command_buffer.add_completed_handler(&block.copy());
+}
+
+/// Reports when the compositor put `drawable` on screen, converted from
+/// Core Animation's host clock to an `Instant`. A drawable that was never
+/// shown reports a zero presented time and is skipped.
+fn observe_presented(drawable: &metal::MetalDrawableRef, observer: gpui::FrameObserver) {
+    unsafe extern "C" {
+        fn CACurrentMediaTime() -> f64;
+    }
+    let block = ConcreteBlock::new(move |drawable: &metal::DrawableRef| {
+        let presented = drawable.presented_time();
+        if presented <= 0.0 {
+            return;
+        }
+        let now = std::time::Instant::now();
+        let ago = (unsafe { CACurrentMediaTime() } - presented).max(0.0);
+        let at = now
+            .checked_sub(std::time::Duration::from_secs_f64(ago))
+            .unwrap_or(now);
+        observer(gpui::FrameStage::Presented, at);
+    });
+    drawable.add_presented_handler(&block.copy());
+}
+
 #[repr(C)]
 pub struct PathRasterizationVertex {
     pub xy_position: Point<ScaledPixels>,
@@ -634,6 +665,11 @@ impl MetalRenderer {
                     let block = block.copy();
                     command_buffer.add_completed_handler(&block);
 
+                    let observer = gpui::frame_observer();
+                    if let Some(observer) = observer {
+                        observe_gpu_completion(&command_buffer, observer);
+                        observe_presented(drawable, observer);
+                    }
                     if self.presents_with_transaction {
                         command_buffer.commit();
                         command_buffer.wait_until_scheduled();
@@ -641,6 +677,9 @@ impl MetalRenderer {
                     } else {
                         command_buffer.present_drawable(drawable);
                         command_buffer.commit();
+                    }
+                    if let Some(observer) = observer {
+                        observer(gpui::FrameStage::Committed, std::time::Instant::now());
                     }
                     return;
                 }
@@ -934,7 +973,14 @@ impl MetalRenderer {
 
                     // Commit without waiting, mirroring presentation to a real
                     // window where the CPU doesn't block on the GPU.
+                    let observer = gpui::frame_observer();
+                    if let Some(observer) = observer {
+                        observe_gpu_completion(&command_buffer, observer);
+                    }
                     command_buffer.commit();
+                    if let Some(observer) = observer {
+                        observer(gpui::FrameStage::Committed, std::time::Instant::now());
+                    }
                     return Ok(());
                 }
                 Err(err) => {

@@ -2069,8 +2069,13 @@ impl ControlServer {
         let p: diri_proto::DeliverMessageParams = decode(params)?;
         // Reuse the existing input serialization. No new terminal owner, queue,
         // or lock is introduced. Receipt writes precede all PTY effects.
-        let mut registry = self.registry.lock().map_err(poisoned)?;
-        if registry.get(&p.session_id.0).is_none() {
+        if self
+            .registry
+            .lock()
+            .map_err(poisoned)?
+            .get(&p.session_id.0)
+            .is_none()
+        {
             return Err(ControlError::not_found(p.session_id.0.clone()));
         }
         let receipt = message_delivery::deliver(
@@ -2079,13 +2084,19 @@ impl ControlServer {
                 .with_file_name("message-receipts-v1.sqlite"),
             &p,
             || {
-                registry
-                    .wake_session(&p.session_id.0)
-                    .map_err(io_control_error)?;
-                self.publish_updated(&registry, &p.session_id.0);
-                registry
-                    .get(&p.session_id.0)
-                    .ok_or_else(|| ControlError::not_found(p.session_id.0.clone()))?
+                let session = {
+                    let mut registry = self.registry.lock().map_err(poisoned)?;
+                    registry
+                        .wake_session(&p.session_id.0)
+                        .map_err(io_control_error)?;
+                    self.publish_updated(&registry, &p.session_id.0);
+                    registry
+                        .get(&p.session_id.0)
+                        .ok_or_else(|| ControlError::not_found(p.session_id.0.clone()))?
+                        .core()
+                };
+                // Written outside the Registry lock: see `Session::core`.
+                session
                     .send_text(&p.text, p.submit)
                     .map_err(io_control_error)
             },
@@ -2138,8 +2149,12 @@ impl ControlServer {
             .map_err(io_control_error)?;
         let session = registry
             .get(&p.session_id.0)
-            .ok_or_else(|| ControlError::not_found(p.session_id.0.clone()))?;
+            .ok_or_else(|| ControlError::not_found(p.session_id.0.clone()))?
+            .core();
+        // Written outside the Registry lock: see `Session::core`.
+        drop(registry);
         session.write_input(&bytes).map_err(io_control_error)?;
+        let registry = self.registry.lock().map_err(poisoned)?;
         self.publish_updated(&registry, &p.session_id.0);
         encode(&diri_proto::SendKeyResult {
             bytes_accepted: bytes.len(),
@@ -2155,10 +2170,18 @@ impl ControlServer {
         self.publish_updated(&registry, &p.session_id.0);
         let session = registry
             .get(&p.session_id.0)
-            .ok_or_else(|| ControlError::not_found(p.session_id.0.clone()))?;
-        session
-            .send_text(&p.text, p.submit)
-            .map_err(|error| ControlError::internal(error.to_string()))?;
+            .ok_or_else(|| ControlError::not_found(p.session_id.0.clone()))?
+            .core();
+        // Written, and the submit's settle slept, outside the Registry lock:
+        // see `Session::core`.
+        drop(registry);
+        session.send_text(&p.text, p.submit).map_err(|error| {
+            if error.kind() == std::io::ErrorKind::WouldBlock {
+                io_control_error(error)
+            } else {
+                ControlError::internal(error.to_string())
+            }
+        })?;
         Ok(json!({}))
     }
 
@@ -2166,13 +2189,20 @@ impl ControlServer {
         let p: diri_proto::ResizeParams = decode(params)?;
         let cols = u16::try_from(p.cols.clamp(2, u16::MAX as i64)).expect("clamped");
         let rows = u16::try_from(p.rows.clamp(2, u16::MAX as i64)).expect("clamped");
-        let registry = self.registry.lock().map_err(poisoned)?;
-        let session = registry
-            .get(&p.session_id.0)
-            .ok_or_else(|| ControlError::not_found(p.session_id.0.clone()))?;
-        session
-            .resize(cols, rows)
-            .map_err(|error| ControlError::internal(error.to_string()))?;
+        let reflow = {
+            let registry = self.registry.lock().map_err(poisoned)?;
+            let session = registry
+                .get(&p.session_id.0)
+                .ok_or_else(|| ControlError::not_found(p.session_id.0.clone()))?;
+            session
+                .resize_pty(cols, rows)
+                .map_err(|error| ControlError::internal(error.to_string()))?
+        };
+        // The reflow runs after the Registry lock is released; see
+        // `Session::resize_pty`.
+        if let Some(reflow) = reflow {
+            reflow.apply();
+        }
         Ok(json!({}))
     }
 
@@ -2314,7 +2344,7 @@ impl ControlServer {
             let registry = self.registry.lock().map_err(poisoned)?;
             registry
                 .get(&p.session_id.0)
-                .map(crate::session::Session::scrollback_reader)
+                .map(|session| session.scrollback_reader())
         };
         if let Some(reader) = reader {
             return encode(&reader.capture_find()?);
@@ -2370,7 +2400,7 @@ impl ControlServer {
             let registry = self.registry.lock().map_err(poisoned)?;
             registry
                 .get(&p.session_id.0)
-                .map(crate::session::Session::scrollback_reader)
+                .map(|session| session.scrollback_reader())
         };
         // A remote history page takes a network round trip (up to the request
         // timeout). Attach input and grid publication also need the Registry;
@@ -2436,9 +2466,7 @@ impl ControlServer {
     ) -> Result<Option<crate::pty::Exit>, ControlError> {
         let stop = {
             let registry = self.registry.lock().map_err(poisoned)?;
-            registry
-                .get(id)
-                .and_then(crate::session::Session::remote_stop)
+            registry.get(id).and_then(|session| session.remote_stop())
         };
         if let Some(stop) = stop {
             let exit = stop.stop(grace).map_err(io_control_error)?;
@@ -4267,6 +4295,8 @@ fn io_control_error(error: std::io::Error) -> ControlError {
     }
     match error.kind() {
         std::io::ErrorKind::NotFound => ControlError::not_found(error.to_string()),
+        // Refused whole: the program has left too much earlier input unread.
+        std::io::ErrorKind::WouldBlock => ControlError::new("input_queue_full", error.to_string()),
         _ => ControlError::internal(error.to_string()),
     }
 }
@@ -4320,6 +4350,17 @@ fn with_session<T>(
         .lock()
         .ok()
         .and_then(|guard| guard.get(session_id).map(read))
+}
+
+/// [`with_session`] for input: the write happens after the Registry lock is
+/// released, so a program slow to read it delays only its own session.
+fn with_session_input<T>(
+    registry: &Arc<Mutex<Registry>>,
+    session_id: &str,
+    write: impl FnOnce(&crate::session::SessionCore) -> T,
+) -> Option<T> {
+    let session = with_session(registry, session_id, crate::session::Session::core)?;
+    Some(write(&session))
 }
 
 /// Handles the only startup prompt Diri can safely pre-authorize: the exact
@@ -4394,7 +4435,8 @@ fn accept_claude_workspace_trust(registry: &Arc<Mutex<Registry>>, session_id: &s
                 "prompt.workspace_trust_accepted",
                 session = diri_telemetry::id(session_id),
             );
-            let _ = with_session(registry, session_id, |session| session.send_text("1", true));
+            let _ =
+                with_session_input(registry, session_id, |session| session.send_text("1", true));
             // Let Claude persist trust and replace the picker before a caller's
             // initial prompt starts its own readiness/verification loop.
             for _ in 0..20 {
@@ -4466,7 +4508,7 @@ fn deliver_initial_prompt(
     }
     let before = screen_text(registry, session_id).ok_or(InitialPromptFailure::SessionEnded)?;
     let probe = verification_probe(prompt, &before);
-    with_session(registry, session_id, |session| session.paste_text(prompt))
+    with_session_input(registry, session_id, |session| session.paste_text(prompt))
         .ok_or(InitialPromptFailure::SessionEnded)?
         .map_err(|_| InitialPromptFailure::InputFailed)?;
     match wait_for_echo(registry, session_id, probe.as_deref(), &before, ECHO_WINDOW) {
@@ -4478,7 +4520,7 @@ fn deliver_initial_prompt(
     }
     // A line-mode reader may not display anything until Enter. Send it once;
     // a missing response leaves an unknown outcome, never permission to retry.
-    with_session(registry, session_id, |session| session.submit_input())
+    with_session_input(registry, session_id, |session| session.submit_input())
         .ok_or(InitialPromptFailure::SessionEnded)?
         .map_err(|_| InitialPromptFailure::InputFailed)?;
     match wait_for_echo(
@@ -4562,7 +4604,7 @@ fn submit_typed_prompt(
     let composer_had_prompt = probe.is_some_and(|probe| {
         composer_text(&before).is_some_and(|composer| composer.contains(probe))
     });
-    with_session(registry, session_id, |session| session.submit_input())
+    with_session_input(registry, session_id, |session| session.submit_input())
         .ok_or(InitialPromptFailure::SessionEnded)?
         .map_err(|_| InitialPromptFailure::InputFailed)?;
     // The prompt may remain in the transcript after submission. In that

@@ -7,12 +7,13 @@
 //! that wasn't running at the time still learns how the child died — then
 //! removes its control files and stops serving.
 
+use std::collections::VecDeque;
 use std::io::{Read, Write};
 use std::net::Shutdown;
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
-use std::sync::{Arc, Mutex, Weak};
-use std::time::Duration;
+use std::sync::{Arc, Condvar, Mutex, Weak};
+use std::time::{Duration, Instant};
 
 use base64::Engine as _;
 
@@ -23,7 +24,8 @@ use super::client::HolderClient;
 use super::guard::GroupGuard;
 use super::process_tree;
 use super::protocol::{
-    HOLDER_OUTPUT_STREAM_VERSION, HOLDER_STREAM_ACK, HOLDER_STREAM_INPUT,
+    HOLDER_INPUT_QUEUE_CAPACITY, HOLDER_OUTPUT_STREAM_VERSION, HOLDER_QUEUED_STREAM_MAX_PAYLOAD,
+    HOLDER_QUEUED_STREAM_VERSION, HOLDER_STREAM_ACK, HOLDER_STREAM_FULL, HOLDER_STREAM_INPUT,
     HOLDER_STREAM_MAX_PAYLOAD, HOLDER_STREAM_RESIZE, HOLDER_STREAM_VERSION, HolderExitMarker,
     HolderExitReason, HolderExitStatus, HolderLaunchSpec, HolderOperation, HolderRequest,
     HolderResponse, HolderStat,
@@ -59,6 +61,14 @@ const OUTPUT_SEND_PATIENCE: Duration = Duration::from_millis(50);
 
 /// Buffer for one subscriber's socket writes.
 const OUTPUT_WRITE_BUFFER: usize = 256 << 10;
+
+/// How long a version 1 writer waits for the PTY to take any byte before it
+/// reports failure, as the Swift holder did. Its bytes stay queued.
+const LEGACY_WRITE_PATIENCE: Duration = Duration::from_secs(1);
+
+/// A drained input queue keeps at most this much of its allocation, so one
+/// large paste does not pin its size in the manager for the Holder's life.
+const INPUT_QUEUE_RETAINED: usize = 64 << 10;
 
 /// Live holders, so a test can inspect the state `run` builds for itself.
 #[cfg(test)]
@@ -101,10 +111,63 @@ struct Shared {
     /// Weak handles let the exit path interrupt blocking input reads without
     /// making idle Holder streams wake on a timer.
     input_streams: Mutex<Vec<Weak<std::os::unix::net::UnixStream>>>,
+    /// Input accepted for the program and not yet taken by the PTY.
+    input: InputQueue,
     /// Daemons receiving output as it is read, rather than by tailing the log.
     /// The log is still written, and is still what a subscriber falls back to;
     /// this only removes the filesystem from the path a live screen waits on.
     output: Mutex<OutputFanout>,
+}
+
+/// Input on its way to the program, in order.
+///
+/// A program that is busy when a paste lands (an agent mid-turn, `sleep; cat`)
+/// leaves the PTY's input buffer full for as long as it likes. The queue holds
+/// the rest, bounded by [`HOLDER_INPUT_QUEUE_CAPACITY`], and a drainer thread
+/// feeds it to the PTY as the program reads. Nothing here ever waits on the
+/// PTY while holding the lock: writes are nonblocking, and the drainer waits
+/// for room in `poll` with the lock released. The pump reads output on its own
+/// thread throughout, so a program blocked writing output while its input is
+/// pending is always drained.
+struct InputQueue {
+    state: Mutex<InputState>,
+    /// Signalled whenever bytes reach the PTY or the queue fails.
+    progress: Condvar,
+}
+
+struct InputState {
+    pending: VecDeque<u8>,
+    /// Bytes ever accepted, and ever taken by the PTY. A writer that needs
+    /// its bytes delivered waits for `written` to pass its own end.
+    accepted: u64,
+    written: u64,
+    /// Whether a drainer thread owns delivering `pending`.
+    draining: bool,
+    /// Why nothing more can be delivered: the program's terminal is gone.
+    failed: Option<String>,
+    /// A handle on the PTY master of its own, so writing never contends with
+    /// resize or stat for the PTY lock. Nonblocking, like every handle.
+    writer: crate::pty::PtyStream,
+}
+
+/// Why input was not accepted.
+enum InputRefusal {
+    /// There is no room for the whole write; none of it was queued.
+    Full,
+    /// The program can no longer receive input.
+    Failed(String),
+}
+
+impl InputRefusal {
+    fn into_error(self) -> HolderError {
+        match self {
+            Self::Full => HolderError::Transport(format!(
+                "the Holder's input queue is full ({} MiB waiting for the program)",
+                HOLDER_INPUT_QUEUE_CAPACITY >> 20
+            )),
+            Self::Failed(reason) => HolderError::Transport(reason),
+        }
+    }
 }
 
 /// Subscribers, and where in the stream the next byte handed to them sits.
@@ -216,6 +279,9 @@ impl HolderServer {
 
         let pump_wake =
             std::io::pipe().map_err(|error| HolderError::io("create pump wake pipe", error))?;
+        let input_writer = pty
+            .writer()
+            .map_err(|error| HolderError::io("PTY writer", error))?;
 
         let shared = Arc::new(Shared {
             child_pid,
@@ -232,6 +298,17 @@ impl HolderServer {
             listen_fd: AtomicI32::new(listen_fd),
             spawned_at,
             input_streams: Mutex::new(Vec::new()),
+            input: InputQueue {
+                state: Mutex::new(InputState {
+                    pending: VecDeque::new(),
+                    accepted: 0,
+                    written: 0,
+                    draining: false,
+                    failed: None,
+                    writer: input_writer,
+                }),
+                progress: Condvar::new(),
+            },
             output: Mutex::new(OutputFanout {
                 // Everything below this belongs to earlier incarnations.
                 next_offset: epoch_offset,
@@ -316,10 +393,11 @@ impl HolderServer {
                     }
                 }
                 Ok(request) if request.op == HolderOperation::Stream => {
-                    if request.stream_version != Some(HOLDER_STREAM_VERSION) {
-                        HolderResponse::failure("unsupported Holder input stream version")
-                    } else {
-                        let response = HolderResponse::stream(HOLDER_STREAM_VERSION);
+                    let version = request.stream_version.filter(|version| {
+                        [HOLDER_STREAM_VERSION, HOLDER_QUEUED_STREAM_VERSION].contains(version)
+                    });
+                    if let Some(version) = version {
+                        let response = HolderResponse::stream(version);
                         if socket::write_json_line(&mut client, &response).is_ok() {
                             let client = Arc::new(client);
                             let mut streams = shared.input_streams.lock().expect("input streams");
@@ -329,9 +407,11 @@ impl HolderServer {
                             let shared = Arc::clone(&shared);
                             let _ = std::thread::Builder::new()
                                 .name(format!("holder-input-{}", shared.spec.session_id))
-                                .spawn(move || serve_input_stream(&shared, client));
+                                .spawn(move || serve_input_stream(&shared, client, version));
                         }
                         continue;
+                    } else {
+                        HolderResponse::failure("unsupported Holder input stream version")
                     }
                 }
                 Ok(request) => handle(&shared, &request)
@@ -721,8 +801,10 @@ fn watch_exit(
         signal = exit.signal,
         runtime_s = shared.spawned_at.elapsed().as_secs(),
     );
-    // The pump waits with no deadline, so it has to be told.
+    // The pump waits with no deadline, so it has to be told. So does an
+    // input drainer waiting for room, which polls the same pipe.
     let _ = (&shared.pump_wake.1).write_all(&[1]);
+    discard_input(shared, "the program has exited");
     for stream in shared
         .input_streams
         .lock()
@@ -782,7 +864,7 @@ fn watch_exit(
     }
 }
 
-fn handle(shared: &Shared, request: &HolderRequest) -> HolderResult<HolderResponse> {
+fn handle(shared: &Arc<Shared>, request: &HolderRequest) -> HolderResult<HolderResponse> {
     match request.op {
         HolderOperation::Stream | HolderOperation::OutputStream => Err(
             HolderError::InvalidRequest("stream negotiation must be the first operation".into()),
@@ -797,7 +879,7 @@ fn handle(shared: &Shared, request: &HolderRequest) -> HolderResult<HolderRespon
                         .ok()
                 })
                 .ok_or_else(|| HolderError::InvalidRequest("write requires base64 data".into()))?;
-            write_pty(shared, &data)?;
+            write_and_wait(shared, &data)?;
             Ok(HolderResponse::success())
         }
 
@@ -851,12 +933,24 @@ fn handle(shared: &Shared, request: &HolderRequest) -> HolderResult<HolderRespon
     }
 }
 
-/// Serves the negotiated high-frequency input lane. Each operation is
-/// acknowledged only after it has reached the PTY, preserving the delivery
-/// guarantee of the legacy request/response protocol without reconnecting or
-/// encoding base64 for every key.
-fn serve_input_stream(shared: &Shared, stream: Arc<std::os::unix::net::UnixStream>) {
+/// Serves the negotiated high-frequency input lane.
+///
+/// Version 1 acknowledges an input frame after it has reached the PTY, and
+/// fails if the PTY takes nothing for a second. Version 2 acknowledges it once
+/// queued, which the Holder then delivers for as long as the program lives,
+/// and answers [`HOLDER_STREAM_FULL`] without closing when there is no room.
+fn serve_input_stream(
+    shared: &Arc<Shared>,
+    stream: Arc<std::os::unix::net::UnixStream>,
+    version: u16,
+) {
     prioritize_interactive_io();
+    let queued = version == HOLDER_QUEUED_STREAM_VERSION;
+    let max_payload = if queued {
+        HOLDER_QUEUED_STREAM_MAX_PAYLOAD
+    } else {
+        HOLDER_STREAM_MAX_PAYLOAD
+    };
     let mut stream = &*stream;
     let mut payload = Vec::with_capacity(256);
     loop {
@@ -865,7 +959,7 @@ fn serve_input_stream(shared: &Shared, stream: Arc<std::os::unix::net::UnixStrea
             return;
         }
         let length = u32::from_be_bytes(header[1..].try_into().expect("four-byte length")) as usize;
-        if length > HOLDER_STREAM_MAX_PAYLOAD {
+        if length > max_payload {
             let _ = stream.write_all(&[1]);
             return;
         }
@@ -874,7 +968,12 @@ fn serve_input_stream(shared: &Shared, stream: Arc<std::os::unix::net::UnixStrea
             return;
         }
         let result = match header[0] {
-            HOLDER_STREAM_INPUT => write_pty(shared, &payload),
+            HOLDER_STREAM_INPUT if queued => match queue_input(shared, &payload) {
+                Ok(_) => Ok(HOLDER_STREAM_ACK),
+                Err(InputRefusal::Full) => Ok(HOLDER_STREAM_FULL),
+                Err(refusal) => Err(refusal.into_error()),
+            },
+            HOLDER_STREAM_INPUT => write_and_wait(shared, &payload).map(|()| HOLDER_STREAM_ACK),
             HOLDER_STREAM_RESIZE if payload.len() == 4 => {
                 let cols = u16::from_be_bytes([payload[0], payload[1]]);
                 let rows = u16::from_be_bytes([payload[2], payload[3]]);
@@ -884,18 +983,23 @@ fn serve_input_stream(shared: &Shared, stream: Arc<std::os::unix::net::UnixStrea
                     ))
                 } else {
                     let _ = shared.pty.lock().expect("pty").resize(cols, rows);
-                    Ok(())
+                    Ok(HOLDER_STREAM_ACK)
                 }
             }
             _ => Err(HolderError::InvalidRequest(
                 "unknown Holder input stream frame".into(),
             )),
         };
-        if result.is_err() {
+        // A paste-sized buffer is not kept for a stream that goes back to
+        // single keys.
+        if payload.capacity() > INPUT_QUEUE_RETAINED {
+            payload = Vec::with_capacity(256);
+        }
+        let Ok(answer) = result else {
             let _ = stream.write_all(&[1]);
             return;
-        }
-        if stream.write_all(&[HOLDER_STREAM_ACK]).is_err() {
+        };
+        if stream.write_all(&[answer]).is_err() {
             return;
         }
     }
@@ -934,18 +1038,149 @@ fn read_stream_exact(shared: &Shared, stream: &mut impl Read, mut bytes: &mut [u
     bytes.is_empty()
 }
 
-/// Writes with the same bounded semantics the Swift holder used: retry
-/// `EINTR`/`EAGAIN`, waiting for the child to drain, but give up if the PTY
-/// stays unwritable for a full second.
-fn write_pty(shared: &Shared, data: &[u8]) -> HolderResult<()> {
-    let pty = shared.pty.lock().expect("pty");
-    let writer = pty
-        .writer()
-        .map_err(|error| HolderError::io("PTY writer", error))?;
-    let fd = writer.as_raw_fd();
+/// Accepts `data` for the program, whole or not at all, and returns the
+/// stream position its last byte will occupy.
+///
+/// With nothing already waiting, as many bytes as the PTY takes right now are
+/// written here, so a keystroke reaches the program without a thread handoff.
+/// Whatever the PTY has no room for is queued behind a drainer.
+fn queue_input(shared: &Arc<Shared>, data: &[u8]) -> Result<u64, InputRefusal> {
+    let mut state = shared.input.state.lock().expect("input");
+    if let Some(reason) = &state.failed {
+        return Err(InputRefusal::Failed(reason.clone()));
+    }
+    if shared.finished.load(Ordering::SeqCst) {
+        return Err(InputRefusal::Failed("the program has exited".into()));
+    }
+    if state.pending.len().saturating_add(data.len()) > HOLDER_INPUT_QUEUE_CAPACITY {
+        return Err(InputRefusal::Full);
+    }
+    let mut rest = data;
+    if state.pending.is_empty() {
+        match write_available(state.writer.as_raw_fd(), rest) {
+            Ok(count) => {
+                state.written += count as u64;
+                rest = &rest[count..];
+            }
+            Err(error) => {
+                let reason = format!("PTY write failed: {error}");
+                state.failed = Some(reason.clone());
+                return Err(InputRefusal::Failed(reason));
+            }
+        }
+    }
+    state.accepted += data.len() as u64;
+    let end = state.accepted;
+    if rest.is_empty() {
+        shared.input.progress.notify_all();
+        return Ok(end);
+    }
+    state.pending.extend(rest);
+    if !state.draining {
+        state.draining = true;
+        let drainer = Arc::clone(shared);
+        let spawned = std::thread::Builder::new()
+            .name(format!("holder-input-drain-{}", shared.spec.session_id))
+            .spawn(move || drain_input(&drainer));
+        if spawned.is_err() {
+            // Delivered on this thread instead: slower for this stream, but
+            // never lost.
+            drop(state);
+            drain_input(shared);
+        }
+    }
+    Ok(end)
+}
+
+/// Delivers the queue to the PTY, waiting for room with the lock released,
+/// until it is empty or the program is gone.
+fn drain_input(shared: &Shared) {
+    loop {
+        let mut state = shared.input.state.lock().expect("input");
+        let fd = state.writer.as_raw_fd();
+        loop {
+            if shared.finished.load(Ordering::SeqCst) || state.failed.is_some() {
+                state.draining = false;
+                return;
+            }
+            if state.pending.is_empty() {
+                state.draining = false;
+                state.pending.shrink_to(INPUT_QUEUE_RETAINED);
+                return;
+            }
+            let (front, _) = state.pending.as_slices();
+            match write_available(fd, front) {
+                Ok(0) => break,
+                Ok(count) => {
+                    state.pending.drain(..count);
+                    state.written += count as u64;
+                    shared.input.progress.notify_all();
+                }
+                Err(error) => {
+                    fail_input(shared, &mut state, format!("PTY write failed: {error}"));
+                    state.draining = false;
+                    return;
+                }
+            }
+        }
+        drop(state);
+        match wait_for_input_room(fd, &shared.pump_wake.0) {
+            Ok(true) => {}
+            // The wake pipe: the program has exited. The next turn discards.
+            Ok(false) => {}
+            Err(reason) => {
+                let mut state = shared.input.state.lock().expect("input");
+                fail_input(shared, &mut state, reason);
+                state.draining = false;
+                return;
+            }
+        }
+    }
+}
+
+/// Parks until the PTY has room for input, or the exit path says the program
+/// is gone. Returns whether the PTY is what woke it.
+fn wait_for_input_room(pty_fd: i32, wake: &std::io::PipeReader) -> Result<bool, String> {
+    use std::os::fd::AsRawFd;
+    let mut descriptors = [
+        libc::pollfd {
+            fd: pty_fd,
+            events: libc::POLLOUT,
+            revents: 0,
+        },
+        libc::pollfd {
+            fd: wake.as_raw_fd(),
+            events: libc::POLLIN,
+            revents: 0,
+        },
+    ];
+    loop {
+        // SAFETY: two initialized poll descriptors stay writable throughout
+        // the call; both fds outlive it. A negative timeout waits forever.
+        let ready = unsafe { libc::poll(descriptors.as_mut_ptr(), 2, -1) };
+        if ready >= 0 {
+            let pty = descriptors[0].revents;
+            if pty & libc::POLLOUT != 0 {
+                return Ok(true);
+            }
+            if pty & (libc::POLLHUP | libc::POLLERR | libc::POLLNVAL) != 0 {
+                return Err("the program's terminal has closed".into());
+            }
+            return Ok(false);
+        }
+        let error = std::io::Error::last_os_error();
+        if error.raw_os_error() != Some(libc::EINTR) {
+            return Err(format!("waiting for the PTY failed: {error}"));
+        }
+    }
+}
+
+/// Writes as much of `data` as the PTY takes without waiting.
+fn write_available(fd: i32, data: &[u8]) -> std::io::Result<usize> {
     let mut written = 0;
     while written < data.len() {
-        // SAFETY: plain write(2) on an owned fd with an in-bounds slice.
+        // SAFETY: plain write(2) on an owned nonblocking fd with an
+        // in-bounds slice.
         let count =
             unsafe { libc::write(fd, data[written..].as_ptr().cast(), data.len() - written) };
         if count > 0 {
@@ -955,22 +1190,67 @@ fn write_pty(shared: &Shared, data: &[u8]) -> HolderResult<()> {
         let error = std::io::Error::last_os_error();
         match error.raw_os_error() {
             Some(libc::EINTR) => continue,
-            Some(libc::EAGAIN) => {
-                let mut poll_fd = libc::pollfd {
-                    fd,
-                    events: libc::POLLOUT,
-                    revents: 0,
-                };
-                // SAFETY: one initialized pollfd, millisecond timeout.
-                let ready = unsafe { libc::poll(&mut poll_fd, 1, 1000) };
-                if ready <= 0 || poll_fd.revents & libc::POLLOUT == 0 {
-                    return Err(HolderError::Transport(
-                        "PTY remained unwritable for 1 second".into(),
-                    ));
-                }
+            Some(libc::EAGAIN) => break,
+            _ if count == 0 => {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::WriteZero,
+                    "PTY write returned zero",
+                ));
             }
-            _ => return Err(HolderError::io("PTY write", error)),
+            _ => return Err(error),
         }
+    }
+    Ok(written)
+}
+
+fn fail_input(shared: &Shared, state: &mut InputState, reason: String) {
+    if !state.pending.is_empty() {
+        diri_telemetry::warn_event!(
+            "holder.input_undeliverable",
+            session = diri_telemetry::id(&shared.spec.session_id),
+            bytes = state.pending.len(),
+        );
+    }
+    state.pending.clear();
+    state.pending.shrink_to(INPUT_QUEUE_RETAINED);
+    state.failed = Some(reason);
+    shared.input.progress.notify_all();
+}
+
+/// The program is gone: input still waiting has nowhere to go.
+fn discard_input(shared: &Shared, reason: &str) {
+    let mut state = shared.input.state.lock().expect("input");
+    fail_input(shared, &mut state, reason.to_owned());
+}
+
+/// Version 1 and legacy request semantics: accept `data`, then wait until the
+/// PTY has taken it, reporting failure once the PTY has taken nothing for
+/// [`LEGACY_WRITE_PATIENCE`]. Unlike the Swift holder, a write that gives up
+/// leaves its bytes queued, so the program still receives them in order.
+fn write_and_wait(shared: &Arc<Shared>, data: &[u8]) -> HolderResult<()> {
+    let end = queue_input(shared, data).map_err(InputRefusal::into_error)?;
+    let mut state = shared.input.state.lock().expect("input");
+    let mut progress = state.written;
+    let mut since = Instant::now();
+    while state.written < end {
+        if let Some(reason) = &state.failed {
+            return Err(HolderError::Transport(reason.clone()));
+        }
+        if state.written > progress {
+            progress = state.written;
+            since = Instant::now();
+        }
+        let Some(patience) = LEGACY_WRITE_PATIENCE.checked_sub(since.elapsed()) else {
+            return Err(HolderError::Transport(
+                "PTY remained unwritable for 1 second".into(),
+            ));
+        };
+        state = shared
+            .input
+            .progress
+            .wait_timeout(state, patience)
+            .expect("input")
+            .0;
     }
     Ok(())
 }

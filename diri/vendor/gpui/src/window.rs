@@ -1132,6 +1132,8 @@ pub struct Window {
     active: Rc<Cell<bool>>,
     hovered: Rc<Cell<bool>>,
     pub(crate) needs_present: Rc<Cell<bool>>,
+    #[cfg(any(test, feature = "test-support"))]
+    immediate_frame_requests: Cell<usize>,
     /// Tracks recent input event timestamps to determine if input is arriving at a high rate.
     /// Used to selectively enable VRR optimization only when input rate exceeds 60fps.
     pub(crate) input_rate_tracker: Rc<RefCell<InputRateTracker>>,
@@ -1853,6 +1855,8 @@ impl Window {
             active,
             hovered,
             needs_present,
+            #[cfg(any(test, feature = "test-support"))]
+            immediate_frame_requests: Cell::new(0),
             input_rate_tracker,
             #[cfg(feature = "input-latency-histogram")]
             input_latency_tracker: InputLatencyTracker::new()?,
@@ -2002,6 +2006,30 @@ impl Window {
             self.refreshing = true;
             self.invalidator.set_dirty(true);
         }
+    }
+
+    /// Draws the window's next frame as soon as the main thread is free
+    /// instead of at the display's next refresh.
+    ///
+    /// For latency-critical changes that arrive while the window is idle,
+    /// such as a terminal's keystroke echo: waiting for the display link
+    /// costs up to a whole refresh interval before drawing starts, and a
+    /// frame presented mid-interval can reach the screen a refresh earlier.
+    /// Call it after invalidating the view. The platform ignores the request
+    /// while a recent frame may still be queued for display, so it never
+    /// stacks frames between refreshes, and several requests before the
+    /// frame runs collapse into one.
+    pub fn request_immediate_frame(&self) {
+        #[cfg(any(test, feature = "test-support"))]
+        self.immediate_frame_requests
+            .set(self.immediate_frame_requests.get() + 1);
+        self.platform_window.request_immediate_frame();
+    }
+
+    /// How many times [`Self::request_immediate_frame`] was called.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn immediate_frame_requests(&self) -> usize {
+        self.immediate_frame_requests.get()
     }
 
     /// Close this window.
@@ -2790,6 +2818,10 @@ impl Window {
         // leak into a later frame across enable/disable of frame tracing.
         let frame_dirty = self.invalidator.take_frame_dirty();
         let draw_started_at = profiler::frame_trace_enabled().then(Instant::now);
+        let observer = crate::frame_observer();
+        if let Some(observer) = observer {
+            observer(crate::FrameStage::DrawStart, Instant::now());
+        }
 
         // Set up the per-App arena for element allocation during this draw.
         // This ensures that multiple test Apps have isolated arenas.
@@ -2896,6 +2928,9 @@ impl Window {
             self.refresh();
         }
         self.needs_present.set(true);
+        if let Some(observer) = observer {
+            observer(crate::FrameStage::DrawEnd, Instant::now());
+        }
 
         if let Some(draw_start) = draw_started_at {
             profiler::record_frame_timing(profiler::FrameTiming {

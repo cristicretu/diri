@@ -1,5 +1,337 @@
 # diri performance record
 
+## A paste waits for a busy program instead of being lost (2026-09-29)
+
+**What was wrong.** A paste into a program that was not reading yet (an agent
+mid-turn, `sleep 5; cat`) filled the PTY's input buffer. The Holder gave up
+once the PTY had taken nothing for one second, the Engine dropped the attach,
+and the unread tail of the paste was lost. For that second the Engine held the
+Registry lock, so every other session's typing and screen updates waited too.
+A large paste into a program that *was* reading held the same lock for the
+whole delivery: 1.4–1.7 s for 16 MiB. The remote Helper had the same loss in
+another form: more than 1 MiB of unread input closed the attach with a
+protocol error.
+
+**What changed.**
+- Local Holder input stream version 2. An input frame is acknowledged once
+  the Holder has queued it, and the Holder delivers the queue in order for as
+  long as the program lives. The queue is bounded at 32 MiB (two of the
+  largest attach frames). A frame that does not fit is refused whole with a
+  distinct answer, the stream stays open, and the Engine reports
+  `input_queue_full` (control) or ends the attach with `attach.input_refused`
+  telemetry. With nothing queued, a keystroke is written straight to the PTY
+  as before; only what the PTY has no room for goes to a drainer thread, which
+  waits in `poll` with no lock held and exits when the queue is empty. The
+  pump reads output on its own thread throughout, so a program that is blocked
+  writing output while its input waits is always drained.
+- Version 1 and the legacy JSON write keep their semantics for old Engines
+  (reply after the PTY took the bytes, fail after a second without progress),
+  but the bytes of a write that gives up stay queued instead of being lost.
+  A new Engine asks for version 2 and falls back to version 1 on a Holder
+  started by an older build.
+- The Engine writes input outside the Registry lock. `Session` is now a
+  cloneable `SessionCore` plus its pump thread; attach and control take a
+  clone under the lock (after the keyboard-controller check and the wake) and
+  write after releasing it. Order within a session is kept by the Holder
+  client's input lock. `session.send_text`'s 30 ms submit settle and the
+  message-receipt SQLite writes no longer run under the lock either.
+- Remote Helper: past 1 MiB of unread input it stops handling controller
+  messages, keeps them in order, and stops reading the socket until the
+  program catches up, so the backpressure reaches the Engine through SSH. The
+  Engine's own 1 MiB remote queue is unchanged and still refuses explicitly
+  beyond it, which old live Helpers need.
+
+**Measured.** A real Engine with real Holders (release), one attach frame
+pasted into a raw-mode `head -c N > file` while a second session is typed
+into every 10 ms. "Busy" means the program starts reading 1.5 s after the
+paste lands. Exact means the file equals the paste byte for byte. Three
+alternating base/branch runs per case; base is main with #560 and #561 merged.
+Load average 6–10, and 20–290 during the busy cases (another agent's build).
+
+| Case | main: delivered | main: other echo max | branch: delivered | branch: other echo max |
+|---|---|---:|---|---:|
+| 1 MiB, reading | exact, 63–65 ms | 48–56 ms | exact, 62–67 ms | 3–33 ms |
+| 4 MiB, reading | exact, 221–230 ms | 208–215 ms | exact, 225–229 ms | 5–14 ms |
+| 16 MiB, reading | exact, 1.42–1.72 s | 1.38–1.66 s | exact, 1.47–2.00 s | 10–148 ms |
+| 1 MiB, busy 1.5 s | lost 2 of 3 | 0.74–1.10 s | exact, 1.02–1.54 s | 0.4–153 ms |
+| 4 MiB, busy 1.5 s | lost 3 of 3 | 0.99–1.31 s | exact, 0.98–1.69 s | 0.5–12 ms |
+| 16 MiB, busy 1.5 s | lost 3 of 3 | 0.99–1.00 s | exact, 2.21–2.25 s | 2–8 ms |
+
+Other-session echo p50 was 0.1–0.6 ms on main and 0.10–0.13 ms on the branch.
+CPU for a delivered paste, from `getrusage` (Engine) and `ps` (Holder
+manager, 10 ms grain): 16 MiB reading, Engine 57–62 ms on main against 77–90
+ms on the branch, Holder 0.81–1.05 s against 0.87–0.89 s. The Engine figure
+includes the echo probe, which completed 6× more keystrokes on the branch
+because they were no longer stalled, so it is not a like-for-like cost.
+Keystroke input over the Holder stream (`holder_input_latency_is_reported`,
+two alternating runs each): p50 10–11 µs / p95 13 µs on main, 10–11 µs / 13–15
+µs on the branch.
+
+**Not claimed.** Nothing about remote throughput: the remote change was
+verified for correctness only
+(`input_for_a_busy_program_waits_instead_of_closing_the_attach`). A refused paste in the desktop ends and re-opens the
+attach rather than showing a toast; that needs an attach frame for Engine-side
+refusals. Pastes over 1 MiB from the desktop are still refused by the
+client's own 1 MiB command budget, so the 4 and 16 MiB cases here are the
+Engine path (attach frames and `session.send_text`), not the app's paste.
+Old live Holders still give up after a second and lose the tail; only
+Holders started by this build queue. The Engine's 1 MiB remote queue still
+refuses larger remote pastes, explicitly.
+
+Reproduce from `diri/`:
+
+```sh
+cargo test -p diri-engine --test holder -- paste_into_a_program full_input_queue
+cargo test -p diri-engine --test interactions a_paste_into_a_busy_program
+cargo test -p diri-engine --lib negotiation_tests
+cargo test -p diri-remote --test holder_e2e input_for_a_busy_program
+DIRI_PASTE_CASE=16777200,1500 DIRI_PASTE_RUNS=3 \
+  cargo test --release -p diri-engine --test interactions -- --ignored --nocapture --test-threads=1 paste_measurement
+```
+
+## Terminal interactions other than typing (2026-09-29)
+
+Every interaction except keystroke echo was measured separately: scrolling
+history, dragging a window or split, sliding a seam, switching sessions,
+selection drags, large pastes, Find, zoom and theme changes. The content was
+10,000 rows of coloured build log with wrapped lines, and CJK/emoji variants.
+Client frames went through GPUI's production text system and the headless
+Metal renderer. Anything that crosses a socket ran against a private Engine
+and real Holders. The renderer met the 120 Hz budget on every interaction.
+The Engine did not:
+
+- **Dragging stalled the whole Engine.** A column change reflows the
+  emulator's history. Over 10,000 wrapped rows that took 8 ms at p50 and
+  43 ms at p95 per step. It ran on the attach thread while that thread held
+  the Registry lock, so every other session's input and publication queued
+  behind it. The desktop sends a resize every 8 ms and the Engine applied
+  each one, so steps backed up for the length of the drag.
+- **Pastes over 1 MiB were lost.** The Holder input stream bounds a frame at
+  1 MiB and rejects a larger one whole. The Engine then dropped the attach,
+  so the paste disappeared and the client had to reseed.
+
+Changes:
+
+- `Session::resize_pty` resizes the PTY (a syscall or one Holder stream
+  write) under the Registry lock and returns the emulator reflow still owed.
+  The attach and control paths run that reflow after releasing the lock. The
+  owed reflow always applies the newest size the PTY was given. Racing
+  resizes therefore still leave the emulator at the PTY's size, and a reflow
+  that finds a newer one already applied does nothing.
+- The attach reader skips a Resize frame when the next frame in the same
+  read is also a Resize. Only an adjacent resize supersedes one, so input and
+  mouse frames keep their order. Each skipped frame saves a reflow and a
+  SIGWINCH repaint.
+- `HolderClient` splits input larger than one stream frame into chunks. They
+  are sent back to back under the input-stream lock, so no other input can
+  land between them. There is no Holder or wire change: old live Holders
+  accept every chunk.
+- When a terminal's origin moves and nothing else about it changes (a
+  sidebar or inspector seam, or a split divider, sliding past), the renderer
+  translates its cached rows instead of preparing every row again. It does
+  this only when the move is a whole number of device pixels, so snapping
+  stays exact.
+
+### Measurements
+
+Apple M4 Max, macOS 27.0, release builds, load average 4–11 during the A/B
+(25–80 earlier). Base is `42bf00a`. Engine runs alternated base and branch,
+3 invocations each of 3 runs, and medians of all 9 are shown. The drag steps
+160→120→160 columns twice, then ends at 150×49, sending one Resize frame
+every 8 ms (1.3 s). A second session is typed into every 20 ms throughout.
+Engine CPU is this process's user+sys time; Holders are separate processes
+and do not reflow.
+
+| Interaction (Engine, real Holders) | Base | Branch |
+| --- | ---: | ---: |
+| Drag: last resize → grid at final size | 57.0 ms | 10.6 ms |
+| Drag: other session's echo, p50 | 23.8 ms | 0.29 ms |
+| Drag: other session's echo, p95 | 382 ms | 7.7 ms |
+| Drag: grids published to the dragged pane | 20 | 93 |
+| Drag: Engine CPU for the drag | 1.32 s | 1.21 s |
+| Paste 1 MiB into a reading program | lost, attach dropped | 74 ms |
+| Paste 100 KiB into a reading program | 10.1–11.3 ms | 9.4–11.8 ms |
+
+With load average 25–80, the base drag settled in 140 ms–1.06 s, the other
+session's echo reached p95 0.54–1.8 s, and only 5–12 grids were published.
+
+The renderer (headless Metal, 120 fps harness, 3 alternating runs, draw time
+per frame from the GPUI report):
+
+| Interaction (renderer) | Base p50 / p95 | Branch p50 / p95 |
+| --- | ---: | ---: |
+| Seam slide past a 160×50 terminal, 1 px/frame | 0.566 / 0.594 ms | 0.424 / 0.456 ms |
+| Seam slide: rows reused | 0% | 99% |
+| Pane narrowing 1 px/frame (clips the grid) | 0.42 / 1.73 ms | unchanged |
+| Reflowed full snapshot arriving each frame | 0.56 / 0.60 ms | unchanged |
+| Switch: first frame of a fresh 160×50 element | 1.72 / 1.86 ms | unchanged |
+| Switch: 160×50 CJK/emoji | 2.47 / 2.68 ms | unchanged |
+| Switch: 240×66 (4K display at 2×) | 2.21 / 2.36 ms | unchanged |
+| Zoom: font size changes every frame | 1.70 / 1.81 ms | unchanged |
+| Selection drag, one row per frame | 0.48 / 0.51 ms | unchanged |
+| Output scrolling a 240×66 CJK grid | 0.64 / 0.68 ms | unchanged |
+| Theme crossfade, 200×60 (existing bench) | 0.62 / 0.69 ms | unchanged |
+| Trackpad fling through history (existing) | 0.60 / 1.49 ms | unchanged |
+
+Engine-side costs per operation (`terminal_interactions` probe, 10,000 rows,
+160×50). These did not change:
+
+| Operation | p50 | p95 |
+| --- | ---: | ---: |
+| Column-change reflow + grid update, ASCII | 8.0 ms | 43.2 ms |
+| Column-change reflow + grid update, CJK/emoji | 9.5 ms | 11.0 ms |
+| Rows-only resize + grid update | 34 µs | 54 µs |
+| Reflow at 340–380 columns (no history row wraps) | 0.19 ms | 0.21 ms |
+| 50-row history page (wheel, 3-row steps) | 65 µs | 72 µs |
+| Client decode of one page | 28 µs | 30 µs |
+| Attach seed (full snapshot + encode, 48 KB) | 41 µs | 45 µs |
+| Find capture of all retained rows | 1.1 ms | 1.5 ms |
+
+Over the real sockets, a 50-row history page round trip measured 0.21–0.48 ms
+at p50 and at most 1.0 ms at p95. Attach to seed grid measured 0.84–2.4 ms at
+p50.
+
+### Not fixed
+
+- **Reflow cost.** Reflowing 10,000 wrapped history rows still decodes and
+  re-encodes the whole compact history on every column change (8–43 ms). A
+  drag is now bounded by one reflow at a time and no longer blocks other
+  sessions, but the Engine spends about a core for the length of the drag.
+  The fix belongs in `vendor/alacritty_terminal` compact history, for
+  example deferring history reflow until a gesture settles.
+- **Paste into a program that is not reading.** The Holder gives up on a PTY
+  that stays unwritable for 1 s and rejects the rest of the input. The Engine
+  then drops the attach, and the unread tail of the paste is lost. Input is
+  still written while the Registry lock is held, so meanwhile every other
+  session's input waits. This measured 0.99 s with 100 KiB into a program
+  that reads only after 1.5 s. A 1 MiB paste into a program that is reading
+  holds that lock for about 70 ms (other sessions' echo max 56–64 ms). Fixing
+  this means moving input writes off the Registry lock and changing the
+  Holder's give-up policy.
+- The Remote Helper still reflows and re-snapshots every Resize it receives.
+  Coalescing in the Engine reduces how many reach it.
+- `cargo bench -p diri-term --bench find_retained` panics on `main`
+  ("Find releases all retained rows"). It was left as it is.
+
+Reproduce from `diri/`:
+
+```sh
+cargo test --release -p diri-engine --test interactions -- --ignored --nocapture --test-threads=1
+cargo bench -p diri-term --bench terminal_interactions
+cargo bench -p diri-terminal-state --bench terminal_interactions -- --gate
+cargo test -p diri-term --test moved_pixels
+cargo test -p diri-engine --lib resize_tests
+cargo test -p diri-engine --test holder a_paste_larger_than_one_input_frame_arrives_whole
+```
+
+The Engine measurements start their own Engine and Holders under `/tmp` and
+never touch an installed app. `DIRI_PASTE_CASE=<bytes>,<busy_ms>` runs one
+paste case. The renderer bench gates seam slide, pane resize, reflow arrival,
+selection drag and grid scrolling at the 8.3 ms frame budget. The
+terminal-state probe's `--gate` covers history pages and attach seeds; the
+reflow is reported but not gated. `moved_pixels` requires the moved frame to
+match a fresh render pixel for pixel and to prepare no row again. The
+existing `paint_fixture` raw pixels (live, overlapping and reading) were
+byte-identical between base and branch.
+
+## Keystroke echo draws without waiting for the display link (2026-09-29)
+
+**Where a keystroke's time goes.** `DIRI_LATENCY_TRACE=1` now stamps every
+hop of a keystroke in the desktop client, from GPUI delivering the key to the
+drawable reaching the screen (see `diri_client::latency_trace`; zero cost when
+unset). The headless harness drives the real `TerminalPane` key handler,
+the production client and transport, a private Engine with a real Holder
+running `cat`, and GPUI's real headless Metal renderer. Release build, 300
+paced keys (every third on a line a backspace), three runs, load average 7–9:
+
+| hop | p50 | p95 |
+| --- | ---: | ---: |
+| key down → input queued (encode, lease, `try_send`) | 0.009–0.010 ms | 0.013–0.014 ms |
+| input queued → socket written (attachment task) | 0.019 ms | 0.031–0.046 ms |
+| socket written → echo decoded (Engine, Holder, PTY) | 0.184–0.190 ms | 0.30–0.36 ms |
+| echo decoded → pane mailbox | 0.005 ms | 0.006–0.007 ms |
+| mailbox → grid applied (GPUI thread) ¹ | 0.005 ms | 0.008–0.011 ms |
+| grid applied → pane notified | 0.004 ms | 0.006 ms |
+| pane notified → draw start ² | 0.001 ms | 0.001 ms |
+| draw (pane-only window) | 0.216–0.232 ms | 0.29–0.31 ms |
+| draw end → Metal commit | 0.035–0.036 ms | 0.045–0.062 ms |
+| commit → GPU completed | 0.37–0.41 ms | 0.83–0.94 ms |
+| **key down → GPU completed** | **0.90–0.94 ms** | **1.97–3.26 ms** |
+
+¹ The harness pumps a test dispatcher in a busy loop, so this is not the main
+run loop's queueing. ² A headless window draws in the effect flush that dirtied
+it; the real app waits for the display link here (below).
+
+`workspace_terminal_echo_redraw_cpu` lands the same echo in a whole
+1600×1000 workspace window (sidebar, strip, workbench): 0.88 ms apply+draw
+p50, 1.0 ms CPU per echo. It is not a whole-window re-render: the sidebar and
+strip replay from cache, and a sample puts 56% of the loop in
+`TerminalElement::paint` shaping and placing every glyph of the 160×50 grid,
+which GPUI repaints in full each frame.
+
+So Diri's own path from key to a finished frame is about 1–2 ms. The rest is
+waiting: the echo is applied at a random moment and GPUI drew only on the next
+`CVDisplayLink` tick, then the compositor shows the frame.
+
+**What changed.** A keystroke's first screen change asks for its frame at
+once. `Window::request_immediate_frame` (vendored GPUI) merges one request
+into the window's display-link dispatch source, so the frame runs as soon as
+the main thread is free, through the same `step` path. macOS refuses it while
+the last present is less than two refresh intervals old: with two drawables
+that frame may still be queued, and a new one could block in `nextDrawable` or
+stack two frames into one refresh. `AttachmentControl::take_echo` grants one
+immediate frame per keystroke, within the 350 ms `KEYSTROKE_WINDOW`. Output
+nobody typed for, streams, and animations stay on the display link. A cursor
+glide in progress keeps frames flowing, so the request is refused then and the
+echo rides the next tick as before.
+
+**How it was measured.** `echo_frame_scheduling_against_the_display_link`
+(gpui_macos, no window) ticks a dispatch source from a real `CVDisplayLink` on
+this MacBook's 120 Hz panel (8.30 ms measured). A typist thread applies echoes
+60–240 ms apart, each followed by an 80 ms glide of frames. Six alternating
+runs of 150 keys:
+
+| echo applied → frame starts drawing | run p50 | run p95 | all p50 | all p95 |
+| --- | --- | --- | ---: | ---: |
+| display link (before) | 5.28 / 4.57 / 4.28 ms | 8.81 / 8.33 / 8.36 ms | 4.67 ms | 8.43 ms |
+| immediate (after) | 0.001 ms ×3 | 5.67 / 7.10 / 6.50 ms | 0.001 ms | 6.56 ms |
+
+387 of 450 echoes (86%) drew immediately. The others landed during the
+previous echo's glide. On a 60 Hz display the wait removed is twice as long.
+
+**What the display pipeline already does.** The layer keeps two drawables
+(`interactive_windows_keep_two_frames_in_flight`), presents without a
+transaction except while resizing, and keeps `displaySyncEnabled`; turning
+sync off would tear. `CVDisplayLink` ticks at the panel's 120 Hz with no
+frame-rate request. #540 covers animations that ran below it.
+
+**Not claimed.**
+
+- Time on screen. The frame starts about 4.7 ms sooner at the median. When
+  that lands it a refresh earlier depends on where WindowServer's compositing
+  deadline falls in the interval, which only an on-screen window can measure.
+  To measure it, run a dev build with `DIRI_LATENCY_TRACE=1` and type in a
+  visible window. The `presented` hop, from `addPresentedHandler`, is printed
+  every 100 keys. It was not run here: these agents may not open windows on
+  this Mac.
+- Main-thread queueing in the real app. The controller and the view each take
+  one main-queue hop. Both are microseconds when idle.
+- Any change to the Engine path or draw cost.
+
+Reproduce from `diri/`:
+
+```sh
+cargo test -p gpui_macos --release --lib echo_frame_scheduling -- --ignored --nocapture
+cargo build --release -p diri-engine --bin diri-holder
+DIRI_HOLDER_BIN=$PWD/target/release/diri-holder \
+  cargo test --release -p diri-app --bin diri keystroke_latency -- --ignored --nocapture
+cargo test --release -p diri-app --bin diri workspace_terminal_echo_redraw_cpu -- --ignored --nocapture
+```
+
+`only_a_keystroke_echo_asks_for_an_immediate_frame`,
+`a_keystroke_buys_one_echo_frame` and
+`immediate_frames_wait_until_the_last_present_is_on_screen` guard the policy.
+
 ## GPUI scenes give back a large frame's storage (2026-09-28)
 
 `vmmap`/`heap` on the installed app attributed about 36 MB of live heap to GPUI

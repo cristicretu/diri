@@ -524,7 +524,7 @@ async fn serve_connection(
                 last_received = Instant::now();
                 let Ok(frames) = codec.feed(&read_buffer[..read]) else { return Err("decode_error") };
                 for frame in frames {
-                    process_incoming(frame, &mut stream, &chunks).await?;
+                    process_incoming(frame, &mut stream, &chunks, keepalive_enabled).await?;
                 }
             }
             command = commands.recv() => {
@@ -532,6 +532,9 @@ async fn serve_connection(
                     Some(Command::Frame(frame, _permit)) => {
                         if write_frame(&mut stream, &frame).await.is_err() {
                             return Err("write_error");
+                        }
+                        if frame.frame_type == FrameType::Input {
+                            crate::latency_trace::mark(crate::latency_trace::Hop::SocketWritten);
                         }
                     }
                     Some(Command::Close) => return Ok(()),
@@ -560,6 +563,7 @@ async fn process_incoming(
     frame: Frame,
     stream: &mut UnixStream,
     chunks: &mpsc::Sender<TerminalChunk>,
+    interactive: bool,
 ) -> Result<(), &'static str> {
     match frame.frame_type {
         FrameType::Grid => {
@@ -567,6 +571,9 @@ async fn process_incoming(
                 .grid_payload()
                 .map_err(|_| "bad_grid")?
                 .ok_or("bad_grid")?;
+            if interactive {
+                crate::latency_trace::mark(crate::latency_trace::Hop::EchoDecoded);
+            }
             chunks
                 .send(TerminalChunk::Grid(update))
                 .await
@@ -889,6 +896,7 @@ mod tests {
             Frame::modes_with_bracketed_paste(true, true, mouse),
             &mut stream,
             &tx,
+            false,
         )
         .await
         .expect("valid modes frame");
@@ -910,6 +918,7 @@ mod tests {
                 .with_secret_input(true),
             &mut stream,
             &tx,
+            false,
         )
         .await
         .expect("valid modes frame");

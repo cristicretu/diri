@@ -10,6 +10,8 @@ mod find_input;
 mod find_overlay;
 #[cfg(all(test, target_os = "macos"))]
 pub(crate) mod find_workflow_tests;
+#[cfg(all(test, target_os = "macos"))]
+mod keystroke_latency_tests;
 mod path_picker;
 mod qol;
 mod reconnect;
@@ -1305,6 +1307,42 @@ impl TerminalPane {
         }
     }
 
+    /// Lands one typed character's echo on the selected grid the way a grid
+    /// frame does, row and cursor included, for redraw-cost fixtures.
+    #[cfg(all(test, target_os = "macos"))]
+    pub(crate) fn land_echo_for_test(
+        &mut self,
+        col: u16,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(id) = self.selected_id() else {
+            return;
+        };
+        let Some((cols, rows)) = self.residents.get(&id).map(|resident| {
+            let buffer = resident.element.buffer();
+            let buffer = buffer.read().unwrap();
+            (buffer.cols, buffer.rows)
+        }) else {
+            return;
+        };
+        let row = rows.saturating_sub(1);
+        let mut cells = vec![diri_proto::grid::GridCell::BLANK; usize::from(cols)];
+        for (index, cell) in cells.iter_mut().enumerate().take(usize::from(col) + 1) {
+            cell.scalar = u32::from(b'a' + (index % 26) as u8);
+        }
+        let update = GridUpdate {
+            cols,
+            rows,
+            cursor_col: col + 1,
+            cursor_row: row,
+            cursor_visible: true,
+            is_full_snapshot: false,
+            changed_rows: vec![diri_proto::grid::ChangedRow::new(row, cells)],
+        };
+        self.apply_grid_updates(id, [update], window, cx);
+    }
+
     #[cfg(test)]
     pub(crate) fn geometry_for_test(&self) -> (Option<TerminalViewport>, Option<(u16, u16)>) {
         let grid = self.selected_session().and_then(|session| {
@@ -1462,7 +1500,12 @@ impl TerminalPane {
                     self.schedule_find(id.clone(), self.find_rescan_delay(&id), window, cx);
                 }
                 if terminal_damage_should_repaint(self.selected_id().as_ref(), &id, changed) {
-                    self.request_terminal_repaint(window, cx);
+                    let echo = self
+                        .residents
+                        .get(&id)
+                        .is_some_and(|resident| resident.attachment.take_echo());
+                    self.request_terminal_repaint(echo, window, cx);
+                    diri_client::latency_trace::mark(diri_client::latency_trace::Hop::PaneNotified);
                 }
             }
             PaneEvent::InputFeedback(id, message) => {
@@ -2008,7 +2051,7 @@ impl TerminalPane {
             self.schedule_find(id, delay, window, cx);
         }
         if repaint {
-            self.request_terminal_repaint(window, cx);
+            self.request_terminal_repaint(false, window, cx);
         }
     }
 
@@ -2024,12 +2067,25 @@ impl TerminalPane {
         }
     }
 
-    fn request_terminal_repaint(&mut self, _window: &mut Window, cx: &mut Context<Self>) {
+    fn request_terminal_repaint(
+        &mut self,
+        echo: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         // GPUI coalesces dirty entities and presents them from the platform's
         // CVDisplayLink. A second fixed-rate timer here can only miss the next
         // display deadline (and capped ProMotion at 60 fps), so terminal
         // damage has exactly one pacing authority: the display itself.
         cx.notify();
+        // Except for the one frame a keystroke's echo buys: in an idle window
+        // it is drawn as soon as this update returns instead of at the next
+        // refresh, which the echo would otherwise wait up to a whole interval
+        // for. The platform refuses while a recent frame may still be queued,
+        // so streams and animations stay on the display link.
+        if echo {
+            window.request_immediate_frame();
+        }
     }
 
     /// Schedules the search a query change just armed, after the delay the
@@ -3173,6 +3229,7 @@ impl TerminalPane {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        diri_client::latency_trace::mark(diri_client::latency_trace::Hop::KeyDown);
         if let Some(navigation) = &self.navigation
             && navigation.read(cx).is_open()
         {
@@ -6645,6 +6702,73 @@ mod tests {
                 window.remove_window();
             })
             .unwrap();
+    }
+
+    /// A keystroke's echo is drawn without waiting for the display's next
+    /// refresh; ordinary output, and output after the echo, keep the display
+    /// link as their only pacer.
+    #[gpui::test]
+    fn only_a_keystroke_echo_asks_for_an_immediate_frame(cx: &mut TestAppContext) {
+        let runtime = Arc::new(StoreRuntime::inert());
+        let tokio = Arc::new(
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap(),
+        );
+        let mut session = fixture_session();
+        session.host = None;
+        let id = session.id.clone();
+        {
+            let mut store = runtime.store.write().unwrap();
+            store.upsert_session(session);
+            store.select(id.clone());
+        }
+        let (pane, cx) = cx.add_window_view({
+            let runtime = runtime.clone();
+            move |window, cx| TerminalPane::new(runtime, tokio, window, cx)
+        });
+        cx.run_until_parked();
+        let (sender, generation) = pane.read_with(cx, |pane, _| {
+            (
+                pane.pane_tx.clone(),
+                pane.residents[&id].attachment_generation,
+            )
+        });
+        let requests = |cx: &mut gpui::VisualTestContext| {
+            cx.update(|window, _| window.immediate_frame_requests())
+        };
+        let damage = |changed: bool, cx: &mut gpui::VisualTestContext| {
+            sender
+                .send(PaneEvent::ControllerDamage(id.clone(), generation, changed))
+                .expect("the pane listens for output");
+            cx.run_until_parked();
+        };
+
+        damage(true, cx);
+        assert_eq!(
+            requests(cx),
+            0,
+            "output nobody typed for waits for the display"
+        );
+
+        pane.read_with(cx, |pane, _| {
+            pane.residents[&id].attachment.note_echo_due_for_test()
+        });
+        damage(false, cx);
+        assert_eq!(
+            requests(cx),
+            0,
+            "an update that changed nothing draws nothing"
+        );
+        damage(true, cx);
+        assert_eq!(requests(cx), 1, "the echo is drawn at once");
+        damage(true, cx);
+        assert_eq!(
+            requests(cx),
+            1,
+            "what follows the echo is paced by the display"
+        );
     }
 
     /// The links panel is its own window and renders the pane while it draws,

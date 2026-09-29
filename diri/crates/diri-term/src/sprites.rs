@@ -250,15 +250,19 @@ pub(crate) enum AntialiasedShape {
 
 impl AntialiasedShape {
     pub(crate) fn move_vertically(&mut self, dy: Pixels) {
+        self.translate(point(Pixels::ZERO, dy));
+    }
+
+    pub(crate) fn translate(&mut self, delta: Point<Pixels>) {
         match self {
             Self::Arc { quad, clip } => {
-                quad.bounds.origin.y += dy;
-                clip.origin.y += dy;
+                quad.bounds.origin += delta;
+                clip.origin += delta;
             }
             Self::Polygon { path, .. } => {
-                path.bounds.origin.y += dy;
+                path.bounds.origin += delta;
                 for vertex in &mut path.vertices {
-                    vertex.xy_position.y += dy;
+                    vertex.xy_position += delta;
                 }
             }
         }

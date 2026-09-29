@@ -162,3 +162,20 @@ latest frame's length. Steady frames never reallocate. Files: `src/scene.rs`.
 Test: `a_scene_gives_back_capacity_a_single_large_frame_left_behind` in
 `crates/diri-app/src/gpui_view_cache_tests.rs`. Re-apply on a GPUI bump by
 re-adding `release_idle_capacity` and its call at the top of `Scene::clear`.
+
+## Immediate frames and a frame-timing observer
+
+`Window::request_immediate_frame` (and `PlatformWindow::request_immediate_frame`,
+a default no-op) lets a latency-critical change, a terminal's keystroke echo,
+draw as soon as the main thread is free instead of at the next display-link
+tick. `gpui_macos` implements it by merging one request into the window's
+display-link dispatch source (`WindowFrameSource::request_now`), refused
+while the last present is under two refresh intervals old
+(`immediate_frame_allowed`, refresh from `NSScreen.maximumFramesPerSecond`).
+`src/frame_observer.rs` adds an optional process-wide observer of draw start
+and end (`Window::draw`), Metal commit, GPU completion and present
+(`metal_renderer.rs`), installed by Diri only under `DIRI_LATENCY_TRACE=1`.
+Files: `src/platform.rs`, `src/window.rs`, `src/frame_observer.rs`,
+`src/gpui.rs`; in `vendor/gpui_macos`: `window.rs`, `display_link.rs`,
+`metal_renderer.rs`. Tests: `immediate_frames_wait_until_the_last_present_is_on_screen`
+(gpui_macos) and `only_a_keystroke_echo_asks_for_an_immediate_frame` (diri-app).

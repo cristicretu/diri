@@ -509,6 +509,10 @@ struct MacWindowState {
     cursor_style: CursorStyle,
     cursor_visible: Arc<AtomicBool>,
     frame_source: Option<WindowFrameSource>,
+    /// When the renderer last presented, for [`immediate_frame_allowed`].
+    last_present: Option<std::time::Instant>,
+    /// The window's display refresh interval, from `maximumFramesPerSecond`.
+    refresh_interval: std::time::Duration,
     renderer: renderer::Renderer,
     request_frame_callback: Option<Box<dyn FnMut(RequestFrameOptions)>>,
     event_callback: Option<Box<dyn FnMut(PlatformInput) -> gpui::DispatchEventResult>>,
@@ -699,6 +703,7 @@ impl MacWindowState {
             // AppKit can temporarily report no screen while displays are being reconfigured.
             return;
         };
+        self.refresh_interval = refresh_interval(unsafe { self.native_window.screen() });
         let data = self.native_view.as_ptr() as *mut c_void;
         self.frame_source
             .get_or_insert_with(|| WindowFrameSource::new(data, step))
@@ -921,6 +926,8 @@ impl MacWindow {
                 cursor_style: CursorStyle::Arrow,
                 cursor_visible,
                 frame_source: None,
+                last_present: None,
+                refresh_interval: DEFAULT_REFRESH_INTERVAL,
                 renderer: renderer::new_renderer(
                     renderer_context,
                     native_window as *mut _,
@@ -1802,6 +1809,22 @@ impl PlatformWindow for MacWindow {
     fn draw(&self, scene: &gpui::Scene) {
         let mut this = self.0.lock();
         this.renderer.draw(scene);
+        this.last_present = Some(std::time::Instant::now());
+    }
+
+    fn request_immediate_frame(&self) {
+        // Never block: a caller inside a platform callback may hold the lock.
+        let Some(this) = self.0.try_lock() else {
+            return;
+        };
+        if immediate_frame_allowed(
+            this.last_present,
+            this.refresh_interval,
+            std::time::Instant::now(),
+        ) && let Some(frame_source) = &this.frame_source
+        {
+            frame_source.request_now();
+        }
     }
 
     fn sprite_atlas(&self) -> Arc<dyn PlatformAtlas> {
@@ -3104,6 +3127,38 @@ where
     }
 }
 
+const DEFAULT_REFRESH_INTERVAL: std::time::Duration = std::time::Duration::from_micros(16_667);
+
+/// The refresh interval of `screen`, 1/60 s when it cannot say.
+fn refresh_interval(screen: id) -> std::time::Duration {
+    if screen.is_null() {
+        return DEFAULT_REFRESH_INTERVAL;
+    }
+    let responds: BOOL =
+        unsafe { msg_send![screen, respondsToSelector: sel!(maximumFramesPerSecond)] };
+    if responds != YES {
+        return DEFAULT_REFRESH_INTERVAL;
+    }
+    let fps: NSInteger = unsafe { msg_send![screen, maximumFramesPerSecond] };
+    if fps <= 0 {
+        return DEFAULT_REFRESH_INTERVAL;
+    }
+    std::time::Duration::from_secs_f64(1.0 / fps as f64)
+}
+
+/// Whether an out-of-band frame may run now. With two drawables, the frame
+/// presented last is either on screen or queued for the next refresh; only
+/// once two refresh intervals have passed is it surely on screen, with the
+/// other drawable free, so a new frame can neither stall the main thread in
+/// `nextDrawable` nor stack a second frame into the same refresh.
+pub(crate) fn immediate_frame_allowed(
+    last_present: Option<std::time::Instant>,
+    refresh_interval: std::time::Duration,
+    now: std::time::Instant,
+) -> bool {
+    last_present.is_none_or(|at| now.saturating_duration_since(at) >= refresh_interval * 2)
+}
+
 fn display_id_for_screen(screen: id) -> Option<CGDirectDisplayID> {
     if screen.is_null() {
         return None;
@@ -3283,6 +3338,38 @@ extern "C" fn toggle_tab_bar(this: &Object, _sel: Sel, _id: id) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn immediate_frames_wait_until_the_last_present_is_on_screen() {
+        let interval = std::time::Duration::from_micros(8_333);
+        let now = std::time::Instant::now();
+        assert!(immediate_frame_allowed(None, interval, now));
+        for ago in [0, 1_000, 8_333, 16_000] {
+            assert!(
+                !immediate_frame_allowed(
+                    Some(now - std::time::Duration::from_micros(ago)),
+                    interval,
+                    now
+                ),
+                "a present {ago} µs ago may still be queued"
+            );
+        }
+        assert!(immediate_frame_allowed(
+            Some(now - std::time::Duration::from_micros(16_666)),
+            interval,
+            now
+        ));
+        assert!(immediate_frame_allowed(
+            Some(now - std::time::Duration::from_millis(250)),
+            interval,
+            now
+        ));
+    }
+
+    #[test]
+    fn refresh_interval_falls_back_to_sixty_hertz_without_a_screen() {
+        assert_eq!(refresh_interval(nil), DEFAULT_REFRESH_INTERVAL);
+    }
 
     #[test]
     fn display_id_for_screen_returns_none_for_null_screen() {

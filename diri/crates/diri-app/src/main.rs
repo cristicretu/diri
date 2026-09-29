@@ -241,6 +241,7 @@ fn main() {
         icons::probe();
         return;
     }
+    telemetry::install_latency_trace();
 
     let smoke_test = std::env::var_os("DIRI_UI_SMOKE_TEST").is_some();
     let preview_value = std::env::var("DIRIJOR_SIDEBAR_PREVIEW").ok();

@@ -670,6 +670,28 @@ fn report_url(support_id: Option<&str>) -> String {
     format!("{REPORT_ISSUE_URL}?body={encoded}")
 }
 
+/// With `DIRI_LATENCY_TRACE=1`, follows each keystroke's echo through GPUI's
+/// draw, the Metal commit and the compositor as well as the transport; see
+/// [`diri_client::latency_trace`]. A no-op otherwise.
+pub(crate) fn install_latency_trace() {
+    if !diri_client::latency_trace::enabled() {
+        return;
+    }
+    gpui::set_frame_observer(|stage, at| {
+        use diri_client::latency_trace::{Hop, mark_at};
+        mark_at(
+            match stage {
+                gpui::FrameStage::DrawStart => Hop::DrawStart,
+                gpui::FrameStage::DrawEnd => Hop::DrawEnd,
+                gpui::FrameStage::Committed => Hop::Committed,
+                gpui::FrameStage::GpuCompleted => Hop::GpuCompleted,
+                gpui::FrameStage::Presented => Hop::Presented,
+            },
+            at,
+        );
+    });
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

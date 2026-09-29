@@ -45,6 +45,25 @@ pub const HOLDER_STREAM_RESIZE: u8 = 2;
 pub const HOLDER_STREAM_ACK: u8 = 0;
 pub const HOLDER_STREAM_MAX_PAYLOAD: usize = 1 << 20;
 
+/// Version 2 of the input stream: the same frames, but an input frame is
+/// acknowledged once the Holder has *queued* it for the PTY rather than once
+/// the PTY took it. The Holder then delivers the queue, in order, for as long
+/// as the program lives, however long the program takes to read. Version 1
+/// gave up when the PTY stayed full for a second and lost the unread tail.
+///
+/// A frame the queue has no room for is refused whole with
+/// [`HOLDER_STREAM_FULL`] and the stream stays open. Holders that predate
+/// version 2 reject its negotiation, and the client falls back to version 1.
+pub const HOLDER_QUEUED_STREAM_VERSION: u16 = 2;
+/// A version 2 frame carries up to one attach frame, so a paste the desktop
+/// sends whole is accepted or refused whole.
+pub const HOLDER_QUEUED_STREAM_MAX_PAYLOAD: usize = diri_proto::frames::MAX_FRAME_BYTES;
+/// Version 2's answer to an input frame the queue has no room for.
+pub const HOLDER_STREAM_FULL: u8 = 2;
+/// Most input a Holder keeps waiting for its program to read: two of the
+/// largest pastes the desktop can send.
+pub const HOLDER_INPUT_QUEUE_CAPACITY: usize = 2 * HOLDER_QUEUED_STREAM_MAX_PAYLOAD;
+
 /// One-way output protocol. After the NDJSON handshake the holder writes
 /// `[offset u64][length u32][payload]` frames until the child exits or the
 /// subscriber falls too far behind.

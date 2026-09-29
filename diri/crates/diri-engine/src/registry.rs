@@ -1017,7 +1017,11 @@ impl Registry {
     }
 
     pub fn views(&self) -> Vec<SessionView> {
-        let mut views: Vec<_> = self.sessions.values().map(Session::view).collect();
+        let mut views: Vec<_> = self
+            .sessions
+            .values()
+            .map(|session| session.view())
+            .collect();
         views.sort_by(|a, b| a.id.cmp(&b.id));
         views
     }
@@ -1483,7 +1487,10 @@ impl Registry {
             .records
             .get(id)
             .is_some_and(|record| record.hibernation.is_some())
-            || self.sessions.get(id).is_some_and(Session::is_hibernated);
+            || self
+                .sessions
+                .get(id)
+                .is_some_and(|session| session.is_hibernated());
         if !hibernated {
             return Ok(());
         }
@@ -1500,7 +1507,10 @@ impl Registry {
             .records
             .get(id)
             .is_some_and(|record| record.hibernation.is_some())
-            || self.sessions.get(id).is_some_and(Session::is_hibernated);
+            || self
+                .sessions
+                .get(id)
+                .is_some_and(|session| session.is_hibernated());
         if let Some(session) = self.sessions.get(id) {
             session.signal_tree(libc::SIGCONT)?;
             // Flush AFTER the CONT so the tree is drinking again.

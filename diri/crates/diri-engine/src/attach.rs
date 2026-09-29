@@ -499,9 +499,13 @@ impl AttachHub {
         let mut pending = buffered;
         'serve: while let Ok(frames) = codec.feed(&pending) {
             pending.clear();
-            for frame in frames {
+            let mut frames = frames.into_iter().peekable();
+            while let Some(frame) = frames.next() {
                 if preview && !matches!(frame.frame_type, FrameType::Ping | FrameType::Pong) {
                     break 'serve;
+                }
+                if resize_superseded(&frame, frames.peek()) {
+                    continue;
                 }
                 if !self.handle_frame(
                     registry,
@@ -661,23 +665,50 @@ impl AttachHub {
         if frame.frame_type == FrameType::Pong {
             return true;
         }
-        let Ok(mut guard) = registry.lock() else {
-            return false;
-        };
-        if frame.frame_type == FrameType::Input
-            && guard
-                .get(session_id)
-                .is_some_and(|session| !session.accepts_keyboard_input(enhanced_keyboard))
-        {
-            return false;
+        if frame.frame_type == FrameType::Resize {
+            let Some((cols, rows)) = frame.resize_payload() else {
+                return true;
+            };
+            // Reflow outside the Registry lock: it can take tens of
+            // milliseconds over long history, and every session's input
+            // and publication needs that lock.
+            let reflow = {
+                let Ok(guard) = registry.lock() else {
+                    return false;
+                };
+                let Some(session) = guard.get(session_id) else {
+                    return true;
+                };
+                session.resize_pty(cols.max(2), rows.max(2))
+            };
+            if let Ok(Some(reflow)) = reflow {
+                reflow.apply();
+            }
+            return true;
         }
-        if matches!(frame.frame_type, FrameType::Input | FrameType::Mouse) {
-            // Input to a frozen session wakes it; write_input's queue covers
-            // the race where the governor froze it mid-keystroke.
-            let _ = guard.wake_session(session_id);
-        }
-        let Some(session) = guard.get(session_id) else {
-            return true; // session ended; swallow input quietly, as Swift does
+        // The Registry lock covers the checks and the wake, not the write: a
+        // program slow to take a paste must delay only its own session, and
+        // every other session's input and publication needs this lock.
+        let session = {
+            let Ok(mut guard) = registry.lock() else {
+                return false;
+            };
+            if frame.frame_type == FrameType::Input
+                && guard
+                    .get(session_id)
+                    .is_some_and(|session| !session.accepts_keyboard_input(enhanced_keyboard))
+            {
+                return false;
+            }
+            if matches!(frame.frame_type, FrameType::Input | FrameType::Mouse) {
+                // Input to a frozen session wakes it; write_input's queue
+                // covers the race where the governor froze it mid-keystroke.
+                let _ = guard.wake_session(session_id);
+            }
+            let Some(session) = guard.get(session_id) else {
+                return true; // session ended; swallow input quietly, as Swift does
+            };
+            session.core()
         };
         // Guards would move the failed-write check into the patterns; the
         // explicit form keeps every input arm reading the same way.
@@ -685,7 +716,17 @@ impl AttachHub {
         match frame.frame_type {
             FrameType::Input => {
                 trace_hop!(InputDecoded);
-                if session.write_input(&frame.payload).is_err() {
+                if let Err(error) = session.write_input(&frame.payload) {
+                    if error.kind() == std::io::ErrorKind::WouldBlock {
+                        // Refused whole, not half written: the program has
+                        // left too much earlier input unread. Ending the
+                        // attach reports it rather than dropping keys.
+                        diri_telemetry::warn_event!(
+                            "attach.input_refused",
+                            session = diri_telemetry::id(session_id),
+                            bytes = frame.payload.len(),
+                        );
+                    }
                     return false;
                 }
                 trace_hop!(InputHandled);
@@ -693,11 +734,6 @@ impl AttachHub {
             FrameType::Mouse => {
                 if session.write_mouse(&frame.payload).is_err() {
                     return false;
-                }
-            }
-            FrameType::Resize => {
-                if let Some((cols, rows)) = frame.resize_payload() {
-                    let _ = session.resize(cols.max(2), rows.max(2));
                 }
             }
             FrameType::Scroll => {
@@ -1135,9 +1171,47 @@ fn wait_readable(stream: &UnixStream) -> bool {
     }
 }
 
+/// A drag sends a resize per display frame. Those that queued up behind a
+/// slow reflow are superseded by the next one in the same read, and skipping
+/// them spares a history reflow and a SIGWINCH repaint each. Only an adjacent
+/// resize supersedes: input or mouse between two resizes keeps its order.
+fn resize_superseded(frame: &Frame, next: Option<&Frame>) -> bool {
+    frame.frame_type == FrameType::Resize
+        && next.is_some_and(|next| next.frame_type == FrameType::Resize)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn only_the_newest_of_adjacent_resizes_is_applied() {
+        let batch = [
+            Frame::resize(100, 30),
+            Frame::resize(101, 30),
+            Frame::input(b"x".to_vec()),
+            Frame::resize(102, 30),
+            Frame::mouse(b"m".to_vec()),
+            Frame::resize(103, 30),
+            Frame::resize(104, 30),
+        ];
+        let applied: Vec<_> = batch
+            .iter()
+            .enumerate()
+            .filter(|(index, frame)| !resize_superseded(frame, batch.get(index + 1)))
+            .map(|(_, frame)| (frame.frame_type, frame.resize_payload()))
+            .collect();
+        assert_eq!(
+            applied,
+            [
+                (FrameType::Resize, Some((101, 30))),
+                (FrameType::Input, None),
+                (FrameType::Resize, Some((102, 30))),
+                (FrameType::Mouse, None),
+                (FrameType::Resize, Some((104, 30))),
+            ]
+        );
+    }
 
     fn constrained_output() -> (SinkOutput, UnixStream) {
         let (writer, reader) = UnixStream::pair().unwrap();

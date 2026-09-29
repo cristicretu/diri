@@ -262,6 +262,17 @@ impl WindowFrameSource {
         Ok(())
     }
 
+    /// Queues one frame request on the main queue now, as a display-link tick
+    /// would, while the source is subscribed (the window is visible). Pending
+    /// requests coalesce, so this and a tick already queued run one frame.
+    pub fn request_now(&self) -> bool {
+        if self.registration.is_none() {
+            return false;
+        }
+        self.frame_requests.merge_data(1);
+        true
+    }
+
     pub fn stop(&mut self) {
         if let Some((display_id, subscriber_id)) = self.registration.take() {
             unsubscribe(display_id, subscriber_id);
@@ -459,3 +470,7 @@ mod sys {
         }
     }
 }
+
+#[cfg(test)]
+#[path = "display_link_pacing_tests.rs"]
+mod pacing_tests;

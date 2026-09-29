@@ -3156,6 +3156,15 @@ impl StoreRuntime {
         }
     }
 
+    /// [`Self::inert`] talking to a private test Engine instead of the
+    /// default socket, which may be the user's real Engine.
+    #[cfg(all(test, target_os = "macos"))]
+    pub(crate) fn inert_with_client(client: Arc<DaemonClient>) -> Self {
+        let mut runtime = Self::inert();
+        runtime.client = client;
+        runtime
+    }
+
     fn start_with_store(
         client: Arc<DaemonClient>,
         store: SessionStore,

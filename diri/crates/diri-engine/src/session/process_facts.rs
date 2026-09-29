@@ -193,11 +193,13 @@ mod tests {
         capture_holder(&shared, &stat);
         (
             Session {
-                shared,
-                transport: Transport::Held(HolderClient::at(&temp.join("facts.sock"))),
+                core: SessionCore {
+                    shared,
+                    transport: Transport::Held(HolderClient::at(&temp.join("facts.sock"))),
+                    manifest_id: spec.manifest_id.into(),
+                    deferred: None,
+                },
                 pump: None,
-                manifest_id: spec.manifest_id,
-                deferred: None,
             },
             stat,
         )

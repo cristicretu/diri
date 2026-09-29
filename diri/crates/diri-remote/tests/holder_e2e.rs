@@ -647,6 +647,84 @@ fn holder_agent_has_a_real_editable_resizable_terminal() {
     ));
 }
 
+/// Input the program has not read yet is held back, not refused. The Holder
+/// once closed the attach with a protocol error once more than 1 MiB of input
+/// was waiting, losing the paste and every key typed after it.
+#[test]
+fn input_for_a_busy_program_waits_instead_of_closing_the_attach() {
+    let temporary = tempfile::tempdir().expect("temp");
+    let state_dir = temporary.path().join("state");
+    let received = temporary.path().join("received");
+    // Three frames of 768 KiB: more than the Holder's pending bound in all.
+    let frames: Vec<Vec<u8>> = (0..3_u8)
+        .map(|frame| {
+            (0..768 * 1024_usize)
+                .map(|index| match index % 97 {
+                    96 => b'\n',
+                    _ => b'a' + ((index / 97 + usize::from(frame) * 7) % 26) as u8,
+                })
+                .collect()
+        })
+        .collect();
+    let total: usize = frames.iter().map(Vec::len).sum::<usize>() + 4;
+    let request = LaunchRequest {
+        session_id: test_session_id("holder-busy-input"),
+        session_token: token(),
+        argv: vec![
+            "/bin/sh".into(),
+            "-c".into(),
+            format!(
+                "stty raw -echo; printf 'busy\\n'; sleep 2; head -c {total} > '{}'; printf 'DONE\\n'; while :; do sleep 1; done",
+                received.display()
+            ),
+        ],
+        cwd: "/".into(),
+        environment: vec![diri_proto::remote_pty::EnvironmentVariable {
+            name: "PATH".into(),
+            value: "/usr/bin:/bin".into(),
+        }],
+        cols: 80,
+        rows: 24,
+        persistence: PersistenceCapability::NonPersistent,
+    };
+    let launch: LaunchResult = run_json("launch", &state_dir, Some(&request));
+    let mut attach = Attach::open(&state_dir, hello(&launch, Some(0), "busy-input"));
+    attach.receive_until(Duration::from_secs(5), |message| {
+        message_contains(message, "busy")
+    });
+
+    for frame in &frames {
+        attach.send(RemoteMessage::Terminal(Frame::input(frame.clone())));
+    }
+    attach.send(RemoteMessage::Terminal(Frame::input(b"tail".to_vec())));
+    let seen = attach.receive_until(Duration::from_secs(30), |message| {
+        message_contains(message, "DONE")
+    });
+    assert!(
+        !seen
+            .iter()
+            .any(|message| matches!(message, RemoteMessage::Error(_))),
+        "the attach stayed healthy: {}",
+        message_kinds(&seen)
+    );
+    let mut expected: Vec<u8> = frames.concat();
+    expected.extend_from_slice(b"tail");
+    assert!(
+        std::fs::read(&received).expect("received") == expected,
+        "every frame arrived whole and in order"
+    );
+
+    let _: SessionInspection = run_json(
+        "kill",
+        &state_dir,
+        Some(&SessionSelector {
+            session_id: launch.session_id,
+            session_token: token(),
+            expected_incarnation: Some(launch.session_incarnation),
+        }),
+    );
+}
+
 #[test]
 fn list_kill_and_gc_complete_the_session_lifecycle() {
     let temporary = tempfile::tempdir().expect("temp");

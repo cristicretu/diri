@@ -77,6 +77,9 @@ pub enum HolderError {
     Rejected(String),
     /// A holder or manager could not be started.
     Launch(String),
+    /// The Holder had no room for the whole input and accepted none of it.
+    /// Input it already holds is unaffected and still delivered.
+    InputQueueFull,
 }
 
 impl std::fmt::Display for HolderError {
@@ -86,6 +89,11 @@ impl std::fmt::Display for HolderError {
             Self::Transport(message) => write!(f, "holder transport: {message}"),
             Self::Rejected(message) => write!(f, "holder rejected: {message}"),
             Self::Launch(message) => write!(f, "holder launch: {message}"),
+            Self::InputQueueFull => write!(
+                f,
+                "holder input queue is full: the program has not read {} MiB of earlier input; this input was not sent",
+                protocol::HOLDER_INPUT_QUEUE_CAPACITY >> 20
+            ),
         }
     }
 }

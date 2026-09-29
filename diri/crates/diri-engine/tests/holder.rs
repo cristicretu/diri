@@ -518,3 +518,157 @@ fn a_dead_manager_leaves_no_hibernated_agent_behind() {
         "outlived the manager: {survivors:?} of {agent:?}"
     );
 }
+
+#[test]
+fn a_paste_larger_than_one_input_frame_arrives_whole() {
+    let root = holders_dir("paste");
+    let logs = root.join("logs");
+    let paths = HolderPaths::new(&root, "s_paste");
+    let size = diri_engine::holder::protocol::HOLDER_STREAM_MAX_PAYLOAD * 3 / 2;
+    let script = format!("stty -echo -icanon; head -c {size} | wc -c; exec cat");
+    let launch = spec(&paths, &logs, &["/bin/sh", "-c", &script]);
+    let server = std::thread::spawn(move || HolderServer::run(launch));
+    let client = HolderClient::new(paths.socket());
+    wait_until("holder ready", Duration::from_secs(5), || client.is_alive());
+    // Let stty run before the paste lands.
+    std::thread::sleep(Duration::from_millis(300));
+
+    // A 1.5 MiB paste used to be rejected whole by the Holder's frame bound.
+    let paste = b"0123456789abcdef".repeat(size / 16);
+    client.write(&paste).expect("a large paste is delivered");
+    let expected = size.to_string();
+    wait_until("the whole paste read", Duration::from_secs(20), || {
+        String::from_utf8_lossy(&log_bytes(&logs, "s_paste")).contains(&expected)
+    });
+
+    client.kill_tree().expect("kill");
+    let _ = server.join();
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// Printable text with newlines and tabs, different at every offset, so a
+/// dropped, duplicated or reordered chunk cannot compare equal.
+fn paste_payload(size: usize) -> Vec<u8> {
+    let mut state = 0x2545_f491_4f6c_dd1d_u64;
+    (0..size)
+        .map(|index| {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            match index % 97 {
+                96 => b'\n',
+                48 => b'\t',
+                _ => b' ' + (state % 95) as u8,
+            }
+        })
+        .collect()
+}
+
+/// A program that is busy when a paste lands (an agent mid-turn) reads it
+/// only seconds later. The Holder used to give up after the PTY stayed full
+/// for one second, and the unread tail of the paste was lost. The program
+/// also echoes everything back while input is still waiting, so the PTY is
+/// full in both directions at once.
+#[test]
+fn a_paste_into_a_program_that_is_not_reading_yet_arrives_whole() {
+    let root = holders_dir("stalled");
+    let logs = root.join("logs");
+    let out = root.join("received");
+    let paths = HolderPaths::new(&root, "s_stalled");
+    let paste = paste_payload(4 << 20);
+    let tail = b"<typed after the paste>";
+    let script = format!(
+        "stty raw -echo; printf 'busy\\n'; sleep 2; head -c {} | tee {}; printf 'DONE'; exec cat",
+        paste.len() + tail.len(),
+        out.display()
+    );
+    let launch = spec(&paths, &logs, &["/bin/sh", "-c", &script]);
+    let server = std::thread::spawn(move || HolderServer::run(launch));
+    let client = HolderClient::new(paths.socket());
+    wait_until("holder ready", Duration::from_secs(5), || client.is_alive());
+    wait_until("program busy", Duration::from_secs(5), || {
+        String::from_utf8_lossy(&log_bytes(&logs, "s_stalled")).contains("busy")
+    });
+
+    let started = Instant::now();
+    client
+        .write(&paste)
+        .expect("a paste into a busy program is accepted");
+    client
+        .write(tail)
+        .expect("keys typed after it are accepted");
+    let accepted = started.elapsed();
+    wait_until(
+        "the program read everything",
+        Duration::from_secs(30),
+        || String::from_utf8_lossy(&log_bytes(&logs, "s_stalled")).contains("DONE"),
+    );
+    let received = std::fs::read(&out).expect("received");
+    let mut expected = paste.clone();
+    expected.extend_from_slice(tail);
+    assert_eq!(received.len(), expected.len(), "every byte arrived once");
+    assert!(
+        received == expected,
+        "the paste arrived byte for byte, in order"
+    );
+    // Accepting is not waiting for the program: the caller is free long
+    // before the program starts reading.
+    assert!(
+        accepted < Duration::from_millis(1500),
+        "accepting a paste took {accepted:?}"
+    );
+
+    client.kill_tree().expect("kill");
+    let _ = server.join();
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// Pending input is bounded. Past the bound the Holder refuses the whole
+/// write, says so, and keeps the stream: nothing is half accepted, and the
+/// input already queued is still delivered.
+#[test]
+fn a_full_input_queue_refuses_a_write_whole_and_keeps_what_it_holds() {
+    use diri_engine::holder::protocol::HOLDER_INPUT_QUEUE_CAPACITY;
+    let root = holders_dir("full");
+    let logs = root.join("logs");
+    let out = root.join("received");
+    let paths = HolderPaths::new(&root, "s_full");
+    let first = paste_payload(HOLDER_INPUT_QUEUE_CAPACITY - 1024);
+    let script = format!(
+        "stty raw -echo; printf 'busy\\n'; sleep 3; head -c {} > {}; printf 'DONE'; exec cat",
+        first.len() + 3,
+        out.display()
+    );
+    let launch = spec(&paths, &logs, &["/bin/sh", "-c", &script]);
+    let server = std::thread::spawn(move || HolderServer::run(launch));
+    let client = HolderClient::new(paths.socket());
+    wait_until("holder ready", Duration::from_secs(5), || client.is_alive());
+    wait_until("program busy", Duration::from_secs(5), || {
+        String::from_utf8_lossy(&log_bytes(&logs, "s_full")).contains("busy")
+    });
+
+    client.write(&first).expect("up to the bound is accepted");
+    let refused = client
+        .write(&paste_payload(256 << 10))
+        .expect_err("past the bound is refused");
+    assert!(
+        refused.to_string().contains("input queue is full"),
+        "the refusal says why: {refused}"
+    );
+    client.write(b"end").expect("the stream survives a refusal");
+    wait_until(
+        "the program read everything",
+        Duration::from_secs(30),
+        || String::from_utf8_lossy(&log_bytes(&logs, "s_full")).contains("DONE"),
+    );
+    let mut expected = first;
+    expected.extend_from_slice(b"end");
+    assert!(
+        std::fs::read(&out).expect("received") == expected,
+        "the queued input arrived whole, and nothing of the refused write"
+    );
+
+    client.kill_tree().expect("kill");
+    let _ = server.join();
+    let _ = std::fs::remove_dir_all(&root);
+}

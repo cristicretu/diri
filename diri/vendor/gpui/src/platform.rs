@@ -837,6 +837,9 @@ pub trait PlatformWindow: HasWindowHandle + HasDisplayHandle {
     fn on_button_layout_changed(&self, _callback: Box<dyn FnMut()>) {}
     fn draw(&self, scene: &Scene);
     fn completed_frame(&self) {}
+    /// Runs the next frame request as soon as the main thread is free rather
+    /// than at the display's next refresh. See [`crate::Window::request_immediate_frame`].
+    fn request_immediate_frame(&self) {}
     fn sprite_atlas(&self) -> Arc<dyn PlatformAtlas>;
     fn is_subpixel_rendering_supported(&self) -> bool;
 

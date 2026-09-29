@@ -14,7 +14,8 @@ use std::time::Duration;
 use base64::Engine as _;
 
 use super::protocol::{
-    HOLDER_OUTPUT_MAX_FRAME, HOLDER_OUTPUT_STREAM_VERSION, HOLDER_STREAM_ACK, HOLDER_STREAM_INPUT,
+    HOLDER_OUTPUT_MAX_FRAME, HOLDER_OUTPUT_STREAM_VERSION, HOLDER_QUEUED_STREAM_MAX_PAYLOAD,
+    HOLDER_QUEUED_STREAM_VERSION, HOLDER_STREAM_ACK, HOLDER_STREAM_FULL, HOLDER_STREAM_INPUT,
     HOLDER_STREAM_MAX_PAYLOAD, HOLDER_STREAM_RESIZE, HOLDER_STREAM_VERSION, HolderLaunchSpec,
     HolderManagerRequest, HolderManagerResponse, HolderOperation, HolderProcessSample,
     HolderRequest, HolderResponse, HolderStat,
@@ -40,6 +41,9 @@ enum InputTransport {
 struct HolderInputStream {
     stream: UnixStream,
     encoded: Vec<u8>,
+    /// The negotiated version: 2 when the Holder queues input for a program
+    /// that is not reading, 1 when it predates that.
+    version: u16,
 }
 
 impl HolderClient {
@@ -182,13 +186,29 @@ impl HolderClient {
             };
         }
         match &mut *transport {
-            InputTransport::Stream(stream) => match stream.send(kind, payload) {
-                Ok(()) => Ok(true),
-                Err(error) => {
-                    *transport = InputTransport::Unknown;
-                    Err(error)
+            InputTransport::Stream(stream) => {
+                // A paste can exceed one stream frame, which the Holder
+                // rejects whole. Its chunks go back to back under this lock,
+                // so no other input can land between them. A version 2 frame
+                // holds any single attach frame, so only input larger than
+                // the desktop can send is ever split.
+                let mut chunks = payload.chunks(stream.max_payload());
+                let first = chunks.next().unwrap_or_default();
+                for chunk in std::iter::once(first).chain(chunks) {
+                    match stream.send(kind, chunk) {
+                        Ok(()) => {}
+                        // Refused whole, and the stream is still in step.
+                        Err(HolderError::InputQueueFull) => {
+                            return Err(HolderError::InputQueueFull);
+                        }
+                        Err(error) => {
+                            *transport = InputTransport::Unknown;
+                            return Err(error);
+                        }
+                    }
                 }
-            },
+                Ok(true)
+            }
             InputTransport::Legacy => Ok(false),
             InputTransport::Unknown => unreachable!("negotiation resolved the transport"),
         }
@@ -322,25 +342,40 @@ impl HolderOutputStream {
 }
 
 impl HolderInputStream {
+    /// Negotiates the newest input stream the Holder serves. A Holder started
+    /// by an older build refuses version 2 and closes that connection, so
+    /// version 1 is asked for on a fresh one.
     fn connect(path: &Path) -> HolderResult<Option<Self>> {
-        let mut stream = socket::connect(path)?;
-        let mut request = HolderRequest::op(HolderOperation::Stream);
-        request.stream_version = Some(HOLDER_STREAM_VERSION);
-        socket::write_json_line(&mut stream, &request)?;
-        let response: HolderResponse = socket::read_json_line(&mut stream)?;
-        if !response.ok || response.stream_version != Some(HOLDER_STREAM_VERSION) {
-            return Ok(None);
+        for version in [HOLDER_QUEUED_STREAM_VERSION, HOLDER_STREAM_VERSION] {
+            let mut stream = socket::connect(path)?;
+            let mut request = HolderRequest::op(HolderOperation::Stream);
+            request.stream_version = Some(version);
+            socket::write_json_line(&mut stream, &request)?;
+            let response: HolderResponse = socket::read_json_line(&mut stream)?;
+            if response.ok && response.stream_version == Some(version) {
+                return Ok(Some(Self {
+                    stream,
+                    encoded: Vec::with_capacity(256),
+                    version,
+                }));
+            }
         }
-        Ok(Some(Self {
-            stream,
-            encoded: Vec::with_capacity(256),
-        }))
+        Ok(None)
+    }
+
+    fn max_payload(&self) -> usize {
+        if self.version == HOLDER_QUEUED_STREAM_VERSION {
+            HOLDER_QUEUED_STREAM_MAX_PAYLOAD
+        } else {
+            HOLDER_STREAM_MAX_PAYLOAD
+        }
     }
 
     fn send(&mut self, kind: u8, payload: &[u8]) -> HolderResult<()> {
-        if payload.len() > HOLDER_STREAM_MAX_PAYLOAD {
+        let max_payload = self.max_payload();
+        if payload.len() > max_payload {
             return Err(HolderError::InvalidRequest(format!(
-                "input stream payload is {} bytes; maximum is {HOLDER_STREAM_MAX_PAYLOAD}",
+                "input stream payload is {} bytes; maximum is {max_payload}",
                 payload.len()
             )));
         }
@@ -358,6 +393,10 @@ impl HolderInputStream {
         self.stream
             .read_exact(&mut acknowledgement)
             .map_err(|error| HolderError::io("read input acknowledgement", error))?;
+        if acknowledgement[0] == HOLDER_STREAM_FULL && self.version == HOLDER_QUEUED_STREAM_VERSION
+        {
+            return Err(HolderError::InputQueueFull);
+        }
         if acknowledgement[0] != HOLDER_STREAM_ACK {
             return Err(HolderError::Rejected(format!(
                 "input stream returned acknowledgement {}",
@@ -504,5 +543,65 @@ mod deadline_tests {
             std::io::ErrorKind::InvalidData
         );
         worker.join().unwrap();
+    }
+}
+
+#[cfg(test)]
+mod negotiation_tests {
+    use super::*;
+    use std::os::unix::net::UnixListener;
+
+    /// A Holder started by an older build still serves only version 1: the
+    /// client must fall back to it, not to the slower legacy requests, and
+    /// keep version 1's frame bound.
+    #[test]
+    fn a_holder_without_the_queued_stream_is_served_version_one() {
+        let temp = tempfile::tempdir_in("/tmp").unwrap();
+        let path = temp.path().join("old.sock");
+        let listener = UnixListener::bind(&path).unwrap();
+        let holder = std::thread::spawn(move || {
+            let mut versions = Vec::new();
+            // The old Holder's answer to version 2, then its version 1 lane.
+            let (mut refused, _) = listener.accept().unwrap();
+            let request: HolderRequest = socket::read_json_line(&mut refused).unwrap();
+            versions.push(request.stream_version);
+            socket::write_json_line(
+                &mut refused,
+                &HolderResponse::failure("unsupported Holder input stream version"),
+            )
+            .unwrap();
+            drop(refused);
+            let (mut lane, _) = listener.accept().unwrap();
+            let request: HolderRequest = socket::read_json_line(&mut lane).unwrap();
+            versions.push(request.stream_version);
+            socket::write_json_line(&mut lane, &HolderResponse::stream(HOLDER_STREAM_VERSION))
+                .unwrap();
+            let mut lengths = Vec::new();
+            let mut header = [0_u8; 5];
+            while lane.read_exact(&mut header).is_ok() {
+                let length = u32::from_be_bytes(header[1..].try_into().unwrap()) as usize;
+                let mut payload = vec![0_u8; length];
+                lane.read_exact(&mut payload).unwrap();
+                lengths.push(length);
+                lane.write_all(&[HOLDER_STREAM_ACK]).unwrap();
+            }
+            (versions, lengths)
+        });
+
+        let client = HolderClient::at(&path);
+        client.write(b"k").unwrap();
+        client
+            .write(&vec![b'x'; HOLDER_STREAM_MAX_PAYLOAD + 1])
+            .unwrap();
+        drop(client);
+        let (versions, lengths) = holder.join().unwrap();
+        assert_eq!(
+            versions,
+            [
+                Some(HOLDER_QUEUED_STREAM_VERSION),
+                Some(HOLDER_STREAM_VERSION)
+            ]
+        );
+        assert_eq!(lengths, [1, HOLDER_STREAM_MAX_PAYLOAD, 1]);
     }
 }

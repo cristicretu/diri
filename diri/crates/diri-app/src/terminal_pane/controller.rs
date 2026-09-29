@@ -68,6 +68,9 @@ struct ControlState {
     resize_storm: crate::telemetry::ResizeStorm,
     /// Last `pane.input_rejected` event, to keep one per burst.
     rejection_recorded: Option<Instant>,
+    /// When the owner last queued typed input whose echo has not yet been
+    /// seen; see [`AttachmentControl::take_echo`].
+    echo_due: Option<Instant>,
     #[cfg(test)]
     resize_sends: u64,
 }
@@ -206,6 +209,7 @@ impl AttachmentControl {
             return Ok(());
         }
         let writer = state.writer.as_ref().ok_or(InputRejection::Disconnected)?;
+        let typed = matches!(command, AttachmentCommand::Input(_));
         let result = match command {
             AttachmentCommand::Input(bytes) => writer.send_input(bytes),
             AttachmentCommand::Mouse(bytes) => writer.send_mouse(bytes),
@@ -217,6 +221,9 @@ impl AttachmentControl {
                 row,
             } => writer.scroll(direction, lines, col, row),
         };
+        if typed && result.is_ok() {
+            state.echo_due = Some(Instant::now());
+        }
         result.map_err(|error| match error {
             AttachmentClosed::Backpressure => InputRejection::Overloaded,
             AttachmentClosed::Closed => InputRejection::Disconnected,
@@ -246,8 +253,27 @@ impl AttachmentControl {
         let result = self.submit(AttachmentCommand::Input(bytes));
         if result.is_ok() {
             self.echo.sent();
+            diri_client::latency_trace::mark(diri_client::latency_trace::Hop::InputQueued);
         }
         self.report("input", result);
+    }
+
+    /// Whether a screen change landing now answers input this attachment
+    /// queued within [`diri_term::cursor_motion::KEYSTROKE_WINDOW`] (long enough for a remote echo).
+    /// True at most once per input, so a keystroke buys one echo frame and
+    /// the output that follows it is paced like any other.
+    pub(super) fn take_echo(&self) -> bool {
+        self.state
+            .lock()
+            .unwrap()
+            .echo_due
+            .take()
+            .is_some_and(|sent| sent.elapsed() <= diri_term::cursor_motion::KEYSTROKE_WINDOW)
+    }
+
+    #[cfg(test)]
+    pub(super) fn note_echo_due_for_test(&self) {
+        self.state.lock().unwrap().echo_due = Some(Instant::now());
     }
 
     pub(super) fn resize(&self, cols: u16, rows: u16) {
@@ -349,6 +375,7 @@ impl ControllerLease {
                 resize_wake: Arc::new(Notify::new()),
                 resize_storm: crate::telemetry::ResizeStorm::default(),
                 rejection_recorded: None,
+                echo_due: None,
                 #[cfg(test)]
                 resize_sends: 0,
             }));
@@ -587,6 +614,7 @@ impl SessionController {
         let changed = self.buffer.write().unwrap().apply(update).changed;
         if changed {
             self.echo.screen_changed();
+            diri_client::latency_trace::mark(diri_client::latency_trace::Hop::GridApplied);
         }
         for view in self.views.values() {
             let _ = view.events.send(PaneEvent::ControllerDamage(
@@ -684,7 +712,13 @@ fn spawn_transport(
                         chunk = attachment.chunks.recv() => match chunk {
                             Some(chunk) => {
                                 trace.chunk(&chunk);
+                                let grid = matches!(chunk, TerminalChunk::Grid(_));
                                 let _ = events.send(PaneEvent::Chunk(id.clone(), 0, chunk));
+                                if grid {
+                                    diri_client::latency_trace::mark(
+                                        diri_client::latency_trace::Hop::MailboxQueued,
+                                    );
+                                }
                             }
                             None => break false,
                         }
@@ -868,6 +902,7 @@ mod tests {
                 resize_wake: Arc::new(Notify::new()),
                 resize_storm: crate::telemetry::ResizeStorm::default(),
                 rejection_recorded: None,
+                echo_due: None,
                 #[cfg(test)]
                 resize_sends: 0,
             }))
@@ -931,6 +966,7 @@ mod tests {
                 resize_wake: Arc::new(Notify::new()),
                 resize_storm: crate::telemetry::ResizeStorm::default(),
                 rejection_recorded: None,
+                echo_due: None,
                 #[cfg(test)]
                 resize_sends: 0,
             })),
@@ -999,6 +1035,59 @@ mod tests {
         control.claim();
         control.mouse_motion(b"\x1b[<35;2;2M".to_vec());
         assert_eq!(feedback(), 1, "owned motion is delivered, not reported");
+    }
+
+    #[gpui::test]
+    fn a_keystroke_buys_one_echo_frame(cx: &mut TestAppContext) {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let engine = FakeEngine::start(&runtime);
+        let (events, _rx) = pane_event_channel();
+        let (_lease, control, _) = cx.update(|cx| {
+            ControllerLease::mount(
+                engine.path.clone(),
+                SessionId("shared-session".into()),
+                runtime.handle(),
+                events,
+                1,
+                None,
+                cx,
+            )
+        });
+        wait_for(cx, &runtime, || {
+            control.state.lock().unwrap().writer.is_some()
+        });
+        assert!(
+            !control.take_echo(),
+            "output nobody typed for is not an echo"
+        );
+        control.input(b"x".to_vec());
+        assert!(
+            !control.take_echo(),
+            "a passive view's rejected key has no echo"
+        );
+        control.claim();
+        control.mouse(b"\x1b[<0;1;1M".to_vec());
+        assert!(!control.take_echo(), "a click is not typing");
+        control.input(b"x".to_vec());
+        assert!(
+            control.take_echo(),
+            "the first change after a key is its echo"
+        );
+        assert!(
+            !control.take_echo(),
+            "the output after it is paced normally"
+        );
+        control.input(b"y".to_vec());
+        control.state.lock().unwrap().echo_due = Some(
+            Instant::now() - diri_term::cursor_motion::KEYSTROKE_WINDOW - Duration::from_millis(1),
+        );
+        assert!(
+            !control.take_echo(),
+            "a key too long ago is not being answered"
+        );
     }
 
     #[gpui::test]
