@@ -67,6 +67,7 @@ use crate::external_drop::{TerminalDropAction, plan_terminal_drop, terminal_drop
 use crate::haptics::{self, Haptic};
 use crate::icons::{SymbolWeight, sf_symbol, sf_symbol_weighted};
 use crate::navigation::NavigationOverlay;
+use crate::window_chrome::TitlebarDragArea as _;
 use crate::query_editor::{self, ClipboardEdit, Edit, QueryEditor};
 use crate::quote::{Quote, QuoteSource};
 use crate::session_surfaces::switcher_key;
@@ -836,6 +837,8 @@ pub struct TerminalPane {
     header_trailing_inset: f32,
     /// This frame's hold-⌘ hint opacity, sampled at render.
     held_hint: f32,
+    /// This frame's title-row opacity (`window_chrome::title_row_opacity`).
+    title_opacity: f32,
     /// The workbench hosts this pane's title-bar actions elsewhere (the
     /// horizontal tab strip), so the pane paints no title bar of its own and
     /// the grid takes the reclaimed height.
@@ -982,6 +985,10 @@ impl TerminalPane {
             if this.reconcile_secure_input(window) {
                 cx.notify();
             }
+            // The title bar dims with the window on Windows.
+            if crate::window_chrome::draws_caption_buttons() {
+                cx.notify();
+            }
             if window.is_window_active() && this.focus.is_focused(window) {
                 this.claim_selected_control();
                 cx.notify();
@@ -1091,6 +1098,7 @@ impl TerminalPane {
             inspector_open: false,
             header_trailing_inset: 0.0,
             held_hint: 0.0,
+            title_opacity: 1.0,
             header_hidden: false,
             navigation: None,
             utility_surfaces: None,
@@ -3980,6 +3988,17 @@ impl TerminalPane {
         }
     }
 
+    /// Room this pane's title bar leaves for the window's caption buttons
+    /// when it reaches the top-right corner of the window (Windows).
+    fn caption_inset(&self) -> f32 {
+        self.viewport.map_or(0.0, |viewport| {
+            crate::window_chrome::caption_inset(
+                viewport.y,
+                f32::from(self.main_viewport.width) - (viewport.x + viewport.width),
+            )
+        })
+    }
+
     /// The top-left pane owns the native window-button lane when navigation
     /// chrome is hidden, including panes mounted by a saved split layout.
     fn occupies_window_titlebar(&self) -> bool {
@@ -4012,9 +4031,17 @@ impl TerminalPane {
             .gap(px(Metrics::TOOLBAR_ITEM_GAP))
             // The visible lights need more breathing room than their native
             // frames imply, so this is an intentional optical safe area.
-            .when(self.occupies_window_titlebar(), |control| {
-                control.child(div().w(px(Metrics::TOOLBAR_TRAFFIC_LIGHT_LANE)).flex_none())
-            })
+            .when(
+                self.occupies_window_titlebar()
+                    && crate::window_chrome::leading_lane() > 0.0,
+                |control| {
+                    control.child(
+                        div()
+                            .w(px(crate::window_chrome::leading_lane()))
+                            .flex_none(),
+                    )
+                },
+            )
             .child(crate::held_hints::below(
                 div()
                     .id("show-sidebar")
@@ -4068,11 +4095,12 @@ impl TerminalPane {
         let shell_controls = matches!(self.session_source, SessionSource::FollowSelection);
         let show_sidebar = self.shows_navigation_control();
         let sidebar_reveal = show_sidebar.then(|| self.render_sidebar_reveal_control(colors, cx));
-        let header_trailing_inset = self.header_trailing_inset;
+        let header_trailing_inset = self.header_trailing_inset + self.caption_inset();
         let header_width = self
             .viewport
             .map_or(f32::INFINITY, |viewport| viewport.width);
         div()
+            .titlebar_drag_area()
             .h(px(Metrics::TITLE_BAR))
             .flex_none()
             .pl(px(Metrics::TOOLBAR_EDGE_INSET))
@@ -4089,6 +4117,7 @@ impl TerminalPane {
                     .items_center()
                     .gap(px(Metrics::TOOLBAR_ITEM_GAP))
                     .overflow_hidden()
+                    .opacity(self.title_opacity)
                     .when_some(sidebar_reveal, |title, control| title.child(control))
                     .when_some(glyph.filter(|_| header_width >= 280.0), |title, glyph| {
                         title.child(
@@ -4128,6 +4157,7 @@ impl TerminalPane {
                     .flex()
                     .items_center()
                     .gap(px(Metrics::TOOLBAR_ITEM_GAP))
+                    .opacity(self.title_opacity)
                     .when(shell_controls, |trailing| {
                         trailing
                             .child(self.render_inspector_toggle(colors, self.held_hint, cx))
@@ -5020,6 +5050,7 @@ impl TerminalPane {
         self.update_selected_geometry(window, cx);
         self.main_viewport = window.viewport_size();
         self.held_hint = crate::held_hints::opacity(window, cx);
+        self.title_opacity = crate::window_chrome::title_row_opacity(window);
 
         let selected = self.selected_session();
 
@@ -5080,13 +5111,14 @@ impl TerminalPane {
                 .when_some(sidebar_reveal, |pane, control| {
                     pane.child(
                         div()
+                            .titlebar_drag_area()
                             .h(px(Metrics::TITLE_BAR))
                             .flex_none()
                             .px(px(Metrics::TOOLBAR_EDGE_INSET))
                             .flex()
                             .items_center()
                             .bg(colors.work_surface_nested())
-                            .child(control),
+                            .child(div().opacity(self.title_opacity).child(control)),
                     )
                 })
                 .child(self.render_empty_workbench(colors))

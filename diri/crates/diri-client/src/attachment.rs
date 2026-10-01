@@ -12,6 +12,7 @@ use std::sync::Arc;
 use std::task::{Context, Poll};
 use std::time::Duration;
 
+use diri_platform::ipc::asynchronous::UnixStream;
 use diri_proto::frames::{Frame, FrameCodec, FrameType};
 use diri_proto::grid::GridUpdate;
 use diri_proto::methods::{AttachRequest, ClientRole};
@@ -19,7 +20,6 @@ use diri_proto::model::SessionId;
 use diri_proto::terminal::MouseModes;
 use futures_core::Stream;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::UnixStream;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore, mpsc};
 use tokio::task::JoinHandle;
 use tokio::time::{Instant, MissedTickBehavior};
@@ -620,7 +620,7 @@ mod tests {
     async fn enhanced_attach_is_explicit_and_decodes_negotiated_modes() {
         use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
         for capable in [false, true] {
-            let (client, server) = tokio::net::UnixStream::pair().unwrap();
+            let (client, server) = diri_platform::ipc::asynchronous::UnixStream::pair().unwrap();
             let peer = tokio::spawn(async move {
                 let mut server = BufReader::new(server);
                 let mut line = String::new();
@@ -672,6 +672,8 @@ mod tests {
     use std::path::{Path, PathBuf};
     use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+    use diri_platform::ipc::asynchronous::UnixStream;
+    use diri_platform::ipc::asynchronous::{OwnedReadHalf, OwnedWriteHalf};
     use diri_proto::control::{ControlMessage, decode_line, encode_line};
     use diri_proto::frames::{Frame, FrameCodec, FrameType};
     use diri_proto::grid::GridCell;
@@ -684,15 +686,13 @@ mod tests {
     use serde::Serialize;
     use serde::de::DeserializeOwned;
     use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
-    use tokio::net::UnixStream;
-    use tokio::net::unix::{OwnedReadHalf, OwnedWriteHalf};
     use tokio::time::timeout;
 
     use super::{SessionAttachment, TerminalChunk, process_incoming};
 
     #[tokio::test]
     async fn checked_close_reports_peer_loss_instead_of_claiming_a_drained_writer() {
-        let (client, server) = tokio::net::UnixStream::pair().unwrap();
+        let (client, server) = diri_platform::ipc::asynchronous::UnixStream::pair().unwrap();
         let mut attachment = SessionAttachment::adopt_with_options(
             client,
             SessionId("lost-peer".into()),
@@ -755,7 +755,7 @@ mod tests {
     #[tokio::test]
     async fn close_drains_a_full_display_queue_and_keeps_accepted_input_ordered() {
         use tokio::io::{AsyncBufReadExt, BufReader};
-        let (client, server) = tokio::net::UnixStream::pair().unwrap();
+        let (client, server) = diri_platform::ipc::asynchronous::UnixStream::pair().unwrap();
         let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
         let peer = tokio::spawn(async move {
             let mut server = BufReader::new(server);
@@ -1113,7 +1113,9 @@ mod tests {
         if let Some(path) = std::env::var_os(DirijorEnv::SOCKET) {
             return Some(PathBuf::from(path));
         }
-        std::env::var_os("HOME").map(DirijorPaths::socket)
+        diri_platform::home_dir()
+            .map(|p| p.into_os_string())
+            .map(DirijorPaths::socket)
     }
 
     fn composed_text(cells: &[GridCell]) -> String {

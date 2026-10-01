@@ -1,5 +1,7 @@
 //! Host-local observation. Never pass a PID obtained from another host here.
-use diri_proto::process::{BootId, ProcessBirth, ProcessIdentity};
+#[cfg(unix)]
+use diri_proto::process::BootId;
+use diri_proto::process::{ProcessBirth, ProcessIdentity};
 use std::io;
 
 /// Observe an identity, not ownership. Owners must capture it while their
@@ -150,7 +152,7 @@ fn linux_start_ticks(pid: u32, stat: &str) -> io::Result<u64> {
         .map_err(|_| invalid("invalid process start ticks"))
 }
 
-#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+#[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
 fn platform_observe(_: u32) -> io::Result<ProcessIdentity> {
     Err(io::Error::new(
         io::ErrorKind::Unsupported,
@@ -161,9 +163,54 @@ fn invalid(message: &'static str) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, message)
 }
 
+#[cfg(windows)]
+fn platform_observe(pid: u32) -> io::Result<ProcessIdentity> {
+    use diri_platform::windows_sys::Win32::{Foundation::FILETIME, System::Threading::*};
+    use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
+    // SAFETY: query-only process handle, owned until all time fields are copied.
+    unsafe {
+        let raw = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid);
+        if raw.is_null() {
+            return Err(io::Error::last_os_error());
+        }
+        let handle = OwnedHandle::from_raw_handle(raw);
+        let mut creation: FILETIME = std::mem::zeroed();
+        let mut exit = std::mem::zeroed();
+        let mut kernel = std::mem::zeroed();
+        let mut user = std::mem::zeroed();
+        if GetProcessTimes(
+            handle.as_raw_handle(),
+            &mut creation,
+            &mut exit,
+            &mut kernel,
+            &mut user,
+        ) == 0
+        {
+            return Err(io::Error::last_os_error());
+        }
+        // Any open handle keeps an exited process object (and its PID and
+        // birth) queryable. An exit time means it is gone, like a reaped
+        // Unix child; never vouch for it.
+        if exit.dwLowDateTime != 0 || exit.dwHighDateTime != 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::NotFound,
+                "process has exited",
+            ));
+        }
+        ProcessIdentity::new(
+            pid,
+            ProcessBirth::Windows {
+                creation_filetime: ((creation.dwHighDateTime as u64) << 32)
+                    | creation.dwLowDateTime as u64,
+            },
+        )
+        .map_err(invalid)
+    }
+}
 #[cfg(test)]
 mod tests {
     use super::*;
+    use diri_proto::process::BootId;
     use std::cell::Cell;
     fn fixture(ticks: u64, boot: &str) -> ProcessIdentity {
         ProcessIdentity::new(
@@ -241,11 +288,22 @@ mod tests {
     }
     #[test]
     fn a_real_owned_child_has_stable_identity_until_reaped() {
-        let mut pty = crate::Pty::spawn(&crate::PtySpec::new(
+        #[cfg(unix)]
+        let spec = crate::PtySpec::new(
             vec!["/bin/sh".into(), "-c".into(), "read -r done".into()],
             "/tmp",
-        ))
-        .unwrap();
+        );
+        #[cfg(windows)]
+        let spec = crate::PtySpec::new(
+            vec![
+                std::env::var("ComSpec").unwrap(),
+                "/d".into(),
+                "/q".into(),
+                "/k".into(),
+            ],
+            std::env::temp_dir(),
+        );
+        let mut pty = crate::Pty::spawn(&spec).unwrap();
         let expected = pty.child_identity().expect("supported host birth identity");
         assert_eq!(expected.pid(), pty.pid());
         assert_eq!(observe(pty.pid()).unwrap(), expected);
@@ -253,7 +311,7 @@ mod tests {
             inspect_verified(&expected, || Ok("owned")).unwrap(),
             "owned"
         );
-        pty.kill_group(libc::SIGKILL).unwrap();
+        pty.kill_group(9).unwrap(); // SIGKILL; a Job termination on Windows
         pty.wait().unwrap();
         assert_eq!(
             pty.child_identity(),

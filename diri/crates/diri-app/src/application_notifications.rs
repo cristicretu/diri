@@ -1,20 +1,24 @@
 //! Application-owned delivery survives closing every workbench window. Native
 //! callbacks carry identifiers onto the main thread; they never retain a Root.
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", windows))]
 use std::rc::Rc;
 use std::{sync::Arc, time::Instant};
 
 #[cfg(target_os = "macos")]
-use crate::macos::notifier::{NativeNotificationEvent, NativeNotifier};
+use crate::macos::notifier::NativeNotifier;
+#[cfg(any(target_os = "macos", windows))]
+use crate::native_notifications::NativeNotificationEvent;
 use crate::notifications::NotificationSound;
 use crate::sounds::{self, PlatformPlayer, SoundGate, StatusSound};
+#[cfg(windows)]
+use crate::windows_notifications::NativeNotifier;
 use crate::{AppServices, sidebar::PreviewScenario};
 use gpui::{App, Global};
 
 pub(crate) struct ApplicationNotifications {
-    #[cfg(target_os = "macos")]
+    #[cfg(any(target_os = "macos", windows))]
     notifier: Rc<NativeNotifier>,
-    #[cfg(target_os = "macos")]
+    #[cfg(any(target_os = "macos", windows))]
     health: String,
 }
 impl Global for ApplicationNotifications {}
@@ -65,9 +69,9 @@ pub(crate) fn install(
         })
         .detach();
     }
-    #[cfg(target_os = "macos")]
+    #[cfg(any(target_os = "macos", windows))]
     let (sender, mut events) = tokio::sync::mpsc::unbounded_channel();
-    #[cfg(target_os = "macos")]
+    #[cfg(any(target_os = "macos", windows))]
     let notifier = Rc::new(NativeNotifier::new(sender));
     #[cfg(target_os = "macos")]
     notifier.set_badge(
@@ -80,12 +84,12 @@ pub(crate) fn install(
             .unread_count(),
     );
     cx.set_global(ApplicationNotifications {
-        #[cfg(target_os = "macos")]
+        #[cfg(any(target_os = "macos", windows))]
         notifier: notifier.clone(),
-        #[cfg(target_os = "macos")]
-        health: "Use Test alert to check Mac notification delivery.".into(),
+        #[cfg(any(target_os = "macos", windows))]
+        health: "Use Test alert to check system notification delivery.".into(),
     });
-    #[cfg(target_os = "macos")]
+    #[cfg(any(target_os = "macos", windows))]
     {
         let services = services.clone();
         cx.spawn(async move |cx| {
@@ -95,7 +99,7 @@ pub(crate) fn install(
         })
         .detach();
     }
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(not(any(target_os = "macos", windows)))]
     let _ = (preview, scenario);
     let mut events = services.store.status_events();
     let mut changes = services.store.changes();
@@ -121,12 +125,12 @@ pub(crate) fn install(
                         };
                         if sound_gate.should_play(sound, Instant::now()) { let _ = sounds::play(&PlatformPlayer, sound); }
                     }
-                    #[cfg(target_os = "macos")]
+                    #[cfg(any(target_os = "macos", windows))]
                     {
                         notifier.dismiss(&event.dismiss);
                         if let Some(notification) = event.notification.filter(|_|deliver && (!active || event.in_app_banner.is_none())) { notifier.post(&notification); }
                     }
-                    #[cfg(not(target_os = "macos"))]
+                    #[cfg(not(any(target_os = "macos", windows)))]
                     let _ = active;
                 }
                 change = changes.recv() => {
@@ -142,16 +146,16 @@ pub(crate) fn install(
     }).detach();
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", windows))]
 pub(crate) fn notifier(cx: &App) -> Rc<NativeNotifier> {
     cx.global::<ApplicationNotifications>().notifier.clone()
 }
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", windows))]
 pub(crate) fn health(cx: &App) -> String {
     cx.global::<ApplicationNotifications>().health.clone()
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", windows))]
 pub(crate) fn route(
     event: NativeNotificationEvent,
     services: &Arc<AppServices>,

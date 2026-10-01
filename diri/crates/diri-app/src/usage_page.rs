@@ -455,7 +455,7 @@ impl UtilitySurfaces {
         if loaded && self.usage_days != 1 && total.total_tokens() == 0 {
             content = content.child(div().p(px(20.0)).rounded(px(8.0)).bg(colors.primary.alpha(0.035)).flex().flex_col().gap(px(6.0))
                 .child(label("Your usage starts with a conversation", 14.0, colors.primary))
-                .child(label("Available Claude Code and Codex transcripts appear automatically, alongside signed-in Cursor usage on this Mac.", 12.0, colors.secondary))
+                .child(label(format!("Available Claude Code and Codex transcripts appear automatically, alongside signed-in Cursor usage on {}.", crate::platform::local_machine_label_lowercase()), 12.0, colors.secondary))
                 .child(label("Try a longer date range to see earlier activity.", 12.0, colors.secondary)));
         }
         content = content.child(hero).child(metrics).child(self.usage_breakdown(report, colors))
@@ -463,7 +463,7 @@ impl UtilitySurfaces {
                 .child(label("About these estimates", 12.0, colors.primary).font_weight(FontWeight::MEDIUM))
                 .child(label(format!("{:.1}% of tokens priced · {} unpriced tokens", ratio(report.total.priced_tokens as f64, total.total_tokens() as f64) * 100.0, UsageFormat::tokens(total.total_tokens() - report.total.priced_tokens)), 11.0, colors.secondary))
                 .child(label("Uses Diri’s bundled model rates for Claude and Codex. Cursor costs come from billed dashboard events. Unpriced Claude/Codex usage is excluded from cost. Cache read savings compare cached reads with uncached input rates; cache write premiums are excluded.", 11.0, colors.tertiary))
-                .child(label("Includes local and remote Claude Code and Codex transcripts, including sessions outside Diri, plus billed Cursor usage on this Mac. Remote machines refresh every 5 minutes over SSH; unavailable machines keep their last saved totals.", 11.0, colors.tertiary)));
+                .child(label(format!("Includes local and remote Claude Code and Codex transcripts, including sessions outside Diri, plus billed Cursor usage on {}. Remote machines refresh every 5 minutes over SSH; unavailable machines keep their last saved totals.", crate::platform::local_machine_label_lowercase()), 11.0, colors.tertiary)));
         settings_page_with_trailing(
             "Usage",
             usage_share::SUPPORTED.then_some(share),

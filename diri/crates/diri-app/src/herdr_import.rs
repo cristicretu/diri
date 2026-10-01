@@ -46,7 +46,8 @@ impl HerdrRoots {
     }
 
     pub fn current_user() -> Self {
-        let home = std::env::var_os("HOME")
+        let home = diri_platform::home_dir()
+            .map(|p| p.into_os_string())
             .map(PathBuf::from)
             .unwrap_or_else(|| PathBuf::from("/nonexistent"));
         let xdg = std::env::var_os("XDG_CONFIG_HOME").map(PathBuf::from);
@@ -418,7 +419,7 @@ fn read_snapshot(path: &Path) -> Option<SessionSnapshot> {
 /// A live herdr server accepts on its API socket; a stale socket file left
 /// by a crash refuses.
 fn socket_answers(path: &Path) -> bool {
-    std::os::unix::net::UnixStream::connect(path).is_ok()
+    diri_platform::ipc::UnixStream::connect(path).is_ok()
 }
 
 #[derive(Deserialize)]

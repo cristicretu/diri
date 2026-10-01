@@ -1,4 +1,25 @@
 const DEV_BUNDLE_PREFIX: &str = "com.dirijor.diri.dev.";
+#[cfg(windows)]
+const WINDOWS_BUNDLE_ID_FILE: &str = "diri-dev-bundle-id";
+
+/// Windows executables carry no bundle metadata. `scripts/dev.ps1` writes the
+/// id beside its copy of `diri.exe`; an installed package never contains it.
+#[cfg(windows)]
+pub(crate) fn windows_bundle_id() -> Option<String> {
+    let executable = std::env::current_exe().ok()?;
+    parse_bundle_id(&std::fs::read_to_string(executable.with_file_name(WINDOWS_BUNDLE_ID_FILE)).ok()?)
+}
+
+#[cfg(any(windows, test))]
+fn parse_bundle_id(contents: &str) -> Option<String> {
+    let id = contents.trim();
+    (!id.is_empty()
+        && id.len() <= 128
+        && id
+            .chars()
+            .all(|character| character.is_ascii_alphanumeric() || matches!(character, '.' | '-')))
+    .then(|| id.to_owned())
+}
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct DevBuildIdentity {
@@ -91,6 +112,18 @@ mod tests {
         assert!(DevBuildIdentity::from_parts(None, bundle, Some("main@abc1234")).is_none());
         assert!(DevBuildIdentity::from_parts(Some("0"), bundle, Some("main@abc1234")).is_none());
         assert!(DevBuildIdentity::from_parts(Some("1"), bundle, None).is_none());
+    }
+
+    #[test]
+    fn windows_bundle_id_file_accepts_only_an_identifier() {
+        assert_eq!(
+            parse_bundle_id("com.dirijor.diri.dev.abc1234\r\n").as_deref(),
+            Some("com.dirijor.diri.dev.abc1234")
+        );
+        for rejected in ["", "  ", "com.dirijor.diri.dev.a b", "com\\dirijor", "id\0x"] {
+            assert_eq!(parse_bundle_id(rejected), None, "{rejected:?}");
+        }
+        assert_eq!(parse_bundle_id(&"a".repeat(129)), None);
     }
 
     #[test]

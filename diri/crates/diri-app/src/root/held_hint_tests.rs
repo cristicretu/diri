@@ -11,7 +11,8 @@ use crate::held_hints::HOLD_DELAY;
 
 fn command() -> Modifiers {
     Modifiers {
-        platform: true,
+        platform: cfg!(target_os = "macos"),
+        control: !cfg!(target_os = "macos"),
         ..Modifiers::default()
     }
 }

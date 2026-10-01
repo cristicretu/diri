@@ -53,6 +53,11 @@ impl HookQueue {
         }
     }
 
+    #[cfg(all(test, unix))]
+    pub(super) fn is_idle(&self) -> bool {
+        self.pending.load(Ordering::Acquire) == 0
+    }
+
     /// Applies `report` now if the Registry is free and nothing is queued;
     /// otherwise hands it to the applier. Returns whether it applied inline,
     /// or `Err` for a poisoned Registry (as every other request reports).

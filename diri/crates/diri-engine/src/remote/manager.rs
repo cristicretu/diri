@@ -3,9 +3,8 @@
 use std::collections::HashMap;
 use std::fs;
 use std::io;
+#[cfg(unix)]
 use std::os::unix::ffi::OsStrExt as _;
-use std::os::unix::fs::MetadataExt as _;
-use std::os::unix::fs::PermissionsExt;
 use std::path::{Component, Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -41,6 +40,7 @@ const MAX_ARTIFACT_BYTES: u64 = 64 * 1024 * 1024;
 // macOS sockaddr_un.sun_path is 104 bytes. OpenSSH briefly appends a dot and
 // 16-byte nonce while creating a multiplex socket, so leave room for the
 // per-host digest plus that suffix.
+#[cfg(unix)]
 const MAX_CONTROL_DIRECTORY_BYTES: usize = 56;
 fn verify_required_helper_probe(
     artifact: &PackagedArtifact,
@@ -194,11 +194,11 @@ impl RemoteManager {
     ) -> io::Result<Self> {
         let control_dir = normalized_control_dir(&control_dir);
         validate_control_dir_if_present(&control_dir)?;
-        fs::create_dir_all(&control_dir)?;
+        diri_platform::security::private_dir_all(&control_dir)?;
         // Recheck after creation to close the `/tmp` create race before chmod
         // or any OpenSSH socket creation follows an attacker-placed symlink.
         validate_control_dir_if_present(&control_dir)?;
-        fs::set_permissions(&control_dir, fs::Permissions::from_mode(0o700))?;
+        diri_platform::security::owner_only(&control_dir, true)?;
         Ok(Self {
             executor,
             artifacts,
@@ -271,6 +271,9 @@ impl RemoteManager {
     /// logout cleanup; any other failed teardown is a correctness error for a
     /// persistence probe.
     fn close_control_master(&self, transport: &SshTransport) -> io::Result<()> {
+        if !transport.uses_control_master() {
+            return Ok(());
+        }
         let output = self.executor.run(
             transport.control_exit(),
             Vec::new(),
@@ -1162,23 +1165,18 @@ fn require_rpc_success(output: CommandOutput) -> io::Result<CommandOutput> {
 }
 
 fn validate_control_dir_if_present(path: &Path) -> io::Result<()> {
-    match fs::symlink_metadata(path) {
-        Ok(metadata)
-            if metadata.file_type().is_symlink()
-                || !metadata.is_dir()
-                || metadata.uid() != effective_uid() =>
-        {
-            Err(io::Error::new(
-                io::ErrorKind::PermissionDenied,
-                "SSH control directory must be a real directory owned by the current user",
-            ))
-        }
-        Ok(_) => Ok(()),
-        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
-        Err(error) => Err(error),
+    match diri_platform::security::validate_directory(path, 0) {
+        Ok(()) => Ok(()),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(e),
     }
 }
 
+#[cfg(windows)]
+fn normalized_control_dir(requested: &Path) -> PathBuf {
+    requested.into()
+}
+#[cfg(unix)]
 fn normalized_control_dir(requested: &Path) -> PathBuf {
     if requested.as_os_str().as_bytes().len() <= MAX_CONTROL_DIRECTORY_BYTES {
         return requested.to_path_buf();
@@ -1194,6 +1192,7 @@ fn normalized_control_dir(requested: &Path) -> PathBuf {
     PathBuf::from(format!("/tmp/diri-ssh-{}-{suffix}", effective_uid()))
 }
 
+#[cfg(unix)]
 fn effective_uid() -> u32 {
     // SAFETY: `geteuid` has no preconditions and does not access caller-owned
     // memory; it returns the kernel credential for this process.
@@ -1269,8 +1268,12 @@ fn persistence_key(host: &HostEntry) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(unix)]
     use std::io::Write as _;
+    #[cfg(unix)]
     use std::os::unix::fs::OpenOptionsExt as _;
+    #[cfg(unix)]
+    use std::os::unix::fs::PermissionsExt;
 
     #[test]
     fn json_line_parser_ignores_bounded_shell_noise() {
@@ -1372,6 +1375,7 @@ mod tests {
         assert!(error.to_string().contains("directory-list"));
     }
 
+    #[cfg(unix)]
     #[test]
     fn long_control_directories_use_a_short_stable_owner_path() {
         let requested = PathBuf::from("/very-long").join("segment".repeat(20));
@@ -1409,6 +1413,7 @@ mod tests {
             .expect("manager"),
         );
         let host = HostEntry {
+            transport: Default::default(),
             id: "fixture".into(),
             name: None,
             ssh: "fake-host".into(),
@@ -1708,6 +1713,7 @@ mod tests {
         )
         .expect("manager");
         let host = HostEntry {
+            transport: Default::default(),
             id: "fixture".into(),
             name: None,
             ssh: "fake-host".into(),
@@ -1750,6 +1756,7 @@ mod tests {
         assert_eq!(error.kind(), io::ErrorKind::Unsupported);
     }
 
+    #[cfg(unix)]
     #[test]
     fn fake_ssh_bootstrap_uploads_activates_and_then_reuses_exact_build() {
         let temporary = tempfile::tempdir().expect("temp");
@@ -1805,6 +1812,7 @@ mod tests {
         )
         .expect("manager");
         let host = HostEntry {
+            transport: Default::default(),
             id: "fixture".into(),
             name: None,
             ssh: "fake-host".into(),

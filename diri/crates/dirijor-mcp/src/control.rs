@@ -1,6 +1,5 @@
+use diri_platform::ipc::UnixStream;
 use std::io::{self, BufRead, BufReader, Write};
-#[cfg(unix)]
-use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
@@ -51,11 +50,12 @@ pub fn default_socket_path() -> PathBuf {
     if let Some(path) = std::env::var_os("DIRIJOR_SOCKET") {
         return PathBuf::from(path);
     }
-    let home = std::env::var_os("HOME").map_or_else(|| PathBuf::from("."), PathBuf::from);
+    let home = diri_platform::home_dir()
+        .map(|p| p.into_os_string())
+        .map_or_else(|| PathBuf::from("."), PathBuf::from);
     diri_proto::paths::DirijorPaths::socket(home)
 }
 
-#[cfg(unix)]
 pub struct ControlClient {
     stream: UnixStream,
     reader: BufReader<UnixStream>,
@@ -64,7 +64,6 @@ pub struct ControlClient {
     _registration: Option<crate::cancellation::Registration>,
 }
 
-#[cfg(unix)]
 impl ControlClient {
     pub fn connect(path: &Path, timeout: Duration) -> Result<Self, ControlFailure> {
         let stream = UnixStream::connect(path)?;
@@ -239,7 +238,7 @@ impl ControlClient {
                 // Darwin rejects SO_RCVTIMEO after a peer closes, even when its
                 // complete reply is queued. Only bypass that error after poll
                 // proves hangup: draining queued bytes/EOF cannot block.
-                if error.raw_os_error() != Some(libc::EINVAL) || !self.peer_hung_up() {
+                if error.raw_os_error() != Some(22) || !self.peer_hung_up() {
                     return Err(self.io_failure(error));
                 }
             }
@@ -270,31 +269,15 @@ impl ControlClient {
     }
 
     fn peer_hung_up(&self) -> bool {
-        use std::os::fd::AsRawFd;
-        let mut descriptor = libc::pollfd {
-            fd: self.stream.as_raw_fd(),
-            events: libc::POLLIN,
+        use diri_platform::poll::AsRawIo;
+        let mut descriptor = diri_platform::poll::PollFd {
+            fd: self.stream.as_raw_io(),
+            events: diri_platform::poll::POLLIN,
             revents: 0,
         };
         // SAFETY: one valid pollfd referring to a stream owned by this client.
-        let ready = unsafe { libc::poll(&mut descriptor, 1, 0) > 0 };
-        ready && descriptor.revents & libc::POLLHUP != 0
-    }
-}
-
-#[cfg(not(unix))]
-pub struct ControlClient;
-
-#[cfg(not(unix))]
-impl ControlClient {
-    pub fn connect(_: &Path, _: Duration) -> Result<Self, ControlFailure> {
-        Err(ControlFailure::Protocol(
-            "the local Diri control socket requires a unix platform".into(),
-        ))
-    }
-
-    pub fn connect_default(timeout: Duration) -> Result<Self, ControlFailure> {
-        Self::connect(Path::new(""), timeout)
+        let ready = unsafe { diri_platform::poll::poll(&mut descriptor, 1, 0) > 0 };
+        ready && descriptor.revents & diri_platform::poll::POLLHUP != 0
     }
 }
 
@@ -307,7 +290,7 @@ mod tests {
         for partial in [false, true] {
             let temp = tempfile::tempdir().unwrap();
             let path = temp.path().join("engine.sock");
-            let listener = std::os::unix::net::UnixListener::bind(&path).unwrap();
+            let listener = diri_platform::ipc::UnixListener::bind(&path).unwrap();
             let worker = std::thread::spawn(move || {
                 let (mut stream, _) = listener.accept().unwrap();
                 let mut line = String::new();
@@ -360,7 +343,7 @@ mod tests {
     fn a_reply_buffered_before_peer_close_is_readable() {
         let temp = tempfile::tempdir().unwrap();
         let path = temp.path().join("engine.sock");
-        let listener = std::os::unix::net::UnixListener::bind(&path).unwrap();
+        let listener = diri_platform::ipc::UnixListener::bind(&path).unwrap();
         let mut client = ControlClient::connect(&path, Duration::from_secs(1)).unwrap();
         let (mut peer, _) = listener.accept().unwrap();
         let reply = ControlMessage::Response {
@@ -381,7 +364,7 @@ mod tests {
     fn protocol_errors_do_not_echo_daemon_payloads() {
         let temp = tempfile::tempdir().unwrap();
         let path = temp.path().join("engine.sock");
-        let listener = std::os::unix::net::UnixListener::bind(&path).unwrap();
+        let listener = diri_platform::ipc::UnixListener::bind(&path).unwrap();
         let worker = std::thread::spawn(move || {
             let (mut stream, _) = listener.accept().unwrap();
             let mut line = String::new();

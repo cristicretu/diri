@@ -190,6 +190,7 @@ fn main_thread_cpu() -> Option<Duration> {
 
 /// Page faults the whole process has taken so far: a slow interval full of
 /// them is memory the system compressed or swapped being paged back in.
+#[cfg(unix)]
 fn process_faults() -> u64 {
     // SAFETY: getrusage fills a caller-owned struct.
     let mut usage: libc::rusage = unsafe { std::mem::zeroed() };
@@ -199,6 +200,11 @@ fn process_faults() -> u64 {
     u64::try_from(usage.ru_minflt)
         .unwrap_or(0)
         .saturating_add(u64::try_from(usage.ru_majflt).unwrap_or(0))
+}
+
+#[cfg(windows)]
+fn process_faults() -> u64 {
+    diri_platform::process::page_faults().unwrap_or(0)
 }
 
 /// Main-thread CPU and process page faults at one moment. Across a slow
@@ -1066,7 +1072,8 @@ pub(crate) fn take_first_run_notice() -> bool {
 /// thread.
 pub(crate) fn upload_now_blocking() -> Result<diri_proto::TelemetryUploadNowResult, String> {
     // Tests never reach the real Engine.
-    let home = std::env::var_os("HOME")
+    let home = diri_platform::home_dir()
+        .map(|p| p.into_os_string())
         .filter(|_| !cfg!(test))
         .ok_or_else(|| "no home directory".to_owned())?;
     // What this process recorded a moment ago goes in the same upload.

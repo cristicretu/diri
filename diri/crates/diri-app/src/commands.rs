@@ -1877,7 +1877,7 @@ impl CommandId {
                 category: Application,
             },
             Self::Quit => ShortcutMetadata {
-                title: "Quit Diri",
+                title: crate::platform::quit_label(),
                 description: "Close Diri and leave no windows open",
                 category: Application,
             },

@@ -7,14 +7,27 @@
 //! rewards an in-process client.
 
 use std::fs;
-use std::io::Write as _;
+use std::io::{Read as _, Write as _};
 use std::path::Path;
 use std::process::{Command, Stdio};
 use std::time::Duration;
 
 use crate::error::{Result, UpdateError};
+use sha2::{Digest, Sha256};
 
-const CURL: &str = "/usr/bin/curl";
+fn curl_path() -> std::path::PathBuf {
+    #[cfg(windows)]
+    {
+        std::path::PathBuf::from(
+            std::env::var_os("SystemRoot").unwrap_or_else(|| "C:\\Windows".into()),
+        )
+        .join("System32/curl.exe")
+    }
+    #[cfg(not(windows))]
+    {
+        "/usr/bin/curl".into()
+    }
+}
 const FEED_TIMEOUT_SECONDS: u32 = 20;
 const DOWNLOAD_TIMEOUT_SECONDS: u32 = 900;
 const PROGRESS_POLL: Duration = Duration::from_millis(150);
@@ -147,10 +160,15 @@ impl Http {
     }
 
     fn curl(&self) -> Command {
-        let mut command = Command::new(CURL);
+        let mut command = Command::new(curl_path());
         // -K - keeps the URL and (more importantly) the credentials out of the
         // process arguments, where any user on the machine could read them.
         command.arg("-K").arg("-");
+        #[cfg(windows)]
+        {
+            use std::os::windows::process::CommandExt;
+            command.creation_flags(0x08000000);
+        }
         command
     }
 
@@ -171,7 +189,12 @@ impl Http {
         config.push_str("max-redirs = 5\n");
         config.push_str(&format!("user-agent = \"diri-updater/{}\"\n", crate::AGENT));
         if let Some(path) = output {
-            config.push_str(&format!("output = \"{}\"\n", path.display()));
+            config.push_str(&format!(
+                "output = \"{}\"\n",
+                path.to_string_lossy()
+                    .replace('\\', "\\\\")
+                    .replace('"', "\\\"")
+            ));
         }
         config
     }
@@ -220,19 +243,23 @@ pub fn verify_sha256(path: &Path, expected: &str) -> Result<()> {
             "release checksum is not a SHA-256 digest".to_owned(),
         ));
     }
-    let output = Command::new("/usr/bin/shasum")
-        .arg("-a")
-        .arg("256")
-        .arg(path)
-        .output()?;
-    if !output.status.success() {
-        return Err(UpdateError::tool(
-            "shasum",
-            String::from_utf8_lossy(&output.stderr).trim().to_owned(),
-        ));
+    // The same bounded, in-process verification works on Windows, where
+    // /usr/bin/shasum does not exist. sha2 is already used by the workspace.
+    let mut file = fs::File::open(path)?;
+    let mut digest = Sha256::new();
+    let mut buffer = [0_u8; 64 * 1024];
+    loop {
+        let read = file.read(&mut buffer)?;
+        if read == 0 {
+            break;
+        }
+        digest.update(&buffer[..read]);
     }
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    let actual = stdout.split_whitespace().next().unwrap_or_default();
+    let actual: String = digest
+        .finalize()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect();
     if !actual.eq_ignore_ascii_case(expected) {
         return Err(UpdateError::Integrity(format!(
             "sha256 {actual} does not match the feed's {expected}"
@@ -309,14 +336,9 @@ mod tests {
         let expected = "8f9a2b0f8c9f2d5f24b3f2ca0d18b6f4b3f7f2e0f5d0b1b0d0f5c6b7a8d9e0f1";
         assert!(verify_sha256(&path, expected).is_err());
 
-        let output = Command::new("/usr/bin/shasum")
-            .arg("-a")
-            .arg("256")
-            .arg(&path)
-            .output()
-            .expect("shasum runs");
-        let stdout = String::from_utf8_lossy(&output.stdout);
-        let actual = stdout.split_whitespace().next().expect("a digest");
+        // Independently computed SHA-256 of the fixed bytes above. Do not
+        // require a Unix shasum executable on the Windows updater path.
+        let actual = "4f3be1a92ededd90292e0eaf67448e820f49b55b45c9275991d824759d58da09";
         assert!(verify_sha256(&path, actual).is_ok());
         assert!(verify_sha256(&path, &actual.to_uppercase()).is_ok());
     }

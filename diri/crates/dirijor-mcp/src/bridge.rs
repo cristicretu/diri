@@ -1023,7 +1023,9 @@ fn required_strings(arguments: &Value, key: &str) -> Result<Vec<String>, String>
 }
 
 fn include_file_path() -> Result<PathBuf, String> {
-    let home = std::env::var_os("HOME").ok_or_else(|| "HOME is not set".to_owned())?;
+    let home = diri_platform::home_dir()
+        .map(|p| p.into_os_string())
+        .ok_or_else(|| "HOME is not set".to_owned())?;
     Ok(DirijorPaths::diri_include_file(home))
 }
 
@@ -1392,8 +1394,8 @@ mod tests {
     #[test]
     #[cfg(unix)]
     fn old_engines_never_trigger_untracked_delivery_fallback() {
+        use diri_platform::ipc::UnixListener;
         use std::io::{BufRead, BufReader, Write};
-        use std::os::unix::net::UnixListener;
         let temp = tempfile::tempdir().unwrap();
         let path = temp.path().join("old-engine.sock");
         let listener = UnixListener::bind(&path).unwrap();

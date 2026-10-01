@@ -228,6 +228,7 @@ fn run(real: bool) {
         .unwrap(),
     );
     let host = HostEntry {
+        transport: Default::default(),
         id: "soak".into(),
         name: None,
         ssh: if real {

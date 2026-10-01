@@ -166,7 +166,7 @@ pub fn scan(roots: &[SkillRoot]) -> Catalog {
     let mut skills = BTreeMap::<PathBuf, Skill>::new();
     let mut remaining = MAX_DIRECTORIES;
     for root in roots {
-        let Ok(canonical_root) = fs::canonicalize(&root.path) else {
+        let Ok(canonical_root) = diri_platform::canonicalize(&root.path) else {
             continue;
         };
         let mut visited = HashSet::new();
@@ -177,7 +177,7 @@ pub fn scan(roots: &[SkillRoot]) -> Catalog {
                 break;
             }
             remaining -= 1;
-            let canonical = match fs::canonicalize(&directory) {
+            let canonical = match diri_platform::canonicalize(&directory) {
                 Ok(path) => path,
                 Err(error) => {
                     if error.kind() != io::ErrorKind::NotFound {

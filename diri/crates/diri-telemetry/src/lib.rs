@@ -136,7 +136,7 @@ pub fn init_default(process: Process) -> bool {
 /// macOS) from `$HOME`.
 #[must_use]
 pub fn default_state_dir() -> Option<std::path::PathBuf> {
-    let home = std::env::var_os("HOME")?;
+    let home = diri_platform::home_dir().map(|p| p.into_os_string())?;
     Some(diri_proto::paths::DirijorPaths::state_dir(home))
 }
 

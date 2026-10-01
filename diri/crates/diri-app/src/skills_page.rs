@@ -102,7 +102,9 @@ impl SkillsPage {
         self.document = None;
         self.instructions = None;
         self.detail_task = None;
-        let home = std::env::var_os("HOME").map(PathBuf::from);
+        let home = diri_platform::home_dir()
+            .map(|p| p.into_os_string())
+            .map(PathBuf::from);
         let project = self.project.clone();
         self.scan_task = Some(cx.spawn(async move |this, cx| {
             let catalog = cx
@@ -430,7 +432,10 @@ impl Render for SkillsPage {
             div()
                 .text_size(px(13.0))
                 .text_color(colors.secondary)
-                .child("Browse skills on this Mac and in the current local project."),
+                .child(format!(
+                    "Browse skills on {} and in the current local project.",
+                    crate::platform::local_machine_label_lowercase()
+                )),
         );
         let search_label = if self.query.is_empty() && self.keyboard_target != 0 {
             div()

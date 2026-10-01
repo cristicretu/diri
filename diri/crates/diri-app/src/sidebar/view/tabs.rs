@@ -395,7 +395,10 @@ impl Sidebar {
             .min_w(px(0.0))
             .h(px(30.0))
             .overflow_x_scroll()
-            .track_scroll(&self.tab_scroll);
+            .track_scroll(&self.tab_scroll)
+            // The scroller's hitbox covers the gaps between tabs; those move
+            // the window like the rest of the strip.
+            .titlebar_drag_area();
         if self.last_tab_selection != selected || self.last_tab_available_width != available_width {
             if let Some(index) = tabs
                 .sessions
@@ -916,6 +919,7 @@ impl Sidebar {
             ))
             .role(Role::TabList)
             .aria_label("Project sessions")
+            .titlebar_drag_area()
             .flex_none()
             .h(px(TAB_STRIP_HEIGHT))
             .w_full()
@@ -924,12 +928,12 @@ impl Sidebar {
             .relative()
             .py(px(6.0))
             .gap(px(0.0))
-            .pl(px(if cfg!(target_os = "macos") && !self.ui.visible {
+            .pl(px(if crate::window_chrome::traffic_lights_visible() && !self.ui.visible {
                 92.0
             } else {
                 10.0
             }))
-            .pr(px(10.0))
+            .pr(px(10.0 + self.strip_caption_inset))
             .child(
                 div()
                     .absolute()
@@ -941,7 +945,16 @@ impl Sidebar {
             )
             .bg(colors.sidebar_surface())
             .text_color(colors.primary)
-            .child(self.project_control(colors, cx))
+            .child(
+                div()
+                    .flex_1()
+                    .min_w(px(0.0))
+                    .h_full()
+                    .flex()
+                    .items_center()
+                    // Content only: the strip's own fill keeps its color.
+                    .opacity(self.title_opacity)
+                    .child(self.project_control(colors, cx))
             .child(rows)
             .child(crate::held_hints::below(
                 div()
@@ -1002,7 +1015,7 @@ impl Sidebar {
                         .items_center()
                         .child(trailing),
                 )
-            })
+            }))
             .into_any_element()
     }
 }

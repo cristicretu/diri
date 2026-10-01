@@ -1,10 +1,11 @@
 //! One Engine-side controller for one remote Holder.
 
+use diri_platform::child::Child;
+use diri_platform::ipc::UnixStream;
+use diri_platform::pipe::{ChildStdin, ChildStdout};
+use diri_platform::poll::{self, OwnedIo};
 use std::collections::{HashMap, VecDeque};
 use std::io::{self, Write};
-use std::os::fd::{AsFd, AsRawFd, OwnedFd};
-use std::os::unix::net::UnixStream;
-use std::process::{Child, ChildStdin, ChildStdout};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
@@ -203,13 +204,7 @@ impl RemoteSessionClient {
 
             // Only this Engine writes this pipe. Never let SSH backpressure block
             // an interactive caller or the Registry that called it.
-            let fd = channel.input.as_raw_fd();
-            // SAFETY: fd is the live owned SSH stdin descriptor; preserve its flags.
-            let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
-            if flags < 0 || unsafe { libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK) } < 0
-            {
-                return Err(io::Error::last_os_error());
-            }
+            poll::set_nonblocking(&channel.input, true)?;
             let (wake, wake_reader) = UnixStream::pair()?;
             wake.set_nonblocking(true)?;
             wake_reader.set_nonblocking(true)?;
@@ -246,17 +241,13 @@ impl RemoteSessionClient {
             .ok_or_else(|| io::Error::other("SSH writer wakeup already taken"))
     }
 
-    pub(crate) fn pending_write_fd(&self, generation: u64) -> io::Result<Option<OwnedFd>> {
+    pub(crate) fn pending_write_fd(&self, generation: u64) -> io::Result<Option<OwnedIo>> {
         let writer = self.writer.lock().expect("remote writer");
         require_generation(&writer, generation)?;
         if writer.pending.is_empty() {
             return Ok(None);
         }
-        writer
-            .input
-            .as_ref()
-            .map(|input| input.as_fd().try_clone_to_owned())
-            .transpose()
+        writer.input.as_ref().map(poll::duplicate).transpose()
     }
 
     pub(crate) fn flush_pending(&self, generation: u64) -> io::Result<()> {
@@ -813,19 +804,19 @@ fn require_generation(writer: &WriterState, generation: u64) -> io::Result<()> {
 fn remote_signal(target: RemoteTarget, signal: i32) -> io::Result<i32> {
     // Existing holders interpret signal numbers using their own operating system.
     match signal {
-        libc::SIGCONT => Ok(match target {
+        diri_platform::signals::SIGCONT => Ok(match target {
             RemoteTarget::LinuxX86_64 | RemoteTarget::LinuxAarch64 => 18,
             RemoteTarget::MacosAarch64 => 19,
         }),
-        libc::SIGSTOP => Ok(match target {
+        diri_platform::signals::SIGSTOP => Ok(match target {
             RemoteTarget::LinuxX86_64 | RemoteTarget::LinuxAarch64 => 19,
             RemoteTarget::MacosAarch64 => 17,
         }),
-        libc::SIGHUP => Ok(1),
-        libc::SIGINT => Ok(2),
-        libc::SIGQUIT => Ok(3),
-        libc::SIGKILL => Ok(9),
-        libc::SIGTERM => Ok(15),
+        diri_platform::signals::SIGHUP => Ok(1),
+        diri_platform::signals::SIGINT => Ok(2),
+        diri_platform::signals::SIGQUIT => Ok(3),
+        diri_platform::signals::SIGKILL => Ok(9),
+        diri_platform::signals::SIGTERM => Ok(15),
         _ => Err(io::Error::new(
             io::ErrorKind::InvalidInput,
             "unsupported remote signal",
@@ -918,7 +909,11 @@ impl Drop for RemoteSessionClient {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(unix)]
+    use diri_platform::poll::AsRawIo;
     use diri_proto::frames::FrameType;
+    #[cfg(unix)]
+    use std::os::fd::OwnedFd;
 
     use super::*;
 
@@ -930,6 +925,7 @@ mod tests {
         use diri_proto::remote_pty::RemoteCapability;
         let temp = tempfile::tempdir().unwrap();
         let host = diri_proto::HostEntry {
+            transport: Default::default(),
             id: "fixture".into(),
             name: None,
             ssh: "fixture".into(),
@@ -991,7 +987,13 @@ mod tests {
     #[test]
     fn unsupported_signals_are_rejected_before_delivery() {
         for target in RemoteTarget::ALL {
-            for signal in [0, -1, libc::SIGUSR1, libc::SIGUSR2, libc::SIGCHLD] {
+            for signal in [
+                0,
+                -1,
+                diri_platform::signals::SIGUSR1,
+                diri_platform::signals::SIGUSR2,
+                diri_platform::signals::SIGCHLD,
+            ] {
                 assert_eq!(
                     remote_signal(target, signal).unwrap_err().kind(),
                     io::ErrorKind::InvalidInput
@@ -1008,13 +1010,13 @@ mod tests {
             (RemoteTarget::MacosAarch64, 17, 19),
         ] {
             for (native, expected) in [
-                (libc::SIGCONT, resume),
-                (libc::SIGSTOP, stop),
-                (libc::SIGINT, 2),
-                (libc::SIGTERM, 15),
-                (libc::SIGKILL, 9),
-                (libc::SIGHUP, 1),
-                (libc::SIGQUIT, 3),
+                (diri_platform::signals::SIGCONT, resume),
+                (diri_platform::signals::SIGSTOP, stop),
+                (diri_platform::signals::SIGINT, 2),
+                (diri_platform::signals::SIGTERM, 15),
+                (diri_platform::signals::SIGKILL, 9),
+                (diri_platform::signals::SIGHUP, 1),
+                (diri_platform::signals::SIGQUIT, 3),
             ] {
                 assert_eq!(
                     remote_signal(target, native).unwrap(),
@@ -1041,6 +1043,7 @@ mod tests {
             FrameType::Input
         );
     }
+    #[cfg(unix)]
     fn pipe_writer() -> (WriterState, UnixStream) {
         let (input, output) = UnixStream::pair().unwrap();
         input.set_nonblocking(true).unwrap();
@@ -1050,7 +1053,7 @@ mod tests {
         assert_eq!(
             unsafe {
                 libc::setsockopt(
-                    input.as_raw_fd(),
+                    input.as_raw_io(),
                     libc::SOL_SOCKET,
                     libc::SO_SNDBUF,
                     (&size as *const libc::c_int).cast(),
@@ -1071,6 +1074,7 @@ mod tests {
         )
     }
 
+    #[cfg(unix)]
     #[test]
     fn fatal_transport_discards_queued_effects_and_rejects_future_writes() {
         let (mut writer, _peer) = pipe_writer();
@@ -1094,6 +1098,7 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
     #[test]
     fn nonblocking_frames_resume_in_order_and_reject_overflow_atomically() {
         use std::io::Read;
@@ -1132,6 +1137,7 @@ mod tests {
         assert_eq!(writer.pending_bytes, 0);
     }
 
+    #[cfg(unix)]
     #[test]
     fn disconnect_never_replays_a_partially_written_effect() {
         let (mut writer, _output) = pipe_writer();
@@ -1152,6 +1158,7 @@ mod tests {
         assert!(queue_input(&mut writer, b"retry").is_err());
     }
 
+    #[cfg(unix)]
     #[test]
     fn disconnect_retains_only_wholly_unwritten_input() {
         let (mut writer, _output) = pipe_writer();
@@ -1171,6 +1178,7 @@ mod tests {
         assert!(!writer.uncertain_effect);
         assert_eq!(writer.queued_input, b"safe");
     }
+    #[cfg(unix)]
     #[test]
     fn explicit_restart_discards_uncertain_effects_and_revokes_the_old_writer() {
         let (mut writer, _output) = pipe_writer();

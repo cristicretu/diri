@@ -273,7 +273,8 @@ pub(super) fn tweet_intent_url(caption: &str) -> String {
 }
 
 pub(super) fn save_directory() -> PathBuf {
-    std::env::var_os("HOME")
+    diri_platform::home_dir()
+        .map(|p| p.into_os_string())
         .map(PathBuf::from)
         .map(|home| {
             let downloads = home.join("Downloads");

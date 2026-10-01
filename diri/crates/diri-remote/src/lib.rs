@@ -961,6 +961,9 @@ mod tests {
             Some(captured)
         );
         let changed_birth = match captured.birth() {
+            diri_proto::process::ProcessBirth::Windows { .. } => {
+                panic!("Windows is not a Remote Helper target")
+            }
             diri_proto::process::ProcessBirth::Linux {
                 boot_id,
                 start_ticks,

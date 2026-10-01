@@ -135,7 +135,7 @@ pub(crate) enum WindowAction {
 }
 struct WindowEntry {
     owner: SpawnOwner,
-    #[cfg(any(target_os = "macos", test))]
+    #[cfg(any(target_os = "macos", windows, test))]
     canonical: std::sync::Weak<RwLock<SessionStore>>,
     navigation: std::rc::Weak<RefCell<WindowNavigation>>,
 }
@@ -171,7 +171,7 @@ impl WindowStore {
                 0,
                 WindowEntry {
                     owner: view.owner,
-                    #[cfg(any(target_os = "macos", test))]
+                    #[cfg(any(target_os = "macos", windows, test))]
                     canonical: Arc::downgrade(&view.canonical),
                     navigation: Rc::downgrade(&view.navigation),
                 },
@@ -179,7 +179,7 @@ impl WindowStore {
         });
         view
     }
-    #[cfg(any(target_os = "macos", test))]
+    #[cfg(any(target_os = "macos", windows, test))]
     pub fn focused(canonical: &Arc<RwLock<SessionStore>>) -> Option<Self> {
         WINDOWS.with(|windows| {
             windows.borrow().iter().rev().find_map(|entry| {
@@ -193,7 +193,7 @@ impl WindowStore {
             })
         })
     }
-    #[cfg(any(target_os = "macos", test))]
+    #[cfg(any(target_os = "macos", windows, test))]
     pub fn enqueue(&self, action: WindowAction) -> bool {
         let mut navigation = self.navigation.borrow_mut();
         if !navigation.live || navigation.actions.len() >= 16 {

@@ -1,0 +1,126 @@
+name: Windows code signing
+
+# Called only for this run's tested main-branch payload. Never sign PR artifacts
+# or arbitrary artifacts from another workflow run with the release identity.
+on:
+  workflow_call:
+    inputs:
+      architecture:
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  sign:
+    name: Sign Windows ${{ inputs.architecture }}
+    if: github.ref == 'refs/heads/main' && github.event_name != 'pull_request' && vars.DIRI_WINDOWS_SIGNING == 'artifact-signing'
+    runs-on: windows-2025
+    timeout-minutes: 30
+    environment: windows-signing
+    permissions:
+      contents: read
+      actions: read
+      id-token: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Download this run's native payload
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: diri-windows-${{ inputs.architecture }}-unsigned
+          path: ${{ runner.temp }}\diri-windows
+      - name: Locate the staged payload
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $payloads = @(Get-ChildItem "$env:RUNNER_TEMP\diri-windows" -Directory -Filter 'payload-*')
+          if ($payloads.Count -ne 1) { throw 'Expected exactly one staged payload' }
+          $payload = $payloads[0].FullName
+          foreach ($name in @('diri','dirijord-rs','diri-holder','diri-ssh-askpass','dirijor','dirijor-mcp')) {
+            if (!(Test-Path -LiteralPath (Join-Path $payload "$name.exe"))) { throw "Missing $name.exe" }
+          }
+          $version = (Get-Item -LiteralPath (Join-Path $payload 'diri.exe')).VersionInfo.ProductVersion
+          if ($version -notmatch '^\d+\.\d+\.\d+$') { throw 'Invalid payload version' }
+          "DIRI_SIGN_PAYLOAD=$payload" >> $env:GITHUB_ENV
+          "DIRI_SIGN_VERSION=$version" >> $env:GITHUB_ENV
+      - name: Azure login (OIDC, no stored secret)
+        uses: azure/login@a641126d1b8aa4d1fa005f4f92df94a3a4c4c906 # v3.1.0
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+      - name: Sign with Azure Artifact Signing
+        uses: azure/artifact-signing-action@c7ab2a863ab5f9a846ddb8265964877ef296ee82 # v2.0.0
+        with:
+          endpoint: ${{ vars.DIRI_ARTIFACT_SIGNING_ENDPOINT }}
+          signing-account-name: ${{ vars.DIRI_ARTIFACT_SIGNING_ACCOUNT }}
+          certificate-profile-name: ${{ vars.DIRI_ARTIFACT_SIGNING_PROFILE }}
+          files-folder: ${{ env.DIRI_SIGN_PAYLOAD }}
+          files-folder-filter: exe,msi
+          files-folder-recurse: true
+          file-digest: SHA256
+          timestamp-rfc3161: http://timestamp.acs.microsoft.com
+          timestamp-digest: SHA256
+          # azure/login above is the only credential source.
+          exclude-environment-credential: true
+          exclude-workload-identity-credential: true
+          exclude-managed-identity-credential: true
+          exclude-shared-token-cache-credential: true
+          exclude-visual-studio-credential: true
+          exclude-visual-studio-code-credential: true
+          exclude-azure-cli-credential: false
+          exclude-azure-powershell-credential: true
+          exclude-azure-developer-cli-credential: true
+          exclude-interactive-browser-credential: true
+      - name: Verify payload and assemble installer
+        shell: pwsh
+        env:
+          DIRI_SIGN_ARCH: ${{ inputs.architecture }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          foreach ($file in Get-ChildItem $env:DIRI_SIGN_PAYLOAD -Filter '*.exe') {
+            $signature = Get-AuthenticodeSignature -LiteralPath $file.FullName
+            if ($signature.Status -ne 'Valid' -or !$signature.TimeStamperCertificate) { throw 'Payload signature or timestamp missing' }
+          }
+          ./diri/scripts/assemble-windows-installer.ps1 -PayloadDirectory $env:DIRI_SIGN_PAYLOAD -OutputDirectory "$env:RUNNER_TEMP\diri-signed" -Architecture $env:DIRI_SIGN_ARCH -Version $env:DIRI_SIGN_VERSION
+      - name: Sign the compiled installer
+        uses: azure/artifact-signing-action@c7ab2a863ab5f9a846ddb8265964877ef296ee82 # v2.0.0
+        with:
+          endpoint: ${{ vars.DIRI_ARTIFACT_SIGNING_ENDPOINT }}
+          signing-account-name: ${{ vars.DIRI_ARTIFACT_SIGNING_ACCOUNT }}
+          certificate-profile-name: ${{ vars.DIRI_ARTIFACT_SIGNING_PROFILE }}
+          files-folder: ${{ runner.temp }}\diri-signed
+          files-folder-filter: exe,msi
+          files-folder-recurse: true
+          file-digest: SHA256
+          timestamp-rfc3161: http://timestamp.acs.microsoft.com
+          timestamp-digest: SHA256
+          # azure/login above is the only credential source.
+          exclude-environment-credential: true
+          exclude-workload-identity-credential: true
+          exclude-managed-identity-credential: true
+          exclude-shared-token-cache-credential: true
+          exclude-visual-studio-credential: true
+          exclude-visual-studio-code-credential: true
+          exclude-azure-cli-credential: false
+          exclude-azure-powershell-credential: true
+          exclude-azure-developer-cli-credential: true
+          exclude-interactive-browser-credential: true
+      - name: Verify installer and generate final appcast
+        shell: pwsh
+        env:
+          DIRI_SIGN_ARCH: ${{ inputs.architecture }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $installer = Join-Path "$env:RUNNER_TEMP\diri-signed" "diri-$env:DIRI_SIGN_VERSION-windows-$env:DIRI_SIGN_ARCH-setup.exe"
+          $signature = Get-AuthenticodeSignature -LiteralPath $installer
+          if ($signature.Status -ne 'Valid' -or !$signature.TimeStamperCertificate) { throw 'Installer signature or timestamp missing' }
+          ./diri/scripts/write-windows-appcast.ps1 -Installer $installer -Application (Join-Path $env:DIRI_SIGN_PAYLOAD 'diri.exe') -Architecture $env:DIRI_SIGN_ARCH -Version $env:DIRI_SIGN_VERSION
+      - name: Upload signed installer and appcast
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: diri-windows-${{ inputs.architecture }}-signed
+          path: ${{ runner.temp }}\diri-signed
+          if-no-files-found: error
+          retention-days: 14

@@ -801,7 +801,7 @@ where
 
 fn git_command(cwd: &Path) -> Command {
     let mut command = Command::new("git");
-    command
+    diri_platform::hide_console_window(&mut command)
         .current_dir(cwd)
         .env("LC_ALL", "C")
         .env("LANG", "C")

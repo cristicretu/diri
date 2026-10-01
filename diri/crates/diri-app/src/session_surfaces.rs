@@ -2210,7 +2210,7 @@ mod tests {
             .unwrap();
         let listener = {
             let _entered = executor.enter();
-            tokio::net::UnixListener::bind(&socket).unwrap()
+            diri_platform::ipc::asynchronous::UnixListener::bind(&socket).unwrap()
         };
         let opened = Arc::new(AtomicUsize::new(0));
         let closed = Arc::new(AtomicUsize::new(0));

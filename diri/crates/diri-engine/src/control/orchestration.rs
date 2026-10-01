@@ -101,7 +101,8 @@ fn transcript_turns(record: &SessionRecord) -> Result<Vec<TranscriptTurnRecord>,
         .agent_session_id
         .as_deref()
         .ok_or("this session has no provider conversation identity yet")?;
-    let home = std::env::var_os("HOME")
+    let home = diri_platform::home_dir()
+        .map(|p| p.into_os_string())
         .map(PathBuf::from)
         .ok_or("HOME is unset")?;
     let snapshot =

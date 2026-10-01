@@ -2,8 +2,6 @@
 //! PTY: a crash between reservation and completion is unknown, never retryable.
 //! No prompts are stored here, and this is outside the terminal hot path.
 
-use std::fs::OpenOptions;
-use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::Path;
 use std::time::Duration;
 
@@ -123,21 +121,7 @@ pub(super) fn open(path: &Path) -> Result<Connection, ControlError> {
             "cannot safely open message receipt storage; nothing was sent",
         )
     };
-    let file = OpenOptions::new()
-        .read(true)
-        .write(true)
-        .create(true)
-        .mode(0o600)
-        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
-        .open(path)
-        .map_err(|_| unavailable())?;
-    let metadata = file.metadata().map_err(|_| unavailable())?;
-    if !metadata.is_file() || metadata.nlink() != 1 || metadata.uid() != unsafe { libc::geteuid() }
-    {
-        return Err(unavailable());
-    }
-    file.set_permissions(std::fs::Permissions::from_mode(0o600))
-        .map_err(|_| unavailable())?;
+    let _file = diri_platform::security::open_private_rw(path).map_err(|_| unavailable())?;
     // macOS /var and /tmp are parent aliases. Resolve the directory only;
     // SQLite NOFOLLOW must still reject a symlink at the database itself.
     let parent = path
@@ -162,6 +146,7 @@ pub(super) fn open(path: &Path) -> Result<Connection, ControlError> {
         );",
     )
     .map_err(storage_error)?;
+    #[cfg(unix)]
     std::fs::File::open(parent)
         .and_then(|dir| dir.sync_all())
         .map_err(|_| unavailable())?;
@@ -171,6 +156,8 @@ pub(super) fn open(path: &Path) -> Result<Connection, ControlError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(unix)]
+    use std::os::unix::fs::PermissionsExt;
     use std::sync::{Arc, Barrier};
 
     fn message() -> DeliverMessageParams {
@@ -183,6 +170,7 @@ mod tests {
         }
     }
 
+    #[cfg(unix)]
     #[test]
     fn receipt_survives_reopen_and_rejects_conflicting_payloads() {
         let temp = tempfile::tempdir().unwrap();
@@ -276,6 +264,7 @@ mod tests {
         }
     }
 
+    #[cfg(unix)]
     #[test]
     fn corrupt_or_symlinked_receipts_fail_before_input() {
         let temp = tempfile::tempdir().unwrap();

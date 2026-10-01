@@ -25,6 +25,14 @@ use allocation::ALLOCS;
 const HISTORY_LINES: usize = 10_000;
 
 /// User plus system CPU time of this (single-threaded) process.
+#[cfg(windows)]
+fn cpu_time() -> Duration {
+    let (_, nanos) = diri_platform::process::usage(std::process::id()).unwrap();
+    Duration::from_nanos(nanos)
+}
+
+/// User plus system CPU time of this (single-threaded) process.
+#[cfg(unix)]
 fn cpu_time() -> Duration {
     // SAFETY: getrusage only writes the zeroed struct it is given.
     let usage = unsafe {

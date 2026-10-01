@@ -4,10 +4,8 @@
 //! No raw replay, process observation, input, notifications, or Holder launch occurs.
 
 use std::ffi::CString;
-use std::fs::{File, OpenOptions};
+
 use std::io::{self, Read, Write};
-use std::os::fd::{AsRawFd, FromRawFd};
-use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 use std::path::Path;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -237,7 +235,7 @@ impl Drop for Admission {
 /// Directory is supplied by Engine configuration, not a control caller. It must
 /// already be a private, owned directory; neither opening nor loading creates it.
 pub struct CompletedTerminalStore {
-    directory: File,
+    directory: diri_platform::directory::PrivateDirectory,
     path: std::path::PathBuf,
 }
 
@@ -252,17 +250,14 @@ pub struct RetentionReport {
 
 impl CompletedTerminalStore {
     pub fn open(directory: &Path) -> Result<Self> {
-        let file = OpenOptions::new()
-            .read(true)
-            .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC)
-            .open(directory)?;
-        let metadata = file.metadata()?;
-        if !metadata.is_dir()
-            || metadata.uid() != unsafe { libc::geteuid() }
-            || metadata.mode() & 0o077 != 0
-        {
-            return Err(StorageError::Corrupt);
-        }
+        let file =
+            diri_platform::directory::PrivateDirectory::open(directory).map_err(|error| {
+                if error.kind() == io::ErrorKind::InvalidData {
+                    StorageError::Corrupt
+                } else {
+                    StorageError::Io(error)
+                }
+            })?;
         Ok(Self {
             directory: file,
             path: directory.to_path_buf(),
@@ -323,15 +318,11 @@ impl CompletedTerminalStore {
     }
 
     fn unlink(&self, name: &str) -> Result<()> {
-        let name = CString::new(name).map_err(|_| StorageError::Corrupt)?;
-        // SAFETY: the owned directory fd and NUL-terminated name remain live.
-        if unsafe { libc::unlinkat(self.directory.as_raw_fd(), name.as_ptr(), 0) } != 0 {
-            let error = io::Error::last_os_error();
-            if error.kind() != io::ErrorKind::NotFound {
-                return Err(error.into());
-            }
+        match self.directory.unlink(name) {
+            Ok(()) => Ok(()),
+            Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(()),
+            Err(e) => Err(e.into()),
         }
-        Ok(())
     }
 
     /// Publish once after observed child exit AND complete PTY drain. Caller
@@ -407,20 +398,9 @@ impl CompletedTerminalStore {
         getrandom::fill(&mut random).map_err(io::Error::other)?;
         let nonce =
             CString::new(format!(".completed-{}.tmp", digest_hex(&random))).expect("hex filename");
-        // SAFETY: the owned directory fd and NUL-terminated name remain live.
-        let fd = unsafe {
-            libc::openat(
-                self.directory.as_raw_fd(),
-                nonce.as_ptr(),
-                libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL | libc::O_NOFOLLOW | libc::O_CLOEXEC,
-                0o600,
-            )
-        };
-        if fd < 0 {
-            return Err(io::Error::last_os_error().into());
-        }
-        // SAFETY: successful openat returned a new fd, transferred exactly once.
-        let mut file = unsafe { File::from_raw_fd(fd) };
+        let mut file = self
+            .directory
+            .create(nonce.to_str().map_err(|_| StorageError::Corrupt)?)?;
         let result = (|| -> Result<()> {
             file.write_all(MAGIC)?;
             file.write_all(&(metadata.len() as u32).to_be_bytes())?;
@@ -428,29 +408,18 @@ impl CompletedTerminalStore {
             file.write_all(&metadata)?;
             file.write_all(&payload.0)?;
             file.sync_all()?;
-            // Atomic no-replace publication. Hardlink stays within the owned
-            // directory and the private temporary name is removed below.
-            // SAFETY: both relative names and the directory fd remain live.
-            if unsafe {
-                libc::linkat(
-                    self.directory.as_raw_fd(),
-                    nonce.as_ptr(),
-                    self.directory.as_raw_fd(),
-                    name.as_ptr(),
-                    0,
-                )
-            } != 0
-            {
-                return Err(io::Error::last_os_error().into());
-            }
+            self.directory.publish(
+                nonce.to_str().map_err(|_| StorageError::Corrupt)?,
+                name.to_str().map_err(|_| StorageError::Corrupt)?,
+            )?;
             Ok(())
         })();
-        let unlinked = unsafe { libc::unlinkat(self.directory.as_raw_fd(), nonce.as_ptr(), 0) };
+        let unlinked = self
+            .directory
+            .unlink(nonce.to_str().map_err(|_| StorageError::Corrupt)?);
         if result.is_ok() {
-            if unlinked != 0 {
-                return Err(io::Error::last_os_error().into());
-            }
-            self.directory.sync_all()?;
+            unlinked?;
+            self.directory.sync()?;
         }
         result
     }
@@ -458,15 +427,7 @@ impl CompletedTerminalStore {
     /// Removes the artifact for one exact run, for example when its record is
     /// deleted. Absence is not an error; nothing else in the directory is touched.
     pub fn discard(&self, key: &CompletedRunKey) -> Result<()> {
-        let name = key.name()?;
-        // SAFETY: the owned directory fd and NUL-terminated name remain live.
-        if unsafe { libc::unlinkat(self.directory.as_raw_fd(), name.as_ptr(), 0) } != 0 {
-            let error = io::Error::last_os_error();
-            if error.kind() != io::ErrorKind::NotFound {
-                return Err(error.into());
-            }
-        }
-        Ok(())
+        self.unlink(key.name()?.to_str().map_err(|_| StorageError::Corrupt)?)
     }
 
     /// Returns None only for an absent exact-run artifact. The expected key must
@@ -484,32 +445,16 @@ impl CompletedTerminalStore {
         };
         check_exit(record, exit)?;
         let name = expected.name()?;
-        // SAFETY: the owned directory fd and NUL-terminated name remain live.
-        let fd = unsafe {
-            libc::openat(
-                self.directory.as_raw_fd(),
-                name.as_ptr(),
-                libc::O_RDONLY | libc::O_NONBLOCK | libc::O_NOFOLLOW | libc::O_CLOEXEC,
-            )
-        };
-        if fd < 0 {
-            let error = io::Error::last_os_error();
-            return if error.kind() == io::ErrorKind::NotFound {
-                Ok(None)
-            } else {
-                Err(error.into())
-            };
-        }
-        // SAFETY: successful openat returned a new fd, transferred exactly once.
-        let mut file = unsafe { File::from_raw_fd(fd) };
-        let stat = file.metadata()?;
-        if !stat.is_file()
-            || stat.uid() != unsafe { libc::geteuid() }
-            || stat.mode() & 0o077 != 0
-            || stat.nlink() != 1
+        let mut file = match self
+            .directory
+            .read(name.to_str().map_err(|_| StorageError::Corrupt)?)
         {
-            return Err(StorageError::Corrupt);
-        }
+            Ok(file) => file,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => return Err(error.into()),
+        };
+        diri_platform::security::validate_file(&file, true).map_err(|_| StorageError::Corrupt)?;
+        let stat = file.metadata()?;
         if stat.len() > (HEADER_BYTES + MAX_METADATA + MAX_CHECKPOINT_BYTES) as u64 {
             return Err(StorageError::TooLarge);
         }
@@ -793,6 +738,7 @@ mod tests {
     use super::*;
     use diri_proto::process::{BootId, ProcessBirth, ProcessIdentity};
     use diri_proto::{AgentKind, ProjectId, Resumability, TitleSource};
+    #[cfg(unix)]
     use std::os::unix::fs::PermissionsExt;
 
     /// The admission counter is process-wide, so store tests run one at a time.
@@ -844,6 +790,7 @@ mod tests {
         }
     }
 
+    #[cfg(unix)]
     fn exited(code: i32) -> ExitInfo {
         ExitInfo {
             reason: ExitReason::Exited,
@@ -884,6 +831,7 @@ mod tests {
         }
     }
 
+    #[cfg(unix)]
     fn live_key(id: &str) -> CompletedRunKey {
         CompletedRunKey::capture(
             &record(id, None),
@@ -892,6 +840,7 @@ mod tests {
         .unwrap()
     }
 
+    #[cfg(unix)]
     /// A real emulator capture: scrollback, a hyperlink annotation, an
     /// enhanced keyboard flag and bracketed paste, exactly as the pump would
     /// checkpoint it after the final drain.
@@ -917,6 +866,7 @@ mod tests {
         }
     }
 
+    #[cfg(unix)]
     fn private_dir(root: &Path) -> std::path::PathBuf {
         let dir = root.join("completed");
         std::fs::create_dir(&dir).unwrap();
@@ -924,6 +874,7 @@ mod tests {
         dir
     }
 
+    #[cfg(unix)]
     fn only_artifact(dir: &Path) -> std::path::PathBuf {
         let entries: Vec<_> = std::fs::read_dir(dir)
             .unwrap()
@@ -943,6 +894,7 @@ mod tests {
         path
     }
 
+    #[cfg(unix)]
     fn published() -> (
         tempfile::TempDir,
         CompletedTerminalStore,
@@ -962,6 +914,7 @@ mod tests {
     /// Re-frames an artifact from its parts so tests can produce hostile but
     /// integrity-consistent files. Metadata is JSON; the payload hash inside it
     /// is recomputed from the supplied payload.
+    #[cfg(unix)]
     fn write_artifact(
         dir: &Path,
         key: &CompletedRunKey,
@@ -981,6 +934,7 @@ mod tests {
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
     }
 
+    #[cfg(unix)]
     fn read_artifact(path: &Path) -> (serde_json::Value, Vec<u8>) {
         let bytes = std::fs::read(path).unwrap();
         let metadata_len = u32::from_be_bytes(bytes[8..12].try_into().unwrap()) as usize;
@@ -989,6 +943,7 @@ mod tests {
         (metadata, bytes[HEADER_BYTES + metadata_len..].to_vec())
     }
 
+    #[cfg(unix)]
     #[test]
     fn publish_then_load_round_trips_the_exact_run() {
         let _serial = serial();
@@ -1077,6 +1032,7 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
     #[test]
     fn a_different_run_of_the_same_session_is_absent_not_substituted() {
         let _serial = serial();
@@ -1098,6 +1054,7 @@ mod tests {
         assert!(store.load(&done, &other_child).unwrap().is_none());
     }
 
+    #[cfg(unix)]
     #[test]
     fn a_key_from_another_record_is_an_identity_mismatch() {
         let _serial = serial();
@@ -1125,6 +1082,7 @@ mod tests {
         ));
     }
 
+    #[cfg(unix)]
     #[test]
     fn publish_never_replaces_an_existing_run_artifact() {
         let _serial = serial();
@@ -1146,6 +1104,7 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
     #[test]
     fn exit_facts_must_be_genuine_and_match_the_record() {
         let _serial = serial();
@@ -1238,6 +1197,7 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
     #[test]
     fn publish_refuses_partial_markers_epoch_regressions_and_oversized_captures() {
         let _serial = serial();
@@ -1297,6 +1257,7 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
     #[test]
     fn load_rejects_tampered_truncated_and_oversized_artifacts() {
         let _serial = serial();
@@ -1364,6 +1325,7 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
     #[test]
     fn expansion_bombs_are_rejected_before_cells_are_allocated() {
         let _serial = serial();
@@ -1415,6 +1377,7 @@ mod tests {
         ));
     }
 
+    #[cfg(unix)]
     #[test]
     fn special_files_and_shared_directories_are_refused() {
         let _serial = serial();
@@ -1474,6 +1437,7 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
     #[test]
     fn bind_reuses_the_captured_run_and_discard_removes_only_that_artifact() {
         let _serial = serial();
@@ -1508,6 +1472,7 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
     #[test]
     fn retention_removes_orphans_first_then_the_oldest_bound_artifacts() {
         let _serial = serial();
@@ -1577,6 +1542,7 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
     #[test]
     fn at_most_two_storage_operations_run_concurrently() {
         let _serial = serial();

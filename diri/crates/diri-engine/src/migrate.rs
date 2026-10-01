@@ -698,6 +698,45 @@ fn copy_file(
     to: &str,
     to_host: Option<&HostEntry>,
 ) -> Result<(), String> {
+    #[cfg(windows)]
+    let (from_path, from_host, to_path, to_host) = {
+        let local = |path: &str, host: Option<&HostEntry>| -> Result<String, String> {
+            if let Some(host) = host.filter(|host| host.wsl_distribution().is_some()) {
+                return crate::wsl::explorer_path(host, path).map_err(|e| e.to_string());
+            }
+            if host.is_none() && path.starts_with('/') {
+                // mktemp in fixed Git-for-Windows maintenance scripts returns
+                // an MSYS path. Convert it before passing it to native file APIs.
+                let shell =
+                    diri_platform::launch::maintenance_shell().map_err(|e| e.to_string())?;
+                let output = diri_platform::child::output(
+                    std::process::Command::new(shell.with_file_name("cygpath.exe"))
+                        .args(["-w", path]),
+                    Duration::from_secs(5),
+                    32768,
+                )
+                .map_err(|e| e.to_string())?;
+                if !output.status.success() {
+                    return Err("Cannot resolve Git for Windows maintenance path".into());
+                }
+                return Ok(String::from_utf8_lossy(&output.stdout).trim().to_owned());
+            }
+            Ok(path.into())
+        };
+        (
+            local(from, from_host)?,
+            from_host.filter(|host| host.wsl_distribution().is_none()),
+            local(to, to_host)?,
+            to_host.filter(|host| host.wsl_distribution().is_none()),
+        )
+    };
+    #[cfg(windows)]
+    let (from, to) = (from_path.as_str(), to_path.as_str());
+    if from_host.is_none() && to_host.is_none() {
+        return std::fs::copy(from, to)
+            .map(|_| ())
+            .map_err(|e| e.to_string());
+    }
     let mut argv = copy_argv(from, from_host, to, to_host);
     let program = argv.remove(0);
     let output = std::process::Command::new(&program)
@@ -724,6 +763,7 @@ mod tests {
 
     fn host(id: &str) -> HostEntry {
         HostEntry {
+            transport: Default::default(),
             id: id.into(),
             name: None,
             ssh: format!("user@{id}"),
@@ -769,13 +809,30 @@ mod tests {
     }
 
     /// A bare origin plus a seeded `source` clone (one `root` commit holding
-    /// `file.txt`) and an empty `target` clone.
+    /// `file.txt`) and an empty `target` clone. Both pin `core.autocrlf=false`:
+    /// Git for Windows enables it system-wide and these fixtures compare bytes.
     fn seeded_repos(temp: &Path) -> (PathBuf, PathBuf) {
         let origin = temp.join("origin.git");
         std::fs::create_dir_all(&origin).unwrap();
         git(&origin, &["init", "-q", "--bare", "-b", "main"]);
         let source = temp.join("source");
-        git(temp, &["clone", "-q", origin.to_str().unwrap(), "source"]);
+        git(
+            temp,
+            &[
+                "-c",
+                "core.autocrlf=false",
+                "-c",
+                "core.fsmonitor=false",
+                "clone",
+                "-q",
+                "--config",
+                "core.autocrlf=false",
+                "--config",
+                "core.fsmonitor=false",
+                origin.to_str().unwrap(),
+                "source",
+            ],
+        );
         // `prepare` invokes git in a separate shell and must not inherit a
         // developer machine's global identity. Give every fixture checkout
         // its own author, just as a real configured checkout has one.
@@ -789,7 +846,23 @@ mod tests {
         git(&source, &["commit", "-q", "-m", "root"]);
         git(&source, &["push", "-q", "-u", "origin", "main"]);
         let target = temp.join("target");
-        git(temp, &["clone", "-q", origin.to_str().unwrap(), "target"]);
+        git(
+            temp,
+            &[
+                "-c",
+                "core.autocrlf=false",
+                "-c",
+                "core.fsmonitor=false",
+                "clone",
+                "-q",
+                "--config",
+                "core.autocrlf=false",
+                "--config",
+                "core.fsmonitor=false",
+                origin.to_str().unwrap(),
+                "target",
+            ],
+        );
         git(&target, &["config", "user.name", "Diri Test"]);
         git(
             &target,
@@ -1043,9 +1116,11 @@ mod tests {
         assert_eq!(git_out(&landed, &["rev-parse", "HEAD"]), before);
     }
 
+    #[cfg(unix)]
     /// Installs a fixture-only pre-push hook: a deterministic stand-in for an
     /// agent that keeps working while the slow transfer is under way.
     fn work_during_transfer(source: &Path, script: &str) {
+        #[cfg(unix)]
         use std::os::unix::fs::PermissionsExt;
         let hook = source.join(".git/hooks/pre-push");
         git(source, &["config", "core.hooksPath", ".git/hooks"]);
@@ -1061,6 +1136,7 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
     /// The agent is alive while `prepare` snapshots and transfers, so the
     /// snapshot can be stale by the time it is stopped. A tracked edit, a new
     /// untracked file and a deletion made in that window must all be on the
@@ -1116,6 +1192,7 @@ mod tests {
         assert!(!source.join("notes.md").exists());
     }
 
+    #[cfg(unix)]
     /// A source that was clean at snapshot time has no snapshot commit to
     /// grow; late work still travels, and still as uncommitted state.
     #[test]
@@ -1140,6 +1217,7 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
     /// A commit the agent makes on top of the snapshot mid-transfer must not
     /// drag the snapshot onto origin, and its content must still arrive.
     #[test]

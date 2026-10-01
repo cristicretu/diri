@@ -1759,7 +1759,13 @@ fn a_first_session_needs_no_project_and_opens_the_default_agent_at_home() {
         panic!("the welcome's Start a session must launch without a folder step");
     };
     assert_eq!(params.kind, AgentKind::CLAUDE_CODE);
-    assert_eq!(params.cwd, std::env::var("HOME").expect("HOME"));
+    assert_eq!(
+        params.cwd,
+        diri_platform::home_dir()
+            .map(|p| p.to_string_lossy().into_owned())
+            .ok_or(std::env::VarError::NotPresent)
+            .expect("HOME")
+    );
     assert_eq!(
         params.initial_prompt, None,
         "the agent's own prompt takes the task"
@@ -1936,8 +1942,8 @@ fn synthetic_events_upsert_project_and_remove_with_neighbor_focus() {
 #[cfg(unix)]
 #[test]
 fn spawned_project_is_published_into_sidebar_order() {
+    use diri_platform::ipc::UnixStream;
     use std::io::{BufRead, BufReader, Write};
-    use std::os::unix::net::UnixStream;
     use std::sync::Mutex;
 
     use diri_proto::{ControlMessage, EventName, Project};
@@ -2208,6 +2214,7 @@ fn remote_spawn_uses_host_default_cwd_and_drops_worktree() {
         Prefs::default(),
     );
     store.set_hosts(vec![diri_proto::HostEntry {
+        transport: Default::default(),
         id: "forge".into(),
         name: Some("Forge".into()),
         ssh: "cristi@forge".into(),
@@ -2288,6 +2295,7 @@ fn new_agent_target_uses_the_configured_default_instead_of_the_selected_session(
         },
     );
     store.set_hosts(vec![diri_proto::HostEntry {
+        transport: Default::default(),
         id: "forge".into(),
         name: Some("Forge".into()),
         ssh: "cristi@forge".into(),
@@ -2315,6 +2323,7 @@ fn top_level_shortcuts_spawn_on_the_configured_default_host() {
         },
     );
     store.set_hosts(vec![diri_proto::HostEntry {
+        transport: Default::default(),
         id: "forge".into(),
         name: Some("Forge".into()),
         ssh: "cristi@forge".into(),
@@ -2358,6 +2367,7 @@ fn the_default_shortcut_declines_and_rescans_when_readiness_is_unknown() {
         ..Prefs::default()
     });
     store.set_hosts(vec![diri_proto::HostEntry {
+        transport: Default::default(),
         id: "forge".into(),
         name: Some("Forge".into()),
         ssh: "forge".into(),
@@ -2403,6 +2413,7 @@ fn default_shortcut_never_launches_an_agent_unavailable_on_its_target() {
         ..Prefs::default()
     });
     store.set_hosts(vec![diri_proto::HostEntry {
+        transport: Default::default(),
         id: "forge".into(),
         name: Some("Forge".into()),
         ssh: "forge".into(),
@@ -2457,6 +2468,7 @@ fn selecting_a_default_host_persists_across_store_reloads() {
     Prefs::default().save(&path).unwrap();
     let (mut store, _effects) = SessionStore::load(&path).unwrap();
     store.set_hosts(vec![diri_proto::HostEntry {
+        transport: Default::default(),
         id: "forge".into(),
         name: Some("Forge".into()),
         ssh: "cristi@forge".into(),
@@ -2482,6 +2494,7 @@ fn a_remote_default_host_round_trips_back_to_local() {
     Prefs::default().save(&path).unwrap();
     let (mut store, mut effects) = SessionStore::load(&path).unwrap();
     store.set_hosts(vec![diri_proto::HostEntry {
+        transport: Default::default(),
         id: "forge".into(),
         name: Some("Forge".into()),
         ssh: "cristi@forge".into(),
@@ -2562,6 +2575,7 @@ fn migrate_session_guards_kind_target_and_reentry() {
 fn sync_prefs_emits_once_per_host_until_finished() {
     let (mut store, mut effects) = hydrated(vec![], vec![], Prefs::default());
     store.set_hosts(vec![diri_proto::HostEntry {
+        transport: Default::default(),
         id: "forge".into(),
         name: Some("Forge".into()),
         ssh: "cristi@forge".into(),
@@ -2598,6 +2612,7 @@ fn repo_targeting_tracks_the_selected_session_and_dedupes_requests() {
         },
     );
     store.set_hosts(vec![diri_proto::HostEntry {
+        transport: Default::default(),
         id: "forge".into(),
         name: Some("Forge".into()),
         ssh: "cristi@forge".into(),
@@ -2710,7 +2725,7 @@ impl FakeRemoveEngine {
 
         let home = tempdir().expect("temporary socket home");
         let socket = home.path().join("engine.sock");
-        let listener = std::os::unix::net::UnixListener::bind(&socket).expect("bind fake Engine");
+        let listener = diri_platform::ipc::UnixListener::bind(&socket).expect("bind fake Engine");
         let removes = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let sessions = Arc::new(std::sync::Mutex::new(sessions));
         let remove_count = Arc::clone(&removes);
@@ -3311,8 +3326,8 @@ fn importing_herdr_resumes_conversations_and_spawns_the_rest_in_herdr_order() {
 /// stays importable while the others are remembered.
 #[tokio::test]
 async fn herdr_import_runner_remembers_only_what_opened_and_reports_failures() {
+    use diri_platform::ipc::UnixListener;
     use std::io::{BufRead as _, BufReader, Write as _};
-    use std::os::unix::net::UnixListener;
 
     use diri_proto::{ControlMessage, HelloResult, Method, RUST_ENGINE_KIND, WIRE_VERSION};
 

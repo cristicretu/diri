@@ -46,6 +46,7 @@ fn real_ssh_detach_soak_reconnects_the_same_process() {
         .expect("remote manager"),
     );
     let host = HostEntry {
+        transport: Default::default(),
         id: "real-ssh-soak".into(),
         name: None,
         ssh: target,
@@ -223,6 +224,7 @@ fn real_ssh_pam_logout_is_classified_non_persistent() {
     )
     .expect("remote manager");
     let host = HostEntry {
+        transport: Default::default(),
         id: "real-ssh-pam-logout".into(),
         name: None,
         ssh: target,

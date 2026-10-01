@@ -159,6 +159,8 @@ pub(crate) fn wire_settings_navigation<V: 'static>(
 
 #[cfg(target_os = "macos")]
 use crate::macos::{menu_bar::NativeMenuBar, notifier::NativeNotifier};
+#[cfg(windows)]
+use crate::windows_notifications::NativeNotifier;
 
 /// Drag payload for the sidebar resize seam. Renders nothing -- it exists so
 /// GPUI keeps routing mouse moves to the root while the seam is being dragged.
@@ -217,7 +219,16 @@ enum QuoteSurface {
 /// The platform window background that realizes a preferred material.
 pub(crate) fn window_background(material: WindowMaterial) -> WindowBackgroundAppearance {
     match material {
-        WindowMaterial::Glass => WindowBackgroundAppearance::Blurred,
+        WindowMaterial::Glass => {
+            #[cfg(windows)]
+            {
+                WindowBackgroundAppearance::MicaBackdrop
+            }
+            #[cfg(not(windows))]
+            {
+                WindowBackgroundAppearance::Blurred
+            }
+        }
         WindowMaterial::Opaque => WindowBackgroundAppearance::Opaque,
     }
 }
@@ -347,7 +358,7 @@ pub struct RootView {
     preview_scenario: PreviewScenario,
     #[cfg(target_os = "macos")]
     menu_bar: Option<NativeMenuBar>,
-    #[cfg(target_os = "macos")]
+    #[cfg(any(target_os = "macos", windows))]
     notifier: std::rc::Rc<NativeNotifier>,
     /// Hold-⌘ shortcut hints for this window; published while it is key.
     held_hints: crate::held_hints::HeldHints,
@@ -978,7 +989,7 @@ impl RootView {
                 let _ = this.update(cx, |this, cx| {
                     this.show_banner(
                         "diri shares diagnostics",
-                        "Crashes, hangs and errors help fix bugs; terminal contents never leave your Mac. Turn it off in Settings › General › Privacy.",
+                        "Crashes, hangs and errors help fix bugs; terminal contents never leave your computer. Turn it off in Settings › General › Privacy.",
                         Duration::from_secs(20),
                         cx,
                     );
@@ -986,7 +997,7 @@ impl RootView {
             })
             .detach();
         }
-        #[cfg(target_os = "macos")]
+        #[cfg(any(target_os = "macos", windows))]
         let notifier = crate::application_notifications::notifier(cx);
 
         let activation = cx.observe_window_activation(window, move |this, window, cx| {
@@ -1002,6 +1013,15 @@ impl RootView {
                 .write()
                 .expect("session store lock poisoned")
                 .set_active(window.is_window_active());
+            // Windows dims the whole title row of an inactive window; the
+            // cached views that paint it repaint for the change.
+            if crate::window_chrome::draws_caption_buttons() {
+                this.sidebar.update(cx, |_, cx| cx.notify());
+                if let Some(inspector) = &this.inspector {
+                    inspector.update(cx, |_, cx| cx.notify());
+                }
+                cx.notify();
+            }
         });
         // Every key in this window, before any binding runs: a key while ⌘ is
         // held is a shortcut, so hold-⌘ hints must stand down for it.
@@ -1428,7 +1448,7 @@ impl RootView {
             notification_focus: cx.focus_handle(),
             pending_notification_open: None,
             notification_health:
-                "Use Test alert to check macOS delivery. Notifications remain available here."
+                "Use Test alert to check system delivery. Notifications remain available here."
                     .into(),
             last_quote_surface: QuoteSurface::default(),
             sidebar_revealed_for_settings: false,
@@ -1438,7 +1458,7 @@ impl RootView {
             preview_scenario,
             #[cfg(target_os = "macos")]
             menu_bar,
-            #[cfg(target_os = "macos")]
+            #[cfg(any(target_os = "macos", windows))]
             notifier,
             held_hints: crate::held_hints::HeldHints::default(),
             _held_hint_timer: None,
@@ -3786,6 +3806,11 @@ impl RootView {
                 });
             let strip = self.sidebar.update(cx, |sidebar, cx| {
                 sidebar.strip_held_hint = held_hint;
+                sidebar.title_opacity = crate::window_chrome::title_row_opacity(window);
+                sidebar.strip_caption_inset = crate::window_chrome::caption_inset(
+                    0.0,
+                    f32::from(viewport_size.width) - (sidebar_width + card_width),
+                );
                 sidebar.render_horizontal_tabs(card_width, trailing, window, cx)
             });
             card = card.child(
@@ -4751,7 +4776,7 @@ impl Render for RootView {
                 }),
             )
         };
-        #[cfg(target_os = "macos")]
+        #[cfg(any(target_os = "macos", windows))]
         {
             self.notification_health = crate::application_notifications::health(cx);
         }
@@ -5423,6 +5448,18 @@ impl Render for RootView {
         }
         if let Some(build) = &self.services.dev_build {
             root = root.child(dev_build_marker(build.marker_label(), colors, 10.0));
+        }
+        // Over every surface, settings included, as the platform's own
+        // caption would be. The toolbar under them leaves their lane free.
+        if let Some(caption) = crate::window_chrome::caption_buttons(window, colors) {
+            root = root.child(caption);
+        }
+        // With horizontal tabs the strip is the whole title bar and carries
+        // no window icon, as tabbed Windows apps do.
+        if self.tabs_seam <= 0.0
+            && let Some(icon) = crate::window_chrome::window_icon(window)
+        {
+            root = root.child(icon);
         }
         root.child(crate::telemetry::frame_probe(
             frame_started,
@@ -9765,6 +9802,121 @@ mod tests {
         }
     }
 
+    /// The window as Windows draws it: no native caption strip, the caption
+    /// buttons in the corner of diri's own title row. Rendered on a Mac with
+    /// the caption forced on. `DIRI_CAPTION_SCREENSHOTS=<dir>`.
+    #[cfg(target_os = "macos")]
+    #[test]
+    #[ignore = "writes Windows caption previews to DIRI_CAPTION_SCREENSHOTS"]
+    fn render_windows_caption_screenshots() {
+        use gpui::{AppContext as _, HeadlessAppContext};
+        let output =
+            std::env::var("DIRI_CAPTION_SCREENSHOTS").expect("DIRI_CAPTION_SCREENSHOTS");
+        std::fs::create_dir_all(&output).unwrap();
+        let _caption = ForcedCaption::on();
+        let platform = gpui_platform::current_platform(true);
+        let mut cx = HeadlessAppContext::with_platform(
+            platform.text_system(),
+            Arc::new(diri_ui::IconAssets),
+            gpui_platform::current_headless_renderer,
+        );
+        cx.update(|cx| {
+            crate::fonts::init(cx);
+            cx.set_reduce_motion(true);
+        });
+        // name, horizontal, light, sidebar, inspector, active
+        for (name, horizontal, light, sidebar, inspector, active) in [
+            ("vertical-dark", false, false, true, false, true),
+            ("vertical-light", false, true, true, false, true),
+            ("vertical-no-sidebar-dark", false, false, false, false, true),
+            ("vertical-inspector-dark", false, false, true, true, true),
+            ("horizontal-dark", true, false, false, false, true),
+            ("horizontal-light", true, true, false, false, true),
+            ("horizontal-inspector-dark", true, false, false, true, true),
+            ("vertical-dark-inactive", false, false, true, false, false),
+            ("horizontal-dark-inactive", true, false, false, false, false),
+        ] {
+            let services = test_services();
+            let fixture = SidebarPreviewFixture::make(PreviewScenario::Typical);
+            {
+                let mut store = services.store.store.write().unwrap();
+                store.hydrate(fixture.list);
+                store.select(fixture.selected_session_id.unwrap());
+                store
+                    .update_preferences(|prefs| {
+                        prefs.sidebar_visible = sidebar;
+                        prefs.terminal_theme = if light {
+                            "dirijor-light"
+                        } else {
+                            "dirijor-dark"
+                        }
+                        .into();
+                    })
+                    .unwrap();
+            }
+            let window = cx
+                .open_window(size(px(1100.0), px(640.0)), |window, cx| {
+                    cx.new(|cx| RootView::new(services, false, PreviewScenario::Empty, window, cx))
+                })
+                .unwrap();
+            cx.run_until_parked();
+            cx.update_window(window.into(), |view, window, cx| {
+                view.downcast::<RootView>().unwrap().update(cx, |root, cx| {
+                    root.run_command(
+                        if horizontal {
+                            CommandId::HorizontalTabs
+                        } else {
+                            CommandId::VerticalTabs
+                        },
+                        window,
+                        cx,
+                    );
+                    if inspector {
+                        root.set_inspector_open(true, cx);
+                    }
+                    // Switching orientation brings the sidebar back.
+                    if !horizontal && !sidebar && root.sidebar.read(cx).is_visible() {
+                        root.run_command(CommandId::ToggleSidebar, window, cx);
+                    }
+                });
+                // An inactive window dims its title row.
+                if active {
+                    window.activate_window();
+                }
+            })
+            .unwrap();
+            cx.run_until_parked();
+            cx.capture_screenshot(window.into())
+                .unwrap()
+                .save(std::path::Path::new(&output).join(format!("{name}.png")))
+                .unwrap();
+            // `DIRI_CAPTION_HITMAP=1` also writes which window control area
+            // answers each 2 pt cell of the title rows, for a hit-area overlay.
+            if std::env::var_os("DIRI_CAPTION_HITMAP").is_some() {
+                let mut map = String::new();
+                cx.update_window(window.into(), |_, window, _| {
+                    for y in (0..64).step_by(2) {
+                        for x in (0..1100).step_by(2) {
+                            let at = point(px(x as f32 + 1.0), px(y as f32 + 1.0));
+                            if let Some(area) = window.window_control_area_at(at) {
+                                map.push_str(&format!("{x} {y} {area:?}\n"));
+                            }
+                        }
+                    }
+                })
+                .unwrap();
+                std::fs::write(
+                    std::path::Path::new(&output).join(format!("{name}-hitmap.txt")),
+                    map,
+                )
+                .unwrap();
+            }
+            cx.update_window(window.into(), |_, window, _| window.remove_window())
+                .unwrap();
+            cx.run_until_parked();
+        }
+    }
+
     /// A note Session selected in the real window: the sidebar lists it among
     /// agents and terminals (one agent is its child), and the main area shows
     /// the note editor. `DIRI_VISUAL_OUTPUT=<png>`, `DIRI_VISUAL_THEME=<id>`.
@@ -10802,6 +10954,173 @@ mod tests {
             root.read_with(cx, |root, _| root.titlebar_drag_armed),
             cfg!(target_os = "macos"),
             "macOS arms window move on empty chrome; Linux leaves it to the compositor"
+        );
+    }
+
+    /// Lays the window out as Windows does for the life of a test.
+    struct ForcedCaption;
+
+    impl ForcedCaption {
+        fn on() -> Self {
+            crate::window_chrome::force_caption_buttons(true);
+            Self
+        }
+    }
+
+    impl Drop for ForcedCaption {
+        fn drop(&mut self) {
+            crate::window_chrome::force_caption_buttons(false);
+        }
+    }
+
+    #[gpui::test]
+    fn windows_caption_buttons_sit_in_the_toolbar_for_both_tab_orientations(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        use gpui::WindowControlArea;
+        let _caption = ForcedCaption::on();
+        cx.update(|cx| cx.set_reduce_motion(true));
+        let services = test_services();
+        let fixture = SidebarPreviewFixture::make(PreviewScenario::Typical);
+        let selected = fixture.selected_session_id.clone().unwrap();
+        {
+            let mut store = services.store.store.write().unwrap();
+            store.hydrate(fixture.list);
+            store.select(fixture.selected_session_id.unwrap());
+            store
+                .update_preferences(|prefs| {
+                    prefs.tab_orientation = crate::store::TabOrientation::Vertical;
+                    prefs.sidebar_visible = true;
+                })
+                .unwrap();
+        }
+        let (root, cx) = cx.add_window_view(move |window, cx| {
+            RootView::new(services, false, PreviewScenario::Empty, window, cx)
+        });
+        cx.simulate_resize(size(px(1000.0), px(700.0)));
+        cx.run_until_parked();
+        let area_at = |cx: &mut gpui::VisualTestContext, at: gpui::Point<gpui::Pixels>| {
+            cx.update(|window, _| window.window_control_area_at(at))
+        };
+
+        let caption = cx
+            .debug_bounds("window-caption-buttons")
+            .expect("diri draws the caption buttons");
+        assert_eq!(caption.top(), px(0.0));
+        assert_eq!(caption.right(), px(1000.0));
+        assert_eq!(caption.size.height, px(Metrics::TITLE_BAR));
+        assert_eq!(
+            caption.size.width,
+            px(crate::window_chrome::caption_lane()),
+            "no native caption strip: the buttons are the toolbar's own"
+        );
+        for (selector, area) in [
+            ("window-minimize", WindowControlArea::Min),
+            ("window-maximize", WindowControlArea::Max),
+            ("window-close", WindowControlArea::Close),
+        ] {
+            let button = cx.debug_bounds(selector).unwrap();
+            assert_eq!(area_at(cx, button.center()), Some(area), "{selector}");
+        }
+
+        // Vertical tabs: the pane's title bar reaches the corner and keeps
+        // its actions clear of the caption.
+        for selector in ["toggle-inspector", "notification-inbox-button"] {
+            let control = cx.debug_bounds(selector).unwrap();
+            assert!(
+                control.center().y < px(Metrics::TITLE_BAR)
+                    && control.right() <= caption.left() - px(Metrics::TOOLBAR_EDGE_INSET),
+                "{selector} must sit beside the caption: {control:?} vs {caption:?}"
+            );
+            assert_eq!(area_at(cx, control.center()), None, "{selector} stays a button");
+        }
+        let sidebar_toggle = cx.debug_bounds("sidebar-toggle").unwrap();
+        assert_eq!(area_at(cx, sidebar_toggle.center()), None);
+        assert_eq!(
+            area_at(cx, point(px(60.0), px(20.0))),
+            Some(WindowControlArea::Drag),
+            "the sidebar's empty title row moves the window"
+        );
+        let bell = cx.debug_bounds("notification-inbox-button").unwrap();
+        assert_eq!(
+            area_at(cx, point(bell.left() - px(80.0), px(20.0))),
+            Some(WindowControlArea::Drag),
+            "so does the pane's title bar"
+        );
+        assert_eq!(area_at(cx, point(px(500.0), px(300.0))), None);
+        // The app icon opens the system menu, centred on the sidebar's row
+        // glyph column.
+        let icon = cx
+            .debug_bounds("window-icon")
+            .expect("vertical tabs show the window icon");
+        assert_eq!(icon.center().x, px(27.0));
+        assert_eq!(icon.center().y, px(Metrics::TITLE_BAR / 2.0));
+        assert_eq!(area_at(cx, icon.center()), None, "the icon is a button");
+
+        // Horizontal tabs: the strip takes the title row and the corner.
+        root.update_in(cx, |root, window, cx| {
+            root.run_command(CommandId::HorizontalTabs, window, cx)
+        });
+        cx.run_until_parked();
+        let strip = cx
+            .debug_bounds("horizontal-tabs")
+            .expect("horizontal strip");
+        assert_eq!(strip.top(), px(0.0));
+        let actions = cx
+            .debug_bounds("hosted-header-actions")
+            .expect("the strip hosts the pane's actions");
+        assert!(
+            actions.right() <= caption.left() - px(10.0),
+            "the hosted actions sit beside the caption: {actions:?} vs {caption:?}"
+        );
+        assert!(
+            cx.debug_bounds("window-icon").is_none(),
+            "the tab strip is the title bar and carries no window icon"
+        );
+        let new_tab = cx.debug_bounds("horizontal-new-tab").unwrap();
+        assert_eq!(area_at(cx, new_tab.center()), None);
+        let tab_selector = format!("horizontal-tab-{}", selected.0);
+        let tab = cx
+            .debug_bounds(tab_selector.leak())
+            .expect("selected tab");
+        assert_eq!(area_at(cx, tab.center()), None, "tabs stay tabs");
+        assert!(
+            (1..24).any(|dx| {
+                area_at(cx, point(tab.right() + px(dx as f32), tab.center().y))
+                    == Some(WindowControlArea::Drag)
+            }),
+            "the gap after a tab moves the window"
+        );
+        assert_eq!(
+            area_at(cx, point(strip.left() + px(4.0), strip.center().y)),
+            Some(WindowControlArea::Drag),
+            "the strip's padding moves the window"
+        );
+        for (selector, area) in [
+            ("window-minimize", WindowControlArea::Min),
+            ("window-close", WindowControlArea::Close),
+        ] {
+            let button = cx.debug_bounds(selector).unwrap();
+            assert_eq!(area_at(cx, button.center()), Some(area), "{selector}");
+        }
+
+        // The inspector takes the corner from the strip, which then needs
+        // no room of its own.
+        root.update_in(cx, |root, _, cx| root.set_inspector_open(true, cx));
+        cx.run_until_parked();
+        let actions = cx.debug_bounds("hosted-header-actions").unwrap();
+        let strip = cx.debug_bounds("horizontal-tabs").unwrap();
+        assert!(
+            strip.right() < caption.left(),
+            "fixture: the inspector sits beside the strip"
+        );
+        assert!(
+            actions.right() >= strip.right() - px(10.0 + Metrics::TOOLBAR_CONTROL_SIZE),
+            "a strip clear of the corner keeps its trailing actions at its edge: {actions:?}"
+        );
+        assert!(
+            cx.debug_bounds("window-caption-buttons").is_some(),
+            "the caption stays over the inspector's title bar"
         );
     }
 

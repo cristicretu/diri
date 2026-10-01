@@ -1773,7 +1773,7 @@ impl NoteEditorView {
     /// state only: nothing is saved and undo is untouched. Other note
     /// features (a to-do's work context) build on this.
     /// Starts this editor is waiting on, for fixtures that answer them.
-    #[cfg(test)]
+    #[cfg(all(test, target_os = "macos"))]
     pub(crate) fn work_tickets_for_test(&self) -> Vec<(diri_notes::doc::BlockId, u64)> {
         self.work.pending_tickets()
     }

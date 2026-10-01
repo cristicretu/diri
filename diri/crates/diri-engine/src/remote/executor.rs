@@ -1,9 +1,12 @@
 //! Bounded, timeout-aware process execution for system OpenSSH.
 
+use diri_platform::child::Child;
+use diri_platform::pipe::{ChildStdin, ChildStdout};
 use std::ffi::OsString;
 use std::io::{self, Read, Write};
+#[cfg(unix)]
 use std::os::unix::process::CommandExt as _;
-use std::process::{Child, ChildStdin, ChildStdout, Command, ExitStatus, Stdio};
+use std::process::{Command, ExitStatus, Stdio};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -56,11 +59,13 @@ impl ProcessExecutor {
         timeout: Duration,
         stdout_limit: usize,
     ) -> io::Result<CommandOutput> {
-        spec.program.clone_from(&self.ssh_executable);
+        if spec.program != "wsl.exe" {
+            spec.program.clone_from(&self.ssh_executable);
+        }
         let mut command = self.command(&spec);
         diri_telemetry::count("ssh.commands", 1);
         let started = Instant::now();
-        let mut child = command.spawn()?;
+        let mut child = diri_platform::child::spawn(&mut command)?;
         let mut stdin = child
             .stdin
             .take()
@@ -118,9 +123,11 @@ impl ProcessExecutor {
     }
 
     pub fn open(&self, mut spec: CommandSpec) -> io::Result<SshChannel> {
-        spec.program.clone_from(&self.ssh_executable);
+        if spec.program != "wsl.exe" {
+            spec.program.clone_from(&self.ssh_executable);
+        }
         diri_telemetry::count("ssh.channels", 1);
-        let mut child = self.command(&spec).spawn()?;
+        let mut child = diri_platform::child::spawn(&mut self.command(&spec))?;
         let input = child
             .stdin
             .take()
@@ -141,15 +148,17 @@ impl ProcessExecutor {
         });
         Ok(SshChannel {
             child,
-            input,
-            output,
+            input: diri_platform::pipe::input(input)?,
+            output: diri_platform::pipe::output(output)?,
             diagnostics,
         })
     }
 
     fn command(&self, spec: &CommandSpec) -> Command {
         let mut command = command(spec);
-        if let Some(askpass) = &self.askpass_executable {
+        if spec.program != "wsl.exe"
+            && let Some(askpass) = &self.askpass_executable
+        {
             command
                 .env("SSH_ASKPASS", askpass)
                 .env("SSH_ASKPASS_REQUIRE", "force");
@@ -167,6 +176,17 @@ impl ProcessExecutor {
 fn command(spec: &CommandSpec) -> Command {
     let mut command = Command::new(&spec.program);
     command.args(&spec.arguments);
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        command
+            .creation_flags(diri_platform::windows_sys::Win32::System::Threading::CREATE_NO_WINDOW);
+    }
+    // WSLENV can explicitly propagate local tokens/socket paths into Linux.
+    // Host environment capture belongs to the Helper in the selected distro.
+    if spec.program == "wsl.exe" {
+        command.env_remove("WSLENV");
+    }
     command
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -175,6 +195,7 @@ fn command(spec: &CommandSpec) -> Command {
     // `setsid` syscall. A dedicated process group lets cancellation reap ssh
     // plus any local ProxyCommand/askpass descendants without touching the
     // Engine's own group.
+    #[cfg(unix)]
     unsafe {
         command.pre_exec(|| {
             if libc::setsid() < 0 {
@@ -187,6 +208,7 @@ fn command(spec: &CommandSpec) -> Command {
 }
 
 pub(crate) fn terminate_process_group(child: &mut Child) {
+    #[cfg(unix)]
     if let Ok(pid) = libc::pid_t::try_from(child.id()) {
         // SAFETY: `pid` is the group leader created by `command`; a negative
         // pid targets precisely that process group.
@@ -212,14 +234,19 @@ impl CommandOutput {
         if self.status.success() {
             Ok(self)
         } else {
+            #[cfg(unix)]
             use std::os::unix::process::ExitStatusExt;
+            #[cfg(unix)]
+            let signal = self.status.signal();
+            #[cfg(windows)]
+            let signal: Option<i32> = None;
             // 255 is OpenSSH's own failure (connect, auth, host key); any
             // other status came from the remote command.
             diri_telemetry::warn_event!(
                 "ssh.command_failed",
                 phase = phase,
                 exit = self.status.code(),
-                signal = self.status.signal(),
+                signal = signal,
                 ssh_failure = self.status.code() == Some(255),
             );
             Err(io::Error::other(format!(
@@ -276,8 +303,10 @@ fn join_reader(
 
 #[cfg(test)]
 mod tests {
+    #[cfg(unix)]
     use super::*;
 
+    #[cfg(unix)]
     #[test]
     fn capture_is_bounded_while_the_child_is_fully_drained() {
         let executor = ProcessExecutor::new("/bin/sh");
@@ -294,6 +323,7 @@ mod tests {
         assert!(output.stdout_truncated);
     }
 
+    #[cfg(unix)]
     #[test]
     fn timeout_terminates_a_stuck_command() {
         let executor = ProcessExecutor::new("/bin/sh");
@@ -307,6 +337,7 @@ mod tests {
         assert_eq!(error.kind(), io::ErrorKind::TimedOut);
     }
 
+    #[cfg(unix)]
     #[test]
     fn authentication_diagnostics_are_bounded_and_propagated() {
         let executor = ProcessExecutor::new("/bin/sh");
@@ -325,6 +356,7 @@ mod tests {
         assert!(error.to_string().contains("authentication-required"));
     }
 
+    #[cfg(unix)]
     #[test]
     fn askpass_is_forced_without_consuming_protocol_stdin() {
         let executor = ProcessExecutor::new("/bin/sh").with_askpass("/tmp/diri-askpass");

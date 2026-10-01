@@ -444,7 +444,7 @@ impl EnvironmentCaptureRequest {
             ));
         }
         if let Some(cwd) = &self.cwd
-            && (!(Path::new(cwd).is_absolute() || cwd == "~" || cwd.starts_with("~/"))
+            && (!(cwd.starts_with('/') || cwd == "~" || cwd.starts_with("~/"))
                 || cwd.as_bytes().contains(&0)
                 || cwd.split('/').any(|component| component == ".."))
         {
@@ -480,7 +480,7 @@ impl DirectoryListRequest {
         if self.path.is_empty()
             || self.path.len() > 4_096
             || self.path.as_bytes().contains(&0)
-            || (!(Path::new(&self.path).is_absolute()
+            || (!((self.path.starts_with('/') || Path::new(&self.path).is_absolute())
                 || self.path == "~"
                 || self.path.starts_with("~/")))
             || self
@@ -653,7 +653,7 @@ impl LaunchRequest {
                 "environment exceeds {MAX_ENVIRONMENT_VARIABLES} entries"
             )));
         }
-        if !Path::new(&self.cwd).is_absolute() || self.cwd.as_bytes().contains(&0) {
+        if !self.cwd.starts_with('/') || self.cwd.as_bytes().contains(&0) {
             return Err(RemoteCodecError::InvalidLaunch(
                 "cwd must be an absolute NUL-free path".into(),
             ));

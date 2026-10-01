@@ -425,8 +425,18 @@ mod tests {
             "{ports:?}"
         );
         drop(listener);
-        let ports = listening_ports(group).unwrap();
-        assert!(ports.iter().all(|info| info.port != port), "{ports:?}");
+        // Parallel process-fact fixtures fork from this test process. A child
+        // can briefly retain the listener between fork and exec/exit even
+        // though this test has closed its own descriptor.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            let ports = listening_ports(group).unwrap();
+            if ports.iter().all(|info| info.port != port) {
+                break;
+            }
+            assert!(std::time::Instant::now() < deadline, "{ports:?}");
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
     }
 
     #[test]

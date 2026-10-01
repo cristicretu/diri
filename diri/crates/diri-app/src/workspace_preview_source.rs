@@ -273,10 +273,8 @@ mod tests {
         grid::{ChangedRow, GridCell, GridUpdate},
         preview_set::{PreviewMember, PreviewSetHeader},
     };
-    use tokio::{
-        io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader},
-        net::UnixListener,
-    };
+    use diri_platform::ipc::asynchronous::UnixListener;
+    use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
     fn target(id: &str) -> Target {
         let (state, _) = watch::channel(PreviewState::Loading);
         Target {
@@ -310,7 +308,9 @@ mod tests {
         bytes.extend(frame);
         bytes
     }
-    async fn membership(stream: &mut BufReader<tokio::net::UnixStream>) -> PreviewSetMembership {
+    async fn membership(
+        stream: &mut BufReader<diri_platform::ipc::asynchronous::UnixStream>,
+    ) -> PreviewSetMembership {
         let mut line = String::new();
         stream.read_line(&mut line).await.unwrap();
         serde_json::from_str(&line).unwrap()

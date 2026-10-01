@@ -2,7 +2,7 @@
 //! Git and gh are read through bounded subprocesses; no fetch or branch deletion.
 use std::collections::{HashMap, HashSet};
 use std::io::{self, Read};
-use std::os::fd::AsRawFd;
+
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
@@ -26,10 +26,8 @@ fn output(program: &str, args: &[&str], cwd: &Path, timeout: Duration) -> Option
         .stderr(Stdio::null())
         .spawn()
         .ok()?;
-    let mut stdout = child.stdout.take()?;
-    let fd = stdout.as_raw_fd();
-    // SAFETY: stdout owns this descriptor for the duration of the read loop.
-    let configured = unsafe { libc::fcntl(fd, libc::F_SETFL, libc::O_NONBLOCK) } >= 0;
+    let mut stdout = diri_platform::pipe::output(child.stdout.take()?).ok()?;
+    let configured = diri_platform::poll::set_nonblocking(&stdout, true).is_ok();
     let start = Instant::now();
     let mut bytes = Vec::new();
     let mut buffer = [0; 8192];
@@ -180,13 +178,35 @@ fn local_session<'a>(records: &'a [SessionRecord], path: &Path) -> Option<&'a Se
                 .into_iter()
                 .flatten()
                 .any(|p| {
-                    let p = Path::new(p)
-                        .canonicalize()
-                        .unwrap_or_else(|_| PathBuf::from(p));
+                    let p = diri_platform::canonicalize(p).unwrap_or_else(|_| PathBuf::from(p));
                     p.starts_with(path)
                 })
         })
         .max_by_key(|r| !matches!(r.status, SessionStatus::Exited(_)))
+}
+/// `du -sk -P` for Windows, which has no `du`: apparent file sizes, without
+/// following reparse points, abandoned (None) at the same deadline.
+#[cfg(windows)]
+fn directory_bytes(root: &Path, timeout: Duration) -> Option<u64> {
+    let deadline = std::time::Instant::now() + timeout;
+    let mut pending = vec![root.to_path_buf()];
+    let mut total = 0_u64;
+    while let Some(directory) = pending.pop() {
+        for entry in std::fs::read_dir(&directory).ok()? {
+            if std::time::Instant::now() >= deadline {
+                return None;
+            }
+            let entry = entry.ok()?;
+            // symlink_metadata never follows a reparse point.
+            let metadata = entry.path().symlink_metadata().ok()?;
+            if metadata.is_dir() {
+                pending.push(entry.path());
+            } else if metadata.is_file() {
+                total = total.saturating_add(metadata.len());
+            }
+        }
+    }
+    Some(total)
 }
 struct RepoFacts<'a> {
     base: Option<String>,
@@ -201,9 +221,7 @@ fn session_index(records: &[SessionRecord]) -> HashMap<PathBuf, &SessionRecord> 
             .into_iter()
             .flatten()
         {
-            let path = Path::new(path)
-                .canonicalize()
-                .unwrap_or_else(|_| path.into());
+            let path = diri_platform::canonicalize(path).unwrap_or_else(|_| path.into());
             for ancestor in path.ancestors() {
                 let entry = index.entry(ancestor.to_path_buf()).or_insert(record);
                 if !matches!(record.status, SessionStatus::Exited(_)) {
@@ -326,6 +344,7 @@ fn inspect_cached(
         .and_then(|t| t.elapsed().ok())
         .map(|d| (d.as_secs() / 86400) as i64)
         .unwrap_or(-1);
+    #[cfg(unix)]
     let disk_bytes = (disk && protection.is_none())
         .then(|| {
             output(
@@ -339,6 +358,10 @@ fn inspect_cached(
         .and_then(|b| String::from_utf8(b).ok())
         .and_then(|s| s.split_whitespace().next()?.parse::<u64>().ok())
         .and_then(|kb| kb.checked_mul(1024));
+    #[cfg(windows)]
+    let disk_bytes = (disk && protection.is_none())
+        .then(|| directory_bytes(path, Duration::from_secs(2)))
+        .flatten();
     WorktreeOverviewEntry {
         path: path.to_string_lossy().into_owned(),
         branch: tree.branch.clone(),
@@ -389,7 +412,7 @@ pub(crate) fn scan(
         if !emit(None, false) {
             return Err("Scan paused after leaving Worktrees. Refresh to continue.".into());
         }
-        let root = root.canonicalize().unwrap_or(root);
+        let root = diri_platform::canonicalize(&root).unwrap_or(root);
         // Session subdirectories reuse discovered checkouts, but an inner
         // .git boundary may be a separately saved nested repository/submodule.
         let mut discovered = false;
@@ -466,7 +489,7 @@ fn refused(reason: &str) -> io::Error {
 }
 fn cleanup_tree(p: &WorktreeCleanupParams) -> io::Result<Tree> {
     let root = Path::new(&p.repo_path);
-    let path = Path::new(&p.worktree_path).canonicalize()?;
+    let path = diri_platform::canonicalize(&p.worktree_path)?;
     if path != Path::new(&p.worktree_path) {
         return Err(refused("Worktree path changed; refresh before cleanup"));
     }
@@ -529,9 +552,12 @@ mod tests {
     }
     fn fixture() -> (tempfile::TempDir, PathBuf, Tree) {
         let temp = tempfile::tempdir().unwrap();
-        let root = temp.path().canonicalize().unwrap().join("repo");
+        let root = diri_platform::canonicalize(temp.path())
+            .unwrap()
+            .join("repo");
         std::fs::create_dir(&root).unwrap();
         run(&root, &["init", "-b", "main"]);
+        run(&root, &["config", "core.fsmonitor", "false"]);
         run(&root, &["commit", "--allow-empty", "-m", "initial"]);
         let path = root.parent().unwrap().join("feature space");
         run(
@@ -619,6 +645,7 @@ mod tests {
         );
         assert!(tree.path.exists());
     }
+    #[cfg(unix)]
     #[test]
     fn worktree_cleanup_protects_unknown_sessions_in_symlinked_subdirectories() {
         let (_temp, root, tree) = fixture();

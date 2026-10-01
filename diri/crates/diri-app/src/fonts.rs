@@ -38,7 +38,7 @@ fn default_ui() -> &'static str {
     ".SystemUIFont"
 }
 
-#[cfg(not(target_os = "macos"))]
+#[cfg(all(unix, not(target_os = "macos")))]
 fn default_ui() -> &'static str {
     "sans-serif"
 }
@@ -48,7 +48,7 @@ fn default_mono() -> &'static str {
     "Menlo"
 }
 
-#[cfg(not(target_os = "macos"))]
+#[cfg(all(unix, not(target_os = "macos")))]
 fn default_mono() -> &'static str {
     "monospace"
 }
@@ -58,7 +58,7 @@ fn select_ui(_names: &HashSet<String>) -> &'static str {
     default_ui()
 }
 
-#[cfg(not(target_os = "macos"))]
+#[cfg(all(unix, not(target_os = "macos")))]
 fn select_ui(names: &HashSet<String>) -> &'static str {
     ["Noto Sans", "DejaVu Sans", "Liberation Sans", "Ubuntu"]
         .into_iter()
@@ -75,7 +75,7 @@ fn select_mono(names: &HashSet<String>) -> &'static str {
     }
 }
 
-#[cfg(not(target_os = "macos"))]
+#[cfg(all(unix, not(target_os = "macos")))]
 fn select_mono(names: &HashSet<String>) -> &'static str {
     [
         "JetBrains Mono",
@@ -103,7 +103,7 @@ fn terminal_fallbacks() -> Vec<String> {
     .collect()
 }
 
-#[cfg(not(target_os = "macos"))]
+#[cfg(all(unix, not(target_os = "macos")))]
 fn terminal_fallbacks() -> Vec<String> {
     [
         "Noto Sans Mono",
@@ -111,6 +111,41 @@ fn terminal_fallbacks() -> Vec<String> {
         "Noto Sans Symbols 2",
         "STIX Two Math",
         "Noto Color Emoji",
+    ]
+    .into_iter()
+    .map(str::to_owned)
+    .collect()
+}
+
+#[cfg(windows)]
+fn default_ui() -> &'static str {
+    "Segoe UI"
+}
+#[cfg(windows)]
+fn default_mono() -> &'static str {
+    "Consolas"
+}
+#[cfg(windows)]
+fn select_ui(names: &HashSet<String>) -> &'static str {
+    ["Segoe UI Variable", "Segoe UI"]
+        .into_iter()
+        .find(|name| names.contains(*name))
+        .unwrap_or(default_ui())
+}
+#[cfg(windows)]
+fn select_mono(names: &HashSet<String>) -> &'static str {
+    ["Cascadia Mono", "Cascadia Code", "Consolas"]
+        .into_iter()
+        .find(|name| names.contains(*name))
+        .unwrap_or(default_mono())
+}
+#[cfg(windows)]
+fn terminal_fallbacks() -> Vec<String> {
+    [
+        "Cascadia Mono",
+        "Consolas",
+        "Segoe UI Symbol",
+        "Segoe UI Emoji",
     ]
     .into_iter()
     .map(str::to_owned)
@@ -133,7 +168,7 @@ mod tests {
             "SF Mono"
         );
 
-        #[cfg(not(target_os = "macos"))]
+        #[cfg(all(unix, not(target_os = "macos")))]
         {
             assert_eq!(
                 select_ui(&HashSet::from(["Noto Sans".to_owned()])),

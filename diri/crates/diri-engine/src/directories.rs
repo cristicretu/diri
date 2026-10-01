@@ -3,7 +3,6 @@
 use std::collections::BinaryHeap;
 use std::fs;
 use std::io;
-use std::os::unix::fs::PermissionsExt as _;
 use std::path::{Path, PathBuf};
 
 use diri_proto::remote_pty::{
@@ -16,7 +15,7 @@ pub fn list(request: &DirectoryListRequest) -> io::Result<DirectoryListResult> {
     request
         .validate()
         .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error))?;
-    let canonical = fs::canonicalize(expand_home(&request.path)?)?;
+    let canonical = diri_platform::canonicalize(expand_home(&request.path)?)?;
     if !canonical.is_dir() {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
@@ -38,9 +37,7 @@ pub fn list(request: &DirectoryListRequest) -> io::Result<DirectoryListResult> {
             || (file_type.is_symlink() && entry.metadata().is_ok_and(|metadata| metadata.is_dir()));
         let is_executable = request.mode == DirectoryListMode::Executables
             && !is_directory
-            && entry.metadata().is_ok_and(|metadata| {
-                metadata.is_file() && metadata.permissions().mode() & 0o111 != 0
-            });
+            && diri_platform::launch::is_executable(&entry.path());
         if !is_directory && !is_executable {
             continue;
         }
@@ -109,7 +106,8 @@ pub fn list(request: &DirectoryListRequest) -> io::Result<DirectoryListResult> {
 
 fn expand_home(path: &str) -> io::Result<PathBuf> {
     if path == "~" || path.starts_with("~/") {
-        let home = std::env::var_os("HOME")
+        let home = diri_platform::home_dir()
+            .map(|p| p.into_os_string())
             .filter(|home| !home.is_empty())
             .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "HOME is not set"))?;
         let mut expanded = PathBuf::from(home);

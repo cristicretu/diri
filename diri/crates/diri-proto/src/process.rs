@@ -62,6 +62,8 @@ impl<'de> Deserialize<'de> for BootId {
     deny_unknown_fields
 )]
 pub enum ProcessBirth {
+    /// GetProcessTimes creation FILETIME: 100 ns ticks since 1601-01-01 UTC.
+    Windows { creation_filetime: u64 },
     /// `/proc/PID/stat` field 22, in `_SC_CLK_TCK` units since this boot.
     Linux {
         boot_id: BootId,
@@ -100,6 +102,9 @@ impl ProcessIdentity {
             return Err("invalid process PID");
         }
         match birth {
+            ProcessBirth::Windows {
+                creation_filetime: 0,
+            } => return Err("invalid Windows process creation time"),
             ProcessBirth::Linux {
                 clock_ticks_per_second: 0,
                 ..
@@ -128,6 +133,10 @@ impl ProcessIdentity {
         let mut bytes = b"diri-process-identity\0\x01".to_vec();
         bytes.extend_from_slice(&self.pid.to_be_bytes());
         match self.birth {
+            ProcessBirth::Windows { creation_filetime } => {
+                bytes.push(3);
+                bytes.extend_from_slice(&creation_filetime.to_be_bytes());
+            }
             ProcessBirth::Linux {
                 boot_id,
                 start_ticks,

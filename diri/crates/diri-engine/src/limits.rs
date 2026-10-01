@@ -85,6 +85,7 @@ pub fn raise_fd_limit() -> Option<FdLimit> {
 /// The soft limit to ask for: the hard limit, capped by the kernel's
 /// per-process ceiling when one is advertised. Pure so the arithmetic is
 /// testable without touching the real process limits.
+#[cfg(any(unix, test))]
 fn raise_target(current: FdLimit, ceiling: Option<u64>) -> u64 {
     let mut target = current.hard;
     if let Some(ceiling) = ceiling {
@@ -95,6 +96,7 @@ fn raise_target(current: FdLimit, ceiling: Option<u64>) -> u64 {
 
 /// Values to try, highest first. Each is strictly above the soft limit we
 /// already hold, so a successful call always improves matters.
+#[cfg(any(unix, test))]
 fn fallback_candidates(target: u64, soft: u64) -> Vec<u64> {
     let mut candidates = vec![target, 65_536, 10_240, 4_096, 1_024];
     candidates.sort_unstable_by(|a, b| b.cmp(a));
@@ -122,7 +124,7 @@ fn platform_fd_ceiling() -> Option<u64> {
     (status == 0 && value > 0).then_some(value as u64)
 }
 
-#[cfg(not(target_os = "macos"))]
+#[cfg(all(unix, not(target_os = "macos")))]
 fn platform_fd_ceiling() -> Option<u64> {
     None
 }
@@ -133,12 +135,31 @@ fn platform_fd_ceiling() -> Option<u64> {
 /// serving. Anything else still gets retried — a daemon that exits strands
 /// every attached terminal — just at a pace that keeps the log readable.
 pub fn accept_retry_delay(error: &io::Error) -> Duration {
+    #[cfg(unix)]
     match error.raw_os_error() {
         Some(libc::EMFILE | libc::ENFILE | libc::ENOBUFS | libc::ENOMEM) => {
             Duration::from_millis(100)
         }
         Some(libc::ECONNABORTED | libc::EAGAIN) => Duration::from_millis(10),
         _ => Duration::from_secs(1),
+    }
+    #[cfg(windows)]
+    {
+        use diri_platform::windows_sys::Win32::Networking::WinSock::{
+            WSAECONNABORTED, WSAEMFILE, WSAENOBUFS, WSAEWOULDBLOCK,
+        };
+        match error.raw_os_error() {
+            Some(WSAEMFILE | WSAENOBUFS) => return Duration::from_millis(100),
+            Some(WSAECONNABORTED | WSAEWOULDBLOCK) => return Duration::from_millis(10),
+            _ => {}
+        }
+        match error.kind() {
+            io::ErrorKind::WouldBlock | io::ErrorKind::ConnectionAborted => {
+                Duration::from_millis(10)
+            }
+            io::ErrorKind::OutOfMemory => Duration::from_millis(100),
+            _ => Duration::from_secs(1),
+        }
     }
 }
 
@@ -183,6 +204,7 @@ mod tests {
     }
 
     #[cfg(unix)]
+    #[cfg(unix)]
     #[test]
     fn raising_the_limit_is_monotonic_and_stays_within_the_hard_limit() {
         let before = raise_fd_limit().expect("rlimit readable");
@@ -194,9 +216,16 @@ mod tests {
 
     #[test]
     fn descriptor_exhaustion_pauses_briefly_instead_of_ending_the_daemon() {
-        let emfile = io::Error::from_raw_os_error(libc::EMFILE);
+        #[cfg(unix)]
+        let (emfile, aborted) = (libc::EMFILE, libc::ECONNABORTED);
+        #[cfg(windows)]
+        let (emfile, aborted) = {
+            use diri_platform::windows_sys::Win32::Networking::WinSock::*;
+            (WSAEMFILE, WSAECONNABORTED)
+        };
+        let emfile = io::Error::from_raw_os_error(emfile);
         assert_eq!(accept_retry_delay(&emfile), Duration::from_millis(100));
-        let aborted = io::Error::from_raw_os_error(libc::ECONNABORTED);
+        let aborted = io::Error::from_raw_os_error(aborted);
         assert_eq!(accept_retry_delay(&aborted), Duration::from_millis(10));
         let unknown = io::Error::other("listener vanished");
         assert_eq!(accept_retry_delay(&unknown), Duration::from_secs(1));

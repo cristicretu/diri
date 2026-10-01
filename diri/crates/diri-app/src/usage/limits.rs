@@ -222,7 +222,9 @@ async fn http_get(url: &str, headers: &[String]) -> Result<Value, &'static str> 
         config.push_str(&header.replace('\\', "\\\\").replace('"', "\\\""));
         config.push_str("\"\n");
     }
-    let mut child = Command::new("/usr/bin/curl")
+    let mut command = Command::new(diri_platform::curl_executable());
+    diri_platform::hide_console_window(command.as_std_mut());
+    let mut child = command
         .args([
             "-q",
             "--silent",

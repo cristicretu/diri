@@ -522,6 +522,12 @@ impl PtyStream {
     }
 }
 
+impl AsRawFd for PtyStream {
+    fn as_raw_fd(&self) -> RawFd {
+        self.0.as_raw_fd()
+    }
+}
+
 impl Read for PtyStream {
     fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
         match self.0.read(buffer) {

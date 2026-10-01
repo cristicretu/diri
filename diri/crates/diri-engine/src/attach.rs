@@ -12,10 +12,10 @@
 //! the grid walk and diff are done once regardless of sink count — the same
 //! shape as the Swift daemon's coalesced `flushGrid`.
 
+use diri_platform::ipc::UnixStream;
+use diri_platform::poll::AsRawIo;
 use std::collections::{HashMap, VecDeque};
 use std::io::{Read, Write};
-use std::os::fd::AsRawFd;
-use std::os::unix::net::UnixStream;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -819,7 +819,7 @@ impl AttachHub {
 
     /// Recipients were captured with the grid under Registry. Looking them
     /// up after encoding could send an older diff behind a newer client's seed.
-    #[cfg(test)]
+    #[cfg(all(test, unix))]
     fn enqueue_publication(
         &self,
         session_id: &str,
@@ -892,9 +892,9 @@ impl AttachHub {
                     return None;
                 };
                 let output = output.lock().ok()?;
-                (!output.closed && !output.frames.is_empty()).then(|| libc::pollfd {
-                    fd: output.stream.as_raw_fd(),
-                    events: libc::POLLOUT,
+                (!output.closed && !output.frames.is_empty()).then(|| diri_platform::poll::PollFd {
+                    fd: output.stream.as_raw_io(),
+                    events: diri_platform::poll::POLLOUT,
                     revents: 0,
                 })
             })
@@ -908,8 +908,9 @@ impl AttachHub {
             let millis = remaining.as_micros().div_ceil(1000).min(i32::MAX as u128) as i32;
             // SAFETY: retained output Arcs keep all sockets live, and the poll
             // array is exclusively owned for its exact initialized length.
-            let result =
-                unsafe { libc::poll(descriptors.as_mut_ptr(), descriptors.len() as _, millis) };
+            let result = unsafe {
+                diri_platform::poll::poll(descriptors.as_mut_ptr(), descriptors.len() as _, millis)
+            };
             if result >= 0
                 || std::io::Error::last_os_error().kind() != std::io::ErrorKind::Interrupted
                 || Instant::now() >= deadline
@@ -1116,17 +1117,21 @@ fn drain_output(output: &mut SinkOutput) -> bool {
 }
 
 fn wait_writable(stream: &UnixStream) -> bool {
-    let mut descriptor = libc::pollfd {
-        fd: stream.as_raw_fd(),
-        events: libc::POLLOUT,
+    let mut descriptor = diri_platform::poll::PollFd {
+        fd: stream.as_raw_io(),
+        events: diri_platform::poll::POLLOUT,
         revents: 0,
     };
     loop {
         // SAFETY: one valid pollfd for a live socket. A hangup or error wakes
         // the poll so the caller's next write fails instead of spinning.
-        let result = unsafe { libc::poll(&mut descriptor, 1, WRITE_RETRY.as_millis() as i32) };
+        let result = unsafe {
+            diri_platform::poll::poll(&mut descriptor, 1, WRITE_RETRY.as_millis() as i32)
+        };
         if result > 0 {
-            return descriptor.revents & (libc::POLLNVAL | libc::POLLERR) == 0;
+            return descriptor.revents
+                & (diri_platform::poll::POLLNVAL | diri_platform::poll::POLLERR)
+                == 0;
         }
         if result == 0 {
             return true; // timed out; let flush judge progress and stalls
@@ -1139,17 +1144,17 @@ fn wait_writable(stream: &UnixStream) -> bool {
 
 /// Blocking readiness wait used only by the existing input reader thread.
 fn wait_readable(stream: &UnixStream) -> bool {
-    let mut descriptor = libc::pollfd {
-        fd: stream.as_raw_fd(),
-        events: libc::POLLIN,
+    let mut descriptor = diri_platform::poll::PollFd {
+        fd: stream.as_raw_io(),
+        events: diri_platform::poll::POLLIN,
         revents: 0,
     };
     loop {
         // SAFETY: one live socket and one initialized pollfd. EINTR is retried;
         // hangup/error wakes the following read so shutdown always unwinds.
-        let result = unsafe { libc::poll(&mut descriptor, 1, -1) };
+        let result = unsafe { diri_platform::poll::poll(&mut descriptor, 1, -1) };
         if result > 0 {
-            return descriptor.revents & libc::POLLNVAL == 0;
+            return descriptor.revents & diri_platform::poll::POLLNVAL == 0;
         }
         if result < 0 && std::io::Error::last_os_error().kind() != std::io::ErrorKind::Interrupted {
             return false;
@@ -1199,6 +1204,7 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
     fn constrained_output() -> (SinkOutput, UnixStream) {
         let (writer, reader) = UnixStream::pair().unwrap();
         let size: libc::c_int = 1024;
@@ -1206,7 +1212,7 @@ mod tests {
         assert_eq!(
             unsafe {
                 libc::setsockopt(
-                    writer.as_raw_fd(),
+                    writer.as_raw_io(),
                     libc::SOL_SOCKET,
                     libc::SO_SNDBUF,
                     (&size as *const libc::c_int).cast(),
@@ -1219,8 +1225,10 @@ mod tests {
         (SinkOutput::new(writer).unwrap(), reader)
     }
 
+    #[cfg(unix)]
     fn retained_registry(temp: &std::path::Path) -> Arc<Mutex<Registry>> {
         use diri_proto::process::{BootId, ProcessBirth, ProcessIdentity};
+        #[cfg(unix)]
         use std::os::unix::fs::PermissionsExt;
         let exit = diri_proto::ExitInfo {
             reason: diri_proto::ExitReason::Exited,
@@ -1311,6 +1319,7 @@ mod tests {
         Arc::new(Mutex::new(registry))
     }
 
+    #[cfg(unix)]
     fn read_frames(codec: &mut FrameCodec, stream: &mut UnixStream, want: usize) -> Vec<Frame> {
         let mut frames = Vec::new();
         let mut chunk = [0u8; 64 << 10];
@@ -1329,6 +1338,7 @@ mod tests {
         frames
     }
 
+    #[cfg(unix)]
     #[test]
     fn attaching_to_a_completed_session_seeds_its_retained_terminal_read_only() {
         let temp = tempfile::tempdir().unwrap();
@@ -1383,6 +1393,7 @@ mod tests {
         serve.join().unwrap();
     }
 
+    #[cfg(unix)]
     #[test]
     fn keyboard_publication_preserves_legacy_bytes_and_shares_grid() {
         let hub = AttachHub::new();
@@ -1457,6 +1468,7 @@ mod tests {
         assert!(!preview.lock().unwrap().closed);
     }
 
+    #[cfg(unix)]
     #[test]
     fn late_registration_cannot_receive_a_pre_seed_publication() {
         let hub = AttachHub::new();
@@ -1514,6 +1526,7 @@ mod tests {
         assert_eq!(old.lock().unwrap().frames.len(), 2);
     }
 
+    #[cfg(unix)]
     #[test]
     fn an_idle_pump_stops_as_soon_as_its_last_sink_leaves() {
         let temp = tempfile::tempdir().unwrap();
@@ -1585,6 +1598,7 @@ mod tests {
         }
     }
 
+    #[cfg(unix)]
     #[test]
     fn output_between_seed_and_registration_is_not_lost() {
         let temp = tempfile::tempdir().unwrap();
@@ -1722,6 +1736,7 @@ mod tests {
             .unwrap();
     }
 
+    #[cfg(unix)]
     #[test]
     fn partial_writes_keep_exact_frame_boundaries_and_release_retained_bytes() {
         let (mut output, mut reader) = constrained_output();
@@ -1766,6 +1781,7 @@ mod tests {
         assert!(output.frames.is_empty());
     }
 
+    #[cfg(unix)]
     #[test]
     fn overflow_after_partial_frame_closes_instead_of_splicing_a_new_frame() {
         let (mut output, mut reader) = constrained_output();
@@ -1787,6 +1803,7 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
     #[test]
     fn small_frames_are_count_bounded_and_stalled_sinks_close() {
         let (mut output, _) = constrained_output();

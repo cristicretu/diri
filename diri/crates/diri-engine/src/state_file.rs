@@ -419,7 +419,18 @@ fn sync_parent(path: &Path) -> io::Result<()> {
         .parent()
         .filter(|parent| !parent.as_os_str().is_empty())
         .unwrap_or_else(|| Path::new("."));
-    File::open(parent)?.sync_all()
+    #[cfg(unix)]
+    {
+        File::open(parent)?.sync_all()
+    }
+    // Windows has no unprivileged directory fsync: FlushFileBuffers on a
+    // directory handle opened for reading fails with access denied. The file
+    // was flushed before the rename; no stronger guarantee is claimed.
+    #[cfg(windows)]
+    {
+        let _ = parent;
+        Ok(())
+    }
 }
 
 struct FileLock(#[allow(dead_code)] File);
@@ -442,6 +453,9 @@ impl FileLock {
                 return Err(io::Error::last_os_error());
             }
         }
+        // LockFileEx; released when the handle closes, like flock.
+        #[cfg(windows)]
+        file.lock()?;
         Ok(Self(file))
     }
 }

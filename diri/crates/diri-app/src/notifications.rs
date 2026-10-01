@@ -473,7 +473,7 @@ pub fn accepts_reply(session: &SessionRecord) -> bool {
             .is_some_and(|detail| detail.secret)
 }
 
-#[cfg(any(target_os = "macos", test))]
+#[cfg(any(target_os = "macos", windows, test))]
 /// Why a banner reply was not typed into its session.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ReplyRefusal {
@@ -484,7 +484,7 @@ pub enum ReplyRefusal {
     MovedOn,
 }
 
-#[cfg(any(target_os = "macos", test))]
+#[cfg(any(target_os = "macos", windows, test))]
 /// Re-check a reply against the state when it arrives, not when the banner
 /// was posted. The target is the banner's own session (`claimed`, from the
 /// delivered notification) and must agree with the inbox entry that posted
@@ -514,7 +514,7 @@ pub fn reply_refusal(
     None
 }
 
-#[cfg(any(target_os = "macos", test))]
+#[cfg(any(target_os = "macos", windows, test))]
 /// The notice for a reply that was not sent. It never repeats the reply
 /// text: that is a prompt, and prompts stay out of logs and banners.
 #[must_use]

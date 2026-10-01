@@ -35,7 +35,8 @@ impl HistoryRoots {
     }
 
     pub fn current_user() -> Self {
-        let home = std::env::var_os("HOME")
+        let home = diri_platform::home_dir()
+            .map(|p| p.into_os_string())
             .map(PathBuf::from)
             .unwrap_or_else(|| PathBuf::from("/nonexistent"));
         Self::in_home(&home)
@@ -697,9 +698,9 @@ fn folder_name(path: &str) -> &str {
 
 #[cfg(test)]
 mod tests {
+    use diri_platform::ipc::UnixListener;
     use std::fs;
     use std::io::Write as _;
-    use std::os::unix::net::UnixListener;
     use std::sync::mpsc;
     use std::time::Duration;
 

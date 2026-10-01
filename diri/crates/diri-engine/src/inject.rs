@@ -99,7 +99,7 @@ fn mcp_launch(cli_path: &Path) -> (String, Vec<String>) {
     let proxy = cli_path
         .parent()
         .unwrap_or_else(|| Path::new("."))
-        .join("dirijor-mcp");
+        .join(diri_platform::executable_name("dirijor-mcp"));
     if is_executable(&proxy) {
         (proxy.to_string_lossy().into_owned(), Vec::new())
     } else {
@@ -219,22 +219,44 @@ pub fn write_cursor_plugin(
         let (target, target_args) = mcp_launch(cli_path);
         // Cursor splits `command` on spaces before spawning it. Keep the
         // App Support path in argv, where JSON preserves it as one argument.
-        let args = std::iter::once(target)
-            .chain(target_args)
-            .collect::<Vec<_>>();
+        #[cfg(unix)]
+        let (command, args, environment) = (
+            "/usr/bin/env".to_owned(),
+            std::iter::once(target)
+                .chain(target_args)
+                .collect::<Vec<_>>(),
+            json!({ "DIRIJOR_SESSION_ID": session_id, "DIRIJOR_SOCKET": socket_path.to_string_lossy(), "DIRIJOR_CLI": cli_path.to_string_lossy() }),
+        );
+        #[cfg(windows)]
+        let (command, args, environment) = {
+            let binary = Path::new(&target);
+            let directory = binary
+                .parent()
+                .ok_or_else(|| io::Error::other("MCP executable has no directory"))?;
+            let path = std::env::var_os("PATH").unwrap_or_default();
+            let path = std::env::join_paths(
+                std::iter::once(directory.to_path_buf()).chain(std::env::split_paths(&path)),
+            )
+            .map_err(io::Error::other)?;
+            (
+                binary
+                    .file_name()
+                    .ok_or_else(|| io::Error::other("MCP executable has no filename"))?
+                    .to_string_lossy()
+                    .into_owned(),
+                target_args,
+                json!({ "PATH": path.to_string_lossy(), "DIRIJOR_SESSION_ID": session_id, "DIRIJOR_SOCKET": socket_path.to_string_lossy(), "DIRIJOR_CLI": cli_path.to_string_lossy() }),
+            )
+        };
         write_atomic(
             &staging.join("mcp.json"),
             &serde_json::to_vec_pretty(&json!({
                 "mcpServers": {
                     "dirijor": {
                         "type": "stdio",
-                        "command": "/usr/bin/env",
+                        "command": command,
                         "args": args,
-                        "env": {
-                            "DIRIJOR_SESSION_ID": session_id,
-                            "DIRIJOR_SOCKET": socket_path.to_string_lossy(),
-                            "DIRIJOR_CLI": cli_path.to_string_lossy(),
-                        }
+                        "env": environment
                     }
                 }
             }))?,
@@ -283,9 +305,22 @@ fn shell_single_quote(s: &str) -> String {
     format!("'{}'", s.replace('\'', "'\\''"))
 }
 
-/// Claude Code's project-directory slug for a working directory: `/` and `.`
-/// replaced by `-`, verified against real dirs under `~/.claude/projects`.
+/// Claude Code's project-directory slug. Native Windows paths also encode the
+/// drive colon, backslashes, spaces and other non-ASCII-alphanumeric characters.
 pub fn claude_project_slug(cwd: &str) -> String {
+    #[cfg(windows)]
+    {
+        // Match the vendor's UTF-16 /[^a-zA-Z0-9]/g replacement, including two
+        // replacements for a non-BMP character. Never join a raw drive path
+        // beneath the transcript root: Path::join would replace that root.
+        cwd.encode_utf16()
+            .map(|unit| match unit {
+                0x30..=0x39 | 0x41..=0x5a | 0x61..=0x7a => char::from_u32(unit.into()).unwrap(),
+                _ => '-',
+            })
+            .collect()
+    }
+    #[cfg(not(windows))]
     cwd.replace(['/', '.'], "-")
 }
 
@@ -373,7 +408,10 @@ mod tests {
         assert_eq!(parsed["mcpServers"]["dirijor"]["args"][0], "mcp-stdio");
 
         // With an executable sibling, it becomes the command.
-        let proxy = temp.path().join("bin/dirijor-mcp");
+        let proxy = temp
+            .path()
+            .join("bin")
+            .join(diri_platform::executable_name("dirijor-mcp"));
         std::fs::write(&proxy, "#!/bin/sh\n").expect("proxy");
         #[cfg(unix)]
         {
@@ -437,7 +475,7 @@ mod tests {
         let cli = temp.path().join("Application Support/dirijor");
         std::fs::create_dir_all(cli.parent().unwrap()).expect("mkdir");
         std::fs::write(&cli, b"#!/bin/sh\n").expect("cli");
-        let proxy = cli.with_file_name("dirijor-mcp");
+        let proxy = cli.with_file_name(diri_platform::executable_name("dirijor-mcp"));
         std::fs::write(&proxy, b"#!/bin/sh\n").expect("proxy");
         #[cfg(unix)]
         {
@@ -463,17 +501,39 @@ mod tests {
             }),
         );
         assert_eq!(args[0], "--plugin-dir");
-        assert!(args[1].ends_with("cursor-plugin/s_test"), "{args:?}");
+        assert!(
+            Path::new(&args[1]).ends_with("cursor-plugin/s_test"),
+            "{args:?}"
+        );
 
         let plugin = Path::new(&args[1]);
         let mcp: serde_json::Value =
             serde_json::from_slice(&std::fs::read(plugin.join("mcp.json")).expect("mcp.json"))
                 .expect("json");
-        assert_eq!(mcp["mcpServers"]["dirijor"]["command"], "/usr/bin/env");
-        assert_eq!(
-            mcp["mcpServers"]["dirijor"]["args"][0],
-            proxy.to_string_lossy().as_ref()
-        );
+        #[cfg(unix)]
+        {
+            assert_eq!(mcp["mcpServers"]["dirijor"]["command"], "/usr/bin/env");
+            assert_eq!(
+                mcp["mcpServers"]["dirijor"]["args"][0],
+                proxy.to_string_lossy().as_ref()
+            );
+        }
+        // Cursor splits `command` on spaces: the bare file name runs from the
+        // proxy's directory, which leads the session's PATH.
+        #[cfg(windows)]
+        {
+            assert_eq!(
+                mcp["mcpServers"]["dirijor"]["command"],
+                proxy.file_name().unwrap().to_string_lossy().as_ref()
+            );
+            let path = mcp["mcpServers"]["dirijor"]["env"]["PATH"]
+                .as_str()
+                .expect("PATH");
+            assert_eq!(
+                std::env::split_paths(path).next().as_deref(),
+                proxy.parent()
+            );
+        }
         assert_eq!(
             mcp["mcpServers"]["dirijor"]["env"]["DIRIJOR_SESSION_ID"],
             "s_test"

@@ -391,7 +391,8 @@ impl Default for DaemonClient {
 impl DaemonClient {
     /// Uses the platform path provider's default control socket.
     pub fn new() -> Self {
-        let home = std::env::var_os("HOME")
+        let home = diri_platform::home_dir()
+            .map(|p| p.into_os_string())
             .map(PathBuf::from)
             .unwrap_or_else(|| PathBuf::from("/nonexistent"));
         Self::with_socket_path(DirijorPaths::socket(home))
@@ -739,6 +740,18 @@ impl DaemonClient {
 
     /// Lists exactly one directory level on the Engine-selected machine.
     /// Remote requests stay behind the Engine's authenticated SSH transport.
+    /// Includes registered WSL distributions discovered by the Engine.
+    pub async fn hosts(&self) -> Result<diri_proto::HostsConfig, ClientError> {
+        let value = self
+            .request(
+                Method::HOST_LIST,
+                Some(&serde_json::json!({})),
+                Some(Duration::from_secs(5)),
+            )
+            .await?;
+        serde_json::from_value(value).map_err(ClientError::json)
+    }
+
     pub async fn list_directories(
         &self,
         host: Option<String>,
@@ -1422,7 +1435,8 @@ mod tests {
         fn start(instance: Option<&str>, events: u64) -> Self {
             let temp = tempfile::tempdir().expect("temp dir");
             let socket = temp.path().join("daemon.sock");
-            let listener = tokio::net::UnixListener::bind(&socket).expect("bind");
+            let listener =
+                diri_platform::ipc::asynchronous::UnixListener::bind(&socket).expect("bind");
             let instance = Arc::new(StdMutex::new(instance.map(str::to_owned)));
             let (subscription_tx, subscription_rx) = mpsc::unbounded_channel();
             let (close_tx, mut close_rx) = mpsc::unbounded_channel::<()>();
@@ -1670,7 +1684,7 @@ mod tests {
             );
             return Ok(());
         }
-        let Some(home) = std::env::var_os("HOME") else {
+        let Some(home) = diri_platform::home_dir().map(|p| p.into_os_string()) else {
             eprintln!("skipping live daemon test: HOME is unset");
             return Ok(());
         };

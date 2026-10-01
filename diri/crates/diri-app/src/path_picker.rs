@@ -158,7 +158,7 @@ fn is_dir(path: &Path) -> bool {
 }
 
 fn git_files(root: &Path) -> Option<Vec<String>> {
-    let output = Command::new("git")
+    let output = diri_platform::hide_console_window(&mut Command::new("git"))
         .arg("-C")
         .arg(root)
         .args([
@@ -627,6 +627,7 @@ mod tests {
         assert_eq!(relatives(&listing), ["node_modules", "src"]);
     }
 
+    #[cfg(unix)]
     #[test]
     fn the_walk_skips_dependency_dirs_and_never_follows_symlinks() {
         let temp = tempfile::tempdir().unwrap();

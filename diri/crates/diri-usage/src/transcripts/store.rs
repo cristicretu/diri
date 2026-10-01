@@ -48,7 +48,9 @@ impl ScanPaths {
 
 impl Default for ScanPaths {
     fn default() -> Self {
-        let home = env::var_os("HOME").map_or_else(std::env::temp_dir, PathBuf::from);
+        let home = env::var_os("HOME")
+            .or_else(|| env::var_os("USERPROFILE"))
+            .map_or_else(std::env::temp_dir, PathBuf::from);
         Self::for_home(home)
     }
 }

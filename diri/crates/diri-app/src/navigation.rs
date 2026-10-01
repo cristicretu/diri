@@ -528,7 +528,8 @@ impl NavigationOverlay {
 
     /// The roots to index, and where their cached index lives.
     fn index_roots(&mut self) -> (Vec<PathBuf>, Vec<PathBuf>, PathBuf, PathBuf) {
-        let home = std::env::var_os("HOME")
+        let home = diri_platform::home_dir()
+            .map(|p| p.into_os_string())
             .map(PathBuf::from)
             .unwrap_or_else(|| PathBuf::from("/nonexistent"));
         let projects = self.project_roots();
@@ -1118,7 +1119,8 @@ impl NavigationOverlay {
     /// One `stat` per keystroke: bare names land beside the most recent
     /// project, so a new project sits with the ones already open.
     fn refresh_quick_create(&mut self) {
-        let home = std::env::var_os("HOME")
+        let home = diri_platform::home_dir()
+            .map(|p| p.into_os_string())
             .map(PathBuf::from)
             .unwrap_or_else(|| PathBuf::from("/nonexistent"));
         let base = self
@@ -2354,7 +2356,7 @@ fn relative_parent(path: &Path) -> String {
     if parent.is_empty() || parent == "/" {
         return parent;
     }
-    let Some(home) = std::env::var_os("HOME") else {
+    let Some(home) = diri_platform::home_dir().map(|p| p.into_os_string()) else {
         return parent;
     };
     let home = PathBuf::from(home);
@@ -2424,7 +2426,10 @@ mod tests {
 
     #[test]
     fn relative_parent_abbreviates_home_like_swift() {
-        let home = std::env::var_os("HOME").map(PathBuf::from).unwrap();
+        let home = diri_platform::home_dir()
+            .map(|p| p.into_os_string())
+            .map(PathBuf::from)
+            .unwrap();
         assert_eq!(relative_parent(&home.join("project")), "~");
         assert_eq!(relative_parent(&home.join("fun/project")), "~/fun");
         assert_eq!(relative_parent(Path::new("/tmp/project")), "/tmp");
@@ -2759,6 +2764,7 @@ mod tests {
         {
             let mut store = runtime.store.write().expect("session store lock poisoned");
             store.set_hosts(vec![HostEntry {
+                transport: Default::default(),
                 id: "forge".into(),
                 name: Some("Forge".into()),
                 ssh: "forge.example".into(),

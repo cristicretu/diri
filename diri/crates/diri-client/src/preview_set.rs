@@ -1,5 +1,6 @@
 //! One receive-only local connection for a bounded changing set of previews.
 use crate::{AttachmentError, TerminalChunk};
+use diri_platform::ipc::asynchronous::UnixStream;
 use diri_proto::SessionId;
 use diri_proto::frames::FrameType;
 use diri_proto::preview_set::*;
@@ -8,7 +9,6 @@ use std::io;
 use std::path::Path;
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::UnixStream;
 use tokio::sync::{mpsc, watch};
 use tokio::task::JoinHandle;
 
@@ -194,7 +194,7 @@ fn membership_for(
 }
 
 async fn write_memberships(
-    mut write: tokio::net::unix::OwnedWriteHalf,
+    mut write: diri_platform::ipc::asynchronous::OwnedWriteHalf,
     mut desired: watch::Receiver<PreviewSetMembership>,
 ) -> io::Result<()> {
     while desired.changed().await.is_ok() {
@@ -210,7 +210,7 @@ async fn write_memberships(
 }
 
 async fn read_previews(
-    mut read: tokio::net::unix::OwnedReadHalf,
+    mut read: diri_platform::ipc::asynchronous::OwnedReadHalf,
     desired: watch::Receiver<PreviewSetMembership>,
     events: mpsc::Sender<PreviewSetEvent>,
 ) -> io::Result<()> {

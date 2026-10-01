@@ -115,3 +115,14 @@ Before a public release:
 1. Install the real Developer ID Application certificate and configure a notarytool keychain profile or CI secrets.
 2. Run the signed/notarized DMG flow and test it on a second Mac outside the build environment.
 3. Publish through the release host with `scripts/release.sh <version>`, which wraps this script and also writes the update feed — see [UPDATING.md](UPDATING.md).
+
+
+## Windows code signing
+
+The native Windows implementation owns its signing pipeline in
+`.github/workflows/windows.yml` and `windows-sign.yml`. It signs the staged
+executables before assembling the versioned per-user installer, then signs the
+installer and generates the final architecture-specific appcast. Release
+signing is restricted to tested `main` builds and disabled until Azure/OIDC
+configuration is provided. See [WINDOWS.md](WINDOWS.md#release-signing-setup)
+for setup, certificate-profile identity policy and outstanding release gates.

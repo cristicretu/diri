@@ -667,7 +667,7 @@ impl UtilitySurfaces {
         }
         let colors = self.settings_colors();
         let mut content = div().flex().flex_col().gap(px(16.0))
-            .child(div().text_size(px(12.0)).text_color(colors.secondary).child("Sign in to each Claude or Codex account once, or save the login already active on this Mac. Choosing an account from the bottom-left menu switches every open conversation of that Agent in place; conversations, MCP setup and settings stay in the shared home. Running tools are interrupted, and hosted connections may need authorization on the selected account."))
+            .child(div().text_size(px(12.0)).text_color(colors.secondary).child(format!("Sign in to each Claude or Codex account once, or save the login already active on {}. Choosing an account from the bottom-left menu switches every open conversation of that Agent in place; conversations, MCP setup and settings stay in the shared home. Running tools are interrupted, and hosted connections may need authorization on the selected account.", crate::platform::local_machine_label_lowercase())))
             .child(div().flex().items_center().justify_between()
                 .child(div().text_size(px(12.0)).text_color(colors.secondary).child(if self.accounts.busy { "Updating accounts…" } else { "Saved profiles" }))
                 .child(self.account_button("add-account", "Add profile", cx, |this, window, cx| this.edit_account(None, window, cx))));

@@ -1,11 +1,14 @@
 //! Local desktop PATH normalization shared by discovery and Agent launches.
 
 use std::collections::{BTreeMap, HashSet};
-use std::path::{Path, PathBuf};
+use std::path::Path;
+#[cfg(unix)]
+use std::path::PathBuf;
 
 /// Keep the shell's choices first, preserve inherited tools, then fill gaps
 /// left by desktop launchers or failed shell initialization. Do not scan
 /// version-manager installs: their shell-selected version remains authoritative.
+#[cfg(unix)]
 pub fn search_path(
     shell_path: Option<&str>,
     environment: impl IntoIterator<Item = (String, String)>,
@@ -84,11 +87,53 @@ pub fn search_path(
         .join(":")
 }
 
+#[cfg(windows)]
+pub fn search_path(
+    shell_path: Option<&str>,
+    environment: impl IntoIterator<Item = (String, String)>,
+) -> String {
+    let environment = environment
+        .into_iter()
+        .map(|(k, v)| (k.to_ascii_uppercase(), v))
+        .collect::<BTreeMap<_, _>>();
+    let mut directories = Vec::new();
+    for value in [shell_path, environment.get("PATH").map(String::as_str)]
+        .into_iter()
+        .flatten()
+    {
+        directories.extend(std::env::split_paths(value).filter(|p| p.is_absolute()));
+    }
+    for (key, suffix) in [
+        ("APPDATA", "npm"),
+        ("LOCALAPPDATA", "pnpm"),
+        ("PNPM_HOME", ""),
+        ("USERPROFILE", ".local/bin"),
+        ("USERPROFILE", ".cargo/bin"),
+        ("USERPROFILE", ".bun/bin"),
+    ] {
+        if let Some(root) = environment
+            .get(key)
+            .map(Path::new)
+            .filter(|p| p.is_absolute())
+        {
+            directories.push(root.join(suffix));
+        }
+    }
+    let mut seen = HashSet::new();
+    directories.retain(|p| seen.insert(p.to_string_lossy().to_ascii_lowercase()));
+    std::env::join_paths(directories)
+        .ok()
+        .and_then(|p| p.into_string().ok())
+        .unwrap_or_default()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(unix)]
     use std::os::unix::fs::PermissionsExt;
 
+    #[cfg(unix)]
     #[test]
     fn pnpm_codex_is_discovered_with_a_desktop_path() {
         let temporary = tempfile::tempdir().unwrap();
@@ -152,6 +197,7 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
     #[test]
     fn package_manager_shims_and_their_runtime_share_the_launch_path() {
         use crate::agent::AgentDescriptor;
@@ -214,6 +260,7 @@ mod tests {
         }
     }
 
+    #[cfg(unix)]
     #[test]
     fn shell_and_inherited_paths_keep_precedence_without_duplicates() {
         let path = search_path(
@@ -233,6 +280,7 @@ mod tests {
         assert_eq!(search_path(None, [("PATH".into(), path.clone())]), path);
     }
 
+    #[cfg(unix)]
     #[test]
     fn invalid_homes_do_not_add_relative_or_injected_search_directories() {
         let path = search_path(
@@ -250,6 +298,7 @@ mod tests {
         assert!(path.split(':').all(|entry| entry.starts_with('/')));
     }
 
+    #[cfg(unix)]
     #[test]
     fn discovery_rejects_non_executable_files_and_accepts_package_manager_symlinks() {
         let temporary = tempfile::tempdir().unwrap();

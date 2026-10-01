@@ -125,6 +125,7 @@ fn host_usage_poll_cost() {
     )
     .unwrap();
     let host = HostEntry {
+        transport: Default::default(),
         id: "bench".into(),
         name: None,
         ssh: "bench-host".into(),

@@ -35,7 +35,6 @@ pub mod attach;
 pub mod attention;
 pub mod browser;
 pub mod checkpoint;
-#[cfg(unix)]
 pub mod completed_terminal;
 pub mod control;
 pub mod detect;
@@ -44,7 +43,6 @@ pub mod events;
 pub mod git;
 pub mod governor;
 pub mod history;
-#[cfg(unix)]
 pub mod holder;
 pub mod hooks;
 pub mod hosts;
@@ -82,3 +80,5 @@ pub use session::{
     HolderConfig, RemoteAdoptSpec, RemoteSessionSpec, Session, SessionSpec, SessionView,
 };
 pub use status::{Authority, ReducerOutcome, StatusReducer, StatusSignal};
+
+pub mod wsl;

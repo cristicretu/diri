@@ -7,6 +7,7 @@
 //! are blocking by design so GPUI can dispatch them to its background executor.
 
 use std::collections::HashSet;
+#[cfg(unix)]
 use std::ffi::OsString;
 use std::fmt;
 use std::fs::{self, File};
@@ -38,7 +39,7 @@ pub(crate) fn local_reference(
 ) -> Option<(PathBuf, Option<SourceTarget>)> {
     let parsed = parse_reference_fragment(reference)?;
     let path = if let Ok(relative) = parsed.path.strip_prefix("~") {
-        PathBuf::from(std::env::var_os("HOME")?).join(relative)
+        PathBuf::from(diri_platform::home_dir().map(|p| p.into_os_string())?).join(relative)
     } else if parsed.path.is_absolute() {
         parsed.path
     } else {
@@ -82,7 +83,7 @@ impl CodeIntelligence {
     /// file tree and search index are built on their first use.
     pub fn for_session(cwd: impl AsRef<Path>) -> Result<Self, CodeIntelligenceError> {
         let requested = cwd.as_ref();
-        let canonical = fs::canonicalize(requested).map_err(|error| {
+        let canonical = diri_platform::canonicalize(requested).map_err(|error| {
             CodeIntelligenceError::WorkspaceUnavailable {
                 path: requested.to_path_buf(),
                 message: error.to_string(),
@@ -258,7 +259,7 @@ impl CodeIntelligence {
     ) -> Result<Vec<DirectoryEntry>, CodeIntelligenceError> {
         let requested = self.workspace_root.join(relative);
         let directory =
-            fs::canonicalize(&requested).map_err(|error| CodeIntelligenceError::Io {
+            diri_platform::canonicalize(&requested).map_err(|error| CodeIntelligenceError::Io {
                 path: relative.to_path_buf(),
                 operation: "read directory",
                 message: error.to_string(),
@@ -286,7 +287,7 @@ impl CodeIntelligence {
             };
             // Symlink targets must pass the same containment boundary as source opens.
             let is_dir = if kind.is_symlink() {
-                let Ok(target) = entry.path().canonicalize() else {
+                let Ok(target) = diri_platform::canonicalize(entry.path()) else {
                     continue;
                 };
                 if !target.starts_with(&self.workspace_root) || target.is_dir() {
@@ -387,7 +388,7 @@ impl CodeIntelligence {
         &self,
         requested: &Path,
     ) -> Result<(PathBuf, PathBuf), CodeIntelligenceError> {
-        let canonical = fs::canonicalize(requested).map_err(|error| {
+        let canonical = diri_platform::canonicalize(requested).map_err(|error| {
             if error.kind() == io::ErrorKind::NotFound {
                 let lexical = lexical_normalize(requested);
                 if lexical.starts_with(&self.workspace_root) {
@@ -727,7 +728,7 @@ struct ParsedReference {
 }
 
 fn discover_workspace_root(session_cwd: &Path) -> Result<PathBuf, CodeIntelligenceError> {
-    if let Ok(output) = Command::new("git")
+    if let Ok(output) = diri_platform::hide_console_window(&mut Command::new("git"))
         .current_dir(session_cwd)
         .args(["rev-parse", "--show-toplevel"])
         .output()
@@ -736,7 +737,7 @@ fn discover_workspace_root(session_cwd: &Path) -> Result<PathBuf, CodeIntelligen
         let root = String::from_utf8_lossy(&output.stdout);
         let root = root.trim();
         if !root.is_empty() {
-            return fs::canonicalize(root).map_err(|error| {
+            return diri_platform::canonicalize(root).map_err(|error| {
                 CodeIntelligenceError::WorkspaceUnavailable {
                     path: PathBuf::from(root),
                     message: error.to_string(),
@@ -798,7 +799,7 @@ fn build_index(workspace_root: &Path) -> WorkspaceIndex {
 }
 
 fn git_paths(workspace_root: &Path) -> Option<Vec<PathBuf>> {
-    let output = Command::new("git")
+    let output = diri_platform::hide_console_window(&mut Command::new("git"))
         .current_dir(workspace_root)
         .args([
             "ls-files",
@@ -1408,7 +1409,7 @@ mod tests {
                 "{reference}"
             );
         }
-        if let Some(home) = std::env::var_os("HOME") {
+        if let Some(home) = diri_platform::home_dir().map(|p| p.into_os_string()) {
             assert_eq!(
                 local_reference(cwd, "~/Desktop/preview.png").map(|(path, _)| path),
                 Some(PathBuf::from(home).join("Desktop/preview.png")),

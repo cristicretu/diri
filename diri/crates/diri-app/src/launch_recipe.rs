@@ -900,6 +900,7 @@ mod tests {
         );
         let projects = HashMap::from([(ProjectId("diri".into()), project("diri", "~/diri", None))]);
         let hosts = vec![HostEntry {
+            transport: Default::default(),
             id: "forge".into(),
             name: Some("Forge".into()),
             ssh: "forge".into(),
@@ -938,6 +939,7 @@ mod tests {
         );
 
         let hosts = vec![HostEntry {
+            transport: Default::default(),
             id: "forge".into(),
             name: Some("Forge".into()),
             ssh: "forge".into(),

@@ -13,7 +13,11 @@ struct Identity {
 fn identity() -> &'static Identity {
     static IDENTITY: OnceLock<Identity> = OnceLock::new();
     IDENTITY.get_or_init(|| Identity {
-        home: std::env::var("HOME").ok().filter(|home| home.len() > 1),
+        home: diri_platform::home_dir()
+            .map(|p| p.to_string_lossy().into_owned())
+            .ok_or(std::env::VarError::NotPresent)
+            .ok()
+            .filter(|home| home.len() > 1),
         user: crate::identity::login_name().filter(|user| user.len() >= 3),
     })
 }

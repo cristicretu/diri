@@ -254,6 +254,7 @@ mod tests {
             ..AgentReadinessResult::default()
         };
         let hosts = vec![HostEntry {
+            transport: Default::default(),
             id: "forge".to_owned(),
             name: Some("Personal production box".to_owned()),
             ssh: "alice@10.0.0.7".to_owned(),

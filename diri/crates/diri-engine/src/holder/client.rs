@@ -5,8 +5,8 @@
 //! acknowledged binary stream; clients fall back to the legacy request shape
 //! when adopting an older live Holder.
 
+use diri_platform::ipc::UnixStream;
 use std::io::{Read, Write};
-use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -207,7 +207,7 @@ const RESPONSE_LINE_LIMIT: u64 = 64 << 10;
 pub struct HolderOutputStream {
     /// Buffered, because a frame costs two reads and frames are small: at PTY
     /// chunk sizes the syscalls cost more than the parsing they feed.
-    stream: std::io::BufReader<std::os::unix::net::UnixStream>,
+    stream: std::io::BufReader<diri_platform::ipc::UnixStream>,
     start_offset: u64,
     /// The timeout currently set on the socket. Setting it is a syscall, and
     /// the coalescing loop would otherwise pay one per frame.
@@ -218,7 +218,11 @@ impl HolderOutputStream {
     fn open(path: &Path) -> HolderResult<Option<Self>> {
         use std::io::BufRead;
         let mut stream = socket::connect(path)?;
-        socket::set_buffer(&stream, libc::SO_RCVBUF, socket::OUTPUT_SOCKET_BUFFER);
+        socket::set_buffer(
+            &stream,
+            socket::RECEIVE_BUFFER,
+            socket::OUTPUT_SOCKET_BUFFER,
+        );
         let mut request = HolderRequest::op(HolderOperation::OutputStream);
         request.stream_version = Some(HOLDER_OUTPUT_STREAM_VERSION);
         socket::write_json_line(&mut stream, &request)?;
@@ -511,11 +515,12 @@ impl HolderClient {
     }
 }
 
-#[cfg(test)]
+// The fixtures bind short Unix socket paths under /tmp.
+#[cfg(all(test, unix))]
 mod deadline_tests {
     use super::*;
+    use diri_platform::ipc::UnixListener;
     use std::io::{BufRead, BufReader};
-    use std::os::unix::net::UnixListener;
     use std::time::Instant;
     #[test]
     fn stat_deadline_is_not_extended_by_partial_replies() {

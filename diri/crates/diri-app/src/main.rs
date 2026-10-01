@@ -8,7 +8,6 @@ mod code_intelligence;
 mod code_viewer;
 mod commands;
 mod composer;
-#[cfg(unix)]
 mod daemon_launch;
 mod delegation;
 mod dev_build;
@@ -37,6 +36,8 @@ pub mod markdown;
 mod markdown_view;
 #[cfg(any(target_os = "macos", test))]
 mod menu_inbox;
+#[cfg(any(target_os = "macos", windows))]
+mod native_notifications;
 pub mod navigation;
 mod notes;
 mod notification_feed;
@@ -79,7 +80,10 @@ pub mod transcript;
 pub mod updates;
 pub mod usage;
 mod whats_new;
+mod window_chrome;
 mod window_restore;
+#[cfg(windows)]
+mod windows_notifications;
 mod workbench;
 #[cfg(all(test, target_os = "macos"))]
 mod workspace_fixture;
@@ -216,7 +220,6 @@ pub(crate) struct AppServices {
     pub(crate) usage_limits_refresh: tokio::sync::mpsc::Sender<()>,
     pub(crate) updates: UpdateHandle,
     pub(crate) dev_build: Option<DevBuildIdentity>,
-    #[cfg(unix)]
     daemon_startup: Option<daemon_launch::DeferredDaemonStartup>,
     // Declared last so every service and its owned startup handle drops before
     // the executor during early unwinding as well as ordinary app shutdown.
@@ -259,10 +262,11 @@ fn main() {
     telemetry::start(preview);
     #[cfg(target_os = "macos")]
     let bundle_id = macos::bundle_identifier();
-    #[cfg(target_os = "macos")]
+    #[cfg(windows)]
+    let bundle_id = dev_build::windows_bundle_id();
+    #[cfg(not(any(target_os = "macos", windows)))]
+    let bundle_id: Option<String> = None;
     let dev_build = DevBuildIdentity::from_process_environment(bundle_id.as_deref());
-    #[cfg(not(target_os = "macos"))]
-    let dev_build = DevBuildIdentity::from_process_environment(None);
 
     // The client runtime multiplexes one daemon socket plus a handful of
     // event-driven housekeeping tasks. The default Tokio constructor creates
@@ -280,14 +284,10 @@ fn main() {
     // Plan app-owned Engine supervision now, but do not probe the socket or
     // hash the bundled executable on GPUI's first-paint path. The one-shot plan
     // is consumed only after the first window has been opened below.
-    #[cfg(unix)]
     let daemon_startup = (!preview)
         .then(daemon_launch::DeferredDaemonStartup::for_process)
         .flatten();
-    #[cfg(unix)]
     let defer_client_start = daemon_startup.is_some();
-    #[cfg(not(unix))]
-    let defer_client_start = false;
 
     let client = Arc::new(DaemonClient::new());
     let store_runtime = {
@@ -325,7 +325,8 @@ fn main() {
     let (usage_tx, _) = tokio::sync::watch::channel(UsageSnapshot::default());
     if !preview {
         let usage_tx = usage_tx.clone();
-        let usage_home = std::env::var_os("HOME")
+        let usage_home = diri_platform::home_dir()
+            .map(|p| p.into_os_string())
             .map(PathBuf::from)
             .unwrap_or_else(|| PathBuf::from("/nonexistent"));
         tokio.spawn(async move {
@@ -339,7 +340,8 @@ fn main() {
         });
     }
     if !preview && std::env::var_os("DIRI_SETTINGS_PREVIEW").is_none() {
-        let home = std::env::var_os("HOME")
+        let home = diri_platform::home_dir()
+            .map(|p| p.into_os_string())
             .map(PathBuf::from)
             .unwrap_or_else(|| PathBuf::from("/nonexistent"));
         tokio.spawn(usage::watch_remote_usage(
@@ -352,7 +354,8 @@ fn main() {
     if !preview && std::env::var_os("DIRI_SETTINGS_PREVIEW").is_none() {
         let usage_tx = usage_tx.clone();
         let client = Arc::clone(&client);
-        let home = std::env::var_os("HOME")
+        let home = diri_platform::home_dir()
+            .map(|p| p.into_os_string())
             .map(PathBuf::from)
             .unwrap_or_else(|| PathBuf::from("/nonexistent"));
         tokio.spawn(async move {
@@ -401,7 +404,6 @@ fn main() {
         usage_limits_refresh,
         updates,
         dev_build,
-        #[cfg(unix)]
         daemon_startup,
         tokio,
     });
@@ -428,6 +430,11 @@ fn main() {
     app.run(move |cx: &mut App| {
         load_system_fonts(cx);
         telemetry::install(cx);
+        // Its own taskbar group, never merged with the installed app's.
+        #[cfg(windows)]
+        if let Some(build) = &services.dev_build {
+            cx.set_app_identity(build.bundle_id(), &build.window_title());
+        }
         // Menus and popovers open as blurred panels under glass; DIRI_FLOATING_PANELS=0
         // keeps them inside the window for comparison or when a panel misbehaves.
         if std::env::var_os("DIRI_FLOATING_PANELS").is_none_or(|value| value != "0") {
@@ -503,7 +510,6 @@ fn main() {
             // 200 ms grace period begins. The coordinator never transfers its
             // sole task handle into that cancellable future: pending startup
             // and idle release remain owned by runtime blocking workers.
-            #[cfg(unix)]
             let startup_owns_release =
                 quit_services
                     .daemon_startup
@@ -513,8 +519,6 @@ fn main() {
                             .request_shutdown(&quit_services.tokio, quit_services.store.client());
                         true
                     });
-            #[cfg(not(unix))]
-            let startup_owns_release = false;
             async move {
                 if let Err(error) = quit_services
                     .store
@@ -577,7 +581,6 @@ fn main() {
         // it runs on Tokio's blocking pool and releases the reconnect loop
         // only after replacement is complete, so the UI cannot race a daemon
         // that is about to shut down.
-        #[cfg(unix)]
         if let Some(startup) = services.daemon_startup.as_ref() {
             startup.after_window_open(&services.tokio, Arc::clone(services.store.client()));
         }
@@ -845,7 +848,9 @@ fn open_window(
             app_owns_titlebar_drag: cfg!(target_os = "macos"),
             titlebar: Some(TitlebarOptions {
                 title,
-                appears_transparent: cfg!(target_os = "macos"),
+                // On Windows this hides the native caption strip; diri draws
+                // the caption buttons into its own toolbar (`window_chrome`).
+                appears_transparent: cfg!(any(target_os = "macos", windows)),
                 // GPUI uses top/left insets here: AppKit's native 8 pt origin plus the
                 // spec's +12 x / -6 frame-origin nudge maps to 20 pt left and 14 pt top.
                 traffic_light_position: cfg!(target_os = "macos")

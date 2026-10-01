@@ -6,6 +6,7 @@ rust-version.workspace = true
 license.workspace = true
 
 [dependencies]
+diri-platform.workspace = true
 diri-proto.workspace = true
 serde.workspace = true
 serde_json.workspace = true

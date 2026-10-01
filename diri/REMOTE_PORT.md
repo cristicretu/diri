@@ -403,6 +403,71 @@ symlinks. A missing catalog entry, corrupt artifact, unsupported target, build
 mismatch, or capability mismatch fails closed and never triggers a `tmux`
 fallback.
 
+## Native Windows extension (issue #552)
+
+The Windows desktop and Engine run natively. WSL distributions are execution
+hosts reached through `wsl.exe`, using the existing Linux Helper bootstrap,
+versioned artifacts, protocol and per-session Holder. The GUI is never hosted
+in WSLg. Windows is not a supported remote Helper target.
+
+On 2026-09-29 the requester explicitly directed implementation of all phases
+without running tests, superseding issue #552's stop-after-Phase-0 sequence.
+This authorizes implementation, not a claim that fidelity or performance gates
+passed. ConPTY fidelity, native agent compatibility and Windows lifecycle
+measurements remain unmeasured until captured on Windows. No fabricated result
+may select native-agent fidelity or a bundled OpenConsole version.
+
+The 2026-10-01 readiness review consolidates the foundation and runtime fixes
+into one PR against current main and enables native Windows tests on both
+architectures. The original no-test implementation instruction is historical,
+not the current verification policy. ConPTY/Holder lifecycle tests and WSL
+parsing/routing/command tests are automated; real WSL, Agent fidelity, installer
+signing/update, desktop interaction and latency evidence remain release gates
+in `WINDOWS.md`. Optional main-only release signing signs payloads before
+installer assembly and validates the final signed installer/feed. Azure
+updater trust pins a validated publisher and stable Public Trust profile EKU,
+not a rotating leaf thumbprint; traditional certificates retain their exact
+thumbprint pin. ConPTY has no reliable POSIX foreground/cwd/canonical-line
+observation; native Windows keeps those newer shell facts unknown.
+
+Native Windows PTYs use ConPTY and an owned kill-on-close Job per session.
+Windows process exit codes preserve native DWORD bits in the existing i32 code
+field (interpretable as u32), and are never POSIX signals.
+Native persistence belongs to detached local Holders; killing the Engine must
+not close their ConPTY or Job handles. An enclosing Job that prohibits breakaway
+causes an explicit launch failure; the app does not silently inherit its lifetime.
+Hosted CI runs only its detached-Holder test binary outside the runner Job via
+the already available WMI process provider, without service or host configuration.
+This is test scaffolding, not a product launch transport. WSL persistence retains the existing
+three outcomes and does not promise survival through `wsl --shutdown`.
+
+The platform seam is `diri-platform`, shared by the app, Engine, Holder and
+clients. Local Windows IPC uses AF_UNIX in a short namespace protected by an
+explicit current-user-SID DACL, rather than named pipes. Microsoft documents
+that Windows enforces pathname-socket file permissions:
+<https://devblogs.microsoft.com/commandline/af_unix-comes-to-windows/>.
+This retains the existing byte-stream framing, nonblocking partial writes and
+backpressure rules. `uds_windows` supplies the native Winsock AF_UNIX adapter;
+it is already a transitive workspace dependency. No TCP listener is introduced.
+The Windows async adapter registers the connected Winsock stream with IOCP.
+Engine identity verification during Hello remains mandatory. Windows OpenSSH
+channels do not use ControlMaster; WSL channels use the same bounded process
+executor with `wsl.exe` and do not pass `WSLENV` to the distro.
+
+Windows private files/directories use protected DACLs granting the current user
+only; permissions are implemented once in `diri-platform::security`. POSIX mode
+bits are not used as a Windows security boundary. State belongs under the user's
+LocalAppData directory, preferences under RoamingAppData. Endpoint names are
+hashed into the private short namespace to avoid AF_UNIX pathname limits.
+
+ConPTY's API minimum is Windows 10 1809, per
+<https://learn.microsoft.com/en-us/windows/console/createpseudoconsole>.
+That API minimum alone is not a supported Diri release/fidelity claim. The
+Windows desktop floor is build 22621, with x64 and ARM64 native packages.
+The installer is per-user and versioned so updates retain live Holder binaries;
+its Authenticode signer must match the running app. The feature audit,
+manual fidelity capture tool, and outstanding evidence are in `WINDOWS.md`.
+
 ## Supported platforms
 
 The Remote Helper support matrix is deliberately limited to:

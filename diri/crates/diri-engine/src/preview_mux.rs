@@ -2,12 +2,12 @@
 //! diff owners; this module owns only membership and one bounded socket writer.
 use crate::attach::AttachHub;
 use crate::registry::Registry;
+use diri_platform::ipc::UnixStream;
+use diri_platform::poll::AsRawIo;
 use diri_proto::frames::MAX_FRAME_BYTES;
 use diri_proto::preview_set::*;
 use std::collections::{HashMap, VecDeque};
 use std::io::{self, Read, Write};
-use std::os::fd::AsRawFd;
-use std::os::unix::net::UnixStream;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
@@ -191,7 +191,7 @@ impl MuxQueue {
                                 self.close();
                                 break;
                             }
-                            poll_socket(&stream, libc::POLLOUT, 1);
+                            poll_socket(&stream, diri_platform::poll::POLLOUT, 1);
                         }
                         Err(_) => {
                             self.close();
@@ -374,7 +374,7 @@ pub(crate) fn serve(
                 Ok(count) => pending.extend_from_slice(&bytes[..count]),
                 Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
                 Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
-                    poll_socket(&reader, libc::POLLIN, -1);
+                    poll_socket(&reader, diri_platform::poll::POLLIN, -1);
                 }
                 Err(error) => return Err(error),
             }
@@ -390,15 +390,15 @@ pub(crate) fn serve(
     result
 }
 
-fn poll_socket(stream: &UnixStream, events: libc::c_short, timeout: i32) {
-    let mut descriptor = libc::pollfd {
-        fd: stream.as_raw_fd(),
+fn poll_socket(stream: &UnixStream, events: i16, timeout: i32) {
+    let mut descriptor = diri_platform::poll::PollFd {
+        fd: stream.as_raw_io(),
         events,
         revents: 0,
     };
     // SAFETY: one live socket and one exclusively owned initialized pollfd.
     unsafe {
-        libc::poll(&mut descriptor, 1, timeout);
+        diri_platform::poll::poll(&mut descriptor, 1, timeout);
     }
 }
 fn invalid(error: impl std::fmt::Display) -> io::Error {
@@ -527,6 +527,7 @@ mod tests {
         assert!(received.iter().all(|byte| *byte == 0));
         worker.join().unwrap();
     }
+    #[cfg(unix)]
     #[test]
     fn capacity_retry_recaptures_the_seed_without_holding_registry() {
         let temp = tempfile::tempdir().unwrap();

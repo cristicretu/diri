@@ -25,6 +25,7 @@ pub enum UpdateError {
 }
 
 impl UpdateError {
+    #[cfg(unix)]
     pub(crate) fn tool(tool: &'static str, detail: impl Into<String>) -> Self {
         Self::Tool {
             tool,

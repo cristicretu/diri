@@ -32,7 +32,7 @@ This is the record of replacing it with `crates/diri-engine`.
 | Layer | State | Notes |
 |---|---|---|
 | Output log | **done** | Byte-identical format; verified against a real 31 MB log the running Swift daemon wrote |
-| PTY | **done** (unix) | Signal reset, `setsid`/`TIOCSCTTY`, fd hygiene, group kill — each with a test. Windows needs ConPTY, shape documented in `pty::unsupported` |
+| PTY | **done** (unix) | Signal reset, `setsid`/`TIOCSCTTY`, fd hygiene, group kill — each with a test. Windows work is tracked in [WINDOWS.md](WINDOWS.md); there is no `pty::unsupported` module |
 | Detection | **done** | All 19 manifests, 81 rules, 39 patterns compile and evaluate unchanged |
 | Status reducer | **done** | Anti-flicker, blocker arbitration, startup grace, subagent isolation, staleness |
 | Headless emulation | **done** | `alacritty_terminal`; OSC 9;4 progress scanned by hand |
@@ -133,8 +133,8 @@ Holder-port notes, for whoever wires the daemon:
 
 ## Windows, specifically
 
-Not attempted yet, and it is a genuine implementation task rather than a port:
-ConPTY replaces the fd model, there are no process groups, and job objects take
-over kill-tree duty. `pty::unsupported` lists the exact calls. Linux should work
-today apart from being untested — nothing in the engine is Darwin-specific
-beyond what `cfg(unix)` already covers.
+Native Windows support is tracked in [WINDOWS.md](WINDOWS.md) and issue #552.
+The app and Engine run natively, with ConPTY for local sessions and WSL distros
+as hosts using the Linux Remote PTY Holder. There is no `pty::unsupported`
+module. Linux PTY and Engine tests already run natively in
+`.github/workflows/ci.yml`; Linux is not an untested platform.

@@ -853,7 +853,7 @@ where
     S: AsRef<OsStr>,
 {
     let mut command = Command::new("git");
-    command
+    diri_platform::hide_console_window(&mut command)
         .current_dir(cwd)
         .arg("--no-pager")
         .arg("-c")

@@ -14,7 +14,7 @@ impl UtilitySurfaces {
         let detail = match &plan {
             _ if importing => "Opening sessions…".to_owned(),
             None => "Looking for herdr sessions…".to_owned(),
-            Some(plan) if !plan.found => "No herdr sessions on this Mac.".to_owned(),
+            Some(plan) if !plan.found => format!("No herdr sessions on {}.", crate::platform::local_machine_label_lowercase()),
             Some(plan) if plan.is_empty() => "Everything from herdr is already here.".to_owned(),
             Some(plan) => plan.summary(),
         };

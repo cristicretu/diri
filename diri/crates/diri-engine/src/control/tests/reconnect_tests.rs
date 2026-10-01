@@ -8,6 +8,7 @@ use crate::remote::{
 };
 use diri_proto::remote_pty::*;
 use diri_proto::{RemoteConnectionState as State, SessionReconnectResult};
+#[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
 use std::time::Instant;
 
@@ -166,6 +167,7 @@ fi
             .unwrap(),
         );
         let host = diri_proto::HostEntry {
+            transport: Default::default(),
             id: "fixture".into(),
             name: None,
             ssh: "fixture".into(),

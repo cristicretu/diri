@@ -219,6 +219,24 @@ fn settled(baseline: ProcessStats) -> ProcessStats {
     }
 }
 
+/// Preserve the identities behind a Linux count failure, so a single late
+/// worker/file can be distinguished from a leaked connection on CI.
+fn descriptor_targets() -> Vec<(String, std::path::PathBuf)> {
+    let Ok(entries) = std::fs::read_dir("/proc/self/fd") else {
+        return Vec::new();
+    };
+    let mut targets: Vec<_> = entries
+        .flatten()
+        .filter_map(|entry| {
+            std::fs::read_link(entry.path())
+                .ok()
+                .map(|target| (entry.file_name().to_string_lossy().into_owned(), target))
+        })
+        .collect();
+    targets.sort();
+    targets
+}
+
 /// Kills the long-lived sessions however the test ends, so a failure does
 /// not leave Holders and their children running.
 struct KillOnDrop<'a> {
@@ -257,9 +275,13 @@ fn threads_and_descriptors_return_to_baseline_after_churn() {
         json!({ "proto": diri_proto::WIRE_VERSION, "build": "test" }),
     );
     let idle = spawn_painted(&mut control, "printf ready; while :; do sleep 5; done");
+    let busy_gate = temp.path().join("start-output");
+    let quoted_gate = busy_gate.to_string_lossy().replace('\'', "'\\''");
     let busy = spawn_painted(
         &mut control,
-        "printf ready; while :; do printf 'tick %s\\n' \"$$\"; sleep 0.02; done",
+        &format!(
+            "printf ready; while [ ! -f '{quoted_gate}' ]; do sleep 0.02; done; while :; do printf 'tick %s\\n' \"$$\"; sleep 0.02; done"
+        ),
     );
     let _cleanup = KillOnDrop {
         server: &server,
@@ -270,8 +292,16 @@ fn threads_and_descriptors_return_to_baseline_after_churn() {
     // manager connection, the persist flusher, the activity log) belong to
     // the baseline, not to growth.
     churn(&server, &mut control, &idle, &busy, 4);
+    // Both followers need an initially drained log to establish their output
+    // subscriptions. Continuous output from process startup can defer that
+    // subscription until after the baseline, counting one legitimate retained
+    // socket as a leak on Linux. Keep both children quiet through warm-up,
+    // then measure the same idle/busy workload before and after churn.
+    std::thread::sleep(Duration::from_millis(600));
+    std::fs::write(&busy_gate, b"start").expect("start busy output");
     std::thread::sleep(Duration::from_millis(600));
     let baseline = ProcessStats::current();
+    let baseline_targets = descriptor_targets();
 
     churn(&server, &mut control, &idle, &busy, CYCLES);
     let after = settled(baseline);
@@ -284,8 +314,9 @@ fn threads_and_descriptors_return_to_baseline_after_churn() {
     );
     assert!(
         after.open_fds <= baseline.open_fds,
-        "descriptors grew from {} to {} over {CYCLES} churn cycles",
+        "descriptors grew from {} to {} over {CYCLES} churn cycles; before: {baseline_targets:?}; after: {:?}",
         baseline.open_fds,
-        after.open_fds
+        after.open_fds,
+        descriptor_targets(),
     );
 }

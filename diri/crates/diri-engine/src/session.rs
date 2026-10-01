@@ -18,8 +18,8 @@
 
 mod process_facts;
 
+use diri_platform::poll::AsRawIo;
 use std::io::Read;
-use std::os::fd::AsRawFd;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
@@ -475,14 +475,18 @@ struct Shared {
 #[derive(Default)]
 struct ForegroundProgram {
     /// The foreground job's process group; `None` at the prompt.
+    #[cfg(unix)]
     group: Option<i32>,
+    #[cfg(unix)]
     group_seen_at: Option<Instant>,
     /// The job's program name, read once per group.
     name: Option<String>,
     cwd: Option<String>,
+    #[cfg(unix)]
     cwd_read_at: Option<Instant>,
     /// The TCP ports the job listens on: a dev server's address.
     ports: Vec<diri_proto::PortInfo>,
+    #[cfg(unix)]
     ports_read_at: Option<Instant>,
     /// The Agent manifest the screen is read with while the reducer is lent.
     read_as: Option<String>,
@@ -495,27 +499,32 @@ struct KnownAgent {
     manifest_version: String,
     /// Whether the manifest has screen rules to read the Agent's status by.
     /// Without them the shell's own job tracking is the better answer.
+    #[cfg(unix)]
     reads_screen: bool,
 }
 
 /// How long a job holds the foreground before the tab is named after it.
 /// Tab titles animate when they change; `git status` or `ls` would otherwise
 /// flash their name and animate straight back to the folder's.
+#[cfg(unix)]
 const JOB_NAME_DELAY: Duration = Duration::from_millis(300);
 
 /// How long a new job's name is retried while its leader still carries the
 /// shell's own name, having forked but not yet exec'd. A job that really is
 /// the shell (`zsh` typed in zsh) stays unnamed after this.
+#[cfg(unix)]
 const JOB_NAME_SETTLE: Duration = Duration::from_secs(2);
 
 /// How often an idle shell's working directory is read again. `cd` moves no
 /// process group, so this is what notices it; a user cannot type a command
 /// and look at the tab faster than this.
+#[cfg(unix)]
 const SHELL_CWD_REFRESH: Duration = Duration::from_millis(500);
 
 /// How often a running job's listening ports are read again. A dev server
 /// opens its port some time after it starts (a bundler compiles first), and
 /// says so on screen, so the samples its output triggers find it within this.
+#[cfg(unix)]
 const JOB_PORTS_REFRESH: Duration = Duration::from_secs(1);
 /// How long reported progress stands without another report, when no shell
 /// job is known to own it. A program that dies mid-build never sends the
@@ -1316,7 +1325,7 @@ impl RemoteStop {
             .terminate_requested
             .store(true, Ordering::SeqCst);
         if !self.shared.exited.load(Ordering::SeqCst) {
-            let _ = self.client.signal(libc::SIGTERM);
+            let _ = self.client.signal(diri_platform::signals::SIGTERM);
             let deadline = Instant::now() + grace;
             while Instant::now() < deadline && !self.shared.exited.load(Ordering::SeqCst) {
                 std::thread::sleep(Duration::from_millis(20));
@@ -3158,7 +3167,7 @@ impl Session {
                 let _ = pump.join();
             }
             self.shared.exited.store(true, Ordering::SeqCst);
-            return Ok(Exit::Signal(libc::SIGKILL));
+            return Ok(Exit::Signal(diri_platform::signals::SIGKILL));
         }
         let exit = match &self.transport {
             Transport::Direct(pty) => terminate_direct(pty, grace)?,
@@ -3187,7 +3196,7 @@ impl Session {
             }
             Transport::Remote(client) => {
                 if !self.shared.exited.load(Ordering::SeqCst) {
-                    let _ = client.signal(libc::SIGTERM);
+                    let _ = client.signal(diri_platform::signals::SIGTERM);
                     let deadline = std::time::Instant::now() + grace;
                     while std::time::Instant::now() < deadline
                         && !self.shared.exited.load(Ordering::SeqCst)
@@ -3237,7 +3246,7 @@ impl Drop for Session {
             && !self.shared.exited.load(Ordering::SeqCst)
             && let Ok(pty) = pty.lock()
         {
-            let _ = pty.kill_group(libc::SIGKILL);
+            let _ = pty.kill_group(diri_platform::signals::SIGKILL);
         }
         if let Transport::Remote(client) = &self.transport {
             client.close();
@@ -3358,6 +3367,7 @@ fn known_agents(engine: &ManifestEngine) -> Vec<KnownAgent> {
                 binary,
                 manifest_id: manifest.id.clone(),
                 manifest_version: manifest.version.clone(),
+                #[cfg(unix)]
                 reads_screen: !manifest.rules.is_empty(),
             })
         })
@@ -3537,10 +3547,15 @@ fn apply_foreground_sample(
         return;
     };
     progress_follows_job(shared, foreground_pgid.filter(|_| running));
-    let agent = match host {
+    let agent: Option<&KnownAgent> = match host {
+        #[cfg(unix)]
         SampleHost::Local => {
             observe_foreground_program(shared, child_pid, foreground_pgid, running)
         }
+        // ConPTY exposes neither a foreground process group nor another
+        // process's cwd/line-wait state. Preserve unknown observations.
+        #[cfg(windows)]
+        SampleHost::Local => None,
         SampleHost::Remote => None,
     };
     let now = SystemTime::now();
@@ -3567,6 +3582,7 @@ fn apply_foreground_sample(
 /// leader has exec'd still carries the shell's own name; that read is not
 /// kept, so samples in the next [`JOB_NAME_SETTLE`] try again. Nothing is
 /// read until the job has lasted [`JOB_NAME_DELAY`].
+#[cfg(unix)]
 fn observe_foreground_program(
     shared: &Shared,
     child_pid: i32,
@@ -3710,6 +3726,7 @@ fn line_probe_due(shared: &Shared) -> Option<bool> {
 
 /// Asks a directly owned PTY whether the shell's job waits on a line, when
 /// the reducer wants to know.
+#[cfg(unix)]
 fn probe_direct_line_wait(shared: &Shared, pty: &Mutex<Pty>) {
     match line_probe_due(shared) {
         Some(true) => {
@@ -3719,6 +3736,11 @@ fn probe_direct_line_wait(shared: &Shared, pty: &Mutex<Pty>) {
         Some(false) => apply_line_wait(shared, false),
         None => {}
     }
+}
+
+#[cfg(windows)]
+fn probe_direct_line_wait(_shared: &Shared, _pty: &Mutex<Pty>) {
+    // Unknown on ConPTY; do not fabricate a negative observation.
 }
 
 /// Folds a line-wait sample into the shell's status, with the question as
@@ -3936,7 +3958,7 @@ fn pump_remote_connection(
     engine: &ManifestEngine,
     client: &RemoteSessionClient,
     generation: u64,
-    output: &mut std::process::ChildStdout,
+    output: &mut diri_platform::pipe::ChildStdout,
     manifest_id: &str,
 ) -> RemoteConnectionDisposition {
     let mut codec = RemoteCodec::new();
@@ -3947,7 +3969,7 @@ fn pump_remote_connection(
     let mut last_eval_seq = 0_u64;
     let mut last_scan_at = None;
     let mut last_scan_seq = 0_u64;
-    let fd = output.as_raw_fd();
+    let fd = output.as_raw_io();
     let Ok(mut write_wakeup) = client.take_write_wakeup(generation) else {
         return RemoteConnectionDisposition::Reconnect;
     };
@@ -3983,26 +4005,26 @@ fn pump_remote_connection(
             Err(_) => return RemoteConnectionDisposition::Reconnect,
         };
         let mut descriptors = [
-            libc::pollfd {
+            diri_platform::poll::PollFd {
                 fd,
-                events: libc::POLLIN,
+                events: diri_platform::poll::POLLIN,
                 revents: 0,
             },
-            libc::pollfd {
-                fd: write_wakeup.as_raw_fd(),
-                events: libc::POLLIN,
+            diri_platform::poll::PollFd {
+                fd: write_wakeup.as_raw_io(),
+                events: diri_platform::poll::POLLIN,
                 revents: 0,
             },
-            libc::pollfd {
-                fd: pending_fd.as_ref().map_or(-1, AsRawFd::as_raw_fd),
-                events: libc::POLLOUT,
+            diri_platform::poll::PollFd {
+                fd: pending_fd.as_ref().map_or(-1, AsRawIo::as_raw_io),
+                events: diri_platform::poll::POLLOUT,
                 revents: 0,
             },
         ];
         // SAFETY: the owned output, wakeup and cloned pending descriptors stay
         // alive throughout poll; generation checks precede every write.
         let ready = unsafe {
-            libc::poll(
+            diri_platform::poll::poll(
                 descriptors.as_mut_ptr(),
                 descriptors.len() as _,
                 tick.as_millis() as i32,
@@ -4569,7 +4591,7 @@ fn pump(
     let mut last_eval_seq = 0u64;
     let mut last_scan_at = None;
     let mut last_scan_seq = 0u64;
-    let fd = reader.as_raw_fd();
+    let fd = reader.as_raw_io();
 
     loop {
         if shared.stop.load(Ordering::SeqCst) {
@@ -4580,13 +4602,15 @@ fn pump(
         // Wait for output, but never longer than a tick. Output interrupts the
         // wait immediately, so the idle tick only slows reducer timers — which
         // are no-ops outside Working anyway.
-        let mut poll_fd = libc::pollfd {
+        let mut poll_fd = diri_platform::poll::PollFd {
             fd,
-            events: libc::POLLIN,
+            events: diri_platform::poll::POLLIN,
             revents: 0,
         };
         // SAFETY: one initialized pollfd, a millisecond timeout.
-        let ready = unsafe { libc::poll(&mut poll_fd, 1, shared.quiet_tick().as_millis() as i32) };
+        let ready = unsafe {
+            diri_platform::poll::poll(&mut poll_fd, 1, shared.quiet_tick().as_millis() as i32)
+        };
         if ready < 0 {
             let error = std::io::Error::last_os_error();
             if error.kind() == std::io::ErrorKind::Interrupted {
@@ -4594,8 +4618,9 @@ fn pump(
             }
             break;
         }
-        let hung_up = poll_fd.revents & (libc::POLLHUP | libc::POLLERR) != 0;
-        let readable = poll_fd.revents & libc::POLLIN != 0;
+        let hung_up =
+            poll_fd.revents & (diri_platform::poll::POLLHUP | diri_platform::poll::POLLERR) != 0;
+        let readable = poll_fd.revents & diri_platform::poll::POLLIN != 0;
 
         let read_result = if readable || hung_up {
             reader.read(&mut buffer)
@@ -4729,11 +4754,15 @@ fn terminate_direct(pty: &Mutex<Pty>, grace: Duration) -> std::io::Result<Exit> 
             std::thread::sleep(crate::pty::REAP_POLL_INTERVAL);
         }
     };
-    pty.lock().expect("pty").kill_group(libc::SIGTERM)?;
+    pty.lock()
+        .expect("pty")
+        .kill_group(diri_platform::signals::SIGTERM)?;
     if let Some(exit) = wait(grace)? {
         return Ok(exit);
     }
-    pty.lock().expect("pty").kill_group(libc::SIGKILL)?;
+    pty.lock()
+        .expect("pty")
+        .kill_group(diri_platform::signals::SIGKILL)?;
     wait(crate::pty::KILL_REAP_TIMEOUT)?.ok_or_else(|| {
         std::io::Error::new(
             std::io::ErrorKind::TimedOut,
@@ -6300,8 +6329,10 @@ mod held_foreground_tests {
 
 #[cfg(test)]
 mod resize_tests {
+    #[cfg(unix)]
     use super::*;
 
+    #[cfg(unix)]
     fn session(temp: &Path) -> Session {
         let (engine, _) = ManifestEngine::load_dir(&crate::detect::bundled_manifest_dir()).unwrap();
         let spec = SessionSpec {
@@ -6322,6 +6353,7 @@ mod resize_tests {
         Session::spawn(spec, Arc::new(engine)).expect("spawn")
     }
 
+    #[cfg(unix)]
     #[test]
     fn the_pty_half_of_a_resize_never_waits_for_the_emulator() {
         let temp = tempfile::tempdir().unwrap();
@@ -6355,6 +6387,7 @@ mod resize_tests {
         let _ = session.terminate(Duration::from_secs(2));
     }
 
+    #[cfg(unix)]
     #[test]
     fn an_owed_reflow_applies_the_newest_pty_size_once() {
         let temp = tempfile::tempdir().unwrap();
@@ -7040,7 +7073,9 @@ mod preview_tests {
 
 #[cfg(test)]
 mod remote_connection_tests {
+    #[cfg(unix)]
     use super::*;
+    #[cfg(unix)]
     use crate::remote::{
         binding::RemoteBindingStore,
         bootstrap::RemoteTarget,
@@ -7048,9 +7083,12 @@ mod remote_connection_tests {
         manager::{ArtifactCatalog, InstalledHelper, RemoteManager},
         ssh::SshTransport,
     };
+    #[cfg(unix)]
     use diri_proto::{HostEntry, RemoteConnectionState as State};
+    #[cfg(unix)]
     use std::os::unix::fs::PermissionsExt;
 
+    #[cfg(unix)]
     fn wait_for(label: &str, mut predicate: impl FnMut() -> bool) {
         let deadline = Instant::now() + Duration::from_secs(5);
         while !predicate() {
@@ -7059,7 +7097,9 @@ mod remote_connection_tests {
         }
     }
 
+    #[cfg(unix)]
     struct ChildGuard(std::process::Child);
+    #[cfg(unix)]
     impl Drop for ChildGuard {
         fn drop(&mut self) {
             let _ = self.0.kill();
@@ -7067,6 +7107,7 @@ mod remote_connection_tests {
         }
     }
 
+    #[cfg(unix)]
     #[test]
     fn bridge_loss_preserves_process_and_grid_until_a_validated_reconnect() {
         for fatal in [false, true] {
@@ -7179,6 +7220,7 @@ fi
                 .unwrap(),
             );
             let host = HostEntry {
+                transport: Default::default(),
                 id: "fixture".into(),
                 name: None,
                 ssh: "fixture".into(),
@@ -7515,6 +7557,7 @@ mod foreground_program_tests {
     /// An Agent typed at a shell prompt is recognised by name, borrows the
     /// shell's status for as long as it holds the foreground, and hands it
     /// back when it leaves; `cd` is followed while the prompt is idle.
+    #[cfg(unix)]
     #[test]
     fn a_shell_names_its_foreground_program_and_recognises_an_agent() {
         let temp = tempfile::tempdir().unwrap();

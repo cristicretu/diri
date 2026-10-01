@@ -795,12 +795,12 @@ impl super::TerminalPane {
 
 #[cfg(test)]
 mod tests {
+    use diri_platform::ipc::asynchronous::UnixListener;
     use diri_proto::frames::{Frame, FrameCodec, FrameType};
     use diri_proto::grid::{ChangedRow, GridCell};
     use gpui::TestAppContext;
     use std::sync::atomic::AtomicUsize;
     use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
-    use tokio::net::UnixListener;
 
     use super::*;
 

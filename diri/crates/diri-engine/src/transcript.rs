@@ -196,8 +196,8 @@ fn validate_provider_path(
         AgentKind::CODEX_ID => home.join(".codex/sessions"),
         _ => return Ok(()),
     };
-    let canonical_root = root.canonicalize()?;
-    let canonical_path = path.canonicalize()?;
+    let canonical_root = diri_platform::canonicalize(root)?;
+    let canonical_path = diri_platform::canonicalize(path)?;
     if !canonical_path.starts_with(&canonical_root) {
         return Err(io::Error::new(
             io::ErrorKind::PermissionDenied,

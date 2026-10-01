@@ -4,9 +4,8 @@
 //! the same executable decision. The desktop only renders these facts.
 
 use std::collections::{BTreeMap, HashMap};
-use std::fs::{self, OpenOptions};
+use std::fs;
 use std::io::{self, Write as _};
-use std::os::unix::fs::{OpenOptionsExt as _, PermissionsExt as _};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
@@ -54,18 +53,12 @@ pub struct AgentCatalogStore {
 impl AgentCatalogStore {
     pub fn new(path: impl Into<PathBuf>) -> io::Result<Self> {
         let path = path.into();
-        let config = match fs::read(&path) {
+        let config = match diri_platform::security::read_owned(&path, true).and_then(|mut file| {
+            let mut bytes = Vec::new();
+            std::io::Read::read_to_end(&mut file, &mut bytes)?;
+            Ok(bytes)
+        }) {
             Ok(bytes) => {
-                let metadata = fs::symlink_metadata(&path)?;
-                if metadata.file_type().is_symlink()
-                    || !metadata.is_file()
-                    || metadata.permissions().mode() & 0o077 != 0
-                {
-                    return Err(io::Error::new(
-                        io::ErrorKind::PermissionDenied,
-                        "Agent configuration must be an owner-only regular file",
-                    ));
-                }
                 let decoded: ConfigFile = serde_json::from_slice(&bytes)
                     .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
                 if decoded.version > CONFIG_VERSION {
@@ -162,14 +155,10 @@ impl AgentCatalogStore {
                 "Agent configuration path has no parent",
             )
         })?;
-        fs::create_dir_all(parent)?;
+        diri_platform::security::private_dir_all(parent)?;
         let nonce = format!("{}-{:?}", std::process::id(), std::thread::current().id());
         let temporary = parent.join(format!(".agents-{nonce}.tmp"));
-        let mut file = OpenOptions::new()
-            .create_new(true)
-            .write(true)
-            .mode(0o600)
-            .open(&temporary)?;
+        let mut file = diri_platform::security::create_private(&temporary)?;
         let result = (|| {
             serde_json::to_writer_pretty(&mut file, &self.config)
                 .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
@@ -228,24 +217,21 @@ pub fn validate_executable(path: &str) -> io::Result<String> {
 }
 
 pub(crate) fn resolve_on_path(binary: &str, path: &str) -> Option<String> {
-    if binary.contains('/') {
-        return validate_executable(binary).ok();
-    }
-    path.split(':')
-        .filter(|directory| !directory.is_empty())
-        .map(|directory| Path::new(directory).join(binary))
-        .find_map(|candidate| executable_path(&candidate))
+    let env = vec![("PATH".into(), path.into())];
+    let cwd = std::env::current_dir().ok()?;
+    diri_platform::launch::find_executable(binary, &env, &cwd)
+        .ok()
+        .and_then(|p| executable_path(&p))
 }
 
 fn executable_path(path: &Path) -> Option<String> {
-    let metadata = fs::metadata(path).ok()?;
-    (metadata.is_file() && metadata.permissions().mode() & 0o111 != 0)
-        .then(|| path.to_string_lossy().into_owned())
+    diri_platform::launch::is_executable(path).then(|| path.to_string_lossy().into_owned())
 }
 
 fn expand_home(path: &str) -> io::Result<PathBuf> {
     if path == "~" || path.starts_with("~/") {
-        let home = std::env::var_os("HOME")
+        let home = diri_platform::home_dir()
+            .map(|p| p.into_os_string())
             .filter(|home| !home.is_empty())
             .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "HOME is not set"))?;
         let mut expanded = PathBuf::from(home);
@@ -265,7 +251,10 @@ fn validate_user_path(path: &str) -> io::Result<()> {
             "executable path must be non-empty, NUL-free, and at most 4096 bytes",
         ));
     }
-    if !(Path::new(path).is_absolute() || path == "~" || path.starts_with("~/"))
+    if !(path.starts_with('/')
+        || Path::new(path).is_absolute()
+        || path == "~"
+        || path.starts_with("~/"))
         || path
             .split('/')
             .any(|component| matches!(component, "." | ".."))
@@ -299,8 +288,12 @@ fn target_key(host: Option<&str>) -> String {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(unix)]
     use super::*;
+    #[cfg(unix)]
+    use std::os::unix::fs::PermissionsExt;
 
+    #[cfg(unix)]
     #[test]
     fn owner_only_config_round_trips_and_invalidates_cache() {
         let temp = tempfile::tempdir().expect("temp");

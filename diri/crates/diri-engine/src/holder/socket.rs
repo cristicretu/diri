@@ -1,7 +1,9 @@
 //! Blocking NDJSON-over-UDS plumbing shared by holder clients and servers.
 
+#[cfg(unix)]
+use diri_platform::ipc::UnixListener;
+use diri_platform::ipc::UnixStream;
 use std::io::{Read, Write};
-use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::Path;
 
 use serde::Serialize;
@@ -26,6 +28,7 @@ pub const OUTPUT_SOCKET_BUFFER: usize = 256 << 10;
 
 /// Raises `SO_SNDBUF` or `SO_RCVBUF` on `stream`. Best effort: a kernel that
 /// refuses keeps its default, which is slower but correct.
+#[cfg(unix)]
 pub fn set_buffer(stream: &UnixStream, option: libc::c_int, bytes: usize) {
     use std::os::fd::AsRawFd;
     let size = libc::c_int::try_from(bytes).unwrap_or(libc::c_int::MAX);
@@ -42,6 +45,7 @@ pub fn set_buffer(stream: &UnixStream, option: libc::c_int, bytes: usize) {
 }
 
 /// Binds an owner-only listening socket, replacing any stale file at `path`.
+#[cfg(unix)]
 pub fn listen(path: &Path) -> HolderResult<UnixListener> {
     let _ = std::fs::remove_file(path);
     let listener = UnixListener::bind(path).map_err(|error| HolderError::io("bind", error))?;
@@ -93,10 +97,11 @@ pub fn write_json_line<T: Serialize>(stream: &mut impl Write, value: &T) -> Hold
 /// wakes an `accept(2)` blocked on an AF_UNIX listener via `shutdown` alone —
 /// the fd must also be closed, which means the accept loop cannot hold a safe
 /// owner of it. The Swift holder shipped this exact shape.
+#[cfg(unix)]
 pub fn accept_raw(
     listen_fd: i32,
     finished: impl Fn() -> bool,
-) -> HolderResult<Option<std::os::unix::net::UnixStream>> {
+) -> HolderResult<Option<diri_platform::ipc::UnixStream>> {
     loop {
         // SAFETY: accept(2) on a listening fd; the addr out-params are unused.
         let client = unsafe { libc::accept(listen_fd, std::ptr::null_mut(), std::ptr::null_mut()) };
@@ -104,7 +109,7 @@ pub fn accept_raw(
             // SAFETY: a fresh fd accept just handed us; the stream owns it.
             return Ok(Some(unsafe {
                 use std::os::fd::FromRawFd;
-                std::os::unix::net::UnixStream::from_raw_fd(client)
+                diri_platform::ipc::UnixStream::from_raw_fd(client)
             }));
         }
         let error = std::io::Error::last_os_error();
@@ -133,3 +138,24 @@ pub fn read_json_line<T: DeserializeOwned>(stream: &mut impl Read) -> HolderResu
         ))
     })
 }
+
+#[cfg(windows)]
+pub fn set_buffer(stream: &UnixStream, option: i32, bytes: usize) {
+    use diri_platform::windows_sys::Win32::Networking::WinSock::*;
+    use std::os::windows::io::AsRawSocket;
+    let value = bytes.min(i32::MAX as usize) as i32;
+    // SAFETY: a live socket and exactly sized integer option.
+    unsafe {
+        setsockopt(
+            stream.as_raw_socket() as usize,
+            SOL_SOCKET,
+            option,
+            (&raw const value).cast(),
+            size_of_val(&value) as i32,
+        );
+    }
+}
+#[cfg(unix)]
+pub const RECEIVE_BUFFER: i32 = libc::SO_RCVBUF;
+#[cfg(windows)]
+pub const RECEIVE_BUFFER: i32 = diri_platform::windows_sys::Win32::Networking::WinSock::SO_RCVBUF;

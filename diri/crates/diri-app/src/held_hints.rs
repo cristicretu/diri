@@ -98,8 +98,8 @@ pub(crate) enum HintEffect {
 impl HeldHints {
     /// Feeds the full modifier state after a flags change.
     pub(crate) fn modifiers_changed(&mut self, modifiers: Modifiers, now: Instant) -> HintEffect {
-        let others = modifiers.shift || modifiers.alt || modifiers.control || modifiers.function;
-        if !modifiers.platform {
+        let (held, others) = shortcut_modifier(modifiers);
+        if !held {
             self.command_down = false;
             self.chorded = false;
             self.armed = None;
@@ -506,13 +506,27 @@ fn slot(
         .into_any_element()
 }
 
+/// Whether the shortcut modifier is down, and whether anything else is. The
+/// hint answers "what does this key do here", so it is the key every shipped
+/// shortcut uses (`platform::shortcut_modifier`), never the Windows key.
+fn shortcut_modifier(modifiers: Modifiers) -> (bool, bool) {
+    let others = if cfg!(target_os = "macos") {
+        modifiers.control || modifiers.shift || modifiers.alt || modifiers.function
+    } else {
+        modifiers.platform || modifiers.shift || modifiers.alt || modifiers.function
+    };
+    (crate::platform::shortcut_modifier(&modifiers), others)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
+    /// The shortcut modifier alone: ⌘ on macOS, Ctrl elsewhere.
     fn command() -> Modifiers {
         Modifiers {
-            platform: true,
+            platform: cfg!(target_os = "macos"),
+            control: !cfg!(target_os = "macos"),
             ..Modifiers::default()
         }
     }
@@ -597,6 +611,26 @@ mod tests {
         assert_eq!(hints.deadline(), None);
     }
 
+    /// Off macOS the platform modifier is the Windows (or Super) key, which
+    /// opens Start; shortcuts there are Ctrl chords, so only Ctrl holds.
+    #[cfg(not(target_os = "macos"))]
+    #[test]
+    fn the_windows_key_alone_never_arms_hints() {
+        let mut hints = HeldHints::default();
+        let windows_key = Modifiers {
+            platform: true,
+            ..Modifiers::default()
+        };
+        assert_eq!(
+            hints.modifiers_changed(windows_key, Instant::now()),
+            HintEffect::None
+        );
+        assert!(matches!(
+            hints.modifiers_changed(command(), Instant::now()),
+            HintEffect::Arm(_)
+        ));
+    }
+
     #[test]
     fn a_second_modifier_or_a_click_cancels_the_hold() {
         let t0 = Instant::now();
@@ -604,9 +638,8 @@ mod tests {
             |hints: &mut HeldHints, at| {
                 hints.modifiers_changed(
                     Modifiers {
-                        platform: true,
                         alt: true,
-                        ..Modifiers::default()
+                        ..command()
                     },
                     at,
                 )

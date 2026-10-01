@@ -214,7 +214,9 @@ fn default_socket_path() -> PathBuf {
     if let Some(from_environment) = std::env::var_os(DirijorEnv::SOCKET) {
         return PathBuf::from(from_environment);
     }
-    let home = std::env::var_os("HOME").map_or_else(|| PathBuf::from("."), PathBuf::from);
+    let home = diri_platform::home_dir()
+        .map(|p| p.into_os_string())
+        .map_or_else(|| PathBuf::from("."), PathBuf::from);
     DirijorPaths::socket(home)
 }
 

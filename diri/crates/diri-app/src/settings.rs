@@ -220,6 +220,7 @@ impl HostDraft {
             return Err("Use a node endpoint like tcp://100.64.0.2:7337.".to_owned());
         }
         Ok(HostEntry {
+            transport: Default::default(),
             id,
             name: Some(name.to_owned()),
             ssh: ssh.to_owned(),
@@ -326,6 +327,7 @@ mod tests {
     #[test]
     fn host_drafts_generate_unique_ids_and_preserve_them_when_edited() {
         let forge = HostEntry {
+            transport: Default::default(),
             id: "forge".into(),
             name: Some("Forge".into()),
             ssh: "you@forge".into(),

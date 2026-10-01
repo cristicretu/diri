@@ -389,7 +389,8 @@ impl Prefs {
     pub const MAX_TERMINAL_FONT_SIZE: f32 = 20.0;
 
     pub fn path() -> PathBuf {
-        let home = std::env::var_os("HOME")
+        let home = diri_platform::home_dir()
+            .map(|p| p.into_os_string())
             .map(PathBuf::from)
             .unwrap_or_else(|| PathBuf::from("/nonexistent"));
         Self::path_in_home(&home)

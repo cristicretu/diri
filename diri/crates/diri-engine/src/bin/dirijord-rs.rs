@@ -5,42 +5,23 @@
 //! migration and resource features remain explicit non-goals rather than
 //! reasons to delegate remote behavior to another daemon.
 
-#[cfg(unix)]
-use std::os::fd::AsRawFd;
-#[cfg(unix)]
 use std::path::{Path, PathBuf};
-#[cfg(unix)]
 use std::sync::atomic::AtomicBool;
-#[cfg(unix)]
 use std::sync::{Arc, Mutex};
 
-#[cfg(unix)]
 use diri_engine::control::{ControlServer, InjectionConfig};
-#[cfg(unix)]
 use diri_engine::detect::ManifestEngine;
-#[cfg(unix)]
 use diri_engine::registry::Registry;
-#[cfg(unix)]
 use diri_engine::session::HolderConfig;
-#[cfg(unix)]
 use diri_proto::paths::{DirijorPaths, EXIT_WHEN_ORPHANED_FLAG};
 
 /// How long the Engine must have had no live session and no client before it
 /// retires itself. Long enough that relaunching the App, or an Agent's hook
 /// reaching us between sessions, never races it.
-#[cfg(unix)]
 const ORPHAN_GRACE: std::time::Duration = std::time::Duration::from_secs(10 * 60);
 /// One wake a minute: the grace is ten, so precision buys nothing.
-#[cfg(unix)]
 const ORPHAN_WATCH_TICK: std::time::Duration = std::time::Duration::from_secs(60);
 
-#[cfg(not(unix))]
-fn main() {
-    eprintln!("dirijord-rs requires a unix platform");
-    std::process::exit(64);
-}
-
-#[cfg(unix)]
 fn main() {
     // Stamp process start on stderr: captured into dirijord.boot.log by the
     // app's launcher, and our only visibility for pre-log failures.
@@ -78,9 +59,7 @@ fn main() {
     // SAFETY: single-threaded startup, before any spawn.
     unsafe { std::env::set_var("PATH", &path) };
 
-    let home = std::env::var_os("HOME")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from("/tmp"));
+    let home = diri_platform::home_dir().expect("user home directory is unavailable");
     let app_support = DirijorPaths::app_support(&home);
     let state_dir = DirijorPaths::state_dir(&home);
     let config_dir = DirijorPaths::config_dir(&home);
@@ -109,7 +88,7 @@ fn main() {
     // run before any thread exists, and the recorder starts one.
     let exe_dir = std::env::current_exe()
         .ok()
-        .and_then(|exe| exe.canonicalize().ok())
+        .and_then(|exe| diri_platform::canonicalize(exe).ok())
         .and_then(|exe| exe.parent().map(Path::to_path_buf))
         .unwrap_or_else(|| PathBuf::from("."));
     start_telemetry(&home, &state_dir, &exe_dir);
@@ -126,7 +105,7 @@ fn main() {
         shell = Path::new(&user_shell)
             .file_name()
             .map(|name| diri_telemetry::id(name.to_string_lossy())),
-        entries = path.split(':').count(),
+        entries = std::env::split_paths(&path).count(),
     );
 
     // Singleton guard: hold an exclusive lock for our lifetime so a second
@@ -145,7 +124,7 @@ fn main() {
             std::process::exit(1);
         });
     // SAFETY: flock on an owned fd; non-blocking probe.
-    if unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
+    if lock.try_lock().is_err() {
         eprintln!("dirijord-rs: another daemon owns the lock — exiting");
         diri_telemetry::debug_event!("engine.duplicate_exit");
         diri_telemetry::flush(std::time::Duration::from_millis(200));
@@ -388,7 +367,6 @@ fn main() {
 
 /// Starts the flight recorder, the uploader, and the crash-report watcher.
 /// Holders this Engine launches record into the same spool.
-#[cfg(unix)]
 fn start_telemetry(home: &Path, state_dir: &Path, exe_dir: &Path) {
     if !diri_telemetry::init(diri_telemetry::Process::Engine, state_dir) {
         return;
@@ -412,7 +390,6 @@ fn start_telemetry(home: &Path, state_dir: &Path, exe_dir: &Path) {
 
 /// Session counts for every `health` event. `try_lock`: a sampler that waits
 /// behind a wedged Registry would stop reporting exactly when it matters.
-#[cfg(unix)]
 fn register_gauges(registry: &Arc<Mutex<Registry>>) {
     let registry = Arc::clone(registry);
     diri_telemetry::register_gauge("sessions", move || match registry.try_lock() {
@@ -435,7 +412,6 @@ fn register_gauges(registry: &Arc<Mutex<Registry>>) {
 /// Accept failures are retried forever; descriptor exhaustion is the one
 /// that strands every attached terminal, so it is an incident, once per
 /// burst rather than once per retry.
-#[cfg(unix)]
 fn record_accept_error(error: &std::io::Error) {
     use std::sync::atomic::{AtomicU64, Ordering};
     static LAST_MS: AtomicU64 = AtomicU64::new(0);
@@ -445,7 +421,10 @@ fn record_accept_error(error: &std::io::Error) {
         return;
     }
     LAST_MS.store(now, Ordering::Relaxed);
+    #[cfg(unix)]
     let exhausted = matches!(error.raw_os_error(), Some(libc::EMFILE | libc::ENFILE));
+    #[cfg(windows)]
+    let exhausted = matches!(error.kind(), std::io::ErrorKind::OutOfMemory);
     if exhausted {
         diri_telemetry::incident!("engine.accept_failed", io = diri_telemetry::io_error(error));
     } else {
@@ -497,7 +476,7 @@ const fn default_shell() -> &'static str {
     "/bin/zsh"
 }
 
-#[cfg(not(target_os = "macos"))]
+#[cfg(all(unix, not(target_os = "macos")))]
 const fn default_shell() -> &'static str {
     "/bin/sh"
 }
@@ -661,7 +640,7 @@ fn install_cli_helpers(exe_dir: &Path, app_support: &Path) -> PathBuf {
         else {
             continue;
         };
-        if source.canonicalize().ok() == dest.canonicalize().ok() {
+        if diri_platform::canonicalize(&source).ok() == diri_platform::canonicalize(&dest).ok() {
             continue;
         }
         match install_cli_helper(&source, &dest) {
@@ -718,7 +697,7 @@ fn install_cli_resource_bundle(exe_dir: &Path, bin_dir: &Path) {
         return;
     };
     let dest = bin_dir.join(NAME);
-    if source.canonicalize().ok() == dest.canonicalize().ok() {
+    if diri_platform::canonicalize(&source).ok() == diri_platform::canonicalize(&dest).ok() {
         return;
     }
     let staging = bin_dir.join(format!(".{NAME}.{}.tmp", std::process::id()));
@@ -771,7 +750,10 @@ fn cli_helper_sources(exe_dir: &Path, name: &str) -> Vec<PathBuf> {
         sources.push(repo.join(".build/debug").join(name));
         sources.push(repo.join(".build/arm64-apple-macosx/debug").join(name));
     }
-    if let Ok(home) = std::env::var("HOME") {
+    if let Ok(home) = diri_platform::home_dir()
+        .map(|p| p.to_string_lossy().into_owned())
+        .ok_or(std::env::VarError::NotPresent)
+    {
         sources.push(
             Path::new(&home)
                 .join("Applications/diri.app/Contents/Resources/bin")
@@ -800,7 +782,6 @@ fn set_executable(path: &Path) {
     }
 }
 
-#[cfg(unix)]
 /// Selects exactly one Rust-owned base catalog, then applies user overrides.
 /// An explicit development catalog wins; otherwise packaged builds use their
 /// count-checked sibling or platform resource catalog, and loose builds fall
@@ -817,7 +798,6 @@ fn load_manifests(exe_dir: &Path, overrides: &Path) -> (ManifestEngine, Vec<Stri
     )
 }
 
-#[cfg(unix)]
 fn load_manifests_from(
     exe_dir: &Path,
     overrides: &Path,
@@ -859,12 +839,10 @@ fn load_manifests_from(
     })
 }
 
-#[cfg(unix)]
 fn holder_executable(exe_dir: &Path) -> PathBuf {
-    exe_dir.join("diri-holder")
+    exe_dir.join(diri_platform::executable_name("diri-holder"))
 }
 
-#[cfg(unix)]
 fn remote_manager(
     exe_dir: &Path,
     app_support: &Path,
@@ -888,7 +866,7 @@ fn remote_manager(
             return None;
         }
     };
-    let askpass = exe_dir.join("diri-ssh-askpass");
+    let askpass = exe_dir.join(diri_platform::executable_name("diri-ssh-askpass"));
     let executor = if askpass.is_file() {
         ProcessExecutor::default().with_askpass(askpass.into_os_string())
     } else {
@@ -907,7 +885,6 @@ fn remote_manager(
     }
 }
 
-#[cfg(unix)]
 #[derive(Clone, Debug, Eq, PartialEq)]
 enum RemoteCatalogSource {
     Native(PathBuf),
@@ -918,7 +895,6 @@ enum RemoteCatalogSource {
 /// while packaged apps contain only the cross-platform manifest. Prefer the
 /// sibling in the former layout so an old `target/remote-helpers` directory
 /// can never silently define the current development build.
-#[cfg(unix)]
 fn resolve_remote_catalog_source(
     exe_dir: &Path,
     configured: Option<&Path>,
@@ -1173,4 +1149,23 @@ mod tests {
             Some(RemoteCatalogSource::Manifest(manifest))
         );
     }
+}
+
+#[cfg(windows)]
+fn login_shell() -> String {
+    diri_platform::launch::default_shell()
+}
+#[cfg(windows)]
+fn login_path(_: &str) -> Option<String> {
+    std::env::var("PATH").ok()
+}
+#[cfg(windows)]
+fn ensure_private_dir(path: &Path) -> std::io::Result<()> {
+    diri_platform::security::private_dir_all(path)
+}
+#[cfg(windows)]
+fn install_cli_helpers(exe_dir: &Path, _: &Path) -> PathBuf {
+    // Windows holds running images open. Versioned installation directories
+    // let a new build coexist with live Holders; use its adjacent CLI directly.
+    exe_dir.join("dirijor.exe")
 }

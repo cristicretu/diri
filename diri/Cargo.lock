@@ -1546,6 +1546,7 @@ dependencies = [
  "diri-client",
  "diri-engine",
  "diri-notes",
+ "diri-platform",
  "diri-proto",
  "diri-telemetry",
  "diri-term",
@@ -1553,6 +1554,7 @@ dependencies = [
  "diri-updater",
  "diri-usage",
  "diri-web",
+ "embed-resource",
  "gpui",
  "gpui_macos",
  "gpui_platform",
@@ -1576,12 +1578,14 @@ dependencies = [
  "tokio",
  "unicode-segmentation",
  "url",
+ "windows 0.61.3",
 ]
 
 [[package]]
 name = "diri-client"
 version = "0.1.0"
 dependencies = [
+ "diri-platform",
  "diri-proto",
  "diri-telemetry",
  "futures-core",
@@ -1599,6 +1603,7 @@ dependencies = [
  "alacritty_terminal",
  "base64 0.23.1",
  "diri-notes",
+ "diri-platform",
  "diri-proto",
  "diri-pty",
  "diri-telemetry",
@@ -1647,9 +1652,23 @@ dependencies = [
 ]
 
 [[package]]
+name = "diri-platform"
+version = "0.1.0"
+dependencies = [
+ "dunce",
+ "libc",
+ "sha2 0.11.0",
+ "socket2",
+ "tokio",
+ "uds_windows",
+ "windows-sys 0.61.2",
+]
+
+[[package]]
 name = "diri-proto"
 version = "0.1.0"
 dependencies = [
+ "diri-platform",
  "serde",
  "serde_json",
  "tempfile",
@@ -1660,6 +1679,7 @@ dependencies = [
 name = "diri-pty"
 version = "0.1.0"
 dependencies = [
+ "diri-platform",
  "diri-proto",
  "libc",
 ]
@@ -1686,6 +1706,7 @@ dependencies = [
 name = "diri-telemetry"
 version = "0.1.0"
 dependencies = [
+ "diri-platform",
  "diri-proto",
  "getrandom 0.4.3",
  "libc",
@@ -1713,9 +1734,13 @@ name = "diri-terminal-state"
 version = "0.1.0"
 dependencies = [
  "alacritty_terminal",
+ "diri-platform",
  "diri-proto",
+ "diri-pty",
  "libc",
  "memchr",
+ "serde",
+ "serde_json",
 ]
 
 [[package]]
@@ -1730,8 +1755,10 @@ dependencies = [
 name = "diri-updater"
 version = "0.1.0"
 dependencies = [
+ "diri-platform",
  "serde",
  "serde_json",
+ "sha2 0.11.0",
  "tempfile",
 ]
 
@@ -1739,6 +1766,7 @@ dependencies = [
 name = "diri-usage"
 version = "0.1.0"
 dependencies = [
+ "diri-platform",
  "diri-proto",
  "libc",
  "serde",
@@ -1751,6 +1779,7 @@ name = "diri-web"
 version = "0.1.0"
 dependencies = [
  "diri-client",
+ "diri-platform",
  "diri-proto",
  "getrandom 0.4.3",
  "serde",
@@ -1765,6 +1794,7 @@ version = "0.1.0"
 dependencies = [
  "diri-engine",
  "diri-notes",
+ "diri-platform",
  "diri-proto",
  "libc",
  "serde",

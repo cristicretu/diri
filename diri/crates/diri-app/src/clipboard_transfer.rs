@@ -81,7 +81,7 @@ fn upload_to_remote_temp(
     remote_name: &str,
 ) -> Result<String, String> {
     let remote_path = format!("{REMOTE_TEMP_DIRECTORY}/{remote_name}");
-    let output = Command::new(SCP)
+    let output = diri_platform::hide_console_window(&mut Command::new(SCP))
         .args(scp_arguments(local_path, ssh, &remote_path))
         .output()
         .map_err(|error| format!("could not start scp: {error}"))?;

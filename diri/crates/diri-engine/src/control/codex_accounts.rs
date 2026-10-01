@@ -7,7 +7,6 @@ use std::time::SystemTime;
 use std::{
     fs,
     io::{Read, Write},
-    os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt},
 };
 
 const LIMIT: u64 = 1024 * 1024;
@@ -18,37 +17,19 @@ fn failure() -> ControlError {
 }
 fn directory(path: &Path) -> Result<(), ControlError> {
     if !path.exists() {
-        fs::DirBuilder::new()
-            .mode(0o700)
-            .create(path)
-            .map_err(|_| failure())?;
+        diri_platform::security::private_dir_all(path).map_err(|_| failure())?;
     }
-    let m = fs::symlink_metadata(path).map_err(|_| failure())?;
-    if !m.is_dir()
-        || m.file_type().is_symlink()
-        || m.uid() != unsafe { libc::geteuid() }
-        || m.mode() & 0o022 != 0
-    {
-        return Err(failure());
-    }
+    diri_platform::security::validate_directory(path, 0o022).map_err(|_| failure())?;
     Ok(())
 }
 fn read(path: &Path) -> Result<Option<Vec<u8>>, ControlError> {
-    let file = match fs::OpenOptions::new()
-        .read(true)
-        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
-        .open(path)
-    {
+    let file = match diri_platform::security::open_regular(path, false, false, false) {
         Ok(f) => f,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
         Err(_) => return Err(failure()),
     };
     let m = file.metadata().map_err(|_| failure())?;
-    if !m.is_file()
-        || m.uid() != unsafe { libc::geteuid() }
-        || m.mode() & 0o077 != 0
-        || m.len() > LIMIT
-    {
+    if diri_platform::security::validate_file(&file, true).is_err() || m.len() > LIMIT {
         return Err(failure());
     }
     let mut bytes = Vec::new();
@@ -92,13 +73,7 @@ fn write(path: &Path, bytes: &[u8]) -> Result<(), ControlError> {
     let expected = read(path)?;
     let temp = path.with_file_name(format!(".auth-{}.tmp", crate::inject::uuid_v4()));
     let result = (|| {
-        let mut file = fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .mode(0o600)
-            .custom_flags(libc::O_NOFOLLOW)
-            .open(&temp)
-            .map_err(|_| failure())?;
+        let mut file = diri_platform::security::create_private(&temp).map_err(|_| failure())?;
         file.write_all(bytes)
             .and_then(|_| file.sync_all())
             .map_err(|_| failure())?;
@@ -108,8 +83,7 @@ fn write(path: &Path, bytes: &[u8]) -> Result<(), ControlError> {
             ));
         }
         fs::rename(&temp, path).map_err(|_| failure())?;
-        fs::File::open(path.parent().ok_or_else(failure)?)
-            .and_then(|f| f.sync_all())
+        diri_platform::security::sync_directory(path.parent().ok_or_else(failure)?)
             .map_err(|_| failure())
     })();
     if result.is_err() {
@@ -119,11 +93,7 @@ fn write(path: &Path, bytes: &[u8]) -> Result<(), ControlError> {
 }
 fn file_backend(home: &Path) -> Result<(), ControlError> {
     let path = home.join("config.toml");
-    let file = match fs::OpenOptions::new()
-        .read(true)
-        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
-        .open(path)
-    {
+    let file = match diri_platform::security::open_regular(&path, false, false, false) {
         Ok(f) => f,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
         Err(_) => return Err(failure()),
@@ -157,7 +127,13 @@ impl ControlServer {
             .ok_or_else(failure)
     }
     fn codex_home(&self) -> Result<PathBuf, ControlError> {
-        let home = PathBuf::from(std::env::var("HOME").map_err(|_| failure())?).join(".codex");
+        let home = PathBuf::from(
+            diri_platform::home_dir()
+                .map(|p| p.to_string_lossy().into_owned())
+                .ok_or(std::env::VarError::NotPresent)
+                .map_err(|_| failure())?,
+        )
+        .join(".codex");
         directory(&home)?;
         file_backend(&home)?;
         Ok(home)
@@ -244,7 +220,15 @@ impl ControlServer {
             let expanded = profile
                 .config_home
                 .strip_prefix("~/")
-                .map(|p| PathBuf::from(std::env::var("HOME").unwrap_or_default()).join(p))
+                .map(|p| {
+                    PathBuf::from(
+                        diri_platform::home_dir()
+                            .map(|p| p.to_string_lossy().into_owned())
+                            .ok_or(std::env::VarError::NotPresent)
+                            .unwrap_or_default(),
+                    )
+                    .join(p)
+                })
                 .unwrap_or_else(|| PathBuf::from(&profile.config_home));
             if expanded == home {
                 return Err(ControlError::bad_request(
@@ -395,12 +379,17 @@ impl ControlServer {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(unix)]
+    use std::os::unix::fs::MetadataExt;
+    #[cfg(unix)]
     use std::os::unix::fs::PermissionsExt;
+    #[cfg(unix)]
     fn auth(account: &str, refresh: &str) -> Vec<u8> {
         let payload =
             base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(br#"{"sub":"fixture-user"}"#);
         serde_json::to_vec(&json!({"tokens":{"account_id":account,"id_token":format!("x.{payload}.x"),"access_token":"fixture-access","refresh_token":refresh}})).unwrap()
     }
+    #[cfg(unix)]
     #[test]
     fn login_files_are_private_atomic_and_reject_symlinks_and_malformed_auth() {
         let tmp = tempfile::tempdir().unwrap();
@@ -418,6 +407,7 @@ mod tests {
         fs::set_permissions(&path, fs::Permissions::from_mode(0o644)).unwrap();
         assert!(read(&path).is_err());
     }
+    #[cfg(unix)]
     #[test]
     fn login_is_a_separate_setup_session_and_cancel_does_not_switch_auth() {
         let tmp = tempfile::tempdir().unwrap();
@@ -488,6 +478,7 @@ mod tests {
             "cli_auth_credentials_store='keyring'\n"
         );
     }
+    #[cfg(unix)]
     #[test]
     fn shared_switch_restarts_open_tabs_without_reading_history_or_touching_tools() {
         let tmp = tempfile::tempdir().unwrap();
@@ -649,6 +640,7 @@ mod tests {
         }
     }
 
+    #[cfg(unix)]
     #[test]
     fn shared_switch_identifies_unbound_tabs_from_their_rollout_and_never_refuses() {
         let tmp = tempfile::tempdir().unwrap();

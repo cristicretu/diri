@@ -52,7 +52,10 @@ impl TerminalPane {
         };
         if session.host.is_some() {
             self.show_terminal_feedback(
-                "Insert Path browses this Mac, so it's unavailable in remote sessions",
+                format!(
+                    "Insert Path browses {}, so it's unavailable in remote sessions",
+                    crate::platform::local_machine_label_lowercase()
+                ),
                 window,
                 cx,
             );
@@ -105,7 +108,11 @@ impl TerminalPane {
                 if root.is_dir() {
                     Ok(path_picker::scan(&root))
                 } else {
-                    Err(format!("{} is not a folder on this Mac", root.display()))
+                    Err(format!(
+                        "{} is not a folder on {}",
+                        root.display(),
+                        crate::platform::local_machine_label_lowercase()
+                    ))
                 }
             })
             .await
@@ -274,7 +281,8 @@ impl TerminalPane {
         let placeholder = picker.root().map_or_else(
             || "Finding files…".to_owned(),
             |root| {
-                let home = std::env::var_os("HOME")
+                let home = diri_platform::home_dir()
+                    .map(|p| p.into_os_string())
                     .map(PathBuf::from)
                     .unwrap_or_default();
                 crate::quick_open::collapse_home(root, &home)

@@ -14,6 +14,7 @@ name = "dirijor"
 path = "src/bin/dirijor.rs"
 
 [dependencies]
+diri-platform.workspace = true
 diri-proto.workspace = true
 diri-notes.workspace = true
 serde.workspace = true

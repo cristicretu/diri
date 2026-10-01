@@ -10,8 +10,9 @@
 //! lets the first remote action use the new packaged Helper catalog. The daemon
 //! holds an `flock` singleton, so a redundant spawn still exits instantly.
 
+use diri_platform::ipc::UnixStream;
 use std::io::{self, BufRead, BufReader, Read, Write};
-use std::os::unix::net::UnixStream;
+#[cfg(unix)]
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -78,7 +79,8 @@ impl DeferredDaemonStartup {
     /// The ordinary socket may also be inherited from an Agent launched by
     /// Diri; that must still verify and refresh the bundled Engine.
     pub(super) fn for_process() -> Option<Self> {
-        let home = std::env::var_os("HOME")
+        let home = diri_platform::home_dir()
+            .map(|p| p.into_os_string())
             .map(PathBuf::from)
             .unwrap_or_else(|| PathBuf::from("/nonexistent"));
         let socket_path = DirijorPaths::socket(home);
@@ -293,7 +295,7 @@ fn ensure_daemon_running(socket_path: &Path, cancelled: &AtomicBool) -> StartupO
     )
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 fn ensure_daemon_running_with(
     socket_path: &Path,
     daemon: Option<PathBuf>,
@@ -532,6 +534,7 @@ fn stop_daemon_for_upgrade(socket_path: &Path, pid: Option<i32>) -> io::Result<(
     ))
 }
 
+#[cfg(unix)]
 fn process_is_alive(pid: i32) -> bool {
     if pid <= 0 {
         return false;
@@ -540,6 +543,21 @@ fn process_is_alive(pid: i32) -> bool {
     // process id still exists and is visible to the current user.
     let result = unsafe { libc::kill(pid, 0) };
     result == 0 || io::Error::last_os_error().raw_os_error() != Some(libc::ESRCH)
+}
+
+#[cfg(windows)]
+fn process_is_alive(pid: i32) -> bool {
+    use diri_platform::windows_sys::Win32::{Foundation::WAIT_TIMEOUT, System::Threading::*};
+    use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
+    if pid <= 0 {
+        return false;
+    }
+    let raw = unsafe { OpenProcess(PROCESS_SYNCHRONIZE, 0, pid as u32) };
+    if raw.is_null() {
+        return std::io::Error::last_os_error().kind() == std::io::ErrorKind::PermissionDenied;
+    }
+    let process = unsafe { OwnedHandle::from_raw_handle(raw) };
+    unsafe { WaitForSingleObject(process.as_raw_handle(), 0) == WAIT_TIMEOUT }
 }
 
 fn executable_sha256(path: &Path) -> io::Result<String> {
@@ -675,12 +693,18 @@ fn resolve_daemon_path_from(
             candidates.push(contents.join("Resources/bin/dirijord-rs"));
         }
         // Loose copy sitting right next to the executable.
-        candidates.push(macos_dir.join("dirijord-rs"));
+        candidates.push(macos_dir.join(diri_platform::executable_name("dirijord-rs")));
     }
 
     if let Some(cwd) = current_dir {
-        candidates.push(cwd.join("target/release/dirijord-rs"));
-        candidates.push(cwd.join("target/debug/dirijord-rs"));
+        candidates.push(
+            cwd.join("target/release")
+                .join(diri_platform::executable_name("dirijord-rs")),
+        );
+        candidates.push(
+            cwd.join("target/debug")
+                .join(diri_platform::executable_name("dirijord-rs")),
+        );
     }
 
     candidates.into_iter().find(|path| is_executable(path))
@@ -713,7 +737,18 @@ fn spawn_detached(daemon: &Path, boot_log: Option<&Path>) -> io::Result<()> {
     // New process group (setpgid to the child's own pid): decouples the daemon
     // from diri's signal/terminal group so quitting diri never SIGHUPs the
     // daemon or its PTYs. Equivalent intent to the Swift POSIX_SPAWN_SETSID path.
+    #[cfg(unix)]
     command.process_group(0);
+    // An invisible console rather than none: with DETACHED_PROCESS every git or
+    // gh the Engine runs would open its own console window.
+    #[cfg(windows)]
+    {
+        use diri_platform::windows_sys::Win32::System::Threading::*;
+        use std::os::windows::process::CommandExt;
+        command.creation_flags(
+            CREATE_NO_WINDOW | CREATE_NEW_PROCESS_GROUP | CREATE_BREAKAWAY_FROM_JOB,
+        );
+    }
 
     // Spawn and deliberately drop the handle — we do not (and must not) wait.
     command.spawn().map(|_child| ())
@@ -722,24 +757,21 @@ fn spawn_detached(daemon: &Path, boot_log: Option<&Path>) -> io::Result<()> {
 /// The platform log directory's early-boot log, created before the Engine can
 /// initialize its own diagnostics. Returns `None` when `HOME` is unset.
 fn boot_log_path() -> Option<PathBuf> {
-    let home = std::env::var_os("HOME")?;
+    let home = diri_platform::home_dir().map(|p| p.into_os_string())?;
     let logs = DirijorPaths::logs_dir(PathBuf::from(home));
     std::fs::create_dir_all(&logs).ok()?;
     Some(logs.join(BOOT_LOG_FILE_NAME))
 }
 
 fn is_executable(path: &Path) -> bool {
-    use std::os::unix::fs::PermissionsExt;
-    std::fs::metadata(path)
-        .map(|meta| meta.is_file() && meta.permissions().mode() & 0o111 != 0)
-        .unwrap_or(false)
+    diri_platform::launch::is_executable(path)
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 mod tests {
     use super::*;
+    use diri_platform::ipc::{UnixListener, UnixStream};
     use std::os::unix::fs::PermissionsExt;
-    use std::os::unix::net::{UnixListener, UnixStream};
     use std::sync::atomic::AtomicUsize;
     use std::sync::{Arc, Mutex, mpsc};
 

@@ -98,7 +98,7 @@ struct Shared {
     spawned_at: std::time::Instant,
     /// Weak handles let the exit path interrupt blocking input reads without
     /// making idle Holder streams wake on a timer.
-    input_streams: Mutex<Vec<Weak<std::os::unix::net::UnixStream>>>,
+    input_streams: Mutex<Vec<Weak<diri_platform::ipc::UnixStream>>>,
     /// Daemons receiving output as it is read, rather than by tailing the log.
     /// The log is still written, and is still what a subscriber falls back to;
     /// this only removes the filesystem from the path a live screen waits on.
@@ -570,7 +570,7 @@ fn offer_frame(subscriber: &OutputSubscriber, offset: u64, frame: &[u8]) -> bool
 /// releases everything held for it.
 fn serve_output_stream(
     shared: &Weak<Shared>,
-    stream: std::os::unix::net::UnixStream,
+    stream: diri_platform::ipc::UnixStream,
     frames: &Arc<super::fanout::FrameQueue>,
 ) {
     // The writer parks on the queue, and a write is the only way it would
@@ -612,7 +612,7 @@ fn serve_output_stream(
 /// A subscriber sends nothing after its request, so this read blocks for the
 /// subscription's whole life and costs no wakeups. It returns when the peer
 /// closes or the writer shuts the socket down on its way out.
-fn watch_output_peer(mut peer: std::os::unix::net::UnixStream, frames: &super::fanout::FrameQueue) {
+fn watch_output_peer(mut peer: diri_platform::ipc::UnixStream, frames: &super::fanout::FrameQueue) {
     let mut scratch = [0u8; 64];
     loop {
         match peer.read(&mut scratch) {
@@ -628,7 +628,7 @@ fn watch_output_peer(mut peer: std::os::unix::net::UnixStream, frames: &super::f
 
 /// Writes frames to one subscriber until a write fails or the queue closes.
 fn write_output_frames(
-    stream: &mut std::io::BufWriter<std::os::unix::net::UnixStream>,
+    stream: &mut std::io::BufWriter<diri_platform::ipc::UnixStream>,
     frames: &super::fanout::FrameQueue,
 ) {
     let mut queued: Option<super::fanout::Frame> = None;
@@ -858,7 +858,7 @@ fn handle(shared: &Shared, request: &HolderRequest) -> HolderResult<HolderRespon
 /// acknowledged only after it has reached the PTY, preserving the delivery
 /// guarantee of the legacy request/response protocol without reconnecting or
 /// encoding base64 for every key.
-fn serve_input_stream(shared: &Shared, stream: Arc<std::os::unix::net::UnixStream>) {
+fn serve_input_stream(shared: &Shared, stream: Arc<diri_platform::ipc::UnixStream>) {
     prioritize_interactive_io();
     let mut stream = &*stream;
     let mut payload = Vec::with_capacity(256);

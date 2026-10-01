@@ -1,8 +1,7 @@
 //! Owner-only local authentication bindings for remote Holders.
 
-use std::fs::{self, OpenOptions};
-use std::io::{self, Write};
-use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+use std::fs;
+use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
 
 use diri_proto::remote_pty::{ProtocolVersion, SessionToken};
@@ -29,8 +28,7 @@ pub struct RemoteBindingStore {
 impl RemoteBindingStore {
     pub fn new(root: impl Into<PathBuf>) -> io::Result<Self> {
         let root = root.into();
-        fs::create_dir_all(&root)?;
-        fs::set_permissions(&root, fs::Permissions::from_mode(0o700))?;
+        diri_platform::security::private_dir_all(&root)?;
         Ok(Self { root })
     }
 
@@ -40,11 +38,7 @@ impl RemoteBindingStore {
         reject_symlink(&path)?;
         let nonce = random_hex()?;
         let temporary = self.root.join(format!(".tmp-{nonce}"));
-        let mut file = OpenOptions::new()
-            .create_new(true)
-            .write(true)
-            .mode(0o600)
-            .open(&temporary)?;
+        let mut file = diri_platform::security::create_private(&temporary)?;
         let result = (|| {
             serde_json::to_writer(&mut file, binding)
                 .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
@@ -88,21 +82,16 @@ impl RemoteBindingStore {
     }
 
     fn load_one(path: &Path) -> io::Result<RemoteBinding> {
-        reject_symlink(path)?;
-        let metadata = fs::metadata(path)?;
-        if !metadata.is_file() || metadata.permissions().mode() & 0o077 != 0 {
-            return Err(io::Error::new(
-                io::ErrorKind::PermissionDenied,
-                "remote binding file is not owner-only",
-            ));
-        }
-        if metadata.len() > 64 * 1024 {
+        let mut file = diri_platform::security::read_owned(path, true)?;
+        let mut bytes = Vec::new();
+        (&mut file).take(64 * 1024 + 1).read_to_end(&mut bytes)?;
+        if bytes.len() > 64 * 1024 {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 "remote binding file exceeds 64 KiB",
             ));
         }
-        let binding: RemoteBinding = serde_json::from_slice(&fs::read(path)?)
+        let binding: RemoteBinding = serde_json::from_slice(&bytes)
             .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
         validate_identifier(&binding.session_id)?;
         Ok(binding)
@@ -116,19 +105,7 @@ impl RemoteBindingStore {
     ) -> io::Result<()> {
         validate_identifier(session_id)?;
         let path = self.path(session_id);
-        reject_symlink(&path)?;
-        let metadata = fs::metadata(&path)?;
-        if !metadata.is_file()
-            || metadata.permissions().mode() & 0o077 != 0
-            || metadata.len() > 64 * 1024
-        {
-            return Err(io::Error::new(
-                io::ErrorKind::PermissionDenied,
-                "remote binding metadata is invalid",
-            ));
-        }
-        let mut binding: RemoteBinding = serde_json::from_slice(&fs::read(path)?)
-            .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+        let mut binding = Self::load_one(&path)?;
         if binding.session_id != session_id || binding.session_incarnation != incarnation {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
@@ -196,6 +173,8 @@ fn random_hex() -> io::Result<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(unix)]
+    use std::os::unix::fs::PermissionsExt;
 
     /// Bindings describe independent live sessions. Rejecting the whole set
     /// over one truncated write would orphan every remote Holder the Engine
@@ -230,6 +209,7 @@ mod tests {
         assert_eq!(loaded[0].session_id, "session-good");
     }
 
+    #[cfg(unix)]
     #[test]
     fn binding_is_owner_only_and_redacts_the_bearer_from_debug() {
         let temporary = tempfile::tempdir().expect("temp");

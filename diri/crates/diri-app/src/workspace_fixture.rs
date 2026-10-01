@@ -24,7 +24,7 @@ pub(crate) struct LiveWorkspace {
 struct ServerResources {
     registry: Arc<Mutex<Registry>>,
     stop: Arc<AtomicBool>,
-    sockets: Arc<Mutex<Vec<std::os::unix::net::UnixStream>>>,
+    sockets: Arc<Mutex<Vec<diri_platform::ipc::UnixStream>>>,
     server: Option<std::thread::JoinHandle<()>>,
 }
 impl LiveWorkspace {

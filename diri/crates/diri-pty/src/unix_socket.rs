@@ -1,8 +1,11 @@
 //! Deadline-bound local Unix socket operations for on-demand management.
+use diri_platform::ipc::UnixStream;
+use diri_platform::poll::AsRawIo;
 use std::io::{self, Read};
-use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+#[cfg(unix)]
+use std::os::fd::{FromRawFd, OwnedFd};
+#[cfg(unix)]
 use std::os::unix::ffi::OsStrExt;
-use std::os::unix::net::UnixStream;
 use std::path::Path;
 use std::time::{Duration, Instant};
 
@@ -12,6 +15,7 @@ pub fn remaining(deadline: Instant) -> io::Result<Duration> {
         .filter(|value| !value.is_zero())
         .ok_or_else(|| io::Error::new(io::ErrorKind::TimedOut, "local request deadline expired"))
 }
+#[cfg(unix)]
 fn pause_until(deadline: Instant) {
     std::thread::sleep(
         deadline
@@ -22,6 +26,7 @@ fn pause_until(deadline: Instant) {
 
 /// The management deadline includes socket admission. A blocking connect can
 /// otherwise wait indefinitely behind a full local listen backlog.
+#[cfg(unix)]
 pub fn connect_until(path: &Path, deadline: Instant) -> io::Result<UnixStream> {
     remaining(deadline)?;
     // SAFETY: all-zero sockaddr_un is valid storage before initializing fields.
@@ -71,9 +76,9 @@ pub fn connect_until(path: &Path, deadline: Instant) -> io::Result<UnixStream> {
                 pause_until(deadline);
             }
             Some(libc::EINPROGRESS) | Some(libc::EALREADY) => {
-                let mut descriptor = libc::pollfd {
+                let mut descriptor = diri_platform::poll::PollFd {
                     fd: raw,
-                    events: libc::POLLOUT,
+                    events: diri_platform::poll::POLLOUT,
                     revents: 0,
                 };
                 let timeout = remaining(deadline)?
@@ -81,7 +86,7 @@ pub fn connect_until(path: &Path, deadline: Instant) -> io::Result<UnixStream> {
                     .max(1)
                     .min(i32::MAX as u128) as i32;
                 // SAFETY: descriptor is live initialized storage for one entry.
-                let ready = unsafe { libc::poll(&mut descriptor, 1, timeout) };
+                let ready = unsafe { diri_platform::poll::poll(&mut descriptor, 1, timeout) };
                 if ready < 0 {
                     let error = io::Error::last_os_error();
                     if error.kind() == io::ErrorKind::Interrupted {
@@ -96,7 +101,7 @@ pub fn connect_until(path: &Path, deadline: Instant) -> io::Result<UnixStream> {
                 if let Some(error) = stream.take_error()? {
                     return Err(error);
                 }
-                if descriptor.revents & libc::POLLOUT != 0 {
+                if descriptor.revents & diri_platform::poll::POLLOUT != 0 {
                     break;
                 }
                 return Err(io::Error::new(
@@ -154,20 +159,20 @@ pub fn read_line_until(
                 ) =>
             {
                 let timeout = remaining(deadline)?.as_millis().clamp(1, i32::MAX as u128) as i32;
-                let mut descriptor = libc::pollfd {
-                    fd: stream.as_raw_fd(),
-                    events: libc::POLLIN,
+                let mut descriptor = diri_platform::poll::PollFd {
+                    fd: stream.as_raw_io(),
+                    events: diri_platform::poll::POLLIN,
                     revents: 0,
                 };
                 // SAFETY: one initialized descriptor, live for this bounded wait.
-                let ready = unsafe { libc::poll(&mut descriptor, 1, timeout) };
+                let ready = unsafe { diri_platform::poll::poll(&mut descriptor, 1, timeout) };
                 if ready < 0 {
                     let error = io::Error::last_os_error();
                     if error.kind() != io::ErrorKind::Interrupted {
                         return Err(error);
                     }
                 }
-                if descriptor.revents & libc::POLLNVAL != 0 {
+                if descriptor.revents & diri_platform::poll::POLLNVAL != 0 {
                     return Err(io::Error::new(
                         io::ErrorKind::NotConnected,
                         "local reply socket invalid",
@@ -181,6 +186,10 @@ pub fn read_line_until(
     }
 }
 
+#[cfg(windows)]
+pub fn connect_until(path: &Path, deadline: Instant) -> io::Result<UnixStream> {
+    UnixStream::connect_timeout(path, remaining(deadline)?)
+}
 #[cfg(test)]
 mod tests {
     use super::*;

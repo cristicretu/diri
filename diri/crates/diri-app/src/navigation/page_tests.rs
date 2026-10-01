@@ -701,6 +701,7 @@ fn dynamic_palette_commands_preserve_their_targets(cx: &mut TestAppContext) {
     store.upsert_session(session);
     store.select(selected.clone());
     store.set_hosts(vec![diri_proto::HostEntry {
+        transport: Default::default(),
         id: "forge".into(),
         name: Some("Forge".into()),
         ssh: "forge".into(),

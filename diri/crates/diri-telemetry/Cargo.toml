@@ -6,6 +6,7 @@ rust-version.workspace = true
 license.workspace = true
 
 [dependencies]
+diri-platform.workspace = true
 diri-proto.workspace = true
 getrandom.workspace = true
 serde.workspace = true

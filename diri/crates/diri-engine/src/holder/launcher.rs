@@ -96,7 +96,7 @@ impl HolderLauncher {
         }
         let beside = std::env::current_exe()
             .ok()
-            .and_then(|exe| exe.canonicalize().ok())
+            .and_then(|exe| diri_platform::canonicalize(exe).ok())
             .and_then(|exe| exe.parent().map(Path::to_path_buf));
         let candidates: Vec<PathBuf> = beside.iter().map(|dir| dir.join("diri-holder")).collect();
         candidates

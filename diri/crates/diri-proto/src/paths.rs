@@ -216,7 +216,24 @@ fn layout(home: &Path) -> PathLayout {
         )
     }
 
-    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    #[cfg(windows)]
+    {
+        let local = absolute_env_path("LOCALAPPDATA")
+            .unwrap_or_else(|| home.join("AppData/Local"))
+            .join("diri");
+        let roaming = absolute_env_path("APPDATA")
+            .unwrap_or_else(|| home.join("AppData/Roaming"))
+            .join("diri");
+        PathLayout {
+            data: local.clone(),
+            state: local.join("state"),
+            runtime: local.join("run"),
+            cache: local.join("cache"),
+            config: roaming,
+        }
+    }
+
+    #[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
     {
         single_root(home.join(".diri"))
     }

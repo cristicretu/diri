@@ -303,7 +303,7 @@ impl IncludeRules {
                 if line.is_empty() || line.starts_with('#') {
                     return None;
                 }
-                let trimmed = line.trim_end_matches('/');
+                let trimmed = line.trim_end_matches(['/', '\\']);
                 let rooted = trimmed.starts_with('/') || trimmed.contains('/');
                 let glob = trimmed.trim_start_matches('/').to_owned();
                 (!glob.is_empty()).then_some(IncludePattern { glob, rooted })
@@ -554,17 +554,17 @@ impl RankCandidate {
 /// `path` with the home directory written as `~`. Only a whole component
 /// matches: `/Users/ann` is `~`, `/Users/anna` is left alone.
 pub(crate) fn home_relative(path: &Path) -> String {
-    let home = std::env::var_os("HOME").map(|home| home.to_string_lossy().into_owned());
+    let home = diri_platform::home_dir().map(|path| path.into_os_string()).map(|home| home.to_string_lossy().into_owned());
     home_relative_to(&path.to_string_lossy(), home.as_deref())
 }
 
 fn home_relative_to(path: &str, home: Option<&str>) -> String {
-    let home = home.unwrap_or_default().trim_end_matches('/');
+    let home = home.unwrap_or_default().trim_end_matches(['/', '\\']);
     if home.is_empty() {
         return path.to_owned();
     }
     path.strip_prefix(home)
-        .filter(|rest| rest.is_empty() || rest.starts_with('/'))
+        .filter(|rest| rest.is_empty() || rest.starts_with(['/', '\\']))
         .map_or_else(|| path.to_owned(), |rest| format!("~{rest}"))
 }
 

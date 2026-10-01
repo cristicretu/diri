@@ -49,7 +49,9 @@ impl ExternalPathRejection {
         match self {
             Self::Missing => "does not exist",
             Self::Unreadable => "is not readable",
-            Self::NotMaterialized => "is not downloaded to this Mac",
+            Self::NotMaterialized if cfg!(target_os = "macos") => "is not downloaded to this Mac",
+            Self::NotMaterialized if cfg!(windows) => "is not downloaded to this PC",
+            Self::NotMaterialized => "is not downloaded to this computer",
             Self::NotFileOrDirectory => "is not a file or directory",
             Self::NotUnicode => "cannot be represented in a prompt",
             Self::RequiresDirectory => "is not a directory",

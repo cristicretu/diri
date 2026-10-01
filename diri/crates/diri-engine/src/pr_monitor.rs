@@ -1159,6 +1159,7 @@ mod tests {
         assert!(!refresh.contains_key(gone));
     }
 
+    #[cfg(unix)]
     /// A registry of records linking pull requests, plus the monitor's state
     /// and a scripted `gh`, so tests drive real sweeps.
     struct Harness {
@@ -1172,10 +1173,13 @@ mod tests {
         fallback: HashSet<String>,
     }
 
+    #[cfg(unix)]
     impl Harness {
+        #[cfg(unix)]
         /// `records` pairs a session id with whether it was seen just now
         /// and the pull request statuses it already carries.
         fn new(records: &[(&str, bool, Vec<PullRequestStatus>)], gh_script: &str) -> Self {
+            #[cfg(unix)]
             use std::os::unix::fs::PermissionsExt;
             let temp = tempfile::tempdir().unwrap();
             let fixture: Value = serde_json::from_str(include_str!(
@@ -1228,6 +1232,7 @@ mod tests {
             }
         }
 
+        #[cfg(unix)]
         fn sweep(&mut self, pending: PendingWake) -> Duration {
             sweep(
                 &self.registry,
@@ -1285,6 +1290,7 @@ mod tests {
         }
     }
 
+    #[cfg(unix)]
     fn open_status(url: &str, number: i64) -> PullRequestStatus {
         parse(
             serde_json::json!({ "number": number, "state": "OPEN" })
@@ -1309,6 +1315,7 @@ mod tests {
         })
     }
 
+    #[cfg(unix)]
     #[test]
     fn refresh_updates_status_only_prs_and_every_session_sharing_the_url() {
         let url = "https://github.com/o/r/pull/12";
@@ -1342,6 +1349,7 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
     #[test]
     fn one_gh_process_refreshes_every_due_pull_request() {
         let urls: Vec<String> = (1..=5)
@@ -1415,6 +1423,7 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
     #[test]
     fn prs_the_batch_cannot_resolve_fall_back_to_gh_pr_view() {
         let url = |n: i64| format!("https://github.com/o/r/pull/{n}");
@@ -1485,6 +1494,7 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
     #[test]
     fn a_failed_batch_falls_back_a_bounded_few_per_iteration() {
         let urls: Vec<String> = (1..=5)
@@ -1754,8 +1764,10 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
     #[test]
     fn gh_output_larger_than_a_pipe_buffer_is_read_in_full() {
+        #[cfg(unix)]
         use std::os::unix::fs::PermissionsExt;
         let temp = tempfile::tempdir().unwrap();
         let gh = temp.path().join("gh");
@@ -1767,8 +1779,10 @@ mod tests {
         assert_eq!(output.len(), 1 << 20);
     }
 
+    #[cfg(unix)]
     #[test]
     fn a_hung_gh_is_killed_at_the_timeout() {
+        #[cfg(unix)]
         use std::os::unix::fs::PermissionsExt;
         let temp = tempfile::tempdir().unwrap();
         let gh = temp.path().join("gh");

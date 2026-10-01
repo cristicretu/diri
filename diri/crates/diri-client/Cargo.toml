@@ -6,6 +6,7 @@ rust-version.workspace = true
 license.workspace = true
 
 [dependencies]
+diri-platform = { workspace = true, features = ["async"] }
 diri-proto.workspace = true
 diri-telemetry.workspace = true
 futures-core.workspace = true

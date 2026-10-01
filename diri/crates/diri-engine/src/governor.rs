@@ -24,6 +24,7 @@
 //! boot, so stale record timestamps never freeze anything on their own.
 
 use std::collections::HashMap;
+#[cfg(unix)]
 use std::process::Command;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -674,7 +675,20 @@ fn footprint_of_pid(pid: i32) -> u64 {
         .unwrap_or(0)
 }
 
+#[cfg(windows)]
+fn footprint_of_pid(pid: i32) -> u64 {
+    diri_platform::process::usage(pid as u32).map_or(0, |(memory, _)| memory)
+}
+#[cfg(windows)]
+fn cpu_time_of_pid(pid: i32) -> u64 {
+    diri_platform::process::usage(pid as u32).map_or(0, |(_, cpu)| cpu)
+}
 fn physical_memory() -> u64 {
+    #[cfg(windows)]
+    {
+        diri_platform::process::physical_memory().unwrap_or(16 << 30)
+    }
+
     #[cfg(target_os = "macos")]
     {
         let mut size: u64 = 0;
@@ -712,6 +726,7 @@ fn physical_memory() -> u64 {
 /// `lsof -a -iTCP -sTCP:LISTEN -p <pids> -Fpcn` over the tree — simple and
 /// off the hot path, with a watchdog so a wedged lsof can't stall the sweep.
 /// `-F` machine format: `p<pid>` `c<command>` `n<host:port>`.
+#[cfg(unix)]
 pub fn listening_ports(pids: &[i32], timeout: Duration) -> Option<Vec<PortInfo>> {
     if pids.is_empty() {
         return Some(Vec::new());
@@ -770,6 +785,20 @@ pub fn listening_ports(pids: &[i32], timeout: Duration) -> Option<Vec<PortInfo>>
     use std::io::Read;
     child.stdout.take()?.read_to_string(&mut output).ok()?;
     Some(parse_lsof(&output))
+}
+
+#[cfg(windows)]
+pub fn listening_ports(pids: &[i32], _timeout: Duration) -> Option<Vec<PortInfo>> {
+    Some(
+        diri_platform::process::listeners(pids)
+            .ok()?
+            .into_iter()
+            .map(|(port, pid)| PortInfo {
+                port: i64::from(port),
+                process_name: format!("PID {pid}"),
+            })
+            .collect(),
+    )
 }
 
 /// Parses `-Fpcn` output into unique (port, process) pairs, ordered by port.

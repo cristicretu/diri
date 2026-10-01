@@ -1,6 +1,6 @@
 use super::*;
+use diri_platform::ipc::{UnixListener, UnixStream};
 use std::io::{BufRead, BufReader, Write};
-use std::os::unix::net::{UnixListener, UnixStream};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 

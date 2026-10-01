@@ -230,6 +230,7 @@ pub enum StoreEffect {
         host: Option<String>,
         path: String,
     },
+    RefreshHosts,
     RefreshAgents {
         host: Option<String>,
         force: bool,
@@ -799,10 +800,25 @@ impl SessionStore {
     /// Re-reads hosts.json (daemon-owned, same machine). Called at startup and
     /// whenever the new-agent picker opens so edits show up without a relaunch.
     pub fn reload_hosts(&mut self) {
-        self.hosts = std::env::var_os("HOME")
+        let discovered = self
+            .hosts
+            .iter()
+            .filter(|h| h.wsl_distribution().is_some())
+            .cloned()
+            .collect::<Vec<_>>();
+        self.hosts = diri_platform::home_dir()
+            .map(|p| p.into_os_string())
             .map(|home| HostsConfig::load(DirijorPaths::hosts_config_file(home)).hosts)
             .unwrap_or_default();
-        self.repair_default_spawn_host();
+        for host in discovered {
+            if !self.hosts.iter().any(|h| h.id == host.id) {
+                self.hosts.push(host);
+            }
+        }
+        if !cfg!(windows) {
+            self.repair_default_spawn_host();
+        }
+        self.emit(StoreEffect::RefreshHosts);
     }
 
     /// Installs the agent catalog fetched on connect.
@@ -872,7 +888,12 @@ impl SessionStore {
             AgentKind::SHELL,
             SpawnOptions {
                 window_target,
-                cwd: Some(std::env::var("HOME").unwrap_or_else(|_| "/".to_owned())),
+                cwd: Some(
+                    diri_platform::home_dir()
+                        .map(|p| p.to_string_lossy().into_owned())
+                        .ok_or(std::env::VarError::NotPresent)
+                        .unwrap_or_else(|_| "/".to_owned()),
+                ),
                 title: Some(format!("Install {}", option.display_name)),
                 initial_prompt: Some(install.command.clone()),
                 ..SpawnOptions::default()
@@ -1997,7 +2018,7 @@ impl SessionStore {
     /// A reply typed into a needs-input banner. Returns the command to type
     /// it, or `None` after posting a notice when the session moved on; the
     /// text itself never leaves this call except inside the command.
-    #[cfg(target_os = "macos")]
+    #[cfg(any(target_os = "macos", windows))]
     pub fn take_notification_reply(
         &mut self,
         notification_id: &str,
@@ -2632,7 +2653,10 @@ impl SessionStore {
         {
             let target = target_host
                 .as_deref()
-                .map_or_else(|| "this Mac".to_owned(), |id| self.host_display_name(id));
+                .map_or_else(
+                    || crate::platform::local_machine_label_lowercase().to_owned(),
+                    |id| self.host_display_name(id),
+                );
             // A recorded failure suppresses passive requests, so a shortcut
             // press — an explicit user action — retries the way Settings'
             // Refresh does. Otherwise it just joins the in-flight scan.
@@ -2860,7 +2884,12 @@ impl SessionStore {
         roots
             .into_iter()
             .next()
-            .or_else(|| std::env::var("HOME").ok())
+            .or_else(|| {
+                diri_platform::home_dir()
+                    .map(|p| p.to_string_lossy().into_owned())
+                    .ok_or(std::env::VarError::NotPresent)
+                    .ok()
+            })
             .unwrap_or_else(|| "/".to_owned())
     }
 
@@ -2904,7 +2933,12 @@ impl SessionStore {
                     .first()
                     .map(|group| group.project.root.clone())
             })
-            .or_else(|| std::env::var("HOME").ok())
+            .or_else(|| {
+                diri_platform::home_dir()
+                    .map(|p| p.to_string_lossy().into_owned())
+                    .ok_or(std::env::VarError::NotPresent)
+                    .ok()
+            })
             .unwrap_or_else(|| "/".to_owned())
     }
 
@@ -3440,6 +3474,12 @@ impl StoreRuntime {
                             store.last_action_failure = None;
                             store.workspace_connection_changed(true);
                         }
+                        if let Ok(catalog) = state_client.hosts().await {
+                            state_store
+                                .write()
+                                .expect("session store lock poisoned")
+                                .set_hosts(catalog.hosts);
+                        }
                         // The agent catalog first: `hydrate` runs the notification
                         // policy for every arriving session, and that policy reads
                         // descriptors for banner copy and approve keystrokes.
@@ -3893,6 +3933,21 @@ async fn run_effects(
                 });
                 Ok(())
             }
+            StoreEffect::RefreshHosts => {
+                let client = Arc::clone(&client);
+                let store = Arc::clone(&store);
+                let change_tx = change_tx.clone();
+                tokio::spawn(async move {
+                    if let Ok(catalog) = client.hosts().await {
+                        store
+                            .write()
+                            .expect("session store lock poisoned")
+                            .set_hosts(catalog.hosts);
+                        let _ = change_tx.send(());
+                    }
+                });
+                Ok(())
+            }
             StoreEffect::RefreshAgents { host, force } => {
                 let client = Arc::clone(&client);
                 let store = Arc::clone(&store);
@@ -4115,7 +4170,8 @@ fn action_context(effect: &StoreEffect) -> Option<ActionContext> {
         // Catalog failures land in `agent_catalog_errors`, which the Agents
         // settings page and launch surfaces render in place — a toast on top
         // would double-report every unreachable host.
-        StoreEffect::RefreshAgents { .. }
+        StoreEffect::RefreshHosts
+        | StoreEffect::RefreshAgents { .. }
         | StoreEffect::ConfigureAgent(_)
         | StoreEffect::WatchAgentInstall { .. } => return None,
         // Import outcomes, failures included, arrive as one summary banner.

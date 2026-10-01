@@ -112,6 +112,10 @@ pub enum IconName {
     Unarchive,
     Warning,
     Worktree,
+    WindowMinimize,
+    WindowMaximize,
+    WindowRestore,
+    WindowClose,
     Text,
     Heading1,
     Heading2,
@@ -142,7 +146,7 @@ pub enum IconName {
 }
 
 impl IconName {
-    pub const ALL: [Self; 93] = [
+    pub const ALL: [Self; 97] = [
         Self::Account,
         Self::Activity,
         Self::Archive,
@@ -209,6 +213,10 @@ impl IconName {
         Self::Unarchive,
         Self::Warning,
         Self::Worktree,
+        Self::WindowMinimize,
+        Self::WindowMaximize,
+        Self::WindowRestore,
+        Self::WindowClose,
         Self::Text,
         Self::Heading1,
         Self::Heading2,
@@ -306,6 +314,10 @@ impl IconName {
             Self::Unarchive => "icons/unarchive.svg",
             Self::Warning => "icons/warning.svg",
             Self::Worktree => "icons/worktree.svg",
+            Self::WindowMinimize => "icons/window-minimize.svg",
+            Self::WindowMaximize => "icons/window-maximize.svg",
+            Self::WindowRestore => "icons/window-restore.svg",
+            Self::WindowClose => "icons/window-close.svg",
             Self::Text => "icons/text.svg",
             Self::Heading1 => "icons/heading-1.svg",
             Self::Heading2 => "icons/heading-2.svg",
@@ -597,6 +609,10 @@ fn embedded_svg(path: &str) -> Option<&'static [u8]> {
         "icons/unarchive.svg" => include_bytes!("../assets/icons/unarchive.svg"),
         "icons/warning.svg" => include_bytes!("../assets/icons/warning.svg"),
         "icons/worktree.svg" => include_bytes!("../assets/icons/worktree.svg"),
+        "icons/window-minimize.svg" => include_bytes!("../assets/icons/window-minimize.svg"),
+        "icons/window-maximize.svg" => include_bytes!("../assets/icons/window-maximize.svg"),
+        "icons/window-restore.svg" => include_bytes!("../assets/icons/window-restore.svg"),
+        "icons/window-close.svg" => include_bytes!("../assets/icons/window-close.svg"),
         _ => return None,
     })
 }

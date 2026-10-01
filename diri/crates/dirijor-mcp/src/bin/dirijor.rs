@@ -330,7 +330,7 @@ fn mcp_stdio() -> Result<(), CliError> {
     let proxy = executable
         .parent()
         .unwrap_or_else(|| Path::new("."))
-        .join("dirijor-mcp");
+        .join(diri_platform::executable_name("dirijor-mcp"));
     if !proxy.is_file() {
         return Err(CliError::failure(format!(
             "MCP frontend is missing at {}",
@@ -988,7 +988,13 @@ fn session_run_params(arguments: &[String]) -> Result<(Value, bool), CliError> {
             format!("could not determine working directory: {error}")
         ))?);
     }
-    if !Path::new(params["cwd"].as_str().unwrap()).is_absolute() {
+    let cwd = params["cwd"].as_str().unwrap();
+    let absolute = if params.get("host").is_some() {
+        cwd.starts_with('/')
+    } else {
+        Path::new(cwd).is_absolute()
+    };
+    if !absolute {
         return Err(CliError::failure(
             "--cwd must be an absolute path on the execution host",
         ));
@@ -1500,7 +1506,9 @@ fn doctor() -> Result<(), CliError> {
             Err(error) => println!("✗ Agent catalog unavailable ({})", error.message),
         }
     }
-    let home = std::env::var_os("HOME").map_or_else(|| PathBuf::from("."), PathBuf::from);
+    let home = diri_platform::home_dir()
+        .map(|p| p.into_os_string())
+        .map_or_else(|| PathBuf::from("."), PathBuf::from);
     let state = if std::env::var_os(diri_proto::paths::ENV_SOCKET).is_some() {
         // An explicit socket normally denotes an isolated test or alternate
         // instance. Its state is conventionally colocated unless the caller
@@ -1724,11 +1732,31 @@ fn stdin_bytes(cap: usize, timeout: Duration) -> Vec<u8> {
     bytes
 }
 
-#[cfg(not(unix))]
-fn stdin_bytes(cap: usize, _: Duration) -> Vec<u8> {
-    let mut bytes = Vec::new();
-    let _ = io::stdin().take(cap as u64).read_to_end(&mut bytes);
-    bytes
+#[cfg(windows)]
+fn stdin_bytes(cap: usize, timeout: Duration) -> Vec<u8> {
+    // Return bytes received before the deadline even if the provider keeps
+    // stdin open. This worker belongs to the short-lived hook CLI process.
+    let bytes = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let pending = bytes.clone();
+    let (done, receive) = std::sync::mpsc::sync_channel(1);
+    let _ = std::thread::Builder::new()
+        .name("hook-input".into())
+        .spawn(move || {
+            let mut input = io::stdin().take(cap as u64);
+            let mut buffer = [0; 8192];
+            while let Ok(n) = input.read(&mut buffer) {
+                if n == 0 {
+                    break;
+                }
+                pending
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .extend_from_slice(&buffer[..n]);
+            }
+            let _ = done.send(());
+        });
+    let _ = receive.recv_timeout(timeout);
+    std::mem::take(&mut *bytes.lock().unwrap_or_else(|e| e.into_inner()))
 }
 
 fn stdin_json(cap: usize, timeout: Duration) -> Value {

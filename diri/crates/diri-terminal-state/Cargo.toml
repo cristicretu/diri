@@ -20,6 +20,10 @@ memchr = "2.8"
 [dev-dependencies]
 # CPU time of benchmark drags (getrusage); already in the lockfile.
 libc = "0.2"
+diri-pty.workspace = true
+diri-platform.workspace = true
+serde.workspace = true
+serde_json.workspace = true
 
 [[bench]]
 name = "terminal_throughput"

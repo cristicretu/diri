@@ -60,6 +60,7 @@ fn remote_scrollback_does_not_block_input_or_screen_reads() {
         .unwrap(),
     );
     let host = HostEntry {
+        transport: Default::default(),
         id: "latency".into(),
         name: None,
         ssh: "fixture".into(),
@@ -327,6 +328,7 @@ fn engine_collects_remote_usage_without_a_node_or_holder() {
     )
     .unwrap();
     let host = HostEntry {
+        transport: Default::default(),
         id: "usage".into(),
         name: None,
         ssh: "fixture-host".into(),
@@ -406,6 +408,7 @@ fn engine_lists_remote_directories_through_the_verified_helper() {
     )
     .expect("manager");
     let host = HostEntry {
+        transport: Default::default(),
         id: "directory-fixture".into(),
         name: None,
         ssh: "fixture-host".into(),
@@ -456,6 +459,7 @@ fn persistence_probe_closes_the_shared_master_before_independent_checks() {
     )
     .expect("manager");
     let host = HostEntry {
+        transport: Default::default(),
         id: "persistence-fixture".into(),
         name: None,
         ssh: "fixture-host".into(),
@@ -506,6 +510,7 @@ fn engine_bootstraps_detaches_and_adopts_the_same_remote_process() {
         .expect("manager"),
     );
     let host = HostEntry {
+        transport: Default::default(),
         id: "fixture".into(),
         name: None,
         ssh: "fixture-host".into(),
@@ -715,6 +720,7 @@ fn engine_resets_a_remote_terminal_without_replacing_the_process() {
         .expect("manager"),
     );
     let host = HostEntry {
+        transport: Default::default(),
         id: "fixture-reset".into(),
         name: None,
         ssh: "fixture-host".into(),
@@ -890,6 +896,7 @@ fn launch_response_disconnect_recovers_the_existing_holder_idempotently() {
     )
     .expect("manager");
     let host = HostEntry {
+        transport: Default::default(),
         id: "fixture-retry".into(),
         name: None,
         ssh: "fixture-host".into(),
@@ -974,6 +981,7 @@ fn bootstrap_refuses_a_symlinked_remote_cache_ancestor() {
     )
     .expect("manager");
     let host = HostEntry {
+        transport: Default::default(),
         id: "fixture-symlink".into(),
         name: None,
         ssh: "fixture-host".into(),
@@ -1007,6 +1015,7 @@ fn interrupted_upload_cleans_only_its_nonce_and_is_retryable() {
     )
     .expect("manager");
     let host = HostEntry {
+        transport: Default::default(),
         id: "fixture-upload-retry".into(),
         name: None,
         ssh: "fixture-host".into(),
@@ -1056,6 +1065,7 @@ fn attach_ssh_disconnect_reconnects_without_replaying_unavailable_input() {
         .expect("manager"),
     );
     let host = HostEntry {
+        transport: Default::default(),
         id: "fixture-attach-retry".into(),
         name: None,
         ssh: "fixture-host".into(),
@@ -1172,6 +1182,7 @@ fn engine_terminate_uses_stop_result_after_controller_revocation() {
         .unwrap(),
     );
     let host = HostEntry {
+        transport: Default::default(),
         id: "stop-fixture".into(),
         name: None,
         ssh: "fixture-host".into(),

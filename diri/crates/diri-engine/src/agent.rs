@@ -435,7 +435,7 @@ impl AgentDescriptor {
             spec.env.retain(|(existing, _)| existing != key);
             spec.env.push((key.clone(), value.clone()));
         }
-        if self.return_to_login_shell {
+        if self.return_to_login_shell && cfg!(unix) {
             // Keep the shell as the PTY's session leader. When the agent exits
             // the command re-enters that shell and leaves a usable prompt
             // instead of ending the session. (An exit that only asks to be
@@ -755,6 +755,7 @@ mod tests {
         assert!(!keys.contains(&"CLAUDECODE"));
     }
 
+    #[cfg(unix)]
     #[test]
     fn bare_binaries_resolve_to_absolute_paths_for_foreign_executors() {
         // The holder manager that execs the argv may carry a launchd-minimal
@@ -792,6 +793,7 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
     #[test]
     fn shipped_agents_land_in_a_login_shell_when_the_agent_exits() {
         // Codex replaces its own binary when it self-updates and then exits.
@@ -1032,6 +1034,7 @@ mod tests {
         }
     }
 
+    #[cfg(unix)]
     #[test]
     fn unknown_shells_run_the_wrapper_without_the_report() {
         assert_eq!(exit_status_parameter("/usr/bin/zsh"), Some("$?"));

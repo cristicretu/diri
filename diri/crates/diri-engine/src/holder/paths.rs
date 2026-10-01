@@ -83,6 +83,9 @@ impl HolderManagerPaths {
 /// The budget check and the FNV-1a hash both match `HolderPaths.safeDirectory`
 /// in Swift exactly — a mismatch would strand every live holder on switch.
 pub fn safe_directory(preferred: &Path) -> PathBuf {
+    if cfg!(windows) {
+        return preferred.to_path_buf();
+    }
     let path = normalized(preferred);
     // Swift budgets `preferred/ssss…s.sock` (40 s's): path + "/" + 45 bytes.
     let budgeted_socket = path.len() + 1 + 45;
@@ -120,6 +123,7 @@ mod tests {
         assert_eq!(paths.pid_file(), Path::new("/tmp/holders/s_abc.pid"));
     }
 
+    #[cfg(unix)]
     #[test]
     fn a_long_directory_hashes_to_the_stable_short_root() {
         let long = format!("/private/var/folders/{}", "x".repeat(80));
@@ -160,6 +164,7 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
     #[test]
     fn the_budget_boundary_matches_swift() {
         // budget = len + 46; the fallback starts at budget >= 100, len >= 54.

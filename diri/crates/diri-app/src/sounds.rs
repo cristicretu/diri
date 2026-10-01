@@ -325,9 +325,36 @@ impl Player for PlatformPlayer {
     }
 }
 
+#[cfg(all(windows, feature = "audio-playback"))]
+impl Player for PlatformPlayer {
+    fn play(&self, wav: &[u8], volume: f32) -> io::Result<()> {
+        use windows::Win32::Media::Audio::{PlaySoundW, SND_MEMORY, SND_NODEFAULT, SND_SYNC};
+        let mut wav = wav.to_vec();
+        // Scale our own PCM instead of changing the user's system volume.
+        for sample in wav[44..].chunks_exact_mut(2) {
+            let value = (f32::from(i16::from_le_bytes([sample[0], sample[1]]))
+                * volume.clamp(0.0, 1.0)) as i16;
+            sample.copy_from_slice(&value.to_le_bytes());
+        }
+        std::thread::Builder::new()
+            .name("diri-status-sound".into())
+            .spawn(move || {
+                // Synchronous on this worker: the in-memory WAVE lives until playback finishes.
+                let _ = unsafe {
+                    PlaySoundW(
+                        windows::core::PCWSTR(wav.as_ptr().cast()),
+                        None,
+                        SND_MEMORY | SND_NODEFAULT | SND_SYNC,
+                    )
+                };
+            })?;
+        Ok(())
+    }
+}
+
 #[cfg(any(
     not(feature = "audio-playback"),
-    not(any(target_os = "macos", target_os = "linux"))
+    not(any(target_os = "macos", target_os = "linux", windows))
 ))]
 impl Player for PlatformPlayer {
     fn play(&self, _wav: &[u8], _volume: f32) -> io::Result<()> {

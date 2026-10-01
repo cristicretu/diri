@@ -252,10 +252,10 @@ impl UtilitySurfaces {
                 ))
                 .child(setting_divider(colors))
                 .child(setting_row(
-                    "Diagnostics on this Mac",
+                    format!("Diagnostics on {}", crate::platform::local_machine_label_lowercase()),
                     "What diri has recorded, before anything is shared.",
                     surface_button(
-                        "Show in Finder",
+                        crate::platform::reveal_in_file_manager_label(),
                         "show-diagnostics-folder",
                         colors,
                         cx,

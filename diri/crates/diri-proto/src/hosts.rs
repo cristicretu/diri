@@ -6,9 +6,10 @@
 
 use std::fs;
 use std::io;
+use std::io::Write as _;
 use std::path::Path;
 
-#[cfg(unix)]
+#[cfg(all(test, unix))]
 use std::os::unix::fs::PermissionsExt;
 
 use serde::{Deserialize, Serialize};
@@ -28,6 +29,17 @@ pub struct HostNodeConfig {
     pub node_id: Option<String>,
 }
 
+/// How the Engine reaches the existing POSIX Remote Helper.
+#[derive(Clone, Debug, Default, Deserialize, PartialEq, Eq, Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum HostTransport {
+    #[default]
+    Ssh,
+    Wsl {
+        distribution: String,
+    },
+}
+
 /// One configured SSH execution host with an optional first-party node used by
 /// enhanced fleet operations. Remote Holder sessions always use `ssh`.
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
@@ -36,10 +48,13 @@ pub struct HostEntry {
     /// Stable identifier referenced by `SessionSpawnParams.host` /
     /// `SessionRecord.host`.
     pub id: String,
+    #[serde(default)]
+    pub transport: HostTransport,
     /// Human-readable name for pickers and badges; falls back to `id`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub name: Option<String>,
     /// SSH destination (`user@host`, or an ssh_config alias).
+    #[serde(default)]
     pub ssh: String,
     /// Default remote working directory for new sessions (e.g. `~/code`).
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -49,6 +64,12 @@ pub struct HostEntry {
 }
 
 impl HostEntry {
+    pub fn wsl_distribution(&self) -> Option<&str> {
+        match &self.transport {
+            HostTransport::Ssh => None,
+            HostTransport::Wsl { distribution } => Some(distribution),
+        }
+    }
     pub fn display_name(&self) -> &str {
         self.name.as_deref().unwrap_or(&self.id)
     }
@@ -86,20 +107,25 @@ impl HostsConfig {
                 "host catalog path has no parent",
             )
         })?;
-        fs::create_dir_all(parent)?;
+        diri_platform::security::private_dir_all(parent)?;
 
         let file_name = path
             .file_name()
             .and_then(|name| name.to_str())
             .unwrap_or("hosts.json");
-        let temporary = parent.join(format!(".{file_name}.tmp-{}", std::process::id()));
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_err(io::Error::other)?
+            .as_nanos();
+        let temporary = parent.join(format!(".{file_name}.tmp-{}-{nonce}", std::process::id()));
         let mut data = serde_json::to_vec_pretty(self).map_err(io::Error::other)?;
         data.push(b'\n');
 
+        let mut file = diri_platform::security::create_private(&temporary)?;
         let result = (|| {
-            fs::write(&temporary, data)?;
-            #[cfg(unix)]
-            fs::set_permissions(&temporary, fs::Permissions::from_mode(0o600))?;
+            file.write_all(&data)?;
+            file.sync_all()?;
+            drop(file);
             fs::rename(&temporary, path)?;
             Ok(())
         })();
@@ -172,6 +198,7 @@ mod tests {
     fn round_trips_through_serde() {
         let config = HostsConfig {
             hosts: vec![HostEntry {
+                transport: Default::default(),
                 id: "forge".into(),
                 name: Some("Forge".into()),
                 ssh: "cristi@forge".into(),
@@ -198,6 +225,7 @@ mod tests {
         let path = directory.path().join("nested/hosts.json");
         let config = HostsConfig {
             hosts: vec![HostEntry {
+                transport: Default::default(),
                 id: "forge".into(),
                 name: Some("Forge".into()),
                 ssh: "you@forge".into(),

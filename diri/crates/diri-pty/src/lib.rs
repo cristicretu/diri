@@ -3,7 +3,6 @@
 //! The child receives an exact argv/environment/cwd tuple. The parent process
 //! environment is never inherited implicitly.
 
-#[cfg(unix)]
 pub mod checkpoint;
 #[cfg(unix)]
 pub mod foreground;
@@ -11,9 +10,10 @@ pub mod foreground;
 pub mod line_wait;
 #[cfg(unix)]
 pub mod process_facts;
-#[cfg(unix)]
+#[cfg(windows)]
+#[path = "process_facts_windows.rs"]
+pub mod process_facts;
 pub mod process_identity;
-#[cfg(unix)]
 pub mod unix_socket;
 
 use std::path::PathBuf;
@@ -61,9 +61,16 @@ mod unix;
 #[cfg(unix)]
 pub use unix::{ExitWatcher, KILL_REAP_TIMEOUT, Pty, PtyStream, REAP_POLL_INTERVAL};
 
+#[cfg(windows)]
+mod windows;
+#[cfg(windows)]
+pub use windows::{ExitWatcher, KILL_REAP_TIMEOUT, Pty, PtyStream, REAP_POLL_INTERVAL};
+
 /// How a child ended.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Exit {
+    /// On Windows this preserves the native DWORD bits as an i32. It is never
+    /// a POSIX signal; use `code as u32` for unsigned/hex presentation.
     Code(i32),
     Signal(i32),
 }

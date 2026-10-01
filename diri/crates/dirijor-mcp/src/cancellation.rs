@@ -1,8 +1,8 @@
 //! Request-scoped cancellation closes only this read operation's Engine sockets.
 //! It never cancels an already-dispatched mutation or kills an Agent session.
 
+use diri_platform::ipc::UnixStream;
 use std::net::Shutdown;
-use std::os::unix::net::UnixStream;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 

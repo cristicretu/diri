@@ -4519,7 +4519,6 @@ mod tests {
             updates: crate::updates::inert(),
             tokio,
             dev_build: None,
-            #[cfg(unix)]
             daemon_startup: None,
         })
     }
@@ -4850,7 +4849,6 @@ mod tests {
             updates: crate::updates::inert(),
             tokio,
             dev_build: None,
-            #[cfg(unix)]
             daemon_startup: None,
         });
         let (launcher, cx) =
@@ -4903,7 +4901,6 @@ mod tests {
             updates: crate::updates::inert(),
             tokio,
             dev_build: None,
-            #[cfg(unix)]
             daemon_startup: None,
         });
         let (launcher, cx) =
@@ -5105,6 +5102,7 @@ mod tests {
         let stored = {
             let mut store = runtime.store.write().expect("store lock");
             store.set_hosts(vec![diri_proto::HostEntry {
+                transport: Default::default(),
                 id: "forge".into(),
                 name: Some("Build Forge".into()),
                 ssh: "forge".into(),
@@ -5312,6 +5310,7 @@ mod tests {
         {
             let mut store = runtime.store.write().expect("store lock");
             store.set_hosts(vec![diri_proto::HostEntry {
+                transport: Default::default(),
                 id: "forge".into(),
                 name: Some("Build Forge".into()),
                 ssh: "forge".into(),
@@ -5779,7 +5778,6 @@ mod tests {
             updates: crate::updates::inert(),
             tokio,
             dev_build: None,
-            #[cfg(unix)]
             daemon_startup: None,
         });
         let window = cx
@@ -6067,7 +6065,6 @@ mod tests {
             updates: crate::updates::inert(),
             tokio,
             dev_build: None,
-            #[cfg(unix)]
             daemon_startup: None,
         });
         let (launcher, cx) =

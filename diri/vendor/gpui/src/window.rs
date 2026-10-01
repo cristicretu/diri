@@ -871,6 +871,8 @@ pub(crate) struct PaintIndex {
     accessed_element_states_index: usize,
     tab_handle_index: usize,
     line_layout_index: LineLayoutIndex,
+    // DIRI PATCH (window control areas in cached views)
+    window_control_hitboxes_index: usize,
     #[cfg(any(test, feature = "test-support"))]
     debug_bounds_index: usize,
 }
@@ -918,6 +920,8 @@ impl PaintIndex {
                 - base.accessed_element_states_index,
             tab_handle_index: self.tab_handle_index - base.tab_handle_index,
             line_layout_index: self.line_layout_index.relative_to(&base.line_layout_index),
+            window_control_hitboxes_index: self.window_control_hitboxes_index
+                - base.window_control_hitboxes_index,
             #[cfg(any(test, feature = "test-support"))]
             debug_bounds_index: self.debug_bounds_index - base.debug_bounds_index,
         }
@@ -933,6 +937,8 @@ impl PaintIndex {
                 + base.accessed_element_states_index,
             tab_handle_index: self.tab_handle_index + base.tab_handle_index,
             line_layout_index: self.line_layout_index.rebased_on(&base.line_layout_index),
+            window_control_hitboxes_index: self.window_control_hitboxes_index
+                + base.window_control_hitboxes_index,
             #[cfg(any(test, feature = "test-support"))]
             debug_bounds_index: self.debug_bounds_index + base.debug_bounds_index,
         }
@@ -1750,12 +1756,7 @@ impl Window {
             Box::new(move || {
                 handle
                     .update(&mut cx, |_, window, _cx| {
-                        for (area, hitbox) in &window.rendered_frame.window_control_hitboxes {
-                            if window.mouse_hit_test.ids.contains(&hitbox.id) {
-                                return Some(*area);
-                            }
-                        }
-                        None
+                        window.window_control_area_for(&window.mouse_hit_test)
                     })
                     .log_err()
                     .unwrap_or(None)
@@ -3422,6 +3423,7 @@ impl Window {
             accessed_element_states_index: self.next_frame.accessed_element_states.len(),
             tab_handle_index: self.next_frame.tab_stops.paint_index(),
             line_layout_index: self.text_system.layout_index(),
+            window_control_hitboxes_index: self.next_frame.window_control_hitboxes.len(),
             #[cfg(any(test, feature = "test-support"))]
             debug_bounds_index: self.next_frame.debug_bounds_history.len(),
         }
@@ -3498,6 +3500,15 @@ impl Window {
         self.next_frame.tab_stops.replay(
             &self.rendered_frame.tab_stops.insertion_history
                 [range.start.tab_handle_index..range.end.tab_handle_index],
+        );
+        // DIRI PATCH (window control areas in cached views): a reused view
+        // keeps its title-bar drag and caption-button areas, as it keeps its
+        // mouse listeners.
+        self.next_frame.window_control_hitboxes.extend(
+            self.rendered_frame.window_control_hitboxes[range.start.window_control_hitboxes_index
+                ..range.end.window_control_hitboxes_index]
+                .iter()
+                .cloned(),
         );
 
         self.text_system
@@ -4674,6 +4685,26 @@ impl Window {
         };
         self.next_frame.hitboxes.push(hitbox.clone());
         hitbox
+    }
+
+    /// DIRI PATCH (frontmost window control area): the platform window
+    /// control under `position` in the last rendered frame.
+    pub fn window_control_area_at(&self, position: Point<Pixels>) -> Option<WindowControlArea> {
+        self.window_control_area_for(&self.rendered_frame.hit_test(position))
+    }
+
+    /// DIRI PATCH (frontmost window control area): an area only claims the
+    /// pointer where its own hitbox is the frontmost one. A button drawn over
+    /// a title-bar drag area then stays a button without having to occlude,
+    /// as an unhandled press does on macOS. Upstream returns the first area
+    /// anywhere under the pointer.
+    fn window_control_area_for(&self, hit_test: &HitTest) -> Option<WindowControlArea> {
+        let frontmost = hit_test.ids.first()?;
+        self.rendered_frame
+            .window_control_hitboxes
+            .iter()
+            .find(|(_, hitbox)| hitbox.id == *frontmost)
+            .map(|(area, _)| *area)
     }
 
     /// Set a hitbox which will act as a control area of the platform window.

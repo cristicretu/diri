@@ -27,7 +27,7 @@ pub mod terminal_input;
 pub mod workspace;
 
 pub use control::{ControlError, ControlMessage, JsonValue, WIRE_VERSION};
-pub use hosts::{HostEntry, HostNodeConfig, HostsConfig};
+pub use hosts::{HostEntry, HostNodeConfig, HostTransport, HostsConfig};
 pub use methods::*;
 pub use model::*;
 pub use node::*;

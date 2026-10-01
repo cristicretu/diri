@@ -128,7 +128,9 @@ pub fn unauthorized() -> Response {
 /// The default token location, alongside the node's enrolment tokens.
 #[must_use]
 pub fn default_token_path() -> PathBuf {
-    let home = std::env::var_os("HOME").map_or_else(|| PathBuf::from("."), PathBuf::from);
+    let home = diri_platform::home_dir()
+        .map(|p| p.into_os_string())
+        .map_or_else(|| PathBuf::from("."), PathBuf::from);
     home.join(".config").join("dirijor").join("web.token")
 }
 

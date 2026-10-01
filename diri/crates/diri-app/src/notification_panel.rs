@@ -41,7 +41,7 @@ impl RootView {
         self.notification_options_open = false;
         self.notification_scroll
             .scroll_to_item(0, ScrollStrategy::Top);
-        #[cfg(target_os = "macos")]
+        #[cfg(any(target_os = "macos", windows))]
         if self.notification_panel_open {
             self.notifier.refresh_health();
         }
@@ -738,16 +738,16 @@ impl RootView {
             .child(div().flex_1())
             .child(option_button("notification-test", "Test alert", colors)
                 .on_click(cx.listener(|this, _, _, cx| {
-                    #[cfg(target_os = "macos")]
+                    # [cfg(any(target_os = "macos", windows))]
                     this.notifier.post(&crate::notifications::NotificationRequest {
                         session_event: false,
                     guard: None,
                         identifier: "diri-notification-test".into(), title: "Diri notifications are ready".into(),
-                        body: "You'll find agent updates in Notifications, even when Mac alerts are silenced.".into(),
+                        body: "You'll find agent updates in Notifications, even when system alerts are silenced.".into(),
                         thread_identifier: None, action_data: None, use_system_sound: false, reply: false,
                     });
-                    #[cfg(not(target_os = "macos"))]
-                    { this.notification_health = "System alerts are available on macOS. Your inbox works here.".into(); }
+                    #[cfg(not(any(target_os = "macos", windows)))]
+                    { this.notification_health = "System alerts are available on macOS and Windows. Your inbox works here.".into(); }
                     cx.notify();
                 })))
             .child(option_button("notification-clear", "Clear all", colors)

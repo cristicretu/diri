@@ -1,0 +1,181 @@
+name: Windows build and package
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: windows-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_PROFILE_DEV_DEBUG: line-tables-only
+  CARGO_PROFILE_RELEASE_DEBUG: '0'
+
+jobs:
+  helpers:
+    name: Windows bundle Helper (${{ matrix.target }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-24.04
+            target: x86_64-unknown-linux-musl
+          - runner: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-musl
+          - runner: macos-15
+            target: aarch64-apple-darwin
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 35
+    defaults:
+      run:
+        working-directory: diri
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            diri/target
+          key: windows-helper-${{ matrix.target }}-${{ hashFiles('diri/Cargo.lock', 'diri/rust-toolchain.toml') }}
+      - name: Install native musl linker on disposable builder
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install --yes musl-tools
+      - name: Install Rust target
+        run: rustup target add ${{ matrix.target }}
+      - name: Build versioned Helper
+        env:
+          DIRI_REMOTE_TARGETS: ${{ matrix.target }}
+          DIRI_REMOTE_BUILD_ID: ${{ github.sha }}
+        run: scripts/build-remote-helpers.sh "$PWD/target/windows-helper"
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: windows-helper-${{ matrix.target }}
+          path: diri/target/windows-helper
+          if-no-files-found: error
+
+  windows-tests:
+    name: Native Windows tests ${{ matrix.architecture }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: windows-latest
+            architecture: x64
+          - runner: windows-11-arm
+            architecture: arm64
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 35
+    defaults:
+      run:
+        working-directory: diri
+        shell: pwsh
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            diri/target
+          key: windows-tests-${{ matrix.architecture }}-${{ hashFiles('diri/Cargo.lock', 'diri/rust-toolchain.toml') }}
+          restore-keys: windows-tests-${{ matrix.architecture }}-
+      - name: Portable and native lifecycle tests
+        env:
+          GIT_CONFIG_COUNT: '1'
+          GIT_CONFIG_KEY_0: core.fsmonitor
+          GIT_CONFIG_VALUE_0: 'false'
+        # These two tests run in the next step outside the runner's restrictive Job.
+        run: cargo test --locked --no-fail-fast -p diri-platform -p diri-pty -p diri-proto -p diri-client -p diri-terminal-state -p diri-notes -p diri-updater -p diri-engine --lib --tests -- --skip a_native_session_is_adopted_with_the_same_identity_screen_and_input --skip holder_failure_kills_the_native_job_including_a_grandchild
+      - name: Detached Holder lifecycle
+        if: ${{ !cancelled() }}
+        run: ./scripts/test-windows-holder.ps1
+      - name: Native test lints
+        run: cargo clippy --locked -p diri-platform -p diri-pty -p diri-proto -p diri-client -p diri-terminal-state -p diri-notes -p diri-updater -p diri-engine --lib --tests -- -D warnings
+
+  windows:
+    name: Native Windows ${{ matrix.architecture }}
+    needs: [helpers, windows-tests]
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: windows-latest
+            architecture: x64
+          - runner: windows-11-arm
+            architecture: arm64
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 90
+    defaults:
+      run:
+        working-directory: diri
+        shell: pwsh
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            diri/target
+          key: windows-${{ matrix.architecture }}-${{ hashFiles('diri/Cargo.lock', 'diri/rust-toolchain.toml') }}
+          restore-keys: windows-${{ matrix.architecture }}-
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          pattern: windows-helper-*
+          path: diri/target/helper-parts
+      - name: Assemble exact Helper catalog
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $root = Join-Path $PWD 'target/remote-helpers'
+          New-Item -ItemType Directory -Force $root | Out-Null
+          $entries = @()
+          foreach ($part in Get-ChildItem target/helper-parts -Directory) {
+            $manifest = Get-Content -Raw (Join-Path $part.FullName 'manifest.json') | ConvertFrom-Json
+            if ($manifest.buildId -ne '${{ github.sha }}' -or $manifest.protocolMajor -ne 1) { throw 'Helper build identity mismatch' }
+            $entries += $manifest.artifacts
+            foreach ($entry in $manifest.artifacts) {
+              $destination = Join-Path $root $entry.path
+              New-Item -ItemType Directory -Force (Split-Path -Parent $destination) | Out-Null
+              Copy-Item (Join-Path $part.FullName $entry.path) $destination
+            }
+          }
+          @{protocolMajor=1; buildId='${{ github.sha }}'; artifacts=$entries} | ConvertTo-Json -Depth 5 | Set-Content -Encoding utf8NoBOM (Join-Path $root 'manifest.json')
+      - name: Format
+        run: cargo fmt --all -- --check
+      - name: Native Rust lints
+        run: cargo clippy --locked -p diri-app -p diri-engine -p dirijor-mcp -p diri-platform -p diri-pty -p diri-updater -p diri-proto -p diri-client --lib --bins -- -D warnings
+      - name: Native app test lints
+        run: cargo clippy --locked -p diri-app --all-targets -- -D warnings
+      - name: Compile fidelity capture tool
+        run: cargo check --locked -p diri-terminal-state --example pty_fidelity
+      - name: Native build and unsigned review installer
+        run: ./scripts/package-windows.ps1 -Architecture '${{ matrix.architecture }}' -HelperCatalog target/remote-helpers/manifest.json -Unsigned
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: diri-windows-${{ matrix.architecture }}-unsigned
+          path: diri/dist/windows/${{ matrix.architecture }}/
+          if-no-files-found: error
+
+  sign:
+    name: Release signatures
+    needs: windows
+    if: github.ref == 'refs/heads/main' && github.event_name != 'pull_request' && vars.DIRI_WINDOWS_SIGNING == 'artifact-signing'
+    strategy:
+      fail-fast: false
+      matrix:
+        architecture: [x64, arm64]
+    permissions:
+      contents: read
+      actions: read
+      id-token: write
+    uses: ./.github/workflows/windows-sign.yml
+    with:
+      architecture: ${{ matrix.architecture }}

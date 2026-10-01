@@ -24,8 +24,8 @@
 //! session is killed, this run's Holder manager (matched by its unique temp
 //! root) is stopped, and the root removed.
 
+use diri_platform::ipc::UnixStream;
 use std::io::{BufRead, Write};
-use std::os::unix::net::UnixStream;
 use std::path::PathBuf;
 use std::sync::Mutex as StdMutex;
 

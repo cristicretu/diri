@@ -70,7 +70,9 @@ impl ProcessFacts {
     pub fn validate(&self) -> Result<(), &'static str> {
         for field in [&self.executable, &self.working_directory] {
             if let ProcessValue::Available { value } = field
-                && (!value.starts_with('/') || value.len() > 16 * 1024 || value.contains('\0'))
+                && (!native_path(value, self.identity)
+                    || value.len() > 64 * 1024
+                    || value.contains('\0'))
             {
                 return Err("invalid native process path");
             }
@@ -87,6 +89,22 @@ impl ProcessFacts {
             return Err("process account does not match effective UID");
         }
         Ok(())
+    }
+}
+
+fn native_path(value: &str, identity: ProcessIdentity) -> bool {
+    if matches!(
+        identity.birth(),
+        crate::process::ProcessBirth::Windows { .. }
+    ) {
+        let bytes = value.as_bytes();
+        value.starts_with("\\\\")
+            || (bytes.len() >= 3
+                && bytes[0].is_ascii_alphabetic()
+                && bytes[1] == b':'
+                && matches!(bytes[2], b'/' | b'\\'))
+    } else {
+        value.starts_with('/')
     }
 }
 

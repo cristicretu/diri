@@ -337,7 +337,7 @@ mod tests {
         use tokio::io::{AsyncBufReadExt as _, AsyncWriteExt as _, BufReader};
         let temp = tempfile::tempdir_in("/tmp").unwrap();
         let socket = temp.path().join("engine.sock");
-        let listener = tokio::net::UnixListener::bind(&socket).unwrap();
+        let listener = diri_platform::ipc::asynchronous::UnixListener::bind(&socket).unwrap();
         let (calls_tx, mut calls_rx) = tokio::sync::mpsc::channel(16);
         let engine = tokio::spawn(async move {
             let (stream, _) = listener.accept().await.unwrap();

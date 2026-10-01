@@ -10,6 +10,7 @@ name = "diri-web"
 path = "src/main.rs"
 
 [dependencies]
+diri-platform = { workspace = true, features = ["async"] }
 diri-client.workspace = true
 diri-proto.workspace = true
 getrandom.workspace = true

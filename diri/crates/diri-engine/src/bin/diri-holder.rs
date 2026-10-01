@@ -10,10 +10,32 @@ use std::time::Duration;
 #[cfg(unix)]
 use diri_engine::holder::{HolderManagerServer, HolderServer};
 
-#[cfg(not(unix))]
+#[cfg(windows)]
 fn main() {
-    eprintln!("diri-holder requires a unix platform");
-    std::process::exit(64);
+    use std::io::Read;
+    let arguments: Vec<String> = std::env::args().collect();
+    let result = (|| -> std::io::Result<()> {
+        let spec = value_after(&arguments, "--spec").ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "usage: diri-holder --spec <path>",
+            )
+        })?;
+        let mut bytes = Vec::new();
+        diri_platform::security::read_owned(std::path::Path::new(&spec), true)?
+            .take(1024 * 1024 + 1)
+            .read_to_end(&mut bytes)?;
+        if bytes.len() > 1024 * 1024 {
+            return Err(std::io::Error::other("oversized Holder specification"));
+        }
+        let parsed = serde_json::from_slice(&bytes).map_err(std::io::Error::other)?;
+        std::fs::remove_file(&spec)?;
+        diri_engine::holder::HolderServer::run(parsed).map_err(std::io::Error::other)
+    })();
+    if let Err(error) = result {
+        eprintln!("diri-holder: {error}");
+        std::process::exit(1);
+    }
 }
 
 #[cfg(unix)]

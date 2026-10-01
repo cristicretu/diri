@@ -1,6 +1,7 @@
 //! Finding — and judging — the `.app` this process is running out of.
 
 use std::path::{Path, PathBuf};
+#[cfg(unix)]
 use std::process::Command;
 
 use crate::error::{Result, UpdateError};
@@ -32,6 +33,7 @@ pub fn running_bundle() -> Option<PathBuf> {
 ///
 /// Falls back to `0.0.0` when `sw_vers` is unavailable, which makes every
 /// release with a floor ineligible — the safe direction to fail.
+#[cfg(not(windows))]
 pub fn system_version() -> Version {
     Command::new("/usr/bin/sw_vers")
         .arg("-productVersion")
@@ -70,6 +72,31 @@ fn directory_is_writable(directory: &Path) -> bool {
             true
         }
         Err(_) => false,
+    }
+}
+
+#[cfg(windows)]
+pub fn system_version() -> Version {
+    // RtlGetVersion reports the OS build independently of compatibility mode.
+    #[repr(C)]
+    struct OsVersion {
+        size: u32,
+        major: u32,
+        minor: u32,
+        build: u32,
+        platform: u32,
+        service_pack: [u16; 128],
+    }
+    #[link(name = "ntdll")]
+    unsafe extern "system" {
+        fn RtlGetVersion(version: *mut OsVersion) -> i32;
+    }
+    let mut version: OsVersion = unsafe { std::mem::zeroed() };
+    version.size = size_of::<OsVersion>() as u32;
+    if unsafe { RtlGetVersion(&mut version) } >= 0 {
+        Version::new(version.major, version.minor, version.build)
+    } else {
+        Version::default()
     }
 }
 

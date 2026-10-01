@@ -321,6 +321,7 @@ fn terminate_sidecar(inner: &mut PoolInner, reason: &str) {
 }
 
 fn terminate_child_group(child: &mut Child) {
+    #[cfg(unix)]
     let process_group = child.id() as i32;
     #[cfg(unix)]
     // SAFETY: the sidecar calls `setsid` before exec, so its positive pid is
@@ -392,7 +393,7 @@ fn locate_sidecar() -> Option<PathBuf> {
         }
     }
     let mut candidates: Vec<PathBuf> = Vec::new();
-    if let Ok(exe) = std::env::current_exe().and_then(|exe| exe.canonicalize()) {
+    if let Ok(exe) = std::env::current_exe().and_then(diri_platform::canonicalize) {
         // /usr/bin/<exe> -> /usr/lib/diri/sidecar/server.js. AppImage keeps the
         // same layout beneath its mounted AppDir.
         candidates.push(

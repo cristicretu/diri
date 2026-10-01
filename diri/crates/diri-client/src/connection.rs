@@ -1,9 +1,9 @@
 use std::path::Path;
 use std::sync::Arc;
 
+use diri_platform::ipc::asynchronous::UnixStream;
 use diri_proto::control::{MAX_CONTROL_LINE_BYTES, decode_line};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-use tokio::net::UnixStream;
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 
