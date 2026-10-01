@@ -444,7 +444,10 @@ impl FrameBreakdown {
             ("faults", Value::from(self.faults)),
             ("idle_ms", Value::from(self.idle)),
             ("active", Value::from(self.window_active)),
-            ("app_active", Value::from(APP_ACTIVE.load(Ordering::Relaxed))),
+            (
+                "app_active",
+                Value::from(APP_ACTIVE.load(Ordering::Relaxed)),
+            ),
             ("window", Value::from(window)),
             ("surface", Value::from(context.surface)),
             ("workspace", Value::from(context.workspace)),
@@ -463,6 +466,7 @@ impl FrameBreakdown {
             ("a11y", Value::from(self.gpui.a11y_active)),
         ]
     }
+}
 
 /// A zero-size element painted last in a main window: the time from the
 /// start of the root view's render to here is the frame's CPU cost (render,
