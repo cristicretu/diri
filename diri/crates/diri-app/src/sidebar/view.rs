@@ -198,6 +198,10 @@ pub(crate) enum SidebarEvent {
     AccountAction(Option<String>),
     ManageAccounts,
     ContinueAccount(SessionId),
+    /// Pop this session out into a floating picture-in-picture window. Root
+    /// owns the app services the window needs.
+    #[cfg(target_os = "macos")]
+    PictureInPicture(SessionId),
     VisibilityChanged,
     /// The sidebar and top strip must adopt the new layout together.
     TabOrientationChanged,
@@ -6516,6 +6520,21 @@ impl Sidebar {
                         ));
                     }
                 }
+            }
+            #[cfg(target_os = "macos")]
+            if running {
+                content = content.child(menu_row(
+                    "Picture in Picture",
+                    colors,
+                    cx.listener({
+                        let id = id.clone();
+                        move |this, _, _, cx| {
+                            this.ui.popover = None;
+                            cx.emit(SidebarEvent::PictureInPicture(id.clone()));
+                            cx.notify();
+                        }
+                    }),
+                ));
             }
             let rename_session = session.clone();
             content = content

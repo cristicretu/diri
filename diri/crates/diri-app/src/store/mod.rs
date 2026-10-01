@@ -40,6 +40,8 @@ pub use prefs::{
     FileEditor, InspectorTab, Prefs, SavedWindow, SidebarGrouping, SidebarOrdering, TabOrientation,
     WindowMaterial, WindowMode, WindowPlacement,
 };
+#[cfg(target_os = "macos")]
+pub use prefs::{PipCorner, PipPlacement};
 pub use projection::{SidebarProject, SidebarProjection, SidebarRow};
 pub use residency::{ResidencyUpdate, TerminalResidency};
 pub(crate) use window_navigation::{WindowAction, WindowStore, WindowWrite};

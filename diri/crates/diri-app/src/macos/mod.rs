@@ -4,6 +4,7 @@ pub(crate) mod floating_panel;
 pub(crate) mod login_item;
 pub mod menu_bar;
 pub mod notifier;
+pub(crate) mod pip_panel;
 pub(crate) mod terminal_keys;
 
 use objc2_foundation::NSBundle;

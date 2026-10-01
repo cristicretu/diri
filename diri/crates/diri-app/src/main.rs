@@ -52,6 +52,8 @@ mod palette_workspace;
 mod path_picker;
 mod peek_settle;
 mod phone_access;
+#[cfg(target_os = "macos")]
+mod picture_in_picture;
 mod platform;
 mod progress_mark;
 mod project_hue;

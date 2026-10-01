@@ -636,6 +636,10 @@ impl RootView {
                     surfaces.open_account_continuation(id.clone(), window, cx)
                 });
             }
+            #[cfg(target_os = "macos")]
+            if let SidebarEvent::PictureInPicture(id) = event {
+                this.toggle_picture_in_picture(id.clone(), window, cx);
+            }
             if let SidebarEvent::HandoffProposed(proposal) = event {
                 this.launcher.update(cx, |launcher, cx| {
                     launcher.open_handoff(proposal.clone(), window, cx);
@@ -2411,6 +2415,18 @@ impl RootView {
                 }
             }
             CommandId::ToggleNotifications => self.toggle_notifications(window, cx),
+            #[cfg(target_os = "macos")]
+            CommandId::PictureInPicture => {
+                let selected = self
+                    .window_store
+                    .read()
+                    .expect("session store lock poisoned")
+                    .selected_session_id()
+                    .cloned();
+                if let Some(id) = selected {
+                    self.toggle_picture_in_picture(id, window, cx);
+                }
+            }
             CommandId::SelectNextAttentionSession => {
                 self.sidebar
                     .update(cx, |sidebar, cx| sidebar.select_next_needing_input(cx));
@@ -2447,6 +2463,48 @@ impl RootView {
             }
             _ => cx.propagate(),
         }
+    }
+
+    /// Pops `id` out into a floating picture-in-picture window, or closes the
+    /// one already open for it.
+    #[cfg(target_os = "macos")]
+    fn toggle_picture_in_picture(
+        &mut self,
+        id: SessionId,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.preview {
+            return;
+        }
+        let display = window.display(cx).map(|display| display.id());
+        crate::picture_in_picture::toggle(
+            id,
+            self.services.clone(),
+            window.window_handle(),
+            display,
+            cx,
+        );
+    }
+
+    /// Brings this window forward on `id` with its terminal focused, the way
+    /// a picture-in-picture window hands its session back.
+    #[cfg(target_os = "macos")]
+    pub(crate) fn reveal_session(
+        &mut self,
+        id: SessionId,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.window_store
+            .write()
+            .expect("session store lock poisoned")
+            .select(id);
+        window.activate_window();
+        if let Some(terminal) = &self.terminal {
+            terminal.update(cx, |terminal, cx| terminal.focus(window, cx));
+        }
+        cx.notify();
     }
 
     fn select_session_shortcut(&mut self, index: usize, cx: &mut Context<Self>) {
@@ -5220,6 +5278,11 @@ impl Render for RootView {
             .on_action(
                 cx.listener(|this, _: &DelegateSelectedSession, window, cx| {
                     this.run_command(CommandId::DelegateSelectedSession, window, cx);
+                }),
+            )
+            .on_action(
+                cx.listener(|this, _: &commands::PictureInPicture, window, cx| {
+                    this.run_command(CommandId::PictureInPicture, window, cx);
                 }),
             )
             .on_action(

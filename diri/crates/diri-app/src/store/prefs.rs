@@ -98,6 +98,28 @@ impl WindowPlacement {
     }
 }
 
+/// A screen corner the picture-in-picture window rests in.
+#[derive(Clone, Copy, Debug, Default, Deserialize, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub enum PipCorner {
+    TopLeft,
+    TopRight,
+    BottomLeft,
+    #[default]
+    BottomRight,
+}
+
+/// Where the last picture-in-picture window settled. A corner rather than a
+/// point, because the window always snaps to one and a corner survives a
+/// change of display resolution; the size is what the user dragged it to.
+#[derive(Clone, Copy, Debug, Deserialize, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PipPlacement {
+    pub corner: PipCorner,
+    pub width: f32,
+    pub height: f32,
+}
+
 /// A window that was open beside the key window when diri last quit, with
 /// enough of its view state to bring it back as it was.
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
@@ -334,6 +356,10 @@ pub struct Prefs {
     /// empty, so an update from those versions shows them once.
     #[serde(default)]
     pub whats_new_seen_version: String,
+    /// Corner and size of the last picture-in-picture window, so the next
+    /// one opens where the user put the previous one. PiP windows are never
+    /// reopened at launch.
+    pub picture_in_picture: Option<PipPlacement>,
 }
 
 impl Default for Prefs {
@@ -393,6 +419,7 @@ impl Default for Prefs {
             last_selected_session: None,
             herdr_imported: Default::default(),
             whats_new_seen_version: crate::updates::CURRENT_VERSION.to_owned(),
+            picture_in_picture: None,
         }
     }
 }

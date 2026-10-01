@@ -128,11 +128,14 @@ impl Drop for LivePreview {
 }
 
 impl LivePreview {
-    pub(crate) fn open(
+    /// `cx` is the view that repaints when the preview's state changes. The
+    /// grid itself is written from the tokio side; the element reads it on
+    /// its own paint.
+    pub(crate) fn open<V: 'static>(
         runtime: &tokio::runtime::Handle,
         socket: std::path::PathBuf,
         id: SessionId,
-        cx: &mut gpui::Context<crate::session_surfaces::SessionSurfaces>,
+        cx: &mut gpui::Context<V>,
     ) -> Self {
         use diri_term::{buffer::GridBuffer, element::TerminalElement};
         let element = TerminalElement::with_buffer(GridBuffer::new(0, 0))

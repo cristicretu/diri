@@ -83,6 +83,7 @@ actions!(
         ArchiveSelectedSession,
         RenameSelectedSession,
         DelegateSelectedSession,
+        PictureInPicture,
         SelectNextAttentionSession,
         CheckForUpdates,
         ShowWhatsNew,
@@ -184,6 +185,7 @@ pub enum CommandId {
     ArchiveSelectedSession,
     RenameSelectedSession,
     DelegateSelectedSession,
+    PictureInPicture,
     SelectNextAttentionSession,
     CheckForUpdates,
     ShowWhatsNew,
@@ -807,6 +809,16 @@ pub const COMMANDS: &[CommandSpec] = &[
         "handoff delegate context agent session"
     ),
     spec!(
+        PictureInPicture,
+        "picture-in-picture",
+        Some("cmd-alt-p"),
+        Some("⌥⌘P"),
+        Some(APP_CONTEXT),
+        "Picture in Picture",
+        "pip.enter",
+        "pip float watch mini window always on top overlay"
+    ),
+    spec!(
         SelectNextAttentionSession,
         "select-next-attention-session",
         Some("cmd-shift-j"),
@@ -1277,6 +1289,7 @@ impl CommandSpec {
             CommandId::DelegateSelectedSession => {
                 KeyBinding::new(key, DelegateSelectedSession, context)
             }
+            CommandId::PictureInPicture => KeyBinding::new(key, PictureInPicture, context),
             CommandId::SelectNextAttentionSession => {
                 KeyBinding::new(key, SelectNextAttentionSession, context)
             }
@@ -1331,7 +1344,8 @@ fn platform_keystroke(id: CommandId, key: &str) -> Option<String> {
 
 #[cfg(any(test, not(target_os = "macos")))]
 fn linux_keystroke(id: CommandId, key: &str) -> Option<String> {
-    if id == CommandId::HideApp {
+    // Picture in Picture is an AppKit panel; there is no Linux window to open.
+    if matches!(id, CommandId::HideApp | CommandId::PictureInPicture) {
         return None;
     }
     // Cmd-Ctrl-D would otherwise collide with the inspector's Cmd-Shift-D
@@ -1543,6 +1557,11 @@ impl CommandId {
             Self::DelegateSelectedSession => ShortcutMetadata {
                 title: "Delegate session",
                 description: "Hand off work from the selected session",
+                category: Sessions,
+            },
+            Self::PictureInPicture => ShortcutMetadata {
+                title: "Picture in Picture",
+                description: "Watch the selected session in a small window above other apps",
                 category: Sessions,
             },
             Self::ToggleNotifications => ShortcutMetadata {
@@ -1970,6 +1989,7 @@ impl CommandId {
             Self::ArchiveSelectedSession => Box::new(ArchiveSelectedSession),
             Self::RenameSelectedSession => Box::new(RenameSelectedSession),
             Self::DelegateSelectedSession => Box::new(DelegateSelectedSession),
+            Self::PictureInPicture => Box::new(PictureInPicture),
             Self::SelectNextAttentionSession => Box::new(SelectNextAttentionSession),
             Self::CheckForUpdates => Box::new(CheckForUpdates),
             Self::ShowWhatsNew => Box::new(ShowWhatsNew),

@@ -329,6 +329,7 @@ fn append_management_actions(
                             | CommandId::ToggleNotifications
                             | CommandId::CheckForUpdates
                             | CommandId::ShowWhatsNew
+                            | CommandId::PictureInPicture
                     )
             )
         }),
@@ -471,6 +472,12 @@ pub fn actions_for_default_host(
         && session.is_note()
     {
         result.push(registered_action(CommandId::NoteVersionHistory));
+    }
+
+    // Picture in Picture follows the selected session, like its shortcut.
+    #[cfg(target_os = "macos")]
+    if selected.is_some_and(|session| !session.is_archived()) {
+        result.push(registered_action(CommandId::PictureInPicture));
     }
 
     // Session handoff: move the SELECTED Claude session across hosts (v1 is

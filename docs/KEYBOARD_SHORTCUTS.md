@@ -23,6 +23,7 @@ continue to take precedence.
 | ⌘R | Command-R | Rename the selected session in place |
 | ⌃⌘D | Control-Command-D | Mark the selected session as a handoff source; select a target and press again to review and send |
 | ⇧⌘W | Shift-Command-W | Archive the selected session |
+| ⌥⌘P | Option-Command-P | Picture in Picture: watch the selected session in a small window that floats above other apps (press again to close it) |
 | ⌘W | Command-W | Close a focused auxiliary terminal; otherwise close the selected session, or the window when none is selected |
 | ⇧⌘T | Shift-Command-T | Reopen the most recently closed session |
 | ⌘Q | Command-Q | Quit Diri (the daemon keeps sessions alive) |
