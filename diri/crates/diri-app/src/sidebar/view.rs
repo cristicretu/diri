@@ -7590,6 +7590,15 @@ impl Sidebar {
         cx.notify();
     }
 
+    /// The workspace session on screen ended without a close from this
+    /// window: a shell's `exit`, or a close from elsewhere. The window moves
+    /// to the session it falls back to, exactly as ⌘W leaves a closed one.
+    pub(crate) fn activate_ended_session_survivor(&mut self, cx: &mut Context<Self>) {
+        // Writing reconciles this window's selection off the ended session.
+        drop(self.store.write().expect("session store lock poisoned"));
+        self.activate_close_survivor(true, cx);
+    }
+
     /// Selects the nth session (⌘1–⌘9 order, matching the row hints) and
     /// reports whether a session existed at that index.
     pub fn select_shortcut(&mut self, index: usize, cx: &mut Context<Self>) -> bool {

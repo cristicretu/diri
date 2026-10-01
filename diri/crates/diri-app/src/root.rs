@@ -11,6 +11,8 @@ mod progress_frames;
 mod project_agent_tests;
 #[cfg(all(test, target_os = "macos"))]
 mod row_motion_frames;
+#[cfg(test)]
+mod session_focus_tests;
 #[cfg(all(test, target_os = "macos"))]
 mod theme_fade_frames;
 #[cfg(all(test, target_os = "macos"))]
@@ -1565,8 +1567,17 @@ impl RootView {
             if let Some(auxiliary) = &self.auxiliary_terminal {
                 auxiliary.update(cx, |terminal, _| terminal.release_layout_control());
             }
+            // The plain terminal stops rendering here. Keeping its focus would
+            // leave every key, ⌘T included, with no element to reach.
+            let terminal_had_focus = self
+                .terminal
+                .as_ref()
+                .is_some_and(|terminal| terminal.read(cx).is_focused(window));
             if let Some(terminal) = &self.terminal {
-                terminal.update(cx, |terminal, _| terminal.release_layout_control());
+                terminal.update(cx, |terminal, _| {
+                    terminal.release_layout_control();
+                    terminal.set_covered(true);
+                });
             }
             if self.workspace_workbench.is_none() {
                 let runtime = self.services.store.clone();
@@ -1617,6 +1628,11 @@ impl RootView {
                                 });
                             }
                         }
+                        crate::workspace_workbench::WorkspaceWorkbenchEvent::FocusedSessionEnded => {
+                            this.sidebar.update(cx, |sidebar, cx| {
+                                sidebar.activate_ended_session_survivor(cx)
+                            });
+                        }
                     },
                 )
                 .detach();
@@ -1638,12 +1654,20 @@ impl RootView {
                 .detach();
                 self.workspace_workbench = Some(workbench);
             }
+            // The workbench is inactive until its tab arrives, so this parks
+            // focus on its placeholder; `set_tab` then hands it to the pane.
+            if terminal_had_focus && let Some(workbench) = &self.workspace_workbench {
+                workbench.update(cx, |workbench, cx| workbench.focus(window, cx));
+            }
         } else {
             if let Some(workbench) = &self.workspace_workbench {
                 workbench.update(cx, |workbench, cx| workbench.deactivate(cx));
             }
             if let Some(terminal) = &self.terminal {
-                terminal.update(cx, |terminal, cx| terminal.focus(window, cx));
+                terminal.update(cx, |terminal, cx| {
+                    terminal.set_covered(false);
+                    terminal.focus(window, cx);
+                });
             }
         }
         self.sync_inspector_context(cx);

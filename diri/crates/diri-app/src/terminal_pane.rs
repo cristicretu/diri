@@ -882,6 +882,10 @@ pub struct TerminalPane {
     /// daemon-created id asynchronously, so this transition is also the
     /// reliable point at which keyboard focus can leave the picker.
     observed_selected_id: Option<SessionId>,
+    /// A saved workspace is painted in this pane's place. Selection still
+    /// moves as workspace panes take focus, but this pane must not follow it
+    /// with the keyboard: keys sent to an unrendered pane reach nothing.
+    covered: bool,
     #[cfg(test)]
     input_observer: Option<InputObserver>,
     /// Every `pane.blank` this pane recorded, for tests.
@@ -1130,6 +1134,7 @@ impl TerminalPane {
             pane_tx,
             next_attachment_generation: 1,
             focus,
+            covered: false,
             glyphs: HashMap::new(),
             session_links: SessionLinks::new(cx),
             main_viewport: gpui::Size::default(),
@@ -1391,7 +1396,7 @@ impl TerminalPane {
         // successful spawns select their daemon-assigned id on the async store
         // path. Following the selection here covers both RPC/event orderings
         // and avoids trying to focus a terminal before its id exists.
-        if selection_changed && selected_id.is_some() {
+        if selection_changed && selected_id.is_some() && !self.covered {
             self.focus(window, cx);
         }
         self.reconcile_secure_input(window);
@@ -1683,6 +1688,10 @@ impl TerminalPane {
 
     pub fn header_hidden(&self) -> bool {
         self.header_hidden
+    }
+
+    pub(crate) fn set_covered(&mut self, covered: bool) {
+        self.covered = covered;
     }
 
     /// Height of the chrome painted above the terminal surface, which every
