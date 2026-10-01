@@ -86,6 +86,49 @@ pub fn source_name(source: StatusEvidenceSource) -> &'static str {
     }
 }
 
+/// One sentence on what kind of signal decided the status.
+#[must_use]
+pub fn source_explanation(source: StatusEvidenceSource) -> &'static str {
+    match source {
+        StatusEvidenceSource::Hook => {
+            "A structured lifecycle hook from the agent drove this status."
+        }
+        StatusEvidenceSource::Notify => {
+            "A structured completion notification from the agent drove this status."
+        }
+        StatusEvidenceSource::ScreenRule => {
+            "A privacy-safe manifest rule matched the terminal state; no screen content is included."
+        }
+        StatusEvidenceSource::ProcessLiveness => {
+            "The agent exposes process-only status, so process activity or exit is authoritative."
+        }
+        StatusEvidenceSource::Staleness => {
+            "Authoritative signals stopped arriving, so Diri fell back to unknown instead of guessing."
+        }
+        StatusEvidenceSource::Transport => {
+            "The remote transport failed; the agent process exit has not been confirmed."
+        }
+        StatusEvidenceSource::Unknown => {
+            "This daemon reported an evidence source this app does not recognize yet."
+        }
+    }
+}
+
+/// How long ago a signal timestamp (milliseconds since the epoch) was.
+#[must_use]
+pub(crate) fn signal_age(signal_at_ms: f64) -> String {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0.0, |elapsed| elapsed.as_secs_f64() * 1000.0);
+    let seconds = ((now - signal_at_ms) / 1000.0).max(0.0) as u64;
+    match seconds {
+        0..=59 => "now".to_owned(),
+        60..=3_599 => format!("{}m ago", seconds / 60),
+        3_600..=86_399 => format!("{}h ago", seconds / 3_600),
+        _ => format!("{}d ago", seconds / 86_400),
+    }
+}
+
 #[must_use]
 pub fn fallback_name(reason: StatusFallbackReason) -> &'static str {
     match reason {
@@ -114,7 +157,7 @@ fn active_name(value: bool) -> &'static str {
     if value { "active" } else { "inactive" }
 }
 
-fn status_name(status: &SessionStatus) -> &'static str {
+pub(crate) fn status_name(status: &SessionStatus) -> &'static str {
     match status {
         SessionStatus::Starting => "starting",
         SessionStatus::Idle => "idle",
