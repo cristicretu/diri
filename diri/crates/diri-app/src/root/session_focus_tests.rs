@@ -65,20 +65,100 @@ fn typing_reaches_active_terminal(root: &RootView, window: &Window, cx: &App) ->
         .is_some_and(|terminal| terminal.read(cx).is_focused(window))
 }
 
+fn exited(code: i32) -> SessionStatus {
+    SessionStatus::Exited(ExitInfo {
+        reason: ExitReason::Exited,
+        code: Some(code),
+        signal: None,
+        system_restart: false,
+    })
+}
+
+fn claude(template: &SessionRecord, id: &str) -> SessionRecord {
+    let mut agent = shell(template, id);
+    agent.kind = AgentKind::CLAUDE_CODE;
+    agent.agent_session_id = Some("conversation".into());
+    agent.resumability = Resumability::Resumable;
+    agent
+}
+
+/// How the session on screen ends.
+enum Ending {
+    /// Its process exits with this status.
+    Process(SessionStatus),
+    /// ⌘W, with no confirmation asked.
+    CloseShortcut,
+}
+
 #[gpui::test]
-fn exiting_the_focused_workspace_shell_shows_the_previous_session_with_the_keyboard(
+fn exiting_the_focused_workspace_shell_shows_the_previous_session_at_once(
     cx: &mut gpui::TestAppContext,
+) {
+    check_the_window_moves_on_in_place(
+        cx,
+        |template| shell(template, "exiting-shell"),
+        Ending::Process(exited(0)),
+        None,
+    );
+}
+
+#[gpui::test]
+fn quitting_a_focused_claude_session_shows_the_previous_session_at_once(
+    cx: &mut gpui::TestAppContext,
+) {
+    check_the_window_moves_on_in_place(
+        cx,
+        |template| claude(template, "quitting-claude"),
+        Ending::Process(exited(0)),
+        None,
+    );
+}
+
+#[gpui::test]
+fn a_crashed_claude_session_stays_listed_and_is_announced(cx: &mut gpui::TestAppContext) {
+    check_the_window_moves_on_in_place(
+        cx,
+        |template| claude(template, "crashed-claude"),
+        Ending::Process(exited(1)),
+        Some("exited with code 1"),
+    );
+}
+
+#[gpui::test]
+fn closing_the_focused_session_with_the_shortcut_stays_in_the_layout(
+    cx: &mut gpui::TestAppContext,
+) {
+    check_the_window_moves_on_in_place(
+        cx,
+        |template| claude(template, "closed-claude"),
+        Ending::CloseShortcut,
+        None,
+    );
+}
+
+/// The session on screen ends. The window shows the session used before it
+/// in the same layout at once, ahead of the Engine, and never paints the
+/// ended one's exit card or an empty pane. A session that did not end
+/// cleanly stays listed and the window says so.
+fn check_the_window_moves_on_in_place(
+    cx: &mut gpui::TestAppContext,
+    ending_session: impl FnOnce(&SessionRecord) -> SessionRecord,
+    ending: Ending,
+    notice: Option<&str>,
 ) {
     cx.update(|cx| commands::bind_keys(cx, &Default::default()));
     let services = test_services();
     let runtime = services.store.clone();
     let fixture = SidebarPreviewFixture::make(PreviewScenario::Typical);
-    let template = fixture.list.sessions[0].clone();
-    let exiting = SessionId::new("exiting-shell");
+    let ending_session = ending_session(&fixture.list.sessions[0]);
+    let exiting = ending_session.id.clone();
     let previous = {
         let mut store = runtime.store.write().unwrap();
         store.hydrate(fixture.list);
-        store.upsert_session(shell(&template, &exiting.0));
+        store.upsert_session(ending_session);
+        store
+            .update_preferences(|prefs| prefs.confirm_before_closing_session = false)
+            .unwrap();
         store
             .ordered_sessions()
             .into_iter()
@@ -116,46 +196,69 @@ fn exiting_the_focused_workspace_shell_shows_the_previous_session_with_the_keybo
         assert_eq!(root.active_session_id(cx), Some(exiting.clone()));
         assert!(typing_reaches_active_terminal(root, window, cx));
     });
-
-    // The shell runs `exit`: a clean exit with nothing to resume closes it.
-    {
-        let mut store = runtime.store.write().unwrap();
-        let mut exited = store.sessions()[&exiting].as_ref().clone();
-        exited.status = SessionStatus::Exited(ExitInfo {
-            reason: ExitReason::Exited,
-            code: Some(0),
-            signal: None,
-            system_restart: false,
+    let shows_previous = |cx: &mut gpui::VisualTestContext| {
+        for selector in ["exit-pill", "exited-card", "workspace-pane-unavailable"] {
+            assert!(
+                cx.debug_bounds(selector).is_none(),
+                "{selector} flashed while the window moved on"
+            );
+        }
+        root.update_in(cx, |root, window, cx| {
+            assert!(root.active_workspace.is_some(), "the layout stays");
+            assert_eq!(
+                root.active_session_id(cx),
+                Some(previous.clone()),
+                "the window shows the session used before"
+            );
+            assert!(typing_reaches_active_terminal(root, window, cx));
+            assert!(keyboard_reaches_app_commands(window, cx));
         });
-        store.upsert_session(exited);
+    };
+
+    match ending {
+        Ending::Process(status) => {
+            let mut store = runtime.store.write().unwrap();
+            let mut record = store.sessions()[&exiting].as_ref().clone();
+            record.status = status;
+            store.upsert_session(record);
+        }
+        Ending::CloseShortcut => {
+            cx.simulate_keystrokes(&commands::test_chords("cmd-w"));
+        }
     }
     runtime.publish_local_change();
     cx.run_until_parked();
-    root.update_in(cx, |root, window, cx| {
-        assert_eq!(
-            root.active_session_id(cx),
-            Some(previous.clone()),
-            "the window moves on to the session used before the shell"
-        );
-        assert!(typing_reaches_active_terminal(root, window, cx));
-        assert!(keyboard_reaches_app_commands(window, cx));
+    // Shown before the Engine answers: the edit that selects it is in flight.
+    shows_previous(cx);
+    assert!(!runtime.store.read().unwrap().workspace_catalog().can_edit());
+    let closes = notice.is_none();
+    assert_eq!(
+        runtime.store.read().unwrap().is_open(&exiting),
+        !closes,
+        "only a session that ended cleanly closes"
+    );
+    root.update_in(cx, |root, _, _| match notice {
+        Some(notice) => {
+            let toast = root.toast.current().expect("the failure is announced");
+            assert_eq!(toast.tone, crate::toast::ToastTone::Warning);
+            assert!(toast.message.contains(notice), "{}", toast.message);
+        }
+        None => assert!(root.toast.current().is_none(), "a clean end is silent"),
     });
 
-    // The Engine confirms the removal while the layout still names the shell.
-    runtime
-        .store
-        .write()
-        .unwrap()
-        .remove_session_record(&exiting);
-    runtime.publish_local_change();
-    cx.run_until_parked();
-    root.update_in(cx, |root, window, cx| {
-        assert_eq!(root.active_session_id(cx), Some(previous.clone()));
-        assert!(typing_reaches_active_terminal(root, window, cx));
-        assert!(keyboard_reaches_app_commands(window, cx));
-    });
+    if closes {
+        // The Engine confirms the removal while the layout still names it.
+        runtime
+            .store
+            .write()
+            .unwrap()
+            .remove_session_record(&exiting);
+        runtime.publish_local_change();
+        cx.run_until_parked();
+        shows_previous(cx);
+    }
 
-    // The project layout opens the survivor's own tab; typing goes there.
+    // The Engine selects the same tab; the window stops leading it.
     runtime
         .store
         .write()
@@ -167,10 +270,104 @@ fn exiting_the_focused_workspace_shell_shows_the_previous_session_with_the_keybo
         ));
     runtime.publish_local_change();
     cx.run_until_parked();
+    shows_previous(cx);
+    root.update_in(cx, |root, _, _| assert!(root.pending_tab.is_none()));
+}
+
+/// The last live session of this layout ends; the next one lives in another
+/// project's layout. The window switches layouts directly, never through
+/// the plain terminal.
+#[gpui::test]
+fn the_last_session_of_a_layout_hands_over_to_another_layout(cx: &mut gpui::TestAppContext) {
+    cx.update(|cx| commands::bind_keys(cx, &Default::default()));
+    let services = test_services();
+    let runtime = services.store.clone();
+    let fixture = SidebarPreviewFixture::make(PreviewScenario::Typical);
+    let exiting = shell(&fixture.list.sessions[0], "last-shell");
+    let exiting_id = exiting.id.clone();
+    let other = fixture.list.sessions[1].id.clone();
+    let here = WorkspaceId::new("focus-workspace");
+    let there = WorkspaceId::new("other-workspace");
+    {
+        let mut store = runtime.store.write().unwrap();
+        store.hydrate(fixture.list);
+        store.upsert_session(exiting);
+        let mut both = snapshot(1, vec![tab("last", &exiting_id)], &tab("last", &exiting_id));
+        let mut elsewhere = snapshot(1, vec![tab("other", &other)], &tab("other", &other))
+            .workspaces
+            .remove(0);
+        elsewhere.id = there.clone();
+        both.workspaces.push(elsewhere);
+        store.seed_workspace_snapshot_for_test(both);
+    }
+    let (root, cx) = cx.add_window_view({
+        let here = here.clone();
+        move |window, cx| {
+            let root = RootView::new(services, false, PreviewScenario::Empty, window, cx);
+            root.sidebar
+                .update(cx, |sidebar, cx| sidebar.activate_workspace(Some(here), cx));
+            root
+        }
+    });
+    cx.simulate_resize(size(px(1100.0), px(800.0)));
+    cx.run_until_parked();
+    root.update_in(cx, |root, _, cx| {
+        assert_eq!(root.active_session_id(cx), Some(exiting_id.clone()));
+    });
+
+    {
+        let mut store = runtime.store.write().unwrap();
+        let mut record = store.sessions()[&exiting_id].as_ref().clone();
+        record.status = exited(0);
+        store.upsert_session(record);
+    }
+    runtime.publish_local_change();
+    cx.run_until_parked();
     root.update_in(cx, |root, window, cx| {
-        assert_eq!(root.active_session_id(cx), Some(previous.clone()));
+        assert_eq!(root.active_workspace, Some(there.clone()));
+        assert_eq!(root.active_session_id(cx), Some(other.clone()));
         assert!(typing_reaches_active_terminal(root, window, cx));
-        assert!(keyboard_reaches_app_commands(window, cx));
+    });
+}
+
+/// Moving on is for a session that ends while on screen. Opening one that
+/// already ended, to read its last screen or resume it, stays on it.
+#[gpui::test]
+fn opening_a_session_that_already_ended_stays_on_it(cx: &mut gpui::TestAppContext) {
+    cx.update(|cx| commands::bind_keys(cx, &Default::default()));
+    let services = test_services();
+    let runtime = services.store.clone();
+    let fixture = SidebarPreviewFixture::make(PreviewScenario::Typical);
+    let mut crashed = claude(&fixture.list.sessions[0], "crashed-earlier");
+    crashed.status = exited(1);
+    let ended = crashed.id.clone();
+    let other = fixture.list.sessions[1].id.clone();
+    {
+        let mut store = runtime.store.write().unwrap();
+        store.hydrate(fixture.list);
+        store.upsert_session(crashed);
+        let ended_tab = tab("ended", &ended);
+        store.seed_workspace_snapshot_for_test(snapshot(
+            1,
+            vec![tab("other", &other), ended_tab.clone()],
+            &ended_tab,
+        ));
+    }
+    let (root, cx) = cx.add_window_view(move |window, cx| {
+        let root = RootView::new(services, false, PreviewScenario::Empty, window, cx);
+        root.sidebar.update(cx, |sidebar, cx| {
+            sidebar.activate_workspace(Some(WorkspaceId::new("focus-workspace")), cx)
+        });
+        root
+    });
+    cx.simulate_resize(size(px(1100.0), px(800.0)));
+    cx.run_until_parked();
+    runtime.publish_local_change();
+    cx.run_until_parked();
+    root.update_in(cx, |root, _, cx| {
+        assert_eq!(root.active_session_id(cx), Some(ended.clone()));
+        assert!(root.pending_tab.is_none());
+        assert!(root.toast.current().is_none());
     });
 }
 

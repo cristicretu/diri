@@ -179,9 +179,9 @@ impl Sidebar {
         }
         if let Some(session) = self.workspace_focused_session() {
             let mut store = self.store.write().expect("store");
-            if store.selected_session_id() != Some(&session)
-                && store.sessions().contains_key(&session)
-            {
+            // A closing session's pane stays focused until the window moves
+            // to its survivor; selecting it again would undo that move.
+            if store.selected_session_id() != Some(&session) && store.is_open(&session) {
                 store.select(session);
             }
         }

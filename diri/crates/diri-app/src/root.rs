@@ -11,6 +11,7 @@ mod progress_frames;
 mod project_agent_tests;
 #[cfg(all(test, target_os = "macos"))]
 mod row_motion_frames;
+mod session_end;
 #[cfg(test)]
 mod session_focus_tests;
 #[cfg(all(test, target_os = "macos"))]
@@ -250,6 +251,11 @@ pub struct RootView {
     active_workspace: Option<diri_proto::workspace::WorkspaceId>,
     /// The last workspace failure shown, and the layout revision it failed at.
     workspace_error: Option<(u64, String)>,
+    /// The survivor this window shows ahead of the Engine after the session
+    /// in its focused pane ended. See `session_end`.
+    pending_tab: Option<session_end::PendingTab>,
+    /// The session the focused workspace pane was running at the last frame.
+    live_on_screen: Option<SessionId>,
     workspace_workbench: Option<Entity<crate::workspace_workbench::WorkspaceWorkbench>>,
     sidebar: Entity<Sidebar>,
     terminal: Option<Entity<TerminalPane>>,
@@ -1400,6 +1406,8 @@ impl RootView {
             launch_scroll: gpui::ScrollHandle::new(),
             active_workspace: None,
             workspace_error: None,
+            pending_tab: None,
+            live_on_screen: None,
             workspace_workbench: None,
             sidebar,
             terminal,
@@ -1558,6 +1566,7 @@ impl RootView {
                 .expect("store")
                 .bump_navigation_context();
         }
+        self.reset_session_end_tracking(id.as_ref());
         self.active_workspace = id;
         self.sync_workspace_spawn_context(cx);
         if let Some(workbench) = &self.workspace_workbench {
@@ -1627,11 +1636,6 @@ impl RootView {
                                     surfaces.open_account_continuation(id.clone(), window, cx)
                                 });
                             }
-                        }
-                        crate::workspace_workbench::WorkspaceWorkbenchEvent::FocusedSessionEnded => {
-                            this.sidebar.update(cx, |sidebar, cx| {
-                                sidebar.activate_ended_session_survivor(cx)
-                            });
                         }
                     },
                 )
@@ -3934,25 +3938,7 @@ impl RootView {
         if let Some(page) = self.todos_page.clone().filter(|_| self.todos_open) {
             body = body.child(page);
         } else if self.active_workspace.is_some() {
-            let tab = {
-                let store = self.window_store.read().expect("store");
-                store
-                    .workspace_catalog()
-                    .snapshot()
-                    .and_then(|snapshot| {
-                        snapshot
-                            .workspaces
-                            .iter()
-                            .find(|workspace| Some(&workspace.id) == self.active_workspace.as_ref())
-                    })
-                    .and_then(|workspace| {
-                        workspace
-                            .tabs
-                            .iter()
-                            .find(|tab| Some(&tab.id) == workspace.selected_tab.as_ref())
-                    })
-                    .cloned()
-            };
+            let tab = self.workspace_tab_to_show(window, cx);
             if let (Some(tab), Some(workbench)) = (tab, &self.workspace_workbench) {
                 workbench.update(cx, |workbench, cx| {
                     workbench.set_tab(

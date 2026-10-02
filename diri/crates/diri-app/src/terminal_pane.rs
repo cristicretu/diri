@@ -4585,7 +4585,16 @@ impl TerminalPane {
         if session.is_archived() {
             return self.render_archived_overlay(session, colors, cx);
         }
-        let exited = matches!(session.status, SessionStatus::Exited(_));
+        // A session on its way out (a clean `exit` closes it) keeps its last
+        // screen, bare, until the window moves on: an exit card or pill would
+        // flash for the frames its tab takes to switch.
+        let closing = !self
+            .runtime
+            .store
+            .read()
+            .expect("store")
+            .is_open(&session.id);
+        let exited = matches!(session.status, SessionStatus::Exited(_)) && !closing;
         // An exited agent leaves its last screen behind in the daemon, and that
         // output is exactly what people want to read after closing an agent --
         // so only take the pane over when there is no terminal left to show.
@@ -4594,6 +4603,9 @@ impl TerminalPane {
         }
         self.probe_history_extent(&session.id);
         let Some(resident) = self.residents.get(&session.id) else {
+            if closing {
+                return div().size_full().into_any_element();
+            }
             return centered_message("Preparing terminal…", "", colors).into_any_element();
         };
         let element = resident
@@ -4756,7 +4768,9 @@ impl TerminalPane {
         }
         // An exited session's own pill already says it ended and offers Resume.
         let unavailable = attachment_state == AttachmentState::Unavailable && !exited;
-        if show_attaching || attachment_state == AttachmentState::Reconnecting || unavailable {
+        if !closing
+            && (show_attaching || attachment_state == AttachmentState::Reconnecting || unavailable)
+        {
             let message = match attachment_state {
                 AttachmentState::Reconnecting => "Reconnecting terminal…",
                 AttachmentState::Unavailable => "Terminal unavailable",
@@ -4833,6 +4847,7 @@ impl TerminalPane {
         let resumable = session.can_resume();
         let mut pill = div()
             .id("exit-pill")
+            .debug_selector(|| "exit-pill".into())
             .rounded(px(999.0))
             .pl(px(12.0))
             .pr(if resumable { px(4.0) } else { px(12.0) })
@@ -5129,7 +5144,8 @@ impl TerminalPane {
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let id = session.id.clone();
-        let content = centered_message("", &exit_description(session), colors);
+        let content = centered_message("", &exit_description(session), colors)
+            .debug_selector(|| "exited-card".into());
         if session.can_resume() {
             let resume = primary_button(
                 "resume-conversation",

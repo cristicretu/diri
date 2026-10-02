@@ -7580,23 +7580,27 @@ impl Sidebar {
         if !selection_changed {
             return;
         }
-        // A saved layout still references the closing session. Leave it before
-        // activating the survivor, so layout synchronization cannot reselect
-        // the closing row while its removal or the next layout is in flight.
+        // A saved layout moves on by itself: RootView sees the session on
+        // screen close and shows the next one in place, in the same frame.
         if self.workspace_nav.active.is_some() {
-            self.activate_workspace(None, cx);
+            cx.notify();
+            return;
         }
         cx.emit(SidebarEvent::SessionActivated);
         cx.notify();
     }
 
-    /// The workspace session on screen ended without a close from this
-    /// window: a shell's `exit`, or a close from elsewhere. The window moves
-    /// to the session it falls back to, exactly as ⌘W leaves a closed one.
-    pub(crate) fn activate_ended_session_survivor(&mut self, cx: &mut Context<Self>) {
+    /// The session on screen ended and no other session has a place in any
+    /// layout: leave the layout for the session this window falls back to,
+    /// which opens in its project layout once the Engine has placed it.
+    pub(crate) fn leave_layout_for_survivor(&mut self, cx: &mut Context<Self>) {
         // Writing reconciles this window's selection off the ended session.
         drop(self.store.write().expect("session store lock poisoned"));
-        self.activate_close_survivor(true, cx);
+        if self.workspace_nav.active.is_some() {
+            self.activate_workspace(None, cx);
+        }
+        cx.emit(SidebarEvent::SessionActivated);
+        cx.notify();
     }
 
     /// Selects the nth session (⌘1–⌘9 order, matching the row hints) and

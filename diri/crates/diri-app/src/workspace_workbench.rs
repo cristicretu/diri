@@ -34,10 +34,6 @@ pub(crate) enum WorkspaceWorkbenchEvent {
         pane: PaneId,
         edge: DockEdge,
     },
-    /// The session in the focused pane is closing or gone: a shell's `exit`,
-    /// or a close from another window or the CLI. Its saved pane stays in the
-    /// layout, so the window has to move on to a live session itself.
-    FocusedSessionEnded,
 }
 #[derive(Clone)]
 struct DraggedWorkspacePane {
@@ -131,9 +127,6 @@ pub(crate) struct WorkspaceWorkbench {
     viewport: TerminalViewport,
     pending_focus: Option<PaneId>,
     sent_focus: Option<PaneId>,
-    /// The focused session while it is ended but still mounted, so one ending
-    /// is reported once however many frames its pane stays on screen.
-    ended: Option<SessionId>,
     resize: Option<ResizeDraft>,
     /// What the drag in flight last snapped to: the pane a moved pane would
     /// land on, or the end of a divider's travel.
@@ -200,7 +193,6 @@ impl WorkspaceWorkbench {
             viewport: TerminalViewport::default(),
             pending_focus: None,
             sent_focus: None,
-            ended: None,
             resize: None,
             drag_haptic: haptics::Crossing::default(),
             _activation: activation,
@@ -285,7 +277,6 @@ impl WorkspaceWorkbench {
             }
         }
         let changed = previous_tab != self.tab || viewport_changed;
-        self.report_ended_focus(cx);
         self.reconcile(window, cx);
         self.flush_focus();
         self.assign_visible_owners(window, cx);
@@ -295,18 +286,6 @@ impl WorkspaceWorkbench {
         if changed {
             cx.notify();
         }
-    }
-
-    /// Runs while the focused pane is still mounted: once `reconcile` drops
-    /// it, the pane no longer says which session it showed.
-    fn report_ended_focus(&mut self, cx: &mut Context<Self>) {
-        let ended = self
-            .focused_session_id()
-            .filter(|session| !self.runtime.store.read().expect("store").is_open(session));
-        if ended.is_some() && ended != self.ended {
-            cx.emit(WorkspaceWorkbenchEvent::FocusedSessionEnded);
-        }
-        self.ended = ended;
     }
 
     /// Keyboard focus was inside this workbench but no mounted pane holds it:
@@ -937,6 +916,7 @@ impl Render for WorkspaceWorkbench {
             } else {
                 surface = surface.child(
                     div()
+                        .debug_selector(|| "workspace-pane-unavailable".into())
                         .p(px(18.0))
                         .text_color(colors.secondary)
                         .child("Session unavailable")
