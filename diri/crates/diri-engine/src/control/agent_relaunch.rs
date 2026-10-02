@@ -41,6 +41,7 @@ impl ControlServer {
                         continue;
                     };
                     if let Err(error) = server.relaunch_agent(&id) {
+                        server.release_held_exit(&id);
                         diri_telemetry::warn_event!(
                             "session.agent_relaunch_failed",
                             session = diri_telemetry::id(&id),
@@ -56,6 +57,18 @@ impl ControlServer {
             })
         {
             eprintln!("diri-engine: could not start agent relaunch: {error}");
+        }
+    }
+
+    /// The relaunch did not happen: the agent's exit, held back for it, is
+    /// published after all. A tab whose session already ended (the respawn
+    /// failed after it) republishes its record, which carries the exit.
+    fn release_held_exit(&self, id: &str) {
+        let Ok(registry) = self.registry.lock() else {
+            return;
+        };
+        if !registry.release_held_exit(id) {
+            self.publish_updated(&registry, id);
         }
     }
 

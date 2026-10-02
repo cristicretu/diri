@@ -4,7 +4,8 @@ use super::tests::test_services;
 use super::*;
 use crate::sidebar::{PreviewScenario, SidebarPreviewFixture};
 use diri_proto::workspace::{
-    LayoutNode, PaneId, TabId, WorkspaceId, WorkspaceRecord, WorkspaceSnapshot, WorkspaceTab,
+    LayoutNode, PaneId, TabId, WorkspaceId, WorkspaceMutation, WorkspaceRecord, WorkspaceSnapshot,
+    WorkspaceTab,
 };
 use diri_proto::{ExitInfo, ExitReason, Resumability, SessionStatus};
 use gpui::size;
@@ -328,6 +329,166 @@ fn the_last_session_of_a_layout_hands_over_to_another_layout(cx: &mut gpui::Test
         assert_eq!(root.active_session_id(cx), Some(other.clone()));
         assert!(typing_reaches_active_terminal(root, window, cx));
     });
+}
+
+/// The ended session's layout is already gone when its exit arrives (removed
+/// from elsewhere in the same batch, or it was the layout's last tab). The
+/// window still moves on to a live session in another layout.
+#[gpui::test]
+fn a_session_whose_layout_went_with_it_still_hands_over(cx: &mut gpui::TestAppContext) {
+    cx.update(|cx| commands::bind_keys(cx, &Default::default()));
+    let services = test_services();
+    let runtime = services.store.clone();
+    let fixture = SidebarPreviewFixture::make(PreviewScenario::Typical);
+    let exiting = shell(&fixture.list.sessions[0], "last-shell");
+    let exiting_id = exiting.id.clone();
+    let other = fixture.list.sessions[1].id.clone();
+    let here = WorkspaceId::new("focus-workspace");
+    let there = WorkspaceId::new("other-workspace");
+    let layouts = |here_tabs: Vec<WorkspaceTab>| {
+        let selected = here_tabs.first().map(|tab| tab.id.clone());
+        let mut both = snapshot(1, here_tabs, &tab("last", &exiting_id));
+        both.workspaces[0].selected_tab = selected;
+        let mut elsewhere = snapshot(1, vec![tab("other", &other)], &tab("other", &other))
+            .workspaces
+            .remove(0);
+        elsewhere.id = there.clone();
+        both.workspaces.push(elsewhere);
+        both
+    };
+    {
+        let mut store = runtime.store.write().unwrap();
+        store.hydrate(fixture.list);
+        store.upsert_session(exiting);
+        store.seed_workspace_snapshot_for_test(layouts(vec![tab("last", &exiting_id)]));
+    }
+    let (root, cx) = cx.add_window_view({
+        let here = here.clone();
+        move |window, cx| {
+            let root = RootView::new(services, false, PreviewScenario::Empty, window, cx);
+            root.sidebar
+                .update(cx, |sidebar, cx| sidebar.activate_workspace(Some(here), cx));
+            root
+        }
+    });
+    cx.simulate_resize(size(px(1100.0), px(800.0)));
+    cx.run_until_parked();
+    root.update_in(cx, |root, _, cx| {
+        assert_eq!(root.active_session_id(cx), Some(exiting_id.clone()));
+    });
+
+    {
+        let mut store = runtime.store.write().unwrap();
+        let mut record = store.sessions()[&exiting_id].as_ref().clone();
+        record.status = exited(0);
+        store.upsert_session(record);
+        store.seed_workspace_snapshot_for_test(layouts(Vec::new()));
+    }
+    runtime.publish_local_change();
+    cx.run_until_parked();
+    root.update_in(cx, |root, _, cx| {
+        assert_eq!(root.active_workspace, Some(there.clone()));
+        assert_eq!(root.active_session_id(cx), Some(other.clone()));
+    });
+}
+
+/// While the window leads the Engine to the next session, the user picks
+/// another tab. Their choice stands: the window does not reselect the one it
+/// moved to.
+#[gpui::test]
+fn choosing_another_tab_while_moving_on_is_not_undone(cx: &mut gpui::TestAppContext) {
+    cx.update(|cx| commands::bind_keys(cx, &Default::default()));
+    let services = test_services();
+    let runtime = services.store.clone();
+    let fixture = SidebarPreviewFixture::make(PreviewScenario::Typical);
+    let exiting = shell(&fixture.list.sessions[0], "exiting-shell");
+    let chosen = shell(&fixture.list.sessions[0], "chosen-shell");
+    let exiting_id = exiting.id.clone();
+    let chosen_id = chosen.id.clone();
+    let previous = {
+        let mut store = runtime.store.write().unwrap();
+        store.hydrate(fixture.list);
+        store.upsert_session(exiting);
+        store.upsert_session(chosen);
+        store
+            .ordered_sessions()
+            .into_iter()
+            .find(|session| {
+                session.id != exiting_id && session.id != chosen_id && !session.is_archived()
+            })
+            .unwrap()
+            .id
+    };
+    let previous_tab = tab("previous", &previous);
+    let exiting_tab = tab("exiting", &exiting_id);
+    let chosen_tab = tab("chosen", &chosen_id);
+    let tabs = || {
+        vec![
+            previous_tab.clone(),
+            exiting_tab.clone(),
+            chosen_tab.clone(),
+        ]
+    };
+    runtime
+        .store
+        .write()
+        .unwrap()
+        .seed_workspace_snapshot_for_test(snapshot(1, tabs(), &exiting_tab));
+    let (root, cx) = cx.add_window_view({
+        let previous = previous.clone();
+        let exiting = exiting_id.clone();
+        move |window, cx| {
+            let root = RootView::new(services, false, PreviewScenario::Empty, window, cx);
+            root.window_store.write().unwrap().select(previous);
+            root.window_store.write().unwrap().select(exiting);
+            root.sidebar.update(cx, |sidebar, cx| {
+                sidebar.activate_workspace(Some(WorkspaceId::new("focus-workspace")), cx)
+            });
+            root
+        }
+    });
+    cx.simulate_resize(size(px(1100.0), px(800.0)));
+    cx.run_until_parked();
+
+    {
+        let mut store = runtime.store.write().unwrap();
+        let mut record = store.sessions()[&exiting_id].as_ref().clone();
+        record.status = exited(0);
+        store.upsert_session(record);
+    }
+    runtime.publish_local_change();
+    cx.run_until_parked();
+    root.update_in(cx, |root, _, cx| {
+        assert_eq!(root.active_session_id(cx), Some(previous.clone()));
+    });
+
+    // The Engine moved on without taking the edit, and before the window
+    // tries again the user picks a tab.
+    {
+        let mut store = runtime.store.write().unwrap();
+        store.finish_workspace_edit_for_test(snapshot(2, tabs(), &exiting_tab));
+        assert!(store.edit_workspace(WorkspaceMutation::SelectTab {
+            workspace_id: WorkspaceId::new("focus-workspace"),
+            tab_id: chosen_tab.id.clone(),
+        }));
+    }
+    runtime.publish_local_change();
+    cx.run_until_parked();
+    runtime
+        .store
+        .write()
+        .unwrap()
+        .finish_workspace_edit_for_test(snapshot(3, tabs(), &chosen_tab));
+    runtime.publish_local_change();
+    cx.run_until_parked();
+    root.update_in(cx, |root, _, cx| {
+        assert_eq!(root.active_session_id(cx), Some(chosen_id.clone()));
+        assert!(root.pending_tab.is_none());
+    });
+    assert!(
+        runtime.store.read().unwrap().workspace_catalog().can_edit(),
+        "the window sent nothing more"
+    );
 }
 
 /// Moving on is for a session that ends while on screen. Opening one that

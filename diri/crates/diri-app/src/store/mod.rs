@@ -1918,6 +1918,9 @@ impl SessionStore {
             && !self.auto_resuming.contains(&id)
             && clean_exit
             && (disposable || quit_after_running)
+            // Closing the tab closes its ⌘J terminals too, and an exit is no
+            // confirmation that a dev server running in one may go.
+            && !self.has_running_auxiliary(&id)
             && previous
                 .as_deref()
                 .is_none_or(|record| !matches!(record.status, SessionStatus::Exited(_)));
@@ -2424,6 +2427,16 @@ impl SessionStore {
     /// their auxiliary terminals, which never outlive their parent. A shell
     /// already in `closing` was removed with its terminal tab; its record can
     /// still be here until the engine drops it, and must not be counted again.
+    /// A ⌘J terminal of `parent` whose process is still running.
+    fn has_running_auxiliary(&self, parent: &SessionId) -> bool {
+        self.sessions.values().any(|session| {
+            session.parent.as_ref() == Some(parent)
+                && is_auxiliary_terminal(session)
+                && !self.closing.contains(&session.id)
+                && !matches!(session.status, SessionStatus::Exited(_))
+        })
+    }
+
     pub(crate) fn closure_set(&self, ids: Vec<SessionId>) -> Vec<SessionId> {
         let mut ids = ids;
         let parents: HashSet<_> = ids.iter().cloned().collect();

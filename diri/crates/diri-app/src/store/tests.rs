@@ -1380,6 +1380,36 @@ fn quitting_a_resumable_agent_closes_its_tab() {
     assert!(store.ordered_sessions().is_empty());
 }
 
+/// Closing a tab closes its ⌘J terminals with it, so quitting the agent must
+/// not take a running one (a dev server) along without asking.
+#[test]
+fn quitting_an_agent_keeps_its_tab_while_a_terminal_under_it_runs() {
+    let mut terminal = session("terminal", "p", 2.0);
+    terminal.kind = AgentKind::SHELL;
+    terminal.parent = Some(id("one"));
+    let (mut store, mut effects) = hydrated(
+        vec![session("one", "p", 1.0), terminal],
+        vec![project("p", "P")],
+        Prefs::default(),
+    );
+    drain(&mut effects);
+
+    let mut exited = session("one", "p", 1.0);
+    exited.status = SessionStatus::Exited(ExitInfo {
+        reason: ExitReason::Exited,
+        code: Some(0),
+        signal: None,
+        system_restart: false,
+    });
+    exited.agent_session_id = Some("conversation".into());
+    exited.resumability = Resumability::Resumable;
+    store.upsert_session(exited);
+
+    let emitted = drain(&mut effects);
+    assert!(!emitted.contains(&StoreEffect::Remove(id("one"))));
+    assert!(!emitted.contains(&StoreEffect::Remove(id("terminal"))));
+}
+
 /// An agent that exits 0 before it ever reached a prompt did not get quit:
 /// the launch failed quietly, and its screen is the only explanation. It stays
 /// listed with its exit pill and Resume button.

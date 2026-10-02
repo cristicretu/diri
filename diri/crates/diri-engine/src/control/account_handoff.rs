@@ -196,9 +196,15 @@ impl ControlServer {
             // Termination waits for the old process tree; no two Claude writers share this session.
             drop(registry);
             self.terminate_session_unlocked(&source.id.0, Duration::from_secs(3))?;
+            // The stop is not published: the session is respawned below, and
+            // an exited record in between reads as the session ending (the
+            // window moves off it and reports the SIGTERM). A handoff that
+            // fails publishes the exited record then.
             let mut registry = self.registry.lock().map_err(poisoned)?;
-            registry.persist_now().map_err(io_control_error)?;
-            self.publish_updated(&registry, &source.id.0);
+            if let Err(error) = registry.persist_now() {
+                self.publish_updated(&registry, &source.id.0);
+                return Err(io_control_error(error));
+            }
         }
         let final_result = (|| {
             // Capture the final flushed transcript, including output written during shutdown.
@@ -244,6 +250,11 @@ impl ControlServer {
                     .ok_or_else(|| ControlError::internal("Continued session vanished"))?,
             )
         })();
+        if final_result.is_err()
+            && let Ok(registry) = self.registry.lock()
+        {
+            self.publish_updated(&registry, &source.id.0);
+        }
         final_result.map_err(|error: ControlError| ControlError { code: error.code, message: format!("Claude was stopped, but the account handoff could not finish: {}. Your saved conversation is intact; check the session's account and resume when ready.", error.message) })
     }
 }

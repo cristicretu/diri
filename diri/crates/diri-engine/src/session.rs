@@ -456,6 +456,10 @@ struct Shared {
     /// The agent exited asking to be started again; the Registry watcher
     /// takes this and the control server relaunches the tab.
     relaunch_requested: AtomicBool,
+    /// The clean exit held back for that relaunch. Published if the relaunch
+    /// does not happen, so a failed one never leaves a live-looking tab with
+    /// no process behind it.
+    exit_held: AtomicBool,
     /// The latest keystroke whose echo the held pump has not published yet.
     echo_request: Mutex<Option<EchoRequest>>,
     /// What a local shell is running and where it is. Stays empty for Agent
@@ -2295,6 +2299,21 @@ impl Session {
         self.shared.relaunch_requested.swap(false, Ordering::SeqCst)
     }
 
+    /// Publishes the clean exit held back for a relaunch that failed.
+    pub fn release_held_exit(&self) {
+        if !self.shared.exit_held.swap(false, Ordering::SeqCst) {
+            return;
+        }
+        let outcome = self.shared.reducer.lock().expect("reducer").reduce(
+            StatusSignal::ProcessExit {
+                code: Some(0),
+                signal: None,
+            },
+            SystemTime::now(),
+        );
+        apply(&self.shared, &outcome);
+    }
+
     pub fn status(&self) -> SessionStatus {
         self.shared.status.lock().expect("status").clone()
     }
@@ -3333,6 +3352,7 @@ fn new_shared(
             .and_then(|agent| agent.relaunch_notice.clone())
             .filter(|notice| !notice.is_empty()),
         relaunch_requested: AtomicBool::new(false),
+        exit_held: AtomicBool::new(false),
         echo_request: Mutex::new(None),
         foreground: Mutex::new(ForegroundProgram::default()),
         progress: Mutex::new(ProgressTrack::default()),
@@ -5752,7 +5772,8 @@ fn record_exit_telemetry(shared: &Shared) {
 
 /// Codex exits 0 after updating itself and asks to be started again. Its
 /// tab is relaunched (`control::agent_relaunch`) instead of ending, so this
-/// exit is never published: the app closes a tab whose agent exits cleanly.
+/// exit is held back: the app closes a tab whose agent exits cleanly. A
+/// relaunch that fails releases it ([`Session::release_held_exit`]).
 fn requests_relaunch(shared: &Shared, exit: Option<Exit>) -> bool {
     let Some(notice) = &shared.relaunch_notice else {
         return false;
@@ -5763,6 +5784,7 @@ fn requests_relaunch(shared: &Shared, exit: Option<Exit>) -> bool {
     if !shows_relaunch_notice(&shared.screen.lock().expect("screen"), notice) {
         return false;
     }
+    shared.exit_held.store(true, Ordering::SeqCst);
     shared.relaunch_requested.store(true, Ordering::SeqCst);
     shared.bump_state_version();
     diri_telemetry::event!(

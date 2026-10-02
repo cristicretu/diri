@@ -605,6 +605,16 @@ impl Registry {
             .collect()
     }
 
+    /// Publishes the exit a failed relaunch held back. `false` when the
+    /// session is no longer live (its record already carries the exit).
+    pub fn release_held_exit(&self, id: &str) -> bool {
+        let Some(session) = self.sessions.get(id) else {
+            return false;
+        };
+        session.release_held_exit();
+        true
+    }
+
     /// Final terminals of held children that exited since the last call, with
     /// everything needed to publish them. Storage happens after the lock is
     /// released; an unbound run is not published.

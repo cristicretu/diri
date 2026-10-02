@@ -17,6 +17,12 @@ pub(super) struct PendingTab {
     /// The catalog revision the confirming edit was sent against.
     sent: Option<u64>,
     attempts: u8,
+    /// [`WorkspaceCatalog::selection_edits`] as of this window's own last
+    /// edit. Another one since is someone choosing a tab: the override
+    /// yields to it instead of reselecting the survivor over their choice.
+    ///
+    /// [`WorkspaceCatalog::selection_edits`]: crate::store::WorkspaceCatalog::selection_edits
+    edits: u64,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -41,12 +47,13 @@ fn panes(node: &LayoutNode, output: &mut Vec<(PaneId, SessionId)>) {
 }
 
 /// Where the window goes when `ended` leaves the focused pane of
-/// `current_tab`: a live pane of the same tab, else a live tab of the same
-/// workspace, else one in another workspace, the most recently used first.
+/// `current_tab` (none once that tab is gone too): a live pane of the same
+/// tab, else a live tab of the same workspace, else one in another
+/// workspace, the most recently used first.
 pub(super) fn survivor(
     snapshot: &WorkspaceSnapshot,
     active: &WorkspaceId,
-    current_tab: &TabId,
+    current_tab: Option<&TabId>,
     ended: &SessionId,
     mru: &[SessionId],
     runs: impl Fn(&SessionId) -> bool,
@@ -64,7 +71,7 @@ pub(super) fn survivor(
                 }
                 let tier = if &workspace.id != active {
                     2
-                } else if &tab.id != current_tab {
+                } else if Some(&tab.id) != current_tab {
                     1
                 } else {
                     0
@@ -171,14 +178,23 @@ impl RootView {
         };
         let mut store = window_store.write().expect("store");
         self.settle_pending_tab(&mut store, &active);
-        let mut tab = self.shown_tab(&store, &active)?;
+        // The ended session's tab can already be gone (removed elsewhere, or
+        // the workspace's last); the window still moves to a survivor.
+        let mut tab = self.shown_tab(&store, &active);
         if let Some(ended_id) = just_ended {
             let mru = store.mru_sessions();
+            let current_tab = tab.as_ref().map(|tab| tab.id.clone());
             let placement = store.workspace_catalog().snapshot().and_then(|snapshot| {
-                survivor(snapshot, &active, &tab.id, &ended_id, &mru, |id| {
-                    runs(&store, id)
-                })
+                survivor(
+                    snapshot,
+                    &active,
+                    current_tab.as_ref(),
+                    &ended_id,
+                    &mru,
+                    |id| runs(&store, id),
+                )
             });
+            let edits = store.workspace_catalog().selection_edits();
             let notice = store
                 .sessions()
                 .get(&ended_id)
@@ -190,9 +206,10 @@ impl RootView {
                         placement,
                         sent: None,
                         attempts: 0,
+                        edits,
                     });
                     self.settle_pending_tab(&mut store, &active);
-                    tab = self.shown_tab(&store, &active)?;
+                    tab = self.shown_tab(&store, &active);
                 }
                 Some(placement) => {
                     let workspace = placement.workspace.clone();
@@ -200,6 +217,7 @@ impl RootView {
                         placement,
                         sent: None,
                         attempts: 0,
+                        edits,
                     });
                     let sidebar = self.sidebar.clone();
                     cx.defer_in(window, move |_, _, cx| {
@@ -221,6 +239,7 @@ impl RootView {
                 });
             }
         }
+        let tab = tab?;
         self.live_on_screen = focused_pane_session(&tab).filter(|id| runs(&store, id));
         Some(tab)
     }
@@ -265,7 +284,7 @@ impl RootView {
             return;
         };
         let target = &pending.placement;
-        let (state, revision, can_edit) = {
+        let (state, revision, can_edit, chosen_elsewhere) = {
             let catalog = store.workspace_catalog();
             let Some(snapshot) = catalog.snapshot() else {
                 return;
@@ -285,7 +304,12 @@ impl RootView {
                                 && tab.focused_pane == target.pane
                         })
                 });
-            (state, snapshot.revision, catalog.can_edit())
+            (
+                state,
+                snapshot.revision,
+                catalog.can_edit(),
+                catalog.selection_edits() != pending.edits,
+            )
         };
         let mutation = WorkspaceMutation::OpenProjectAgent {
             session_id: target.session.clone(),
@@ -294,6 +318,8 @@ impl RootView {
         let confirmed = match state {
             // Gone from the layout, or the survivor itself has ended.
             None => true,
+            // Someone chose another tab meanwhile; their choice stands.
+            Some(_) if chosen_elsewhere => true,
             Some(_) if !runs(store, &target.session) => true,
             Some(acknowledged) => {
                 acknowledged
@@ -315,6 +341,7 @@ impl RootView {
         if store.edit_workspace(mutation) {
             pending.sent = Some(revision);
             pending.attempts += 1;
+            pending.edits = store.workspace_catalog().selection_edits();
         }
     }
 
@@ -404,7 +431,7 @@ mod tests {
         survivor(
             &snapshot(),
             &WorkspaceId::new("here"),
-            &TabId::new("current"),
+            Some(&TabId::new("current")),
             &SessionId::new("ended"),
             &mru,
             |id| !dead.contains(&id.0.as_str()),

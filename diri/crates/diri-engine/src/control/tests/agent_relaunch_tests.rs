@@ -176,3 +176,80 @@ fn a_clean_exit_without_the_notice_ends_the_session() {
     assert!(registry.lock().unwrap().take_relaunch_requests().is_empty());
     let _ = registry.lock().unwrap().terminate("s_quit", Duration::ZERO);
 }
+
+#[test]
+fn a_relaunch_that_fails_still_ends_the_session() {
+    let temp = tempfile::tempdir().unwrap();
+    let home = temp.path().join("home");
+    std::fs::create_dir_all(&home).unwrap();
+    let agent = updating_agent(temp.path());
+    let engine = Arc::new(crate::detect::ManifestEngine::new(vec![manifest(
+        &agent, &home,
+    )]));
+    let registry = Arc::new(Mutex::new(Registry::new(
+        engine,
+        temp.path().join("state.json"),
+    )));
+    let server = Arc::new(ControlServer::new(
+        Arc::clone(&registry),
+        temp.path().join("daemon.sock"),
+    ));
+    server.spawn_agent_relaunch();
+    let stop = Arc::new(AtomicBool::new(false));
+    let watcher = crate::events::spawn_registry_watcher(
+        Arc::clone(&registry),
+        server.events(),
+        Arc::clone(&stop),
+    );
+
+    let mut record = test_record("s_stuck");
+    record.kind = diri_proto::AgentKind::CODEX;
+    record.cwd = temp.path().to_string_lossy().into_owned();
+    // An account bound to another agent: the relaunch refuses to start it.
+    record.account_profile = Some(diri_proto::AgentAccountProfile {
+        id: "other".into(),
+        label: "Other".into(),
+        agent: "claude-code".into(),
+        host: None,
+        config_home: temp.path().join("other").to_string_lossy().into_owned(),
+        is_default: false,
+        login_store: None,
+    });
+    {
+        let mut guard = registry.lock().unwrap();
+        let spec = server
+            .fresh_spec(&guard, "s_stuck", "codex", &record.cwd, None)
+            .unwrap();
+        guard.spawn(spec, record).unwrap();
+    }
+
+    // The exit held back for the relaunch is published once it fails, so
+    // the tab never looks alive with no process behind it.
+    let deadline = Instant::now() + Duration::from_secs(15);
+    while !registry
+        .lock()
+        .unwrap()
+        .get("s_stuck")
+        .is_some_and(|session| {
+            matches!(
+                session.status(),
+                diri_proto::SessionStatus::Exited(diri_proto::ExitInfo { code: Some(0), .. })
+            )
+        })
+    {
+        assert!(
+            Instant::now() < deadline,
+            "the failed relaunch left the session looking alive:\n{}",
+            screen(&registry, "s_stuck")
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    assert!(!screen(&registry, "s_stuck").contains("RELAUNCHED"));
+
+    stop.store(true, Ordering::SeqCst);
+    let _ = watcher.join();
+    let _ = registry
+        .lock()
+        .unwrap()
+        .terminate("s_stuck", Duration::ZERO);
+}

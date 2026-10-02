@@ -27,6 +27,10 @@ pub struct WorkspaceCatalog {
     announced_revision: u64,
     in_flight: Option<AttemptedEdit>,
     rejected: Option<RejectedEdit>,
+    /// Edits sent that choose what a workspace shows: selecting, opening, or
+    /// creating a tab. A window showing a tab ahead of the Engine yields to
+    /// any it did not send itself.
+    selection_edits: u64,
     pub error: Option<String>,
     pub created_workspace: Option<(u64, diri_proto::workspace::WorkspaceId)>,
     pub create_request_id: u64,
@@ -47,6 +51,7 @@ impl Default for WorkspaceCatalog {
             announced_revision: 0,
             in_flight: None,
             rejected: None,
+            selection_edits: 0,
             error: None,
             created_workspace: None,
             create_request_id: 0,
@@ -91,6 +96,9 @@ impl WorkspaceCatalog {
     }
     pub fn status(&self) -> &WorkspaceCatalogStatus {
         &self.status
+    }
+    pub fn selection_edits(&self) -> u64 {
+        self.selection_edits
     }
     pub fn can_edit(&self) -> bool {
         self.connected
@@ -229,6 +237,16 @@ impl SessionStore {
         };
         let params = edit.params.clone();
         let catalog = &mut self.workspaces;
+        if matches!(
+            &params.mutation,
+            WorkspaceMutation::OpenProjectAgent { .. }
+                | WorkspaceMutation::CreateWorkspace { .. }
+                | WorkspaceMutation::CreateTab { .. }
+                | WorkspaceMutation::SelectTab { .. }
+                | WorkspaceMutation::SplitPane { .. }
+        ) {
+            catalog.selection_edits += 1;
+        }
         catalog.in_flight = Some(edit);
         catalog.editing = true;
         catalog.creating = matches!(&params.mutation, WorkspaceMutation::CreateWorkspace { .. });
