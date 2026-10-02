@@ -178,4 +178,24 @@ impl<L> UsageSnapshot<L> {
         }
         history
     }
+
+    /// Newest collection time across this machine and remote machines.
+    #[must_use]
+    pub fn collected_at(&self) -> i64 {
+        self.remote
+            .iter()
+            .filter_map(|host| host.data.as_ref().map(|data| data.collected_at))
+            .fold(self.updated_at, i64::max)
+    }
+
+    /// Cost of the rolling 24 hours across all machines, matching the Usage
+    /// page's 24h range.
+    #[must_use]
+    pub fn last_24h_cost(&self) -> f64 {
+        self.history_for_source(None)
+            .report(self.collected_at(), 1)
+            .total
+            .tokens
+            .c
+    }
 }

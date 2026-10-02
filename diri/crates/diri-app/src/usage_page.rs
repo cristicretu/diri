@@ -56,12 +56,7 @@ impl UtilitySurfaces {
                 .child(label("Reading local usage…", 14.0, colors.primary))
                 .child(label("Preparing costs and token history from local Claude Code and Codex transcripts, plus billed Cursor usage when signed in.", 12.0, colors.secondary)), colors).into_any_element();
         }
-        let now = self
-            .usage
-            .remote
-            .iter()
-            .filter_map(|host| host.data.as_ref().map(|data| data.collected_at))
-            .fold(self.usage.updated_at, i64::max);
+        let now = self.usage_now();
         let history = self.usage.history_for_source(self.usage_host.as_deref());
         let compare = history.compare(now, self.usage_days);
         let report = &compare.current;
@@ -474,11 +469,7 @@ impl UtilitySurfaces {
     }
 
     fn usage_now(&self) -> i64 {
-        self.usage
-            .remote
-            .iter()
-            .filter_map(|host| host.data.as_ref().map(|data| data.collected_at))
-            .fold(self.usage.updated_at, i64::max)
+        self.usage.collected_at()
     }
 
     fn chart_provider_samples(&self, history: &UsageHistory, now: i64) -> [Vec<ChartSample>; 3] {

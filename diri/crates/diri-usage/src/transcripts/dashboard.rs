@@ -508,6 +508,42 @@ mod tests {
     }
 
     #[test]
+    fn snapshot_last_24h_cost_matches_the_rolling_day() {
+        let mut history = UsageHistory::default();
+        let now: i64 = 1_700_000_000;
+        let now_hour = now.div_euclid(3_600);
+        seed(&mut history, now_hour, 10, 2.0);
+        seed(&mut history, now_hour - 23, 10, 0.5);
+        seed(&mut history, now_hour - 24, 10, 7.0);
+        let mut remote = UsageHistory::default();
+        seed(&mut remote, now_hour, 10, 4.0);
+        let snapshot = super::super::UsageSnapshot::<()> {
+            updated_at: now,
+            history: std::sync::Arc::new(history),
+            remote: vec![super::super::RemoteUsageSnapshot {
+                host: "forge".into(),
+                name: "Forge".into(),
+                status: super::super::RemoteUsageStatus::Ready,
+                data: Some(std::sync::Arc::new(
+                    remote.remote_summary(now, "a".repeat(32)).unwrap(),
+                )),
+            }],
+            ..Default::default()
+        };
+        assert_eq!(snapshot.last_24h_cost(), 6.5);
+        assert_eq!(
+            snapshot.last_24h_cost(),
+            snapshot
+                .history_for_source(None)
+                .compare(now, 1)
+                .current
+                .total
+                .tokens
+                .c
+        );
+    }
+
+    #[test]
     fn compare_omits_deltas_without_prior_usage() {
         let mut history = UsageHistory::default();
         let now: i64 = 1_700_000_000;

@@ -673,6 +673,7 @@ pub struct Sidebar {
     hover_task: Option<Task<()>>,
     hover_keystrokes: Option<gpui::Subscription>,
     usage: Option<UsageSnapshot>,
+    last_24h_cost: f64,
     number_flows: crate::number_flow::Bank,
     accounts: accounts::MenuAccounts,
     update: UpdateState,
@@ -867,6 +868,7 @@ impl Sidebar {
             hover_task: None,
             hover_keystrokes: None,
             usage: None,
+            last_24h_cost: 0.0,
             number_flows: crate::number_flow::Bank::default(),
             accounts: accounts::MenuAccounts::new(preview),
             update: UpdateState::default(),
@@ -1042,6 +1044,7 @@ impl Sidebar {
         {
             cx.emit(SidebarEvent::RefreshUsageLimits);
         }
+        self.last_24h_cost = snapshot.last_24h_cost();
         self.usage = Some(snapshot);
         cx.notify();
     }
@@ -4676,10 +4679,7 @@ impl Sidebar {
         let cost = if self.preview {
             Some(PREVIEW_USAGE)
         } else {
-            self.usage
-                .as_ref()
-                .map(|snapshot| snapshot.today().cost)
-                .filter(|cost| *cost > 0.0)
+            Some(self.last_24h_cost).filter(|cost| *cost > 0.0)
         };
         div()
             .flex_none()
