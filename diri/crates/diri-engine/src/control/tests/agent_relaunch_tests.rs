@@ -116,7 +116,7 @@ fn an_agent_that_updated_itself_is_relaunched_with_its_injection() {
     );
     assert!(
         !relaunched.contains("Please restart Codex."),
-        "the relaunch is a new terminal, not the old shell:\n{relaunched}"
+        "the relaunch is a new terminal, not the run that exited:\n{relaunched}"
     );
 
     stop.store(true, Ordering::SeqCst);
@@ -128,7 +128,7 @@ fn an_agent_that_updated_itself_is_relaunched_with_its_injection() {
 }
 
 #[test]
-fn a_clean_exit_without_the_notice_stays_at_the_shell() {
+fn a_clean_exit_without_the_notice_ends_the_session() {
     let temp = tempfile::tempdir().unwrap();
     let home = temp.path().join("home");
     std::fs::create_dir_all(&home).unwrap();
@@ -157,15 +157,20 @@ fn a_clean_exit_without_the_notice_stays_at_the_shell() {
         guard.spawn(spec, record).unwrap();
     }
     wait_for_screen(&registry, "s_quit", "Goodbye from codex");
-    // The wrapper's report arrives right behind the agent's output.
+    // The agent's own exit ends the session, published as a clean exit.
     let deadline = Instant::now() + Duration::from_secs(5);
-    while registry
+    while !registry
         .lock()
         .unwrap()
         .get("s_quit")
-        .is_some_and(|session| session.agent_exit().is_none())
+        .is_some_and(|session| {
+            matches!(
+                session.status(),
+                diri_proto::SessionStatus::Exited(diri_proto::ExitInfo { code: Some(0), .. })
+            )
+        })
     {
-        assert!(Instant::now() < deadline, "no wrapper exit report");
+        assert!(Instant::now() < deadline, "the session did not end");
         std::thread::sleep(Duration::from_millis(20));
     }
     assert!(registry.lock().unwrap().take_relaunch_requests().is_empty());

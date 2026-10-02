@@ -314,7 +314,13 @@ pub fn bind_pty(
             .map(|key| format!("-u {key}"))
             .collect::<Vec<_>>()
             .join(" ");
-        pty.argv[4] = format!("/usr/bin/env {scrub} {quoted} {}", pty.argv[4]);
+        // The wrapper `exec`s the agent; `env` goes between, so it still
+        // replaces the shell and execs the agent with the account applied.
+        let (exec, command) = match pty.argv[4].strip_prefix("exec ") {
+            Some(command) => ("exec ", command),
+            None => ("", pty.argv[4].as_str()),
+        };
+        pty.argv[4] = format!("{exec}/usr/bin/env {scrub} {quoted} {command}");
     }
     Ok(())
 }

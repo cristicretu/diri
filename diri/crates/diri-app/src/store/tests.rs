@@ -1352,16 +1352,43 @@ fn a_signalled_agent_keeps_its_row_and_its_scrollback() {
     assert_eq!(store.ordered_sessions().len(), 1);
 }
 
-/// A conversation that can be re-entered is the case every Resume affordance
-/// exists for. Removing the row on exit makes the exit pill, the resume card
-/// and the sidebar entry unreachable.
+/// Quitting a running agent (`/exit`, ^D) is the user ending the session, the
+/// way `exit` ends a shell's. Its record goes to the Engine's recently closed
+/// list, where ⇧⌘T reopens it and Resume continues the conversation.
 #[test]
-fn an_exited_but_resumable_agent_stays_listed_for_resume() {
+fn quitting_a_resumable_agent_closes_its_tab() {
     let (mut store, mut effects) = hydrated(
         vec![session("one", "p", 1.0)],
         vec![project("p", "P")],
         Prefs::default(),
     );
+    drain(&mut effects);
+
+    let mut exited = session("one", "p", 1.0);
+    exited.status = SessionStatus::Exited(ExitInfo {
+        reason: ExitReason::Exited,
+        code: Some(0),
+        signal: None,
+        system_restart: false,
+    });
+    exited.agent_session_id = Some("conversation".into());
+    exited.resumability = Resumability::Resumable;
+    store.upsert_session(exited);
+
+    let emitted = drain(&mut effects);
+    assert!(emitted.contains(&StoreEffect::Remove(id("one"))));
+    assert!(store.ordered_sessions().is_empty());
+}
+
+/// An agent that exits 0 before it ever reached a prompt did not get quit:
+/// the launch failed quietly, and its screen is the only explanation. It stays
+/// listed with its exit pill and Resume button.
+#[test]
+fn a_resumable_agent_that_exits_while_starting_stays_listed_for_resume() {
+    let mut starting = session("one", "p", 1.0);
+    starting.status = SessionStatus::Starting;
+    let (mut store, mut effects) =
+        hydrated(vec![starting], vec![project("p", "P")], Prefs::default());
     drain(&mut effects);
 
     let mut exited = session("one", "p", 1.0);
@@ -1377,7 +1404,7 @@ fn an_exited_but_resumable_agent_stays_listed_for_resume() {
     let emitted = drain(&mut effects);
     assert!(
         !emitted.contains(&StoreEffect::Remove(id("one"))),
-        "a resumable conversation must stay listed"
+        "a launch that never started must stay listed"
     );
     assert_eq!(store.ordered_sessions().len(), 1);
 }

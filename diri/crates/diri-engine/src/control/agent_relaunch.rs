@@ -1,12 +1,13 @@
-//! Restarts a wrapped agent that exited only to be started again.
+//! Restarts an agent that exited only to be started again.
 //!
 //! Codex's startup update chooser runs `npm install -g @openai/codex` (or the
-//! Homebrew/bun equivalent), prints "Please restart Codex." and exits 0. The
-//! `returnToLoginShell` wrapper then leaves a bare login shell, and a `codex`
-//! typed there runs without the `-c` overrides Diri injects, so the tab loses
-//! the dirijor MCP server and its notify hook. The session pump spots the
-//! manifest's `relaunchNotice` as the wrapper reports the exit; this relaunches
-//! the tab through the same spec builders `session.resume` uses.
+//! Homebrew/bun equivalent), prints "Please restart Codex." and exits 0. A
+//! clean exit ends the session, so the tab would close; and a bare `codex`
+//! started by hand would run without the `-c` overrides Diri injects (the
+//! dirijor MCP server and its notify hook). The session pump spots the
+//! manifest's `relaunchNotice` as the agent exits and holds that exit back;
+//! this relaunches the tab through the same spec builders `session.resume`
+//! uses.
 use super::*;
 
 impl ControlServer {
@@ -58,7 +59,7 @@ impl ControlServer {
         }
     }
 
-    /// Replaces the tab's login shell with a fresh launch of its agent.
+    /// Replaces the tab's exited agent with a fresh launch of it.
     ///
     /// The notice is printed before the agent has a conversation (Codex's
     /// update chooser runs ahead of its TUI), so a tab that knows no
@@ -100,8 +101,14 @@ impl ControlServer {
             }
             crate::accounts::bind_pty(&mut profile, &mut spec.pty)?;
         }
-        self.terminate_session_unlocked(id, Duration::from_millis(500))?;
+        // The agent has already exited (that exit is what asked for this),
+        // so ending the session waits on nothing. Ending it under the same
+        // lock as the respawn keeps its exit from ever being published: the
+        // app would close a tab whose agent exited cleanly.
         let mut registry = self.registry.lock().map_err(poisoned)?;
+        registry
+            .terminate(id, Duration::from_millis(500))
+            .map_err(io_control_error)?;
         registry.respawn(spec).map_err(io_control_error)?;
         registry.persist_now().map_err(io_control_error)?;
         self.publish_updated(&registry, id);

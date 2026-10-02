@@ -3010,7 +3010,6 @@ impl ControlServer {
         let Some((signal, meta)) = parsed else {
             return Ok(json!({}));
         };
-        let session_end = p.kind == "claude-hook" && p.event.as_deref() == Some("SessionEnd");
         // Never wait on the Registry here: the Agent is blocked on this reply.
         self.hook_reports
             .submit(
@@ -3020,7 +3019,6 @@ impl ControlServer {
                     session_id: session_id.0,
                     signal,
                     meta,
-                    session_end,
                 },
             )
             .map_err(poisoned)?;

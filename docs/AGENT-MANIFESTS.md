@@ -108,8 +108,8 @@ Do not use an ignored key for behavior.
 | `statusAuthority` | Yes for built-ins | `screen` for ordinary TUI agents, `hooks` when a supported hook integration is primary, or `process` for liveness only. |
 | `binary` | Yes for a launchable agent | `argv[0]`, such as `maki`; omit only for pseudo-agents such as `shell` and `generic`. |
 | `spawnArgs` | No | Fixed argv words inserted on every launch. Each item is one word; never concatenate a shell command. |
-| `returnToLoginShell` | No | After a local agent exits, return to an interactive login shell instead of ending the PTY. Most terminal agents set this to `true`. |
-| `relaunchNotice` | No | With `returnToLoginShell`: text the agent prints when it exits only to be started again. A clean exit with it in the bottom screen lines relaunches the tab with its full launch (injection included) instead of leaving the shell. Codex sets `"Please restart Codex."` for its startup self-update. |
+| `returnToLoginShell` | No | Launch a local agent from the user's interactive login shell (`$SHELL -i -l -c "exec agent …"`), so it sees the PATH and version managers that shell sets up. The session ends with the agent; the name is historical. Most terminal agents set this to `true`. |
+| `relaunchNotice` | No | Text the agent prints when it exits only to be started again. A clean exit with it in the bottom screen lines relaunches the tab with its full launch (injection included) instead of ending the session. Codex sets `"Please restart Codex."` for its startup self-update. |
 | `approve`, `deny` | No | Canned prompt answers: `text` is typed literally and `submit` controls whether Return follows. `deny` defaults to Escape; omit `approve` when no universal safe answer exists. |
 
 `env` is a map of values Diri deliberately forces into the child. Use it only

@@ -31,7 +31,6 @@ pub(super) struct HookReport {
     pub(super) session_id: String,
     pub(super) signal: crate::status::StatusSignal,
     pub(super) meta: crate::hooks::HookMetadata,
-    pub(super) session_end: bool,
 }
 
 /// A report and when it was handed to the applier.
@@ -128,11 +127,6 @@ fn spawn_applier(
 /// the same bound `persist` already allowed) instead of fsyncing under the
 /// Registry lock on the Agent's hook path.
 fn apply(registry: &mut Registry, events: &EventBus, report: HookReport) {
-    if report.session_end
-        && let Some(session) = registry.get(&report.session_id)
-    {
-        session.note_agent_ended();
-    }
     if registry.apply_hook_report(&report.session_id, report.signal, &report.meta) {
         registry.persist_deferred();
     }

@@ -175,14 +175,17 @@ pub struct AgentDescriptor {
     /// comes from the caller.
     #[serde(default)]
     pub binary: Option<String>,
+    /// Launch through the user's interactive login shell (`exec`ing the
+    /// agent from it), so the agent sees the PATH and version managers that
+    /// shell sets up. The manifest key keeps its historical name; the
+    /// session no longer drops into that shell when the agent exits.
     #[serde(default)]
     pub return_to_login_shell: bool,
     /// What the agent prints when it exits only to be started again: Codex,
-    /// after updating itself, says "Please restart Codex." and quits. When a
-    /// `returnToLoginShell` wrapper reports a clean exit with this text at
-    /// the bottom of the screen, the Engine relaunches the tab with its full
-    /// launch (injected MCP and notify included) instead of leaving a bare
-    /// shell whose hand-typed `codex` would run without them.
+    /// after updating itself, says "Please restart Codex." and quits. When it
+    /// exits cleanly with this text at the bottom of the screen, the Engine
+    /// relaunches the tab with its full launch (injected MCP and notify
+    /// included) instead of ending the session.
     #[serde(default)]
     pub relaunch_notice: Option<String>,
     /// Swift Codable spelling: capital ID, which `rename_all = "camelCase"`
@@ -436,14 +439,13 @@ impl AgentDescriptor {
             spec.env.push((key.clone(), value.clone()));
         }
         if self.return_to_login_shell {
-            // Keep the shell as the PTY's session leader. When the agent exits
-            // the command re-enters that shell and leaves a usable prompt
-            // instead of ending the session. (An exit that only asks to be
-            // started again, Codex's self-update, is relaunched by the Engine:
-            // see `relaunch_notice`.)
-            // The agent binary deliberately stays bare: the fresh interactive
-            // login shell re-sources nvm/mise/Homebrew config and resolves the
-            // version selected *now*, not when the daemon started.
+            // Launch through the user's interactive login shell, which
+            // re-sources nvm/mise/Homebrew config and resolves the version
+            // selected *now*, not when the daemon started; the agent binary
+            // deliberately stays bare for that. The shell then `exec`s the
+            // agent, so the session is the agent: quitting it ends the
+            // session, never at a prompt that needs a second `exit`, and the
+            // PTY's exit status is the agent's own.
             let shell = spec
                 .env
                 .iter()
@@ -451,56 +453,10 @@ impl AgentDescriptor {
                 .find(|(key, value)| key == "SHELL" && !value.is_empty())
                 .map(|(_, value)| value.clone())
                 .unwrap_or_else(|| "/bin/sh".to_string());
-            let mut command = spec
-                .argv
-                .iter()
-                .map(|argument| shell_quote(argument))
+            let command = std::iter::once("exec".to_string())
+                .chain(spec.argv.iter().map(|argument| shell_quote(argument)))
                 .collect::<Vec<_>>()
                 .join(" ");
-            // An agent that dies or is killed (hibernation, a crash, Codex
-            // self-updating) leaves its terminal modes behind, and the shell
-            // then receives mouse reports and escape-coded keys as text:
-            // `35;12;38M35;13;38M` at the prompt. Reset them before the shell
-            // takes over, as the agent itself should have on a clean exit.
-            //
-            // First, the agent's own exit status goes to the Engine as a
-            // private OSC ([`diri_terminal_state::AGENT_EXIT_OSC`]): once the
-            // shell takes over it is otherwise lost, and an agent that dies at
-            // startup looks exactly like one the user quit. A separate
-            // `printf`, so the reset runs whatever the report does.
-            //
-            // The user is told too: an agent that fails at startup otherwise
-            // leaves a bare prompt that looks like the agent never ran. Only
-            // for a failure code; a signal death is usually diri's or the
-            // user's own doing (hibernation, a kill), not a failure to report.
-            let status = exit_status_capture(&shell);
-            if let Some(status) = status {
-                command.push_str(&format!(
-                    "; {}; printf '\\033]{}%s\\007' \"{}\"",
-                    status.save,
-                    diri_terminal_state::AGENT_EXIT_OSC,
-                    EXIT_STATUS_VARIABLE_REF
-                ));
-            }
-            command.push_str(&format!("; printf '{AGENT_EXIT_TERMINAL_RESET}'"));
-            if let Some(and) = status.and_then(|status| status.and) {
-                let agent = spec
-                    .argv
-                    .first()
-                    .map_or("", |binary| binary.rsplit('/').next().unwrap_or(binary));
-                let shell_name = std::path::Path::new(&shell)
-                    .file_name()
-                    .and_then(|name| name.to_str())
-                    .unwrap_or("login")
-                    .trim_start_matches('-');
-                command.push_str(&format!(
-                    "; [ \"{v}\" -ge 1 ]{and}[ \"{v}\" -le 128 ]{and}printf '{AGENT_EXIT_NOTICE}' {} \"{v}\" {}",
-                    shell_quote(agent),
-                    shell_quote(shell_name),
-                    v = EXIT_STATUS_VARIABLE_REF,
-                ));
-            }
-            command.push_str(&format!("; exec {} -i -l", shell_quote(&shell)));
             spec.argv = vec![shell, "-i".into(), "-l".into(), "-c".into(), command];
         } else if let Some(first) = spec.argv.first_mut()
             && !first.contains('/')
@@ -564,49 +520,6 @@ impl AgentDescriptor {
     }
 }
 
-/// How the wrapper keeps the agent's exit status for the report and the
-/// notice that follow it: `save` stores it in [`EXIT_STATUS_VARIABLE_REF`].
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-struct ExitStatusCapture {
-    save: &'static str,
-    /// How the shell chains the notice's conditions: `&&` in POSIX shells,
-    /// `; and` in fish (fish 2 has no `&&`). `None` for csh, which only gets
-    /// the report.
-    and: Option<&'static str>,
-}
-
-/// The wrapper's own variable; it dies with the `exec` into the login shell.
-const EXIT_STATUS_VARIABLE_REF: &str = "$__diri_agent_status";
-
-/// Shown under a wrapped agent that failed, before the login shell's prompt:
-/// the agent's name, its exit code and the shell the tab now is.
-const AGENT_EXIT_NOTICE: &str =
-    r"\n\033[2m%s exited with code %s. This tab is now a %s shell.\033[0m\n";
-
-/// `None` for a shell whose syntax is unknown, which then runs the wrapper
-/// without the report rather than risk a parse error that would stop the
-/// agent launching at all.
-fn exit_status_capture(shell: &str) -> Option<ExitStatusCapture> {
-    let name = std::path::Path::new(shell).file_name()?.to_str()?;
-    match name.trim_start_matches('-') {
-        "sh" | "bash" | "zsh" | "dash" | "ksh" | "mksh" | "ash" | "yash" => {
-            Some(ExitStatusCapture {
-                save: "__diri_agent_status=$?",
-                and: Some(" && "),
-            })
-        }
-        "fish" => Some(ExitStatusCapture {
-            save: "set __diri_agent_status $status",
-            and: Some("; and "),
-        }),
-        "csh" | "tcsh" => Some(ExitStatusCapture {
-            save: "set __diri_agent_status=$status",
-            and: None,
-        }),
-        _ => None,
-    }
-}
-
 /// Forces a real colour terminal onto a PTY child.
 ///
 /// The local Engine is a GUI daemon: it often has no `TERM` at all. PTY spawn
@@ -635,26 +548,6 @@ pub(crate) fn assert_color_environment(env: &mut Vec<(String, String)>) {
 }
 
 const CARGO_PROGRESS_ENV: &str = "CARGO_TERM_PROGRESS_TERM_INTEGRATION";
-
-/// Terminal modes an agent may leave on, turned off after it exits and
-/// before the login shell takes the PTY, written for the shell's `printf`
-/// (octal escapes work in sh, bash, zsh and fish). In order: end any open
-/// synchronized update; mouse tracking and its encodings; focus and
-/// colour-scheme reports; bracketed paste (shells re-enable their own);
-/// modifyOtherKeys; the kitty keyboard stack; cursor-key and keypad
-/// application modes; SGR; visible cursor; leave the alternate screen.
-/// Claude Code sets all of these and never clears them when it is killed.
-const AGENT_EXIT_TERMINAL_RESET: &str = concat!(
-    r"\033[?2026l",
-    r"\033[?1000l\033[?1002l\033[?1003l\033[?1005l\033[?1006l\033[?1015l",
-    r"\033[?1004l\033[?2031l",
-    r"\033[?2004l",
-    r"\033[>4;0m",
-    r"\033[<99u\033[=0;1u",
-    r"\033[?1l\033>",
-    r"\033[0m\033[?25h",
-    r"\033[?1049l",
-);
 
 fn shell_quote(value: &str) -> String {
     format!("'{}'", value.replace('\'', r"'\''"))
@@ -847,11 +740,11 @@ mod tests {
     }
 
     #[test]
-    fn shipped_agents_land_in_a_login_shell_when_the_agent_exits() {
-        // Codex replaces its own binary when it self-updates and then exits.
-        // Without the wrapper the PTY dies with it and the session is gone; the
-        // wrapper leaves a usable prompt in the same tab. Dropping
-        // `returnToLoginShell` from the manifests silently reverts that.
+    fn shipped_agents_start_from_the_users_login_shell() {
+        // The login shell is what puts nvm/mise/Homebrew on PATH and picks the
+        // version the user selected now; `exec` then makes the session the
+        // agent itself. Dropping `returnToLoginShell` from the manifests
+        // silently reverts the first.
         let codex = descriptor("codex");
         assert!(codex.return_to_login_shell);
         // ...and the line it prints before that exit has the Engine relaunch
@@ -873,18 +766,7 @@ mod tests {
             .expect("codex has a binary");
 
         assert_eq!(spec.argv[..4], ["/bin/sh", "-i", "-l", "-c"]);
-        assert_eq!(
-            spec.argv[4],
-            format!(
-                "'codex' '--version'; __diri_agent_status=$?; \
-                 printf '\\033]6973;agent-exit;%s\\007' \"$__diri_agent_status\"; \
-                 printf '{AGENT_EXIT_TERMINAL_RESET}'; \
-                 [ \"$__diri_agent_status\" -ge 1 ] && [ \"$__diri_agent_status\" -le 128 ] && \
-                 printf '{AGENT_EXIT_NOTICE}' 'codex' \"$__diri_agent_status\" 'sh'; \
-                 exec '/bin/sh' -i -l"
-            ),
-            "the agent runs first, then the shell takes the PTY over"
-        );
+        assert_eq!(spec.argv[4], "exec 'codex' '--version'");
     }
 
     /// Nineteen of the twenty-three shipped manifests declare `returnToLoginShell`;
@@ -962,69 +844,13 @@ mod tests {
         );
     }
 
+    /// The session is the agent in every shell family the wrapper may run
+    /// under: its exit, clean or not, ends the PTY with the agent's own
+    /// status, and no login shell is left waiting for a second `exit`.
     #[cfg(unix)]
     #[test]
-    fn wrapped_agent_really_accepts_shell_input_after_the_agent_finishes() {
-        use std::io::Write;
-        use std::process::{Command, Stdio};
-
-        let wrapped = AgentDescriptor {
-            binary: Some("/bin/sh".into()),
-            return_to_login_shell: true,
-            ..Default::default()
-        };
-        let spec = wrapped
-            .spawn_spec(
-                Path::new("/tmp"),
-                [("SHELL".to_string(), "/bin/sh".to_string())],
-                &["-c".into(), "printf 'agent-finished\\n'".into()],
-            )
-            .expect("spec");
-
-        let mut child = Command::new(&spec.argv[0])
-            .args(&spec.argv[1..])
-            .current_dir(&spec.cwd)
-            .envs(spec.env.iter().cloned())
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()
-            .expect("launch wrapped agent");
-        child
-            .stdin
-            .as_mut()
-            .expect("stdin")
-            .write_all(b"printf 'shell-ready\\n'\nexit\n")
-            .expect("type after agent exit");
-        let output = child.wait_with_output().expect("wait");
-        let stdout = String::from_utf8_lossy(&output.stdout);
-
-        assert!(
-            output.status.success(),
-            "stderr: {}",
-            String::from_utf8_lossy(&output.stderr)
-        );
-        assert!(
-            stdout.contains("agent-finished"),
-            "agent did not run: {stdout:?}"
-        );
-        assert!(
-            stdout.contains("shell-ready"),
-            "the session did not accept shell input after agent exit: {stdout:?}"
-        );
-        // The reset reaches the terminal between the agent and the shell.
-        let reset = stdout.find("\x1b[?1003l").expect("mouse tracking reset");
-        assert!(stdout.find("agent-finished").unwrap() < reset);
-        assert!(reset < stdout.find("shell-ready").unwrap());
-        assert!(stdout.contains("\x1b[>4;0m\x1b[<99u\x1b[=0;1u"));
-    }
-
-    /// The status the wrapper's shell saw reaches the Engine's screen as the
-    /// private OSC, in every shell family the wrapper speaks, for a plain
-    /// failure and for a signal death, and the reset still follows it.
-    #[cfg(unix)]
-    #[test]
-    fn wrapper_reports_the_agent_exit_status_in_every_shell() {
+    fn a_wrapped_session_ends_with_its_agent_and_its_status() {
+        use std::os::unix::process::ExitStatusExt;
         use std::process::{Command, Stdio};
 
         let shells = [
@@ -1039,8 +865,12 @@ mod tests {
         .collect::<Vec<_>>();
         assert!(shells.contains(&"/bin/sh"));
         for shell in shells {
-            // The agent: `sh -c` either exits 3 or SIGKILLs itself.
-            for (script, expected) in [("exit 0", 0), ("exit 3", 3), ("kill -9 $$", 128 + 9)] {
+            // The agent: `sh -c` quits cleanly, fails, or SIGKILLs itself.
+            for (script, code, signal) in [
+                ("exit 0", Some(0), None),
+                ("exit 3", Some(3), None),
+                ("kill -9 $$", None, Some(9)),
+            ] {
                 let wrapped = AgentDescriptor {
                     binary: Some("/bin/sh".into()),
                     return_to_login_shell: true,
@@ -1053,113 +883,23 @@ mod tests {
                         &["-c".into(), script.into()],
                     )
                     .expect("spec");
-                // Run only the agent half: the final `exec` would start an
-                // interactive login shell that reads the user's rc files.
-                let command = spec.argv[4]
-                    .rsplit_once("; exec ")
-                    .expect("wrapper execs the shell")
-                    .0;
-                let output = Command::new(shell)
-                    .args(["-c", command])
+                assert_eq!(spec.argv[..4], [shell, "-i", "-l", "-c"]);
+                // `-i -l` would read the user's rc files; the command alone
+                // is what decides how the session ends.
+                let status = Command::new(shell)
+                    .args(["-c", &spec.argv[4]])
                     .env_clear()
                     .envs(spec.env.iter().cloned())
                     .stdin(Stdio::null())
-                    .output()
+                    .status()
                     .expect("run wrapper");
-
-                let mut screen =
-                    diri_terminal_state::HeadlessScreen::new(80, 24).with_notifications();
-                screen.feed(&output.stdout);
                 assert_eq!(
-                    screen.take_agent_exit(),
-                    Some(expected),
-                    "{shell} `{script}`: {:?}",
-                    String::from_utf8_lossy(&output.stdout)
+                    (status.code(), status.signal()),
+                    (code, signal),
+                    "{shell} `{script}`"
                 );
-                let report = output
-                    .stdout
-                    .windows(4)
-                    .position(|window| window == b"6973")
-                    .expect("report");
-                let reset = output
-                    .stdout
-                    .windows(8)
-                    .position(|window| window == b"\x1b[?1003l")
-                    .expect("the reset still runs");
-                assert!(report < reset, "{shell}");
-                // A failure code is spelled out under the reset; a clean exit
-                // and a signal death leave the prompt as it was.
-                let stdout = String::from_utf8_lossy(&output.stdout);
-                let notice = stdout.find("sh exited with code 3. This tab is now a ");
-                assert_eq!(
-                    notice.is_some(),
-                    expected == 3,
-                    "{shell} `{script}`: {stdout:?}"
-                );
-                if let Some(notice) = notice {
-                    assert!(reset < notice, "{shell}");
-                    let name = Path::new(shell).file_name().unwrap().to_str().unwrap();
-                    assert!(
-                        stdout.contains(&format!("This tab is now a {name} shell.")),
-                        "{stdout:?}"
-                    );
-                }
-                assert!(!stdout.contains("exited with code 137"), "{stdout:?}");
             }
         }
-    }
-
-    #[test]
-    fn unknown_shells_run_the_wrapper_without_the_report() {
-        let save = |shell| exit_status_capture(shell).map(|capture| capture.save);
-        assert_eq!(save("/usr/bin/zsh"), Some("__diri_agent_status=$?"));
-        assert_eq!(save("-bash"), Some("__diri_agent_status=$?"));
-        assert_eq!(
-            save("/opt/homebrew/bin/fish"),
-            Some("set __diri_agent_status $status")
-        );
-        assert_eq!(save("/usr/local/bin/nu"), None);
-        let spec = AgentDescriptor {
-            binary: Some("codex".into()),
-            return_to_login_shell: true,
-            ..Default::default()
-        }
-        .spawn_spec(
-            Path::new("/tmp"),
-            [("SHELL".to_string(), "/usr/local/bin/nu".to_string())],
-            &[],
-        )
-        .expect("spec");
-        assert!(!spec.argv[4].contains("6973"), "{}", spec.argv[4]);
-        assert!(spec.argv[4].contains("exec '/usr/local/bin/nu' -i -l"));
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn exit_reset_clears_every_mode_claude_code_leaves_on() {
-        // Exactly what Claude Code writes on start (from session logs),
-        // then the wrapper's reset as the shell's printf renders it.
-        let reset = std::process::Command::new("/bin/sh")
-            .args(["-c", &format!("printf '{AGENT_EXIT_TERMINAL_RESET}'")])
-            .output()
-            .expect("printf")
-            .stdout;
-        let mut screen =
-            diri_terminal_state::HeadlessScreen::new_with_keyboard_enhancements(80, 24);
-        screen.feed(
-            b"\x1b[?1049h\x1b[?1004h\x1b[?2004h\x1b[?2031h\x1b[>4;1m\x1b[>7u\x1b[=5u\
-              \x1b[?1000h\x1b[?1002h\x1b[?1003h\x1b[?1006h\x1b[?1h\x1b=\x1b[?2026h",
-        );
-        assert_ne!(screen.mouse_modes(), diri_proto::terminal::MouseModes::OFF);
-        assert!(screen.is_alt_screen());
-
-        screen.feed(&reset);
-        assert_eq!(screen.mouse_modes(), diri_proto::terminal::MouseModes::OFF);
-        assert!(!screen.is_alt_screen());
-        assert!(!screen.bracketed_paste());
-        let keyboard = screen.keyboard_state();
-        assert!(!keyboard.application_cursor_keys && !keyboard.application_keypad);
-        assert_eq!(keyboard.enhancements.map(|flags| flags.bits()), Some(0));
     }
 
     #[test]

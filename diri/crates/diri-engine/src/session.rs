@@ -451,13 +451,10 @@ struct Shared {
     terminate_requested: AtomicBool,
     /// The exit was recorded to telemetry; later observers stay quiet.
     exit_recorded: AtomicBool,
-    /// The exit status a `returnToLoginShell` wrapper reported for its agent,
-    /// which the PTY's own exit never carries: the login shell outlives it.
-    agent_exit: Mutex<Option<i32>>,
-    /// The manifest's `relaunchNotice`, for a wrapped agent that declares one.
+    /// The manifest's `relaunchNotice`, for an agent that declares one.
     relaunch_notice: Option<String>,
-    /// The wrapped agent exited asking to be started again; the Registry
-    /// watcher takes this and the control server relaunches the tab.
+    /// The agent exited asking to be started again; the Registry watcher
+    /// takes this and the control server relaunches the tab.
     relaunch_requested: AtomicBool,
     /// The latest keystroke whose echo the held pump has not published yet.
     echo_request: Mutex<Option<EchoRequest>>,
@@ -1957,10 +1954,6 @@ impl Session {
             let logs_dir = spec.logs_dir.clone();
             let id = spec.id.clone();
             let mut pty = spec.pty.clone();
-            let return_to_shell = engine
-                .manifest(&spec.manifest_id)
-                .and_then(|manifest| manifest.agent.as_ref())
-                .is_some_and(|agent| agent.return_to_login_shell);
             std::thread::Builder::new()
                 .name(format!("diri-session-{}", spec.id))
                 .spawn(move || {
@@ -2020,9 +2013,6 @@ impl Session {
                         cols = pty.cols,
                         rows = pty.rows,
                     );
-                    if return_to_shell {
-                        watch_early_return_to_shell(&shared, &client);
-                    }
                     let stat = stat
                         .or_else(|| {
                             client
@@ -2298,11 +2288,6 @@ impl Session {
 
     pub fn state_version(&self) -> u64 {
         self.shared.state_version.load(Ordering::SeqCst)
-    }
-
-    /// The exit status the `returnToLoginShell` wrapper reported, if any.
-    pub fn agent_exit(&self) -> Option<i32> {
-        *self.shared.agent_exit.lock().expect("agent exit")
     }
 
     /// Whether the wrapped agent exited asking to be started again, once.
@@ -2759,33 +2744,6 @@ impl Session {
             return Ok(());
         }
         self.write_raw(&queued)
-    }
-
-    /// The agent reported its own end (Claude's `SessionEnd` hook). A moment
-    /// later, when it has had the chance to restore the terminal, check
-    /// whether it really left its login shell behind and with which modes.
-    /// `SessionEnd` also fires on `/clear`, which is why the foreground is
-    /// asked rather than assumed.
-    pub fn note_agent_ended(&self) {
-        if !diri_telemetry::is_enabled() {
-            return;
-        }
-        let Transport::Held(client) = &self.transport else {
-            return;
-        };
-        let shared = Arc::clone(&self.shared);
-        let client = client.clone();
-        let _ = std::thread::Builder::new()
-            .name("diri-agent-end-probe".into())
-            .spawn(move || {
-                std::thread::sleep(Duration::from_secs(2));
-                if shared.stop.load(Ordering::SeqCst) || shared.exited.load(Ordering::SeqCst) {
-                    return;
-                }
-                if agent_returned_to_shell(&client) == Some(true) {
-                    record_returned_to_shell(&shared, false, "session_end_hook");
-                }
-            });
     }
 
     /// Whether a local Holder owns this session's PTY.
@@ -3369,11 +3327,9 @@ fn new_shared(
         launched_at: fresh.then(Instant::now),
         terminate_requested: AtomicBool::new(false),
         exit_recorded: AtomicBool::new(false),
-        agent_exit: Mutex::new(None),
         relaunch_notice: engine
             .manifest(&spec.manifest_id)
             .and_then(|manifest| manifest.agent.as_ref())
-            .filter(|agent| agent.return_to_login_shell)
             .and_then(|agent| agent.relaunch_notice.clone())
             .filter(|notice| !notice.is_empty()),
         relaunch_requested: AtomicBool::new(false),
@@ -4745,16 +4701,18 @@ fn pump(
     // The stream ended: reap the child and record how it died.
     let exit = reap_direct(&shared, &pty, &mut reader, &mut buffer);
     *shared.exit.lock().expect("exit") = exit;
-    let (code, signal) = match exit {
-        Some(Exit::Code(code)) => (Some(code), None),
-        Some(Exit::Signal(signal)) => (None, Some(signal)),
-        None => (None, None),
-    };
-    let outcome = shared.reducer.lock().expect("reducer").reduce(
-        StatusSignal::ProcessExit { code, signal },
-        SystemTime::now(),
-    );
-    apply(&shared, &outcome);
+    if !requests_relaunch(&shared, exit) {
+        let (code, signal) = match exit {
+            Some(Exit::Code(code)) => (Some(code), None),
+            Some(Exit::Signal(signal)) => (None, Some(signal)),
+            None => (None, None),
+        };
+        let outcome = shared.reducer.lock().expect("reducer").reduce(
+            StatusSignal::ProcessExit { code, signal },
+            SystemTime::now(),
+        );
+        apply(&shared, &outcome);
+    }
     shared.exited.store(true, Ordering::SeqCst);
     record_exit_telemetry(&shared);
     let _ = shared.log.lock().expect("log").flush();
@@ -4895,9 +4853,6 @@ fn feed_output_batch(
             screen.feed(&buffer[..count]);
             if screen.has_notifications() {
                 shared.bump_state_version();
-            }
-            if let Some(status) = screen.take_agent_exit() {
-                note_agent_exit(shared, status, &screen);
             }
             let after = screen.filled_cells();
             // A closed synchronized update is a whole frame, however much
@@ -5565,9 +5520,6 @@ fn pump_held(
                 if screen.has_notifications() {
                     shared.bump_state_version();
                 }
-                if let Some(status) = screen.take_agent_exit() {
-                    note_agent_exit(&shared, status, &screen);
-                }
                 let replies = screen.take_replies();
                 let observation = if evaluate_now {
                     last_eval_at = Some(Instant::now());
@@ -5703,16 +5655,18 @@ fn pump_held(
         *shared.completed.lock().expect("completed capture") =
             Some(CompletedCapture { checkpoint, exit });
     }
-    let (code, signal) = match exit {
-        Some(Exit::Code(code)) => (Some(code), None),
-        Some(Exit::Signal(signal)) => (None, Some(signal)),
-        None => (None, None),
-    };
-    let outcome = shared.reducer.lock().expect("reducer").reduce(
-        StatusSignal::ProcessExit { code, signal },
-        SystemTime::now(),
-    );
-    apply(&shared, &outcome);
+    if !requests_relaunch(&shared, exit) {
+        let (code, signal) = match exit {
+            Some(Exit::Code(code)) => (Some(code), None),
+            Some(Exit::Signal(signal)) => (None, Some(signal)),
+            None => (None, None),
+        };
+        let outcome = shared.reducer.lock().expect("reducer").reduce(
+            StatusSignal::ProcessExit { code, signal },
+            SystemTime::now(),
+        );
+        apply(&shared, &outcome);
+    }
     shared.exited.store(true, Ordering::SeqCst);
     record_exit_telemetry(&shared);
 }
@@ -5796,86 +5750,31 @@ fn record_exit_telemetry(shared: &Shared) {
     }
 }
 
-/// Whether the agent a `returnToLoginShell` wrapper started has already gone,
-/// leaving its login shell in the foreground. `None` when the Holder cannot
-/// say.
-fn agent_returned_to_shell(client: &HolderClient) -> Option<bool> {
-    let stat = client.stat().ok()?;
-    Some(shell_is_back(
-        stat.alive,
-        stat.foreground_pid,
-        stat.child_pid,
-        || crate::holder::process_tree::has_children(stat.child_pid),
-    ))
-}
-
-/// The wrapper is `<shell> -c "agent; …; exec <shell>"`. Whether the agent
-/// gets its own foreground job depends on the shell: `zsh -i -c` gives it
-/// one, but `fish -c` (and `sh -c`) run it in the shell's own process group,
-/// so the child's pid is the foreground group for the agent's whole life.
-/// The group only rules the shell out; the agent is gone only once the
-/// shell also has no child left running it.
-fn shell_is_back(
-    alive: bool,
-    foreground_pgid: Option<i32>,
-    child_pid: i32,
-    shell_has_children: impl FnOnce() -> bool,
-) -> bool {
-    alive && foreground_pgid == Some(child_pid) && !shell_has_children()
-}
-
-/// Splits a shell's `$?` the way shells encode it: 128 + N is signal N.
-fn split_shell_status(status: i32) -> (Option<i32>, Option<i32>) {
-    match status {
-        129..=192 => (None, Some(status - 128)),
-        _ => (Some(status), None),
+/// Codex exits 0 after updating itself and asks to be started again. Its
+/// tab is relaunched (`control::agent_relaunch`) instead of ending, so this
+/// exit is never published: the app closes a tab whose agent exits cleanly.
+fn requests_relaunch(shared: &Shared, exit: Option<Exit>) -> bool {
+    let Some(notice) = &shared.relaunch_notice else {
+        return false;
+    };
+    if exit != Some(Exit::Code(0)) || shared.terminate_requested.load(Ordering::SeqCst) {
+        return false;
     }
+    if !shows_relaunch_notice(&shared.screen.lock().expect("screen"), notice) {
+        return false;
+    }
+    shared.relaunch_requested.store(true, Ordering::SeqCst);
+    shared.bump_state_version();
+    diri_telemetry::event!(
+        "session.agent_relaunch_requested",
+        session = diri_telemetry::id(&shared.id),
+        agent = diri_telemetry::id(&shared.agent),
+    );
+    true
 }
 
-/// The login-shell wrapper reported how its agent ended. Its exit status is
-/// otherwise invisible: the PTY lives on as the shell, so `session.exit`
-/// later carries the shell's status, not the agent's. The early-exit probe
-/// reads the stored status to say why an agent died at startup.
-fn note_agent_exit(shared: &Shared, status: i32, screen: &HeadlessScreen) {
-    *shared.agent_exit.lock().expect("agent exit") = Some(status);
-    if status == 0
-        && let Some(notice) = &shared.relaunch_notice
-        && shows_relaunch_notice(screen, notice)
-    {
-        shared.relaunch_requested.store(true, Ordering::SeqCst);
-        shared.bump_state_version();
-        diri_telemetry::event!(
-            "session.agent_relaunch_requested",
-            session = diri_telemetry::id(&shared.id),
-            agent = diri_telemetry::id(&shared.agent),
-        );
-    }
-    let (code, signal) = split_shell_status(status);
-    let runtime = shared.launched_at.map(|launched| launched.elapsed());
-    if status == 0 {
-        diri_telemetry::event!(
-            "session.agent_exited",
-            session = diri_telemetry::id(&shared.id),
-            agent = diri_telemetry::id(&shared.agent),
-            source = "wrapper",
-            code = code,
-            runtime_s = runtime.map(|runtime| runtime.as_secs()),
-        );
-    } else {
-        diri_telemetry::warn_event!(
-            "session.agent_exited",
-            session = diri_telemetry::id(&shared.id),
-            agent = diri_telemetry::id(&shared.agent),
-            source = "wrapper",
-            code = code,
-            signal = signal,
-            runtime_s = runtime.map(|runtime| runtime.as_secs()),
-        );
-    }
-}
-
-/// Whether the agent's last words, the bottom lines above the wrapper's own
-/// output, carry its relaunch notice. Only the bottom: an older notice still
+/// Whether the agent's last words, the bottom lines of its screen, carry its
+/// relaunch notice. Only the bottom: an older notice still
 /// higher up the screen (an earlier run's) must not restart a tab whose agent
 /// the user has just quit. Rows are joined so a soft-wrapped notice matches.
 fn shows_relaunch_notice(screen: &HeadlessScreen, notice: &str) -> bool {
@@ -5895,73 +5794,8 @@ fn shows_relaunch_notice(screen: &HeadlessScreen, notice: &str) -> bool {
 }
 
 /// Non-blank bottom rows searched for a relaunch notice: the notice itself,
-/// possibly wrapped, and the first prompt line of the shell that follows it.
+/// possibly wrapped, and whatever the agent printed after it.
 const RELAUNCH_NOTICE_LINES: usize = 4;
-
-fn record_returned_to_shell(shared: &Shared, early: bool, source: &'static str) {
-    let left = terminal_modes_left(shared);
-    let runtime = shared.launched_at.map(|launched| launched.elapsed());
-    if early {
-        let (code, signal) = shared
-            .agent_exit
-            .lock()
-            .expect("agent exit")
-            .map_or((None, None), split_shell_status);
-        diri_telemetry::incident!(
-            "session.early_exit",
-            session = diri_telemetry::id(&shared.id),
-            agent = diri_telemetry::id(&shared.agent),
-            kind = "returned_to_shell",
-            code = code,
-            signal = signal,
-            ms = runtime,
-            modes = left.fields(),
-        );
-    } else {
-        diri_telemetry::event!(
-            "session.agent_exited",
-            session = diri_telemetry::id(&shared.id),
-            agent = diri_telemetry::id(&shared.agent),
-            source = source,
-            runtime_s = runtime.map(|runtime| runtime.as_secs()),
-            modes = left.fields(),
-        );
-    }
-    if left.corrupts_input() {
-        diri_telemetry::warn_event!(
-            "session.modes_left_on_exit",
-            session = diri_telemetry::id(&shared.id),
-            agent = diri_telemetry::id(&shared.agent),
-            kind = "returned_to_shell",
-            modes = left.fields(),
-        );
-    }
-}
-
-/// One probe, [`EARLY_EXIT`] after a launch: an agent that is already back at
-/// its login shell by then failed to start (a resume of a conversation that
-/// was never written prints "No conversation found" and exits), even though
-/// the session itself lives on as a shell.
-///
-/// [`EARLY_EXIT`]: crate::telemetry::EARLY_EXIT
-fn watch_early_return_to_shell(shared: &Arc<Shared>, client: &HolderClient) {
-    if !diri_telemetry::is_enabled() {
-        return;
-    }
-    let shared = Arc::clone(shared);
-    let client = client.clone();
-    let _ = std::thread::Builder::new()
-        .name("diri-early-exit-probe".into())
-        .spawn(move || {
-            std::thread::sleep(crate::telemetry::EARLY_EXIT);
-            if shared.stop.load(Ordering::SeqCst) || shared.exited.load(Ordering::SeqCst) {
-                return;
-            }
-            if agent_returned_to_shell(&client) == Some(true) {
-                record_returned_to_shell(&shared, true, "launch_probe");
-            }
-        });
-}
 
 /// Records a deferred launch that never produced a child: the session
 /// reports exit 127, the spawn-failure convention the app already knows.
@@ -7470,99 +7304,6 @@ mod echo_request_tests {
         assert!(request.answered_by(at, 400, 0, 80, true));
         let late = at + ECHO_WINDOW + Duration::from_millis(1);
         assert!(!request.answered_by(late, 400, 120, 80, true));
-    }
-}
-
-#[cfg(all(test, unix))]
-mod returned_to_shell_tests {
-    use super::shell_is_back;
-    use std::io::Read;
-    use std::time::{Duration, Instant};
-
-    #[test]
-    fn the_foreground_group_alone_never_says_the_agent_left() {
-        assert!(!shell_is_back(true, Some(42), 42, || true));
-        assert!(shell_is_back(true, Some(42), 42, || false));
-        assert!(!shell_is_back(true, Some(99), 42, || false));
-        assert!(!shell_is_back(true, None, 42, || false));
-        assert!(!shell_is_back(false, Some(42), 42, || false));
-    }
-
-    /// The `returnToLoginShell` wrapper's shape on a real PTY, per shell:
-    /// `fish -c` runs the agent in the shell's own group (every Claude launch
-    /// under fish was reported as back at its shell ~10 s in), `zsh -i -c`
-    /// gives it its own job. Neither may read as returned while the agent
-    /// runs, and both must once it is gone and the shell was exec'd again.
-    #[test]
-    fn a_running_agent_is_not_mistaken_for_its_login_shell() {
-        let mut shells: Vec<Vec<&str>> = vec![vec!["/bin/sh"]];
-        if std::path::Path::new("/bin/zsh").exists() {
-            shells.push(vec!["/bin/zsh", "-f", "-i"]);
-        }
-        for fish in [
-            "/opt/homebrew/bin/fish",
-            "/usr/local/bin/fish",
-            "/usr/bin/fish",
-        ] {
-            if std::path::Path::new(fish).exists() {
-                shells.push(vec![fish, "--no-config", "-i"]);
-                break;
-            }
-        }
-        for shell in shells {
-            check_shell(&shell);
-        }
-    }
-
-    fn check_shell(shell: &[&str]) {
-        let mut argv: Vec<String> = shell.iter().map(|arg| (*arg).to_string()).collect();
-        // `sleep` stands in for the agent, `exec cat` for the idle login
-        // shell the wrapper execs into (same pid, nothing running under it).
-        argv.extend(["-c".into(), "sleep 2; exec cat".into()]);
-        let spec = crate::pty::PtySpec::new(argv, "/tmp")
-            .env("PATH", "/usr/bin:/bin")
-            .env("TERM", "xterm-256color")
-            .env("HOME", "/tmp");
-        let mut pty = crate::pty::Pty::spawn(&spec).expect("spawn shell");
-        let child = pty.pid() as i32;
-        let mut reader = pty.reader().expect("reader");
-        reader.set_nonblocking(true).ok();
-        let mut drain = [0u8; 4096];
-        let returned = |pty: &crate::pty::Pty| {
-            shell_is_back(true, pty.foreground_pgid(), child, || {
-                crate::holder::process_tree::has_children(child)
-            })
-        };
-
-        // While the agent runs: sampled well inside its two seconds.
-        let started = Instant::now();
-        while started.elapsed() < Duration::from_millis(1400) {
-            let _ = reader.read(&mut drain);
-            if started.elapsed() > Duration::from_millis(400) {
-                assert!(
-                    !returned(&pty),
-                    "{shell:?}: agent still running but read as returned (fg={:?} child={child})",
-                    pty.foreground_pgid()
-                );
-            }
-            std::thread::sleep(Duration::from_millis(50));
-        }
-
-        // After it: the shell is back.
-        let deadline = Instant::now() + Duration::from_secs(5);
-        loop {
-            let _ = reader.read(&mut drain);
-            if returned(&pty) {
-                break;
-            }
-            assert!(
-                Instant::now() < deadline,
-                "{shell:?}: agent gone but never read as returned (fg={:?} child={child})",
-                pty.foreground_pgid()
-            );
-            std::thread::sleep(Duration::from_millis(50));
-        }
-        let _ = pty.terminate(Duration::from_millis(500));
     }
 }
 

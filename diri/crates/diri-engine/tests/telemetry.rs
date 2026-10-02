@@ -147,9 +147,9 @@ fn launches_exits_and_holder_facts_reach_the_spool() {
         "an incident asks the uploader to send soon"
     );
 
-    // A `returnToLoginShell` agent that fails at startup: the PTY lives on as
-    // the login shell, so only the wrapper's report says how the agent ended,
-    // and the early-exit probe carries that status instead of guessing.
+    // A `returnToLoginShell` agent that fails at startup: its login shell
+    // `exec`s it, so the session ends with the agent and carries its own
+    // status, reported like any other launch that died early.
     let wrapped = diri_engine::agent::AgentDescriptor {
         binary: Some("/bin/sh".into()),
         return_to_login_shell: true,
@@ -171,23 +171,23 @@ fn launches_exits_and_holder_facts_reach_the_spool() {
         .size(80, 24);
     let mut wrapped_spec = spec("s_tel_wrapped", root.path(), holder, "");
     wrapped_spec.pty = pty;
-    // The early-exit probe watches deferred launches of wrapped manifests.
     wrapped_spec.manifest_id = "codex".into();
     wrapped_spec.defer_launch = true;
     let mut session = Session::spawn(wrapped_spec, engine()).expect("spawn wrapped");
     let records = wait_for(&state, "wrapped agent exit", |records| {
-        find(records, "session.agent_exited", "s_tel_wrapped").is_some()
-            && find(records, "session.early_exit", "s_tel_wrapped").is_some()
+        find(records, "session.early_exit", "s_tel_wrapped").is_some()
     });
     let _ = session.terminate(Duration::from_secs(1));
     drop(session);
 
-    let exited = find(&records, "session.agent_exited", "s_tel_wrapped").unwrap();
-    assert_eq!(exited["s"], "warn");
-    assert_eq!(exited["f"]["source"], "wrapper");
-    assert_eq!(exited["f"]["code"], 7);
-    assert_eq!(exited["f"]["runtime_s"], 0);
+    let exit = find(&records, "session.exit", "s_tel_wrapped").unwrap();
+    assert_eq!(exit["f"]["code"], 7);
+    assert_eq!(exit["f"]["requested"], false);
     let early = find(&records, "session.early_exit", "s_tel_wrapped").unwrap();
-    assert_eq!(early["f"]["kind"], "returned_to_shell");
+    assert_eq!(early["f"]["kind"], "exit");
     assert_eq!(early["f"]["code"], 7);
+    assert!(
+        find(&records, "session.agent_exited", "s_tel_wrapped").is_none(),
+        "no login shell outlives the agent to report on"
+    );
 }
