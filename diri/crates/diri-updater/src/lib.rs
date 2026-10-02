@@ -49,6 +49,8 @@ pub const DEFAULT_FEED_URL: &str =
 /// app's What's New page.
 pub const LATEST_RELEASE_URL: &str =
     "https://api.github.com/repos/cristicretu/diri/releases/latest";
+/// Every release's notes, for readers who want more than the latest.
+pub const RELEASES_PAGE_URL: &str = "https://github.com/cristicretu/diri/releases";
 const MAX_RELEASE_METADATA_BYTES: usize = 512 * 1024;
 
 /// Set to `1` to let an unsigned local build run the whole flow. Only useful
