@@ -1706,7 +1706,13 @@ impl Sidebar {
         if key == "escape" {
             cx.stop_propagation();
             if self.ui.popover.take().is_none() {
-                cx.emit(SidebarEvent::FocusTerminal);
+                // As settings navigation, leaving the sidebar without leaving
+                // settings would cost a second Escape.
+                cx.emit(if self.settings_nav.is_some() {
+                    SidebarEvent::SettingsDismissed
+                } else {
+                    SidebarEvent::FocusTerminal
+                });
             }
             cx.notify();
             return;

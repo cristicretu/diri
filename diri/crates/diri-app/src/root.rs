@@ -136,6 +136,11 @@ pub(crate) fn wire_settings_navigation<V: 'static>(
             SidebarEvent::SettingsTabSelected(tab) => {
                 let tab = *tab;
                 surfaces.update(cx, |surfaces, cx| surfaces.open_settings_tab(tab, cx));
+                // The press focused the sidebar; the keyboard belongs to the
+                // page it opened, so Escape closes settings from there.
+                if surfaces.read(cx).is_settings_open() {
+                    surfaces.read(cx).focus_handle(cx).focus(window, cx);
+                }
             }
             SidebarEvent::SettingsSearchFocused => {
                 surfaces.update(cx, |surfaces, cx| {
@@ -820,10 +825,13 @@ impl RootView {
                 } else if !open && this.settings_was_open {
                     this.settings_was_open = false;
                     let restore = this.settings_return_terminal.take();
-                    if surfaces
+                    // The sidebar was settings navigation until now, so focus
+                    // on it is still focus inside settings.
+                    if (surfaces
                         .read(cx)
                         .focus_handle(cx)
                         .contains_focused(window, cx)
+                        || this.sidebar.read(cx).is_focused(window))
                         && let Some(terminal) = restore.or_else(|| this.active_terminal(cx))
                     {
                         terminal.update(cx, |terminal, cx| terminal.focus(window, cx));
@@ -10796,6 +10804,122 @@ mod tests {
                 "closing settings returns focus to the session"
             );
         });
+    }
+
+    #[gpui::test]
+    fn one_escape_closes_settings_and_returns_to_the_session(cx: &mut gpui::TestAppContext) {
+        cx.update(|cx| cx.set_reduce_motion(true));
+        // Each way of arriving on a page: straight from the shortcut, a click
+        // on a tab in the sidebar's settings navigation, a click into the
+        // empty search field, and keyboard focus left on the sidebar. None of
+        // them leaves a nested action open.
+        for arrival in [
+            None,
+            Some("SETTINGS_TAB_What's New"),
+            Some("SETTINGS_TAB_Appearance"),
+            Some("settings-search"),
+            Some("sidebar"),
+        ] {
+            let services = test_services();
+            let fixture = SidebarPreviewFixture::make(PreviewScenario::Typical);
+            services.store.store.write().unwrap().hydrate(fixture.list);
+            let (root, cx) = cx.add_window_view(move |window, cx| {
+                RootView::new(services, false, PreviewScenario::Empty, window, cx)
+            });
+            cx.simulate_resize(size(px(1200.0), px(800.0)));
+            root.update_in(cx, |root, window, cx| {
+                root.utility_surfaces
+                    .as_ref()
+                    .expect("settings")
+                    .update(cx, |surfaces, _| {
+                        surfaces.seed_release_notes(diri_updater::ReleaseNotes {
+                            tag_name: "v0.6.0".into(),
+                            name: Some("diri 0.6.0".into()),
+                            body: "## Highlights\n\n- Faster sessions".into(),
+                            published_at: Some("2026-09-05T12:17:55Z".into()),
+                        })
+                    });
+                let terminal = root.terminal.as_ref().expect("terminal").clone();
+                terminal.update(cx, |terminal, cx| terminal.focus(window, cx));
+                root.run_command(CommandId::OpenSettings, window, cx);
+            });
+            cx.run_until_parked();
+            if arrival == Some("sidebar") {
+                root.update_in(cx, |root, window, cx| {
+                    root.sidebar
+                        .update(cx, |sidebar, cx| sidebar.focus(window, cx));
+                    assert!(root.sidebar.read(cx).is_focused(window));
+                });
+            } else if let Some(selector) = arrival {
+                let target = cx
+                    .debug_bounds(selector)
+                    .unwrap_or_else(|| panic!("{selector} is painted"));
+                cx.simulate_click(target.center(), Modifiers::default());
+            }
+            cx.run_until_parked();
+
+            cx.simulate_keystrokes("escape");
+            cx.run_until_parked();
+            root.update_in(cx, |root, window, cx| {
+                assert!(
+                    !root
+                        .utility_surfaces
+                        .as_ref()
+                        .expect("settings")
+                        .read(cx)
+                        .is_settings_open(),
+                    "one Escape must close settings after {arrival:?}"
+                );
+                assert!(
+                    root.terminal
+                        .as_ref()
+                        .expect("terminal")
+                        .read(cx)
+                        .is_focused(window),
+                    "closing settings after {arrival:?} returns focus to the session"
+                );
+            });
+        }
+    }
+
+    #[gpui::test]
+    fn escape_clears_a_settings_search_before_closing_settings(cx: &mut gpui::TestAppContext) {
+        cx.update(|cx| cx.set_reduce_motion(true));
+        let services = test_services();
+        let (root, cx) = cx.add_window_view(move |window, cx| {
+            RootView::new(services, false, PreviewScenario::Empty, window, cx)
+        });
+        cx.simulate_resize(size(px(1200.0), px(800.0)));
+        root.update_in(cx, |root, window, cx| {
+            root.run_command(CommandId::OpenSettings, window, cx);
+        });
+        cx.run_until_parked();
+        let search = cx.debug_bounds("settings-search").expect("settings search");
+        cx.simulate_click(search.center(), Modifiers::default());
+        cx.simulate_keystrokes("a g");
+        cx.run_until_parked();
+        let settings_open = |root: &Entity<RootView>, cx: &mut gpui::VisualTestContext| {
+            root.read_with(cx, |root, cx| {
+                root.utility_surfaces
+                    .as_ref()
+                    .expect("settings")
+                    .read(cx)
+                    .is_settings_open()
+            })
+        };
+
+        cx.simulate_keystrokes("escape");
+        cx.run_until_parked();
+        assert!(
+            settings_open(&root, cx),
+            "a search with text spends Escape on clearing it"
+        );
+        cx.simulate_keystrokes("escape");
+        cx.run_until_parked();
+        assert!(
+            !settings_open(&root, cx),
+            "the emptied search lets the next Escape close settings"
+        );
     }
 
     #[gpui::test]

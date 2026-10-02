@@ -853,6 +853,14 @@ impl UtilitySurfaces {
         .detach();
     }
 
+    /// Lets tests outside this module open What's New without fetching from
+    /// GitHub on a runtime thread.
+    #[cfg(test)]
+    pub(crate) fn seed_release_notes(&mut self, release: diri_updater::ReleaseNotes) {
+        let document = Arc::new(crate::markdown::MarkdownDocument::parse(&release.body));
+        self.release_notes = ReleaseNotesState::Loaded { release, document };
+    }
+
     fn confirm_cleanup(&mut self, cx: &mut Context<Self>) {
         let Some(params) = self.worktrees.confirm_cleanup() else {
             return;
@@ -2025,12 +2033,13 @@ impl UtilitySurfaces {
             return false;
         }
         match event.keystroke.key.as_str() {
+            // An empty field has nothing to clear, so Escape leaves settings.
+            "escape" if self.shortcut_search.is_empty() => {
+                self.shortcut_search_active = false;
+                return false;
+            }
             "escape" => {
-                if self.shortcut_search.is_empty() {
-                    self.shortcut_search_active = false;
-                } else {
-                    self.shortcut_search.clear();
-                }
+                self.shortcut_search.clear();
                 cx.notify();
             }
             _ => {
@@ -2064,12 +2073,13 @@ impl UtilitySurfaces {
             return false;
         }
         match event.keystroke.key.as_str() {
+            // An empty field has nothing to clear, so Escape leaves settings.
+            "escape" if self.settings_search.is_empty() => {
+                self.settings_search_active = false;
+                return false;
+            }
             "escape" => {
-                if self.settings_search.is_empty() {
-                    self.settings_search_active = false;
-                } else {
-                    self.settings_search.clear();
-                }
+                self.settings_search.clear();
                 cx.notify();
             }
             "enter" => {
