@@ -176,6 +176,9 @@ fn render_inline(content: &InlineText, colors: SemanticColors, heading: bool) ->
         line = line.child(
             div()
                 .id(SharedString::from(format!("markdown-inline-{span:p}")))
+                .debug_selector(|| "MARKDOWN_INLINE_SPAN".to_owned())
+                .min_w(px(0.0))
+                .max_w_full()
                 .when(style.bold, |piece| piece.font_weight(FontWeight::SEMIBOLD))
                 .when(style.italic, |piece| piece.italic())
                 .when(style.strikethrough, |piece| piece.line_through())
