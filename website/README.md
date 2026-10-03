@@ -51,7 +51,7 @@ Agents can read the site three ways: the Markdown twin of each page, `llms.txt` 
 
 ## Release downloads
 
-On each page load, `downloads.js` checks GitHub's public [latest release API](https://docs.github.com/en/rest/releases/releases#get-the-latest-release). The primary button links directly to that release's universal macOS DMG, with its version and release notes beside it. Other downloads lists the macOS ZIP and Linux x86_64 AppImage/DEB only when those assets exist in the same release. Linux is not included in every release; the full release history and Linux installation guide are always available.
+On each page load, `downloads.js` checks GitHub's public [latest release API](https://docs.github.com/en/rest/releases/releases#get-the-latest-release). The primary button links directly to that release's universal macOS DMG, with its version and release notes beside it. Other downloads lists the macOS ZIP and the Linux x86_64 and arm64 AppImage/DEB only when those assets exist in the same release. Linux is not included in every release; the full release history and Linux installation guide are always available.
 
 Publishing a new stable GitHub release updates downloads on subsequent page loads without a website rebuild, deploy hook, or token. The browser uses GitHub's normal HTTP caching. Only completed, nonempty desktop assets with matching repository/tag/filename URLs are accepted. Drafts and prereleases are excluded. Asset names follow the current release scripts; update the format list if packaging names change.
 

@@ -19,8 +19,11 @@ The script builds every release binary, installs the locked browser-sidecar
 dependencies, validates the repository's license policy, and passes a declared
 resource manifest to cargo-packager. It emits an AppImage, a Debian package,
 `SHA256SUMS`, `linux-release.json`, and the third-party license inventory under
-`dist/linux`. `linux-release.json` records the version, source commit,
-platform, architecture, format, size, and SHA-256 digest of each artifact.
+`dist/linux`, named for the host architecture (`diri_<v>_x86_64.AppImage` and
+`diri_<v>_amd64.deb`, or `diri_<v>_aarch64.AppImage` and `diri_<v>_arm64.deb`).
+The script refuses to cross-build. `linux-release.json` records the version,
+source commit, platform, architecture, format, size, and SHA-256 digest of each
+artifact.
 
 The AppImage and Debian package have the same internal layout: executables in
 `usr/bin`, manifests and the browser sidecar in `usr/lib/diri`, desktop
@@ -29,8 +32,14 @@ tree. The Debian package declares the glibc 2.35, fontconfig, GLib, Vulkan,
 Wayland, X11/XCB, and xkbcommon runtime dependencies.
 
 Linux packages are always built on Ubuntu 22.04 to establish the oldest
-supported glibc floor, then installed and smoke-tested on clean Ubuntu 22.04
-and 24.04 CI jobs. The smoke covers X11 launch, package upgrade and uninstall,
+supported glibc floor (2.35), natively on both `ubuntu-22.04` (x86_64) and
+`ubuntu-22.04-arm` (aarch64), then installed and smoke-tested on clean Ubuntu
+22.04 and 24.04 CI jobs of the same architecture. A release-set job merges the
+two builds with `write-linux-release-manifest.py --merge`: one `SHA256SUMS`
+over all four packages, and one `linux-release.json` whose top-level
+`architecture`/`artifacts` stay the x86_64 build (the shape every release
+before aarch64 published) while the additive `builds` array lists every
+architecture with its Debian architecture name. The smoke covers X11 launch, package upgrade and uninstall,
 a live shell session, Engine restart/holder adoption, CLI hooks, and MCP. The
 workspace job additionally launches the GUI against headless Wayland. Manual
 native-GPU QA remains a release gate; virtual displays cannot validate real
@@ -46,16 +55,17 @@ assets.
 
 ### Linux signatures
 
-The Nightly `linux-package` job signs the AppImage, the Debian package,
-`SHA256SUMS`, and `linux-release.json` with Sigstore keyless signing
+The Nightly `linux-package-release` job signs every AppImage and Debian
+package the merged `linux-release.json` declares, plus `SHA256SUMS` and
+`linux-release.json`, with Sigstore keyless signing
 (`scripts/linux-signatures.sh sign`), then verifies them before uploading.
 cosign exchanges the job's GitHub OIDC token for a short-lived certificate
 whose identity is
 `https://github.com/cristicretu/diri/.github/workflows/nightly.yml@refs/heads/main`,
 and records the signature in the public Rekor transparency log. Each file gets
 a `<file>.sigstore.json` bundle. Only `main` runs sign; pull-request runs do
-not. The Ubuntu 24.04 smoke job verifies the bundles again on a machine that
-did not sign them, and `release.sh` verifies them with the pinned identity
+not. The Ubuntu 24.04 smoke jobs (x86_64 and aarch64) verify the bundles again
+on machines that did not sign them, and `release.sh` verifies them with the pinned identity
 before publishing, so an unsigned or wrongly signed Linux artifact cannot ship.
 The release carries CI's signed Linux checksum list as `SHA256SUMS-linux`
 beside the release-wide `SHA256SUMS`, which `release.sh` writes on the Mac and
@@ -98,11 +108,13 @@ clears both variables before its own verification, and needs `cosign` on the
 release Mac (`brew install cosign`).
 
 Not yet: an APT repository with a signed `InRelease` (so `apt upgrade`
-verifies updates), GitHub build-provenance attestations, and aarch64 packages.
+verifies updates), and GitHub build-provenance attestations.
 The in-app updater does not download Linux artifacts (it tells Linux users to
 update through APT or a newer download), so it has nothing to verify. If a
 Linux self-updater is ever added, it must verify these bundles against the same
-pinned identity.
+pinned identity, and pick its files from the `builds` entry whose
+`architecture` matches the running binary, never from the top-level x86_64
+fields.
 
 ## macOS
 

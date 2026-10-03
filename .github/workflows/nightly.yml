@@ -10,7 +10,7 @@ name: Nightly
 # request that touches the packaging or CI machinery they exercise.
 #
 # A push to main that changes diri-app's manifest (every version bump does)
-# runs only the two Linux package jobs. diri/scripts/release.sh needs signed
+# runs only the Linux package jobs. diri/scripts/release.sh needs signed
 # Linux packages built by this workflow on main for the exact release commit;
 # starting them when the bump merges means they are ready by the time the
 # macOS build and notarization finish, instead of 40 minutes later.
@@ -347,19 +347,35 @@ jobs:
           test "$(find "${app}/Contents/Resources/bin/remote-helpers/artifacts" -name diri-remote -type f | wc -l | tr -d ' ')" = 3
           codesign --verify --deep --strict "${app}"
 
+  # Linux packages are built natively per architecture (package-linux.sh
+  # refuses to cross-build), merged into one release set, signed once, and
+  # smoke-tested on a clean Ubuntu 24.04 machine of each architecture.
+  # await-ci.sh waits on every job named "Linux package*" and counts them:
+  # changing the matrix or these names must update LINUX_JOB_COUNT there.
   linux-package:
-    name: Linux packages (Ubuntu 22.04)
+    name: Linux packages (${{ matrix.arch }}, Ubuntu 22.04)
     # Not gated on app-linux: CI already tested the commit, and waiting for
     # the full Linux suite added ~25 minutes (and its flakes) to every release.
     # This job still installs, launches and smokes what it packages.
-    runs-on: ubuntu-22.04
+    # Ubuntu 22.04 on both architectures keeps one glibc 2.35 floor.
+    runs-on: ${{ matrix.runner }}
     timeout-minutes: 75
-    # id-token lets cosign sign the packages keylessly: Sigstore issues a
-    # certificate naming this workflow and ref, so there is no private key to
-    # keep. Only main-branch runs sign (see "Sign Linux release artifacts").
-    permissions:
-      contents: read
-      id-token: write
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: x86_64
+            deb-arch: amd64
+            runner: ubuntu-22.04
+            # Kept from the single-architecture job so its cache carries over,
+            # and allowed to start from the full Linux suite's x86_64 target.
+            cache: linux-package-cargo
+            fallback-cache: linux-app-cargo
+          - arch: aarch64
+            deb-arch: arm64
+            runner: ubuntu-22.04-arm
+            cache: linux-package-aarch64-cargo
+            fallback-cache: linux-package-aarch64-cargo
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
@@ -383,12 +399,12 @@ jobs:
             ~/.cargo/registry
             ~/.cargo/git
             diri/target
-          key: linux-package-cargo-${{ hashFiles('diri/Cargo.lock') }}-${{ github.event.pull_request.head.sha || github.sha }}
+          key: ${{ matrix.cache }}-${{ hashFiles('diri/Cargo.lock') }}-${{ github.event.pull_request.head.sha || github.sha }}
           restore-keys: |
-            linux-package-cargo-${{ hashFiles('diri/Cargo.lock') }}-
-            linux-package-cargo-
-            linux-app-cargo-${{ hashFiles('diri/Cargo.lock') }}-
-            linux-app-cargo-
+            ${{ matrix.cache }}-${{ hashFiles('diri/Cargo.lock') }}-
+            ${{ matrix.cache }}-
+            ${{ matrix.fallback-cache }}-${{ hashFiles('diri/Cargo.lock') }}-
+            ${{ matrix.fallback-cache }}-
       - name: Build AppImage and Debian package
         env:
           SOURCE_COMMIT: ${{ github.event.pull_request.head.sha || github.sha }}
@@ -397,13 +413,22 @@ jobs:
         run: |
           diri/scripts/verify-linux-package.sh diri/dist/linux
           deb="$(find diri/dist/linux -maxdepth 1 -name '*.deb' -print -quit)"
+          test "$(dpkg-deb --field "${deb}" Architecture)" = "${{ matrix.deb-arch }}"
+          appimage="$(find diri/dist/linux -maxdepth 1 -name '*.AppImage' -print -quit)"
+          case "${{ matrix.arch }}" in
+            x86_64) machine="x86-64" ;;
+            aarch64) machine="ARM aarch64" ;;
+          esac
+          file --brief "${appimage}" | grep -F "${machine}"
           stage="${RUNNER_TEMP}/diri-desktop-entry"
           dpkg-deb --extract "${deb}" "${stage}"
+          file --brief "${stage}/usr/bin/diri" | grep -F "${machine}"
           desktop-file-validate "${stage}/usr/share/applications/diri.desktop"
           (cd diri/dist/linux && sha256sum --check SHA256SUMS)
           jq -e \
             --arg commit "${{ github.event.pull_request.head.sha || github.sha }}" \
-            '.platform == "linux" and .architecture == "x86_64" and .commit == $commit and (.artifacts | length) == 2' \
+            --arg arch "${{ matrix.arch }}" \
+            '.platform == "linux" and .architecture == $arch and .commit == $commit and (.artifacts | length) == 2' \
             diri/dist/linux/linux-release.json
       - name: Exercise Debian upgrade, runtime, and uninstall
         run: |
@@ -425,6 +450,54 @@ jobs:
           appimage="$(find diri/dist/linux -maxdepth 1 -name '*.AppImage' -print -quit)"
           xvfb-run -a env -u WAYLAND_DISPLAY APPIMAGE_EXTRACT_AND_RUN=1 \
             DIRI_UI_SMOKE_TEST=1 "${appimage}"
+      - name: Upload ${{ matrix.arch }} packages
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: linux-packages-${{ matrix.arch }}-${{ github.event.pull_request.head.sha || github.sha }}
+          path: |
+            diri/dist/linux/*.AppImage
+            diri/dist/linux/*.deb
+            diri/dist/linux/SHA256SUMS
+            diri/dist/linux/linux-release.json
+            diri/dist/linux/THIRD-PARTY-LICENSES.json
+          if-no-files-found: error
+          retention-days: 14
+
+  linux-package-release:
+    name: Linux package release set
+    needs: linux-package
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    # id-token lets cosign sign the packages keylessly: Sigstore issues a
+    # certificate naming this workflow and ref, so there is no private key to
+    # keep. Only main-branch runs sign (see "Sign Linux release artifacts").
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          pattern: linux-packages-*-${{ github.event.pull_request.head.sha || github.sha }}
+          path: ${{ runner.temp }}/linux-builds
+      # One release set: every architecture's packages, one SHA256SUMS over
+      # all of them, and a linux-release.json whose top-level fields still
+      # describe x86_64 for readers that predate the "builds" list.
+      - name: Merge architectures into the release set
+        env:
+          SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+        run: |
+          builds="${RUNNER_TEMP}/linux-builds"
+          python3 diri/scripts/write-linux-release-manifest.py --directory diri/dist/linux \
+            --merge "${builds}/linux-packages-x86_64-${SHA}" "${builds}/linux-packages-aarch64-${SHA}"
+          cp "${builds}/linux-packages-x86_64-${SHA}/THIRD-PARTY-LICENSES.json" diri/dist/linux/
+          (cd diri/dist/linux && sha256sum --check SHA256SUMS)
+          jq -e --arg commit "${SHA}" '
+            .platform == "linux" and .architecture == "x86_64" and .commit == $commit
+            and (.artifacts | length) == 2
+            and ([.builds[] | "\(.architecture)/\(.debArchitecture)/\(.artifacts | length)"]
+                 == ["x86_64/amd64/2", "aarch64/arm64/2"])' \
+            diri/dist/linux/linux-release.json
       # Release signatures are made only for main, where the certificate
       # identity is ".../nightly.yml@refs/heads/main" — the identity users and
       # release.sh pin. Pull-request runs would carry a refs/pull identity that
@@ -453,10 +526,20 @@ jobs:
           retention-days: 14
 
   linux-package-ubuntu-24:
-    name: Linux package smoke (Ubuntu 24.04)
-    needs: linux-package
-    runs-on: ubuntu-24.04
+    name: Linux package smoke (${{ matrix.arch }}, Ubuntu 24.04)
+    needs: linux-package-release
+    runs-on: ${{ matrix.runner }}
     timeout-minutes: 25
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: x86_64
+            deb-arch: amd64
+            runner: ubuntu-24.04
+          - arch: aarch64
+            deb-arch: arm64
+            runner: ubuntu-24.04-arm
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
@@ -477,10 +560,20 @@ jobs:
         env:
           GH_REPO: ${{ github.repository }}
         run: diri/scripts/linux-signatures.sh verify diri/dist/linux
+      # Pick this machine's packages by the names linux-release.json declares
+      # for its architecture, as a user (or a script) would.
       - name: Install, launch, recover a session, and uninstall
         run: |
-          deb="$(find "${PWD}/diri/dist/linux" -maxdepth 1 -name '*.deb' -print -quit)"
-          appimage="$(find "${PWD}/diri/dist/linux" -maxdepth 1 -name '*.AppImage' -print -quit)"
+          dist="${PWD}/diri/dist/linux"
+          (cd "${dist}" && sha256sum --check SHA256SUMS)
+          pick() {
+            jq -er --arg arch "${{ matrix.arch }}" --arg format "$1" \
+              '[.builds[] | select(.architecture == $arch) | .artifacts[] | select(.format == $format) | .file] | if length == 1 then .[0] else error("expected one \($format) for \($arch)") end' \
+              "${dist}/linux-release.json"
+          }
+          deb="${dist}/$(pick deb)"
+          appimage="${dist}/$(pick appimage)"
+          test "$(dpkg-deb --field "${deb}" Architecture)" = "${{ matrix.deb-arch }}"
           chmod +x "${appimage}"
           sudo apt-get install --yes "${deb}"
           xvfb-run -a env -u WAYLAND_DISPLAY DIRI_UI_SMOKE_TEST=1 diri

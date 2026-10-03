@@ -49,11 +49,11 @@ To install a specific release, including an older one, **Option-click** the upda
 > A build that is not inside a signed `.app`, such as one you built from source, shows "Updates off for this build". If diri sits in a folder your user cannot write to, download the DMG by hand instead.
 
 ## Linux beta
-diri runs on x86_64 Ubuntu 22.04 and 24.04 under Wayland or X11. Linux packages are not included in every release, so check the [release list](https://github.com/cristicretu/diri/releases) for one with Linux assets.
+diri runs on x86_64 and arm64 Ubuntu 22.04 and 24.04 under Wayland or X11. Linux packages are not included in every release, so check the [release list](https://github.com/cristicretu/diri/releases) for one with Linux assets.
 
 | Requirement | Value |
 | --- | --- |
-| Distribution | Ubuntu 22.04 or 24.04, x86_64 (glibc 2.35 or newer) |
+| Distribution | Ubuntu 22.04 or 24.04, x86_64 or arm64 (glibc 2.35 or newer) |
 | Display | Wayland or X11 |
 | Graphics | A Vulkan 1.3 driver |
 | Packages | `.deb` and `.AppImage` |
@@ -69,20 +69,20 @@ Each Linux file also has a Sigstore bundle. The [Linux guide](https://github.com
 Install the Debian package with APT so its dependencies resolve. It adds the desktop entry and the `diri`, `dirijor` and `dirijor-mcp` commands:
 
 ```sh
-sudo apt install ./diri_<version>_amd64.deb
+sudo apt install ./diri_<version>_amd64.deb    # x86_64
+sudo apt install ./diri_<version>_arm64.deb    # arm64
 ```
 
 Or run the AppImage directly:
 
 ```sh
-chmod +x diri_<version>_amd64.AppImage
-./diri_<version>_amd64.AppImage
+chmod +x diri_<version>_x86_64.AppImage    # or diri_<version>_aarch64.AppImage on arm64
+./diri_<version>_x86_64.AppImage
 ```
 
 diri does not update itself on Linux. Settings shows the installed version; update by installing a newer package the same way.
 
 ### Linux limits
-- No aarch64 packages.
 - No native tray or notification actions. Approvals and status still work inside diri.
 - No automatic in-app updates.
 - No iPhone companion or remote port forwarding.

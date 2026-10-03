@@ -11,8 +11,12 @@ export function releaseDownloads(release) {
   const formats = [
     { name: `diri-${version}-universal.dmg`, label: 'macOS · Universal DMG', primary: true },
     { name: `diri-${version}-universal.zip`, label: 'macOS · Universal ZIP' },
-    { name: `diri_${version}_amd64.AppImage`, label: 'Linux beta · x86_64 AppImage' },
+    // cargo-packager names the AppImage by machine (x86_64, aarch64) and the
+    // Debian package by Debian architecture (amd64, arm64).
+    { name: `diri_${version}_x86_64.AppImage`, label: 'Linux beta · x86_64 AppImage' },
     { name: `diri_${version}_amd64.deb`, label: 'Linux beta · x86_64 Debian package' },
+    { name: `diri_${version}_aarch64.AppImage`, label: 'Linux beta · arm64 AppImage' },
+    { name: `diri_${version}_arm64.deb`, label: 'Linux beta · arm64 Debian package' },
   ];
   const downloads = formats.flatMap(format => {
     const url = `${repository}/releases/download/${tag}/${format.name}`;

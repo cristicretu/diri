@@ -55,6 +55,7 @@ if [[ "${formats}" == *appimage* && "${formats}" == *deb* ]]; then
     python3 "${script_dir}/write-linux-release-manifest.py" \
         --directory "${dist_dir}" \
         --version "${version}" \
+        --architecture "$(uname -m)" \
         --commit "${source_commit}"
 fi
 

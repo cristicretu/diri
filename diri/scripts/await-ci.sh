@@ -26,9 +26,12 @@ set -euo pipefail
 GH_REPO="${GH_REPO:-cristicretu/diri}"
 POLL="${DIRI_CI_POLL_SECONDS:-20}"
 DEADLINE=$((SECONDS + ${DIRI_CI_TIMEOUT_SECONDS:-5400}))
-# Display-name prefix shared by the Nightly packaging job and its Ubuntu 24.04
-# smoke. Renaming those jobs must update this.
+# Display-name prefix shared by the Nightly Linux jobs: the per-architecture
+# package builds (x86_64, aarch64), the signed release set that merges them,
+# and the per-architecture Ubuntu 24.04 smokes. Renaming those jobs, or
+# changing the architecture matrix, must update these.
 LINUX_JOB_PREFIX="Linux package"
+LINUX_JOB_COUNT=5
 
 usage() {
     echo "usage: await-ci.sh gates <sha> | await-ci.sh linux <sha> <out-dir>" >&2
@@ -133,8 +136,8 @@ await_linux() {
     fi
     log "Nightly run $run for $sha: https://github.com/$GH_REPO/actions/runs/$run"
 
-    # Dependent jobs are only listed once they are queued, so require both
-    # Linux jobs to be present before trusting "none pending".
+    # Dependent jobs are only listed once they are queued, so require every
+    # Linux job to be present before trusting "none pending".
     while :; do
         read -r status count pending failed < <(linux_job_state "$run")
         if [ "$failed" -gt 0 ]; then
@@ -142,7 +145,7 @@ await_linux() {
             echo "  https://github.com/$GH_REPO/actions/runs/$run" >&2
             exit 1
         fi
-        if [ "$count" -ge 2 ] && [ "$pending" -eq 0 ]; then
+        if [ "$count" -ge "$LINUX_JOB_COUNT" ] && [ "$pending" -eq 0 ]; then
             break
         fi
         if [ "$status" = "completed" ]; then

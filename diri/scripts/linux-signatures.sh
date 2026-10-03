@@ -5,8 +5,9 @@
 #   diri/scripts/linux-signatures.sh sign   <dist-directory>
 #   diri/scripts/linux-signatures.sh verify <dist-directory>
 #
-# The signed set is the one AppImage, the one Debian package, SHA256SUMS, and
-# linux-release.json in <dist-directory>. Each <file> gets a detached
+# The signed set is every AppImage and Debian package linux-release.json
+# declares (one of each per architecture, see write-linux-release-manifest.py),
+# SHA256SUMS, and linux-release.json in <dist-directory>. Each <file> gets a detached
 # <file>.sigstore.json bundle beside it: the signature, the short-lived signing
 # certificate, and the Rekor transparency-log inclusion proof, so a bundle
 # verifies without any other download.
@@ -52,23 +53,50 @@ gh_repo="${GH_REPO:-cristicretu/diri}"
 identity="${DIRI_SIGNING_IDENTITY:-https://github.com/${gh_repo}/.github/workflows/nightly.yml@refs/heads/main}"
 issuer="${DIRI_SIGNING_OIDC_ISSUER:-https://token.actions.githubusercontent.com}"
 
-# Exactly one of each package format: a stray second AppImage would otherwise
-# ship unsigned, or be signed without anyone meaning to publish it.
-find_one() {
-    local pattern="$1" matches
-    matches="$(find "${dist_dir}" -maxdepth 1 -type f -name "${pattern}" -print)"
-    if [ -z "${matches}" ] || [ "$(printf '%s\n' "${matches}" | wc -l | tr -d ' ')" != 1 ]; then
-        echo "error: expected exactly one ${pattern} in ${dist_dir}" >&2
-        exit 1
-    fi
-    printf '%s\n' "${matches}"
-}
+# Exactly the packages the manifest declares: a stray second AppImage would
+# otherwise ship unsigned, or be signed without anyone meaning to publish it.
+if ! command -v python3 >/dev/null 2>&1; then
+    echo "error: python3 is required to read linux-release.json" >&2
+    exit 1
+fi
+if [ ! -f "${dist_dir}/linux-release.json" ]; then
+    echo "error: missing ${dist_dir}/linux-release.json" >&2
+    exit 1
+fi
+# Read into a variable first: bash 3.2 (macOS, where release.sh verifies)
+# misparses a here-document inside $(...).
+list_packages=""
+IFS= read -r -d '' list_packages <<'PY' || true
+import json
+import pathlib
+import sys
 
-appimage="$(find_one '*.AppImage')" || exit 1
-deb="$(find_one '*.deb')" || exit 1
+directory = pathlib.Path(sys.argv[1])
+manifest = json.loads((directory / "linux-release.json").read_text())
+builds = manifest.get("builds") or [{"artifacts": manifest.get("artifacts", [])}]
+declared = [record["file"] for build in builds for record in build.get("artifacts", [])]
+present = sorted(
+    path.name
+    for path in directory.iterdir()
+    if path.is_file() and path.suffix in {".deb", ".AppImage"}
+)
+if not declared or len(set(declared)) != len(declared) or sorted(declared) != present:
+    sys.exit(
+        f"error: expected exactly the packages linux-release.json declares in {directory}; "
+        f"declared {sorted(declared)}, found {present}"
+    )
+for name in declared:
+    if "/" in name or name.startswith("."):
+        sys.exit(f"error: unsafe package name in linux-release.json: {name!r}")
+    print(name)
+PY
+declared="$(python3 -c "${list_packages}" "${dist_dir}")" || exit 1
+packages=()
+while IFS= read -r package; do
+    packages+=("${dist_dir}/${package}")
+done <<< "${declared}"
 files=(
-    "${appimage}"
-    "${deb}"
+    "${packages[@]}"
     "${dist_dir}/SHA256SUMS"
     "${dist_dir}/linux-release.json"
 )

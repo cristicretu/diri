@@ -12,7 +12,7 @@ Alternatively, download the latest DMG from [GitHub Releases](https://github.com
 open it, and drag Diri to Applications. The app checks the same release feed for
 updates; it never installs one until you click restart.
 
-On x86_64 Ubuntu 22.04 or 24.04, use an AppImage or Debian package from a
+On x86_64 or arm64 Ubuntu 22.04 or 24.04, use an AppImage or Debian package from a
 [GitHub release](https://github.com/cristicretu/diri/releases) that includes Linux
 artifacts, or build from source. Linux packages are not included in every
 release. The [Linux beta guide](../diri/LINUX.md) covers installation, source

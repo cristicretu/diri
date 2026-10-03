@@ -7,7 +7,8 @@ function fixture(version = '0.6.2') {
     tag_name: `v${version}`, draft: false, prerelease: false,
     assets: [
       `diri-${version}-universal.dmg`, `diri-${version}-universal.zip`,
-      `diri_${version}_amd64.AppImage`, `diri_${version}_amd64.deb`,
+      `diri_${version}_x86_64.AppImage`, `diri_${version}_amd64.deb`,
+      `diri_${version}_aarch64.AppImage`, `diri_${version}_arm64.deb`,
       'appcast.json', 'SHA256SUMS', 'diri-remote-linux-x86_64',
     ].map(name => ({
       name, state: 'uploaded', size: 1024,
@@ -23,6 +24,7 @@ test('resolves macOS and Linux installers, excluding helpers and metadata', () =
   assert.deepEqual(result.downloads.map(asset => asset.label), [
     'macOS · Universal DMG', 'macOS · Universal ZIP',
     'Linux beta · x86_64 AppImage', 'Linux beta · x86_64 Debian package',
+    'Linux beta · arm64 AppImage', 'Linux beta · arm64 Debian package',
   ]);
   assert.equal(result.downloads.find(asset => asset.primary).name, 'diri-0.6.2-universal.dmg');
 });

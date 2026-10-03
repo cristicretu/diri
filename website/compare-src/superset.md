@@ -9,7 +9,7 @@ Superset is a desktop workspace for running many coding agents in parallel, each
 ## At a glance
 | | diri | Superset |
 | --- | --- | --- |
-| Platforms | macOS 15 or newer (universal), Linux beta on x86_64 Ubuntu, iPhone companion beta | macOS (Apple silicon or Intel), experimental Linux x64 AppImage, iPhone app with Pro; no Windows |
+| Platforms | macOS 15 or newer (universal), Linux beta on x86_64 and arm64 Ubuntu, iPhone companion beta | macOS (Apple silicon or Intel), experimental Linux x64 AppImage, iPhone app with Pro; no Windows |
 | Price | Free | Free tier; Pro $20/mo, or $15 per user per month billed yearly; Enterprise custom |
 | License | Apache-2.0, open source | Elastic License 2.0, source-available (not OSI-approved) |
 | App stack | Rust and GPUI | Electron and React |

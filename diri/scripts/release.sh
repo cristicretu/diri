@@ -33,7 +33,7 @@
 # arrive, verified the same way. See scripts/await-ci.sh.
 #
 # This publishes two notarized macOS artifacts plus the CI-built Linux
-# AppImage and Debian package:
+# AppImage and Debian package for each of x86_64 and aarch64:
 #   diri-<version>-universal.dmg  what people download by hand
 #   diri-<version>-universal.zip  what the in-app updater fetches
 # plus appcast.json, SHA256SUMS, and the reviewed dependency-license inventory.
@@ -334,50 +334,70 @@ if [ -n "$GATES_PID" ]; then
 fi
 
 # Validates the Linux CI artifact, verifies its Sigstore signatures against
-# main's Nightly identity, and stages it in $DIST. Fills LINUX_ASSETS.
+# main's Nightly identity, and stages it in $DIST. Fills LINUX_PACKAGES and
+# LINUX_ASSETS.
+#
+# The artifact is Nightly's merged release set: an AppImage and a Debian
+# package for every architecture in LINUX_ARCHITECTURES, one SHA256SUMS over
+# all of them, and one linux-release.json. Its top-level "architecture" and
+# "artifacts" stay the x86_64 build's, as every release before aarch64 had
+# them; "builds" lists each architecture (see write-linux-release-manifest.py).
+LINUX_ARCHITECTURES="x86_64 aarch64"
+LINUX_PACKAGES=()
 LINUX_ASSETS=()
 stage_linux() {
-    LINUX_APPIMAGE_SOURCE="$(find "$DIRI_LINUX_DIST" -maxdepth 1 -type f -name '*.AppImage' -print -quit)"
-    LINUX_DEB_SOURCE="$(find "$DIRI_LINUX_DIST" -maxdepth 1 -type f -name '*.deb' -print -quit)"
     LINUX_MANIFEST_SOURCE="$DIRI_LINUX_DIST/linux-release.json"
-    if [ -z "$LINUX_APPIMAGE_SOURCE" ] || [ -z "$LINUX_DEB_SOURCE" ] || [ ! -f "$LINUX_MANIFEST_SOURCE" ]; then
-        echo "error: Linux CI artifact must contain one AppImage, one DEB, and linux-release.json" >&2
+    if [ ! -f "$LINUX_MANIFEST_SOURCE" ]; then
+        echo "error: Linux CI artifact must contain linux-release.json" >&2
         exit 1
     fi
 
+    local listing="$CI_LOG_DIR/linux-packages.txt"
     python3 - "$LINUX_MANIFEST_SOURCE" "$VERSION" "$SOURCE_COMMIT" \
-        "$LINUX_APPIMAGE_SOURCE" "$LINUX_DEB_SOURCE" <<'PYLINUX'
+        "$LINUX_ARCHITECTURES" > "$listing" <<'PYLINUX'
 import hashlib
 import json
 import pathlib
 import sys
 
-manifest_path, version, commit, *artifact_names = sys.argv[1:]
-manifest = json.loads(pathlib.Path(manifest_path).read_text())
+manifest_path, version, commit, architectures = sys.argv[1:]
+manifest_path = pathlib.Path(manifest_path)
+manifest = json.loads(manifest_path.read_text())
 if manifest.get("version") != version or manifest.get("commit") != commit:
     raise SystemExit("Linux artifact version/source commit does not match this release")
+# Readers that predate "builds" take the top-level fields as the x86_64 build.
 if manifest.get("platform") != "linux" or manifest.get("architecture") != "x86_64":
     raise SystemExit("Linux artifact has the wrong platform or architecture")
-records = {record["file"]: record for record in manifest.get("artifacts", [])}
-for name in artifact_names:
-    path = pathlib.Path(name)
-    record = records.get(path.name)
-    if record is None:
-        raise SystemExit(f"Linux manifest does not declare {path.name}")
-    digest = hashlib.sha256(path.read_bytes()).hexdigest()
-    if digest != record.get("sha256"):
-        raise SystemExit(f"Linux artifact digest mismatch: {path.name}")
+builds = {build.get("architecture"): build for build in manifest.get("builds", [])}
+if sorted(builds) != sorted(architectures.split()) or len(builds) != len(manifest["builds"]):
+    raise SystemExit(f"Linux artifact builds {sorted(builds)}, expected {architectures.split()}")
+if manifest.get("artifacts") != builds["x86_64"].get("artifacts"):
+    raise SystemExit("Linux manifest's top-level artifacts are not the x86_64 build")
+for architecture, build in builds.items():
+    formats = sorted(record.get("format") for record in build.get("artifacts", []))
+    if formats != ["appimage", "deb"]:
+        raise SystemExit(f"Linux {architecture} build must have one AppImage and one DEB")
+    for record in build["artifacts"]:
+        name = record["file"]
+        if "/" in name or name.startswith("."):
+            raise SystemExit(f"unsafe Linux artifact name {name!r}")
+        path = manifest_path.parent / name
+        if not path.is_file():
+            raise SystemExit(f"Linux CI artifact is missing {name}")
+        digest = hashlib.sha256(path.read_bytes()).hexdigest()
+        if digest != record.get("sha256"):
+            raise SystemExit(f"Linux artifact digest mismatch: {name}")
+        print(name)
 PYLINUX
 
     # The packages must carry signatures from main's Nightly workflow. Overrides a
     # maintainer may have exported for a rehearsal are dropped so the pinned
-    # identity, not the environment, decides what is accepted.
+    # identity, not the environment, decides what is accepted. This also
+    # refuses any package in the directory that the manifest does not declare.
     echo "==> Verifying Linux Sigstore signatures"
     env -u DIRI_COSIGN_PUBLIC_KEY -u DIRI_SIGNING_IDENTITY -u DIRI_SIGNING_OIDC_ISSUER \
         GH_REPO="$GH_REPO" "$WORKSPACE/scripts/linux-signatures.sh" verify "$DIRI_LINUX_DIST"
 
-    LINUX_APPIMAGE="$DIST/$(basename "$LINUX_APPIMAGE_SOURCE")"
-    LINUX_DEB="$DIST/$(basename "$LINUX_DEB_SOURCE")"
     LINUX_MANIFEST="$DIST/linux-release.json"
     # The release-wide SHA256SUMS below covers every platform and is written here,
     # so it cannot carry CI's signature. CI's signed Linux-only list ships beside it
@@ -389,23 +409,27 @@ PYLINUX
             cp "$1" "$2"
         fi
     }
-    copy_linux_asset "$LINUX_APPIMAGE_SOURCE" "$LINUX_APPIMAGE"
-    copy_linux_asset "$LINUX_DEB_SOURCE" "$LINUX_DEB"
+    LINUX_PACKAGES=()
+    local package_signatures=() name
+    while IFS= read -r name; do
+        [ -n "$name" ] || continue
+        copy_linux_asset "$DIRI_LINUX_DIST/$name" "$DIST/$name"
+        copy_linux_asset "$DIRI_LINUX_DIST/$name.sigstore.json" "$DIST/$name.sigstore.json"
+        LINUX_PACKAGES+=("$DIST/$name")
+        package_signatures+=("$DIST/$name.sigstore.json")
+    done < "$listing"
     copy_linux_asset "$LINUX_MANIFEST_SOURCE" "$LINUX_MANIFEST"
     copy_linux_asset "$DIRI_LINUX_DIST/SHA256SUMS" "$LINUX_CHECKSUMS"
-    copy_linux_asset "$LINUX_APPIMAGE_SOURCE.sigstore.json" "$LINUX_APPIMAGE.sigstore.json"
-    copy_linux_asset "$LINUX_DEB_SOURCE.sigstore.json" "$LINUX_DEB.sigstore.json"
     copy_linux_asset "$LINUX_MANIFEST_SOURCE.sigstore.json" "$LINUX_MANIFEST.sigstore.json"
     copy_linux_asset "$DIRI_LINUX_DIST/SHA256SUMS.sigstore.json" "$LINUX_CHECKSUMS.sigstore.json"
     LINUX_SIGNATURES=(
         "$LINUX_CHECKSUMS"
-        "$LINUX_APPIMAGE.sigstore.json"
-        "$LINUX_DEB.sigstore.json"
+        "${package_signatures[@]}"
         "$LINUX_MANIFEST.sigstore.json"
         "$LINUX_CHECKSUMS.sigstore.json"
     )
     LINUX_ASSETS=(
-        "$LINUX_APPIMAGE" "$LINUX_DEB" "$LINUX_MANIFEST" "${LINUX_SIGNATURES[@]}"
+        "${LINUX_PACKAGES[@]}" "$LINUX_MANIFEST" "${LINUX_SIGNATURES[@]}"
     )
 }
 
@@ -500,7 +524,10 @@ fi
 echo "==> Writing $CHECKSUMS"
 CHECKSUMMED=("$(basename "$DMG")" "$(basename "$ZIP")")
 if [ "$LINUX_DEFERRED" = 0 ]; then
-    CHECKSUMMED+=("$(basename "$LINUX_APPIMAGE")" "$(basename "$LINUX_DEB")" "$(basename "$LINUX_MANIFEST")")
+    for package in "${LINUX_PACKAGES[@]}"; do
+        CHECKSUMMED+=("$(basename "$package")")
+    done
+    CHECKSUMMED+=("$(basename "$LINUX_MANIFEST")")
 fi
 CHECKSUMMED+=("$(basename "$FEED")" "$(basename "$INVENTORY")")
 (
@@ -524,9 +551,10 @@ worktrees, review tools, and direct SSH hosts.
 Universal (Apple silicon and Intel), signed and notarized, so it opens without
 a Gatekeeper prompt.
 
-**Linux beta:** download the x86_64 Debian package or AppImage. Ubuntu 22.04
-and 24.04 are supported under X11 and Wayland. Linux updates use a newer
-package/download rather than the in-app macOS updater.
+**Linux beta:** download the Debian package or AppImage for your machine:
+\`amd64\`/\`x86_64\` for Intel and AMD, \`arm64\`/\`aarch64\` for 64-bit ARM.
+Ubuntu 22.04 and 24.04 are supported under X11 and Wayland. Linux updates use
+a newer package/download rather than the in-app macOS updater.
 
 See \`SHA256SUMS\` and \`linux-release.json\` for artifact metadata. Each Linux
 file has a Sigstore \`.sigstore.json\` signature from this repository's CI;
@@ -581,8 +609,7 @@ cat <<EOF
 ============================================================
   DMG        : $DMG
   Update zip : $ZIP
-  AppImage   : $LINUX_APPIMAGE
-  Debian     : $LINUX_DEB
+  Linux      : $(for package in "${LINUX_PACKAGES[@]}"; do printf '%s ' "$(basename "$package")"; done)
   Linux meta : $LINUX_MANIFEST
   DMG sha256 : $DMG_SHA256
   ZIP sha256 : $SHA256

@@ -1,9 +1,27 @@
 # Linux beta
 
-Diri supports x86_64 Ubuntu 22.04 and 24.04 under native Wayland and X11.
-The desktop renderer requires a Vulkan 1.3-capable driver. The release build
-has a glibc 2.35 floor and does not require Swift, SwiftPM, Xcode, or a macOS
-application bundle.
+Diri supports Ubuntu 22.04 and 24.04 on x86_64 and on 64-bit ARM (aarch64,
+Debian's `arm64`) under native Wayland and X11. The desktop renderer requires a
+Vulkan 1.3-capable driver. Both architectures are built natively on Ubuntu
+22.04, so both have a glibc 2.35 floor; neither requires Swift, SwiftPM, Xcode,
+or a macOS application bundle.
+
+| Architecture | AppImage | Debian package | glibc | CI-tested on |
+|---|---|---|---|---|
+| x86_64 (Intel, AMD) | `diri_<version>_x86_64.AppImage` | `diri_<version>_amd64.deb` | 2.35 or newer | Ubuntu 22.04, 24.04 |
+| aarch64 (64-bit ARM) | `diri_<version>_aarch64.AppImage` | `diri_<version>_arm64.deb` | 2.35 or newer | Ubuntu 22.04, 24.04 (`ubuntu-*-arm` runners) |
+
+`uname -m` prints the name to pick. aarch64 packages are published from the
+first release after 0.9.1; earlier releases are x86_64 only. Other
+distributions with glibc 2.35 or newer and a Vulkan 1.3 driver, such as Asahi
+Linux on Apple silicon with Mesa's Honeykrisp driver, are expected to run the
+AppImage but are not in the tested matrix. The AppImage is the format for
+distributions without APT.
+
+Scripts should pick files from the release's `linux-release.json`: its
+`builds` list has one entry per `architecture` (`x86_64`, `aarch64`) with that
+build's `debArchitecture` and `artifacts`. The top-level `architecture` and
+`artifacts` fields are kept for older readers and always describe x86_64.
 
 ## Install
 
@@ -22,19 +40,21 @@ is tested), download the artifact and its bundle, then run:
 
 ```sh
 cosign verify-blob \
-  --bundle diri_<version>_amd64.AppImage.sigstore.json \
+  --bundle diri_<version>_x86_64.AppImage.sigstore.json \
   --certificate-identity https://github.com/cristicretu/diri/.github/workflows/nightly.yml@refs/heads/main \
   --certificate-oidc-issuer https://token.actions.githubusercontent.com \
-  diri_<version>_amd64.AppImage
+  diri_<version>_x86_64.AppImage
 ```
 
 `Verified OK` means the file is byte-for-byte what the `nightly.yml` workflow
 on `main` signed, and that the signature is recorded in the public Sigstore
 transparency log. Any other signer, a modified file, or a missing bundle
-fails. Use the same command for `diri_<version>_amd64.deb`.
+fails. Use the same command for `diri_<version>_amd64.deb`, or for the
+aarch64 files `diri_<version>_aarch64.AppImage` and `diri_<version>_arm64.deb`.
 
 To check every Linux file at once, verify the signed Linux checksum list and
-then check against it:
+then check against it. `SHA256SUMS-linux` lists the packages of every
+architecture; `--ignore-missing` checks the ones you downloaded:
 
 ```sh
 cosign verify-blob \
@@ -55,7 +75,8 @@ For Ubuntu or another Debian-based system, install the package with APT so its
 runtime dependencies are resolved:
 
 ```sh
-sudo apt install ./diri_<version>_amd64.deb
+sudo apt install ./diri_<version>_amd64.deb    # x86_64
+sudo apt install ./diri_<version>_arm64.deb    # aarch64
 ```
 
 This installs the desktop entry and the `diri`, `dirijor`, and `dirijor-mcp`
@@ -67,8 +88,8 @@ deleted by package removal.
 The AppImage needs no installation:
 
 ```sh
-chmod +x diri_<version>_amd64.AppImage
-./diri_<version>_amd64.AppImage
+chmod +x diri_<version>_x86_64.AppImage    # or diri_<version>_aarch64.AppImage
+./diri_<version>_x86_64.AppImage
 ```
 
 Diri does not replace packages from inside the app on Linux. Settings shows
@@ -147,14 +168,14 @@ driver, plus the privacy-safe diagnostics from Settings.
 
 ## Beta limitations
 
-The first beta intentionally does not provide aarch64 packages, native tray or
-notification actions, automatic in-app package replacement, mobile-companion
+The beta intentionally does not provide native tray or notification actions, automatic in-app package replacement, mobile-companion
 connectivity, or remote port forwarding. Approval and status workflows remain
 available inside Diri. Start-at-login is hidden until a desktop-neutral
 autostart implementation exists.
 
 CI launches a real GPUI window through Xvfb and a headless Weston compositor,
 and package smoke tests cover install, upgrade, uninstall, a live shell,
-daemon restart/adoption, hooks, and MCP on clean Ubuntu 22.04 and 24.04 jobs.
+daemon restart/adoption, hooks, and MCP on clean Ubuntu 22.04 and 24.04 jobs
+for both x86_64 and aarch64.
 Those virtual displays do not replace the manual release matrix for multiple
 monitors, fractional scaling, suspend/resume, and native GPU drivers.
