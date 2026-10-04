@@ -276,8 +276,10 @@ struct FakeAgent {
     transcript: Vec<String>,
     top: usize,
     lines: fn(u16) -> usize,
-    /// Lines a single notch moves.
-    notch: f32,
+    /// How the planner expects it to move.
+    notches: Notches,
+    /// PageUp/PageDown move half the transcript; otherwise they do nothing.
+    pages: bool,
     swallow_reversal: bool,
     /// Like Claude Code, leave this message undrawn when it scrolls into
     /// view from below, until the view next moves up.
@@ -293,7 +295,7 @@ const SCREEN: usize = 30;
 const REGION: usize = 26;
 
 impl FakeAgent {
-    fn new(replies: &[usize], lines: fn(u16) -> usize) -> Self {
+    fn new(replies: &[usize], lines: fn(u16) -> usize, notches: Notches) -> Self {
         let mut transcript = vec!["  >_ Agent".to_owned(), String::new()];
         for (turn, reply) in replies.iter().enumerate() {
             transcript.push(format!("› Message {turn}"));
@@ -309,7 +311,8 @@ impl FakeAgent {
             transcript,
             top: 0,
             lines,
-            notch: lines(1) as f32,
+            notches,
+            pages: notches.page_keys,
             swallow_reversal: false,
             undrawn_going_down: None,
             undrawn: false,
@@ -382,14 +385,44 @@ impl FakeAgent {
         self.redraws += 1;
     }
 
+    fn page(&mut self, up: bool) {
+        if !self.pages {
+            return;
+        }
+        let lines = (REGION - 1) / 2;
+        let visible = |agent: &Self| {
+            agent.undrawn_going_down.as_ref().is_some_and(|hidden| {
+                agent.transcript[agent.top..(agent.top + REGION).min(agent.transcript.len())]
+                    .contains(hidden)
+            })
+        };
+        let before = visible(self);
+        self.top = if up {
+            self.top.saturating_sub(lines)
+        } else {
+            (self.top + lines).min(self.bottom())
+        };
+        if up {
+            self.undrawn = false;
+        } else if !before && visible(self) {
+            self.undrawn = true;
+        }
+        self.spinner = !self.spinner;
+        self.redraws += 1;
+    }
+
     /// Runs one jump; returns the transcript line the arrived message is.
     fn jump(&mut self, next: bool, from: Option<usize>) -> Option<(usize, String)> {
         let (mut travel, mut step) =
-            Travel::begin_with_notch(Gutter::Codex, self.notch, next, &self.screen(), from);
+            Travel::begin_with(Gutter::Codex, self.notches, next, &self.screen(), from);
         for _ in 0..1000 {
             step = match step {
                 TravelStep::Scroll { up, ticks } => {
                     self.wheel(up, ticks);
+                    travel.observe(&self.screen())
+                }
+                TravelStep::Page { up } => {
+                    self.page(up);
                     travel.observe(&self.screen())
                 }
                 TravelStep::Wait => travel.observe(&self.screen()),
@@ -448,36 +481,73 @@ fn walk(agent: &mut FakeAgent, tolerance: usize) {
 
 #[test]
 fn travel_visits_every_message_with_three_line_notches() {
-    let mut agent = FakeAgent::new(&[3, 40, 1, 120, 8, 2, 60], |ticks| usize::from(ticks) * 3);
+    let mut agent = FakeAgent::new(
+        &[3, 40, 1, 120, 8, 2, 60],
+        |ticks| usize::from(ticks) * 3,
+        Notches::THREE_LINES,
+    );
     walk(&mut agent, 3);
-    // About 450 transcript rows each way: half a screen a step, a few to
-    // align each of the fourteen jumps.
-    assert!(agent.redraws < 120, "{} redraws", agent.redraws);
+    // About 450 transcript rows each way: most of a screen a step, and one
+    // more to place each of the fourteen jumps.
+    assert!(agent.redraws < 80, "{} redraws", agent.redraws);
 }
 
 #[test]
 fn travel_survives_accelerated_notches_and_a_swallowed_reversal() {
-    // Claude Code moves one line per notch, accelerating repeated notches,
-    // and may ignore the first notch after the wheel turns around.
-    let mut agent = FakeAgent::new(&[5, 70, 2, 150, 40], |ticks| {
-        let ticks = usize::from(ticks);
-        ticks + ticks * ticks / 10
-    });
+    // Claude Code: page keys, then notches that speed up in longer bursts,
+    // and the first notch after the wheel turns around ignored.
+    let mut agent = FakeAgent::new(
+        &[5, 70, 2, 150, 40],
+        |ticks| Notches::CLAUDE.lines(ticks, false) as usize,
+        Notches::CLAUDE,
+    );
     agent.swallow_reversal = true;
     walk(&mut agent, 2);
-    assert!(agent.redraws < 200, "{} redraws", agent.redraws);
+    assert!(agent.redraws < 120, "{} redraws", agent.redraws);
+}
+
+#[test]
+fn travel_falls_back_to_notches_when_page_keys_do_nothing() {
+    let mut agent = FakeAgent::new(
+        &[5, 70, 2, 150, 40],
+        |ticks| Notches::CLAUDE.lines(ticks, false) as usize,
+        Notches::CLAUDE,
+    );
+    agent.pages = false;
+    agent.swallow_reversal = true;
+    walk(&mut agent, 2);
+}
+
+#[test]
+fn travel_finds_a_message_claude_leaves_undrawn_while_paging_down() {
+    let mut agent = FakeAgent::new(
+        &[3, 40, 30, 50],
+        |ticks| Notches::CLAUDE.lines(ticks, false) as usize,
+        Notches::CLAUDE,
+    );
+    agent.swallow_reversal = true;
+    agent.undrawn_going_down = Some("› Message 2".into());
+    walk(&mut agent, 2);
 }
 
 #[test]
 fn travel_finds_a_message_left_undrawn_while_moving_down() {
-    let mut agent = FakeAgent::new(&[3, 40, 30, 50], |ticks| usize::from(ticks) * 3);
+    let mut agent = FakeAgent::new(
+        &[3, 40, 30, 50],
+        |ticks| usize::from(ticks) * 3,
+        Notches::THREE_LINES,
+    );
     agent.undrawn_going_down = Some("› Message 2".into());
     walk(&mut agent, 3);
 }
 
 #[test]
 fn travel_from_live_skips_the_message_already_on_screen() {
-    let mut agent = FakeAgent::new(&[3, 30, 4], |ticks| usize::from(ticks) * 3);
+    let mut agent = FakeAgent::new(
+        &[3, 30, 4],
+        |ticks| usize::from(ticks) * 3,
+        Notches::THREE_LINES,
+    );
     // The latest message and its short reply are visible at the bottom.
     assert!(
         agent
@@ -487,6 +557,24 @@ fn travel_from_live_skips_the_message_already_on_screen() {
     );
     let (_, text) = agent.jump(false, None).unwrap();
     assert_eq!(text, "› Message 1");
+}
+
+#[test]
+fn notch_models_match_the_recorded_curves() {
+    let claude = Notches::CLAUDE;
+    assert_eq!(claude.lines(4, false), 4.0);
+    assert_eq!(claude.lines(10, false), 19.0);
+    assert_eq!(claude.lines(9, false), 16.0, "between recorded sizes");
+    assert_eq!(claude.lines(8, true), 10.0, "a turn loses one notch");
+    assert_eq!(claude.lines(1, true), 0.0);
+    assert_eq!(claude.within(20.0, false), 10);
+    assert_eq!(claude.within(5.0, false), 4);
+    assert_eq!(claude.within(1.0, true), 2, "the shortest burst that moves");
+    assert_eq!(claude.within_most(40.0, false, claude.most_aligning), 8);
+    let three = Notches::THREE_LINES;
+    assert_eq!(three.lines(7, true), 21.0);
+    assert_eq!(three.within(40.0, false), 13);
+    assert_eq!(three.within(2.0, false), 1);
 }
 
 #[test]

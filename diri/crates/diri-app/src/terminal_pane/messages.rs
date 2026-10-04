@@ -1,8 +1,10 @@
 //! Jumps between the messages a person sent to an Agent (⌘⇧↑ / ⌘⇧↓).
 //!
 //! A full-screen Agent owns its transcript's scrolling, so a jump sends it
-//! the wheel notches a trackpad would and reads each redrawn screen until the
-//! message sits at the top ([`diri_term::messages::Travel`]). An inline Agent
+//! the wheel notches a trackpad would (or the PageUp/PageDown it scrolls with)
+//! and reads each redrawn screen until the message sits at the top
+//! ([`diri_term::messages::Travel`]). The pane keeps showing the screen as it
+//! was meanwhile, so the jump appears as one cut. An inline Agent
 //! leaves its transcript in the terminal history: a jump reads retained rows
 //! from the Engine and scrolls Diri's own view, as the wheel would. Either
 //! way the view stays an ordinary terminal: scrolling, typing and selecting
@@ -14,6 +16,7 @@ use diri_term::messages::{Gutter, Travel, TravelStep};
 /// A jump in flight.
 pub(super) struct MessageJump {
     token: u64,
+    id: SessionId,
     /// Pressed again while travelling: where to go once this jump arrives.
     queued: Option<bool>,
 }
@@ -34,8 +37,29 @@ pub(super) struct MessageMark {
 
 /// How long a jump may take before it gives the view back.
 const JUMP_DEADLINE: Duration = Duration::from_secs(8);
-/// An Agent that has not redrawn this long after notches did not move.
-const REDRAW_TIMEOUT: Duration = Duration::from_millis(220);
+/// An Agent that has not redrawn this long after notches did not move:
+/// each answers within about 45 ms.
+const REDRAW_TIMEOUT: Duration = Duration::from_millis(90);
+
+/// How a full-screen jump ended, and what it needs to mark the result.
+struct TravelEnd {
+    next: bool,
+    /// Whether the Agent's view moved at all.
+    moved: bool,
+    finished: TravelStep,
+    /// The screen it ended on.
+    rows: Vec<Vec<GridCell>>,
+    /// The row the jump started from, to keep reading from it when nothing
+    /// lay that way.
+    origin: Option<Vec<GridCell>>,
+}
+
+/// What a jump step sends to the Agent.
+#[derive(Clone, Copy)]
+enum TravelInput {
+    Notches { up: bool, ticks: u16 },
+    Page { up: bool },
+}
 
 fn screen_rows(buffer: &diri_term::buffer::GridBuffer) -> Vec<Vec<GridCell>> {
     (0..usize::from(buffer.rows))
@@ -104,10 +128,11 @@ impl TerminalPane {
         })
     }
 
-    fn begin_jump(&mut self) -> u64 {
+    fn begin_jump(&mut self, id: &SessionId) -> u64 {
         self.qol.message_tokens += 1;
         self.qol.message_jump = Some(MessageJump {
             token: self.qol.message_tokens,
+            id: id.clone(),
             queued: None,
         });
         self.qol.message_tokens
@@ -134,6 +159,10 @@ impl TerminalPane {
         let Some(jump) = self.qol.message_jump.take_if(|jump| jump.token == token) else {
             return;
         };
+        if let Some(resident) = self.residents.get(&jump.id) {
+            resident.element.hold_frame(false);
+        }
+        cx.notify();
         if arrived
             && let Some(next) = jump.queued
             && let Some(gutter) = self.message_gutter()
@@ -168,58 +197,43 @@ impl TerminalPane {
         let from = origin.as_ref().map(|mark| mark.row as usize);
         let origin = origin.map(|mark| mark.cells);
         let (mut travel, mut step) = Travel::begin(gutter, next, &rows, from);
-        let token = self.begin_jump();
+        let token = self.begin_jump(&id);
+        // The Agent's view moves underneath; the screen shows only where it
+        // lands.
+        self.residents[&id].element.hold_frame(true);
         cx.spawn_in(window, async move |this, cx| {
             let started = Instant::now();
+            let notches = travel.notches();
             let mut last_burst: Option<Instant> = None;
             loop {
-                match step {
+                let pointer = travel.pointer_row();
+                let send = match step {
                     TravelStep::Scroll { up, ticks } => {
+                        // Bursts closer than this are sped up unpredictably.
                         if let Some(sent) = last_burst {
-                            let wait = gutter.burst_interval().saturating_sub(sent.elapsed());
+                            let wait = notches.interval.saturating_sub(sent.elapsed());
                             if !wait.is_zero() {
                                 cx.background_executor().timer(wait).await;
                             }
                         }
                         last_burst = Some(Instant::now());
-                        let pointer = travel.pointer_row();
-                        let sent = crate::floating::update_in_owner(&this, cx, |this, _, _| {
-                            if !this.jump_current(&id, token, interactions) {
-                                return None;
-                            }
-                            let resident = &this.residents[&id];
-                            let before = buffer.read().unwrap().generation();
-                            let col = resident.element.grid_cols() / 2;
-                            resident.attachment.scroll(
-                                u8::from(!up),
-                                ticks,
-                                col,
-                                u16::try_from(pointer).unwrap_or(u16::MAX),
-                            );
-                            Some(before)
-                        });
-                        let Some(Some(before)) = sent else {
-                            let _ =
-                                crate::floating::update_in_owner(&this, cx, |this, window, cx| {
-                                    this.end_jump(token, false, window, cx);
-                                });
-                            return;
-                        };
-                        Self::await_redraw(&buffer, before, gutter.settle_time(), cx).await;
+                        Some(TravelInput::Notches { up, ticks })
                     }
-                    TravelStep::Wait => {
-                        cx.background_executor()
-                            .timer(gutter.settle_time().max(Duration::from_millis(30)))
-                            .await;
-                    }
+                    TravelStep::Page { up } => Some(TravelInput::Page { up }),
+                    TravelStep::Wait => None,
                     finished => {
                         let rows = screen_rows(&buffer.read().unwrap());
                         let moved = travel.moved();
                         let _ = crate::floating::update_in_owner(&this, cx, |this, window, cx| {
                             if this.jump_current(&id, token, interactions) {
-                                this.finish_travel(
-                                    &id, next, moved, finished, rows, origin, window, cx,
-                                );
+                                let end = TravelEnd {
+                                    next,
+                                    moved,
+                                    finished,
+                                    rows,
+                                    origin,
+                                };
+                                this.finish_travel(&id, end, window, cx);
                             }
                             this.end_jump(
                                 token,
@@ -230,6 +244,38 @@ impl TerminalPane {
                         });
                         return;
                     }
+                };
+                if let Some(input) = send {
+                    let sent = crate::floating::update_in_owner(&this, cx, |this, _, _| {
+                        if !this.jump_current(&id, token, interactions) {
+                            return None;
+                        }
+                        let resident = &this.residents[&id];
+                        let before = buffer.read().unwrap().generation();
+                        match input {
+                            TravelInput::Notches { up, ticks } => resident.attachment.scroll(
+                                u8::from(!up),
+                                ticks,
+                                resident.element.grid_cols() / 2,
+                                u16::try_from(pointer).unwrap_or(u16::MAX),
+                            ),
+                            TravelInput::Page { up } => resident
+                                .attachment
+                                .navigate(if up { b"\x1b[5~" } else { b"\x1b[6~" }.to_vec()),
+                        }
+                        Some(before)
+                    });
+                    let Some(Some(before)) = sent else {
+                        let _ = crate::floating::update_in_owner(&this, cx, |this, window, cx| {
+                            this.end_jump(token, false, window, cx);
+                        });
+                        return;
+                    };
+                    Self::await_redraw(&buffer, before, &travel, notches.settle, cx).await;
+                } else {
+                    cx.background_executor()
+                        .timer(notches.settle.max(Duration::from_millis(20)))
+                        .await;
                 }
                 let rows = screen_rows(&buffer.read().unwrap());
                 step = if started.elapsed() > JUMP_DEADLINE {
@@ -242,11 +288,12 @@ impl TerminalPane {
         .detach();
     }
 
-    /// Waits for the Agent to draw the notches just sent: the first redraw
-    /// and whatever follows it at once, or nothing at all.
+    /// Waits for the Agent to draw what was just sent: until a redraw shows
+    /// the whole move predicted, or redraws stop for `settle`, or none comes.
     async fn await_redraw(
         buffer: &diri_term::element::SharedGridBuffer,
         before: u64,
+        travel: &Travel,
         settle: Duration,
         cx: &mut gpui::AsyncWindowContext,
     ) {
@@ -255,37 +302,44 @@ impl TerminalPane {
         let mut changed = None;
         loop {
             cx.background_executor()
-                .timer(Duration::from_millis(4))
+                .timer(Duration::from_millis(2))
                 .await;
             let generation = buffer.read().unwrap().generation();
             if generation != seen {
                 seen = generation;
                 changed = Some(Instant::now());
+                if travel.shows_predicted_move(&screen_rows(&buffer.read().unwrap())) {
+                    return;
+                }
             }
             match changed {
                 Some(at) if at.elapsed() >= settle => return,
                 None if sent.elapsed() >= REDRAW_TIMEOUT => return,
-                _ if sent.elapsed() >= REDRAW_TIMEOUT * 2 => return,
+                _ if sent.elapsed() >= REDRAW_TIMEOUT * 3 => return,
                 _ => {}
             }
         }
     }
 
-    #[allow(clippy::too_many_arguments)]
     fn finish_travel(
         &mut self,
         id: &SessionId,
-        next: bool,
-        moved: bool,
-        finished: TravelStep,
-        rows: Vec<Vec<GridCell>>,
-        origin: Option<Vec<GridCell>>,
+        end: TravelEnd,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        let TravelEnd {
+            next,
+            moved,
+            finished,
+            rows,
+            origin,
+        } = end;
         let Some(resident) = self.residents.get(id) else {
             return;
         };
+        // Cut to where the jump landed.
+        resident.element.hold_frame(false);
         match finished {
             TravelStep::Arrived { start, end } => {
                 resident.element.flash_message(start..end);

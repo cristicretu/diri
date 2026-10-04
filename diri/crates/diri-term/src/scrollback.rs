@@ -147,6 +147,9 @@ pub struct ScrollbackViewport {
     /// Precise travel not yet large enough to leave the live edge.
     leaving_live: f32,
     keyboard_pinned: bool,
+    /// The screen as it was when a message jump began, painted while the
+    /// Agent's own view moves underneath, so the jump appears as one cut.
+    frame_held: bool,
     /// Absolute row pinned to the top of the window while scrolled back.
     ///
     /// `view_offset` alone anchors the view to the *live edge*, so history
@@ -211,7 +214,29 @@ impl ScrollbackViewport {
         }
     }
     pub(crate) fn is_reading(&self) -> bool {
-        self.find_source.is_some() || self.keyboard_pinned || self.view_offset > 0
+        self.find_source.is_some()
+            || self.keyboard_pinned
+            || self.frame_held
+            || self.view_offset > 0
+    }
+
+    /// Holds or releases the painted frame; see `frame_held`.
+    pub(crate) fn hold_frame(&mut self, held: bool, buffer: &GridBuffer) {
+        if self.frame_held == held {
+            return;
+        }
+        self.frame_held = held;
+        if !self.is_reading() {
+            self.release_reading_view();
+        } else {
+            self.hold_reading_view(buffer);
+        }
+        self.sync_anchor();
+    }
+
+    #[must_use]
+    pub const fn frame_held(&self) -> bool {
+        self.frame_held
     }
 
     pub(crate) fn pin_keyboard(&mut self, pinned: bool, buffer: &GridBuffer) {
@@ -352,7 +377,11 @@ impl ScrollbackViewport {
             self.queue_missing_window(visible_rows);
             return true;
         }
-        if clamped.rows == 0 && !self.keyboard_pinned && self.find_source.is_none() {
+        if clamped.rows == 0
+            && !self.keyboard_pinned
+            && !self.frame_held
+            && self.find_source.is_none()
+        {
             self.release_reading_view();
         }
         self.sync_anchor();
@@ -695,6 +724,7 @@ impl ScrollbackViewport {
     /// Alternate screen has no history. Entering it always returns to live.
     pub fn enter_alt_screen(&mut self) -> bool {
         self.keyboard_pinned = false;
+        self.frame_held = false;
         // A paused search is an explicit immutable reading view, including
         // when the live application changes screen modes underneath it.
         if self.find_source.is_some() {

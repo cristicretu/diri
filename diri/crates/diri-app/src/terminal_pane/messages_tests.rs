@@ -141,6 +141,13 @@ impl Harness<'_> {
         self.wait("the jump", Duration::from_secs(15), |pane, _| {
             pane.qol.message_jump.is_none() && !pane.qol.busy
         });
+        let id = self.id.clone();
+        assert!(
+            !self
+                .pane
+                .read_with(self.cx, |pane, _| pane.residents[&id].element.frame_held()),
+            "a finished jump shows the live screen again"
+        );
         // History rows arrive with the scrollback fetch that follows.
         for _ in 0..200 {
             if let Some(rows) = self.flashed()

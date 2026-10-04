@@ -375,6 +375,17 @@ impl AttachmentControl {
         }
     }
 
+    /// Keys a message jump sends to move an Agent's transcript (PageUp,
+    /// PageDown). Like a wheel report they travel as raw terminal bytes, so
+    /// neither the Engine's status nor its prompt tracking reads them as the
+    /// user typing.
+    pub(super) fn navigate(&self, bytes: Vec<u8>) {
+        if !bytes.is_empty() {
+            self.claim_if_vacant();
+            self.report("navigate", self.submit(AttachmentCommand::Mouse(bytes)));
+        }
+    }
+
     pub(super) fn scroll(&self, direction: u8, lines: u16, col: u16, row: u16) {
         self.claim_if_vacant();
         self.report(

@@ -3,10 +3,12 @@
 //!
 //! `record_message_fixtures` writes the screens under
 //! `diri-term/tests/fixtures/agent_messages` (as `.ansi`, with a styled
-//! `.txt` description beside each); `measure_wheel_response` prints how far and
-//! how fast each Agent's transcript moves per wheel notch, the figures behind
-//! each `Gutter`'s notch size, burst pacing and settle time. Re-run both when
-//! an Agent changes how it draws its transcript.
+//! `.txt` description beside each). The measurements print the figures each
+//! `Notches` model is built from: `measure_burst_curve` the lines one burst of
+//! wheel notches moves and when it is drawn, `measure_wheel_response` how
+//! bursts close together speed up, and `measure_claude_page_keys` how far
+//! Claude Code's PageUp/PageDown move and that they leave a draft alone.
+//! Re-run them when an Agent changes how it draws or scrolls its transcript.
 //!
 //! Nothing here needs a provider account. Each CLI talks to
 //! `fixtures/fake_agent_api.py` (OpenAI chat and Responses, Anthropic
@@ -616,4 +618,221 @@ fn measure_wheel_response() {
         }
         let _ = client.call("session.kill", json!({ "sessionID": id }));
     }
+}
+
+/// Prints the lines one burst of `n` notches moves after a pause, each way,
+/// and when its last redraw lands: the curve a jump plans its steps with.
+#[test]
+#[ignore = "measurement: needs real Agent CLIs on PATH"]
+fn measure_burst_curve() {
+    let agents = std::env::var("DIRI_AGENTS").unwrap_or_else(|_| "claude-code".into());
+    let fixture = fixture();
+    let (mut client, registry) = start_with_registry(fixture.temp.path());
+    for agent in agents.split(',') {
+        let record = client
+            .call(
+                "session.spawn",
+                json!({ "kind": { agent: {} }, "cwd": fixture.project, "initialCols": 100, "initialRows": 40 }),
+            )
+            .unwrap();
+        let id = record["id"].as_str().unwrap().to_string();
+        client.wait_screen(&id, Duration::from_secs(30), |screen| {
+            screen.trim().len() > 40
+        });
+        std::thread::sleep(Duration::from_secs(4));
+        for prompt in ["Alpha message LINES 200", "Bravo message LINES 200"] {
+            client
+                .call(
+                    "session.send_text",
+                    json!({ "sessionID": id, "text": prompt, "submit": true }),
+                )
+                .unwrap();
+            std::thread::sleep(Duration::from_secs(8));
+        }
+        let wheel = |up: bool, ticks: usize| {
+            let registry = registry.lock().unwrap();
+            registry
+                .get(&id)
+                .unwrap()
+                .scroll(up, ticks, 50, 10)
+                .unwrap();
+        };
+        let position = |client: &mut Client| -> i64 {
+            client
+                .screen(&id)
+                .lines()
+                .enumerate()
+                .find_map(|(row, line)| {
+                    let rest = line.trim().strip_prefix("Reply line ")?;
+                    let n: i64 = rest.split(' ').next()?.parse().ok()?;
+                    Some(n * 2 - row as i64)
+                })
+                .unwrap_or(-1)
+        };
+        // Start well inside the transcript.
+        wheel(true, 30);
+        std::thread::sleep(Duration::from_millis(400));
+        wheel(true, 30);
+        std::thread::sleep(Duration::from_millis(400));
+        let mut last_up = true;
+        for n in [1usize, 1, 2, 2, 3, 4, 5, 6, 7, 8, 10, 12, 14, 16, 20, 24] {
+            for up in [true, false, false, true] {
+                let start = position(&mut client);
+                let sent = Instant::now();
+                wheel(up, n);
+                let mut last_change = None;
+                let mut last = start;
+                while sent.elapsed() < Duration::from_millis(250) {
+                    let now = position(&mut client);
+                    if now != last {
+                        last_change = Some(sent.elapsed().as_millis());
+                        last = now;
+                    }
+                    std::thread::sleep(Duration::from_millis(2));
+                }
+                let reversal = if up != last_up { " (turned)" } else { "" };
+                last_up = up;
+                println!(
+                    "{agent} n={n:2} {}{reversal}: {} lines, settled at {:?} ms",
+                    if up { "up  " } else { "down" },
+                    (start - last).abs(),
+                    last_change
+                );
+                std::thread::sleep(Duration::from_millis(150));
+            }
+        }
+        let _ = client.call("session.kill", json!({ "sessionID": id }));
+    }
+}
+
+/// Prints how far Claude Code's PageUp/PageDown move its transcript, how
+/// soon they are drawn, and that they leave a draft in the composer alone,
+/// also while the conversation still fits on screen.
+#[test]
+#[ignore = "measurement: needs real Agent CLIs on PATH"]
+fn measure_claude_page_keys() {
+    let fixture = fixture();
+    let (mut client, registry) = start_with_registry(fixture.temp.path());
+    let record = client
+        .call(
+            "session.spawn",
+            json!({ "kind": { "claude-code": {} }, "cwd": fixture.project, "initialCols": 100, "initialRows": 40 }),
+        )
+        .unwrap();
+    let id = record["id"].as_str().unwrap().to_string();
+    client.wait_screen(&id, Duration::from_secs(30), |screen| {
+        screen.trim().len() > 40
+    });
+    std::thread::sleep(Duration::from_secs(4));
+    let key = |bytes: &[u8]| {
+        let registry = registry.lock().unwrap();
+        registry.get(&id).unwrap().write_input(bytes).unwrap();
+    };
+    // The composer: the rows between the last two full-width rules.
+    let draft = |client: &mut Client| {
+        let screen = client.screen(&id);
+        let lines: Vec<&str> = screen.lines().collect();
+        let rules: Vec<usize> = lines
+            .iter()
+            .enumerate()
+            .filter(|(_, line)| line.chars().filter(|ch| *ch == '─').count() > 40)
+            .map(|(row, _)| row)
+            .collect();
+        match rules.as_slice() {
+            [.., upper, lower] => lines[upper + 1..*lower].join(" / "),
+            _ => String::from("(no composer)"),
+        }
+    };
+    // A short conversation that fits, with a draft.
+    client
+        .call(
+            "session.send_text",
+            json!({ "sessionID": id, "text": "Short one LINES 2", "submit": true }),
+        )
+        .unwrap();
+    std::thread::sleep(Duration::from_secs(5));
+    client
+        .call(
+            "session.send_text",
+            json!({ "sessionID": id, "text": "keep this draft", "submit": false }),
+        )
+        .unwrap();
+    std::thread::sleep(Duration::from_millis(500));
+    let before = draft(&mut client);
+    let screen = client.screen(&id);
+    for bytes in [&b"\x1b[5~"[..], b"\x1b[6~", b"\x1b[5~"] {
+        key(bytes);
+        std::thread::sleep(Duration::from_millis(200));
+    }
+    println!("fits: draft before {before:?}");
+    println!("fits: draft after  {:?}", draft(&mut client));
+    let after = client.screen(&id);
+    for (row, (a, b)) in screen.lines().zip(after.lines()).enumerate() {
+        if a != b {
+            println!("fits: row {row} changed {a:?} -> {b:?}");
+        }
+    }
+    // Clear the draft, then a long conversation.
+    key(b"\x15");
+    std::thread::sleep(Duration::from_millis(300));
+    for prompt in ["Alpha message LINES 200", "Bravo message LINES 200"] {
+        client
+            .call(
+                "session.send_text",
+                json!({ "sessionID": id, "text": prompt, "submit": true }),
+            )
+            .unwrap();
+        std::thread::sleep(Duration::from_secs(8));
+    }
+    client
+        .call(
+            "session.send_text",
+            json!({ "sessionID": id, "text": "keep this draft", "submit": false }),
+        )
+        .unwrap();
+    std::thread::sleep(Duration::from_millis(500));
+    let position = |client: &mut Client| -> i64 {
+        client
+            .screen(&id)
+            .lines()
+            .enumerate()
+            .find_map(|(row, line)| {
+                let rest = line.trim().strip_prefix("Reply line ")?;
+                let n: i64 = rest.split(' ').next()?.parse().ok()?;
+                Some(n * 2 - row as i64)
+            })
+            .unwrap_or(-1)
+    };
+    for (name, bytes, gap) in [
+        ("pageup", &b"\x1b[5~"[..], 150u64),
+        ("pageup", b"\x1b[5~", 150),
+        ("pagedown", b"\x1b[6~", 150),
+        ("pageup", b"\x1b[5~", 5),
+        ("pageup", b"\x1b[5~", 5),
+        ("pageup", b"\x1b[5~", 5),
+        ("pagedown", b"\x1b[6~", 5),
+    ] {
+        let start = position(&mut client);
+        let sent = Instant::now();
+        key(bytes);
+        let mut last = start;
+        let mut landed = None;
+        while sent.elapsed() < Duration::from_millis(120) {
+            let now = position(&mut client);
+            if now != last {
+                landed = Some(sent.elapsed().as_millis());
+                last = now;
+            }
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        println!(
+            "{name}: {} lines, drawn by {landed:?} ms",
+            (start - last).abs()
+        );
+        std::thread::sleep(Duration::from_millis(gap));
+    }
+    println!("long: draft after {:?}", draft(&mut client));
+    // Cursor keys move within a draft and must not reach it from a jump.
+    println!("long: draft before keys {:?}", draft(&mut client));
+    let _ = client.call("session.kill", json!({ "sessionID": id }));
 }

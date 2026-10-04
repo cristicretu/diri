@@ -7,8 +7,10 @@
 //!
 //! Full-screen Agents keep their whole transcript in their own scrolling view
 //! on the alternate screen; the terminal retains nothing above it. There
-//! [`Travel`] moves that view with the same wheel input a trackpad sends,
-//! reading each redrawn screen until the wanted message sits at the top.
+//! [`Travel`] moves that view with the same wheel input a trackpad sends (and
+//! PageUp/PageDown where an Agent scrolls its transcript with them), planned
+//! with each Agent's measured response ([`Notches`]) and checked against each
+//! redrawn screen until the wanted message sits at the top.
 //! Inline Agents leave their transcript in the terminal history, where the
 //! app scrolls its own view to rows found by [`Gutter::history_starts`].
 
@@ -32,6 +34,129 @@ pub enum Gutter {
     Marker(&'static str),
     /// Agents that label turns `You:` or `User:`.
     Label,
+}
+
+/// How a full-screen Agent's transcript answers wheel notches, as
+/// `diri-engine`'s `measure_burst_curve` records it: the lines one burst moves
+/// after a pause. A jump plans every step with it and checks each redraw
+/// against it.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Notches {
+    /// Lines every notch moves, for an Agent that never speeds them up.
+    per_notch: Option<f32>,
+    /// Otherwise (notches, lines) for each burst size a jump may send.
+    curve: &'static [(u16, f32)],
+    /// The longest burst a jump sends.
+    most: u16,
+    /// The longest burst that lifts a message into place. Claude Code has
+    /// left a message blank after carrying it most of a screen in one burst.
+    most_aligning: u16,
+    /// The first notch after the view turns around moves nothing.
+    ignores_turn: bool,
+    /// PageUp and PageDown move the transcript half its height, never sped
+    /// up and never typed into the composer: the fastest way through it.
+    pub page_keys: bool,
+    /// The least time between bursts: sooner ones are sped up by an amount
+    /// no single redraw shows.
+    pub interval: std::time::Duration,
+    /// How long a redraw must stay unchanged before the view counts as at
+    /// rest, when it has not yet shown the move predicted.
+    pub settle: std::time::Duration,
+}
+
+impl Notches {
+    /// Codex and OpenCode: three lines a notch, however many and however fast.
+    pub const THREE_LINES: Self = Self {
+        per_notch: Some(3.0),
+        curve: &[],
+        most: 40,
+        most_aligning: 40,
+        ignores_turn: false,
+        page_keys: false,
+        interval: std::time::Duration::ZERO,
+        settle: std::time::Duration::from_millis(14),
+    };
+
+    /// Claude Code: a line a notch for short bursts, faster for longer ones,
+    /// and faster still for bursts under about 50 ms apart.
+    pub const CLAUDE: Self = Self {
+        per_notch: None,
+        curve: &[
+            (1, 1.0),
+            (2, 2.0),
+            (3, 3.0),
+            (4, 4.0),
+            (5, 6.0),
+            (6, 8.0),
+            (7, 10.0),
+            (8, 13.0),
+            (10, 19.0),
+            (12, 26.0),
+            (14, 34.0),
+            (16, 44.0),
+            (20, 67.0),
+            (24, 91.0),
+        ],
+        most: 24,
+        most_aligning: 8,
+        ignores_turn: true,
+        page_keys: true,
+        interval: std::time::Duration::from_millis(55),
+        settle: std::time::Duration::from_millis(30),
+    };
+
+    /// Lines a burst moves; `turned` when it reverses the last one.
+    #[must_use]
+    pub fn lines(&self, notches: u16, turned: bool) -> f32 {
+        let notches = if turned && self.ignores_turn {
+            notches.saturating_sub(1)
+        } else {
+            notches
+        };
+        if notches == 0 {
+            return 0.0;
+        }
+        if let Some(lines) = self.per_notch {
+            return lines * f32::from(notches);
+        }
+        let below = self.curve.iter().rev().find(|(size, _)| *size <= notches);
+        let above = self.curve.iter().find(|(size, _)| *size >= notches);
+        match (below, above) {
+            (Some(&(low, from)), Some(&(high, to))) if high > low => {
+                from + (to - from) * f32::from(notches - low) / f32::from(high - low)
+            }
+            (Some(&(_, lines)), _) | (None, Some(&(_, lines))) => lines,
+            (None, None) => f32::from(notches),
+        }
+    }
+
+    /// The longest burst a jump may send that moves at most `lines`; at
+    /// least the shortest that moves at all.
+    #[must_use]
+    pub fn within(&self, lines: f32, turned: bool) -> u16 {
+        self.within_most(lines, turned, self.most)
+    }
+
+    fn within_most(&self, lines: f32, turned: bool, most: u16) -> u16 {
+        let sizes: Vec<u16> = if self.per_notch.is_some() {
+            (1..=most).collect()
+        } else {
+            self.curve
+                .iter()
+                .map(|(size, _)| *size)
+                .filter(|size| *size <= most)
+                .collect()
+        };
+        let moving = sizes
+            .iter()
+            .copied()
+            .filter(|size| self.lines(*size, turned) > 0.0);
+        let fitting = moving
+            .clone()
+            .filter(|size| self.lines(*size, turned) <= lines + 0.01)
+            .max();
+        fitting.or_else(|| moving.min()).unwrap_or(1)
+    }
 }
 
 /// One sent message as drawn on a screen.
@@ -87,45 +212,12 @@ impl Gutter {
         }
     }
 
-    /// Lines one wheel notch is expected to move the transcript, before any
-    /// movement has been measured.
+    /// How this Agent's transcript answers wheel notches.
     #[must_use]
-    pub const fn lines_per_tick(self) -> f32 {
+    pub const fn notches(self) -> Notches {
         match self {
-            Self::Claude => 1.0,
-            _ => 3.0,
-        }
-    }
-
-    /// The least time between bursts of notches. Claude Code speeds up
-    /// notches that follow each other within about 50 ms, by a factor no
-    /// measurement made in passing can be trusted with; apart, they move it
-    /// a steady line each. Codex and OpenCode move three lines a notch however
-    /// fast they come.
-    #[must_use]
-    pub const fn burst_interval(self) -> std::time::Duration {
-        match self {
-            Self::Claude => std::time::Duration::from_millis(60),
-            _ => std::time::Duration::ZERO,
-        }
-    }
-
-    /// How long a redraw must stay unchanged before the view counts as
-    /// settled. Claude Code eases a scroll out over several frames.
-    #[must_use]
-    pub const fn settle_time(self) -> std::time::Duration {
-        match self {
-            Self::Claude => std::time::Duration::from_millis(45),
-            _ => std::time::Duration::from_millis(14),
-        }
-    }
-
-    /// The most notches in one burst. Claude Code also speeds up the later
-    /// notches of a long burst (8 notches move 13 lines).
-    const fn max_burst(self) -> u16 {
-        match self {
-            Self::Claude => 10,
-            _ => 64,
+            Self::Claude => Notches::CLAUDE,
+            _ => Notches::THREE_LINES,
         }
     }
 
@@ -362,6 +454,8 @@ pub enum TravelStep {
     /// Send `ticks` wheel notches, toward older output when `up`, then show
     /// [`Travel::observe`] the redrawn screen.
     Scroll { up: bool, ticks: u16 },
+    /// Send PageUp (`up`) or PageDown, then show the redrawn screen.
+    Page { up: bool },
     /// Look again without sending anything: the last notches may not have
     /// been drawn yet.
     Wait,
@@ -376,13 +470,16 @@ pub enum TravelStep {
 
 /// One jump to the previous or next sent message in a full-screen Agent.
 ///
-/// Each step compares the redrawn screen with the one before to measure how
-/// far the transcript moved, so the reading position follows the content
-/// even when an Agent accelerates repeated wheel notches. Every row passes
-/// through the screen on the way, so no message is skipped.
+/// Each step sends the burst of notches [`Notches`] predicts covers most of a
+/// screen, then compares the redrawn screen with the one before to measure
+/// how far the transcript really moved. Every row passes through the screen
+/// on the way, so no message is skipped, and the reading position follows the
+/// content however the Agent moved. Once the message is on screen, one burst
+/// lifts it to just below the pinned header.
 #[derive(Debug)]
 pub struct Travel {
     gutter: Gutter,
+    notches: Notches,
     next: bool,
     landing: usize,
     /// Where reading started, in current screen rows; it leaves the screen as
@@ -392,9 +489,20 @@ pub struct Travel {
     region: Range<usize>,
     target: Option<Target>,
     sent: Option<(bool, u16)>,
-    lines_per_tick: f32,
-    /// Lines one notch alone moves.
-    nominal: f32,
+    /// The last step was a page key rather than notches.
+    paged: bool,
+    /// Page keys are in use: they move this Agent's transcript.
+    pages: bool,
+    /// Lines a page key moves, once one has been measured.
+    page_lines: Option<f32>,
+    /// Which way the last notches went: page keys leave it be.
+    notch_up: Option<bool>,
+    /// The last burst reversed the notches before it.
+    turned: bool,
+    /// How the Agent's moves compare with the model, should it have changed.
+    scale: f32,
+    /// The last move was exactly the one predicted: the redraw is complete.
+    exact: bool,
     /// The pinned header on the screen before this one.
     pinned: Option<String>,
     /// Messages drawn in the transcript at some point during this jump.
@@ -430,7 +538,19 @@ struct Target {
     aligning_steps: u8,
 }
 
-const MAX_STEPS: u16 = 600;
+impl Target {
+    fn new(message: &MessageRows) -> Self {
+        Self {
+            row: message.start as i64,
+            text: message.text.clone(),
+            confirming: false,
+            recovering: 0,
+            aligning_steps: 0,
+        }
+    }
+}
+
+const MAX_STEPS: u16 = 400;
 
 impl Travel {
     /// Starts a jump from the message last arrived at, when it is still on
@@ -441,13 +561,13 @@ impl Travel {
         rows: &[Vec<GridCell>],
         from: Option<usize>,
     ) -> (Self, TravelStep) {
-        Self::begin_with_notch(gutter, gutter.lines_per_tick(), next, rows, from)
+        Self::begin_with(gutter, gutter.notches(), next, rows, from)
     }
 
-    /// [`Self::begin`] for an Agent whose single notch moves `nominal` lines.
-    fn begin_with_notch(
+    /// [`Self::begin`] for an Agent that answers notches as `notches` says.
+    fn begin_with(
         gutter: Gutter,
-        nominal: f32,
+        notches: Notches,
         next: bool,
         rows: &[Vec<GridCell>],
         from: Option<usize>,
@@ -456,6 +576,7 @@ impl Travel {
         let landing = screen.region.start;
         let mut travel = Self {
             gutter,
+            notches,
             next,
             landing,
             reading: from.unwrap_or(landing) as i64,
@@ -463,8 +584,13 @@ impl Travel {
             region: screen.region.clone(),
             target: None,
             sent: None,
-            lines_per_tick: nominal,
-            nominal,
+            paged: false,
+            pages: notches.page_keys,
+            page_lines: None,
+            notch_up: None,
+            turned: false,
+            scale: 1.0,
+            exact: false,
             pinned: screen.pinned.clone(),
             seen: screen
                 .messages
@@ -487,6 +613,12 @@ impl Travel {
         (travel, step)
     }
 
+    /// How the Agent answers notches: the pacing and settling to wait for.
+    #[must_use]
+    pub const fn notches(&self) -> Notches {
+        self.notches
+    }
+
     /// Whether the jump moved the view, for telling a person who reached
     /// the end of the transcript where the view went.
     #[must_use]
@@ -499,6 +631,24 @@ impl Travel {
     #[must_use]
     pub fn pointer_row(&self) -> usize {
         (self.region.start + self.region.end) / 2
+    }
+
+    /// Whether `rows` already show the whole move the last burst predicts,
+    /// so there is nothing more to wait for.
+    #[must_use]
+    pub fn shows_predicted_move(&self, rows: &[Vec<GridCell>]) -> bool {
+        let expected = self.expected();
+        if expected == 0 {
+            return false;
+        }
+        let keys: Vec<_> = rows.iter().map(|row| row_key(row)).collect();
+        estimate_shift(
+            &self.keys,
+            &keys,
+            &self.region,
+            expected,
+            expected..=expected,
+        ) == Some(expected)
     }
 
     /// The redrawn screen after the last [`TravelStep::Scroll`] or
@@ -514,9 +664,11 @@ impl Travel {
         }
         let keys: Vec<_> = rows.iter().map(|row| row_key(row)).collect();
         self.region = screen.region.clone();
+        let expected = self.expected();
         let measured = self.measure(&keys, &screen.region);
         self.keys = keys;
-        let moved = measured.map_or_else(|| self.expected(), |(lines, _)| lines);
+        let moved = measured.map_or(expected, |(lines, _)| lines);
+        self.exact = measured.is_some_and(|(lines, _)| lines == expected);
         let confirming = self.target.as_ref().is_some_and(|target| target.confirming);
         if moved == 0 && self.sent.is_some() && !confirming {
             // A spinner may redraw before the notches are drawn: look once
@@ -527,12 +679,21 @@ impl Travel {
             }
         }
         self.stalled = false;
-        if let (Some((lines, true)), Some((_, ticks))) = (measured, self.sent)
+        if self.paged
+            && let Some((lines, true)) = measured
             && lines != 0
         {
-            let nominal = self.nominal;
-            self.lines_per_tick = (lines.unsigned_abs() as f32 / f32::from(ticks))
-                .clamp(nominal * 0.75, nominal * 8.0);
+            self.page_lines = Some(lines.unsigned_abs() as f32);
+        } else if let (Some((lines, true)), Some((_, ticks))) = (measured, self.sent)
+            && lines != 0
+            && !self.exact
+        {
+            // The Agent no longer moves as measured: follow what it does.
+            let model = self.notches.lines(ticks, self.turned);
+            if model > 0.0 {
+                let ratio = lines.unsigned_abs() as f32 / model;
+                self.scale = ((self.scale + ratio) / 2.0).clamp(0.5, 2.0);
+            }
         }
         self.reading += moved;
         self.last_move = moved;
@@ -552,26 +713,36 @@ impl Travel {
         self.decide(&screen, Some(moved))
     }
 
-    /// How far the last notches were expected to move content down.
+    /// How far the last burst should move content down.
     fn expected(&self) -> i64 {
         self.sent.map_or(0, |(up, ticks)| {
-            let lines = (f32::from(ticks) * self.lines_per_tick).round() as i64;
+            let lines = if self.paged {
+                self.page_estimate().round() as i64
+            } else {
+                (self.notches.lines(ticks, self.turned) * self.scale).round() as i64
+            };
             if up { lines } else { -lines }
         })
     }
 
-    /// How far content moved since the last screen, and whether that was a
-    /// plausible move for the notches sent. Agents repeat whole lines (every
-    /// reply may end alike, numbered lists line up), and a screen of them
-    /// lines up at many offsets; the notches' own way and size decide first.
-    /// Only when nothing plausible lines up is a smaller move considered:
-    /// the view reaching the end of the transcript part way.
+    /// Lines a page key moves: as measured, or half the transcript area.
+    fn page_estimate(&self) -> f32 {
+        self.page_lines
+            .unwrap_or_else(|| (self.region.len() as f32 / 2.0).floor().max(1.0))
+    }
+
+    /// How far content moved since the last screen, and whether that was
+    /// close to the move predicted. Agents repeat whole lines (every reply
+    /// may end alike, numbered lists line up), and a screen of them lines up
+    /// at many offsets; moves near the prediction decide first. Only when
+    /// none lines up is any move the notches' way considered: the view
+    /// reaching the end of the transcript part way.
     fn measure(&self, keys: &[Option<u64>], region: &Range<usize>) -> Option<(i64, bool)> {
         let (up, _) = self.sent?;
         let expected = self.expected().abs();
         let reach = region.len() as i64;
-        let near = ((expected as f32 * 0.4).floor() as i64).max(1)
-            ..=(((expected as f32) * 2.5).ceil() as i64 + 2).min(reach);
+        let near = ((expected as f32 * 0.6).floor() as i64 - 1).max(1)
+            ..=((expected as f32 * 1.5).ceil() as i64 + 2).min(reach);
         let signed = |range: std::ops::RangeInclusive<i64>| {
             if up {
                 range
@@ -614,20 +785,14 @@ impl Travel {
                 .find(|message| same_message(&message.text, &text))
             {
                 self.unseen = None;
-                self.target = Some(Target {
-                    row: message.start as i64,
-                    text: message.text.clone(),
-                    confirming: false,
-                    recovering: 0,
-                    aligning_steps: 0,
-                });
+                self.target = Some(Target::new(message));
                 return None;
             }
             self.unseen_budget -= self.last_move.max(0);
             if self.unseen_budget <= 0 || self.unseen_steps >= 16 {
                 return Some(TravelStep::Lost);
             }
-            return Some(self.step_back());
+            return Some(self.step_back(screen));
         }
         let now = screen.pinned.as_ref()?;
         let changed = pinned.is_none_or(|before| !same_message(&before, now));
@@ -635,15 +800,21 @@ impl Travel {
         if changed && !drawn && self.unseen_steps == 0 {
             self.unseen = Some(now.clone());
             self.unseen_budget = self.last_move.abs() + screen.region.len() as i64 / 2;
-            return Some(self.step_back());
+            return Some(self.step_back(screen));
         }
         None
     }
 
-    /// A few notches up, never enough for an Agent to speed them up.
-    fn step_back(&mut self) -> TravelStep {
+    /// Back up by a quarter of the screen, so the message, just above it,
+    /// comes into view without being carried past again.
+    fn step_back(&mut self, screen: &ScreenMessages) -> TravelStep {
         self.unseen_steps += 1;
-        self.send(true, 4)
+        if self.pages {
+            return self.page(true);
+        }
+        let lines = (screen.region.len() as f32 / 4.0).max(2.0) / self.scale;
+        let turned = self.notch_up == Some(false);
+        self.send(true, self.notches.within(lines, turned))
     }
 
     fn decide(&mut self, screen: &ScreenMessages, moved: Option<i64>) -> TravelStep {
@@ -662,13 +833,12 @@ impl Travel {
                     .max_by_key(|message| message.start)
             };
             if let Some(message) = found {
-                self.target = Some(Target {
-                    row: message.start as i64,
-                    text: message.text.clone(),
-                    confirming: false,
-                    recovering: 0,
-                    aligning_steps: 0,
-                });
+                self.target = Some(Target::new(message));
+            } else if moved == Some(0) && self.paged && self.page_lines.is_none() {
+                // A page key that never moved anything may be bound to
+                // something else here: go on with notches.
+                self.pages = false;
+                return self.seek(screen);
             } else if moved == Some(0) {
                 return self.unmoved(TravelStep::Exhausted);
             } else {
@@ -683,8 +853,9 @@ impl Travel {
     /// before taking it for the end of the transcript.
     fn unmoved(&mut self, otherwise: TravelStep) -> TravelStep {
         match self.sent {
-            Some((up, ticks)) if self.may_retry => {
+            Some((up, ticks)) if self.may_retry && !self.paged => {
                 self.may_retry = false;
+                self.turned = false;
                 TravelStep::Scroll { up, ticks }
             }
             _ => otherwise,
@@ -692,26 +863,33 @@ impl Travel {
     }
 
     fn send(&mut self, up: bool, ticks: u16) -> TravelStep {
-        self.may_retry = self.sent.is_none_or(|(was_up, _)| was_up != up);
+        self.turned = self.notch_up.is_some_and(|was_up| was_up != up);
+        self.may_retry = self.notch_up.is_none_or(|was_up| was_up != up);
+        self.notch_up = Some(up);
+        self.paged = false;
         self.sent = Some((up, ticks));
         TravelStep::Scroll { up, ticks }
     }
 
+    fn page(&mut self, up: bool) -> TravelStep {
+        self.may_retry = false;
+        self.paged = true;
+        self.sent = Some((up, 0));
+        TravelStep::Page { up }
+    }
+
     fn seek(&mut self, screen: &ScreenMessages) -> TravelStep {
-        // Move well under a screen per step: every row is seen on the way, and
-        // most of each screen is still on the next one, which is what tells
-        // a real move from repeated lines that happen to line up. Bursts grow
-        // gradually, since an Agent may accelerate a longer burst.
-        let span = (screen.region.len() as f32 * 0.5).max(2.0);
-        let ideal = (span / self.lines_per_tick).round().max(1.0) as u16;
-        let ticks = match self.sent {
-            Some((_, previous)) => ideal.clamp(
-                (previous * 2 / 3).max(1),
-                (previous * 3 / 2).max(previous + 1),
-            ),
-            None => ideal.min(4),
-        };
-        self.send(!self.next, ticks.min(self.gutter.max_burst()))
+        // Most of a screen per step: every row is still seen on the way, and
+        // enough of each screen stays on the next to tell a real move from
+        // repeated lines that happen to line up.
+        let up = !self.next;
+        if self.pages {
+            return self.page(up);
+        }
+        let rows = screen.region.len() as f32;
+        let span = (rows * 0.75).min(rows - 6.0).max(2.0) / self.scale;
+        let turned = self.notch_up.is_some_and(|was_up| was_up != up);
+        self.send(up, self.notches.within(span, turned))
     }
 
     fn align(&mut self, screen: &ScreenMessages, moved: Option<i64>) -> TravelStep {
@@ -725,8 +903,7 @@ impl Travel {
             .min_by_key(|message| (message.start as i64 - target.row).abs());
         let Some(message) = found else {
             // Aligning only ever lifts the message, so one that left the
-            // screen went up under the header: bring it back down a notch at
-            // a time. An Agent may ignore the first notch after a turn.
+            // screen went up under the header: bring it back down.
             if target.recovering >= 4 {
                 return TravelStep::Lost;
             }
@@ -734,7 +911,9 @@ impl Travel {
                 recovering: target.recovering + 1,
                 ..target
             });
-            return self.send(true, 1);
+            let hidden = (self.landing as i64 - target.row).max(1) as f32 / self.scale;
+            let turned = self.notch_up == Some(false);
+            return self.send(true, self.notches.within(hidden, turned));
         };
         let arrived = TravelStep::Arrived {
             start: message.start,
@@ -746,20 +925,17 @@ impl Travel {
             aligning_steps: target.aligning_steps.saturating_add(1),
             ..target
         });
-
-        // One notch alone is never accelerated: it moves the Agent's
-        // nominal lines, the finest step there is.
-        let nominal = self.nominal;
-        // A row or two below the header reads as the top; the last single
-        // line is the one an Agent's own snapping is likeliest to overshoot.
+        // Within a notch of the top reads as the top: the finest move there
+        // is would carry it under the header.
+        let finest = self.notches.lines(1, false).max(2.0);
         let placed = distance <= 0
-            || target.aligning_steps >= 10
-            || (distance as f32) < nominal.max(2.0)
+            || target.aligning_steps >= 8
+            || (distance as f32) < finest
             || target.recovering > 0;
         if placed || (moved == Some(0) && self.sent.is_some_and(|(up, _)| !up)) {
-            // An Agent may still be easing the last notches in: arrive once a
-            // look finds the view at rest.
-            if moved.is_some_and(|lines| lines != 0) && !target.confirming {
+            // An Agent may still be easing a move in that did not land as
+            // predicted: arrive once a look finds the view at rest.
+            if moved.is_some_and(|lines| lines != 0) && !self.exact && !target.confirming {
                 self.target = Some(Target {
                     confirming: true,
                     ..self.target.clone().expect("aligning a target")
@@ -776,17 +952,16 @@ impl Travel {
             confirming: false,
             ..self.target.clone().expect("aligning a target")
         });
-        // Never more notches than single notches could take without passing
-        // it, and a burst only a little longer than one already measured:
-        // an Agent may accelerate a longer one past the message.
-        let fine = (distance as f32 / nominal).floor();
-        let coarse = (distance as f32 / self.lines_per_tick).floor();
-        let measured = match self.sent {
-            Some((_, previous)) if target.recovering == 0 => (f32::from(previous) * 1.5).max(4.0),
-            _ => 4.0,
-        };
-        let ticks = fine.min(coarse).min(measured).max(1.0) as u16;
-        self.send(false, ticks.min(self.gutter.max_burst()))
+        if self.pages && distance as f32 >= self.page_estimate() {
+            return self.page(false);
+        }
+        let turned = self.notch_up == Some(true);
+        let ticks = self.notches.within_most(
+            distance as f32 / self.scale,
+            turned,
+            self.notches.most_aligning,
+        );
+        self.send(false, ticks)
     }
 }
 

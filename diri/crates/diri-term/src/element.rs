@@ -927,10 +927,22 @@ impl TerminalElement {
     }
 
     /// The user took the view: typing, a wheel or a selection. Ends a message
-    /// band, and tells a jump in flight to stop.
+    /// band, tells a jump in flight to stop, and shows the screen as it is.
     fn note_interaction(&self) {
         self.shared.interactions.fetch_add(1, Ordering::Relaxed);
         *mutex_lock(&self.shared.message_flash) = None;
+        self.hold_frame(false);
+    }
+
+    /// Keeps painting the screen as it is now while a message jump moves the
+    /// Agent's view underneath, then shows the result at once on release.
+    /// The live grid keeps receiving every update meanwhile.
+    pub fn hold_frame(&self, held: bool) {
+        mutex_lock(&self.shared.viewport).hold_frame(held, &read_lock(&self.buffer));
+    }
+
+    pub fn frame_held(&self) -> bool {
+        mutex_lock(&self.shared.viewport).frame_held()
     }
 
     /// Advances on every keystroke, wheel and selection gesture.
@@ -4704,6 +4716,28 @@ mod selection_repaint_tests {
             None,
             "selecting ends the band"
         );
+    }
+
+    #[test]
+    fn a_held_frame_hides_the_live_grid_until_released() {
+        let element = populated_element();
+        element.hold_frame(true);
+        assert!(element.frame_held());
+        // The Agent's view travels underneath.
+        element.apply_damage(update(true, &[(0, "new"), (1, "output"), (2, "below")]));
+        let painted = |element: &TerminalElement| {
+            element
+                .viewport()
+                .window_row(&super::read_lock(&element.buffer), 1)
+        };
+        assert_eq!(painted(&element), row("one"));
+        assert_eq!(element.view_offset(), 0, "holding is not scrolling");
+        element.hold_frame(false);
+        assert_eq!(painted(&element), row("output"));
+        // Typing shows the screen as it is at once.
+        element.hold_frame(true);
+        let _ = element.note_user_input();
+        assert!(!element.frame_held());
     }
 
     #[test]

@@ -145,6 +145,7 @@ impl TerminalPane {
                 .and_then(|id| self.residents.get(id))
             {
                 previous.element.pin_keyboard_selection(false);
+                previous.element.hold_frame(false);
             }
             self.qol = QolState {
                 session: Some(id.clone()),

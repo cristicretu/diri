@@ -896,10 +896,13 @@ frame, capability or Helper state. Inline Agents leave their transcript in
 retained history, which the app reads through the existing paged history RPC
 before scrolling its own view. Full-screen Agents keep their transcript on the
 alternate screen, where the terminal retains nothing above it; the app sends
-them the ordinary wheel frames a trackpad would, through the attached
-controller, and reads each redrawn grid until the message is in view. It sends
-no keystrokes, and the user's own input, wheel or selection ends a jump in
-flight.
+them the ordinary wheel frames a trackpad would through the attached
+controller, plus PageUp/PageDown for an Agent that scrolls its transcript with
+them (Claude Code). Those keys travel as raw terminal bytes on the existing
+mouse frame, which the status reducer and prompt tracking never read as
+typing. The app reads each redrawn grid until the message is in view, while
+the pane keeps painting the screen as it was; the user's own input, wheel or
+selection ends a jump in flight and shows the live screen.
 
 Protocol 1.6 advertises optional `terminal-annotations-v1`. Grid flag bit 2 adds
 an extension version byte (1), a big-endian u32 byte length, and bounded JSON

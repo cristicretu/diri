@@ -34,9 +34,11 @@
   ordinary terminal: scroll, select or type at any time. Any of these ends a
   jump in progress, and typing returns to the composer as usual.
   Full-screen Agents (Claude Code, Codex and OpenCode, which keep their
-  transcript on the alternate screen) are scrolled with the same wheel input
-  a trackpad sends, so their own view moves to the message. Inline Agents
-  are found in Diri's retained scrollback. Claude Code, Codex, OpenCode,
+  transcript on the alternate screen) are moved to the message with the
+  wheel input a trackpad sends, and with PageUp/PageDown in Claude Code,
+  while the pane keeps showing the screen until the message is in place:
+  the jump appears as one cut. Inline Agents are found in Diri's retained
+  scrollback. Claude Code, Codex, OpenCode,
   Copilot, Kimi and Gemini gutters are recognized; other Agents can use
   explicit `You:` or `User:` labels. Composers and drafts, numbered choosers,
   pinned headers, tool output and soft-wrap continuations are not stops.
