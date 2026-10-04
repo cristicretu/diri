@@ -9,6 +9,7 @@
 //! from the Engine and scrolls Diri's own view, as the wheel would. Either
 //! way the view stays an ordinary terminal: scrolling, typing and selecting
 //! work as before, and any of them ends a jump in flight.
+use super::qol::PromptMiss;
 use super::*;
 use diri_proto::grid::{GridCell, GridRowCodec};
 use diri_term::messages::{Gutter, Travel, TravelStep};
@@ -517,18 +518,23 @@ impl TerminalPane {
                     return;
                 }
                 match result {
-                    Ok(Ok((None, ..))) if !next || offset == 0 => {
-                        // Nothing that way: the view stays, and so does the mark.
+                    Ok(Ok((None, ..))) if next && offset == 0 => {
+                        // Nothing later than the live output.
                         this.qol.message_mark = origin;
-                        this.show_terminal_feedback(
-                            if next {
-                                "No later messages"
-                            } else {
-                                "No earlier messages"
-                            },
-                            window,
-                            cx,
-                        );
+                        this.show_terminal_feedback("No later messages", window, cx);
+                    }
+                    Ok(Ok((None, ..))) => {
+                        // No message that way, but the session may be a
+                        // shell after all: a generic command, or an Agent
+                        // that exited to its shell. Its prompt marks still
+                        // lead somewhere; the mark stays for a later press.
+                        this.qol.message_mark = origin;
+                        let miss = if next {
+                            PromptMiss::Live
+                        } else {
+                            PromptMiss::Say("No earlier messages")
+                        };
+                        this.read_history(Some(next), miss, window, cx);
                     }
                     Ok(Ok((found, live_start, total, sequence))) => this.land_in_history(
                         &id,

@@ -603,3 +603,38 @@ fn shift_measurement_prefers_lined_up_text() {
     );
     assert_eq!(estimate_shift(&after, &before, &(0..8), 4, 0..=8), None);
 }
+
+#[test]
+fn short_messages_match_only_themselves() {
+    assert!(same_message("y", "y"));
+    assert!(same_message("ok", "ok"));
+    assert!(!same_message("y", "yes please"));
+    assert!(!same_message("go", "go on then"));
+    assert!(same_message("fix the build", "fix the"));
+    assert!(!same_message("", ""));
+}
+
+#[test]
+fn travel_reaches_short_messages() {
+    // `yes`, `ok`, `y`: a reply to a question is often a word or a letter.
+    let mut agent = FakeAgent::new(
+        &[3, 40, 1, 60],
+        |ticks| usize::from(ticks) * 3,
+        Notches::THREE_LINES,
+    );
+    let short = ["› y", "› ok", "› go", "› yes"];
+    let mut turn = 0;
+    for line in &mut agent.transcript {
+        if line.starts_with('›') {
+            *line = short[turn].to_owned();
+            turn += 1;
+        }
+    }
+    let mut from = None;
+    for text in short.iter().rev() {
+        let (row, found) = agent.jump(false, from).expect("an earlier message");
+        assert_eq!(&found, text);
+        from = Some(row);
+    }
+    assert_eq!(agent.jump(false, from), None, "nothing before the first");
+}

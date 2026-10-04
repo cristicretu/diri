@@ -45,7 +45,9 @@
   In shells the same shortcuts jump between retained prompt marks. Your
   shell must emit OSC 133 A (for example through its terminal integration);
   no shell configuration is changed. A shell running a recognized foreground
-  Agent uses message navigation.
+  Agent uses message navigation. An inline session with no message that way
+  (a generic command, or an Agent that exited to its shell) falls back to
+  its prompt marks.
 
 Settings → Terminal contains Copy on Selection (off by default), Hide Pointer
 While Typing (on), and Review Command Pastes (off by default). Paste review applies to

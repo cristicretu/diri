@@ -1059,9 +1059,14 @@ fn panel_text(row: &[GridCell], col: usize) -> String {
 }
 
 /// Whether two message texts are the same message, one possibly cut short.
+/// A short message such as `yes` only matches itself: as a prefix it would
+/// match any longer message that begins the same way.
 fn same_message(a: &str, b: &str) -> bool {
+    if a.is_empty() || b.is_empty() {
+        return false;
+    }
     let shorter = a.chars().count().min(b.chars().count());
-    shorter >= 4 && (a.starts_with(b) || b.starts_with(a))
+    a == b || (shorter >= 4 && (a.starts_with(b) || b.starts_with(a)))
 }
 
 fn soft_wraps(row: &[GridCell]) -> bool {

@@ -235,6 +235,39 @@ fn inline_agent_jumps_through_history_and_the_live_grid(cx: &mut TestAppContext)
     fixture.verify_process_identity();
 }
 
+/// A generic command or an Agent that exited to its shell has no messages
+/// but may have shell prompt marks: the shortcut still jumps between them.
+#[gpui::test]
+fn sessions_without_messages_jump_between_shell_prompts(cx: &mut TestAppContext) {
+    let fixture = crate::workspace_fixture::LiveWorkspace::start_with_agent_script(
+        "stty raw -echo; printf '\\033]133;A\\007$ first command\\r\\n'; i=0; while [ $i -lt 200 ]; do printf 'output line %s\\r\\n' $i; i=$((i + 1)); done; printf '\\033]133;A\\007$ '; printf ready > ready; cat > received",
+        ProtoAgentKind::new("generic"),
+    );
+    let mut harness = Harness::open(cx, &fixture);
+    harness.settle(Duration::from_millis(200));
+    harness.cx.simulate_keystrokes("cmd-shift-up");
+    harness.wait("the prompt jump", Duration::from_secs(15), |pane, id| {
+        pane.qol.message_jump.is_none()
+            && !pane.qol.busy
+            && pane.residents[id].element.view_offset() > 100
+    });
+    harness.settle(Duration::from_millis(200));
+    let top = harness.pane.read_with(harness.cx, |pane, _| {
+        let element = &pane.residents[&SessionId::new("build")].element;
+        row_text(
+            &element
+                .viewport()
+                .window_row(&element.buffer().read().unwrap(), 0),
+        )
+    });
+    assert_eq!(top, "$ first command");
+    assert_eq!(
+        harness.jump("cmd-shift-up"),
+        Err("No earlier messages".into())
+    );
+    fixture.verify_process_identity();
+}
+
 /// A real Agent under a private HOME, talking to the scripted model API.
 struct RealAgent {
     _home: tempfile::TempDir,

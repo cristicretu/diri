@@ -105,6 +105,17 @@ enum MenuAction {
     NextMessage,
 }
 
+/// What a prompt jump that finds no prompt mark does.
+#[derive(Clone, Copy)]
+pub(super) enum PromptMiss {
+    /// Explains that prompt jumps need shell integration.
+    NeedsMarks,
+    /// Says this instead: a message jump found nothing either.
+    Say(&'static str),
+    /// Returns to the latest output, as Next past the last message does.
+    Live,
+}
+
 impl MenuAction {
     fn label(self, editor: Option<crate::file_links::Editor>) -> SharedString {
         match self {
@@ -799,6 +810,18 @@ impl TerminalPane {
             self.jump_to_message(next, gutter, window, cx);
             return;
         }
+        self.read_history(direction, PromptMiss::NeedsMarks, window, cx);
+    }
+
+    /// Exports the history, or with a `direction` jumps to the shell prompt
+    /// that way; `miss` says what happens when there is none.
+    pub(super) fn read_history(
+        &mut self,
+        direction: Option<bool>,
+        miss: PromptMiss,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         let Some(id) = self.selected_id() else {
             return;
         };
@@ -926,11 +949,27 @@ impl TerminalPane {
                                 }
                                 this.qol.feedback = None;
                             } else {
-                                this.show_terminal_feedback(
-                                    "No shell prompt that way (needs OSC 133 marks)",
-                                    window,
-                                    cx,
-                                );
+                                match miss {
+                                    PromptMiss::NeedsMarks => this.show_terminal_feedback(
+                                        "No shell prompt that way (needs OSC 133 marks)",
+                                        window,
+                                        cx,
+                                    ),
+                                    PromptMiss::Say(message) => {
+                                        this.show_terminal_feedback(message, window, cx);
+                                    }
+                                    PromptMiss::Live => {
+                                        if let Some(resident) = this.residents.get(&id) {
+                                            let rows = usize::from(resident.element.grid_rows());
+                                            resident.element.scroll_to_live(rows);
+                                        }
+                                        this.show_terminal_feedback(
+                                            "Back to the latest output",
+                                            window,
+                                            cx,
+                                        );
+                                    }
+                                }
                             }
                         } else {
                             let saved = (|| -> std::io::Result<tempfile::NamedTempFile> {

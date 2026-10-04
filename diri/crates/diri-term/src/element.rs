@@ -245,6 +245,10 @@ impl TerminalInputHandler {
         // Committed text is typing like any key: it lands at the live prompt,
         // which a held reading view would keep off screen with no cursor. The
         // target offset is zero, so the visible row count cannot clamp it.
+        // It also ends a message jump in flight, even at the live edge.
+        if !text.is_empty() {
+            note_interaction(&self.view.shared, &self.view.buffer);
+        }
         let returned =
             !text.is_empty() && set_view_offset(&self.view.shared, &self.view.buffer, 0, 0);
         let solid = note_keystroke(&self.cursor);
@@ -929,9 +933,7 @@ impl TerminalElement {
     /// The user took the view: typing, a wheel or a selection. Ends a message
     /// band, tells a jump in flight to stop, and shows the screen as it is.
     fn note_interaction(&self) {
-        self.shared.interactions.fetch_add(1, Ordering::Relaxed);
-        *mutex_lock(&self.shared.message_flash) = None;
-        self.hold_frame(false);
+        note_interaction(&self.shared, &self.buffer);
     }
 
     /// Keeps painting the screen as it is now while a message jump moves the
@@ -2056,6 +2058,12 @@ fn paint_cursor_glyph(
             cx,
         );
     }
+}
+
+fn note_interaction(shared: &ElementSharedState, buffer: &SharedGridBuffer) {
+    shared.interactions.fetch_add(1, Ordering::Relaxed);
+    *mutex_lock(&shared.message_flash) = None;
+    mutex_lock(&shared.viewport).hold_frame(false, &read_lock(buffer));
 }
 
 fn note_keystroke(cursor: &Mutex<CursorDriver>) -> bool {
@@ -4738,6 +4746,30 @@ mod selection_repaint_tests {
         element.hold_frame(true);
         let _ = element.note_user_input();
         assert!(!element.frame_held());
+    }
+
+    #[test]
+    fn committed_text_ends_a_jump_in_flight() {
+        // Ordinary letters arrive as committed text, not encoded keys, and
+        // must stop a jump just the same, even with the view already live.
+        let element = populated_element();
+        use gpui::{Bounds, point, px, size};
+        let handler = super::TerminalInputHandler {
+            text_input: std::sync::Arc::new(|_| {}),
+            ime_state: std::sync::Arc::default(),
+            view: element.damage_observer(),
+            cursor_bounds: Bounds::new(point(px(0.0), px(0.0)), size(px(8.0), px(16.0))),
+            cell_width: px(8.0),
+            cursor: std::sync::Arc::default(),
+        };
+        element.hold_frame(true);
+        element.flash_message(1..2);
+        let before = element.interaction_generation();
+        handler.commit_text("y");
+        assert!(element.interaction_generation() > before);
+        assert!(!element.frame_held());
+        assert_eq!(element.message_flash_rows(), None);
+        assert_eq!(element.view_offset(), 0);
     }
 
     #[test]
