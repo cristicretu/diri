@@ -35,6 +35,10 @@ impl LiveWorkspace {
     }
 
     pub(crate) fn start_with_script(script: &str) -> Self {
+        Self::start_with_agent_script(script, diri_proto::AgentKind::SHELL)
+    }
+
+    pub(crate) fn start_with_agent_script(script: &str, agent: diri_proto::AgentKind) -> Self {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("engine.sock");
         let state = directory.path().join("state.json");
@@ -50,7 +54,7 @@ impl LiveWorkspace {
         for (id, title) in [("build", "Build frontend"), ("review", "Review API")] {
             let cwd = directory.path().join(id);
             std::fs::create_dir(&cwd).unwrap();
-            let record=serde_json::from_value(serde_json::json!({"id":id,"kind":diri_proto::AgentKind::SHELL,"cwd":cwd,"projectID":project["id"],"title":title,"titleSource":diri_proto::TitleSource::UserRename,"status":diri_proto::SessionStatus::Idle,"resumability":diri_proto::Resumability::Live,"createdAt":0,"updatedAt":0,"pinned":false})).unwrap();
+            let record=serde_json::from_value(serde_json::json!({"id":id,"kind":agent,"cwd":cwd,"projectID":project["id"],"title":title,"titleSource":diri_proto::TitleSource::UserRename,"status":diri_proto::SessionStatus::Idle,"resumability":diri_proto::Resumability::Live,"createdAt":0,"updatedAt":0,"pinned":false})).unwrap();
             registry
                 .lock()
                 .unwrap()
@@ -59,7 +63,7 @@ impl LiveWorkspace {
                         id: id.into(),
                         pty: PtySpec::new(vec!["/bin/sh".into(), "-c".into(), script.into()], &cwd)
                             .size(120, 40),
-                        manifest_id: "shell".into(),
+                        manifest_id: agent.id().into(),
                         authority: Authority::ProcessOnly,
                         logs_dir: directory.path().join("logs"),
                         holder: None,

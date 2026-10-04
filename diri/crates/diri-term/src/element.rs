@@ -379,6 +379,39 @@ struct ElementSharedState {
     /// Called once, from the first paint that puts non-blank content on
     /// screen after it was armed; see [`TerminalElement::on_first_content_paint`].
     content_paint: Mutex<Option<ArmedContentPaint>>,
+    /// The message a jump just brought into view, briefly marked.
+    message_flash: Mutex<Option<MessageFlash>>,
+    /// Advances whenever the user types, scrolls or starts a selection, so a
+    /// jump in flight can tell it no longer owns the view.
+    interactions: AtomicU64,
+}
+
+/// A band over a message Diri just brought into view: it holds, then fades.
+#[derive(Clone, Debug)]
+struct MessageFlash {
+    /// Absolute rows, in the coordinates of [`ScrollbackViewport::absolute_row`].
+    rows: std::ops::Range<i64>,
+    started: Instant,
+    /// The first row as it looked once drawn. Output that rewrites it ends
+    /// the band early, rather than leaving it over other text.
+    first: Option<Vec<GridCell>>,
+}
+
+const MESSAGE_FLASH_HOLD: Duration = Duration::from_millis(500);
+const MESSAGE_FLASH: Duration = Duration::from_millis(1700);
+
+impl MessageFlash {
+    /// Full strength while held, then an ease-out to nothing.
+    fn strength(&self, now: Instant) -> f32 {
+        let elapsed = now.saturating_duration_since(self.started);
+        if elapsed <= MESSAGE_FLASH_HOLD {
+            return 1.0;
+        }
+        let fade = (elapsed - MESSAGE_FLASH_HOLD).as_secs_f32()
+            / (MESSAGE_FLASH - MESSAGE_FLASH_HOLD).as_secs_f32();
+        let rest = (1.0 - fade).clamp(0.0, 1.0);
+        rest * rest
+    }
 }
 
 /// When a view first painted content after the host armed the callback.
@@ -739,6 +772,8 @@ impl TerminalElement {
                 scroll_glide: Mutex::new(GlideState::default()),
                 paints: AtomicU64::new(0),
                 content_paint: Mutex::new(None),
+                message_flash: Mutex::new(None),
+                interactions: AtomicU64::new(0),
             }),
             theme: TermTheme::default(),
             background_opacity: 1.0,
@@ -881,7 +916,128 @@ impl TerminalElement {
     /// cursor is dimmed on screen and the host should repaint it solid.
     #[must_use]
     pub fn note_user_input(&self) -> bool {
+        self.note_interaction();
         note_keystroke(&self.shared.cursor)
+    }
+
+    /// A press the terminal application receives: like typing, it ends a
+    /// message jump in flight and its band.
+    pub fn note_pointer_input(&self) {
+        self.note_interaction();
+    }
+
+    /// The user took the view: typing, a wheel or a selection. Ends a message
+    /// band, and tells a jump in flight to stop.
+    fn note_interaction(&self) {
+        self.shared.interactions.fetch_add(1, Ordering::Relaxed);
+        *mutex_lock(&self.shared.message_flash) = None;
+    }
+
+    /// Advances on every keystroke, wheel and selection gesture.
+    pub fn interaction_generation(&self) -> u64 {
+        self.shared.interactions.load(Ordering::Relaxed)
+    }
+
+    /// Marks the message on these window rows for a moment.
+    pub fn flash_message(&self, rows: std::ops::Range<usize>) {
+        let viewport = mutex_lock(&self.shared.viewport);
+        let start = viewport.absolute_row(rows.start);
+        let end = viewport.absolute_row(rows.end);
+        drop(viewport);
+        self.flash_message_rows(start..end);
+    }
+
+    /// Marks the message on these absolute rows for a moment, including rows
+    /// a reading view has yet to fetch.
+    pub fn flash_message_rows(&self, rows: std::ops::Range<i64>) {
+        *mutex_lock(&self.shared.message_flash) = Some(MessageFlash {
+            rows,
+            started: Instant::now(),
+            first: None,
+        });
+    }
+
+    /// The absolute rows a message band covers while it shows.
+    pub fn message_flash_rows(&self) -> Option<std::ops::Range<i64>> {
+        mutex_lock(&self.shared.message_flash)
+            .as_ref()
+            .filter(|flash| flash.started.elapsed() < MESSAGE_FLASH)
+            .map(|flash| flash.rows.clone())
+    }
+
+    pub fn clear_message_flash(&self) {
+        *mutex_lock(&self.shared.message_flash) = None;
+    }
+
+    /// Draws the message band under the text: a tint across the message's
+    /// rows and a bar in its left margin. Returns whether it still animates.
+    fn paint_message_flash(
+        &self,
+        viewport: &ScrollbackViewport,
+        painted_rows: usize,
+        visible_cols: usize,
+        origin: Point<Pixels>,
+        metrics: CellMetrics,
+        quads: &mut Vec<PaintQuad>,
+    ) -> bool {
+        let mut slot = mutex_lock(&self.shared.message_flash);
+        let Some(flash) = slot.as_mut() else {
+            return false;
+        };
+        let strength = flash.strength(Instant::now());
+        let top = viewport.absolute_row(0);
+        let first = usize::try_from(flash.rows.start - top)
+            .ok()
+            .filter(|row| *row < painted_rows);
+        if let Some(row) = first {
+            let cells = viewport.window_row(&read_lock(&self.buffer), row);
+            let blank = cells.iter().all(|cell| matches!(cell.scalar, 0 | 32));
+            match &flash.first {
+                Some(drawn) if *drawn != cells => {
+                    *slot = None;
+                    return false;
+                }
+                None if !blank => flash.first = Some(cells),
+                _ => {}
+            }
+        }
+        if strength <= 0.0 {
+            *slot = None;
+            return false;
+        }
+        let band = self.theme.find_match;
+        let bar = self.theme.find_match_current;
+        for absolute in flash.rows.clone() {
+            let Some(row) = usize::try_from(absolute - top)
+                .ok()
+                .filter(|row| *row < painted_rows)
+            else {
+                continue;
+            };
+            append_overlay_quad(
+                row,
+                0,
+                visible_cols,
+                origin,
+                metrics,
+                gpui::Rgba {
+                    a: band.a * 0.7 * strength,
+                    ..band
+                },
+                quads,
+            );
+            quads.push(fill(
+                Bounds::new(
+                    point(origin.x, origin.y + metrics.y_for_row(row as u16)),
+                    size(px(3.0), metrics.line_height),
+                ),
+                gpui::Rgba {
+                    a: (bar.a * 2.0).min(1.0) * strength,
+                    ..bar
+                },
+            ));
+        }
+        true
     }
 
     /// Drives cursor motion from a caller-owned clock instead of the wall
@@ -977,6 +1133,13 @@ impl TerminalElement {
     }
 
     #[must_use]
+    /// The absolute row at the top of a reading view whose history geometry
+    /// is known; `None` while following live output.
+    pub fn reading_top_row(&self) -> Option<i64> {
+        let viewport = mutex_lock(&self.shared.viewport);
+        (viewport.geometry_known() && viewport.view_offset() > 0).then(|| viewport.absolute_row(0))
+    }
+
     pub fn viewport(&self) -> ScrollbackViewport {
         mutex_lock(&self.shared.viewport).clone()
     }
@@ -1078,6 +1241,7 @@ impl TerminalElement {
     /// Resolves a wheel event and applies local scrollback movement. Daemon
     /// routes are returned for the app to pass to `SessionAttachment::scroll`.
     pub fn route_wheel(&self, event: WheelEvent) -> Option<WheelRoute> {
+        self.note_interaction();
         self.cancel_scroll_glide();
         let modes = *mutex_lock(&self.shared.modes);
         if let WheelDelta::PrecisePoints(points) = event.delta
@@ -1173,6 +1337,7 @@ impl TerminalElement {
     }
 
     pub fn begin_selection(&self, col: usize, window_row: usize) {
+        self.note_interaction();
         let absolute_row = mutex_lock(&self.shared.viewport).absolute_row(window_row);
         mutex_lock(&self.shared.selection).begin(SelectionPoint {
             row: absolute_row,
@@ -1187,17 +1352,20 @@ impl TerminalElement {
     }
 
     pub fn begin_rectangle_selection(&self, col: usize, row: usize) {
+        self.note_interaction();
         let row = mutex_lock(&self.shared.viewport).absolute_row(row);
         mutex_lock(&self.shared.selection).begin_rectangle(SelectionPoint { row, col });
     }
 
     pub fn select_word(&self, col: usize, window_row: usize) {
+        self.note_interaction();
         let viewport = mutex_lock(&self.shared.viewport);
         let buffer = read_lock(&self.buffer);
         mutex_lock(&self.shared.selection).select_word(&viewport, &buffer, window_row, col);
     }
 
     pub fn select_line(&self, window_row: usize) {
+        self.note_interaction();
         let viewport = mutex_lock(&self.shared.viewport);
         let buffer = read_lock(&self.buffer);
         mutex_lock(&self.shared.selection).select_line(&viewport, &buffer, window_row);
@@ -2382,6 +2550,16 @@ impl Element for TerminalElement {
         }
 
         drop(highlights);
+        if self.paint_message_flash(
+            &viewport,
+            painted_rows,
+            visible_cols,
+            bounds.origin,
+            metrics,
+            &mut overlay_quads,
+        ) {
+            window.request_animation_frame();
+        }
 
         *mutex_lock(&self.shared.input_cell) = (!viewport.is_reading()
             && usize::from(cursor.row) < visible_rows
@@ -4499,6 +4677,48 @@ mod selection_repaint_tests {
         let element = TerminalElement::with_buffer(GridBuffer::new(COLS, ROWS));
         element.apply_damage(update(true, &[(0, "zero"), (1, "one"), (2, "two")]));
         element
+    }
+
+    #[test]
+    fn message_band_marks_rows_until_the_user_takes_the_view() {
+        let element = populated_element();
+        let top = element.viewport().absolute_row(0);
+        element.flash_message(1..3);
+        assert_eq!(element.message_flash_rows(), Some(top + 1..top + 3));
+        // A jump in flight compares this to tell the user took the view.
+        let before = element.interaction_generation();
+        let _ = element.note_user_input();
+        assert!(element.interaction_generation() > before);
+        assert_eq!(element.message_flash_rows(), None, "typing ends the band");
+        element.flash_message_rows(40..42);
+        assert!(element.route_wheel(wheel(1.0)).is_some());
+        assert_eq!(
+            element.message_flash_rows(),
+            None,
+            "the wheel ends the band"
+        );
+        element.flash_message_rows(40..42);
+        element.begin_selection(0, 0);
+        assert_eq!(
+            element.message_flash_rows(),
+            None,
+            "selecting ends the band"
+        );
+    }
+
+    #[test]
+    fn message_band_holds_then_fades_out() {
+        let started = std::time::Instant::now();
+        let flash = super::MessageFlash {
+            rows: 0..1,
+            started,
+            first: None,
+        };
+        assert_eq!(flash.strength(started), 1.0);
+        assert_eq!(flash.strength(started + super::MESSAGE_FLASH_HOLD), 1.0);
+        let midway = started + (super::MESSAGE_FLASH_HOLD + super::MESSAGE_FLASH) / 2;
+        assert!((0.0..1.0).contains(&flash.strength(midway)));
+        assert_eq!(flash.strength(started + super::MESSAGE_FLASH), 0.0);
     }
 
     #[test]

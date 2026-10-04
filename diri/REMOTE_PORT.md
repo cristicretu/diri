@@ -891,6 +891,16 @@ Prompt marks are ignored on the alternate screen. Shell prompt navigation is a
 client interpretation of retained marks, not Agent status or hook ingestion.
 Shells must emit OSC 133; no remote shell configuration is installed.
 
+Agent message navigation is likewise a desktop interpretation and adds no
+frame, capability or Helper state. Inline Agents leave their transcript in
+retained history, which the app reads through the existing paged history RPC
+before scrolling its own view. Full-screen Agents keep their transcript on the
+alternate screen, where the terminal retains nothing above it; the app sends
+them the ordinary wheel frames a trackpad would, through the attached
+controller, and reads each redrawn grid until the message is in view. It sends
+no keystrokes, and the user's own input, wheel or selection ends a jump in
+flight.
+
 Protocol 1.6 advertises optional `terminal-annotations-v1`. Grid flag bit 2 adds
 an extension version byte (1), a big-endian u32 byte length, and bounded JSON
 row annotations after the unchanged RLE rows. Unknown versions, invalid spans,

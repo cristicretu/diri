@@ -28,7 +28,13 @@ pub(super) struct QolState {
     pub autoscroll: Option<Autoscroll>,
     autoscroll_generation: u64,
     export_files: Vec<tempfile::NamedTempFile>,
-    busy: bool,
+    pub(super) busy: bool,
+    /// The history read whose result may still land; a newer read or a
+    /// session switch replaces it.
+    pub(super) read_owner: Option<Arc<()>>,
+    pub(super) message_jump: Option<super::messages::MessageJump>,
+    pub(super) message_mark: Option<super::messages::MessageMark>,
+    pub(super) message_tokens: u64,
     /// Which file references under the pointer name a real local file.
     files: crate::file_links::ExistenceCache,
 }
@@ -95,6 +101,8 @@ enum MenuAction {
     Export,
     PreviousPrompt,
     NextPrompt,
+    PreviousMessage,
+    NextMessage,
 }
 
 impl MenuAction {
@@ -121,6 +129,8 @@ impl MenuAction {
             Self::Export => "Open scrollback in editor",
             Self::PreviousPrompt => "Previous shell prompt",
             Self::NextPrompt => "Next shell prompt",
+            Self::PreviousMessage => "Previous message",
+            Self::NextMessage => "Next message",
         }
     }
 }
@@ -280,13 +290,12 @@ impl TerminalPane {
         if has_selection {
             actions.extend([MenuAction::Copy, MenuAction::Find]);
         }
-        actions.extend([
-            MenuAction::Paste,
-            MenuAction::CopyMode,
-            MenuAction::Export,
-            MenuAction::PreviousPrompt,
-            MenuAction::NextPrompt,
-        ]);
+        actions.extend([MenuAction::Paste, MenuAction::CopyMode, MenuAction::Export]);
+        if self.message_gutter().is_some() {
+            actions.extend([MenuAction::PreviousMessage, MenuAction::NextMessage]);
+        } else {
+            actions.extend([MenuAction::PreviousPrompt, MenuAction::NextPrompt]);
+        }
         let editor = self.file_editor();
         self.qol.menu = Some(TerminalMenu {
             position,
@@ -340,8 +349,12 @@ impl TerminalPane {
             MenuAction::Find => self.find_selection(window, cx),
             MenuAction::CopyMode => self.enter_copy_mode(window, cx),
             MenuAction::Export => self.read_terminal_history(None, window, cx),
-            MenuAction::PreviousPrompt => self.read_terminal_history(Some(false), window, cx),
-            MenuAction::NextPrompt => self.read_terminal_history(Some(true), window, cx),
+            MenuAction::PreviousPrompt | MenuAction::PreviousMessage => {
+                self.read_terminal_history(Some(false), window, cx)
+            }
+            MenuAction::NextPrompt | MenuAction::NextMessage => {
+                self.read_terminal_history(Some(true), window, cx)
+            }
         }
         cx.notify();
     }
@@ -779,12 +792,19 @@ impl TerminalPane {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if self.qol.busy {
+        if let Some(next) = direction
+            && let Some(gutter) = self.message_gutter()
+        {
+            self.jump_to_message(next, gutter, window, cx);
             return;
         }
         let Some(id) = self.selected_id() else {
             return;
         };
+        self.reset_qol_session(&id);
+        if self.qol.busy {
+            return;
+        }
         let Some(resident) = self.residents.get(&id) else {
             return;
         };
@@ -798,9 +818,11 @@ impl TerminalPane {
             let mut text = String::new();
             let mut prompts = Vec::new();
             let mut live_start = 0;
+            let mut page_rows = 1_i64;
+            let mut width = None;
             loop {
                 let response = client
-                    .read_scrollback_cells(&request_id, first, 128)
+                    .read_scrollback_cells(&request_id, first, page_rows)
                     .await
                     .map_err(|_| "Couldn’t read the terminal history")?;
                 if sequence.is_some_and(|seq| seq != response.content_seq) {
@@ -812,11 +834,25 @@ impl TerminalPane {
                 }
                 let count =
                     usize::try_from(response.row_count).map_err(|_| "Invalid history response")?;
-                if count > 128 || response.first_row != first || response.total_rows > 1_000_000 {
+                if count as i64 > page_rows
+                    || response.first_row != first
+                    || response.total_rows > 1_000_000
+                    || !(1..=4096).contains(&response.cols)
+                    || width.is_some_and(|cols| cols != response.cols)
+                    || (!response.metadata.is_empty() && response.metadata.len() != count)
+                {
                     return Err("Invalid history response");
                 }
+                width = Some(response.cols);
+                // Worst-case RLE plus base64 must fit one control response,
+                // even for wide, densely styled terminal rows.
+                page_rows =
+                    (diri_proto::FIND_CAPTURE_MAX_CELLS as i64 / response.cols).clamp(1, 1024);
                 let rows = GridRowCodec::decode_rows(&response.payload, count)
                     .map_err(|_| "Invalid history response")?;
+                if rows.iter().any(|row| row.len() as i64 != response.cols) {
+                    return Err("Invalid history response");
+                }
                 for (index, row) in rows.iter().enumerate() {
                     if row
                         .iter()
@@ -846,18 +882,26 @@ impl TerminalPane {
         });
         self.qol.busy = true;
         self.show_terminal_feedback("Reading terminal output…", window, cx);
+        let read_owner = Arc::new(());
+        self.qol.read_owner = Some(Arc::clone(&read_owner));
         cx.spawn_in(window, async move |this, cx| {
             let result = task.await;
             let _ = crate::floating::update_in_owner(&this, cx, |this, window, cx| {
-                if this.selected_id().as_ref() != Some(&id) {
+                if this.selected_id().as_ref() != Some(&id)
+                    || this
+                        .qol
+                        .read_owner
+                        .as_ref()
+                        .is_none_or(|owner| !Arc::ptr_eq(owner, &read_owner))
+                {
                     return;
                 }
                 this.qol.busy = false;
-                if this
-                    .residents
-                    .get(&id)
-                    .is_none_or(|resident| resident.attachment_generation != generation)
-                {
+                this.qol.read_owner = None;
+                if this.residents.get(&id).is_none_or(|resident| {
+                    resident.attachment_generation != generation
+                        || resident.element.view_offset() != top_offset
+                }) {
                     this.show_terminal_feedback("Terminal changed. Try again.", window, cx);
                     return;
                 }

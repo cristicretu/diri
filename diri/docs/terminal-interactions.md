@@ -9,7 +9,7 @@
   directory; line/column suffixes are removed before opening the file.
   Cmd-Shift-D continues to open the code sidebar explicitly.
 - Right-click for Open/Copy Link, Copy Selection, Find Selection, Paste,
-  Keyboard Copy Mode, Open Scrollback in Editor, and shell prompt navigation.
+  Keyboard Copy Mode, Open Scrollback in Editor, and message/prompt navigation.
   In mouse-aware terminal applications, Option-right-click opens Diri's menu.
 - Double-click then drag selects whole words. Triple-click then drag selects
   complete lines. Option-Shift-drag selects a rectangular column. Option-drag
@@ -26,10 +26,24 @@
   temporary file is owned by the app until the session view is released; save
   it from the editor to keep a permanent copy. Output changing across pages
   produces a retry message rather than mixing revisions.
-- Cmd-Shift-Up/Down jumps between retained shell prompt marks. Your shell must
-  emit OSC 133 A (for example through its terminal integration). No shell
-  configuration is changed. Older live Helpers and full-screen TUIs may have
-  no prompt marks available.
+- Cmd-Shift-Up/Down jumps between the messages you sent to an Agent; the
+  terminal menu offers **Previous message** and **Next message**. The message
+  lands at the top of the view and is marked briefly. Previous starts from the
+  top of what is on screen, so a message you can already see is skipped. Past
+  the newest message, Next returns to the latest output. The view stays an
+  ordinary terminal: scroll, select or type at any time. Any of these ends a
+  jump in progress, and typing returns to the composer as usual.
+  Full-screen Agents (Claude Code, Codex and OpenCode, which keep their
+  transcript on the alternate screen) are scrolled with the same wheel input
+  a trackpad sends, so their own view moves to the message. Inline Agents
+  are found in Diri's retained scrollback. Claude Code, Codex, OpenCode,
+  Copilot, Kimi and Gemini gutters are recognized; other Agents can use
+  explicit `You:` or `User:` labels. Composers and drafts, numbered choosers,
+  pinned headers, tool output and soft-wrap continuations are not stops.
+  In shells the same shortcuts jump between retained prompt marks. Your
+  shell must emit OSC 133 A (for example through its terminal integration);
+  no shell configuration is changed. A shell running a recognized foreground
+  Agent uses message navigation.
 
 Settings → Terminal contains Copy on Selection (off by default), Hide Pointer
 While Typing (on), and Review Command Pastes (off by default). Paste review applies to
@@ -39,6 +53,8 @@ remain immediate. A reconnect or terminal mode change invalidates a pending
 paste review, so the user must paste again into the current terminal.
 
 All history features operate on retained output, not an unlimited session log.
+Message navigation in inline Agents reads retained history in bounded pages,
+including messages older than the recent Find capture.
 Oversized link annotations remain plain text. Existing live Helpers remain
 attachable after an upgrade; annotations become available in new Helpers.
 

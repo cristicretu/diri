@@ -12,6 +12,9 @@ mod find_overlay;
 pub(crate) mod find_workflow_tests;
 #[cfg(all(test, target_os = "macos"))]
 mod keystroke_latency_tests;
+mod messages;
+#[cfg(all(test, target_os = "macos"))]
+mod messages_tests;
 mod path_picker;
 mod qol;
 mod reconnect;
@@ -3278,6 +3281,7 @@ impl TerminalPane {
                 let Some(button) = terminal_mouse_button(event.button) else {
                     return;
                 };
+                resident.element.note_pointer_input();
                 if let Some(bytes) = encode_mouse_event(
                     resident.element.mouse_modes(),
                     TerminalMouseEvent::Press(button),
