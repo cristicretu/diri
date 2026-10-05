@@ -85,6 +85,12 @@ await_gates() {
     log "Gate: a passing CI run on tree $tree (commit $sha)"
     while :; do
         pending=0
+        # Every main commit gets a push run, but GitHub creates it a few
+        # seconds to minutes after the merge. Until it exists, a failed PR run
+        # (a flake) is not the final word: 0.9.3's gate gave up in that gap.
+        if ! gate_candidates "$sha" "$tree" | grep -q ' push$'; then
+            pending=$((pending + 1))
+        fi
         while read -r id event; do
             [ -n "$id" ] || continue
             read -r status conclusion < <(gh run view "$id" -R "$GH_REPO" \
