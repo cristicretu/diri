@@ -40,6 +40,9 @@ use diri_engine::registry::Registry;
 use diri_proto::ControlMessage;
 use serde_json::{Value, json};
 
+#[path = "support/teardown.rs"]
+mod teardown;
+
 struct Client {
     writer: UnixStream,
     reader: BufReader<UnixStream>,
@@ -151,13 +154,16 @@ impl Drop for Fixture {
     fn drop(&mut self) {
         // The daemon is detached (setsid) and outlives every tab; stop it
         // before its HOME disappears.
-        let _ = Command::new(&self.whipcode)
-            .args(["daemon", "stop"])
-            .env("HOME", &self.home)
-            .env_remove("WHIPCODE_HOME")
-            .status();
+        teardown::stop_daemon(
+            &self.whipcode,
+            &["daemon", "stop"],
+            &self.home,
+            "WHIPCODE_HOME",
+        );
         let _ = self.api.kill();
         let _ = self.api.wait();
+        teardown::sweep(self.temp.path());
+        teardown::remove_tree(self.temp.path());
     }
 }
 
