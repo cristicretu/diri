@@ -23,6 +23,10 @@
 //!   cargo test -p diri-engine --test agent_messages_real -- --ignored --nocapture --test-threads=1
 //! ```
 //!
+//! Codex starts a detached app-server daemon in that HOME on first launch.
+//! The fixture stops it with `codex app-server daemon stop` (same HOME) on
+//! drop; one left running outlives its deleted HOME until reboot.
+//!
 //! `DIRI_INLINE=1` runs Codex with `--no-alt-screen`, recording its inline
 //! history instead. The tests set process-wide environment the Engine hands
 //! to its children, so they must run with `--test-threads=1`.
@@ -31,7 +35,7 @@
 use std::io::{BufRead, BufReader, Write};
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command};
+use std::process::{Child, Command, Stdio};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -162,12 +166,22 @@ fn describe(rows: &[Vec<GridCell>]) -> String {
 
 struct Fixture {
     temp: tempfile::TempDir,
+    home: PathBuf,
     project: PathBuf,
     api: Child,
 }
 
 impl Drop for Fixture {
     fn drop(&mut self) {
+        // Codex's daemon is detached and outlives every tab; stop it before
+        // its HOME disappears. A no-op when Codex never ran. CODEX_HOME would
+        // aim the stop at the developer's own daemon.
+        let _ = Command::new("codex")
+            .args(["app-server", "daemon", "stop"])
+            .env("HOME", &self.home)
+            .env_remove("CODEX_HOME")
+            .stdout(Stdio::null())
+            .status();
         let _ = self.api.kill();
         let _ = self.api.wait();
     }
@@ -228,6 +242,7 @@ fn fixture() -> Fixture {
         std::env::set_var("ANTHROPIC_API_KEY", "sk-ant-fake-key-for-diri-e2e-0000");
         for name in [
             "OPENAI_API_KEY",
+            "CODEX_HOME",
             "OPENCODE_CONFIG",
             "OPENCODE_CONFIG_CONTENT",
         ] {
@@ -312,7 +327,12 @@ fn fixture() -> Fixture {
         .to_string(),
     )
     .unwrap();
-    Fixture { temp, project, api }
+    Fixture {
+        temp,
+        home,
+        project,
+        api,
+    }
 }
 
 fn which(name: &str) -> Result<PathBuf, ()> {
