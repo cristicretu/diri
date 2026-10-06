@@ -507,6 +507,10 @@ pub struct UtilitySurfaces {
     /// The registration macOS last reported, which is what the toggle shows;
     /// `prefs.start_at_login` only mirrors it.
     login_item_state: crate::login_item::LoginItemState,
+    /// A login-item read or change in flight on a background thread. Each is
+    /// an XPC round trip to launchd that has taken seconds, so it never runs
+    /// on the UI thread; the toggle ignores clicks until it lands.
+    login_item_task: Option<Task<()>>,
     store: crate::store::WindowStore,
     store_runtime: Arc<StoreRuntime>,
     runtime: Arc<Runtime>,
@@ -550,22 +554,7 @@ impl UtilitySurfaces {
         include_editor.insert_multiline(&quick_open::load_include(&include_path));
         let include_persisted = include_editor.text().to_owned();
         let mut roots_editor = QueryEditor::default();
-        // App start: the user may have approved or removed the login item in
-        // System Settings since the preference was last saved.
         let login_item = crate::login_item::LoginItem::system();
-        let login_item_state = login_item.observe();
-        {
-            let mut store = store_runtime
-                .store
-                .write()
-                .expect("session store lock poisoned");
-            let saved = store.preferences().start_at_login;
-            let actual = login_item_state.preference(saved);
-            if actual != saved {
-                // Best effort: Settings reconciles again whenever it opens.
-                let _ = store.update_preferences(|prefs| prefs.start_at_login = actual);
-            }
-        }
         let (prefs, hosts, agents_host) = {
             let store = store_runtime
                 .store
@@ -666,7 +655,7 @@ impl UtilitySurfaces {
         if settings_tab == SettingsTab::Schedules {
             schedules.update(cx, |schedules, cx| schedules.open(cx));
         }
-        Self {
+        let mut this = Self {
             focus,
             skills,
             schedules,
@@ -734,9 +723,11 @@ impl UtilitySurfaces {
             host_editor: None,
             host_initialization: None,
             host_initialization_generation: 0,
+            // Shown until macOS answers the read started below.
+            login_item_state: crate::login_item::LoginItemState::assumed(prefs.start_at_login),
             prefs,
             login_item,
-            login_item_state,
+            login_item_task: None,
             store: crate::store::WindowStore::from_canonical(Arc::clone(&store_runtime.store)),
             store_runtime,
             runtime,
@@ -749,7 +740,11 @@ impl UtilitySurfaces {
             privacy: Default::default(),
             _update_changes: update_changes,
             _store_changes: store_changes,
-        }
+        };
+        // App start: the user may have approved or removed the login item in
+        // System Settings since the preference was last saved.
+        this.refresh_login_item(cx);
+        this
     }
 
     fn colors(&self) -> SemanticColors {
@@ -1001,13 +996,37 @@ impl UtilitySurfaces {
         }
     }
 
+    /// Reads the registration off the UI thread, then shows and saves it.
+    fn refresh_login_item(&mut self, cx: &mut Context<Self>) {
+        let item = self.login_item.clone();
+        self.run_login_item(cx, move || item.observe());
+    }
+
     fn toggle_login_item(&mut self, cx: &mut Context<Self>) {
-        if !self.login_item_state.available() {
+        if !self.login_item_state.available() || self.login_item_task.is_some() {
             return;
         }
-        let state = self.login_item.set(!self.login_item_state.enabled());
-        self.apply_login_item_state(state);
-        cx.notify();
+        let wanted = !self.login_item_state.enabled();
+        let item = self.login_item.clone();
+        self.run_login_item(cx, move || item.set(wanted));
+    }
+
+    /// Runs `call` on a background thread and applies its answer. A newer
+    /// call replaces one still in flight, whose answer is then dropped.
+    fn run_login_item(
+        &mut self,
+        cx: &mut Context<Self>,
+        call: impl FnOnce() -> crate::login_item::LoginItemState + Send + 'static,
+    ) {
+        let answer = cx.background_executor().spawn(async move { call() });
+        self.login_item_task = Some(cx.spawn(async move |this, cx| {
+            let state = answer.await;
+            let _ = this.update(cx, |this, cx| {
+                this.login_item_task = None;
+                this.apply_login_item_state(state);
+                cx.notify();
+            });
+        }));
     }
 
     // Only the macOS-only login item tests swap the backend.
@@ -1017,6 +1036,7 @@ impl UtilitySurfaces {
         backend: impl crate::login_item::LoginItemBackend + 'static,
     ) {
         self.login_item = crate::login_item::LoginItem::new(backend);
+        self.login_item_task = None;
         let state = self.login_item.observe();
         self.apply_login_item_state(state);
     }
@@ -1770,8 +1790,7 @@ impl UtilitySurfaces {
             .expect("session store lock poisoned")
             .preferences()
             .clone();
-        let login_item_state = self.login_item.observe();
-        self.apply_login_item_state(login_item_state);
+        self.refresh_login_item(cx);
         self.surface = Surface::Settings;
         self.settings_scroll.set_offset(point(px(0.0), px(0.0)));
         self.settings_search.clear();
@@ -10163,6 +10182,47 @@ mod tests {
         cx.run_until_parked();
         assert!(!saved());
         assert!(fake.calls().is_empty(), "looking must not register");
+    }
+
+    /// Each login-item call is an XPC round trip to launchd that has taken
+    /// four seconds, freezing the app as Settings opened. Opening Settings or
+    /// clicking the toggle must leave it to a background thread.
+    #[cfg(target_os = "macos")]
+    #[gpui::test]
+    fn login_item_calls_never_run_on_the_ui_thread(cx: &mut TestAppContext) {
+        use crate::login_item::{LoginItemStatus, testing::Fake};
+
+        let (harness, cx) = open_settings_workbench(cx);
+        let surfaces = harness.read_with(cx, |harness, _| harness.surfaces.clone());
+        let fake = Fake::with_status(LoginItemStatus::NotRegistered);
+        surfaces.update(cx, |surfaces, cx| {
+            surfaces.set_login_item_backend(fake.clone());
+            cx.notify();
+        });
+        cx.run_until_parked();
+        let reads = fake.reads();
+
+        surfaces.update(cx, |surfaces, cx| surfaces.open_settings(cx));
+        assert_eq!(
+            fake.reads(),
+            reads,
+            "opening Settings read on the UI thread"
+        );
+        cx.run_until_parked();
+        assert_eq!(fake.reads(), reads + 1);
+
+        surfaces.update(cx, |surfaces, cx| surfaces.toggle_login_item(cx));
+        assert!(
+            fake.calls().is_empty(),
+            "the toggle registered on the UI thread"
+        );
+        // A second click while the first is in flight is ignored.
+        surfaces.update(cx, |surfaces, cx| surfaces.toggle_login_item(cx));
+        cx.run_until_parked();
+        assert_eq!(fake.calls(), ["register"]);
+        surfaces.read_with(cx, |surfaces, _| {
+            assert!(surfaces.login_item_state.enabled())
+        });
     }
 
     #[gpui::test]

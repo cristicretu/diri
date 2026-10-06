@@ -119,8 +119,18 @@ pub struct SchedulesPage {
     wake_helper: LoginState,
     /// The Engine's last failure reaching the wake helper.
     wake_helper_error: Option<String>,
+    /// A login-item read or change in flight on a background thread. Each is
+    /// an XPC round trip to launchd that has taken seconds, so it never runs
+    /// on the UI thread; both switches ignore clicks until it lands.
+    login_task: Option<Task<()>>,
     refresh_task: Option<Task<()>>,
     _events: Task<()>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum LoginItem {
+    App,
+    WakeHelper,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -164,15 +174,17 @@ impl SchedulesPage {
             error: None,
             draft: None,
             busy: Vec::new(),
+            // Shown off until `open` hears back from macOS.
             login: LoginState {
-                status: login::status(),
+                status: login::Status::Disabled,
                 error: None,
             },
             wake_helper: LoginState {
-                status: login::status_of(login::Service::WakeHelper),
+                status: login::Status::Disabled,
                 error: None,
             },
             wake_helper_error: None,
+            login_task: None,
             refresh_task: None,
             _events: events_task,
         }
@@ -197,9 +209,64 @@ impl SchedulesPage {
 
     /// Called when the tab is shown.
     pub fn open(&mut self, cx: &mut Context<Self>) {
-        self.login.status = login::status();
-        self.wake_helper.status = login::status_of(login::Service::WakeHelper);
+        self.refresh_login(cx);
         self.refresh(cx);
+    }
+
+    /// Reads both login items off the UI thread.
+    fn refresh_login(&mut self, cx: &mut Context<Self>) {
+        let read = cx.background_executor().spawn(async {
+            (
+                login::status(),
+                login::status_of(login::Service::WakeHelper),
+            )
+        });
+        self.login_task = Some(cx.spawn(async move |this, cx| {
+            let (app, helper) = read.await;
+            let _ = this.update(cx, |this, cx| {
+                this.login_task = None;
+                this.login.status = app;
+                this.wake_helper.status = helper;
+                cx.notify();
+            });
+        }));
+    }
+
+    /// Registers or unregisters `which` off the UI thread, then shows the
+    /// result. macOS asks for approval in System Settings, which this opens.
+    fn change_login(&mut self, which: LoginItem, enable: bool, cx: &mut Context<Self>) {
+        if self.login_task.is_some() {
+            return;
+        }
+        let change = cx.background_executor().spawn(async move {
+            match which {
+                LoginItem::App => login::set_enabled(enable),
+                LoginItem::WakeHelper => login::set_enabled_of(login::Service::WakeHelper, enable),
+            }
+        });
+        self.login_task = Some(cx.spawn(async move |this, cx| {
+            let result = change.await;
+            let _ = this.update(cx, |this, cx| {
+                this.login_task = None;
+                let state = match which {
+                    LoginItem::App => &mut this.login,
+                    LoginItem::WakeHelper => &mut this.wake_helper,
+                };
+                match result {
+                    Ok(status) => {
+                        *state = LoginState {
+                            status,
+                            error: None,
+                        };
+                        if status == login::Status::RequiresApproval {
+                            login::open_settings();
+                        }
+                    }
+                    Err(error) => state.error = Some(error),
+                }
+                cx.notify();
+            });
+        }));
     }
 
     fn client(&self) -> Arc<DaemonClient> {
@@ -419,36 +486,12 @@ impl SchedulesPage {
     /// it in System Settings > Login Items, which this opens.
     fn toggle_wake_helper(&mut self, cx: &mut Context<Self>) {
         let enable = self.wake_helper.status != login::Status::Enabled;
-        match login::set_enabled_of(login::Service::WakeHelper, enable) {
-            Ok(status) => {
-                self.wake_helper = LoginState {
-                    status,
-                    error: None,
-                };
-                if status == login::Status::RequiresApproval {
-                    login::open_settings();
-                }
-            }
-            Err(error) => self.wake_helper.error = Some(error),
-        }
-        cx.notify();
+        self.change_login(LoginItem::WakeHelper, enable, cx);
     }
 
     fn toggle_login(&mut self, cx: &mut Context<Self>) {
         let enable = self.login.status != login::Status::Enabled;
-        match login::set_enabled(enable) {
-            Ok(status) => {
-                self.login = LoginState {
-                    status,
-                    error: None,
-                };
-                if status == login::Status::RequiresApproval {
-                    login::open_settings();
-                }
-            }
-            Err(error) => self.login.error = Some(error),
-        }
-        cx.notify();
+        self.change_login(LoginItem::App, enable, cx);
     }
 
     pub(crate) fn handle_key(&mut self, event: &KeyDownEvent, cx: &mut Context<Self>) -> bool {

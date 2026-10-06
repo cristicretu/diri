@@ -59,12 +59,18 @@ pub(crate) fn set_enabled(enabled: bool) -> Result<LoginItemStatus, String> {
     set_enabled_of(Service::App, enabled)
 }
 
+/// A synchronous XPC round trip to launchd that can take seconds: call it
+/// off the UI thread.
 pub(crate) fn status_of(which: Service) -> LoginItemStatus {
-    let Some(service) = service(which) else {
+    // Callers are executor threads; drain the autoreleased service here.
+    let status = objc2::rc::autoreleasepool(|_| {
+        let service = service(which)?;
+        // SAFETY: `status` is an NSInteger-valued property of SMAppService.
+        Some(unsafe { msg_send![service, status] })
+    });
+    let Some(status): Option<isize> = status else {
         return LoginItemStatus::Unavailable;
     };
-    // SAFETY: `status` is an NSInteger-valued property of SMAppService.
-    let status: isize = unsafe { msg_send![service, status] };
     match status {
         1 => LoginItemStatus::Enabled,
         0 => LoginItemStatus::Disabled,
@@ -74,8 +80,13 @@ pub(crate) fn status_of(which: Service) -> LoginItemStatus {
 }
 
 /// Registers or unregisters a service. Returns the new status; a helper that
-/// still needs the administrator's approval reports `RequiresApproval`.
+/// still needs the administrator's approval reports `RequiresApproval`. Like
+/// `status_of`, call it off the UI thread.
 pub(crate) fn set_enabled_of(which: Service, enabled: bool) -> Result<LoginItemStatus, String> {
+    objc2::rc::autoreleasepool(|_| set_enabled_in_pool(which, enabled))
+}
+
+fn set_enabled_in_pool(which: Service, enabled: bool) -> Result<LoginItemStatus, String> {
     let service = service(which).ok_or_else(|| "Login items aren't available here.".to_owned())?;
     let mut error: *mut AnyObject = std::ptr::null_mut();
     // SAFETY: both selectors take an `NSError **` out-parameter and return BOOL.

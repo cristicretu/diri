@@ -37,7 +37,11 @@ const ERROR_LAUNCH_DENIED_BY_USER: isize = 11;
 
 /// The operating system calls, behind a seam so the reconciliation can be
 /// tested without ServiceManagement or a signed bundle.
-pub(crate) trait LoginItemBackend {
+///
+/// Every call is a synchronous XPC round trip to launchd's service manager,
+/// which can take seconds when it is busy, so callers run them on a
+/// background thread, never on the UI thread.
+pub(crate) trait LoginItemBackend: Send + Sync {
     fn status(&self) -> LoginItemStatus;
     fn register(&self) -> Result<(), LoginItemError>;
     fn unregister(&self) -> Result<(), LoginItemError>;
@@ -54,6 +58,18 @@ pub(crate) struct LoginItemState {
 }
 
 impl LoginItemState {
+    /// The saved preference, standing in until macOS has been asked.
+    pub(crate) fn assumed(saved: bool) -> Self {
+        Self {
+            status: if saved {
+                LoginItemStatus::Enabled
+            } else {
+                LoginItemStatus::NotRegistered
+            },
+            failure: None,
+        }
+    }
+
     /// Whether the toggle is on. Only a registration macOS will actually act
     /// on counts; one still waiting for approval does not.
     pub(crate) fn enabled(self) -> bool {
@@ -98,14 +114,17 @@ impl LoginItemState {
     }
 }
 
+/// Cheap to clone, so a copy can carry the system calls to a background
+/// thread.
+#[derive(Clone)]
 pub(crate) struct LoginItem {
-    backend: Box<dyn LoginItemBackend>,
+    backend: std::sync::Arc<dyn LoginItemBackend>,
 }
 
 impl LoginItem {
     pub(crate) fn new(backend: impl LoginItemBackend + 'static) -> Self {
         Self {
-            backend: Box::new(backend),
+            backend: std::sync::Arc::new(backend),
         }
     }
 
@@ -171,7 +190,7 @@ impl LoginItemBackend for Unsupported {
 #[cfg(all(target_os = "macos", not(test)))]
 mod macos {
     use objc2::msg_send;
-    use objc2::rc::Retained;
+    use objc2::rc::{Retained, autoreleasepool};
     use objc2::runtime::{AnyClass, AnyObject};
     use objc2_foundation::{NSBundle, NSError};
 
@@ -217,12 +236,17 @@ mod macos {
 
     impl LoginItemBackend for MainApp {
         fn status(&self) -> LoginItemStatus {
-            let Some(service) = service() else {
+            // These run on executor threads, so drain what they autorelease
+            // here rather than in whatever pool the thread happens to have.
+            let status = autoreleasepool(|_| {
+                let service = service()?;
+                // SAFETY: `-[SMAppService status]` returns the NSInteger-backed
+                // `SMAppServiceStatus`.
+                Some(unsafe { msg_send![&*service, status] })
+            });
+            let Some(status): Option<isize> = status else {
                 return LoginItemStatus::Unavailable;
             };
-            // SAFETY: `-[SMAppService status]` returns the NSInteger-backed
-            // `SMAppServiceStatus`.
-            let status: isize = unsafe { msg_send![&*service, status] };
             match status {
                 1 => LoginItemStatus::Enabled,
                 2 => LoginItemStatus::RequiresApproval,
@@ -233,18 +257,22 @@ mod macos {
         }
 
         fn register(&self) -> Result<(), LoginItemError> {
-            let service = service().ok_or(LoginItemError { code: 0 })?;
-            // SAFETY: `-registerAndReturnError:` follows the Cocoa error
-            // convention `msg_send!` models with the trailing `_`.
-            let result = unsafe { msg_send![&*service, registerAndReturnError: _] };
-            outcome(result, ERROR_ALREADY_REGISTERED)
+            autoreleasepool(|_| {
+                let service = service().ok_or(LoginItemError { code: 0 })?;
+                // SAFETY: `-registerAndReturnError:` follows the Cocoa error
+                // convention `msg_send!` models with the trailing `_`.
+                let result = unsafe { msg_send![&*service, registerAndReturnError: _] };
+                outcome(result, ERROR_ALREADY_REGISTERED)
+            })
         }
 
         fn unregister(&self) -> Result<(), LoginItemError> {
-            let service = service().ok_or(LoginItemError { code: 0 })?;
-            // SAFETY: as for `register`.
-            let result = unsafe { msg_send![&*service, unregisterAndReturnError: _] };
-            outcome(result, ERROR_JOB_NOT_FOUND)
+            autoreleasepool(|_| {
+                let service = service().ok_or(LoginItemError { code: 0 })?;
+                // SAFETY: as for `register`.
+                let result = unsafe { msg_send![&*service, unregisterAndReturnError: _] };
+                outcome(result, ERROR_JOB_NOT_FOUND)
+            })
         }
 
         fn open_approval_settings(&self) {
@@ -259,8 +287,7 @@ mod macos {
 
 #[cfg(test)]
 pub(crate) mod testing {
-    use std::cell::RefCell;
-    use std::rc::Rc;
+    use std::sync::{Arc, Mutex, MutexGuard};
 
     use super::{LoginItemBackend, LoginItemError, LoginItemStatus};
 
@@ -268,7 +295,7 @@ pub(crate) mod testing {
     /// changes, and can hold new registrations for approval.
     #[derive(Clone)]
     pub(crate) struct Fake {
-        state: Rc<RefCell<FakeState>>,
+        state: Arc<Mutex<FakeState>>,
     }
 
     struct FakeState {
@@ -276,46 +303,59 @@ pub(crate) mod testing {
         refuse: Option<LoginItemError>,
         hold_for_approval: bool,
         calls: Vec<&'static str>,
+        reads: usize,
     }
 
     impl Fake {
         pub(crate) fn with_status(status: LoginItemStatus) -> Self {
             Self {
-                state: Rc::new(RefCell::new(FakeState {
+                state: Arc::new(Mutex::new(FakeState {
                     status,
                     refuse: None,
                     hold_for_approval: false,
                     calls: Vec::new(),
+                    reads: 0,
                 })),
             }
         }
 
         pub(crate) fn refuse(&self, code: isize) {
-            self.state.borrow_mut().refuse = Some(LoginItemError { code });
+            self.lock().refuse = Some(LoginItemError { code });
         }
 
         pub(crate) fn hold_for_approval(&self) {
-            self.state.borrow_mut().hold_for_approval = true;
+            self.lock().hold_for_approval = true;
         }
 
         /// What the user did in System Settings behind the app's back.
         pub(crate) fn set_status(&self, status: LoginItemStatus) {
-            self.state.borrow_mut().status = status;
+            self.lock().status = status;
+        }
+
+        fn lock(&self) -> MutexGuard<'_, FakeState> {
+            self.state.lock().expect("fake login item lock poisoned")
+        }
+
+        /// How many times the registration was read.
+        pub(crate) fn reads(&self) -> usize {
+            self.lock().reads
         }
 
         /// Every mutating call the backend received, in order.
         pub(crate) fn calls(&self) -> Vec<&'static str> {
-            self.state.borrow().calls.clone()
+            self.lock().calls.clone()
         }
     }
 
     impl LoginItemBackend for Fake {
         fn status(&self) -> LoginItemStatus {
-            self.state.borrow().status
+            let mut state = self.lock();
+            state.reads += 1;
+            state.status
         }
 
         fn register(&self) -> Result<(), LoginItemError> {
-            let mut state = self.state.borrow_mut();
+            let mut state = self.lock();
             state.calls.push("register");
             if let Some(error) = state.refuse {
                 return Err(error);
@@ -329,7 +369,7 @@ pub(crate) mod testing {
         }
 
         fn unregister(&self) -> Result<(), LoginItemError> {
-            let mut state = self.state.borrow_mut();
+            let mut state = self.lock();
             state.calls.push("unregister");
             if let Some(error) = state.refuse {
                 return Err(error);
@@ -339,7 +379,7 @@ pub(crate) mod testing {
         }
 
         fn open_approval_settings(&self) {
-            self.state.borrow_mut().calls.push("open_approval_settings");
+            self.lock().calls.push("open_approval_settings");
         }
     }
 }
