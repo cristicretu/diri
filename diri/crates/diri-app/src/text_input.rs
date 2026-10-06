@@ -41,8 +41,9 @@ impl Composition {
         self.epoch = self.epoch.wrapping_add(1);
     }
 
-    /// Marks `text` as preedit at the caret, as an input method would.
-    #[cfg(test)]
+    /// Marks `text` as preedit at the caret, as an input method would. Only
+    /// the macOS sidebar screenshot drives it.
+    #[cfg(all(test, target_os = "macos"))]
     pub fn compose(&mut self, query: &mut QueryEditor, text: &str, selected: Range<usize>) {
         self.replace(query, None, text, Some(selected), true);
     }
