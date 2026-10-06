@@ -4071,3 +4071,28 @@ fn a_closing_session_cannot_be_selected_or_marked_seen() {
         "a closing session must not be marked seen"
     );
 }
+
+/// #721: History finds a conversation by the name the user gave it after the
+/// tab closes, and the Agent's own later titles never take that name back.
+#[test]
+fn a_user_rename_outlives_its_tab_for_history() {
+    let directory = tempdir().unwrap();
+    let path = directory.path().join("prefs.json");
+    let (mut store, _effects) = SessionStore::load(&path).unwrap();
+    let mut record = session("a", "p", 1.0);
+    record.agent_session_id = Some("conversation".into());
+    store.upsert_session(record.clone());
+    assert!(store.preferences().conversation_titles.is_empty());
+
+    store.rename(id("a"), "  Billing refactor ");
+    store.remove_session_record(&id("a"));
+    record.title = "Agent title".into();
+    record.title_source = TitleSource::AgentProvided;
+    store.upsert_session(record);
+
+    let titles = Prefs::load(&path).unwrap().conversation_titles;
+    assert_eq!(
+        titles.get("conversation").map(String::as_str),
+        Some("Billing refactor")
+    );
+}

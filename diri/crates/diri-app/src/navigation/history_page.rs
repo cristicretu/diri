@@ -19,19 +19,11 @@ impl NavigationOverlay {
         cx.notify();
 
         let roots = crate::history::HistoryRoots::current_user();
-        let tracked = self
-            .store
-            .read()
-            .expect("session store lock poisoned")
-            .sessions()
-            .values()
-            .filter_map(|session| session.agent_session_id.clone())
-            .collect();
         let runtime = Arc::clone(&self.tokio);
         cx.spawn(async move |this, cx| {
             let task = runtime.spawn(async move {
                 tokio::task::spawn_blocking(move || {
-                    let entries = scanner.scan(&roots, &tracked);
+                    let entries = scanner.scan(&roots, &HashSet::new());
                     (scanner, entries)
                 })
                 .await
@@ -45,17 +37,20 @@ impl NavigationOverlay {
                 this.history_loading = false;
                 match result {
                     Ok((scanner, mut entries)) => {
-                        // A session can become tracked while the disk scan is
-                        // running. Reconcile against the current store as well.
-                        let tracked = this
-                            .store
-                            .read()
-                            .expect("session store lock poisoned")
+                        // Open conversations stay listed so they can be found
+                        // by name; choosing one focuses its tab. A user rename
+                        // outranks the provider's title, open or closed.
+                        let store = this.store.read().expect("session store lock poisoned");
+                        this.history_open = store
                             .sessions()
                             .values()
                             .filter_map(|session| session.agent_session_id.clone())
-                            .collect::<HashSet<_>>();
-                        entries.retain(|entry| !tracked.contains(&entry.id));
+                            .collect();
+                        crate::history::apply_user_titles(
+                            &mut entries,
+                            &store.preferences().conversation_titles,
+                        );
+                        drop(store);
                         let selected_id = this.highlighted_history().map(|entry| entry.id.clone());
                         this.history_scanner = Some(scanner);
                         if this.overlay.is_none() {
@@ -149,10 +144,19 @@ impl NavigationOverlay {
                         if this.overlay == Some(Overlay::History) {
                             this.filter_history();
                         }
-                        this.store
-                            .write()
-                            .expect("session store lock poisoned")
-                            .apply_spawn_result(id.clone());
+                        let mut store = this.store.write().expect("session store lock poisoned");
+                        store.apply_spawn_result(id.clone());
+                        // The Engine resumes under the provider's title; the
+                        // tab keeps the name the user gave the conversation.
+                        if let Some(title) = store
+                            .preferences()
+                            .conversation_titles
+                            .get(&conversation_id)
+                            .cloned()
+                        {
+                            store.rename(id.clone(), title);
+                        }
+                        drop(store);
                         if this.overlay == Some(Overlay::History) {
                             this.close_overlay(window, cx);
                         }
@@ -182,7 +186,9 @@ impl NavigationOverlay {
         let colors = self.colors();
         let entry = self.history[self.history_matches[index]].clone();
         let selected = index == self.highlight;
-        let resumable = entry.cwd_exists;
+        let open = self.history_open.contains(&entry.id);
+        // Focusing an open tab does not need the folder.
+        let resumable = open || entry.cwd_exists;
         let opening = self.history_resuming.as_deref() == Some(&entry.id);
         let busy = self.history_resuming.is_some();
         let title = entry
@@ -194,7 +200,11 @@ impl NavigationOverlay {
             detail.push('\n');
             detail.push_str(crate::i18n::t("nav.history.folder_unavailable"));
         }
-        let age = relative_time(entry.last_active_at.0);
+        let age = if open {
+            crate::i18n::t("nav.history.open").to_owned()
+        } else {
+            relative_time(entry.last_active_at.0)
+        };
         let agent = crate::surface_shell::ui_agent(&entry.kind);
         div()
             .h(px(ROW_HEIGHT))

@@ -272,6 +272,11 @@ pub struct Prefs {
     pub status_sounds: bool,
     pub status_notifications: bool,
     pub muted_notification_sessions: std::collections::BTreeSet<String>,
+    /// Names the user gave conversations, by the Agent's own conversation id.
+    /// History reads them after the tab that carried the rename has closed:
+    /// provider transcripts never learn a Diri rename.
+    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+    pub conversation_titles: BTreeMap<String, String>,
     /// Check, download, and verify releases in the background. A staged update
     /// installs on quit or when the user requests a restart.
     pub automatic_updates: bool,
@@ -408,6 +413,7 @@ impl Default for Prefs {
             status_sounds: true,
             status_notifications: true,
             muted_notification_sessions: Default::default(),
+            conversation_titles: BTreeMap::new(),
             automatic_updates: true,
             skipped_update_version: String::new(),
             hibernate_after_minutes: 60,

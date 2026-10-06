@@ -5,6 +5,7 @@ mod page_tests;
 
 use crate::tooltip_warmth::WarmTooltip;
 use std::cmp::Ordering;
+use std::collections::HashSet;
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
 use std::ops::Range;
@@ -150,6 +151,8 @@ pub struct NavigationOverlay {
     history_loading: bool,
     history_error: Option<String>,
     history_scanner: Option<crate::history::HistoryScanner>,
+    /// Conversation ids an open session carries, as of the last scan.
+    history_open: HashSet<String>,
     history_search: crate::history::HistorySearch,
     history_matches: Vec<usize>,
     history_resuming: Option<String>,
@@ -281,6 +284,7 @@ impl NavigationOverlay {
             history_loading: false,
             history_error: None,
             history_scanner: Some(crate::history::HistoryScanner::default()),
+            history_open: HashSet::new(),
             history_search: crate::history::HistorySearch::default(),
             history_matches: Vec::new(),
             history_resuming: None,
@@ -340,6 +344,7 @@ impl NavigationOverlay {
             history_loading: false,
             history_error: None,
             history_scanner: Some(crate::history::HistoryScanner::default()),
+            history_open: HashSet::new(),
             history_search: crate::history::HistorySearch::default(),
             history_matches: Vec::new(),
             history_resuming: None,

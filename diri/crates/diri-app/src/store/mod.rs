@@ -1951,6 +1951,7 @@ impl SessionStore {
             && previous
                 .as_deref()
                 .is_none_or(|record| !matches!(record.status, SessionStatus::Exited(_)));
+        self.remember_conversation_title(&session);
         self.sessions.insert(id.clone(), Arc::new(session));
         self.reconcile_notifications();
         let current = self.sessions.get(&id).expect("inserted");
@@ -2691,9 +2692,38 @@ impl SessionStore {
             let session = Arc::make_mut(session);
             session.title.clone_from(&title);
             session.title_source = diri_proto::TitleSource::UserRename;
+            let session = session.clone();
+            self.remember_conversation_title(&session);
             self.invalidate_projection();
         }
         self.emit(StoreEffect::Rename { id, title });
+    }
+
+    /// Keeps a user rename findable in History once its tab is gone. Only
+    /// renames are remembered: Agent and Diri titles are the provider's own
+    /// to report, and a later automatic title never erases the user's.
+    fn remember_conversation_title(&mut self, session: &SessionRecord) {
+        if session.title_source != diri_proto::TitleSource::UserRename {
+            return;
+        }
+        let Some(conversation) = session.agent_session_id.as_ref() else {
+            return;
+        };
+        let title = session.title.trim();
+        if title.is_empty()
+            || self
+                .prefs
+                .conversation_titles
+                .get(conversation)
+                .map(String::as_str)
+                == Some(title)
+        {
+            return;
+        }
+        self.prefs
+            .conversation_titles
+            .insert(conversation.clone(), title.to_owned());
+        let _ = self.persist_preferences();
     }
 
     pub fn reopen_last(&self) {

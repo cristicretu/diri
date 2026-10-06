@@ -125,6 +125,20 @@ impl HistoryScanner {
     }
 }
 
+/// A name the user gave a conversation in Diri outranks the provider's own
+/// title. Providers never learn a Diri rename, so without this a closed
+/// conversation reverts to its first prompt or generated title.
+pub fn apply_user_titles(
+    entries: &mut [HistoryEntry],
+    titles: &std::collections::BTreeMap<String, String>,
+) {
+    for entry in entries {
+        if let Some(title) = titles.get(&entry.id) {
+            entry.title = Some(title.clone());
+        }
+    }
+}
+
 /// Resume a durable conversation through the first-class Engine path. The
 /// typed request preserves the Agent kind, conversation id, and transcript
 /// path on the new record so another machine or Engine restart can resume it
@@ -968,6 +982,42 @@ mod tests {
         fs::remove_file(path).unwrap();
         assert!(scanner.scan(&roots, &HashSet::new()).is_empty());
         assert!(scanner.files.is_empty());
+    }
+
+    /// #721: a closed conversation is found by the name the user gave it,
+    /// not by its first prompt; unrenamed rows keep the provider's title.
+    #[test]
+    fn user_titles_outrank_provider_titles() {
+        let temp = TempDir::new().unwrap();
+        let roots = fixture_roots(&temp);
+        let project = roots.claude.join("project");
+        fs::create_dir_all(&project).unwrap();
+        for id in [
+            "12345678-1234-1234-1234-123456789abc",
+            "12345678-1234-1234-1234-123456789abd",
+        ] {
+            fs::write(project.join(format!("{id}.jsonl")), "{\"type\":\"system\",\"cwd\":\"/tmp\"}\n{\"type\":\"user\",\"message\":{\"content\":\"First prompt\"}}\n").unwrap();
+        }
+        let mut entries = HistoryScanner::default().scan(&roots, &HashSet::new());
+        let titles = std::collections::BTreeMap::from([(
+            "12345678-1234-1234-1234-123456789abc".to_owned(),
+            "Billing refactor".to_owned(),
+        )]);
+        apply_user_titles(&mut entries, &titles);
+        let title = |id: &str| {
+            entries
+                .iter()
+                .find(|entry| entry.id == id)
+                .and_then(|entry| entry.title.as_deref())
+        };
+        assert_eq!(
+            title("12345678-1234-1234-1234-123456789abc"),
+            Some("Billing refactor")
+        );
+        assert_eq!(
+            title("12345678-1234-1234-1234-123456789abd"),
+            Some("First prompt")
+        );
     }
 
     #[test]
