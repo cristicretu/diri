@@ -10545,7 +10545,7 @@ mod tests {
         assert_eq!(close.center(), logo.center());
         assert_eq!(
             close.size,
-            size(px(SIDEBAR_ACTION_SLOT), px(SIDEBAR_ACTION_SLOT))
+            gpui::size(px(SIDEBAR_ACTION_SLOT), px(SIDEBAR_ACTION_SLOT))
         );
         cx.simulate_mouse_move(point(px(500.0), px(320.0)), None, Modifiers::default());
         assert_eq!(

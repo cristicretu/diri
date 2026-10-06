@@ -120,6 +120,10 @@ impl SampledThread {
     }
 
     /// A frame record (caller fp, return address) at `fp` fits in the stack.
+    #[cfg_attr(
+        not(all(target_os = "macos", target_arch = "aarch64")),
+        allow(dead_code)
+    )]
     fn holds_frame(self, fp: usize) -> bool {
         fp.is_multiple_of(std::mem::align_of::<usize>())
             && fp >= self.stack_bottom
@@ -129,6 +133,10 @@ impl SampledThread {
 
 /// Drops pointer-authentication bits: system frameworks are arm64e and sign
 /// the return addresses they save. User addresses fit in 47 bits.
+#[cfg_attr(
+    not(all(target_os = "macos", target_arch = "aarch64")),
+    allow(dead_code)
+)]
 fn strip(address: usize) -> usize {
     address & ((1 << 47) - 1)
 }
@@ -171,6 +179,10 @@ fn c_str(pointer: *const libc::c_char) -> Option<String> {
 
 /// Rust's legacy mangling (`_ZN4diri3app5stall17h0123456789abcdefE`) as a
 /// path without its hash; anything else (C, Objective-C, Swift) unchanged.
+#[cfg_attr(
+    not(all(target_os = "macos", target_arch = "aarch64")),
+    allow(dead_code)
+)]
 fn demangle(symbol: &str) -> String {
     let Some(mut rest) = symbol
         .strip_prefix("__ZN")
@@ -211,6 +223,10 @@ fn demangle(symbol: &str) -> String {
 
 /// Legacy escapes: `$LT$` → `<`, `$u20$` → ` `, `..` → `::`; a part that
 /// begins with an escape carries a leading `_`.
+#[cfg_attr(
+    not(all(target_os = "macos", target_arch = "aarch64")),
+    allow(dead_code)
+)]
 fn unescape(part: &str) -> String {
     let part = part
         .strip_prefix('_')

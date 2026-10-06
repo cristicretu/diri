@@ -36,13 +36,13 @@ else
     fail "Agent catalog carries only ${count} manifests (expected at least 23)"
 fi
 
-# Nineteen launchable Agents declare returnToLoginShell. Dropping it means an Agent
+# Twenty launchable Agents declare returnToLoginShell. Dropping it means an Agent
 # that exits or self-updates ends the session instead of landing at a prompt.
 login_shell="$(grep -l returnToLoginShell "${manifests}"/*.json | wc -l | tr -d ' ')"
-if [[ "${login_shell}" -eq 19 ]]; then
+if [[ "${login_shell}" -eq 20 ]]; then
     pass "returnToLoginShell declared on ${login_shell} Agents"
 else
-    fail "returnToLoginShell declared on ${login_shell} Agents (expected 19)"
+    fail "returnToLoginShell declared on ${login_shell} Agents (expected 20)"
 fi
 
 # Without a caller-minted conversation id, Gemini cannot resume at all.
