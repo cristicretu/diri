@@ -336,7 +336,9 @@ pub(crate) mod testing {
             self.state.lock().expect("fake login item lock poisoned")
         }
 
-        /// How many times the registration was read.
+        /// How many times the registration was read. Only the macOS login
+        /// item tests count reads.
+        #[cfg(target_os = "macos")]
         pub(crate) fn reads(&self) -> usize {
             self.lock().reads
         }
