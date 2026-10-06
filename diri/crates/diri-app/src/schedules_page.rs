@@ -917,14 +917,18 @@ mod local {
     }
 }
 
+/// The login items. Test builds get the inert stand-in: each real call is an
+/// XPC round trip that queues behind every other caller in
+/// backgroundtaskmanagementd, so a test run that asked macOS stalled the
+/// installed app's Settings for seconds.
 mod login {
-    #[cfg(target_os = "macos")]
+    #[cfg(all(target_os = "macos", not(test)))]
     pub(super) use crate::macos::login_item::{
         LoginItemStatus as Status, Service, open_settings, set_enabled, set_enabled_of, status,
         status_of,
     };
 
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(not(all(target_os = "macos", not(test))))]
     #[derive(Clone, Copy, Debug, PartialEq, Eq)]
     #[allow(
         dead_code,
@@ -937,31 +941,31 @@ mod login {
         Unavailable,
     }
 
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(not(all(target_os = "macos", not(test))))]
     pub(super) fn status() -> Status {
         Status::Unavailable
     }
 
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(not(all(target_os = "macos", not(test))))]
     pub(super) fn set_enabled(_: bool) -> Result<Status, String> {
         Err(crate::i18n::t("settings.schedules.login_unavailable_platform").into())
     }
 
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(not(all(target_os = "macos", not(test))))]
     pub(super) fn open_settings() {}
 
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(not(all(target_os = "macos", not(test))))]
     #[derive(Clone, Copy, Debug, PartialEq, Eq)]
     pub(super) enum Service {
         WakeHelper,
     }
 
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(not(all(target_os = "macos", not(test))))]
     pub(super) fn status_of(_: Service) -> Status {
         Status::Unavailable
     }
 
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(not(all(target_os = "macos", not(test))))]
     pub(super) fn set_enabled_of(_: Service, _: bool) -> Result<Status, String> {
         Err(crate::i18n::t("settings.schedules.wake_macos_only").into())
     }
