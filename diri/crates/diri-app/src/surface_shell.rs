@@ -24,7 +24,6 @@ use crate::quick_open;
 use crate::settings::{HostDraft, SettingsNav, SettingsTab, theme};
 mod account_settings;
 mod import_settings;
-mod new_agent_settings;
 mod privacy_settings;
 use crate::sidebar::DraggedSidebarItem;
 use crate::store::{Prefs, SessionStore, StoreRuntime, WindowMaterial};
@@ -3303,7 +3302,6 @@ impl UtilitySurfaces {
                     ),
                     colors,
                 ))
-                .child(self.new_agent_start_settings(cx))
                 .child(setting_section(
                     t("settings.general.behavior"),
                     div()
