@@ -677,7 +677,7 @@ struct ResidentTerminal {
     /// The editable text behind `find`'s query, so ⌘F gets the same caret,
     /// selection, and readline keys as the other query fields.
     find_query: QueryEditor,
-    find_composition: find_input::Composition,
+    find_composition: crate::text_input::Composition,
     last_size: (u16, u16),
     pointer_owner: Option<(MouseButton, PointerOwner)>,
     mouse_motion: MouseMotionLimiter,
@@ -1443,7 +1443,7 @@ impl TerminalPane {
                     find: None,
                     find_scheduler: FindSearchScheduler::default(),
                     find_query: QueryEditor::default(),
-                    find_composition: find_input::Composition::default(),
+                    find_composition: crate::text_input::Composition::default(),
                     last_size,
                     pointer_owner: None,
                     mouse_motion: MouseMotionLimiter::default(),

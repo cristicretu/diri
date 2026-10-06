@@ -6,6 +6,7 @@ mod hover_linger;
 mod hue_tests;
 mod lineage;
 mod project_picker;
+mod rename_input;
 mod rows;
 mod strip_tabs;
 mod tabs;
@@ -1651,6 +1652,11 @@ impl Sidebar {
             // Rename remains a modal editor for every editing keystroke. A
             // non-editing application shortcut may continue through GPUI's
             // action dispatch, matching the existing command behavior.
+            if self.rename_composition_key(event.keystroke.key.as_str(), window, cx) {
+                cx.stop_propagation();
+                cx.notify();
+                return;
+            }
             match event.keystroke.key.as_str() {
                 "enter" => self.commit_rename(),
                 "escape" => self.ui.cancel_rename(),
@@ -3852,7 +3858,7 @@ impl Sidebar {
                         .overflow_hidden()
                         .text_size(px(Typo::ROW.size))
                         .text_color(colors.primary)
-                        .child(query_label(&self.ui.rename_draft)),
+                        .child(self.rename_field(&id, colors, cx)),
                 )
                 // Keep the trailing fold slot inert while editing, preserving
                 // the same title width as the non-editing row.
@@ -8442,6 +8448,7 @@ pub(crate) mod render_probe {
 impl Render for Sidebar {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         crate::perf_overlay::rendered("sidebar");
+        self.discard_rename_preedit(window, cx);
         #[cfg(test)]
         let render_started = std::time::Instant::now();
         let root = self.render_sidebar(window, cx);
@@ -10035,6 +10042,7 @@ fn compact_duration(seconds: i64) -> String {
 
 #[cfg(test)]
 mod tests {
+    use gpui::InputHandler as _;
     #[cfg(target_os = "macos")]
     use std::path::PathBuf;
 
@@ -11797,6 +11805,109 @@ mod tests {
         });
     }
 
+    fn rename_harness(
+        cx: &mut TestAppContext,
+    ) -> (Entity<Sidebar>, SessionId, &mut VisualTestContext) {
+        let (view, cx) = cx.add_window_view(|_, cx| {
+            let sidebar = cx.new(|cx| Sidebar::new(None, true, PreviewScenario::Typical, cx));
+            SidebarPopoverHarness { sidebar }
+        });
+        let sidebar = view.read_with(cx, |harness, _| harness.sidebar.clone());
+        let id = sidebar.read_with(cx, |sidebar, _| {
+            sidebar
+                .ui
+                .focus_cursor
+                .clone()
+                .expect("render seeds the cursor")
+        });
+        sidebar.update_in(cx, |sidebar, window, cx| {
+            sidebar.ui.begin_rename(id.clone(), "Before");
+            sidebar.focus_handle.focus(window, cx);
+            cx.notify();
+        });
+        cx.run_until_parked();
+        (sidebar, id, cx)
+    }
+
+    #[gpui::test]
+    fn rename_accepts_composed_cjk_text_once(cx: &mut TestAppContext) {
+        let (sidebar, id, cx) = rename_harness(cx);
+        let mut handler = sidebar.update(cx, |sidebar, cx| sidebar.rename_input_handler(cx));
+        cx.update(|window, cx| {
+            // Composition replaces the selected title, and the candidate
+            // window anchors inside the field.
+            handler.replace_and_mark_text_in_range(None, "ni", Some(2..2), window, cx);
+            assert_eq!(handler.marked_text_range(window, cx), Some(0..2));
+            let caret = handler
+                .bounds_for_range(2..2, window, cx)
+                .expect("caret bounds");
+            assert!(caret.left() >= px(40.0) && caret.right() <= px(200.0));
+            handler.replace_and_mark_text_in_range(None, "你好", Some(2..2), window, cx);
+            handler.replace_text_in_range(None, "你好", window, cx);
+            assert_eq!(handler.marked_text_range(window, cx), None);
+        });
+        sidebar.read_with(cx, |sidebar, _| {
+            assert_eq!(sidebar.ui.rename_draft.text(), "你好");
+            assert!(!sidebar.ui.rename_composition.is_composing());
+        });
+
+        cx.simulate_keystrokes("enter");
+
+        sidebar.read_with(cx, |sidebar, _| {
+            assert!(sidebar.ui.renaming.is_none());
+            let store = sidebar.store.read().expect("store");
+            assert_eq!(store.sessions()[&id].title, "你好");
+        });
+    }
+
+    #[gpui::test]
+    fn rename_escape_cancels_composition_before_the_edit(cx: &mut TestAppContext) {
+        let (sidebar, _, cx) = rename_harness(cx);
+        let mut handler = sidebar.update(cx, |sidebar, cx| sidebar.rename_input_handler(cx));
+        cx.update(|window, cx| {
+            handler.replace_and_mark_text_in_range(None, "かん", Some(2..2), window, cx);
+        });
+        sidebar.read_with(cx, |sidebar, _| {
+            assert_eq!(sidebar.ui.rename_draft.text(), "かん");
+            assert!(sidebar.ui.rename_composition.is_composing());
+        });
+
+        cx.simulate_keystrokes("escape");
+
+        sidebar.read_with(cx, |sidebar, _| {
+            assert!(sidebar.ui.renaming.is_some(), "Escape only cancels preedit");
+            assert_eq!(sidebar.ui.rename_draft.text(), "Before");
+            assert!(!sidebar.ui.rename_composition.is_composing());
+        });
+        // The cancelled composition's handler is stale: a late commit from the
+        // input method changes nothing.
+        cx.update(|window, cx| handler.replace_text_in_range(None, "感", window, cx));
+        sidebar.read_with(cx, |sidebar, _| {
+            assert_eq!(sidebar.ui.rename_draft.text(), "Before");
+        });
+
+        cx.simulate_keystrokes("escape");
+
+        sidebar.read_with(cx, |sidebar, _| assert!(sidebar.ui.renaming.is_none()));
+    }
+
+    #[gpui::test]
+    fn rename_editing_keys_fix_preedit_as_typed_text(cx: &mut TestAppContext) {
+        let (sidebar, _, cx) = rename_harness(cx);
+        let mut handler = sidebar.update(cx, |sidebar, cx| sidebar.rename_input_handler(cx));
+        cx.update(|window, cx| {
+            handler.replace_and_mark_text_in_range(None, "한", Some(3..3), window, cx);
+        });
+
+        cx.simulate_keystrokes("backspace");
+
+        sidebar.read_with(cx, |sidebar, _| {
+            assert_eq!(sidebar.ui.rename_draft.text(), "");
+            assert!(!sidebar.ui.rename_composition.is_composing());
+            assert!(sidebar.ui.renaming.is_some());
+        });
+    }
+
     #[gpui::test]
     fn keyboard_cursor_moves_without_activating_until_enter(cx: &mut TestAppContext) {
         let (view, cx) = cx.add_window_view(|_, cx| {
@@ -12260,7 +12371,7 @@ mod tests {
         cx.update(|cx| crate::fonts::init(cx));
 
         let window = cx
-            .open_window(size(px(width), px(height)), |_, cx| {
+            .open_window(size(px(width), px(height)), |window, cx| {
                 let sidebar = cx.new(|cx| {
                     let mut sidebar = Sidebar::new(None, true, scenario, cx);
                     sidebar.ui.width = width;
@@ -12274,6 +12385,17 @@ mod tests {
                     }
                     if std::env::var_os("DIRI_VISUAL_HOVER").is_some() {
                         sidebar.ui.hovered_session = Some(SessionId::new("preview-codex"));
+                    }
+                    // `DIRI_VISUAL_RENAME=<title>` opens the inline rename,
+                    // with `<title>` composing as input-method preedit.
+                    if let Ok(title) = std::env::var("DIRI_VISUAL_RENAME") {
+                        sidebar.ui.begin_rename(SessionId::new("preview-codex"), "");
+                        let units = title.encode_utf16().count();
+                        sidebar.ui.rename_composition.compose(
+                            &mut sidebar.ui.rename_draft,
+                            &title,
+                            units..units,
+                        );
                     }
                     let now = wall_clock_millis();
                     let mut store = sidebar.store.write().expect("preview session store");
@@ -12519,6 +12641,9 @@ mod tests {
                     }
                     sidebar
                 });
+                if std::env::var_os("DIRI_VISUAL_RENAME").is_some() {
+                    sidebar.update(cx, |sidebar, cx| sidebar.focus_handle.focus(window, cx));
+                }
                 cx.new(|_| SidebarPopoverHarness { sidebar })
             })
             .expect("open headless sidebar window");

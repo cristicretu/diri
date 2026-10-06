@@ -89,6 +89,7 @@ mod tab_peek;
 mod tab_preview;
 mod telemetry;
 pub mod terminal_pane;
+mod text_input;
 mod toast;
 mod tooltip_warmth;
 pub mod transcript;

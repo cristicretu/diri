@@ -3,6 +3,7 @@ use gpui::{Bounds, Pixels, Point};
 
 use crate::delegation::SiblingProposal;
 use crate::query_editor::QueryEditor;
+use crate::text_input::Composition;
 
 pub const DEFAULT_SIDEBAR_WIDTH: f32 = 248.0;
 pub const MIN_SIDEBAR_WIDTH: f32 = 200.0;
@@ -100,6 +101,12 @@ pub struct SidebarUiState {
     pub layout_menu_index: usize,
     pub renaming: Option<SessionId>,
     pub rename_draft: QueryEditor,
+    /// Input-method preedit inside `rename_draft`; never committed by a
+    /// rename that ends mid-composition.
+    pub(crate) rename_composition: Composition,
+    /// A cancelled preedit still lives in the Cocoa input context until the
+    /// next render discards it there.
+    pub rename_discard_native: bool,
     /// Session whose hover card is showing. Its current row bounds own the anchor.
     pub hover_card: Option<SessionId>,
     pub drag: Option<DragItem>,
@@ -140,6 +147,8 @@ impl SidebarUiState {
             layout_menu_index: 0,
             renaming: None,
             rename_draft: QueryEditor::default(),
+            rename_composition: Composition::default(),
+            rename_discard_native: false,
             hover_card: None,
             drag: None,
             drag_target: None,
@@ -227,6 +236,7 @@ impl SidebarUiState {
     }
 
     pub fn begin_rename(&mut self, id: SessionId, title: impl Into<String>) {
+        self.cancel_rename_composition();
         self.renaming = Some(id);
         self.rename_draft.clear();
         self.rename_draft.insert(&title.into());
@@ -235,15 +245,26 @@ impl SidebarUiState {
     }
 
     pub fn cancel_rename(&mut self) {
+        self.cancel_rename_composition();
         self.renaming = None;
         self.rename_draft.clear();
     }
 
     pub fn take_rename(&mut self) -> Option<(SessionId, String)> {
+        self.cancel_rename_composition();
         let id = self.renaming.take()?;
         let title = self.rename_draft.text().trim().to_owned();
         self.rename_draft.clear();
         (!title.is_empty()).then_some((id, title))
+    }
+
+    /// Drops uncommitted preedit, restoring the draft it replaced, and
+    /// retires every input handler installed for the old epoch.
+    pub fn cancel_rename_composition(&mut self) {
+        if self.rename_composition.is_composing() {
+            self.rename_discard_native = true;
+        }
+        self.rename_composition.cancel(&mut self.rename_draft);
     }
 
     pub fn cancel_delegation(&mut self) {
