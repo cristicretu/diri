@@ -50,7 +50,7 @@ fn directory(path: &Path) -> Result<(), ControlError> {
     Ok(())
 }
 
-fn read_private(path: &Path) -> Result<Option<Vec<u8>>, ControlError> {
+pub(super) fn read_private(path: &Path) -> Result<Option<Vec<u8>>, ControlError> {
     let file = match fs::OpenOptions::new()
         .read(true)
         .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
@@ -74,7 +74,7 @@ fn read_private(path: &Path) -> Result<Option<Vec<u8>>, ControlError> {
     Ok(Some(bytes))
 }
 
-fn write_private(path: &Path, bytes: &[u8]) -> Result<(), ControlError> {
+pub(super) fn write_private(path: &Path, bytes: &[u8]) -> Result<(), ControlError> {
     directory(path.parent().ok_or_else(failure)?)?;
     let temp = path.with_file_name(format!(".write-{}.tmp", crate::inject::uuid_v4()));
     let result = (|| {
@@ -118,7 +118,7 @@ fn default_store(home: &Path) -> PathBuf {
 }
 
 #[derive(Clone, Copy)]
-enum Store<'a> {
+pub(super) enum Store<'a> {
     Default,
     Slot(&'a str),
 }
@@ -208,7 +208,7 @@ fn kill_and_reap(child: &mut std::process::Child) {
 /// Whether `store` holds a login, without reading any secret. Claude Code
 /// falls back to the credentials file when the Keychain is unavailable, so a
 /// file counts on every platform; on macOS the Keychain item is the norm.
-fn has_login(store: Store<'_>, home: &Path) -> Result<bool, ControlError> {
+pub(super) fn has_login(store: Store<'_>, home: &Path) -> Result<bool, ControlError> {
     if read_private(&store.file(home))?.is_some() {
         return Ok(true);
     }
@@ -243,7 +243,7 @@ pub(super) fn default_login_present(config_home: &Path) -> Option<bool> {
 /// Copy the active login of `from` into `to`. On macOS the secret moves
 /// between Keychain items through `security -i` so it never appears in argv;
 /// elsewhere the credentials file is copied with owner-only permissions.
-fn copy_login(from: Store<'_>, to: Store<'_>, home: &Path) -> Result<(), ControlError> {
+pub(super) fn copy_login(from: Store<'_>, to: Store<'_>, home: &Path) -> Result<(), ControlError> {
     if cfg!(target_os = "macos") {
         let account = keychain_account();
         let (code, secret) = security(
@@ -262,10 +262,24 @@ fn copy_login(from: Store<'_>, to: Store<'_>, home: &Path) -> Result<(), Control
                 "No Claude login is active on this Mac. Sign in with Open Agent first.",
             ));
         }
-        let secret = secret.strip_suffix('\n').unwrap_or(&secret);
-        if secret.is_empty() || !secret.starts_with('{') {
-            return Err(failure());
-        }
+        return store_login(to, &secret, home);
+    }
+    let bytes = read_private(&from.file(home))?.ok_or_else(|| {
+        ControlError::bad_request(
+            "No Claude login is active on this machine. Sign in with Open Agent first.",
+        )
+    })?;
+    write_private(&to.file(home), &bytes)
+}
+
+/// Save a Claude credential (the JSON Claude Code keeps) into `to`.
+pub(super) fn store_login(to: Store<'_>, secret: &str, home: &Path) -> Result<(), ControlError> {
+    let secret = secret.strip_suffix('\n').unwrap_or(secret);
+    if secret.is_empty() || !secret.starts_with('{') {
+        return Err(failure());
+    }
+    if cfg!(target_os = "macos") {
+        let account = keychain_account();
         let hex: String = secret.bytes().map(|b| format!("{b:02x}")).collect();
         let quote =
             |value: &str| format!("\"{}\"", value.replace('\\', "\\\\").replace('"', "\\\""));
@@ -298,12 +312,7 @@ fn copy_login(from: Store<'_>, to: Store<'_>, home: &Path) -> Result<(), Control
         }
         return Ok(());
     }
-    let bytes = read_private(&from.file(home))?.ok_or_else(|| {
-        ControlError::bad_request(
-            "No Claude login is active on this machine. Sign in with Open Agent first.",
-        )
-    })?;
-    write_private(&to.file(home), &bytes)
+    write_private(&to.file(home), secret.as_bytes())
 }
 
 // MARK: Account identity shown by Claude's /status
@@ -318,7 +327,7 @@ fn global_config_path(home: &Path) -> PathBuf {
         .map_or_else(|| PathBuf::from(".claude.json"), |p| p.join(".claude.json"))
 }
 
-fn read_global_config(home: &Path) -> Option<serde_json::Map<String, Value>> {
+pub(super) fn read_global_config(home: &Path) -> Option<serde_json::Map<String, Value>> {
     let path = global_config_path(home);
     let bytes = read_private(&path).ok()??;
     match serde_json::from_slice::<Value>(&bytes).ok()? {
@@ -358,11 +367,11 @@ fn with_global_config_lock<T>(home: &Path, f: impl FnOnce() -> T) -> Option<T> {
     Some(result)
 }
 
-fn snapshot_path(store: &str) -> PathBuf {
+pub(super) fn snapshot_path(store: &str) -> PathBuf {
     Path::new(store).join("oauth-account.json")
 }
 
-fn snapshot_identity(home: &Path, store: &str) {
+pub(super) fn snapshot_identity(home: &Path, store: &str) {
     if let Some(config) = read_global_config(home)
         && let Some(account) = config.get("oauthAccount").filter(|v| v.is_object())
         && let Ok(bytes) = serde_json::to_vec_pretty(account)
@@ -395,13 +404,13 @@ impl ControlServer {
             .ok_or_else(failure)
     }
 
-    fn claude_home(&self) -> Result<PathBuf, ControlError> {
+    pub(super) fn claude_home(&self) -> Result<PathBuf, ControlError> {
         let home = PathBuf::from(std::env::var("HOME").map_err(|_| failure())?).join(".claude");
         directory(&home)?;
         Ok(home)
     }
 
-    fn claude_slot(&self, id: &str) -> Result<PathBuf, ControlError> {
+    pub(super) fn claude_slot(&self, id: &str) -> Result<PathBuf, ControlError> {
         if id.is_empty()
             || !id
                 .bytes()
@@ -441,7 +450,7 @@ impl ControlServer {
 
     /// Bind the profile to its private store and the shared home, durably,
     /// so a login that lands there is usable by the next switch.
-    fn adopt_claude_slot(
+    pub(super) fn adopt_claude_slot(
         &self,
         mut profile: AgentAccountProfile,
         home: &Path,
@@ -472,6 +481,7 @@ impl ControlServer {
         let current = self.current_claude_store()?;
         let from = current.as_deref().map_or(Store::Default, Store::Slot);
         if current.as_deref() != Some(store.as_str()) {
+            Self::forget_claude_identity(&slot);
             copy_login(from, Store::Slot(&store), &home)?;
         }
         snapshot_identity(&home, &store);
@@ -492,6 +502,8 @@ impl ControlServer {
         self.ensure_claude_login_finished(&slot)?;
         let profile = self.adopt_claude_slot(profile, &home, &slot)?;
         let binary = self.resolve_local_agent_executable("claude-code", "claude")?;
+        // This sign-in may land another account than the slot held.
+        Self::forget_claude_identity(&slot);
         let title = format!("Claude sign in · {}", profile.label);
         let argv = super::account_switch::sign_in_argv(
             std::env::var("SHELL").ok(),
@@ -503,8 +515,12 @@ impl ControlServer {
                 "ANTHROPIC_AUTH_TOKEN".into(),
                 "-u".into(),
                 "CLAUDE_CODE_OAUTH_TOKEN".into(),
-                "-u".into(),
-                "CLAUDE_CONFIG_DIR".into(),
+                // Signing in records the account in the config directory's
+                // `.claude.json`. Keep that record in the slot: in the shared
+                // one it would name this account while new tabs still use
+                // another. Both variables name the slot, so the credential
+                // store is the slot's whichever one Claude reads.
+                format!("CLAUDE_CONFIG_DIR={}", slot.display()),
                 format!("CLAUDE_SECURESTORAGE_CONFIG_DIR={}", slot.display()),
                 binary,
                 "auth".into(),
@@ -627,16 +643,17 @@ impl ControlServer {
             }
             // The identity Claude shows follows the login: keep the outgoing
             // account's copy, then present the incoming one.
-            if let Some(previous) = &previous
-                && previous != &store
-            {
-                snapshot_identity(&home, previous);
+            match &previous {
+                Some(previous) if previous != &store => snapshot_identity(&home, previous),
+                Some(_) => {}
+                None => self.save_default_store_login(&home, &store),
             }
             if let Some(account) = read_private(&snapshot_path(&store))
                 .ok()
                 .flatten()
                 .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok())
                 .filter(Value::is_object)
+                .or_else(|| super::account_overview::signed_in_account(&store))
             {
                 install_identity(&home, account);
             } else if let Some(account) = self.claude_identity_from_status(&store, &home) {
@@ -660,24 +677,41 @@ impl ControlServer {
         encode(&result)
     }
 
-    /// Ask Claude which account a store holds, merged over the current display
-    /// identity so fields Diri does not know are kept. Best effort.
-    fn claude_identity_from_status(&self, store: &str, home: &Path) -> Option<Value> {
+    /// What `claude auth status --json` reports for a credential store, or
+    /// `None` when Claude cannot be run or does not answer. Best effort.
+    pub(super) fn claude_auth_status(&self, store: &str) -> Option<Value> {
         let binary = self
             .resolve_local_agent_executable("claude-code", "claude")
             .ok()?;
-        let mut child = Command::new(binary)
-            .args(["auth", "status", "--json"])
-            .env_remove("CLAUDE_CONFIG_DIR")
-            .env_remove("ANTHROPIC_API_KEY")
-            .env_remove("ANTHROPIC_AUTH_TOKEN")
-            .env_remove("CLAUDE_CODE_OAUTH_TOKEN")
-            .env("CLAUDE_SECURESTORAGE_CONFIG_DIR", store)
-            .stdin(Stdio::null())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::null())
-            .spawn()
-            .ok()?;
+        let prepare = |command: &mut Command| {
+            command
+                .env_remove("CLAUDE_CONFIG_DIR")
+                .env_remove("ANTHROPIC_API_KEY")
+                .env_remove("ANTHROPIC_AUTH_TOKEN")
+                .env_remove("CLAUDE_CODE_OAUTH_TOKEN")
+                .env("CLAUDE_SECURESTORAGE_CONFIG_DIR", store)
+                .stdin(Stdio::null())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::null());
+        };
+        let mut direct = Command::new(&binary);
+        direct.args(["auth", "status", "--json"]);
+        prepare(&mut direct);
+        let mut child = match direct.spawn() {
+            Ok(child) => child,
+            // The Engine's PATH may lack the nvm/mise directories `claude`
+            // lives in: ask the login shell, as Agent launches do.
+            Err(_) => {
+                let argv = super::account_switch::sign_in_argv(
+                    std::env::var("SHELL").ok(),
+                    &[binary, "auth".into(), "status".into(), "--json".into()],
+                );
+                let mut shell = Command::new(&argv[0]);
+                shell.args(&argv[1..]);
+                prepare(&mut shell);
+                shell.spawn().ok()?
+            }
+        };
         let deadline = Instant::now() + Duration::from_secs(10);
         let status = wait_until(&mut child, deadline, Duration::from_millis(50)).ok()??;
         if !status.success() {
@@ -685,7 +719,15 @@ impl ControlServer {
         }
         let mut out = String::new();
         child.stdout.take()?.read_to_string(&mut out).ok()?;
-        let reported: Value = serde_json::from_str(&out).ok()?;
+        // A login shell may print its own greeting first.
+        serde_json::from_str(&out[out.find('{')?..]).ok()
+    }
+
+    /// Ask Claude which account a store holds, merged over the current display
+    /// identity so fields Diri does not know are kept -- only when that record
+    /// describes the same account. Best effort.
+    pub(super) fn claude_identity_from_status(&self, store: &str, home: &Path) -> Option<Value> {
+        let reported = self.claude_auth_status(store)?;
         if reported.get("loggedIn") != Some(&Value::Bool(true)) {
             return None;
         }
@@ -696,6 +738,8 @@ impl ControlServer {
                 Value::Object(map) => Some(map),
                 _ => None,
             })
+            // Another account's record would lend this one its account id.
+            .filter(|map| map.get("emailAddress").and_then(Value::as_str) == Some(email.as_str()))
             .unwrap_or_default();
         account.insert("emailAddress".into(), Value::String(email));
         for (from, to) in [
@@ -964,8 +1008,9 @@ mod tests {
         assert_eq!(config["oauthAccount"]["emailAddress"], "two@example.test");
         assert_eq!(config["oauthAccount"]["organizationName"], "Two");
         assert_eq!(
-            config["oauthAccount"]["accountUuid"], "acct-1",
-            "unknown fields are kept"
+            config["oauthAccount"].get("accountUuid"),
+            None,
+            "the outgoing account's id is not lent to the incoming one"
         );
         assert!(
             config.contains_key("mcpServers"),
