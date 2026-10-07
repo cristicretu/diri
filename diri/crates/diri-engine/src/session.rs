@@ -477,6 +477,9 @@ struct Shared {
     foreground: Mutex<ForegroundProgram>,
     /// The `OSC 9;4` progress this session publishes. See [`observe_progress`].
     progress: Mutex<ProgressTrack>,
+    /// What the program says it is doing with `OSC 7501`. See
+    /// [`observe_program_status`].
+    program_status: Mutex<ProgramStatusTrack>,
     /// Agents a shell recognises in its foreground, by the program name a
     /// user types to start them. Empty for every session but a shell.
     known_agents: Vec<KnownAgent>,
@@ -545,6 +548,34 @@ struct ProgressTrack {
     /// a job runs ends with that job, not with a timeout: a long link step
     /// can go quiet for a minute and still be the same build.
     job: Option<i32>,
+}
+
+/// The `OSC 7501` summary a session last derived, and whether the reducer
+/// has been told. A leaf lock: nothing else is taken while it is held.
+#[derive(Default)]
+struct ProgramStatusTrack {
+    generation_seen: u64,
+    published: Option<diri_terminal_state::ProgramRecord>,
+    unreduced: bool,
+}
+
+impl ProgramStatusTrack {
+    /// Progress a working or blocked record carries, shown when no
+    /// `OSC 9;4` progress is.
+    fn progress(&self) -> Option<diri_proto::TerminalProgress> {
+        use diri_proto::TerminalProgressState as State;
+        use diri_terminal_state::ProgramState;
+        let record = self.published.as_ref()?;
+        let state = match record.state {
+            ProgramState::Working => State::Normal,
+            ProgramState::Blocked => State::Paused,
+            _ => return None,
+        };
+        Some(diri_proto::TerminalProgress {
+            state,
+            percent: record.progress?,
+        })
+    }
 }
 
 struct RemoteGridState {
@@ -2286,6 +2317,13 @@ impl Session {
                 .lock()
                 .expect("progress")
                 .published
+                .or_else(|| {
+                    self.shared
+                        .program_status
+                        .lock()
+                        .expect("program status")
+                        .progress()
+                })
                 .filter(|_| !self.shared.exited.load(Ordering::SeqCst)),
             status: self.shared.status.lock().expect("status").clone(),
             status_evidence,
@@ -3397,6 +3435,7 @@ fn new_shared(
         echo_request: Mutex::new(None),
         foreground: Mutex::new(ForegroundProgram::default()),
         progress: Mutex::new(ProgressTrack::default()),
+        program_status: Mutex::new(ProgramStatusTrack::default()),
         known_agents: if spec.manifest_id == "shell" {
             known_agents(engine)
         } else {
@@ -4431,6 +4470,9 @@ fn apply_remote_output(
             if screen.has_notifications() {
                 shared.bump_state_version();
             }
+            // The remote Holder owns the PTY and its answers; this mirror's
+            // would otherwise pile up unread for the session's lifetime.
+            let _ = screen.take_replies();
             evaluate_if_screen_changed(shared, &mut screen, engine, manifest_id, last_eval_seq)
         })
         .flatten();
@@ -4440,6 +4482,7 @@ fn apply_remote_output(
         let outcome = reducer.reduce(StatusSignal::PtyOutputActivity, now);
         apply(shared, &outcome);
     }
+    reduce_program_status(shared, &mut reducer, now);
     if let Some(observation) = observation {
         let outcome = reducer.reduce(StatusSignal::Screen(observation), now);
         drop(reducer);
@@ -4522,12 +4565,10 @@ fn apply_remote_snapshot(
         }
         evaluate_if_screen_changed(shared, &mut screen, engine, manifest_id, last_eval_seq)
     };
+    let mut reducer = shared.reducer.lock().expect("reducer");
+    reduce_program_status(shared, &mut reducer, SystemTime::now());
     if let Some(observation) = observation {
-        let outcome = shared
-            .reducer
-            .lock()
-            .expect("reducer")
-            .reduce(StatusSignal::Screen(observation), SystemTime::now());
+        let outcome = reducer.reduce(StatusSignal::Screen(observation), SystemTime::now());
         apply(shared, &outcome);
     }
     Ok(())
@@ -4766,6 +4807,7 @@ fn pump(
                 let mut reducer = shared.reducer.lock().expect("reducer");
                 let outcome = reducer.reduce(StatusSignal::PtyOutputActivity, now);
                 apply(&shared, &outcome);
+                reduce_program_status(&shared, &mut reducer, now);
                 if let Some(observation) = observation {
                     let outcome = reducer.reduce(StatusSignal::Screen(observation), now);
                     drop(reducer);
@@ -4972,7 +5014,7 @@ fn feed_output_batch(
                 shared.bump_state_version();
             }
             if let Some(status) = screen.take_agent_exit() {
-                note_agent_exit(shared, status, &screen);
+                note_agent_exit(shared, status, &mut screen);
             }
             let after = screen.filled_cells();
             // A closed synchronized update is a whole frame, however much
@@ -5082,15 +5124,74 @@ fn progress_from(state: i64, percent: i64) -> Option<diri_proto::TerminalProgres
     Some(diri_proto::TerminalProgress { state, percent })
 }
 
+/// Notes the screen's `OSC 7501` summary if a report changed it. The reducer
+/// hears of it through [`reduce_program_status`], outside the screen lock.
+fn observe_program_status(shared: &Shared, screen: &HeadlessScreen) {
+    let generation = screen.program_status_generation();
+    let mut track = shared.program_status.lock().expect("program status");
+    if generation == track.generation_seen {
+        return;
+    }
+    track.generation_seen = generation;
+    let next = screen.program_status();
+    if track.published == next {
+        return;
+    }
+    let progress = track.progress();
+    track.published = next;
+    track.unreduced = true;
+    let progress_changed = track.progress() != progress;
+    drop(track);
+    if progress_changed {
+        shared.bump_state_version();
+    }
+}
+
+/// Hands the reducer a program-status change it has not seen. Called with
+/// the reducer already locked, ahead of the screen observation from the same
+/// output, so a program that just reported work silences the screen rules.
+fn reduce_program_status(shared: &Shared, reducer: &mut StatusReducer, now: SystemTime) {
+    let report = {
+        let mut track = shared.program_status.lock().expect("program status");
+        if !std::mem::take(&mut track.unreduced) {
+            return;
+        }
+        track.published.clone()
+    };
+    let outcome = reducer.reduce(StatusSignal::ProgramStatus(report), now);
+    apply(shared, &outcome);
+}
+
+/// The program a session's `OSC 7501` records described has ended: the
+/// wrapped agent returned to its shell, or a shell's job left the foreground.
+fn end_program_status(shared: &Shared) {
+    {
+        let mut screen = shared.screen.lock().expect("screen");
+        if !screen.end_program_status() {
+            return;
+        }
+        observe_program_status(shared, &screen);
+    }
+    let mut reducer = shared.reducer.lock().expect("reducer");
+    reduce_program_status(shared, &mut reducer, SystemTime::now());
+}
+
 /// Clears progress a shell job owned once that job leaves the foreground.
 /// `job` is the foreground process group while one runs, else `None`.
+///
+/// A job leaving the foreground is also its shell returning to the prompt,
+/// which ends whatever it reported with `OSC 7501`.
 fn progress_follows_job(shared: &Shared, job: Option<i32>) {
     let mut track = shared.progress.lock().expect("progress");
     let ended = track.job.is_some() && track.job != job;
     track.job = job;
-    if ended && track.published.take().is_some() {
-        drop(track);
+    let cleared = ended && track.published.take().is_some();
+    drop(track);
+    if cleared {
         shared.bump_state_version();
+    }
+    if ended {
+        end_program_status(shared);
     }
 }
 
@@ -5125,8 +5226,9 @@ fn evaluate_if_screen_changed(
     last_eval_seq: &mut u64,
 ) -> Option<crate::detect::ScreenObservation> {
     // Progress is not screen content: a report that moves only the percent
-    // leaves `content_seq` where it was.
+    // leaves `content_seq` where it was. Nor is a program's own status.
     observe_progress(shared, screen);
+    observe_program_status(shared, screen);
     let seq = screen.content_seq();
     if seq == *last_eval_seq {
         return None;
@@ -5460,12 +5562,11 @@ fn pump_held(
                         &mut last_eval_seq,
                     )
                 };
+                let mut reducer = shared.reducer.lock().expect("reducer");
+                reduce_program_status(&shared, &mut reducer, SystemTime::now());
                 if let Some(observation) = observation {
-                    let outcome = shared
-                        .reducer
-                        .lock()
-                        .expect("reducer")
-                        .reduce(StatusSignal::Screen(observation), SystemTime::now());
+                    let outcome =
+                        reducer.reduce(StatusSignal::Screen(observation), SystemTime::now());
                     apply(&shared, &outcome);
                 }
             }
@@ -5641,7 +5742,7 @@ fn pump_held(
                     shared.bump_state_version();
                 }
                 if let Some(status) = screen.take_agent_exit() {
-                    note_agent_exit(&shared, status, &screen);
+                    note_agent_exit(&shared, status, &mut screen);
                 }
                 let replies = screen.take_replies();
                 let observation = if evaluate_now {
@@ -5706,6 +5807,7 @@ fn pump_held(
                 let outcome = reducer.reduce(StatusSignal::PtyOutputActivity, now);
                 apply(&shared, &outcome);
             }
+            reduce_program_status(&shared, &mut reducer, now);
             if let Some(observation) = observation {
                 let outcome = reducer.reduce(StatusSignal::Screen(observation), now);
                 apply(&shared, &outcome);
@@ -5960,8 +6062,14 @@ fn split_shell_status(status: i32) -> (Option<i32>, Option<i32>) {
 /// otherwise invisible: the PTY lives on as the shell, so `session.exit`
 /// later carries the shell's status, not the agent's. The early-exit probe
 /// reads the stored status to say why an agent died at startup.
-fn note_agent_exit(shared: &Shared, status: i32, screen: &HeadlessScreen) {
+///
+/// The agent's `OSC 7501` records end with it; the pump hands the reducer
+/// that change with the rest of this output.
+fn note_agent_exit(shared: &Shared, status: i32, screen: &mut HeadlessScreen) {
     *shared.agent_exit.lock().expect("agent exit") = Some(status);
+    if screen.end_program_status() {
+        observe_program_status(shared, screen);
+    }
     if status == 0
         && let Some(notice) = &shared.relaunch_notice
         && shows_relaunch_notice(screen, notice)

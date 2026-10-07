@@ -25,6 +25,7 @@ use diri_proto::{
 };
 
 use crate::detect::{ManifestState, ScreenObservation, redact};
+use diri_terminal_state::{BlockedKind, ProgramRecord, ProgramState};
 
 /// Which source of truth leads for an agent.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -128,6 +129,9 @@ pub enum StatusSignal {
     /// terminal (`Proceed? [y/N]`, `Password:`, a script's `read`), sampled
     /// from the PTY owner. `None` when it is not.
     TerminalLine(Option<TerminalPrompt>),
+    /// The `OSC 7501` record that best describes the program in the
+    /// terminal, sent whenever it changes; `None` once nothing reports.
+    ProgramStatus(Option<ProgramRecord>),
     /// Periodic tick driving the debounce timers.
     Tick,
 }
@@ -255,6 +259,10 @@ pub struct StatusReducer {
     /// The shell's own authority and manifest while an Agent it runs in the
     /// foreground has borrowed the reducer. See [`Self::lend_to_agent`].
     lent_from: Option<(Authority, Option<String>, Option<String>)>,
+    /// The program reports its own status with `OSC 7501`. Until it clears
+    /// its records or ends, that outranks everything inferred from the screen
+    /// or the shell's job; hooks, input and exit still apply.
+    program_active: bool,
 }
 
 impl StatusReducer {
@@ -269,6 +277,7 @@ impl StatusReducer {
             manifest_version: None,
             evidence: None,
             lent_from: None,
+            program_active: false,
         }
     }
 
@@ -518,6 +527,25 @@ impl StatusReducer {
             return outcome;
         }
 
+        if let StatusSignal::ProgramStatus(report) = signal {
+            self.apply_program_status(report, now, &mut outcome);
+            return outcome;
+        }
+        if self.program_active
+            && matches!(
+                signal,
+                StatusSignal::Screen(_)
+                    | StatusSignal::ForegroundJob { .. }
+                    | StatusSignal::TerminalLine(_)
+                    | StatusSignal::Tick
+            )
+        {
+            // Inference, and the staleness that doubts it, wait while the
+            // program says what it is doing. A long quiet build is working.
+            self.state.last_signal_at = now;
+            return outcome;
+        }
+
         // processOnly: starting → working on first output, then only exit
         // moves it. A shell is still process-only, but an idle login prompt
         // is not work: Working follows the foreground process group.
@@ -544,11 +572,14 @@ impl StatusReducer {
             | StatusSignal::ForegroundJob { .. }
             | StatusSignal::TerminalLine(_)
             | StatusSignal::ProcessExit { .. }
-            | StatusSignal::TransportUnavailable => None,
+            | StatusSignal::TransportUnavailable
+            | StatusSignal::ProgramStatus(_) => None,
         };
 
         match signal {
-            StatusSignal::ProcessExit { .. } | StatusSignal::TransportUnavailable => {} // handled above
+            StatusSignal::ProcessExit { .. }
+            | StatusSignal::TransportUnavailable
+            | StatusSignal::ProgramStatus(_) => {} // handled above
             StatusSignal::ForegroundJob { .. } | StatusSignal::TerminalLine(_) => {}
             StatusSignal::PtyOutputActivity => {
                 // Bytes alone do not establish work: late terminal repaints,
@@ -773,6 +804,92 @@ impl StatusReducer {
             }
             _ => {}
         }
+    }
+
+    /// Follows an `OSC 7501` report. A result (idle, done, error) ends the
+    /// turn once; `None` hands the session back to inference.
+    fn apply_program_status(
+        &mut self,
+        report: Option<ProgramRecord>,
+        now: SystemTime,
+        outcome: &mut ReducerOutcome,
+    ) {
+        let was_active = std::mem::replace(&mut self.program_active, report.is_some());
+        self.state.last_signal_at = now;
+        match report {
+            Some(record) if record.state == ProgramState::Blocked => {
+                let kind = match record.kind {
+                    Some(BlockedKind::Permission) => NeedsInputKind::Permission,
+                    Some(BlockedKind::Question | BlockedKind::Auth) | None => {
+                        NeedsInputKind::Question
+                    }
+                };
+                let detail = program_detail(&record, kind, now);
+                self.cancel_idle_candidacy();
+                self.state.hold_idle_against_screen = false;
+                self.state.turn_in_flight = true;
+                let unchanged = self.status == SessionStatus::NeedsInput(kind)
+                    && self
+                        .state
+                        .pending_needs_input
+                        .as_ref()
+                        .is_some_and(|pending| {
+                            pending.source == NeedsInputSource::ProgramStatus
+                                && pending.summary == detail.summary
+                                && pending.prompt_excerpt == detail.prompt_excerpt
+                        });
+                if !unchanged {
+                    self.state.pending_needs_input = Some(detail.clone());
+                    outcome.needs_input = Some(detail);
+                }
+                self.set_status(SessionStatus::NeedsInput(kind), outcome);
+            }
+            Some(record) if record.state == ProgramState::Working => {
+                self.state.pending_needs_input = None;
+                self.go_working(now, false, outcome);
+            }
+            Some(_) => {
+                self.state.pending_needs_input = None;
+                self.state.screen_blocker_active = false;
+                self.state.blocker_miss_scans = 0;
+                self.state.blocker_miss_since = None;
+                match self.status {
+                    SessionStatus::Working
+                    | SessionStatus::NeedsInput(_)
+                    | SessionStatus::Unknown => {
+                        // A spinner frame still on screen must not undo it.
+                        self.state.hold_idle_against_screen = true;
+                        self.state.pending_turn_completed = self.state.turn_in_flight;
+                        self.commit_idle(now, outcome);
+                    }
+                    SessionStatus::Starting => self.set_status(SessionStatus::Idle, outcome),
+                    SessionStatus::Idle | SessionStatus::Exited(_) => {}
+                }
+            }
+            None if was_active => {
+                // Cleared, or its program ended. Whatever turn it reported is
+                // over without a result, and inference takes over from here.
+                self.state.pending_needs_input = None;
+                self.cancel_idle_candidacy();
+                self.state.last_screen_seq = None;
+                let next = if self.authority == Authority::ProcessOnly && !self.tracks_shell_jobs()
+                {
+                    SessionStatus::Working
+                } else {
+                    self.state.turn_in_flight = false;
+                    SessionStatus::Idle
+                };
+                self.set_status(next, outcome);
+            }
+            None => return,
+        }
+        self.publish_evidence(
+            StatusEvidenceSource::ProgramStatus,
+            None,
+            None,
+            now,
+            outcome,
+        );
     }
 
     fn tracks_shell_jobs(&self) -> bool {
@@ -1431,6 +1548,48 @@ fn line_prompt_detail(prompt: &TerminalPrompt, now: SystemTime) -> NeedsInputDet
         options: None,
         occurred_at: now.into(),
         secret: prompt.secret,
+    }
+}
+
+/// The most a needs-input detail shows of a program's message.
+const PROGRAM_MESSAGE_MAX_CHARS: usize = 400;
+
+fn program_detail(
+    record: &ProgramRecord,
+    kind: NeedsInputKind,
+    now: SystemTime,
+) -> NeedsInputDetail {
+    let message = record
+        .msg
+        .as_deref()
+        .or(record.title.as_deref())
+        .map(|text| {
+            redact(text.trim())
+                .chars()
+                .take(PROGRAM_MESSAGE_MAX_CHARS)
+                .collect::<String>()
+        })
+        .filter(|text| !text.is_empty());
+    let summary = message.clone().unwrap_or_else(|| {
+        match record.kind {
+            Some(BlockedKind::Permission) => "Waiting for permission",
+            Some(BlockedKind::Auth) => "Waiting for sign-in",
+            Some(BlockedKind::Question) | None => "Waiting for input",
+        }
+        .to_owned()
+    });
+    NeedsInputDetail {
+        kind,
+        source: NeedsInputSource::ProgramStatus,
+        tool_name: record.app.clone(),
+        risk_hint: message
+            .as_deref()
+            .map_or(diri_proto::RiskHint::Neutral, classify_risk),
+        summary,
+        prompt_excerpt: message,
+        options: None,
+        secret: false,
+        occurred_at: now.into(),
     }
 }
 

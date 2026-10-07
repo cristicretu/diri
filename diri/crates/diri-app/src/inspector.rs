@@ -6122,6 +6122,7 @@ fn status_evidence_explanation(source: diri_proto::StatusEvidenceSource) -> &'st
         diri_proto::StatusEvidenceSource::ProcessLiveness => "panel.evidence.source.process",
         diri_proto::StatusEvidenceSource::Staleness => "panel.evidence.source.staleness",
         diri_proto::StatusEvidenceSource::Transport => "panel.evidence.source.transport",
+        diri_proto::StatusEvidenceSource::ProgramStatus => "panel.evidence.source.program_status",
         diri_proto::StatusEvidenceSource::Unknown => "panel.evidence.source.unknown",
     })
 }

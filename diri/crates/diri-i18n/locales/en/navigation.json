@@ -302,6 +302,7 @@
   "panel.evidence.source.hook": "A structured lifecycle hook from the agent drove this status.",
   "panel.evidence.source.notify": "A structured completion notification from the agent drove this status.",
   "panel.evidence.source.process": "The agent exposes process-only status, so process activity or exit is authoritative.",
+  "panel.evidence.source.program_status": "The program in the terminal reported this status itself (OSC 7501).",
   "panel.evidence.source.screen_rule": "A privacy-safe manifest rule matched the terminal state; no screen content is included.",
   "panel.evidence.source.staleness": "Authoritative signals stopped arriving, so Diri fell back to unknown instead of guessing.",
   "panel.evidence.source.transport": "The remote transport failed; the agent process exit has not been confirmed.",

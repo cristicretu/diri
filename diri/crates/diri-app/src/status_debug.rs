@@ -82,6 +82,7 @@ pub fn source_name(source: StatusEvidenceSource) -> &'static str {
         StatusEvidenceSource::ProcessLiveness => "process liveness",
         StatusEvidenceSource::Staleness => "signal staleness",
         StatusEvidenceSource::Transport => "remote transport",
+        StatusEvidenceSource::ProgramStatus => "program status report",
         StatusEvidenceSource::Unknown => "unknown source",
     }
 }

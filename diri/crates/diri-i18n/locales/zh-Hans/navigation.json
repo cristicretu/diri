@@ -302,6 +302,7 @@
   "panel.evidence.source.hook": "此状态由智能体的结构化生命周期钩子决定。",
   "panel.evidence.source.notify": "此状态由智能体的结构化完成通知决定。",
   "panel.evidence.source.process": "此智能体只提供进程级状态，因此以进程活动或退出为准。",
+  "panel.evidence.source.program_status": "终端中的程序自行报告了此状态（OSC 7501）。",
   "panel.evidence.source.screen_rule": "一条保护隐私的清单规则匹配了终端状态；不包含任何屏幕内容。",
   "panel.evidence.source.staleness": "权威信号不再到达，因此 diri 回退为未知状态而不是猜测。",
   "panel.evidence.source.transport": "远程传输失败；尚未确认智能体进程已退出。",

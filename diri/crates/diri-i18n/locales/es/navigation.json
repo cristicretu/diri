@@ -302,6 +302,7 @@
   "panel.evidence.source.hook": "Un hook estructurado del ciclo de vida del agente determinó este estado.",
   "panel.evidence.source.notify": "Una notificación estructurada de finalización del agente determinó este estado.",
   "panel.evidence.source.process": "El agente solo expone el estado del proceso, así que la actividad o la salida del proceso es la referencia.",
+  "panel.evidence.source.program_status": "El programa de la terminal informó este estado por sí mismo (OSC 7501).",
   "panel.evidence.source.screen_rule": "Una regla del manifiesto que respeta la privacidad coincidió con el estado del terminal; no se incluye contenido de la pantalla.",
   "panel.evidence.source.staleness": "Las señales fiables dejaron de llegar, así que diri volvió a «desconocido» en lugar de adivinar.",
   "panel.evidence.source.transport": "Falló el transporte remoto; no se ha confirmado la salida del proceso del agente.",

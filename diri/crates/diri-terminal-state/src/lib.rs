@@ -14,7 +14,9 @@
 //! see [`scan_progress`].
 
 mod notifications;
+mod program_status;
 pub use notifications::{AGENT_EXIT_OSC, TerminalNotification};
+pub use program_status::{BlockedKind, ProgramRecord, ProgramState};
 
 use std::sync::mpsc::{self, Receiver, SyncSender};
 
@@ -515,6 +517,28 @@ impl HeadlessScreen {
         self.notifications.as_mut()?.agent_exit.take()
     }
 
+    /// Bumps whenever an `OSC 7501` report changes a program-status record.
+    /// Zero, and never moving, without notifications.
+    pub fn program_status_generation(&self) -> u64 {
+        self.notifications
+            .as_ref()
+            .map_or(0, |parser| parser.program.generation())
+    }
+
+    /// The `OSC 7501` record that best describes what the program is doing:
+    /// blocked before working before a result. `None` when nothing reports.
+    pub fn program_status(&self) -> Option<ProgramRecord> {
+        self.notifications.as_ref()?.program.summary()
+    }
+
+    /// Drops the `OSC 7501` records of a program that has ended. Returns
+    /// whether there were any.
+    pub fn end_program_status(&mut self) -> bool {
+        self.notifications
+            .as_mut()
+            .is_some_and(|parser| parser.program.end_program())
+    }
+
     pub fn take_notifications(&mut self) -> Vec<TerminalNotification> {
         self.notifications
             .as_mut()
@@ -540,6 +564,11 @@ impl HeadlessScreen {
                 parser.reset_sequence();
             }
             parser.feed(&bytes[historical_bytes.min(bytes.len())..]);
+            // An `OSC 7501` support query is answered ahead of the emulator's
+            // replies for the same chunk. Programs detect support by sending
+            // the query and then a device-attributes request, and read an
+            // answer arriving before the attributes as support.
+            self.replies.append(&mut parser.replies);
         }
         self.parser.advance(&mut self.term, bytes);
         self.settle();

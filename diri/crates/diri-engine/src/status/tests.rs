@@ -1316,3 +1316,158 @@ fn cursor_transcript_cannot_finish_a_live_spinner() {
     assert_eq!(reducer.status(), &SessionStatus::Working);
     assert!(!outcome.turn_completed);
 }
+
+fn program(state: ProgramState) -> StatusSignal {
+    StatusSignal::ProgramStatus(Some(ProgramRecord {
+        state,
+        kind: None,
+        progress: None,
+        app: None,
+        title: None,
+        msg: None,
+    }))
+}
+
+/// `OSC 7501` is the program saying what it is doing. While it reports work,
+/// a screen that happens to read idle (a spinner between frames, a finished
+/// sub-step) does not end the turn; its own `done` does, exactly once.
+#[test]
+fn a_program_reporting_work_outranks_the_screen_until_it_reports_done() {
+    let mut reducer =
+        StatusReducer::new(Authority::ScreenPrimary, t0()).with_manifest("codex", Some("1"));
+    let now = settled(&mut reducer, t0());
+
+    let outcome = reducer.reduce(program(ProgramState::Working), now);
+    assert_eq!(outcome.status_change, Some(SessionStatus::Working));
+    assert_eq!(
+        outcome.status_evidence.map(|evidence| evidence.source),
+        Some(StatusEvidenceSource::ProgramStatus)
+    );
+
+    for seq in 1..=5 {
+        let at = now + Duration::from_secs(seq);
+        reducer.reduce(
+            StatusSignal::Screen(observation(ManifestState::Idle, seq)),
+            at,
+        );
+        reducer.reduce(StatusSignal::Tick, at);
+    }
+    // Quiet for longer than staleness allows, and still working.
+    reducer.reduce(StatusSignal::Tick, now + Duration::from_secs(600));
+    assert_eq!(*reducer.status(), SessionStatus::Working);
+
+    let outcome = reducer.reduce(program(ProgramState::Done), now + Duration::from_secs(601));
+    assert_eq!(outcome.status_change, Some(SessionStatus::Idle));
+    assert!(outcome.turn_completed);
+    let again = reducer.reduce(program(ProgramState::Idle), now + Duration::from_secs(602));
+    assert!(!again.turn_completed);
+    // A stale prompt still on screen does not outvote the program's result.
+    reducer.reduce(
+        StatusSignal::Screen(observation(ManifestState::BlockedQuestion, 98)),
+        now + Duration::from_secs(602),
+    );
+    assert_eq!(*reducer.status(), SessionStatus::Idle);
+
+    // Once the program stops reporting, the screen is read again.
+    reducer.reduce(
+        StatusSignal::ProgramStatus(None),
+        now + Duration::from_secs(603),
+    );
+    let outcome = reducer.reduce(
+        StatusSignal::Screen(observation(ManifestState::BlockedQuestion, 99)),
+        now + Duration::from_secs(603),
+    );
+    assert_eq!(
+        outcome.status_change,
+        Some(SessionStatus::NeedsInput(NeedsInputKind::Question))
+    );
+}
+
+#[test]
+fn a_blocked_program_needs_input_with_its_own_message() {
+    let mut reducer =
+        StatusReducer::new(Authority::ProcessOnly, t0()).with_manifest("aider", Some("1"));
+    reducer.reduce(StatusSignal::PtyOutputActivity, t0());
+    let report = StatusSignal::ProgramStatus(Some(ProgramRecord {
+        state: ProgramState::Blocked,
+        kind: Some(BlockedKind::Permission),
+        progress: None,
+        app: Some("terraform".into()),
+        title: None,
+        msg: Some("Apply 3 to add, 1 to change, 0 to destroy?".into()),
+    }));
+    let outcome = reducer.reduce(report.clone(), t0());
+    assert_eq!(
+        outcome.status_change,
+        Some(SessionStatus::NeedsInput(NeedsInputKind::Permission))
+    );
+    let detail = outcome.needs_input.expect("a needs-input detail");
+    assert_eq!(detail.source, NeedsInputSource::ProgramStatus);
+    assert_eq!(detail.summary, "Apply 3 to add, 1 to change, 0 to destroy?");
+    assert_eq!(detail.tool_name.as_deref(), Some("terraform"));
+
+    // The same report again is not a second question.
+    assert_eq!(reducer.reduce(report, t0()).needs_input, None);
+
+    // A process-only agent that stops reporting is running, not idle.
+    let outcome = reducer.reduce(StatusSignal::ProgramStatus(None), t0());
+    assert_eq!(outcome.status_change, Some(SessionStatus::Working));
+    assert!(!outcome.turn_completed);
+}
+
+#[test]
+fn a_shell_follows_a_reporting_job_and_returns_to_idle_when_it_stops() {
+    let mut reducer =
+        StatusReducer::new(Authority::ProcessOnly, t0()).with_manifest("shell", Some("1"));
+    let now = t0() + Duration::from_secs(1);
+    reducer.reduce(StatusSignal::PtyOutputActivity, now);
+    reducer.reduce(StatusSignal::ForegroundJob { running: true }, now);
+
+    let outcome = reducer.reduce(
+        StatusSignal::ProgramStatus(Some(ProgramRecord {
+            state: ProgramState::Blocked,
+            kind: Some(BlockedKind::Auth),
+            progress: None,
+            app: None,
+            title: None,
+            msg: None,
+        })),
+        now,
+    );
+    assert_eq!(outcome.needs_input.unwrap().summary, "Waiting for sign-in");
+    // The job is still in the foreground and not reading a line, which on
+    // its own would read as Working.
+    reducer.reduce(StatusSignal::TerminalLine(None), now);
+    reducer.reduce(StatusSignal::ForegroundJob { running: true }, now);
+    assert_eq!(
+        *reducer.status(),
+        SessionStatus::NeedsInput(NeedsInputKind::Question)
+    );
+
+    // The job ended without a result: the Engine drops its records.
+    let outcome = reducer.reduce(StatusSignal::ProgramStatus(None), now);
+    assert_eq!(outcome.status_change, Some(SessionStatus::Idle));
+    assert!(!outcome.turn_completed);
+
+    // Inference is back.
+    let outcome = reducer.reduce(StatusSignal::ForegroundJob { running: true }, now);
+    assert_eq!(outcome.status_change, Some(SessionStatus::Working));
+}
+
+#[test]
+fn a_program_error_is_a_result_that_ends_the_turn() {
+    let mut reducer =
+        StatusReducer::new(Authority::ProcessOnly, t0()).with_manifest("aider", Some("1"));
+    reducer.reduce(StatusSignal::PtyOutputActivity, t0());
+    reducer.reduce(program(ProgramState::Working), t0());
+    let outcome = reducer.reduce(program(ProgramState::Error), t0() + Duration::from_secs(1));
+    assert_eq!(outcome.status_change, Some(SessionStatus::Idle));
+    assert!(outcome.turn_completed);
+    // Still running and no longer reporting: process-only reads as working.
+    let outcome = reducer.reduce(
+        StatusSignal::ProgramStatus(None),
+        t0() + Duration::from_secs(2),
+    );
+    assert_eq!(outcome.status_change, Some(SessionStatus::Working));
+    assert!(!outcome.turn_completed);
+}
