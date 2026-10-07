@@ -837,7 +837,7 @@ mod tests {
         let executable = tmp.path().join("claude");
         fs::write(
             &executable,
-            "#!/bin/sh\nif [ \"$1\" = auth ]; then printf '%s' '{\"loggedIn\":true,\"email\":\"two@example.test\",\"orgId\":\"org-2\",\"orgName\":\"Two\"}'; exit 0; fi\n{ printf 'launch\\n'; printf '%s\\n' \"$@\"; printf 'config-dir=%s\\n' \"${CLAUDE_CONFIG_DIR:-unset}\"; } >> \"$CLAUDE_SECURESTORAGE_CONFIG_DIR/launches\"\nexec /bin/sleep 30\n",
+            "#!/bin/sh\nif [ \"$1\" = auth ]; then printf '%s' '{\"loggedIn\":true,\"email\":\"two@example.test\",\"orgId\":\"org-2\",\"orgName\":\"Two\"}'; exit 0; fi\nrecord=\"$CLAUDE_SECURESTORAGE_CONFIG_DIR/launch.$$\"\n{ printf 'launch\\n'; printf '%s\\n' \"$@\"; printf 'config-dir=%s\\n' \"${CLAUDE_CONFIG_DIR:-unset}\"; } > \"$record\"\ncat \"$record\" >> \"$CLAUDE_SECURESTORAGE_CONFIG_DIR/launches\"\nrm -f \"$record\"\nexec /bin/sleep 30\n",
         )
         .unwrap();
         fs::set_permissions(&executable, fs::Permissions::from_mode(0o700)).unwrap();
@@ -936,9 +936,9 @@ mod tests {
         let deadline = std::time::Instant::now() + Duration::from_secs(10);
         let launched = loop {
             let text = fs::read_to_string(&launches).unwrap_or_default();
-            // The fake appends one launch in several writes, so a record is
-            // complete only once its last line is there. Counting the first
-            // line raced the rest of the second record under load (#461).
+            // The fake appends each launch in one write: two relaunches run at
+            // once, and records written piecemeal interleaved (#461). A record
+            // is complete once its last line is there.
             if text.matches("config-dir=").count() >= 2 && text.ends_with('\n') {
                 break text;
             }
