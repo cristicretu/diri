@@ -14,6 +14,7 @@ mod titles;
 mod windowing;
 mod workspaces;
 
+pub(crate) use accounts::AccountRequest;
 #[cfg(all(test, target_os = "macos"))]
 pub(crate) use titles::testing as title_clock_for_test;
 
@@ -217,7 +218,7 @@ pub(crate) enum SidebarEvent {
     /// Root-mounted header popup visibility changed; no sidebar layout change.
     ProjectPickerChanged,
     RefreshUsageLimits,
-    AccountAction(Option<String>),
+    AccountAction(AccountRequest),
     ManageAccounts,
     ContinueAccount(SessionId),
     VisibilityChanged,
@@ -4845,7 +4846,7 @@ impl Sidebar {
                         };
                         if !this.preview && this.ui.popover == Some(Popover::Account) {
                             cx.emit(SidebarEvent::RefreshUsageLimits);
-                            cx.emit(SidebarEvent::AccountAction(None));
+                            cx.emit(SidebarEvent::AccountAction(AccountRequest::Refresh));
                         }
                         cx.notify();
                     }))
@@ -6359,7 +6360,11 @@ impl Sidebar {
             .child(menu_divider(colors))
             .child(self.account_switch_menu(colors, cx))
             .child(menu_divider(colors))
-            .child(account_limits_menu(&limits, colors))
+            .child(account_limits_menu(
+                &limits,
+                !self.preview && !self.accounts_loaded(),
+                colors,
+            ))
             .child(menu_divider(colors))
             .child(account_action_row(
                 "account-settings",
@@ -9418,6 +9423,7 @@ const ACCOUNT_MENU_STAT_ROW_HEIGHT: f32 = 22.0;
 /// when the menu opens, so there is no control here.
 fn account_limits_menu(
     limits: &[crate::usage::limits::AccountLimits],
+    loading: bool,
     colors: SemanticColors,
 ) -> AnyElement {
     let now = crate::usage::Clock::read(&crate::usage::SystemClock).unix_seconds;
@@ -9428,10 +9434,12 @@ fn account_limits_menu(
         .flex()
         .flex_col()
         .py(px(3.0));
-    if limits.is_empty() {
+    // Every window of the logins in use; each account row above shows its tightest.
+    let live: Vec<_> = limits.iter().filter(|account| account.live).collect();
+    if live.is_empty() && loading {
         section = section.child(menu_note(t("sidebar.account.checking_limits"), colors));
     }
-    for account in limits {
+    for account in live {
         for (index, limit) in account.windows.iter().enumerate() {
             let expired = limit.resets_at.is_some_and(|reset| reset <= now);
             let stale = expired || account.error.is_some() || now - account.checked_at > 360;
@@ -11966,7 +11974,7 @@ mod tests {
                 sidebar
             });
             cx.subscribe(&sidebar, move |_, _, event: &SidebarEvent, _| {
-                if let SidebarEvent::AccountAction(Some(id)) = event {
+                if let SidebarEvent::AccountAction(AccountRequest::Switch(id)) = event {
                     observed.borrow_mut().push(id.clone());
                 }
             })
@@ -11986,6 +11994,64 @@ mod tests {
         assert!(
             cx.debug_bounds("account-menu").is_some(),
             "switch stays in menu"
+        );
+    }
+
+    #[gpui::test]
+    fn account_menu_stays_one_line_per_account(cx: &mut TestAppContext) {
+        let requests = Rc::new(RefCell::new(Vec::new()));
+        let observed = requests.clone();
+        let (_view, cx) = cx.add_window_view(|_, cx| {
+            let sidebar = cx.new(|cx| {
+                let mut sidebar = Sidebar::new(None, true, PreviewScenario::Typical, cx);
+                sidebar.ui.popover = Some(Popover::Account);
+                // Side project was never signed in; Codex also runs on a
+                // login no profile holds yet.
+                let overview = sidebar.accounts.overview_mut();
+                overview.logins[3].signed_in = false;
+                overview.live[1].profile_id = None;
+                sidebar
+            });
+            cx.subscribe(&sidebar, move |_, _, event: &SidebarEvent, _| {
+                if let SidebarEvent::AccountAction(request) = event {
+                    observed.borrow_mut().push(request.clone());
+                }
+            })
+            .detach();
+            SidebarPopoverHarness { sidebar }
+        });
+        let click = |cx: &mut gpui::VisualTestContext, selector: &'static str| {
+            let target = cx
+                .debug_bounds(selector)
+                .unwrap_or_else(|| panic!("{selector} is shown"));
+            cx.simulate_click(target.center(), Modifiers::default());
+        };
+
+        click(cx, "switch-account-preview-0");
+        assert!(
+            requests.borrow().is_empty(),
+            "the account in use is already live"
+        );
+        click(cx, "switch-account-preview-1");
+        click(cx, "switch-account-preview-3");
+        assert_eq!(
+            *requests.borrow(),
+            vec![
+                AccountRequest::Switch("preview-1".into()),
+                AccountRequest::SignIn("preview-3".into()),
+            ]
+        );
+        // Saving and adding accounts live in Settings, not here.
+        for selector in ["add-account", "save-account-codex", "unsaved-account-codex"] {
+            assert!(
+                cx.debug_bounds(selector).is_none(),
+                "{selector} is not in the menu"
+            );
+        }
+        assert!(cx.debug_bounds("manage-accounts").is_some());
+        assert!(
+            cx.debug_bounds("account-menu").is_some(),
+            "the menu stays open"
         );
     }
 

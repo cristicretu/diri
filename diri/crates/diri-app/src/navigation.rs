@@ -115,6 +115,7 @@ struct PageState {
 }
 
 impl gpui::EventEmitter<crate::palette_workspace::WorkspaceCommand> for NavigationOverlay {}
+impl gpui::EventEmitter<crate::sidebar::AccountRequest> for NavigationOverlay {}
 
 pub struct NavigationOverlay {
     active_workspace: Option<diri_proto::workspace::WorkspaceId>,
@@ -144,6 +145,9 @@ pub struct NavigationOverlay {
     /// Readiness and displayed preference identity. Terminal output does not
     /// rebuild ranked rows; orientation and shortcut changes do.
     palette_context_fingerprint: u64,
+    /// Every saved account as last reported with its plan limits: the
+    /// palette offers switching to each one not in use.
+    account_limits: Vec<crate::usage::limits::AccountLimits>,
     list_scroll: UniformListScrollHandle,
     list_scroller: diri_ui::ScrollerState,
     tokio: Arc<tokio::runtime::Runtime>,
@@ -277,6 +281,7 @@ impl NavigationOverlay {
             ranked_items: Vec::new(),
             quick_create: None,
             palette_context_fingerprint: 0,
+            account_limits: Vec::new(),
             list_scroll: UniformListScrollHandle::new(),
             list_scroller: diri_ui::ScrollerState::new(),
             tokio,
@@ -337,6 +342,7 @@ impl NavigationOverlay {
             ranked_items: Vec::new(),
             quick_create: None,
             palette_context_fingerprint: 0,
+            account_limits: Vec::new(),
             list_scroll: UniformListScrollHandle::new(),
             list_scroller: diri_ui::ScrollerState::new(),
             tokio,
@@ -444,8 +450,18 @@ impl NavigationOverlay {
         if self.overlay == Some(Overlay::CommandPalette) {
             self.close_overlay(window, cx);
         } else {
+            // The first ⌘K learns the saved accounts, as opening the account
+            // menu does, so switching is offered here too.
+            if self.account_limits.is_empty() {
+                cx.emit(crate::sidebar::AccountRequest::Refresh);
+            }
             self.open_overlay(Overlay::CommandPalette, window, cx);
         }
+    }
+
+    /// The saved accounts and their limits, as the account menu last read them.
+    pub(crate) fn set_account_limits(&mut self, limits: Vec<crate::usage::limits::AccountLimits>) {
+        self.account_limits = limits;
     }
 
     pub(crate) fn toggle_quick_open(
@@ -1016,6 +1032,10 @@ impl NavigationOverlay {
                     .resume_all();
                 self.close_overlay(window, cx);
             }
+            PaletteCommand::SwitchAccount { profile_id } => {
+                self.close_overlay(window, cx);
+                cx.emit(crate::sidebar::AccountRequest::Switch(profile_id));
+            }
         }
     }
 
@@ -1055,6 +1075,10 @@ impl NavigationOverlay {
             if let Some(count) = store.resume_all_offer() {
                 actions.push(palette::resume_all_action(count));
             }
+            actions.extend(palette::account_actions(
+                &self.account_limits,
+                crate::usage::Clock::read(&crate::usage::SystemClock).unix_seconds,
+            ));
             let orientation = store.preferences().tab_orientation;
             for action in &mut actions {
                 if let PaletteCommand::Action(command) = action.command {
@@ -2700,6 +2724,10 @@ mod tests {
                                 prefs.tab_orientation = crate::store::TabOrientation::Horizontal
                             })
                             .unwrap();
+                    }
+                    // DIRI_VISUAL_ACCOUNTS: the saved accounts the menu reported.
+                    if std::env::var_os("DIRI_VISUAL_ACCOUNTS").is_some() {
+                        overlay.set_account_limits(crate::usage::limits::preview());
                     }
                     overlay.refresh_command_items();
                     match std::env::var("DIRI_VISUAL_PAGE").as_deref() {

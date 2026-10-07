@@ -1,15 +1,25 @@
+//! Settings › Accounts: every Claude Code and Codex account on this Mac, who
+//! it is (email, plan), how much of each plan window it has used and when
+//! that resets, and one click to switch, sign in, rename or remove it. Remote
+//! and separate-directory profiles keep the full profile editor below.
 use super::*;
-use diri_proto::{AgentAccountCatalog, AgentAccountProfile};
-use gpui::Role;
+use crate::tooltip_warmth::WarmTooltip;
+use crate::usage::limits::AccountLimits;
+#[cfg(test)]
+use diri_proto::AgentAccountCatalog;
+use diri_proto::{AgentAccountOverview, AgentAccountProfile, AgentKind};
+use gpui::{Div, Hsla, Role};
 
 #[derive(Default)]
 pub(super) struct AccountsState {
-    catalog: AgentAccountCatalog,
+    overview: AgentAccountOverview,
     loaded: bool,
     busy: bool,
     error: Option<String>,
     notice: Option<String>,
     editor: Option<ProfileEditor>,
+    /// An account being renamed in place: its id and the name typed so far.
+    renaming: Option<(String, QueryEditor)>,
     sequence: u64,
     continue_session: Option<diri_proto::SessionId>,
     continue_highlight: usize,
@@ -27,7 +37,177 @@ enum AccountAction {
     Refresh,
     Save(AgentAccountProfile),
     Remove(String),
-    Capture(AgentAccountProfile),
+    /// Save the login an Agent uses now.
+    Adopt(String),
+}
+
+/// What opens a sign-in tab: a saved profile, or a new account of an Agent.
+enum SignIn {
+    Profile(AgentAccountProfile),
+    New(&'static str),
+}
+
+fn agent_title(agent: &str) -> &'static str {
+    if agent == AgentKind::CODEX_ID {
+        "Codex"
+    } else {
+        "Claude Code"
+    }
+}
+
+/// "max" → "Max", as the provider sells it.
+fn plan_label(plan: &str) -> String {
+    let mut chars = plan.chars();
+    chars.next().map_or_else(String::new, |first| {
+        first.to_uppercase().chain(chars).collect()
+    })
+}
+
+/// "5-hour limit" → "5-hour"; the account above says what is limited.
+fn window_title(label: &str) -> &str {
+    label.strip_suffix(" limit").unwrap_or(label)
+}
+
+/// Compact time until a window resets: "3d 4h", "1h 12m", "9m".
+fn until(seconds: i64) -> String {
+    let minutes = (seconds / 60).max(1);
+    let (days, hours) = (seconds / 86_400, seconds % 86_400 / 3_600);
+    match (days, minutes / 60, minutes % 60) {
+        (1.., _, _) if hours == 0 => format!("{days}d"),
+        (1.., _, _) => format!("{days}d {hours}h"),
+        (0, h @ 1.., 0) => format!("{h}h"),
+        (0, h @ 1.., m) => format!("{h}h {m}m"),
+        _ => format!("{minutes}m"),
+    }
+}
+
+/// How much more room (percentage points) another account must have before
+/// it is pointed out.
+const ROOM_MARGIN: f64 = 20.0;
+
+fn provider(agent: &str) -> &'static str {
+    if agent == AgentKind::CODEX_ID {
+        "Codex"
+    } else {
+        "Claude"
+    }
+}
+
+/// The organization worth naming: not the "you@…'s Organization" that Claude
+/// gives every personal account.
+fn organization(identity: &diri_proto::AgentAccountIdentity) -> Option<String> {
+    let organization = identity.organization.clone()?;
+    let personal = identity
+        .email
+        .as_deref()
+        .is_some_and(|email| organization.contains(email));
+    (!personal).then_some(organization)
+}
+
+/// The leading slot: a checkmark on the account new tabs use.
+fn account_check(live: bool, colors: SemanticColors) -> AnyElement {
+    div()
+        .flex_none()
+        .w(px(14.0))
+        .flex()
+        .justify_center()
+        .when(live, |slot| {
+            slot.child(sf_symbol("checkmark", 10.0, colors.secondary))
+        })
+        .into_any_element()
+}
+
+/// A short status beside an account's name: "In use", "Most room", …
+fn account_tag(label: &'static str, color: Hsla, colors: SemanticColors) -> AnyElement {
+    div()
+        .flex_none()
+        .h(px(17.0))
+        .px(px(6.0))
+        .rounded(px(Radius::BADGE))
+        .flex()
+        .items_center()
+        .bg(colors.primary.alpha(0.06))
+        .text_size(px(10.5))
+        .font_weight(FontWeight::MEDIUM)
+        .text_color(color)
+        .child(label)
+        .into_any_element()
+}
+
+/// Every plan window of an account on one line: name, meter, use, and when
+/// it resets. An idle account's last answer is dated.
+fn plan_windows(usage: &AccountLimits, live: bool, now: i64, colors: SemanticColors) -> AnyElement {
+    let mut line = div()
+        .flex()
+        .flex_wrap()
+        .items_center()
+        .gap_x(px(14.0))
+        .gap_y(px(4.0))
+        .pt(px(2.0));
+    for window in &usage.windows {
+        let reset = window.resets_at.filter(|reset| *reset > now);
+        let used = if window.resets_at.is_some_and(|reset| reset <= now) {
+            0.0
+        } else {
+            window.used_percent
+        };
+        let fill = if used >= 90.0 {
+            Hsla::from(Ink::DANGER)
+        } else if used >= 75.0 {
+            Hsla::from(Ink::ATTENTION)
+        } else if live {
+            Hsla::from(Palette::GEMINI_BLUE)
+        } else {
+            colors.tertiary.into()
+        };
+        line = line.child(
+            div()
+                .flex()
+                .items_center()
+                .gap(px(6.0))
+                .text_size(px(Typo::META.size))
+                .text_color(colors.tertiary)
+                .child(window_title(&window.label).to_owned())
+                .child(
+                    div()
+                        .w(px(44.0))
+                        .h(px(3.0))
+                        .rounded_full()
+                        .bg(colors.primary.alpha(0.09))
+                        .child(
+                            div()
+                                .h_full()
+                                .w(gpui::relative((used / 100.0).clamp(0.0, 1.0) as f32))
+                                .rounded_full()
+                                .bg(fill),
+                        ),
+                )
+                .child(
+                    div()
+                        .font_family(crate::fonts::mono_family())
+                        .text_color(colors.secondary)
+                        .child(format!("{used:.0}%")),
+                )
+                .when_some(reset, |row, reset| {
+                    row.child(tf(
+                        "settings.accounts.resets_in",
+                        &[("time", &until(reset - now))],
+                    ))
+                }),
+        );
+    }
+    if now - usage.checked_at > 600 {
+        line = line.child(
+            div()
+                .text_size(px(Typo::META.size))
+                .text_color(colors.tertiary)
+                .child(tf(
+                    "settings.accounts.as_of",
+                    &[("time", &until(now - usage.checked_at))],
+                )),
+        );
+    }
+    line.into_any_element()
 }
 
 /// A local profile that shares the provider's home and switches only its
@@ -69,6 +249,7 @@ impl UtilitySurfaces {
             return Vec::new();
         };
         self.accounts
+            .overview
             .catalog
             .profiles
             .iter()
@@ -84,7 +265,8 @@ impl UtilitySurfaces {
             .collect()
     }
 
-    fn login_account(&mut self, profile: AgentAccountProfile, cx: &mut Context<Self>) {
+    /// Open a sign-in tab and take the user there.
+    fn login_account(&mut self, sign_in: SignIn, cx: &mut Context<Self>) {
         if self.accounts.busy {
             return;
         }
@@ -95,10 +277,13 @@ impl UtilitySurfaces {
         cx.spawn(async move |this, cx| {
             let result = runtime
                 .spawn(async move {
-                    if profile.agent == "claude-code" {
-                        client.login_claude_account(profile.id).await
-                    } else {
-                        client.login_codex_account(profile.id).await
+                    client.wait_until_connected(Duration::from_secs(5)).await?;
+                    match sign_in {
+                        SignIn::New(agent) => client.add_account(agent.into()).await,
+                        SignIn::Profile(profile) if profile.agent == AgentKind::CLAUDE_CODE_ID => {
+                            client.login_claude_account(profile.id).await
+                        }
+                        SignIn::Profile(profile) => client.login_codex_account(profile.id).await,
                     }
                 })
                 .await
@@ -448,32 +633,102 @@ impl UtilitySurfaces {
         settings_page(t("settings.accounts.switch_title"), content, colors).into_any_element()
     }
 
+    /// Two Claude and two Codex accounts with limits, plus a remote profile
+    /// (opened in the editor when `editor`).
     #[cfg(test)]
     pub(super) fn seed_account_preview(&mut self, editor: bool) {
-        let profile = AgentAccountProfile {
-            id: "work".into(),
-            label: "Work".into(),
+        let remote = AgentAccountProfile {
+            id: "build-box".into(),
+            label: "Build box".into(),
             agent: "codex".into(),
-            host: None,
-            config_home: "~/.codex-work".into(),
+            host: Some("devbox".into()),
+            config_home: "~/.codex".into(),
             is_default: true,
             login_store: None,
         };
+        let mut overview = crate::usage::limits::preview_overview();
+        overview.catalog.profiles.push(remote.clone());
         self.accounts = AccountsState {
             loaded: true,
-            catalog: AgentAccountCatalog {
-                profiles: vec![profile.clone()],
-            },
+            overview,
             ..Default::default()
         };
+        self.usage.limits = crate::usage::limits::preview();
         if editor {
             self.accounts.editor = Some(ProfileEditor {
-                name: text_editor(&profile.label),
-                path: text_editor(&profile.config_home),
-                profile,
+                name: text_editor(&remote.label),
+                path: text_editor(&remote.config_home),
+                profile: remote,
                 path_active: false,
             });
         }
+    }
+
+    /// Every state an account can be in besides "fine": its login revoked,
+    /// a sign-in tab still open, never signed in, a full window that reset
+    /// since, and an idle account showing its last answer.
+    #[cfg(test)]
+    pub(super) fn seed_account_states_preview(&mut self) {
+        let now = crate::usage::Clock::read(&crate::usage::SystemClock).unix_seconds;
+        self.seed_account_preview(false);
+        let profiles = &mut self.accounts.overview.catalog.profiles;
+        profiles.retain(|p| p.host.is_none());
+        let template = profiles[1].clone();
+        for (id, label, agent) in [
+            ("preview-4", "Client", "claude-code"),
+            ("preview-5", "Weekend", "codex"),
+        ] {
+            profiles.push(AgentAccountProfile {
+                id: id.into(),
+                label: label.into(),
+                agent: agent.into(),
+                is_default: false,
+                ..template.clone()
+            });
+        }
+        let logins = &mut self.accounts.overview.logins;
+        let mut client = logins[1].clone();
+        client.profile_id = "preview-4".into();
+        client.identity.email = Some("alex@client.example".into());
+        client.signing_in = true;
+        client.signed_in = false;
+        let mut weekend = logins[3].clone();
+        weekend.profile_id = "preview-5".into();
+        weekend.identity = Default::default();
+        weekend.signed_in = false;
+        logins.extend([client, weekend]);
+        // Revoked: the provider refused a token that had not expired.
+        let personal = &mut self.usage.limits[1];
+        personal.windows.clear();
+        personal.error = Some(crate::usage::limits::SIGN_IN_AGAIN);
+        // Idle since this morning: its full 5-hour window has reset since.
+        let mut windows = self.usage.limits[2].windows.clone();
+        windows[0].used_percent = 100.0;
+        windows[0].resets_at = Some(now - 1_800);
+        windows[1].used_percent = 62.0;
+        let side = &mut self.usage.limits[3];
+        side.checked_at = now - 4 * 3_600;
+        side.windows = windows;
+    }
+
+    /// First run: nothing saved in Diri yet, both logins in use.
+    #[cfg(test)]
+    pub(super) fn seed_account_first_run_preview(&mut self) {
+        let mut overview = crate::usage::limits::first_run_overview();
+        overview.catalog.profiles.clear();
+        self.accounts = AccountsState {
+            loaded: true,
+            overview,
+            ..Default::default()
+        };
+        self.usage.limits = crate::usage::limits::preview()
+            .into_iter()
+            .filter(|l| l.live)
+            .map(|mut l| {
+                l.profile_id = None;
+                l
+            })
+            .collect();
     }
 
     #[cfg(test)]
@@ -509,8 +764,11 @@ impl UtilitySurfaces {
         self.accounts = AccountsState {
             loaded: true,
             continue_session: Some(source.id.clone()),
-            catalog: AgentAccountCatalog {
-                profiles: vec![work, personal],
+            overview: AgentAccountOverview {
+                catalog: AgentAccountCatalog {
+                    profiles: vec![work, personal],
+                },
+                ..Default::default()
             },
             ..Default::default()
         };
@@ -532,6 +790,13 @@ impl UtilitySurfaces {
         self.accounts.sequence += 1;
         let sequence = self.accounts.sequence;
         let close_editor = !matches!(action, AccountAction::Refresh);
+        let adopting = match &action {
+            AccountAction::Adopt(agent) => Some(agent.clone()),
+            _ => None,
+        };
+        if !matches!(action, AccountAction::Refresh) {
+            self.accounts.notice = None;
+        }
         let client = Arc::clone(self.store_runtime.client());
         let runtime = Arc::clone(&self.runtime);
         cx.spawn(async move |this, cx| {
@@ -539,17 +804,16 @@ impl UtilitySurfaces {
                 .spawn(async move {
                     client.wait_until_connected(Duration::from_secs(5)).await?;
                     match action {
-                        AccountAction::Refresh => client.account_profiles().await,
-                        AccountAction::Save(profile) => client.save_account_profile(&profile).await,
-                        AccountAction::Remove(id) => client.remove_account_profile(id).await,
-                        AccountAction::Capture(profile) => {
-                            if profile.agent == "claude-code" {
-                                client.capture_claude_account(profile.id).await
-                            } else {
-                                client.capture_codex_account(profile.id).await
-                            }
+                        AccountAction::Refresh => {}
+                        AccountAction::Save(profile) => {
+                            client.save_account_profile(&profile).await?;
                         }
+                        AccountAction::Remove(id) => {
+                            client.remove_account_profile(id).await?;
+                        }
+                        AccountAction::Adopt(agent) => return client.adopt_account(agent).await,
                     }
+                    client.account_overview().await
                 })
                 .await;
             let result = result
@@ -561,20 +825,82 @@ impl UtilitySurfaces {
                 }
                 this.accounts.busy = false;
                 match result {
-                    Ok(catalog) => {
-                        this.accounts.catalog = catalog;
+                    Ok(overview) => {
+                        if let Some(agent) = adopting
+                            && let Some(label) = overview
+                                .live(&agent)
+                                .and_then(|l| l.profile_id.as_deref())
+                                .and_then(|id| {
+                                    overview.catalog.profiles.iter().find(|p| p.id == id)
+                                })
+                                .map(|p| p.label.clone())
+                        {
+                            this.accounts.notice =
+                                Some(tf("settings.accounts.saved_as", &[("account", &label)]));
+                        }
+                        this.accounts.overview = overview;
                         this.accounts.loaded = true;
                         if close_editor {
                             this.accounts.editor = None;
+                            this.accounts.renaming = None;
                         }
                     }
                     Err(error) => this.accounts.error = Some(error),
                 }
+                // Limits follow the accounts: ask for every one of them.
+                cx.emit(UtilitySurfacesEvent::RefreshUsageLimits);
                 cx.notify();
             });
         })
         .detach();
         cx.notify();
+    }
+
+    fn start_rename(
+        &mut self,
+        profile: &AgentAccountProfile,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.accounts.busy {
+            return;
+        }
+        self.accounts.renaming = Some((profile.id.clone(), text_editor(&profile.label)));
+        self.accounts.editor = None;
+        self.accounts.error = None;
+        self.settings_search_active = false;
+        self.focus.focus(window, cx);
+        cx.notify();
+    }
+
+    fn finish_rename(&mut self, cx: &mut Context<Self>) {
+        let Some((id, editor)) = self.accounts.renaming.take() else {
+            return;
+        };
+        let label = editor.text().trim().to_owned();
+        let Some(mut profile) = self
+            .accounts
+            .overview
+            .catalog
+            .profiles
+            .iter()
+            .find(|p| p.id == id)
+            .cloned()
+        else {
+            return;
+        };
+        if label.is_empty() {
+            self.accounts.renaming = Some((id, editor));
+            self.accounts.error = Some(t("settings.accounts.name_required").into());
+            cx.notify();
+            return;
+        }
+        if label == profile.label {
+            cx.notify();
+            return;
+        }
+        profile.label = label;
+        self.account_action(AccountAction::Save(profile), cx);
     }
 
     fn edit_account(
@@ -635,6 +961,7 @@ impl UtilitySurfaces {
         if shares_login(&profile) {
             profile.is_default = self
                 .accounts
+                .overview
                 .catalog
                 .profiles
                 .iter()
@@ -677,6 +1004,47 @@ impl UtilitySurfaces {
                     }
                 }
                 _ => return false,
+            }
+            cx.notify();
+            return true;
+        }
+        if self.accounts.renaming.is_some() {
+            if self.accounts.busy {
+                return true;
+            }
+            match event.keystroke.key.as_str() {
+                "escape" => {
+                    self.accounts.renaming = None;
+                    self.accounts.error = None;
+                }
+                "enter" => {
+                    self.finish_rename(cx);
+                    return true;
+                }
+                _ => {
+                    let Some(edit) = query_editor::edit_for(&event.keystroke) else {
+                        return false;
+                    };
+                    let (_, input) = self.accounts.renaming.as_mut().unwrap();
+                    match edit {
+                        Edit::Local(local) => {
+                            input.apply(local);
+                        }
+                        Edit::Clipboard(ClipboardEdit::Copy) => {
+                            query_editor::copy_selection(input, cx)
+                        }
+                        Edit::Clipboard(ClipboardEdit::Cut) => {
+                            query_editor::cut_selection(input, cx);
+                        }
+                        Edit::Clipboard(ClipboardEdit::Paste) => {
+                            if let Some(text) =
+                                cx.read_from_clipboard().and_then(|item| item.text())
+                            {
+                                input.insert(&text);
+                            }
+                        }
+                    }
+                }
             }
             cx.notify();
             return true;
@@ -732,44 +1100,40 @@ impl UtilitySurfaces {
             return self.continue_account_settings(cx);
         }
         let colors = self.settings_colors();
-        let mut content = div()
-            .flex()
-            .flex_col()
-            .gap(px(16.0))
-            .child(
+        let now = crate::usage::Clock::read(&crate::usage::SystemClock).unix_seconds;
+        let mut content = div().flex().flex_col().gap(px(16.0)).child(
+            div()
+                .text_size(px(12.0))
+                .text_color(colors.secondary)
+                .child(t("settings.accounts.intro")),
+        );
+        if let Some(notice) = &self.accounts.notice {
+            content = content.child(
                 div()
+                    .id("account-notice")
                     .text_size(px(12.0))
                     .text_color(colors.secondary)
-                    .child(t("settings.accounts.intro")),
-            )
-            .child(
-                div()
-                    .flex()
-                    .items_center()
-                    .justify_between()
-                    .child(
-                        div()
-                            .text_size(px(12.0))
-                            .text_color(colors.secondary)
-                            .child(if self.accounts.busy {
-                                t("settings.accounts.updating")
-                            } else {
-                                t("settings.accounts.saved_profiles")
-                            }),
-                    )
-                    .child(self.account_button(
-                        "add-account",
-                        t("settings.accounts.add_profile"),
-                        cx,
-                        |this, window, cx| this.edit_account(None, window, cx),
-                    )),
+                    .child(notice.clone()),
             );
-        if let Some(error) = &self.accounts.error {
+        }
+        if self.accounts.busy {
             content = content.child(
                 div()
                     .text_size(px(12.0))
+                    .text_color(colors.tertiary)
+                    .child(t("settings.accounts.updating")),
+            );
+        }
+        if let Some(error) = &self.accounts.error {
+            content = content.child(
+                div()
+                    .id("account-error")
+                    .flex()
+                    .items_center()
+                    .gap(px(10.0))
+                    .text_size(px(12.0))
                     .text_color(Ink::DANGER)
-                    .child(error.clone())
+                    .child(div().flex_1().child(error.clone()))
                     .child(self.account_button(
                         "retry-accounts",
                         t("settings.accounts.retry"),
@@ -778,6 +1142,41 @@ impl UtilitySurfaces {
                     )),
             );
         }
+        for agent in [AgentKind::CLAUDE_CODE_ID, AgentKind::CODEX_ID] {
+            content = content.child(self.agent_accounts(agent, now, cx));
+        }
+        content = content.child(
+            div()
+                .flex()
+                .items_end()
+                .justify_between()
+                .gap(px(12.0))
+                .child(
+                    div()
+                        .flex()
+                        .flex_col()
+                        .gap(px(2.0))
+                        .child(
+                            div()
+                                .text_size(px(Typo::SECTION_HEADER.size))
+                                .font_weight(Typo::SECTION_HEADER.weight)
+                                .text_color(colors.tertiary)
+                                .child(t("settings.accounts.other_profiles")),
+                        )
+                        .child(
+                            div()
+                                .text_size(px(Typo::META.size))
+                                .text_color(colors.tertiary)
+                                .child(t("settings.accounts.other_detail")),
+                        ),
+                )
+                .child(self.account_button(
+                    "add-account",
+                    t("settings.accounts.add_profile"),
+                    cx,
+                    |this, window, cx| this.edit_account(None, window, cx),
+                )),
+        );
         if let Some(editor) = &self.accounts.editor {
             let mut form = div()
                 .p(px(14.0))
@@ -991,46 +1390,18 @@ impl UtilitySurfaces {
                 );
             content = content.child(form);
         }
-        if self.accounts.loaded
-            && self.accounts.catalog.profiles.is_empty()
-            && self.accounts.editor.is_none()
+        // Remote and separate-directory profiles: chosen per launch.
+        for profile in self
+            .accounts
+            .overview
+            .catalog
+            .profiles
+            .iter()
+            .filter(|p| !shares_login(p))
         {
-            content = content.child(
-                div()
-                    .p(px(20.0))
-                    .rounded(px(Radius::PANEL))
-                    .bg(colors.primary.alpha(0.025))
-                    .flex()
-                    .flex_col()
-                    .gap(px(8.0))
-                    .child(
-                        div()
-                            .text_size(px(14.0))
-                            .child(t("settings.accounts.empty_title")),
-                    )
-                    .child(
-                        div()
-                            .text_size(px(12.0))
-                            .text_color(colors.secondary)
-                            .child(t("settings.accounts.empty_detail")),
-                    ),
-            );
-        }
-        if let Some(notice) = &self.accounts.notice {
-            content = content.child(
-                div()
-                    .text_size(px(12.0))
-                    .text_color(colors.secondary)
-                    .child(notice.clone()),
-            );
-        }
-        for profile in &self.accounts.catalog.profiles {
-            let switch = profile.clone();
             let edit = profile.clone();
             let open = profile.clone();
             let remove = profile.id.clone();
-            let capture = profile.clone();
-            let local_codex = shares_login(profile);
             let host = profile
                 .host
                 .as_deref()
@@ -1067,15 +1438,7 @@ impl UtilitySurfaces {
                         div()
                             .text_size(px(11.0))
                             .text_color(colors.secondary)
-                            .child(format!(
-                                "{} · {}",
-                                if profile.agent == "codex" {
-                                    "Codex"
-                                } else {
-                                    "Claude Code"
-                                },
-                                host
-                            )),
+                            .child(format!("{} · {}", agent_title(&profile.agent), host)),
                     )
                     .child(
                         div()
@@ -1091,17 +1454,9 @@ impl UtilitySurfaces {
                             .gap(px(8.0))
                             .child(self.account_button(
                                 format!("open-{}", profile.id),
-                                if local_codex {
-                                    t("settings.accounts.sign_in")
-                                } else {
-                                    t("settings.accounts.open_agent")
-                                },
+                                t("settings.accounts.open_agent"),
                                 cx,
                                 move |this, _, cx| {
-                                    if local_codex {
-                                        this.login_account(open.clone(), cx);
-                                        return;
-                                    }
                                     let kind = diri_proto::AgentKind::new(&open.agent);
                                     let mut store =
                                         this.store.write().expect("session store lock poisoned");
@@ -1122,29 +1477,6 @@ impl UtilitySurfaces {
                                     this.close_surface(cx);
                                 },
                             ))
-                            .when(local_codex, |row| {
-                                row.child(self.account_button(
-                                    format!("capture-{}", profile.id),
-                                    t("settings.accounts.save_current_login"),
-                                    cx,
-                                    move |this, _, cx| {
-                                        this.account_action(
-                                            AccountAction::Capture(capture.clone()),
-                                            cx,
-                                        )
-                                    },
-                                ))
-                            })
-                            .when(local_codex, |row| {
-                                row.child(self.account_button(
-                                    format!("switch-{}", profile.id),
-                                    t("settings.accounts.switch_title"),
-                                    cx,
-                                    move |this, _, cx| {
-                                        this.continue_account(switch.id.clone(), cx);
-                                    },
-                                ))
-                            })
                             .child(self.account_button(
                                 format!("edit-{}", profile.id),
                                 t("settings.accounts.edit"),
@@ -1164,13 +1496,418 @@ impl UtilitySurfaces {
                     ),
             );
         }
-        content = content.child(
-            div()
-                .text_size(px(11.0))
-                .text_color(colors.tertiary)
-                .child(t("settings.accounts.footer")),
-        );
+        let others = self
+            .accounts
+            .overview
+            .catalog
+            .profiles
+            .iter()
+            .any(|p| !shares_login(p));
+        if others || self.accounts.editor.is_some() {
+            content = content.child(
+                div()
+                    .text_size(px(11.0))
+                    .text_color(colors.tertiary)
+                    .child(t("settings.accounts.footer")),
+            );
+        }
         settings_page(t("settings.accounts.title"), content, colors).into_any_element()
+    }
+
+    /// One Agent's accounts as a settings group: each account, the login in
+    /// use when no account holds it yet, and adding another.
+    fn agent_accounts(&self, agent: &'static str, now: i64, cx: &mut Context<Self>) -> AnyElement {
+        let colors = self.settings_colors();
+        let overview = &self.accounts.overview;
+        let limits = &self.usage.limits;
+        let suggested = crate::usage::limits::most_room(overview, limits, agent, ROOM_MARGIN, now);
+        let mut rows = div().flex().flex_col();
+        let mut first = true;
+        let mut divided = |rows: Div, row: AnyElement| {
+            let rows = if first {
+                rows
+            } else {
+                rows.child(setting_divider(colors))
+            };
+            first = false;
+            rows.child(row)
+        };
+        for profile in overview
+            .catalog
+            .profiles
+            .iter()
+            .filter(|p| p.agent == agent && shares_login(p))
+        {
+            let usage = limits
+                .iter()
+                .find(|l| l.profile_id.as_deref() == Some(profile.id.as_str()));
+            let row = self.account_row(
+                profile,
+                usage,
+                suggested.as_deref() == Some(profile.id.as_str()),
+                now,
+                cx,
+            );
+            rows = divided(rows, row);
+        }
+        if let Some(live) = overview.live(agent).filter(|l| l.profile_id.is_none()) {
+            let usage = limits
+                .iter()
+                .find(|l| l.live && l.profile_id.is_none() && l.provider == provider(agent));
+            let row = self.unsaved_account_row(agent, &live.identity, usage, now, cx);
+            rows = divided(rows, row);
+        }
+        let add =
+            div()
+                .id(SharedString::from(format!("add-{agent}-account")))
+                .debug_selector(move || format!("add-{agent}-account"))
+                .h(px(38.0))
+                .px(px(12.0))
+                .flex()
+                .items_center()
+                .gap(px(8.0))
+                .text_size(px(Typo::ROW.size))
+                .text_color(colors.secondary)
+                .when(!self.accounts.busy, |row| {
+                    row.cursor_pointer()
+                        .hover(move |s| s.bg(colors.primary.alpha(0.035)))
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            this.login_account(SignIn::New(agent), cx)
+                        }))
+                })
+                .child(div().w(px(14.0)).flex().justify_center().child(sf_symbol(
+                    "plus",
+                    10.0,
+                    colors.secondary,
+                )))
+                .child(tf(
+                    "settings.accounts.add_agent",
+                    &[("agent", &agent_title(agent))],
+                ))
+                .into_any_element();
+        rows = divided(rows, add);
+        setting_section(agent_title(agent), rows, colors).into_any_element()
+    }
+
+    /// An account: who it is, its plan windows, and what can be done with it.
+    fn account_row(
+        &self,
+        profile: &AgentAccountProfile,
+        usage: Option<&AccountLimits>,
+        suggested: bool,
+        now: i64,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let colors = self.settings_colors();
+        let overview = &self.accounts.overview;
+        let live = overview.is_live(profile);
+        let login = overview.login(&profile.id);
+        let signed_in = login.is_some_and(|l| l.signed_in);
+        let signing_in = login.is_some_and(|l| l.signing_in);
+        let needs_sign_in = usage.is_some_and(AccountLimits::needs_sign_in);
+        let identity = login.map(|l| &l.identity);
+        let plan = usage
+            .and_then(|u| u.plan.clone())
+            .or_else(|| identity.and_then(|i| i.plan.as_deref()).map(plan_label));
+        let detail = [
+            identity.and_then(|i| i.email.clone()),
+            identity.and_then(organization),
+            plan,
+        ]
+        .into_iter()
+        .flatten()
+        .collect::<Vec<_>>()
+        .join(" · ");
+        let tag = if signing_in {
+            Some((t("settings.accounts.signing_in"), colors.secondary.into()))
+        } else if !signed_in {
+            Some((
+                t("settings.accounts.not_signed_in"),
+                colors.secondary.into(),
+            ))
+        } else if needs_sign_in {
+            Some((
+                t("settings.accounts.needs_sign_in"),
+                Hsla::from(Ink::DANGER),
+            ))
+        } else if live {
+            Some((t("settings.accounts.in_use"), colors.secondary.into()))
+        } else if usage.is_some_and(|u| u.ready_again(now)) {
+            Some((t("settings.accounts.ready"), Hsla::from(Ink::FRESH)))
+        } else if suggested {
+            Some((t("settings.accounts.most_room"), Hsla::from(Ink::FRESH)))
+        } else {
+            None
+        };
+        let renaming = self
+            .accounts
+            .renaming
+            .as_ref()
+            .filter(|(id, _)| id == &profile.id)
+            .map(|(_, input)| input);
+        let id = profile.id.clone();
+        let mut actions = div().flex_none().flex().items_center().gap(px(6.0));
+        if renaming.is_some() {
+            actions = actions
+                .child(self.account_button(
+                    "rename-save",
+                    t("settings.accounts.save"),
+                    cx,
+                    |this, _, cx| this.finish_rename(cx),
+                ))
+                .child(self.account_button(
+                    "rename-cancel",
+                    t("settings.accounts.cancel"),
+                    cx,
+                    |this, _, cx| {
+                        this.accounts.renaming = None;
+                        this.accounts.error = None;
+                        cx.notify();
+                    },
+                ));
+        } else {
+            if (!signed_in || needs_sign_in) && !signing_in {
+                let sign_in = profile.clone();
+                actions = actions.child(self.account_button(
+                    format!("sign-in-{id}"),
+                    t("settings.accounts.sign_in"),
+                    cx,
+                    move |this, _, cx| this.login_account(SignIn::Profile(sign_in.clone()), cx),
+                ));
+            } else if signed_in && !live {
+                let switch = profile.id.clone();
+                actions = actions.child(self.account_button(
+                    format!("switch-{id}"),
+                    t("settings.accounts.switch"),
+                    cx,
+                    move |this, _, cx| this.continue_account(switch.clone(), cx),
+                ));
+            }
+            let rename = profile.clone();
+            let remove = profile.id.clone();
+            actions = actions
+                .child(self.account_icon_button(
+                    format!("rename-{id}"),
+                    "pencil",
+                    t("settings.accounts.rename"),
+                    false,
+                    cx,
+                    move |this, window, cx| this.start_rename(&rename, window, cx),
+                ))
+                .child(self.account_icon_button(
+                    format!("remove-{id}"),
+                    "trash",
+                    t("settings.accounts.remove"),
+                    true,
+                    cx,
+                    move |this, _, cx| {
+                        this.account_action(AccountAction::Remove(remove.clone()), cx)
+                    },
+                ));
+        }
+        let title = match renaming {
+            Some(input) => div()
+                .id("account-rename")
+                .role(Role::TextInput)
+                .aria_label(t("settings.accounts.name"))
+                .h(px(24.0))
+                .w(px(220.0))
+                .px(px(7.0))
+                .rounded(px(Radius::BADGE))
+                .border_1()
+                .border_color(colors.primary.alpha(0.3))
+                .bg(colors.primary.alpha(0.04))
+                .flex()
+                .items_center()
+                .overflow_hidden()
+                .text_size(px(Typo::ROW.size))
+                .cursor(CursorStyle::IBeam)
+                .child(query_label(input))
+                .into_any_element(),
+            None => div()
+                .flex()
+                .items_center()
+                .gap(px(7.0))
+                .min_w(px(0.0))
+                .child(
+                    div()
+                        .min_w(px(0.0))
+                        .whitespace_nowrap()
+                        .overflow_hidden()
+                        .text_ellipsis()
+                        .text_size(px(Typo::ROW_EMPHASIZED.size))
+                        .font_weight(Typo::ROW_EMPHASIZED.weight)
+                        .text_color(colors.primary)
+                        .child(profile.label.clone()),
+                )
+                .when_some(tag, |row, (tag, color)| {
+                    row.child(account_tag(tag, color, colors))
+                })
+                .into_any_element(),
+        };
+        let windows = match usage {
+            _ if !signed_in || needs_sign_in => None,
+            Some(usage) if !usage.windows.is_empty() => {
+                Some(plan_windows(usage, live, now, colors))
+            }
+            // Its token expired before Diri asked: say when numbers come.
+            _ => Some(
+                div()
+                    .text_size(px(Typo::META.size))
+                    .text_color(colors.tertiary)
+                    .child(t("settings.accounts.not_checked"))
+                    .into_any_element(),
+            ),
+        };
+        div()
+            .id(SharedString::from(format!("account-{id}")))
+            .debug_selector(move || format!("account-{id}"))
+            .min_h(px(SETTINGS_ROW_HEIGHT))
+            .px(px(12.0))
+            .py(px(10.0))
+            .flex()
+            .items_center()
+            .gap(px(10.0))
+            .child(
+                div()
+                    .self_start()
+                    .pt(px(4.0))
+                    .child(account_check(live, colors)),
+            )
+            .child(
+                div()
+                    .flex_1()
+                    .min_w(px(0.0))
+                    .flex()
+                    .flex_col()
+                    .gap(px(3.0))
+                    .child(title)
+                    .when(!detail.is_empty(), |column| {
+                        column.child(
+                            div()
+                                .whitespace_nowrap()
+                                .overflow_hidden()
+                                .text_ellipsis()
+                                .text_size(px(Typo::META.size))
+                                .text_color(colors.tertiary)
+                                .child(detail),
+                        )
+                    })
+                    .children(windows),
+            )
+            .child(actions)
+            .into_any_element()
+    }
+
+    /// The login an Agent uses now that no account holds: one click keeps it.
+    fn unsaved_account_row(
+        &self,
+        agent: &'static str,
+        identity: &diri_proto::AgentAccountIdentity,
+        usage: Option<&AccountLimits>,
+        now: i64,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let colors = self.settings_colors();
+        let detail = [organization(identity), usage.and_then(|u| u.plan.clone())]
+            .into_iter()
+            .flatten()
+            .chain(std::iter::once(t("settings.accounts.not_saved").to_owned()))
+            .collect::<Vec<_>>()
+            .join(" · ");
+        div()
+            .id(SharedString::from(format!("unsaved-{agent}")))
+            .debug_selector(move || format!("unsaved-{agent}"))
+            .min_h(px(SETTINGS_ROW_HEIGHT))
+            .px(px(12.0))
+            .py(px(10.0))
+            .flex()
+            .items_center()
+            .gap(px(10.0))
+            .child(
+                div()
+                    .self_start()
+                    .pt(px(4.0))
+                    .child(account_check(true, colors)),
+            )
+            .child(
+                div()
+                    .flex_1()
+                    .min_w(px(0.0))
+                    .flex()
+                    .flex_col()
+                    .gap(px(3.0))
+                    .child(
+                        div()
+                            .whitespace_nowrap()
+                            .overflow_hidden()
+                            .text_ellipsis()
+                            .text_size(px(Typo::ROW_EMPHASIZED.size))
+                            .font_weight(Typo::ROW_EMPHASIZED.weight)
+                            .text_color(colors.primary)
+                            .child(
+                                identity
+                                    .email
+                                    .clone()
+                                    .unwrap_or_else(|| t("settings.accounts.signed_in").into()),
+                            ),
+                    )
+                    .child(
+                        div()
+                            .text_size(px(Typo::META.size))
+                            .text_color(colors.tertiary)
+                            .child(detail),
+                    )
+                    .children(usage.map(|u| plan_windows(u, true, now, colors))),
+            )
+            .child(self.account_button(
+                format!("save-{agent}-login"),
+                t("settings.accounts.save"),
+                cx,
+                move |this, _, cx| this.account_action(AccountAction::Adopt(agent.into()), cx),
+            ))
+            .into_any_element()
+    }
+
+    /// A quiet icon action with its name on hover.
+    fn account_icon_button(
+        &self,
+        id: impl Into<SharedString>,
+        icon: &'static str,
+        label: &'static str,
+        destructive: bool,
+        cx: &mut Context<Self>,
+        action: impl Fn(&mut Self, &mut Window, &mut Context<Self>) + 'static,
+    ) -> impl IntoElement {
+        let colors = self.settings_colors();
+        let busy = self.accounts.busy;
+        div()
+            .id(id.into())
+            .role(Role::Button)
+            .aria_label(label)
+            .size(px(26.0))
+            .flex_none()
+            .rounded(px(Radius::BADGE))
+            .flex()
+            .items_center()
+            .justify_center()
+            .when(!busy, |button| {
+                button
+                    .cursor_pointer()
+                    .hover(move |s| {
+                        s.bg(if destructive {
+                            Ink::DANGER.alpha(0.10)
+                        } else {
+                            colors.primary.alpha(0.08)
+                        })
+                    })
+                    .warm_tooltip(move |_, cx| {
+                        cx.new(|_| crate::palette_chrome::PaletteTooltip(label.into(), colors))
+                            .into()
+                    })
+                    .on_click(cx.listener(move |this, _, window, cx| action(this, window, cx)))
+            })
+            .child(sf_symbol(icon, 10.0, colors.tertiary))
     }
 
     fn account_button(
@@ -1210,6 +1947,73 @@ impl UtilitySurfaces {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn claudes_default_personal_organization_is_not_repeated() {
+        let identity = |email: &str, organization: &str| diri_proto::AgentAccountIdentity {
+            email: Some(email.into()),
+            organization: Some(organization.into()),
+            plan: None,
+        };
+        assert_eq!(
+            organization(&identity(
+                "me@example.test",
+                "me@example.test's Organization"
+            )),
+            None,
+            "it only repeats the email"
+        );
+        assert_eq!(
+            organization(&identity("me@corp.test", "Corp Engineering")).as_deref(),
+            Some("Corp Engineering")
+        );
+    }
+
+    #[gpui::test]
+    fn renaming_in_place_keeps_a_name_and_escape_leaves_it_unchanged(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let runtime = Arc::new(StoreRuntime::inert());
+        let tokio = Arc::new(
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap(),
+        );
+        let (surfaces, cx) = cx.add_window_view(move |window, cx| {
+            let mut surfaces =
+                UtilitySurfaces::new(runtime, tokio, crate::updates::inert(), window, cx);
+            surfaces.open_settings(cx);
+            surfaces.settings_tab = SettingsTab::Accounts;
+            surfaces.seed_account_preview(false);
+            surfaces
+        });
+        let key = |name| KeyDownEvent {
+            keystroke: gpui::Keystroke::parse(name).unwrap(),
+            is_held: false,
+            prefer_character_input: false,
+        };
+        surfaces.update_in(cx, |surfaces, window, cx| {
+            let personal = surfaces.accounts.overview.catalog.profiles[1].clone();
+            surfaces.start_rename(&personal, window, cx);
+            surfaces.accounts.renaming.as_mut().unwrap().1.select_all();
+            assert!(surfaces.handle_account_key(&key("backspace"), cx));
+            assert!(surfaces.handle_account_key(&key("enter"), cx));
+            assert_eq!(
+                surfaces.accounts.error.as_deref(),
+                Some(t("settings.accounts.name_required")),
+                "an account keeps a name"
+            );
+            assert!(!surfaces.accounts.busy, "nothing was sent");
+            assert!(surfaces.handle_account_key(&key("escape"), cx));
+            assert!(surfaces.accounts.renaming.is_none());
+            assert_eq!(
+                surfaces.accounts.overview.catalog.profiles[1].label,
+                "Personal"
+            );
+        });
+    }
+
     #[gpui::test]
     fn saving_a_nameless_profile_asks_for_a_name_without_calling_the_engine(
         cx: &mut gpui::TestAppContext,
@@ -1262,8 +2066,8 @@ mod tests {
             surfaces
         });
         surfaces.update_in(cx, |surfaces, _, cx| {
-            let personal = surfaces.accounts.catalog.profiles[1].clone();
-            surfaces.accounts.catalog.profiles.extend([
+            let personal = surfaces.accounts.overview.catalog.profiles[1].clone();
+            surfaces.accounts.overview.catalog.profiles.extend([
                 AgentAccountProfile {
                     id: "remote".into(),
                     host: Some("server".into()),
@@ -1303,6 +2107,18 @@ mod tests {
         });
     }
 
+    /// The remote profile the preview opens in the editor, as saved.
+    fn saved(surfaces: &UtilitySurfaces) -> &AgentAccountProfile {
+        surfaces
+            .accounts
+            .overview
+            .catalog
+            .profiles
+            .iter()
+            .find(|p| p.id == "build-box")
+            .unwrap()
+    }
+
     #[gpui::test]
     fn account_editor_keeps_unsaved_changes_local_and_blocks_input_during_save(
         cx: &mut gpui::TestAppContext,
@@ -1337,20 +2153,14 @@ mod tests {
                 .unwrap()
                 .path
                 .insert("-changed");
-            assert_eq!(
-                surfaces.accounts.catalog.profiles[0].config_home,
-                "~/.codex-work"
-            );
+            assert_eq!(saved(surfaces).config_home, "~/.codex");
             surfaces.accounts.busy = true;
             surfaces.handle_account_key(&key("escape"), cx);
             assert!(surfaces.accounts.editor.is_some());
             surfaces.accounts.busy = false;
             surfaces.handle_account_key(&key("escape"), cx);
             assert!(surfaces.accounts.editor.is_none());
-            assert_eq!(
-                surfaces.accounts.catalog.profiles[0].config_home,
-                "~/.codex-work"
-            );
+            assert_eq!(saved(surfaces).config_home, "~/.codex");
         });
     }
 }

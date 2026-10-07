@@ -1,9 +1,24 @@
+//! The accounts part of the bottom-left menu, kept to one line per account:
+//! a click switches every open tab of its Agent to it, a checkmark marks the
+//! login new tabs use. Who each account is and how much room it has live in
+//! Settings › Accounts.
 use super::*;
-use diri_proto::{AgentAccountCatalog, AgentAccountProfile};
+use diri_proto::{AgentAccountOverview, AgentAccountProfile, AgentKind};
+
+/// What the account menu asks the Engine to do.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum AccountRequest {
+    /// Re-read the accounts (the menu opened).
+    Refresh,
+    /// Switch every open tab of the profile's Agent to it.
+    Switch(String),
+    /// Open the sign-in tab of a saved profile.
+    SignIn(String),
+}
 
 #[derive(Default)]
 pub(super) struct MenuAccounts {
-    catalog: AgentAccountCatalog,
+    overview: AgentAccountOverview,
     loaded: bool,
     busy: bool,
     message: Option<String>,
@@ -11,32 +26,39 @@ pub(super) struct MenuAccounts {
 }
 
 impl MenuAccounts {
+    #[cfg(test)]
+    pub(super) fn overview_mut(&mut self) -> &mut AgentAccountOverview {
+        &mut self.overview
+    }
+
     pub(super) fn new(preview: bool) -> Self {
         let mut state = Self::default();
         if preview {
             state.loaded = true;
-            state.catalog.profiles = ["Personal", "Work"]
-                .into_iter()
-                .enumerate()
-                .map(|(i, label)| AgentAccountProfile {
-                    id: format!("preview-{i}"),
-                    label: label.into(),
-                    agent: "codex".into(),
-                    host: None,
-                    config_home: String::new(),
-                    is_default: i == 0,
-                    login_store: None,
-                })
-                .collect();
+            state.overview = crate::usage::limits::preview_overview();
         }
         state
     }
 }
 
+enum Outcome {
+    Switched(diri_proto::SwitchAccountResult),
+    Opened(Box<diri_proto::SessionRecord>),
+    Refreshed,
+}
+
+fn switchable(profile: &AgentAccountProfile) -> bool {
+    profile.host.is_none()
+        && matches!(
+            profile.agent.as_str(),
+            AgentKind::CODEX_ID | AgentKind::CLAUDE_CODE_ID
+        )
+}
+
 impl Sidebar {
     pub(crate) fn account_menu_action(
         &mut self,
-        profile: Option<String>,
+        request: AccountRequest,
         services: Arc<crate::AppServices>,
         cx: &mut Context<Self>,
     ) {
@@ -44,32 +66,51 @@ impl Sidebar {
             return;
         }
         self.accounts.busy = true;
-        if profile.is_some() {
+        if request != AccountRequest::Refresh {
             self.accounts.failed = false;
-            self.accounts.message = Some(t("sidebar.account.switching").into());
+            self.accounts.message = match &request {
+                AccountRequest::Switch(_) => Some(t("sidebar.account.switching").into()),
+                _ => None,
+            };
         }
         let client = services.store.client().clone();
         let runtime = services.tokio.clone();
+        let previous = self.accounts.overview.clone();
         cx.spawn(async move |this, cx| {
+            let request_kind = request.clone();
             let result = runtime
                 .spawn(async move {
                     client
                         .wait_until_connected(Duration::from_secs(5))
                         .await
                         .map_err(|e| e.to_string())?;
-                    let switched = if let Some(id) = profile {
-                        Some(
+                    let outcome = match request {
+                        AccountRequest::Refresh => Outcome::Refreshed,
+                        AccountRequest::Switch(id) => Outcome::Switched(
                             client
                                 .switch_all_accounts(id)
                                 .await
                                 .map_err(|e| e.to_string())?,
-                        )
-                    } else {
-                        None
+                        ),
+                        AccountRequest::SignIn(id) => {
+                            let claude = previous
+                                .catalog
+                                .profiles
+                                .iter()
+                                .any(|p| p.id == id && p.agent == AgentKind::CLAUDE_CODE_ID);
+                            Outcome::Opened(Box::new(
+                                if claude {
+                                    client.login_claude_account(id).await
+                                } else {
+                                    client.login_codex_account(id).await
+                                }
+                                .map_err(|e| e.to_string())?,
+                            ))
+                        }
                     };
-                    // A catalog refresh failure must not hide a completed switch.
-                    let catalog = client.account_profiles().await.map_err(|e| e.to_string());
-                    Ok::<_, String>((switched, catalog))
+                    // A refresh failure must not hide a completed action.
+                    let overview = client.account_overview().await.map_err(|e| e.to_string());
+                    Ok::<_, String>((outcome, overview))
                 })
                 .await
                 .map_err(|e| e.to_string())
@@ -77,72 +118,27 @@ impl Sidebar {
             let _ = this.update(cx, |this, cx| {
                 this.accounts.busy = false;
                 match result {
-                    Ok((switched, catalog)) => {
-                        if let Some(result) = switched {
-                            let count = result.switched.len();
-                            let unchanged = result.unchanged.len();
-                            let mut store =
-                                this.store.write().expect("session store lock poisoned");
-                            for record in result.switched {
-                                store.upsert_session(record);
-                            }
-                            let deferred = result.deferred.len();
-                            let mut errors = result
-                                .failures
-                                .iter()
-                                .map(|failure| {
-                                    let label = store
-                                        .sessions()
-                                        .get(&failure.session_id)
-                                        .map(|s| s.title.as_str())
-                                        .unwrap_or(&failure.session_id.0);
-                                    format!("{label}: {}", failure.message)
-                                })
-                                .collect::<Vec<_>>();
-                            if let Some(error) = result.default_error {
-                                errors.push(error);
-                            }
-                            this.accounts.failed = !errors.is_empty() || !result.default_changed;
-                            this.accounts.message = Some(if this.accounts.failed {
-                                tf(
-                                    "sidebar.account.switched_with_errors",
-                                    &[("count", &count), ("errors", &errors.join("\n"))],
-                                )
-                            } else {
-                                if deferred > 0 {
-                                    tf(
-                                        "sidebar.account.switched_deferred",
-                                        &[
-                                            ("count", &count),
-                                            ("unchanged", &unchanged),
-                                            ("deferred", &deferred),
-                                        ],
-                                    )
-                                } else {
-                                    tf(
-                                        "sidebar.account.switched",
-                                        &[("count", &count), ("unchanged", &unchanged)],
-                                    )
-                                }
-                            });
-                            drop(store);
-                            services.store.publish_local_change();
-                            cx.emit(SidebarEvent::RefreshUsageLimits);
-                        }
-                        match catalog {
-                            Ok(catalog) => {
-                                this.accounts.catalog = catalog;
+                    Ok((outcome, overview)) => {
+                        this.account_outcome(outcome, &services, cx);
+                        match overview {
+                            Ok(overview) => {
+                                this.accounts.overview = overview;
                                 this.accounts.loaded = true;
                             }
                             Err(error) => {
                                 this.accounts.failed = true;
                                 let message = this.accounts.message.get_or_insert_default();
-                                message.push('\n');
+                                if !message.is_empty() {
+                                    message.push('\n');
+                                }
                                 message.push_str(&tf(
                                     "sidebar.account.refresh_failed",
                                     &[("error", &error)],
                                 ));
                             }
+                        }
+                        if request_kind != AccountRequest::Refresh {
+                            cx.emit(SidebarEvent::RefreshUsageLimits);
                         }
                     }
                     Err(error) => {
@@ -157,31 +153,112 @@ impl Sidebar {
         cx.notify();
     }
 
+    fn account_outcome(
+        &mut self,
+        outcome: Outcome,
+        services: &Arc<crate::AppServices>,
+        cx: &mut Context<Self>,
+    ) {
+        match outcome {
+            Outcome::Refreshed => {}
+            Outcome::Switched(result) => {
+                let count = result.switched.len();
+                let unchanged = result.unchanged.len();
+                let deferred = result.deferred.len();
+                let mut store = self.store.write().expect("session store lock poisoned");
+                for record in result.switched {
+                    store.upsert_session(record);
+                }
+                let mut errors = result
+                    .failures
+                    .iter()
+                    .map(|failure| {
+                        let label = store
+                            .sessions()
+                            .get(&failure.session_id)
+                            .map(|s| s.title.as_str())
+                            .unwrap_or(&failure.session_id.0);
+                        format!("{label}: {}", failure.message)
+                    })
+                    .collect::<Vec<_>>();
+                drop(store);
+                if let Some(error) = result.default_error {
+                    errors.push(error);
+                }
+                self.accounts.failed = !errors.is_empty() || !result.default_changed;
+                self.accounts.message = Some(if self.accounts.failed {
+                    tf(
+                        "sidebar.account.switched_with_errors",
+                        &[("count", &count), ("errors", &errors.join("\n"))],
+                    )
+                } else if deferred > 0 {
+                    tf(
+                        "sidebar.account.switched_deferred",
+                        &[
+                            ("count", &count),
+                            ("unchanged", &unchanged),
+                            ("deferred", &deferred),
+                        ],
+                    )
+                } else {
+                    tf(
+                        "sidebar.account.switched",
+                        &[("count", &count), ("unchanged", &unchanged)],
+                    )
+                });
+                services.store.publish_local_change();
+            }
+            Outcome::Opened(record) => {
+                // The sign-in tab: show it and let the user type in it.
+                let id = record.id.clone();
+                {
+                    let mut store = self.store.write().expect("session store lock poisoned");
+                    store.upsert_session(*record);
+                    store.select(id);
+                }
+                services.store.publish_local_change();
+                self.accounts.message = None;
+                self.ui.popover = None;
+                cx.emit(SidebarEvent::SessionActivated);
+            }
+        }
+    }
+
+    /// Whether the account list has been read since launch.
+    pub(super) fn accounts_loaded(&self) -> bool {
+        self.accounts.loaded
+    }
+
+    /// One line per saved local account, then managing them.
     pub(super) fn account_switch_menu(
         &self,
         colors: SemanticColors,
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let busy = self.accounts.busy;
+        let overview = &self.accounts.overview;
         let mut section = div()
             .id("account-switcher")
             .debug_selector(|| "account-switcher".into())
             .flex()
             .flex_col()
             .py(px(3.0));
-        for profile in self
-            .accounts
-            .catalog
-            .profiles
-            .iter()
-            .filter(|p| p.host.is_none() && matches!(p.agent.as_str(), "codex" | "claude-code"))
-        {
+        for profile in overview.catalog.profiles.iter().filter(|p| switchable(p)) {
             let id = profile.id.clone();
-            let agent = if profile.agent == "codex" {
+            let agent = if profile.agent == AgentKind::CODEX_ID {
                 "Codex"
             } else {
                 "Claude"
             };
+            let live = overview.is_live(profile);
+            // A click switches to the account, or signs in one with no login.
+            let action = (!live).then(|| {
+                if overview.login(&profile.id).is_some_and(|l| l.signed_in) {
+                    AccountRequest::Switch(profile.id.clone())
+                } else {
+                    AccountRequest::SignIn(profile.id.clone())
+                }
+            });
             section = section.child(
                 div()
                     .id(SharedString::from(format!("switch-account-{id}")))
@@ -193,7 +270,7 @@ impl Sidebar {
                     .items_center()
                     .gap(px(8.0))
                     .rounded(px(SIDEBAR_MENU_ROW_RADIUS))
-                    .when(!busy, |row| {
+                    .when(!busy && action.is_some(), |row| {
                         row.cursor_pointer().glass_menu_row(colors, false)
                     })
                     .text_size(px(Typo::ROW.size))
@@ -224,18 +301,17 @@ impl Sidebar {
                             .w(px(12.0))
                             .flex()
                             .justify_center()
-                            .when(profile.is_default, |slot| {
+                            .when(live, |slot| {
                                 slot.child(sf_symbol("checkmark", 9.0, colors.secondary))
                             }),
                     )
-                    .on_click(cx.listener({
-                        let id = profile.id.clone();
-                        move |this, _, _, cx| {
+                    .when_some(action.filter(|_| !busy), |row, action| {
+                        row.on_click(cx.listener(move |this, _, _, cx| {
                             if !this.accounts.busy {
-                                cx.emit(SidebarEvent::AccountAction(Some(id.clone())));
+                                cx.emit(SidebarEvent::AccountAction(action.clone()));
                             }
-                        }
-                    })),
+                        }))
+                    }),
             );
         }
         if !self.accounts.loaded && !self.accounts.failed {

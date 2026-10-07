@@ -41,6 +41,10 @@ pub enum PaletteCommand {
     },
     /// Resume every session a restart ended (see `store::resume_all`).
     ResumeAll,
+    /// Switch every open tab of the account's Agent to this saved account.
+    SwitchAccount {
+        profile_id: String,
+    },
     /// Show a note (from the notes ⌘K finds while typing), with the caret
     /// on the block that matched.
     OpenNote {
@@ -368,6 +372,67 @@ pub fn actions(
     selected: Option<&SessionRecord>,
 ) -> Vec<PaletteAction> {
     actions_for_default_host(default_agent, catalog, projects, hosts, selected, None)
+}
+
+/// "Switch Claude Code to Personal" for every saved account not in use, as
+/// last reported with its limits. The one with the most room is marked.
+pub fn account_actions(
+    limits: &[crate::usage::limits::AccountLimits],
+    now: i64,
+) -> Vec<PaletteAction> {
+    // Only known use counts: an account never asked makes no claim.
+    let used = |account: &crate::usage::limits::AccountLimits| {
+        account.binding(now).map(|window| window.used_percent)
+    };
+    let candidates: Vec<_> = limits
+        .iter()
+        .filter(|account| account.profile_id.is_some() && !account.live)
+        .filter(|account| !account.needs_sign_in())
+        .collect();
+    candidates
+        .iter()
+        .map(|account| {
+            let agent = if account.provider == "Codex" {
+                "Codex"
+            } else {
+                "Claude Code"
+            };
+            let live = limits
+                .iter()
+                .find(|other| other.live && other.provider == account.provider)
+                .map(used);
+            let best = candidates
+                .iter()
+                .filter(|other| other.provider == account.provider)
+                .filter_map(|other| used(other))
+                .fold(f64::INFINITY, f64::min);
+            let roomiest = used(account)
+                .is_some_and(|own| own <= best && live.flatten().is_some_and(|live| own < live));
+            PaletteAction {
+                id: format!(
+                    "switch-account-{}",
+                    account.profile_id.as_deref().unwrap_or_default()
+                ),
+                title: tf(
+                    "palette.switch_account",
+                    &[("agent", &agent), ("account", &account.account)],
+                ),
+                system_image: "account.circle",
+                shortcut: None,
+                detail: roomiest.then(|| t("palette.most_room").into()),
+                enabled: true,
+                is_default: false,
+                command: PaletteCommand::SwitchAccount {
+                    profile_id: account.profile_id.clone().unwrap_or_default(),
+                },
+                keywords: format!(
+                    "account switch login limit usage {} {}",
+                    account.plan.as_deref().unwrap_or_default(),
+                    account.provider
+                ),
+            }
+        })
+        .collect()
 }
 
 /// "Resume All (N)", offered while more than one session a restart ended
@@ -841,6 +906,49 @@ mod tests {
     use diri_proto::{AgentDescriptor, AgentPathSource, AgentReadinessItem, AgentSetup, ProjectId};
 
     use super::*;
+
+    #[test]
+    fn every_saved_account_not_in_use_can_be_switched_to() {
+        let now = 1_000;
+        let mut limits = crate::usage::limits::preview();
+        let switch_targets = |limits: &[crate::usage::limits::AccountLimits]| {
+            account_actions(limits, now)
+                .into_iter()
+                .map(|a| (a.command, a.detail))
+                .collect::<Vec<_>>()
+        };
+        for account in &mut limits {
+            for window in &mut account.windows {
+                window.resets_at = Some(now + 600);
+            }
+        }
+        assert_eq!(
+            switch_targets(&limits),
+            vec![
+                (
+                    PaletteCommand::SwitchAccount {
+                        profile_id: "preview-1".into()
+                    },
+                    Some(t("palette.most_room").to_owned())
+                ),
+                (
+                    PaletteCommand::SwitchAccount {
+                        profile_id: "preview-3".into()
+                    },
+                    None
+                ),
+            ],
+            "Personal and the idle Side project: Work and Main are in use"
+        );
+        let title = &account_actions(&limits, now)[0].title;
+        assert!(
+            title.contains("Claude Code") && title.contains("Personal"),
+            "{title}"
+        );
+        // A login that needs signing in again is not offered.
+        limits[1].error = Some(crate::usage::limits::SIGN_IN_AGAIN);
+        assert_eq!(switch_targets(&limits).len(), 1);
+    }
 
     fn catalog() -> AgentReadinessResult {
         AgentReadinessResult {
