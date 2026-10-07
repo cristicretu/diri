@@ -7,6 +7,7 @@
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use diri_proto::{
     AgentKind, DateMillis, ExitInfo, Resumability, SessionRecord, SessionStatus, TitleSource,
@@ -321,6 +322,9 @@ impl Registry {
                 }
                 for (root, host) in locations {
                     self.ensure_session_project(&root, host.as_deref());
+                }
+                if let Some(home) = home {
+                    repaired.extend(self.identify_unbound_codex(home));
                 }
                 self.seed_completed_runs();
                 if !repaired.is_empty() {
@@ -1672,16 +1676,25 @@ impl Registry {
                 .and_then(validate)
                 .or_else(|| record.transcript_path.as_deref().and_then(validate))
                 .or_else(|| {
-                    (kind.id() == diri_proto::AgentKind::CODEX_ID)
-                        .then(|| {
-                            crate::history::find_profile_codex_transcript(
-                                record.account_profile.as_ref(),
-                                home,
-                                agent_id,
-                                &record.cwd,
+                    if kind.id() != diri_proto::AgentKind::CODEX_ID {
+                        return None;
+                    }
+                    let profile = record.account_profile.as_ref();
+                    crate::history::find_profile_codex_transcript(
+                        profile,
+                        home,
+                        agent_id,
+                        &record.cwd,
+                    )
+                    .or_else(|| {
+                        // An unbound tab's own notify names its thread even
+                        // when Codex spelled the directory differently.
+                        record.agent_session_id.is_none().then(|| {
+                            crate::history::find_profile_codex_transcript_any_cwd(
+                                profile, home, agent_id,
                             )
-                        })
-                        .flatten()
+                        })?
+                    })
                 })
         });
         // Codex children inherit the parent's Diri notify command. Their
@@ -1689,11 +1702,20 @@ impl Registry {
         if self.records.get(id).is_some_and(|record| {
             record.host.is_none() && record.effective_kind() == &AgentKind::CODEX
         }) && meta.agent_session_id.is_some()
-            && transcript
-                .as_mut()
-                .is_none_or(|transcript| transcript.is_codex_subagent())
         {
-            return None;
+            let reason = match transcript.as_mut() {
+                None => Some("no_transcript"),
+                Some(transcript) => transcript.is_codex_subagent().then_some("subagent"),
+            };
+            if let Some(reason) = reason {
+                diri_telemetry::event!(
+                    "session.conversation_refused",
+                    session = diri_telemetry::id(id),
+                    conv = meta.agent_session_id.as_deref().map(diri_telemetry::id),
+                    reason = reason,
+                );
+                return None;
+            }
         }
         let native_title = self.records.get(id).and_then(|record| {
             if record.host.is_some() || !accepts_native_title(record.title_source) {
@@ -2208,6 +2230,62 @@ impl Registry {
             .map(|(other, _)| ("held_by_other_session", Some(other.clone())))
     }
 
+    /// Codex tabs that never learned their thread: no turn completed, or an
+    /// older Engine dropped the notify. Without an id the tab cannot resume,
+    /// which after a restart leaves an ended card with no way back. Codex
+    /// writes its rollout at launch, so name the thread from the launch, as
+    /// the account switch does. Only recent tabs: older rollouts fall outside
+    /// the bounded walk anyway, and each attempt reads rollout headers.
+    fn identify_unbound_codex(&mut self, home: &Path) -> Vec<String> {
+        const RECENT: Duration = Duration::from_secs(8 * 24 * 60 * 60);
+        let now = SystemTime::now();
+        let unbound: Vec<String> = self
+            .records
+            .values()
+            .filter(|record| record.host.is_none() && record.effective_kind() == &AgentKind::CODEX)
+            .filter(|record| record.agent_session_id.as_deref().is_none_or(str::is_empty))
+            .filter(|record| {
+                now.duration_since(launch_time(record))
+                    .is_ok_and(|age| age < RECENT)
+            })
+            .map(|record| record.id.0.clone())
+            .collect();
+        if unbound.is_empty() {
+            return Vec::new();
+        }
+        let mut claimed = self.claimed_agent_ids(None);
+        let mut identified = Vec::new();
+        for id in unbound {
+            let Some(record) = self.records.get_mut(&id) else {
+                continue;
+            };
+            let codex_home = record
+                .account_profile
+                .as_ref()
+                .map_or_else(|| home.join(".codex"), |p| PathBuf::from(&p.config_home));
+            let Some((thread, path)) = crate::history::find_codex_thread_for_launch(
+                &codex_home.join("sessions"),
+                &record.cwd,
+                launch_time(record),
+                &claimed,
+            ) else {
+                continue;
+            };
+            diri_telemetry::event!(
+                "session.conversation",
+                session = diri_telemetry::id(&id),
+                agent = diri_telemetry::id(record.kind.id()),
+                conv = diri_telemetry::id(&thread),
+                source = "codex_launch",
+            );
+            claimed.insert(thread.clone());
+            record.agent_session_id = Some(thread);
+            record.transcript_path = Some(path.to_string_lossy().into_owned());
+            identified.push(id);
+        }
+        identified
+    }
+
     fn claimed_agent_ids(&self, except: Option<&str>) -> HashSet<String> {
         self.records
             .iter()
@@ -2586,6 +2664,10 @@ fn directory_title(path: &str) -> String {
         Some(name) if !name.is_empty() => name.to_owned(),
         _ => "/".to_owned(),
     }
+}
+
+fn launch_time(record: &SessionRecord) -> SystemTime {
+    UNIX_EPOCH + Duration::from_millis(record.created_at.0.max(0.0) as u64)
 }
 
 fn repair_codex_conversation(record: &mut SessionRecord, home: &Path) -> bool {
@@ -4129,6 +4211,122 @@ mod tests {
                 .as_deref(),
             Some("parent")
         );
+    }
+
+    #[test]
+    fn codex_notify_keeps_its_thread_when_codex_spells_the_cwd_differently() {
+        let temp = tempfile::tempdir().expect("temp");
+        let real = temp.path().join("projects/app");
+        std::fs::create_dir_all(&real).expect("mkdir");
+        let link = temp.path().join("code");
+        std::os::unix::fs::symlink(temp.path().join("projects"), &link).expect("symlink");
+        let sessions = temp.path().join(".codex/sessions/2026/10/07");
+        std::fs::create_dir_all(&sessions).expect("mkdir");
+        let rollout = |id: &str, cwd: &Path| {
+            let path = sessions.join(format!("rollout-now-{id}.jsonl"));
+            std::fs::write(
+                &path,
+                serde_json::json!({
+                    "type": "session_meta", "payload": {"id": id, "cwd": cwd}
+                })
+                .to_string()
+                    + "\n",
+            )
+            .expect("write rollout");
+            path
+        };
+        // Codex records getcwd(): the resolved directory, not the symlink.
+        let resolved = rollout("thread-a", &real.canonicalize().unwrap());
+        let mut registry = Registry::new(engine(), temp.path().join("state.json"));
+        let mut session = record("codex");
+        session.kind = AgentKind::CODEX;
+        session.cwd = link.join("app").to_string_lossy().into_owned();
+        registry.insert_record(session.clone());
+        let notify = |thread: &str| crate::hooks::HookMetadata {
+            agent_session_id: Some(thread.to_owned()),
+            binds_conversation: true,
+            ..crate::hooks::HookMetadata::default()
+        };
+        assert!(registry.apply_hook_metadata_with_home(
+            "codex",
+            &notify("thread-a"),
+            Some(temp.path())
+        ));
+        let bound = registry.record("codex").expect("record");
+        assert_eq!(bound.agent_session_id.as_deref(), Some("thread-a"));
+        assert_eq!(bound.transcript_path.as_deref(), resolved.to_str());
+
+        // An unbound tab trusts its own notify even when the directories
+        // share no spelling at all (the subagent guard still applies).
+        let elsewhere = rollout("thread-b", Path::new("/somewhere/else"));
+        registry.insert_record(session);
+        assert!(registry.apply_hook_metadata_with_home(
+            "codex",
+            &notify("thread-b"),
+            Some(temp.path())
+        ));
+        let bound = registry.record("codex").expect("record");
+        assert_eq!(bound.agent_session_id.as_deref(), Some("thread-b"));
+        assert_eq!(bound.transcript_path.as_deref(), elsewhere.to_str());
+
+        // Once bound, a thread from another directory never re-points it.
+        rollout("thread-c", Path::new("/somewhere/else"));
+        assert_eq!(
+            registry.accept_hook_metadata("codex", &notify("thread-c"), Some(temp.path())),
+            None
+        );
+        assert_eq!(
+            registry
+                .record("codex")
+                .unwrap()
+                .agent_session_id
+                .as_deref(),
+            Some("thread-b")
+        );
+    }
+
+    #[test]
+    fn unbound_codex_tabs_learn_their_thread_from_the_launch_on_load() {
+        let temp = tempfile::tempdir().expect("temp");
+        let launched = SystemTime::now() - Duration::from_secs(60);
+        let mut registry = Registry::new(engine(), temp.path().join("state.json"));
+        let mut session = record("codex");
+        session.kind = AgentKind::CODEX;
+        session.created_at = DateMillis::from(launched);
+        session.status = SessionStatus::Exited(ExitInfo::restart(true));
+        registry.insert_record(session);
+        let mut stale = record("old");
+        stale.kind = AgentKind::CODEX;
+        stale.created_at = DateMillis::from(launched - Duration::from_secs(30 * 24 * 60 * 60));
+        registry.insert_record(stale);
+        registry.persist_now().unwrap();
+
+        let sessions = temp.path().join(".codex/sessions/2026/10/07");
+        std::fs::create_dir_all(&sessions).expect("mkdir");
+        let rollout = sessions.join("rollout-now-thread-l.jsonl");
+        std::fs::write(
+            &rollout,
+            "{\"type\":\"session_meta\",\"payload\":{\"id\":\"thread-l\",\"cwd\":\"/tmp\"}}\n",
+        )
+        .expect("write rollout");
+
+        let mut reloaded = Registry::new(engine(), temp.path().join("state.json"));
+        reloaded.load_with_home(Some(temp.path())).unwrap();
+        let bound = reloaded.record("codex").expect("record");
+        assert_eq!(bound.agent_session_id.as_deref(), Some("thread-l"));
+        assert_eq!(bound.transcript_path.as_deref(), rollout.to_str());
+        // One thread names one tab; the month-old tab is left alone.
+        assert!(reloaded.record("old").unwrap().agent_session_id.is_none());
+        let disk: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(temp.path().join("state.json")).unwrap())
+                .unwrap();
+        let ids: Vec<_> = disk["sessions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|s| s["agentSessionID"].as_str())
+            .collect();
+        assert_eq!(ids, ["thread-l"]);
     }
 
     #[test]

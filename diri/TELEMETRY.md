@@ -167,7 +167,7 @@ recorded by the Engine, not the Holder.
 | `session.agent_relaunched` / `session.agent_relaunch_failed` | info / warn | `session`; failed adds `code` (hashed control error code) | the Engine replaced that tab's login shell with a fresh launch of the agent (resume of a known conversation, otherwise fresh), injection included |
 | `session.modes_left_on_exit` | warn | `session, agent, kind: pty_exit\|returned_to_shell, modes` | mouse tracking or bracketed paste still on after the program that enabled it exited: `^[[<35;14;25M` typed into the shell |
 | `session.conversation` | info | `session, agent, conv, previous, source: hook\|cursor_store\|codex_repair` | conversation ids assigned, discovered or changed |
-| `session.conversation_refused` | info | `session, conv, reason: not_session_start\|held_by_other_session, holder` | a hook named another conversation and was not allowed to re-point the tab (only Claude SessionStart may switch it; never onto a conversation another live tab holds) |
+| `session.conversation_refused` | info | `session, conv, reason: not_session_start\|held_by_other_session\|no_transcript\|subagent, holder` | a hook named another conversation and was not allowed to re-point the tab (only Claude SessionStart may switch it; never onto a conversation another live tab holds; a Codex thread must have a root rollout on disk) |
 | `session.transcript` | debug | `session, path (hash), moved` | the transcript moving (worktree entry) |
 | `session.lost` | info | `session, agent, conv, status` | each session whose holder was gone at Engine start |
 | `session.adopted` | debug | `session, agent, hibernated, from_capsule` | each holder re-adopted at start |
