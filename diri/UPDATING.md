@@ -133,7 +133,8 @@ machine. A Diri schedule runs it every night with `wake_mac` on. Each run:
 1. Picks the newest first-parent commit on `origin/main` with a passing CI
    push run. A red or still-running tip is never shipped; the last green
    commit is built instead.
-2. Does nothing if that commit is already the newest nightly.
+2. Does nothing if that commit is already the newest nightly, or if a stable
+   release already contains it (no commits since the release).
 3. Checks the commit out in `../dirijor-nightly-build`, a persistent worktree
    with its own `target/release-pipeline` cache, and stamps diri-app's
    `Cargo.toml`/`Cargo.lock` with the nightly version for that build only.

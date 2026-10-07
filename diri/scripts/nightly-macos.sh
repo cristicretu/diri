@@ -12,8 +12,9 @@
 #   1. Picks the newest commit on origin/main whose CI push run passed. A red or
 #      still-running tip is skipped in favour of the last green commit, never
 #      shipped.
-#   2. Stops if that commit is already the newest nightly (NIGHTLY_FORCE=1 to
-#      rebuild anyway).
+#   2. Stops if that commit is already the newest nightly, or a stable release
+#      already contains it (nothing has landed since the release, so a nightly
+#      would only repackage it). NIGHTLY_FORCE=1 builds anyway.
 #   3. Checks it out in a dedicated worktree (DIRI_NIGHTLY_WORKTREE, default
 #      ../dirijor-nightly-build next to the main checkout) with its own build
 #      cache, and stamps diri-app as X.Y.Z-nightly.YYYYMMDDHHMM. X.Y.Z is the
@@ -34,7 +35,8 @@
 #   GH_REPO                default cristicretu/diri
 #   DIRI_NIGHTLY_WORKTREE  build worktree (default ../dirijor-nightly-build)
 #   NIGHTLY_COMMIT         build this main commit instead of the newest green one
-#   NIGHTLY_FORCE=1        build even if the commit already has a nightly
+#   NIGHTLY_FORCE=1        build even if the commit already has a nightly or a
+#                          stable release
 #   NIGHTLY_PERF_GATE=1    also run the packaged memory/idle-CPU gate (opens
 #                          windows, so it is off for unattended runs)
 #   KEEP_NIGHTLIES         nightlies kept in the feed and on the release (default 7)
@@ -121,6 +123,14 @@ if [ "${NIGHTLY_STAGE:-}" != build ]; then
         fi
     fi
     log "Nightly source: $COMMIT $(git -C "$MAIN_REPO" log -1 --format=%s "$COMMIT")"
+
+    # Right after a release nothing on main is newer than the stable build.
+    LATEST_TAG="$(git -C "$MAIN_REPO" tag -l "v*" | grep -E "^v[0-9]+\.[0-9]+\.[0-9]+$" | sort -V | tail -1 || true)"
+    if [ -n "$LATEST_TAG" ] && [ "${NIGHTLY_FORCE:-0}" != 1 ] \
+        && git -C "$MAIN_REPO" merge-base --is-ancestor "$COMMIT" "$LATEST_TAG"; then
+        log "Stable $LATEST_TAG already contains $COMMIT; nothing to do (NIGHTLY_FORCE=1 rebuilds)"
+        exit 0
+    fi
 
     PREVIOUS_COMMIT="$(curl -fsSL --connect-timeout 15 --max-time 60 "$FEED_URL" 2>/dev/null \
         | python3 -c 'import json, sys; print(json.load(sys.stdin)["releases"][0].get("commit", ""))' \
