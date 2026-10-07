@@ -1037,11 +1037,13 @@ impl ControlServer {
                     .profiles
                     .iter()
                     .any(|p| p.id == profile.id && p.label != profile.label);
-                let catalog = accounts.upsert(profile.clone())?;
-                drop(accounts);
+                // Under the catalog lock, so naming a new profile after its
+                // email never lands after this rename.
                 if renamed {
                     self.keep_chosen_name(&profile);
                 }
+                let catalog = accounts.upsert(profile)?;
+                drop(accounts);
                 encode(&catalog)
             }
             Method::ACCOUNT_PROFILES_REMOVE => {

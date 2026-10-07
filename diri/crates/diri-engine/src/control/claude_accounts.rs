@@ -694,33 +694,30 @@ impl ControlServer {
                 .stdout(Stdio::piped())
                 .stderr(Stdio::null());
         };
+        let ask = |command: &mut Command| -> Option<Value> {
+            prepare(command);
+            let mut child = command.spawn().ok()?;
+            let deadline = Instant::now() + Duration::from_secs(10);
+            wait_until(&mut child, deadline, Duration::from_millis(50)).ok()??;
+            let mut out = String::new();
+            child.stdout.take()?.read_to_string(&mut out).ok()?;
+            first_json_object(&out)
+        };
         let mut direct = Command::new(&binary);
         direct.args(["auth", "status", "--json"]);
-        prepare(&mut direct);
-        let mut child = match direct.spawn() {
-            Ok(child) => child,
-            // The Engine's PATH may lack the nvm/mise directories `claude`
-            // lives in: ask the login shell, as Agent launches do.
-            Err(_) => {
-                let argv = super::account_switch::sign_in_argv(
-                    std::env::var("SHELL").ok(),
-                    &[binary, "auth".into(), "status".into(), "--json".into()],
-                );
-                let mut shell = Command::new(&argv[0]);
-                shell.args(&argv[1..]);
-                prepare(&mut shell);
-                shell.spawn().ok()?
-            }
-        };
-        let deadline = Instant::now() + Duration::from_secs(10);
-        let status = wait_until(&mut child, deadline, Duration::from_millis(50)).ok()??;
-        if !status.success() {
-            return None;
+        if let Some(answer) = ask(&mut direct) {
+            return Some(answer);
         }
-        let mut out = String::new();
-        child.stdout.take()?.read_to_string(&mut out).ok()?;
-        // A login shell may print its own greeting first.
-        serde_json::from_str(&out[out.find('{')?..]).ok()
+        // The Engine's PATH may lack the nvm/mise directories `claude` (or
+        // the node its script runs on) lives in: ask the login shell, as
+        // Agent launches do.
+        let argv = super::account_switch::sign_in_argv(
+            std::env::var("SHELL").ok(),
+            &[binary, "auth".into(), "status".into(), "--json".into()],
+        );
+        let mut shell = Command::new(&argv[0]);
+        shell.args(&argv[1..]);
+        ask(&mut shell)
     }
 
     /// Ask Claude which account a store holds, merged over the current display
@@ -754,6 +751,18 @@ impl ControlServer {
     }
 }
 
+/// The first JSON object in a command's output: a login shell may print a
+/// greeting before it and other output after it.
+fn first_json_object(out: &str) -> Option<Value> {
+    out.match_indices('{').find_map(|(at, _)| {
+        serde_json::Deserializer::from_str(&out[at..])
+            .into_iter::<Value>()
+            .next()?
+            .ok()
+            .filter(Value::is_object)
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -773,6 +782,23 @@ mod tests {
         // A zombie still answers signal 0; only a reaped pid is gone.
         // SAFETY: existence probe of a pid this test owned.
         assert_eq!(unsafe { libc::kill(pid, 0) }, -1, "the child was reaped");
+    }
+
+    #[test]
+    fn auth_status_is_read_past_shell_noise() {
+        let answer = r#"{"loggedIn":true,"email":"a@example.test"}"#;
+        for out in [
+            answer.to_owned(),
+            format!("Welcome {{user}}\n{answer}\n"),
+            format!("{answer}\nbye\n"),
+        ] {
+            assert_eq!(
+                first_json_object(&out).and_then(|v| v.get("email").cloned()),
+                Some(Value::String("a@example.test".into())),
+                "{out:?}"
+            );
+        }
+        assert_eq!(first_json_object("no json here"), None);
     }
 
     #[test]

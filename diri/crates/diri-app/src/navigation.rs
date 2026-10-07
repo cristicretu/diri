@@ -460,8 +460,22 @@ impl NavigationOverlay {
     }
 
     /// The saved accounts and their limits, as the account menu last read them.
-    pub(crate) fn set_account_limits(&mut self, limits: Vec<crate::usage::limits::AccountLimits>) {
+    /// An open palette shows the switches that arrive after it opened.
+    pub(crate) fn set_account_limits(
+        &mut self,
+        limits: Vec<crate::usage::limits::AccountLimits>,
+        cx: &mut Context<Self>,
+    ) {
+        if self.account_limits == limits {
+            return;
+        }
         self.account_limits = limits;
+        if self.overlay == Some(Overlay::CommandPalette) {
+            let highlighted = self.highlighted_command();
+            self.refresh_command_items();
+            self.restore_highlight(highlighted.as_ref());
+            cx.notify();
+        }
     }
 
     pub(crate) fn toggle_quick_open(
@@ -2727,7 +2741,7 @@ mod tests {
                     }
                     // DIRI_VISUAL_ACCOUNTS: the saved accounts the menu reported.
                     if std::env::var_os("DIRI_VISUAL_ACCOUNTS").is_some() {
-                        overlay.set_account_limits(crate::usage::limits::preview());
+                        overlay.account_limits = crate::usage::limits::preview();
                     }
                     overlay.refresh_command_items();
                     match std::env::var("DIRI_VISUAL_PAGE").as_deref() {

@@ -17,9 +17,10 @@ use diri_proto::{
     AgentAccountAgent, AgentAccountCatalog, AgentAccountIdentity, AgentAccountLogin,
     AgentAccountOverview, AgentAccountProfile, AgentKind, AgentLiveLogin,
 };
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::sync::LazyLock;
+use std::time::{Duration, Instant};
 
 /// Marks a profile `account.add` created: it is named after the login's
 /// email once one lands in its slot.
@@ -31,7 +32,10 @@ const NAME_LIMIT: usize = 40;
 
 /// Claude slots whose identity was already asked for this Engine run, so a
 /// login Claude will not describe is not asked about on every menu open.
-static ASKED: LazyLock<Mutex<HashSet<String>>> = LazyLock::new(Default::default);
+static ASKED: LazyLock<Mutex<HashMap<String, Instant>>> = LazyLock::new(Default::default);
+/// A store whose question failed (Keychain locked, Claude slow) is asked
+/// again after this long, not never.
+const ASK_AGAIN_AFTER: Duration = Duration::from_secs(5 * 60);
 
 /// A login's identity and the key that tells its account apart.
 #[derive(Clone, Debug, Default, PartialEq)]
@@ -470,11 +474,19 @@ impl ControlServer {
         (login, known)
     }
 
-    /// Ask Claude who a store's login belongs to (once per Engine run and
-    /// sign-in), and keep the answer beside the store for next time.
+    /// Ask Claude who a store's login belongs to (once per sign-in, or again
+    /// after a while when it could not answer), and keep the answer beside
+    /// the store for next time.
     fn learn_claude_identity(&self, store: &str) -> Option<Known> {
-        if !ASKED.lock().ok()?.insert(store.to_owned()) {
-            return None;
+        {
+            let mut asked = ASKED.lock().ok()?;
+            if asked
+                .get(store)
+                .is_some_and(|at| at.elapsed() < ASK_AGAIN_AFTER)
+            {
+                return None;
+            }
+            asked.insert(store.to_owned(), Instant::now());
         }
         let reported = self.claude_auth_status(store)?;
         if reported.get("loggedIn") != Some(&Value::Bool(true)) {
@@ -555,9 +567,18 @@ impl ControlServer {
         let Ok(_shared) = self.account_operations.try_read() else {
             return false;
         };
+        // Decide against the catalog as it is now, under its lock: the user
+        // may have renamed or removed the profile while Claude was asked.
+        // A rename clears the marker before releasing this lock.
+        let Ok(accounts) = self.accounts.lock() else {
+            return false;
+        };
+        let Ok(mut current) = accounts.catalog() else {
+            return false;
+        };
         let mut renamed = false;
         for (id, known) in knowns {
-            let Some(profile) = catalog.profiles.iter().find(|p| &p.id == id).cloned() else {
+            let Some(profile) = current.profiles.iter().find(|p| &p.id == id).cloned() else {
                 continue;
             };
             let Some(marker) = self
@@ -571,18 +592,16 @@ impl ControlServer {
                 continue;
             };
             let mut named = profile.clone();
-            named.label = unique_label(catalog, &profile.agent, &name, Some(&profile.id));
-            let Ok(updated) = self
-                .accounts
-                .lock()
-                .map_err(poisoned)
-                .and_then(|a| a.upsert(named))
-            else {
+            named.label = unique_label(&current, &profile.agent, &name, Some(&profile.id));
+            let Ok(updated) = accounts.upsert(named) else {
                 continue;
             };
-            *catalog = updated;
+            current = updated;
             let _ = fs::remove_file(marker);
             renamed = true;
+        }
+        if renamed {
+            *catalog = current;
         }
         renamed
     }
@@ -1033,6 +1052,45 @@ mod tests {
             "fields Diri does not know are kept"
         );
         assert_eq!(account["organizationName"], "One");
+    }
+
+    #[test]
+    fn naming_after_the_email_never_brings_back_a_removed_profile() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (server, homes) = sandbox(tmp.path());
+        server
+            .agent_catalog
+            .lock()
+            .unwrap()
+            .configure(
+                None,
+                "codex",
+                crate::agent_catalog::AgentPreference {
+                    executable_path: Some("/usr/bin/true".into()),
+                    show_in_quick_create: Some(true),
+                },
+            )
+            .unwrap();
+        let record: diri_proto::SessionRecord =
+            serde_json::from_value(server.add_account_at("codex", &homes).unwrap()).unwrap();
+        let _ = server.session_kill(Some(json!({"sessionID": record.id})));
+        // The overview read the catalog, then the profile was removed while
+        // it was still asking who the login belongs to.
+        let mut stale = server.accounts.lock().unwrap().catalog().unwrap();
+        let id = stale.profiles[0].id.clone();
+        server
+            .dispatch(Method::ACCOUNT_PROFILES_REMOVE, Some(json!({"id": id})))
+            .unwrap();
+        let known = Known {
+            key: None,
+            identity: AgentAccountIdentity {
+                email: Some("side@corp.test".into()),
+                ..Default::default()
+            },
+        };
+        assert!(!server.name_pending_profiles(&mut stale, &[(id.clone(), known)]));
+        let catalog = server.accounts.lock().unwrap().catalog().unwrap();
+        assert!(catalog.profiles.iter().all(|p| p.id != id), "stays removed");
     }
 
     #[test]

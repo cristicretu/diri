@@ -1175,8 +1175,8 @@ impl RootView {
                         let _ = this.update(cx, |this, cx| {
                             if let Some(navigation) = &this.navigation {
                                 let limits = snapshot.limits.clone();
-                                navigation.update(cx, |navigation, _| {
-                                    navigation.set_account_limits(limits)
+                                navigation.update(cx, |navigation, cx| {
+                                    navigation.set_account_limits(limits, cx)
                                 });
                             }
                             if let Some(surfaces) = &this.utility_surfaces {

@@ -380,10 +380,10 @@ pub fn account_actions(
     limits: &[crate::usage::limits::AccountLimits],
     now: i64,
 ) -> Vec<PaletteAction> {
-    // Only known use counts: an account never asked makes no claim.
-    let used = |account: &crate::usage::limits::AccountLimits| {
-        account.binding(now).map(|window| window.used_percent)
-    };
+    use crate::usage::limits::{ROOM_MARGIN, roomiest};
+    // The same rule Settings › Accounts marks "Most room" by.
+    let suggested = [AgentKind::CLAUDE_CODE_ID, AgentKind::CODEX_ID]
+        .map(|agent| roomiest(limits, agent, ROOM_MARGIN, now, |_| true));
     let candidates: Vec<_> = limits
         .iter()
         .filter(|account| account.profile_id.is_some() && !account.live)
@@ -397,17 +397,7 @@ pub fn account_actions(
             } else {
                 "Claude Code"
             };
-            let live = limits
-                .iter()
-                .find(|other| other.live && other.provider == account.provider)
-                .map(used);
-            let best = candidates
-                .iter()
-                .filter(|other| other.provider == account.provider)
-                .filter_map(|other| used(other))
-                .fold(f64::INFINITY, f64::min);
-            let roomiest = used(account)
-                .is_some_and(|own| own <= best && live.flatten().is_some_and(|live| own < live));
+            let roomiest = account.profile_id.is_some() && suggested.contains(&account.profile_id);
             PaletteAction {
                 id: format!(
                     "switch-account-{}",

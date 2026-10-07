@@ -81,10 +81,6 @@ fn until(seconds: i64) -> String {
     }
 }
 
-/// How much more room (percentage points) another account must have before
-/// it is pointed out.
-const ROOM_MARGIN: f64 = 20.0;
-
 fn provider(agent: &str) -> &'static str {
     if agent == AgentKind::CODEX_ID {
         "Codex"
@@ -1520,7 +1516,13 @@ impl UtilitySurfaces {
         let colors = self.settings_colors();
         let overview = &self.accounts.overview;
         let limits = &self.usage.limits;
-        let suggested = crate::usage::limits::most_room(overview, limits, agent, ROOM_MARGIN, now);
+        let suggested = crate::usage::limits::most_room(
+            overview,
+            limits,
+            agent,
+            crate::usage::limits::ROOM_MARGIN,
+            now,
+        );
         let mut rows = div().flex().flex_col();
         let mut first = true;
         let mut divided = |rows: Div, row: AnyElement| {
@@ -1750,8 +1752,20 @@ impl UtilitySurfaces {
             Some(usage) if !usage.windows.is_empty() => {
                 Some(plan_windows(usage, live, now, colors))
             }
+            // Asked, and the provider or the network said why not.
+            Some(AccountLimits {
+                error: Some(error), ..
+            }) => Some(
+                div()
+                    .text_size(px(Typo::META.size))
+                    .text_color(colors.tertiary)
+                    .child(*error)
+                    .into_any_element(),
+            ),
+            // Not read yet: the first answer is on its way.
+            None => None,
             // Its token expired before Diri asked: say when numbers come.
-            _ => Some(
+            Some(_) => Some(
                 div()
                     .text_size(px(Typo::META.size))
                     .text_color(colors.tertiary)

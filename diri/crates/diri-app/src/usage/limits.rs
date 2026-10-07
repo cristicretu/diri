@@ -41,7 +41,13 @@ pub struct AccountLimits {
     /// When the provider reported `windows`: an idle account's are remembered.
     pub checked_at: i64,
     pub error: Option<&'static str>,
+    /// Its sign-in tab is still open: never pointed out as the one to use.
+    pub signing_in: bool,
 }
+
+/// How many percentage points more room another account needs before it is
+/// pointed out: a slightly emptier one is not worth a switch.
+pub(crate) const ROOM_MARGIN: f64 = 20.0;
 
 /// The provider rejected a login whose token had not expired: it was revoked.
 pub(crate) const SIGN_IN_AGAIN: &str = "Sign in again to refresh limits";
@@ -95,30 +101,45 @@ pub(crate) fn most_room(
     margin: f64,
     now: i64,
 ) -> Option<String> {
+    roomiest(limits, agent, margin, now, |limits| {
+        limits.profile_id.as_deref().is_some_and(|id| {
+            overview
+                .catalog
+                .profiles
+                .iter()
+                .any(|p| p.id == id && p.host.is_none() && !overview.is_live(p))
+                && overview
+                    .login(id)
+                    .is_some_and(|l| l.signed_in && !l.signing_in)
+        })
+    })
+}
+
+/// [`most_room`] from the limits alone, for views without the overview
+/// (the command palette). `eligible` narrows the saved accounts that compete.
+pub(crate) fn roomiest(
+    limits: &[AccountLimits],
+    agent: &str,
+    margin: f64,
+    now: i64,
+    eligible: impl Fn(&AccountLimits) -> bool,
+) -> Option<String> {
     let provider = provider_of(agent);
-    let of = |id: &str| limits.iter().find(|l| l.profile_id.as_deref() == Some(id));
     let live = limits
         .iter()
         .find(|l| l.live && l.provider == provider)
         .and_then(|l| l.binding(now))
         .map(|w| w.used_percent);
-    let (best, used) = overview
-        .catalog
-        .profiles
+    let (best, used) = limits
         .iter()
-        .filter(|p| p.agent == agent && p.host.is_none() && !overview.is_live(p))
-        .filter(|p| {
-            overview
-                .login(&p.id)
-                .is_some_and(|l| l.signed_in && !l.signing_in)
-        })
-        .filter_map(|p| {
-            let limits = of(&p.id).filter(|l| !l.needs_sign_in())?;
-            Some((p, limits.binding(now)?.used_percent))
-        })
+        .filter(|l| l.provider == provider && l.profile_id.is_some() && !l.live)
+        .filter(|l| !l.signing_in && !l.needs_sign_in() && eligible(l))
+        .filter_map(|l| Some((l, l.binding(now)?.used_percent)))
         .min_by(|a, b| a.1.total_cmp(&b.1))?;
     let room_now = 100.0 - live.unwrap_or(100.0);
-    (100.0 - used >= room_now + margin).then(|| best.id.clone())
+    (100.0 - used >= room_now + margin)
+        .then(|| best.profile_id.clone())
+        .flatten()
 }
 
 enum Credential {
@@ -140,6 +161,7 @@ struct AccountSource {
     memory_key: String,
     profile_id: Option<String>,
     live: bool,
+    signing_in: bool,
     credential: Credential,
 }
 
@@ -195,6 +217,10 @@ fn sources(home: &Path, overview: &AgentAccountOverview) -> Vec<AccountSource> {
             Credential::Codex {
                 file: PathBuf::from(file),
             }
+        } else if overview.is_live(profile) && !profile.is_default {
+            // Saved from Claude's default store before any switch: the tabs
+            // keep refreshing that store, so the profile's copy goes stale.
+            default_claude_credential(home)
         } else {
             let Some(store) = &profile.login_store else {
                 continue;
@@ -211,6 +237,7 @@ fn sources(home: &Path, overview: &AgentAccountOverview) -> Vec<AccountSource> {
             ),
             profile_id: Some(profile.id.clone()),
             live: overview.is_live(profile),
+            signing_in: login.signing_in,
             credential,
         });
     }
@@ -218,16 +245,7 @@ fn sources(home: &Path, overview: &AgentAccountOverview) -> Vec<AccountSource> {
     // profile finds it, mirroring the provider's own overrides.
     for live in overview.live.iter().filter(|l| l.profile_id.is_none()) {
         let credential = match live.agent.as_str() {
-            AgentKind::CLAUDE_CODE_ID => {
-                let store = match std::env::var_os("CLAUDE_SECURESTORAGE_CONFIG_DIR") {
-                    // Set but empty pins the default store.
-                    Some(value) => (!value.is_empty()).then(|| PathBuf::from(value)),
-                    None => std::env::var_os("CLAUDE_CONFIG_DIR")
-                        .filter(|p| !p.is_empty())
-                        .map(PathBuf::from),
-                };
-                claude_credential(store, home)
-            }
+            AgentKind::CLAUDE_CODE_ID => default_claude_credential(home),
             AgentKind::CODEX_ID => Credential::Codex {
                 file: std::env::var_os("CODEX_HOME")
                     .filter(|p| !p.is_empty())
@@ -250,10 +268,24 @@ fn sources(home: &Path, overview: &AgentAccountOverview) -> Vec<AccountSource> {
             ),
             profile_id: None,
             live: true,
+            signing_in: false,
             credential,
         });
     }
     out
+}
+
+/// Where a Claude launch without a profile finds its login, mirroring
+/// Claude's own overrides.
+fn default_claude_credential(home: &Path) -> Credential {
+    let store = match std::env::var_os("CLAUDE_SECURESTORAGE_CONFIG_DIR") {
+        // Set but empty pins the default store.
+        Some(value) => (!value.is_empty()).then(|| PathBuf::from(value)),
+        None => std::env::var_os("CLAUDE_CONFIG_DIR")
+            .filter(|p| !p.is_empty())
+            .map(PathBuf::from),
+    };
+    claude_credential(store, home)
 }
 
 /// The last answer each account gave, so an idle account (whose token
@@ -337,8 +369,11 @@ pub(crate) async fn refresh(
         });
     }
     let mut answered = Vec::new();
-    while let Some(Ok(result)) = tasks.join_next().await {
-        answered.push(result);
+    // One account's failed task must not end the others.
+    while let Some(joined) = tasks.join_next().await {
+        if let Ok(result) = joined {
+            answered.push(result);
+        }
     }
     answered.sort_by_key(|(index, ..)| *index);
     let result = answered
@@ -375,6 +410,7 @@ pub(crate) async fn refresh(
                 windows,
                 checked_at,
                 error,
+                signing_in: source.signing_in,
             }
         })
         .collect();
@@ -837,6 +873,7 @@ pub(crate) fn preview() -> Vec<AccountLimits> {
                     .collect(),
                 checked_at: now,
                 error: None,
+                signing_in: false,
             }
         };
     vec![
@@ -931,6 +968,7 @@ mod tests {
             }],
             checked_at: 0,
             error: None,
+            signing_in: false,
         }
     }
 
@@ -991,6 +1029,43 @@ mod tests {
             Credential::Codex { file } if file == Path::new("/state/codex-logins/main/auth.json")));
         assert!(found[2].live && found[2].profile_id.is_none());
         assert_ne!(found[0].memory_key, found[2].memory_key);
+    }
+
+    #[test]
+    fn a_claude_login_saved_from_the_default_store_is_read_where_tabs_refresh_it() {
+        // Saved before any switch: in use through Claude's default store,
+        // which the tabs keep rotating, while the profile holds a copy.
+        let overview = AgentAccountOverview {
+            catalog: AgentAccountCatalog {
+                profiles: vec![profile(
+                    "personal",
+                    "claude-code",
+                    None,
+                    Some("/state/claude-logins/personal"),
+                )],
+            },
+            logins: vec![login("personal", None)],
+            live: vec![AgentLiveLogin {
+                agent: "claude-code".into(),
+                profile_id: Some("personal".into()),
+                identity: AgentAccountIdentity::default(),
+            }],
+        };
+        let home = Path::new("/home/me");
+        let found = sources(home, &overview);
+        let directory = |credential: &Credential| match credential {
+            Credential::Claude { directory, .. } => directory.clone(),
+            Credential::Codex { .. } => panic!("a Claude login"),
+        };
+        assert!(found[0].live);
+        assert_eq!(
+            directory(&found[0].credential),
+            directory(&default_claude_credential(home))
+        );
+        assert_ne!(
+            directory(&found[0].credential),
+            Path::new("/state/claude-logins/personal")
+        );
     }
 
     #[test]

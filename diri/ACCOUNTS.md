@@ -67,7 +67,8 @@ previous login and is reported; it switches when restarted.
 - **Claude Code** keeps one `~/.claude`. Claude derives its credential store
   from `CLAUDE_SECURESTORAGE_CONFIG_DIR` (a macOS Keychain item named after the
   path, `.credentials.json` elsewhere), so each profile owns a private store
-  directory and Diri never copies tokens on a switch. Open tabs relaunch with
+  directory and a switch between profiles copies no tokens (the one exception,
+  leaving Claude's default store, is below). Open tabs relaunch with
   `claude --resume <conversation>`; a tab that has not saved a transcript yet
   relaunches fresh with the same conversation id. The account identity that
   `/status` displays is kept per profile and swapped alongside the login; a
