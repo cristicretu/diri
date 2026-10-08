@@ -263,6 +263,10 @@ pub struct StatusReducer {
     /// its records or ends, that outranks everything inferred from the screen
     /// or the shell's job; hooks, input and exit still apply.
     program_active: bool,
+    /// The choices the screen last showed for a blocker while a program
+    /// reports, which its `OSC 7501` record does not carry. See
+    /// [`Self::note_screen_while_program_reports`].
+    program_screen_choices: Option<(NeedsInputKind, Vec<String>)>,
 }
 
 impl StatusReducer {
@@ -278,6 +282,7 @@ impl StatusReducer {
             evidence: None,
             lent_from: None,
             program_active: false,
+            program_screen_choices: None,
         }
     }
 
@@ -531,19 +536,56 @@ impl StatusReducer {
             self.apply_program_status(report, now, &mut outcome);
             return outcome;
         }
-        if self.program_active
-            && matches!(
-                signal,
-                StatusSignal::Screen(_)
-                    | StatusSignal::ForegroundJob { .. }
-                    | StatusSignal::TerminalLine(_)
-                    | StatusSignal::Tick
-            )
-        {
+        if self.program_active {
             // Inference, and the staleness that doubts it, wait while the
             // program says what it is doing. A long quiet build is working.
-            self.state.last_signal_at = now;
-            return outcome;
+            //
+            // So do an agent's own hooks and notify events where they would
+            // only move it between working and idle: a CLI that reports
+            // program status and still runs hooks would otherwise race the
+            // two, and the report is the one the program keeps current. A
+            // hook that raises a blocker still applies, for it names the
+            // tool and command a report's message may not, and a report that
+            // follows keeps that detail.
+            match &signal {
+                StatusSignal::Screen(observation) => {
+                    self.note_screen_while_program_reports(observation, &mut outcome);
+                    self.state.last_signal_at = now;
+                    return outcome;
+                }
+                StatusSignal::ForegroundJob { .. }
+                | StatusSignal::TerminalLine(_)
+                | StatusSignal::Tick
+                | StatusSignal::CodexTurnComplete
+                | StatusSignal::CursorTranscriptWorking
+                | StatusSignal::CursorTranscriptIdle => {
+                    self.state.last_signal_at = now;
+                    return outcome;
+                }
+                StatusSignal::ClaudeHook {
+                    hook,
+                    is_subagent,
+                    pending_work,
+                } if *is_subagent || !raises_blocker(hook) => {
+                    self.state.last_signal_at = now;
+                    match hook {
+                        ClaudeHook::SubagentStart(id) => {
+                            self.state.active_subagents.insert(id.clone());
+                        }
+                        ClaudeHook::SubagentStop(id) => {
+                            self.state.active_subagents.remove(id);
+                        }
+                        _ if !is_subagent => {
+                            if let Some(pending) = pending_work {
+                                self.state.claude_pending_work = *pending;
+                            }
+                        }
+                        _ => {}
+                    }
+                    return outcome;
+                }
+                _ => {}
+            }
         }
 
         // processOnly: starting → working on first output, then only exit
@@ -815,6 +857,9 @@ impl StatusReducer {
         outcome: &mut ReducerOutcome,
     ) {
         let was_active = std::mem::replace(&mut self.program_active, report.is_some());
+        if report.is_none() {
+            self.program_screen_choices = None;
+        }
         self.state.last_signal_at = now;
         match report {
             Some(record) if record.state == ProgramState::Blocked => {
@@ -824,7 +869,28 @@ impl StatusReducer {
                         NeedsInputKind::Question
                     }
                 };
-                let detail = program_detail(&record, kind, now);
+                let hook_detail = self
+                    .state
+                    .pending_needs_input
+                    .as_ref()
+                    .filter(|pending| {
+                        self.status == SessionStatus::NeedsInput(kind)
+                            && pending.kind == kind
+                            && matches!(
+                                pending.source,
+                                NeedsInputSource::ClaudePermissionHook
+                                    | NeedsInputSource::ClaudeNotificationHook
+                                    | NeedsInputSource::CodexNotify
+                            )
+                    })
+                    .cloned();
+                let mut detail = hook_detail.unwrap_or_else(|| program_detail(&record, kind, now));
+                if detail.options.is_none()
+                    && let Some((shown, options)) = &self.program_screen_choices
+                    && *shown == kind
+                {
+                    detail.options = Some(options.clone());
+                }
                 self.cancel_idle_candidacy();
                 self.state.hold_idle_against_screen = false;
                 self.state.turn_in_flight = true;
@@ -834,9 +900,10 @@ impl StatusReducer {
                         .pending_needs_input
                         .as_ref()
                         .is_some_and(|pending| {
-                            pending.source == NeedsInputSource::ProgramStatus
+                            pending.source == detail.source
                                 && pending.summary == detail.summary
                                 && pending.prompt_excerpt == detail.prompt_excerpt
+                                && pending.options == detail.options
                         });
                 if !unchanged {
                     self.state.pending_needs_input = Some(detail.clone());
@@ -890,6 +957,30 @@ impl StatusReducer {
             now,
             outcome,
         );
+    }
+
+    /// While a program reports, the screen only lends a blocker its
+    /// choices: the record says the program is waiting, the screen what it
+    /// offers. Remembered when they render before the report arrives.
+    fn note_screen_while_program_reports(
+        &mut self,
+        observation: &ScreenObservation,
+        outcome: &mut ReducerOutcome,
+    ) {
+        self.program_screen_choices = needs_input_kind(observation.state)
+            .zip(observation.options.clone())
+            .filter(|(_, options)| !options.is_empty());
+        let (SessionStatus::NeedsInput(kind), Some(pending), Some((shown, options))) = (
+            &self.status,
+            self.state.pending_needs_input.as_mut(),
+            &self.program_screen_choices,
+        ) else {
+            return;
+        };
+        if kind == shown && pending.kind == *kind && pending.options.is_none() {
+            pending.options = Some(options.clone());
+            outcome.needs_input = Some(pending.clone());
+        }
     }
 
     fn tracks_shell_jobs(&self) -> bool {
@@ -1466,6 +1557,20 @@ pub fn foreground_job_running(child_pid: i32, foreground_pgid: Option<i32>) -> O
     }
     let pgid = foreground_pgid.filter(|pgid| *pgid > 0)?;
     Some(pgid != child_pid)
+}
+
+/// A hook that says the agent is waiting on the user.
+fn raises_blocker(hook: &ClaudeHook) -> bool {
+    match hook {
+        ClaudeHook::PermissionRequest { .. } => true,
+        ClaudeHook::Notification {
+            notification_type, ..
+        } => matches!(
+            notification_type.as_deref(),
+            Some("permission_prompt" | "agent_needs_input" | "elicitation_dialog")
+        ),
+        _ => false,
+    }
 }
 
 fn needs_input_kind(state: ManifestState) -> Option<NeedsInputKind> {

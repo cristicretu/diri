@@ -67,6 +67,11 @@ impl NotificationParser {
                     }
                 }
                 1 => {
+                    if byte == b'c' {
+                        // RIS ends every program-status record; a soft reset
+                        // (DECSTR) and screen switches keep them.
+                        self.program.end_program();
+                    }
                     self.state = match byte {
                         b']' => 2,
                         b'P' | b'_' | b'^' | b'X' => 4,
@@ -381,6 +386,15 @@ mod tests {
         screen.feed(b"plain output");
         assert_eq!(screen.program_status_generation(), generation);
         assert!(screen.end_program_status());
+        assert_eq!(screen.program_status(), None);
+    }
+
+    #[test]
+    fn a_full_reset_clears_program_status() {
+        let mut screen = crate::HeadlessScreen::new(80, 24).with_notifications();
+        screen.feed(b"\x1b]7501;state=working\x07\x1b[!p\x1b[?1049h");
+        assert!(screen.program_status().is_some(), "DECSTR and 1049 keep it");
+        screen.feed(b"\x1bc");
         assert_eq!(screen.program_status(), None);
     }
 

@@ -1471,3 +1471,124 @@ fn a_program_error_is_a_result_that_ends_the_turn() {
     assert_eq!(outcome.status_change, Some(SessionStatus::Working));
     assert!(!outcome.turn_completed);
 }
+
+/// Claude Code and Codex are adding `OSC 7501` while keeping their hooks and
+/// notify events. Two sources racing would flip a tab between working and
+/// idle; the program's report is the one it keeps current, so it decides.
+#[test]
+fn hooks_do_not_race_a_program_that_reports_its_status() {
+    let mut reducer =
+        StatusReducer::new(Authority::HooksPrimary, t0()).with_manifest("claude-code", Some("4"));
+    let now = settled(&mut reducer, t0());
+    reducer.reduce(program(ProgramState::Working), now);
+
+    // A Stop for the foreground response while background work still runs.
+    let outcome = reducer.reduce(hook(ClaudeHook::Stop), now + Duration::from_millis(10));
+    assert_eq!(outcome.status_change, None);
+    assert!(!outcome.turn_completed);
+    reducer.reduce(StatusSignal::Tick, now + Duration::from_secs(5));
+    assert_eq!(*reducer.status(), SessionStatus::Working);
+
+    let outcome = reducer.reduce(program(ProgramState::Done), now + Duration::from_secs(6));
+    assert_eq!(outcome.status_change, Some(SessionStatus::Idle));
+    assert!(outcome.turn_completed);
+
+    // A late tool hook from the finished turn does not reopen it.
+    let outcome = reducer.reduce(hook(ClaudeHook::PostToolUse), now + Duration::from_secs(7));
+    assert_eq!(outcome.status_change, None);
+    let outcome = reducer.reduce(
+        StatusSignal::CodexTurnComplete,
+        now + Duration::from_secs(7),
+    );
+    assert_eq!(outcome.status_change, None);
+    assert_eq!(*reducer.status(), SessionStatus::Idle);
+}
+
+/// A permission hook names the tool and command; a report that follows says
+/// only that the program is blocked. The richer detail stays.
+#[test]
+fn a_blocking_hook_keeps_its_detail_under_the_programs_report() {
+    let mut reducer =
+        StatusReducer::new(Authority::HooksPrimary, t0()).with_manifest("claude-code", Some("4"));
+    let now = settled(&mut reducer, t0());
+    reducer.reduce(program(ProgramState::Working), now);
+
+    let outcome = reducer.reduce(
+        hook(ClaudeHook::PermissionRequest {
+            tool_name: Some("Bash".into()),
+            input_summary: Some("rm -rf build".into()),
+        }),
+        now + Duration::from_millis(5),
+    );
+    assert_eq!(
+        outcome.status_change,
+        Some(SessionStatus::NeedsInput(NeedsInputKind::Permission))
+    );
+
+    let blocked = StatusSignal::ProgramStatus(Some(ProgramRecord {
+        state: ProgramState::Blocked,
+        kind: Some(BlockedKind::Permission),
+        progress: None,
+        app: Some("claude-code".into()),
+        title: None,
+        msg: Some("Allow Bash?".into()),
+    }));
+    let outcome = reducer.reduce(blocked, now + Duration::from_millis(10));
+    assert_eq!(outcome.status_change, None);
+    assert_eq!(outcome.needs_input, None, "not a second request");
+
+    // Approved: the program says it is working again.
+    let outcome = reducer.reduce(program(ProgramState::Working), now + Duration::from_secs(1));
+    assert_eq!(outcome.status_change, Some(SessionStatus::Working));
+}
+
+/// A report says the program waits; the screen says what it offers. The
+/// choices reach the request whichever arrives first.
+#[test]
+fn a_blocked_report_borrows_the_choices_on_screen() {
+    let choices = vec!["Yes".to_owned(), "No".to_owned()];
+    let blocked = || {
+        StatusSignal::ProgramStatus(Some(ProgramRecord {
+            state: ProgramState::Blocked,
+            kind: Some(BlockedKind::Permission),
+            progress: None,
+            app: None,
+            title: None,
+            msg: Some("Run the migration?".into()),
+        }))
+    };
+    let dialog = |seq| {
+        let mut shown = observation(ManifestState::BlockedPermission, seq);
+        shown.options = Some(vec!["Yes".to_owned(), "No".to_owned()]);
+        StatusSignal::Screen(shown)
+    };
+
+    // The dialog renders first.
+    let mut reducer =
+        StatusReducer::new(Authority::ScreenPrimary, t0()).with_manifest("codex", Some("1"));
+    let now = settled(&mut reducer, t0());
+    reducer.reduce(program(ProgramState::Working), now);
+    assert_eq!(reducer.reduce(dialog(1), now).status_change, None);
+    let outcome = reducer.reduce(blocked(), now);
+    let detail = outcome.needs_input.expect("a request");
+    assert_eq!(detail.summary, "Run the migration?");
+    assert_eq!(detail.options.as_ref(), Some(&choices));
+
+    // The report arrives first.
+    let mut reducer =
+        StatusReducer::new(Authority::ScreenPrimary, t0()).with_manifest("codex", Some("1"));
+    let now = settled(&mut reducer, t0());
+    reducer.reduce(program(ProgramState::Working), now);
+    assert_eq!(
+        reducer.reduce(blocked(), now).needs_input.unwrap().options,
+        None
+    );
+    let outcome = reducer.reduce(dialog(2), now);
+    assert_eq!(outcome.status_change, None);
+    assert_eq!(
+        outcome.needs_input.unwrap().options.as_ref(),
+        Some(&choices)
+    );
+    // Once only.
+    assert_eq!(reducer.reduce(dialog(3), now).needs_input, None);
+}

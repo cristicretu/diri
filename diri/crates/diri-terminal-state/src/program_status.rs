@@ -14,12 +14,13 @@ pub(crate) const PREFIX: &str = "7501;";
 /// What a program sends to ask whether the terminal speaks the protocol, and
 /// what a terminal that does sends back.
 pub(crate) const QUERY: &str = "?";
-pub(crate) const QUERY_REPLY: &[u8] = b"\x1b]7501;?\x1b\\";
+pub const QUERY_REPLY: &[u8] = b"\x1b]7501;?\x1b\\";
 
 /// The whole sequence, introducer and terminator included.
 const SEQUENCE_LIMIT: usize = 4096;
 /// `ESC ]` plus the longer terminator, `ESC \`.
 const FRAMING: usize = 4;
+const KEY_LIMIT: usize = 16;
 const RECORD_LIMIT: usize = 256;
 const ID_LIMIT: usize = 128;
 const ID_SEGMENT_LIMIT: usize = 32;
@@ -143,11 +144,22 @@ impl ProgramStatusTable {
     /// The record that best describes the whole program: one waiting on the
     /// user first, then one at work, then a failure, a result, an idle
     /// program. Ties go to the most recently reported.
+    /// A record without `app` takes its nearest ancestor's.
     pub fn summary(&self) -> Option<ProgramRecord> {
-        self.records
-            .values()
-            .max_by_key(|(record, updated)| (record.state, *updated))
-            .map(|(record, _)| record.clone())
+        let (id, (record, _)) = self
+            .records
+            .iter()
+            .max_by_key(|(_, (record, updated))| (record.state, *updated))?;
+        let mut record = record.clone();
+        let mut ancestor = id.as_str();
+        while record.app.is_none() && !ancestor.is_empty() {
+            ancestor = ancestor.rsplit_once('/').map_or("", |(parent, _)| parent);
+            record.app = self
+                .records
+                .get(ancestor)
+                .and_then(|(parent, _)| parent.app.clone());
+        }
+        Some(record)
     }
 }
 
@@ -167,13 +179,13 @@ struct Report {
 }
 
 impl Report {
+    /// Lenient where the specification is: a malformed pair is skipped, an
+    /// unknown key ignored, a repeated key keeps its last value, and an
+    /// invalid `progress`, `kind` or `app` reads as absent. Strict where it
+    /// is: a missing or unknown state, a bad id, text that fails to decode
+    /// or carries a control character, or a broken limit drops the report.
     fn parse(report: &str) -> Option<Self> {
-        if report.len() + PREFIX.len() + FRAMING > SEQUENCE_LIMIT
-            || report.is_empty()
-            || !report
-                .bytes()
-                .all(|byte| byte.is_ascii_alphanumeric() || b"_.,+/=-:".contains(&byte))
-        {
+        if report.len() + PREFIX.len() + FRAMING > SEQUENCE_LIMIT {
             return None;
         }
         let mut state = None;
@@ -184,21 +196,37 @@ impl Report {
         let mut title = None;
         let mut msg = None;
         for pair in report.split(':') {
-            let (key, value) = pair.split_once('=')?;
-            let slot_taken = match key {
-                "state" => state.replace(value).is_some(),
-                "id" => id.replace(value).is_some(),
-                "kind" => kind.replace(value).is_some(),
-                "progress" => progress.replace(value).is_some(),
-                "app" => app.replace(value).is_some(),
-                "title" => title.replace(value).is_some(),
-                "msg" => msg.replace(value).is_some(),
-                // A newer revision's key: the rest of the report still holds.
-                _ => false,
+            let Some((key, value)) = pair.split_once('=') else {
+                continue;
             };
-            if slot_taken {
-                return None;
+            if !(1..=KEY_LIMIT).contains(&key.len())
+                || !key.bytes().all(|byte| byte.is_ascii_lowercase())
+            {
+                continue;
             }
+            if !value
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || b"_.,+/=-".contains(&byte))
+            {
+                // Text that is not base64 is invalid, not merely malformed:
+                // none of the report is shown.
+                if matches!(key, "msg" | "title") {
+                    return None;
+                }
+                continue;
+            }
+            let slot = match key {
+                "state" => &mut state,
+                "id" => &mut id,
+                "kind" => &mut kind,
+                "progress" => &mut progress,
+                "app" => &mut app,
+                "title" => &mut title,
+                "msg" => &mut msg,
+                // A newer revision's key: the rest of the report still holds.
+                _ => continue,
+            };
+            *slot = Some(value);
         }
         let id = match id {
             Some(id) => valid_id(id)?.to_owned(),
@@ -213,13 +241,9 @@ impl Report {
             "clear" => return Some(Self { id, record: None }),
             _ => return None,
         };
-        let progress = match progress {
-            Some(value) => {
-                let percent = value.parse::<u8>().ok().filter(|percent| *percent <= 100)?;
-                state.is_transient().then_some(percent)
-            }
-            None => None,
-        };
+        let progress = progress
+            .and_then(|value| value.parse::<u8>().ok())
+            .filter(|percent| *percent <= 100 && state.is_transient());
         let kind = kind
             .filter(|_| state == ProgramState::Blocked)
             .and_then(|kind| match kind {
@@ -228,18 +252,14 @@ impl Report {
                 "auth" => Some(BlockedKind::Auth),
                 _ => None,
             });
-        let app = match app {
-            Some(app)
-                if (1..=APP_LIMIT).contains(&app.len())
+        let app = app
+            .filter(|app| {
+                (1..=APP_LIMIT).contains(&app.len())
                     && app
                         .bytes()
-                        .all(|byte| byte.is_ascii_alphanumeric() || b"_.-".contains(&byte)) =>
-            {
-                Some(app.to_owned())
-            }
-            Some(_) => return None,
-            None => None,
-        };
+                        .all(|byte| byte.is_ascii_alphanumeric() || b"_.-".contains(&byte))
+            })
+            .map(str::to_owned);
         let title = text(title, TITLE_ENCODED_LIMIT, TITLE_DECODED_LIMIT)?;
         let msg = text(msg, MSG_ENCODED_LIMIT, MSG_DECODED_LIMIT)?;
         Some(Self {
@@ -262,7 +282,10 @@ fn valid_id(id: &str) -> Option<&str> {
         && id.len() <= ID_LIMIT
         && segments.clone().count() <= ID_DEPTH_LIMIT
         && segments.into_iter().all(|segment| {
-            (1..=ID_SEGMENT_LIMIT).contains(&segment.len()) && !segment.contains('=')
+            (1..=ID_SEGMENT_LIMIT).contains(&segment.len())
+                && segment
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || b"_.+-".contains(&byte))
         });
     valid.then_some(id)
 }
@@ -405,6 +428,42 @@ mod tests {
     }
 
     #[test]
+    fn a_child_inherits_the_nearest_ancestors_app() {
+        let table = table(&[
+            "state=working:app=deploy",
+            "state=working:id=eu",
+            "state=blocked:id=eu/db:kind=permission",
+        ]);
+        assert_eq!(table.summary().unwrap().app.as_deref(), Some("deploy"));
+        let table = self::table(&["state=working:id=eu:app=eu-tool", "state=blocked:id=eu/db"]);
+        assert_eq!(table.summary().unwrap().app.as_deref(), Some("eu-tool"));
+    }
+
+    #[test]
+    fn lenient_where_the_specification_is() {
+        for (report, expected) in [
+            // A malformed pair is skipped.
+            ("state=working:garbage:progress=7", Some(7)),
+            ("state=working:Bad=1:progress=7", Some(7)),
+            // A repeated key keeps its last value.
+            ("state=idle:state=working:progress=1:progress=9", Some(9)),
+            // Invalid progress is indeterminate, not a rejected report.
+            ("state=working:progress=101", None),
+            ("state=working:progress=-1", None),
+            ("state=working:progress=x", None),
+        ] {
+            let table = table(&[report]);
+            let summary = table.summary().unwrap_or_else(|| panic!("{report}"));
+            assert_eq!(summary.state, ProgramState::Working, "{report}");
+            assert_eq!(summary.progress, expected, "{report}");
+        }
+        let table = table(&["state=done:app=has space:app=bad!"]);
+        assert_eq!(table.summary().unwrap().app, None);
+        let table = self::table(&["state=done:app=way-too-long-app-name-for-the-32-byte-limit"]);
+        assert_eq!(table.summary().unwrap().app, None);
+    }
+
+    #[test]
     fn malformed_reports_change_nothing() {
         let mut table = table(&["state=idle"]);
         let generation = table.generation();
@@ -412,12 +471,10 @@ mod tests {
             "",
             "state=sleeping",
             "kind=permission",
-            "state=working:state=idle",
-            "state=working:progress=101",
-            "state=working:progress=-1",
+            "state=working:state=sleeping",
             "state=working:id=a//b",
+            "state=working:id=a,b",
             "state=working:id=a/b/c/d/e/f/g/h/i",
-            "state=working:app=has space",
             "state=working:msg=not base64!",
             "state=working:msg=YQ===",
             // "a\nb": a control character inside decoded text.
