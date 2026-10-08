@@ -517,24 +517,34 @@ impl AttachHub {
         // no live Session to attach to, but its final terminal may have been
         // retained. Serve that as a read-only seed on this connection.
         let completed = {
-            let Ok(guard) = registry.lock() else {
+            let Ok(mut guard) = registry.lock() else {
                 return;
             };
             if guard.get(session_id).is_some() {
                 None
             } else {
-                guard.completed_run(session_id)
+                guard.completed_run(session_id).and_then(|handle| {
+                    // Watched from the same lock as the lookup: a resume can
+                    // only install its Session after this, and closes it.
+                    let view = self.next_sink.fetch_add(1, Ordering::SeqCst);
+                    let stream = reader.try_clone().ok()?;
+                    guard.watch_completed_view(session_id, view, stream);
+                    Some((handle, view))
+                })
             }
         };
-        if let Some(handle) = completed {
+        if let Some((handle, view)) = completed {
             // A retained run whose terminal never made it to disk (the Mac
             // restarted before the checkpoint, or it no longer loads) has
             // nothing to show. Refuse it like a missing session: a bare close
             // reads as a dropped connection, and the pane would retry it every
             // 30 s for as long as it stays open.
-            if !self.serve_completed(handle, output, reader, buffered, session_id, preview)
-                && !preview
-            {
+            let served =
+                self.serve_completed(handle, output, reader, buffered, session_id, preview);
+            if let Ok(mut guard) = registry.lock() {
+                guard.forget_completed_view(session_id, view);
+            }
+            if !served && !preview {
                 self.reject(&writer, session_id, AttachRejection::SessionNotFound);
             }
             return;
@@ -711,6 +721,8 @@ impl AttachHub {
     /// pings are answered, every other frame is swallowed because there is no
     /// child to receive it, and nothing is ever published again. The pane
     /// sees the same thing a live exited session shows, its last screen.
+    /// A Session installed under the id (a resume) shuts the connection
+    /// down so the client reattaches to it.
     /// False when there was no screen to seed, before anything was written.
     fn serve_completed(
         &self,
@@ -1624,6 +1636,89 @@ mod tests {
         );
         drop(client);
         serve.join().unwrap();
+    }
+
+    #[test]
+    fn resuming_a_completed_run_closes_its_read_only_attach() {
+        // Selecting an ended tab after an Engine restart attaches to its
+        // retained terminal; the auto-resume lands right after. That
+        // connection must end, or the pane keeps it and every keystroke
+        // is swallowed while the resumed Agent waits at its prompt.
+        let temp = tempfile::tempdir().unwrap();
+        let registry = retained_registry(temp.path());
+        let hub = AttachHub::new();
+        let (mut client, server) = UnixStream::pair().unwrap();
+        let writer = Arc::new(Mutex::new(server.try_clone().unwrap()));
+        let serve = {
+            let registry = Arc::clone(&registry);
+            let hub = hub.clone();
+            std::thread::spawn(move || hub.serve(&registry, "finished", server, Vec::new(), writer))
+        };
+        client
+            .set_read_timeout(Some(Duration::from_millis(50)))
+            .unwrap();
+        let mut codec = FrameCodec::new();
+        read_frames(&mut codec, &mut client, 2);
+
+        let engine = Arc::new(crate::ManifestEngine::new(Vec::new()));
+        registry
+            .lock()
+            .unwrap()
+            .respawn(crate::session::SessionSpec {
+                id: "finished".into(),
+                pty: crate::pty::PtySpec::new(
+                    vec!["/bin/sh".into(), "-c".into(), "read line".into()],
+                    temp.path(),
+                )
+                .size(40, 4),
+                manifest_id: "shell".into(),
+                authority: crate::session::authority_for("shell", &engine),
+                logs_dir: temp.path().join("logs"),
+                holder: None,
+                remote: None,
+                defer_launch: false,
+            })
+            .unwrap();
+
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let mut chunk = [0u8; 4096];
+        loop {
+            assert!(
+                Instant::now() < deadline,
+                "the read-only attach stayed open"
+            );
+            match client.read(&mut chunk) {
+                Ok(0) => break,
+                Ok(_) => {}
+                Err(error)
+                    if matches!(
+                        error.kind(),
+                        std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                    ) => {}
+                Err(_) => break,
+            }
+        }
+        serve.join().unwrap();
+
+        // A fresh attach now reaches the live run.
+        let (mut client, server) = UnixStream::pair().unwrap();
+        let writer = Arc::new(Mutex::new(server.try_clone().unwrap()));
+        let serve = {
+            let registry = Arc::clone(&registry);
+            let hub = hub.clone();
+            std::thread::spawn(move || hub.serve(&registry, "finished", server, Vec::new(), writer))
+        };
+        client
+            .set_read_timeout(Some(Duration::from_millis(50)))
+            .unwrap();
+        read_frames(&mut FrameCodec::new(), &mut client, 2);
+        assert!(hub.has_sinks("finished"), "attached to the live Session");
+        drop(client);
+        serve.join().unwrap();
+        let _ = registry
+            .lock()
+            .unwrap()
+            .terminate("finished", Duration::from_millis(500));
     }
 
     #[test]

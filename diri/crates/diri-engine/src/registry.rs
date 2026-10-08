@@ -130,6 +130,11 @@ pub struct Registry {
     unreadable_records: Vec<serde_json::Value>,
     cursor_title_refresh_at: Option<std::time::Instant>,
     native_title_refresh_at: Option<std::time::Instant>,
+    /// Attach connections showing a completed run's retained terminal, by
+    /// session id. Such a connection is read-only and swallows input, so a
+    /// Session installed under that id closes it and the client reattaches
+    /// to the live run instead of typing into the dead one.
+    completed_views: HashMap<String, Vec<(u64, std::os::unix::net::UnixStream)>>,
 }
 
 /// Immutable input for a Cursor provider-store scan. The events watcher builds
@@ -238,6 +243,7 @@ impl Registry {
             last_persist: None,
             persist_sequence: 0,
             unreadable_records: Vec::new(),
+            completed_views: HashMap::new(),
             cursor_title_refresh_at: None,
             native_title_refresh_at: None,
         }
@@ -530,6 +536,7 @@ impl Registry {
         };
         self.records.insert(id.clone(), record);
         self.sessions.insert(id.clone(), session);
+        self.close_completed_views(&id);
         self.bind_completed_run(&id);
         Ok(id)
     }
@@ -677,6 +684,39 @@ impl Registry {
         })
     }
 
+    /// Tracks a connection seeded from [`Self::completed_run`] until it ends
+    /// or a live Session takes the id. Call under the same lock as the
+    /// `completed_run` lookup, so no launch can slip in between.
+    pub(crate) fn watch_completed_view(
+        &mut self,
+        id: &str,
+        view: u64,
+        stream: std::os::unix::net::UnixStream,
+    ) {
+        self.completed_views
+            .entry(id.to_owned())
+            .or_default()
+            .push((view, stream));
+    }
+
+    pub(crate) fn forget_completed_view(&mut self, id: &str, view: u64) {
+        if let Some(views) = self.completed_views.get_mut(id) {
+            views.retain(|(watched, _)| *watched != view);
+            if views.is_empty() {
+                self.completed_views.remove(id);
+            }
+        }
+    }
+
+    /// The id is live again (resume, relaunch, adoption): end every
+    /// connection still showing its completed run. The client sees an
+    /// ordinary drop and reattaches to the live Session.
+    fn close_completed_views(&mut self, id: &str) {
+        for (_, stream) in self.completed_views.remove(id).unwrap_or_default() {
+            let _ = stream.shutdown(std::net::Shutdown::Both);
+        }
+    }
+
     pub(crate) fn reserve_launch(&mut self, id: &str, new_record: bool) -> std::io::Result<()> {
         if self.sessions.contains_key(id)
             || self.pending_launches.contains(id)
@@ -714,7 +754,8 @@ impl Registry {
             record.needs_input = None;
             record.updated_at = DateMillis::from(std::time::SystemTime::now());
         }
-        self.sessions.insert(id, session);
+        self.sessions.insert(id.clone(), session);
+        self.close_completed_views(&id);
         Ok(())
     }
 
@@ -791,6 +832,7 @@ impl Registry {
             initial_status,
         )?;
         self.sessions.insert(id.clone(), session);
+        self.close_completed_views(&id);
         Ok(id)
     }
 
@@ -984,6 +1026,7 @@ impl Registry {
                         let _ = session.set_hibernated(true);
                     }
                     self.sessions.insert(session_id.clone(), session);
+                    self.close_completed_views(&session_id);
                     self.bind_completed_run(&session_id);
                     if let Ok(Some(seed)) = self.recovery_store(&session_id).read_activity()
                         && (recovered_from_capsule
@@ -1522,6 +1565,7 @@ impl Registry {
         }
         let session = Session::spawn(spec, Arc::clone(&self.engine))?;
         self.sessions.insert(id.clone(), session);
+        self.close_completed_views(&id);
         let record = self.records.get_mut(&id).expect("checked above");
         record.status = SessionStatus::Starting;
         record.needs_input = None;
