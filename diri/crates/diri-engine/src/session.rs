@@ -560,21 +560,25 @@ struct ProgramStatusTrack {
 }
 
 impl ProgramStatusTrack {
-    /// Progress a working or blocked record carries, shown when no
-    /// `OSC 9;4` progress is.
-    fn progress(&self) -> Option<diri_proto::TerminalProgress> {
+    /// The progress a reporting program shows: `None` while nothing reports,
+    /// else what its record carries. Once a program reports with `OSC 7501`
+    /// its record owns progress, and `OSC 9;4` no longer shows; a mapped
+    /// percent would contradict the record the program keeps.
+    #[allow(clippy::option_option)]
+    fn progress(&self) -> Option<Option<diri_proto::TerminalProgress>> {
         use diri_proto::TerminalProgressState as State;
         use diri_terminal_state::ProgramState;
         let record = self.published.as_ref()?;
         let state = match record.state {
             ProgramState::Working => State::Normal,
             ProgramState::Blocked => State::Paused,
-            _ => return None,
+            _ => return Some(None),
         };
-        Some(diri_proto::TerminalProgress {
-            state,
-            percent: record.progress?,
-        })
+        Some(
+            record
+                .progress
+                .map(|percent| diri_proto::TerminalProgress { state, percent }),
+        )
     }
 }
 
@@ -2311,20 +2315,7 @@ impl Session {
             foreground_agent,
             terminal_cwd,
             foreground_ports,
-            terminal_progress: self
-                .shared
-                .progress
-                .lock()
-                .expect("progress")
-                .published
-                .or_else(|| {
-                    self.shared
-                        .program_status
-                        .lock()
-                        .expect("program status")
-                        .progress()
-                })
-                .filter(|_| !self.shared.exited.load(Ordering::SeqCst)),
+            terminal_progress: shown_progress(&self.shared),
             status: self.shared.status.lock().expect("status").clone(),
             status_evidence,
             needs_input: self.shared.needs_input.lock().expect("needs input").clone(),
@@ -4317,6 +4308,7 @@ fn handle_remote_message(
                     offset,
                     bytes,
                     *replaying,
+                    Some(client),
                 ) {
                     Some(next_offset) => {
                         client.observe_output_offset(next_offset);
@@ -4436,6 +4428,7 @@ fn handle_remote_message(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn apply_remote_output(
     shared: &Shared,
     engine: &ManifestEngine,
@@ -4444,6 +4437,7 @@ fn apply_remote_output(
     offset: u64,
     bytes: &[u8],
     replaying: bool,
+    client: Option<&RemoteSessionClient>,
 ) -> Option<u64> {
     let expected = shared.remote_output_offset.load(Ordering::SeqCst);
     let end = offset.saturating_add(bytes.len() as u64);
@@ -4463,19 +4457,33 @@ fn apply_remote_output(
     }
     shared.remote_output_offset.store(end, Ordering::SeqCst);
     let _ = shared.log.lock().expect("log").append(bytes);
-    let observation = (!replaying)
-        .then(|| {
-            let mut screen = shared.screen.lock().expect("screen");
-            screen.feed(bytes);
-            if screen.has_notifications() {
-                shared.bump_state_version();
+    let observation = (!replaying).then(|| {
+        let mut screen = shared.screen.lock().expect("screen");
+        screen.feed(bytes);
+        if screen.has_notifications() {
+            shared.bump_state_version();
+        }
+        // The attached terminal answers the emulator's queries; this
+        // mirror's would otherwise pile up unread for the session's
+        // lifetime. The one it answers itself is the `OSC 7501` support
+        // query, for the Engine is what reads program status.
+        let queries = program_status_queries(&screen.take_replies());
+        let observation =
+            evaluate_if_screen_changed(shared, &mut screen, engine, manifest_id, last_eval_seq);
+        (observation, queries)
+    });
+    let (observation, queries) = observation.unwrap_or((None, 0));
+    if let Some(client) = client {
+        for _ in 0..queries {
+            // Live output only, never a replay: the program asked just now.
+            if client
+                .write(diri_terminal_state::PROGRAM_STATUS_QUERY_REPLY)
+                .is_err()
+            {
+                break;
             }
-            // The remote Holder owns the PTY and its answers; this mirror's
-            // would otherwise pile up unread for the session's lifetime.
-            let _ = screen.take_replies();
-            evaluate_if_screen_changed(shared, &mut screen, engine, manifest_id, last_eval_seq)
-        })
-        .flatten();
+        }
+    }
     let now = SystemTime::now();
     let mut reducer = shared.reducer.lock().expect("reducer");
     if !replaying {
@@ -5122,6 +5130,29 @@ fn progress_from(state: i64, percent: i64) -> Option<diri_proto::TerminalProgres
         percent.clamp(0, 100) as u8
     };
     Some(diri_proto::TerminalProgress { state, percent })
+}
+
+/// The progress a session shows: a reporting program's record, else its
+/// `OSC 9;4` progress, and nothing once it has exited.
+fn shown_progress(shared: &Shared) -> Option<diri_proto::TerminalProgress> {
+    // Taken one after the other: the program-status lock is a leaf.
+    let program = shared
+        .program_status
+        .lock()
+        .expect("program status")
+        .progress();
+    program
+        .unwrap_or_else(|| shared.progress.lock().expect("progress").published)
+        .filter(|_| !shared.exited.load(Ordering::SeqCst))
+}
+
+/// How many `OSC 7501` support queries a chunk of replies answers.
+fn program_status_queries(replies: &[u8]) -> usize {
+    let reply = diri_terminal_state::PROGRAM_STATUS_QUERY_REPLY;
+    replies
+        .windows(reply.len())
+        .filter(|window| *window == reply)
+        .count()
 }
 
 /// Notes the screen's `OSC 7501` summary if a report changed it. The reducer
@@ -6952,7 +6983,64 @@ mod progress_tests {
     /// Feeds live output through the remote path, the one every transport
     /// shares from the parsed screen onward.
     fn feed(engine: &ManifestEngine, shared: &Shared, seq: &mut u64, end: &mut u64, bytes: &[u8]) {
-        *end = apply_remote_output(shared, engine, "shell", seq, *end, bytes, false).unwrap();
+        *end = apply_remote_output(shared, engine, "shell", seq, *end, bytes, false, None).unwrap();
+    }
+
+    /// `OSC 9;4` maps only busy and a percent onto a program; once it
+    /// reports with `OSC 7501`, its record owns progress, as the
+    /// specification asks.
+    #[test]
+    fn a_reporting_program_owns_progress() {
+        let (_temp, engine, shared) = remote_shell("program-progress");
+        let (mut seq, mut end) = (0, 0);
+        feed(&engine, &shared, &mut seq, &mut end, b"\x1b]9;4;1;35\x07");
+        assert_eq!(shown_progress(&shared), progress(State::Normal, 35));
+
+        let before = shared.state_version.load(Ordering::SeqCst);
+        feed(
+            &engine,
+            &shared,
+            &mut seq,
+            &mut end,
+            b"\x1b]7501;state=working\x07",
+        );
+        assert_eq!(shown_progress(&shared), None, "indeterminate work");
+        assert!(shared.state_version.load(Ordering::SeqCst) > before);
+
+        feed(&engine, &shared, &mut seq, &mut end, b"\x1b]9;4;1;80\x07");
+        feed(
+            &engine,
+            &shared,
+            &mut seq,
+            &mut end,
+            b"\x1b]7501;state=blocked:progress=60\x07",
+        );
+        assert_eq!(shown_progress(&shared), progress(State::Paused, 60));
+
+        // The program stops reporting: `OSC 9;4` shows again.
+        feed(
+            &engine,
+            &shared,
+            &mut seq,
+            &mut end,
+            b"\x1b]7501;state=clear\x07",
+        );
+        assert_eq!(shown_progress(&shared), progress(State::Normal, 80));
+    }
+
+    #[test]
+    fn only_the_program_status_query_is_answered_for_a_remote_terminal() {
+        let reply = diri_terminal_state::PROGRAM_STATUS_QUERY_REPLY;
+        let mut replies = b"\x1b[?62;22c".to_vec();
+        replies.extend_from_slice(reply);
+        replies.extend_from_slice(b"\x1b[0n");
+        replies.extend_from_slice(reply);
+        assert_eq!(program_status_queries(&replies), 2);
+        assert_eq!(program_status_queries(b"\x1b[?62;22c"), 0);
+
+        let mut screen = HeadlessScreen::new(80, 24).with_notifications();
+        screen.feed(b"\x1b]7501;?\x1b\\\x1b[c");
+        assert_eq!(program_status_queries(&screen.take_replies()), 1);
     }
 
     #[test]
@@ -7057,7 +7145,7 @@ mod progress_tests {
         let (_temp, engine, shared) = remote_shell("progress-replay");
         let mut seq = 0;
         let bytes = b"\x1b]9;4;1;70\x07";
-        apply_remote_output(&shared, &engine, "shell", &mut seq, 0, bytes, true).unwrap();
+        apply_remote_output(&shared, &engine, "shell", &mut seq, 0, bytes, true, None).unwrap();
         assert_eq!(published(&shared), None);
     }
 }
@@ -7084,14 +7172,15 @@ mod notification_tests {
         let shared = new_shared(&spec, log, &engine, true);
         let mut seq = 0;
         let bytes = b"\x1b]777;notify;Build;Passed\x07";
-        let end = apply_remote_output(&shared, &engine, "shell", &mut seq, 0, bytes, true).unwrap();
+        let end =
+            apply_remote_output(&shared, &engine, "shell", &mut seq, 0, bytes, true, None).unwrap();
         assert!(!shared.screen.lock().unwrap().has_notifications());
-        apply_remote_output(&shared, &engine, "shell", &mut seq, end, bytes, false).unwrap();
+        apply_remote_output(&shared, &engine, "shell", &mut seq, end, bytes, false, None).unwrap();
         let events = shared.screen.lock().unwrap().take_notifications();
         assert_eq!(events.len(), 1);
         assert_eq!(events[0].body, "Passed");
         assert!(shared.state_version.load(Ordering::SeqCst) > 0);
-        apply_remote_output(&shared, &engine, "shell", &mut seq, end, bytes, false).unwrap();
+        apply_remote_output(&shared, &engine, "shell", &mut seq, end, bytes, false, None).unwrap();
         assert!(!shared.screen.lock().unwrap().has_notifications());
         assert_eq!(*shared.status.lock().unwrap(), SessionStatus::Idle);
     }
@@ -7115,10 +7204,11 @@ mod notification_tests {
         let mut seq = 0;
         // Codex over SSH: `Copied 45 chars` arrives as OSC 52 alone.
         let bytes = b"\x1b]52;c;Y29waWVkIGZyb20gY29kZXg=\x07";
-        let end = apply_remote_output(&shared, &engine, "shell", &mut seq, 0, bytes, true).unwrap();
+        let end =
+            apply_remote_output(&shared, &engine, "shell", &mut seq, 0, bytes, true, None).unwrap();
         assert_eq!(shared.screen.lock().unwrap().take_clipboard(), None);
         let before = shared.state_version.load(Ordering::SeqCst);
-        apply_remote_output(&shared, &engine, "shell", &mut seq, end, bytes, false).unwrap();
+        apply_remote_output(&shared, &engine, "shell", &mut seq, end, bytes, false, None).unwrap();
         assert!(shared.state_version.load(Ordering::SeqCst) > before);
         let data = shared.screen.lock().unwrap().take_clipboard().unwrap();
         assert_eq!(

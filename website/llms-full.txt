@@ -504,7 +504,7 @@ The mark on the left of a row shows what the session is doing; the agent's logo 
 
 Claude Code reports its status through hooks, which is the most reliable signal. Codex also reports each finished turn. For every other agent, diri reads the status from its screen. Every agent still runs as a normal terminal.
 
-Any program can also report its own status with [OSC 7501](https://www.superlogical.com/rex/docs/build/program-status), in an agent tab or a plain terminal tab. While it reports, diri shows what it says instead of what it reads from the screen: working (with progress), waiting on you, or done. Its reports end when it exits or its shell returns to the prompt.
+Any program can also report its own status with [OSC 7501](https://www.superlogical.com/rex/docs/build/program-status), in an agent tab or a plain terminal tab. While it reports, diri shows what it says instead of what it reads from the screen: working (with progress), waiting on you, or done. This works in remote tabs too, and an agent that reports this way is believed over its own hooks. Its reports end when it exits or its shell returns to the prompt.
 
 Right-click a row to **Mark as Read** or **Mark as Unread**.
 

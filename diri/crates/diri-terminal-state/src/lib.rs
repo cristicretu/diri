@@ -16,7 +16,9 @@
 mod notifications;
 mod program_status;
 pub use notifications::{AGENT_EXIT_OSC, TerminalNotification};
-pub use program_status::{BlockedKind, ProgramRecord, ProgramState};
+pub use program_status::{
+    BlockedKind, ProgramRecord, ProgramState, QUERY_REPLY as PROGRAM_STATUS_QUERY_REPLY,
+};
 
 use std::sync::mpsc::{self, Receiver, SyncSender};
 
