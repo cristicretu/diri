@@ -912,7 +912,9 @@ impl Element for ScrollArea {
             if geometry.is_none() && inner.drag.is_some() {
                 inner.drag = None;
             }
-            let visibility = if geometry.is_none() && style == ScrollerStyle::Overlay {
+            // A reserved legacy gutter is still part of the surrounding
+            // surface when there is nothing to scroll.
+            let visibility = if geometry.is_none() {
                 inner.revealed_since = None;
                 Visibility {
                     opacity: 0.0,
@@ -1196,7 +1198,9 @@ impl ScrollerLook {
             }
             ScrollerStyle::Legacy => {
                 let (rest, hover) = if dark { (0.36, 0.46) } else { (0.28, 0.38) };
-                let fill = colors.background.blend(colors.primary.alpha(0.02));
+                // Tint the actual surface underneath, including translucent
+                // sidebars, rather than painting the terminal background.
+                let fill = colors.primary.alpha(0.02);
                 Self {
                     thumb: colors.primary.alpha(if expanded { hover } else { rest }),
                     track: Some(TrackLook {
