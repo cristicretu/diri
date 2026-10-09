@@ -115,7 +115,7 @@ fn real_claude_code_reports_its_status(tag: &str, held: bool) {
                 "CLAUDE_CODE_ENTRYPOINT".into(),
                 "-u".into(),
                 "CLAUDE_CODE_CHILD_SESSION".into(),
-                claude.into(),
+                claude,
                 "--model".into(),
                 "haiku".into(),
                 // Ask before running a command, whatever the project sets.
