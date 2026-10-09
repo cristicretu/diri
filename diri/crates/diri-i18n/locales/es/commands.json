@@ -1,4 +1,10 @@
 {
+  "command.show_app.title": "Mostrar u ocultar Diri globalmente",
+  "command.show_app.description": "Muestra Diri desde cualquier app; vuelve a pulsar con Diri al frente para ocultarlo. También restaura o reabre su ventana. Sin asignar por defecto; solo macOS.",
+  "settings.shortcuts.global_conflict": "Otra app ya utiliza este atajo. Elige otro.",
+  "settings.shortcuts.global_unavailable": "No se pudo registrar el atajo global. Prueba otro.",
+  "settings.shortcuts.global_unsupported": "Esta tecla no puede registrarse globalmente. Graba otro atajo.",
+  "settings.shortcuts.global_modifier": "Incluye Comando, Control u Opción. Los atajos con Fn o solo Mayúsculas no se admiten globalmente.",
   "command.archive_selected_session.description": "Archiva la sesión seleccionada",
   "command.archive_selected_session.title": "Archivar sesión",
   "command.category.application": "Aplicación",

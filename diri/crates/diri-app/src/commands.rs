@@ -21,7 +21,14 @@ static ACTIVE_SHORTCUT_OVERRIDES: OnceLock<RwLock<ShortcutOverrides>> = OnceLock
 
 actions!(
     diri_app,
-    [Quit, HideApp, NewWindow, CloseWindow, ReportProblem]
+    [
+        Quit,
+        HideApp,
+        ShowApp,
+        NewWindow,
+        CloseWindow,
+        ReportProblem
+    ]
 );
 
 actions!(
@@ -134,6 +141,7 @@ actions!(
 pub enum CommandId {
     Quit,
     HideApp,
+    ShowApp,
     CloseWindow,
     NewWindow,
     CloseSession,
@@ -338,6 +346,8 @@ macro_rules! spec_with_alternates {
 pub const COMMANDS: &[CommandSpec] = &[
     spec!(Quit, "quit", Some("cmd-q"), Some("⌘Q"), None),
     spec!(HideApp, "hide-app", Some("cmd-h"), Some("⌘H"), None),
+    #[cfg(target_os = "macos")]
+    spec!(ShowApp, "show-app", None, None, None),
     spec!(
         NewWindow,
         "new-window",
@@ -1172,6 +1182,10 @@ fn set_active_shortcut_overrides(overrides: &ShortcutOverrides) {
 
 impl CommandSpec {
     fn key_bindings(&self, overrides: &ShortcutOverrides) -> Vec<KeyBinding> {
+        // The system owns this binding, including while Diri is inactive.
+        if self.id == CommandId::ShowApp {
+            return Vec::new();
+        }
         self.effective_keystrokes(overrides)
             .into_iter()
             .map(|key| self.key_binding(&key))
@@ -1267,6 +1281,7 @@ impl CommandSpec {
         match self.id {
             CommandId::Quit => KeyBinding::new(key, Quit, context),
             CommandId::HideApp => KeyBinding::new(key, HideApp, context),
+            CommandId::ShowApp => KeyBinding::new(key, ShowApp, context),
             CommandId::CloseWindow => KeyBinding::new(key, CloseWindow, context),
             CommandId::NewWindow => KeyBinding::new(key, NewWindow, context),
             CommandId::CloseSession => KeyBinding::new(key, CloseSession, context),
@@ -1987,6 +2002,11 @@ impl CommandId {
                 description: t("command.hide_app.description"),
                 category: Application,
             },
+            Self::ShowApp => ShortcutMetadata {
+                title: t("command.show_app.title"),
+                description: t("command.show_app.description"),
+                category: Application,
+            },
             Self::Quit => ShortcutMetadata {
                 title: t("command.quit.title"),
                 description: t("command.quit.description"),
@@ -2009,6 +2029,7 @@ impl CommandId {
         match self {
             Self::Quit => Box::new(Quit),
             Self::HideApp => Box::new(HideApp),
+            Self::ShowApp => Box::new(ShowApp),
             Self::CloseWindow => Box::new(CloseWindow),
             Self::NewWindow => Box::new(NewWindow),
             Self::CloseSession => Box::new(CloseSession),

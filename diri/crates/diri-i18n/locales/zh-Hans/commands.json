@@ -1,4 +1,10 @@
 {
+  "command.show_app.title": "全局唤起/隐藏 Diri",
+  "command.show_app.description": "从任何应用唤起 Diri；Diri 在前台时再次按下则隐藏。也可恢复或重新打开窗口。默认不绑定；仅限 macOS。",
+  "settings.shortcuts.global_conflict": "此快捷键已被其他应用占用，请选择其他快捷键。",
+  "settings.shortcuts.global_unavailable": "无法注册全局快捷键，请尝试其他快捷键。",
+  "settings.shortcuts.global_unsupported": "此按键无法注册为全局快捷键，请重新录制其他快捷键。",
+  "settings.shortcuts.global_modifier": "请包含 Command、Control 或 Option。全局快捷键不支持 Fn 或仅含 Shift 的组合。",
   "command.archive_selected_session.description": "归档所选会话",
   "command.archive_selected_session.title": "归档会话",
   "command.category.application": "应用程序",

@@ -491,6 +491,57 @@ fn main() {
             .clone();
         commands::bind_keys(cx, &shortcut_overrides);
         install_app_menus(cx);
+        let activation_services = Arc::clone(&services);
+        cx.on_action(move |_: &commands::ShowApp, cx| {
+            let mut windows = cx.windows();
+            if let Some(active) = cx.active_window() {
+                windows.retain(|handle| *handle != active);
+                windows.insert(0, active);
+            }
+            let main = windows.into_iter().find(|handle| {
+                handle
+                    .update(cx, |root, _, _| root.downcast::<RootView>().is_ok())
+                    .unwrap_or(false)
+            });
+            if let Some(handle) = main {
+                #[cfg(target_os = "macos")]
+                if handle
+                    .update(cx, |_, window, _| {
+                        macos::global_shortcut::should_hide(window)
+                    })
+                    .unwrap_or(false)
+                {
+                    cx.hide();
+                    return;
+                }
+                let _ = handle.update(cx, |_, window, _| {
+                    #[cfg(target_os = "macos")]
+                    macos::global_shortcut::reveal(window);
+                    #[cfg(not(target_os = "macos"))]
+                    window.activate_window();
+                });
+            } else {
+                open_main_window(
+                    cx,
+                    Arc::clone(&activation_services),
+                    preview,
+                    scenario,
+                    RestorePolicy::FRAME_ONLY,
+                );
+            }
+            cx.activate(true);
+        });
+        #[cfg(target_os = "macos")]
+        {
+            let prefs = services
+                .store
+                .store
+                .read()
+                .expect("session store lock poisoned")
+                .preferences()
+                .clone();
+            macos::global_shortcut::install(cx, &prefs);
+        }
         let window_services = services.clone();
         cx.on_action(move |_: &commands::NewWindow, cx| {
             let context = cx.active_window().and_then(|handle| {

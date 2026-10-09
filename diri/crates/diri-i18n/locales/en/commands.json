@@ -1,4 +1,10 @@
 {
+  "command.show_app.title": "Show or hide Diri globally",
+  "command.show_app.description": "Show Diri from any app; press again while Diri is in front to hide it. Also restores or reopens its window. Unassigned by default; macOS only.",
+  "settings.shortcuts.global_conflict": "This shortcut is already used by another app. Choose a different shortcut.",
+  "settings.shortcuts.global_unavailable": "The global shortcut could not be registered. Try another shortcut.",
+  "settings.shortcuts.global_unsupported": "This key cannot be registered globally. Record a different shortcut.",
+  "settings.shortcuts.global_modifier": "Include Command, Control, or Option. Fn and Shift-only shortcuts are not supported globally.",
   "command.archive_selected_session.description": "Archive the selected session",
   "command.archive_selected_session.title": "Archive session",
   "command.category.application": "Application",

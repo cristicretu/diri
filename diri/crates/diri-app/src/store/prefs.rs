@@ -408,6 +408,9 @@ pub struct Prefs {
     /// Unknown ids are retained so opening these preferences in an older diri
     /// build does not erase settings written by a newer one.
     pub shortcut_overrides: BTreeMap<String, Option<String>>,
+    /// Physical macOS key code recorded with the global Show App binding.
+    /// Keeping the native code avoids assuming a US keyboard layout.
+    pub global_shortcut_key_code: Option<u16>,
     /// Session that should regain focus after the daemon's initial hydrate.
     pub last_selected_session: Option<SessionId>,
     /// herdr panes and conversations already brought over, so importing
@@ -488,6 +491,7 @@ impl Default for Prefs {
             sidebar_expanded_archives: Vec::new(),
             launch_recipes: LaunchRecipeBook::default(),
             shortcut_overrides: BTreeMap::new(),
+            global_shortcut_key_code: None,
             last_selected_session: None,
             herdr_imported: Default::default(),
             whats_new_seen_version: crate::updates::CURRENT_VERSION.to_owned(),

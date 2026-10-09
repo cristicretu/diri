@@ -167,6 +167,16 @@ the catalogue does not activate skills or change provider configuration.
 
 ## Agent preferences
 
+On macOS, **Settings → Shortcuts → Application → Show or hide Diri globally**
+can record a system-wide shortcut that brings Diri to the front from another app.
+Press the same shortcut while Diri is in the foreground to hide it.
+It also restores a minimized main window or reopens it if it was closed. The shortcut is unassigned
+by default, persists across launches, and can be cleared or restored using the
+existing shortcut controls. Include Command, Control, or Option; Fn combinations
+are unsupported. Registration conflicts are shown without replacing the previous
+assignment. No Accessibility permission is required. Diri must still be running;
+the shortcut does not launch the app after quitting.
+
 The default agent is stored in
 `~/Library/Application Support/diri/prefs.json` as the agent manifest's stable
 `id`. Preferences written before the manifest catalog (`claudeCode`, `codex`,
