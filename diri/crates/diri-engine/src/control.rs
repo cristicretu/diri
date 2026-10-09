@@ -25,6 +25,7 @@ use sha2::{Digest, Sha256};
 
 use crate::registry::Registry;
 mod account_handoff;
+mod account_overview;
 mod account_switch;
 mod agent_relaunch;
 mod agent_sign_in;
@@ -764,6 +765,9 @@ impl ControlServer {
                         | Method::SESSION_SPAWN_TRACKED
                         | Method::SESSION_CONTINUE_ACCOUNT
                         | Method::ACCOUNT_SWITCH_ALL
+                        | Method::ACCOUNT_OVERVIEW
+                        | Method::ACCOUNT_ADOPT
+                        | Method::ACCOUNT_ADD
                         | Method::ACCOUNT_CODEX_LOGIN
                         | Method::ACCOUNT_CLAUDE_LOGIN
                         | Method::HOST_INITIALIZE
@@ -980,6 +984,8 @@ impl ControlServer {
                 | Method::ACCOUNT_CODEX_CAPTURE
                 | Method::ACCOUNT_CLAUDE_LOGIN
                 | Method::ACCOUNT_CLAUDE_CAPTURE
+                | Method::ACCOUNT_ADOPT
+                | Method::ACCOUNT_ADD
         ) {
             Some(self.account_operations.try_write().map_err(|_| ControlError::bad_request("An account or session operation is already in progress. Retry when it finishes."))?)
         } else {
@@ -1013,6 +1019,9 @@ impl ControlServer {
             Method::ACCOUNT_CODEX_CAPTURE => self.codex_account_capture(params),
             Method::ACCOUNT_CLAUDE_LOGIN => self.claude_account_login(params),
             Method::ACCOUNT_CLAUDE_CAPTURE => self.claude_account_capture(params),
+            Method::ACCOUNT_OVERVIEW => self.account_overview(params),
+            Method::ACCOUNT_ADOPT => self.account_adopt(params),
+            Method::ACCOUNT_ADD => self.account_add(params),
             Method::SESSION_CONTINUE_ACCOUNT => self.session_continue_account(params),
             Method::ACCOUNT_PROFILES_LIST => {
                 encode(&self.accounts.lock().map_err(poisoned)?.catalog()?)
@@ -1022,7 +1031,20 @@ impl ControlServer {
                 if let Some(host) = &profile.host {
                     self.resolve_host(host)?;
                 }
-                encode(&self.accounts.lock().map_err(poisoned)?.upsert(profile)?)
+                let accounts = self.accounts.lock().map_err(poisoned)?;
+                let renamed = accounts
+                    .catalog()?
+                    .profiles
+                    .iter()
+                    .any(|p| p.id == profile.id && p.label != profile.label);
+                // Under the catalog lock, so naming a new profile after its
+                // email never lands after this rename.
+                if renamed {
+                    self.keep_chosen_name(&profile);
+                }
+                let catalog = accounts.upsert(profile)?;
+                drop(accounts);
+                encode(&catalog)
             }
             Method::ACCOUNT_PROFILES_REMOVE => {
                 let params: diri_proto::AgentAccountId = decode(params)?;

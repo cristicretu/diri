@@ -382,6 +382,11 @@ fn main() {
             .unwrap_or_else(|| PathBuf::from("/nonexistent"));
         tokio.spawn(async move {
             let mut last_request: Option<std::time::Instant> = None;
+            // Beside the Engine's state, so dev builds keep their own. Not
+            // the socket's directory: on Linux that is cleared at logout.
+            let mut memory = usage::limits::LimitsMemory::load(
+                diri_proto::paths::DirijorPaths::state_dir(&home).join("account-limits.json"),
+            );
             while limits_requests.recv().await.is_some() {
                 if last_request.is_some_and(|last| last.elapsed() < Duration::from_secs(10)) {
                     continue;
@@ -396,10 +401,10 @@ fn main() {
                 {
                     continue;
                 }
-                let Ok(accounts) = client.account_profiles().await else {
+                let Ok(accounts) = client.account_overview().await else {
                     continue;
                 };
-                let limits = usage::limits::refresh(&home, &accounts).await;
+                let limits = usage::limits::refresh(&home, &accounts, &mut memory).await;
                 usage_tx.send_modify(|snapshot| snapshot.limits = limits);
             }
         });

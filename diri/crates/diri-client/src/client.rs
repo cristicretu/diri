@@ -1135,6 +1135,43 @@ impl DaemonClient {
         self.no_params(Method::ACCOUNT_PROFILES_LIST).await
     }
 
+    /// The catalog with who each local login belongs to. It may ask Claude
+    /// about a login it has not described yet, so it allows a few seconds.
+    pub async fn account_overview(&self) -> Result<diri_proto::AgentAccountOverview, ClientError> {
+        self.core
+            .request_typed::<EmptyParams, _>(
+                Method::ACCOUNT_OVERVIEW,
+                None,
+                Some(std::time::Duration::from_secs(30)),
+            )
+            .await
+    }
+
+    /// Save the login an Agent uses now as a profile named after its email.
+    pub async fn adopt_account(
+        &self,
+        agent: String,
+    ) -> Result<diri_proto::AgentAccountOverview, ClientError> {
+        self.core
+            .request_typed(
+                Method::ACCOUNT_ADOPT,
+                Some(&diri_proto::AgentAccountAgent { agent }),
+                Some(std::time::Duration::from_secs(60)),
+            )
+            .await
+    }
+
+    /// A new profile for the Agent and the sign-in tab that fills it.
+    pub async fn add_account(&self, agent: String) -> Result<SessionRecord, ClientError> {
+        self.core
+            .request_typed(
+                Method::ACCOUNT_ADD,
+                Some(&diri_proto::AgentAccountAgent { agent }),
+                Some(std::time::Duration::from_secs(60)),
+            )
+            .await
+    }
+
     pub async fn login_codex_account(&self, id: String) -> Result<SessionRecord, ClientError> {
         self.typed(
             Method::ACCOUNT_CODEX_LOGIN,

@@ -282,6 +282,8 @@ pub fn is_lifecycle_method(method: &str) -> bool {
             | Method::ACCOUNT_CLAUDE_LOGIN
             | Method::ACCOUNT_CODEX_CAPTURE
             | Method::ACCOUNT_CLAUDE_CAPTURE
+            | Method::ACCOUNT_ADOPT
+            | Method::ACCOUNT_ADD
             | Method::ACCOUNT_PROFILES_SAVE
             | Method::ACCOUNT_PROFILES_REMOVE
             | Method::HOST_INITIALIZE

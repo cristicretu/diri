@@ -33,7 +33,7 @@ fn directory(path: &Path) -> Result<(), ControlError> {
     }
     Ok(())
 }
-fn read(path: &Path) -> Result<Option<Vec<u8>>, ControlError> {
+pub(super) fn read(path: &Path) -> Result<Option<Vec<u8>>, ControlError> {
     let file = match fs::OpenOptions::new()
         .read(true)
         .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
@@ -60,7 +60,7 @@ fn read(path: &Path) -> Result<Option<Vec<u8>>, ControlError> {
     }
     Ok(Some(bytes))
 }
-fn login(path: &Path) -> Result<Vec<u8>, ControlError> {
+pub(super) fn login(path: &Path) -> Result<Vec<u8>, ControlError> {
     let bytes = read(path)?.ok_or_else(|| {
         ControlError::bad_request(
             "Sign in to this profile, or save its current login, before switching.",
@@ -87,7 +87,7 @@ fn identity(bytes: &[u8]) -> Option<(String, String)> {
         claims["sub"].as_str()?.into(),
     ))
 }
-fn write(path: &Path, bytes: &[u8]) -> Result<(), ControlError> {
+pub(super) fn write(path: &Path, bytes: &[u8]) -> Result<(), ControlError> {
     directory(path.parent().ok_or_else(failure)?)?;
     let expected = read(path)?;
     let temp = path.with_file_name(format!(".auth-{}.tmp", crate::inject::uuid_v4()));
@@ -156,13 +156,13 @@ impl ControlServer {
             .resolve(Some(id), AgentKind::CODEX_ID, None)?
             .ok_or_else(failure)
     }
-    fn codex_home(&self) -> Result<PathBuf, ControlError> {
+    pub(super) fn codex_home(&self) -> Result<PathBuf, ControlError> {
         let home = PathBuf::from(std::env::var("HOME").map_err(|_| failure())?).join(".codex");
         directory(&home)?;
         file_backend(&home)?;
         Ok(home)
     }
-    fn codex_slot(&self, id: &str) -> Result<PathBuf, ControlError> {
+    pub(super) fn codex_slot(&self, id: &str) -> Result<PathBuf, ControlError> {
         if id.is_empty()
             || !id
                 .bytes()

@@ -432,6 +432,8 @@ impl HostEditor {
 
 pub(crate) enum UtilitySurfacesEvent {
     AccountLoginOpened,
+    /// Ask every account for its plan limits again.
+    RefreshUsageLimits,
     /// A What's New thumbnail was clicked: open the sheet on that highlight.
     ShowWhatsNew(usize),
 }
@@ -9569,6 +9571,12 @@ mod tests {
                     );
                     if std::env::var_os("DIRI_VISUAL_ACCOUNT_HANDOFF").is_some() {
                         surfaces.seed_account_handoff_preview();
+                    }
+                    if std::env::var_os("DIRI_VISUAL_ACCOUNT_FIRST_RUN").is_some() {
+                        surfaces.seed_account_first_run_preview();
+                    }
+                    if std::env::var_os("DIRI_VISUAL_ACCOUNT_STATES").is_some() {
+                        surfaces.seed_account_states_preview();
                     }
                 }
                 surfaces

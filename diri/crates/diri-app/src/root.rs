@@ -623,6 +623,20 @@ impl RootView {
             cx.subscribe_in(
                 navigation,
                 window,
+                |this, _, request: &crate::sidebar::AccountRequest, _, cx| {
+                    if request == &crate::sidebar::AccountRequest::Refresh {
+                        let _ = this.services.usage_limits_refresh.try_send(());
+                    }
+                    let services = this.services.clone();
+                    this.sidebar.update(cx, |sidebar, cx| {
+                        sidebar.account_menu_action(request.clone(), services, cx);
+                    });
+                },
+            )
+            .detach();
+            cx.subscribe_in(
+                navigation,
+                window,
                 |this, _, command: &crate::palette_workspace::WorkspaceCommand, window, cx| {
                     let handled = this.sidebar.update(cx, |sidebar, cx| {
                         sidebar.run_workspace_palette(command.clone(), window, cx)
@@ -866,8 +880,19 @@ impl RootView {
                 surfaces,
                 window,
                 |this, _, event: &crate::surface_shell::UtilitySurfacesEvent, window, cx| {
-                    if let crate::surface_shell::UtilitySurfacesEvent::ShowWhatsNew(page) = event {
-                        this.open_whats_new_at(*page, window, cx);
+                    use crate::surface_shell::UtilitySurfacesEvent;
+                    match event {
+                        UtilitySurfacesEvent::ShowWhatsNew(page) => {
+                            this.open_whats_new_at(*page, window, cx);
+                        }
+                        UtilitySurfacesEvent::RefreshUsageLimits => {
+                            let _ = this.services.usage_limits_refresh.try_send(());
+                        }
+                        // The sign-in tab is selected: show it, ready to type.
+                        UtilitySurfacesEvent::AccountLoginOpened => {
+                            this.sidebar
+                                .update(cx, |_, cx| cx.emit(SidebarEvent::SessionActivated));
+                        }
                     }
                 },
             )
@@ -1148,6 +1173,12 @@ impl RootView {
                             sidebar.set_usage(snapshot.clone(), cx);
                         });
                         let _ = this.update(cx, |this, cx| {
+                            if let Some(navigation) = &this.navigation {
+                                let limits = snapshot.limits.clone();
+                                navigation.update(cx, |navigation, cx| {
+                                    navigation.set_account_limits(limits, cx)
+                                });
+                            }
                             if let Some(surfaces) = &this.utility_surfaces {
                                 surfaces.update(cx, |surfaces, cx| surfaces.set_usage(snapshot, cx));
                             }
