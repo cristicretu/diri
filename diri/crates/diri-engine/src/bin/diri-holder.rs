@@ -53,6 +53,18 @@ fn main() {
         let _ = diri_engine::holder::guard::run_group_guard(std::io::stdin().lock());
         return;
     }
+    #[cfg(target_os = "macos")]
+    if arguments.get(1).map(String::as_str) == Some(diri_engine::holder::launcher::RELAY_FLAG) {
+        // A one-shot launchd job that submits the manager's job from outside
+        // diri.app's coalition, then exits (see `RELAY_FLAG`).
+        let executable =
+            std::env::current_exe().unwrap_or_else(|_| std::path::PathBuf::from(&arguments[0]));
+        if let Err(error) = diri_engine::holder::launcher::run_relay(&executable, &arguments[2..]) {
+            eprintln!("diri-holder: relay: {error}");
+            std::process::exit(1);
+        }
+        return;
+    }
     // The daemon detaches us with setsid at spawn. Direct/manual launches
     // detach here as well; parent death never terminates a POSIX child, and
     // ignoring SIGHUP severs the last terminal coupling.
