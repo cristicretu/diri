@@ -1776,7 +1776,15 @@ mod tests {
             process_state(helper).is_some_and(|state| !state.starts_with('T'))
         });
 
-        client.kill_tree().expect("kill-tree");
+        // The leader's death may already have ended the session (Linux
+        // reports it at once), taking the socket with it; then there is
+        // nothing left to kill.
+        if let Err(error) = client.kill_tree() {
+            assert!(
+                server.is_finished() || !client.is_alive(),
+                "kill-tree on a live holder: {error:?}"
+            );
+        }
         wait_until("holder finished", || server.is_finished());
         server.join().expect("join").expect("clean holder exit");
     }
