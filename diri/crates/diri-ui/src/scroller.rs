@@ -8,8 +8,8 @@
 //! - **Overlay scrollers.** A thin rounded knob on the trailing edge that
 //!   appears while the content moves, lingers for a second and fades, widens
 //!   into a track when the pointer reaches it, and can be dragged. When the
-//!   user has set "Show scroll bars: Always" the knob lives in a permanent
-//!   track that reserves its own width instead.
+//!   user has set "Show scroll bars: Always" the knob lives in a track that
+//!   reserves its own width instead and shows while the content overflows.
 //! - **Rubber-band overscroll.** Trackpad gestures past either end pull the
 //!   content with increasing resistance and spring it back when the fingers
 //!   lift; momentum that runs into an edge bounces off it.
@@ -557,6 +557,15 @@ struct ScrollerInner {
     wake_due: Option<Instant>,
     overscroll: Overscroll,
     pin: Pin,
+    /// Legacy style only: whether the content overflowed last frame, and
+    /// when that last changed while the track is still fading.
+    track: Option<LegacyTrack>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct LegacyTrack {
+    scrollable: bool,
+    since: Option<Instant>,
 }
 
 /// Per-list scroller state: fade timing, hover, drag and the rubber band.
@@ -582,6 +591,7 @@ impl ScrollerState {
             wake_due: None,
             overscroll: Overscroll::new(),
             pin: Pin::from_env(),
+            track: None,
         })))
     }
 
@@ -598,13 +608,17 @@ impl ScrollerState {
         self.0.borrow().overscroll.offset()
     }
 
-    /// True while the knob is on screen: shown by recent movement, held by
-    /// the pointer, or always there in the legacy style. Callers that pay to
-    /// learn their content's length only need it while this holds.
+    /// True while the knob is on screen (shown by recent movement or held by
+    /// the pointer), and always in the legacy style, whose track appears as
+    /// soon as the content overflows. Callers that pay to learn their
+    /// content's length only need it while this holds.
     #[must_use]
     pub fn is_revealed(&self) -> bool {
         let inner = self.0.borrow();
-        inner.revealed_since.is_some() || inner.hovered || inner.drag.is_some()
+        inner.track.is_some()
+            || inner.revealed_since.is_some()
+            || inner.hovered
+            || inner.drag.is_some()
     }
 
     /// True while the pointer is on the scroller strip or dragging the knob.
@@ -626,16 +640,28 @@ struct Visibility {
 }
 
 impl ScrollerInner {
+    /// `scrollable` is whether the content overflows the viewport; with
+    /// nothing to scroll neither style shows a knob or track.
     fn visibility(
         &mut self,
         now: Instant,
         style: ScrollerStyle,
+        scrollable: bool,
         reduce_motion: bool,
     ) -> Visibility {
-        let held = self.hovered
-            || self.drag.is_some()
-            || style == ScrollerStyle::Legacy
-            || self.pin != Pin::None;
+        if style == ScrollerStyle::Legacy {
+            return self.legacy_visibility(now, scrollable, reduce_motion);
+        }
+        self.track = None;
+        if !scrollable {
+            self.revealed_since = None;
+            return Visibility {
+                opacity: 0.0,
+                animating: false,
+                hide_at: None,
+            };
+        }
+        let held = self.hovered || self.drag.is_some() || self.pin != Pin::None;
         let active_until = self.last_activity.map(|at| at + LINGER);
         let wants_shown = held || active_until.is_some_and(|until| now < until);
         if wants_shown {
@@ -676,6 +702,41 @@ impl ScrollerInner {
         Visibility {
             opacity,
             animating: opacity > 0.0,
+            hide_at: None,
+        }
+    }
+
+    /// The legacy track stays put while the content overflows and is absent
+    /// while it fits, so the reserved gutter reads as part of the surface.
+    /// Content crossing that line (a row added, a section collapsed) fades
+    /// the track instead of flipping the gutter in one frame. The first
+    /// frame settles without a fade.
+    fn legacy_visibility(
+        &mut self,
+        now: Instant,
+        scrollable: bool,
+        reduce_motion: bool,
+    ) -> Visibility {
+        self.revealed_since = None;
+        let since = match self.track {
+            Some(track) if track.scrollable == scrollable => track.since,
+            Some(_) => Some(now),
+            None => None,
+        };
+        let fade = if scrollable { FADE_IN } else { FADE_OUT };
+        let progress = match since {
+            Some(at) if !reduce_motion => {
+                (now.saturating_duration_since(at).as_secs_f32() / fade.as_secs_f32()).min(1.0)
+            }
+            _ => 1.0,
+        };
+        self.track = Some(LegacyTrack {
+            scrollable,
+            since: since.filter(|_| progress < 1.0),
+        });
+        Visibility {
+            opacity: if scrollable { progress } else { 1.0 - progress },
+            animating: progress < 1.0,
             hide_at: None,
         }
     }
@@ -774,6 +835,8 @@ impl ScrollArea {
                 point(thumb_left, travel_top + px(geometry.start)),
                 size(px(thumb_width), px(geometry.length)),
             ),
+            // A knobless track, so the legacy strip can fade out after
+            // the content stops overflowing.
             None if style == ScrollerStyle::Legacy => Bounds::new(
                 point(thumb_left, travel_top),
                 size(px(thumb_width), px(0.0)),
@@ -912,16 +975,7 @@ impl Element for ScrollArea {
             if geometry.is_none() && inner.drag.is_some() {
                 inner.drag = None;
             }
-            let visibility = if geometry.is_none() && style == ScrollerStyle::Overlay {
-                inner.revealed_since = None;
-                Visibility {
-                    opacity: 0.0,
-                    animating: false,
-                    hide_at: None,
-                }
-            } else {
-                inner.visibility(now, style, reduce_motion)
-            };
+            let visibility = inner.visibility(now, style, geometry.is_some(), reduce_motion);
             let expanded = inner.hovered || inner.drag.is_some() || inner.pin == Pin::Expanded;
             (visibility, expanded)
         };
@@ -1196,7 +1250,9 @@ impl ScrollerLook {
             }
             ScrollerStyle::Legacy => {
                 let (rest, hover) = if dark { (0.36, 0.46) } else { (0.28, 0.38) };
-                let fill = colors.background.blend(colors.primary.alpha(0.02));
+                // Tint the actual surface underneath, including translucent
+                // sidebars, rather than painting the terminal background.
+                let fill = colors.primary.alpha(0.02);
                 Self {
                     thumb: colors.primary.alpha(if expanded { hover } else { rest }),
                     track: Some(TrackLook {
@@ -1467,43 +1523,108 @@ mod tests {
             wake_due: None,
             overscroll: Overscroll::new(),
             pin: Pin::None,
+            track: None,
         };
         // The first frame after activity starts the fade-in; a frame later
         // the knob is fully shown and knows when it will start hiding.
-        let revealing = inner.visibility(t0, ScrollerStyle::Overlay, false);
+        let revealing = inner.visibility(t0, ScrollerStyle::Overlay, true, false);
         assert_eq!(revealing.opacity, 0.0);
         assert!(revealing.animating);
-        let shown = inner.visibility(t0 + FADE_IN, ScrollerStyle::Overlay, false);
+        let shown = inner.visibility(t0 + FADE_IN, ScrollerStyle::Overlay, true, false);
         assert_eq!(shown.opacity, 1.0);
         assert!(!shown.animating);
         assert_eq!(shown.hide_at, Some(t0 + LINGER));
-        let fading = inner.visibility(t0 + LINGER + FADE_OUT / 2, ScrollerStyle::Overlay, false);
+        let fading = inner.visibility(
+            t0 + LINGER + FADE_OUT / 2,
+            ScrollerStyle::Overlay,
+            true,
+            false,
+        );
         assert!(fading.animating);
         assert!(fading.opacity > 0.4 && fading.opacity < 0.6, "{fading:?}");
-        let gone = inner.visibility(t0 + LINGER + FADE_OUT * 2, ScrollerStyle::Overlay, false);
+        let gone = inner.visibility(
+            t0 + LINGER + FADE_OUT * 2,
+            ScrollerStyle::Overlay,
+            true,
+            false,
+        );
         assert_eq!(gone.opacity, 0.0);
         assert!(!gone.animating);
 
         // Hovering the strip holds it fully shown with no fade pending.
         inner.hovered = true;
-        let held = inner.visibility(t0 + LINGER * 5, ScrollerStyle::Overlay, false);
+        let held = inner.visibility(t0 + LINGER * 5, ScrollerStyle::Overlay, true, false);
         assert_eq!(held.opacity, 1.0);
         assert_eq!(held.hide_at, None);
 
         // Reduce Motion: shown or hidden, never in between.
         inner.hovered = false;
         inner.last_activity = Some(t0 + LINGER * 5);
-        let instant = inner.visibility(t0 + LINGER * 5, ScrollerStyle::Overlay, true);
+        let instant = inner.visibility(t0 + LINGER * 5, ScrollerStyle::Overlay, true, true);
         assert_eq!(instant.opacity, 1.0);
         assert!(!instant.animating);
-        let off = inner.visibility(t0 + LINGER * 7, ScrollerStyle::Overlay, true);
+        let off = inner.visibility(t0 + LINGER * 7, ScrollerStyle::Overlay, true, true);
         assert_eq!(off.opacity, 0.0);
         assert!(!off.animating);
 
-        // Legacy scrollers never hide.
-        inner.last_activity = None;
-        let legacy = inner.visibility(t0 + LINGER * 9, ScrollerStyle::Legacy, false);
-        assert_eq!(legacy.opacity, 1.0);
+        // Nothing to scroll: no knob, even while held.
+        inner.hovered = true;
+        let fits = inner.visibility(t0 + LINGER * 8, ScrollerStyle::Overlay, false, false);
+        assert_eq!(fits.opacity, 0.0);
+        assert!(!fits.animating);
+    }
+
+    #[test]
+    fn legacy_track_shows_while_content_overflows() {
+        let t0 = Instant::now();
+        let state = ScrollerState::new();
+        let visibility = |at: Instant, scrollable: bool, reduce_motion: bool| {
+            state
+                .0
+                .borrow_mut()
+                .visibility(at, ScrollerStyle::Legacy, scrollable, reduce_motion)
+        };
+
+        // The first frame settles without a fade either way.
+        let fits = visibility(t0, false, false);
+        assert_eq!(fits.opacity, 0.0);
+        assert!(!fits.animating);
+        // A legacy scroller with nothing to scroll still counts as revealed,
+        // so the terminal keeps probing for its history length.
+        assert!(state.is_revealed());
+
+        // Overflowing fades the track in, and it then stays without lingering.
+        let appearing = visibility(t0 + LINGER, true, false);
+        assert_eq!(appearing.opacity, 0.0);
+        assert!(appearing.animating);
+        let shown = visibility(t0 + LINGER + FADE_IN, true, false);
+        assert_eq!(shown.opacity, 1.0);
+        assert!(!shown.animating);
+        assert_eq!(shown.hide_at, None);
+        assert_eq!(visibility(t0 + LINGER * 20, true, false).opacity, 1.0);
+
+        // Fitting again fades it out instead of dropping it in one frame.
+        let leaving = visibility(t0 + LINGER * 21, false, false);
+        assert_eq!(leaving.opacity, 1.0);
+        assert!(leaving.animating);
+        let half = visibility(t0 + LINGER * 21 + FADE_OUT / 2, false, false);
+        assert!(half.opacity > 0.4 && half.opacity < 0.6, "{half:?}");
+        let gone = visibility(t0 + LINGER * 21 + FADE_OUT, false, false);
+        assert_eq!(gone.opacity, 0.0);
+        assert!(!gone.animating);
+        assert!(state.is_revealed());
+
+        // Reduce Motion: shown or hidden, never in between.
+        assert_eq!(visibility(t0 + LINGER * 30, true, true).opacity, 1.0);
+        assert_eq!(visibility(t0 + LINGER * 31, false, true).opacity, 0.0);
+
+        // Switching to overlay drops the legacy reveal.
+        visibility(t0 + LINGER * 32, false, false);
+        state
+            .0
+            .borrow_mut()
+            .visibility(t0 + LINGER * 33, ScrollerStyle::Overlay, false, false);
+        assert!(!state.is_revealed());
     }
 
     #[test]
