@@ -274,11 +274,79 @@ pub fn theme(id: &str) -> TermTheme {
 }
 
 pub fn next_theme(id: &str) -> TermTheme {
-    let index = TermTheme::CATALOG
-        .iter()
-        .position(|theme| theme.id == id)
-        .unwrap_or(0);
-    TermTheme::CATALOG[(index + 1) % TermTheme::CATALOG.len()]
+    let all = diri_term::themes::all();
+    let index = all.iter().position(|theme| theme.id == id);
+    index.map_or(TermTheme::DIRIJOR_DARK, |index| {
+        all[(index + 1) % all.len()]
+    })
+}
+
+/// A group of the theme picker, in the order it lists them.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ThemeGroup {
+    Imported,
+    Dark,
+    Light,
+}
+
+/// One row of the theme picker: a group header or a theme.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum ThemePickerRow {
+    Header(ThemeGroup),
+    Theme(&'static TermTheme),
+}
+
+/// The picker's rows for `query`: imported themes, then dark, then light,
+/// each in catalog order (curated first), empty groups left out. Every word
+/// of the query must appear in the theme's name or in "dark"/"light".
+pub fn theme_picker_rows(query: &str) -> Vec<ThemePickerRow> {
+    use diri_term::theme::ThemeAppearance;
+    let query = query.to_lowercase();
+    let words = query.split_whitespace().collect::<Vec<_>>();
+    let matches = |theme: &TermTheme| {
+        words.is_empty() || {
+            let haystack = format!(
+                "{} {}",
+                theme.name.to_lowercase(),
+                theme.appearance.label().to_lowercase()
+            );
+            words.iter().all(|word| haystack.contains(word))
+        }
+    };
+    let imported = diri_term::themes::imported();
+    let catalog = diri_term::themes::catalog();
+    let groups: [(ThemeGroup, Box<dyn Iterator<Item = &'static TermTheme>>); 3] = [
+        (ThemeGroup::Imported, Box::new(imported.iter().copied())),
+        (
+            ThemeGroup::Dark,
+            Box::new(
+                catalog
+                    .iter()
+                    .filter(|theme| theme.appearance == ThemeAppearance::Dark),
+            ),
+        ),
+        (
+            ThemeGroup::Light,
+            Box::new(
+                catalog
+                    .iter()
+                    .filter(|theme| theme.appearance == ThemeAppearance::Light),
+            ),
+        ),
+    ];
+    let mut rows = Vec::new();
+    for (group, themes) in groups {
+        let header = rows.len();
+        rows.extend(
+            themes
+                .filter(|theme| matches(theme))
+                .map(ThemePickerRow::Theme),
+        );
+        if rows.len() > header {
+            rows.insert(header, ThemePickerRow::Header(group));
+        }
+    }
+    rows
 }
 
 pub fn cycle_hibernate_minutes(value: u32) -> u32 {
@@ -325,8 +393,71 @@ mod tests {
     #[test]
     fn terminal_theme_falls_back_and_wraps() {
         assert_eq!(theme("missing").id, TermTheme::DIRIJOR_DARK.id);
-        let last = TermTheme::CATALOG.last().unwrap();
-        assert_eq!(next_theme(last.id).id, TermTheme::DIRIJOR_DARK.id);
+        let all = diri_term::themes::all();
+        let last = all.last().unwrap();
+        assert_eq!(next_theme(last.id).id, all[0].id);
+        assert_eq!(next_theme("missing").id, TermTheme::DIRIJOR_DARK.id);
+        // Vendored and curated ids both resolve.
+        assert_eq!(theme("3024-night").name, "3024 Night");
+        assert_eq!(theme("vesper"), TermTheme::VESPER);
+    }
+
+    #[test]
+    fn theme_picker_groups_and_filters_the_whole_catalog() {
+        let headers = |rows: &[ThemePickerRow]| {
+            rows.iter()
+                .filter_map(|row| match row {
+                    ThemePickerRow::Header(group) => Some(*group),
+                    ThemePickerRow::Theme(_) => None,
+                })
+                .filter(|group| *group != ThemeGroup::Imported)
+                .collect::<Vec<_>>()
+        };
+        let all = theme_picker_rows("");
+        assert_eq!(headers(&all), [ThemeGroup::Dark, ThemeGroup::Light]);
+        assert!(all.len() > 700, "{}", all.len());
+        let dark_first = all.iter().find_map(|row| match row {
+            // Other tests import themes into the shared registry.
+            ThemePickerRow::Theme(theme)
+                if theme.appearance == diri_term::theme::ThemeAppearance::Dark
+                    && !diri_term::themes::is_imported(theme.id) =>
+            {
+                Some(theme.id)
+            }
+            _ => None,
+        });
+        assert_eq!(
+            dark_first,
+            Some(TermTheme::DIRIJOR_DARK.id),
+            "curated themes lead"
+        );
+
+        let gruvbox = theme_picker_rows("GRUVBOX light");
+        assert_eq!(headers(&gruvbox), [ThemeGroup::Light]);
+        assert!(gruvbox.iter().all(|row| match row {
+            ThemePickerRow::Theme(theme) => theme.name.to_lowercase().contains("gruvbox"),
+            ThemePickerRow::Header(_) => true,
+        }));
+        assert!(gruvbox.iter().any(
+            |row| matches!(row, ThemePickerRow::Theme(theme) if theme.id == TermTheme::GRUVBOX_LIGHT.id)
+        ));
+        assert!(theme_picker_rows("no such theme anywhere").is_empty());
+    }
+
+    /// The picker rebuilds its rows on every keystroke and frame it is open.
+    #[test]
+    fn theme_picker_rows_are_cheap_to_rebuild() {
+        let _ = theme_picker_rows("");
+        let start = std::time::Instant::now();
+        for query in ["", "a", "night", "solarized dark"] {
+            let _ = theme_picker_rows(query);
+        }
+        // Generous for a debug build on a busy machine; release is ~50x faster.
+        assert!(
+            start.elapsed() < std::time::Duration::from_millis(250),
+            "{:?}",
+            start.elapsed()
+        );
     }
 
     #[test]

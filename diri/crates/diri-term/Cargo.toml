@@ -13,6 +13,11 @@ gpui.workspace = true
 # terminal images (PNG/JPEG/GIF and Kitty's zlib-compressed raw pixels).
 image = { workspace = true, features = ["gif", "jpeg", "png"] }
 miniz_oxide = "0.8"
+# Theme import/export: `.itermcolors` property lists and diri's JSON theme
+# file. All three are already built for diri-engine and diri-app.
+plist.workspace = true
+serde.workspace = true
+serde_json.workspace = true
 unicode-width = "0.2.2"
 
 [dev-dependencies]

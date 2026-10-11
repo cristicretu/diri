@@ -3389,6 +3389,7 @@ impl StoreRuntime {
     }
 
     pub fn start_default(client: Arc<DaemonClient>) -> io::Result<Self> {
+        crate::imported_themes::load_into_registry(&crate::imported_themes::default_dir());
         Self::start(client, Prefs::path())
     }
 
@@ -3397,6 +3398,7 @@ impl StoreRuntime {
     /// Engine off the GPUI thread; the supervisor starts the client exactly
     /// once after that authoritative decision finishes.
     pub(crate) fn start_default_deferred(client: Arc<DaemonClient>) -> io::Result<Self> {
+        crate::imported_themes::load_into_registry(&crate::imported_themes::default_dir());
         let (store, effects) = SessionStore::load(Prefs::path())?;
         Ok(Self::start_with_store(
             client,

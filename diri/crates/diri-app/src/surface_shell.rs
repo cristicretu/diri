@@ -21,7 +21,9 @@ use crate::icons::{SymbolWeight, sf_symbol, sf_symbol_weighted};
 use crate::navigation::query_label;
 use crate::query_editor::{self, ClipboardEdit, Edit, LocalEdit, QueryEditor};
 use crate::quick_open;
-use crate::settings::{HostDraft, SettingsNav, SettingsTab, theme};
+use crate::settings::{
+    HostDraft, SettingsNav, SettingsTab, ThemeGroup, ThemePickerRow, theme, theme_picker_rows,
+};
 mod account_settings;
 mod import_settings;
 mod privacy_settings;
@@ -39,8 +41,9 @@ use diri_ui::{
 use gpui::{
     Animation, AnimationExt, AnyElement, App, Bounds, ClickEvent, Context, CursorStyle,
     DragMoveEvent, FocusHandle, Focusable, FontWeight, IntoElement, KeyDownEvent, MouseButton,
-    MouseDownEvent, PathPromptOptions, Pixels, Render, Rgba, ScrollHandle, SharedString, Task,
-    TextRun, Window, canvas, deferred, div, ease_out_quint, font, point, prelude::*, px, rgba,
+    MouseDownEvent, PathPromptOptions, Pixels, Render, Rgba, ScrollHandle, ScrollStrategy,
+    SharedString, Task, TextRun, UniformListScrollHandle, Window, canvas, deferred, div,
+    ease_out_quint, font, point, prelude::*, px, rgba, uniform_list,
 };
 use tokio::runtime::Runtime;
 
@@ -279,6 +282,41 @@ struct AgentPathEditor {
     error: Option<String>,
 }
 
+/// One line for an import that failed: which file, and why in words the
+/// person can act on.
+fn theme_import_failure(path: &Path, error: &crate::imported_themes::ImportError) -> String {
+    use crate::imported_themes::ImportError;
+    use diri_term::theme_file::ThemeFileError;
+    let reason = match error {
+        ImportError::Read => "settings.appearance.theme_error_read",
+        ImportError::Write => "settings.appearance.theme_error_write",
+        ImportError::Parse(ThemeFileError::TooLarge) => "settings.appearance.theme_error_too_large",
+        ImportError::Parse(ThemeFileError::UnsupportedVersion(_)) => {
+            "settings.appearance.theme_error_newer"
+        }
+        ImportError::Parse(ThemeFileError::Missing(_)) => "settings.appearance.theme_error_missing",
+        ImportError::Parse(ThemeFileError::NotText | ThemeFileError::Invalid(_)) => {
+            "settings.appearance.theme_error_format"
+        }
+    };
+    let file = path
+        .file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    tf(
+        "settings.appearance.theme_import_failed",
+        &[("file", &file), ("reason", &t(reason))],
+    )
+}
+
+/// What the last theme import or export did.
+#[derive(Clone, Debug, PartialEq)]
+enum ThemeFileStatus {
+    Imported(usize),
+    Exported(String),
+    Failed(String),
+}
+
 struct ShortcutEditor {
     command: CommandId,
     error: Option<String>,
@@ -497,6 +535,11 @@ pub struct UtilitySurfaces {
     shortcut_search: QueryEditor,
     shortcut_search_active: bool,
     shortcut_editor: Option<ShortcutEditor>,
+    /// The open theme menu's search; typing goes here while it is open.
+    theme_search: QueryEditor,
+    theme_scroll: UniformListScrollHandle,
+    /// The last theme import or export, shown beside its buttons.
+    theme_file_status: Option<ThemeFileStatus>,
     include_path: PathBuf,
     include_editor: QueryEditor,
     include_editor_active: bool,
@@ -724,6 +767,9 @@ impl UtilitySurfaces {
             shortcut_search: QueryEditor::default(),
             shortcut_search_active: false,
             shortcut_editor: None,
+            theme_search: QueryEditor::default(),
+            theme_scroll: UniformListScrollHandle::new(),
+            theme_file_status: None,
             include_path,
             include_editor,
             include_editor_active: false,
@@ -2179,6 +2225,219 @@ impl UtilitySurfaces {
         true
     }
 
+    /// Typing while the theme menu is open filters it; Return picks the
+    /// first match and Escape closes the menu.
+    fn handle_theme_search_key(&mut self, event: &KeyDownEvent, cx: &mut Context<Self>) -> bool {
+        if self.surface != Surface::Settings
+            || self.settings_menu != Some(SettingsMenu::TerminalTheme)
+        {
+            return false;
+        }
+        match event.keystroke.key.as_str() {
+            "escape" => {
+                if self.theme_search.is_empty() {
+                    self.settings_menu = None;
+                } else {
+                    self.theme_search.clear();
+                }
+            }
+            "enter" => {
+                let first = theme_picker_rows(self.theme_search.text())
+                    .into_iter()
+                    .find_map(|row| match row {
+                        ThemePickerRow::Theme(theme) => Some(theme.id),
+                        ThemePickerRow::Header(_) => None,
+                    });
+                if let Some(id) = first {
+                    self.choose_terminal_theme(id);
+                }
+            }
+            _ => {
+                let Some(edit) = query_editor::edit_for(&event.keystroke) else {
+                    return false;
+                };
+                match edit {
+                    Edit::Local(local) => {
+                        self.theme_search.apply(local);
+                    }
+                    Edit::Clipboard(ClipboardEdit::Copy) => {
+                        query_editor::copy_selection(&self.theme_search, cx);
+                    }
+                    Edit::Clipboard(ClipboardEdit::Cut) => {
+                        query_editor::cut_selection(&mut self.theme_search, cx);
+                    }
+                    Edit::Clipboard(ClipboardEdit::Paste) => {
+                        if let Some(text) = cx.read_from_clipboard().and_then(|item| item.text()) {
+                            self.theme_search.insert(&text);
+                        }
+                    }
+                }
+                self.theme_scroll.scroll_to_item(0, ScrollStrategy::Top);
+            }
+        }
+        cx.notify();
+        true
+    }
+
+    fn choose_terminal_theme(&mut self, id: &'static str) {
+        self.settings_menu = None;
+        self.update_prefs(move |prefs| {
+            prefs.follow_system_theme = false;
+            prefs.terminal_theme = id.to_owned();
+        });
+    }
+
+    /// Opens the theme menu at the selected theme with an empty search.
+    fn open_terminal_theme_menu(&mut self) {
+        self.theme_search.clear();
+        let selected = self.prefs.terminal_theme.clone();
+        if let Some(index) = theme_picker_rows("")
+            .iter()
+            .position(|row| matches!(row, ThemePickerRow::Theme(theme) if theme.id == selected))
+        {
+            self.theme_scroll
+                .scroll_to_item(index, ScrollStrategy::Center);
+        }
+    }
+
+    fn import_terminal_themes(&mut self, cx: &mut Context<Self>) {
+        self.settings_menu = None;
+        let paths = cx.prompt_for_paths(PathPromptOptions {
+            files: true,
+            directories: false,
+            multiple: true,
+            prompt: Some(t("settings.appearance.theme_import_prompt").into()),
+        });
+        cx.spawn(async move |this, cx| {
+            let Ok(Ok(Some(paths))) = paths.await else {
+                return;
+            };
+            let dir = crate::imported_themes::default_dir();
+            let results = cx
+                .background_spawn(async move {
+                    paths
+                        .iter()
+                        .map(|path| {
+                            (
+                                path.clone(),
+                                crate::imported_themes::import_path(&dir, path),
+                            )
+                        })
+                        .collect::<Vec<_>>()
+                })
+                .await;
+            let _ = this.update(cx, |this, cx| {
+                let mut imported = Vec::new();
+                let mut failed = None;
+                for (path, result) in results {
+                    match result {
+                        Ok(theme) => imported.push(theme),
+                        Err(error) => {
+                            failed.get_or_insert_with(|| theme_import_failure(&path, &error));
+                        }
+                    }
+                }
+                // The last good import becomes the theme, as choosing it would.
+                if let Some(theme) = imported.last() {
+                    this.choose_terminal_theme(theme.id);
+                }
+                this.theme_file_status = Some(match failed {
+                    Some(message) => ThemeFileStatus::Failed(message),
+                    None => ThemeFileStatus::Imported(imported.len()),
+                });
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    fn export_terminal_theme(&mut self, cx: &mut Context<Self>) {
+        self.settings_menu = None;
+        let current = theme(&self.prefs.terminal_theme);
+        let text = diri_term::theme_file::export_diri(&current);
+        let directory = std::env::var_os("HOME")
+            .map(|home| PathBuf::from(home).join("Downloads"))
+            .filter(|path| path.is_dir())
+            .unwrap_or_else(std::env::temp_dir);
+        let path = cx.prompt_for_new_path(
+            &directory,
+            Some(&crate::imported_themes::export_file_name(&current)),
+        );
+        cx.spawn(async move |this, cx| {
+            let Ok(Ok(Some(path))) = path.await else {
+                return;
+            };
+            let status = match std::fs::write(&path, text) {
+                Ok(()) => ThemeFileStatus::Exported(
+                    path.file_name()
+                        .map(|name| name.to_string_lossy().into_owned())
+                        .unwrap_or_default(),
+                ),
+                Err(_) => ThemeFileStatus::Failed(tf(
+                    "settings.appearance.theme_export_failed",
+                    &[("file", &path.display().to_string())],
+                )),
+            };
+            let _ = this.update(cx, |this, cx| {
+                this.theme_file_status = Some(status);
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    fn theme_files_control(&self, cx: &mut Context<Self>) -> AnyElement {
+        let colors = self.settings_colors();
+        let status = self.theme_file_status.as_ref().map(|status| match status {
+            ThemeFileStatus::Imported(count) => (
+                tf(
+                    "settings.appearance.theme_imported",
+                    &[("count", &count.to_string())],
+                ),
+                colors.secondary,
+            ),
+            ThemeFileStatus::Exported(file) => (
+                tf("settings.appearance.theme_exported", &[("file", file)]),
+                colors.secondary,
+            ),
+            ThemeFileStatus::Failed(message) => (message.clone(), Ink::DANGER),
+        });
+        div()
+            .min_w(px(0.0))
+            .flex()
+            .items_center()
+            .gap(px(7.0))
+            .when_some(status, |row, (text, color)| {
+                row.child(
+                    div()
+                        .debug_selector(|| "theme-file-status".into())
+                        .min_w(px(0.0))
+                        .max_w(px(260.0))
+                        .overflow_hidden()
+                        .whitespace_nowrap()
+                        .text_ellipsis()
+                        .text_size(px(11.0))
+                        .text_color(color)
+                        .child(text),
+                )
+            })
+            .child(surface_button(
+                t("settings.appearance.theme_import"),
+                "import-terminal-theme",
+                colors,
+                cx,
+                |this, cx| this.import_terminal_themes(cx),
+            ))
+            .child(surface_button(
+                t("settings.appearance.theme_export"),
+                "export-terminal-theme",
+                colors,
+                cx,
+                |this, cx| this.export_terminal_theme(cx),
+            ))
+            .into_any_element()
+    }
+
     fn handle_shortcut_search_key(&mut self, event: &KeyDownEvent, cx: &mut Context<Self>) -> bool {
         if self.surface != Surface::Settings
             || self.settings_tab != SettingsTab::Shortcuts
@@ -2309,7 +2568,7 @@ impl UtilitySurfaces {
         {
             return;
         }
-        if self.handle_settings_search_key(event, cx) {
+        if self.handle_theme_search_key(event, cx) || self.handle_settings_search_key(event, cx) {
             cx.stop_propagation();
             return;
         }
@@ -4622,92 +4881,177 @@ impl UtilitySurfaces {
         options.into_any_element()
     }
 
+    /// Every theme, searchable, grouped imported/dark/light. The list is
+    /// virtual: only visible rows are built, so hundreds of themes cost what
+    /// a dozen did.
     fn terminal_theme_options(&self, colors: SemanticColors, cx: &mut Context<Self>) -> AnyElement {
-        let selected = theme(&self.prefs.terminal_theme);
-        let mut options = div()
-            .id("terminal-theme-options")
-            .max_h(px(300.0))
-            .overflow_y_scroll()
-            .p(px(4.0))
+        let selected = theme(&self.prefs.terminal_theme).id;
+        let rows = Rc::new(theme_picker_rows(self.theme_search.text()));
+        let search_content = if self.theme_search.is_empty() {
+            div()
+                .text_color(colors.tertiary)
+                .child(t("settings.appearance.theme_search_placeholder"))
+                .into_any_element()
+        } else {
+            query_label(&self.theme_search)
+        };
+        let search = div()
+            .debug_selector(|| "terminal-theme-search".into())
+            .h(px(30.0))
+            .mx(px(4.0))
+            .mt(px(4.0))
+            .px(px(8.0))
             .flex()
-            .flex_col();
-        for appearance in ThemeAppearance::ALL {
-            options = options.child(
+            .items_center()
+            .gap(px(7.0))
+            .rounded(px(Radius::inner(crate::floating::MENU_RADIUS, 4.0)))
+            .bg(colors.primary.alpha(0.05))
+            .child(sf_symbol("magnifyingglass", 11.0, colors.tertiary))
+            .child(
                 div()
-                    .h(px(24.0))
+                    .flex_1()
+                    .min_w(px(0.0))
+                    .overflow_hidden()
+                    .whitespace_nowrap()
+                    .text_size(px(Typo::ROW.size))
+                    .text_color(colors.primary)
+                    .child(search_content),
+            );
+        let list = if rows.is_empty() {
+            div()
+                .h(px(64.0))
+                .flex()
+                .items_center()
+                .justify_center()
+                .text_size(px(Typo::ROW.size))
+                .text_color(colors.secondary)
+                .child(t("settings.appearance.theme_no_match"))
+                .into_any_element()
+        } else {
+            let entity = cx.entity();
+            let height = (rows.len() as f32 * Metrics::ROW_HEIGHT).min(320.0) + 8.0;
+            div()
+                .h(px(height))
+                .child(
+                    uniform_list("terminal-theme-options", rows.len(), move |range, _, cx| {
+                        entity.update(cx, |this, cx| {
+                            range
+                                .map(|index| {
+                                    this.terminal_theme_row(
+                                        rows[index],
+                                        index,
+                                        selected,
+                                        colors,
+                                        cx,
+                                    )
+                                })
+                                .collect()
+                        })
+                    })
+                    .track_scroll(&self.theme_scroll)
+                    .p(px(4.0))
+                    .size_full(),
+                )
+                .into_any_element()
+        };
+        div()
+            .debug_selector(|| "terminal-theme-menu".into())
+            .flex()
+            .flex_col()
+            .child(search)
+            .child(list)
+            .into_any_element()
+    }
+
+    fn terminal_theme_row(
+        &mut self,
+        row: ThemePickerRow,
+        index: usize,
+        selected: &'static str,
+        colors: SemanticColors,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let candidate = match row {
+            ThemePickerRow::Header(group) => {
+                return div()
+                    .w_full()
+                    .h(px(Metrics::ROW_HEIGHT))
                     .px(px(8.0))
                     .flex()
-                    .items_center()
+                    .items_end()
+                    .pb(px(4.0))
                     .text_size(px(Typo::META.size - 1.0))
                     .font_weight(FontWeight::SEMIBOLD)
                     .text_color(colors.tertiary)
-                    .child(t(match appearance {
-                        ThemeAppearance::Light => "settings.appearance.group_light",
-                        ThemeAppearance::Dark => "settings.appearance.group_dark",
-                    })),
-            );
-            for (index, candidate) in TermTheme::CATALOG
-                .into_iter()
-                .enumerate()
-                .filter(|(_, theme)| theme.appearance == appearance)
-            {
-                let is_selected = candidate.id == selected.id;
-                options = options.child(
-                    div()
-                        .id(SharedString::from(format!("terminal-theme-option-{index}")))
-                        .h(px(Metrics::ROW_HEIGHT))
-                        .px(px(8.0))
-                        .rounded(px(Radius::inner(crate::floating::MENU_RADIUS, 4.0)))
-                        .flex()
-                        .items_center()
-                        .gap(px(8.0))
-                        .bg(Fill::selected(colors, is_selected))
-                        .cursor_pointer()
-                        .glass_menu_row(colors, false)
-                        .on_click(cx.listener(move |this, _, _, cx| {
-                            this.settings_menu = None;
-                            this.update_prefs(move |prefs| {
-                                prefs.follow_system_theme = false;
-                                prefs.terminal_theme = candidate.id.to_owned();
-                            });
-                            cx.notify();
-                        }))
-                        .child(
-                            div()
-                                .size(px(16.0))
-                                .rounded(px(5.0))
-                                .bg(candidate.background)
-                                .border_1()
-                                .border_color(colors.primary.alpha(0.16))
-                                .flex()
-                                .items_center()
-                                .justify_center()
-                                .child(
-                                    div()
-                                        .size(px(5.0))
-                                        .rounded(px(2.5))
-                                        .bg(candidate.foreground),
-                                ),
-                        )
-                        .child(
-                            div().flex().gap(px(2.0)).children(
-                                [candidate.ansi[2], candidate.ansi[4], candidate.ansi[5]]
-                                    .map(|color| div().size(px(5.0)).rounded(px(2.5)).bg(color)),
-                            ),
-                        )
-                        .child(
-                            div()
-                                .flex_1()
-                                .text_size(px(Typo::ROW.size))
-                                .child(candidate.name),
-                        )
-                        .when(is_selected, |row| {
-                            row.child(sf_symbol("checkmark", 10.0, colors.secondary))
-                        }),
-                );
+                    .child(t(match group {
+                        ThemeGroup::Imported => "settings.appearance.group_imported",
+                        ThemeGroup::Light => "settings.appearance.group_light",
+                        ThemeGroup::Dark => "settings.appearance.group_dark",
+                    }))
+                    .into_any_element();
             }
-        }
-        options.into_any_element()
+            ThemePickerRow::Theme(theme) => theme,
+        };
+        let is_selected = candidate.id == selected;
+        div()
+            .id(SharedString::from(format!("terminal-theme-option-{index}")))
+            .w_full()
+            .h(px(Metrics::ROW_HEIGHT))
+            .px(px(8.0))
+            .rounded(px(Radius::inner(crate::floating::MENU_RADIUS, 4.0)))
+            .flex()
+            .items_center()
+            .gap(px(8.0))
+            .bg(Fill::selected(colors, is_selected))
+            .cursor_pointer()
+            .glass_menu_row(colors, false)
+            .on_click(cx.listener(move |this, _, _, cx| {
+                this.choose_terminal_theme(candidate.id);
+                cx.notify();
+            }))
+            .child(
+                div()
+                    .flex_none()
+                    .size(px(16.0))
+                    .rounded(px(5.0))
+                    .bg(candidate.background)
+                    .border_1()
+                    .border_color(colors.primary.alpha(0.16))
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .child(
+                        div()
+                            .size(px(5.0))
+                            .rounded(px(2.5))
+                            .bg(candidate.foreground),
+                    ),
+            )
+            .child(
+                div().flex_none().flex().gap(px(2.0)).children(
+                    [
+                        candidate.ansi[1],
+                        candidate.ansi[2],
+                        candidate.ansi[4],
+                        candidate.ansi[5],
+                    ]
+                    .map(|color| div().size(px(5.0)).rounded(px(2.5)).bg(color)),
+                ),
+            )
+            .child(
+                div()
+                    .flex_1()
+                    .min_w(px(0.0))
+                    .overflow_hidden()
+                    .whitespace_nowrap()
+                    .text_ellipsis()
+                    .text_size(px(Typo::ROW.size))
+                    .child(candidate.name),
+            )
+            .when(is_selected, |row| {
+                row.child(sf_symbol("checkmark", 10.0, colors.secondary))
+            })
+            .into_any_element()
     }
 
     fn hibernate_options(&self, colors: SemanticColors, cx: &mut Context<Self>) -> AnyElement {
@@ -5216,6 +5560,12 @@ impl UtilitySurfaces {
                         .child(appearance_setting_row(
                             t("settings.appearance.color_theme"),
                             self.terminal_theme_dropdown(cx),
+                            colors,
+                        ))
+                        .child(appearance_divider(colors))
+                        .child(appearance_setting_row(
+                            t("settings.appearance.theme_files"),
+                            self.theme_files_control(cx),
                             colors,
                         ))
                         .child(appearance_divider(colors))
@@ -7834,6 +8184,9 @@ fn settings_select_button(
             } else {
                 Some(menu)
             };
+            if this.settings_menu == Some(SettingsMenu::TerminalTheme) {
+                this.open_terminal_theme_menu();
+            }
             if this.settings_menu == Some(SettingsMenu::TerminalFont) {
                 // Read on open, so a font installed while diri runs shows up;
                 // the last listing shows meanwhile.
@@ -9413,6 +9766,24 @@ mod tests {
                                     .map(str::to_owned)
                                     .into();
                             surfaces.settings_menu = Some(SettingsMenu::TerminalFont);
+                            cx.notify();
+                        });
+                    }
+                    if std::env::var_os("DIRI_APPEARANCE_THEME_STATUS").is_some() {
+                        harness.surfaces.update(cx, |surfaces, cx| {
+                            surfaces.theme_file_status = Some(ThemeFileStatus::Imported(1));
+                            cx.notify();
+                        });
+                    }
+                    if std::env::var_os("DIRI_APPEARANCE_THEME_MENU").is_some() {
+                        let query = std::env::var("DIRI_APPEARANCE_THEME_QUERY").ok();
+                        harness.surfaces.update(cx, |surfaces, cx| {
+                            surfaces.settings_menu = Some(SettingsMenu::TerminalTheme);
+                            surfaces.open_terminal_theme_menu();
+                            if let Some(query) = &query {
+                                surfaces.theme_search.insert(query);
+                                surfaces.theme_scroll.scroll_to_item(0, ScrollStrategy::Top);
+                            }
                             cx.notify();
                         });
                     }

@@ -36,6 +36,7 @@ mod herdr_import;
 pub mod history;
 mod i18n;
 mod icons;
+mod imported_themes;
 mod inspector;
 mod launch_recipe;
 mod launcher;

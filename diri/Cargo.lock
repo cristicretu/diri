@@ -1721,6 +1721,9 @@ dependencies = [
  "gpui_platform",
  "image",
  "miniz_oxide",
+ "plist",
+ "serde",
+ "serde_json",
  "unicode-width",
 ]
 

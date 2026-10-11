@@ -22,4 +22,6 @@ pub mod selection_shimmer;
 pub mod smooth_scroll;
 mod sprites;
 pub mod theme;
+pub mod theme_file;
+pub mod themes;
 pub mod tints;

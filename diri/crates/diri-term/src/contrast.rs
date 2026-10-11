@@ -143,7 +143,7 @@ pub(crate) fn painted_foreground(
         if own {
             let on_paper = !inverse && is_default(cell.bg);
             let corrected = correct(theme, authored, background, on_paper, dim, floor);
-            color = phased_in(theme, authored, corrected);
+            color = phased_in(theme, authored, corrected, background);
         }
         if let Some(tint) = tint {
             // A tint gives back the legibility it took and no more: a color
@@ -179,16 +179,26 @@ const PHASE_IN_FULL: f32 = 0.85;
 /// on the first or last frame. Only a cache miss pays for this.
 #[cold]
 #[inline(never)]
-fn phased_in(theme: &TermTheme, authored: Rgba, corrected: Rgba) -> Rgba {
+fn phased_in(theme: &TermTheme, authored: Rgba, corrected: Rgba, background: Rgba) -> Rgba {
     let paper = oklch(linear(theme.background)).lightness;
     if paper >= PHASE_IN_FULL {
         return corrected;
     }
-    crate::crossfade::mix_color(
+    let mixed = crate::crossfade::mix_color(
         authored,
         corrected,
         ramp(paper, PHASE_IN_FROM, PHASE_IN_FULL),
-    )
+    );
+    // On mid-tone paper (an orange or tan light theme) white and its dark
+    // correction sit on opposite sides of the paper, and the way between
+    // them crosses it: the blend would vanish. It may never read worse than
+    // both of the colors it blends. Only a theme at rest: a fade frame
+    // (`blend` stamped) must move continuously, and passes in a few frames.
+    let worst = contrast_ratio(authored, background).min(contrast_ratio(corrected, background));
+    if theme.blend == 0 && contrast_ratio(mixed, background) < worst {
+        return corrected;
+    }
+    mixed
 }
 
 /// Cursor fill and the color of the glyph inside it, for a cursor sitting on
