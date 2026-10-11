@@ -19,6 +19,7 @@
   "platform.this_computer_lowercase": "este equipo",
   "platform.this_mac": "Este Mac",
   "platform.this_mac_lowercase": "este Mac",
+  "quick_terminal.session_title": "Terminal rápido",
   "settings.keywords.accounts": "cuentas perfiles trabajo personal inicio de sesión iniciar sesion autenticación autenticacion codex claude predeterminada predeterminado configuración configuracion home carpeta",
   "settings.keywords.agents": "agentes codex claude cursor gemini ejecutable instalados instalado línea de comandos linea comandos cli creación rápida creacion rapida predeterminado",
   "settings.keywords.appearance": "apariencia terminal color colores tema temas tipo de letra fuente texto tamaño tamano zoom ampliar",

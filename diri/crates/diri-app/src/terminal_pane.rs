@@ -979,6 +979,9 @@ pub struct TerminalPane {
     blank_reports: Vec<BlankReport>,
     viewport: Option<TerminalViewport>,
     sidebar_visible: bool,
+    /// Paint the hairline on the pane's leading edge, where it meets the
+    /// sidebar. A pane that fills a window of its own has no neighbour.
+    leading_hairline: bool,
     inspector_open: bool,
     /// Space in the title bar reserved for workbench-owned controls painted
     /// above this pane, such as the auxiliary terminal's close button.
@@ -1247,6 +1250,7 @@ impl TerminalPane {
             blank_reports: Vec::new(),
             viewport: None,
             sidebar_visible: true,
+            leading_hairline: true,
             inspector_open: false,
             header_trailing_inset: 0.0,
             held_hint: 0.0,
@@ -1823,6 +1827,13 @@ impl TerminalPane {
         self.sidebar_visible = sidebar_visible;
         self.inspector_open = inspector_open;
         cx.notify();
+    }
+
+    pub(crate) fn set_leading_hairline(&mut self, visible: bool, cx: &mut Context<Self>) {
+        if self.leading_hairline != visible {
+            self.leading_hairline = visible;
+            cx.notify();
+        }
     }
 
     pub fn set_header_trailing_inset(&mut self, inset: f32, cx: &mut Context<Self>) {
@@ -5536,8 +5547,10 @@ impl TerminalPane {
                 .flex_1()
                 .h_full()
                 .overflow_hidden()
-                .border_l_1()
-                .border_color(sidebar_colors.primary.alpha(0.08))
+                .when(self.leading_hairline, |pane| {
+                    pane.border_l_1()
+                        .border_color(sidebar_colors.primary.alpha(0.08))
+                })
                 .bg(colors.terminal_surface())
                 .when(!self.header_hidden, |pane| {
                     pane.child(self.render_header(&session, sidebar_colors, cx))

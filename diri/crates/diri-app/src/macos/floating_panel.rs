@@ -14,7 +14,7 @@ use objc2_app_kit::{NSScreen, NSView, NSWindow};
 use objc2_foundation::{NSPoint, NSRect, NSSize};
 use raw_window_handle::{HasWindowHandle, RawWindowHandle};
 
-fn ns_window(window: &Window) -> Option<Retained<NSWindow>> {
+pub(crate) fn ns_window(window: &Window) -> Option<Retained<NSWindow>> {
     let handle = HasWindowHandle::window_handle(window).ok()?;
     let RawWindowHandle::AppKit(handle) = handle.as_raw() else {
         return None;
@@ -63,7 +63,7 @@ pub(crate) fn prepare(window: &Window, radius: f32) {
 }
 
 /// GPUI's `BlurredView`, the `NSVisualEffectView` it slips under its content.
-fn blur_view(ns_window: &NSWindow) -> Option<Retained<NSView>> {
+pub(crate) fn blur_view(ns_window: &NSWindow) -> Option<Retained<NSView>> {
     let content = ns_window.contentView()?;
     let effect_class = objc2::class!(NSVisualEffectView);
     content

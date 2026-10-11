@@ -25,6 +25,7 @@ actions!(
         Quit,
         HideApp,
         ShowApp,
+        ToggleQuickTerminal,
         NewWindow,
         CloseWindow,
         ReportProblem
@@ -143,6 +144,7 @@ pub enum CommandId {
     Quit,
     HideApp,
     ShowApp,
+    ToggleQuickTerminal,
     CloseWindow,
     NewWindow,
     CloseSession,
@@ -350,6 +352,17 @@ pub const COMMANDS: &[CommandSpec] = &[
     spec!(HideApp, "hide-app", Some("cmd-h"), Some("⌘H"), None),
     #[cfg(target_os = "macos")]
     spec!(ShowApp, "show-app", None, None, None),
+    #[cfg(target_os = "macos")]
+    spec!(
+        ToggleQuickTerminal,
+        "quick-terminal",
+        None,
+        None,
+        None,
+        "command.quick_terminal.palette_title",
+        "terminal",
+        "quake dropdown drop down hotkey global"
+    ),
     spec!(
         NewWindow,
         "new-window",
@@ -1194,8 +1207,8 @@ fn set_active_shortcut_overrides(overrides: &ShortcutOverrides) {
 
 impl CommandSpec {
     fn key_bindings(&self, overrides: &ShortcutOverrides) -> Vec<KeyBinding> {
-        // The system owns this binding, including while Diri is inactive.
-        if self.id == CommandId::ShowApp {
+        // The system owns these bindings, including while Diri is inactive.
+        if matches!(self.id, CommandId::ShowApp | CommandId::ToggleQuickTerminal) {
             return Vec::new();
         }
         self.effective_keystrokes(overrides)
@@ -1294,6 +1307,7 @@ impl CommandSpec {
             CommandId::Quit => KeyBinding::new(key, Quit, context),
             CommandId::HideApp => KeyBinding::new(key, HideApp, context),
             CommandId::ShowApp => KeyBinding::new(key, ShowApp, context),
+            CommandId::ToggleQuickTerminal => KeyBinding::new(key, ToggleQuickTerminal, context),
             CommandId::CloseWindow => KeyBinding::new(key, CloseWindow, context),
             CommandId::NewWindow => KeyBinding::new(key, NewWindow, context),
             CommandId::CloseSession => KeyBinding::new(key, CloseSession, context),
@@ -2027,6 +2041,11 @@ impl CommandId {
                 description: t("command.show_app.description"),
                 category: Application,
             },
+            Self::ToggleQuickTerminal => ShortcutMetadata {
+                title: t("command.quick_terminal.title"),
+                description: t("command.quick_terminal.description"),
+                category: Application,
+            },
             Self::Quit => ShortcutMetadata {
                 title: t("command.quit.title"),
                 description: t("command.quit.description"),
@@ -2050,6 +2069,7 @@ impl CommandId {
             Self::Quit => Box::new(Quit),
             Self::HideApp => Box::new(HideApp),
             Self::ShowApp => Box::new(ShowApp),
+            Self::ToggleQuickTerminal => Box::new(ToggleQuickTerminal),
             Self::CloseWindow => Box::new(CloseWindow),
             Self::NewWindow => Box::new(NewWindow),
             Self::CloseSession => Box::new(CloseSession),

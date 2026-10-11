@@ -207,6 +207,9 @@ pub enum StoreEffect {
         params: SessionSpawnParams,
         slot: usize,
     },
+    /// The quick terminal's shell. Like an auxiliary shell, its response
+    /// must not move the sidebar selection: the panel shows it on its own.
+    SpawnQuickTerminal(SessionSpawnParams),
     /// Wake the client's idempotent reconnect loop out of backoff.
     RetryConnection,
     /// `session.migrate` — move a Claude session between local and a host.
@@ -402,6 +405,8 @@ pub struct SessionStore {
     sessions: HashMap<SessionId, Arc<SessionRecord>>,
     auxiliary_slots: HashMap<(SessionId, usize), SessionId>,
     auxiliary_pending: HashSet<(SessionId, usize)>,
+    /// A quick terminal shell has been requested and not yet answered.
+    quick_terminal_pending: bool,
     work_items: work_items::WorkItems,
     projects: HashMap<ProjectId, Project>,
     /// Projects in the order the Engine first saw them. Its list is
@@ -534,6 +539,7 @@ impl SessionStore {
                 sessions: HashMap::new(),
                 auxiliary_slots: HashMap::new(),
                 auxiliary_pending: HashSet::new(),
+                quick_terminal_pending: false,
                 work_items: work_items::WorkItems::default(),
                 projects: HashMap::new(),
                 project_seniority: Vec::new(),
@@ -2831,6 +2837,67 @@ impl SessionStore {
         true
     }
 
+    /// The live shell the quick terminal shows: the remembered Session while
+    /// it is still running. An ended, archived or closing one answers `None`,
+    /// so the next show starts a fresh shell instead of a dead screen.
+    pub fn quick_terminal_session(&self) -> Option<Arc<SessionRecord>> {
+        let id = self.prefs.quick_terminal_session.as_ref()?;
+        self.sessions
+            .get(id)
+            .filter(|session| {
+                !session.is_archived()
+                    && !self.closing.contains(id)
+                    && !matches!(session.status, SessionStatus::Exited(_))
+            })
+            .cloned()
+    }
+
+    pub fn quick_terminal_spawn_pending(&self) -> bool {
+        self.quick_terminal_pending
+    }
+
+    /// Starts the quick terminal's login shell in the home directory, on this
+    /// Mac: the panel opens over whatever app is in front, so it belongs to
+    /// no project or selection. Returns whether a request is in flight.
+    pub fn spawn_quick_terminal(&mut self, title: String) -> bool {
+        if self.quick_terminal_session().is_some() {
+            return false;
+        }
+        if self.quick_terminal_pending {
+            return true;
+        }
+        self.quick_terminal_pending = true;
+        self.last_action_failure = None;
+        let home = std::env::var("HOME").ok().filter(|home| !home.is_empty());
+        self.emit(StoreEffect::SpawnQuickTerminal(SessionSpawnParams {
+            appearance: None,
+            kind: AgentKind::SHELL,
+            cwd: home.unwrap_or_else(|| "/".to_owned()),
+            new_worktree: None,
+            worktree_branch: None,
+            worktree_base: None,
+            title: Some(title),
+            initial_prompt: None,
+            parent: None,
+            initial_cols: None,
+            initial_rows: None,
+            host: None,
+            account_profile_id: None,
+            same_repo_as: None,
+            start_directory: None,
+            note_id: None,
+        }));
+        true
+    }
+
+    pub(crate) fn finish_quick_terminal_spawn(&mut self, id: Option<SessionId>) {
+        self.quick_terminal_pending = false;
+        if let Some(id) = id {
+            self.prefs.quick_terminal_session = Some(id);
+            let _ = self.persist_preferences();
+        }
+    }
+
     pub fn spawn_kind(&mut self, kind: AgentKind, options: SpawnOptions) {
         self.spawn_kind_adopting(kind, options, None);
     }
@@ -3945,6 +4012,17 @@ async fn run_effects(
                 );
                 result.map(|_| ())
             }
+            StoreEffect::SpawnQuickTerminal(params) => {
+                let result = client.spawn(params).await;
+                store
+                    .write()
+                    .expect("session store lock poisoned")
+                    .finish_quick_terminal_spawn(result.as_ref().ok().cloned());
+                // The panel may be key while Diri is inactive, when daemon
+                // events do not wake views; it still has to learn its shell.
+                let _ = change_tx.send(());
+                result.map(|_| ())
+            }
             StoreEffect::RetryConnection => {
                 client.retry_now();
                 Ok(())
@@ -4281,7 +4359,9 @@ fn action_context(effect: &StoreEffect) -> Option<ActionContext> {
         StoreEffect::Spawn(_) | StoreEffect::StartWorkItem { .. } => {
             ("Create session failed", None)
         }
-        StoreEffect::SpawnAuxiliary { .. } => ("Open terminal failed", None),
+        StoreEffect::SpawnAuxiliary { .. } | StoreEffect::SpawnQuickTerminal(_) => {
+            ("Open terminal failed", None)
+        }
         StoreEffect::Migrate { .. } => ("Move session failed", None),
         StoreEffect::ReparentWorktree(_) => ("Move session to worktree failed", None),
         StoreEffect::SyncPrefs { host, host_name } => (
@@ -4325,7 +4405,7 @@ pub fn prefs_path_in_home(home: &Path) -> PathBuf {
 }
 
 #[cfg(test)]
-mod tests;
+pub(crate) mod tests;
 
 /// A shell on this machine, whose live directory the Engine can read.
 fn is_local_terminal(session: &SessionRecord) -> bool {

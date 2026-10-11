@@ -2020,19 +2020,19 @@ impl UtilitySurfaces {
             .preferences()
             .clone();
         #[cfg(target_os = "macos")]
-        let native_key_code = if command == CommandId::ShowApp {
+        let hotkey = crate::macos::global_shortcut::Hotkey::for_command(command);
+        #[cfg(target_os = "macos")]
+        let native_key_code = hotkey.map(|_| {
             value.as_ref().and_then(Option::as_ref).and_then(|_| {
                 self.shortcut_editor
                     .as_ref()
                     .and_then(|editor| editor.native_key_code)
             })
-        } else {
-            previous.global_shortcut_key_code
-        };
+        });
         #[cfg(target_os = "macos")]
-        if command == CommandId::ShowApp {
+        if let Some(hotkey) = hotkey {
             let mut next = previous.clone();
-            next.global_shortcut_key_code = native_key_code;
+            hotkey.set_key_code(&mut next, native_key_code.flatten());
             match &value {
                 Some(value) => {
                     next.shortcut_overrides
@@ -2042,7 +2042,7 @@ impl UtilitySurfaces {
                     next.shortcut_overrides.remove(&stable_id);
                 }
             }
-            if let Err(error) = crate::macos::global_shortcut::configure(&next) {
+            if let Err(error) = crate::macos::global_shortcut::configure(hotkey, &next) {
                 if let Some(editor) = &mut self.shortcut_editor {
                     editor.error = Some(t(error).to_owned());
                 }
@@ -2052,8 +2052,8 @@ impl UtilitySurfaces {
         }
         if !self.update_prefs(move |prefs| {
             #[cfg(target_os = "macos")]
-            if command == CommandId::ShowApp {
-                prefs.global_shortcut_key_code = native_key_code;
+            if let Some(hotkey) = hotkey {
+                hotkey.set_key_code(prefs, native_key_code.flatten());
             }
             match value {
                 Some(value) => {
@@ -2065,8 +2065,8 @@ impl UtilitySurfaces {
             }
         }) {
             #[cfg(target_os = "macos")]
-            if command == CommandId::ShowApp {
-                let _ = crate::macos::global_shortcut::configure(&previous);
+            if let Some(hotkey) = hotkey {
+                let _ = crate::macos::global_shortcut::configure(hotkey, &previous);
             }
             return false;
         }
@@ -2124,9 +2124,10 @@ impl UtilitySurfaces {
         if self.update_prefs(|prefs| {
             prefs.shortcut_overrides.clear();
             prefs.global_shortcut_key_code = None;
+            prefs.quick_terminal_key_code = None;
         }) {
             #[cfg(target_os = "macos")]
-            let _ = crate::macos::global_shortcut::configure(&self.prefs);
+            crate::macos::global_shortcut::configure_all(&self.prefs);
             crate::commands::rebind_keys(cx, &self.prefs.shortcut_overrides);
             crate::refresh_app_menus(cx);
             self.shortcut_editor = None;
@@ -5354,10 +5355,57 @@ impl UtilitySurfaces {
                                 });
                                 cx.notify();
                             },
-                        )),
+                        ))
+                        .children(
+                            cfg!(target_os = "macos")
+                                .then(|| self.quick_terminal_rows(colors, cx))
+                                .into_iter()
+                                .flatten(),
+                        ),
                 ),
             colors,
         )
+    }
+
+    /// The quick terminal's behaviour; its global shortcut is recorded with
+    /// the other shortcuts.
+    fn quick_terminal_rows(
+        &self,
+        colors: SemanticColors,
+        cx: &mut Context<Self>,
+    ) -> Vec<AnyElement> {
+        vec![
+            appearance_divider(colors).into_any_element(),
+            toggle_row(
+                t("settings.appearance.quick_terminal_escape"),
+                t("settings.appearance.quick_terminal_escape_detail"),
+                self.prefs.quick_terminal_hide_on_escape,
+                "quick_terminal_hide_on_escape",
+                colors,
+                cx,
+                |this, cx| {
+                    let enabled = !this.prefs.quick_terminal_hide_on_escape;
+                    this.update_prefs(move |prefs| prefs.quick_terminal_hide_on_escape = enabled);
+                    cx.notify();
+                },
+            )
+            .into_any_element(),
+            appearance_divider(colors).into_any_element(),
+            toggle_row(
+                t("settings.appearance.quick_terminal_autohide"),
+                t("settings.appearance.quick_terminal_autohide_detail"),
+                self.prefs.quick_terminal_autohide,
+                "quick_terminal_autohide",
+                colors,
+                cx,
+                |this, cx| {
+                    let enabled = !this.prefs.quick_terminal_autohide;
+                    this.update_prefs(move |prefs| prefs.quick_terminal_autohide = enabled);
+                    cx.notify();
+                },
+            )
+            .into_any_element(),
+        ]
     }
 
     fn resource_settings(&self, cx: &mut Context<Self>) -> impl IntoElement {
@@ -7065,9 +7113,8 @@ fn shortcut_row(
         .and_then(|editor| editor.error.as_deref());
     #[cfg(target_os = "macos")]
     let error = error.or_else(|| {
-        (command.id == CommandId::ShowApp)
-            .then(crate::macos::global_shortcut::error)
-            .flatten()
+        crate::macos::global_shortcut::Hotkey::for_command(command.id)
+            .and_then(crate::macos::global_shortcut::error)
             .map(t)
     });
     let assignment = command.shortcut_label_for(overrides);
@@ -8475,6 +8522,11 @@ mod tests {
         {
             diri_i18n::set_language(language);
         }
+        // DIRI_VISUAL_HEIGHT=1400 reaches rows below the default fold.
+        let height = std::env::var("DIRI_VISUAL_HEIGHT")
+            .ok()
+            .and_then(|value| value.parse::<f32>().ok())
+            .unwrap_or(800.0);
         let platform = gpui_platform::current_platform(true);
         let mut cx = HeadlessAppContext::with_platform(
             platform.text_system(),
@@ -8490,7 +8542,7 @@ mod tests {
         });
 
         let window = cx
-            .open_window(size(px(1200.0), px(800.0)), move |window, cx| {
+            .open_window(size(px(1200.0), px(height)), move |window, cx| {
                 // Exercise the requested destination from a sidebar the user
                 // had previously widened. Remote remains the default capture.
                 let harness = cx.new(|cx| SettingsWorkbenchHarness::open_at(tab, window, cx));
@@ -8527,6 +8579,21 @@ mod tests {
                 });
             })
             .expect("switch language");
+            cx.run_until_parked();
+        }
+        // `DIRI_VISUAL_SHORTCUT_QUERY=quick` filters the Shortcuts page.
+        if let Ok(query) = std::env::var("DIRI_VISUAL_SHORTCUT_QUERY") {
+            cx.update_window(window.into(), |root, _, cx| {
+                let harness = root
+                    .downcast::<SettingsWorkbenchHarness>()
+                    .expect("harness");
+                let surfaces = harness.read(cx).surfaces.clone();
+                surfaces.update(cx, |surfaces, cx| {
+                    surfaces.shortcut_search.insert(&query);
+                    cx.notify();
+                });
+            })
+            .expect("filter shortcuts");
             cx.run_until_parked();
         }
         // `DIRI_VISUAL_PRIVACY=on|off` seeds Settings > General > Privacy
