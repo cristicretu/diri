@@ -41,6 +41,25 @@ previous login and is reported; it switches when restarted.
   relaunches fresh with the same conversation id. The account identity that
   `/status` displays is kept per profile and swapped alongside the login.
 
+### `claude` typed in a terminal
+
+Terminal tabs are never restarted, so their environment predates a switch.
+Instead, a zsh or fish terminal gets a `claude` function that reads
+`shell-integration/claude-login` (beside `accounts.json`, owner-only) on every
+launch and runs Claude with that profile's store; an empty file is Claude's
+default store. The Engine rewrites the file whenever the selected profile
+changes, so a terminal opened before a switch follows it. Codex needs no help
+there: the switch already replaced the shared `auth.json`.
+
+The function is defined through the shell's own startup hooks, handed back
+before the user's files run: zsh through a `ZDOTDIR` whose `.zshenv` restores
+the user's `ZDOTDIR` and sources their `.zshenv`; fish through an
+`XDG_DATA_DIRS` entry whose `vendor_conf.d` file restores the variable. A
+`CLAUDE_SECURESTORAGE_CONFIG_DIR` or `CLAUDE_CONFIG_DIR` set in the shell wins,
+as does a `claude` function the user defines. bash and other shells,
+Agent tabs (bound at launch), and scripts that run `claude` themselves are
+unchanged. Terminals opened before upgrading get the function once reopened.
+
 Closed and archived sessions are excluded from restart. Since the login is
 shared, their next resume also uses the current login. CLI processes outside
 Diri are not restarted and may retain cached credentials; do not switch while

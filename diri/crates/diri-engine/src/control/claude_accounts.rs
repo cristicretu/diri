@@ -925,6 +925,11 @@ mod tests {
         assert!(result.failures.is_empty(), "{:?}", result.failures);
         assert!(result.default_changed, "{:?}", result.default_error);
         assert_eq!(result.switched.len(), 2);
+        // `claude` typed in an already-open terminal follows the switch too.
+        assert_eq!(
+            server.accounts.lock().unwrap().terminal_selection(),
+            profiles[1].login_store.clone().unwrap()
+        );
         assert!(result.deferred.is_empty());
         for record in &result.switched {
             assert_eq!(

@@ -14,13 +14,41 @@ struct File {
     profiles: Vec<AgentAccountProfile>,
 }
 
+mod shell;
+
 pub struct AccountStore {
     path: PathBuf,
+    shell: shell::ShellAccounts,
 }
 
 impl AccountStore {
     pub fn new(path: PathBuf) -> Self {
-        Self { path }
+        let root = path
+            .parent()
+            .unwrap_or_else(|| Path::new("/"))
+            .join("shell-integration");
+        let store = Self {
+            path,
+            shell: shell::ShellAccounts::new(root),
+        };
+        // Older builds wrote no integration; a terminal opened before the
+        // next switch must still find it.
+        let catalog = store.catalog().unwrap_or_default();
+        if store.shell.install(&catalog).is_err() {
+            eprintln!("diri-engine: terminal account integration unavailable");
+        }
+        store
+    }
+
+    /// Let `claude` typed in a local terminal follow the selected account.
+    pub fn terminal_environment(&self, argv: &[String], env: &mut Vec<(String, String)>) {
+        self.shell.apply(argv, env);
+    }
+
+    /// The login store `claude` typed in a terminal uses next.
+    #[cfg(test)]
+    pub(crate) fn terminal_selection(&self) -> String {
+        self.shell.selection()
     }
 
     pub fn catalog(&self) -> Result<AgentAccountCatalog, ControlError> {
@@ -177,6 +205,9 @@ impl AccountStore {
             fs::rename(&temporary, &self.path)?;
             Ok(())
         })();
+        if result.is_ok() && self.shell.select(catalog).is_err() {
+            eprintln!("diri-engine: terminal account selection not updated");
+        }
         if result.is_err() {
             let _ = fs::remove_file(&temporary);
         }
