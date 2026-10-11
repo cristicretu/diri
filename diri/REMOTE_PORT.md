@@ -260,6 +260,8 @@ cannot remain local:
 - one Agent PTY and process tree per session;
 - the current terminal grid, cursor, modes, and dimensions;
 - bounded raw output and bounded scrollback;
+- the pixels of inline images placed on that grid, in a bounded memory store
+  (`inline-images-v1`, see "Inline images");
 - output sequence and offset;
 - process exit facts;
 - one controller lease and its monotonically increasing epoch;
@@ -1106,6 +1108,8 @@ Ping
 Pong
 ProcessExit
 ForegroundProcess
+ImageRequest
+ImageResponse
 Signal
 AcquireControl
 ControlGranted
@@ -1661,13 +1665,6 @@ refactor work:
 - multiple read-only observers;
 - remote secret-input (password prompt) reporting; see "Secret input
   awareness" below;
-- remote inline images (Kitty graphics, iTerm2 `OSC 1337 File`). Local
-  sessions place them in the Engine's emulator as `diri-image:` anchors on the
-  covered cells and serve the pixels over `session.read_image`. A remote
-  Holder does not opt in: it neither intercepts those sequences nor answers
-  their support queries, so remote programs see no image support. Carrying
-  pixels needs an additive Remote Helper capability and a bounded image
-  read, not a change to Snapshot/Diff;
 - deeper, explicitly configured `diri-node` integration.
 
 Adding any of these requires an explicit proposal update. They must not enlarge
@@ -1845,6 +1842,62 @@ Old Holders never receive the request or the boundary and report unsupported.
 Not included: desktop invalidation of retained reading views, selections and
 Find captures by reset generation; a reset currently reaches them the same way
 a program clearing its own screen does. That remains open work.
+
+## Inline images (protocol minor 16)
+
+Protocol minor 16 adds optional `inline-images-v1`: remote programs can show
+Kitty graphics (`APC G`, direct transmission) and iTerm2 `OSC 1337 File`
+images exactly as local ones do. Snapshot, Diff and the grid codec are
+unchanged. The Holder runs the same `diri-terminal-state` interception as the
+local Engine: each placement becomes blank cells carrying a `diri-image:`
+anchor link (terminal-annotations metadata), so images scroll, erase and leave
+history with their rows, and the pixels sit in the Holder's per-terminal store.
+That store is memory only, 32 MiB per Holder with oldest-first eviction, and
+costs nothing until a program sends an image; it is never written to disk and
+does not survive the Holder. A reset rebuilds it empty, and new keys carry a
+fresh per-store nonce.
+
+Support is advertised to remote programs only by a Holder that has it. Such a
+Holder answers exactly the image-support probes, and only those: Kitty graphics
+responses, `OSC 1337 ReportCellSize`, `CSI 14 t`, `CSI 16 t` and primary device
+attributes (`?62;22c`, which kitten's probe waits on), and it sets the PTY's
+`ws_xpixel`/`ws_ypixel` from its cell size. The Engine still answers `OSC 7501`
+queries. Every other reply stays unanswered, as before, and the Holder keeps
+no queue of unanswered replies. A Holder from before minor 16 neither intercepts
+nor answers, so its programs see no support and keep working unchanged.
+
+Pixels are read on demand. `ImageRequest` (kind 50, JSON) names an anchor
+key and a byte offset. `ImageResponse` (kind 51) carries a length-prefixed JSON
+header and up to 256 KiB of raw bytes, or no image for an unknown or evicted
+key. The decoder rejects a response over 260 KiB from its header alone, before
+buffering the body, as well as a chunk that overruns its total, a total above
+the 24 MiB image limit, and a miss that carries bytes. A request with a zero
+id, an invalid key or an offset past the limit never leaves the Engine. The
+Engine asks for one chunk at a time, so a read never puts more than one chunk
+ahead of interactive output.
+
+Negotiation is per controller attach. The Engine never requires the
+capability. The Holder names it in `HelloAck` only to a controller at minor 16
+or above. The Engine records it from each accepted `HelloAck`, clears it on
+every reconnect, and before that sends no `ImageRequest`, because an older
+Holder closes the Bridge on the unknown frame kind. An unsolicited
+`ImageResponse` is fatal for the connection. A Holder refuses `ImageRequest`
+from a controller that did not negotiate the capability. It also removes image
+anchors from that controller's snapshots, diffs and scrollback, so an older
+Engine sees plain blanks instead of links it cannot resolve. A request made
+while the controller's outbound queue is over its bound is refused and the
+Bridge reconnects. A slow-client reseed discards queued image bytes like any
+other publication, but the stored image stays readable. PTY reads never wait
+on a read.
+
+`session.read_image` serves remote sessions through this path, with the
+Registry released while the chunk is in flight. Holders built before minor 16
+answer `image_not_found`, as they did before.
+
+Not included: Sixel, Kitty file/temp-file/shared-memory transmission,
+Unicode placeholders and animation (as for local sessions); a per-client cell
+size for remote `ws_xpixel` (the Holder uses the default cell size); and image
+survival across Holder restarts.
 
 ## Read-only output log ownership
 

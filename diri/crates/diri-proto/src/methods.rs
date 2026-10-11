@@ -54,8 +54,9 @@ impl Method {
     pub const SESSION_READ_SCROLLBACK: &'static str = "session.read_scrollback";
     pub const SESSION_READ_SCROLLBACK_CELLS: &'static str = "session.read_scrollback_cells";
     pub const SESSION_READ_DIFF: &'static str = "session.read_diff";
-    /// One chunk of an inline image a terminal placed. Local sessions only;
-    /// unknown keys, evicted images and remote sessions answer `not_found`.
+    /// One chunk of an inline image a terminal placed. A remote session's is
+    /// read from its Holder (`inline-images-v1`) in smaller chunks; unknown
+    /// keys, evicted images and older Holders answer `image_not_found`.
     pub const SESSION_READ_IMAGE: &'static str = "session.read_image";
     pub const SESSION_READ_TRANSCRIPT: &'static str = "session.read_transcript";
     pub const SESSION_MARK_SEEN: &'static str = "session.mark_seen";

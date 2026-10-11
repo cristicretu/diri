@@ -14,9 +14,12 @@
 //! pixels sit in a small per-terminal store with a hard byte budget that
 //! evicts the oldest image; a client reads them by key.
 //!
-//! Off unless the owner opts in ([`HeadlessScreen::with_inline_images`]):
-//! the remote Holder does not, so its terminals neither intercept these
-//! sequences nor answer the support queries, and tools there see no support.
+//! Off unless the owner opts in ([`HeadlessScreen::with_inline_images`]).
+//! The local Engine does for its own terminals. A remote Holder does from
+//! `inline-images-v1` on, and also calls
+//! [`HeadlessScreen::answering_image_queries_only`]: the Engine owns every
+//! other reply a remote program gets, and the Holder answers only the probes
+//! that advertise images, so a Holder built before it shows no support.
 //!
 //! Not supported yet, and answered with an error where the protocol has one:
 //! Kitty file, temp-file and shared-memory transmission, Unicode placeholders,
@@ -138,10 +141,22 @@ impl InlineImages {
 
 impl HeadlessScreen {
     /// Opt in only where a client renders this terminal's grid: the local
-    /// Engine. See the [module docs](crate::inline_images).
+    /// Engine, or a capable remote Holder. See the
+    /// [module docs](crate::inline_images).
     #[must_use]
     pub fn with_inline_images(mut self) -> Self {
         self.images = Some(Box::new(InlineImages::new()));
+        self
+    }
+
+    /// Keep only the replies that report inline-image support: Kitty graphics
+    /// responses, `OSC 1337 ReportCellSize`, `CSI 14 t`/`CSI 16 t` and primary
+    /// device attributes (which a support probe waits for). Every other query
+    /// stays unanswered and nothing accumulates. For a remote Holder, whose
+    /// terminal answered no query before; see the [module docs](self).
+    #[must_use]
+    pub fn answering_image_queries_only(mut self) -> Self {
+        self.image_replies_only = true;
         self
     }
 

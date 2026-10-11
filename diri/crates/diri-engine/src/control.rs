@@ -2835,17 +2835,45 @@ impl ControlServer {
     }
 
     /// One chunk of an inline image. The bytes are shared with the store,
-    /// so the Registry is held only long enough to find them.
+    /// so the Registry is held only long enough to find them. A remote
+    /// session's chunk is read from its Holder after the Registry is
+    /// released.
     fn session_read_image(&self, params: Option<JsonValue>) -> Result<JsonValue, ControlError> {
         let p: diri_proto::SessionReadImageParams = decode(params)?;
-        let image = {
+        let not_found = || ControlError::new("image_not_found", "No such image");
+        let source = {
             let registry = self.registry.lock().map_err(poisoned)?;
-            registry
+            let session = registry
                 .get(&p.session_id.0)
-                .ok_or_else(|| ControlError::not_found(p.session_id.0.clone()))?
-                .inline_image(&p.key)
-        }
-        .ok_or_else(|| ControlError::new("image_not_found", "No such image"))?;
+                .ok_or_else(|| ControlError::not_found(p.session_id.0.clone()))?;
+            match session.remote_inline_images() {
+                Some(client) => Err(client),
+                None => Ok(session.inline_image(&p.key)),
+            }
+        };
+        let image = match source {
+            Ok(image) => image.ok_or_else(not_found)?,
+            Err(client) => {
+                if !diri_proto::inline_image::valid_key(&p.key) {
+                    return Err(not_found());
+                }
+                let chunk = client
+                    .read_image(&p.key, p.offset)
+                    .map_err(|error| {
+                        ControlError::new("remote_image_unavailable", error.to_string())
+                    })?
+                    .ok_or_else(not_found)?;
+                return encode(&diri_proto::SessionReadImageResult {
+                    format: chunk.format,
+                    compressed: chunk.compressed,
+                    width: chunk.width,
+                    height: chunk.height,
+                    total: chunk.total,
+                    offset: chunk.offset,
+                    data: chunk.data,
+                });
+            }
+        };
         let total = image.data.len() as u64;
         let start = p.offset.min(total) as usize;
         let end = (start + diri_proto::inline_image::READ_IMAGE_CHUNK_BYTES).min(image.data.len());

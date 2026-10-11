@@ -482,3 +482,42 @@ fn headers_name_format_and_size() {
     assert_eq!(sniff(&jpeg), Some((InlineImageFormat::Jpeg, 0x40, 0x30)));
     assert_eq!(sniff(b"plain text"), None);
 }
+
+#[test]
+fn holder_scope_answers_only_image_support_probes() {
+    let mut holder = HeadlessScreen::new(40, 10)
+        .with_inline_images()
+        .answering_image_queries_only();
+    // Kitty probe + DA1, then queries the Engine side owns or never answered
+    // for a remote program: CPR, DSR, chars text area, secondary DA, OSC 7501.
+    holder.feed(b"\x1b_Gi=31,s=1,v=1,a=q,t=d,f=24;AAAA\x1b\\\x1b[c");
+    holder.feed(b"\x1b[6n\x1b[5n\x1b[18t\x1b[>c\x1b]7501;?\x1b\\");
+    holder.feed(b"\x1b[14t\x1b[16t\x1b]1337;ReportCellSize\x07");
+    let replies = String::from_utf8(holder.take_replies()).unwrap();
+    assert_eq!(
+        replies,
+        format!(
+            "\x1b_Gi=31;OK\x1b\\\x1b[?62;22c\x1b[4;340;640t\x1b[6;34;16t{}",
+            cell_size_reply()
+        ),
+    );
+
+    // The scope survives a terminal reset (RIS from a controller).
+    holder.reset();
+    holder.feed(b"\x1b[6n\x1b[c");
+    assert_eq!(holder.take_replies(), b"\x1b[?62;22c");
+
+    // A Holder that places no images answers nothing at all, so it never
+    // advertises support and its replies cannot pile up unread.
+    let mut plain = HeadlessScreen::new(40, 10).answering_image_queries_only();
+    plain.feed(b"\x1b_Gi=31,s=1,v=1,a=q,t=d,f=24;AAAA\x1b\\\x1b[c\x1b[6n\x1b[14t\x1b[16t");
+    assert!(plain.take_replies().is_empty());
+}
+
+/// What the local scope answers to `ReportCellSize`, so the Holder scope can
+/// be compared against it without restating the format.
+fn cell_size_reply() -> String {
+    let mut local = screen();
+    local.feed(b"\x1b]1337;ReportCellSize\x07");
+    String::from_utf8(local.take_replies()).unwrap()
+}

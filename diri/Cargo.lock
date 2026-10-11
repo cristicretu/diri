@@ -1682,6 +1682,7 @@ dependencies = [
 name = "diri-remote"
 version = "0.1.0"
 dependencies = [
+ "base64 0.23.1",
  "diri-engine",
  "diri-proto",
  "diri-pty",

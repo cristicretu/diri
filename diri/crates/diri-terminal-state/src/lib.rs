@@ -391,6 +391,9 @@ pub struct HeadlessScreen {
     /// A program that asks and is never answered blocks until its own timeout,
     /// or forever, so the pump must write these back to the PTY.
     replies: Vec<u8>,
+    /// Keep only the replies that report inline-image support; see
+    /// [`HeadlessScreen::answering_image_queries_only`].
+    image_replies_only: bool,
     /// Whether the title moved since the last settle, tracked where it is
     /// assigned so no per-chunk clone is needed to notice.
     title_changed: bool,
@@ -463,6 +466,7 @@ impl HeadlessScreen {
             notifications: None,
             images: None,
             replies: Vec::new(),
+            image_replies_only: false,
             title_changed: false,
             last_cells: Vec::new(),
             last_annotations: Vec::new(),
@@ -503,6 +507,7 @@ impl HeadlessScreen {
             reset = reset.with_inline_images();
             reset.set_cell_pixels(cell_pixels.0, cell_pixels.1);
         }
+        reset.image_replies_only = self.image_replies_only;
         reset.content_seq = self.content_seq.saturating_add(1);
         *self = reset;
     }
@@ -582,7 +587,11 @@ impl HeadlessScreen {
             // replies for the same chunk. Programs detect support by sending
             // the query and then a device-attributes request, and read an
             // answer arriving before the attributes as support.
-            self.replies.append(&mut parser.replies);
+            if self.image_replies_only {
+                parser.replies.clear();
+            } else {
+                self.replies.append(&mut parser.replies);
+            }
         }
         self.advance_with_images(bytes, historical_bytes);
         self.settle();
@@ -1606,6 +1615,9 @@ impl HeadlessScreen {
                 // attributes, and so on. Collected here and written back by
                 // the pump, which owns the write side of the PTY.
                 Event::PtyWrite(text) => {
+                    if self.image_replies_only && !(self.images.is_some() && text == "\x1b[?6c") {
+                        continue;
+                    }
                     // A terminal that places images answers primary device
                     // attributes as a VT220 with ANSI color (no Sixel): the
                     // emulator's three-byte `?6c` is too short for kitty's
@@ -1617,6 +1629,8 @@ impl HeadlessScreen {
                     };
                     self.replies.extend_from_slice(text.as_bytes());
                 }
+                Event::TextAreaSizeRequest(_)
+                    if self.image_replies_only && self.images.is_none() => {}
                 Event::TextAreaSizeRequest(format) => {
                     // Cell pixel size is a rendering concern the daemon knows
                     // only where it places inline images; elsewhere report the

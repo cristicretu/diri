@@ -3239,6 +3239,18 @@ impl Session {
         self.shared.screen.lock().expect("screen").inline_image(key)
     }
 
+    /// The remote client that serves this session's inline images, when its
+    /// live Holder negotiated `inline-images-v1`. Reads through it wait on
+    /// the network, so callers must not hold the Registry while they do.
+    pub fn remote_inline_images(&self) -> Option<Arc<RemoteSessionClient>> {
+        match &self.transport {
+            Transport::Remote(client) if client.supports_inline_images() => {
+                Some(Arc::clone(client))
+            }
+            _ => None,
+        }
+    }
+
     pub fn resize(&self, cols: u16, rows: u16) -> std::io::Result<()> {
         if let Some(reflow) = self.resize_pty(cols, rows)? {
             reflow.apply();
@@ -3482,9 +3494,9 @@ fn new_shared(
             let screen = HeadlessScreen::new(spec.pty.cols as usize, spec.pty.rows as usize)
                 .with_notifications();
             // Only a local session's own emulator feeds the client grid; a
-            // remote session's grid comes from its Holder, which has no
-            // image support, so storing images here would cost memory for
-            // pixels nobody can see.
+            // remote session's grid, image anchors and pixels come from its
+            // Holder (`inline-images-v1`), so storing images here too would
+            // cost memory for pixels nobody reads.
             if spec.remote.is_none() {
                 screen.with_inline_images()
             } else {
@@ -4355,6 +4367,7 @@ fn handle_remote_message(
             {
                 return RemoteConnectionDisposition::Fatal;
             }
+            client.observe_hello_capabilities(&acknowledgement);
             if let RemoteProcessState::Exited { code, signal } = acknowledgement.process_state {
                 record_remote_exit(shared, ProcessExit { code, signal });
                 return RemoteConnectionDisposition::Exited;
@@ -4490,6 +4503,10 @@ fn handle_remote_message(
         }
         RemoteMessage::ScrollbackResponse(response) => {
             client.complete_scrollback(response);
+            RemoteConnectionDisposition::Continue
+        }
+        RemoteMessage::ImageResponse(response) if client.supports_inline_images() => {
+            client.complete_image(response);
             RemoteConnectionDisposition::Continue
         }
         RemoteMessage::Error(error) => {

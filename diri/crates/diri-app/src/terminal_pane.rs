@@ -1458,8 +1458,9 @@ impl TerminalPane {
 
     /// Gives a new terminal's image cache its fetcher: a key the grid shows
     /// for the first time is read from the Engine, decoded off the main
-    /// thread and painted. Remote sessions never show one (their Holder
-    /// places no images), so the task just waits out the element.
+    /// thread and painted. A remote session's come from its Holder through
+    /// the Engine; with a Holder from before `inline-images-v1` none are
+    /// placed, so the task just waits out the element.
     fn fetch_inline_images(
         &self,
         id: &SessionId,

@@ -39,8 +39,8 @@ struct Inner {
     retired: Vec<Arc<RenderImage>>,
 }
 
-/// Decoded images for one terminal. Without a requester (a remote session,
-/// a preview) unknown keys stay unknown and nothing is drawn.
+/// Decoded images for one terminal. Without a requester (a preview) unknown
+/// keys stay unknown and nothing is drawn.
 #[derive(Default)]
 pub struct InlineImageCache {
     inner: Mutex<Inner>,

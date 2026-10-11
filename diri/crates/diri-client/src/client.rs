@@ -653,8 +653,9 @@ impl DaemonClient {
             .await
     }
 
-    /// The whole of an inline image a local terminal placed, read in
-    /// chunks. Errors with `image_not_found` once the Engine evicted it.
+    /// The whole of an inline image a terminal placed, read in chunks.
+    /// Errors with `image_not_found` once the Engine (or a remote session's
+    /// Holder) evicted it.
     pub async fn read_image(
         &self,
         session_id: &SessionId,

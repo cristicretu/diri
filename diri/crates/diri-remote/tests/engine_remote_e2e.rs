@@ -1246,6 +1246,138 @@ fn engine_terminate_uses_stop_result_after_controller_revocation() {
     );
 }
 
+/// A remote program prints an inline image; the Holder keeps its pixels and
+/// anchors the cells, and the Engine reads the pixels back in bounded chunks
+/// over the same SSH protocol channel.
+#[test]
+fn engine_reads_remote_inline_images_from_a_capable_holder() {
+    let temporary = tempfile::tempdir().expect("temp");
+    let remote_home = temporary.path().join("remote-home");
+    let remote_state = temporary.path().join("remote-state");
+    fs::create_dir(&remote_home).expect("remote home");
+    let fake_ssh = write_fake_ssh(temporary.path(), &remote_home, &remote_state);
+    let manager = Arc::new(
+        RemoteManager::new(
+            ProcessExecutor::new(fake_ssh),
+            ArtifactCatalog::from_native_helper(Path::new(helper())).expect("catalog"),
+            temporary.path().join("ssh-control"),
+        )
+        .expect("manager"),
+    );
+    let host = HostEntry {
+        id: "fixture-images".into(),
+        name: None,
+        ssh: "fixture-host".into(),
+        default_cwd: Some("/".into()),
+        node: None,
+    };
+    let installed = manager.ensure_helper(&host).expect("bootstrap");
+    // 300×300 RGBA spans two 256 KiB chunks; a position-dependent pattern
+    // proves the chunks are joined in order.
+    let pixels: Vec<u8> = (0..300 * 300 * 4)
+        .map(|index: usize| (index % 251) as u8)
+        .collect();
+    let image = temporary.path().join("pixels");
+    fs::write(&image, &pixels).expect("pixels");
+    let script = format!(
+        "printf '\\033_Ga=T,f=32,s=300,v=300,i=4,q=2;'; base64 < '{}' | tr -d '\\n'; \
+         printf '\\033\\\\ready>'; IFS= read -r line",
+        image.display()
+    );
+    let session_id = unique_stop_session_id("engine-remote-images");
+    let request = LaunchRequest {
+        session_id: session_id.clone(),
+        session_token: SessionToken::new("0123abcd0123abcd0123abcd0123abcd").expect("token"),
+        argv: vec!["/bin/sh".into(), "-c".into(), script],
+        cwd: "/".into(),
+        environment: vec![
+            EnvironmentVariable {
+                name: "TERM".into(),
+                value: "xterm-256color".into(),
+            },
+            EnvironmentVariable {
+                name: "PATH".into(),
+                value: "/usr/bin:/bin".into(),
+            },
+        ],
+        cols: 80,
+        rows: 24,
+        persistence: PersistenceCapability::NativeDetach,
+    };
+    let bindings = RemoteBindingStore::new(temporary.path().join("bindings")).expect("bindings");
+    let session = Session::spawn(
+        SessionSpec {
+            id: session_id.clone(),
+            pty: PtySpec::new(request.argv.clone(), "/").size(80, 24),
+            manifest_id: "shell".into(),
+            authority: Authority::ProcessOnly,
+            logs_dir: temporary.path().join("logs"),
+            holder: None,
+            remote: Some(RemoteSessionSpec {
+                manager: Arc::clone(&manager),
+                helper: installed,
+                launch: request,
+                host_id: host.id.clone(),
+                binding_store: bindings,
+            }),
+            defer_launch: false,
+        },
+        Arc::new(ManifestEngine::new(Vec::new())),
+    )
+    .expect("spawn remote Session");
+    wait_until("the image and prompt", Duration::from_secs(10), || {
+        session.screen_lines().join("\n").contains("ready>")
+    });
+
+    // The Holder's grid carries the anchors; a fresh signature reads a full
+    // grid once any pending diff has been taken.
+    let mut key = None;
+    for _ in 0..2 {
+        let mut signature = diri_engine::session::GridSignature::default();
+        let grid = session
+            .grid_update_if_changed(&mut signature)
+            .expect("grid");
+        key = key.or_else(|| {
+            grid.changed_rows
+                .iter()
+                .flat_map(|row| &row.metadata.links)
+                .find_map(|link| diri_proto::inline_image::ImageAnchor::parse(&link.uri))
+                .map(|anchor| anchor.key)
+        });
+    }
+    let key = key.expect("an image anchor in the remote grid");
+
+    let client = session
+        .remote_inline_images()
+        .expect("the bootstrapped Holder negotiated inline-images-v1");
+    let mut read = Vec::new();
+    while read.len() < pixels.len() {
+        let chunk = client
+            .read_image(&key, read.len() as u64)
+            .expect("read")
+            .expect("stored on the Holder");
+        assert_eq!(
+            chunk.format,
+            diri_proto::inline_image::InlineImageFormat::Rgba
+        );
+        assert_eq!((chunk.width, chunk.height), (300, 300));
+        assert_eq!(chunk.total, pixels.len() as u64);
+        assert!(chunk.data.len() <= diri_proto::remote_pty::MAX_IMAGE_CHUNK_BYTES);
+        assert!(!chunk.data.is_empty());
+        read.extend_from_slice(&chunk.data);
+    }
+    assert_eq!(read, pixels);
+    assert_eq!(client.read_image("00000000.1", 0).expect("miss"), None);
+
+    // Input still flows on the same channel after the reads.
+    session.write_input(b"done\n").expect("input");
+    wait_until("remote exit", Duration::from_secs(5), || {
+        session.view().exited
+    });
+    let mut session = session;
+    let _ = session.terminate(Duration::from_millis(100));
+}
+
 fn wait_for_grid(session: &Session, needle: &str) {
     wait_until(needle, Duration::from_secs(5), || {
         session.screen_lines().join("\n").contains(needle)
