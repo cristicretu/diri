@@ -2,6 +2,7 @@
 
 mod blocks;
 pub mod buffer;
+pub mod command_marks;
 mod contrast;
 pub mod crossfade;
 pub mod cursor_focus;

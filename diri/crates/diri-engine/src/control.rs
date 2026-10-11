@@ -1315,6 +1315,29 @@ impl ControlServer {
                 // as manifest-backed Agents instead of leaving tools such as
                 // `clear` unable to operate.
                 crate::agent::assert_color_environment(&mut spec.env);
+                // Every pane can name itself to `dirijor`, as manifest-backed
+                // ones do below; no hooks or MCP config apply to a bare argv.
+                if let Some(injection) = &self.injection {
+                    spec.env.retain(|(key, _)| {
+                        !matches!(
+                            key.as_str(),
+                            crate::inject::SESSION_ID_ENV
+                                | crate::inject::SOCKET_ENV
+                                | crate::inject::CLI_ENV
+                        )
+                    });
+                    spec.env.extend([
+                        (crate::inject::SESSION_ID_ENV.into(), id.clone()),
+                        (
+                            crate::inject::SOCKET_ENV.into(),
+                            self.socket_path.to_string_lossy().into_owned(),
+                        ),
+                        (
+                            crate::inject::CLI_ENV.into(),
+                            injection.cli_path.to_string_lossy().into_owned(),
+                        ),
+                    ]);
+                }
                 spec
             }
             None => {

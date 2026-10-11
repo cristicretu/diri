@@ -2127,7 +2127,8 @@ fn put_color(out: &mut Vec<u8>, value: Color) {
 fn put_style(out: &mut Vec<u8>, style: &Cell) {
     put_color(out, style.fg);
     put_color(out, style.bg);
-    out.extend_from_slice(&style.flags.bits().to_le_bytes());
+    // A varint: ordinary styles fit one byte; shell marks use high bits.
+    put_varint(out, style.flags.bits() as usize);
     let Some(extra) = &style.extra else {
         out.push(0);
         return;
@@ -2370,7 +2371,7 @@ impl<'a> Reader<'a> {
     fn style(&mut self) -> Cell {
         let fg = self.color();
         let bg = self.color();
-        let flags = Flags::from_bits_retain(u16::from_le_bytes([self.byte(), self.byte()]));
+        let flags = Flags::from_bits_retain(self.varint() as u32);
         let extra = (self.byte() == 1).then(|| {
             let zerowidth = (0..self.varint())
                 .map(|_| char::from_u32(self.varint() as u32).expect("internally encoded scalar"))
@@ -2722,7 +2723,7 @@ mod tests {
                         cell.fg = colors[(random >> 8) as usize % colors.len()];
                         cell.bg = colors[(random >> 16) as usize % colors.len()];
                         // Includes WRAPLINE for some rows.
-                        cell.flags = Flags::from_bits_retain((random >> 24) as u16);
+                        cell.flags = Flags::from_bits_retain((random >> 24) as u32 & 0x00ff_ffff);
                     }
                     match (random >> 40) % 11 {
                         0 => cell.push_zerowidth('\u{301}'),

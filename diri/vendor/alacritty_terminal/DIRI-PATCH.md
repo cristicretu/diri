@@ -10,6 +10,18 @@ updates, instead of adding a second escape-sequence parser or guessing boundarie
 from terminal text. No new runtime dependency. The source participates in the
 Remote Helper Build ID. Revisit this small patch when updating the parser.
 
+## Shell command marks
+
+`Flags` widens from u16 to u32 for four more cell flags set by
+`Handler::mark_shell_command`: `INPUT_START` (OSC 133 B), `OUTPUT_START` (C),
+and `COMMAND_SUCCEEDED` / `COMMAND_FAILED` (D; both together when the status is
+unknown, and a later D on the same cell replaces the earlier one). Like
+`PROMPT_START` they mark the cursor cell, are ignored on the alternate screen,
+survive overwriting by printed characters (`Flags::SHELL_MARKS`), and follow
+erase, scroll and reflow. `Cell` stays 24 bytes (`cell_size_is_below_cap`). The
+compact history codec writes style flags as a varint, so ordinary styles still
+take one byte. The codec is process-local, so no stored format changes.
+
 ## Deferred alternate-screen allocation
 
 The pristine alternate grid is represented by `None` until the first screen

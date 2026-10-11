@@ -2,6 +2,7 @@
 use super::autoscroll;
 use super::*;
 use diri_proto::grid::{GridCell, GridRowCodec, RowMetadata, TermStyle};
+use diri_term::command_marks::{CommandOutput, LastCommandOutput};
 use diri_term::element::ReferenceHit;
 use gpui::{Pixels, Point};
 use std::io::Write;
@@ -103,6 +104,9 @@ enum MenuAction {
     NextPrompt,
     PreviousMessage,
     NextMessage,
+    /// The output of the finished shell command under the pointer.
+    SelectCommandOutput(CommandOutput),
+    CopyCommandOutput(CommandOutput),
 }
 
 /// What a prompt jump that finds no prompt mark does.
@@ -142,6 +146,8 @@ impl MenuAction {
             Self::NextPrompt => "terminal.menu.next_prompt",
             Self::PreviousMessage => "terminal.menu.previous_message",
             Self::NextMessage => "terminal.menu.next_message",
+            Self::SelectCommandOutput(_) => "terminal.menu.select_command_output",
+            Self::CopyCommandOutput(_) => "terminal.menu.copy_command_output",
         })
     }
 }
@@ -288,6 +294,7 @@ impl TerminalPane {
         };
         let target = resident.element.reference_hit_at(col, row);
         let has_selection = !resident.element.selected_text().is_empty();
+        let command_output = resident.element.command_output_at(col, row);
         let target = self.linkable(target);
         let mut actions = Vec::new();
         match target.as_ref().map(|hit| &hit.reference) {
@@ -301,6 +308,12 @@ impl TerminalPane {
         }
         if has_selection {
             actions.extend([MenuAction::Copy, MenuAction::Find]);
+        }
+        if let Some(output) = command_output {
+            actions.extend([
+                MenuAction::CopyCommandOutput(output),
+                MenuAction::SelectCommandOutput(output),
+            ]);
         }
         actions.extend([MenuAction::Paste, MenuAction::CopyMode, MenuAction::Export]);
         if self.message_gutter().is_some() {
@@ -366,6 +379,17 @@ impl TerminalPane {
             }
             MenuAction::NextPrompt | MenuAction::NextMessage => {
                 self.read_terminal_history(Some(true), window, cx)
+            }
+            MenuAction::SelectCommandOutput(output) => {
+                if let Some(resident) = self.selected_id().and_then(|id| self.residents.get(&id)) {
+                    resident.element.select_range(output.start, output.end);
+                }
+            }
+            MenuAction::CopyCommandOutput(output) => {
+                if let Some(resident) = self.selected_id().and_then(|id| self.residents.get(&id)) {
+                    resident.element.select_range(output.start, output.end);
+                }
+                self.copy_selection(&CopySelection, window, cx);
             }
         }
         cx.notify();
@@ -796,6 +820,65 @@ impl TerminalPane {
         true
     }
 
+    /// Copies the output of the newest finished shell command in retained
+    /// history, found from its OSC 133 output and end marks.
+    pub(super) fn copy_last_command_output(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(id) = self.selected_id() else {
+            return;
+        };
+        self.reset_qol_session(&id);
+        if self.qol.busy || !self.residents.contains_key(&id) {
+            return;
+        }
+        let client = Arc::clone(self.runtime.client());
+        let request_id = id.clone();
+        let task = self.tokio.spawn(async move {
+            let mut last = LastCommandOutput::default();
+            read_retained_rows(&client, &request_id, |_, cells, metadata| {
+                last.push_row(cells, metadata);
+                if last.held_cells() > COMMAND_OUTPUT_MAX_CELLS {
+                    return Err(t("terminal.command_output.too_large"));
+                }
+                Ok(())
+            })
+            .await?;
+            Ok::<_, &'static str>(last.finish().map(|output| command_output_text(&output)))
+        });
+        self.qol.busy = true;
+        let read_owner = Arc::new(());
+        self.qol.read_owner = Some(Arc::clone(&read_owner));
+        cx.spawn_in(window, async move |this, cx| {
+            let result = task.await;
+            let _ = crate::floating::update_in_owner(&this, cx, |this, window, cx| {
+                if this
+                    .qol
+                    .read_owner
+                    .as_ref()
+                    .is_none_or(|owner| !Arc::ptr_eq(owner, &read_owner))
+                {
+                    return;
+                }
+                this.qol.busy = false;
+                this.qol.read_owner = None;
+                if this.selected_id().as_ref() != Some(&id) {
+                    return;
+                }
+                let message = match result {
+                    Ok(Ok(Some(text))) if !text.is_empty() => {
+                        cx.write_to_clipboard(ClipboardItem::new_string(text));
+                        t("terminal.command_output.copied")
+                    }
+                    Ok(Ok(_)) => t("terminal.command_output.none"),
+                    Ok(Err(message)) => message,
+                    Err(_) => t("terminal.history.read_failed"),
+                };
+                this.show_terminal_feedback(message, window, cx);
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
     /// Uses the same Engine RPC for local and remote history. A changing
     /// sequence aborts instead of exporting mismatched pages or jumping wrong.
     pub(super) fn read_terminal_history(
@@ -837,72 +920,26 @@ impl TerminalPane {
         let client = Arc::clone(self.runtime.client());
         let request_id = id.clone();
         let task = self.tokio.spawn(async move {
-            let mut first = 0_i64;
-            let mut sequence = None;
             let mut text = String::new();
             let mut prompts = Vec::new();
-            let mut live_start = 0;
-            let mut page_rows = 1_i64;
-            let mut width = None;
-            loop {
-                let response = client
-                    .read_scrollback_cells(&request_id, first, page_rows)
-                    .await
-                    .map_err(|_| t("terminal.history.read_failed"))?;
-                if sequence.is_some_and(|seq| seq != response.content_seq) {
-                    return Err(t("terminal.history.changed"));
-                }
-                sequence = Some(response.content_seq);
-                if first == 0 {
-                    live_start = response.live_start_row;
-                }
-                let count = usize::try_from(response.row_count)
-                    .map_err(|_| t("terminal.history.invalid"))?;
-                if count as i64 > page_rows
-                    || response.first_row != first
-                    || response.total_rows > 1_000_000
-                    || !(1..=4096).contains(&response.cols)
-                    || width.is_some_and(|cols| cols != response.cols)
-                    || (!response.metadata.is_empty() && response.metadata.len() != count)
-                {
-                    return Err(t("terminal.history.invalid"));
-                }
-                width = Some(response.cols);
-                // Worst-case RLE plus base64 must fit one control response,
-                // even for wide, densely styled terminal rows.
-                page_rows =
-                    (diri_proto::FIND_CAPTURE_MAX_CELLS as i64 / response.cols).clamp(1, 1024);
-                let rows = GridRowCodec::decode_rows(&response.payload, count)
-                    .map_err(|_| t("terminal.history.invalid"))?;
-                if rows.iter().any(|row| row.len() as i64 != response.cols) {
-                    return Err(t("terminal.history.invalid"));
-                }
-                for (index, row) in rows.iter().enumerate() {
-                    if row
+            let (live_start, total, sequence) =
+                read_retained_rows(&client, &request_id, |row, cells, metadata| {
+                    if cells
                         .iter()
                         .any(|cell| cell.style.contains(TermStyle::PROMPT_START))
                     {
-                        prompts.push(first + index as i64);
+                        prompts.push(row);
                     }
                     if direction.is_none() {
-                        append_export_row(&mut text, row, response.metadata.get(index));
+                        append_export_row(&mut text, cells, metadata);
+                        if text.len() > 16 * 1024 * 1024 {
+                            return Err(t("terminal.history.too_large"));
+                        }
                     }
-                }
-                if text.len() > 16 * 1024 * 1024 {
-                    return Err(t("terminal.history.too_large"));
-                }
-                first += count as i64;
-                if count == 0 || first >= response.total_rows {
-                    break;
-                }
-            }
-            Ok((
-                text,
-                prompts,
-                live_start,
-                first,
-                sequence.unwrap_or_default(),
-            ))
+                    Ok(())
+                })
+                .await?;
+            Ok::<_, &'static str>((text, prompts, live_start, total, sequence))
         });
         self.qol.busy = true;
         self.show_terminal_feedback(t("terminal.history.reading"), window, cx);
@@ -1369,6 +1406,76 @@ pub(super) fn paste_review_preview(chars: &mut std::str::Chars<'_>, secret: bool
         .collect()
 }
 
+/// Cells a copied command output may hold: the Engine retains 4 MiB of
+/// history, so this is never the limit for a single command in practice.
+const COMMAND_OUTPUT_MAX_CELLS: usize = 4 * 1024 * 1024;
+
+/// Reads all retained rows through the Engine RPC used for local and remote
+/// history alike, in order. A changing sequence aborts instead of mixing
+/// revisions. Returns the live start row, the rows read and the sequence.
+async fn read_retained_rows(
+    client: &diri_client::DaemonClient,
+    id: &SessionId,
+    mut visit: impl FnMut(i64, &[GridCell], Option<&RowMetadata>) -> Result<(), &'static str>,
+) -> Result<(i64, i64, u64), &'static str> {
+    let mut first = 0_i64;
+    let mut sequence = None;
+    let mut live_start = 0;
+    let mut page_rows = 1_i64;
+    let mut width = None;
+    loop {
+        let response = client
+            .read_scrollback_cells(id, first, page_rows)
+            .await
+            .map_err(|_| t("terminal.history.read_failed"))?;
+        if sequence.is_some_and(|seq| seq != response.content_seq) {
+            return Err(t("terminal.history.changed"));
+        }
+        sequence = Some(response.content_seq);
+        if first == 0 {
+            live_start = response.live_start_row;
+        }
+        let count =
+            usize::try_from(response.row_count).map_err(|_| t("terminal.history.invalid"))?;
+        if count as i64 > page_rows
+            || response.first_row != first
+            || response.total_rows > 1_000_000
+            || !(1..=4096).contains(&response.cols)
+            || width.is_some_and(|cols| cols != response.cols)
+            || (!response.metadata.is_empty() && response.metadata.len() != count)
+        {
+            return Err(t("terminal.history.invalid"));
+        }
+        width = Some(response.cols);
+        // Worst-case RLE plus base64 must fit one control response,
+        // even for wide, densely styled terminal rows.
+        page_rows = (diri_proto::FIND_CAPTURE_MAX_CELLS as i64 / response.cols).clamp(1, 1024);
+        let rows = GridRowCodec::decode_rows(&response.payload, count)
+            .map_err(|_| t("terminal.history.invalid"))?;
+        if rows.iter().any(|row| row.len() as i64 != response.cols) {
+            return Err(t("terminal.history.invalid"));
+        }
+        for (index, row) in rows.iter().enumerate() {
+            visit(first + index as i64, row, response.metadata.get(index))?;
+        }
+        first += count as i64;
+        if count == 0 || first >= response.total_rows {
+            break;
+        }
+    }
+    Ok((live_start, first, sequence.unwrap_or_default()))
+}
+
+/// The text of a command's output rows, without the blank lines a shell
+/// leaves before its next prompt.
+fn command_output_text(output: &diri_term::command_marks::OutputRows) -> String {
+    let mut text = String::new();
+    for (cells, metadata) in &output.rows {
+        append_export_row(&mut text, cells, metadata.as_ref());
+    }
+    text.trim_end_matches('\n').to_owned()
+}
+
 fn append_export_row(text: &mut String, row: &[GridCell], metadata: Option<&RowMetadata>) {
     let mut line = String::new();
     for (col, cell) in row.iter().enumerate() {
@@ -1453,5 +1560,49 @@ mod native_paste_review_tests {
         let message = native_paste_review_message("hunter2\nhunter2", true);
         assert!(!message.contains("hunter2"));
         assert!(message.ends_with("15 characters, hidden while the terminal reads a password."));
+    }
+}
+
+#[cfg(test)]
+mod command_output_tests {
+    use super::command_output_text;
+    use diri_proto::grid::{GridCell, TermStyle};
+    use diri_term::command_marks::LastCommandOutput;
+
+    fn row(text: &str, marks: &[(usize, TermStyle)], width: usize) -> Vec<GridCell> {
+        let mut cells = vec![GridCell::BLANK; width];
+        for (cell, ch) in cells.iter_mut().zip(text.chars()) {
+            cell.scalar = u32::from(ch);
+        }
+        for &(col, mark) in marks {
+            cells[col].style |= mark;
+        }
+        cells
+    }
+
+    #[test]
+    fn copied_output_is_the_text_between_the_output_mark_and_the_end() {
+        let width = 8;
+        let mut wrapped = row("abcdefgh", &[], width);
+        wrapped[width - 1].style |= TermStyle::SOFT_WRAP;
+        let rows = [
+            row("$ ls", &[(0, TermStyle::PROMPT_START)], width),
+            // Output starting mid-row, as after `echo -n` or a same-line C.
+            row("$ x  out", &[(5, TermStyle::OUTPUT_START)], width),
+            wrapped,
+            row("ij", &[], width),
+            row("", &[], width),
+            row(
+                "$",
+                &[(0, TermStyle::COMMAND_FAILED | TermStyle::PROMPT_START)],
+                width,
+            ),
+        ];
+        let mut last = LastCommandOutput::default();
+        for cells in &rows {
+            last.push_row(cells, None);
+        }
+        let output = last.finish().expect("a finished output");
+        assert_eq!(command_output_text(&output), "out\nabcdefghij");
     }
 }

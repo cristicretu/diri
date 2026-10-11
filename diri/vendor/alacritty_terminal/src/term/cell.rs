@@ -12,8 +12,23 @@ use crate::vte::ansi::{Color, Hyperlink as VteHyperlink, NamedColor};
 bitflags! {
     #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
     #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
-    pub struct Flags: u16 {
+    pub struct Flags: u32 {
         const PROMPT_START              = 0b1000_0000_0000_0000;
+        /// OSC 133 B: command input starts at this cell.
+        const INPUT_START               = 0b0001_0000_0000_0000_0000;
+        /// OSC 133 C: command output starts at this cell.
+        const OUTPUT_START              = 0b0010_0000_0000_0000_0000;
+        /// OSC 133 D with status 0. With COMMAND_FAILED: status unknown.
+        const COMMAND_SUCCEEDED         = 0b0100_0000_0000_0000_0000;
+        /// OSC 133 D with a non-zero status.
+        const COMMAND_FAILED            = 0b1000_0000_0000_0000_0000;
+        /// Any OSC 133 D.
+        const COMMAND_END               = Self::COMMAND_SUCCEEDED.bits()
+                                        | Self::COMMAND_FAILED.bits();
+        /// Shell-integration marks: positions, not styles. Writing a
+        /// character keeps them; erasing the cell drops them.
+        const SHELL_MARKS               = Self::PROMPT_START.bits() | Self::INPUT_START.bits()
+                                        | Self::OUTPUT_START.bits() | Self::COMMAND_END.bits();
         const INVERSE                   = 0b0000_0000_0000_0001;
         const BOLD                      = 0b0000_0000_0000_0010;
         const ITALIC                    = 0b0000_0000_0000_0100;

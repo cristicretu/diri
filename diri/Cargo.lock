@@ -1675,6 +1675,7 @@ version = "0.1.0"
 dependencies = [
  "diri-proto",
  "libc",
+ "tempfile",
 ]
 
 [[package]]

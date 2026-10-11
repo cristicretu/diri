@@ -279,10 +279,13 @@ struct AgentPathEditor {
     error: Option<String>,
 }
 
-#[derive(Clone, Debug)]
 struct ShortcutEditor {
     command: CommandId,
     error: Option<String>,
+    #[cfg(target_os = "macos")]
+    native_key_code: Option<u16>,
+    #[cfg(target_os = "macos")]
+    _global_recording: crate::macos::global_shortcut::Recording,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -558,6 +561,12 @@ impl UtilitySurfaces {
         cx: &mut Context<Self>,
     ) -> Self {
         let focus = cx.focus_handle();
+        cx.observe_window_activation(_window, |this, window, cx| {
+            if !window.is_window_active() && this.shortcut_editor.take().is_some() {
+                cx.notify();
+            }
+        })
+        .detach();
         let home = std::env::var_os("HOME")
             .map(PathBuf::from)
             .unwrap_or_else(|| PathBuf::from("/nonexistent"));
@@ -1974,6 +1983,10 @@ impl UtilitySurfaces {
         self.shortcut_editor = Some(ShortcutEditor {
             command,
             error: None,
+            #[cfg(target_os = "macos")]
+            native_key_code: None,
+            #[cfg(target_os = "macos")]
+            _global_recording: crate::macos::global_shortcut::Recording::begin(),
         });
         self.focus.focus(window, cx);
         cx.notify();
@@ -1999,14 +2012,62 @@ impl UtilitySurfaces {
         cx: &mut Context<Self>,
     ) -> bool {
         let stable_id = crate::commands::command(command).stable_id.to_owned();
-        if !self.update_prefs(move |prefs| match value {
-            Some(value) => {
-                prefs.shortcut_overrides.insert(stable_id, value);
+        #[cfg(target_os = "macos")]
+        let previous = self
+            .store
+            .read()
+            .expect("session store lock poisoned")
+            .preferences()
+            .clone();
+        #[cfg(target_os = "macos")]
+        let native_key_code = if command == CommandId::ShowApp {
+            value.as_ref().and_then(Option::as_ref).and_then(|_| {
+                self.shortcut_editor
+                    .as_ref()
+                    .and_then(|editor| editor.native_key_code)
+            })
+        } else {
+            previous.global_shortcut_key_code
+        };
+        #[cfg(target_os = "macos")]
+        if command == CommandId::ShowApp {
+            let mut next = previous.clone();
+            next.global_shortcut_key_code = native_key_code;
+            match &value {
+                Some(value) => {
+                    next.shortcut_overrides
+                        .insert(stable_id.clone(), value.clone());
+                }
+                None => {
+                    next.shortcut_overrides.remove(&stable_id);
+                }
             }
-            None => {
-                prefs.shortcut_overrides.remove(&stable_id);
+            if let Err(error) = crate::macos::global_shortcut::configure(&next) {
+                if let Some(editor) = &mut self.shortcut_editor {
+                    editor.error = Some(t(error).to_owned());
+                }
+                self.activity = t(error).to_owned();
+                return false;
+            }
+        }
+        if !self.update_prefs(move |prefs| {
+            #[cfg(target_os = "macos")]
+            if command == CommandId::ShowApp {
+                prefs.global_shortcut_key_code = native_key_code;
+            }
+            match value {
+                Some(value) => {
+                    prefs.shortcut_overrides.insert(stable_id, value);
+                }
+                None => {
+                    prefs.shortcut_overrides.remove(&stable_id);
+                }
             }
         }) {
+            #[cfg(target_os = "macos")]
+            if command == CommandId::ShowApp {
+                let _ = crate::macos::global_shortcut::configure(&previous);
+            }
             return false;
         }
 
@@ -2034,7 +2095,9 @@ impl UtilitySurfaces {
         }
         if self.save_shortcut_override(command, Some(Some(binding)), cx) {
             self.shortcut_editor = None;
-        } else if let Some(editor) = &mut self.shortcut_editor {
+        } else if let Some(editor) = &mut self.shortcut_editor
+            && editor.error.is_none()
+        {
             editor.error = Some(t("settings.shortcuts.save_failed").to_owned());
         }
         cx.notify();
@@ -2058,7 +2121,12 @@ impl UtilitySurfaces {
         if self.prefs.shortcut_overrides.is_empty() {
             return;
         }
-        if self.update_prefs(|prefs| prefs.shortcut_overrides.clear()) {
+        if self.update_prefs(|prefs| {
+            prefs.shortcut_overrides.clear();
+            prefs.global_shortcut_key_code = None;
+        }) {
+            #[cfg(target_os = "macos")]
+            let _ = crate::macos::global_shortcut::configure(&self.prefs);
             crate::commands::rebind_keys(cx, &self.prefs.shortcut_overrides);
             crate::refresh_app_menus(cx);
             self.shortcut_editor = None;
@@ -2101,6 +2169,11 @@ impl UtilitySurfaces {
             }
             cx.notify();
             return true;
+        }
+        #[cfg(target_os = "macos")]
+        if let Some(editor) = &mut self.shortcut_editor {
+            editor.error = None;
+            editor.native_key_code = gpui_macos::current_native_key_code(event);
         }
         self.assign_shortcut(command, key.unparse(), cx);
         true
@@ -6990,6 +7063,13 @@ fn shortcut_row(
     let error = editor
         .filter(|editor| editor.command == command.id)
         .and_then(|editor| editor.error.as_deref());
+    #[cfg(target_os = "macos")]
+    let error = error.or_else(|| {
+        (command.id == CommandId::ShowApp)
+            .then(crate::macos::global_shortcut::error)
+            .flatten()
+            .map(t)
+    });
     let assignment = command.shortcut_label_for(overrides);
     let modified = command.is_overridden(overrides);
     let command_id = command.id;

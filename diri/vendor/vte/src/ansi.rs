@@ -47,6 +47,17 @@ const BSU_CSI: [u8; SYNC_ESCAPE_LEN] = *b"\x1b[?2026h";
 /// ESU CSI sequence for terminating synchronized updates.
 const ESU_CSI: [u8; SYNC_ESCAPE_LEN] = *b"\x1b[?2026l";
 
+/// An OSC 133 boundary after the prompt start (FinalTerm semantic prompts).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ShellCommandMark {
+    /// `B`: the prompt ended and command input begins.
+    InputStart,
+    /// `C`: the command was submitted and its output begins.
+    OutputStart,
+    /// `D[;status]`: the command finished, with its exit status if reported.
+    End(Option<i32>),
+}
+
 #[derive(Debug, PartialEq, Eq, Hash)]
 pub struct Hyperlink {
     /// Identifier for the given hyperlink.
@@ -726,6 +737,10 @@ pub trait Handler {
 
     /// Mark the beginning of a shell prompt (OSC 133 A).
     fn mark_prompt(&mut self) {}
+
+    /// Mark a later OSC 133 boundary: command input (B), command output (C),
+    /// or the end of a command (D) with its exit status when one was given.
+    fn mark_shell_command(&mut self, _: ShellCommandMark) {}
 
     /// Set mouse cursor icon.
     fn set_mouse_cursor_icon(&mut self, _: CursorIcon) {}
@@ -1425,8 +1440,21 @@ where
             },
 
             // Hyperlink.
-            b"133" if params.get(1) == Some(&b"A".as_slice()) => {
-                self.handler.mark_prompt();
+            b"133" => match params.get(1).copied() {
+                Some(b"A") => self.handler.mark_prompt(),
+                Some(b"B") => self.handler.mark_shell_command(ShellCommandMark::InputStart),
+                Some(b"C") => self.handler.mark_shell_command(ShellCommandMark::OutputStart),
+                Some(b"D") => {
+                    // `D;<status>` may carry further `key=value` options after
+                    // the status. A missing or malformed status is unknown,
+                    // never success.
+                    let status = params
+                        .get(2)
+                        .and_then(|status| str::from_utf8(status).ok())
+                        .and_then(|status| status.parse::<i32>().ok());
+                    self.handler.mark_shell_command(ShellCommandMark::End(status));
+                },
+                _ => unhandled(params),
             },
             b"8" if params.len() > 2 => {
                 let link_params = params[1];
@@ -2151,6 +2179,52 @@ mod tests {
         fn carriage_return(&mut self) {
             self.executed.push(b'\r');
         }
+    }
+
+    /// Records OSC 133 boundaries in arrival order; `None` is a prompt (A).
+    #[derive(Default)]
+    struct ShellMarkRecorder {
+        marks: Vec<Option<ShellCommandMark>>,
+    }
+
+    impl Handler for ShellMarkRecorder {
+        fn mark_prompt(&mut self) {
+            self.marks.push(None);
+        }
+
+        fn mark_shell_command(&mut self, mark: ShellCommandMark) {
+            self.marks.push(Some(mark));
+        }
+    }
+
+    #[test]
+    fn osc_133_boundaries_reach_the_handler_with_their_exit_status() {
+        let mut parser = Processor::<TestSyncHandler>::new();
+        let mut handler = ShellMarkRecorder::default();
+        let stream = concat!(
+            "\x1b]133;A;click_events=1\x07",
+            "\x1b]133;B\x1b\\",
+            "\x1b]133;C;cmdline_url=ls\x07",
+            "\x1b]133;D;0\x07",
+            "\x1b]133;D;127;aid=7\x07",
+            "\x1b]133;D\x07",
+            "\x1b]133;D;x\x07",
+            "\x1b]133;Z\x07",
+            "\x1b]133\x07",
+        );
+        parser.advance(&mut handler, stream.as_bytes());
+        assert_eq!(
+            handler.marks,
+            [
+                None,
+                Some(ShellCommandMark::InputStart),
+                Some(ShellCommandMark::OutputStart),
+                Some(ShellCommandMark::End(Some(0))),
+                Some(ShellCommandMark::End(Some(127))),
+                Some(ShellCommandMark::End(None)),
+                Some(ShellCommandMark::End(None)),
+            ]
+        );
     }
 
     #[test]

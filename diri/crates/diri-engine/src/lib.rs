@@ -65,6 +65,7 @@ pub mod migrate;
 pub mod pr_monitor;
 mod preview_mux;
 pub mod pty;
+pub mod recognition;
 pub mod registry;
 pub mod remote;
 pub mod schedule;

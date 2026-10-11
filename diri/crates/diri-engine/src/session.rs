@@ -496,6 +496,8 @@ struct ForegroundProgram {
     group_seen_at: Option<Instant>,
     /// The job's program name, read once per group.
     name: Option<String>,
+    /// The Agent that name was recognised as, decided with it.
+    agent: Option<ForegroundAgent>,
     cwd: Option<String>,
     cwd_read_at: Option<Instant>,
     /// The TCP ports the job listens on: a dev server's address.
@@ -503,6 +505,42 @@ struct ForegroundProgram {
     ports_read_at: Option<Instant>,
     /// The Agent manifest the screen is read with while the reducer is lent.
     read_as: Option<String>,
+}
+
+/// An Agent recognised in a shell's foreground.
+#[derive(Clone, Copy)]
+enum ForegroundAgent {
+    /// One with a launch manifest, by its index in `known_agents`.
+    Manifest(usize),
+    /// One the recognition catalog names, whose status follows its output.
+    Activity(&'static str),
+}
+
+/// How a shell's status is read while an Agent holds its foreground.
+enum Lend<'a> {
+    Screen(&'a KnownAgent),
+    Activity(&'static str),
+}
+
+/// What the program `name` leading group `group` is, if an Agent: a
+/// manifest's own binary first, then the recognition catalog, whose entries
+/// that share a manifest's id are read with that manifest. The npm package is
+/// read only for a short name that needs one.
+fn recognize_agent(known: &[KnownAgent], name: &str, group: i32) -> Option<ForegroundAgent> {
+    if let Some(index) = known.iter().position(|agent| agent.binary == name) {
+        return Some(ForegroundAgent::Manifest(index));
+    }
+    let id = crate::recognition::recognize(name, || {
+        diri_pty::foreground::npm_package(group as u32)
+            .ok()
+            .flatten()
+    })?;
+    Some(
+        match known.iter().position(|agent| agent.manifest_id == id) {
+            Some(index) => ForegroundAgent::Manifest(index),
+            None => ForegroundAgent::Activity(id),
+        },
+    )
 }
 
 /// An Agent a shell can recognise in its foreground.
@@ -2293,12 +2331,11 @@ impl Session {
             .clone();
         let (foreground_program, foreground_agent, terminal_cwd, foreground_ports) = {
             let foreground = self.shared.foreground.lock().expect("foreground");
-            let agent = foreground.name.as_deref().and_then(|name| {
-                self.shared
-                    .known_agents
-                    .iter()
-                    .find(|agent| agent.binary == name)
-                    .map(|agent| agent.manifest_id.clone())
+            let agent = foreground.agent.map(|agent| match agent {
+                ForegroundAgent::Manifest(index) => {
+                    self.shared.known_agents[index].manifest_id.clone()
+                }
+                ForegroundAgent::Activity(id) => id.to_owned(),
             });
             (
                 foreground.name.clone(),
@@ -3731,9 +3768,10 @@ fn apply_foreground_sample(
     let outcome = {
         let mut reducer = shared.reducer.lock().expect("reducer");
         let outcome = match agent {
-            Some(agent) => {
+            Some(Lend::Screen(agent)) => {
                 reducer.lend_to_agent(&agent.manifest_id, Some(&agent.manifest_version), now)
             }
+            Some(Lend::Activity(id)) => reducer.lend_to_activity(id, now),
             None if reducer.foreground_agent().is_some() => reducer.return_from_agent(running, now),
             None => reducer.reduce(StatusSignal::ForegroundJob { running }, now),
         };
@@ -3745,7 +3783,9 @@ fn apply_foreground_sample(
 }
 
 /// Names a local shell's foreground job and reads its working directory,
-/// returning the Agent that job is when it is one whose screen can be read.
+/// returning how to read the Agent that job is, when it is one: by its
+/// manifest's screen rules, or by its output when it is known only by name.
+/// A manifest Agent without screen rules is left to the shell's job tracking.
 ///
 /// A job's name is read once per process group. A group seen before its
 /// leader has exec'd still carries the shell's own name; that read is not
@@ -3756,7 +3796,7 @@ fn observe_foreground_program(
     child_pid: i32,
     foreground_pgid: Option<i32>,
     running: bool,
-) -> Option<&KnownAgent> {
+) -> Option<Lend<'_>> {
     let job = foreground_pgid.filter(|_| running);
     let mut changed = false;
     let mut foreground = shared.foreground.lock().expect("foreground");
@@ -3765,6 +3805,7 @@ fn observe_foreground_program(
         foreground.group_seen_at = Some(Instant::now());
         foreground.ports_read_at = None;
         changed |= foreground.name.take().is_some();
+        foreground.agent = None;
         changed |= !std::mem::take(&mut foreground.ports).is_empty();
     }
     // What the job serves, read on the same terms as its name: once it has
@@ -3793,6 +3834,7 @@ fn observe_foreground_program(
         && let Ok(name) = diri_pty::foreground::program_name(group as u32)
         && diri_pty::foreground::program_name(child_pid as u32).ok() != Some(name.clone())
     {
+        foreground.agent = recognize_agent(&shared.known_agents, &name, group);
         foreground.name = Some(name);
         changed = true;
     }
@@ -3808,11 +3850,12 @@ fn observe_foreground_program(
             changed = true;
         }
     }
-    let agent = foreground.name.as_deref().and_then(|name| {
-        shared
-            .known_agents
-            .iter()
-            .find(|agent| agent.binary == name && agent.reads_screen)
+    let agent = foreground.agent.and_then(|agent| match agent {
+        ForegroundAgent::Manifest(index) => {
+            let agent = &shared.known_agents[index];
+            agent.reads_screen.then_some(Lend::Screen(agent))
+        }
+        ForegroundAgent::Activity(id) => Some(Lend::Activity(id)),
     });
     drop(foreground);
     if changed {
@@ -8117,6 +8160,82 @@ mod foreground_program_tests {
         let sub = root.join("sub").to_string_lossy().into_owned();
         wait_until("cd to be followed", || {
             session.view().terminal_cwd.as_deref() == Some(sub.as_str())
+        });
+        let _ = session.terminate(Duration::from_secs(2));
+    }
+
+    /// An Agent with no launch manifest, typed at the prompt, is recognised
+    /// by name from the catalog and its status follows its output.
+    #[test]
+    fn a_shell_recognises_an_agent_known_only_by_name() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        let bin = root.join("bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        let fake_goose = bin.join("goose");
+        // Streams a reply for a while after each line, as an Agent does.
+        std::fs::write(
+            &fake_goose,
+            "#!/bin/sh\necho ready\nwhile read -r line; do\n  i=0\n  while [ $i -lt 15 ]; do echo \"working $i\"; sleep 0.1; i=$((i+1)); done\ndone\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(
+            &fake_goose,
+            std::os::unix::fs::PermissionsExt::from_mode(0o755),
+        )
+        .unwrap();
+        let (engine, _) = ManifestEngine::load_dir(&crate::detect::bundled_manifest_dir()).unwrap();
+        let logs = root.join("logs");
+        std::fs::create_dir_all(&logs).unwrap();
+        let spec = SessionSpec {
+            id: "foreground-goose".into(),
+            pty: PtySpec::new(vec!["/bin/sh".into(), "-i".into()], &root)
+                .env("PATH", &format!("{}:/usr/bin:/bin", bin.display()))
+                .env("PS1", "$ ")
+                .size(80, 24),
+            manifest_id: "shell".into(),
+            authority: Authority::ProcessOnly,
+            logs_dir: logs,
+            holder: None,
+            remote: None,
+            defer_launch: false,
+        };
+        let mut session = Session::spawn(spec, Arc::new(engine)).expect("spawn");
+        let root_text = root.to_string_lossy().into_owned();
+        wait_until("the prompt's directory", || {
+            session.view().terminal_cwd.as_deref() == Some(root_text.as_str())
+        });
+
+        session.write_input(b"goose\r").unwrap();
+        wait_until("the Agent to be recognised", || {
+            let view = session.view();
+            view.foreground_program.as_deref() == Some("goose")
+                && view.foreground_agent.as_deref() == Some("goose")
+        });
+        wait_until("the reducer to be lent and idle", || {
+            session.shared.reducer.lock().unwrap().foreground_agent() == Some("goose")
+                && session.status() == SessionStatus::Idle
+        });
+
+        session.write_input(b"go\r").unwrap();
+        wait_until("its reply to read as work", || {
+            session.status() == SessionStatus::Working
+        });
+        wait_until("its quiet to read as idle", || {
+            session.status() == SessionStatus::Idle
+        });
+
+        session.write_input(b"\x03").unwrap();
+        wait_until("the shell to take its status back", || {
+            let view = session.view();
+            view.foreground_agent.is_none()
+                && session
+                    .shared
+                    .reducer
+                    .lock()
+                    .unwrap()
+                    .foreground_agent()
+                    .is_none()
         });
         let _ = session.terminate(Duration::from_secs(2));
     }
