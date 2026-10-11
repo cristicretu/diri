@@ -1348,6 +1348,12 @@ impl ControlServer {
         if let Some(profile) = &mut account_profile {
             crate::accounts::bind_pty(profile, &mut pty)?;
         }
+        if kind == diri_proto::AgentKind::SHELL_ID {
+            self.accounts
+                .lock()
+                .map_err(poisoned)?
+                .terminal_environment(&pty.argv, &mut pty.env);
+        }
         let mut record = new_record(&id, &kind, &cwd);
         record.scheduled_run = scheduled;
         record.terminal_cwd = start_directory.map(|path| path.to_string_lossy().into_owned());
@@ -3735,12 +3741,16 @@ impl ControlServer {
         record: &diri_proto::SessionRecord,
         directory: Option<&Path>,
     ) -> Result<crate::session::SessionSpec, ControlError> {
-        let registry = self.registry.lock().map_err(poisoned)?;
         let kind = diri_proto::AgentKind::SHELL_ID;
         let launch_path = directory.unwrap_or_else(|| Path::new(&record.cwd));
         let mut pty = crate::pty::PtySpec::new(login_shell_argv(), launch_path);
         pty.env = std::env::vars().collect();
         crate::agent::assert_color_environment(&mut pty.env);
+        self.accounts
+            .lock()
+            .map_err(poisoned)?
+            .terminal_environment(&pty.argv, &mut pty.env);
+        let registry = self.registry.lock().map_err(poisoned)?;
         Ok(crate::session::SessionSpec {
             id: record.id.0.clone(),
             pty,
