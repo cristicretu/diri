@@ -56,6 +56,7 @@
   "nav.age.now": "now",
   "nav.all_settings": "All settings",
   "nav.back_tooltip": "Back · ⌘[",
+  "nav.clear_query": "Clear search",
   "nav.create_folder": "Create “{name}”",
   "nav.create_folder_failed": "Could not create {path}: {error}",
   "nav.create_folder_tooltip": "{path}\nEnter to create and open · {terminal} for a terminal",

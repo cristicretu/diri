@@ -56,6 +56,7 @@
   "nav.age.now": "刚刚",
   "nav.all_settings": "所有设置",
   "nav.back_tooltip": "返回 · ⌘[",
+  "nav.clear_query": "清除搜索",
   "nav.create_folder": "创建“{name}”",
   "nav.create_folder_failed": "无法创建 {path}：{error}",
   "nav.create_folder_tooltip": "{path}\n按 Enter 创建并打开 · 按 {terminal} 打开终端",
