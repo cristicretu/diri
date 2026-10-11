@@ -147,6 +147,12 @@ impl InputRejection {
     }
 }
 
+/// Where a view's typing is copied while its tab synchronizes panes: every
+/// clone of the view's attachments shares it, and the pane sets it. `None`
+/// (the default) costs one uncontended lock per input.
+pub(crate) type InputMirror =
+    Arc<Mutex<Option<tokio::sync::mpsc::UnboundedSender<(SessionId, Vec<u8>)>>>>;
+
 #[derive(Clone)]
 pub(super) struct AttachmentControl {
     state: Arc<Mutex<ControlState>>,
@@ -154,6 +160,7 @@ pub(super) struct AttachmentControl {
     events: PaneEventSender,
     id: SessionId,
     echo: Arc<crate::telemetry::EchoProbe>,
+    pub(super) mirror: InputMirror,
     #[cfg(test)]
     pub(super) input_observer: Option<(SessionId, InputObserver)>,
 }
@@ -307,9 +314,22 @@ impl AttachmentControl {
     }
 
     pub(super) fn input(&self, bytes: Vec<u8>) {
+        self.send_input(bytes, true);
+    }
+
+    /// Input copied here from a synchronized pane: never copied on again.
+    pub(super) fn input_unmirrored(&self, bytes: Vec<u8>) {
+        self.send_input(bytes, false);
+    }
+
+    fn send_input(&self, bytes: Vec<u8>, mirror: bool) {
         if bytes.is_empty() {
             return;
         }
+        let mirror = mirror
+            .then(|| self.mirror.lock().ok().and_then(|tx| tx.clone()))
+            .flatten()
+            .map(|tx| (tx, bytes.clone()));
         #[cfg(test)]
         if let Some((id, observer)) = &self.input_observer
             && self.is_controller()
@@ -320,6 +340,9 @@ impl AttachmentControl {
         if result.is_ok() {
             self.echo.sent();
             diri_client::latency_trace::mark(diri_client::latency_trace::Hop::InputQueued);
+            if let Some((tx, bytes)) = mirror {
+                let _ = tx.send((self.id.clone(), bytes));
+            }
         }
         self.report("input", result);
     }
@@ -535,6 +558,7 @@ impl ControllerLease {
             events: events.clone(),
             id: id.clone(),
             echo: core.echo.clone(),
+            mirror: InputMirror::default(),
             #[cfg(test)]
             input_observer: None,
         };
@@ -1229,8 +1253,51 @@ mod tests {
             events: pane_event_channel().0,
             id: SessionId("a-note".into()),
             echo: Arc::default(),
+            mirror: InputMirror::default(),
             input_observer: None,
         }
+    }
+
+    /// Synchronize-panes: typing accepted by a live attachment is copied to
+    /// its mirror once; input that arrived through a mirror is not copied
+    /// on, so two synchronized panes never echo each other forever.
+    #[test]
+    fn accepted_input_is_mirrored_once_and_forwarded_input_never() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let (path, _drop_now, engine) = dropping_engine(&runtime);
+        let ((state, states, stop), _notices) = transport_with_notices(&runtime, path.clone());
+        runtime.block_on(async {
+            tokio::time::timeout(Duration::from_secs(2), async {
+                while !states.lock().unwrap().contains(&AttachmentState::Live) {
+                    tokio::time::sleep(Duration::from_millis(1)).await;
+                }
+            })
+            .await
+            .unwrap();
+        });
+        let control = input_control(&state);
+        // Off: nothing is copied anywhere.
+        control.input(b"pwd".to_vec());
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        *control.mirror.lock().unwrap() = Some(tx);
+        // Every clone of the view's attachment shares the mirror (the IME
+        // path types through a clone).
+        control.clone().input(b"ls\r".to_vec());
+        control.input_unmirrored(b"echo from a sibling\r".to_vec());
+        assert_eq!(
+            rx.try_recv().unwrap(),
+            (SessionId("a-note".into()), b"ls\r".to_vec())
+        );
+        assert!(rx.try_recv().is_err(), "forwarded input is not copied on");
+        *control.mirror.lock().unwrap() = None;
+        control.input(b"q".to_vec());
+        assert!(rx.try_recv().is_err());
+        let _ = stop.send(());
+        engine.abort();
+        let _ = std::fs::remove_file(path);
     }
 
     /// Drops one live attachment (after `typing`, if any) and returns the
@@ -1382,6 +1449,7 @@ mod tests {
             events,
             id: SessionId("benchmark".into()),
             echo: Arc::default(),
+            mirror: InputMirror::default(),
             input_observer: None,
         };
         let mut samples = Vec::new();

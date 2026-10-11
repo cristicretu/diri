@@ -123,6 +123,7 @@ impl SessionStore {
         self.workspaces.status = WorkspaceCatalogStatus::Ready;
         self.workspaces.connected = true;
         self.workspaces.hydrated = true;
+        self.refresh_standalone_shells();
     }
 
     #[cfg(test)]
@@ -252,6 +253,7 @@ impl SessionStore {
                 | WorkspaceMutation::CreateTab { .. }
                 | WorkspaceMutation::SelectTab { .. }
                 | WorkspaceMutation::SplitPane { .. }
+                | WorkspaceMutation::BreakPane { .. }
         ) {
             catalog.selection_edits += 1;
         }
@@ -279,6 +281,7 @@ impl SessionStore {
         if generation != catalog.generation || !catalog.connected {
             return;
         }
+        let mut accepted = false;
         let attempted = if mutation {
             catalog.editing = false;
             catalog.in_flight.take()
@@ -313,6 +316,7 @@ impl SessionStore {
                 if accepts {
                     catalog.snapshot = Some(Arc::new(snapshot));
                     catalog.hydrated = true;
+                    accepted = true;
                 }
                 catalog.status = WorkspaceCatalogStatus::Ready;
                 if catalog
@@ -346,7 +350,11 @@ impl SessionStore {
                 }
             }
         }
-        if std::mem::take(&mut catalog.refresh_again) {
+        let refresh = std::mem::take(&mut catalog.refresh_again);
+        if accepted {
+            self.refresh_standalone_shells();
+        }
+        if refresh {
             self.refresh_workspaces();
         }
     }

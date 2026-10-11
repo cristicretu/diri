@@ -39,6 +39,8 @@ pub(in crate::sidebar) struct StripTabProps {
     /// ⌘1–⌘8, then ⌘9 for the last tab.
     pub(super) rank: Option<usize>,
     pub(super) state: StatusState,
+    /// Panes in this tab's split tree, when it is split (else 0 or 1).
+    pub(super) panes: usize,
     /// Terminal progress, when the session reports any.
     pub(super) progress: Option<crate::progress_mark::ProgressFace>,
     pub(super) colors: SemanticColors,
@@ -104,6 +106,7 @@ impl Sidebar {
         count: usize,
         active: bool,
         state: StatusState,
+        panes: usize,
         colors: SemanticColors,
         custom_ordering: bool,
         reduce_motion: bool,
@@ -134,6 +137,7 @@ impl Sidebar {
             active,
             rank,
             state,
+            panes,
             progress: crate::progress_mark::face(session, self.activity_frame, reduce_motion),
             colors,
             custom_ordering,

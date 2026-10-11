@@ -460,6 +460,12 @@ pub struct SessionStore {
     cached_projection: Option<(u64, Arc<SidebarProjection>)>,
     /// The same tree with sidebar folds blanked; see [`SessionStore::menu_bar_projection`].
     cached_menu_projection: Option<(u64, Arc<SidebarProjection>)>,
+    /// Pane shells broken out of their owner's tab: they are tabs of their
+    /// own, so they get sidebar rows (see [`Self::standalone_pane_shells`]).
+    standalone_shells: HashSet<SessionId>,
+    /// Pane shells shown away from their owner, and the session whose tab
+    /// row they now belong to (themselves when they head their tab).
+    shell_owners: HashMap<SessionId, SessionId>,
     prefs_path: Option<PathBuf>,
     /// Set by the menu bar's New Agent action; drained by Root on UI sync.
     pending_open_launcher: bool,
@@ -575,6 +581,8 @@ impl SessionStore {
                 revision: 0,
                 cached_projection: None,
                 cached_menu_projection: None,
+                standalone_shells: HashSet::new(),
+                shell_owners: HashMap::new(),
                 prefs_path,
                 pending_open_launcher: false,
                 pending_open_settings: false,
@@ -1623,6 +1631,7 @@ impl SessionStore {
             &self.prefs,
             self.selected_session_id.as_ref(),
             &self.closing,
+            &self.standalone_shells,
         ));
         self.cached_projection = Some((self.revision, Arc::clone(&projection)));
         projection
@@ -1649,6 +1658,7 @@ impl SessionStore {
             &prefs,
             self.selected_session_id.as_ref(),
             &self.closing,
+            &self.standalone_shells,
         ));
         self.cached_menu_projection = Some((self.revision, Arc::clone(&projection)));
         projection
@@ -1962,7 +1972,12 @@ impl SessionStore {
                 .as_deref()
                 .is_none_or(|record| !matches!(record.status, SessionStatus::Exited(_)));
         self.remember_conversation_title(&session);
+        let new_shell = is_new && is_auxiliary_terminal(&session);
         self.sessions.insert(id.clone(), Arc::new(session));
+        if new_shell {
+            // Its tab may have arrived first.
+            self.refresh_standalone_shells();
+        }
         self.reconcile_notifications();
         let current = self.sessions.get(&id).expect("inserted");
         let focused = self.notification_is_focused(&id);
@@ -2811,11 +2826,90 @@ impl SessionStore {
     /// The session a pane belongs to in the sidebar: a pane shell's parent,
     /// otherwise the session itself.
     pub fn pane_owner(&self, session: &SessionId) -> SessionId {
+        if let Some(owner) = self.shell_owners.get(session) {
+            return owner.clone();
+        }
         self.sessions
             .get(session)
             .filter(|record| is_auxiliary_terminal(record))
             .and_then(|record| record.parent.clone())
             .unwrap_or_else(|| session.clone())
+    }
+
+    /// Pane shells some tab shows without their owner beside them: broken
+    /// out of the owner's tab (prefix `!`, "Break Pane into Its Own Tab")
+    /// or joined into another tab. A tab is one sidebar row, so each such
+    /// shell belongs to its tab's head: the tab's first pane that is not a
+    /// pane shell, else its first such shell, which then takes a row of its
+    /// own. Unplaced shells (the inspector's, one `⌘J` hid) stay with their
+    /// owner. Returns shell → the session whose row it belongs to.
+    pub fn shell_tab_owners(&self) -> HashMap<SessionId, SessionId> {
+        use diri_proto::workspace::LayoutNode;
+        fn leaves<'a>(node: &'a LayoutNode, out: &mut Vec<&'a SessionId>) {
+            match node {
+                LayoutNode::Pane { session_id, .. } => out.push(session_id),
+                LayoutNode::Split { first, second, .. } => {
+                    leaves(first, out);
+                    leaves(second, out);
+                }
+            }
+        }
+        let Some(snapshot) = self.workspaces.snapshot() else {
+            return HashMap::new();
+        };
+        let mut owners = HashMap::new();
+        let mut owned = HashSet::new();
+        let mut panes = Vec::new();
+        for tab in snapshot.workspaces.iter().flat_map(|w| &w.tabs) {
+            panes.clear();
+            leaves(&tab.layout, &mut panes);
+            let parent = |id: &SessionId| {
+                self.sessions
+                    .get(id)
+                    .filter(|record| is_auxiliary_terminal(record))
+                    .and_then(|record| record.parent.clone())
+            };
+            let mut orphans = Vec::new();
+            for id in &panes {
+                match parent(id) {
+                    Some(parent) if panes.contains(&&parent) => {
+                        owned.insert((*id).clone());
+                    }
+                    Some(_) => orphans.push((*id).clone()),
+                    None => {}
+                }
+            }
+            let Some(head) = panes
+                .iter()
+                .find(|id| parent(id).is_none())
+                .map(|id| (*id).clone())
+                .or_else(|| orphans.first().cloned())
+            else {
+                continue;
+            };
+            for orphan in orphans {
+                owners.entry(orphan).or_insert_with(|| head.clone());
+            }
+        }
+        // A shell shown both beside its owner and elsewhere stays the owner's.
+        owners.retain(|id, _| !owned.contains(id));
+        owners
+    }
+
+    /// Recomputes [`Self::shell_tab_owners`] after the layout or the
+    /// sessions changed; the sidebar rebuilds only when rows moved.
+    pub(super) fn refresh_standalone_shells(&mut self) {
+        let owners = self.shell_tab_owners();
+        let standalone: HashSet<SessionId> = owners
+            .iter()
+            .filter(|(shell, owner)| shell == owner)
+            .map(|(shell, _)| shell.clone())
+            .collect();
+        self.shell_owners = owners;
+        if standalone != self.standalone_shells {
+            self.standalone_shells = standalone;
+            self.invalidate_projection();
+        }
     }
 
     /// The tab that shows `owner`, as its sidebar row sums it up: how many
@@ -2845,7 +2939,9 @@ impl SessionStore {
                     .iter()
                     .filter_map(|id| self.sessions.get(*id))
                     .filter(|session| {
-                        session.parent.as_ref() == Some(owner) && is_auxiliary_terminal(session)
+                        session.id != *owner
+                            && is_auxiliary_terminal(session)
+                            && self.pane_owner(&session.id) == *owner
                     })
                     .cloned()
                     .collect();
@@ -3179,6 +3275,7 @@ impl SessionStore {
             &self.prefs,
             self.selected_session_id.as_ref(),
             &self.closing,
+            &self.standalone_shells,
         );
         projection
             .first_active()

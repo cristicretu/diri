@@ -3941,6 +3941,23 @@ impl UtilitySurfaces {
                         .text_color(colors.secondary)
                         .child(t("settings.shortcuts.intro")),
                 )
+                .child(setting_section(
+                    t("settings.shortcuts.prefix_section"),
+                    toggle_row(
+                        t("settings.shortcuts.prefix"),
+                        t("settings.shortcuts.prefix_detail"),
+                        self.prefs.multiplexer_prefix,
+                        "toggle-multiplexer-prefix",
+                        colors,
+                        cx,
+                        |this, cx| {
+                            let enabled = !this.prefs.multiplexer_prefix;
+                            this.update_prefs(move |prefs| prefs.multiplexer_prefix = enabled);
+                            cx.notify();
+                        },
+                    ),
+                    colors,
+                ))
                 .child(
                     div()
                         .flex()

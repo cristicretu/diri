@@ -720,6 +720,7 @@ impl WindowWrite<'_> {
             &self.prefs,
             self.navigation.selected_session_id.as_ref(),
             &self.closing,
+            &self.standalone_shells,
         ));
         self.navigation.projection = Some((self.revision, projection.clone()));
         projection

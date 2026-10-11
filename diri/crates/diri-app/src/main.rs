@@ -44,6 +44,7 @@ pub mod markdown;
 mod markdown_view;
 #[cfg(any(target_os = "macos", test))]
 mod menu_inbox;
+mod multiplexer;
 pub mod navigation;
 mod notes;
 mod notification_feed;

@@ -96,6 +96,7 @@ pub(super) fn build_projection(
     prefs: &Prefs,
     selected: Option<&SessionId>,
     closing: &HashSet<SessionId>,
+    standalone_shells: &HashSet<SessionId>,
 ) -> SidebarProjection {
     let mut grouped: HashMap<ProjectId, Vec<Arc<SessionRecord>>> = HashMap::new();
     for session in sessions.values() {
@@ -103,7 +104,10 @@ pub(super) fn build_projection(
         // Workbench-owned terminal shells live under their primary agent and
         // are reopened there; exposing them as top-level rows would split one
         // workspace into two unrelated-looking sessions.
-        if closing.contains(&session.id) || is_auxiliary_terminal(session) {
+        // A shell broken out into a tab of its own is a row like any other.
+        if closing.contains(&session.id)
+            || (is_auxiliary_terminal(session) && !standalone_shells.contains(&session.id))
+        {
             continue;
         }
         grouped

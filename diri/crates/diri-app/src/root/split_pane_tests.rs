@@ -274,3 +274,339 @@ fn command_j_hides_the_terminal_below_and_command_w_closes_only_a_shell_pane(
         assert!(store.is_open(&SessionId::new("pane-tests")));
     }
 }
+
+/// Settles the edit in flight as the Engine would: same layout, next
+/// revision. Returns the edit.
+fn settle(runtime: &crate::store::StoreRuntime) -> Option<WorkspaceMutation> {
+    let mut store = runtime.store.write().unwrap();
+    let edit = store.in_flight_workspace_edit_for_test().cloned();
+    let mut snapshot = (*store.workspace_catalog().snapshot().unwrap()).clone();
+    snapshot.revision += 1;
+    store.finish_workspace_edit_for_test(snapshot);
+    edit
+}
+
+/// Settles every edit the last keys set off, follow-ups included.
+fn settle_all(runtime: &crate::store::StoreRuntime, cx: &mut gpui::VisualTestContext) {
+    loop {
+        cx.run_until_parked();
+        if settle(runtime).is_none() {
+            return;
+        }
+    }
+}
+
+#[gpui::test]
+fn the_prefix_layer_runs_tmux_verbs_and_keeps_its_keys_from_the_terminal(
+    cx: &mut gpui::TestAppContext,
+) {
+    let (services, workspace) = stacked_tab("tests");
+    let runtime = services.store.clone();
+    runtime
+        .store
+        .write()
+        .unwrap()
+        .update_preferences(|prefs| prefs.multiplexer_prefix = true)
+        .unwrap();
+    let (root, cx) = cx.add_window_view(move |window, cx| {
+        RootView::new(services, false, PreviewScenario::Empty, window, cx)
+    });
+    root.update_in(cx, |root, window, cx| {
+        root.activate_saved_workspace(Some(workspace), window, cx)
+    });
+    cx.simulate_resize(size(px(1100.0), px(800.0)));
+    cx.run_until_parked();
+    root.update_in(cx, |root, window, cx| {
+        let workbench = root.workspace_workbench.clone().unwrap();
+        workbench.update(cx, |workbench, cx| workbench.focus(window, cx));
+    });
+    cx.run_until_parked();
+    let release = TabId::new("release");
+
+    // ⌃A arms the layer (and shows that it did); Space cycles layouts from
+    // even-horizontal on.
+    cx.simulate_keystrokes("ctrl-a");
+    assert!(root.read_with(cx, |root, _| root.prefix.is_armed()));
+    cx.simulate_keystrokes("space");
+    assert!(root.read_with(cx, |root, _| !root.prefix.is_armed()));
+    assert_eq!(
+        settle(&runtime),
+        Some(WorkspaceMutation::ApplyLayout {
+            tab_id: release.clone(),
+            preset: LayoutPreset::EvenHorizontal,
+        })
+    );
+    cx.simulate_keystrokes("ctrl-a space");
+    assert_eq!(
+        settle(&runtime),
+        Some(WorkspaceMutation::ApplyLayout {
+            tab_id: release.clone(),
+            preset: LayoutPreset::EvenVertical,
+        })
+    );
+
+    // S synchronizes this tab's panes (both copy their typing); again
+    // turns it off and no pane copies anything.
+    let sync = |cx: &mut gpui::VisualTestContext| {
+        root.read_with(cx, |root, cx| {
+            let workbench = root.workspace_workbench.as_ref().unwrap().read(cx);
+            (
+                workbench.synchronized(),
+                workbench.mirrored_panes_for_test(),
+            )
+        })
+    };
+    assert_eq!(sync(cx), (false, 0));
+    cx.simulate_keystrokes("ctrl-a shift-s->S");
+    assert_eq!(sync(cx), (true, 2));
+    cx.simulate_keystrokes("ctrl-a shift-s->S");
+    assert_eq!(sync(cx), (false, 0));
+
+    // ? shows the cheatsheet; the next key only takes it down.
+    cx.simulate_keystrokes("ctrl-a shift-/->?");
+    assert!(root.read_with(cx, |root, _| root.multiplexer_sheet));
+    cx.simulate_keystrokes("z");
+    assert!(root.read_with(cx, |root, _| !root.multiplexer_sheet));
+    assert!(
+        !matches!(settle(&runtime), Some(WorkspaceMutation::ZoomPane { .. })),
+        "z only closed the sheet"
+    );
+    settle_all(&runtime, cx);
+
+    // ! breaks the focused pane into its own tab.
+    cx.simulate_keystrokes("ctrl-a shift-1->!");
+    assert_eq!(
+        settle(&runtime),
+        Some(WorkspaceMutation::BreakPane {
+            tab_id: release.clone(),
+            pane_id: PaneId::new("tests"),
+        })
+    );
+
+    // q numbers the panes; a digit focuses one.
+    cx.simulate_keystrokes("ctrl-a q");
+    assert!(root.read_with(cx, |root, cx| {
+        root.workspace_workbench
+            .as_ref()
+            .unwrap()
+            .read(cx)
+            .pane_numbers_shown()
+    }));
+    cx.simulate_keystrokes("1");
+    cx.run_until_parked();
+    root.read_with(cx, |root, cx| {
+        let workbench = root.workspace_workbench.as_ref().unwrap().read(cx);
+        assert!(!workbench.pane_numbers_shown());
+        assert_eq!(
+            workbench.focused_session_id(),
+            Some(SessionId::new("preview-claude"))
+        );
+    });
+    // Focus and the sidebar following it.
+    settle_all(&runtime, cx);
+
+    // x on the agent's pane never closes it: the agent's pane is the tab.
+    cx.simulate_keystrokes("ctrl-a x");
+    assert!(
+        runtime
+            .store
+            .read()
+            .unwrap()
+            .is_open(&SessionId::new("preview-claude"))
+    );
+
+    // Off, ⌃A is the terminal's again.
+    runtime
+        .store
+        .write()
+        .unwrap()
+        .update_preferences(|prefs| prefs.multiplexer_prefix = false)
+        .unwrap();
+    cx.simulate_keystrokes("ctrl-a");
+    assert!(root.read_with(cx, |root, _| !root.prefix.is_armed()));
+}
+
+#[gpui::test]
+fn x_closes_only_a_shell_pane(cx: &mut gpui::TestAppContext) {
+    let (services, workspace) = stacked_tab("tests");
+    let runtime = services.store.clone();
+    runtime
+        .store
+        .write()
+        .unwrap()
+        .update_preferences(|prefs| prefs.multiplexer_prefix = true)
+        .unwrap();
+    let (root, cx) = cx.add_window_view(move |window, cx| {
+        RootView::new(services, false, PreviewScenario::Empty, window, cx)
+    });
+    root.update_in(cx, |root, window, cx| {
+        root.activate_saved_workspace(Some(workspace), window, cx)
+    });
+    cx.simulate_resize(size(px(1100.0), px(800.0)));
+    cx.run_until_parked();
+    root.update_in(cx, |root, window, cx| {
+        let workbench = root.workspace_workbench.clone().unwrap();
+        workbench.update(cx, |workbench, cx| workbench.focus(window, cx));
+    });
+    cx.run_until_parked();
+    cx.simulate_keystrokes("ctrl-a x");
+    let store = runtime.store.read().unwrap();
+    assert!(!store.is_open(&SessionId::new("pane-tests")));
+    assert!(store.is_open(&SessionId::new("preview-claude")));
+}
+
+const LOGS: &str = "~/work/diri $ tail -f target/release.log\n[12:04:11] signing diri.app\n[12:04:19] notarizing: submitted\n[12:05:02] notarizing: accepted\n[12:05:03] stapling ticket\n";
+
+/// The PR's multiplexer screenshots: `name` picks the layout and what the
+/// keys put on screen.
+#[test]
+#[ignore = "writes multiplexer screenshots to DIRI_MUX_SCREENSHOTS (a directory)"]
+fn render_multiplexer_screenshot() {
+    use gpui::HeadlessAppContext;
+    let output = std::path::PathBuf::from(std::env::var("DIRI_MUX_SCREENSHOTS").unwrap());
+    std::fs::create_dir_all(&output).unwrap();
+    for name in ["cheatsheet", "pane-numbers", "tiled", "sync", "tab-strip"] {
+        let platform = gpui_platform::current_platform(true);
+        let mut cx = HeadlessAppContext::with_platform(
+            platform.text_system(),
+            Arc::new(diri_ui::IconAssets),
+            gpui_platform::current_headless_renderer,
+        );
+        cx.update(|cx| {
+            crate::fonts::init(cx);
+            cx.set_reduce_motion(true);
+        });
+        let services = test_services();
+        let mut fixture = SidebarPreviewFixture::make(PreviewScenario::Typical);
+        let mut tests = pane_shell("pane-tests", "cargo test", &fixture);
+        // The strip folds a working pane into the tab's own state.
+        tests.status = diri_proto::SessionStatus::Working;
+        let server = pane_shell("pane-server", "pnpm dev · website", &fixture);
+        let logs = pane_shell("pane-logs", "tail -f release.log", &fixture);
+        fixture.list.sessions.extend([tests, server, logs]);
+        let workspace = WorkspaceId::new("project-workspace");
+        let agent = pane("agent", "preview-claude");
+        let (tree, focused) = match name {
+            "tiled" => (
+                split(
+                    "rows",
+                    LayoutAxis::Vertical,
+                    0.5,
+                    split(
+                        "top",
+                        LayoutAxis::Horizontal,
+                        0.5,
+                        agent,
+                        pane("tests", "pane-tests"),
+                    ),
+                    split(
+                        "bottom",
+                        LayoutAxis::Horizontal,
+                        0.5,
+                        pane("server", "pane-server"),
+                        pane("logs", "pane-logs"),
+                    ),
+                ),
+                PaneId::new("tests"),
+            ),
+            "sync" => (
+                split(
+                    "columns",
+                    LayoutAxis::Horizontal,
+                    0.5,
+                    pane("tests", "pane-tests"),
+                    pane("server", "pane-server"),
+                ),
+                PaneId::new("tests"),
+            ),
+            _ => {
+                let (tree, focused, _) = layout("three");
+                (tree, focused)
+            }
+        };
+        {
+            let mut store = services.store.store.write().unwrap();
+            store.hydrate(fixture.list);
+            store
+                .update_preferences(|prefs| {
+                    prefs.terminal_theme = "dirijor-dark".into();
+                    prefs.sidebar_visible = true;
+                    prefs.multiplexer_prefix = true;
+                    if name == "tab-strip" {
+                        prefs.tab_orientation = crate::store::TabOrientation::Horizontal;
+                    }
+                })
+                .unwrap();
+            store.select(SessionId::new("preview-claude"));
+            store.seed_workspace_snapshot_for_test(WorkspaceSnapshot {
+                revision: 3,
+                workspaces: vec![WorkspaceRecord {
+                    project_id: None,
+                    id: workspace.clone(),
+                    name: "diri".into(),
+                    selected_tab: Some(TabId::new("release")),
+                    tabs: vec![
+                        WorkspaceTab {
+                            id: TabId::new("release"),
+                            title: None,
+                            focused_pane: focused,
+                            zoomed_pane: None,
+                            layout: tree,
+                        },
+                        WorkspaceTab {
+                            id: TabId::new("codex"),
+                            title: None,
+                            focused_pane: PaneId::new("codex"),
+                            zoomed_pane: None,
+                            layout: pane("codex", "preview-codex"),
+                        },
+                    ],
+                }],
+                ..Default::default()
+            });
+        }
+        let window = cx
+            .open_window(size(px(1280.0), px(780.0)), |window, cx| {
+                cx.new(|cx| {
+                    let root = RootView::new(services, false, PreviewScenario::Empty, window, cx);
+                    root.sidebar.update(cx, |sidebar, cx| {
+                        sidebar.activate_workspace(Some(workspace), cx);
+                    });
+                    root
+                })
+            })
+            .unwrap();
+        cx.run_until_parked();
+        cx.update_window(window.into(), |root, window, cx| {
+            let root = root.downcast::<RootView>().unwrap();
+            let workbench = root.read(cx).workspace_workbench.clone().unwrap();
+            workbench.update(cx, |workbench, cx| {
+                workbench.seed_pane_text_for_test(
+                    &[
+                        ("preview-claude", CLAUDE),
+                        ("pane-tests", TESTS),
+                        ("pane-server", SERVER),
+                        ("pane-logs", LOGS),
+                    ],
+                    cx,
+                )
+            });
+            let command = match name {
+                "cheatsheet" => Some(CommandId::ShowMultiplexerKeys),
+                "pane-numbers" => Some(CommandId::ShowPaneNumbers),
+                "sync" => Some(CommandId::ToggleSynchronizePanes),
+                _ => None,
+            };
+            if let Some(command) = command {
+                root.update(cx, |root, cx| root.run_command(command, window, cx));
+            }
+        })
+        .unwrap();
+        cx.run_until_parked();
+        let image = cx.capture_screenshot(window.into()).unwrap();
+        image.save(output.join(format!("{name}.png"))).unwrap();
+        cx.update_window(window.into(), |_, window, _| window.remove_window())
+            .unwrap();
+        cx.run_until_parked();
+    }
+}

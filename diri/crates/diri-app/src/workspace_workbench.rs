@@ -134,6 +134,22 @@ pub(crate) struct WorkspaceWorkbench {
     /// What the drag in flight last snapped to: the pane a moved pane would
     /// land on, or the end of a divider's travel.
     drag_haptic: haptics::Crossing,
+    /// Tabs whose panes type together (synchronize-panes). Window-local
+    /// and off by default: a reopened window never types into many panes.
+    synced: HashSet<TabId>,
+    /// The panes whose input is copied right now: the visible panes of a
+    /// synchronized tab on screen.
+    mirrored: HashSet<PaneId>,
+    /// Where those panes copy their input, drained by `_sync`. Made the
+    /// first time a tab synchronizes; idle until then.
+    sync_tx: Option<tokio::sync::mpsc::UnboundedSender<(SessionId, Vec<u8>)>>,
+    _sync: Option<gpui::Task<()>>,
+    /// The preset each tab last took, so "Next layout" cycles from it.
+    layouts: HashMap<TabId, diri_proto::workspace::LayoutPreset>,
+    /// The pane "Join marked pane here" brings over.
+    marked: Option<(TabId, PaneId)>,
+    /// While set, every pane shows its number; the task takes them down.
+    numbers: Option<gpui::Task<()>>,
     _activation: Subscription,
 }
 impl EventEmitter<WorkspaceWorkbenchEvent> for WorkspaceWorkbench {}
@@ -199,6 +215,13 @@ impl WorkspaceWorkbench {
             sent_focus: None,
             resize: None,
             drag_haptic: haptics::Crossing::default(),
+            synced: HashSet::new(),
+            mirrored: HashSet::new(),
+            sync_tx: None,
+            _sync: None,
+            layouts: HashMap::new(),
+            marked: None,
+            numbers: None,
             _activation: activation,
         }
     }
@@ -282,6 +305,7 @@ impl WorkspaceWorkbench {
         }
         let changed = previous_tab != self.tab || viewport_changed;
         self.reconcile(window, cx);
+        self.sync_mirrors(cx);
         self.flush_focus();
         self.assign_visible_owners(window, cx);
         if switched || focus_changed || (held_focus && self.keyboard_stranded(window, cx)) {
@@ -486,10 +510,131 @@ impl WorkspaceWorkbench {
     pub(crate) fn deactivate(&mut self, cx: &mut Context<Self>) {
         self.enabled = false;
         self.cancel_resize();
+        self.numbers = None;
+        self.sync_mirrors(cx);
         for pane in self.mounted.values() {
             pane.terminal
                 .update(cx, |terminal, _| terminal.release_layout_control());
         }
+    }
+
+    /// Whether the tab on screen types into all its panes.
+    pub(crate) fn synchronized(&self) -> bool {
+        self.enabled
+            && self
+                .tab
+                .as_ref()
+                .is_some_and(|tab| self.synced.contains(&tab.id))
+    }
+
+    /// Points the input mirror of exactly the visible panes of a
+    /// synchronized tab at the workbench, and every other pane at nothing.
+    /// Only panes whose state changes are touched.
+    fn sync_mirrors(&mut self, cx: &mut Context<Self>) {
+        let wanted: HashSet<PaneId> = if self.synchronized() {
+            self.visible
+                .iter()
+                .filter(|pane| self.mounted.contains_key(*pane))
+                .cloned()
+                .collect()
+        } else {
+            HashSet::new()
+        };
+        if wanted == self.mirrored {
+            return;
+        }
+        if !wanted.is_empty() && self.sync_tx.is_none() {
+            let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<(SessionId, Vec<u8>)>();
+            self.sync_tx = Some(tx);
+            self._sync = Some(cx.spawn(async move |this, cx| {
+                while let Some((source, bytes)) = rx.recv().await {
+                    if this
+                        .update(cx, |this, cx| this.forward_synced(&source, bytes, cx))
+                        .is_err()
+                    {
+                        break;
+                    }
+                }
+            }));
+        }
+        for (id, pane) in &self.mounted {
+            let on = wanted.contains(id);
+            if on != self.mirrored.contains(id) {
+                let tx = on.then(|| self.sync_tx.clone()).flatten();
+                pane.terminal.read(cx).set_input_mirror(tx);
+            }
+        }
+        self.mirrored = wanted;
+    }
+
+    /// Input one synchronized pane received, typed into the others. A
+    /// session shown twice gets it once, and never back into its source.
+    fn forward_synced(&mut self, source: &SessionId, bytes: Vec<u8>, cx: &mut Context<Self>) {
+        let mut reached = HashSet::from([source.clone()]);
+        let targets: Vec<_> = self
+            .mirrored
+            .iter()
+            .filter_map(|id| self.mounted.get(id))
+            .filter(|pane| reached.insert(pane.session.clone()))
+            .map(|pane| pane.terminal.clone())
+            .collect();
+        for terminal in targets {
+            terminal.update(cx, |terminal, cx| {
+                terminal.send_mirrored_input(bytes.clone(), cx)
+            });
+        }
+    }
+
+    /// `prefix q`: every pane shows its number for a moment.
+    fn show_pane_numbers(&mut self, cx: &mut Context<Self>) {
+        self.numbers = Some(cx.spawn(async move |this, cx| {
+            cx.background_executor()
+                .timer(crate::multiplexer::PANE_NUMBERS_TIME)
+                .await;
+            let _ = this.update(cx, |this, cx| {
+                this.numbers = None;
+                cx.notify();
+            });
+        }));
+        cx.notify();
+    }
+
+    /// The panes whose input is being copied, for tests.
+    #[cfg(test)]
+    pub(crate) fn mirrored_panes_for_test(&self) -> usize {
+        self.mirrored.len()
+    }
+
+    pub(crate) fn pane_numbers_shown(&self) -> bool {
+        self.numbers.is_some()
+    }
+
+    pub(crate) fn hide_pane_numbers(&mut self, cx: &mut Context<Self>) {
+        if self.numbers.take().is_some() {
+            cx.notify();
+        }
+    }
+
+    /// A digit while the numbers are up: focus pane `number` (from 1, in
+    /// reading order). False when there is no such pane.
+    pub(crate) fn focus_pane_number(
+        &mut self,
+        number: usize,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        self.hide_pane_numbers(cx);
+        let Some(tab) = &self.tab else {
+            return false;
+        };
+        let mut panes = Vec::new();
+        leaves(&tab.layout, &mut panes);
+        let Some(pane) = number.checked_sub(1).and_then(|index| panes.get(index)) else {
+            return false;
+        };
+        let pane = pane.pane.clone();
+        self.focus_pane(pane, window, cx);
+        true
     }
 
     fn focused_id(&self) -> Option<&PaneId> {
@@ -946,6 +1091,16 @@ impl Render for WorkspaceWorkbench {
             }
             (shells, owners)
         };
+        // Reading order, for the pane numbers.
+        let order: Vec<PaneId> = {
+            let mut all = Vec::new();
+            if let Some(tab) = &self.tab {
+                leaves(&tab.layout, &mut all);
+            }
+            all.into_iter().map(|pane| pane.pane).collect()
+        };
+        let synchronized = self.synchronized();
+        let numbers = self.numbers.is_some();
         for pane in &geometry.panes {
             let bounds = pane.bounds;
             // The pane whose title bar ends at the window's trailing edge.
@@ -1212,8 +1367,93 @@ impl Render for WorkspaceWorkbench {
                         .border_color(colors.primary.alpha(0.16)),
                 );
             }
+            if synchronized {
+                // Every pane that typing reaches wears the same frame.
+                surface = surface.child(
+                    div()
+                        .debug_selector(|| "workspace-pane-synchronized".into())
+                        .absolute()
+                        .inset_0()
+                        .border_2()
+                        .border_color(diri_ui::Ink::ATTENTION.alpha(0.75)),
+                );
+            }
+            if numbers && let Some(index) = order.iter().position(|id| *id == pane.identity.pane) {
+                let focused = geometry.focused.pane == pane.identity.pane;
+                let number = index + 1;
+                surface = surface.child(
+                    div()
+                        .absolute()
+                        .inset_0()
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .child(
+                            div()
+                                .id(SharedString::from(format!(
+                                    "workspace-pane-number-{number}"
+                                )))
+                                .debug_selector(move || format!("workspace-pane-number-{number}"))
+                                .role(Role::Image)
+                                .aria_label(crate::i18n::tf(
+                                    "multiplexer.pane_number",
+                                    &[("number", &number)],
+                                ))
+                                .size(px(84.0))
+                                .rounded(px(18.0))
+                                .flex()
+                                .items_center()
+                                .justify_center()
+                                .bg(if focused {
+                                    gpui::rgba(0x4f83f1ff).alpha(0.92)
+                                } else {
+                                    colors.terminal_surface().alpha(0.92)
+                                })
+                                .border_1()
+                                .border_color(colors.primary.alpha(0.18))
+                                .text_size(px(44.0))
+                                .font_weight(gpui::FontWeight::SEMIBOLD)
+                                .text_color(if focused {
+                                    gpui::white()
+                                } else {
+                                    colors.primary.into()
+                                })
+                                .child(number.to_string()),
+                        ),
+                );
+            }
             surface = surface.child(controls);
             root = root.child(surface);
+        }
+        if synchronized {
+            root = root.child(
+                div()
+                    .absolute()
+                    .bottom(px(10.0))
+                    .left(px(0.0))
+                    .right(px(0.0))
+                    .flex()
+                    .justify_center()
+                    .child(
+                        div()
+                            .id("workspace-sync-badge")
+                            .debug_selector(|| "workspace-sync-badge".into())
+                            .role(Role::Status)
+                            .aria_label(crate::i18n::t("multiplexer.sync_on"))
+                            .flex()
+                            .items_center()
+                            .gap(px(6.0))
+                            .px(px(10.0))
+                            .py(px(4.0))
+                            .rounded_full()
+                            .bg(diri_ui::Ink::ATTENTION)
+                            .text_size(px(11.0))
+                            .font_weight(gpui::FontWeight::SEMIBOLD)
+                            .text_color(gpui::black())
+                            .child(sf_symbol("keyboard", 11.0, gpui::black().into()))
+                            .child(crate::i18n::t("multiplexer.sync_on")),
+                    ),
+            );
         }
         root
     }

@@ -71,6 +71,18 @@ actions!(
         MovePaneRight,
         MovePaneUp,
         MovePaneDown,
+        LayoutEvenHorizontal,
+        LayoutEvenVertical,
+        LayoutMainHorizontal,
+        LayoutMainVertical,
+        LayoutTiled,
+        NextLayout,
+        ToggleSynchronizePanes,
+        BreakPane,
+        JoinPane,
+        ShowPaneNumbers,
+        ShowMultiplexerKeys,
+        MarkPane,
         OpenWorktrees,
         NewNote,
         ShowTodos,
@@ -185,6 +197,18 @@ pub enum CommandId {
     MovePaneRight,
     MovePaneUp,
     MovePaneDown,
+    LayoutEvenHorizontal,
+    LayoutEvenVertical,
+    LayoutMainHorizontal,
+    LayoutMainVertical,
+    LayoutTiled,
+    NextLayout,
+    ToggleSynchronizePanes,
+    BreakPane,
+    JoinPane,
+    ShowPaneNumbers,
+    ShowMultiplexerKeys,
+    MarkPane,
     OpenWorktrees,
     NewNote,
     ShowTodos,
@@ -717,6 +741,126 @@ pub const COMMANDS: &[CommandSpec] = &[
         "command.move_pane_down.palette_title",
         "rectangle.split.2x1",
         "workspace move pane down dock"
+    ),
+    spec!(
+        LayoutEvenHorizontal,
+        "layout-even-horizontal",
+        None,
+        None,
+        Some(APP_CONTEXT),
+        "command.layout_even_horizontal.palette_title",
+        "rectangle.split.3x1",
+        "workspace layout preset even horizontal columns side by side tmux"
+    ),
+    spec!(
+        LayoutEvenVertical,
+        "layout-even-vertical",
+        None,
+        None,
+        Some(APP_CONTEXT),
+        "command.layout_even_vertical.palette_title",
+        "rectangle.split.1x2",
+        "workspace layout preset even vertical rows stacked tmux"
+    ),
+    spec!(
+        LayoutMainHorizontal,
+        "layout-main-horizontal",
+        None,
+        None,
+        Some(APP_CONTEXT),
+        "command.layout_main_horizontal.palette_title",
+        "rectangle.split.2x1",
+        "workspace layout preset main horizontal top tmux"
+    ),
+    spec!(
+        LayoutMainVertical,
+        "layout-main-vertical",
+        None,
+        None,
+        Some(APP_CONTEXT),
+        "command.layout_main_vertical.palette_title",
+        "rectangle.split.2x1",
+        "workspace layout preset main vertical left tmux"
+    ),
+    spec!(
+        LayoutTiled,
+        "layout-tiled",
+        None,
+        None,
+        Some(APP_CONTEXT),
+        "command.layout_tiled.palette_title",
+        "square.grid.2x2",
+        "workspace layout preset tiled grid tmux"
+    ),
+    spec!(
+        NextLayout,
+        "next-layout",
+        None,
+        None,
+        Some(APP_CONTEXT),
+        "command.next_layout.palette_title",
+        "rectangle.3.group",
+        "workspace layout cycle next preset tmux"
+    ),
+    spec!(
+        ToggleSynchronizePanes,
+        "toggle-synchronize-panes",
+        None,
+        None,
+        Some(APP_CONTEXT),
+        "command.toggle_synchronize_panes.palette_title",
+        "keyboard.badge.ellipsis",
+        "workspace synchronize sync panes broadcast type all tmux"
+    ),
+    spec!(
+        BreakPane,
+        "break-pane",
+        None,
+        None,
+        Some(APP_CONTEXT),
+        "command.break_pane.palette_title",
+        "rectangle.portrait.and.arrow.right",
+        "workspace break pane own tab move out tmux"
+    ),
+    spec!(
+        JoinPane,
+        "join-pane",
+        None,
+        None,
+        Some(APP_CONTEXT),
+        "command.join_pane.palette_title",
+        "rectangle.portrait.and.arrow.forward",
+        "workspace join marked pane move into this tab merge tmux"
+    ),
+    spec!(
+        ShowPaneNumbers,
+        "show-pane-numbers",
+        None,
+        None,
+        Some(APP_CONTEXT),
+        "command.show_pane_numbers.palette_title",
+        "number.square",
+        "workspace pane numbers display jump tmux"
+    ),
+    spec!(
+        ShowMultiplexerKeys,
+        "show-multiplexer-keys",
+        None,
+        None,
+        Some(APP_CONTEXT),
+        "command.show_multiplexer_keys.palette_title",
+        "keyboard",
+        "workspace prefix keys cheatsheet tmux multiplexer help"
+    ),
+    spec!(
+        MarkPane,
+        "mark-pane",
+        None,
+        None,
+        Some(APP_CONTEXT),
+        "command.mark_pane.palette_title",
+        "pin",
+        "workspace mark pane join source tmux"
     ),
     spec!(
         NewNote,
@@ -1369,6 +1513,20 @@ impl CommandSpec {
             CommandId::MovePaneRight => KeyBinding::new(key, MovePaneRight, context),
             CommandId::MovePaneUp => KeyBinding::new(key, MovePaneUp, context),
             CommandId::MovePaneDown => KeyBinding::new(key, MovePaneDown, context),
+            CommandId::LayoutEvenHorizontal => KeyBinding::new(key, LayoutEvenHorizontal, context),
+            CommandId::LayoutEvenVertical => KeyBinding::new(key, LayoutEvenVertical, context),
+            CommandId::LayoutMainHorizontal => KeyBinding::new(key, LayoutMainHorizontal, context),
+            CommandId::LayoutMainVertical => KeyBinding::new(key, LayoutMainVertical, context),
+            CommandId::LayoutTiled => KeyBinding::new(key, LayoutTiled, context),
+            CommandId::NextLayout => KeyBinding::new(key, NextLayout, context),
+            CommandId::ToggleSynchronizePanes => {
+                KeyBinding::new(key, ToggleSynchronizePanes, context)
+            }
+            CommandId::BreakPane => KeyBinding::new(key, BreakPane, context),
+            CommandId::JoinPane => KeyBinding::new(key, JoinPane, context),
+            CommandId::ShowPaneNumbers => KeyBinding::new(key, ShowPaneNumbers, context),
+            CommandId::ShowMultiplexerKeys => KeyBinding::new(key, ShowMultiplexerKeys, context),
+            CommandId::MarkPane => KeyBinding::new(key, MarkPane, context),
 
             CommandId::OpenWorktrees => KeyBinding::new(key, OpenWorktrees, context),
             CommandId::NewNote => KeyBinding::new(key, NewNote, context),
@@ -1847,6 +2005,66 @@ impl CommandId {
                 description: t("command.move_pane_down.description"),
                 category: Workspace,
             },
+            Self::LayoutEvenHorizontal => ShortcutMetadata {
+                title: t("command.layout_even_horizontal.title"),
+                description: t("command.layout_even_horizontal.description"),
+                category: Workspace,
+            },
+            Self::LayoutEvenVertical => ShortcutMetadata {
+                title: t("command.layout_even_vertical.title"),
+                description: t("command.layout_even_vertical.description"),
+                category: Workspace,
+            },
+            Self::LayoutMainHorizontal => ShortcutMetadata {
+                title: t("command.layout_main_horizontal.title"),
+                description: t("command.layout_main_horizontal.description"),
+                category: Workspace,
+            },
+            Self::LayoutMainVertical => ShortcutMetadata {
+                title: t("command.layout_main_vertical.title"),
+                description: t("command.layout_main_vertical.description"),
+                category: Workspace,
+            },
+            Self::LayoutTiled => ShortcutMetadata {
+                title: t("command.layout_tiled.title"),
+                description: t("command.layout_tiled.description"),
+                category: Workspace,
+            },
+            Self::NextLayout => ShortcutMetadata {
+                title: t("command.next_layout.title"),
+                description: t("command.next_layout.description"),
+                category: Workspace,
+            },
+            Self::ToggleSynchronizePanes => ShortcutMetadata {
+                title: t("command.toggle_synchronize_panes.title"),
+                description: t("command.toggle_synchronize_panes.description"),
+                category: Workspace,
+            },
+            Self::BreakPane => ShortcutMetadata {
+                title: t("command.break_pane.title"),
+                description: t("command.break_pane.description"),
+                category: Workspace,
+            },
+            Self::JoinPane => ShortcutMetadata {
+                title: t("command.join_pane.title"),
+                description: t("command.join_pane.description"),
+                category: Workspace,
+            },
+            Self::ShowPaneNumbers => ShortcutMetadata {
+                title: t("command.show_pane_numbers.title"),
+                description: t("command.show_pane_numbers.description"),
+                category: Workspace,
+            },
+            Self::ShowMultiplexerKeys => ShortcutMetadata {
+                title: t("command.show_multiplexer_keys.title"),
+                description: t("command.show_multiplexer_keys.description"),
+                category: Workspace,
+            },
+            Self::MarkPane => ShortcutMetadata {
+                title: t("command.mark_pane.title"),
+                description: t("command.mark_pane.description"),
+                category: Workspace,
+            },
             Self::ToggleTabPeek => ShortcutMetadata {
                 title: t("command.toggle_tab_peek.title"),
                 description: t("command.toggle_tab_peek.description"),
@@ -2152,6 +2370,18 @@ impl CommandId {
             Self::MovePaneRight => Box::new(MovePaneRight),
             Self::MovePaneUp => Box::new(MovePaneUp),
             Self::MovePaneDown => Box::new(MovePaneDown),
+            Self::LayoutEvenHorizontal => Box::new(LayoutEvenHorizontal),
+            Self::LayoutEvenVertical => Box::new(LayoutEvenVertical),
+            Self::LayoutMainHorizontal => Box::new(LayoutMainHorizontal),
+            Self::LayoutMainVertical => Box::new(LayoutMainVertical),
+            Self::LayoutTiled => Box::new(LayoutTiled),
+            Self::NextLayout => Box::new(NextLayout),
+            Self::ToggleSynchronizePanes => Box::new(ToggleSynchronizePanes),
+            Self::BreakPane => Box::new(BreakPane),
+            Self::JoinPane => Box::new(JoinPane),
+            Self::ShowPaneNumbers => Box::new(ShowPaneNumbers),
+            Self::ShowMultiplexerKeys => Box::new(ShowMultiplexerKeys),
+            Self::MarkPane => Box::new(MarkPane),
 
             Self::OpenWorktrees => Box::new(OpenWorktrees),
             Self::NewNote => Box::new(NewNote),
@@ -2467,6 +2697,31 @@ mod tests {
             assert_eq!(command(id).keystroke, Some(key), "{id:?}");
         }
         assert!(command(CommandId::SplitPaneWithSession).palette.is_some());
+    }
+
+    /// Every prefix-layer verb also runs from the palette, with no default
+    /// shortcut of its own: the prefix layer is off by default.
+    #[test]
+    fn multiplexer_verbs_are_palette_commands_without_default_keys() {
+        for id in [
+            CommandId::LayoutEvenHorizontal,
+            CommandId::LayoutEvenVertical,
+            CommandId::LayoutMainHorizontal,
+            CommandId::LayoutMainVertical,
+            CommandId::LayoutTiled,
+            CommandId::NextLayout,
+            CommandId::ToggleSynchronizePanes,
+            CommandId::BreakPane,
+            CommandId::MarkPane,
+            CommandId::JoinPane,
+            CommandId::ShowPaneNumbers,
+            CommandId::ShowMultiplexerKeys,
+        ] {
+            let spec = command(id);
+            assert!(spec.palette.is_some(), "{id:?}");
+            assert_eq!(spec.keystroke, None, "{id:?}");
+            assert_eq!(spec.context, Some(APP_CONTEXT), "{id:?}");
+        }
     }
 
     #[test]

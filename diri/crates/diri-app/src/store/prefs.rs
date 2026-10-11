@@ -411,6 +411,12 @@ pub struct Prefs {
     /// Physical macOS key code recorded with the global Show App binding.
     /// Keeping the native code avoids assuming a US keyboard layout.
     pub global_shortcut_key_code: Option<u16>,
+    /// The tmux-style prefix layer (`crate::multiplexer`): off by default,
+    /// so no key a terminal program expects is taken.
+    pub multiplexer_prefix: bool,
+    /// The prefix keystroke while the layer is on, in GPUI form. Pressed
+    /// twice it types itself.
+    pub multiplexer_prefix_key: String,
     /// Session that should regain focus after the daemon's initial hydrate.
     pub last_selected_session: Option<SessionId>,
     /// herdr panes and conversations already brought over, so importing
@@ -492,6 +498,8 @@ impl Default for Prefs {
             launch_recipes: LaunchRecipeBook::default(),
             shortcut_overrides: BTreeMap::new(),
             global_shortcut_key_code: None,
+            multiplexer_prefix: false,
+            multiplexer_prefix_key: crate::multiplexer::DEFAULT_PREFIX.to_owned(),
             last_selected_session: None,
             herdr_imported: Default::default(),
             whats_new_seen_version: crate::updates::CURRENT_VERSION.to_owned(),

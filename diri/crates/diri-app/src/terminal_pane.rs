@@ -5,7 +5,7 @@
 
 mod autoscroll;
 mod controller;
-use controller::{AttachmentControl, ControllerLease};
+use controller::{AttachmentControl, ControllerLease, InputMirror};
 mod find_input;
 mod find_overlay;
 #[cfg(all(test, target_os = "macos"))]
@@ -972,6 +972,8 @@ pub struct TerminalPane {
     /// moves as workspace panes take focus, but this pane must not follow it
     /// with the keyboard: keys sent to an unrendered pane reach nothing.
     covered: bool,
+    /// Synchronize-panes: where this pane's input is copied, if anywhere.
+    input_mirror: InputMirror,
     #[cfg(test)]
     input_observer: Option<InputObserver>,
     /// Every `pane.blank` this pane recorded, for tests.
@@ -1241,6 +1243,7 @@ impl TerminalPane {
             started_at: Instant::now(),
             session_source,
             observed_selected_id,
+            input_mirror: InputMirror::default(),
             #[cfg(test)]
             input_observer: None,
             #[cfg(test)]
@@ -1389,12 +1392,12 @@ impl TerminalPane {
                 parked_buffer,
                 cx,
             );
+            let mut attachment = attachment;
+            attachment.mirror = self.input_mirror.clone();
             #[cfg(test)]
-            let attachment = {
-                let mut attachment = attachment;
+            {
                 attachment.input_observer = self.input_observer.clone().map(|tx| (id.clone(), tx));
-                attachment
-            };
+            }
             let ime_attachment = attachment.clone();
             let reuse_parked = parked
                 .as_ref()
@@ -1805,6 +1808,31 @@ impl TerminalPane {
 
     pub fn is_focused(&self, window: &Window) -> bool {
         self.focus.is_focused(window)
+    }
+
+    /// Synchronize-panes: copy everything typed here (keys, pastes, IME
+    /// text) to `mirror`, or stop with `None`.
+    pub(crate) fn set_input_mirror(
+        &self,
+        mirror: Option<tokio::sync::mpsc::UnboundedSender<(SessionId, Vec<u8>)>>,
+    ) {
+        if let Ok(mut slot) = self.input_mirror.lock() {
+            *slot = mirror;
+        }
+    }
+
+    /// Input another synchronized pane received. It is not copied on.
+    pub(crate) fn send_mirrored_input(&mut self, bytes: Vec<u8>, cx: &mut Context<Self>) {
+        let Some(id) = self.selected_id() else {
+            return;
+        };
+        if let Some(resident) = self.residents.get(&id) {
+            resident
+                .element
+                .scroll_to_live(usize::from(resident.last_size.1));
+            resident.attachment.input_unmirrored(bytes);
+            cx.notify();
+        }
     }
 
     #[cfg(all(test, target_os = "macos"))]

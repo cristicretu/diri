@@ -372,6 +372,12 @@ pub struct RootView {
     /// Hold-⌘ shortcut hints for this window; published while it is key.
     held_hints: crate::held_hints::HeldHints,
     _held_hint_timer: Option<Task<()>>,
+    /// The tmux-style prefix layer (`crate::multiplexer`).
+    prefix: crate::multiplexer::PrefixLayer,
+    /// Disarms an armed prefix that never got its second key.
+    _prefix_timer: Option<Task<()>>,
+    /// `prefix ?`: the cheatsheet is up; the next key takes it down.
+    multiplexer_sheet: bool,
     /// Waits for frames to stop while the performance overlay shows, then
     /// repaints it once as idle. See `crate::perf_overlay`.
     perf_idle_repaint: Option<Task<()>>,
@@ -1111,6 +1117,18 @@ impl RootView {
                 this.apply_held_hint_effect(effect, window, cx);
             });
         });
+        // The prefix layer reads every key before any binding or terminal,
+        // so an armed prefix and its second key never reach the PTY.
+        let prefix_root = cx.weak_entity();
+        let prefix_window = window.window_handle();
+        let prefix_keys = cx.intercept_keystrokes(move |event, window, cx| {
+            if window.window_handle() != prefix_window {
+                return;
+            }
+            let _ = prefix_root.update(cx, |this, cx| {
+                this.prefix_key_down(&event.keystroke, window, cx);
+            });
+        });
         let bounds_observer = (!preview).then(|| {
             cx.observe_window_bounds(window, |this, window, cx| {
                 this.window_bounds_changed(window, cx);
@@ -1518,8 +1536,12 @@ impl RootView {
             notifier,
             held_hints: crate::held_hints::HeldHints::default(),
             _held_hint_timer: None,
+            prefix: crate::multiplexer::PrefixLayer::default(),
+            _prefix_timer: None,
+            multiplexer_sheet: false,
             _subscriptions: std::iter::once(activation)
                 .chain(std::iter::once(held_hint_keys))
+                .chain(std::iter::once(prefix_keys))
                 .chain(bounds_observer)
                 .chain(appearance_observer)
                 .chain(peek_observer)
@@ -2406,6 +2428,15 @@ impl RootView {
                     })
                 });
             if handled {
+                if command == CommandId::ShowPaneNumbers
+                    && self
+                        .workspace_workbench
+                        .as_ref()
+                        .is_some_and(|workbench| workbench.read(cx).pane_numbers_shown())
+                {
+                    // A digit picks a pane, from the palette as from `prefix q`.
+                    self.prefix.await_number();
+                }
                 return;
             }
             // ⌥⌘arrows and ⌘[ / ⌘] move between sessions wherever there is
@@ -2692,7 +2723,139 @@ impl RootView {
                 self.sidebar
                     .update(cx, |sidebar, cx| sidebar.select_last(cx));
             }
+            CommandId::ShowMultiplexerKeys => {
+                self.multiplexer_sheet = !self.multiplexer_sheet;
+                cx.notify();
+            }
             _ => cx.propagate(),
+        }
+    }
+
+    /// One keystroke through the prefix layer (see `crate::multiplexer`).
+    /// Stops propagation for every key the layer takes, so neither a key
+    /// binding nor the terminal sees it.
+    fn prefix_key_down(
+        &mut self,
+        keystroke: &gpui::Keystroke,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        use crate::multiplexer::{Outcome, Verb};
+        let modifier = matches!(
+            keystroke.key.as_str(),
+            "shift" | "control" | "alt" | "platform" | "function" | "capslock"
+        );
+        if self.multiplexer_sheet {
+            if !modifier {
+                // Any key takes the cheatsheet down, and only that.
+                self.multiplexer_sheet = false;
+                cx.stop_propagation();
+                cx.notify();
+            }
+            return;
+        }
+        let (enabled, key) = {
+            let store = self
+                .window_store
+                .read()
+                .expect("session store lock poisoned");
+            let prefs = store.preferences();
+            (
+                prefs.multiplexer_prefix,
+                prefs.multiplexer_prefix_key.clone(),
+            )
+        };
+        let workbench = self
+            .active_workspace
+            .as_ref()
+            .and(self.workspace_workbench.clone());
+        let numbers = workbench
+            .as_ref()
+            .is_some_and(|workbench| workbench.read(cx).pane_numbers_shown());
+        // Only a terminal's keys: a palette or a text field keeps ⌃A.
+        let terminal_focused = workbench
+            .as_ref()
+            .and_then(|workbench| workbench.read(cx).focused_terminal())
+            .is_some_and(|terminal| terminal.read(cx).is_focused(window))
+            || self
+                .terminal
+                .as_ref()
+                .is_some_and(|terminal| terminal.read(cx).is_focused(window));
+        let was_armed = self.prefix.is_armed();
+        if !terminal_focused && !was_armed && !numbers {
+            return;
+        }
+        let prefix = enabled.then(|| crate::multiplexer::parse_prefix(&key));
+        let outcome = self
+            .prefix
+            .key_down(keystroke, prefix.as_ref(), std::time::Instant::now());
+        if numbers
+            && !matches!(outcome, Outcome::FocusNumber(_))
+            && !modifier
+            && let Some(workbench) = &workbench
+        {
+            workbench.update(cx, |workbench, cx| workbench.hide_pane_numbers(cx));
+        }
+        match outcome {
+            Outcome::Pass | Outcome::Literal => {}
+            Outcome::Swallow => cx.stop_propagation(),
+            Outcome::FocusNumber(number) => {
+                if let Some(workbench) = workbench.filter(|_| numbers) {
+                    workbench.update(cx, |workbench, cx| {
+                        workbench.focus_pane_number(number, window, cx)
+                    });
+                    cx.stop_propagation();
+                }
+            }
+            Outcome::Run(verb) => {
+                cx.stop_propagation();
+                match verb {
+                    Verb::Command(command) => self.run_command(command, window, cx),
+                    Verb::KillPane => self.kill_focused_pane(cx),
+                }
+            }
+        }
+        let armed = self.prefix.is_armed();
+        if armed {
+            // (Re)start the timeout: a repeating resize keeps it alive.
+            self._prefix_timer = Some(cx.spawn(async move |this, cx| {
+                cx.background_executor()
+                    .timer(crate::multiplexer::PREFIX_TIMEOUT)
+                    .await;
+                let _ = this.update(cx, |this, cx| {
+                    this.prefix.cancel();
+                    cx.notify();
+                });
+            }));
+        } else {
+            self._prefix_timer = None;
+        }
+        if armed != was_armed {
+            cx.notify();
+        }
+    }
+
+    /// `prefix x`: a terminal pane closes (its shell ends, the split
+    /// collapses). An Agent's pane is its tab and is never closed here.
+    fn kill_focused_pane(&mut self, cx: &mut Context<Self>) {
+        let Some(workbench) = self
+            .active_workspace
+            .as_ref()
+            .and(self.workspace_workbench.as_ref())
+        else {
+            return;
+        };
+        match workbench.read(cx).closable_pane_session() {
+            Some(pane) => self
+                .window_store
+                .write()
+                .expect("session store lock poisoned")
+                .remove_sessions(vec![pane]),
+            None => self.show_feedback(
+                "workspace",
+                Toast::info(t("multiplexer.agent_pane_stays")),
+                cx,
+            ),
         }
     }
 
@@ -5367,6 +5530,66 @@ impl Render for RootView {
                     this.run_command(CommandId::EqualizePanes, window, cx);
                 }),
             )
+            .on_action(cx.listener(
+                |this, _: &crate::commands::LayoutEvenHorizontal, window, cx| {
+                    this.run_command(CommandId::LayoutEvenHorizontal, window, cx);
+                },
+            ))
+            .on_action(cx.listener(
+                |this, _: &crate::commands::LayoutEvenVertical, window, cx| {
+                    this.run_command(CommandId::LayoutEvenVertical, window, cx);
+                },
+            ))
+            .on_action(cx.listener(
+                |this, _: &crate::commands::LayoutMainHorizontal, window, cx| {
+                    this.run_command(CommandId::LayoutMainHorizontal, window, cx);
+                },
+            ))
+            .on_action(cx.listener(
+                |this, _: &crate::commands::LayoutMainVertical, window, cx| {
+                    this.run_command(CommandId::LayoutMainVertical, window, cx);
+                },
+            ))
+            .on_action(
+                cx.listener(|this, _: &crate::commands::LayoutTiled, window, cx| {
+                    this.run_command(CommandId::LayoutTiled, window, cx);
+                }),
+            )
+            .on_action(
+                cx.listener(|this, _: &crate::commands::NextLayout, window, cx| {
+                    this.run_command(CommandId::NextLayout, window, cx);
+                }),
+            )
+            .on_action(cx.listener(
+                |this, _: &crate::commands::ToggleSynchronizePanes, window, cx| {
+                    this.run_command(CommandId::ToggleSynchronizePanes, window, cx);
+                },
+            ))
+            .on_action(
+                cx.listener(|this, _: &crate::commands::BreakPane, window, cx| {
+                    this.run_command(CommandId::BreakPane, window, cx);
+                }),
+            )
+            .on_action(
+                cx.listener(|this, _: &crate::commands::JoinPane, window, cx| {
+                    this.run_command(CommandId::JoinPane, window, cx);
+                }),
+            )
+            .on_action(
+                cx.listener(|this, _: &crate::commands::ShowPaneNumbers, window, cx| {
+                    this.run_command(CommandId::ShowPaneNumbers, window, cx);
+                }),
+            )
+            .on_action(cx.listener(
+                |this, _: &crate::commands::ShowMultiplexerKeys, window, cx| {
+                    this.run_command(CommandId::ShowMultiplexerKeys, window, cx);
+                },
+            ))
+            .on_action(
+                cx.listener(|this, _: &crate::commands::MarkPane, window, cx| {
+                    this.run_command(CommandId::MarkPane, window, cx);
+                }),
+            )
             .on_action(
                 cx.listener(|this, _: &crate::commands::TogglePaneZoom, window, cx| {
                     this.run_command(CommandId::TogglePaneZoom, window, cx);
@@ -5766,6 +5989,24 @@ impl Render for RootView {
         }
         if let Some(picker) = self.quote_target_picker(colors, sidebar_width, cx) {
             root = root.child(deferred(picker));
+        }
+        if self.multiplexer_sheet || self.prefix.is_armed() {
+            let (enabled, key) = {
+                let store = self
+                    .window_store
+                    .read()
+                    .expect("session store lock poisoned");
+                let prefs = store.preferences();
+                (
+                    prefs.multiplexer_prefix,
+                    prefs.multiplexer_prefix_key.clone(),
+                )
+            };
+            root = root.child(deferred(if self.multiplexer_sheet {
+                crate::multiplexer::cheatsheet(enabled, &key, colors)
+            } else {
+                crate::multiplexer::armed_mark(&key, colors)
+            }));
         }
         if let Some(panel) = self.notification_panel(window, cx) {
             root = root.child(deferred(panel));

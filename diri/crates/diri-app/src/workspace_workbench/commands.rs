@@ -1,7 +1,7 @@
 //! Keyboard operations project the saved tree and submit typed Engine mutations.
 use super::*;
 use crate::commands::CommandId;
-use diri_proto::workspace::SpawnPane;
+use diri_proto::workspace::{LayoutPreset, SpawnPane};
 
 #[derive(Clone, Copy, Debug)]
 pub(crate) enum PaneCommand {
@@ -18,6 +18,18 @@ pub(crate) enum PaneCommand {
     Resize(LayoutAxis, bool),
     Swap(DockEdge),
     Move(DockEdge),
+    /// One of tmux's five layouts, or the next one after the tab's last.
+    Layout(Option<LayoutPreset>),
+    /// Type into every pane of the tab at once.
+    ToggleSync,
+    /// The focused pane into a tab of its own.
+    Break,
+    /// Remember the focused pane for `Join`.
+    Mark,
+    /// The marked pane, from whichever tab, next to the focused pane.
+    Join,
+    /// Number the panes; a digit then focuses one.
+    Numbers,
 }
 impl PaneCommand {
     pub(crate) fn from_id(id: CommandId) -> Option<Self> {
@@ -46,6 +58,17 @@ impl PaneCommand {
             CommandId::MovePaneRight => Self::Move(DockEdge::Right),
             CommandId::MovePaneUp => Self::Move(DockEdge::Top),
             CommandId::MovePaneDown => Self::Move(DockEdge::Bottom),
+            CommandId::LayoutEvenHorizontal => Self::Layout(Some(LayoutPreset::EvenHorizontal)),
+            CommandId::LayoutEvenVertical => Self::Layout(Some(LayoutPreset::EvenVertical)),
+            CommandId::LayoutMainHorizontal => Self::Layout(Some(LayoutPreset::MainHorizontal)),
+            CommandId::LayoutMainVertical => Self::Layout(Some(LayoutPreset::MainVertical)),
+            CommandId::LayoutTiled => Self::Layout(Some(LayoutPreset::Tiled)),
+            CommandId::NextLayout => Self::Layout(None),
+            CommandId::ToggleSynchronizePanes => Self::ToggleSync,
+            CommandId::BreakPane => Self::Break,
+            CommandId::MarkPane => Self::Mark,
+            CommandId::JoinPane => Self::Join,
+            CommandId::ShowPaneNumbers => Self::Numbers,
             _ => return None,
         })
     }
@@ -214,6 +237,47 @@ impl WorkspaceWorkbench {
             // A multi-pane tab keeps the keys at its edges: no session jump.
             return true;
         }
+        let split = matches!(tab.layout, LayoutNode::Split { .. });
+        let one_pane =
+            || WorkspaceWorkbenchEvent::Notice(crate::i18n::t("multiplexer.one_pane").to_owned());
+        match command {
+            PaneCommand::ToggleSync => {
+                if !self.synced.remove(&tab.id) {
+                    if !split {
+                        cx.emit(one_pane());
+                        return true;
+                    }
+                    self.synced.insert(tab.id.clone());
+                }
+                self.sync_mirrors(cx);
+                cx.notify();
+                return true;
+            }
+            PaneCommand::Numbers => {
+                if split {
+                    self.show_pane_numbers(cx);
+                } else {
+                    cx.emit(one_pane());
+                }
+                return true;
+            }
+            PaneCommand::Mark => {
+                self.marked = Some((tab.id.clone(), focused));
+                cx.emit(WorkspaceWorkbenchEvent::Notice(crate::i18n::tf(
+                    "multiplexer.pane_marked",
+                    &[(
+                        "keys",
+                        &crate::commands::command(CommandId::JoinPane)
+                            .shortcut_label()
+                            .unwrap_or_else(|| {
+                                crate::i18n::t("command.join_pane.title").to_owned()
+                            }),
+                    )],
+                )));
+                return true;
+            }
+            _ => {}
+        }
         if !self
             .runtime
             .store
@@ -248,6 +312,51 @@ impl WorkspaceWorkbench {
             return true;
         }
         let mutation = match command {
+            PaneCommand::Layout(preset) => {
+                if !split {
+                    cx.emit(one_pane());
+                    return true;
+                }
+                let preset = preset.unwrap_or_else(|| {
+                    self.layouts
+                        .get(&tab.id)
+                        .map_or(LayoutPreset::EvenHorizontal, |last| last.next())
+                });
+                self.layouts.insert(tab.id.clone(), preset);
+                WorkspaceMutation::ApplyLayout {
+                    tab_id: tab.id,
+                    preset,
+                }
+            }
+            PaneCommand::Break => {
+                if !split {
+                    cx.emit(one_pane());
+                    return true;
+                }
+                WorkspaceMutation::BreakPane {
+                    tab_id: tab.id,
+                    pane_id: focused,
+                }
+            }
+            PaneCommand::Join => {
+                let Some((source_tab, pane)) = self.marked.clone() else {
+                    cx.emit(WorkspaceWorkbenchEvent::Notice(
+                        crate::i18n::t("multiplexer.nothing_marked").to_owned(),
+                    ));
+                    return true;
+                };
+                if pane == focused {
+                    return true;
+                }
+                self.marked = None;
+                WorkspaceMutation::MoveNode {
+                    source_tab,
+                    node: LayoutNodeId::Pane(pane),
+                    destination_tab: tab.id,
+                    target: focused,
+                    edge: DockEdge::Right,
+                }
+            }
             PaneCommand::Zoom => {
                 // Zoom needs company: one pane already fills the tab.
                 if !matches!(tab.layout, LayoutNode::Split { .. }) {
@@ -304,7 +413,10 @@ impl WorkspaceWorkbench {
             PaneCommand::Focus(_)
             | PaneCommand::Cycle(_)
             | PaneCommand::Split(_)
-            | PaneCommand::SplitWithSession(_) => return true,
+            | PaneCommand::SplitWithSession(_)
+            | PaneCommand::ToggleSync
+            | PaneCommand::Numbers
+            | PaneCommand::Mark => return true,
         };
         self.runtime
             .store
@@ -315,7 +427,7 @@ impl WorkspaceWorkbench {
         true
     }
 
-    fn focus_pane(&mut self, pane: PaneId, window: &mut Window, cx: &mut Context<Self>) {
+    pub(super) fn focus_pane(&mut self, pane: PaneId, window: &mut Window, cx: &mut Context<Self>) {
         self.pending_focus = Some(pane);
         self.flush_focus();
         self.focus(window, cx);

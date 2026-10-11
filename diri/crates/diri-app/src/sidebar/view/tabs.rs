@@ -366,15 +366,21 @@ impl Sidebar {
             let custom = store.preferences().sidebar_ordering == SidebarOrdering::Custom;
             let tabs = selected_project_tabs(&mut store);
             // The same reduction the sidebar rows use, so a tab and its row
-            // never disagree about what a session is doing.
-            let marks: Vec<StatusState> = tabs
+            // never disagree about what a session is doing: a split tab
+            // shows its most urgent pane and how many panes it has.
+            let marks: Vec<(StatusState, usize)> = tabs
                 .sessions
                 .iter()
                 .map(|session| {
-                    sidebar_activity_state(
+                    let own = sidebar_activity_state(
                         status_state(session, store.migrating().contains(&session.id)),
                         store.notifications().session_unread(&session.id),
-                    )
+                    );
+                    let (panes, shells) = store.pane_group(&session.id).unwrap_or_default();
+                    let state = shells.iter().fold(own, |state, shell| {
+                        rows::most_urgent(state, status_state(shell, false))
+                    });
+                    (state, panes)
                 })
                 .collect();
             (tabs, selected, custom, marks)
@@ -479,7 +485,7 @@ impl Sidebar {
         }
         let tab_count = tabs.sessions.len();
         let mut mounted = HashSet::with_capacity(tab_count);
-        for (index, (session, state)) in tabs.sessions.into_iter().zip(marks).enumerate() {
+        for (index, (session, (state, panes))) in tabs.sessions.into_iter().zip(marks).enumerate() {
             mounted.insert(session.id.clone());
             let active = selected.as_ref() == Some(&session.id);
             let props = self.strip_tab_props(
@@ -488,6 +494,7 @@ impl Sidebar {
                 tab_count,
                 active,
                 state,
+                panes,
                 colors,
                 custom_ordering,
                 reduce_motion,
@@ -524,6 +531,7 @@ impl Sidebar {
             held_hint,
             pill_drawn,
             hover_linger,
+            panes,
             ..
         } = *props;
         let id = id.clone();
@@ -682,6 +690,10 @@ impl Sidebar {
                         row
                     }
                 })
+            })
+            .when(panes > 1, |tab| {
+                // A split tab is still one tab; this says how many panes.
+                tab.child(pane_count_mark(&id, panes, colors))
             })
             .child(crate::held_hints::below(
                 div()

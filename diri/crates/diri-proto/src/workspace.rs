@@ -229,6 +229,55 @@ pub enum WorkspaceMutation {
     EqualizeTab {
         tab_id: TabId,
     },
+    /// Rearrange every pane of the tab into a tmux-style preset, keeping
+    /// pane identities, their sessions and the focused pane. Additive: an
+    /// Engine without it rejects the unknown variant.
+    ApplyLayout {
+        tab_id: TabId,
+        preset: LayoutPreset,
+    },
+    /// Move one pane of a split tab out into a new tab of the same
+    /// workspace, placed right after it and selected. The pane keeps its
+    /// identity. Additive, like [`Self::ApplyLayout`].
+    BreakPane {
+        tab_id: TabId,
+        pane_id: PaneId,
+    },
+}
+
+/// tmux's five layouts. "Main" is the first pane in reading order.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub enum LayoutPreset {
+    /// Side by side, equal widths.
+    EvenHorizontal,
+    /// Stacked, equal heights.
+    EvenVertical,
+    /// The main pane across the top, the rest side by side below it.
+    MainHorizontal,
+    /// The main pane on the left, the rest stacked on its right.
+    MainVertical,
+    /// As square a grid as the pane count allows.
+    Tiled,
+}
+
+impl LayoutPreset {
+    pub const ALL: [Self; 5] = [
+        Self::EvenHorizontal,
+        Self::EvenVertical,
+        Self::MainHorizontal,
+        Self::MainVertical,
+        Self::Tiled,
+    ];
+
+    /// The preset after this one, wrapping (tmux's `next-layout`).
+    pub fn next(self) -> Self {
+        let index = Self::ALL
+            .iter()
+            .position(|preset| *preset == self)
+            .unwrap_or(0);
+        Self::ALL[(index + 1) % Self::ALL.len()]
+    }
 }
 
 /// Where `session.spawn` places a new session in a tab's split tree. It

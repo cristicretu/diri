@@ -884,6 +884,47 @@ fn mutate(
         EqualizeTab { tab_id } => {
             tree::equalize(&mut tab(state, &tab_id)?.layout);
         }
+        ApplyLayout { tab_id, preset } => {
+            let tab = tab(state, &tab_id)?;
+            let panes = tree::leaves(&tab.layout);
+            let ids = (0..panes.len())
+                .map(|_| new_id("split").map(SplitId))
+                .collect::<Result<Vec<_>, _>>()?;
+            tab.layout = tree::arrange(&panes, preset, &mut ids.into_iter());
+            // A zoomed pane would hide the layout just asked for.
+            tab.zoomed_pane = None;
+        }
+        BreakPane { tab_id, pane_id } => {
+            let (workspace_index, tab_index) = state
+                .workspaces
+                .iter()
+                .enumerate()
+                .find_map(|(w, workspace)| {
+                    workspace
+                        .tabs
+                        .iter()
+                        .position(|tab| tab.id == tab_id)
+                        .map(|t| (w, t))
+                })
+                .ok_or_else(missing)?;
+            let source = &mut state.workspaces[workspace_index].tabs[tab_index];
+            let (retained, removed) =
+                tree::take(source.layout.clone(), &LayoutNodeId::Pane(pane_id.clone()));
+            let removed = removed.ok_or_else(missing)?;
+            // A one-pane tab is already its own tab.
+            let retained = retained.ok_or_else(|| invalid("the tab has only this pane"))?;
+            source.layout = retained;
+            let broken = WorkspaceTab {
+                id: TabId(new_id("tab")?),
+                title: None,
+                layout: removed,
+                focused_pane: pane_id,
+                zoomed_pane: None,
+            };
+            let workspace = &mut state.workspaces[workspace_index];
+            workspace.selected_tab = Some(broken.id.clone());
+            workspace.tabs.insert(tab_index + 1, broken);
+        }
     }
     Ok(())
 }
@@ -1368,6 +1409,179 @@ mod tests {
             edge,
         });
         f.snapshot.workspaces[0].tabs[0].focused_pane.clone()
+    }
+
+    /// The tree's shape with pane ids and rounded fractions, for asserting
+    /// a whole preset at once: `H(.4 a V(.5 b c))`.
+    fn shape(node: &LayoutNode) -> String {
+        match node {
+            LayoutNode::Pane { session_id, .. } => {
+                session_id.0.trim_start_matches("session_").into()
+            }
+            LayoutNode::Split {
+                axis,
+                fraction,
+                first,
+                second,
+                ..
+            } => format!(
+                "{}({:.2} {} {})",
+                if *axis == LayoutAxis::Horizontal {
+                    "H"
+                } else {
+                    "V"
+                },
+                fraction,
+                shape(first),
+                shape(second)
+            ),
+        }
+    }
+
+    #[test]
+    fn layout_presets_rearrange_the_same_panes_in_reading_order() {
+        let mut f = Fixture::new();
+        let workspace = f.create_workspace("Project");
+        let (tab, a) = f.create_tab(workspace, 0);
+        let b = split_at(&mut f, &tab, &a, 1, DockEdge::Bottom);
+        let c = split_at(&mut f, &tab, &b, 2, DockEdge::Right);
+        let d = split_at(&mut f, &tab, &c, 3, DockEdge::Bottom);
+        split_at(&mut f, &tab, &d, 4, DockEdge::Right);
+        f.apply(FocusPane {
+            tab_id: tab.clone(),
+            pane_id: c.clone(),
+        });
+        f.apply(ZoomPane {
+            tab_id: tab.clone(),
+            pane_id: Some(c.clone()),
+        });
+        let before = tree::panes(&f.snapshot.workspaces[0].tabs[0].layout);
+        let expected = [
+            (
+                LayoutPreset::EvenHorizontal,
+                "H(0.40 H(0.50 0 1) H(0.33 2 H(0.50 3 4)))",
+            ),
+            (
+                LayoutPreset::EvenVertical,
+                "V(0.40 V(0.50 0 1) V(0.33 2 V(0.50 3 4)))",
+            ),
+            (
+                LayoutPreset::MainVertical,
+                "H(0.60 0 V(0.50 V(0.50 1 2) V(0.50 3 4)))",
+            ),
+            (
+                LayoutPreset::MainHorizontal,
+                "V(0.60 0 H(0.50 H(0.50 1 2) H(0.50 3 4)))",
+            ),
+            (
+                LayoutPreset::Tiled,
+                "V(0.50 H(0.33 0 H(0.50 1 2)) H(0.50 3 4))",
+            ),
+        ];
+        for (preset, want) in expected {
+            f.apply(ApplyLayout {
+                tab_id: tab.clone(),
+                preset,
+            });
+            let saved = &f.snapshot.workspaces[0].tabs[0];
+            assert_eq!(shape(&saved.layout), want, "{preset:?}");
+            // Same panes, same order, same focus; the zoom gives way.
+            assert_eq!(tree::panes(&saved.layout), before);
+            assert_eq!(saved.focused_pane, c);
+            assert_eq!(saved.zoomed_pane, None);
+        }
+        // `next` walks all five and wraps.
+        let mut preset = LayoutPreset::EvenHorizontal;
+        for _ in 0..5 {
+            preset = preset.next();
+        }
+        assert_eq!(preset, LayoutPreset::EvenHorizontal);
+    }
+
+    #[test]
+    fn every_preset_fits_the_pane_and_depth_limits() {
+        let mut f = Fixture::new();
+        let workspace = f.create_workspace("Project");
+        let (tab, mut last) = f.create_tab(workspace, 0);
+        for session in 1..MAX_TAB_PANES {
+            last = split_at(&mut f, &tab, &last, session, DockEdge::Right);
+        }
+        for preset in LayoutPreset::ALL {
+            f.apply(ApplyLayout {
+                tab_id: tab.clone(),
+                preset,
+            });
+            assert_eq!(
+                tree::panes(&f.snapshot.workspaces[0].tabs[0].layout).len(),
+                MAX_TAB_PANES
+            );
+        }
+        // One pane: every preset is that pane.
+        let (single, pane) = f.create_tab(f.snapshot.workspaces[0].id.clone(), 9);
+        f.apply(ApplyLayout {
+            tab_id: single,
+            preset: LayoutPreset::Tiled,
+        });
+        let tab = f.snapshot.workspaces[0].tabs.last().unwrap();
+        assert!(matches!(&tab.layout, LayoutNode::Pane { id, .. } if *id == pane));
+    }
+
+    #[test]
+    fn break_pane_moves_one_pane_into_a_new_selected_tab_after_its_own() {
+        let mut f = Fixture::new();
+        let workspace = f.create_workspace("Project");
+        let (first, a) = f.create_tab(workspace.clone(), 0);
+        let (other, _) = f.create_tab(workspace, 5);
+        let b = split_at(&mut f, &first, &a, 1, DockEdge::Right);
+        f.apply(SelectTab {
+            workspace_id: f.snapshot.workspaces[0].id.clone(),
+            tab_id: first.clone(),
+        });
+        f.apply(BreakPane {
+            tab_id: first.clone(),
+            pane_id: b.clone(),
+        });
+        let saved = &f.snapshot.workspaces[0];
+        assert_eq!(saved.tabs.len(), 3);
+        assert_eq!(saved.tabs[0].id, first);
+        assert!(matches!(&saved.tabs[0].layout, LayoutNode::Pane { id, .. } if *id == a));
+        // The source's focus falls back to what it kept.
+        assert_eq!(saved.tabs[0].focused_pane, a);
+        let broken = &saved.tabs[1];
+        assert!(matches!(&broken.layout, LayoutNode::Pane { id, session_id }
+            if *id == b && session_id.0 == "session_1"));
+        assert_eq!(broken.focused_pane, b);
+        assert_eq!(saved.selected_tab.as_ref(), Some(&broken.id));
+        assert_eq!(saved.tabs[2].id, other);
+
+        // Joining it back is a move of that pane onto another tab's pane.
+        let broken = broken.id.clone();
+        f.apply(MoveNode {
+            source_tab: broken,
+            node: LayoutNodeId::Pane(b.clone()),
+            destination_tab: first.clone(),
+            target: a.clone(),
+            edge: DockEdge::Bottom,
+        });
+        let saved = &f.snapshot.workspaces[0];
+        assert_eq!(saved.tabs.len(), 2, "the emptied tab closes");
+        assert_eq!(tree::panes(&saved.tabs[0].layout), vec![a.clone(), b]);
+
+        // A one-pane tab has nothing to break away from.
+        f.reject(
+            BreakPane {
+                tab_id: other,
+                pane_id: saved.tabs[1].focused_pane.clone(),
+            },
+            "invalid_workspace",
+        );
+        f.reject(
+            BreakPane {
+                tab_id: first,
+                pane_id: PaneId::new("missing"),
+            },
+            "workspace_target_not_found",
+        );
     }
 
     #[test]

@@ -4173,6 +4173,112 @@ mod split_panes {
         assert!(!rows.contains(&"shown".to_owned()) && !rows.contains(&"hidden".to_owned()));
     }
 
+    fn rows(store: &mut SessionStore) -> Vec<String> {
+        store
+            .sidebar_projection()
+            .projects
+            .iter()
+            .flat_map(|group| &group.sessions)
+            .map(|row| row.id().0.clone())
+            .collect()
+    }
+
+    /// "Break pane into its own tab": the Engine moves the shell's pane into
+    /// a new tab. A tab is a sidebar row, so the shell takes one and owns
+    /// its tab; joined back beside its owner, it folds into the owner's row.
+    #[test]
+    fn a_shell_broken_out_of_its_owners_tab_becomes_a_row_of_its_own() {
+        let (mut store, _) = split_store();
+        let mut snapshot = (*store.workspace_catalog().snapshot().unwrap()).clone();
+        let workspace = &mut snapshot.workspaces[0];
+        workspace.tabs[0].layout = leaf("agent", "one");
+        workspace.tabs.push(WorkspaceTab {
+            id: TabId::new("broken"),
+            title: None,
+            focused_pane: PaneId::new("terminal"),
+            zoomed_pane: None,
+            layout: leaf("terminal", "shown"),
+        });
+        snapshot.revision += 1;
+        store.seed_workspace_snapshot_for_test(snapshot.clone());
+        assert!(rows(&mut store).contains(&"shown".to_owned()));
+        assert!(
+            !rows(&mut store).contains(&"hidden".to_owned()),
+            "unplaced stays hidden"
+        );
+        assert_eq!(store.pane_owner(&id("shown")), id("shown"));
+
+        // Joined into "two"'s tab, it is no longer beside its owner...
+        snapshot.workspaces[0].tabs.pop();
+        snapshot.workspaces[0].tabs.push(WorkspaceTab {
+            id: TabId::new("two"),
+            title: None,
+            focused_pane: PaneId::new("two"),
+            zoomed_pane: None,
+            layout: LayoutNode::Split {
+                id: SplitId::new("j"),
+                axis: LayoutAxis::Horizontal,
+                fraction: 0.5,
+                first: Box::new(leaf("two", "two")),
+                second: Box::new(leaf("terminal", "shown")),
+            },
+        });
+        snapshot.revision += 1;
+        store.seed_workspace_snapshot_for_test(snapshot.clone());
+        // ...but the tab is "two"'s row, so the shell folds into it.
+        assert!(!rows(&mut store).contains(&"shown".to_owned()));
+        assert_eq!(store.pane_owner(&id("shown")), id("two"));
+        let (panes, shells) = store.pane_group(&id("two")).unwrap();
+        assert_eq!(panes, 2);
+        assert_eq!(shells[0].id, id("shown"));
+
+        // Two broken-out shells sharing a tab are still one row: the first.
+        snapshot.workspaces[0].tabs.pop();
+        snapshot.workspaces[0].tabs.push(WorkspaceTab {
+            id: TabId::new("shells"),
+            title: None,
+            focused_pane: PaneId::new("terminal"),
+            zoomed_pane: None,
+            layout: LayoutNode::Split {
+                id: SplitId::new("k"),
+                axis: LayoutAxis::Horizontal,
+                fraction: 0.5,
+                first: Box::new(leaf("terminal", "shown")),
+                second: Box::new(leaf("other", "hidden")),
+            },
+        });
+        snapshot.revision += 1;
+        store.seed_workspace_snapshot_for_test(snapshot.clone());
+        let shown = rows(&mut store);
+        assert!(shown.contains(&"shown".to_owned()) && !shown.contains(&"hidden".to_owned()));
+        assert_eq!(store.pane_owner(&id("hidden")), id("shown"));
+        assert_eq!(store.pane_group(&id("shown")).unwrap().0, 2);
+
+        // Back beside "one": one row again.
+        let (mut back, _) = split_store();
+        assert!(!rows(&mut back).contains(&"shown".to_owned()));
+        assert_eq!(back.pane_owner(&id("shown")), id("one"));
+    }
+
+    /// The shell's record can land after the layout that shows it.
+    #[test]
+    fn a_shell_record_arriving_after_its_tab_still_gets_its_row() {
+        let (mut store, _) = split_store();
+        let mut snapshot = (*store.workspace_catalog().snapshot().unwrap()).clone();
+        snapshot.workspaces[0].tabs.push(WorkspaceTab {
+            id: TabId::new("late"),
+            title: None,
+            focused_pane: PaneId::new("late"),
+            zoomed_pane: None,
+            layout: leaf("late", "late-shell"),
+        });
+        snapshot.revision += 1;
+        store.seed_workspace_snapshot_for_test(snapshot);
+        assert!(!rows(&mut store).contains(&"late-shell".to_owned()));
+        store.upsert_session(pane_shell("late-shell", "one", 5.0));
+        assert!(rows(&mut store).contains(&"late-shell".to_owned()));
+    }
+
     #[test]
     fn the_row_counts_its_tab_panes_and_folds_in_its_shells() {
         let (store, _) = split_store();

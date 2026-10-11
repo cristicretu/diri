@@ -224,3 +224,84 @@ pub(super) fn panes_of(node: &LayoutNode, session: &SessionId) -> Vec<PaneId> {
         }
     }
 }
+
+/// The panes of `node` in reading order, as leaves.
+pub(super) fn leaves(node: &LayoutNode) -> Vec<LayoutNode> {
+    match node {
+        LayoutNode::Pane { .. } => vec![node.clone()],
+        LayoutNode::Split { first, second, .. } => {
+            let mut result = leaves(first);
+            result.extend(leaves(second));
+            result
+        }
+    }
+}
+
+/// `nodes` in one row (`Horizontal`) or column (`Vertical`), each the same
+/// size: a balanced tree, so eight panes stay well inside the depth limit.
+fn even(
+    nodes: &[LayoutNode],
+    axis: LayoutAxis,
+    ids: &mut impl Iterator<Item = SplitId>,
+) -> LayoutNode {
+    if nodes.len() == 1 {
+        return nodes[0].clone();
+    }
+    let half = nodes.len() / 2;
+    LayoutNode::Split {
+        id: ids.next().expect("one split id per pane"),
+        axis,
+        fraction: half as f32 / nodes.len() as f32,
+        first: Box::new(even(&nodes[..half], axis, ids)),
+        second: Box::new(even(&nodes[half..], axis, ids)),
+    }
+}
+
+/// The share the main pane of a main-* preset takes.
+pub(super) const MAIN_FRACTION: f32 = 0.6;
+
+/// The first pane across `axis` from the rest, which share the other side
+/// evenly the other way.
+fn main(
+    panes: &[LayoutNode],
+    axis: LayoutAxis,
+    ids: &mut impl Iterator<Item = SplitId>,
+) -> LayoutNode {
+    if panes.len() < 2 {
+        return panes[0].clone();
+    }
+    let rest = match axis {
+        LayoutAxis::Horizontal => LayoutAxis::Vertical,
+        LayoutAxis::Vertical => LayoutAxis::Horizontal,
+    };
+    LayoutNode::Split {
+        id: ids.next().expect("one split id per pane"),
+        axis,
+        fraction: MAIN_FRACTION,
+        first: Box::new(panes[0].clone()),
+        second: Box::new(even(&panes[1..], rest, ids)),
+    }
+}
+
+/// `panes` (leaves, in reading order) arranged as `preset`. `ids` supplies
+/// one fresh split id per pane, which is always enough.
+pub(super) fn arrange(
+    panes: &[LayoutNode],
+    preset: LayoutPreset,
+    ids: &mut impl Iterator<Item = SplitId>,
+) -> LayoutNode {
+    match preset {
+        LayoutPreset::EvenHorizontal => even(panes, LayoutAxis::Horizontal, ids),
+        LayoutPreset::EvenVertical => even(panes, LayoutAxis::Vertical, ids),
+        LayoutPreset::MainVertical => main(panes, LayoutAxis::Horizontal, ids),
+        LayoutPreset::MainHorizontal => main(panes, LayoutAxis::Vertical, ids),
+        LayoutPreset::Tiled => {
+            let columns = (panes.len() as f32).sqrt().ceil() as usize;
+            let rows: Vec<LayoutNode> = panes
+                .chunks(columns.max(1))
+                .map(|row| even(row, LayoutAxis::Horizontal, ids))
+                .collect();
+            even(&rows, LayoutAxis::Vertical, ids)
+        }
+    }
+}

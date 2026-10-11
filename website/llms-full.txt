@@ -377,6 +377,27 @@ A tab works like a terminal multiplexer: it holds a split tree of panes, and sta
 
 Drag a divider to resize; panes stop at a minimum size. Quitting an agent (^C^C, /exit) returns its pane to your login shell and never closes it. **Split pane with session…**, swapping, moving and removing panes are in the command palette without default shortcuts.
 
+### Prefix keys (tmux style)
+
+Off by default. Turn on **Settings › Keyboard Shortcuts › tmux-style prefix**, then press <kbd>⌃</kbd><kbd>A</kbd> and a second key. Neither key reaches the terminal; <kbd>⌃</kbd><kbd>A</kbd> twice types <kbd>⌃</kbd><kbd>A</kbd>, <kbd>Esc</kbd> cancels, and an armed prefix gives up after two seconds.
+
+| After <kbd>⌃</kbd><kbd>A</kbd> | Action |
+| --- | --- |
+| <kbd>%</kbd> / <kbd>"</kbd> | Split right / down with a new terminal |
+| arrows | Focus the pane in that direction |
+| <kbd>o</kbd> / <kbd>;</kbd> | Next / previous pane |
+| <kbd>z</kbd> | Zoom the focused pane |
+| <kbd>x</kbd> | Close the focused terminal pane; an agent's pane is never closed this way |
+| <kbd>⇧</kbd> + arrow | Resize the pane; hold under the prefix to keep nudging |
+| <kbd>q</kbd> | Number the panes; press a digit to focus one |
+| <kbd>Space</kbd> | Next layout: even horizontal, even vertical, main horizontal, main vertical, tiled |
+| <kbd>S</kbd> | Synchronize panes: typing goes to every pane of the tab, framed in amber |
+| <kbd>!</kbd> | Break the focused pane into its own tab |
+| <kbd>m</kbd> / <kbd>j</kbd> | Mark a pane, then join it next to the focused pane of another tab |
+| <kbd>?</kbd> | Show the cheatsheet |
+
+Every prefix action is also in the command palette, including each layout by name.
+
 ## Inside the palette
 | Shortcut | Action |
 | --- | --- |

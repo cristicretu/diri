@@ -91,6 +91,29 @@ focused pane's directory, on the same host.
 | ⌥⇧⌘ arrows | Option-Shift-Command-arrow | Resize the nearest divider by five percent |
 | ⌘W | Command-W | Close the focused terminal pane; on the agent's pane, close the tab |
 
+### Prefix keys (tmux style, off by default)
+
+Turn on **Settings › Keyboard Shortcuts › tmux-style prefix**. Then ⌃A arms
+the layer for one key; neither key reaches the terminal. ⌃A twice types ⌃A,
+Escape cancels, and an armed prefix gives up after two seconds.
+
+| After ⌃A | Action |
+| --- | --- |
+| % / " | Split right / down with a new terminal |
+| arrows | Focus the pane in that direction |
+| o / ; | Next / previous pane |
+| z | Zoom the focused pane |
+| x | Close the focused terminal pane (never an agent's pane) |
+| ⇧ arrows | Resize; the prefix stays armed so the key repeats |
+| q | Number the panes; press a digit to focus one |
+| Space | Next layout: even horizontal, even vertical, main horizontal, main vertical, tiled |
+| S | Synchronize panes: typing goes to every pane of the tab (amber frame) |
+| ! | Break the focused pane into its own tab (a terminal gets its own sidebar row) |
+| m / j | Mark a pane, then join it next to the focused pane of another tab |
+| ? | Show this list |
+
+Every one of these is also in the command palette (layout presets by name).
+
 The command palette always lists ⌘T for the default agent. When Codex is not
 the default, its command also shows ⇧⌘N. The palette lists ⌥⌘T, ⌘P, ⇧⌘O,
 ⌥⌘W, ⌘B and ⌘, too, so it doubles as a reminder for the shortcuts you use
