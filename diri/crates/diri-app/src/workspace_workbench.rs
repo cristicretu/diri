@@ -963,9 +963,15 @@ impl Render for WorkspaceWorkbench {
                 .w(px(bounds.width))
                 .h(px(bounds.height))
                 .overflow_hidden();
+            // The tab owner's pane has no ✕; its title keeps that room.
+            let closable = multiple_panes && !owners.contains(&pane.identity.session);
             if let Some(mounted) = self.mounted.get(&pane.identity.pane) {
                 mounted.terminal.update(cx, |terminal, cx| {
-                    let controls = if multiple_panes { 116.0 } else { 26.0 };
+                    let controls = match (multiple_panes, closable) {
+                        (true, true) => 116.0,
+                        (true, false) => 116.0 - (Metrics::TOOLBAR_CONTROL_SIZE + 4.0),
+                        _ => 26.0,
+                    };
                     let toggle = if inspector_toggle {
                         Metrics::TOOLBAR_CONTROL_SIZE + 4.0
                     } else {

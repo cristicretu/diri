@@ -106,7 +106,7 @@ fn render_split_panes_screenshot() {
         let services = test_services();
         let mut fixture = SidebarPreviewFixture::make(PreviewScenario::Typical);
         let tests = pane_shell("pane-tests", "cargo test", &fixture);
-        let server = pane_shell("pane-server", "Dev server · localhost:3000", &fixture);
+        let server = pane_shell("pane-server", "pnpm dev · website", &fixture);
         fixture.list.sessions.push(tests);
         fixture.list.sessions.push(server);
         let workspace = WorkspaceId::new("project-workspace");
