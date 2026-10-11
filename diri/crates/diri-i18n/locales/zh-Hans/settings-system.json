@@ -26,6 +26,8 @@
   "settings.appearance.mode_system": "跟随系统",
   "settings.appearance.paste_protection": "粘贴命令前确认",
   "settings.appearance.paste_protection_detail": "向 shell 粘贴多行内容或含控制字符的文本前先询问。",
+  "settings.appearance.shell_integration": "Shell 集成",
+  "settings.appearance.shell_integration_detail": "在新终端中标记 zsh 和 bash 的提示符与命令结果。更改后打开的终端生效。",
   "settings.appearance.terminal_font": "终端字体",
   "settings.appearance.theme": "主题",
   "settings.appearance.title": "外观",

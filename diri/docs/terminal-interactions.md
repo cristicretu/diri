@@ -42,9 +42,8 @@
   Copilot, Kimi and Gemini gutters are recognized; other Agents can use
   explicit `You:` or `User:` labels. Composers and drafts, numbered choosers,
   pinned headers, tool output and soft-wrap continuations are not stops.
-  In shells the same shortcuts jump between retained prompt marks. Your
-  shell must emit OSC 133 A (for example through its terminal integration);
-  no shell configuration is changed. A shell running a recognized foreground
+  In shells the same shortcuts jump between retained prompt marks (OSC 133
+  A; see shell integration below). A shell running a recognized foreground
   Agent uses message navigation. An inline session with no message that way
   (a generic command, or an Agent that exited to its shell) falls back to
   its prompt marks.
@@ -54,10 +53,19 @@
   commands and ends without a status stay unmarked. Right-click a finished
   command's prompt, command line or output for **Copy command output** and
   **Select command output**; Cmd-Option-O copies the output of the last
-  finished command in retained history. fish 4 emits these marks by default;
-  other shells need their terminal integration (no shell configuration is
-  changed). Marks work in remote sessions whose Helper was installed by this
-  version; older live Helpers show no marks until the session restarts.
+  finished command in retained history. fish 4 emits these marks by default.
+  Local zsh and bash terminals get them from Diri's shell integration with no
+  setup and no change to the user's files: zsh starts with `ZDOTDIR` pointing
+  at a `.zshenv` shim that puts `ZDOTDIR` back before any of the user's files
+  run; bash starts as the same `bash -l` with a one-shot `PROMPT_COMMAND` that
+  loads the hooks at the first prompt, after every startup file. Both chain
+  around prompt frameworks (oh-my-zsh, powerlevel10k, starship,
+  bash-preexec, a user's own DEBUG trap) and keep `$?` for them. Settings →
+  Appearance → Shell integration turns it off for terminals opened afterwards.
+  Agents' login-shell wrappers and remote shells are not changed; remote
+  shells need their own terminal integration. Marks work in remote sessions
+  whose Helper was installed by this version; older live Helpers show no
+  marks until the session restarts.
 
 Settings → Terminal contains Copy on Selection (off by default), Hide Pointer
 While Typing (on), and Review Command Pastes (off by default). Paste review applies to

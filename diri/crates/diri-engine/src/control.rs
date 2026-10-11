@@ -80,6 +80,20 @@ const TERMINAL_ONLY_METHODS: &[&str] = &[
     Method::SESSION_MIGRATE,
     Method::SESSION_CONTINUE_ACCOUNT,
 ];
+/// The last `terminal.configure`, in the config directory, so terminals the
+/// Engine starts before the app connects follow it too.
+const TERMINAL_SETTINGS_FILE: &str = "terminal.json";
+
+/// Missing or unreadable settings are the defaults: integration on.
+fn terminal_settings(config_dir: &Path) -> diri_proto::TerminalConfigureParams {
+    std::fs::read(config_dir.join(TERMINAL_SETTINGS_FILE))
+        .ok()
+        .and_then(|bytes| serde_json::from_slice(&bytes).ok())
+        .unwrap_or(diri_proto::TerminalConfigureParams {
+            shell_integration: true,
+        })
+}
+
 /// A terminal's shell: the user's own, as a login shell.
 fn login_shell_argv() -> Vec<String> {
     let shell = std::env::var("SHELL").unwrap_or_else(|_| default_shell().into());
@@ -116,6 +130,9 @@ pub struct ControlServer {
     attach: crate::attach::AttachHub,
     pr_monitor_wake: crate::pr_monitor::PrMonitorWake,
     injection: Option<InjectionConfig>,
+    /// The zsh/bash OSC 133 scripts, installed beside the injection files.
+    /// `terminal.configure` can switch them off (see [`TERMINAL_SETTINGS_FILE`]).
+    shell_integration: Option<crate::shell_integration::ShellIntegration>,
     /// The Engine-served MCP endpoint, once [`ControlServer::start_mcp_http`]
     /// bound it. Unset means every Agent keeps the stdio `dirijor-mcp`.
     mcp_http: std::sync::OnceLock<crate::mcp_http::McpHttpEndpoint>,
@@ -237,6 +254,7 @@ impl ControlServer {
             attach: crate::attach::AttachHub::new(),
             pr_monitor_wake: crate::pr_monitor::PrMonitorWake::default(),
             injection: None,
+            shell_integration: None,
             mcp_http: std::sync::OnceLock::new(),
             cli_versions: Default::default(),
             governor: std::sync::Arc::new(Mutex::new(crate::governor::GovernorConfig::default())),
@@ -264,8 +282,35 @@ impl ControlServer {
         let _ = crate::inject::write_claude_hooks_file(&config.inject_dir);
         let _ = crate::inject::write_claude_mcp_file(&config.inject_dir, &config.cli_path);
         let _ = crate::inject::write_claude_skills_plugin(&config.inject_dir);
+        match crate::shell_integration::ShellIntegration::install(&config.inject_dir) {
+            Ok(integration) => self.shell_integration = Some(integration),
+            Err(error) => eprintln!("diri-engine: shell integration unavailable: {error}"),
+        }
         self.injection = Some(config);
         self
+    }
+
+    /// The shell integration a new local terminal gets: `None` when it is
+    /// not installed or the user switched it off.
+    fn terminal_shell_integration(&self) -> Option<&crate::shell_integration::ShellIntegration> {
+        let integration = self.shell_integration.as_ref()?;
+        terminal_settings(&self.config_dir)
+            .shell_integration
+            .then_some(integration)
+    }
+
+    fn terminal_configure(&self, params: Option<JsonValue>) -> Result<JsonValue, ControlError> {
+        let p: diri_proto::TerminalConfigureParams = decode(params)?;
+        if terminal_settings(&self.config_dir) != p {
+            let bytes = serde_json::to_vec_pretty(&p)
+                .map_err(|error| ControlError::internal(error.to_string()))?;
+            crate::shell_integration::write_private(
+                &self.config_dir.join(TERMINAL_SETTINGS_FILE),
+                &bytes,
+            )
+            .map_err(io_control_error)?;
+        }
+        Ok(json!({}))
     }
 
     /// Serves the `dirijor` MCP tools over loopback Streamable HTTP so Agents
@@ -1110,6 +1155,7 @@ impl ControlServer {
             Method::DAEMON_SHUTDOWN => self.daemon_shutdown(),
             Method::TELEMETRY_UPLOAD_NOW => telemetry_upload_now(),
             Method::GOVERNOR_CONFIGURE => self.governor_configure(params),
+            Method::TERMINAL_CONFIGURE => self.terminal_configure(params),
             Method::CLIENT_SET_ACTIVE => self.client_set_active(params),
             other => Err(ControlError::not_found(format!(
                 "method {other:?} is not implemented by this engine yet"
@@ -1198,6 +1244,11 @@ impl ControlServer {
         }
 
         let kind = p.kind.id().to_string();
+        // A plain terminal: the user's login shell, which may get Diri's
+        // shell integration below.
+        let login_terminal = argv.is_empty()
+            && kind == diri_proto::AgentKind::SHELL_ID
+            && p.kind.command().is_none_or(str::is_empty);
         // A generic kind carries the user's command line inside itself.
         let argv = if argv.is_empty() {
             match p.kind.command() {
@@ -1346,6 +1397,9 @@ impl ControlServer {
                 )));
             }
         };
+        if login_terminal && let Some(integration) = self.terminal_shell_integration() {
+            integration.apply(&mut pty);
+        }
 
         if let Some(profile) = &mut account_profile {
             crate::accounts::bind_pty(profile, &mut pty)?;
@@ -3769,6 +3823,9 @@ impl ControlServer {
         let mut pty = crate::pty::PtySpec::new(login_shell_argv(), launch_path);
         pty.env = std::env::vars().collect();
         crate::agent::assert_color_environment(&mut pty.env);
+        if let Some(integration) = self.terminal_shell_integration() {
+            integration.apply(&mut pty);
+        }
         Ok(crate::session::SessionSpec {
             id: record.id.0.clone(),
             pty,
@@ -6766,6 +6823,54 @@ mod tests {
                 "bad_request"
             );
         }
+    }
+
+    #[test]
+    fn terminal_configure_switches_shell_integration_and_survives_a_restart() {
+        let temp = tempfile::tempdir().unwrap();
+        let start = || {
+            let registry = Registry::new(engine(), temp.path().join("state.json"));
+            ControlServer::new(Arc::new(Mutex::new(registry)), temp.path().join("socket"))
+                .with_injection(InjectionConfig {
+                    inject_dir: temp.path().join("inject"),
+                    cli_path: temp.path().join("dirijor"),
+                })
+        };
+        let server = start();
+        let integration = server
+            .terminal_shell_integration()
+            .expect("on by default once installed");
+        let mut spec = crate::pty::PtySpec::new(vec!["/bin/zsh".into(), "-l".into()], "/tmp");
+        integration.apply(&mut spec);
+        assert!(spec.env.iter().any(|(key, _)| key == "ZDOTDIR"));
+
+        server
+            .dispatch(
+                Method::TERMINAL_CONFIGURE,
+                Some(json!({ "shellIntegration": false })),
+            )
+            .unwrap();
+        assert!(server.terminal_shell_integration().is_none());
+        let settings = temp.path().join(TERMINAL_SETTINGS_FILE);
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(&settings).unwrap().permissions().mode();
+            assert_eq!(mode & 0o777, 0o600);
+        }
+        // Terminals the next Engine restarts before the app connects.
+        assert!(start().terminal_shell_integration().is_none());
+
+        server
+            .dispatch(
+                Method::TERMINAL_CONFIGURE,
+                Some(json!({ "shellIntegration": true })),
+            )
+            .unwrap();
+        assert!(start().terminal_shell_integration().is_some());
+        // Without injection (tests, a bare Engine) nothing is installed.
+        let registry = Registry::new(engine(), temp.path().join("state.json"));
+        let bare = ControlServer::new(Arc::new(Mutex::new(registry)), temp.path().join("socket"));
+        assert!(bare.terminal_shell_integration().is_none());
     }
 
     #[test]

@@ -26,6 +26,8 @@
   "settings.appearance.mode_system": "System",
   "settings.appearance.paste_protection": "Review command pastes",
   "settings.appearance.paste_protection_detail": "Ask before pasting multiple lines into a shell or text with control characters.",
+  "settings.appearance.shell_integration": "Shell integration",
+  "settings.appearance.shell_integration_detail": "Mark zsh and bash prompts and command results in new terminals. Applies to terminals opened after the change.",
   "settings.appearance.terminal_font": "Terminal font",
   "settings.appearance.theme": "Theme",
   "settings.appearance.title": "Appearance",

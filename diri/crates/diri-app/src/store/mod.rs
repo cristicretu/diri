@@ -23,6 +23,7 @@ use diri_proto::{
     AgentDescriptor, AgentKind, AgentReadinessResult, AttentionLevel, DateMillis, EventName,
     ExitReason, GovernorConfigureParams, HelloResult, HostEntry, HostsConfig, Project, ProjectId,
     SessionId, SessionListResult, SessionRecord, SessionSpawnParams, SessionStatus,
+    TerminalConfigureParams,
 };
 use tokio::sync::{Notify, broadcast, mpsc};
 use tokio::task::JoinHandle;
@@ -246,6 +247,7 @@ pub enum StoreEffect {
     ReopenLast,
     SetActive(bool),
     ConfigureGovernor(GovernorConfigureParams),
+    ConfigureTerminal(TerminalConfigureParams),
     /// T11 consumes this by closing and dropping the corresponding attachment.
     DetachAttachment(SessionId),
     /// T15 consumes this without involving daemon lifecycle operations.
@@ -1361,6 +1363,7 @@ impl SessionStore {
         self.invalidate_projection();
         if matches!(self.daemon_state, DaemonState::Connected) {
             self.emit(StoreEffect::ConfigureGovernor(self.governor_settings()));
+            self.emit(StoreEffect::ConfigureTerminal(self.terminal_settings()));
         }
         Ok(())
     }
@@ -1599,6 +1602,12 @@ impl SessionStore {
                 .memory_hard_limit_gb
                 .saturating_mul(1024 * 1024 * 1024),
         )
+    }
+
+    pub fn terminal_settings(&self) -> TerminalConfigureParams {
+        TerminalConfigureParams {
+            shell_integration: self.prefs.terminal_shell_integration,
+        }
     }
 
     pub fn sidebar_projection(&mut self) -> Arc<SidebarProjection> {
@@ -3624,12 +3633,17 @@ impl StoreRuntime {
                             };
                             state_snapshots.send_replace(snapshot);
                         }
-                        let (active, governor) = {
+                        let (active, governor, terminal) = {
                             let store = state_store.read().expect("session store lock poisoned");
-                            (store.app_is_active, store.governor_settings())
+                            (
+                                store.app_is_active,
+                                store.governor_settings(),
+                                store.terminal_settings(),
+                            )
                         };
                         let _ = state_client.set_active(active).await;
                         let _ = state_client.configure_governor(governor).await;
+                        let _ = state_client.configure_terminal(terminal).await;
                         // Warm the default remote only after local catalog,
                         // session hydration and lifecycle state have completed.
                         // A slow SSH login can then never delay first paint.
@@ -4222,6 +4236,7 @@ async fn run_effects(
             },
             StoreEffect::SetActive(active) => client.set_active(active).await,
             StoreEffect::ConfigureGovernor(settings) => client.configure_governor(settings).await,
+            StoreEffect::ConfigureTerminal(settings) => client.configure_terminal(settings).await,
             StoreEffect::DetachAttachment(id) => {
                 let _ = detach_tx.send(id);
                 Ok(())
@@ -4304,6 +4319,7 @@ fn action_context(effect: &StoreEffect) -> Option<ActionContext> {
         | StoreEffect::ListDirectories { .. }
         | StoreEffect::SetActive(_)
         | StoreEffect::ConfigureGovernor(_)
+        | StoreEffect::ConfigureTerminal(_)
         | StoreEffect::DetachAttachment(_)
         | StoreEffect::StatusTransition(_) => return None,
         // Catalog failures land in `agent_catalog_errors`, which the Agents

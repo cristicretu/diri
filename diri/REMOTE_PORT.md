@@ -970,8 +970,14 @@ flags as a varint. New Helper sources change the Build ID as usual.
 Command interpretation stays on the desktop: the pass/fail gutter mark beside a
 finished command's prompt, Select/Copy Command Output on a command under the
 pointer, and Copy Last Command Output (read through the existing scrollback
-RPC). Shells must emit OSC 133 themselves (fish 4 does by default); emitting it
-from Diri's login-shell wrapper is a separate, deferred change.
+RPC). Local terminal tabs running zsh or bash get the marks from the Engine's
+shell integration (October 2026): the login shell keeps its argv and login
+semantics, and only its environment changes (`ZDOTDIR` to a `.zshenv` shim that
+restores it before any user file runs; a one-shot `PROMPT_COMMAND` bootstrap
+for bash). Settings can switch it off. Remote shells and Agent wrappers are
+unchanged: remote shells must still emit OSC 133 themselves (fish 4 does by
+default). Shipping the scripts to remote hosts is deferred: it would make the
+Helper install shell scripts, which this baseline does not.
 
 ## Engine-owned orchestration message delivery (September 2026)
 

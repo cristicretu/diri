@@ -5341,6 +5341,22 @@ impl UtilitySurfaces {
                         ))
                         .child(appearance_divider(colors))
                         .child(toggle_row(
+                            t("settings.appearance.shell_integration"),
+                            t("settings.appearance.shell_integration_detail"),
+                            self.prefs.terminal_shell_integration,
+                            "terminal_shell_integration",
+                            colors,
+                            cx,
+                            |this, cx| {
+                                let enabled = !this.prefs.terminal_shell_integration;
+                                this.update_prefs(move |prefs| {
+                                    prefs.terminal_shell_integration = enabled
+                                });
+                                cx.notify();
+                            },
+                        ))
+                        .child(appearance_divider(colors))
+                        .child(toggle_row(
                             t("settings.appearance.last_folder"),
                             t("settings.appearance.last_folder_detail"),
                             self.prefs.terminal_follows_last_directory,

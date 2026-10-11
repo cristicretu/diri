@@ -72,6 +72,7 @@ pub mod schedule;
 pub mod screen;
 pub mod session;
 pub mod session_files;
+pub mod shell_integration;
 mod state_file;
 pub mod status;
 pub mod telemetry;

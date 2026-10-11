@@ -952,6 +952,13 @@ impl DaemonClient {
         self.empty(Method::GOVERNOR_CONFIGURE, &params).await
     }
 
+    pub async fn configure_terminal(
+        &self,
+        params: TerminalConfigureParams,
+    ) -> Result<(), ClientError> {
+        self.empty(Method::TERMINAL_CONFIGURE, &params).await
+    }
+
     /// `agent.readiness`: PATH metadata locally, but a remote target crosses
     /// ssh and may install the Helper first, so the two carry very different
     /// bounds. Both are explicit: the settings page shows a spinner for the

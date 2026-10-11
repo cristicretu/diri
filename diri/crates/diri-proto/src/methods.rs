@@ -95,6 +95,7 @@ impl Method {
     pub const PROJECT_ADD: &'static str = "project.add";
     pub const CLIENT_SET_ACTIVE: &'static str = "client.set_active";
     pub const GOVERNOR_CONFIGURE: &'static str = "governor.configure";
+    pub const TERMINAL_CONFIGURE: &'static str = "terminal.configure";
     pub const AGENT_READINESS: &'static str = "agent.readiness";
     pub const AGENT_CONFIGURE: &'static str = "agent.configure";
     pub const ACCOUNT_PROFILES_LIST: &'static str = "account.profiles.list";
@@ -1273,6 +1274,19 @@ pub struct HookReportParams {
 pub type HookReportResult = EmptyResult;
 pub type GovernorConfigureParams = GovernorSettingsParams;
 pub type GovernorConfigureResult = EmptyResult;
+
+/// Engine-side terminal settings the app owns. The Engine keeps the last
+/// value it was sent, so terminals it restarts before the app connects follow
+/// it too.
+#[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TerminalConfigureParams {
+    /// Whether new zsh and bash terminals get Diri's OSC 133 prompt and
+    /// command marks without any setup.
+    pub shell_integration: bool,
+}
+
+pub type TerminalConfigureResult = EmptyResult;
 pub type ClientSetActiveResult = EmptyResult;
 pub type DaemonPrepareShutdownParams = EmptyParams;
 pub type DaemonPrepareShutdownResult = EmptyResult;

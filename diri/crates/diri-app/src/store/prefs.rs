@@ -339,6 +339,9 @@ pub struct Prefs {
     /// Command- or Control-click.
     pub terminal_open_links_on_click: bool,
     pub terminal_hide_pointer: bool,
+    /// Give new zsh and bash terminals Diri's OSC 133 prompt and command
+    /// marks. The Engine applies it; the store pushes it on every change.
+    pub terminal_shell_integration: bool,
     /// Where a clicked `file:line` reference in terminal output opens.
     #[serde(default)]
     pub terminal_file_editor: FileEditor,
@@ -460,6 +463,7 @@ impl Default for Prefs {
             terminal_copy_on_select: false,
             terminal_open_links_on_click: true,
             terminal_hide_pointer: true,
+            terminal_shell_integration: true,
             terminal_file_editor: FileEditor::Automatic,
             terminal_follows_last_directory: true,
             terminal_paste_protection: false,
