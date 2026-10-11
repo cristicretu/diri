@@ -1637,19 +1637,6 @@ impl RootView {
                         crate::workspace_workbench::WorkspaceWorkbenchEvent::Notice(message) => {
                             this.show_feedback("workspace", Toast::info(message.clone()), cx)
                         }
-                        crate::workspace_workbench::WorkspaceWorkbenchEvent::RequestSplit {
-                            tab,
-                            pane,
-                            edge,
-                        } => this.sidebar.update(cx, |sidebar, cx| {
-                            sidebar.choose_split_session(
-                                tab.clone(),
-                                pane.clone(),
-                                *edge,
-                                window,
-                                cx,
-                            )
-                        }),
                         crate::workspace_workbench::WorkspaceWorkbenchEvent::Terminal(
                             TerminalPaneEvent::RevealSession(id),
                         ) => this.open_workspace_launch_session(id.clone(), window, cx),
@@ -5357,11 +5344,6 @@ impl Render for RootView {
                     this.run_command(CommandId::FocusNextPane, window, cx);
                 }),
             )
-            .on_action(cx.listener(
-                |this, _: &crate::commands::SplitPaneWithSession, window, cx| {
-                    this.run_command(CommandId::SplitPaneWithSession, window, cx);
-                },
-            ))
             .on_action(
                 cx.listener(|this, _: &crate::commands::EqualizePanes, window, cx| {
                     this.run_command(CommandId::EqualizePanes, window, cx);

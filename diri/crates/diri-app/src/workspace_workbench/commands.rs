@@ -10,8 +10,6 @@ pub(crate) enum PaneCommand {
     Cycle(bool),
     /// A new shell pane on this side of the focused pane.
     Split(DockEdge),
-    /// The old split: choose an existing session for the new pane.
-    SplitWithSession(DockEdge),
     Equalize,
     Zoom,
     Remove,
@@ -30,7 +28,6 @@ impl PaneCommand {
             CommandId::SplitPaneBelow => Self::Split(DockEdge::Bottom),
             CommandId::FocusPreviousPane => Self::Cycle(false),
             CommandId::FocusNextPane => Self::Cycle(true),
-            CommandId::SplitPaneWithSession => Self::SplitWithSession(DockEdge::Right),
             CommandId::EqualizePanes => Self::Equalize,
             CommandId::TogglePaneZoom => Self::Zoom,
             CommandId::RemoveFocusedPane => Self::Remove,
@@ -225,14 +222,6 @@ impl WorkspaceWorkbench {
         {
             return true;
         }
-        if let PaneCommand::SplitWithSession(edge) = command {
-            cx.emit(WorkspaceWorkbenchEvent::RequestSplit {
-                tab: tab.id,
-                pane: focused,
-                edge,
-            });
-            return true;
-        }
         if let PaneCommand::Split(edge) = command {
             let Some(source) = pane_session(&tab.layout, &focused) else {
                 return true;
@@ -301,10 +290,7 @@ impl WorkspaceWorkbench {
                     edge,
                 }
             }
-            PaneCommand::Focus(_)
-            | PaneCommand::Cycle(_)
-            | PaneCommand::Split(_)
-            | PaneCommand::SplitWithSession(_) => return true,
+            PaneCommand::Focus(_) | PaneCommand::Cycle(_) | PaneCommand::Split(_) => return true,
         };
         self.runtime
             .store
@@ -431,6 +417,7 @@ pub(super) fn pane_session(node: &LayoutNode, pane: &PaneId) -> Option<SessionId
 #[cfg(test)]
 mod tests {
     use super::*;
+    use diri_proto::workspace::TabId;
     fn leaf(id: &str) -> LayoutNode {
         LayoutNode::Pane {
             id: PaneId::new(id),
@@ -594,7 +581,7 @@ mod tests {
     }
 
     #[test]
-    fn split_commands_map_to_shells_and_the_old_picker_stays_in_the_palette() {
+    fn split_commands_map_to_shells() {
         assert!(matches!(
             PaneCommand::from_id(CommandId::SplitPaneRight),
             Some(PaneCommand::Split(DockEdge::Right))
@@ -602,10 +589,6 @@ mod tests {
         assert!(matches!(
             PaneCommand::from_id(CommandId::SplitPaneBelow),
             Some(PaneCommand::Split(DockEdge::Bottom))
-        ));
-        assert!(matches!(
-            PaneCommand::from_id(CommandId::SplitPaneWithSession),
-            Some(PaneCommand::SplitWithSession(DockEdge::Right))
         ));
         assert!(matches!(
             PaneCommand::from_id(CommandId::EqualizePanes),

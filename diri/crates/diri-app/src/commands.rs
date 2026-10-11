@@ -55,7 +55,6 @@ actions!(
         SplitPaneBelow,
         FocusPreviousPane,
         FocusNextPane,
-        SplitPaneWithSession,
         EqualizePanes,
         TogglePaneZoom,
         RemoveFocusedPane,
@@ -169,7 +168,6 @@ pub enum CommandId {
     SplitPaneBelow,
     FocusPreviousPane,
     FocusNextPane,
-    SplitPaneWithSession,
     EqualizePanes,
     TogglePaneZoom,
     RemoveFocusedPane,
@@ -557,16 +555,6 @@ pub const COMMANDS: &[CommandSpec] = &[
         "command.focus_next_pane.palette_title",
         "rectangle.split.2x1",
         "workspace focus pane next cycle"
-    ),
-    spec!(
-        SplitPaneWithSession,
-        "split-pane-with-session",
-        None,
-        None,
-        Some(APP_CONTEXT),
-        "command.split_pane_with_session.palette_title",
-        "rectangle.split.2x1",
-        "workspace split pane existing session choose add layout"
     ),
     spec!(
         EqualizePanes,
@@ -1353,7 +1341,6 @@ impl CommandSpec {
             CommandId::SplitPaneBelow => KeyBinding::new(key, SplitPaneBelow, context),
             CommandId::FocusPreviousPane => KeyBinding::new(key, FocusPreviousPane, context),
             CommandId::FocusNextPane => KeyBinding::new(key, FocusNextPane, context),
-            CommandId::SplitPaneWithSession => KeyBinding::new(key, SplitPaneWithSession, context),
             CommandId::EqualizePanes => KeyBinding::new(key, EqualizePanes, context),
             CommandId::TogglePaneZoom => KeyBinding::new(key, TogglePaneZoom, context),
             CommandId::RemoveFocusedPane => KeyBinding::new(key, RemoveFocusedPane, context),
@@ -1767,11 +1754,6 @@ impl CommandId {
                 description: t("command.focus_next_pane.description"),
                 category: Workspace,
             },
-            Self::SplitPaneWithSession => ShortcutMetadata {
-                title: t("command.split_pane_with_session.title"),
-                description: t("command.split_pane_with_session.description"),
-                category: Workspace,
-            },
             Self::EqualizePanes => ShortcutMetadata {
                 title: t("command.equalize_panes.title"),
                 description: t("command.equalize_panes.description"),
@@ -2136,7 +2118,6 @@ impl CommandId {
             Self::SplitPaneBelow => Box::new(SplitPaneBelow),
             Self::FocusPreviousPane => Box::new(FocusPreviousPane),
             Self::FocusNextPane => Box::new(FocusNextPane),
-            Self::SplitPaneWithSession => Box::new(SplitPaneWithSession),
             Self::EqualizePanes => Box::new(EqualizePanes),
             Self::TogglePaneZoom => Box::new(TogglePaneZoom),
             Self::RemoveFocusedPane => Box::new(RemoveFocusedPane),
@@ -2466,7 +2447,6 @@ mod tests {
         ] {
             assert_eq!(command(id).keystroke, Some(key), "{id:?}");
         }
-        assert!(command(CommandId::SplitPaneWithSession).palette.is_some());
     }
 
     #[test]

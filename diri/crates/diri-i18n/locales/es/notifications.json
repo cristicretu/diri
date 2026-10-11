@@ -138,7 +138,6 @@
   "toast.session_stopped_signal": "La sesión se detuvo por la señal {signal}.",
   "toast.tab_bar_failed": "No se pudo guardar el ajuste de la barra de pestañas",
   "toast.tab_layout_failed": "No se pudo guardar la disposición de pestañas",
-  "toast.workspace_layout_changed_move": "La disposición cambió durante el movimiento. Inténtalo de nuevo.",
   "toast.workspace_layout_changed_resize": "La disposición cambió al redimensionar. Inténtalo de nuevo.",
   "toast.workspace_open_to_arrange": "Abre un espacio de trabajo para organizar sus paneles",
   "toast.workspace_rejected": "No se guardó el cambio del espacio de trabajo",

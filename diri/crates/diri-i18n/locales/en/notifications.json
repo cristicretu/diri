@@ -138,7 +138,6 @@
   "toast.session_stopped_signal": "Session was stopped by signal {signal}.",
   "toast.tab_bar_failed": "Couldn’t save the tab bar setting",
   "toast.tab_layout_failed": "Couldn’t save the tab layout",
-  "toast.workspace_layout_changed_move": "The layout changed mid-move. Try again.",
   "toast.workspace_layout_changed_resize": "The layout changed mid-resize. Try again.",
   "toast.workspace_open_to_arrange": "Open a workspace to arrange its panes",
   "toast.workspace_rejected": "Workspace change wasn’t saved",

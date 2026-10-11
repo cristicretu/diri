@@ -375,7 +375,7 @@ A tab works like a terminal multiplexer: it holds a split tree of panes, and sta
 | <kbd>⌘</kbd><kbd>J</kbd> | Show or hide a terminal pane below the focused pane; a hidden terminal keeps running |
 | <kbd>⌘</kbd><kbd>W</kbd> | Close the focused terminal pane; on the agent's pane, close the tab |
 
-Drag a divider to resize; panes stop at a minimum size. Quitting an agent (^C^C, /exit) returns its pane to your login shell and never closes it. **Split pane with session…**, swapping, moving and removing panes are in the command palette without default shortcuts.
+Drag a divider to resize; panes stop at a minimum size. Quitting an agent (^C^C, /exit) returns its pane to your login shell and never closes it. A pane's title bar only carries a ✕ on terminal panes; splitting, zoom, swapping and moving panes are on the keyboard and in the command palette.
 
 ## Inside the palette
 | Shortcut | Action |
