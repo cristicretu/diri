@@ -457,6 +457,32 @@ impl WorkspaceWorkbench {
         }
     }
 
+    /// Seeds each listed session's pane with its own lines of text.
+    #[cfg(all(test, target_os = "macos"))]
+    pub(crate) fn seed_pane_text_for_test(&self, texts: &[(&str, &str)], cx: &mut Context<Self>) {
+        for pane in self.mounted.values() {
+            let Some((_, text)) = texts.iter().find(|(id, _)| *id == pane.session.0) else {
+                continue;
+            };
+            let lines: Vec<_> = text.lines().collect();
+            // As tall as the text: a short pane shows a grid's bottom rows.
+            let mut grid = diri_term::buffer::GridBuffer::new(100, lines.len() as u16 + 1);
+            grid.cursor = diri_term::buffer::CursorState {
+                col: lines.last().map_or(0, |line| line.chars().count()) as u16,
+                row: lines.len().saturating_sub(1) as u16,
+                visible: true,
+            };
+            for (y, line) in lines.iter().enumerate() {
+                for (x, ch) in line.chars().take(100).enumerate() {
+                    grid.cells[y * 100 + x].scalar = ch as u32;
+                }
+            }
+            pane.terminal.update(cx, |terminal, cx| {
+                terminal.seed_preview_grid_for_test(grid, cx)
+            });
+        }
+    }
+
     pub(crate) fn deactivate(&mut self, cx: &mut Context<Self>) {
         self.enabled = false;
         self.cancel_resize();
@@ -654,7 +680,15 @@ impl WorkspaceWorkbench {
             return;
         }
         let requested = position / available;
-        resize.fraction = requested.clamp(0.1, 0.9);
+        // The ratio stops where the panes stop: at the geometry's minimum
+        // pane size, so the saved ratio is the one on screen.
+        let minimum = if resize.axis == LayoutAxis::Horizontal {
+            crate::workspace_geometry::MIN_PANE_WIDTH
+        } else {
+            crate::workspace_geometry::MIN_PANE_HEIGHT
+        };
+        let floor = (minimum / available).clamp(0.1, 0.5);
+        resize.fraction = requested.clamp(floor, 1.0 - floor);
         // A divider has no snap points; the ends of its travel are the only
         // thresholds a resize crosses.
         let limit = (requested != resize.fraction)
@@ -891,6 +925,27 @@ impl Render for WorkspaceWorkbench {
             .tab
             .as_ref()
             .is_some_and(|tab| matches!(tab.layout, LayoutNode::Split { .. }));
+        // A pane shell's ✕ ends its shell (⌘W). Another session's ✕ only
+        // takes it out of the layout, unless it owns shells here: the
+        // owner's pane is the tab, and the tab closes from the sidebar.
+        let (shells, owners): (HashSet<SessionId>, HashSet<SessionId>) = {
+            // The whole tree, not what shows: a zoomed owner is still one.
+            let mut all = Vec::new();
+            if let Some(tab) = &self.tab {
+                leaves(&tab.layout, &mut all);
+            }
+            let store = self.runtime.store.read().expect("store");
+            let mut shells = HashSet::new();
+            let mut owners = HashSet::new();
+            for pane in all {
+                let owner = store.pane_owner(&pane.session);
+                if owner != pane.session {
+                    shells.insert(pane.session);
+                    owners.insert(owner);
+                }
+            }
+            (shells, owners)
+        };
         for pane in &geometry.panes {
             let bounds = pane.bounds;
             // The pane whose title bar ends at the window's trailing edge.
@@ -952,7 +1007,6 @@ impl Render for WorkspaceWorkbench {
             }
             let tab = geometry.tab.clone();
             let pane_id = pane.identity.pane.clone();
-            let split_tab = tab.clone();
             let split_pane = pane_id.clone();
             let zoom_tab = tab.clone();
             let zoom_pane = pane_id.clone();
@@ -1031,13 +1085,14 @@ impl Render for WorkspaceWorkbench {
                         .cursor_pointer()
                         .child(sf_symbol("rectangle.split.2x1", 14.0, colors.secondary))
                         .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
-                        .on_click(cx.listener(move |_, _, _, cx| {
+                        .on_click(cx.listener(move |this, _, window, cx| {
                             if can_edit {
-                                cx.emit(WorkspaceWorkbenchEvent::RequestSplit {
-                                    tab: split_tab.clone(),
-                                    pane: split_pane.clone(),
-                                    edge: DockEdge::Right,
-                                });
+                                this.pending_focus = Some(split_pane.clone());
+                                this.execute_command(
+                                    PaneCommand::Split(DockEdge::Right),
+                                    window,
+                                    cx,
+                                );
                             }
                         })),
                 )
@@ -1079,32 +1134,47 @@ impl Render for WorkspaceWorkbench {
                             })),
                     )
                 })
-                .when(multiple_panes, |controls| {
-                    controls.child(
-                        div()
-                            .id(SharedString::from(format!("remove-pane-{}", pane_id.0)))
-                            .role(Role::Button)
-                            .aria_label("Remove pane from tab")
-                            .size(px(Metrics::TOOLBAR_CONTROL_SIZE))
-                            .rounded(px(Radius::BADGE))
-                            .hover(move |button| button.bg(Fill::subtle(colors)))
-                            .flex()
-                            .items_center()
-                            .justify_center()
-                            .cursor_pointer()
-                            .child(sf_symbol("xmark", 12.0, colors.secondary))
-                            .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
-                            .on_click(cx.listener(move |this, _, _, cx| {
-                                this.runtime.store.write().expect("store").edit_workspace(
-                                    WorkspaceMutation::RemovePane {
-                                        tab_id: tab.clone(),
-                                        pane_id: pane_id.clone(),
-                                    },
-                                );
-                                cx.notify();
-                            })),
-                    )
-                })
+                .when(
+                    multiple_panes && !owners.contains(&pane.identity.session),
+                    |controls| {
+                        let session = pane.identity.session.clone();
+                        let shell = shells.contains(&session);
+                        controls.child(
+                            div()
+                                .id(SharedString::from(format!("remove-pane-{}", pane_id.0)))
+                                .role(Role::Button)
+                                .aria_label(if shell {
+                                    "Close pane"
+                                } else {
+                                    "Remove pane from tab"
+                                })
+                                .size(px(Metrics::TOOLBAR_CONTROL_SIZE))
+                                .rounded(px(Radius::BADGE))
+                                .hover(move |button| button.bg(Fill::subtle(colors)))
+                                .flex()
+                                .items_center()
+                                .justify_center()
+                                .cursor_pointer()
+                                .child(sf_symbol("xmark", 12.0, colors.secondary))
+                                .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                                .on_click(cx.listener(move |this, _, _, cx| {
+                                    let mut store = this.runtime.store.write().expect("store");
+                                    if shell {
+                                        // The Engine collapses the split once the
+                                        // session is gone.
+                                        store.remove_sessions(vec![session.clone()]);
+                                    } else {
+                                        store.edit_workspace(WorkspaceMutation::RemovePane {
+                                            tab_id: tab.clone(),
+                                            pane_id: pane_id.clone(),
+                                        });
+                                    }
+                                    drop(store);
+                                    cx.notify();
+                                })),
+                        )
+                    },
+                )
                 .when(inspector_toggle, |controls| {
                     controls.child(crate::right_panel::dispatching_toggle(
                         "workspace-toggle-inspector",
@@ -1113,6 +1183,17 @@ impl Render for WorkspaceWorkbench {
                         0.0,
                     ))
                 });
+            // Unfocused panes recede a little, the way a split terminal
+            // marks where typing goes without a heavy frame.
+            if geometry.panes.len() > 1 && geometry.focused.pane != pane.identity.pane {
+                surface = surface.child(
+                    div()
+                        .debug_selector(|| "workspace-pane-dimmed".into())
+                        .absolute()
+                        .inset_0()
+                        .bg(colors.terminal_surface().alpha(0.28)),
+                );
+            }
             if geometry.panes.len() > 1 && geometry.focused.pane == pane.identity.pane {
                 surface = surface.child(
                     div()

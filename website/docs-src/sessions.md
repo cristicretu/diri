@@ -86,8 +86,8 @@ Idle agents still use memory. In **Settings → Resources**, **Hibernate idle se
 | Quote a selection into your reply | <kbd>⇧</kbd><kbd>⌘</kbd><kbd>C</kbd> |
 | Open scrollback in your editor | <kbd>⇧</kbd><kbd>⌘</kbd><kbd>E</kbd> |
 | Jump between shell prompts | <kbd>⇧</kbd><kbd>⌘</kbd><kbd>↑</kbd> / <kbd>↓</kbd> |
-| Auxiliary terminal | <kbd>⌘</kbd><kbd>J</kbd> opens a shell below the session |
-| Split panes | <kbd>⌘</kbd><kbd>D</kbd> splits right, <kbd>⌥</kbd><kbd>⇧</kbd><kbd>⌘</kbd><kbd>D</kbd> splits below |
+| Terminal pane | <kbd>⌘</kbd><kbd>J</kbd> shows or hides a shell below the focused pane |
+| Split panes | <kbd>⌘</kbd><kbd>D</kbd> splits right, <kbd>⇧</kbd><kbd>⌘</kbd><kbd>D</kbd> splits down; the tab stays one sidebar row |
 
 Links in the output open with a click, and `file:line` links open in your editor at that line (set it in **Settings → Appearance → Open file links in**). Clipboard writes from programs over OSC 52, such as Codex copying text, reach your clipboard. Themes, terminal font and line height are in **Settings → Appearance**.
 

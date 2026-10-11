@@ -1,3 +1,4 @@
+use diri_proto::SessionId;
 use diri_proto::workspace::*;
 
 pub(super) fn panes(node: &LayoutNode) -> Vec<PaneId> {
@@ -146,6 +147,80 @@ pub(super) fn repair(snapshot: &mut WorkspaceSnapshot) {
             if tab.zoomed_pane.is_some() {
                 tab.zoomed_pane = Some(tab.focused_pane.clone());
             }
+        }
+    }
+}
+
+/// How many panes sit side by side along `axis` inside `node`: a split on
+/// the same axis adds its halves, a split across it is as wide as its wider
+/// half. Equal weights give every visible column (or row) the same share.
+fn span(node: &LayoutNode, axis: LayoutAxis) -> u32 {
+    match node {
+        LayoutNode::Pane { .. } => 1,
+        LayoutNode::Split {
+            axis: split_axis,
+            first,
+            second,
+            ..
+        } => {
+            let (first, second) = (span(first, axis), span(second, axis));
+            if *split_axis == axis {
+                first + second
+            } else {
+                first.max(second)
+            }
+        }
+    }
+}
+
+/// Rebalance every divider so panes in a row or column share it equally.
+/// Returns whether any fraction moved.
+pub(super) fn equalize(node: &mut LayoutNode) -> bool {
+    let LayoutNode::Split {
+        axis,
+        fraction,
+        first,
+        second,
+        ..
+    } = node
+    else {
+        return false;
+    };
+    let (left, right) = (span(first, *axis), span(second, *axis));
+    let balanced = (left as f32 / (left + right) as f32).clamp(0.1, 0.9);
+    let moved = (*fraction - balanced).abs() > f32::EPSILON;
+    *fraction = balanced;
+    let first_moved = equalize(first);
+    let second_moved = equalize(second);
+    moved || first_moved || second_moved
+}
+
+/// Drop every pane showing `session` from a tab that keeps at least one
+/// other pane. A tab whose only pane it is stays as it was.
+pub(super) fn prune(layout: &mut LayoutNode, session: &SessionId) -> bool {
+    let mut changed = false;
+    loop {
+        let doomed = panes_of(layout, session).into_iter().next();
+        let Some(pane) = doomed else {
+            return changed;
+        };
+        let (retained, _) = take(layout.clone(), &LayoutNodeId::Pane(pane));
+        let Some(retained) = retained else {
+            return changed;
+        };
+        *layout = retained;
+        changed = true;
+    }
+}
+
+pub(super) fn panes_of(node: &LayoutNode, session: &SessionId) -> Vec<PaneId> {
+    match node {
+        LayoutNode::Pane { id, session_id } if session_id == session => vec![id.clone()],
+        LayoutNode::Pane { .. } => Vec::new(),
+        LayoutNode::Split { first, second, .. } => {
+            let mut result = panes_of(first, session);
+            result.extend(panes_of(second, session));
+            result
         }
     }
 }

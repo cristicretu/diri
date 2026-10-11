@@ -60,7 +60,10 @@ impl Sidebar {
                 .expect("store")
                 .workspace_catalog()
                 .can_edit()
-            && self.workspace_focused_session().as_ref() == Some(&session)
+            && self.workspace_focused_session().is_some_and(|focused| {
+                // A tab whose terminal pane has focus is already on screen.
+                self.store.read().expect("store").pane_owner(&focused) == session
+            })
         {
             self.workspace_nav.project_agent = None;
             cx.emit(SidebarEvent::WorkspaceTabActivated);
@@ -179,6 +182,8 @@ impl Sidebar {
         }
         if let Some(session) = self.workspace_focused_session() {
             let mut store = self.store.write().expect("store");
+            // A pane shell has no row: its tab's owner stays selected.
+            let session = store.pane_owner(&session);
             // A closing session's pane stays focused until the window moves
             // to its survivor; selecting it again would undo that move.
             if store.selected_session_id() != Some(&session) && store.is_open(&session) {

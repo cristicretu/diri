@@ -224,7 +224,42 @@ pub enum WorkspaceMutation {
         tab_id: TabId,
         pane_id: Option<PaneId>,
     },
+    /// Give every pane of the tab an equal share of its row or column.
+    /// Additive: an Engine without it rejects the unknown variant.
+    EqualizeTab {
+        tab_id: TabId,
+    },
 }
+
+/// Where `session.spawn` places a new session in a tab's split tree. It
+/// travels as the optional `pane` field of the spawn params, beside the
+/// typed [`crate::SessionSpawnParams`], so older Engines ignore it.
+///
+/// Absent, a shell spawned with a `parent` (a pane shell: `⌘J`, a split, or
+/// an Agent's MCP `shell` child) docks below its parent's pane, so the tab
+/// stays one sidebar row. The placement is recorded only once the spawn has
+/// succeeded; a failed placement never fails or repeats the spawn.
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+#[serde(
+    tag = "type",
+    rename_all = "camelCase",
+    rename_all_fields = "camelCase"
+)]
+pub enum SpawnPane {
+    /// Split `target` of `tab_id` and put the new session on `edge`.
+    Beside {
+        tab_id: TabId,
+        target: PaneId,
+        edge: DockEdge,
+    },
+    /// Below the pane that shows the session's parent.
+    BelowParent,
+    /// Not placed: a shell another surface shows (the inspector terminal).
+    Detached,
+}
+
+/// The `session.spawn` params field that carries a [`SpawnPane`].
+pub const SPAWN_PANE_FIELD: &str = "pane";
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]

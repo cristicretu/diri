@@ -14,6 +14,8 @@ use serde_json::value::RawValue;
 use crate::state_file::JsonStateFile;
 
 const KEY: &str = "workspaceState";
+/// Marker: pre-split `⌘J` terminals were moved into their tabs.
+const PANE_SHELLS_KEY: &str = "workspacePaneShells";
 
 /// Resolved under Registry once, before the workspace file transaction. The
 /// client supplies only a session identity, never a project name or location.
@@ -64,21 +66,124 @@ impl WorkspaceStore {
         sessions: &HashSet<SessionId>,
         project_agent: Option<&ProjectAgentInventory>,
     ) -> Result<WorkspaceSnapshot, ControlError> {
+        self.transact(|next| {
+            if next.revision != params.expected_revision {
+                return Err(ControlError::new(
+                    "workspace_revision_conflict",
+                    format!(
+                        "expected revision {}, current revision {}",
+                        params.expected_revision, next.revision
+                    ),
+                ));
+            }
+            mutate(next, params.mutation, sessions, project_agent)?;
+            reclaim_unavailable_tabs(next, sessions);
+            Ok(true)
+        })
+        .map(|(snapshot, _)| snapshot)
+    }
+
+    /// Records where a session that just spawned goes. Never an error the
+    /// spawn has to answer for: a parent that is placed nowhere, a full tab,
+    /// or a target that moved leaves the session unplaced (`⌘J` brings a
+    /// pane shell back). Returns the new snapshot when the layout changed.
+    pub(crate) fn place_spawned(
+        &self,
+        session: &SessionId,
+        parent: Option<&SessionId>,
+        placement: &SpawnPane,
+    ) -> Option<WorkspaceSnapshot> {
+        let result = self.transact(|next| {
+            Ok(place(next, session, parent, placement).is_ok_and(|placed| placed))
+        });
+        match result {
+            Ok((snapshot, true)) => Some(snapshot),
+            _ => None,
+        }
+    }
+
+    /// A removed session's panes leave every tab they share with another
+    /// pane, so closing a pane collapses its split instead of leaving a
+    /// "Session unavailable" hole. A one-pane tab is left to its owner.
+    pub(crate) fn prune_session(&self, session: &SessionId) -> Option<WorkspaceSnapshot> {
+        let result = self.transact(|next| {
+            let mut changed = false;
+            for tab in next.workspaces.iter_mut().flat_map(|w| &mut w.tabs) {
+                changed |= tree::prune(&mut tab.layout, session);
+            }
+            Ok(changed)
+        });
+        match result {
+            Ok((snapshot, true)) => Some(snapshot),
+            _ => None,
+        }
+    }
+
+    /// One-time move of pre-split `⌘J` terminals into their parent's tab:
+    /// `children` pairs each live pane shell with its parent, newest first.
+    /// The newest unplaced shell of each placed parent docks below it. A
+    /// marker beside the layout makes this run once; later `⌘J` toggles
+    /// decide on their own what is shown.
+    pub(crate) fn adopt_pane_shells(
+        &self,
+        children: &[(SessionId, SessionId)],
+    ) -> Option<WorkspaceSnapshot> {
+        let mut changed = None;
+        let written = self.file.update_durable(|document| {
+            if document.get(PANE_SHELLS_KEY).is_some() {
+                return Err(std::io::Error::other("already adopted"));
+            }
+            let mut next =
+                decode(document.get(KEY)).map_err(|_| std::io::Error::other("corrupt"))?;
+            let mut adopted = HashSet::new();
+            let mut any = false;
+            for (child, parent) in children {
+                if adopted.contains(parent) {
+                    continue;
+                }
+                let before = next.clone();
+                match place(&mut next, child, Some(parent), &SpawnPane::BelowParent) {
+                    Ok(true) => {
+                        tree::repair(&mut next);
+                        if validate(&next).is_ok() {
+                            adopted.insert(parent.clone());
+                            any = true;
+                        } else {
+                            next = before;
+                        }
+                    }
+                    _ => next = before,
+                }
+            }
+            if any {
+                next.revision = next
+                    .revision
+                    .checked_add(1)
+                    .ok_or_else(|| std::io::Error::other("revision"))?;
+                let encoded = serde_json::to_value(&next).map_err(std::io::Error::other)?;
+                document.insert(KEY, &encoded)?;
+                changed = Some(next);
+            }
+            document.insert(PANE_SHELLS_KEY, &1u32)?;
+            Ok(())
+        });
+        written.ok().and(changed)
+    }
+
+    /// Validation, revision bump, and atomic replacement under one lock.
+    /// `edit` returns whether it changed anything; an unchanged layout is
+    /// not rewritten and keeps its revision.
+    fn transact(
+        &self,
+        edit: impl FnOnce(&mut WorkspaceSnapshot) -> Result<bool, ControlError>,
+    ) -> Result<(WorkspaceSnapshot, bool), ControlError> {
         let mut outcome = None;
         let written = self.file.update_durable(|document| {
             let result = (|| {
                 let mut next = decode(document.get(KEY))?;
-                if next.revision != params.expected_revision {
-                    return Err(ControlError::new(
-                        "workspace_revision_conflict",
-                        format!(
-                            "expected revision {}, current revision {}",
-                            params.expected_revision, next.revision
-                        ),
-                    ));
+                if !edit(&mut next)? {
+                    return Ok((next, false));
                 }
-                mutate(&mut next, params.mutation, sessions, project_agent)?;
-                reclaim_unavailable_tabs(&mut next, sessions);
                 tree::repair(&mut next);
                 validate(&next)?;
                 next.revision = next
@@ -93,8 +198,9 @@ impl WorkspaceStore {
                 document
                     .insert(KEY, &encoded)
                     .map_err(|_| invalid("cannot encode workspace state"))?;
-                Ok(next)
+                Ok((next, true))
             })();
+            // An unchanged document is not rewritten (`Document::changed`).
             let failed = result.is_err();
             outcome = Some(result);
             if failed {
@@ -105,13 +211,85 @@ impl WorkspaceStore {
         });
         match outcome {
             Some(Err(error)) => Err(error),
-            Some(Ok(snapshot)) => {
+            Some(Ok((snapshot, changed))) => {
                 written.map_err(storage_error)?;
-                Ok(snapshot)
+                Ok((snapshot, changed))
             }
             None => Err(storage_error(written.unwrap_err())),
         }
     }
+}
+
+/// Docks `session` per `placement`. `Ok(false)`: nothing to do (already
+/// placed, detached, or the parent is placed nowhere).
+fn place(
+    state: &mut WorkspaceSnapshot,
+    session: &SessionId,
+    parent: Option<&SessionId>,
+    placement: &SpawnPane,
+) -> Result<bool, ControlError> {
+    if state
+        .workspaces
+        .iter()
+        .flat_map(|w| &w.tabs)
+        .any(|tab| !tree::panes_of(&tab.layout, session).is_empty())
+    {
+        return Ok(false);
+    }
+    let (tab_id, target, edge) = match placement {
+        SpawnPane::Detached => return Ok(false),
+        SpawnPane::Beside {
+            tab_id,
+            target,
+            edge,
+        } => (tab_id.clone(), target.clone(), *edge),
+        SpawnPane::BelowParent => {
+            let Some(parent) = parent else {
+                return Ok(false);
+            };
+            // The parent's own tab first: the selected tab of a workspace
+            // that shows it, else the first tab that places it.
+            let found = state
+                .workspaces
+                .iter()
+                .flat_map(|w| {
+                    w.tabs
+                        .iter()
+                        .map(move |tab| (w.selected_tab.as_ref() == Some(&tab.id), tab))
+                })
+                .filter_map(|(selected, tab)| {
+                    let pane = tree::panes_of(&tab.layout, parent).into_iter().next()?;
+                    Some((!selected, tab.id.clone(), pane))
+                })
+                .min_by_key(|(unselected, _, _)| *unselected);
+            let Some((_, tab_id, pane)) = found else {
+                return Ok(false);
+            };
+            (tab_id, pane, DockEdge::Bottom)
+        }
+    };
+    let tab = tab(state, &tab_id)?;
+    if tree::panes(&tab.layout).len() >= MAX_TAB_PANES {
+        return Ok(false);
+    }
+    let pane_id = PaneId(new_id("pane")?);
+    let incoming = LayoutNode::Pane {
+        id: pane_id.clone(),
+        session_id: session.clone(),
+    };
+    if !tree::dock(
+        &mut tab.layout,
+        &target,
+        &incoming,
+        edge,
+        &SplitId(new_id("split")?),
+    ) {
+        return Ok(false);
+    }
+    tab.focused_pane = pane_id;
+    // A new pane shows: zoom on another pane would hide it.
+    tab.zoomed_pane = None;
+    Ok(true)
 }
 
 fn storage_error(_: std::io::Error) -> ControlError {
@@ -703,6 +881,9 @@ fn mutate(
             }
             tab.zoomed_pane = pane_id;
         }
+        EqualizeTab { tab_id } => {
+            tree::equalize(&mut tab(state, &tab_id)?.layout);
+        }
     }
     Ok(())
 }
@@ -1157,5 +1338,248 @@ mod tests {
                 "invalid_workspace",
             );
         }
+    }
+
+    fn fractions(node: &LayoutNode, out: &mut Vec<f32>) {
+        if let LayoutNode::Split {
+            fraction,
+            first,
+            second,
+            ..
+        } = node
+        {
+            out.push(*fraction);
+            fractions(first, out);
+            fractions(second, out);
+        }
+    }
+
+    fn split_at(
+        f: &mut Fixture,
+        tab: &TabId,
+        target: &PaneId,
+        session: usize,
+        edge: DockEdge,
+    ) -> PaneId {
+        f.apply(SplitPane {
+            tab_id: tab.clone(),
+            target: target.clone(),
+            session_id: SessionId::new(format!("session_{session}")),
+            edge,
+        });
+        f.snapshot.workspaces[0].tabs[0].focused_pane.clone()
+    }
+
+    #[test]
+    fn equalize_gives_each_column_and_row_an_equal_share() {
+        let mut f = Fixture::new();
+        let workspace = f.create_workspace("Project");
+        let (tab, a) = f.create_tab(workspace, 0);
+        // A | B | C across, then C split down into C / D.
+        let b = split_at(&mut f, &tab, &a, 1, DockEdge::Right);
+        let c = split_at(&mut f, &tab, &b, 2, DockEdge::Right);
+        split_at(&mut f, &tab, &c, 3, DockEdge::Bottom);
+        let split = |f: &Fixture| match &f.snapshot.workspaces[0].tabs[0].layout {
+            LayoutNode::Split { id, .. } => id.clone(),
+            _ => panic!(),
+        };
+        f.apply(ResizeSplit {
+            tab_id: tab.clone(),
+            split_id: split(&f),
+            fraction: 0.8,
+        });
+        f.apply(EqualizeTab {
+            tab_id: tab.clone(),
+        });
+        let mut found = Vec::new();
+        fractions(&f.snapshot.workspaces[0].tabs[0].layout, &mut found);
+        // Root: A against (B | C/D), one column of three. Then B against
+        // C/D, one of two; the C/D stack splits its column in half.
+        assert_eq!(found.len(), 3);
+        assert!((found[0] - 1.0 / 3.0).abs() < 1e-6, "{found:?}");
+        assert!((found[1] - 0.5).abs() < 1e-6, "{found:?}");
+        assert!((found[2] - 0.5).abs() < 1e-6, "{found:?}");
+    }
+
+    #[test]
+    fn equalize_stays_inside_the_ratio_clamp_at_the_pane_limit() {
+        let mut f = Fixture::new();
+        let workspace = f.create_workspace("Project");
+        let (tab, mut last) = f.create_tab(workspace, 0);
+        for session in 1..MAX_TAB_PANES {
+            last = split_at(&mut f, &tab, &last, session, DockEdge::Right);
+        }
+        f.apply(EqualizeTab { tab_id: tab });
+        let mut found = Vec::new();
+        fractions(&f.snapshot.workspaces[0].tabs[0].layout, &mut found);
+        assert!(found.iter().all(|fraction| (0.1..=0.9).contains(fraction)));
+        // Eight columns: the first is one of eight, the next one of seven…
+        assert!((found[0] - 1.0 / 8.0).abs() < 1e-6, "{found:?}");
+        assert!((found[6] - 0.5).abs() < 1e-6, "{found:?}");
+    }
+
+    #[test]
+    fn spawned_pane_docks_beside_its_target_or_below_its_parent() {
+        let mut f = Fixture::new();
+        let workspace = f.create_workspace("Project");
+        let (tab, owner) = f.create_tab(workspace, 0);
+        let parent = SessionId::new("session_0");
+        // A split: right of the focused pane, and focused.
+        let placed = f
+            .store
+            .place_spawned(
+                &SessionId::new("session_1"),
+                Some(&parent),
+                &SpawnPane::Beside {
+                    tab_id: tab.clone(),
+                    target: owner.clone(),
+                    edge: DockEdge::Right,
+                },
+            )
+            .expect("placed");
+        let layout = &placed.workspaces[0].tabs[0].layout;
+        let LayoutNode::Split { axis, second, .. } = layout else {
+            panic!("split expected: {layout:?}");
+        };
+        assert_eq!(*axis, LayoutAxis::Horizontal);
+        assert!(
+            matches!(&**second, LayoutNode::Pane { session_id, .. } if session_id.0 == "session_1")
+        );
+        assert_eq!(
+            tree::panes_of(layout, &SessionId::new("session_1")),
+            vec![placed.workspaces[0].tabs[0].focused_pane.clone()]
+        );
+        // An MCP child shell: below the parent's pane.
+        let placed = f
+            .store
+            .place_spawned(
+                &SessionId::new("session_2"),
+                Some(&parent),
+                &SpawnPane::BelowParent,
+            )
+            .expect("placed");
+        assert_eq!(tree::panes(&placed.workspaces[0].tabs[0].layout).len(), 3);
+        // Placing twice, a detached shell, or a parent placed nowhere: no edit.
+        for (session, parent, placement) in [
+            ("session_2", "session_0", SpawnPane::BelowParent),
+            ("session_3", "session_0", SpawnPane::Detached),
+            ("session_4", "session_9", SpawnPane::BelowParent),
+        ] {
+            assert!(
+                f.store
+                    .place_spawned(
+                        &SessionId::new(session),
+                        Some(&SessionId::new(parent)),
+                        &placement
+                    )
+                    .is_none()
+            );
+        }
+        assert_eq!(f.store.snapshot().unwrap(), placed);
+    }
+
+    #[test]
+    fn a_full_tab_leaves_the_spawned_pane_unplaced() {
+        let mut f = Fixture::new();
+        let workspace = f.create_workspace("Project");
+        let (tab, mut last) = f.create_tab(workspace, 0);
+        for session in 1..MAX_TAB_PANES {
+            last = split_at(&mut f, &tab, &last, session, DockEdge::Right);
+        }
+        assert!(
+            f.store
+                .place_spawned(
+                    &SessionId::new("session_11"),
+                    Some(&SessionId::new("session_0")),
+                    &SpawnPane::BelowParent
+                )
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn closing_a_pane_collapses_its_parent_split_but_keeps_a_one_pane_tab() {
+        let mut f = Fixture::new();
+        let workspace = f.create_workspace("Project");
+        let (tab, a) = f.create_tab(workspace.clone(), 0);
+        let b = split_at(&mut f, &tab, &a, 1, DockEdge::Right);
+        split_at(&mut f, &tab, &b, 2, DockEdge::Bottom);
+        f.create_tab(workspace, 3);
+        let snapshot = f
+            .store
+            .prune_session(&SessionId::new("session_2"))
+            .expect("pruned");
+        // A | B again: the B/C split collapsed into B, the root kept its id.
+        let layout = &snapshot.workspaces[0].tabs[0].layout;
+        let LayoutNode::Split { first, second, .. } = layout else {
+            panic!("{layout:?}");
+        };
+        assert!(matches!(&**first, LayoutNode::Pane { id, .. } if *id == a));
+        assert!(matches!(&**second, LayoutNode::Pane { id, .. } if *id == b));
+        // Focus left the removed pane.
+        assert!(tree::panes(layout).contains(&snapshot.workspaces[0].tabs[0].focused_pane));
+        // The only pane of a tab stays: closing that tab is its owner's call.
+        assert!(
+            f.store
+                .prune_session(&SessionId::new("session_3"))
+                .is_none()
+        );
+        assert!(
+            f.store
+                .prune_session(&SessionId::new("session_7"))
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn pre_split_terminals_move_into_their_parent_tab_once() {
+        let mut f = Fixture::new();
+        let workspace = f.create_workspace("Project");
+        f.create_tab(workspace, 0);
+        let pair = |child: &str, parent: &str| (SessionId::new(child), SessionId::new(parent));
+        // Newest first: session_2 is the ⌘J terminal; session_1 an older one.
+        let adopted = f
+            .store
+            .adopt_pane_shells(&[
+                pair("session_2", "session_0"),
+                pair("session_1", "session_0"),
+                pair("session_5", "session_9"),
+            ])
+            .expect("adopted");
+        let layout = &adopted.workspaces[0].tabs[0].layout;
+        let LayoutNode::Split { axis, second, .. } = layout else {
+            panic!("{layout:?}");
+        };
+        assert_eq!(*axis, LayoutAxis::Vertical);
+        assert!(
+            matches!(&**second, LayoutNode::Pane { session_id, .. } if session_id.0 == "session_2")
+        );
+        assert_eq!(tree::panes(layout).len(), 2);
+        // Never again: a terminal hidden with ⌘J stays hidden.
+        f.store.prune_session(&SessionId::new("session_2"));
+        assert!(
+            f.store
+                .adopt_pane_shells(&[pair("session_1", "session_0")])
+                .is_none()
+        );
+        assert_eq!(
+            tree::panes(&f.store.snapshot().unwrap().workspaces[0].tabs[0].layout).len(),
+            1
+        );
+    }
+
+    #[test]
+    fn a_split_layout_survives_reopening_the_state_file() {
+        let mut f = Fixture::new();
+        let workspace = f.create_workspace("Project");
+        let (tab, a) = f.create_tab(workspace, 0);
+        let b = split_at(&mut f, &tab, &a, 1, DockEdge::Right);
+        split_at(&mut f, &tab, &b, 2, DockEdge::Bottom);
+        f.apply(ZoomPane {
+            tab_id: tab.clone(),
+            pane_id: Some(b),
+        });
+        let reopened = WorkspaceStore::new(&f.path).snapshot().unwrap();
+        assert_eq!(reopened, f.snapshot);
     }
 }

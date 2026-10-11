@@ -9,6 +9,9 @@ use diri_proto::{
 use std::collections::HashSet;
 
 pub(crate) const DIVIDER: f32 = 5.0;
+/// The narrowest and shortest a pane gets while its split has room.
+pub(crate) const MIN_PANE_WIDTH: f32 = 160.0;
+pub(crate) const MIN_PANE_HEIGHT: f32 = 100.0;
 
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub(crate) struct Rect {
@@ -242,7 +245,12 @@ fn place(
             };
             let seam = DIVIDER.min(total.max(0.0));
             let available = (total - seam).max(0.0);
-            let minimum = if horizontal { 160.0_f32 } else { 100.0 }.min(available / 2.0);
+            let minimum = if horizontal {
+                MIN_PANE_WIDTH
+            } else {
+                MIN_PANE_HEIGHT
+            }
+            .min(available / 2.0);
             let a = (available * fraction).clamp(minimum, available - minimum);
             let (left, right, divider) = if horizontal {
                 (

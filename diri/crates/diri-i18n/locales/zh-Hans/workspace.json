@@ -143,6 +143,7 @@
   "session.close.title_project": "关闭“{project}”中的所有会话？",
   "session.close.title_untitled": "关闭会话？",
   "session.close_session": "关闭会话",
+  "session.pane_count": "{count} 个窗格",
   "session.sleeping": "休眠中",
   "sidebar.a11y.not_selected": "未选中",
   "sidebar.a11y.selected": "已选中",

@@ -126,6 +126,14 @@ impl SessionStore {
     }
 
     #[cfg(test)]
+    pub(crate) fn in_flight_workspace_edit_for_test(&self) -> Option<&WorkspaceMutation> {
+        self.workspaces
+            .in_flight
+            .as_ref()
+            .map(|edit| &edit.params.mutation)
+    }
+
+    #[cfg(test)]
     pub(crate) fn finish_workspace_edit_for_test(&mut self, snapshot: WorkspaceSnapshot) {
         self.finish_workspace_request(self.workspaces.generation, true, Ok(snapshot));
     }

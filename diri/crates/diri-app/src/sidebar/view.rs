@@ -3729,6 +3729,7 @@ impl Sidebar {
             ref drag_selection,
             migrating,
             activity_state,
+            panes,
             progress,
             marked,
             hovered,
@@ -3770,6 +3771,11 @@ impl Sidebar {
             !hovered && focused && shortcut.is_some(),
         ) - if loading { 60.0 } else { 0.0 }
             - if scheduled_run.is_some() { 18.0 } else { 0.0 }
+            - if panes > 1 {
+                PANE_COUNT_WIDTH + 8.0
+            } else {
+                0.0
+            }
             - if row.has_children {
                 SIDEBAR_TRAILING_SLOT + 8.0
             } else {
@@ -4145,6 +4151,10 @@ impl Sidebar {
             .when(remote_marked, |element| {
                 // This session's agent runs on another machine.
                 element.child(remote_mark(colors))
+            })
+            .when(panes > 1, |element| {
+                // A split tab is still one row; this says how many panes.
+                element.child(pane_count_mark(&id, panes, colors))
             })
             .when_some(lineage, |element, role| {
                 element.child(lineage_glyph(&id, role, colors))
@@ -9129,6 +9139,34 @@ fn archive_count(count: usize, colors: SemanticColors) -> AnyElement {
 /// rather than the host's name: the name repeated down a whole project reads
 /// as a wall of chips, while one small server mark says "not this machine"
 /// without competing with the titles.
+const PANE_COUNT_WIDTH: f32 = 24.0;
+
+/// A split tab's pane count: a quiet two-column glyph and the number.
+fn pane_count_mark(id: &SessionId, panes: usize, colors: SemanticColors) -> AnyElement {
+    div()
+        .debug_selector({
+            let id = id.clone();
+            move || format!("session-panes:{}", id.0)
+        })
+        .id(format!("session-panes:{}", id.0))
+        .role(Role::Image)
+        .aria_label(tf("session.pane_count", &[("count", &panes)]))
+        .flex_none()
+        .w(px(PANE_COUNT_WIDTH))
+        .flex()
+        .items_center()
+        .justify_end()
+        .gap(px(2.0))
+        .child(sf_symbol("rectangle.split.2x1", 9.0, colors.tertiary))
+        .child(
+            div()
+                .text_size(px(Typo::META.size))
+                .text_color(colors.tertiary)
+                .child(panes.to_string()),
+        )
+        .into_any_element()
+}
+
 fn remote_mark(colors: SemanticColors) -> AnyElement {
     div()
         .debug_selector(|| "remote-mark".to_owned())

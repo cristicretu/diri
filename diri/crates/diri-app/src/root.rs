@@ -34,6 +34,8 @@ mod workspace_palette_tests;
 mod gesture_acceptance_tests;
 #[cfg(all(test, target_os = "macos"))]
 mod gesture_schedule_profile;
+#[cfg(all(test, target_os = "macos"))]
+mod split_pane_tests;
 
 use std::collections::HashSet;
 use std::sync::Arc;
@@ -2378,8 +2380,8 @@ impl RootView {
     /// context. This is the only place that translates static commands into
     /// mutations of RootView's child modules.
     fn run_command(&mut self, command: CommandId, window: &mut Window, cx: &mut Context<Self>) {
-        if let Some(command) = crate::workspace_workbench::PaneCommand::from_id(command) {
-            if (self.sidebar.read(cx).workspace_menu_is_open()
+        if let Some(pane) = crate::workspace_workbench::PaneCommand::from_id(command) {
+            let blocked = (self.sidebar.read(cx).workspace_menu_is_open()
                 || self.sidebar.read(cx).project_picker_active())
                 || self.launcher.read(cx).is_open()
                 || self
@@ -2395,17 +2397,32 @@ impl RootView {
                     .as_ref()
                     .is_some_and(|view| view.read(cx).tab_peek_visible())
                 || (self.launches_expanded && self.launches_focus.contains_focused(window, cx))
-                || self.quote_target_picker.is_some()
-            {
+                || self.quote_target_picker.is_some();
+            let handled = !blocked
+                && self.active_workspace.is_some()
+                && self.workspace_workbench.clone().is_some_and(|workbench| {
+                    workbench.update(cx, |workbench, cx| {
+                        workbench.execute_command(pane, window, cx)
+                    })
+                });
+            if handled {
                 return;
             }
-            if self.active_workspace.is_some()
-                && let Some(workbench) = &self.workspace_workbench
-            {
-                workbench.update(cx, |workbench, cx| {
-                    workbench.execute_command(command, window, cx)
-                });
-            } else {
+            // ⌥⌘arrows and ⌘[ / ⌘] move between sessions wherever there is
+            // no second pane to move to, as they did before splits.
+            if let Some(forward) = pane.session_fallback() {
+                self.run_command(
+                    if forward {
+                        CommandId::SelectNextSession
+                    } else {
+                        CommandId::SelectPreviousSession
+                    },
+                    window,
+                    cx,
+                );
+                return;
+            }
+            if !blocked && self.active_workspace.is_none() {
                 self.show_feedback(
                     "workspace",
                     Toast::info(crate::i18n::t("toast.workspace_open_to_arrange")),
@@ -2607,6 +2624,17 @@ impl RootView {
                 }
             }
             CommandId::ToggleAuxiliaryTerminal => {
+                // A tab's terminal is a pane of its split tree. The inspector
+                // terminal and the pre-split lower pane remain for windows
+                // without a layout.
+                if self.active_workspace.is_some()
+                    && !self.preview
+                    && let Some(workbench) = self.workspace_workbench.clone()
+                    && workbench
+                        .update(cx, |workbench, cx| workbench.toggle_bottom_pane(window, cx))
+                {
+                    return;
+                }
                 self.open_auxiliary_terminal(window, cx);
             }
             CommandId::QuoteSelection => self.quote_selection(false, window, cx),
@@ -3338,6 +3366,26 @@ impl RootView {
             })
         });
         if closed_workspace {
+            return;
+        }
+        // ⌘W in a split tab closes the focused pane: its shell ends and the
+        // Engine collapses the split. The owner's pane is the tab itself.
+        let pane = self
+            .active_workspace
+            .as_ref()
+            .and(self.workspace_workbench.as_ref())
+            .filter(|workbench| {
+                workbench
+                    .read(cx)
+                    .focused_terminal()
+                    .is_some_and(|terminal| terminal.read(cx).is_focused(window))
+            })
+            .and_then(|workbench| workbench.read(cx).closable_pane_session());
+        if let Some(pane) = pane {
+            self.window_store
+                .write()
+                .expect("session store lock poisoned")
+                .remove_sessions(vec![pane]);
             return;
         }
         let closed = self
@@ -5297,6 +5345,26 @@ impl Render for RootView {
             .on_action(
                 cx.listener(|this, _: &crate::commands::SplitPaneBelow, window, cx| {
                     this.run_command(CommandId::SplitPaneBelow, window, cx);
+                }),
+            )
+            .on_action(
+                cx.listener(|this, _: &crate::commands::FocusPreviousPane, window, cx| {
+                    this.run_command(CommandId::FocusPreviousPane, window, cx);
+                }),
+            )
+            .on_action(
+                cx.listener(|this, _: &crate::commands::FocusNextPane, window, cx| {
+                    this.run_command(CommandId::FocusNextPane, window, cx);
+                }),
+            )
+            .on_action(cx.listener(
+                |this, _: &crate::commands::SplitPaneWithSession, window, cx| {
+                    this.run_command(CommandId::SplitPaneWithSession, window, cx);
+                },
+            ))
+            .on_action(
+                cx.listener(|this, _: &crate::commands::EqualizePanes, window, cx| {
+                    this.run_command(CommandId::EqualizePanes, window, cx);
                 }),
             )
             .on_action(
@@ -11468,7 +11536,7 @@ mod tests {
             cx.notify();
         });
         cx.run_until_parked();
-        cx.simulate_keystrokes(&commands::test_chords("cmd-shift-d"));
+        cx.simulate_keystrokes(&commands::test_chords("cmd-alt-i"));
         cx.run_until_parked();
         assert!(
             root.read_with(cx, |root, _| root.inspector_open),

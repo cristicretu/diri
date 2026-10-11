@@ -1,11 +1,18 @@
 //! Keyboard operations project the saved tree and submit typed Engine mutations.
 use super::*;
 use crate::commands::CommandId;
+use diri_proto::workspace::SpawnPane;
 
 #[derive(Clone, Copy, Debug)]
 pub(crate) enum PaneCommand {
     Focus(DockEdge),
+    /// ⌘[ / ⌘]: the previous or next pane in reading order, wrapping.
+    Cycle(bool),
+    /// A new shell pane on this side of the focused pane.
     Split(DockEdge),
+    /// The old split: choose an existing session for the new pane.
+    SplitWithSession(DockEdge),
+    Equalize,
     Zoom,
     Remove,
     Resize(LayoutAxis, bool),
@@ -21,6 +28,10 @@ impl PaneCommand {
             CommandId::FocusPaneDown => Self::Focus(DockEdge::Bottom),
             CommandId::SplitPaneRight => Self::Split(DockEdge::Right),
             CommandId::SplitPaneBelow => Self::Split(DockEdge::Bottom),
+            CommandId::FocusPreviousPane => Self::Cycle(false),
+            CommandId::FocusNextPane => Self::Cycle(true),
+            CommandId::SplitPaneWithSession => Self::SplitWithSession(DockEdge::Right),
+            CommandId::EqualizePanes => Self::Equalize,
             CommandId::TogglePaneZoom => Self::Zoom,
             CommandId::RemoveFocusedPane => Self::Remove,
             CommandId::PaneGrowWidth => Self::Resize(LayoutAxis::Horizontal, true),
@@ -38,6 +49,34 @@ impl PaneCommand {
             _ => return None,
         })
     }
+}
+
+impl PaneCommand {
+    /// Pane navigation that, in a one-pane tab, moves between sessions
+    /// instead: ⌥⌘arrows and ⌘[ / ⌘] keep their old meaning there.
+    pub(crate) fn session_fallback(self) -> Option<bool> {
+        match self {
+            Self::Focus(DockEdge::Left | DockEdge::Top) | Self::Cycle(false) => Some(false),
+            Self::Focus(DockEdge::Right | DockEdge::Bottom) | Self::Cycle(true) => Some(true),
+            _ => None,
+        }
+    }
+}
+
+/// The pane after (or before) `focused` in reading order, wrapping.
+pub(super) fn cycle(node: &LayoutNode, focused: &PaneId, forward: bool) -> Option<PaneId> {
+    let mut panes = Vec::new();
+    leaves(node, &mut panes);
+    if panes.len() < 2 {
+        return None;
+    }
+    let index = panes.iter().position(|pane| &pane.pane == focused)?;
+    let next = if forward {
+        (index + 1) % panes.len()
+    } else {
+        (index + panes.len() - 1) % panes.len()
+    };
+    Some(panes[next].pane.clone())
 }
 
 pub(super) fn contains_pane(node: &LayoutNode, pane: &PaneId) -> bool {
@@ -129,21 +168,27 @@ fn resize_ancestor(
 }
 
 impl WorkspaceWorkbench {
+    /// Runs a pane command against the tab on screen. False when there was
+    /// nothing for it to act on, so the caller can fall back (pane focus in
+    /// a one-pane tab moves between sessions instead).
     pub(crate) fn execute_command(
         &mut self,
         command: PaneCommand,
         window: &mut Window,
         cx: &mut Context<Self>,
-    ) {
+    ) -> bool {
         if !self.enabled {
-            return;
+            return false;
         }
         let Some(mut tab) = self.tab.clone() else {
-            return;
+            return false;
         };
         let Some(focused) = self.focused_id().cloned() else {
-            return;
+            return false;
         };
+        if command.session_fallback().is_some() && !matches!(tab.layout, LayoutNode::Split { .. }) {
+            return false;
+        }
         // Neighbor navigation uses the complete saved tree even while zoomed.
         tab.focused_pane = focused.clone();
         tab.zoomed_pane = None;
@@ -155,16 +200,19 @@ impl WorkspaceWorkbench {
                 ..Default::default()
             },
         ) else {
-            return;
+            return false;
         };
-        if let PaneCommand::Focus(edge) = command {
-            if let Some(next) = nearest(&geometry, edge) {
-                self.pending_focus = Some(next);
-                self.flush_focus();
-                self.focus(window, cx);
-                cx.notify();
+        let target = match command {
+            PaneCommand::Focus(edge) => Some(nearest(&geometry, edge)),
+            PaneCommand::Cycle(forward) => Some(cycle(&tab.layout, &focused, forward)),
+            _ => None,
+        };
+        if let Some(target) = target {
+            if let Some(next) = target {
+                self.focus_pane(next, window, cx);
             }
-            return;
+            // A multi-pane tab keeps the keys at its edges: no session jump.
+            return true;
         }
         if !self
             .runtime
@@ -175,25 +223,46 @@ impl WorkspaceWorkbench {
             .can_edit()
             || self.resize.is_some()
         {
-            return;
+            return true;
         }
-        if let PaneCommand::Split(edge) = command {
+        if let PaneCommand::SplitWithSession(edge) = command {
             cx.emit(WorkspaceWorkbenchEvent::RequestSplit {
                 tab: tab.id,
                 pane: focused,
                 edge,
             });
-            return;
+            return true;
+        }
+        if let PaneCommand::Split(edge) = command {
+            let Some(source) = pane_session(&tab.layout, &focused) else {
+                return true;
+            };
+            self.runtime.store.write().expect("store").spawn_pane_shell(
+                &source,
+                SpawnPane::Beside {
+                    tab_id: tab.id,
+                    target: focused,
+                    edge,
+                },
+            );
+            return true;
         }
         let mutation = match command {
-            PaneCommand::Zoom => WorkspaceMutation::ZoomPane {
-                tab_id: tab.id,
-                pane_id: self
-                    .tab
-                    .as_ref()
-                    .is_some_and(|tab| tab.zoomed_pane.is_none())
-                    .then_some(focused),
-            },
+            PaneCommand::Zoom => {
+                // Zoom needs company: one pane already fills the tab.
+                if !matches!(tab.layout, LayoutNode::Split { .. }) {
+                    return true;
+                }
+                WorkspaceMutation::ZoomPane {
+                    tab_id: tab.id,
+                    pane_id: self
+                        .tab
+                        .as_ref()
+                        .is_some_and(|tab| tab.zoomed_pane.is_none())
+                        .then_some(focused),
+                }
+            }
+            PaneCommand::Equalize => WorkspaceMutation::EqualizeTab { tab_id: tab.id },
             PaneCommand::Remove => WorkspaceMutation::RemovePane {
                 tab_id: tab.id,
                 pane_id: focused,
@@ -201,7 +270,7 @@ impl WorkspaceWorkbench {
             PaneCommand::Resize(axis, grow) => {
                 let Some((split_id, fraction)) = resize_ancestor(&tab.layout, &focused, axis, grow)
                 else {
-                    return;
+                    return true;
                 };
                 WorkspaceMutation::ResizeSplit {
                     tab_id: tab.id,
@@ -211,7 +280,7 @@ impl WorkspaceWorkbench {
             }
             PaneCommand::Swap(edge) => {
                 let Some(target) = nearest(&geometry, edge) else {
-                    return;
+                    return true;
                 };
                 WorkspaceMutation::SwapPanes {
                     first_tab: tab.id.clone(),
@@ -222,7 +291,7 @@ impl WorkspaceWorkbench {
             }
             PaneCommand::Move(edge) => {
                 let Some(target) = nearest(&geometry, edge) else {
-                    return;
+                    return true;
                 };
                 WorkspaceMutation::MoveNode {
                     source_tab: tab.id.clone(),
@@ -232,7 +301,10 @@ impl WorkspaceWorkbench {
                     edge,
                 }
             }
-            PaneCommand::Focus(_) | PaneCommand::Split(_) => return,
+            PaneCommand::Focus(_)
+            | PaneCommand::Cycle(_)
+            | PaneCommand::Split(_)
+            | PaneCommand::SplitWithSession(_) => return true,
         };
         self.runtime
             .store
@@ -240,6 +312,119 @@ impl WorkspaceWorkbench {
             .expect("store")
             .edit_workspace(mutation);
         cx.notify();
+        true
+    }
+
+    fn focus_pane(&mut self, pane: PaneId, window: &mut Window, cx: &mut Context<Self>) {
+        self.pending_focus = Some(pane);
+        self.flush_focus();
+        self.focus(window, cx);
+        cx.notify();
+    }
+
+    /// ⌘J: hide the focused pane shell (it keeps running), or show the
+    /// tab owner's hidden one below the focused pane, or start a new one
+    /// there. Never touches the inspector terminal.
+    pub(crate) fn toggle_bottom_pane(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        let _ = window;
+        if !self.enabled {
+            return false;
+        }
+        let (Some(tab), Some(focused)) = (self.tab.clone(), self.focused_id().cloned()) else {
+            return false;
+        };
+        let Some(source) = pane_session(&tab.layout, &focused) else {
+            return false;
+        };
+        let mut store = self.runtime.store.write().expect("store");
+        if !store.workspace_catalog().can_edit() {
+            return true;
+        }
+        let owner = store.pane_owner(&source);
+        let multiple = matches!(tab.layout, LayoutNode::Split { .. });
+        let below = below_sibling(&tab.layout, &focused)
+            .filter(|(_, session)| store.pane_owner(session) != *session);
+        if owner != source && multiple {
+            store.edit_workspace(WorkspaceMutation::RemovePane {
+                tab_id: tab.id,
+                pane_id: focused,
+            });
+        } else if let Some((pane, _)) = below {
+            // The terminal docked right below this pane: ⌘J hides it again.
+            store.edit_workspace(WorkspaceMutation::RemovePane {
+                tab_id: tab.id,
+                pane_id: pane,
+            });
+        } else if let Some(hidden) = store.hidden_pane_shell(&owner) {
+            store.edit_workspace(WorkspaceMutation::SplitPane {
+                tab_id: tab.id,
+                target: focused,
+                session_id: hidden,
+                edge: DockEdge::Bottom,
+            });
+        } else {
+            store.spawn_pane_shell(
+                &source,
+                SpawnPane::Beside {
+                    tab_id: tab.id,
+                    target: focused,
+                    edge: DockEdge::Bottom,
+                },
+            );
+        }
+        drop(store);
+        cx.notify();
+        true
+    }
+
+    /// The pane ⌘W closes: the focused pane's session when it is a pane
+    /// shell sharing the tab. None closes the whole tab, as before: the
+    /// owner's pane is the tab.
+    pub(crate) fn closable_pane_session(&self) -> Option<SessionId> {
+        if !self.enabled {
+            return None;
+        }
+        let tab = self.tab.as_ref()?;
+        if !matches!(tab.layout, LayoutNode::Split { .. }) {
+            return None;
+        }
+        let session = pane_session(&tab.layout, self.focused_id()?)?;
+        let store = self.runtime.store.read().expect("store");
+        (store.pane_owner(&session) != session).then_some(session)
+    }
+}
+
+/// The single pane docked directly below `pane`: its split partner when
+/// they share a top-over-bottom split with `pane` on top.
+pub(super) fn below_sibling(node: &LayoutNode, pane: &PaneId) -> Option<(PaneId, SessionId)> {
+    let LayoutNode::Split {
+        axis,
+        first,
+        second,
+        ..
+    } = node
+    else {
+        return None;
+    };
+    if *axis == LayoutAxis::Vertical
+        && matches!(&**first, LayoutNode::Pane { id, .. } if id == pane)
+        && let LayoutNode::Pane { id, session_id } = &**second
+    {
+        return Some((id.clone(), session_id.clone()));
+    }
+    below_sibling(first, pane).or_else(|| below_sibling(second, pane))
+}
+
+pub(super) fn pane_session(node: &LayoutNode, pane: &PaneId) -> Option<SessionId> {
+    match node {
+        LayoutNode::Pane { id, session_id } => (id == pane).then(|| session_id.clone()),
+        LayoutNode::Split { first, second, .. } => {
+            pane_session(first, pane).or_else(|| pane_session(second, pane))
+        }
     }
 }
 
@@ -342,5 +527,89 @@ mod tests {
             resize_ancestor(&tree, &PaneId::new("missing"), LayoutAxis::Horizontal, true),
             None
         );
+    }
+
+    #[test]
+    fn pane_cycle_walks_reading_order_and_wraps() {
+        let tree = split(
+            "outer",
+            LayoutAxis::Horizontal,
+            0.5,
+            leaf("a"),
+            split("right", LayoutAxis::Vertical, 0.5, leaf("b"), leaf("c")),
+        );
+        let next = |from: &str, forward| cycle(&tree, &PaneId::new(from), forward);
+        assert_eq!(next("a", true), Some(PaneId::new("b")));
+        assert_eq!(next("c", true), Some(PaneId::new("a")));
+        assert_eq!(next("a", false), Some(PaneId::new("c")));
+        assert_eq!(cycle(&leaf("a"), &PaneId::new("a"), true), None);
+    }
+
+    #[test]
+    fn only_navigation_falls_back_to_sessions() {
+        assert_eq!(
+            PaneCommand::Focus(DockEdge::Left).session_fallback(),
+            Some(false)
+        );
+        assert_eq!(
+            PaneCommand::Focus(DockEdge::Top).session_fallback(),
+            Some(false)
+        );
+        assert_eq!(
+            PaneCommand::Focus(DockEdge::Right).session_fallback(),
+            Some(true)
+        );
+        assert_eq!(PaneCommand::Cycle(true).session_fallback(), Some(true));
+        assert_eq!(PaneCommand::Cycle(false).session_fallback(), Some(false));
+        assert_eq!(PaneCommand::Split(DockEdge::Right).session_fallback(), None);
+        assert_eq!(PaneCommand::Zoom.session_fallback(), None);
+    }
+
+    #[test]
+    fn the_terminal_below_is_a_pane_directly_under_the_focused_one() {
+        let tree = split(
+            "outer",
+            LayoutAxis::Horizontal,
+            0.5,
+            split(
+                "left",
+                LayoutAxis::Vertical,
+                0.6,
+                leaf("agent"),
+                leaf("shell"),
+            ),
+            leaf("side"),
+        );
+        assert_eq!(
+            below_sibling(&tree, &PaneId::new("agent")),
+            Some((PaneId::new("shell"), SessionId::new("shell")))
+        );
+        // Beside, or above: not "below".
+        assert_eq!(below_sibling(&tree, &PaneId::new("side")), None);
+        assert_eq!(below_sibling(&tree, &PaneId::new("shell")), None);
+        assert_eq!(
+            pane_session(&tree, &PaneId::new("side")),
+            Some(SessionId::new("side"))
+        );
+    }
+
+    #[test]
+    fn split_commands_map_to_shells_and_the_old_picker_stays_in_the_palette() {
+        assert!(matches!(
+            PaneCommand::from_id(CommandId::SplitPaneRight),
+            Some(PaneCommand::Split(DockEdge::Right))
+        ));
+        assert!(matches!(
+            PaneCommand::from_id(CommandId::SplitPaneBelow),
+            Some(PaneCommand::Split(DockEdge::Bottom))
+        ));
+        assert!(matches!(
+            PaneCommand::from_id(CommandId::SplitPaneWithSession),
+            Some(PaneCommand::SplitWithSession(DockEdge::Right))
+        ));
+        assert!(matches!(
+            PaneCommand::from_id(CommandId::EqualizePanes),
+            Some(PaneCommand::Equalize)
+        ));
     }
 }

@@ -143,6 +143,7 @@
   "session.close.title_project": "Close all sessions in “{project}”?",
   "session.close.title_untitled": "Close session?",
   "session.close_session": "Close session",
+  "session.pane_count": "{count} panes",
   "session.sleeping": "Sleeping",
   "sidebar.a11y.not_selected": "Not selected",
   "sidebar.a11y.selected": "Selected",
