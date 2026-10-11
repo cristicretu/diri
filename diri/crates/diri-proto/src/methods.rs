@@ -517,6 +517,12 @@ pub struct SessionSpawnParams {
     /// leaves that question to the user.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub appearance: Option<TerminalAppearance>,
+    /// What a binary-free kind (a `shell` terminal) runs instead of the login
+    /// shell: one structured argv, exec'd directly in the PTY, never joined
+    /// into a shell command. The Engine validates it before any side effect.
+    /// Absent keeps the manifest's launch.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub argv: Option<Vec<String>>,
 }
 
 /// The light or dark family of the terminal theme a Session is shown in.

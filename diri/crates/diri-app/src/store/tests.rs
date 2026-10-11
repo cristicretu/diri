@@ -4096,3 +4096,53 @@ fn a_user_rename_outlives_its_tab_for_history() {
         Some("Billing refactor")
     );
 }
+
+#[test]
+fn an_opened_link_runs_its_argv_in_a_local_terminal_even_with_a_remote_default() {
+    let (mut store, mut effects) = hydrated(
+        vec![session("local", "p", 1.0)],
+        vec![project("p", "P")],
+        Prefs {
+            default_spawn_host: Some("forge".into()),
+            ..Prefs::default()
+        },
+    );
+    drain(&mut effects);
+
+    // What `RootView::open_external` sends for `ssh://me@host`.
+    store.spawn_shell(super::SpawnOptions {
+        cwd: Some("/Users/me".into()),
+        title: Some("ssh me@host".into()),
+        argv: Some(vec![
+            "/usr/bin/ssh".into(),
+            "-l".into(),
+            "me".into(),
+            "--".into(),
+            "host".into(),
+        ]),
+        ..super::SpawnOptions::default()
+    });
+
+    let params = match effects.try_recv() {
+        Ok(StoreEffect::Spawn(params)) => params,
+        other => panic!("expected spawn effect, got {other:?}"),
+    };
+    assert_eq!(params.kind, AgentKind::SHELL);
+    assert_eq!(params.host, None, "a link names a program on this Mac");
+    assert_eq!(params.cwd, "/Users/me");
+    assert_eq!(params.initial_prompt, None, "nothing is typed into a shell");
+    assert_eq!(
+        params.argv.as_deref(),
+        Some(&["/usr/bin/ssh", "-l", "me", "--", "host"].map(String::from)[..])
+    );
+}
+
+#[test]
+fn an_unopenable_link_is_reported_without_spawning() {
+    let (mut store, mut effects) = SessionStore::headless(Prefs::default());
+    store.report_open_failure("bad host".into());
+    let failure = store.action_failure().expect("failure shown");
+    assert_eq!(failure.detail, "bad host");
+    assert!(!failure.can_retry());
+    assert!(!matches!(effects.try_recv(), Ok(StoreEffect::Spawn(_))));
+}

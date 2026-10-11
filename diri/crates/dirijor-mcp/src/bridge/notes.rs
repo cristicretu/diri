@@ -68,6 +68,7 @@ impl Bridge {
             same_repo_as: None,
             start_directory: None,
             note_id: None,
+            argv: None,
         };
         let params = serde_json::to_value(params).map_err(|e| e.to_string())?;
         let mut client = match self.connect(NOTE_SPAWN_TIMEOUT) {

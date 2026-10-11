@@ -527,6 +527,12 @@ pub struct UtilitySurfaces {
     /// an XPC round trip to launchd that has taken seconds, so it never runs
     /// on the UI thread; the toggle ignores clicks until it lands.
     login_item_task: Option<Task<()>>,
+    default_terminal: crate::default_terminal::DefaultTerminal,
+    /// Whether Launch Services sends `ssh://` links and `.command` files to
+    /// diri, as last read when Settings opened.
+    default_terminal_state: crate::default_terminal::DefaultTerminalState,
+    /// A Launch Services read or change in flight off the UI thread.
+    default_terminal_task: Option<Task<()>>,
     store: crate::store::WindowStore,
     store_runtime: Arc<StoreRuntime>,
     runtime: Arc<Runtime>,
@@ -750,6 +756,9 @@ impl UtilitySurfaces {
             prefs,
             login_item,
             login_item_task: None,
+            default_terminal: crate::default_terminal::DefaultTerminal::system(),
+            default_terminal_state: crate::default_terminal::DefaultTerminalState::UNKNOWN,
+            default_terminal_task: None,
             store: crate::store::WindowStore::from_canonical(Arc::clone(&store_runtime.store)),
             store_runtime,
             runtime,
@@ -1046,6 +1055,38 @@ impl UtilitySurfaces {
             let _ = this.update(cx, |this, cx| {
                 this.login_item_task = None;
                 this.apply_login_item_state(state);
+                cx.notify();
+            });
+        }));
+    }
+
+    /// Reads which app opens `ssh://` links and `.command` files, off the UI
+    /// thread. Reading never changes anything.
+    fn refresh_default_terminal(&mut self, cx: &mut Context<Self>) {
+        let terminal = self.default_terminal.clone();
+        self.run_default_terminal(cx, move || terminal.observe());
+    }
+
+    /// The Settings button, and the only caller that changes the default.
+    fn make_default_terminal(&mut self, cx: &mut Context<Self>) {
+        if !self.default_terminal_state.can_make_default() || self.default_terminal_task.is_some() {
+            return;
+        }
+        let terminal = self.default_terminal.clone();
+        self.run_default_terminal(cx, move || terminal.make_default());
+    }
+
+    fn run_default_terminal(
+        &mut self,
+        cx: &mut Context<Self>,
+        call: impl FnOnce() -> crate::default_terminal::DefaultTerminalState + Send + 'static,
+    ) {
+        let answer = cx.background_executor().spawn(async move { call() });
+        self.default_terminal_task = Some(cx.spawn(async move |this, cx| {
+            let state = answer.await;
+            let _ = this.update(cx, |this, cx| {
+                this.default_terminal_task = None;
+                this.default_terminal_state = state;
                 cx.notify();
             });
         }));
@@ -1813,6 +1854,7 @@ impl UtilitySurfaces {
             .preferences()
             .clone();
         self.refresh_login_item(cx);
+        self.refresh_default_terminal(cx);
         self.surface = Surface::Settings;
         self.settings_scroll.set_offset(point(px(0.0), px(0.0)));
         self.settings_search.clear();
@@ -5354,7 +5396,15 @@ impl UtilitySurfaces {
                                 });
                                 cx.notify();
                             },
-                        )),
+                        ))
+                        .when(cfg!(target_os = "macos"), |rows| {
+                            rows.child(appearance_divider(colors))
+                                .child(default_terminal_row(
+                                    self.default_terminal_state,
+                                    colors,
+                                    cx,
+                                ))
+                        }),
                 ),
             colors,
         )
@@ -6973,6 +7023,66 @@ fn login_item_row(
         )
 }
 
+/// "Default terminal": what Launch Services reports, and a button that asks
+/// it to send diri the links and files. Nothing changes without that click.
+fn default_terminal_row(
+    state: crate::default_terminal::DefaultTerminalState,
+    colors: SemanticColors,
+    cx: &mut Context<UtilitySurfaces>,
+) -> impl IntoElement {
+    div()
+        .id("default-terminal")
+        .debug_selector(|| "default-terminal".into())
+        .min_h(px(SETTINGS_ROW_HEIGHT))
+        .px(px(12.0))
+        .flex()
+        .items_center()
+        .justify_between()
+        .gap(px(12.0))
+        .child(
+            div()
+                .flex_1()
+                .min_w(px(0.0))
+                .flex()
+                .flex_col()
+                .gap(px(2.0))
+                .child(
+                    div()
+                        .min_w(px(0.0))
+                        .w_full()
+                        .whitespace_normal()
+                        .text_size(px(Typo::ROW_EMPHASIZED.size))
+                        .font_weight(Typo::ROW_EMPHASIZED.weight)
+                        .text_color(colors.primary)
+                        .child(t("default_terminal.title")),
+                )
+                .child(
+                    div()
+                        .debug_selector(|| "default-terminal-detail".into())
+                        .min_w(px(0.0))
+                        .w_full()
+                        .whitespace_normal()
+                        .text_size(px(Typo::META.size))
+                        .line_height(px(14.0))
+                        .text_color(if state.failed() {
+                            Ink::DANGER
+                        } else {
+                            colors.tertiary
+                        })
+                        .child(wrappable_setting_copy(state.detail().into())),
+                ),
+        )
+        .when(state.can_make_default(), |row| {
+            row.child(surface_button(
+                t("default_terminal.make_default"),
+                "make-default-terminal",
+                colors,
+                cx,
+                |this, cx| this.make_default_terminal(cx),
+            ))
+        })
+}
+
 fn setting_section(
     title: &'static str,
     content: impl IntoElement,
@@ -8565,6 +8675,47 @@ mod tests {
                 window.refresh();
             })
             .expect("scroll to privacy settings");
+            cx.run_until_parked();
+        }
+        // `DIRI_VISUAL_DEFAULT_TERMINAL=default|not-default|failed` seeds
+        // Settings > Terminal > Default terminal (tests never ask Launch
+        // Services) and scrolls to it at the bottom of the page.
+        if let Ok(seed) = std::env::var("DIRI_VISUAL_DEFAULT_TERMINAL") {
+            use crate::default_terminal::{DefaultTerminalState, DefaultTerminalStatus};
+            let state = DefaultTerminalState {
+                status: if seed == "default" {
+                    DefaultTerminalStatus::Default
+                } else {
+                    DefaultTerminalStatus::NotDefault
+                },
+                failure: (seed == "failed").then_some(-54),
+            };
+            cx.update_window(window.into(), |root, window, cx| {
+                let harness = root
+                    .downcast::<SettingsWorkbenchHarness>()
+                    .expect("harness");
+                let surfaces = harness.read(cx).surfaces.clone();
+                surfaces.update(cx, |surfaces, cx| {
+                    surfaces.default_terminal_task = None;
+                    surfaces.default_terminal_state = state;
+                    cx.notify();
+                });
+                window.refresh();
+            })
+            .expect("seed default terminal");
+            cx.run_until_parked();
+            cx.update_window(window.into(), |root, window, cx| {
+                let harness = root
+                    .downcast::<SettingsWorkbenchHarness>()
+                    .expect("harness");
+                let surfaces = harness.read(cx).surfaces.clone();
+                surfaces.update(cx, |surfaces, _| {
+                    let bottom = surfaces.settings_scroll.max_offset().y;
+                    surfaces.settings_scroll.set_offset(point(px(0.0), -bottom));
+                });
+                window.refresh();
+            })
+            .expect("scroll to default terminal");
             cx.run_until_parked();
         }
         if std::env::var("DIRI_VISUAL_SETTINGS_TAB").as_deref() == Ok("whats-new") {

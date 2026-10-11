@@ -2712,6 +2712,43 @@ impl RootView {
         true
     }
 
+    /// A link or file macOS handed diri as the default terminal: a new local
+    /// terminal running its argv, or the reason it will not run.
+    pub(crate) fn open_external(
+        &mut self,
+        request: Result<crate::open_handler::OpenRequest, crate::open_handler::OpenError>,
+        cx: &mut Context<Self>,
+    ) {
+        if self.preview {
+            return;
+        }
+        let workspace_target = self.workspace_spawn_target();
+        let mut store = self
+            .window_store
+            .write()
+            .expect("session store lock poisoned");
+        match request {
+            Ok(request) => {
+                // An explicit directory keeps it local: a link names a program
+                // on this Mac, never one on the default remote host.
+                let cwd = request
+                    .cwd
+                    .or_else(|| std::env::var_os("HOME").map(std::path::PathBuf::from))
+                    .unwrap_or_else(|| std::path::PathBuf::from("/"));
+                store.spawn_shell(SpawnOptions {
+                    workspace_target,
+                    cwd: Some(cwd.to_string_lossy().into_owned()),
+                    title: Some(request.title),
+                    argv: Some(request.argv),
+                    ..SpawnOptions::default()
+                });
+            }
+            Err(error) => store.report_open_failure(error.detail()),
+        }
+        drop(store);
+        cx.notify();
+    }
+
     /// ⌥⌘N: a note Session in the current project, created like ⌘T creates
     /// a terminal. The Engine writes the note's file and the spawn reply
     /// selects it.

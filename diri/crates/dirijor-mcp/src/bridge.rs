@@ -268,6 +268,7 @@ impl Bridge {
             same_repo_as: None,
             start_directory: None,
             note_id: None,
+            argv: None,
         };
         let params = serde_json::to_value(params).map_err(|error| error.to_string())?;
         if !tracked {

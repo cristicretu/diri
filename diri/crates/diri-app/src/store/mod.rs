@@ -356,6 +356,9 @@ pub struct SpawnOptions {
     /// the SAME repository as this session on the target host (matched by
     /// origin URL), falling back to `cwd` / defaultCwd when not cloned there.
     pub same_repo_as: Option<SessionId>,
+    /// A terminal that runs this argv instead of the login shell (an `ssh://`
+    /// link, a man page, an opened `.command` file). Local terminals only.
+    pub argv: Option<Vec<String>>,
 }
 
 /// Async resolution state for "the active session's repo on host X" — drives
@@ -1290,6 +1293,17 @@ impl SessionStore {
             retrying: false,
             retry: None,
         });
+    }
+
+    /// A link or file macOS sent diri that it will not open.
+    pub(crate) fn report_open_failure(&mut self, detail: String) {
+        self.last_action_failure = Some(ActionFailure {
+            title: crate::i18n::t("open_handler.failed_title").to_owned(),
+            detail,
+            retrying: false,
+            retry: None,
+        });
+        self.emit(StoreEffect::UiChanged);
     }
 
     pub fn dismiss_action_failure(&mut self) {
@@ -2826,6 +2840,7 @@ impl SessionStore {
                 same_repo_as: None,
                 start_directory: None,
                 note_id: None,
+                argv: None,
             },
         });
         true
@@ -2939,6 +2954,7 @@ impl SessionStore {
             same_repo_as: options.same_repo_as,
             start_directory,
             note_id: None,
+            argv: options.argv,
         }
     }
 

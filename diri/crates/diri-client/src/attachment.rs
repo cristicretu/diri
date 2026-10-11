@@ -1232,6 +1232,7 @@ mod tests {
             same_repo_as: None,
             start_directory: None,
             note_id: None,
+            argv: None,
         };
         let session: SessionRecord = control.request(Method::SESSION_SPAWN, &spawn).await?;
         let session_id = session.id;
