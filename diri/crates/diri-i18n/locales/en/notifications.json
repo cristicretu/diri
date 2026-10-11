@@ -95,6 +95,7 @@
   "toast.agent_ready_detail": "It asks you to sign in the first time.",
   "toast.connecting": "Connecting…",
   "toast.connecting_body": "Sessions stay visible meanwhile.",
+  "toast.density_failed": "Couldn’t save the density",
   "toast.developer_setting_failed": "Couldn’t save the developer setting",
   "toast.engine_unreachable": "diri can’t reach its engine",
   "toast.engine_unreachable_body": "Retry, or relaunch diri if it keeps failing.",

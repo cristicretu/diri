@@ -2,7 +2,7 @@ use diri_term::theme::{TermTheme, ThemeAppearance};
 use diri_ui::{Appearance, Material, SemanticColors};
 use gpui::Rgba;
 
-use crate::store::SessionStore;
+use crate::store::{InterfaceStyle, SessionStore};
 
 pub(crate) mod live;
 
@@ -38,7 +38,36 @@ pub(crate) fn follow(store: &SessionStore, window: &mut gpui::Window, cx: &mut g
 pub(crate) fn terminal_theme_in(store: &SessionStore) -> TermTheme {
     let theme = catalog_theme(store.theme_id());
     live::head_for(theme);
-    live::resolve(theme)
+    styled_terminal(live::resolve(theme), store.interface_style())
+}
+
+/// The terminal under an interface style. Neutral styles paint the grid on a
+/// system gray, so the theme keeps its text and ANSI colors while contrast
+/// correction measures against the background actually on screen.
+fn styled_terminal(mut theme: TermTheme, style: InterfaceStyle) -> TermTheme {
+    if style.neutral() {
+        theme.background = system_background(theme.appearance);
+    }
+    theme
+}
+
+/// The window background native macOS apps paint: `#212121` dark, white
+/// light, matching the system-palette style measured from Superlogical.
+const fn system_background(appearance: ThemeAppearance) -> Rgba {
+    match appearance {
+        ThemeAppearance::Dark => Rgba {
+            r: 0.129,
+            g: 0.129,
+            b: 0.129,
+            a: 1.0,
+        },
+        ThemeAppearance::Light => Rgba {
+            r: 1.0,
+            g: 1.0,
+            b: 1.0,
+            a: 1.0,
+        },
+    }
 }
 
 /// Opaque application palette for a theme id. Previews, tests, and surfaces
@@ -63,15 +92,68 @@ pub(crate) fn sidebar_colors_with(id: &str, material: Material) -> SemanticColor
 /// Live palette for a store: the previewed theme, if any, under the user's
 /// window material.
 pub(crate) fn colors_in(store: &SessionStore) -> SemanticColors {
-    semantic_colors(terminal_theme_in(store), false)
-        .with_material(store.preferences().window_material.to_ui())
-        .with_transparency(store.preferences().window_transparency)
+    styled_colors(store, false)
 }
 
 pub(crate) fn sidebar_colors_in(store: &SessionStore) -> SemanticColors {
-    semantic_colors(terminal_theme_in(store), true)
-        .with_material(store.preferences().window_material.to_ui())
-        .with_transparency(store.preferences().window_transparency)
+    styled_colors(store, true)
+}
+
+/// The application palette under the store's interface style (its palette
+/// preview included): hue source, window material and glass density.
+fn styled_colors(store: &SessionStore, sidebar_tones: bool) -> SemanticColors {
+    style_colors(
+        terminal_theme_in(store),
+        store.interface_style(),
+        store.preferences().window_transparency,
+        sidebar_tones,
+    )
+}
+
+pub(crate) fn style_colors(
+    theme: TermTheme,
+    style: InterfaceStyle,
+    transparency: f32,
+    sidebar_tones: bool,
+) -> SemanticColors {
+    let colors = if style.neutral() {
+        neutral_colors(theme.appearance, sidebar_tones)
+    } else {
+        semantic_colors(theme, sidebar_tones)
+    };
+    colors
+        .with_material(style.material().to_ui())
+        .with_clear_glass(style.clear_glass())
+        .with_transparency(transparency)
+}
+
+/// Chrome in system grays: no theme hue reaches the sidebar, menus or
+/// window fill. Labels use the system's black or white.
+fn neutral_colors(appearance: ThemeAppearance, sidebar_tones: bool) -> SemanticColors {
+    let gray = |value: f32, alpha: f32| Rgba {
+        r: value,
+        g: value,
+        b: value,
+        a: alpha,
+    };
+    match appearance {
+        ThemeAppearance::Dark => SemanticColors::themed(
+            Appearance::Dark,
+            system_background(appearance),
+            gray(1.0, 1.0),
+            gray(0.106, 0.86),
+            gray(0.176, 1.0),
+            sidebar_tones,
+        ),
+        ThemeAppearance::Light => SemanticColors::themed(
+            Appearance::Light,
+            system_background(appearance),
+            gray(0.0, 1.0),
+            gray(0.937, 0.90),
+            gray(0.965, 1.0),
+            sidebar_tones,
+        ),
+    }
 }
 
 fn semantic_colors(theme: TermTheme, sidebar_tones: bool) -> SemanticColors {
@@ -179,6 +261,47 @@ mod tests {
                 ThemeAppearance::Light => 1.0,
             };
             assert_eq!(chrome_lightness(theme), expected, "{}", theme.id);
+        }
+    }
+
+    #[test]
+    fn neutral_styles_drop_the_theme_hue_but_keep_its_text_colors() {
+        let dracula = terminal_theme("dracula");
+        for style in [InterfaceStyle::Modern, InterfaceStyle::System] {
+            let colors = style_colors(dracula, style, 1.0, false);
+            let terminal = styled_terminal(dracula, style);
+            assert_eq!(colors.background, system_background(dracula.appearance));
+            assert_eq!(terminal.background, colors.background);
+            assert_eq!(terminal.ansi, dracula.ansi);
+            assert_eq!(terminal.foreground, dracula.foreground);
+            let surface = colors.sidebar_surface();
+            assert!((surface.r - surface.g).abs() < 1e-6 && (surface.g - surface.b).abs() < 1e-6);
+        }
+        for style in [InterfaceStyle::Themed, InterfaceStyle::Blended] {
+            assert_eq!(
+                style_colors(dracula, style, 1.0, false).background,
+                dracula.background
+            );
+            assert_eq!(styled_terminal(dracula, style), dracula);
+        }
+    }
+
+    #[test]
+    fn modern_glass_lets_more_desktop_through_than_blended() {
+        let theme = terminal_theme("dirijor-dark");
+        let modern = style_colors(theme, InterfaceStyle::Modern, 1.0, false);
+        let blended = style_colors(theme, InterfaceStyle::Blended, 1.0, false);
+        assert!(modern.terminal_surface().a < blended.terminal_surface().a);
+        assert!(modern.sidebar_surface().a < blended.sidebar_surface().a);
+        assert!(
+            modern.terminal_surface().a > 0.4,
+            "text needs a tint under it"
+        );
+        for style in [InterfaceStyle::System, InterfaceStyle::Themed] {
+            assert_eq!(
+                style_colors(theme, style, 1.0, false).terminal_surface().a,
+                1.0
+            );
         }
     }
 

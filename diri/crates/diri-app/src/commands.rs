@@ -76,6 +76,8 @@ actions!(
         ToggleTabOrientation,
         HorizontalTabs,
         VerticalTabs,
+        ComfortableDensity,
+        CompactDensity,
         FocusSidebar,
         ToggleInspector,
         ToggleAuxiliaryTerminal,
@@ -180,6 +182,8 @@ pub enum CommandId {
     ToggleTabOrientation,
     HorizontalTabs,
     VerticalTabs,
+    ComfortableDensity,
+    CompactDensity,
     FocusSidebar,
     ToggleInspector,
     ToggleAuxiliaryTerminal,
@@ -771,6 +775,26 @@ pub const COMMANDS: &[CommandSpec] = &[
         "tab placement orientation side"
     ),
     spec!(
+        ComfortableDensity,
+        "comfortable-density",
+        None,
+        None,
+        Some(APP_CONTEXT),
+        "command.comfortable_density.palette_title",
+        "square.grid.2x2",
+        "density islands spacing comfortable panes layout appearance"
+    ),
+    spec!(
+        CompactDensity,
+        "compact-density",
+        None,
+        None,
+        Some(APP_CONTEXT),
+        "command.compact_density.palette_title",
+        "rectangle.split.2x1",
+        "density compact border panes layout appearance"
+    ),
+    spec!(
         FocusSidebar,
         "focus-sidebar",
         Some("cmd-shift-b"),
@@ -1314,6 +1338,8 @@ impl CommandSpec {
             CommandId::ToggleTabOrientation => KeyBinding::new(key, ToggleTabOrientation, context),
             CommandId::HorizontalTabs => KeyBinding::new(key, HorizontalTabs, context),
             CommandId::VerticalTabs => KeyBinding::new(key, VerticalTabs, context),
+            CommandId::ComfortableDensity => KeyBinding::new(key, ComfortableDensity, context),
+            CommandId::CompactDensity => KeyBinding::new(key, CompactDensity, context),
             CommandId::FocusSidebar => KeyBinding::new(key, FocusSidebar, context),
             CommandId::ToggleInspector => KeyBinding::new(key, ToggleInspector, context),
             CommandId::ToggleAuxiliaryTerminal => {
@@ -1857,6 +1883,11 @@ impl CommandId {
                     category: Workspace,
                 }
             }
+            Self::ComfortableDensity | Self::CompactDensity => ShortcutMetadata {
+                title: t("command.density.title"),
+                description: t("command.density.description"),
+                category: Workspace,
+            },
             Self::ToggleSidebar => ShortcutMetadata {
                 title: t("command.toggle_sidebar.title"),
                 description: t("command.toggle_sidebar.description"),
@@ -2056,6 +2087,8 @@ impl CommandId {
             Self::ToggleTabOrientation => Box::new(ToggleTabOrientation),
             Self::HorizontalTabs => Box::new(HorizontalTabs),
             Self::VerticalTabs => Box::new(VerticalTabs),
+            Self::ComfortableDensity => Box::new(ComfortableDensity),
+            Self::CompactDensity => Box::new(CompactDensity),
             Self::FocusSidebar => Box::new(FocusSidebar),
             Self::ToggleInspector => Box::new(ToggleInspector),
             Self::ToggleAuxiliaryTerminal => Box::new(ToggleAuxiliaryTerminal),

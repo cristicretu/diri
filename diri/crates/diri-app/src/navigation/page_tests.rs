@@ -202,6 +202,55 @@ fn pages_restore_query_selection_and_focus_and_theme_cancel(cx: &mut TestAppCont
 }
 
 #[gpui::test]
+fn interface_style_rows_preview_live_and_only_a_pick_persists(cx: &mut TestAppContext) {
+    use crate::store::InterfaceStyle;
+    let (overlay, cx) = cx.add_window_view(|_, cx| {
+        NavigationOverlay::opened_for_test(Arc::new(StoreRuntime::inert()), cx)
+    });
+    overlay.update_in(cx, |overlay, window, cx| {
+        let saved = overlay
+            .store
+            .read()
+            .unwrap()
+            .preferences()
+            .interface_style();
+        overlay.push_page(Overlay::InterfaceStyles, window, cx);
+        assert_eq!(overlay.style_matches()[overlay.highlight], saved);
+        // Moving onto Modern previews it: glass on, saved style untouched.
+        let modern = InterfaceStyle::ALL
+            .iter()
+            .position(|style| *style == InterfaceStyle::Modern)
+            .unwrap();
+        overlay.move_highlight(modern as isize - overlay.highlight as isize, cx);
+        {
+            let store = overlay.store.read().unwrap();
+            assert_eq!(store.interface_style(), InterfaceStyle::Modern);
+            assert_eq!(store.preferences().interface_style(), saved);
+        }
+        overlay.back(window, cx);
+        assert_eq!(overlay.store.read().unwrap().interface_style(), saved);
+        overlay.push_page(Overlay::InterfaceStyles, window, cx);
+        let system = InterfaceStyle::ALL
+            .iter()
+            .position(|style| *style == InterfaceStyle::System)
+            .unwrap();
+        overlay.move_highlight(system as isize - overlay.highlight as isize, cx);
+        overlay.run_highlighted(false, window, cx);
+        assert!(!overlay.is_open());
+        let store = overlay.store.read().unwrap();
+        assert_eq!(
+            store.preferences().interface_style(),
+            InterfaceStyle::System
+        );
+        assert_eq!(
+            store.preferences().window_material,
+            crate::store::WindowMaterial::Opaque
+        );
+        assert_eq!(store.interface_style(), InterfaceStyle::System);
+    });
+}
+
+#[gpui::test]
 fn shortcuts_switch_pages_without_stacking_overlays(cx: &mut TestAppContext) {
     let (overlay, cx) = cx.add_window_view(|_, cx| {
         NavigationOverlay::opened_for_test(Arc::new(StoreRuntime::inert()), cx)
@@ -524,6 +573,8 @@ impl Render for ActionHarness {
             ToggleSidebar,
             HorizontalTabs,
             VerticalTabs,
+            ComfortableDensity,
+            CompactDensity,
             OpenSettings,
             ToggleNotifications,
             CheckForUpdates,
@@ -567,7 +618,7 @@ fn every_static_palette_action_dispatches_once_by_mouse_and_keyboard(cx: &mut Te
     };
     assert_eq!(
         actions.len(),
-        38,
+        40,
         "new static actions need a dispatch probe"
     );
     for action in actions {

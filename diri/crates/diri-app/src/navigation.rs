@@ -99,6 +99,7 @@ enum Overlay {
     Notes,
     Settings,
     Themes,
+    InterfaceStyles,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -770,6 +771,7 @@ impl NavigationOverlay {
                 self.filter_themes();
                 self.preview_highlighted_theme(cx);
             }
+            Some(Overlay::InterfaceStyles) => self.preview_highlighted_theme(cx),
             Some(Overlay::CommandPalette) => self.refresh_command_items(),
             _ => {}
         }
@@ -824,6 +826,7 @@ impl NavigationOverlay {
             Some(Overlay::Notes) => self.notes.hits.len(),
             Some(Overlay::Settings) => self.settings_items().len(),
             Some(Overlay::Themes) => self.theme_matches.len(),
+            Some(Overlay::InterfaceStyles) => self.style_matches().len(),
             None => 0,
         }
     }
@@ -896,6 +899,7 @@ impl NavigationOverlay {
                 None => {}
             },
             Some(Overlay::Themes) => self.commit_theme(window, cx),
+            Some(Overlay::InterfaceStyles) => self.commit_interface_style(window, cx),
             None => {}
         }
     }
@@ -942,6 +946,7 @@ impl NavigationOverlay {
                 cx.emit(command);
             }
             PaletteCommand::Themes => self.push_page(Overlay::Themes, window, cx),
+            PaletteCommand::InterfaceStyles => self.push_page(Overlay::InterfaceStyles, window, cx),
             PaletteCommand::Action(CommandId::ToggleQuickOpen) => {
                 self.push_page(Overlay::QuickOpen, window, cx)
             }
@@ -1056,7 +1061,26 @@ impl NavigationOverlay {
                 actions.push(palette::resume_all_action(count));
             }
             let orientation = store.preferences().tab_orientation;
+            let density = store.preferences().pane_density;
+            let style = store.preferences().interface_style();
+            let theme_name =
+                crate::app_theme::terminal_theme(&store.preferences().terminal_theme).name;
             for action in &mut actions {
+                match &action.command {
+                    PaletteCommand::Themes => action.detail = Some(theme_name.into()),
+                    PaletteCommand::InterfaceStyles => action.detail = Some(style.title().into()),
+                    PaletteCommand::Action(CommandId::ComfortableDensity)
+                        if density == crate::store::PaneDensity::Comfortable =>
+                    {
+                        action.detail = Some(t("palette.current").into());
+                    }
+                    PaletteCommand::Action(CommandId::CompactDensity)
+                        if density == crate::store::PaneDensity::Compact =>
+                    {
+                        action.detail = Some(t("palette.current").into());
+                    }
+                    _ => {}
+                }
                 if let PaletteCommand::Action(command) = action.command {
                     let current = matches!(
                         (command, orientation),
@@ -1188,13 +1212,15 @@ impl NavigationOverlay {
         }
     }
 
+    /// Drops whichever preview the color theme or interface style page left
+    /// on screen; the saved preferences paint again.
     fn cancel_theme_preview(&mut self) {
-        if self
-            .store
-            .write()
-            .expect("session store lock poisoned")
-            .preview_theme(None)
-        {
+        let changed = {
+            let mut store = self.store.write().expect("session store lock poisoned");
+            let theme = store.preview_theme(None);
+            store.preview_interface_style(None) || theme
+        };
+        if changed {
             self._runtime.publish_local_change();
         }
     }
@@ -1248,6 +1274,19 @@ impl NavigationOverlay {
                     .position(|theme| theme.id == saved)
                     .unwrap_or(0);
                 self.scroll_to_highlight();
+            }
+            Overlay::InterfaceStyles => {
+                let saved = self
+                    .store
+                    .read()
+                    .expect("session store lock poisoned")
+                    .preferences()
+                    .interface_style();
+                self.highlight = self
+                    .style_matches()
+                    .iter()
+                    .position(|style| *style == saved)
+                    .unwrap_or(0);
             }
         }
         cx.notify();
@@ -1315,7 +1354,51 @@ impl NavigationOverlay {
             .collect();
     }
 
+    fn style_matches(&self) -> Vec<crate::store::InterfaceStyle> {
+        let query = self.query.text().trim().to_lowercase();
+        crate::store::InterfaceStyle::ALL
+            .into_iter()
+            .filter(|style| style.title().to_lowercase().contains(&query))
+            .collect()
+    }
+
+    fn commit_interface_style(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(style) = self.style_matches().get(self.highlight).copied() else {
+            return;
+        };
+        let result = {
+            let mut store = self.store.write().expect("session store lock poisoned");
+            store.preview_interface_style(None);
+            store.update_preferences(|prefs| prefs.set_interface_style(style))
+        };
+        match result {
+            Ok(()) => {
+                self.close_overlay(window, cx);
+                self._runtime.publish_local_change();
+            }
+            Err(error) => {
+                self.page_error = Some(tf("nav.save_theme_failed", &[("error", &error)]));
+                cx.notify();
+            }
+        }
+    }
+
+    /// Shows the highlighted row of the color theme or interface style page
+    /// across the whole window while it stays highlighted.
     fn preview_highlighted_theme(&mut self, cx: &mut Context<Self>) {
+        if self.overlay == Some(Overlay::InterfaceStyles) {
+            let style = self.style_matches().get(self.highlight).copied();
+            if self
+                .store
+                .write()
+                .expect("session store lock poisoned")
+                .preview_interface_style(style)
+            {
+                self._runtime.publish_local_change();
+                self.refresh_main_window(cx);
+            }
+            return;
+        }
         if self.overlay != Some(Overlay::Themes) {
             return;
         }
@@ -1374,6 +1457,7 @@ impl NavigationOverlay {
         match self.overlay {
             Some(Overlay::CommandPalette) => self.visible_count().clamp(1, 9),
             Some(Overlay::Settings) => 2,
+            Some(Overlay::InterfaceStyles) => 4,
             Some(Overlay::History) => 7,
             // Six two-line note rows.
             Some(Overlay::Notes) => 9,
@@ -1408,6 +1492,7 @@ impl NavigationOverlay {
             Overlay::Notes => "nav.placeholder.notes",
             Overlay::Settings => "nav.placeholder.settings",
             Overlay::Themes => "nav.placeholder.themes",
+            Overlay::InterfaceStyles => "nav.placeholder.interface_styles",
         });
         let error = if page == Overlay::History {
             self.history_error.clone()
@@ -1770,6 +1855,7 @@ impl NavigationOverlay {
                 }
             }
             Some(Overlay::Settings | Overlay::Themes) => self.render_setting_row(index, colors, cx),
+            Some(Overlay::InterfaceStyles) => self.render_style_row(index, colors, cx),
             _ => div().into_any_element(),
         };
         div()
@@ -1872,6 +1958,48 @@ impl NavigationOverlay {
         .into_any_element()
     }
 
+    fn render_style_row(
+        &mut self,
+        index: usize,
+        colors: SemanticColors,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let style = self.style_matches()[index];
+        let (saved, theme) = {
+            let store = self.store.read().expect("session store lock poisoned");
+            (
+                store.preferences().interface_style(),
+                crate::app_theme::terminal_theme(&store.preferences().terminal_theme),
+            )
+        };
+        palette_row(
+            div().child(style.title()).into_any_element(),
+            style_swatch(style, theme, colors),
+            Vec::new(),
+            index == self.highlight,
+            index,
+            true,
+            colors,
+        )
+        .when(style == saved, |row| {
+            row.child(sf_symbol("checkmark", 12.0, colors.secondary))
+        })
+        .on_hover(cx.listener(move |this, hovered: &bool, _, cx| {
+            if *hovered && this.highlight != index {
+                this.highlight = index;
+                this.preview_highlighted_theme(cx);
+                cx.notify();
+            }
+        }))
+        .on_click(cx.listener(move |this, _, window, cx| {
+            this.in_main(window, cx, move |this, window, cx| {
+                this.highlight = index;
+                this.run_highlighted(false, window, cx);
+            })
+        }))
+        .into_any_element()
+    }
+
     fn render_action_row(
         &mut self,
         ranked: Ranked<PaletteAction>,
@@ -1885,6 +2013,7 @@ impl NavigationOverlay {
         let opens_page = matches!(
             command,
             PaletteCommand::Themes
+                | PaletteCommand::InterfaceStyles
                 | PaletteCommand::Action(
                     CommandId::ToggleQuickOpen
                         | CommandId::ToggleHistory
@@ -2251,6 +2380,48 @@ fn highlighted_label_styled(
     }
     StyledText::new(text)
         .with_highlights(matches.iter().map(|range| (range.clone(), style)))
+        .into_any_element()
+}
+
+/// A 16pt tile for an interface style row: the saved theme's background for
+/// the themed styles, system gray for the neutral ones, and a wash of desktop
+/// blue under the glass ones.
+fn style_swatch(
+    style: crate::store::InterfaceStyle,
+    theme: diri_term::theme::TermTheme,
+    colors: SemanticColors,
+) -> AnyElement {
+    use crate::store::InterfaceStyle;
+    let desktop = gpui::rgba(0x2f6fb4ff);
+    let gray = if theme.appearance == diri_term::theme::ThemeAppearance::Dark {
+        gpui::rgba(0x212121ff)
+    } else {
+        gpui::rgba(0xf2f2f2ff)
+    };
+    let (surface, glass) = match style {
+        InterfaceStyle::Modern => (gray.alpha(0.45), true),
+        InterfaceStyle::System => (gray, false),
+        InterfaceStyle::Themed => (theme.background, false),
+        InterfaceStyle::Blended => (theme.background.alpha(0.72), true),
+    };
+    div()
+        .size(px(16.0))
+        .rounded(px(5.0))
+        .overflow_hidden()
+        .border_1()
+        .border_color(colors.primary.alpha(0.2))
+        .when(glass, |tile| tile.bg(desktop))
+        .child(
+            div()
+                .size_full()
+                .bg(surface)
+                .flex()
+                .items_center()
+                .justify_center()
+                .when(!style.neutral(), |tile| {
+                    tile.child(div().size(px(6.0)).rounded_full().bg(theme.ansi[4]))
+                }),
+        )
         .into_any_element()
 }
 
@@ -2757,6 +2928,17 @@ mod tests {
                                 })
                                 .unwrap_or(0);
                             overlay.scroll_to_highlight();
+                        }
+                        // `DIRI_VISUAL_HIGHLIGHT=<row>` rests on another
+                        // style, previewing it as an arrow key would.
+                        Ok("styles") => {
+                            overlay.prepare_page(Overlay::InterfaceStyles, cx);
+                            if let Some(row) = std::env::var("DIRI_VISUAL_HIGHLIGHT")
+                                .ok()
+                                .and_then(|row| row.parse().ok())
+                            {
+                                overlay.highlight = row;
+                            }
                         }
                         _ => {}
                     }

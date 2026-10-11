@@ -65,6 +65,99 @@ pub enum WindowMaterial {
     Opaque,
 }
 
+/// How the whole interface is painted: where chrome takes its hues from and
+/// how much desktop shows through. The palette's Change Interface Style page
+/// and Settings › Appearance offer these four, in this order.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub enum InterfaceStyle {
+    /// Clear glass in neutral hues: the desktop reads through every surface,
+    /// the terminal included.
+    Modern,
+    /// Solid neutral grays, as native macOS windows paint. The terminal keeps
+    /// its theme's text colors on a system background.
+    System,
+    /// Solid, with the color theme tinting every surface.
+    Themed,
+    /// The color theme's tints laid over a blurred desktop.
+    Blended,
+}
+
+impl InterfaceStyle {
+    pub const ALL: [Self; 4] = [Self::Modern, Self::System, Self::Themed, Self::Blended];
+
+    /// The platform window material the style needs.
+    pub const fn material(self) -> WindowMaterial {
+        match self {
+            Self::Modern | Self::Blended => WindowMaterial::Glass,
+            Self::System | Self::Themed => WindowMaterial::Opaque,
+        }
+    }
+
+    /// The style a preferences file written before styles existed meant.
+    pub const fn from_material(material: WindowMaterial) -> Self {
+        match material {
+            WindowMaterial::Glass => Self::Blended,
+            WindowMaterial::Opaque => Self::Themed,
+        }
+    }
+
+    /// Chrome hues come from neutral system grays rather than the theme.
+    pub const fn neutral(self) -> bool {
+        matches!(self, Self::Modern | Self::System)
+    }
+
+    pub const fn clear_glass(self) -> bool {
+        matches!(self, Self::Modern)
+    }
+
+    pub fn title(self) -> &'static str {
+        crate::i18n::t(match self {
+            Self::Modern => "interface_style.modern",
+            Self::System => "interface_style.system",
+            Self::Themed => "interface_style.themed",
+            Self::Blended => "interface_style.blended",
+        })
+    }
+}
+
+/// How terminal panes sit in the window. Field-level default so files
+/// written before density existed keep the flush layout.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub enum PaneDensity {
+    /// Each pane is a rounded island with a gap of window chrome around it.
+    Comfortable,
+    /// Panes fill the window edge to edge, split by single hairlines.
+    #[default]
+    #[serde(other)]
+    Compact,
+}
+
+impl PaneDensity {
+    pub const ALL: [Self; 2] = [Self::Comfortable, Self::Compact];
+
+    /// Chrome between neighbouring islands and between an island and the
+    /// window or sidebar edge; zero when compact.
+    pub const fn island_gap(self) -> f32 {
+        match self {
+            Self::Comfortable => 6.0,
+            Self::Compact => 0.0,
+        }
+    }
+
+    pub const fn islands(self) -> bool {
+        matches!(self, Self::Comfortable)
+    }
+
+    pub fn title(self) -> &'static str {
+        crate::i18n::t(match self {
+            Self::Comfortable => "density.comfortable",
+            Self::Compact => "density.compact",
+        })
+    }
+}
+
 /// Where a new Agent opened from a project (⌘T, New Agent) starts. Stored
 /// per project; a missing entry, or a name this build does not know, is the
 /// current checkout, which is what every project did before the choice.
@@ -265,6 +358,15 @@ fn terminal_follows_last_directory_default() -> bool {
     true
 }
 
+/// A style this build does not know, written by a newer diri, reads as
+/// unset (the material decides) rather than failing the whole file.
+fn deserialize_interface_style<'de, D: Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Option<InterfaceStyle>, D::Error> {
+    let value = Option::<serde_json::Value>::deserialize(deserializer)?;
+    Ok(value.and_then(|value| serde_json::from_value(value).ok()))
+}
+
 const fn window_transparency_default() -> f32 {
     1.0
 }
@@ -355,6 +457,19 @@ pub struct Prefs {
     /// tint (1.0). Missing files keep the shipped look.
     #[serde(default = "window_transparency_default")]
     pub window_transparency: f32,
+    /// The chosen interface style. `None` in files written before styles
+    /// existed; read it through [`Prefs::interface_style`], which falls back
+    /// to `window_material`. Stored beside the material rather than in place
+    /// of it so an older diri reading this file keeps the right blur.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "deserialize_interface_style"
+    )]
+    pub interface_style: Option<InterfaceStyle>,
+    /// Islands (comfortable) or flush panes (compact).
+    #[serde(default)]
+    pub pane_density: PaneDensity,
     /// Last size, position, and presentation mode of the key window.
     pub window_placement: Option<WindowPlacement>,
     /// The other windows open at the last quit, in no particular order. They
@@ -462,6 +577,8 @@ impl Default for Prefs {
             terminal_paste_protection: false,
             window_material: WindowMaterial::Glass,
             window_transparency: window_transparency_default(),
+            interface_style: None,
+            pane_density: PaneDensity::Compact,
             window_placement: None,
             additional_windows: Vec::new(),
             sidebar_visible: false,
@@ -589,6 +706,21 @@ impl Prefs {
         self.hibernation_defaults_revision = Self::HIBERNATION_DEFAULTS_REVISION;
     }
 
+    /// The interface style in effect. A stored style whose material no
+    /// longer matches `window_material` lost to a later material change (an
+    /// older diri, or a direct write), so the material decides.
+    pub fn interface_style(&self) -> InterfaceStyle {
+        match self.interface_style {
+            Some(style) if style.material() == self.window_material => style,
+            _ => InterfaceStyle::from_material(self.window_material),
+        }
+    }
+
+    pub fn set_interface_style(&mut self, style: InterfaceStyle) {
+        self.interface_style = Some(style);
+        self.window_material = style.material();
+    }
+
     pub fn apply_system_theme(&mut self, dark: bool) -> bool {
         if !self.follow_system_theme {
             return false;
@@ -668,6 +800,46 @@ impl Prefs {
 mod tests {
     use super::*;
     use crate::launch_recipe::{LaunchRecipe, RecipeProject};
+
+    #[test]
+    fn files_from_before_interface_styles_keep_their_material() {
+        let glass: Prefs = serde_json::from_str("{}").unwrap();
+        assert_eq!(glass.interface_style(), InterfaceStyle::Blended);
+        assert_eq!(glass.pane_density, PaneDensity::Compact);
+        let opaque: Prefs = serde_json::from_str(r#"{"windowMaterial":"opaque"}"#).unwrap();
+        assert_eq!(opaque.interface_style(), InterfaceStyle::Themed);
+    }
+
+    #[test]
+    fn a_chosen_style_round_trips_and_carries_its_material() {
+        for style in InterfaceStyle::ALL {
+            let mut prefs = Prefs::default();
+            prefs.set_interface_style(style);
+            prefs.pane_density = PaneDensity::Comfortable;
+            assert_eq!(prefs.window_material, style.material());
+            let read: Prefs =
+                serde_json::from_str(&serde_json::to_string(&prefs).unwrap()).unwrap();
+            assert_eq!(read.interface_style(), style);
+            assert_eq!(read.pane_density, PaneDensity::Comfortable);
+        }
+    }
+
+    #[test]
+    fn a_later_material_change_outranks_a_stale_style() {
+        // An older diri only knows the material; flipping it there must win.
+        let mut prefs = Prefs::default();
+        prefs.set_interface_style(InterfaceStyle::Modern);
+        prefs.window_material = WindowMaterial::Opaque;
+        assert_eq!(prefs.interface_style(), InterfaceStyle::Themed);
+    }
+
+    #[test]
+    fn unknown_density_and_style_names_fall_back() {
+        let prefs: Prefs = serde_json::from_str(r#"{"paneDensity":"airy"}"#).unwrap();
+        assert_eq!(prefs.pane_density, PaneDensity::Compact);
+        let prefs: Prefs = serde_json::from_str(r#"{"interfaceStyle":"neon"}"#).unwrap();
+        assert_eq!(prefs.interface_style(), InterfaceStyle::Blended);
+    }
 
     #[test]
     fn new_agents_start_in_the_current_checkout_unless_a_project_opts_in() {

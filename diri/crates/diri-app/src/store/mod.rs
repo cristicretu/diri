@@ -38,8 +38,9 @@ use crate::switcher::{
 };
 
 pub use prefs::{
-    FileEditor, InspectorTab, NewAgentStart, Prefs, SavedWindow, SidebarGrouping, SidebarOrdering,
-    TabOrientation, UiLanguage, WindowMaterial, WindowMode, WindowPlacement,
+    FileEditor, InspectorTab, InterfaceStyle, NewAgentStart, PaneDensity, Prefs, SavedWindow,
+    SidebarGrouping, SidebarOrdering, TabOrientation, UiLanguage, WindowMaterial, WindowMode,
+    WindowPlacement,
 };
 pub use projection::{SidebarProject, SidebarProjection, SidebarRow};
 pub use residency::{ResidencyUpdate, TerminalResidency};
@@ -433,6 +434,9 @@ pub struct SessionStore {
     directory_listing: Option<DirectoryListing>,
     prefs: Prefs,
     theme_preview: Option<String>,
+    /// The interface style the palette is showing while its row is
+    /// highlighted; like `theme_preview`, never persisted.
+    interface_style_preview: Option<InterfaceStyle>,
     terminal_residency: TerminalResidency,
     app_is_active: bool,
     focused_window: Option<SpawnOwner>,
@@ -552,6 +556,7 @@ impl SessionStore {
                 directory_listing: None,
                 prefs,
                 theme_preview: None,
+                interface_style_preview: None,
                 terminal_residency: TerminalResidency::default(),
                 app_is_active: true,
                 focused_window: None,
@@ -1343,6 +1348,22 @@ impl SessionStore {
             return false;
         }
         self.theme_preview = theme;
+        true
+    }
+
+    /// The interface style on screen: the palette's preview, else the saved
+    /// one. The window material follows it, so a preview of a glass style
+    /// blurs the desktop for as long as the row stays highlighted.
+    pub fn interface_style(&self) -> InterfaceStyle {
+        self.interface_style_preview
+            .unwrap_or_else(|| self.prefs.interface_style())
+    }
+
+    pub fn preview_interface_style(&mut self, style: Option<InterfaceStyle>) -> bool {
+        if self.interface_style_preview == style {
+            return false;
+        }
+        self.interface_style_preview = style;
         true
     }
 

@@ -129,6 +129,8 @@ enum SettingsMenu {
     MemoryLimit,
     FileEditor,
     UpdateChannel,
+    InterfaceStyle,
+    PaneDensity,
 }
 
 /// Update channels, in menu order.
@@ -4456,6 +4458,8 @@ impl UtilitySurfaces {
             SettingsMenu::MemoryLimit => (self.memory_options(colors, cx), 132.0),
             SettingsMenu::FileEditor => (self.file_editor_options(colors, cx), 204.0),
             SettingsMenu::UpdateChannel => (self.update_channel_options(colors, cx), 132.0),
+            SettingsMenu::InterfaceStyle => (self.interface_style_options(colors, cx), 172.0),
+            SettingsMenu::PaneDensity => (self.pane_density_options(colors, cx), 172.0),
         })
     }
 
@@ -4650,6 +4654,89 @@ impl UtilitySurfaces {
                 move |this, cx| {
                     this.settings_menu = None;
                     this.update_prefs(move |prefs| prefs.hibernate_after_minutes = value);
+                    cx.notify();
+                },
+            ));
+        }
+        options.into_any_element()
+    }
+
+    fn interface_style_dropdown(&self, cx: &mut Context<Self>) -> AnyElement {
+        let colors = self.settings_colors();
+        let open = self.settings_menu == Some(SettingsMenu::InterfaceStyle);
+        let mut control = div()
+            .relative()
+            .min_w(px(132.0))
+            .child(settings_select_button(
+                self.prefs.interface_style().title().to_owned(),
+                "interface-style-dropdown",
+                open,
+                SettingsMenu::InterfaceStyle,
+                colors,
+                cx,
+            ));
+        if open {
+            control = control.child(self.settings_menu_host(cx));
+        }
+        control.into_any_element()
+    }
+
+    fn interface_style_options(
+        &self,
+        colors: SemanticColors,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let current = self.prefs.interface_style();
+        let mut options = div().p(px(4.0)).flex().flex_col();
+        for (index, choice) in crate::store::InterfaceStyle::ALL.into_iter().enumerate() {
+            options = options.child(settings_choice_row(
+                format!("interface-style-option-{index}"),
+                choice.title().to_owned(),
+                choice == current,
+                colors,
+                cx,
+                move |this, cx| {
+                    this.settings_menu = None;
+                    this.update_prefs(move |prefs| prefs.set_interface_style(choice));
+                    cx.notify();
+                },
+            ));
+        }
+        options.into_any_element()
+    }
+
+    fn pane_density_dropdown(&self, cx: &mut Context<Self>) -> AnyElement {
+        let colors = self.settings_colors();
+        let open = self.settings_menu == Some(SettingsMenu::PaneDensity);
+        let mut control = div()
+            .relative()
+            .min_w(px(132.0))
+            .child(settings_select_button(
+                self.prefs.pane_density.title().to_owned(),
+                "pane-density-dropdown",
+                open,
+                SettingsMenu::PaneDensity,
+                colors,
+                cx,
+            ));
+        if open {
+            control = control.child(self.settings_menu_host(cx));
+        }
+        control.into_any_element()
+    }
+
+    fn pane_density_options(&self, colors: SemanticColors, cx: &mut Context<Self>) -> AnyElement {
+        let mut options = div().p(px(4.0)).flex().flex_col();
+        for (index, choice) in crate::store::PaneDensity::ALL.into_iter().enumerate() {
+            options = options.child(settings_choice_row(
+                format!("pane-density-option-{index}"),
+                choice.title().to_owned(),
+                choice == self.prefs.pane_density,
+                colors,
+                cx,
+                move |this, cx| {
+                    this.settings_menu = None;
+                    this.update_prefs(move |prefs| prefs.pane_density = choice);
                     cx.notify();
                 },
             ));
@@ -5147,12 +5234,14 @@ impl UtilitySurfaces {
                         ))
                         .child(appearance_divider(colors))
                         .child(appearance_setting_row(
-                            t("settings.appearance.glass_window"),
-                            window_material_switch(
-                                self.prefs.window_material == WindowMaterial::Glass,
-                                colors,
-                                cx,
-                            ),
+                            t("settings.appearance.interface_style"),
+                            self.interface_style_dropdown(cx),
+                            colors,
+                        ))
+                        .child(appearance_divider(colors))
+                        .child(appearance_setting_row(
+                            t("settings.appearance.density"),
+                            self.pane_density_dropdown(cx),
                             colors,
                         ))
                         .child(appearance_divider(colors))
@@ -7495,35 +7584,6 @@ fn appearance_setting_row(
 
 /// Blur the desktop behind the window, or paint it solid. Solid is cheaper
 /// for the compositor, so the choice stays one click away from the theme.
-fn window_material_switch(
-    enabled: bool,
-    colors: SemanticColors,
-    cx: &mut Context<UtilitySurfaces>,
-) -> impl IntoElement {
-    div()
-        .id("window-material")
-        .flex_none()
-        .w(px(30.0))
-        .h(px(18.0))
-        .p(px(2.0))
-        .rounded(px(9.0))
-        .bg(if enabled {
-            Ink::FRESH.alpha(0.72)
-        } else {
-            colors.primary.alpha(0.14)
-        })
-        .flex()
-        .justify_end()
-        .when(!enabled, |toggle| toggle.justify_start())
-        .cursor_pointer()
-        .on_click(cx.listener(|this, _, _, cx| {
-            let material = this.prefs.window_material.toggled();
-            this.update_prefs(move |prefs| prefs.window_material = material);
-            cx.notify();
-        }))
-        .child(div().size(px(14.0)).rounded(px(7.0)).bg(colors.primary))
-}
-
 /// Drag toward "less" for a denser tint, toward "more" for clearer glass. The
 /// shipped density sits on a tick; clicking the value label returns to it.
 fn window_transparency_slider(

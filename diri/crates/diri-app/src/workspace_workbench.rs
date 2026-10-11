@@ -25,6 +25,11 @@ use gpui::{
     SharedString, StyleRefinement, Subscription, Window, div, prelude::*, px,
 };
 
+/// Compact panes meet at one hairline. Its grab area reaches this far into
+/// the panes on each side, so it is as easy to catch as the old 5 pt strip.
+const COMPACT_SEAM: f32 = 1.0;
+const COMPACT_SEAM_REACH: f32 = 2.0;
+
 #[derive(Clone)]
 pub(crate) enum WorkspaceWorkbenchEvent {
     Terminal(TerminalPaneEvent),
@@ -457,6 +462,174 @@ impl WorkspaceWorkbench {
         }
     }
 
+    /// Seeds each mounted pane with its own coloured page (a git UI, a
+    /// lockfile, a shell prompt, a test run) so style screenshots show how a
+    /// theme's ANSI colours sit on every surface.
+    #[cfg(test)]
+    pub(crate) fn seed_styled_panes_for_test(&self, cx: &mut Context<Self>) {
+        use diri_proto::grid::TermColor;
+        type Span = (&'static str, Option<u8>);
+        const PAGES: [&[&[Span]]; 4] = [
+            &[
+                &[(
+                    "─[1]─Status─────────┐┌─[0]─Unstaged changes───────",
+                    Some(2),
+                )],
+                &[
+                    ("─[2]─", None),
+                    ("Files", Some(2)),
+                    (" - Worktrees ││ ", None),
+                    ("diff --git", Some(15)),
+                ],
+                &[
+                    (" ▼ crates/diri-app/  ││ ", None),
+                    ("a/crates/diri-app/src/root.rs", Some(15)),
+                ],
+                &[
+                    ("   ", None),
+                    ("M", Some(1)),
+                    (" root.rs          ││ ", None),
+                    ("index 5c6b31b..aeabfb7 100644", None),
+                ],
+                &[
+                    ("                     ││ ", None),
+                    ("@@ -4085,6 +4085,10 @@", Some(6)),
+                ],
+                &[
+                    ("                     ││ ", None),
+                    ("-        let mut card = div()", Some(1)),
+                ],
+                &[
+                    ("                     ││ ", None),
+                    ("+        let card_island = islands;", Some(2)),
+                ],
+                &[
+                    ("                     ││ ", None),
+                    ("+        let mut card = div()", Some(2)),
+                ],
+                &[(
+                    "───────────1 of 2────┘└────────────────────────────",
+                    Some(2),
+                )],
+                &[
+                    ("─[3]─", None),
+                    ("Local", Some(2)),
+                    (" b1 of 24──┐┌─Command log───────────", None),
+                ],
+                &[
+                    ("─[4]─", None),
+                    ("Commit", Some(5)),
+                    ("1 of 300──┤│ ", None),
+                    ("on that commit", Some(2)),
+                ],
+                &[
+                    ("Switch view: <tab> | …   ", Some(4)),
+                    ("Donate", Some(5)),
+                    (" ", None),
+                    ("Ask Question", Some(3)),
+                ],
+            ],
+            &[
+                &[
+                    (" 8 ", Some(8)),
+                    ("        \"type\": ", Some(4)),
+                    ("\"tarball\",", Some(3)),
+                ],
+                &[
+                    (" 9 ", Some(8)),
+                    ("        \"url\": ", Some(4)),
+                    ("\"https://releases.nixos.org/\"", Some(3)),
+                ],
+                &[("10 ", Some(8)), ("      },", None)],
+                &[("11 ", Some(8)), ("      \"original\": {", Some(4))],
+                &[
+                    ("12 ", Some(8)),
+                    ("        \"type\": ", Some(4)),
+                    ("\"tarball\",", Some(3)),
+                ],
+                &[
+                    ("13 ", Some(8)),
+                    ("        \"url\": ", Some(4)),
+                    ("\"https://channels.nixos.org\"", Some(3)),
+                ],
+                &[("14 ", Some(8)), ("      }", None)],
+                &[("15 ", Some(8)), ("    },", None)],
+                &[("16 ", Some(8)), ("    \"root\": {", Some(4))],
+                &[("17 ", Some(8)), ("      \"inputs\": {", Some(4))],
+                &[
+                    ("18 ", Some(8)),
+                    ("        \"nixpkgs\": ", Some(4)),
+                    ("\"nixpkgs\"", Some(3)),
+                ],
+                &[("19 ", Some(8)), ("      }", None)],
+                &[(":", None)],
+            ],
+            &[
+                &[
+                    ("~/fun/diri", Some(4)),
+                    (" main", Some(8)),
+                    ("* ", Some(3)),
+                    ("≡", Some(6)),
+                ],
+                &[("❯ ", Some(5)), ("lg", None)],
+            ],
+            &[
+                &[("direnv: loading ~/fun/diri/.envrc", None)],
+                &[
+                    ("warning", Some(5)),
+                    (": Git tree has uncommitted changes", None),
+                ],
+                &[
+                    ("~/fun/diri", Some(4)),
+                    (" main", Some(8)),
+                    ("* ", Some(3)),
+                    ("≡", Some(6)),
+                ],
+                &[("❯ ", Some(5)), ("cargo test -p diri-ui", None)],
+                &[("   Compiling", Some(2)), (" diri-ui v0.9.6", None)],
+                &[("running 4 tests", None)],
+                &[("test glass_alpha_clears ... ", None), ("ok", Some(2))],
+                &[("test neutral_palette ... ", None), ("ok", Some(2))],
+                &[("test islands_inset ... ", None), ("ok", Some(2))],
+                &[
+                    ("test result: ", None),
+                    ("ok", Some(2)),
+                    (". 4 passed", None),
+                ],
+            ],
+        ];
+        let mut seeded = HashSet::new();
+        let mut page = 0;
+        let mut panes: Vec<_> = self.mounted.iter().collect();
+        panes.sort_by(|a, b| a.0.0.cmp(&b.0.0));
+        for (_, pane) in panes {
+            if !seeded.insert(pane.session.clone()) {
+                continue;
+            }
+            // As tall as a quarter-window pane: a taller grid would show
+            // its blank bottom rows, the way a terminal follows its end.
+            let mut grid = diri_term::buffer::GridBuffer::new(100, 14);
+            for (y, line) in PAGES[page % PAGES.len()].iter().enumerate() {
+                let mut x = 0;
+                for (text, color) in line.iter() {
+                    for ch in text.chars() {
+                        let cell = &mut grid.cells[y * 100 + x];
+                        cell.scalar = ch as u32;
+                        if let Some(color) = color {
+                            cell.fg = TermColor::Ansi(*color);
+                        }
+                        x += 1;
+                    }
+                }
+            }
+            page += 1;
+            pane.terminal.update(cx, |terminal, cx| {
+                terminal.seed_preview_grid_for_test(grid, cx);
+                cx.notify();
+            });
+        }
+    }
+
     pub(crate) fn deactivate(&mut self, cx: &mut Context<Self>) {
         self.enabled = false;
         self.cancel_resize();
@@ -749,12 +922,24 @@ impl WorkspaceWorkbench {
             }
             tab.focused_pane = focused.clone();
         }
-        WorkspaceGeometry::settled(
+        let density = self
+            .runtime
+            .store
+            .read()
+            .expect("store")
+            .preferences()
+            .pane_density;
+        WorkspaceGeometry::settled_with_seam(
             &tab,
             Rect {
                 width: self.viewport.width,
                 height: self.viewport.height,
                 ..Rect::default()
+            },
+            if density.islands() {
+                density.island_gap()
+            } else {
+                COMPACT_SEAM
             },
         )
     }
@@ -787,9 +972,12 @@ impl WorkspaceWorkbench {
 impl Render for WorkspaceWorkbench {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         crate::perf_overlay::rendered("workbench");
-        let colors = {
+        let (colors, islands) = {
             let store = self.runtime.store.read().expect("store");
-            crate::app_theme::colors_in(&store)
+            (
+                crate::app_theme::colors_in(&store),
+                store.preferences().pane_density.islands(),
+            )
         };
         if !cx.has_active_drag() {
             self.drag_haptic.reset();
@@ -807,7 +995,13 @@ impl Render for WorkspaceWorkbench {
             .relative()
             .size_full()
             .overflow_hidden()
-            .bg(colors.work_surface_nested())
+            // Islands float on the sidebar's material; compact panes meet at
+            // hairlines over the work surface.
+            .bg(if islands {
+                colors.sidebar_surface()
+            } else {
+                colors.work_surface_nested()
+            })
             .on_drag_move(cx.listener(
                 |this, event: &DragMoveEvent<DraggedWorkspaceDivider>, _, cx| {
                     this.drag_resize(
@@ -842,12 +1036,25 @@ impl Render for WorkspaceWorkbench {
             .expect("store")
             .workspace_catalog()
             .can_edit();
+        // Painted after the panes so a compact seam's grab area, which
+        // overlaps the panes either side, wins hit tests over them.
+        let mut seams = Vec::with_capacity(geometry.dividers.len());
         for divider in &geometry.dividers {
             let divider = divider.clone();
-            let bounds = divider.bounds;
             let horizontal = divider.axis == LayoutAxis::Horizontal;
+            // Compact panes meet at a 1 pt seam; reach past it on both sides
+            // so the grab area stays as wide as the old 5 pt divider.
+            let reach = if islands { 0.0 } else { COMPACT_SEAM_REACH };
+            let mut bounds = divider.bounds;
+            if horizontal {
+                bounds.x -= reach;
+                bounds.width += 2.0 * reach;
+            } else {
+                bounds.y -= reach;
+                bounds.height += 2.0 * reach;
+            }
             let drag = divider.clone();
-            root = root.child(
+            seams.push(
                 div()
                     .id(SharedString::from(format!(
                         "workspace-divider-{}",
@@ -864,7 +1071,21 @@ impl Render for WorkspaceWorkbench {
                     } else {
                         CursorStyle::ResizeUpDown
                     })
-                    .bg(colors.primary.alpha(0.07))
+                    // Compact draws the seam as one hairline; between islands
+                    // the chrome itself is the divider.
+                    .when(!islands, |seam| {
+                        seam.child(
+                            div()
+                                .absolute()
+                                .when(horizontal, |line| {
+                                    line.top_0().bottom_0().left(px(reach)).w(px(1.0))
+                                })
+                                .when(!horizontal, |line| {
+                                    line.left_0().right_0().top(px(reach)).h(px(1.0))
+                                })
+                                .bg(colors.primary.alpha(0.10)),
+                        )
+                    })
                     .hover(move |line| line.bg(gpui::rgba(0x4f83f1ff).alpha(0.6)))
                     .on_drag(DraggedWorkspaceDivider, |_, _, _, cx| {
                         cx.stop_propagation();
@@ -907,6 +1128,7 @@ impl Render for WorkspaceWorkbench {
                 .top(px(bounds.y))
                 .w(px(bounds.width))
                 .h(px(bounds.height))
+                .when(islands, |surface| surface.rounded(px(Radius::CARD)))
                 .overflow_hidden();
             if let Some(mounted) = self.mounted.get(&pane.identity.pane) {
                 mounted.terminal.update(cx, |terminal, cx| {
@@ -1113,7 +1335,8 @@ impl Render for WorkspaceWorkbench {
                         0.0,
                     ))
                 });
-            if geometry.panes.len() > 1 && geometry.focused.pane == pane.identity.pane {
+            let focused = geometry.panes.len() > 1 && geometry.focused.pane == pane.identity.pane;
+            if focused || islands {
                 surface = surface.child(
                     div()
                         .absolute()
@@ -1121,14 +1344,15 @@ impl Render for WorkspaceWorkbench {
                         .left(px(0.0))
                         .right(px(0.0))
                         .bottom(px(0.0))
+                        .when(islands, |edge| edge.rounded(px(Radius::CARD)))
                         .border_1()
-                        .border_color(colors.primary.alpha(0.16)),
+                        .border_color(colors.primary.alpha(if focused { 0.16 } else { 0.10 })),
                 );
             }
             surface = surface.child(controls);
             root = root.child(surface);
         }
-        root
+        root.children(seams)
     }
 }
 

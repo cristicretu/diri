@@ -220,6 +220,23 @@ enum QuoteSurface {
 ///
 /// Takes the slide by `&mut Option<_>` rather than hanging off `RootView` so
 /// both seams can be advanced in one pass without borrowing all of `self`.
+/// `DIRI_VISUAL_BACKDROP=gradient` (a soft blue wallpaper, like the blurred
+/// desktop the real window sits over) or `=<rrggbb>` for a flat colour.
+#[cfg(test)]
+fn test_desktop_backdrop() -> Option<gpui::Background> {
+    let value = std::env::var("DIRI_VISUAL_BACKDROP").ok()?;
+    if value == "gradient" {
+        return Some(gpui::linear_gradient(
+            135.0,
+            gpui::linear_color_stop(gpui::rgb(0x0b2a4f), 0.0),
+            gpui::linear_color_stop(gpui::rgb(0x2c6db3), 1.0),
+        ));
+    }
+    u32::from_str_radix(&value, 16)
+        .ok()
+        .map(|hex| gpui::rgb(hex).into())
+}
+
 /// The platform window background that realizes a preferred material.
 pub(crate) fn window_background(material: WindowMaterial) -> WindowBackgroundAppearance {
     match material {
@@ -1730,7 +1747,7 @@ impl RootView {
 
     /// Pushes the preferred window material to the platform window when it
     /// changes. The window opens with the right material already; this only
-    /// follows the settings toggle afterwards.
+    /// follows the interface style afterwards, including a palette preview.
     fn sync_window_material(&mut self, window: &Window) {
         let material = self
             .services
@@ -1738,8 +1755,8 @@ impl RootView {
             .store
             .read()
             .expect("session store lock poisoned")
-            .preferences()
-            .window_material;
+            .interface_style()
+            .material();
         if self.applied_material == Some(material) {
             return;
         }
@@ -2529,6 +2546,28 @@ impl RootView {
                         }
                     }
                 }
+            }
+            CommandId::ComfortableDensity | CommandId::CompactDensity => {
+                let density = if command == CommandId::ComfortableDensity {
+                    crate::store::PaneDensity::Comfortable
+                } else {
+                    crate::store::PaneDensity::Compact
+                };
+                let result = self
+                    .window_store
+                    .write()
+                    .expect("session store lock poisoned")
+                    .update_preferences(|prefs| prefs.pane_density = density);
+                match result {
+                    Ok(()) => self.services.store.publish_local_change(),
+                    Err(error) => self.show_feedback(
+                        "prefs",
+                        Toast::error(crate::i18n::t("toast.density_failed"))
+                            .detail(error.to_string()),
+                        cx,
+                    ),
+                }
+                cx.notify();
             }
             CommandId::ToggleTabOrientation
             | CommandId::HorizontalTabs
@@ -4010,14 +4049,26 @@ impl RootView {
         } else {
             0.0
         };
+        // Comfortable density floats the card (or, in a workspace, each pane)
+        // as an island inset by this much window chrome on every side.
+        let density = self
+            .window_store
+            .read()
+            .expect("session store lock poisoned")
+            .preferences()
+            .pane_density;
+        let gap = density.island_gap();
+        let islands = density.islands();
+        let origin_x = sidebar_width + gap;
+        let origin_y = gap;
         let card_width =
-            (f32::from(viewport_size.width) - sidebar_width - inspector_width).max(0.0);
+            (f32::from(viewport_size.width) - sidebar_width - inspector_width - 2.0 * gap).max(0.0);
         let tabs_height = if self.sidebar.read(cx).horizontal_tabs_visible() {
             crate::tab_navigation::TAB_STRIP_HEIGHT
         } else {
             0.0
         };
-        let card_height = (f32::from(viewport_size.height) - tabs_height).max(0.0);
+        let card_height = (f32::from(viewport_size.height) - tabs_height - 2.0 * gap).max(0.0);
         if self.tabs_target != tabs_height {
             self.tabs_target = tabs_height;
             self.tabs_slide = (!cx.reduce_motion())
@@ -4058,13 +4109,13 @@ impl RootView {
                 .and_then(|terminal| terminal.read(cx).page_geometry());
             surfaces.update(cx, |surfaces, cx| {
                 surfaces.sync_resident_buffers(buffers);
-                surfaces.set_tab_peek_region(sidebar_width, tabs_height, card_width, cx);
+                surfaces.set_tab_peek_region(origin_x, origin_y + tabs_height, card_width, cx);
                 // Last frame's primary pane, which is the page a pinch picks
                 // up; the whole card when no pane has been laid out yet.
                 let page = page_geometry.unwrap_or((
                     crate::terminal_pane::TerminalViewport {
-                        x: sidebar_width,
-                        y: tabs_height,
+                        x: origin_x,
+                        y: origin_y + tabs_height,
                         width: card_width,
                         height: card_height,
                     },
@@ -4082,6 +4133,9 @@ impl RootView {
                 );
             });
         }
+        // In a workspace each pane is its own island, so the card itself is
+        // only the chrome between them.
+        let card_island = islands && self.active_workspace.is_none();
         let mut card = div()
             .relative()
             .flex_1()
@@ -4089,10 +4143,13 @@ impl RootView {
             .flex_col()
             .h_full()
             .min_w(px(0.0))
-            .when(seam <= 0.0, |card| card.rounded_tl(px(Radius::CARD)))
-            .when(inspector_seam <= 0.0, |card| {
+            .when(!islands && seam <= 0.0, |card| {
+                card.rounded_tl(px(Radius::CARD))
+            })
+            .when(!islands && inspector_seam <= 0.0, |card| {
                 card.rounded_tr(px(Radius::CARD))
             })
+            .when(card_island, |card| card.rounded(px(Radius::CARD)))
             .bg(terminal.work_surface_nested())
             .overflow_hidden()
             .text_color(terminal.primary);
@@ -4118,20 +4175,30 @@ impl RootView {
         // borderless sidebar title bar even though both are 42 points tall.
         // The sidebar owns the shared divider; only draw our left edge when
         // it is hidden. Bottom corners stay square against the window edge.
-        let card_outline = div()
-            .absolute()
-            .inset_0()
-            .when(seam <= 0.0, |outline| outline.rounded_tl(px(Radius::CARD)))
-            .when(inspector_seam <= 0.0, |outline| {
-                outline.rounded_tr(px(Radius::CARD))
-            })
-            .border_t_1()
-            .border_b_1()
-            .when(seam <= 0.0, |outline| outline.border_l_1())
-            // Mirror of the left edge: the right panel owns the divider while
-            // it is on screen, so the seam is one hairline rather than two.
-            .when(inspector_seam <= 0.0, |outline| outline.border_r_1())
-            .border_color(terminal.primary.alpha(0.10));
+        let card_outline = if islands {
+            div()
+                .absolute()
+                .inset_0()
+                .rounded(px(Radius::CARD))
+                .when(card_island, |outline| outline.border_1())
+                .border_color(terminal.primary.alpha(0.10))
+        } else {
+            div()
+                .absolute()
+                .inset_0()
+                .when(seam <= 0.0, |outline| outline.rounded_tl(px(Radius::CARD)))
+                .when(inspector_seam <= 0.0, |outline| {
+                    outline.rounded_tr(px(Radius::CARD))
+                })
+                .border_t_1()
+                .border_b_1()
+                .when(seam <= 0.0, |outline| outline.border_l_1())
+                // Mirror of the left edge: the right panel owns the divider
+                // while it is on screen, so the seam is one hairline rather
+                // than two.
+                .when(inspector_seam <= 0.0, |outline| outline.border_r_1())
+                .border_color(terminal.primary.alpha(0.10))
+        };
 
         if let Some(workbench) = &self.workspace_workbench {
             let external_owner = if terminal_in_workspace_panel
@@ -4156,7 +4223,7 @@ impl RootView {
                 terminal.set_header_trailing_inset(0.0, cx);
                 terminal.set_viewport(
                     TerminalViewport {
-                        x: sidebar_width + card_width,
+                        x: origin_x + card_width + gap,
                         // The pane sits under the inspector header. Counting
                         // that header in the height sizes the PTY past the
                         // painted grid, so a wrapped line parks the prompt on
@@ -4237,8 +4304,8 @@ impl RootView {
                     workbench.set_tab(
                         tab,
                         TerminalViewport {
-                            x: sidebar_width,
-                            y: tabs_height,
+                            x: origin_x,
+                            y: origin_y + tabs_height,
                             width: card_width,
                             height: card_height,
                         },
@@ -4271,8 +4338,8 @@ impl RootView {
                     terminal.set_header_hidden(hosts_pane_actions, cx);
                     terminal.set_viewport(
                         TerminalViewport {
-                            x: sidebar_width,
-                            y: tabs_height,
+                            x: origin_x,
+                            y: origin_y + tabs_height,
                             width: card_width,
                             height: heights.primary,
                         },
@@ -4303,8 +4370,8 @@ impl RootView {
                     terminal.set_header_trailing_inset(48.0, cx);
                     terminal.set_viewport(
                         TerminalViewport {
-                            x: sidebar_width,
-                            y: tabs_height + heights.primary + 1.0,
+                            x: origin_x,
+                            y: origin_y + tabs_height + heights.primary + 1.0,
                             width: card_width,
                             height: heights.auxiliary,
                         },
@@ -4365,8 +4432,8 @@ impl RootView {
                 terminal.set_header_hidden(hosts_pane_actions, cx);
                 terminal.set_viewport(
                     TerminalViewport {
-                        x: sidebar_width,
-                        y: tabs_height,
+                        x: origin_x,
+                        y: origin_y + tabs_height,
                         width: card_width,
                         height: card_height,
                     },
@@ -4393,7 +4460,23 @@ impl RootView {
                 }
             });
         }
-        card.child(body).child(card_outline).into_any_element()
+        let card = card.child(body).child(card_outline);
+        if !islands {
+            return card.into_any_element();
+        }
+        // The chrome around the island paints the sidebar's material, so the
+        // card reads as lifted off the same surface the navigation sits on.
+        div()
+            .id("island-chrome")
+            .debug_selector(|| "island-chrome".into())
+            .flex_1()
+            .flex()
+            .h_full()
+            .min_w(px(0.0))
+            .p(px(gap))
+            .bg(terminal.sidebar_surface())
+            .child(card)
+            .into_any_element()
     }
 
     fn preview_workbench(&self, colors: SemanticColors) -> AnyElement {
@@ -5425,6 +5508,16 @@ impl Render for RootView {
             .on_action(cx.listener(|this, _: &commands::VerticalTabs, window, cx| {
                 this.run_command(CommandId::VerticalTabs, window, cx);
             }))
+            .on_action(
+                cx.listener(|this, _: &commands::ComfortableDensity, window, cx| {
+                    this.run_command(CommandId::ComfortableDensity, window, cx);
+                }),
+            )
+            .on_action(
+                cx.listener(|this, _: &commands::CompactDensity, window, cx| {
+                    this.run_command(CommandId::CompactDensity, window, cx);
+                }),
+            )
             .on_action(cx.listener(|this, _: &FocusSidebar, window, cx| {
                 this.run_command(CommandId::FocusSidebar, window, cx);
             }))
@@ -5711,10 +5804,17 @@ impl Render for RootView {
         if let Some(overlay) = self.perf_overlay(colors, window, cx) {
             root = root.child(overlay);
         }
-        root.child(crate::telemetry::frame_probe(
+        let root = root.child(crate::telemetry::frame_probe(
             frame_started,
             self.frame_context(cx),
-        ))
+        ));
+        // Fixtures stand a fake desktop behind the window: headless windows
+        // have nothing there, so glass would capture as transparent pixels.
+        #[cfg(test)]
+        if let Some(desktop) = test_desktop_backdrop() {
+            return div().size_full().bg(desktop).child(root).into_any_element();
+        }
+        root.into_any_element()
     }
 }
 
@@ -9928,6 +10028,176 @@ mod tests {
         cx.update_window(window.into(), |_, window, _| window.remove_window())
             .unwrap();
         cx.run_until_parked();
+    }
+
+    /// Every interface style at both densities, in a 2x2 workspace like the
+    /// layout Superlogical demonstrates them on. Writes
+    /// `<style>-<density>.png` into `DIRI_STYLE_SCREENSHOTS`.
+    /// `DIRI_STYLE_THEME=<theme id>` picks the color theme (default
+    /// dirijor-dark); `DIRI_STYLE_ONLY=modern-comfortable,...` narrows the set;
+    /// `DIRI_STYLE_SIDEBAR=0` hides the sidebar; `DIRI_STYLE_SINGLE=1` shows
+    /// the selected session alone instead of the workspace. Run it with
+    /// `DIRI_VISUAL_BACKDROP=gradient` so glass has a desktop to show.
+    #[cfg(target_os = "macos")]
+    #[test]
+    #[ignore = "writes interface style screenshots to DIRI_STYLE_SCREENSHOTS"]
+    fn render_interface_style_screenshots() {
+        use crate::store::{InterfaceStyle, PaneDensity};
+        use diri_proto::workspace::*;
+        use gpui::HeadlessAppContext;
+        let output = std::env::var("DIRI_STYLE_SCREENSHOTS").expect("DIRI_STYLE_SCREENSHOTS");
+        std::fs::create_dir_all(&output).unwrap();
+        let theme = std::env::var("DIRI_STYLE_THEME").unwrap_or_else(|_| "dirijor-dark".into());
+        let only = std::env::var("DIRI_STYLE_ONLY").ok();
+        let sidebar = std::env::var("DIRI_STYLE_SIDEBAR").as_deref() != Ok("0");
+        let single = std::env::var_os("DIRI_STYLE_SINGLE").is_some();
+        let platform = gpui_platform::current_platform(true);
+        let mut cx = HeadlessAppContext::with_platform(
+            platform.text_system(),
+            Arc::new(diri_ui::IconAssets),
+            gpui_platform::current_headless_renderer,
+        );
+        cx.update(|cx| {
+            crate::fonts::init(cx);
+            cx.set_reduce_motion(true);
+        });
+        let name = |style: InterfaceStyle| match style {
+            InterfaceStyle::Modern => "modern",
+            InterfaceStyle::System => "system",
+            InterfaceStyle::Themed => "themed",
+            InterfaceStyle::Blended => "blended",
+        };
+        for style in InterfaceStyle::ALL {
+            for density in PaneDensity::ALL {
+                let file = format!(
+                    "{}-{}",
+                    name(style),
+                    if density.islands() {
+                        "comfortable"
+                    } else {
+                        "compact"
+                    }
+                );
+                if only
+                    .as_ref()
+                    .is_some_and(|only| !only.split(',').any(|item| item == file))
+                {
+                    continue;
+                }
+                let services = test_services();
+                let workspace = WorkspaceId::new("style-workspace");
+                let pane = |id: &str, session: &str| LayoutNode::Pane {
+                    id: PaneId::new(id),
+                    session_id: SessionId::new(session),
+                };
+                {
+                    let mut store = services.store.store.write().unwrap();
+                    store.hydrate(SidebarPreviewFixture::make(PreviewScenario::Typical).list);
+                    store
+                        .update_preferences(|prefs| {
+                            prefs.terminal_theme = theme.clone();
+                            prefs.set_interface_style(style);
+                            prefs.pane_density = density;
+                            prefs.sidebar_visible = sidebar;
+                        })
+                        .unwrap();
+                    store.seed_workspace_snapshot_for_test(WorkspaceSnapshot {
+                        revision: 1,
+                        workspaces: vec![WorkspaceRecord {
+                            project_id: None,
+                            id: workspace.clone(),
+                            name: "diri".into(),
+                            selected_tab: Some(TabId::new("style-tab")),
+                            tabs: vec![WorkspaceTab {
+                                id: TabId::new("style-tab"),
+                                title: Some("~/fun/diri".into()),
+                                focused_pane: PaneId::new("c-shell"),
+                                zoomed_pane: None,
+                                layout: LayoutNode::Split {
+                                    id: SplitId::new("columns"),
+                                    axis: LayoutAxis::Horizontal,
+                                    fraction: 0.5,
+                                    first: Box::new(LayoutNode::Split {
+                                        id: SplitId::new("left"),
+                                        axis: LayoutAxis::Vertical,
+                                        fraction: 0.5,
+                                        first: Box::new(pane("a-git", "preview-claude")),
+                                        second: Box::new(pane("b-json", "preview-codex")),
+                                    }),
+                                    second: Box::new(LayoutNode::Split {
+                                        id: SplitId::new("right"),
+                                        axis: LayoutAxis::Vertical,
+                                        fraction: 0.5,
+                                        first: Box::new(pane("c-shell", "preview-cursor")),
+                                        second: Box::new(pane("d-test", "preview-shell")),
+                                    }),
+                                },
+                            }],
+                        }],
+                        ..Default::default()
+                    });
+                }
+                let window = cx
+                    .open_window(size(px(1200.0), px(760.0)), |window, cx| {
+                        cx.new(|cx| {
+                            let root =
+                                RootView::new(services, false, PreviewScenario::Empty, window, cx);
+                            root.sidebar.update(cx, |sidebar, cx| {
+                                sidebar
+                                    .set_tab_orientation(crate::store::TabOrientation::Vertical, cx)
+                                    .unwrap();
+                                if !single {
+                                    sidebar.activate_workspace(Some(workspace), cx);
+                                }
+                            });
+                            root
+                        })
+                    })
+                    .unwrap();
+                cx.run_until_parked();
+                cx.update_window(window.into(), |root, _, cx| {
+                    let root = root.downcast::<RootView>().unwrap();
+                    if single {
+                        let terminal = root.read(cx).terminal.clone().unwrap();
+                        let mut grid = diri_term::buffer::GridBuffer::new(100, 30);
+                        for (y, line) in [
+                            "~/fun/diri main* ≡",
+                            "❯ cargo test -p diri-ui",
+                            "   Compiling diri-ui v0.9.6",
+                            "running 4 tests",
+                            "test glass_alpha_clears ... ok",
+                            "test neutral_palette ... ok",
+                            "test islands_inset ... ok",
+                            "test result: ok. 4 passed",
+                        ]
+                        .into_iter()
+                        .enumerate()
+                        {
+                            for (x, ch) in line.chars().enumerate() {
+                                grid.cells[y * 100 + x].scalar = ch as u32;
+                            }
+                        }
+                        terminal.update(cx, |terminal, cx| {
+                            terminal.seed_preview_grid_for_test(grid, cx);
+                            cx.notify();
+                        });
+                    } else {
+                        let workbench = root.read(cx).workspace_workbench.clone().unwrap();
+                        workbench
+                            .update(cx, |workbench, cx| workbench.seed_styled_panes_for_test(cx));
+                    }
+                })
+                .unwrap();
+                cx.run_until_parked();
+                cx.capture_screenshot(window.into())
+                    .unwrap()
+                    .save(std::path::Path::new(&output).join(format!("{file}.png")))
+                    .unwrap();
+                cx.update_window(window.into(), |_, window, _| window.remove_window())
+                    .unwrap();
+                cx.run_until_parked();
+            }
+        }
     }
 
     #[cfg(target_os = "macos")]

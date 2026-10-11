@@ -21,6 +21,8 @@ use crate::i18n::{t, tf};
 pub enum PaletteCommand {
     Workspace(crate::palette_workspace::WorkspaceCommand),
     Themes,
+    /// The interface style page: Modern, System, Themed, Blended.
+    InterfaceStyles,
     /// A static application command. The palette dispatches the same typed
     /// action used by key bindings, menus, and toolbar controls.
     Action(CommandId),
@@ -338,6 +340,7 @@ fn append_management_actions(
                 action.command,
                 PaletteCommand::MigrateSelected { .. }
                     | PaletteCommand::Themes
+                    | PaletteCommand::InterfaceStyles
                     | PaletteCommand::SyncPrefs { .. }
                     | PaletteCommand::Action(
                         CommandId::OpenWorktrees
@@ -347,6 +350,8 @@ fn append_management_actions(
                             | CommandId::ToggleSidebar
                             | CommandId::HorizontalTabs
                             | CommandId::VerticalTabs
+                            | CommandId::ComfortableDensity
+                            | CommandId::CompactDensity
                             | CommandId::OpenSettings
                             | CommandId::ToggleHistory
                             | CommandId::ToggleNotifications
@@ -608,6 +613,21 @@ pub fn actions_for_default_host(
             command: PaletteCommand::Themes,
             keywords: "settings appearance dark light preferences".into(),
         },
+        PaletteAction {
+            id: "interface-style".into(),
+            title: t("palette.interface_style").into(),
+            system_image: "desktopcomputer",
+            shortcut: None,
+            detail: None,
+            enabled: true,
+            is_default: false,
+            command: PaletteCommand::InterfaceStyles,
+            keywords:
+                "appearance glass transparent solid system modern themed blended blur material"
+                    .into(),
+        },
+        registered_action(CommandId::ComfortableDensity),
+        registered_action(CommandId::CompactDensity),
         registered_action(CommandId::CheckForUpdates),
         registered_action(CommandId::ShowWhatsNew),
         registered_action(CommandId::TogglePerfOverlay),
@@ -1204,6 +1224,9 @@ mod tests {
                 "history",
                 "toggle-notifications",
                 "color-theme",
+                "interface-style",
+                "comfortable-density",
+                "compact-density",
                 "check-for-updates",
                 "whats-new",
                 "toggle-perf-overlay",

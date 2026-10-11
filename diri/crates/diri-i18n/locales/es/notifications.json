@@ -95,6 +95,7 @@
   "toast.agent_ready_detail": "La primera vez te pedirá iniciar sesión.",
   "toast.connecting": "Conectando…",
   "toast.connecting_body": "Las sesiones siguen visibles mientras tanto.",
+  "toast.density_failed": "No se pudo guardar la densidad",
   "toast.developer_setting_failed": "No se pudo guardar el ajuste de desarrollador",
   "toast.engine_unreachable": "diri no puede contactar con su motor",
   "toast.engine_unreachable_body": "Reintenta o vuelve a abrir diri si sigue fallando.",

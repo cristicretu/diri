@@ -95,6 +95,7 @@
   "toast.agent_ready_detail": "首次使用时需要登录。",
   "toast.connecting": "正在连接…",
   "toast.connecting_body": "期间会话保持可见。",
+  "toast.density_failed": "无法保存密度",
   "toast.developer_setting_failed": "无法保存开发者设置",
   "toast.engine_unreachable": "diri 无法连接到引擎",
   "toast.engine_unreachable_body": "请重试；如果持续失败，请重新启动 diri。",
