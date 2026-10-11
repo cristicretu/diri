@@ -1632,6 +1632,13 @@ refactor work:
 - multiple read-only observers;
 - remote secret-input (password prompt) reporting; see "Secret input
   awareness" below;
+- remote inline images (Kitty graphics, iTerm2 `OSC 1337 File`). Local
+  sessions place them in the Engine's emulator as `diri-image:` anchors on the
+  covered cells and serve the pixels over `session.read_image`. A remote
+  Holder does not opt in: it neither intercepts those sequences nor answers
+  their support queries, so remote programs see no image support. Carrying
+  pixels needs an additive Remote Helper capability and a bounded image
+  read, not a change to Snapshot/Diff;
 - deeper, explicitly configured `diri-node` integration.
 
 Adding any of these requires an explicit proposal update. They must not enlarge

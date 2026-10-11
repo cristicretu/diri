@@ -9,6 +9,7 @@ pub mod cursor_motion;
 pub mod element;
 pub mod find;
 pub mod identity_hue;
+pub mod inline_images;
 pub mod keys;
 pub mod messages;
 pub mod metrics;

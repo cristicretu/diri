@@ -217,3 +217,12 @@ such a reset can keep, so it is no oracle there),
 checks each greedy line against `Grid::resize`),
 `grow_pulls_kept_history_into_the_viewport_like_dense_storage` and
 `column_changes_after_the_first_decode_only_new_history`.
+
+## Cell size request
+
+`Term` implements `Handler::cell_size_pixels` (`CSI 16 t`, see the VTE patch)
+by sending `Event::CellSizeRequest` with a formatter for `CSI 6 ; height ;
+width t`. It is a separate event from `TextAreaSizeRequest` so a host that
+does not know its cell size (the Remote Helper, a terminal without inline
+images) can leave the query unanswered exactly as before. No wire, checkpoint
+or protocol change.

@@ -1409,7 +1409,9 @@ impl TerminalPane {
                 element.set_text_input_enabled(true);
                 element
             } else {
-                TerminalElement::new(buffer)
+                let element = TerminalElement::new(buffer);
+                self.fetch_inline_images(&id, &element, cx);
+                element
             };
             let element = element
                 .font(mono)
@@ -1452,6 +1454,69 @@ impl TerminalPane {
                 },
             );
         }
+    }
+
+    /// Gives a new terminal's image cache its fetcher: a key the grid shows
+    /// for the first time is read from the Engine, decoded off the main
+    /// thread and painted. Remote sessions never show one (their Holder
+    /// places no images), so the task just waits out the element.
+    fn fetch_inline_images(
+        &self,
+        id: &SessionId,
+        element: &TerminalElement,
+        cx: &mut Context<Self>,
+    ) {
+        let cache = element.inline_images();
+        let (requests, mut keys) = mpsc::unbounded_channel::<String>();
+        cache.set_requester(move |key| {
+            let _ = requests.send(key);
+        });
+        // The cache owns the sender; a strong cache here would keep the
+        // channel, and this task, alive forever.
+        let cache = Arc::downgrade(&cache);
+        let client = Arc::clone(self.runtime.client());
+        let tokio = self.tokio.clone();
+        let id = id.clone();
+        cx.spawn(async move |this, cx| {
+            while let Some(key) = keys.recv().await {
+                let read = {
+                    let (client, id, key) = (Arc::clone(&client), id.clone(), key.clone());
+                    tokio.spawn(async move { client.read_image(&id, &key).await })
+                };
+                let decoded = match read.await {
+                    Ok(Ok(image)) => cx
+                        .background_executor()
+                        .spawn(async move {
+                            diri_term::inline_images::decode(
+                                image.format,
+                                image.compressed,
+                                image.width,
+                                image.height,
+                                &image.data,
+                            )
+                        })
+                        .await
+                        .map_err(|_| "decode"),
+                    // Evicted or deleted since it was drawn, most often.
+                    Ok(Err(_)) | Err(_) => Err("read"),
+                };
+                let Some(cache) = cache.upgrade() else {
+                    return;
+                };
+                match decoded {
+                    Ok(image) => cache.insert(&key, image),
+                    Err(stage) => {
+                        diri_telemetry::debug_event!("terminal.image_unavailable", stage = stage);
+                        cache.fail(&key);
+                    }
+                }
+                drop(cache);
+                if this.update(cx, |_, cx| cx.notify()).is_err() {
+                    return;
+                }
+            }
+        })
+        .detach();
     }
 
     fn reconcile_store_change(&mut self, window: &mut Window, cx: &mut Context<Self>) {

@@ -54,6 +54,9 @@ impl Method {
     pub const SESSION_READ_SCROLLBACK: &'static str = "session.read_scrollback";
     pub const SESSION_READ_SCROLLBACK_CELLS: &'static str = "session.read_scrollback_cells";
     pub const SESSION_READ_DIFF: &'static str = "session.read_diff";
+    /// One chunk of an inline image a terminal placed. Local sessions only;
+    /// unknown keys, evicted images and remote sessions answer `not_found`.
+    pub const SESSION_READ_IMAGE: &'static str = "session.read_image";
     pub const SESSION_READ_TRANSCRIPT: &'static str = "session.read_transcript";
     pub const SESSION_MARK_SEEN: &'static str = "session.mark_seen";
     /// Returns a completed turn to "done · unseen", like marking a chat
@@ -1297,6 +1300,33 @@ pub struct ForwardRequest {
     pub forward: u16,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub token: Option<String>,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SessionReadImageParams {
+    #[serde(rename = "sessionID")]
+    pub session_id: SessionId,
+    /// The key of an [`crate::inline_image::ImageAnchor`].
+    pub key: String,
+    #[serde(default)]
+    pub offset: u64,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SessionReadImageResult {
+    pub format: crate::inline_image::InlineImageFormat,
+    /// Raw formats are zlib-compressed (Kitty `o=z`).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub compressed: bool,
+    pub width: u32,
+    pub height: u32,
+    /// Length of the whole stored image; read on while `offset + data` is short.
+    pub total: u64,
+    pub offset: u64,
+    #[serde(with = "base64_bytes")]
+    pub data: Vec<u8>,
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]

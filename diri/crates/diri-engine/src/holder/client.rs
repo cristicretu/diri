@@ -15,9 +15,10 @@ use base64::Engine as _;
 
 use super::protocol::{
     HOLDER_OUTPUT_MAX_FRAME, HOLDER_OUTPUT_STREAM_VERSION, HOLDER_STREAM_ACK, HOLDER_STREAM_INPUT,
-    HOLDER_STREAM_MAX_PAYLOAD, HOLDER_STREAM_RESIZE, HOLDER_STREAM_VERSION, HolderLaunchSpec,
-    HolderManagerRequest, HolderManagerResponse, HolderOperation, HolderProcessSample,
-    HolderRequest, HolderResponse, HolderStat,
+    HOLDER_STREAM_MAX_PAYLOAD, HOLDER_STREAM_RESIZE, HOLDER_STREAM_RESIZE_PIXELS,
+    HOLDER_STREAM_VERSION, HOLDER_STREAM_VERSION_PIXELS, HolderLaunchSpec, HolderManagerRequest,
+    HolderManagerResponse, HolderOperation, HolderProcessSample, HolderRequest, HolderResponse,
+    HolderStat,
 };
 use super::socket;
 use super::{HolderError, HolderResult};
@@ -40,6 +41,9 @@ enum InputTransport {
 struct HolderInputStream {
     stream: UnixStream,
     encoded: Vec<u8>,
+    /// Negotiated: [`HOLDER_STREAM_VERSION_PIXELS`] unless the Holder
+    /// predates it.
+    version: u16,
 }
 
 impl HolderClient {
@@ -65,10 +69,26 @@ impl HolderClient {
     }
 
     pub fn resize(&self, cols: u16, rows: u16) -> HolderResult<()> {
-        let mut payload = [0_u8; 4];
-        payload[..2].copy_from_slice(&cols.to_be_bytes());
-        payload[2..].copy_from_slice(&rows.to_be_bytes());
-        if self.send_stream(HOLDER_STREAM_RESIZE, &payload)? {
+        self.resize_with_pixels(cols, rows, (0, 0))
+    }
+
+    /// Resizes and sets the PTY's pixel size where the Holder supports it;
+    /// an older Holder gets the plain resize, and its pixel size stays zero.
+    pub fn resize_with_pixels(&self, cols: u16, rows: u16, pixels: (u16, u16)) -> HolderResult<()> {
+        let mut payload = Vec::with_capacity(8);
+        payload.extend_from_slice(&cols.to_be_bytes());
+        payload.extend_from_slice(&rows.to_be_bytes());
+        let sent = self.with_stream(|stream| {
+            if pixels != (0, 0) && stream.version >= HOLDER_STREAM_VERSION_PIXELS {
+                let mut payload = payload.clone();
+                payload.extend_from_slice(&pixels.0.to_be_bytes());
+                payload.extend_from_slice(&pixels.1.to_be_bytes());
+                stream.send(HOLDER_STREAM_RESIZE_PIXELS, &payload)
+            } else {
+                stream.send(HOLDER_STREAM_RESIZE, &payload)
+            }
+        })?;
+        if sent.is_some() {
             return Ok(());
         }
         let mut request = HolderRequest::op(HolderOperation::Resize);
@@ -165,6 +185,27 @@ impl HolderClient {
     /// accepted a frame, a missing acknowledgement is returned as an error and
     /// the frame is never retried, avoiding duplicate keystrokes.
     fn send_stream(&self, kind: u8, payload: &[u8]) -> HolderResult<bool> {
+        // A paste can exceed one stream frame, which the Holder rejects
+        // whole. Its chunks go back to back under the transport lock, so no
+        // other input can land between them.
+        let sent = self.with_stream(|stream| {
+            let mut chunks = payload.chunks(HOLDER_STREAM_MAX_PAYLOAD);
+            let first = chunks.next().unwrap_or_default();
+            for chunk in std::iter::once(first).chain(chunks) {
+                stream.send(kind, chunk)?;
+            }
+            Ok(())
+        })?;
+        Ok(sent.is_some())
+    }
+
+    /// Runs `send` on the negotiated input stream; `None` for a Holder that
+    /// only speaks the legacy requests. A failure forgets the stream, and the
+    /// next call negotiates again.
+    fn with_stream<R>(
+        &self,
+        send: impl FnOnce(&mut HolderInputStream) -> HolderResult<R>,
+    ) -> HolderResult<Option<R>> {
         let mut transport = self
             .input
             .lock()
@@ -176,21 +217,14 @@ impl HolderClient {
             };
         }
         match &mut *transport {
-            InputTransport::Stream(stream) => {
-                // A paste can exceed one stream frame, which the Holder
-                // rejects whole. Its chunks go back to back under this lock,
-                // so no other input can land between them.
-                let mut chunks = payload.chunks(HOLDER_STREAM_MAX_PAYLOAD);
-                let first = chunks.next().unwrap_or_default();
-                for chunk in std::iter::once(first).chain(chunks) {
-                    if let Err(error) = stream.send(kind, chunk) {
-                        *transport = InputTransport::Unknown;
-                        return Err(error);
-                    }
+            InputTransport::Stream(stream) => match send(stream) {
+                Ok(result) => Ok(Some(result)),
+                Err(error) => {
+                    *transport = InputTransport::Unknown;
+                    Err(error)
                 }
-                Ok(true)
-            }
-            InputTransport::Legacy => Ok(false),
+            },
+            InputTransport::Legacy => Ok(None),
             InputTransport::Unknown => unreachable!("negotiation resolved the transport"),
         }
     }
@@ -391,18 +425,28 @@ impl HolderOutputStream {
 }
 
 impl HolderInputStream {
+    /// The newest stream version the Holder accepts. One that predates
+    /// pixel resizes refuses version 2 and is asked again for version 1.
     fn connect(path: &Path) -> HolderResult<Option<Self>> {
+        if let Some(stream) = Self::connect_version(path, HOLDER_STREAM_VERSION_PIXELS)? {
+            return Ok(Some(stream));
+        }
+        Self::connect_version(path, HOLDER_STREAM_VERSION)
+    }
+
+    fn connect_version(path: &Path, version: u16) -> HolderResult<Option<Self>> {
         let mut stream = socket::connect(path)?;
         let mut request = HolderRequest::op(HolderOperation::Stream);
-        request.stream_version = Some(HOLDER_STREAM_VERSION);
+        request.stream_version = Some(version);
         socket::write_json_line(&mut stream, &request)?;
         let response: HolderResponse = socket::read_json_line(&mut stream)?;
-        if !response.ok || response.stream_version != Some(HOLDER_STREAM_VERSION) {
+        if !response.ok || response.stream_version != Some(version) {
             return Ok(None);
         }
         Ok(Some(Self {
             stream,
             encoded: Vec::with_capacity(256),
+            version,
         }))
     }
 

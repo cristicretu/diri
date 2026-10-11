@@ -9,6 +9,10 @@ license.workspace = true
 diri-proto.workspace = true
 diri-telemetry.workspace = true
 gpui.workspace = true
+# Both already built for GPUI's own image loading; used to decode inline
+# terminal images (PNG/JPEG/GIF and Kitty's zlib-compressed raw pixels).
+image = { workspace = true, features = ["gif", "jpeg", "png"] }
+miniz_oxide = "0.8"
 unicode-width = "0.2.2"
 
 [dev-dependencies]

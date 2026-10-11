@@ -13,8 +13,12 @@
 //! emulator does not model, so it is scanned out of the byte stream directly —
 //! see [`scan_progress`].
 
+mod inline_images;
 mod notifications;
 mod program_status;
+pub use inline_images::{
+    DEFAULT_CELL_PIXELS, STORE_BUDGET_BYTES as INLINE_IMAGE_BUDGET_BYTES, StoredImage,
+};
 pub use notifications::{AGENT_EXIT_OSC, TerminalNotification};
 pub use program_status::{
     BlockedKind, ProgramRecord, ProgramState, QUERY_REPLY as PROGRAM_STATUS_QUERY_REPLY,
@@ -380,6 +384,8 @@ pub struct HeadlessScreen {
     /// boundary is still recognized.
     progress_carry: Vec<u8>,
     notifications: Option<notifications::NotificationParser>,
+    /// Kitty graphics and iTerm2 inline images; `None` unless opted in.
+    images: Option<Box<inline_images::InlineImages>>,
     /// Answers the emulator owes the child: a cursor-position report, a device
     /// attributes reply, and anything else generated in response to a query.
     /// A program that asks and is never answered blocks until its own timeout,
@@ -455,6 +461,7 @@ impl HeadlessScreen {
             pending_damage_rows: vec![true; geometry.rows],
             progress_carry: Vec::new(),
             notifications: None,
+            images: None,
             replies: Vec::new(),
             title_changed: false,
             last_cells: Vec::new(),
@@ -490,6 +497,11 @@ impl HeadlessScreen {
         );
         if self.notifications.is_some() {
             reset = reset.with_notifications();
+        }
+        if let Some(images) = &self.images {
+            let cell_pixels = images.cell_pixels;
+            reset = reset.with_inline_images();
+            reset.set_cell_pixels(cell_pixels.0, cell_pixels.1);
         }
         reset.content_seq = self.content_seq.saturating_add(1);
         *self = reset;
@@ -572,7 +584,7 @@ impl HeadlessScreen {
             // answer arriving before the attributes as support.
             self.replies.append(&mut parser.replies);
         }
-        self.parser.advance(&mut self.term, bytes);
+        self.advance_with_images(bytes, historical_bytes);
         self.settle();
     }
 
@@ -1593,18 +1605,43 @@ impl HeadlessScreen {
                 // Replies to queries the child made — CSI 6n, device
                 // attributes, and so on. Collected here and written back by
                 // the pump, which owns the write side of the PTY.
-                Event::PtyWrite(text) => self.replies.extend_from_slice(text.as_bytes()),
+                Event::PtyWrite(text) => {
+                    // A terminal that places images answers primary device
+                    // attributes as a VT220 with ANSI color (no Sixel): the
+                    // emulator's three-byte `?6c` is too short for kitty's
+                    // tools, which then never finish their support probe.
+                    let text = if self.images.is_some() && text == "\x1b[?6c" {
+                        "\x1b[?62;22c"
+                    } else {
+                        text.as_str()
+                    };
+                    self.replies.extend_from_slice(text.as_bytes());
+                }
                 Event::TextAreaSizeRequest(format) => {
-                    // Cell pixel size is a rendering concern the daemon does
-                    // not know; report the grid it does know. Callers use this
-                    // to size output, and cols/rows is the part they act on.
+                    // Cell pixel size is a rendering concern the daemon knows
+                    // only where it places inline images; elsewhere report the
+                    // grid it does know. Callers use this to size output, and
+                    // cols/rows is the part they act on.
+                    let (cell_width, cell_height) = self.cell_pixels().unwrap_or((0, 0));
                     let size = WindowSize {
                         num_cols: self.geometry.cols as u16,
                         num_lines: self.geometry.rows as u16,
-                        cell_width: 0,
-                        cell_height: 0,
+                        cell_width,
+                        cell_height,
                     };
                     self.replies.extend_from_slice(format(size).as_bytes());
+                }
+                // Unanswered where the cell size is unknown, as before.
+                Event::CellSizeRequest(format) => {
+                    if let Some((cell_width, cell_height)) = self.cell_pixels() {
+                        let size = WindowSize {
+                            num_cols: self.geometry.cols as u16,
+                            num_lines: self.geometry.rows as u16,
+                            cell_width,
+                            cell_height,
+                        };
+                        self.replies.extend_from_slice(format(size).as_bytes());
+                    }
                 }
                 _ => {}
             }

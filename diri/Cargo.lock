@@ -1718,6 +1718,8 @@ dependencies = [
  "diri-terminal-state",
  "gpui",
  "gpui_platform",
+ "image",
+ "miniz_oxide",
  "unicode-width",
 ]
 

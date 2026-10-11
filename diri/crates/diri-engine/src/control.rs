@@ -770,6 +770,7 @@ impl ControlServer {
                         | Method::HOST_USAGE
                         | Method::HOST_LIST_DIRECTORIES
                         | Method::SESSION_READ_DIFF
+                        | Method::SESSION_READ_IMAGE
                         | Method::WORKTREE_INTEGRATE
                         | Method::TASK_ANSWER
                         | Method::TASK_CANCEL
@@ -1099,6 +1100,7 @@ impl ControlServer {
             Method::AGENT_CONFIGURE => self.agent_configure(params),
             Method::PROJECT_ADD => self.project_add(params),
             Method::SESSION_READ_DIFF => self.session_read_diff(params),
+            Method::SESSION_READ_IMAGE => self.session_read_image(params),
             Method::SESSION_READ_TRANSCRIPT => self.session_read_transcript(params),
             Method::WORKTREE_INTEGRATE => self.worktree_integrate(params),
             Method::SESSION_HIBERNATE => self.session_hibernate(params),
@@ -2806,6 +2808,32 @@ impl ControlServer {
         encode(&diri_proto::SessionTerminalTitleResult {
             session_id: p.session_id,
             title,
+        })
+    }
+
+    /// One chunk of an inline image. The bytes are shared with the store,
+    /// so the Registry is held only long enough to find them.
+    fn session_read_image(&self, params: Option<JsonValue>) -> Result<JsonValue, ControlError> {
+        let p: diri_proto::SessionReadImageParams = decode(params)?;
+        let image = {
+            let registry = self.registry.lock().map_err(poisoned)?;
+            registry
+                .get(&p.session_id.0)
+                .ok_or_else(|| ControlError::not_found(p.session_id.0.clone()))?
+                .inline_image(&p.key)
+        }
+        .ok_or_else(|| ControlError::new("image_not_found", "No such image"))?;
+        let total = image.data.len() as u64;
+        let start = p.offset.min(total) as usize;
+        let end = (start + diri_proto::inline_image::READ_IMAGE_CHUNK_BYTES).min(image.data.len());
+        encode(&diri_proto::SessionReadImageResult {
+            format: image.format,
+            compressed: image.compressed,
+            width: image.width,
+            height: image.height,
+            total,
+            offset: start as u64,
+            data: image.data[start..end].to_vec(),
         })
     }
 

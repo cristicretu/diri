@@ -16,7 +16,7 @@ use std::future::Future;
 use std::ops::Range;
 use std::pin::Pin;
 
-use diri_proto::grid::{GridCell, GridCodecError, GridRowCodec, RowMetadata};
+use diri_proto::grid::{GridCell, GridCodecError, GridRowCodec, LinkSpan, RowMetadata};
 use diri_proto::methods::ReadScrollbackCellsResult;
 use diri_proto::model::SessionId;
 use diri_proto::terminal::MouseModes;
@@ -456,6 +456,12 @@ impl ScrollbackViewport {
         self.row_metadata_ref(buffer, row)
             .cloned()
             .unwrap_or_default()
+    }
+
+    /// The row's links without copying its metadata.
+    pub fn row_links<'a>(&'a self, buffer: &'a GridBuffer, row: i64) -> &'a [LinkSpan] {
+        self.row_metadata_ref(buffer, row)
+            .map_or(&[], |metadata| metadata.links.as_slice())
     }
 
     pub fn row_graphemes<'a>(&'a self, buffer: &'a GridBuffer, row: i64) -> &'a [(u16, String)] {
