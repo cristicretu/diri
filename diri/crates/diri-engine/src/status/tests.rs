@@ -690,6 +690,111 @@ fn a_shell_lends_its_status_to_an_agent_in_its_foreground() {
     assert_eq!(outcome.status_change, Some(SessionStatus::Working));
 }
 
+/// Streams output every 100 ms from `from` for `span`, then ticks; returns
+/// the time of the last frame and whether any reduction finished a turn.
+fn stream(reducer: &mut StatusReducer, from: SystemTime, span: Duration) -> (SystemTime, bool) {
+    let mut at = from;
+    let mut completed = false;
+    while at < from + span {
+        completed |= reducer
+            .reduce(StatusSignal::PtyOutputActivity, at)
+            .turn_completed;
+        completed |= reducer.reduce(StatusSignal::Tick, at).turn_completed;
+        at += Duration::from_millis(100);
+    }
+    (at, completed)
+}
+
+/// An Agent the catalog knows only by name (`goose`) has no screen rules:
+/// while it holds the shell's foreground, sustained output is Working and a
+/// still terminal is Idle. A turn the user asked for ends with an
+/// announcement; being recognised, or redrawing on its own, does not.
+#[test]
+fn an_agent_known_by_name_is_read_from_its_output() {
+    let mut reducer =
+        StatusReducer::new(Authority::ProcessOnly, t0()).with_manifest("shell", Some("1"));
+    let now = t0() + Duration::from_secs(1);
+    reducer.reduce(StatusSignal::ForegroundJob { running: true }, now);
+    let outcome = reducer.lend_to_activity("goose", now);
+    assert_eq!(outcome.status_change, Some(SessionStatus::Idle));
+    assert_eq!(reducer.foreground_agent(), Some("goose"));
+    assert_eq!(
+        reducer.lend_to_activity("goose", now),
+        ReducerOutcome::default()
+    );
+
+    // Its banner and composer paint in one short burst: not work.
+    let (at, _) = stream(&mut reducer, now, Duration::from_millis(300));
+    assert_eq!(reducer.status(), &SessionStatus::Idle);
+
+    // Typing echoes; that is not work either, however long it goes on.
+    let mut at = at + Duration::from_secs(5);
+    for _ in 0..20 {
+        reducer.reduce(StatusSignal::UserKeystroke, at);
+        reducer.reduce(
+            StatusSignal::PtyOutputActivity,
+            at + Duration::from_millis(20),
+        );
+        at += Duration::from_millis(100);
+    }
+    assert_eq!(reducer.status(), &SessionStatus::Idle);
+
+    // Enter, then a reply streams: Working, then Idle with an announcement.
+    reducer.reduce(StatusSignal::UserSubmission, at);
+    let (at, completed) = stream(
+        &mut reducer,
+        at + Duration::from_millis(300),
+        Duration::from_secs(4),
+    );
+    assert_eq!(reducer.status(), &SessionStatus::Working);
+    assert!(!completed);
+    // A silent wait between chunks keeps it Working.
+    let outcome = reducer.reduce(StatusSignal::Tick, at + Duration::from_secs(2));
+    assert_eq!(outcome.status_change, None);
+    let outcome = reducer.reduce(StatusSignal::Tick, at + Duration::from_secs(3));
+    assert_eq!(outcome.status_change, Some(SessionStatus::Idle));
+    assert!(outcome.turn_completed, "the turn the user asked for ends");
+    let evidence = reducer.evidence().expect("evidence");
+    assert_eq!(evidence.manifest_id.as_deref(), Some("goose"));
+    assert_eq!(evidence.status, SessionStatus::Idle);
+
+    // Output nobody asked for (a background refresh) is work, not a turn.
+    let at = at + Duration::from_secs(10);
+    let (at, _) = stream(&mut reducer, at, Duration::from_secs(1));
+    assert_eq!(reducer.status(), &SessionStatus::Working);
+    let outcome = reducer.reduce(StatusSignal::Tick, at + Duration::from_secs(4));
+    assert_eq!(outcome.status_change, Some(SessionStatus::Idle));
+    assert!(!outcome.turn_completed);
+
+    // Leaving hands the shell back its job tracking.
+    reducer.return_from_agent(false, at + Duration::from_secs(5));
+    assert_eq!(reducer.foreground_agent(), None);
+    assert_eq!(reducer.authority(), Authority::ProcessOnly);
+    let outcome = reducer.reduce(
+        StatusSignal::ForegroundJob { running: true },
+        at + Duration::from_secs(6),
+    );
+    assert_eq!(outcome.status_change, Some(SessionStatus::Working));
+}
+
+/// An Agent with screen rules recognised after one read by its output (a
+/// new job in the same shell) is read by its rules, not by its output.
+#[test]
+fn a_screen_agent_replaces_an_activity_reading() {
+    let mut reducer =
+        StatusReducer::new(Authority::ProcessOnly, t0()).with_manifest("shell", Some("1"));
+    let now = t0() + Duration::from_secs(1);
+    reducer.lend_to_activity("goose", now);
+    reducer.lend_to_agent("kimi", Some("1"), now);
+    assert_eq!(reducer.foreground_agent(), Some("kimi"));
+    let (_, _) = stream(&mut reducer, now, Duration::from_secs(2));
+    assert_eq!(
+        reducer.status(),
+        &SessionStatus::Idle,
+        "bytes alone are not a screen Agent's work"
+    );
+}
+
 fn shell_running_a_job(now: SystemTime) -> StatusReducer {
     let mut reducer =
         StatusReducer::new(Authority::ProcessOnly, t0()).with_manifest("shell", Some("1"));
