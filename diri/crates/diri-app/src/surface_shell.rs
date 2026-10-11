@@ -8223,7 +8223,9 @@ fn settings_dropdown(
             .w(px(width))
             .occlude()
             .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
-            .child(FloatingSurface::new(colors, content)),
+            // Over settings rows with nothing blurring behind it, so the
+            // menu must hide the labels under it outright.
+            .child(FloatingSurface::new(colors, content).opaque(true)),
     )
     .with_priority(5)
 }
