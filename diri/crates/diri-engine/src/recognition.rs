@@ -35,7 +35,8 @@ pub enum Alias {
 /// An Agent a shell can recognise by name.
 #[derive(Debug)]
 pub struct RecognizedAgent {
-    /// An `AgentKind` id: a manifest's when the Agent has one.
+    /// An `AgentKind` id: a manifest's when the Agent has one. One without
+    /// is named in `diri_proto::agent_names`.
     pub id: &'static str,
     pub aliases: &'static [Alias],
 }
@@ -289,6 +290,26 @@ mod tests {
         for id in ["aider", "grok", "kilo", "kimi", "kiro", "qoder"] {
             assert!(CATALOG.iter().any(|agent| agent.id == id), "{id}");
             assert!(engine.manifest(id).is_some(), "{id} has no manifest");
+        }
+    }
+
+    /// Every Agent known only by name has a display name; a manifest's Agent
+    /// takes its manifest's, so the catalog never names one twice.
+    #[test]
+    fn agents_without_a_manifest_and_only_those_are_named_here() {
+        let (engine, _) =
+            crate::detect::ManifestEngine::load_dir(&crate::detect::bundled_manifest_dir())
+                .unwrap();
+        let name = diri_proto::agent_names::recognized_agent_name;
+        for agent in CATALOG {
+            let has_manifest = engine.manifest(agent.id).is_some();
+            assert_eq!(name(agent.id).is_none(), has_manifest, "{}", agent.id);
+        }
+        for &(id, _) in diri_proto::agent_names::RECOGNIZED_AGENT_NAMES {
+            assert!(
+                CATALOG.iter().any(|agent| agent.id == id),
+                "{id} is named but never recognised"
+            );
         }
     }
 

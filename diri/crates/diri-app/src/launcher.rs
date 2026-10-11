@@ -4486,7 +4486,7 @@ fn ui_agent_kind(kind: &AgentKind) -> UiAgentKind {
         AgentKind::CURSOR_ID => UiAgentKind::Cursor,
         AgentKind::GEMINI_ID => UiAgentKind::Gemini,
         AgentKind::SHELL_ID => UiAgentKind::Shell,
-        _ => UiAgentKind::Generic,
+        id => UiAgentKind::from_agent_id(id),
     }
 }
 

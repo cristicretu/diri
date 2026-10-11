@@ -1883,7 +1883,7 @@ fn ui_agent_kind(kind: &ProtoAgentKind) -> AgentKind {
         ProtoAgentKind::CURSOR_ID => AgentKind::Cursor,
         ProtoAgentKind::GEMINI_ID => AgentKind::Gemini,
         ProtoAgentKind::SHELL_ID => AgentKind::Shell,
-        _ => AgentKind::Generic,
+        id => AgentKind::from_agent_id(id),
     }
 }
 

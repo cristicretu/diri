@@ -174,6 +174,7 @@ pub(crate) fn display_name(kind: &AgentKind, catalog: &AgentReadinessResult) -> 
         .into_iter()
         .find(|option| option.kind == *kind)
         .map(|option| option.display_name)
+        .or_else(|| diri_proto::agent_names::recognized_agent_name(kind.id()).map(str::to_owned))
         .unwrap_or_else(|| title_case_id(kind.id()))
 }
 
@@ -318,6 +319,23 @@ mod tests {
     use diri_proto::{AgentDescriptor, AgentReadinessItem, AgentSetup};
 
     use super::*;
+
+    #[test]
+    fn an_agent_known_only_by_name_keeps_its_brand_spelling() {
+        let catalog = AgentReadinessResult::default();
+        assert_eq!(
+            display_name(&AgentKind::new("traecli"), &catalog),
+            "TRAE CLI"
+        );
+        assert_eq!(
+            display_name(&AgentKind::new("codebuddy"), &catalog),
+            "CodeBuddy"
+        );
+        assert_eq!(
+            display_name(&AgentKind::new("some-cli"), &catalog),
+            "Some Cli"
+        );
+    }
 
     fn item(id: &str, available: bool, first_class: bool) -> AgentReadinessItem {
         AgentReadinessItem {

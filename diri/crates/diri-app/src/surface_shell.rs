@@ -8280,7 +8280,7 @@ pub(crate) fn ui_agent(kind: &ProtoAgentKind) -> diri_ui::AgentKind {
         ProtoAgentKind::CURSOR_ID => diri_ui::AgentKind::Cursor,
         ProtoAgentKind::GEMINI_ID => diri_ui::AgentKind::Gemini,
         ProtoAgentKind::SHELL_ID => diri_ui::AgentKind::Shell,
-        _ => diri_ui::AgentKind::Generic,
+        id => diri_ui::AgentKind::from_agent_id(id),
     }
 }
 

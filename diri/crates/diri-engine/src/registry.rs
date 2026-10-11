@@ -2645,6 +2645,12 @@ fn fold_shell_view(record: &mut SessionRecord, view: &SessionView) {
             normalize_terminal_title_for(title, agent, cwd)
         })
         .or_else(|| serving_title(record.foreground_ports.as_deref().unwrap_or_default()))
+        // An Agent known only by name is called that, not by its executable
+        // (`codebuddy-code`, `muse-bin-1.4.2`); a manifest's keeps the program.
+        .or_else(|| {
+            let agent = record.foreground_agent.as_ref()?;
+            diri_proto::agent_names::recognized_agent_name(agent.id()).map(str::to_owned)
+        })
         .or_else(|| view.foreground_program.clone())
         .or_else(|| record.terminal_cwd.as_deref().map(directory_title));
     if let Some(title) = title
@@ -4567,6 +4573,15 @@ mod tests {
             ),
         );
         assert_eq!(shell.title, "Fix login redirect");
+
+        // An Agent known only by name: its display name, not its executable,
+        // until it titles the terminal itself.
+        fold_session_view(
+            &mut shell,
+            &view(Some("codebuddy-code"), Some("codebuddy"), None),
+        );
+        assert_eq!(shell.effective_kind(), &AgentKind::new("codebuddy"));
+        assert_eq!(shell.title, "CodeBuddy");
 
         fold_session_view(&mut shell, &view(None, None, None));
         assert_eq!(shell.foreground_agent, None);

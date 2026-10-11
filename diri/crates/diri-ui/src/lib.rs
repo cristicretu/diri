@@ -6,6 +6,7 @@
 //! continuous-corner squircles, so radii use GPUI rounded corners as the
 //! documented approximation. See the gallery example for every supported state.
 
+mod agent_marks;
 mod brand;
 mod components;
 mod frame_loop;
@@ -18,6 +19,7 @@ mod svg;
 pub mod title_fade;
 mod tokens;
 
+pub use agent_marks::{AGENT_MARKS, AgentMark, agent_mark};
 pub use brand::{
     AgentKind, AgentLogo, BrandMark, BrandMarkKind, CLAUDE_PATH, CURSOR_PATH, GEMINI_PATH,
     MarkRasterizer, OPENAI_PATH, set_mark_rasterizer,
