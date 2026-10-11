@@ -762,28 +762,54 @@ impl UtilitySurfaces {
         this
     }
 
+    /// Settings stands where the terminal card does and paints like it: the
+    /// work surface under the interface style, and under comfortable density
+    /// a rounded island inset on the sidebar's material.
+    fn settings_island(&self, page: AnyElement) -> AnyElement {
+        let colors = self.colors();
+        let density = self.prefs.pane_density;
+        if !density.islands() {
+            return div()
+                .size_full()
+                .bg(colors.terminal_surface())
+                .child(page)
+                .into_any_element();
+        }
+        let radius = px(Radius::CARD);
+        div()
+            .size_full()
+            .p(px(density.island_gap()))
+            .bg(colors.sidebar_surface())
+            .child(
+                div()
+                    .relative()
+                    .size_full()
+                    .rounded(radius)
+                    .bg(colors.terminal_surface())
+                    .overflow_hidden()
+                    .child(page)
+                    .child(
+                        div()
+                            .absolute()
+                            .inset_0()
+                            .rounded(radius)
+                            .border_1()
+                            .border_color(colors.primary.alpha(0.10)),
+                    ),
+            )
+            .into_any_element()
+    }
+
+    /// The live palette, interface style and its palette preview included,
+    /// so Settings paints as part of the same window as the workbench.
     fn colors(&self) -> SemanticColors {
-        crate::app_theme::colors_with(
-            self.store
-                .read()
-                .expect("session store lock poisoned")
-                .preview_theme_id()
-                .unwrap_or(&self.prefs.terminal_theme),
-            self.prefs.window_material.to_ui(),
-        )
-        .with_transparency(self.prefs.window_transparency)
+        crate::app_theme::colors_in(&self.store.read().expect("session store lock poisoned"))
     }
 
     fn settings_colors(&self) -> SemanticColors {
-        crate::app_theme::sidebar_colors_with(
-            self.store
-                .read()
-                .expect("session store lock poisoned")
-                .preview_theme_id()
-                .unwrap_or(&self.prefs.terminal_theme),
-            self.prefs.window_material.to_ui(),
+        crate::app_theme::sidebar_colors_in(
+            &self.store.read().expect("session store lock poisoned"),
         )
-        .with_transparency(self.prefs.window_transparency)
     }
 
     pub(crate) fn open_worktrees(&mut self, cx: &mut Context<Self>) {
@@ -2741,7 +2767,8 @@ impl UtilitySurfaces {
             .track_scroll(&self.settings_scroll)
             .size_full()
             .overflow_y_scroll()
-            .bg(colors.background)
+            // The settings island behind paints the surface, styled like
+            // the terminal card it stands in for.
             .child(
                 div()
                     .w_full()
@@ -6556,8 +6583,7 @@ impl Render for UtilitySurfaces {
                         .occlude()
                         .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
                         .on_scroll_wheel(|_, _, cx| cx.stop_propagation())
-                        .bg(self.colors().background)
-                        .child(overlay),
+                        .child(self.settings_island(overlay)),
                 );
                 if self.usage_share.is_some() {
                     page.child(self.usage_share_overlay(window, cx))

@@ -1,5 +1,5 @@
 use diri_term::theme::{TermTheme, ThemeAppearance};
-use diri_ui::{Appearance, Material, SemanticColors};
+use diri_ui::{Appearance, SemanticColors};
 use gpui::Rgba;
 
 use crate::store::{InterfaceStyle, SessionStore};
@@ -73,20 +73,13 @@ const fn system_background(appearance: ThemeAppearance) -> Rgba {
 /// Opaque application palette for a theme id. Previews, tests, and surfaces
 /// that never sit on the blurred window use this; live chrome goes through
 /// [`colors_in`] so the window material travels with the palette.
+#[cfg(test)]
 pub(crate) fn colors(id: &str) -> SemanticColors {
     semantic_colors(terminal_theme(id), false)
 }
 
 pub(crate) fn sidebar_colors(id: &str) -> SemanticColors {
     semantic_colors(terminal_theme(id), true)
-}
-
-pub(crate) fn colors_with(id: &str, material: Material) -> SemanticColors {
-    colors(id).with_material(material)
-}
-
-pub(crate) fn sidebar_colors_with(id: &str, material: Material) -> SemanticColors {
-    sidebar_colors(id).with_material(material)
 }
 
 /// Live palette for a store: the previewed theme, if any, under the user's

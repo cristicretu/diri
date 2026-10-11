@@ -4150,7 +4150,11 @@ impl RootView {
                 card.rounded_tr(px(Radius::CARD))
             })
             .when(card_island, |card| card.rounded(px(Radius::CARD)))
-            .bg(terminal.work_surface_nested())
+            // A workspace's islands sit on the chrome painted around the
+            // card, so the card itself stays clear there.
+            .when(!islands || card_island, |card| {
+                card.bg(terminal.work_surface_nested())
+            })
             .overflow_hidden()
             .text_color(terminal.primary);
 
@@ -4220,6 +4224,7 @@ impl RootView {
         if terminal_in_workspace_panel && let Some(auxiliary) = &self.auxiliary_terminal {
             auxiliary.update(cx, |terminal, cx| {
                 terminal.set_shell_chrome(visible_sidebar, true, cx);
+                terminal.set_island_corners(false, cx);
                 terminal.set_header_trailing_inset(0.0, cx);
                 terminal.set_viewport(
                     TerminalViewport {
@@ -4294,7 +4299,10 @@ impl RootView {
             .w_full()
             .h(px(card_height))
             .min_h(px(0.0))
-            .bg(terminal.work_surface_nested());
+            .when(card_island, |body| body.rounded(px(Radius::CARD)))
+            .when(!islands || card_island, |body| {
+                body.bg(terminal.work_surface_nested())
+            });
         if let Some(page) = self.todos_page.clone().filter(|_| self.todos_open) {
             body = body.child(page);
         } else if self.active_workspace.is_some() {
@@ -4335,6 +4343,7 @@ impl RootView {
             if let Some(primary) = &self.terminal {
                 primary.update(cx, |terminal, cx| {
                     terminal.set_shell_chrome(visible_sidebar, self.inspector_open, cx);
+                    terminal.set_island_corners(card_island, cx);
                     terminal.set_header_hidden(hosts_pane_actions, cx);
                     terminal.set_viewport(
                         TerminalViewport {
@@ -4368,6 +4377,7 @@ impl RootView {
             if let Some(terminal) = &self.auxiliary_terminal {
                 terminal.update(cx, |terminal, cx| {
                     terminal.set_header_trailing_inset(48.0, cx);
+                    terminal.set_island_corners(card_island, cx);
                     terminal.set_viewport(
                         TerminalViewport {
                             x: origin_x,
@@ -4429,6 +4439,7 @@ impl RootView {
             self.terminal_available_height = card_height;
             primary.update(cx, |terminal, cx| {
                 terminal.set_shell_chrome(visible_sidebar, self.inspector_open, cx);
+                terminal.set_island_corners(card_island, cx);
                 terminal.set_header_hidden(hosts_pane_actions, cx);
                 terminal.set_viewport(
                     TerminalViewport {
@@ -5209,6 +5220,13 @@ impl Render for RootView {
             .absolute()
             .size_full()
         });
+        let islands = self
+            .window_store
+            .read()
+            .expect("session store lock poisoned")
+            .preferences()
+            .pane_density
+            .islands();
         let sidebar_wrapper = div()
             .id("sidebar-frame")
             .absolute()
@@ -5260,7 +5278,14 @@ impl Render for RootView {
                                 .top_0()
                                 .bottom_0()
                                 .w(px(1.0))
-                                .bg(colors.sidebar_stroke().opacity(1.0 - self.sidebar_float)),
+                                // Islands sit apart from the sidebar on its own
+                                // material; a hairline there would double the
+                                // edge the gap already draws.
+                                .bg(colors.sidebar_stroke().opacity(if islands {
+                                    0.0
+                                } else {
+                                    1.0 - self.sidebar_float
+                                })),
                         ),
                 )
             });
@@ -5632,6 +5657,11 @@ impl Render for RootView {
             ))
             .child(div().flex_none().h_full().w(px(seam)))
             .when(seam > 0.0, |root| root.child(self.resize_handle(cx)));
+        let settings_over_glass = colors.material() == diri_ui::Material::Glass
+            && self
+                .utility_surfaces
+                .as_ref()
+                .is_some_and(|surfaces| surfaces.read(cx).is_settings_open());
         if launcher_open {
             // Command-N behaves like an unsaved new tab: preserve the app
             // shell, but replace the live session pane instead of floating a
@@ -5650,14 +5680,26 @@ impl Render for RootView {
                     ),
             );
         } else {
-            root = root.child(self.terminal_card(
+            let card = self.terminal_card(
                 sidebar_visible,
                 seam,
                 inspector_width,
                 inspector_seam,
                 window,
                 cx,
-            ));
+            );
+            // Settings paints the same glass as the card it stands over; the
+            // card keeps its layout (and every PTY its size) but must not
+            // read through it.
+            root = root.child(
+                div()
+                    .flex_1()
+                    .flex()
+                    .h_full()
+                    .min_w(px(0.0))
+                    .when(settings_over_glass, |card| card.invisible())
+                    .child(card),
+            );
         }
         if inspector_seam > 0.0 {
             // The handle is deferred so it wins hit tests against the terminal.
@@ -5678,6 +5720,7 @@ impl Render for RootView {
                         .h_full()
                         .w(px(inspector_seam))
                         .overflow_hidden()
+                        .when(settings_over_glass, |panel| panel.invisible())
                         // The panel paints the terminal's own fill, so this
                         // hairline is all that separates the two surfaces.
                         .border_l_1()
@@ -10036,7 +10079,8 @@ mod tests {
     /// `DIRI_STYLE_THEME=<theme id>` picks the color theme (default
     /// dirijor-dark); `DIRI_STYLE_ONLY=modern-comfortable,...` narrows the set;
     /// `DIRI_STYLE_SIDEBAR=0` hides the sidebar; `DIRI_STYLE_SINGLE=1` shows
-    /// the selected session alone instead of the workspace. Run it with
+    /// the selected session alone instead of the workspace;
+    /// `DIRI_STYLE_SETTINGS=1` opens Settings over it. Run it with
     /// `DIRI_VISUAL_BACKDROP=gradient` so glass has a desktop to show.
     #[cfg(target_os = "macos")]
     #[test]
@@ -10188,6 +10232,24 @@ mod tests {
                     }
                 })
                 .unwrap();
+                // `DIRI_STYLE_SETTINGS=1`: Settings › Terminal (appearance)
+                // open over the same window, where it stands in for the card.
+                if std::env::var_os("DIRI_STYLE_SETTINGS").is_some() {
+                    cx.update_window(window.into(), |root, window, cx| {
+                        let root = root.downcast::<RootView>().unwrap();
+                        root.update(cx, |root, cx| {
+                            root.run_command(CommandId::OpenSettings, window, cx);
+                            let surfaces = root.utility_surfaces.clone().unwrap();
+                            surfaces.update(cx, |surfaces, cx| {
+                                surfaces
+                                    .open_settings_tab(crate::settings::SettingsTab::Terminal, cx)
+                            });
+                            cx.notify();
+                        });
+                    })
+                    .unwrap();
+                    cx.run_until_parked();
+                }
                 cx.run_until_parked();
                 cx.capture_screenshot(window.into())
                     .unwrap()

@@ -8825,7 +8825,14 @@ impl Sidebar {
             self.request_motion_frame(window, cx);
         }
         // Paint the edge without reducing the shared sidebar content width.
-        root = root.when(!self.surface_in_parent, |root| {
+        let islands = self
+            .store
+            .read()
+            .expect("session store lock poisoned")
+            .preferences()
+            .pane_density
+            .islands();
+        root = root.when(!self.surface_in_parent && !islands, |root| {
             root.child(
                 div()
                     .absolute()

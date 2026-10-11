@@ -995,13 +995,10 @@ impl Render for WorkspaceWorkbench {
             .relative()
             .size_full()
             .overflow_hidden()
-            // Islands float on the sidebar's material; compact panes meet at
-            // hairlines over the work surface.
-            .bg(if islands {
-                colors.sidebar_surface()
-            } else {
-                colors.work_surface_nested()
-            })
+            // Between islands the window chrome behind the card shows (the
+            // card paints it once; a second translucent tint here would
+            // compound under glass). Compact panes meet over the work surface.
+            .when(!islands, |root| root.bg(colors.work_surface_nested()))
             .on_drag_move(cx.listener(
                 |this, event: &DragMoveEvent<DraggedWorkspaceDivider>, _, cx| {
                     this.drag_resize(
@@ -1139,6 +1136,7 @@ impl Render for WorkspaceWorkbench {
                         0.0
                     };
                     terminal.set_header_trailing_inset(controls + toggle, cx);
+                    terminal.set_island_corners(islands, cx);
                     terminal.set_viewport(
                         TerminalViewport {
                             x: self.viewport.x + bounds.x,
@@ -1212,9 +1210,12 @@ impl Render for WorkspaceWorkbench {
                 }));
             let controls = div()
                 .absolute()
-                .top(px(
-                    (Metrics::TITLE_BAR - Metrics::TOOLBAR_CONTROL_SIZE) / 2.0
-                ))
+                .top(px((if islands {
+                    crate::terminal_pane::island_title_bar()
+                } else {
+                    Metrics::TITLE_BAR
+                } - Metrics::TOOLBAR_CONTROL_SIZE)
+                    / 2.0))
                 .right(px(Metrics::TOOLBAR_EDGE_INSET))
                 .flex()
                 .gap(px(4.0))
