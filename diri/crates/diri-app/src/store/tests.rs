@@ -29,7 +29,7 @@ fn pid(value: &str) -> ProjectId {
     ProjectId::new(value)
 }
 
-pub(super) fn session(value: &str, project: &str, created: f64) -> SessionRecord {
+pub(crate) fn session(value: &str, project: &str, created: f64) -> SessionRecord {
     SessionRecord {
         attention_state: None,
         id: id(value),
@@ -4095,4 +4095,107 @@ fn a_user_rename_outlives_its_tab_for_history() {
         titles.get("conversation").map(String::as_str),
         Some("Billing refactor")
     );
+}
+
+#[test]
+fn the_quick_terminal_starts_one_home_shell_without_moving_the_selection() {
+    let selected = session("selected", "a", 1.0);
+    let (mut store, mut effects) =
+        hydrated(vec![selected], vec![project("a", "A")], Prefs::default());
+    store.select(id("selected"));
+    drain(&mut effects);
+
+    assert!(store.quick_terminal_session().is_none());
+    assert!(store.spawn_quick_terminal("Quick Terminal".to_owned()));
+    // A second press while the Engine answers joins the same request.
+    assert!(store.spawn_quick_terminal("Quick Terminal".to_owned()));
+    let spawned = drain(&mut effects);
+    let [StoreEffect::SpawnQuickTerminal(params)] = spawned.as_slice() else {
+        panic!("exactly one quick terminal spawn, got {spawned:?}");
+    };
+    assert_eq!(params.kind, AgentKind::SHELL);
+    assert_eq!(params.cwd, std::env::var("HOME").expect("HOME"));
+    assert_eq!(params.title.as_deref(), Some("Quick Terminal"));
+    assert_eq!(params.host, None, "the panel opens over this Mac");
+    assert_eq!(params.parent, None, "an ordinary top-level session");
+    assert!(store.quick_terminal_spawn_pending());
+
+    store.finish_quick_terminal_spawn(Some(id("quick")));
+    assert!(!store.quick_terminal_spawn_pending());
+    assert_eq!(
+        store.preferences().quick_terminal_session,
+        Some(id("quick"))
+    );
+    let mut quick = session("quick", "home", 2.0);
+    quick.kind = AgentKind::SHELL;
+    store.upsert_session(quick);
+    assert_eq!(
+        store
+            .quick_terminal_session()
+            .map(|session| session.id.clone()),
+        Some(id("quick"))
+    );
+    assert_eq!(store.selected_session_id(), Some(&id("selected")));
+    // A live shell is reused, not doubled.
+    assert!(!store.spawn_quick_terminal("Quick Terminal".to_owned()));
+    assert!(drain(&mut effects).is_empty());
+}
+
+#[test]
+fn an_ended_or_archived_quick_terminal_is_replaced_on_the_next_show() {
+    let mut quick = session("quick", "home", 1.0);
+    quick.kind = AgentKind::SHELL;
+    let prefs = Prefs {
+        quick_terminal_session: Some(id("quick")),
+        ..Prefs::default()
+    };
+    let (mut store, mut effects) = hydrated(vec![quick.clone()], vec![], prefs);
+    assert!(store.quick_terminal_session().is_some());
+
+    let mut ended = quick.clone();
+    ended.status = SessionStatus::Exited(ExitInfo {
+        reason: ExitReason::Exited,
+        code: Some(0),
+        signal: None,
+        system_restart: false,
+        interrupted: false,
+    });
+    store.upsert_session(ended);
+    assert!(store.quick_terminal_session().is_none());
+
+    let mut archived = quick;
+    archived.archived_at = Some(DateMillis(2.0));
+    store.upsert_session(archived);
+    assert!(store.quick_terminal_session().is_none());
+
+    drain(&mut effects);
+    assert!(store.spawn_quick_terminal("Quick Terminal".to_owned()));
+    assert!(matches!(
+        drain(&mut effects).as_slice(),
+        [StoreEffect::SpawnQuickTerminal(_)]
+    ));
+    // A failed spawn clears the request and keeps no id.
+    store.finish_quick_terminal_spawn(None);
+    assert!(!store.quick_terminal_spawn_pending());
+    assert_eq!(
+        store.preferences().quick_terminal_session,
+        Some(id("quick"))
+    );
+}
+
+#[test]
+fn quick_terminal_preferences_default_and_survive_older_files() {
+    let prefs: Prefs = serde_json::from_str("{}").expect("empty prefs");
+    assert!(prefs.quick_terminal_autohide);
+    assert!(!prefs.quick_terminal_hide_on_escape);
+    assert_eq!(prefs.quick_terminal_session, None);
+    assert_eq!(prefs.quick_terminal_key_code, None);
+    let saved = Prefs {
+        quick_terminal_session: Some(id("quick")),
+        quick_terminal_key_code: Some(50),
+        quick_terminal_autohide: false,
+        ..Prefs::default()
+    };
+    let round_trip: Prefs = serde_json::from_str(&serde_json::to_string(&saved).unwrap()).unwrap();
+    assert_eq!(round_trip, saved);
 }

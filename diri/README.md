@@ -177,6 +177,15 @@ are unsupported. Registration conflicts are shown without replacing the previous
 assignment. No Accessibility permission is required. Diri must still be running;
 the shortcut does not launch the app after quitting.
 
+**Show or hide the quick terminal**, beside it, records a second system-wide
+shortcut (same rules, also unassigned by default; Control-` is a common pick).
+It drops a shell from the top of the screen under the pointer, over whatever app
+is in front, without bringing Diri's windows forward; press it again to slide it
+away. The shell is an ordinary session listed in the sidebar and survives
+relaunches. **Settings → Appearance** can hide it with Escape (off by default)
+or when it loses focus (on by default). The palette's **Toggle Quick Terminal**
+does the same without a shortcut.
+
 The default agent is stored in
 `~/Library/Application Support/diri/prefs.json` as the agent manifest's stable
 `id`. Preferences written before the manifest catalog (`claudeCode`, `codex`,

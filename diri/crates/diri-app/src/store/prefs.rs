@@ -261,6 +261,10 @@ impl Prefs {
     }
 }
 
+fn quick_terminal_autohide_default() -> bool {
+    true
+}
+
 fn terminal_follows_last_directory_default() -> bool {
     true
 }
@@ -411,6 +415,19 @@ pub struct Prefs {
     /// Physical macOS key code recorded with the global Show App binding.
     /// Keeping the native code avoids assuming a US keyboard layout.
     pub global_shortcut_key_code: Option<u16>,
+    /// Physical macOS key code recorded with the quick terminal's global
+    /// binding, for the same reason.
+    pub quick_terminal_key_code: Option<u16>,
+    /// The Engine session the quick terminal shows. It is an ordinary shell
+    /// Session; this only remembers which one, so the panel finds the same
+    /// shell after a relaunch. A missing or ended Session means a new one.
+    pub quick_terminal_session: Option<SessionId>,
+    /// Hide the quick terminal when Escape is pressed in it. Off by default:
+    /// Escape belongs to the shell, editors and Agents running there.
+    pub quick_terminal_hide_on_escape: bool,
+    /// Hide the quick terminal when another window or app takes focus.
+    #[serde(default = "quick_terminal_autohide_default")]
+    pub quick_terminal_autohide: bool,
     /// Session that should regain focus after the daemon's initial hydrate.
     pub last_selected_session: Option<SessionId>,
     /// herdr panes and conversations already brought over, so importing
@@ -492,6 +509,10 @@ impl Default for Prefs {
             launch_recipes: LaunchRecipeBook::default(),
             shortcut_overrides: BTreeMap::new(),
             global_shortcut_key_code: None,
+            quick_terminal_key_code: None,
+            quick_terminal_session: None,
+            quick_terminal_hide_on_escape: false,
+            quick_terminal_autohide: true,
             last_selected_session: None,
             herdr_imported: Default::default(),
             whats_new_seen_version: crate::updates::CURRENT_VERSION.to_owned(),

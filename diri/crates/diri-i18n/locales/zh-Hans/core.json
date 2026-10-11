@@ -19,6 +19,7 @@
   "platform.this_computer_lowercase": "这台电脑",
   "platform.this_mac": "这台 Mac",
   "platform.this_mac_lowercase": "这台 Mac",
+  "quick_terminal.session_title": "快捷终端",
   "settings.keywords.accounts": "账户 配置 工作 个人 登录 认证 默认",
   "settings.keywords.agents": "智能体 可执行文件 已安装 命令行 快速创建 默认",
   "settings.keywords.appearance": "外观 终端 颜色 主题 字体 字号 缩放",

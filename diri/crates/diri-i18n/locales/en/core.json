@@ -19,6 +19,7 @@
   "platform.this_computer_lowercase": "this computer",
   "platform.this_mac": "This Mac",
   "platform.this_mac_lowercase": "this Mac",
+  "quick_terminal.session_title": "Quick Terminal",
   "settings.keywords.accounts": "accounts profiles work personal login authentication codex claude default config home",
   "settings.keywords.agents": "agents codex claude cursor gemini executable installed command line quick create default",
   "settings.keywords.appearance": "terminal appearance color theme font text size zoom",

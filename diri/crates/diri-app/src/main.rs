@@ -65,6 +65,8 @@ mod progress_mark;
 mod project_hue;
 pub mod query_editor;
 pub mod quick_open;
+#[cfg(target_os = "macos")]
+mod quick_terminal;
 pub mod quote;
 mod recovery;
 pub mod review_prompt;
@@ -541,6 +543,7 @@ fn main() {
                 .preferences()
                 .clone();
             macos::global_shortcut::install(cx, &prefs);
+            quick_terminal::init(cx, Arc::clone(&services));
         }
         let window_services = services.clone();
         cx.on_action(move |_: &commands::NewWindow, cx| {
