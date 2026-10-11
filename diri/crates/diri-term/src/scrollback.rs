@@ -518,6 +518,17 @@ impl ScrollbackViewport {
         source.unwrap_or_default()
     }
 
+    /// The stored cells behind `absolute_row`, or `None` when the row is
+    /// beyond the screen or not fetched. Never pads or allocates.
+    #[must_use]
+    pub fn stored_row<'a>(
+        &'a self,
+        buffer: &'a GridBuffer,
+        absolute_row: i64,
+    ) -> Option<&'a [GridCell]> {
+        Some(self.row_source(buffer, absolute_row)).filter(|cells| !cells.is_empty())
+    }
+
     #[must_use]
     pub fn window_row(&self, buffer: &GridBuffer, window_row: usize) -> Vec<GridCell> {
         let mut row = Vec::new();

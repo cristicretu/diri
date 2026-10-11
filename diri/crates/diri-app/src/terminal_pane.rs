@@ -4844,6 +4844,8 @@ impl TerminalPane {
                         ),
                     },
                 )
+                // Shell command marks sit in the grid's left padding.
+                .bleed_left(px(diri_term::element::COMMAND_MARK_GUTTER))
                 .size_full(),
             );
 
@@ -5594,6 +5596,12 @@ impl TerminalPane {
                     cx.stop_propagation();
                 }),
             )
+            .on_action(cx.listener(
+                |this, _: &crate::commands::CopyLastCommandOutput, window, cx| {
+                    this.copy_last_command_output(window, cx);
+                    cx.stop_propagation();
+                },
+            ))
             .on_action(
                 cx.listener(|this, _: &crate::commands::NextPrompt, window, cx| {
                     this.read_terminal_history(Some(true), window, cx);
@@ -7660,6 +7668,33 @@ mod tests {
                         ).as_bytes());
                         grid = screen.full_snapshot();
                     }
+                    if scene.starts_with("commands") {
+                        // A shell with OSC 133 marks: two commands that
+                        // passed, one that failed, and one still running.
+                        let mut screen = diri_engine::HeadlessScreen::new(80, 16);
+                        let run = |command: &str, output: &str, status: u8| {
+                            format!(
+                                "\x1b]133;A\x07\x1b[36m~/work/diri\x1b[0m $ \x1b]133;B\x07{command}\r\n\
+                                 \x1b]133;C\x07{output}\x1b]133;D;{status}\x07"
+                            )
+                        };
+                        screen.feed(run("ls", "Cargo.toml  README.md  crates  docs\r\n", 0).as_bytes());
+                        screen.feed(run(
+                            "cargo test -p diri-term command_marks",
+                            "running 3 tests\r\ntest a_prompt_shows_how_its_own_command_ended ... ok\r\n\
+                             test command_output_runs_from_its_output_mark_to_its_end ... ok\r\n\
+                             test the_last_finished_output_is_kept_while_reading_forward ... ok\r\n\r\n\
+                             test result: \x1b[32mok\x1b[0m. 3 passed; 0 failed\r\n",
+                            0,
+                        ).as_bytes());
+                        screen.feed(run(
+                            "git push origin HEAD",
+                            "\x1b[31merror:\x1b[0m failed to push some refs to 'origin'\r\n",
+                            1,
+                        ).as_bytes());
+                        screen.feed(b"\x1b]133;A\x07\x1b[36m~/work/diri\x1b[0m $ \x1b]133;B\x07sleep 5\r\n\x1b]133;C\x07");
+                        grid = screen.full_snapshot();
+                    }
                     let find_fixture = if scene == "find-unicode" {
                         let mut screen = diri_engine::HeadlessScreen::new(80, 28);
                         screen.feed("$ printf 'Unicode terminal output'\r\n\r\n1  <界> cafe\u{301}\r\n2  A🙂B  cafe\u{301}\r\n\r\nSearch keeps wide glyphs and combining marks aligned with their cells.".as_bytes());
@@ -7766,6 +7801,18 @@ mod tests {
                                 cx,
                             );
                         }
+                        "commands-select" => {
+                            let resident = pane.residents.get(&id).unwrap();
+                            let output = resident.element.command_output_at(10, 4).unwrap();
+                            resident.element.select_range(output.start, output.end);
+                        }
+                        "commands-menu" => pane.open_terminal_menu(
+                            gpui::point(px(220.0), px(110.0)),
+                            10,
+                            4,
+                            window,
+                            cx,
+                        ),
                         "menu" => pane.open_terminal_menu(
                             gpui::point(px(260.0), px(180.0)),
                             2,

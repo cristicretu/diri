@@ -68,3 +68,12 @@ complete redraw from a half-drawn one: a keystroke answered by a closed
 synchronized update is published at once even when the redraw removed cells.
 Parsing is unchanged; the counter is one field and one increment per ESU.
 Test: `completed_synchronized_updates_are_counted`.
+
+## OSC 133 command boundaries
+
+OSC 133 already dispatched `A` to `Handler::mark_prompt`. `B`, `C` and
+`D[;status]` now reach one new `Handler::mark_shell_command(ShellCommandMark)`
+method, which defaults to doing nothing. A `D` status that is missing or not an
+integer is passed as `None` rather than as success; options after the status
+(`aid=`, `cmdline_url=`) are ignored. Other `133` kinds remain unhandled.
+Test: `osc_133_boundaries_reach_the_handler_with_their_exit_status`.

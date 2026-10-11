@@ -755,6 +755,8 @@ pub struct ScrollArea {
     colors: SemanticColors,
     child: AnyElement,
     style: StyleRefinement,
+    /// How far the child may paint left of the area, into its host's padding.
+    bleed_left: Pixels,
 }
 
 /// Builds a [`ScrollArea`] around `child`, which must be the element that
@@ -771,6 +773,24 @@ pub fn scroll_area(
         colors,
         child: child.into_any_element(),
         style: StyleRefinement::default(),
+        bleed_left: px(0.0),
+    }
+}
+
+impl ScrollArea {
+    /// Lets the child paint this far left of the area, into padding its host
+    /// keeps clear. Hit testing and the scroller itself are unchanged.
+    #[must_use]
+    pub fn bleed_left(mut self, width: Pixels) -> Self {
+        self.bleed_left = width;
+        self
+    }
+
+    fn child_mask(&self, bounds: Bounds<Pixels>) -> ContentMask<Pixels> {
+        let mut bounds = bounds;
+        bounds.origin.x -= self.bleed_left;
+        bounds.size.width += self.bleed_left;
+        ContentMask { bounds }
     }
 }
 
@@ -948,7 +968,7 @@ impl Element for ScrollArea {
             offset
         };
 
-        window.with_content_mask(Some(ContentMask { bounds }), |window| {
+        window.with_content_mask(Some(self.child_mask(bounds)), |window| {
             window.with_element_offset(point(px(0.0), px(overscroll)), |window| {
                 self.child.prepaint(window, cx);
             });
@@ -1017,7 +1037,7 @@ impl Element for ScrollArea {
         window: &mut Window,
         cx: &mut App,
     ) {
-        window.with_content_mask(Some(ContentMask { bounds }), |window| {
+        window.with_content_mask(Some(self.child_mask(bounds)), |window| {
             self.child.paint(window, cx);
         });
 

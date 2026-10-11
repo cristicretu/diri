@@ -134,6 +134,7 @@ actions!(
         ExportScrollback,
         PreviousPrompt,
         NextPrompt,
+        CopyLastCommandOutput,
     ]
 );
 
@@ -228,6 +229,7 @@ pub enum CommandId {
     ExportScrollback,
     PreviousPrompt,
     NextPrompt,
+    CopyLastCommandOutput,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1115,6 +1117,16 @@ pub const COMMANDS: &[CommandSpec] = &[
         "arrow.down",
         "terminal message prompt next conversation"
     ),
+    spec!(
+        CopyLastCommandOutput,
+        "terminal-copy-last-command-output",
+        Some("cmd-alt-o"),
+        Some("⌘⌥O"),
+        Some(TERMINAL_CONTEXT),
+        "command.copy_last_command_output.palette_title",
+        "doc.on.doc",
+        "terminal shell command output copy last osc 133"
+    ),
 ];
 
 pub fn command(id: CommandId) -> &'static CommandSpec {
@@ -1387,6 +1399,9 @@ impl CommandSpec {
             CommandId::ExportScrollback => KeyBinding::new(key, ExportScrollback, context),
             CommandId::PreviousPrompt => KeyBinding::new(key, PreviousPrompt, context),
             CommandId::NextPrompt => KeyBinding::new(key, NextPrompt, context),
+            CommandId::CopyLastCommandOutput => {
+                KeyBinding::new(key, CopyLastCommandOutput, context)
+            }
         }
     }
 }
@@ -1957,6 +1972,11 @@ impl CommandId {
                 description: t("command.next_prompt.description"),
                 category: ShortcutCategory::Terminal,
             },
+            Self::CopyLastCommandOutput => ShortcutMetadata {
+                title: t("command.copy_last_command_output.title"),
+                description: t("command.copy_last_command_output.description"),
+                category: ShortcutCategory::Terminal,
+            },
             Self::CopySelection => ShortcutMetadata {
                 title: t("command.copy_selection.title"),
                 description: t("command.copy_selection.description"),
@@ -2117,6 +2137,7 @@ impl CommandId {
             Self::ExportScrollback => Box::new(ExportScrollback),
             Self::PreviousPrompt => Box::new(PreviousPrompt),
             Self::NextPrompt => Box::new(NextPrompt),
+            Self::CopyLastCommandOutput => Box::new(CopyLastCommandOutput),
         }
     }
 }

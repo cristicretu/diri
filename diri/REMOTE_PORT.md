@@ -944,6 +944,35 @@ round trips, selection and paste tests, and desktop interaction verification.
 The existing release performance, persistence, lease, and real-SSH gates remain
 mandatory.
 
+## Shell command marks (October 2026)
+
+This revises the September statement that the Holder collects no exit-code
+history. The shared parser now also keeps OSC 133 B (input start), C (output
+start) and D (command end) marks, next to the existing A prompt marks, as
+flags on the cell under the cursor when each arrives. A D mark records only
+passed (status 0), failed (any other status) or unknown (no usable status);
+the numeric status is not retained. There is no list, counter or history
+beyond the cells themselves: marks share the grid's erase, scroll, reflow,
+4 MiB history and alternate-screen rules (ignored there), so they are screen
+facts in the same sense as prompt marks. The Holder still infers no commands,
+runs no shell hooks and installs no shell configuration.
+
+The marks travel as additive style bits 11-14 (`INPUT_START`, `OUTPUT_START`,
+`COMMAND_SUCCEEDED`, `COMMAND_FAILED`; both end bits mean unknown) in the
+existing u16 cell style, through full snapshots, deltas, scrollback, GridMirror
+and checkpoints unchanged. No protocol minor, capability or checkpoint version
+is added: a new Engine attaching to an older live Holder receives no new marks
+and shows no command status, never a fabricated one; an older Engine ignores
+the bits. The vendored alacritty_terminal cell flags widen from u16 to u32 to
+hold them; the cell stays 24 bytes and the in-process compact history stores
+flags as a varint. New Helper sources change the Build ID as usual.
+
+Command interpretation stays on the desktop: the pass/fail gutter mark beside a
+finished command's prompt, Select/Copy Command Output on a command under the
+pointer, and Copy Last Command Output (read through the existing scrollback
+RPC). Shells must emit OSC 133 themselves (fish 4 does by default); emitting it
+from Diri's login-shell wrapper is a separate, deferred change.
+
 ## Engine-owned orchestration message delivery (September 2026)
 
 Initial prompts are pasted and submitted at most once. Screen echo, composer

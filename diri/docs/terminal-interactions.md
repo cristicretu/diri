@@ -48,6 +48,16 @@
   Agent uses message navigation. An inline session with no message that way
   (a generic command, or an Agent that exited to its shell) falls back to
   its prompt marks.
+- Shells that report command boundaries with OSC 133 (A prompt, B input,
+  C output, D end with exit status) get a short mark in the left margin of each
+  finished command's prompt: green when it exited 0, red otherwise. Running
+  commands and ends without a status stay unmarked. Right-click a finished
+  command's prompt, command line or output for **Copy command output** and
+  **Select command output**; Cmd-Option-O copies the output of the last
+  finished command in retained history. fish 4 emits these marks by default;
+  other shells need their terminal integration (no shell configuration is
+  changed). Marks work in remote sessions whose Helper was installed by this
+  version; older live Helpers show no marks until the session restarts.
 
 Settings → Terminal contains Copy on Selection (off by default), Hide Pointer
 While Typing (on), and Review Command Pastes (off by default). Paste review applies to
@@ -67,13 +77,16 @@ and [Herdr source at bafbc09](https://github.com/herdrdev/herdr/tree/bafbc0949dd
 Diri implements these behaviors in its Rust Engine, shared parser and GPUI client.
 
 Visual fixtures: [link hover](screenshots/terminal-qol/hover.png),
-[terminal menu](screenshots/terminal-qol/menu.png), and paste review in
+[terminal menu](screenshots/terminal-qol/menu.png), command marks
+([gutter](screenshots/terminal-qol/commands.png),
+[menu](screenshots/terminal-qol/commands-menu.png),
+[selection](screenshots/terminal-qol/commands-select.png)), and paste review in
 [dark](screenshots/paste-review/dark.png) and
 [narrow light](screenshots/paste-review/light-narrow.png) appearances.
 To regenerate a scene on macOS,
 run the ignored `terminal_pane::tests::render_terminal_qol_screenshot` test with
 `DIRI_QOL_SCREENSHOT` set to an output PNG and `DIRI_QOL_SCENE` set to `hover`,
-`menu`, `paste`, or `copy`. For paste review, the fixture explicitly enables the
+`menu`, `paste`, `copy`, `commands`, `commands-menu` or `commands-select`. For paste review, the fixture explicitly enables the
 opt-in setting. `DIRI_QOL_THEME`, `DIRI_QOL_WIDTH`, `DIRI_QOL_HEIGHT`, and
 `DIRI_QOL_PASTE` override the theme, window size, and clipboard text.
 

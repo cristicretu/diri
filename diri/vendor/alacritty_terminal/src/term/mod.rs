@@ -23,7 +23,7 @@ use crate::vi_mode::{ViModeCursor, ViMotion};
 use crate::vte::ansi::{
     self, Attr, CharsetIndex, Color, CursorShape, CursorStyle, Handler, Hyperlink, KeyboardModes,
     KeyboardModesApplyBehavior, NamedColor, NamedMode, NamedPrivateMode, PrivateMode, Rgb,
-    StandardCharset,
+    ShellCommandMark, StandardCharset,
 };
 
 pub mod cell;
@@ -1199,7 +1199,7 @@ impl<T> Term<T> {
         let fg = self.grid.cursor.template.fg;
         let bg = self.grid.cursor.template.bg;
         let flags = self.grid.cursor.template.flags
-            | (self.grid[self.grid.cursor.point].flags & Flags::PROMPT_START);
+            | (self.grid[self.grid.cursor.point].flags & Flags::SHELL_MARKS);
         let extra = self.grid.cursor.template.extra.clone();
 
         let mut cursor_cell = self.grid.cursor_cell();
@@ -1325,7 +1325,7 @@ impl<T: EventListener> Handler for Term<T> {
                 cell.c = charset.map(char::from(byte));
                 cell.fg = template.fg;
                 cell.bg = template.bg;
-                cell.flags = template.flags | (cell.flags & Flags::PROMPT_START);
+                cell.flags = template.flags | (cell.flags & Flags::SHELL_MARKS);
                 cell.extra = template.extra.clone();
             }
             index += count;
@@ -2216,6 +2216,29 @@ impl<T: EventListener> Handler for Term<T> {
         if !self.mode.contains(TermMode::ALT_SCREEN) {
             let point = self.grid.cursor.point;
             self.grid[point].flags.insert(Flags::PROMPT_START);
+            self.damage_cursor();
+        }
+    }
+
+    #[inline]
+    fn mark_shell_command(&mut self, mark: ShellCommandMark) {
+        // Same lifetime and alternate-screen rule as `mark_prompt`. A command
+        // end replaces any earlier end on the same cell.
+        if !self.mode.contains(TermMode::ALT_SCREEN) {
+            let point = self.grid.cursor.point;
+            let flags = &mut self.grid[point].flags;
+            match mark {
+                ShellCommandMark::InputStart => flags.insert(Flags::INPUT_START),
+                ShellCommandMark::OutputStart => flags.insert(Flags::OUTPUT_START),
+                ShellCommandMark::End(status) => {
+                    flags.remove(Flags::COMMAND_END);
+                    flags.insert(match status {
+                        Some(0) => Flags::COMMAND_SUCCEEDED,
+                        Some(_) => Flags::COMMAND_FAILED,
+                        None => Flags::COMMAND_END,
+                    });
+                }
+            }
             self.damage_cursor();
         }
     }
@@ -4088,6 +4111,9 @@ mod ascii_run_tests {
                 "\x1b]8;id=x;https://example.invalid\x07",
                 "\x1b]8;;\x07",
                 "\x1b]133;A\x07",
+                "\x1b]133;B\x07",
+                "\x1b]133;C\x07",
+                "\x1b]133;D;1\x07",
                 "界",
                 "界界",
                 "\u{301}",

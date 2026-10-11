@@ -1932,6 +1932,38 @@ fn style_word(flags: Flags, fg: Color, bg: Color) -> u64 {
     )
 }
 
+/// OSC 133 marks as wire bits and parser flags, one bit each.
+const SHELL_MARK_BITS: [(TermStyle, Flags); 5] = [
+    (TermStyle::PROMPT_START, Flags::PROMPT_START),
+    (TermStyle::INPUT_START, Flags::INPUT_START),
+    (TermStyle::OUTPUT_START, Flags::OUTPUT_START),
+    (TermStyle::COMMAND_SUCCEEDED, Flags::COMMAND_SUCCEEDED),
+    (TermStyle::COMMAND_FAILED, Flags::COMMAND_FAILED),
+];
+
+/// The parser keeps the marks in five consecutive flag bits and the wire in
+/// five consecutive style bits, in the same order, so every cell maps them
+/// with one shift instead of a branch per mark.
+const SHELL_MARK_SHIFT: u32 = Flags::PROMPT_START.bits().trailing_zeros();
+const SHELL_MARK_WIRE_SHIFT: u32 = TermStyle::PROMPT_START.bits().trailing_zeros();
+const _: () = {
+    let mut index = 0;
+    while index < SHELL_MARK_BITS.len() {
+        let (style, flag) = SHELL_MARK_BITS[index];
+        assert!(flag.bits() == 1 << (SHELL_MARK_SHIFT + index as u32));
+        assert!(style.bits() == 1 << (SHELL_MARK_WIRE_SHIFT + index as u32));
+        index += 1;
+    }
+    assert!(Flags::SHELL_MARKS.bits() == 0x1f << SHELL_MARK_SHIFT);
+};
+
+#[inline(always)]
+fn shell_mark_style(flags: Flags) -> TermStyle {
+    TermStyle::from_bits_retain(
+        (((flags.bits() >> SHELL_MARK_SHIFT) & 0x1f) as u16) << SHELL_MARK_WIRE_SHIFT,
+    )
+}
+
 fn wire_style(flags: Flags) -> TermStyle {
     let mut style = TermStyle::empty();
     if flags.contains(Flags::WRAPLINE) {
@@ -1940,9 +1972,7 @@ fn wire_style(flags: Flags) -> TermStyle {
     if flags.intersects(Flags::WIDE_CHAR_SPACER | Flags::LEADING_WIDE_CHAR_SPACER) {
         style |= TermStyle::WIDE_SPACER;
     }
-    if flags.contains(Flags::PROMPT_START) {
-        style |= TermStyle::PROMPT_START;
-    }
+    style |= shell_mark_style(flags);
     if flags.intersects(Flags::BOLD | Flags::DIM_BOLD) {
         style |= TermStyle::BOLD;
     }
@@ -2030,8 +2060,10 @@ fn restore_semantic_flags(target: &mut Cell, source: GridCell) {
     if source.style.contains(TermStyle::SOFT_WRAP) {
         target.flags.insert(Flags::WRAPLINE);
     }
-    if source.style.contains(TermStyle::PROMPT_START) {
-        target.flags.insert(Flags::PROMPT_START);
+    for (style, flag) in SHELL_MARK_BITS {
+        if source.style.contains(style) {
+            target.flags.insert(flag);
+        }
     }
     if source.style.contains(TermStyle::WIDE_SPACER) {
         target.flags.insert(Flags::WIDE_CHAR_SPACER);
@@ -3150,6 +3182,140 @@ mod qol_tests {
                 .any(|c| c.style.contains(TermStyle::PROMPT_START))
         );
     }
+    /// Every cell of the retained history and screen with a shell mark, as
+    /// (absolute row, column, mark bits).
+    fn shell_marks(screen: &mut HeadlessScreen) -> Vec<(usize, usize, u16)> {
+        let marks = TermStyle::PROMPT_START
+            | TermStyle::INPUT_START
+            | TermStyle::OUTPUT_START
+            | TermStyle::COMMAND_END;
+        let mut rows = screen.history_snapshot();
+        let visible = screen.full_snapshot();
+        let mut screen_rows = vec![Vec::new(); usize::from(visible.rows)];
+        for row in visible.changed_rows {
+            screen_rows[usize::from(row.y)] = row.cells;
+        }
+        rows.extend(screen_rows);
+        rows.iter()
+            .enumerate()
+            .flat_map(|(row, cells)| {
+                cells.iter().enumerate().filter_map(move |(col, cell)| {
+                    let bits = (cell.style & marks).bits();
+                    (bits != 0).then_some((row, col, bits))
+                })
+            })
+            .collect()
+    }
+
+    #[test]
+    fn command_marks_record_input_output_and_exit_status_through_history() {
+        const A: u16 = TermStyle::PROMPT_START.bits();
+        const B: u16 = TermStyle::INPUT_START.bits();
+        const C: u16 = TermStyle::OUTPUT_START.bits();
+        const OK: u16 = TermStyle::COMMAND_SUCCEEDED.bits();
+        const FAIL: u16 = TermStyle::COMMAND_FAILED.bits();
+        let mut screen = HeadlessScreen::new(10, 3);
+        // fish 4 order: D at the next prompt, then A; B after the prompt
+        // text; C once the command line was submitted.
+        let cycle = |command: &str, output: &str, status: &str| {
+            format!(
+                "\x1b]133;A;click_events=1\x07$ \x1b]133;B\x07{command}\r\n\
+                 \x1b]133;C\x07{output}\x1b]133;D;{status}\x07"
+            )
+        };
+        screen.feed(cycle("ls", "a\r\nb\r\n", "0").as_bytes());
+        screen.feed(cycle("false", "", "1").as_bytes());
+        screen.feed(b"\x1b]133;A\x07$ \x1b]133;B\x07");
+        assert_eq!(
+            shell_marks(&mut screen),
+            [
+                (0, 0, A),
+                (0, 2, B),
+                (1, 0, C),
+                (3, 0, OK | A),
+                (3, 2, B),
+                (4, 0, C | FAIL | A),
+                (4, 2, B),
+            ],
+            "marks stay on their cells as rows scroll into history"
+        );
+
+        // Typing over a marked cell keeps the mark; a status without a
+        // number is unknown, and a later end replaces an earlier one.
+        screen.feed(b"x\x08\x1b]133;D\x07");
+        let row = shell_marks(&mut screen)
+            .into_iter()
+            .find(|mark| mark.0 == 4 && mark.1 == 2)
+            .unwrap();
+        assert_eq!(
+            TermStyle::from_bits_retain(row.2).command_end(),
+            Some(diri_proto::grid::CommandEnd::Unknown)
+        );
+        screen.feed(b"\x1b]133;D;0\x07");
+        let row = shell_marks(&mut screen)
+            .into_iter()
+            .find(|mark| mark.0 == 4 && mark.1 == 2)
+            .unwrap();
+        assert_eq!(row.2, B | OK);
+
+        // The alternate screen records nothing; erasing drops marks.
+        screen.feed(b"\x1b[?1049h\x1b]133;C\x07\x1b]133;D;1\x07\x1b[?1049l");
+        assert_eq!(shell_marks(&mut screen).len(), 7);
+        screen.feed(b"\r\x1b[K");
+        assert!(
+            shell_marks(&mut screen).iter().all(|mark| mark.0 != 4),
+            "{:?}",
+            shell_marks(&mut screen)
+        );
+    }
+
+    #[test]
+    fn command_marks_survive_reflow_and_restore() {
+        let mut screen = HeadlessScreen::new(12, 4);
+        screen.feed(
+            b"\x1b]133;A\x07$ \x1b]133;B\x07echo hi\r\n\x1b]133;C\x07hi\r\n\
+              \x1b]133;D;2\x07\x1b]133;A\x07$ ",
+        );
+        let before = shell_marks(&mut screen);
+        let marked = |marks: &[(usize, usize, u16)], bit: TermStyle| {
+            marks.iter().filter(|mark| mark.2 & bit.bits() != 0).count()
+        };
+        for (cols, rows) in [(5, 3), (3, 2), (12, 4)] {
+            screen.resize(cols, rows);
+            let marks = shell_marks(&mut screen);
+            for bit in [
+                TermStyle::PROMPT_START,
+                TermStyle::INPUT_START,
+                TermStyle::OUTPUT_START,
+                TermStyle::COMMAND_FAILED,
+            ] {
+                assert_eq!(marked(&marks, bit), marked(&before, bit), "{cols}x{rows}");
+            }
+        }
+        // A round trip may leave a blank row in history; marks keep their
+        // cells relative to each other.
+        let relative = |marks: Vec<(usize, usize, u16)>| {
+            let top = marks.first().map_or(0, |mark| mark.0);
+            marks
+                .into_iter()
+                .map(|(row, col, bits)| (row - top, col, bits))
+                .collect::<Vec<_>>()
+        };
+        let before = relative(before);
+        assert_eq!(relative(shell_marks(&mut screen)), before);
+
+        let history = screen.history_snapshot();
+        let mut restored = HeadlessScreen::new(12, 4);
+        assert!(restored.restore(
+            &history,
+            &screen.full_snapshot(),
+            false,
+            false,
+            MouseModes::OFF
+        ));
+        assert_eq!(relative(shell_marks(&mut restored)), before);
+    }
+
     #[test]
     fn visible_text_preserves_unicode_without_terminal_filler_cells() {
         let mut screen = HeadlessScreen::new(20, 4);
