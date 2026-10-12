@@ -1651,6 +1651,60 @@ mod tests {
         assert!(panel.bottom() <= px(388.0));
     }
 
+    /// A long agent session the way they really look: two PRs, three dev
+    /// servers, a dozen dashboards on the same two hosts, ids for titles.
+    fn busy_session(session: &mut SessionRecord) {
+        let urls = [
+            "https://linear.app/acme/issue/PRD-8201/bring-extraction-to-the-reader",
+            "https://abcdxyzproj.supabase.co/auth/v1/oauth/authorize?client_id=reader",
+            "http://localhost:3000/",
+            "https://api.acme.test",
+            "https://github.com/diri/app/pull/181",
+            "https://docs.rs/gpui/latest/gpui/struct.Window.html",
+            "https://us.posthog.com/project/344763/dashboard/2180383",
+            "https://www.braintrust.dev/app/Acme/p/dev/dashboards/40d80dc6-506a-4fb7-85d3-808d7e074267",
+            "https://developer.apple.com/documentation/appkit/nsvisualeffectview",
+            "https://www.braintrust.dev/app/Acme/p/chat-v3/dashboards/5a245a5b-31a2-4bec-aaff-e43de7e82fda",
+            "https://us.posthog.com/project/344763/dashboard/1970912",
+            "https://acme.sentry.io/issues/5912034/",
+            "https://www.figma.com/design/x7Hq2Lw/Reader-docked-chat",
+            "https://github.com/diri/app/pull/180",
+            "https://us.posthog.com/project/344763/dashboard/1957976",
+            "https://www.notion.so/acme/Reader-launch-plan-1f2e3d4c5b6a79881f2e3d4c5b6a7988",
+            "https://us.posthog.com/project/344763/dashboard/2134737",
+            "https://acme-git-guide-onboarding-cursor.vercel.app",
+            "https://claude.ai/artifact/QquGRTGC4XqV32G1EGUR3c",
+        ];
+        session.git_branch = Some("feature/reader-docked-chat".into());
+        session.artifacts = Some(
+            urls.iter()
+                .enumerate()
+                .map(|(i, url)| SessionArtifact {
+                    kind: if url.contains("/pull/") {
+                        ArtifactKind::PullRequest
+                    } else if url.contains("linear.app") {
+                        ArtifactKind::LinearIssue
+                    } else if url.contains("localhost") {
+                        ArtifactKind::Preview
+                    } else {
+                        ArtifactKind::Link
+                    },
+                    url: (*url).into(),
+                    first_seen_at: DateMillis(i as f64),
+                })
+                .collect(),
+        );
+        session.listening_ports = Some(
+            [(3000, "node"), (3001, "Python"), (42069, "node")]
+                .into_iter()
+                .map(|(port, name)| diri_proto::PortInfo {
+                    port,
+                    process_name: name.into(),
+                })
+                .collect(),
+        );
+    }
+
     #[cfg(target_os = "macos")]
     #[test]
     #[ignore = "writes a deterministic session-links screenshot"]
@@ -1685,6 +1739,9 @@ mod tests {
             session.pull_requests = None;
             session.git_branch = Some("fix/email-serif".into());
         }
+        if std::env::var_os("DIRI_VISUAL_BUSY").is_some() {
+            busy_session(&mut session);
+        }
         if std::env::var_os("DIRI_VISUAL_MERGED").is_some() {
             session.pull_requests.as_mut().unwrap()[0].state = "MERGED".into();
         }
@@ -1702,8 +1759,13 @@ mod tests {
         } else {
             900.0
         };
+        let height = if std::env::var_os("DIRI_VISUAL_BUSY").is_some() {
+            720.0
+        } else {
+            560.0
+        };
         let window = cx
-            .open_window(size(px(width), px(560.0)), move |window, cx| {
+            .open_window(size(px(width), px(height)), move |window, cx| {
                 cx.new(|cx| {
                     let mut pane = TerminalPane::new(runtime, tokio, window, cx);
                     pane.session_links.open = true;
@@ -1722,6 +1784,23 @@ mod tests {
         cx.update_window(window.into(), |_, window, _| window.refresh())
             .unwrap();
         cx.run_until_parked();
+        // `DIRI_VISUAL_POINTER=x,y` rests the pointer there until a tooltip opens.
+        if let Some((x, y)) = std::env::var("DIRI_VISUAL_POINTER").ok().and_then(|value| {
+            let (x, y) = value.split_once(',')?;
+            Some((x.trim().parse::<f32>().ok()?, y.trim().parse::<f32>().ok()?))
+        }) {
+            cx.update_window(window.into(), |_, window, cx| {
+                window.simulate_mouse_move(point(px(x), px(y)), cx);
+            })
+            .unwrap();
+            for _ in 0..8 {
+                cx.advance_clock(Duration::from_millis(120));
+                cx.run_until_parked();
+                cx.update_window(window.into(), |_, window, _| window.refresh())
+                    .unwrap();
+                cx.run_until_parked();
+            }
+        }
         if let Some(parent) = output.parent() {
             std::fs::create_dir_all(parent).unwrap();
         }
