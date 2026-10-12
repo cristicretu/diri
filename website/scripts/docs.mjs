@@ -31,6 +31,7 @@ const TOOL_GROUPS = [
   ['Start and manage agents', ['spawn_agent', 'spawn_agents', 'fork_agent', 'manage_agent', 'release_agent', 'list_agents', 'get_status']],
   ['Talk to agents and wait', ['send_prompt', 'wait_any', 'wait_for_agent', 'read_output']],
   ['Tracked tasks', ['submit_task', 'submit_tasks', 'get_task', 'wait_for_task', 'report_task', 'answer_task', 'cancel_task', 'list_tasks']],
+  ['Split panes', ['get_layout', 'manage_layout']],
   ['Lineage', ['whoami', 'list_children', 'wait_for_children', 'summarize_children', 'report_to_parent']],
   ['Code and worktrees', ['get_diff', 'integrate', 'create_worktree', 'list_worktrees', 'remove_worktree', 'get_artifacts', 'quick_open_include']],
   ['Schedules', ['schedule_agent', 'list_schedules', 'delete_schedule']],

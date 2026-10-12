@@ -818,3 +818,152 @@ fn anchored_waits_ignore_an_idle_state_from_before_the_message() {
         .call("release_agent", &json!({"session_id":id}))
         .unwrap();
 }
+
+/// Applies one raw mutation at the current revision, as another client would.
+fn mutate(bridge: &Bridge, mutation: serde_json::Value) -> serde_json::Value {
+    let revision = bridge
+        .request(
+            Method::WORKSPACE_SNAPSHOT,
+            json!({}),
+            Duration::from_secs(3),
+        )
+        .unwrap()["revision"]
+        .clone();
+    bridge
+        .request(
+            Method::WORKSPACE_MUTATE,
+            json!({"expectedRevision": revision, "mutation": mutation}),
+            Duration::from_secs(3),
+        )
+        .unwrap()
+}
+
+#[test]
+fn agents_split_panes_by_session_id_without_touching_processes() {
+    let temp = tempfile::tempdir().unwrap();
+    let fixture = temp.path().join("prompt-fixture");
+    std::fs::write(&fixture, "#!/bin/sh\nexec cat > /dev/null\n").unwrap();
+    std::fs::set_permissions(&fixture, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let server = start_server(temp.path(), &fixture, temp.path());
+    let parent = Bridge::new(server.socket_path().into(), Some("s_parent".into()));
+    let created = mutate(&parent, json!({"type":"createWorkspace","name":"Work"}));
+    let workspace = created["workspaces"][0]["id"].as_str().unwrap().to_owned();
+    mutate(
+        &parent,
+        json!({"type":"createTab","workspaceId":workspace,"sessionId":"s_parent","title":null}),
+    );
+    let alone = parent.call("get_layout", &json!({})).unwrap();
+    assert_eq!(alone["placed"], true, "{alone}");
+    assert_eq!(alone["tabs"][0]["pane_count"], 1);
+
+    // Spawned beside the caller: one tab, side by side, the new pane focused.
+    let spawn_args =
+        json!({"kind":"prompt-fixture", "cwd":temp.path(), "name":"server", "split":"right"});
+    let spawned = parent.call("spawn_agent", &spawn_args).unwrap();
+    assert_eq!(spawned["layout"]["placed"], true, "{spawned}");
+    let watcher = spawned["id"].as_str().unwrap().to_owned();
+    let layout = parent.call("get_layout", &json!({})).unwrap();
+    let tab = &layout["tabs"][0];
+    assert_eq!(tab["sessions"], json!(["s_parent", watcher]), "{layout}");
+    assert_eq!(tab["layout"]["split"], "side_by_side");
+    assert_eq!(tab["focused_session"], watcher.as_str());
+
+    // An unplaced session is docked below the caller by session id alone.
+    let helper = parent
+        .call(
+            "spawn_agent",
+            &json!({"kind":"prompt-fixture", "cwd":temp.path(), "name":"helper"}),
+        )
+        .unwrap()["id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let split = parent
+        .call(
+            "manage_layout",
+            &json!({"action":"split", "session_id":helper, "split":"down"}),
+        )
+        .unwrap();
+    assert_eq!(split["tab"]["pane_count"], 3, "{split}");
+    let zoomed = parent
+        .call(
+            "manage_layout",
+            &json!({"action":"zoom", "session_id":helper}),
+        )
+        .unwrap();
+    assert_eq!(zoomed["tab"]["zoomed_session"], helper.as_str(), "{zoomed}");
+    let restored = parent
+        .call("manage_layout", &json!({"action":"unzoom"}))
+        .unwrap();
+    assert_eq!(restored["tab"]["zoomed_session"], json!(null));
+    parent
+        .call("manage_layout", &json!({"action":"equalize"}))
+        .unwrap();
+    let focused = parent
+        .call("manage_layout", &json!({"action":"focus"}))
+        .unwrap();
+    assert_eq!(focused["tab"]["focused_session"], "s_parent");
+    assert!(
+        parent
+            .call("manage_layout", &json!({"action":"split"}))
+            .is_err(),
+        "a session cannot be split beside itself"
+    );
+
+    // Unsplit gives the watcher its own tab; close only hides the helper.
+    let unsplit = parent
+        .call(
+            "manage_layout",
+            &json!({"action":"unsplit", "session_id":watcher}),
+        )
+        .unwrap();
+    assert_eq!(unsplit["tab"]["sessions"], json!([watcher]), "{unsplit}");
+    let closed = parent
+        .call(
+            "manage_layout",
+            &json!({"action":"close", "session_id":helper}),
+        )
+        .unwrap();
+    assert_eq!(closed["tab"]["sessions"], json!(["s_parent"]), "{closed}");
+    let hidden = parent
+        .call("get_layout", &json!({"session_id":helper}))
+        .unwrap();
+    assert_eq!(hidden["placed"], false);
+    let status = parent
+        .call("get_status", &json!({"session_id":helper}))
+        .unwrap();
+    assert_ne!(status["status"], "exited", "{status}");
+    assert!(
+        parent
+            .call("manage_layout", &json!({"action":"unsplit"}))
+            .is_err(),
+        "a lone pane has nothing to unsplit"
+    );
+
+    // The caller's pane gets a new id; retrying the original spawn still
+    // returns the original session instead of a fingerprint conflict.
+    parent
+        .call("manage_layout", &json!({"action":"close"}))
+        .unwrap();
+    mutate(
+        &parent,
+        json!({"type":"createTab","workspaceId":workspace,"sessionId":"s_parent","title":null}),
+    );
+    let retried = parent.call("spawn_agent", &spawn_args).unwrap();
+    assert_eq!(retried["id"], watcher.as_str(), "{retried}");
+
+    // A split needs a shown pane to split.
+    assert!(
+        parent
+            .call(
+                "spawn_agent",
+                &json!({"kind":"prompt-fixture", "cwd":temp.path(), "beside_session_id":helper}),
+            )
+            .is_err()
+    );
+    for id in [watcher, helper] {
+        parent
+            .call("release_agent", &json!({"session_id":id}))
+            .unwrap();
+    }
+}

@@ -8,6 +8,10 @@ Prefer `spawn_agents` with one entry per subtask (`worktree: true`, `prompt`, `t
 
 To spawn another agent, select its native kind (for example `claude` or `codex`) and pass its task as `prompt`. If no agent is named, use your own native kind when available. Never use `shell` to launch an agent CLI such as `claude`, `codex`, `cursor`, or `gemini`: a child `shell` is a raw terminal in the parent's Cmd+J pane whose prompt runs as shell commands.
 
+## Split panes
+
+Pass `split: "right"` or `"down"` to `spawn_agent` / `spawn_agents` to open the session as a pane beside yours (or beside `beside_session_id`) instead of in its own tab. Do it when the user benefits from seeing both at once: a dev server, test watcher, or log tail next to your work, or a child agent they want to watch. Leave background work in its own tab. `get_layout` shows who shares your tab; `manage_layout` moves an existing session beside another (`split`), gives it its own tab again (`unsplit`), takes its pane off the tab (`close`, the session keeps running), or focuses, zooms, and equalizes. Do not rearrange panes the user did not ask about.
+
 ## Tasks
 
 - When you receive a Diri task: `report_task` acknowledged before starting, then completed or failed for that exact `task_id` after verifying (JSON matching `result_schema` when the task has one), or blocked with your question.

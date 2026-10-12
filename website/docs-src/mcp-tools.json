@@ -13,7 +13,7 @@
     },
     {
       "description": "Spawn and coordinate other Diri agents: parallel subtasks in worktrees, tracked tasks you assign or receive, waiting, retries, and reviewing their work.",
-      "markdown": "# Working with other Diri sessions\n\n## Parallel work\n\nPrefer `spawn_agents` with one entry per subtask (`worktree: true`, `prompt`, `task: true`), then `wait_any(task_ids)`. For each ready task: read its result (`read_output` with `mode: \"last_message\"` for detail), `answer_task` if it is blocked, `get_diff` to review, `integrate` to bring its branch into your checkout. Call `wait_any` again with the pending ids, and `release_agent` when done. `wait_any` returns as soon as **any** target needs you; do not wait for all of them at once.\n\n## Agents versus terminals\n\nTo spawn another agent, select its native kind (for example `claude` or `codex`) and pass its task as `prompt`. If no agent is named, use your own native kind when available. Never use `shell` to launch an agent CLI such as `claude`, `codex`, `cursor`, or `gemini`: a child `shell` is a raw terminal in the parent's Cmd+J pane whose prompt runs as shell commands.\n\n## Tasks\n\n- When you receive a Diri task: `report_task` acknowledged before starting, then completed or failed for that exact `task_id` after verifying (JSON matching `result_schema` when the task has one), or blocked with your question.\n- `report_to_parent` is recorded on your open task automatically.\n\n## Delivery\n\nMessages, spawns, and tasks are deduplicated and delivered at most once. Reuse `message_id` / `operation_id` / `request_id` on retries; never resend under a new identity because an agent is slow or its screen is unchanged. A delivery receipt does not mean the work is done. For untracked prompts, pass the returned `since_ms` to `wait_for_agent` / `wait_any` so an agent that was already idle does not count as finished.\n\n## Also\n\n- `get_artifacts` returns PR and preview URLs and ports; PRs include live GitHub status.\n- `fork_agent` branches a conversation to try an alternative.\n- `manage_agent` hibernates idle children instead of killing them.\n- `quick_open_include` edits the folders Cmd+P indexes (for example `**/.worktrees/`).\n",
+      "markdown": "# Working with other Diri sessions\n\n## Parallel work\n\nPrefer `spawn_agents` with one entry per subtask (`worktree: true`, `prompt`, `task: true`), then `wait_any(task_ids)`. For each ready task: read its result (`read_output` with `mode: \"last_message\"` for detail), `answer_task` if it is blocked, `get_diff` to review, `integrate` to bring its branch into your checkout. Call `wait_any` again with the pending ids, and `release_agent` when done. `wait_any` returns as soon as **any** target needs you; do not wait for all of them at once.\n\n## Agents versus terminals\n\nTo spawn another agent, select its native kind (for example `claude` or `codex`) and pass its task as `prompt`. If no agent is named, use your own native kind when available. Never use `shell` to launch an agent CLI such as `claude`, `codex`, `cursor`, or `gemini`: a child `shell` is a raw terminal in the parent's Cmd+J pane whose prompt runs as shell commands.\n\n## Split panes\n\nPass `split: \"right\"` or `\"down\"` to `spawn_agent` / `spawn_agents` to open the session as a pane beside yours (or beside `beside_session_id`) instead of in its own tab. Do it when the user benefits from seeing both at once: a dev server, test watcher, or log tail next to your work, or a child agent they want to watch. Leave background work in its own tab. `get_layout` shows who shares your tab; `manage_layout` moves an existing session beside another (`split`), gives it its own tab again (`unsplit`), takes its pane off the tab (`close`, the session keeps running), or focuses, zooms, and equalizes. Do not rearrange panes the user did not ask about.\n\n## Tasks\n\n- When you receive a Diri task: `report_task` acknowledged before starting, then completed or failed for that exact `task_id` after verifying (JSON matching `result_schema` when the task has one), or blocked with your question.\n- `report_to_parent` is recorded on your open task automatically.\n\n## Delivery\n\nMessages, spawns, and tasks are deduplicated and delivered at most once. Reuse `message_id` / `operation_id` / `request_id` on retries; never resend under a new identity because an agent is slow or its screen is unchanged. A delivery receipt does not mean the work is done. For untracked prompts, pass the returned `since_ms` to `wait_for_agent` / `wait_any` so an agent that was already idle does not count as finished.\n\n## Also\n\n- `get_artifacts` returns PR and preview URLs and ports; PRs include live GitHub status.\n- `fork_agent` branches a conversation to try an alternative.\n- `manage_agent` hibernates idle children instead of killing them.\n- `quick_open_include` edits the folders Cmd+P indexes (for example `**/.worktrees/`).\n",
       "name": "orchestration"
     },
     {
@@ -323,12 +323,17 @@
       "name": "wait_any"
     },
     {
-      "description": "Open a new Diri session running an agent or shell, locally or on a configured remote host. Use this whenever the user asks to spawn another agent, session, or terminal. Identical arguments are deduplicated for this caller; reuse operation_id on retries and supply a new operation_id only for an intentional additional session. Inspect spawn_receipt: unknown/failed must never be retried under a new identity blindly.",
+      "description": "Open a new Diri session running an agent or shell, locally or on a configured remote host. Use this whenever the user asks to spawn another agent, session, or terminal. Pass split to open it as a pane beside your own (or beside_session_id's) instead of a separate tab: good for a dev server, test watcher, or log tail you want in view, or a child agent the user should watch work; leave it out for background work. Identical arguments are deduplicated for this caller; reuse operation_id on retries and supply a new operation_id only for an intentional additional session. Inspect spawn_receipt: unknown/failed must never be retried under a new identity blindly.",
       "inputSchema": {
         "additionalProperties": false,
         "properties": {
           "base": {
             "description": "Starting ref for a new worktree, e.g. main. Omitted preserves HEAD behavior.",
+            "minLength": 1,
+            "type": "string"
+          },
+          "beside_session_id": {
+            "description": "Session whose pane to split; defaults to the calling session. Implies split right when split is omitted.",
             "minLength": 1,
             "type": "string"
           },
@@ -388,6 +393,16 @@
           "result_schema": {
             "description": "Optional JSON Schema (object) for the completed result. The Agent must then report result as JSON matching it (type, required, properties, enum, items are checked).",
             "type": "object"
+          },
+          "split": {
+            "description": "Open as a split pane on this side of beside_session_id's pane (default your own) instead of a new tab. A tab holds at most 8 panes.",
+            "enum": [
+              "right",
+              "down",
+              "left",
+              "up"
+            ],
+            "type": "string"
           },
           "task": {
             "description": "Deliver prompt as a tracked Diri task instead of an untracked initial prompt. The result then includes task.task_id for wait_any or wait_for_task.",
@@ -526,7 +541,7 @@
       "name": "delete_schedule"
     },
     {
-      "description": "Fan out: open several sessions in one call (at most 8), concurrently. Each entry takes the same fields as spawn_agent (kind, cwd, worktree, branch, base, host, prompt, name, operation_id, task, result_schema) and is deduplicated the same way. Use worktree:true per entry for parallel edits. Returns one result per entry in order, plus the session_ids and task_ids to pass to wait_any.",
+      "description": "Fan out: open several sessions in one call (at most 8), concurrently. Each entry takes the same fields as spawn_agent (kind, cwd, worktree, branch, base, host, prompt, name, operation_id, task, result_schema, split, beside_session_id) and is deduplicated the same way. Use worktree:true per entry for parallel edits. Returns one result per entry in order, plus the session_ids and task_ids to pass to wait_any.",
       "inputSchema": {
         "additionalProperties": false,
         "properties": {
@@ -535,6 +550,11 @@
               "additionalProperties": false,
               "properties": {
                 "base": {
+                  "minLength": 1,
+                  "type": "string"
+                },
+                "beside_session_id": {
+                  "description": "Session whose pane to split; defaults to the calling session. Implies split right when split is omitted.",
                   "minLength": 1,
                   "type": "string"
                 },
@@ -570,6 +590,16 @@
                 "result_schema": {
                   "description": "Optional JSON Schema (object) for the completed result. The Agent must then report result as JSON matching it (type, required, properties, enum, items are checked).",
                   "type": "object"
+                },
+                "split": {
+                  "description": "Open as a split pane on this side of beside_session_id's pane (default your own) instead of a new tab. A tab holds at most 8 panes.",
+                  "enum": [
+                    "right",
+                    "down",
+                    "left",
+                    "up"
+                  ],
+                  "type": "string"
                 },
                 "task": {
                   "type": "boolean"
@@ -1172,6 +1202,65 @@
         "type": "object"
       },
       "name": "whoami"
+    },
+    {
+      "description": "Show the split-pane layout of the tab(s) that show a session (default yours): which sessions share the tab, side_by_side or stacked splits, the focused and zoomed session. Read it before manage_layout, or to check what the user sees beside you.",
+      "inputSchema": {
+        "additionalProperties": false,
+        "properties": {
+          "session_id": {
+            "minLength": 1,
+            "type": "string"
+          }
+        },
+        "type": "object"
+      },
+      "name": "get_layout"
+    },
+    {
+      "description": "Arrange split panes by session id; panes are views, so nothing is started or stopped. split: move session_id's pane beside beside_session_id's (default yours), e.g. bring a child agent or a running server into view next to you. unsplit: give session_id its own tab again. close: take its pane off the tab (the session keeps running and stays in the sidebar). focus, zoom/unzoom (fill the tab with one pane), equalize (even out the tab's splits). session_id defaults to you. Split only when the user benefits from seeing both at once; do not rearrange panes the user did not ask about.",
+      "inputSchema": {
+        "additionalProperties": false,
+        "properties": {
+          "action": {
+            "enum": [
+              "split",
+              "unsplit",
+              "close",
+              "focus",
+              "zoom",
+              "unzoom",
+              "equalize"
+            ],
+            "type": "string"
+          },
+          "beside_session_id": {
+            "description": "split only: the session to dock beside; defaults to the calling session.",
+            "minLength": 1,
+            "type": "string"
+          },
+          "session_id": {
+            "description": "The session whose pane to act on; defaults to the calling session.",
+            "minLength": 1,
+            "type": "string"
+          },
+          "split": {
+            "description": "split only: which side of beside_session_id's pane; default right.",
+            "enum": [
+              "right",
+              "down",
+              "left",
+              "up"
+            ],
+            "type": "string"
+          }
+        },
+        "required": [
+          "action"
+        ],
+        "type": "object"
+      },
+      "name": "manage_layout"
     },
     {
       "description": "Find the person's Diri Notes (briefs, plans, to-do lists). Notes are kept by Diri, not in the project folder, so use this rather than searching files. Defaults to notes for your project; project:\"all\" lists every note, or pass a project folder. mentions:\"me\" returns notes that @-mention you or an ancestor that started you (mentioned_via says which). query filters title and body. links_to (a note's id or title) returns the notes that link to that note. session_id is the note's sidebar Session.",

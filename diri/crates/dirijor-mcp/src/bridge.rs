@@ -16,6 +16,7 @@ use crate::tools::{ToolDefinition, tool_definitions_for};
 mod api;
 #[cfg(test)]
 mod audit_tests;
+mod layout;
 mod notes;
 pub use notes::NoteSpawn;
 mod orchestration;
@@ -144,6 +145,8 @@ impl Bridge {
             "open_api_request" => self.open_api_request(arguments),
             "quick_open_include" => self.quick_open_include(arguments),
             "whoami" => self.whoami(),
+            "get_layout" => self.get_layout(arguments),
+            "manage_layout" => self.manage_layout(arguments),
             "list_children" => self.list_children(arguments),
             "wait_for_children" => self.wait_for_children(arguments),
             "summarize_children" => self.summarize_children(arguments),
@@ -250,6 +253,8 @@ impl Bridge {
         let kind = resolve_agent_kind(&readiness, &requested);
 
         let tracked = parent.is_some();
+        // Resolved before launching, so a bad split request starts nothing.
+        let placement = self.spawn_placement(arguments, tracked)?;
         let params = SessionSpawnParams {
             appearance: None,
             kind,
@@ -270,9 +275,17 @@ impl Bridge {
             note_id: None,
             argv: None,
         };
-        let params = serde_json::to_value(params).map_err(|error| error.to_string())?;
+        let mut params = serde_json::to_value(params).map_err(|error| error.to_string())?;
+        if let Some((pane, _)) = &placement {
+            params[diri_proto::workspace::SPAWN_PANE_FIELD] =
+                serde_json::to_value(pane).map_err(|error| error.to_string())?;
+        }
         if !tracked {
-            return self.request(Method::SESSION_SPAWN, params, SPAWN_TIMEOUT);
+            let mut spawned = self.request(Method::SESSION_SPAWN, params, SPAWN_TIMEOUT)?;
+            if let Some((_, anchor)) = &placement {
+                spawned["layout"] = self.spawned_layout(spawned["id"].as_str(), anchor);
+            }
+            return Ok(spawned);
         }
         let mut identity = arguments.clone();
         identity.as_object_mut().unwrap().remove("operation_id");
@@ -290,6 +303,12 @@ impl Bridge {
             "senderID":self.require_caller()?, "operationID":operation_id, "spawn":params,
         }), SPAWN_TIMEOUT).map_err(|error| format!("{error}. Spawn identity: {operation_id}. Retry only the same arguments and operation_id; never launch a fresh copy after a lost response."))?;
         spawned["since_ms"] = json!(since_ms);
+        if let Some((_, anchor)) = &placement {
+            let session = spawned["spawn_receipt"]["session_id"]
+                .as_str()
+                .filter(|_| spawned["ok"] == true);
+            spawned["layout"] = self.spawned_layout(session, anchor);
+        }
         if as_task {
             let session_id = spawned["spawn_receipt"]["session_id"]
                 .as_str()

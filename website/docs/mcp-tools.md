@@ -11,29 +11,31 @@ For setup, permissions and patterns, read [MCP server](/docs/mcp/) first. Descri
 
 ### `spawn_agent`
 
-Open a new Diri session running an agent or shell, locally or on a configured remote host. Use this whenever the user asks to spawn another agent, session, or terminal. Identical arguments are deduplicated for this caller; reuse operation_id on retries and supply a new operation_id only for an intentional additional session. Inspect spawn_receipt: unknown/failed must never be retried under a new identity blindly.
+Open a new Diri session running an agent or shell, locally or on a configured remote host. Use this whenever the user asks to spawn another agent, session, or terminal. Pass split to open it as a pane beside your own (or beside_session_id's) instead of a separate tab: good for a dev server, test watcher, or log tail you want in view, or a child agent the user should watch work; leave it out for background work. Identical arguments are deduplicated for this caller; reuse operation_id on retries and supply a new operation_id only for an intentional additional session. Inspect spawn_receipt: unknown/failed must never be retried under a new identity blindly.
 
 | Argument | Type | Notes |
 | --- | --- | --- |
 | `cwd` | string | **Required.** |
 | `kind` | agent label or `shell` ([list](/docs/agents/)) | **Required.** |
 | `base` | string | Starting ref for a new worktree, e.g. main. Omitted preserves HEAD behavior. |
+| `beside_session_id` | string | Session whose pane to split; defaults to the calling session. Implies split right when split is omitted. |
 | `branch` | string |  |
 | `host` | string |  |
 | `name` | string |  |
 | `operation_id` | string | Stable identity for this logical message. Reuse on retries. If omitted, identical content is deduplicated for this sender/target. Use a new value only for an intentional repeat. |
 | `prompt` | string |  |
 | `result_schema` | object | Optional JSON Schema (object) for the completed result. The Agent must then report result as JSON matching it (type, required, properties, enum, items are checked). |
+| `split` | `right`, `down`, `left`, `up` | Open as a split pane on this side of beside_session_id's pane (default your own) instead of a new tab. A tab holds at most 8 panes. |
 | `task` | boolean | Deliver prompt as a tracked Diri task instead of an untracked initial prompt. The result then includes task.task_id for wait_any or wait_for_task. |
 | `worktree` | boolean |  |
 
 ### `spawn_agents`
 
-Fan out: open several sessions in one call (at most 8), concurrently. Each entry takes the same fields as spawn_agent (kind, cwd, worktree, branch, base, host, prompt, name, operation_id, task, result_schema) and is deduplicated the same way. Use worktree:true per entry for parallel edits. Returns one result per entry in order, plus the session_ids and task_ids to pass to wait_any.
+Fan out: open several sessions in one call (at most 8), concurrently. Each entry takes the same fields as spawn_agent (kind, cwd, worktree, branch, base, host, prompt, name, operation_id, task, result_schema, split, beside_session_id) and is deduplicated the same way. Use worktree:true per entry for parallel edits. Returns one result per entry in order, plus the session_ids and task_ids to pass to wait_any.
 
 | Argument | Type | Notes |
 | --- | --- | --- |
-| `agents` | array of objects | **Required.** Each item: `base`, `branch`, `cwd`, `host`, `kind`, `name`, `operation_id`, `prompt`, `result_schema`, `task`, `worktree`. |
+| `agents` | array of objects | **Required.** Each item: `base`, `beside_session_id`, `branch`, `cwd`, `host`, `kind`, `name`, `operation_id`, `prompt`, `result_schema`, `split`, `task`, `worktree`. |
 
 ### `fork_agent`
 
@@ -203,6 +205,28 @@ List tasks you submitted (role sent), were assigned (role assigned), or both, ne
 | `include_terminal` | boolean |  |
 | `limit` | number |  |
 | `role` | `sent`, `assigned`, `all` |  |
+
+
+## Split panes
+
+### `get_layout`
+
+Show the split-pane layout of the tab(s) that show a session (default yours): which sessions share the tab, side_by_side or stacked splits, the focused and zoomed session. Read it before manage_layout, or to check what the user sees beside you.
+
+| Argument | Type | Notes |
+| --- | --- | --- |
+| `session_id` | string |  |
+
+### `manage_layout`
+
+Arrange split panes by session id; panes are views, so nothing is started or stopped. split: move session_id's pane beside beside_session_id's (default yours), e.g. bring a child agent or a running server into view next to you. unsplit: give session_id its own tab again. close: take its pane off the tab (the session keeps running and stays in the sidebar). focus, zoom/unzoom (fill the tab with one pane), equalize (even out the tab's splits). session_id defaults to you. Split only when the user benefits from seeing both at once; do not rearrange panes the user did not ask about.
+
+| Argument | Type | Notes |
+| --- | --- | --- |
+| `action` | `split`, `unsplit`, `close`, `focus`, `zoom`, `unzoom`, `equalize` | **Required.** |
+| `beside_session_id` | string | split only: the session to dock beside; defaults to the calling session. |
+| `session_id` | string | The session whose pane to act on; defaults to the calling session. |
+| `split` | `right`, `down`, `left`, `up` | split only: which side of beside_session_id's pane; default right. |
 
 
 ## Lineage
