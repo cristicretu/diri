@@ -106,6 +106,10 @@ pub(crate) struct WorkspaceWorkbench {
     /// When the focused pane goes away (⌘W, ⌘J, its shell exiting) focus
     /// returns to the one used before it, not the Engine's first pane.
     focus_history: HashMap<TabId, Vec<PaneId>>,
+    /// Sessions this window just closed. Their panes stay in the layout
+    /// until the Engine collapses the split; until then they paint blank,
+    /// not as a saved pane whose session is unavailable.
+    closing: HashSet<SessionId>,
     resize: Option<ResizeDraft>,
     /// What the drag in flight last snapped to: the pane a moved pane would
     /// land on, or the end of a divider's travel.
@@ -174,6 +178,7 @@ impl WorkspaceWorkbench {
             pending_focus: None,
             sent_focus: None,
             focus_history: HashMap::new(),
+            closing: HashSet::new(),
             resize: None,
             drag_haptic: haptics::Crossing::default(),
             _activation: activation,
@@ -275,6 +280,10 @@ impl WorkspaceWorkbench {
             focus_changed = true;
         }
         self.remember_focus();
+        if let Some(tab) = &self.tab {
+            self.closing
+                .retain(|session| commands::pane_for_session(&tab.layout, session).is_some());
+        }
         let changed = previous_tab != self.tab || viewport_changed;
         self.reconcile(window, cx);
         self.flush_focus();
@@ -1142,6 +1151,8 @@ impl Render for WorkspaceWorkbench {
                         .clone()
                         .cached(StyleRefinement::default().size_full()),
                 );
+            } else if self.closing.contains(&pane.identity.session) {
+                surface = surface.bg(colors.terminal_surface());
             } else {
                 surface = surface.child(
                     div()
@@ -1188,7 +1199,8 @@ impl Render for WorkspaceWorkbench {
                             .cursor_pointer()
                             .child(sf_symbol("xmark", 12.0, colors.secondary))
                             .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
-                            .on_click(cx.listener(move |this, _, _, cx| {
+                            .on_click(cx.listener(move |this, _, window, cx| {
+                                this.focus_before_closing(&session, window, cx);
                                 // The Engine collapses the split once the
                                 // session is gone.
                                 this.runtime

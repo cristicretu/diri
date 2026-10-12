@@ -1398,7 +1398,14 @@ impl ControlServer {
             // No binary in the manifest: the caller has to say what to run.
             None if !argv.is_empty() => {
                 let mut spec = crate::pty::PtySpec::new(argv.clone(), launch_path);
-                spec.env = inherited;
+                // A terminal is scrubbed by its manifest too: an Engine
+                // started from inside a Claude session must not hand its
+                // child-session marker to a `claude` typed in this shell,
+                // which would then save no transcript.
+                spec.env = inherited
+                    .into_iter()
+                    .filter(|(key, _)| !descriptor.should_scrub(key))
+                    .collect();
                 // GUI apps launched by launchd commonly inherit no terminal
                 // environment. A binary-free descriptor is still attached to
                 // Diri's colour-capable PTY, so assert the same capabilities

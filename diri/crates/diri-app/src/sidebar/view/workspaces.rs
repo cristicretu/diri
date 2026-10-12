@@ -307,6 +307,12 @@ impl Sidebar {
         cx.emit(SidebarEvent::WorkspaceActivated(id));
         cx.notify();
     }
+    /// Settles workspace navigation outside a render, for a store change
+    /// the sidebar would otherwise only see when it next paints.
+    pub(crate) fn settle_workspace_navigation(&mut self, cx: &mut Context<Self>) {
+        self.reconcile_workspace_navigation(cx);
+    }
+
     pub(super) fn reconcile_workspace_navigation(&mut self, cx: &mut Context<Self>) {
         self.reconcile_project_agent(cx);
         self.reconcile_workspace_activation(cx);

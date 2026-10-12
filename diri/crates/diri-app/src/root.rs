@@ -1293,6 +1293,12 @@ impl RootView {
                                 (false, false, Vec::new())
                             };
                             this.open_api_requests(api_requests, cx);
+                            // The sidebar opens the selected session's
+                            // workspace while it renders; a hidden or idle
+                            // sidebar would leave ⌘D with no workspace until
+                            // something repainted it.
+                            this.sidebar
+                                .update(cx, |sidebar, cx| sidebar.settle_workspace_navigation(cx));
                             if open_launcher {
                                 this.open_launcher(&OpenLauncher, window, cx);
                             }
@@ -3437,6 +3443,11 @@ impl RootView {
             })
             .and_then(|workbench| workbench.read(cx).closable_pane_session());
         if let Some(pane) = pane {
+            if let Some(workbench) = self.workspace_workbench.clone() {
+                workbench.update(cx, |workbench, cx| {
+                    workbench.focus_before_closing(&pane, window, cx)
+                });
+            }
             self.window_store
                 .write()
                 .expect("session store lock poisoned")
@@ -5813,10 +5824,12 @@ impl Render for RootView {
                 // Comfortable: an island on the chrome, like the terminal
                 // card beside it, whose own gap separates the two. Compact:
                 // flush, the hairline the only edge between two terminal fills.
+                // Anchored to the window edge, so opening slides the whole
+                // panel in rather than uncovering it from its left side.
                 let panel = div()
                     .absolute()
                     .top(px(gap))
-                    .left(px(0.0))
+                    .right(px(gap))
                     .h(px(
                         (f32::from(window.viewport_size().height) - 2.0 * gap).max(0.0)
                     ))

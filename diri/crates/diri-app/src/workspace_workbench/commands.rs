@@ -368,6 +368,31 @@ impl WorkspaceWorkbench {
         true
     }
 
+    /// Before ⌘W ends `session`, focus the pane used before it. The local
+    /// removal lands first and would otherwise leave focus to the tab's
+    /// agent pane, then the Engine's first pane.
+    pub(crate) fn focus_before_closing(
+        &mut self,
+        session: &SessionId,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.closing.insert(session.clone());
+        let Some(tab) = self.tab.clone() else {
+            return;
+        };
+        let recent = self.focus_history.get(&tab.id).and_then(|history| {
+            history
+                .iter()
+                .rev()
+                .find(|pane| pane_session(&tab.layout, pane).is_some_and(|other| other != *session))
+                .cloned()
+        });
+        if let Some(pane) = recent {
+            self.focus_pane(pane, window, cx);
+        }
+    }
+
     /// The pane ⌘W closes: the focused pane's session when it is a pane
     /// shell sharing the tab. None closes the whole tab, as before: the
     /// owner's pane is the tab.
@@ -404,6 +429,15 @@ pub(super) fn below_sibling(node: &LayoutNode, pane: &PaneId) -> Option<(PaneId,
         return Some((id.clone(), session_id.clone()));
     }
     below_sibling(first, pane).or_else(|| below_sibling(second, pane))
+}
+
+pub(super) fn pane_for_session(node: &LayoutNode, session: &SessionId) -> Option<PaneId> {
+    match node {
+        LayoutNode::Pane { id, session_id } => (session_id == session).then(|| id.clone()),
+        LayoutNode::Split { first, second, .. } => {
+            pane_for_session(first, session).or_else(|| pane_for_session(second, session))
+        }
+    }
 }
 
 pub(super) fn pane_session(node: &LayoutNode, pane: &PaneId) -> Option<SessionId> {

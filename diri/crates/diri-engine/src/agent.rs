@@ -557,7 +557,7 @@ impl AgentDescriptor {
         Some(spec)
     }
 
-    fn should_scrub(&self, key: &str) -> bool {
+    pub(crate) fn should_scrub(&self, key: &str) -> bool {
         self.env_scrub_prefixes
             .iter()
             .any(|prefix| key.starts_with(prefix))
@@ -784,6 +784,15 @@ mod tests {
         // An agent added by dropping in a JSON file gets the right authority
         // with no code change at all.
         assert_eq!(descriptor("opencode").authority(), Authority::ScreenPrimary);
+    }
+
+    #[test]
+    fn a_terminal_drops_the_claude_child_session_marker_but_keeps_claude_config() {
+        let shell = descriptor("shell");
+        assert!(shell.should_scrub("CLAUDE_CODE_CHILD_SESSION"));
+        assert!(shell.should_scrub("CLAUDECODE"));
+        assert!(!shell.should_scrub("CLAUDE_CONFIG_DIR"));
+        assert!(!shell.should_scrub("PATH"));
     }
 
     #[test]

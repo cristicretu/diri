@@ -13,7 +13,11 @@
       "sh"
     ],
     "firstClass": false,
-    "statusAuthority": "process"
+    "statusAuthority": "process",
+    "envScrubPrefixes": [
+      "CLAUDECODE",
+      "CLAUDE_CODE_CHILD_SESSION"
+    ]
   },
   "rules": []
 }

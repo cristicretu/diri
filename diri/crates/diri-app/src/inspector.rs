@@ -1033,6 +1033,7 @@ impl WorkbenchInspector {
             }
         };
         let tab_visible = self.visible;
+        let transition = self.tab_transition_generation;
         let previous = SessionWorkspace {
             tabs: std::mem::take(&mut self.workspace_tabs),
             active: self.workspace_active.take(),
@@ -1091,6 +1092,11 @@ impl WorkbenchInspector {
             && let Some(surface) = self.load_workspace(id, cx)
         {
             cx.emit(InspectorEvent::WorkspaceRestored(surface));
+        }
+        if same_tab {
+            // Moving between panes of one tab swaps the panel's content in
+            // place; the tab-switch slide would read as the panel re-entering.
+            self.tab_transition_generation = transition;
         }
         if self.visible {
             self.seed_default_workspace(cx);
