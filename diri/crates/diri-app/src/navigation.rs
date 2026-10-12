@@ -43,6 +43,7 @@ use gpui::{
     StatefulInteractiveElement, StyledText, Task, UniformListScrollHandle, Window, div,
     ease_out_quint, prelude::*, px, rgba, uniform_list,
 };
+pub(crate) use history_page::relative_time;
 pub(crate) use notes_page::NoteOpened;
 
 /// The search header: an inset field pill plus the row inset above it.
@@ -2535,13 +2536,13 @@ fn style_swatch(
 /// The highlighted palette row's fill: diri's clay deepened toward the ember
 /// of the app icon, so it reads as a solid selection in light and dark alike
 /// and a clay Claude mark on it stays visible.
-fn palette_selection() -> gpui::Rgba {
+pub(crate) fn palette_selection() -> gpui::Rgba {
     rgba(0x9c452eff)
 }
 
 /// Ink for everything painted on a palette row: the dark-appearance ink on
 /// the solid selection, the surface's own otherwise.
-fn row_ink(colors: SemanticColors, highlighted: bool) -> SemanticColors {
+pub(crate) fn row_ink(colors: SemanticColors, highlighted: bool) -> SemanticColors {
     if highlighted {
         // Icons and shortcuts lift toward the title: the fill already says
         // which row is current, so its secondary ink need not recede as far.

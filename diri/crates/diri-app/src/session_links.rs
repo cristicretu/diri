@@ -1,6 +1,6 @@
 //! One contextual home for session links. Status is always attached by URL.
 use super::*;
-use crate::palette_chrome::{PaletteTooltip, scroll_fades};
+use crate::palette_chrome::{PaletteTooltip, keycap, scroll_fades};
 use crate::query_editor::{self, ClipboardEdit, Edit, QueryEditor};
 use crate::tooltip_warmth::WarmTooltip;
 use diri_proto::{ArtifactKind, PrCheck, PullRequestStatus, SessionArtifact};
@@ -25,20 +25,35 @@ pub(super) enum LinksStyle {
     Compact,
     /// Compact rows, with several links to one site gathered under it.
     Grouped,
+    /// The ⌘K palette's skin: an inset search field, a solid selection with
+    /// a return keycap, and the address beside the title only while a row
+    /// is selected.
+    Palette,
+    /// The palette, with when each link came up instead of its site, like
+    /// the History page.
+    Recent,
+    /// The palette, with ⌘1–⌘9 opening the first nine rows.
+    Numbered,
 }
 impl LinksStyle {
     fn from_env() -> Self {
         match std::env::var("DIRI_LINKS_STYLE").as_deref() {
             Ok("refined") => Self::Refined,
             Ok("grouped") => Self::Grouped,
+            Ok("palette") => Self::Palette,
+            Ok("recent") => Self::Recent,
+            Ok("numbered") => Self::Numbered,
             _ => Self::Compact,
         }
     }
     fn row_height(self) -> f32 {
         match self {
             Self::Refined => ROW_HEIGHT,
-            Self::Compact | Self::Grouped => COMPACT_ROW_HEIGHT,
+            _ => COMPACT_ROW_HEIGHT,
         }
+    }
+    fn palette(self) -> bool {
+        matches!(self, Self::Palette | Self::Recent | Self::Numbered)
     }
 }
 pub(super) struct SessionLinks {
@@ -107,6 +122,8 @@ struct LinkRow {
     /// What links to one place are gathered under (`PostHog`).
     group: String,
     section: Section,
+    /// When the chat first mentioned it, in milliseconds since the epoch.
+    seen: Option<f64>,
     icon: IconName,
     status: Option<(String, gpui::Rgba)>,
     action: LinkAction,
@@ -214,6 +231,7 @@ fn pr_row(pr: &PullRequestStatus) -> LinkRow {
         site: format!("#{}", pr.number),
         group: "GitHub".into(),
         section: Section::PullRequests,
+        seen: None,
         icon: if pr.state == "MERGED" {
             IconName::Merge
         } else {
@@ -231,6 +249,7 @@ fn port_row(port: &diri_proto::PortInfo) -> LinkRow {
         site: port.process_name.clone(),
         group: "localhost".into(),
         section: Section::Running,
+        seen: None,
         icon: IconName::Monitor,
         status: None,
         action: LinkAction::Open(format!("http://localhost:{}", port.port)),
@@ -280,6 +299,7 @@ fn artifact_row(artifact: &SessionArtifact) -> LinkRow {
         site: site_label(url),
         group: recognized.map_or_else(|| brand(url), |r| r.name.to_owned()),
         section: Section::Links,
+        seen: Some(artifact.first_seen_at.0),
         icon,
         status: None,
         action: LinkAction::Open(artifact.url.clone()),
@@ -454,6 +474,13 @@ fn link_title(url: &str) -> String {
         (None, None) => format!("{} {kind}", brand(url)),
     }
 }
+/// An address as people read it: no scheme, no trailing slash.
+fn display_address(url: &str) -> String {
+    url.trim_start_matches("https://")
+        .trim_start_matches("http://")
+        .trim_end_matches('/')
+        .to_owned()
+}
 /// One destination, however the chat spelled it: `localhost:3000/` is the
 /// dev server on port 3000.
 fn link_key(url: &str) -> &str {
@@ -520,7 +547,10 @@ fn session_rows(session: &SessionRecord) -> Vec<LinkRow> {
             continue;
         }
         match statuses.iter().find(|pr| pr.url == artifact.url) {
-            Some(pr) => prs.push(pr_row(pr)),
+            Some(pr) => prs.push(LinkRow {
+                seen: Some(artifact.first_seen_at.0),
+                ..pr_row(pr)
+            }),
             None => {
                 let mut row = artifact_row(artifact);
                 if artifact.kind == ArtifactKind::PullRequest {
@@ -694,6 +724,7 @@ fn row_score(row: &LinkRow, words: &[String]) -> Option<u32> {
 }
 fn detail_rows(pr: &PullRequestStatus) -> Vec<LinkRow> {
     let mut rows = vec![LinkRow {
+        seen: None,
         site: String::new(),
         group: String::new(),
         section: Section::Links,
@@ -721,6 +752,7 @@ fn detail_rows(pr: &PullRequestStatus) -> Vec<LinkRow> {
             site: String::new(),
             group: String::new(),
             section: Section::Links,
+            seen: None,
             title: check.name,
             subtitle: check.detail.filter(|s| !s.is_empty()).unwrap_or_default(),
             icon,
@@ -738,6 +770,7 @@ fn detail_rows(pr: &PullRequestStatus) -> Vec<LinkRow> {
             site: String::new(),
             group: String::new(),
             section: Section::Links,
+            seen: None,
             title: "Checks".into(),
             subtitle: check_summary(pr)
                 .map_or_else(|| "No checks reported".into(), |(label, _)| label),
@@ -752,6 +785,7 @@ fn detail_rows(pr: &PullRequestStatus) -> Vec<LinkRow> {
             site: String::new(),
             group: String::new(),
             section: Section::Links,
+            seen: None,
             title: "Discussion".into(),
             subtitle: comments_help(pr),
             icon: IconName::Comment,
@@ -1034,6 +1068,9 @@ impl TerminalPane {
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let style = self.session_links.style;
+        if style.palette() {
+            return self.render_palette_link_row(index, row, colors, cx);
+        }
         let action = row.action.clone();
         let selected = index == self.session_links.selected;
         let status = row
@@ -1079,7 +1116,7 @@ impl TerminalPane {
                         el.child(metadata)
                     })
             }
-            LinksStyle::Compact | LinksStyle::Grouped => {
+            _ => {
                 let title = if nested {
                     nested_title(row).into_owned()
                 } else {
@@ -1124,7 +1161,7 @@ impl TerminalPane {
         } else {
             14.0
         };
-        div()
+        let element = div()
             .id(("session-link", index))
             .debug_selector(move || format!("session-link-{index}"))
             .h(px(style.row_height()))
@@ -1188,8 +1225,166 @@ impl TerminalPane {
                                 })),
                         )
                     }),
-            )
-            // The pointer and the keys move one highlight, never two.
+            );
+        self.link_row_events(element, index, action, cx)
+    }
+    /// A row in the ⌘K palette's skin: solid selection, the address beside
+    /// the title while selected, and one trailing detail otherwise.
+    fn render_palette_link_row(
+        &self,
+        index: usize,
+        row: &LinkRow,
+        colors: SemanticColors,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let style = self.session_links.style;
+        let selected = index == self.session_links.selected;
+        let ink = crate::navigation::row_ink(colors, selected);
+        // A PR row's status already says what it is; its title gets the room.
+        let address = match &row.action {
+            _ if row.status.is_some() => String::new(),
+            LinkAction::Open(url) | LinkAction::PullRequest(url) => display_address(url),
+            LinkAction::Account => String::new(),
+        };
+        let trailing = match (&row.status, style) {
+            (_, LinksStyle::Numbered) if index < 9 => Some(format!("⌘{}", index + 1)),
+            (Some(_), _) => None,
+            (None, LinksStyle::Recent) => row
+                .seen
+                .map(crate::navigation::relative_time)
+                .or_else(|| Some(row.site.clone())),
+            _ => (!row.title.ends_with(row.site.as_str())).then(|| row.site.clone()),
+        }
+        .filter(|text| !text.is_empty() && !selected);
+        let row_radius = Radius::inner(Radius::PANEL, crate::navigation::PALETTE_ROW_INSET);
+        let element = div()
+            .id(("session-link", index))
+            .debug_selector(move || format!("session-link-{index}"))
+            .h(px(COMPACT_ROW_HEIGHT))
+            .px(px(crate::navigation::PALETTE_ROW_INSET))
+            .child(
+                div()
+                    .h_full()
+                    .px(px(10.0))
+                    .rounded(px(row_radius))
+                    .flex()
+                    .items_center()
+                    .gap(px(8.0))
+                    .map(|el| {
+                        if selected {
+                            el.bg(crate::navigation::palette_selection())
+                        } else {
+                            el.hover(move |el| el.bg(Fill::hover(colors, true)))
+                        }
+                    })
+                    .cursor_pointer()
+                    .text_size(px(13.0))
+                    .text_color(ink.primary)
+                    .child(
+                        div()
+                            .w(px(16.0))
+                            .flex_none()
+                            .flex()
+                            .justify_center()
+                            .child(Icon::new(row.icon, 14.0, ink.secondary)),
+                    )
+                    .child(
+                        div()
+                            .min_w(px(0.0))
+                            .flex_1()
+                            .flex()
+                            .items_center()
+                            .gap(px(8.0))
+                            .child(
+                                div()
+                                    .min_w(px(0.0))
+                                    // The title keeps its width; the address
+                                    // takes what is left.
+                                    .when(selected && !address.is_empty(), |el| {
+                                        el.flex_shrink_0().max_w(gpui::relative(0.7))
+                                    })
+                                    .truncate()
+                                    .child(row.title.clone()),
+                            )
+                            .when(selected && !address.is_empty(), |el| {
+                                el.child(
+                                    div()
+                                        .min_w(px(0.0))
+                                        .flex_1()
+                                        .truncate()
+                                        .text_size(px(11.0))
+                                        .text_color(ink.secondary)
+                                        .child(address),
+                                )
+                            }),
+                    )
+                    .when_some(row.status.clone(), |el, (label, tone)| {
+                        el.child(
+                            div()
+                                .flex_none()
+                                .text_size(px(12.0))
+                                .text_color(if selected { ink.primary } else { tone })
+                                .child(label),
+                        )
+                    })
+                    .when_some(trailing, |el, text| {
+                        el.child(
+                            div()
+                                .flex_none()
+                                .max_w(px(150.0))
+                                .truncate()
+                                .text_size(px(12.0))
+                                .text_color(ink.secondary)
+                                .child(text),
+                        )
+                    })
+                    .when(selected, |el| {
+                        el.child(keycap(ink).child(Icon::new(
+                            IconName::Return,
+                            14.0,
+                            ink.secondary,
+                        )))
+                    })
+                    .when_some(row.details.clone(), |el, url| {
+                        el.child(
+                            div()
+                                .id(("session-link-details", index))
+                                .debug_selector(move || format!("session-link-details-{index}"))
+                                .size(px(20.0))
+                                .flex_none()
+                                .flex()
+                                .items_center()
+                                .justify_center()
+                                .rounded(px(Radius::CHIP))
+                                .hover(move |el| el.bg(Fill::hover(colors, true)))
+                                .child(Icon::new(IconName::ChevronRight, 12.0, ink.secondary))
+                                .on_click(cx.listener(move |this, _, window, cx| {
+                                    this.session_links.selected = index;
+                                    let url = url.clone();
+                                    this.in_main_window(window, cx, move |this, window, cx| {
+                                        this.activate_link(
+                                            &LinkAction::PullRequest(url),
+                                            false,
+                                            window,
+                                            cx,
+                                        );
+                                    });
+                                    cx.stop_propagation();
+                                })),
+                        )
+                    }),
+            );
+        self.link_row_events(element, index, row.action.clone(), cx)
+    }
+    /// Hover moves the one highlight; a click opens (⌥ copies).
+    fn link_row_events(
+        &self,
+        element: gpui::Stateful<gpui::Div>,
+        index: usize,
+        action: LinkAction,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        element
             .on_mouse_move(cx.listener(move |this, _, _, cx| {
                 if this.session_links.selected != index {
                     this.session_links.selected = index;
@@ -1205,6 +1400,107 @@ impl TerminalPane {
                 cx.stop_propagation();
             }))
             .into_any_element()
+    }
+    /// The ⌘K palette's search field: an inset pill with an esc keycap.
+    fn render_palette_links_header(
+        &self,
+        pull_request: Option<i64>,
+        colors: SemanticColors,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let inset = crate::navigation::PALETTE_ROW_INSET;
+        let query = &self.session_links.query;
+        let text = match pull_request {
+            Some(number) => div()
+                .text_color(colors.primary)
+                .child(format!("Pull request #{number}"))
+                .into_any_element(),
+            None if query.is_empty() => div()
+                .text_color(colors.secondary)
+                .child("Search links…")
+                .into_any_element(),
+            None => div()
+                .text_color(colors.primary)
+                .child(crate::navigation::query_label(query))
+                .into_any_element(),
+        };
+        div()
+            .mt(px(inset))
+            .mx(px(inset))
+            .mb(px(inset))
+            .h(px(34.0))
+            .pl(px(4.0))
+            .pr(px(10.0))
+            .rounded(px(Radius::inner(Radius::PANEL, inset)))
+            .bg(Fill::subtle(colors))
+            .flex()
+            .items_center()
+            .gap(px(4.0))
+            .child(
+                div()
+                    .id("session-links-back")
+                    .debug_selector(|| "session-links-back".into())
+                    .size(px(28.0))
+                    .flex_none()
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .rounded(px(Radius::CHIP))
+                    .when(pull_request.is_some(), |el| {
+                        el.cursor_pointer()
+                            .hover(move |el| el.bg(Fill::hover(colors, true)))
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.links_back(cx);
+                                cx.stop_propagation();
+                            }))
+                    })
+                    .child(Icon::new(
+                        if pull_request.is_some() {
+                            IconName::ChevronLeft
+                        } else {
+                            IconName::Search
+                        },
+                        13.0,
+                        colors.secondary,
+                    )),
+            )
+            .child(
+                div()
+                    .id("session-links-search")
+                    .debug_selector(|| "session-links-search".into())
+                    .flex_1()
+                    .min_w(px(0.0))
+                    .overflow_hidden()
+                    .text_size(px(14.0))
+                    .child(text),
+            )
+            .child(
+                keycap(colors)
+                    .id("session-links-close")
+                    .cursor_pointer()
+                    .hover(move |el| el.bg(Fill::hover(colors, true)))
+                    .on_click(cx.listener(|this, _, window, cx| {
+                        this.close_session_links(window, cx);
+                        cx.stop_propagation();
+                    }))
+                    .child("esc"),
+            )
+            .into_any_element()
+    }
+    /// ⌘1–⌘9 open the first nine rows in the Numbered layout. They are app
+    /// bindings (select session), which run before key listeners.
+    fn links_open_numbered(&mut self, number: usize, window: &mut Window, cx: &mut Context<Self>) {
+        if self.session_links.style != LinksStyle::Numbered {
+            return;
+        }
+        let Some(session) = self.selected_session() else {
+            return;
+        };
+        if let Some(row) = self.links_rows(&session).get(number - 1) {
+            let action = row.action.clone();
+            self.activate_link(&action, false, window, cx);
+        }
+        cx.stop_propagation();
     }
     fn render_list_label(
         text: &str,
@@ -1311,7 +1607,7 @@ impl TerminalPane {
                 .child(crate::navigation::query_label(query))
                 .into_any_element(),
         };
-        let header = div()
+        let classic_header = div()
             .h(px(34.0))
             .pl(px(14.0))
             .pr(px(14.0))
@@ -1381,6 +1677,11 @@ impl TerminalPane {
                         cx.stop_propagation();
                     })),
             );
+        let header = if self.session_links.style.palette() {
+            self.render_palette_links_header(pr.map(|pr| pr.number), colors, cx)
+        } else {
+            classic_header.into_any_element()
+        };
         let style = self.session_links.style;
         let row_height = style.row_height();
         let items = self.links_items(&rows);
@@ -1393,7 +1694,7 @@ impl TerminalPane {
             .min((f32::from(self.main_viewport.height) - 230.0).max(row_height));
         // One-line rows leave the address out; the footer shows the
         // highlighted link's, like a browser's status bar.
-        let address = (style != LinksStyle::Refined)
+        let address = (style != LinksStyle::Refined && !style.palette())
             .then(|| rows.get(self.session_links.selected))
             .flatten()
             .and_then(|row| match &row.action {
@@ -1643,6 +1944,51 @@ impl TerminalPane {
                 this.links_clipboard(ClipboardEdit::Copy, cx);
                 cx.stop_propagation();
             }))
+            .on_action(
+                cx.listener(|this, _: &crate::commands::SelectSession1, window, cx| {
+                    this.links_open_numbered(1, window, cx)
+                }),
+            )
+            .on_action(
+                cx.listener(|this, _: &crate::commands::SelectSession2, window, cx| {
+                    this.links_open_numbered(2, window, cx)
+                }),
+            )
+            .on_action(
+                cx.listener(|this, _: &crate::commands::SelectSession3, window, cx| {
+                    this.links_open_numbered(3, window, cx)
+                }),
+            )
+            .on_action(
+                cx.listener(|this, _: &crate::commands::SelectSession4, window, cx| {
+                    this.links_open_numbered(4, window, cx)
+                }),
+            )
+            .on_action(
+                cx.listener(|this, _: &crate::commands::SelectSession5, window, cx| {
+                    this.links_open_numbered(5, window, cx)
+                }),
+            )
+            .on_action(
+                cx.listener(|this, _: &crate::commands::SelectSession6, window, cx| {
+                    this.links_open_numbered(6, window, cx)
+                }),
+            )
+            .on_action(
+                cx.listener(|this, _: &crate::commands::SelectSession7, window, cx| {
+                    this.links_open_numbered(7, window, cx)
+                }),
+            )
+            .on_action(
+                cx.listener(|this, _: &crate::commands::SelectSession8, window, cx| {
+                    this.links_open_numbered(8, window, cx)
+                }),
+            )
+            .on_action(
+                cx.listener(|this, _: &crate::commands::SelectLastSession, window, cx| {
+                    this.links_open_numbered(9, window, cx)
+                }),
+            )
             .on_scroll_wheel(|_, _, cx| cx.stop_propagation())
             .child(div().absolute().inset_0().occlude().on_mouse_down(
                 MouseButton::Left,
@@ -2043,6 +2389,45 @@ mod tests {
         assert!(cx.debug_bounds("session-link-0").is_some());
         assert!(cx.debug_bounds("session-link-1").is_none());
     }
+    /// The app's key context, where ⌘1–⌘9 are bound.
+    struct AppContextHarness(Entity<TerminalPane>);
+    impl Render for AppContextHarness {
+        fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+            div()
+                .key_context(crate::commands::APP_CONTEXT)
+                .size_full()
+                .child(self.0.clone())
+        }
+    }
+    #[gpui::test]
+    fn numbered_layout_opens_a_row_with_its_command_digit(cx: &mut TestAppContext) {
+        cx.update(|cx| {
+            cx.set_reduce_motion(true);
+            crate::commands::bind_keys(cx, &Default::default());
+        });
+        let (runtime, tokio) = runtime(fixture());
+        let (harness, cx) = cx.add_window_view(move |window, cx| {
+            let pane = cx.new(|cx| {
+                let mut pane = TerminalPane::new(runtime, tokio, window, cx);
+                pane.session_links.style = LinksStyle::Numbered;
+                pane
+            });
+            cx.observe(&pane, |_, _, cx| cx.notify()).detach();
+            AppContextHarness(pane)
+        });
+        let pane = harness.read_with(cx, |h, _| h.0.clone());
+        cx.simulate_resize(size(px(900.0), px(700.0)));
+        cx.run_until_parked();
+        let trigger = cx.debug_bounds("session-links-trigger").unwrap().center();
+        cx.simulate_click(trigger, Modifiers::default());
+        cx.run_until_parked();
+        cx.simulate_keystrokes(&crate::commands::test_chords("cmd-2"));
+        assert_eq!(
+            cx.opened_url().as_deref(),
+            Some("https://github.com/diri/app/pull/181")
+        );
+        assert!(!pane.read_with(cx, |p, _| p.session_links.open));
+    }
     #[gpui::test]
     fn typing_filters_links_and_escape_clears_before_closing(cx: &mut TestAppContext) {
         cx.update(|cx| cx.set_reduce_motion(true));
@@ -2285,6 +2670,10 @@ mod tests {
             "https://claude.ai/artifact/QquGRTGC4XqV32G1EGUR3c",
         ];
         session.git_branch = Some("feature/reader-docked-chat".into());
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as f64;
         session.artifacts = Some(
             urls.iter()
                 .enumerate()
@@ -2299,7 +2688,7 @@ mod tests {
                         ArtifactKind::Link
                     },
                     url: (*url).into(),
-                    first_seen_at: DateMillis(i as f64),
+                    first_seen_at: DateMillis(now - (urls.len() - i) as f64 * 7.0 * 60_000.0),
                 })
                 .collect(),
         );

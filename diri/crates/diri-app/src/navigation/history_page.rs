@@ -301,7 +301,7 @@ impl NavigationOverlay {
     }
 }
 
-pub(super) fn relative_time(milliseconds: f64) -> String {
+pub(crate) fn relative_time(milliseconds: f64) -> String {
     let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map_or(0.0, |duration| duration.as_secs_f64() * 1000.0);
