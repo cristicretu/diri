@@ -21,23 +21,16 @@
     {
       "name": "playwright",
       "ecosystem": "npm",
-      "version": "1.62.1",
+      "version": "1.64.0",
       "license": "Apache-2.0",
       "source": "https://github.com/microsoft/playwright"
     },
     {
       "name": "playwright-core",
       "ecosystem": "npm",
-      "version": "1.62.1",
+      "version": "1.64.0",
       "license": "Apache-2.0",
       "source": "https://github.com/microsoft/playwright"
-    },
-    {
-      "name": "fsevents",
-      "ecosystem": "npm",
-      "version": "2.3.2",
-      "license": "MIT",
-      "source": "https://github.com/fsevents/fsevents"
     }
   ],
   "notes": [
