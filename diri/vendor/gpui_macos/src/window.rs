@@ -2489,20 +2489,28 @@ extern "C" fn handle_view_event(this: &Object, _: Sel, native_event: id) {
 
 extern "C" fn window_did_change_occlusion_state(this: &Object, _: Sel, _: id) {
     let window_state = unsafe { get_window_state(this) };
-    let lock = &mut *window_state.lock();
-    unsafe {
-        if lock
-            .native_window
-            .occlusionState()
-            .contains(NSWindowOcclusionState::NSWindowOcclusionStateVisible)
-        {
-            lock.update_backing_surface();
-            lock.move_traffic_light();
-            lock.start_display_link();
-        } else {
-            lock.stop_display_link();
-            lock.update_backing_surface();
-        }
+    let mut lock = window_state.lock();
+    if !lock.is_visible() {
+        lock.stop_display_link();
+        lock.update_backing_surface();
+        return;
+    }
+    lock.update_backing_surface();
+    lock.move_traffic_light();
+    lock.start_display_link();
+
+    // While hidden the drawable was 1x1, and any frame drawn then (or the one
+    // that consumed the last invalidation) left a 1x1 image in the layer. The
+    // drawable is full size again, but an idle window has nothing dirty, so
+    // without a forced render it keeps showing that stretched pixel after
+    // unlock until some view happens to notify.
+    if let Some(mut callback) = lock.request_frame_callback.take() {
+        drop(lock);
+        callback(RequestFrameOptions {
+            require_presentation: true,
+            force_render: true,
+        });
+        window_state.lock().request_frame_callback = Some(callback);
     }
 }
 
