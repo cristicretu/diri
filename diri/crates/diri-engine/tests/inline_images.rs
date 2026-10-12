@@ -66,9 +66,14 @@ fn at_prompt(session: &Session) -> bool {
 }
 
 fn anchors(session: &Session) -> Vec<(u16, u16, u16, ImageAnchor)> {
-    let grid = session
-        .grid_update_if_changed(&mut GridSignature::default())
-        .expect("grid");
+    // A screen redrawn after `clear` is published once the redraw settles,
+    // which can trail the parsed screen by a few milliseconds.
+    let mut grid = None;
+    wait_until(session, "the published grid", || {
+        grid = session.grid_update_if_changed(&mut GridSignature::default());
+        grid.is_some()
+    });
+    let grid = grid.expect("grid");
     grid.changed_rows
         .iter()
         .flat_map(|row| {

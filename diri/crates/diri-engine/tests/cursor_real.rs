@@ -1,6 +1,6 @@
 //! Opt-in Engine -> real Cursor CLI -> scripted localhost Cursor backend.
 //!
-//! Verified with 2026.09.28-64d2043. Extract the official platform tarball into
+//! Verified with 2026.09.28-64d2043 and 2026.10.01-e373342. Extract the official platform tarball into
 //! a scratch directory (do not install globally), then run from `diri/`:
 //!
 //! ```sh
@@ -32,7 +32,9 @@ use std::time::{Duration, Instant};
 use diri_engine::control::ControlServer;
 use diri_engine::detect::ManifestEngine;
 use diri_engine::registry::Registry;
+use diri_engine::session::HolderConfig;
 use diri_proto::ControlMessage;
+use diri_proto::frames::{Frame, FrameCodec, FrameType};
 use serde_json::{Value, json};
 
 struct Client {
@@ -329,6 +331,11 @@ fn connect(socket: &Path) -> Client {
 }
 
 fn start(temp: &Path) -> Client {
+    start_with(temp, false)
+}
+
+/// `held` runs sessions through a real Holder, as the app does.
+fn start_with(temp: &Path, held: bool) -> Client {
     let (engine, _) =
         ManifestEngine::load_dir(&diri_engine::detect::bundled_manifest_dir()).unwrap();
     let registry = Arc::new(Mutex::new(Registry::new(
@@ -336,9 +343,15 @@ fn start(temp: &Path) -> Client {
         temp.join("state.json"),
     )));
     let socket = temp.join("daemon.sock");
-    let server = Arc::new(
-        ControlServer::new(Arc::clone(&registry), socket.clone()).with_logs_dir(temp.join("logs")),
-    );
+    let mut server =
+        ControlServer::new(Arc::clone(&registry), socket.clone()).with_logs_dir(temp.join("logs"));
+    if held {
+        server = server.with_holder(HolderConfig {
+            holders_dir: temp.join("holders"),
+            executable: PathBuf::from(env!("CARGO_BIN_EXE_diri-holder")),
+        });
+    }
+    let server = Arc::new(server);
     let listener = server.bind().unwrap();
     let stop = Arc::new(AtomicBool::new(false));
     let watcher =
@@ -412,11 +425,20 @@ fn spawn(
     project: &Path,
     prompt: Option<&str>,
 ) -> (String, Result<(), String>) {
+    spawn_sized(client, project, prompt, 30)
+}
+
+fn spawn_sized(
+    client: &mut Client,
+    project: &Path,
+    prompt: Option<&str>,
+    rows: u16,
+) -> (String, Result<(), String>) {
     let mut params = json!({
         "kind": { "cursor": {} },
         "cwd": project,
         "initialCols": 100,
-        "initialRows": 30,
+        "initialRows": rows,
     });
     if let Some(prompt) = prompt {
         params["initialPrompt"] = json!(prompt);
@@ -712,4 +734,336 @@ fn unattended_login_reports_delivery_failure_without_consuming_the_prompt() {
         "PINEAPPLE retained"
     );
     assert!(fixture.requests().is_empty());
+}
+
+/// One published grid as an attached pane saw it.
+struct Shot {
+    at: Instant,
+    cols: u16,
+    rows: Vec<String>,
+}
+
+/// What an attached pane saw: every published grid, in order.
+struct Recorder {
+    input: UnixStream,
+    frames: Arc<Mutex<Vec<Shot>>>,
+    done: Arc<AtomicBool>,
+    thread: Option<std::thread::JoinHandle<()>>,
+}
+
+impl Recorder {
+    fn attach(client: &Client, id: &str) -> Self {
+        let socket = &client.engine.as_ref().unwrap().socket;
+        let mut stream = UnixStream::connect(socket).unwrap();
+        writeln!(stream, "{}", json!({ "attach": id })).unwrap();
+        stream
+            .set_read_timeout(Some(Duration::from_millis(100)))
+            .unwrap();
+        let input = stream.try_clone().unwrap();
+        let frames = Arc::new(Mutex::new(Vec::new()));
+        let done = Arc::new(AtomicBool::new(false));
+        let thread = {
+            let (frames, done) = (frames.clone(), done.clone());
+            std::thread::spawn(move || {
+                use std::io::Read;
+                let mut codec = FrameCodec::new();
+                let mut rows: Vec<String> = Vec::new();
+                let mut chunk = vec![0u8; 256 << 10];
+                while !done.load(Ordering::SeqCst) {
+                    let count = match stream.read(&mut chunk) {
+                        Ok(0) => return,
+                        Ok(count) => count,
+                        Err(_) => continue,
+                    };
+                    for frame in codec.feed(&chunk[..count]).unwrap() {
+                        if frame.frame_type != FrameType::Grid {
+                            continue;
+                        }
+                        let Ok(Some(update)) = frame.grid_payload() else {
+                            continue;
+                        };
+                        if update.is_full_snapshot {
+                            rows.clear();
+                        }
+                        rows.resize(usize::from(update.rows), String::new());
+                        for row in &update.changed_rows {
+                            if let Some(slot) = rows.get_mut(usize::from(row.y)) {
+                                *slot = row
+                                    .cells
+                                    .iter()
+                                    .map(|cell| char::from_u32(cell.scalar).unwrap_or(' '))
+                                    .collect::<String>()
+                                    .trim_end()
+                                    .to_string();
+                            }
+                        }
+                        frames.lock().unwrap().push(Shot {
+                            at: Instant::now(),
+                            cols: update.cols,
+                            rows: rows.clone(),
+                        });
+                    }
+                }
+            })
+        };
+        Self {
+            input,
+            frames,
+            done,
+            thread: Some(thread),
+        }
+    }
+
+    /// Types like a person: one key per data-channel frame, as the app sends.
+    fn type_text(&mut self, text: &str, gap: Duration) {
+        for key in text.chars() {
+            let bytes = key.to_string().into_bytes();
+            self.input
+                .write_all(&FrameCodec::encode(&Frame::input(bytes)).unwrap())
+                .unwrap();
+            std::thread::sleep(gap);
+        }
+    }
+
+    fn resize(&mut self, cols: u16, rows: u16) {
+        self.input
+            .write_all(&FrameCodec::encode(&Frame::resize(cols, rows)).unwrap())
+            .unwrap();
+    }
+
+    fn finish(mut self) -> Vec<Shot> {
+        self.stop();
+        std::mem::take(&mut *self.frames.lock().unwrap())
+    }
+
+    fn stop(&mut self) {
+        self.done.store(true, Ordering::SeqCst);
+        let _ = self.input.shutdown(std::net::Shutdown::Both);
+        if let Some(thread) = self.thread.take() {
+            let _ = thread.join();
+        }
+    }
+}
+
+impl Drop for Recorder {
+    // The Engine joins every client connection on shutdown, so an attach left
+    // open by a failed assertion would hang the test instead of failing it.
+    fn drop(&mut self) {
+        self.stop();
+    }
+}
+
+fn filled(rows: &[String]) -> usize {
+    rows.iter()
+        .map(|row| row.chars().filter(|c| !c.is_whitespace()).count())
+        .sum()
+}
+
+/// Frames a pane painted as a flicker: a row whose content vanished for one
+/// frame and came straight back, or a frame holding a whole row less than
+/// both neighbours. Either is the erased half of a repaint published alone.
+fn flashes(frames: &[Shot]) -> Vec<String> {
+    let mut found = Vec::new();
+    for i in 1..frames.len().saturating_sub(1) {
+        let (before, now, after) = (&frames[i - 1].rows, &frames[i].rows, &frames[i + 1].rows);
+        // Across a resize the layout legitimately changes and changes back.
+        let cols = frames[i].cols;
+        if before.len() != now.len()
+            || now.len() != after.len()
+            || frames[i - 1].cols != cols
+            || frames[i + 1].cols != cols
+        {
+            continue;
+        }
+        let cols = usize::from(cols);
+        let dip = filled(now) + cols <= filled(before).min(filled(after));
+        // A row that shows something else for exactly one frame. A full
+        // clear published mid-rewrite shows other conversation rows here,
+        // not blanks.
+        let blinked: Vec<usize> = (0..now.len())
+            .filter(|&y| !before[y].is_empty() && before[y] == after[y] && now[y] != before[y])
+            .collect();
+        if dip || blinked.len() >= 2 || blinked.iter().any(|&y| now[y].is_empty()) {
+            found.push(format!(
+                "frame {i} (+{}ms after previous): filled {} -> {} -> {}, blinked rows {blinked:?}\n{}",
+                frames[i].at.duration_since(frames[i - 1].at).as_millis(),
+                filled(before),
+                filled(now),
+                filled(after),
+                indent(&now.join("\n")),
+            ));
+        }
+    }
+    found
+}
+
+#[test]
+#[ignore = "needs DIRI_CURSOR_BIN_DIR; run serially"]
+fn held_cursor_never_publishes_a_half_erased_repaint() {
+    never_publishes_a_half_erased_repaint(30);
+}
+
+/// A pane shorter than Cursor's live region (a split, a small window) makes
+/// every repaint clear the screen and scrollback and rewrite the whole
+/// conversation, which spans many PTY writes.
+#[test]
+#[ignore = "needs DIRI_CURSOR_BIN_DIR; run serially"]
+fn short_held_cursor_never_publishes_a_half_erased_repaint() {
+    never_publishes_a_half_erased_repaint(10);
+}
+
+fn never_publishes_a_half_erased_repaint(rows: u16) {
+    // Read before the fixture replaces the environment.
+    let dump = std::env::var_os("DIRI_FLICKER_DUMP");
+    let fixture = fixture(true);
+    let mut client = start_with(fixture.temp.path(), true);
+    let (id, result) = spawn_sized(&mut client, &fixture.project, None, rows);
+    assert!(result.is_ok(), "{result:?}");
+    expect_screen(
+        &mut client,
+        &id,
+        "trust",
+        "needsInput",
+        "Trust this workspace",
+    );
+    client.key(&id, "a", false);
+    expect_screen(
+        &mut client,
+        &id,
+        "ready",
+        "idle",
+        "→ Plan, search, build anything",
+    );
+
+    let mut recorder = Recorder::attach(&client, &id);
+    std::thread::sleep(Duration::from_millis(500));
+    for turn in 0..3 {
+        recorder.type_text(
+            &format!("TALL answer number {turn} please\r"),
+            Duration::from_millis(35),
+        );
+        let deadline = Instant::now() + Duration::from_secs(30);
+        let answered = || {
+            std::fs::read_to_string(fixture.temp.path().join("api.log"))
+                .unwrap_or_default()
+                .matches("\"prompt\"")
+                .count()
+                > turn
+        };
+        // The finished answer may have scrolled off a short pane, so the turn
+        // is done once the backend saw it and Cursor has stayed idle a while.
+        let mut idle_since: Option<Instant> = None;
+        let mut statuses: Vec<String> = Vec::new();
+        loop {
+            let status = client.status(&id);
+            if statuses.last() != Some(&status) {
+                statuses.push(status.clone());
+            }
+            if answered() && status.contains("idle") {
+                if idle_since.get_or_insert_with(Instant::now).elapsed() > Duration::from_secs(4) {
+                    println!("turn {turn} statuses: {statuses:?}");
+                    break;
+                }
+            } else {
+                idle_since = None;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "turn {turn} never finished: {}\n{}",
+                client.status(&id),
+                client.screen(&id)
+            );
+            // Typing while the answer streams is the other half of the
+            // complaint: every key repaints Cursor's whole live region.
+            recorder.type_text("x", Duration::from_millis(60));
+            recorder.type_text("\x7f", Duration::from_millis(60));
+        }
+    }
+    let frames = recorder.finish();
+    if let Some(path) = dump {
+        let dump: Vec<Value> = frames
+            .iter()
+            .map(|shot| json!({"ms": shot.at.duration_since(frames[0].at).as_millis(), "cols": shot.cols, "rows": shot.rows}))
+            .collect();
+        std::fs::write(
+            Path::new(&path).join(format!("frames-{rows}.json")),
+            serde_json::to_string(&dump).unwrap(),
+        )
+        .unwrap();
+    }
+    let found = flashes(&frames);
+    println!("{} frames published, {} flashes", frames.len(), found.len());
+    assert!(
+        found.is_empty(),
+        "{} of {} published frames were half-erased repaints:\n{}",
+        found.len(),
+        frames.len(),
+        found.join("\n\n")
+    );
+}
+
+/// Window drags, split panes and the sidebar all resize the pane, and Cursor
+/// answers every resize by clearing the screen and scrollback and rewriting
+/// the conversation.
+#[test]
+#[ignore = "needs DIRI_CURSOR_BIN_DIR; run serially"]
+fn held_cursor_resizes_without_flashing() {
+    let dump = std::env::var_os("DIRI_FLICKER_DUMP");
+    let fixture = fixture(true);
+    let mut client = start_with(fixture.temp.path(), true);
+    let (id, result) = spawn_sized(&mut client, &fixture.project, None, 30);
+    assert!(result.is_ok(), "{result:?}");
+    expect_screen(
+        &mut client,
+        &id,
+        "trust",
+        "needsInput",
+        "Trust this workspace",
+    );
+    client.key(&id, "a", false);
+    expect_screen(
+        &mut client,
+        &id,
+        "ready",
+        "idle",
+        "→ Plan, search, build anything",
+    );
+    client.send(&id, "TALL history to reflow");
+    expect_screen(&mut client, &id, "answered", "idle", "TALLDONE");
+
+    let mut recorder = Recorder::attach(&client, &id);
+    std::thread::sleep(Duration::from_millis(500));
+    let sizes = [
+        (98, 30),
+        (100, 30),
+        (100, 24),
+        (100, 30),
+        (90, 20),
+        (100, 30),
+    ];
+    for &(cols, rows) in sizes.iter().cycle().take(18) {
+        recorder.resize(cols, rows);
+        std::thread::sleep(Duration::from_millis(400));
+    }
+    let frames = recorder.finish();
+    if let Some(path) = dump {
+        let dump: Vec<Value> = frames
+            .iter()
+            .map(|shot| json!({"ms": shot.at.duration_since(frames[0].at).as_millis(), "cols": shot.cols, "rows": shot.rows}))
+            .collect();
+        std::fs::write(
+            Path::new(&path).join("frames-resize.json"),
+            serde_json::to_string(&dump).unwrap(),
+        )
+        .unwrap();
+    }
+    let found = flashes(&frames);
+    println!("{} frames published, {} flashes", frames.len(), found.len());
+    assert!(
+        found.is_empty(),
+        "{} of {} published frames flashed during resizes:\n{}",
+        found.len(),
+        frames.len(),
+        found.join("\n\n")
+    );
 }
