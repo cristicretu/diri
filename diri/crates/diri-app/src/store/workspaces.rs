@@ -134,7 +134,7 @@ impl SessionStore {
         self.workspaces.hydrated = true;
     }
 
-    #[cfg(test)]
+    #[cfg(all(test, target_os = "macos"))]
     pub(crate) fn in_flight_workspace_edit_for_test(&self) -> Option<&WorkspaceMutation> {
         self.workspaces
             .in_flight
