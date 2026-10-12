@@ -47,6 +47,8 @@ pub(in crate::sidebar) struct SessionRowProps {
     pub(super) drag_selection: Option<Vec<SessionId>>,
     pub(super) migrating: bool,
     pub(super) activity_state: StatusState,
+    /// Panes in this row's tab, when it is split.
+    pub(super) panes: usize,
     /// Terminal progress, when the session reports any.
     pub(super) progress: Option<crate::progress_mark::ProgressFace>,
     pub(super) marked: bool,
@@ -108,7 +110,7 @@ impl Sidebar {
     ) -> SessionRowProps {
         let session = &row.session;
         let id = &session.id;
-        let (selected, multi, drag_selection, migrating, unread) = {
+        let (selected, multi, drag_selection, migrating, unread, pane_group) = {
             let mut store = self.store.write().expect("session store lock poisoned");
             (
                 // While the To-dos page covers the workbench, no row is the
@@ -118,9 +120,15 @@ impl Sidebar {
                 (store.sidebar_selection().len() > 1).then(|| store.sidebar_selection_ordered()),
                 store.migrating().contains(id),
                 store.notifications().session_unread(id),
+                store.pane_group(id),
             )
         };
-        let activity_state = sidebar_activity_state(status_state(session, migrating), unread);
+        let (panes, shells) = pane_group.unwrap_or_default();
+        // One row per tab: it shows its most urgent pane.
+        let activity_state = shells.iter().fold(
+            sidebar_activity_state(status_state(session, migrating), unread),
+            |state, shell| most_urgent(state, status_state(shell, false)),
+        );
         SessionRowProps {
             row: row.clone(),
             shortcut,
@@ -132,6 +140,7 @@ impl Sidebar {
             drag_selection,
             migrating,
             activity_state,
+            panes,
             progress: crate::progress_mark::face(session, self.activity_frame, reduce_motion),
             marked: self.ui.delegation_mark.as_ref() == Some(id),
             hovered: self.ui.hovered_session.as_ref() == Some(id),
@@ -255,5 +264,44 @@ impl Sidebar {
         }
         self.rows_stale = true;
         self.tabs_stale = true;
+    }
+}
+
+/// The state a split tab's row shows: needs you, then working, then
+/// finished-unseen; otherwise the row's own.
+pub(super) fn most_urgent(row: StatusState, pane: StatusState) -> StatusState {
+    fn rank(state: StatusState) -> u8 {
+        match state {
+            StatusState::NeedsInput { .. } => 3,
+            StatusState::Working => 2,
+            StatusState::DoneUnseen => 1,
+            _ => 0,
+        }
+    }
+    if rank(pane) > rank(row) { pane } else { row }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_split_row_shows_its_most_urgent_pane() {
+        let ask = StatusState::NeedsInput { destructive: false };
+        assert_eq!(most_urgent(StatusState::Working, ask), ask);
+        assert_eq!(
+            most_urgent(StatusState::IdleSeen, StatusState::Working),
+            StatusState::Working
+        );
+        assert_eq!(most_urgent(ask, StatusState::Working), ask);
+        // A quiet shell never hides the row's own state.
+        assert_eq!(
+            most_urgent(StatusState::DoneUnseen, StatusState::None),
+            StatusState::DoneUnseen
+        );
+        assert_eq!(
+            most_urgent(StatusState::Hibernated, StatusState::IdleSeen),
+            StatusState::Hibernated
+        );
     }
 }

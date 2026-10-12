@@ -607,6 +607,25 @@ impl DaemonClient {
         Ok(record.id)
     }
 
+    /// Spawns and places the session in a tab's split tree in one request.
+    /// An Engine without placement ignores `pane` and leaves it unplaced.
+    pub async fn spawn_placed(
+        &self,
+        params: SessionSpawnParams,
+        pane: diri_proto::workspace::SpawnPane,
+    ) -> Result<SessionId, ClientError> {
+        #[derive(Serialize)]
+        struct Placed {
+            #[serde(flatten)]
+            params: SessionSpawnParams,
+            pane: diri_proto::workspace::SpawnPane,
+        }
+        let record: SessionSpawnResult = self
+            .typed(Method::SESSION_SPAWN, &Placed { params, pane })
+            .await?;
+        Ok(record.id)
+    }
+
     pub async fn kill(&self, session_id: &SessionId) -> Result<(), ClientError> {
         self.empty(Method::SESSION_KILL, &session_params(session_id))
             .await

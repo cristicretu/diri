@@ -14,14 +14,16 @@ On Linux, ⌘ becomes Ctrl and ⌃⌘ becomes Ctrl+Shift. A few bindings move to
 
 | Command | macOS | Linux |
 | --- | --- | --- |
-| Toggle inspector | ⇧⌘D | Ctrl+Shift+D |
+| Toggle inspector | ⌥⌘I | Ctrl+Alt+I |
+| Previous / next session | ⇧⌘[ / ⇧⌘] | Ctrl+Alt+← / → |
 | Delegate session | ⌃⌘D | Ctrl+Alt+D |
 | To-dos | ⌃⌘T | Ctrl+Alt+Shift+T |
-| Focus pane left / right / up / down | ⌃⌥ + arrow | Ctrl+Alt+H / L / K / J |
+| Focus pane left / right / up / down | ⌥⌘ + arrow | Ctrl+Alt+H / L / K / J |
+| Previous / next pane | ⌘[ / ⌘] | palette only |
 | Hide diri | ⌘H | none |
 
 ## See shortcuts in place
-Hold ⌘ on its own for a moment (700 ms) and the ⌘ shortcuts appear on the controls they operate: ⌘1 … ⌘9 on session rows and tabs, ⌘T on New Agent and the new-tab button, ⌘B on the sidebar toggle, ⇧⌘D on the inspector toggle, ⇧⌘H on search, and ⌘W under the selected tab's close button. Release ⌘ and they fade out.
+Hold ⌘ on its own for a moment (700 ms) and the ⌘ shortcuts appear on the controls they operate: ⌘1 … ⌘9 on session rows and tabs, ⌘T on New Agent and the new-tab button, ⌘B on the sidebar toggle, ⌥⌘I on the inspector toggle, ⇧⌘H on search, and ⌘W under the selected tab's close button. Release ⌘ and they fade out.
 
 Pressing another key or clicking while ⌘ is down counts as a shortcut, so the labels never flash during ⌘C or ⌘T. A command rebound away from ⌘ shows nothing. With Reduce Motion they appear and disappear without a fade.
 
@@ -36,7 +38,7 @@ Pressing another key or clicking while ⌘ is down counts as a shortcut, so the 
 | <kbd>⌘</kbd><kbd>R</kbd> | Rename the selected session in place |
 | <kbd>⌃</kbd><kbd>⌘</kbd><kbd>D</kbd> | Delegate: mark the selected session as a handoff source; select a target and press again to review and send |
 | <kbd>⌥</kbd><kbd>⇧</kbd><kbd>⌘</kbd><kbd>W</kbd> | Archive the selected session |
-| <kbd>⌘</kbd><kbd>W</kbd> | Close a focused auxiliary terminal; otherwise close the selected session, or the window when none is selected |
+| <kbd>⌘</kbd><kbd>W</kbd> | Close the focused terminal pane; otherwise close the selected session, or the window when none is selected |
 | <kbd>⇧</kbd><kbd>⌘</kbd><kbd>T</kbd> | Reopen the most recently closed session |
 | <kbd>⇧</kbd><kbd>⌘</kbd><kbd>N</kbd> | New window for the current workspace |
 | <kbd>⇧</kbd><kbd>⌘</kbd><kbd>W</kbd> | Close the window; sessions keep running |
@@ -50,9 +52,8 @@ Set the default agent for ⌘T in **Settings → General → Default agent**.
 | --- | --- |
 | <kbd>⌘</kbd><kbd>1</kbd> … <kbd>⌘</kbd><kbd>8</kbd> | Select the nth session; hold ⌘ to see each row's number |
 | <kbd>⌘</kbd><kbd>9</kbd> | Select the last session |
-| <kbd>⌘</kbd><kbd>[</kbd> / <kbd>⌘</kbd><kbd>]</kbd> | Previous / next session in sidebar order, wrapping |
-| <kbd>⌥</kbd><kbd>⌘</kbd><kbd>←</kbd> / <kbd>⌥</kbd><kbd>⌘</kbd><kbd>→</kbd> | Previous / next session |
-| <kbd>⌥</kbd><kbd>⌘</kbd><kbd>↑</kbd> / <kbd>⌥</kbd><kbd>⌘</kbd><kbd>↓</kbd> | Previous / next session |
+| <kbd>⇧</kbd><kbd>⌘</kbd><kbd>[</kbd> / <kbd>⇧</kbd><kbd>⌘</kbd><kbd>]</kbd> | Previous / next session in sidebar order, wrapping |
+| <kbd>⌘</kbd><kbd>[</kbd> / <kbd>⌘</kbd><kbd>]</kbd>, <kbd>⌥</kbd><kbd>⌘</kbd> + arrow | In a tab with one pane: previous / next session, as before. In a split tab they move between panes |
 | <kbd>⌃</kbd><kbd>⌘</kbd><kbd>↑</kbd> / <kbd>⌃</kbd><kbd>⌘</kbd><kbd>↓</kbd> | Move the selected row up or down among its siblings |
 | <kbd>⇧</kbd><kbd>⌘</kbd><kbd>J</kbd> | Jump to the next session that needs you |
 | <kbd>⌃</kbd><kbd>⇥</kbd> | Most-recently-used switcher; hold ⌃ and press ⇥ again to advance |
@@ -77,21 +78,29 @@ While the switcher is open: ⇧⌃⇥ cycles backwards, ← ↑ go back, → ↓
 | <kbd>⌘</kbd><kbd>,</kbd> | Settings |
 | <kbd>⌘</kbd><kbd>B</kbd> | Show or hide the sidebar (or the top bar with horizontal tabs) |
 | <kbd>⇧</kbd><kbd>⌘</kbd><kbd>S</kbd> | Switch tabs between the sidebar and the top |
-| <kbd>⇧</kbd><kbd>⌘</kbd><kbd>D</kbd> | Show or hide the inspector |
-| <kbd>⌘</kbd><kbd>J</kbd> | Show or hide an auxiliary terminal below the selected session |
+| <kbd>⌥</kbd><kbd>⌘</kbd><kbd>I</kbd> | Show or hide the inspector |
+| <kbd>⌘</kbd><kbd>J</kbd> | Show or hide a terminal pane below the focused pane |
 
 ⌘K, ⌘P and ⇧⌘H open the same palette on different pages. The palette lists most commands with their shortcuts, so it doubles as a reminder for the ones you use least. **Check for Updates…**, **What's New** and **Review session launches** have no default shortcut and live in the palette.
 
 ## Panes
 | Shortcut | Action |
 | --- | --- |
-| <kbd>⌘</kbd><kbd>D</kbd> | Split right and choose a session for the new pane |
-| <kbd>⇧</kbd><kbd>⌥</kbd><kbd>⌘</kbd><kbd>D</kbd> | Split below and choose a session |
-| <kbd>⇧</kbd><kbd>⌘</kbd><kbd>↵</kbd> | Zoom the focused pane, or restore the layout |
-| <kbd>⌃</kbd><kbd>⌥</kbd> + arrow | Focus the nearest pane in that direction |
-| <kbd>⌥</kbd><kbd>⇧</kbd><kbd>⌘</kbd> + arrow | Resize the nearest split divider by five percent |
+A tab works like a terminal multiplexer: it holds a split tree of panes, and stays one row in the sidebar. The row shows the most urgent pane's state (needs you, then working) and a small pane count. A new pane is a terminal in the focused pane's directory, on the same host.
 
-Swapping, moving and removing panes are in the command palette without default shortcuts. Removing a pane keeps its session running.
+| Shortcut | Action |
+| --- | --- |
+| <kbd>⌘</kbd><kbd>D</kbd> | Split right: a new terminal pane |
+| <kbd>⇧</kbd><kbd>⌘</kbd><kbd>D</kbd> | Split down: a new terminal pane |
+| <kbd>⌥</kbd><kbd>⌘</kbd> + arrow | Focus the nearest pane in that direction |
+| <kbd>⌘</kbd><kbd>[</kbd> / <kbd>⌘</kbd><kbd>]</kbd> | Focus the previous / next pane, wrapping |
+| <kbd>⇧</kbd><kbd>⌘</kbd><kbd>↵</kbd> | Zoom the focused pane, or restore the layout |
+| <kbd>⌃</kbd><kbd>⌘</kbd><kbd>=</kbd> | Equalize: every pane gets an equal share of its row or column |
+| <kbd>⌥</kbd><kbd>⇧</kbd><kbd>⌘</kbd> + arrow | Resize the nearest split divider by five percent |
+| <kbd>⌘</kbd><kbd>J</kbd> | Show or hide a terminal pane below the focused pane; a hidden terminal keeps running |
+| <kbd>⌘</kbd><kbd>W</kbd> | Close the focused terminal pane; on the agent's pane, close the tab |
+
+Drag a divider to resize; panes stop at a minimum size. Quitting an agent (^C^C, /exit) returns its pane to your login shell and never closes it. A pane's title bar only carries a ✕ on terminal panes; splitting, zoom, swapping and moving panes are on the keyboard and in the command palette.
 
 ## Inside the palette
 | Shortcut | Action |
@@ -200,7 +209,7 @@ diri asks which surface is in front, then falls back to the terminal.
 - **An unhandled global shortcut is not swallowed.** ⌘R or ⌘J with nothing selected, or ⌘9 with no sessions, leaves the keystroke alone.
 - **The launcher takes everything while it is open**, except ⌘N, which closes it.
 - **Settings and the worktrees overview take everything** except ⇧⌘H, ⌘K, ⌘P and ⌘,.
-- **The switcher and the overview own the arrow keys** while they are visible, so ⌥⌘↑, ⌘[ and ⌃⌘↑ stand down.
+- **The switcher and the overview own the arrow keys** while they are visible, so ⌥⌘↑, ⇧⌘[ and ⌃⌘↑ stand down.
 - **Esc is shared.** With the overview closed, Esc clears a multi-session sidebar selection but still reaches the focused terminal, so Esc in vim never depends on the sidebar.
-- **⌘W is three commands.** It closes a focused auxiliary terminal first, then the selected session, and only with no session selected the window.
-- **⌘J and ⇧⌘J are unrelated.** ⌘J toggles the auxiliary terminal; ⇧⌘J jumps to the next session that needs you.
+- **⌘W is three commands.** It closes the focused terminal pane first, then the selected session, and only with no session selected the window.
+- **⌘J and ⇧⌘J are unrelated.** ⌘J toggles a terminal pane; ⇧⌘J jumps to the next session that needs you.

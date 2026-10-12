@@ -203,6 +203,14 @@ fn local_session_uses_worktree(record: &diri_proto::SessionRecord, target: &Path
 }
 
 impl ControlServer {
+    /// One-time, at Engine start: pre-split `⌘J` terminals become panes of
+    /// their parent's tab. Later starts only read the marker.
+    pub fn adopt_pane_shells(&self) {
+        let records = self.registry.lock().expect("registry").records();
+        self.workspaces
+            .adopt_pane_shells(&live_pane_shells(&records));
+    }
+
     /// Configure private power endpoints before starting the scheduler.
     pub fn with_schedule_power(mut self, config: crate::wake::PowerConfig) -> Self {
         Arc::get_mut(&mut self.scheduler)
@@ -1207,6 +1215,37 @@ impl ControlServer {
     }
 
     fn session_spawn_identified(
+        &self,
+        params: Option<JsonValue>,
+        reserved_id: Option<String>,
+        scheduled: Option<diri_proto::schedules::ScheduledRunInfo>,
+    ) -> Result<JsonValue, ControlError> {
+        let raw = params.ok_or_else(|| ControlError::bad_request("params are required"))?;
+        // Decoded before the spawn so a malformed hint never starts a process.
+        let placement = spawn_pane_placement(&raw)?;
+        let parent = raw
+            .get("parent")
+            .and_then(JsonValue::as_str)
+            .map(diri_proto::SessionId::new);
+        let result = self.session_spawn_unplaced(Some(raw), reserved_id, scheduled)?;
+        if let Some(placement) = placement
+            && let Some(id) = result.get("id").and_then(JsonValue::as_str)
+            && let Some(snapshot) = self.workspaces.place_spawned(
+                &diri_proto::SessionId::new(id),
+                parent.as_ref(),
+                &placement,
+            )
+        {
+            self.events.publish(
+                diri_proto::EventName::WORKSPACE_UPDATED,
+                json!({"revision": snapshot.revision}),
+                None,
+            );
+        }
+        Ok(result)
+    }
+
+    fn session_spawn_unplaced(
         &self,
         params: Option<JsonValue>,
         reserved_id: Option<String>,
@@ -3164,12 +3203,21 @@ impl ControlServer {
         // Closing a note's tab never touches its file: the note stays in
         // Search notes (as a closed note) and opening it there brings its tab
         // back, the way closed chats stay in conversation search.
+        drop(registry);
         self.events.record_removed(&removed);
         self.events.publish(
             diri_proto::EventName::SESSION_REMOVED,
             json!({ "id": p.session_id.0, "reason": "released" }),
             Some(&p.session_id.0),
         );
+        // Closing a pane collapses its split; the tab stays one sidebar row.
+        if let Some(snapshot) = self.workspaces.prune_session(&p.session_id) {
+            self.events.publish(
+                diri_proto::EventName::WORKSPACE_UPDATED,
+                json!({"revision": snapshot.revision}),
+                None,
+            );
+        }
         Ok(json!({}))
     }
 
@@ -4888,6 +4936,52 @@ fn claude_resume_target_in(
         Some(id) => Some(Some(id)),
         None => agent_session_id.map(|_| None),
     }
+}
+
+/// The optional placement hint of `session.spawn`. Absent, a pane shell (a
+/// shell with a parent) docks below its parent; anything else is not placed.
+fn spawn_pane_placement(
+    params: &JsonValue,
+) -> Result<Option<diri_proto::workspace::SpawnPane>, ControlError> {
+    use diri_proto::workspace::{SPAWN_PANE_FIELD, SpawnPane};
+    if let Some(value) = params.get(SPAWN_PANE_FIELD) {
+        return serde_json::from_value(value.clone())
+            .map(Some)
+            .map_err(|_| ControlError::bad_request("pane is not a valid placement"));
+    }
+    let shell = params
+        .get("kind")
+        .and_then(|kind| serde_json::from_value::<diri_proto::AgentKind>(kind.clone()).ok())
+        .is_some_and(|kind| kind == diri_proto::AgentKind::SHELL);
+    let parented = params.get("parent").is_some_and(JsonValue::is_string);
+    Ok((shell && parented).then_some(SpawnPane::BelowParent))
+}
+
+/// Running pane shells with their parents, newest first: what the one-time
+/// layout adoption moves into the parents' tabs.
+fn live_pane_shells(
+    records: &[diri_proto::SessionRecord],
+) -> Vec<(diri_proto::SessionId, diri_proto::SessionId)> {
+    let mut shells: Vec<_> = records
+        .iter()
+        .filter(|record| {
+            record.kind == diri_proto::AgentKind::SHELL
+                && !record.is_archived()
+                && !matches!(record.status, diri_proto::SessionStatus::Exited(_))
+        })
+        .filter_map(|record| {
+            Some((
+                record.created_at.0,
+                record.id.clone(),
+                record.parent.clone()?,
+            ))
+        })
+        .collect();
+    shells.sort_by(|left, right| right.0.total_cmp(&left.0));
+    shells
+        .into_iter()
+        .map(|(_, id, parent)| (id, parent))
+        .collect()
 }
 
 fn decode_launch_argv(params: &JsonValue) -> Result<Vec<String>, ControlError> {
@@ -10149,5 +10243,50 @@ mod tests {
             std::thread::sleep(Duration::from_millis(1));
         }
         panic!("subscription worker did not observe Drop cancellation");
+    }
+}
+
+#[cfg(test)]
+mod pane_placement_tests {
+    use super::*;
+    use diri_proto::workspace::{DockEdge, SpawnPane};
+
+    #[test]
+    fn a_parented_shell_docks_below_its_parent_unless_told_otherwise() {
+        let shell = serde_json::to_value(diri_proto::AgentKind::SHELL).unwrap();
+        let claude = serde_json::to_value(diri_proto::AgentKind::CLAUDE_CODE).unwrap();
+        let placement = |params: JsonValue| spawn_pane_placement(&params).unwrap();
+        // An Agent's MCP `shell` child, and a ⌘J from an older client.
+        assert_eq!(
+            placement(json!({"kind": shell, "cwd": "/w", "parent": "s_1"})),
+            Some(SpawnPane::BelowParent)
+        );
+        // A top-level shell, or a child Agent, is not a pane.
+        assert_eq!(placement(json!({"kind": shell, "cwd": "/w"})), None);
+        assert_eq!(
+            placement(json!({"kind": claude, "cwd": "/w", "parent": "s_1"})),
+            None
+        );
+        // Explicit placements win, including "not a pane".
+        assert_eq!(
+            placement(
+                json!({"kind": shell, "cwd": "/w", "parent": "s_1", "pane": {"type": "detached"}})
+            ),
+            Some(SpawnPane::Detached)
+        );
+        assert_eq!(
+            placement(json!({"kind": shell, "cwd": "/w", "pane": {
+                "type": "beside", "tabId": "t", "target": "p", "edge": "right"
+            }})),
+            Some(SpawnPane::Beside {
+                tab_id: diri_proto::workspace::TabId::new("t"),
+                target: diri_proto::workspace::PaneId::new("p"),
+                edge: DockEdge::Right,
+            })
+        );
+        // A malformed hint is refused before anything spawns.
+        assert!(
+            spawn_pane_placement(&json!({"kind": shell, "pane": {"type": "sideways"}})).is_err()
+        );
     }
 }

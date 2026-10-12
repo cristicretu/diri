@@ -15,7 +15,7 @@ use crate::{
 use diri_proto::{
     SessionId,
     workspace::{
-        DockEdge, LayoutAxis, LayoutNode, LayoutNodeId, PaneId, SplitId, TabId, WorkspaceMutation,
+        DockEdge, LayoutAxis, LayoutNode, LayoutNodeId, PaneId, SplitId, WorkspaceMutation,
         WorkspaceTab,
     },
 };
@@ -34,43 +34,7 @@ const COMPACT_SEAM_REACH: f32 = 2.0;
 pub(crate) enum WorkspaceWorkbenchEvent {
     Terminal(TerminalPaneEvent),
     Notice(String),
-    RequestSplit {
-        tab: TabId,
-        pane: PaneId,
-        edge: DockEdge,
-    },
 }
-#[derive(Clone)]
-struct DraggedWorkspacePane {
-    tab: TabId,
-    pane: PaneId,
-    revision: u64,
-}
-impl Render for DraggedWorkspacePane {
-    fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
-        div()
-            .px(px(12.0))
-            .py(px(6.0))
-            .rounded(px(6.0))
-            .bg(gpui::rgba(0x34363aff))
-            .text_color(gpui::white())
-            .child("Move pane · center to swap")
-    }
-}
-fn dock_edge(x: f32, y: f32, width: f32, height: f32) -> Option<DockEdge> {
-    let normalized = [
-        (x / width, DockEdge::Left),
-        ((width - x) / width, DockEdge::Right),
-        (y / height, DockEdge::Top),
-        ((height - y) / height, DockEdge::Bottom),
-    ];
-    normalized
-        .into_iter()
-        .filter(|(distance, _)| *distance < 0.25)
-        .min_by(|a, b| a.0.total_cmp(&b.0))
-        .map(|(_, edge)| edge)
-}
-
 #[derive(Clone)]
 struct DraggedWorkspaceDivider;
 impl Render for DraggedWorkspaceDivider {
@@ -630,6 +594,32 @@ impl WorkspaceWorkbench {
         }
     }
 
+    /// Seeds each listed session's pane with its own lines of text.
+    #[cfg(all(test, target_os = "macos"))]
+    pub(crate) fn seed_pane_text_for_test(&self, texts: &[(&str, &str)], cx: &mut Context<Self>) {
+        for pane in self.mounted.values() {
+            let Some((_, text)) = texts.iter().find(|(id, _)| *id == pane.session.0) else {
+                continue;
+            };
+            let lines: Vec<_> = text.lines().collect();
+            // As tall as the text: a short pane shows a grid's bottom rows.
+            let mut grid = diri_term::buffer::GridBuffer::new(100, lines.len() as u16 + 1);
+            grid.cursor = diri_term::buffer::CursorState {
+                col: lines.last().map_or(0, |line| line.chars().count()) as u16,
+                row: lines.len().saturating_sub(1) as u16,
+                visible: true,
+            };
+            for (y, line) in lines.iter().enumerate() {
+                for (x, ch) in line.chars().take(100).enumerate() {
+                    grid.cells[y * 100 + x].scalar = ch as u32;
+                }
+            }
+            pane.terminal.update(cx, |terminal, cx| {
+                terminal.seed_preview_grid_for_test(grid, cx)
+            });
+        }
+    }
+
     pub(crate) fn deactivate(&mut self, cx: &mut Context<Self>) {
         self.enabled = false;
         self.cancel_resize();
@@ -728,58 +718,6 @@ impl WorkspaceWorkbench {
         }
         // Keep local focus until the authoritative snapshot acknowledges it.
     }
-    fn drop_pane(
-        &mut self,
-        dragged: &DraggedWorkspacePane,
-        target: PaneId,
-        bounds: Rect,
-        window: &Window,
-        cx: &mut Context<Self>,
-    ) {
-        let Some(tab) = &self.tab else {
-            return;
-        };
-        if dragged.tab == tab.id && dragged.pane == target {
-            return;
-        }
-        let position = window.mouse_position();
-        let edge = dock_edge(
-            f32::from(position.x) - self.viewport.x - bounds.x,
-            f32::from(position.y) - self.viewport.y - bounds.y,
-            bounds.width,
-            bounds.height,
-        );
-        let mutation = if let Some(edge) = edge {
-            WorkspaceMutation::MoveNode {
-                source_tab: dragged.tab.clone(),
-                node: LayoutNodeId::Pane(dragged.pane.clone()),
-                destination_tab: tab.id.clone(),
-                target,
-                edge,
-            }
-        } else {
-            WorkspaceMutation::SwapPanes {
-                first_tab: dragged.tab.clone(),
-                first: dragged.pane.clone(),
-                second_tab: tab.id.clone(),
-                second: target,
-            }
-        };
-        let mut store = self.runtime.store.write().expect("store");
-        if store
-            .workspace_catalog()
-            .snapshot()
-            .map(|snapshot| snapshot.revision)
-            != Some(dragged.revision)
-            || !store.edit_workspace(mutation)
-        {
-            cx.emit(WorkspaceWorkbenchEvent::Notice(
-                crate::i18n::t("toast.workspace_layout_changed_move").into(),
-            ));
-        }
-        cx.notify();
-    }
-
     fn begin_resize(&mut self, divider: crate::workspace_geometry::DividerPlacement) {
         let store = self.runtime.store.read().expect("store");
         if !store.workspace_catalog().can_edit() {
@@ -827,7 +765,15 @@ impl WorkspaceWorkbench {
             return;
         }
         let requested = position / available;
-        resize.fraction = requested.clamp(0.1, 0.9);
+        // The ratio stops where the panes stop: at the geometry's minimum
+        // pane size, so the saved ratio is the one on screen.
+        let minimum = if resize.axis == LayoutAxis::Horizontal {
+            crate::workspace_geometry::MIN_PANE_WIDTH
+        } else {
+            crate::workspace_geometry::MIN_PANE_HEIGHT
+        };
+        let floor = (minimum / available).clamp(0.1, 0.5);
+        resize.fraction = requested.clamp(floor, 1.0 - floor);
         // A divider has no snap points; the ends of its travel are the only
         // thresholds a resize crosses.
         let limit = (requested != resize.fraction)
@@ -881,36 +827,6 @@ impl WorkspaceWorkbench {
             && let Some(tab) = &mut self.tab
         {
             tab.layout = resize.original;
-        }
-    }
-
-    /// One tick as a pane being moved arrives over a pane that would take
-    /// it, the moment that pane's border lights. The dock zones inside a
-    /// pane are not drawn, so crossing between them stays silent.
-    fn track_pane_drag(
-        &mut self,
-        dragged: &PaneId,
-        local: gpui::Point<gpui::Pixels>,
-        pointer: gpui::Point<gpui::Pixels>,
-    ) {
-        let (x, y) = (f32::from(local.x), f32::from(local.y));
-        let target = self.geometry().and_then(|geometry| {
-            geometry
-                .panes
-                .iter()
-                .find(|pane| {
-                    let bounds = pane.bounds;
-                    x >= bounds.x
-                        && x < bounds.x + bounds.width
-                        && y >= bounds.y
-                        && y < bounds.y + bounds.height
-                })
-                .map(|pane| pane.identity.pane.clone())
-                .filter(|pane| pane != dragged)
-                .map(|pane| haptics::key("workspace-pane", pane))
-        });
-        if let Some(target) = self.drag_haptic.moved_to(target, pointer) {
-            haptics::perform(Haptic::Snap, target);
         }
     }
 
@@ -1008,13 +924,6 @@ impl Render for WorkspaceWorkbench {
                     );
                 },
             ))
-            .on_drag_move(cx.listener(
-                |this, event: &DragMoveEvent<DraggedWorkspacePane>, _, cx| {
-                    let dragged = event.drag(cx).pane.clone();
-                    let pointer = event.event.position;
-                    this.track_pane_drag(&dragged, pointer - event.bounds.origin, pointer);
-                },
-            ))
             .on_key_down(cx.listener(|this, event: &gpui::KeyDownEvent, _, cx| {
                 if event.keystroke.key == "escape" && this.resize.is_some() {
                     this.cancel_resize();
@@ -1026,13 +935,6 @@ impl Render for WorkspaceWorkbench {
             return root.child("Choose a tab to continue");
         };
         self.assign_visible_owners(window, cx);
-        let can_edit = self
-            .runtime
-            .store
-            .read()
-            .expect("store")
-            .workspace_catalog()
-            .can_edit();
         // Painted after the panes so a compact seam's grab area, which
         // overlaps the panes either side, wins hit tests over them.
         let mut seams = Vec::with_capacity(geometry.dividers.len());
@@ -1109,6 +1011,18 @@ impl Render for WorkspaceWorkbench {
             .tab
             .as_ref()
             .is_some_and(|tab| matches!(tab.layout, LayoutNode::Split { .. }));
+        // A pane's only control is the ✕ of a terminal pane: it ends that
+        // shell (⌘W). The agent's pane is the tab; it closes from the sidebar.
+        let shells: HashSet<SessionId> = {
+            let store = self.runtime.store.read().expect("store");
+            geometry
+                .panes
+                .iter()
+                .map(|pane| &pane.identity.session)
+                .filter(|session| store.pane_owner(session) != **session)
+                .cloned()
+                .collect()
+        };
         for pane in &geometry.panes {
             let bounds = pane.bounds;
             // The pane whose title bar ends at the window's trailing edge.
@@ -1127,15 +1041,19 @@ impl Render for WorkspaceWorkbench {
                 .h(px(bounds.height))
                 .when(islands, |surface| surface.rounded(px(Radius::CARD)))
                 .overflow_hidden();
+            let close_shell = multiple_panes && shells.contains(&pane.identity.session);
             if let Some(mounted) = self.mounted.get(&pane.identity.pane) {
                 mounted.terminal.update(cx, |terminal, cx| {
-                    let controls = if multiple_panes { 116.0 } else { 26.0 };
-                    let toggle = if inspector_toggle {
-                        Metrics::TOOLBAR_CONTROL_SIZE + 4.0
-                    } else {
+                    // The ✕ and the right-panel toggle sit in the title
+                    // bar's own trailing padding: each slot is a control and
+                    // its gap, less that padding once, so every gap matches.
+                    let count = u8::from(close_shell) + u8::from(inspector_toggle);
+                    let inset = if count == 0 {
                         0.0
+                    } else {
+                        f32::from(count) * (Metrics::TOOLBAR_CONTROL_SIZE + 4.0) - 11.0
                     };
-                    terminal.set_header_trailing_inset(controls + toggle, cx);
+                    terminal.set_header_trailing_inset(inset, cx);
                     terminal.set_island_corners(islands, cx);
                     terminal.set_viewport(
                         TerminalViewport {
@@ -1170,44 +1088,7 @@ impl Render for WorkspaceWorkbench {
                         ),
                 );
             }
-            let tab = geometry.tab.clone();
             let pane_id = pane.identity.pane.clone();
-            let split_tab = tab.clone();
-            let split_pane = pane_id.clone();
-            let zoom_tab = tab.clone();
-            let zoom_pane = pane_id.clone();
-            let zoomed = self
-                .tab
-                .as_ref()
-                .is_some_and(|tab| tab.zoomed_pane.as_ref() == Some(&pane_id));
-            let move_source = DraggedWorkspacePane {
-                tab: tab.clone(),
-                pane: pane_id.clone(),
-                revision: self
-                    .runtime
-                    .store
-                    .read()
-                    .expect("store")
-                    .workspace_catalog()
-                    .snapshot()
-                    .map_or(0, |snapshot| snapshot.revision),
-            };
-            let drop_target = pane_id.clone();
-            surface = surface
-                .drag_over::<DraggedWorkspacePane>(move |surface, dragged, _, _| {
-                    if dragged.pane != drop_target {
-                        surface.border_1().border_color(gpui::rgba(0x4f83f1ff))
-                    } else {
-                        surface
-                    }
-                })
-                .on_drop(cx.listener({
-                    let target = pane_id.clone();
-                    move |this, dragged: &DraggedWorkspacePane, window, cx| {
-                        this.drop_pane(dragged, target.clone(), bounds, window, cx);
-                        cx.stop_propagation();
-                    }
-                }));
             let controls = div()
                 .absolute()
                 .top(px((if islands {
@@ -1219,95 +1100,17 @@ impl Render for WorkspaceWorkbench {
                 .right(px(Metrics::TOOLBAR_EDGE_INSET))
                 .flex()
                 .gap(px(4.0))
-                .when(multiple_panes, |controls| {
+                .when(close_shell, |controls| {
+                    let session = pane.identity.session.clone();
                     controls.child(
                         div()
-                            .id(SharedString::from(format!("move-pane-{}", pane_id.0)))
-                            .role(Role::Button)
-                            .aria_label("Drag pane to an edge to move, or center to swap")
-                            .size(px(Metrics::TOOLBAR_CONTROL_SIZE))
-                            .rounded(px(Radius::BADGE))
-                            .hover(move |button| button.bg(Fill::subtle(colors)))
-                            .flex()
-                            .items_center()
-                            .justify_center()
-                            .cursor(CursorStyle::OpenHand)
-                            .child(sf_symbol("arrow.up.arrow.down", 14.0, colors.secondary))
-                            .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
-                            .on_drag(move_source, |source, _, _, cx| {
-                                cx.stop_propagation();
-                                cx.new(|_| source.clone())
-                            }),
-                    )
-                })
-                .child(
-                    div()
-                        .id(SharedString::from(format!("split-pane-{}", pane_id.0)))
-                        .role(Role::Button)
-                        .aria_label("Split pane")
-                        .size(px(Metrics::TOOLBAR_CONTROL_SIZE))
-                        .rounded(px(Radius::BADGE))
-                        .hover(move |button| button.bg(Fill::subtle(colors)))
-                        .flex()
-                        .items_center()
-                        .justify_center()
-                        .cursor_pointer()
-                        .child(sf_symbol("rectangle.split.2x1", 14.0, colors.secondary))
-                        .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
-                        .on_click(cx.listener(move |_, _, _, cx| {
-                            if can_edit {
-                                cx.emit(WorkspaceWorkbenchEvent::RequestSplit {
-                                    tab: split_tab.clone(),
-                                    pane: split_pane.clone(),
-                                    edge: DockEdge::Right,
-                                });
-                            }
-                        })),
-                )
-                .when(multiple_panes, |controls| {
-                    controls.child(
-                        div()
-                            .id(SharedString::from(format!("zoom-pane-{}", pane_id.0)))
-                            .role(Role::Button)
-                            .aria_label(if zoomed {
-                                "Show all panes"
-                            } else {
-                                "Focus this pane"
+                            .id(SharedString::from(format!("close-pane-{}", pane_id.0)))
+                            .debug_selector({
+                                let pane = pane_id.clone();
+                                move || format!("close-pane-{}", pane.0)
                             })
-                            .size(px(Metrics::TOOLBAR_CONTROL_SIZE))
-                            .rounded(px(Radius::BADGE))
-                            .hover(move |button| button.bg(Fill::subtle(colors)))
-                            .flex()
-                            .items_center()
-                            .justify_center()
-                            .cursor_pointer()
-                            .child(sf_symbol(
-                                if zoomed {
-                                    "arrow.down.right.and.arrow.up.left"
-                                } else {
-                                    "arrow.up.left.and.arrow.down.right"
-                                },
-                                14.0,
-                                colors.secondary,
-                            ))
-                            .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
-                            .on_click(cx.listener(move |this, _, _, cx| {
-                                this.runtime.store.write().expect("store").edit_workspace(
-                                    WorkspaceMutation::ZoomPane {
-                                        tab_id: zoom_tab.clone(),
-                                        pane_id: (!zoomed).then(|| zoom_pane.clone()),
-                                    },
-                                );
-                                cx.notify();
-                            })),
-                    )
-                })
-                .when(multiple_panes, |controls| {
-                    controls.child(
-                        div()
-                            .id(SharedString::from(format!("remove-pane-{}", pane_id.0)))
                             .role(Role::Button)
-                            .aria_label("Remove pane from tab")
+                            .aria_label("Close pane")
                             .size(px(Metrics::TOOLBAR_CONTROL_SIZE))
                             .rounded(px(Radius::BADGE))
                             .hover(move |button| button.bg(Fill::subtle(colors)))
@@ -1318,12 +1121,13 @@ impl Render for WorkspaceWorkbench {
                             .child(sf_symbol("xmark", 12.0, colors.secondary))
                             .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
                             .on_click(cx.listener(move |this, _, _, cx| {
-                                this.runtime.store.write().expect("store").edit_workspace(
-                                    WorkspaceMutation::RemovePane {
-                                        tab_id: tab.clone(),
-                                        pane_id: pane_id.clone(),
-                                    },
-                                );
+                                // The Engine collapses the split once the
+                                // session is gone.
+                                this.runtime
+                                    .store
+                                    .write()
+                                    .expect("store")
+                                    .remove_sessions(vec![session.clone()]);
                                 cx.notify();
                             })),
                     )
@@ -1337,6 +1141,18 @@ impl Render for WorkspaceWorkbench {
                     ))
                 });
             let focused = geometry.panes.len() > 1 && geometry.focused.pane == pane.identity.pane;
+            // Unfocused panes recede a little, the way a split terminal
+            // marks where typing goes without a heavy frame.
+            if geometry.panes.len() > 1 && !focused {
+                surface = surface.child(
+                    div()
+                        .debug_selector(|| "workspace-pane-dimmed".into())
+                        .absolute()
+                        .inset_0()
+                        .when(islands, |dim| dim.rounded(px(Radius::CARD)))
+                        .bg(colors.terminal_surface().alpha(0.28)),
+                );
+            }
             if focused || islands {
                 surface = surface.child(
                     div()
@@ -1360,7 +1176,7 @@ impl Render for WorkspaceWorkbench {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use diri_proto::workspace::{WorkspaceId, WorkspaceRecord, WorkspaceSnapshot};
+    use diri_proto::workspace::{TabId, WorkspaceId, WorkspaceRecord, WorkspaceSnapshot};
     use gpui::TestAppContext;
     use std::cell::Cell;
     use std::rc::Rc;
@@ -1730,66 +1546,6 @@ mod tests {
             })
             .unwrap();
         cx.run_until_parked();
-    }
-    #[gpui::test]
-    fn a_moved_pane_ticks_as_it_arrives_over_another_pane_and_not_over_itself(
-        cx: &mut TestAppContext,
-    ) {
-        let (runtime, tokio, tab) = fixture(false);
-        let handle =
-            cx.add_window(|window, cx| WorkspaceWorkbench::new(runtime, tokio, window, cx));
-        handle
-            .update(cx, |workbench, window, cx| {
-                workbench.set_tab(tab, viewport(), window, cx);
-                let geometry = workbench.geometry().unwrap();
-                let center = |id: &str| {
-                    let bounds = geometry
-                        .panes
-                        .iter()
-                        .find(|pane| pane.identity.pane == PaneId::new(id))
-                        .unwrap()
-                        .bounds;
-                    gpui::point(
-                        px(bounds.x + bounds.width / 2.0),
-                        px(bounds.y + bounds.height / 2.0),
-                    )
-                };
-                let dragged = PaneId::new("a");
-                let move_to = |workbench: &mut WorkspaceWorkbench, to| {
-                    workbench.track_pane_drag(&dragged, to, to);
-                    haptics::testing::take()
-                };
-                let _ = haptics::testing::take();
-
-                assert_eq!(move_to(workbench, center("a")), [], "its own pane");
-                let arrived = [(
-                    Haptic::Snap,
-                    haptics::key("workspace-pane", PaneId::new("b")),
-                )];
-                assert_eq!(move_to(workbench, center("b")), arrived);
-                // Across the pane, through every undrawn dock zone: silent.
-                let step = gpui::point(px(40.0), px(60.0));
-                assert_eq!(move_to(workbench, center("b") + step), []);
-                assert_eq!(move_to(workbench, center("b") - step), []);
-                assert_eq!(move_to(workbench, center("b") - step), []);
-                assert_eq!(move_to(workbench, center("a")), []);
-                haptics::testing::advance(haptics::REPEAT_WINDOW * 2);
-                assert_eq!(move_to(workbench, center("b")), arrived);
-                window.remove_window();
-            })
-            .unwrap();
-        cx.run_until_parked();
-    }
-    #[test]
-    fn docking_edges_and_center_are_unambiguous() {
-        assert_eq!(dock_edge(2.0, 100.0, 400.0, 300.0), Some(DockEdge::Left));
-        assert_eq!(dock_edge(398.0, 100.0, 400.0, 300.0), Some(DockEdge::Right));
-        assert_eq!(dock_edge(200.0, 2.0, 400.0, 300.0), Some(DockEdge::Top));
-        assert_eq!(
-            dock_edge(200.0, 298.0, 400.0, 300.0),
-            Some(DockEdge::Bottom)
-        );
-        assert_eq!(dock_edge(200.0, 150.0, 400.0, 300.0), None);
     }
     #[gpui::test]
     fn tab_switch_preserves_recent_view_identity_and_bounds_retained_mounts(

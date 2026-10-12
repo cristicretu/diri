@@ -279,6 +279,7 @@ fn main() {
     if let Some(remote) = remote_manager(&exe_dir, &app_support) {
         server = server.with_remote(remote);
     }
+    server.adopt_pane_shells();
     let server = Arc::new(server);
     {
         let server = Arc::clone(&server);

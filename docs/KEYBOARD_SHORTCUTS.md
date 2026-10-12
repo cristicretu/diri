@@ -23,7 +23,7 @@ continue to take precedence.
 | ⌘R | Command-R | Rename the selected session in place |
 | ⌃⌘D | Control-Command-D | Mark the selected session as a handoff source; select a target and press again to review and send |
 | ⇧⌘W | Shift-Command-W | Archive the selected session |
-| ⌘W | Command-W | Close a focused auxiliary terminal; otherwise close the selected session, or the window when none is selected |
+| ⌘W | Command-W | Close the focused terminal pane; otherwise close the selected session, or the window when none is selected |
 | ⇧⌘T | Shift-Command-T | Reopen the most recently closed session |
 | ⌘Q | Command-Q | Quit Diri (the daemon keeps sessions alive) |
 | ⌘H | Command-H | Hide Diri |
@@ -32,7 +32,7 @@ continue to take precedence.
 
 Hold ⌘ on its own for a moment (700 ms) and the ⌘ shortcuts appear on the
 controls they operate: ⌘1 … ⌘9 on session rows and tabs, ⌘T on New Agent and
-the new-tab button, ⌘B on the sidebar toggle, ⇧⌘D on the inspector toggle, ⇧⌘H
+the new-tab button, ⌘B on the sidebar toggle, ⌥⌘I on the inspector toggle, ⇧⌘H
 on search and ⌘W under the selected tab's close button. Release ⌘ and they fade
 out. Pressing any key or clicking while ⌘ is down is treated as a shortcut, so
 the labels never flash during ⌘C or ⌘T. They follow your custom bindings, and a
@@ -45,9 +45,8 @@ disappear without a fade.
 | --- | --- | --- |
 | ⌘1 … ⌘8 | Command-1 to Command-8 | Select the nth session; hold ⌘ to see each row's number |
 | ⌘9 | Command-9 | Select the last session, the browser convention |
-| ⌘[ / ⌘] | Command-bracket | Previous / next session in sidebar order, wrapping |
-| ⌥⌘↑ / ⌥⌘↓ | Option-Command-arrow | Previous / next session |
-| ⌥⌘← / ⌥⌘→ | Option-Command-arrow | Previous / next session |
+| ⇧⌘[ / ⇧⌘] | Shift-Command-bracket | Previous / next session in sidebar order, wrapping |
+| ⌘[ / ⌘], ⌥⌘ arrows | Command-bracket, Option-Command-arrow | In a one-pane tab: previous / next session. In a split tab they move between panes (see Panes) |
 | ⌃⌘↑ / ⌃⌘↓ | Control-Command-arrow | Move the selected row up or down among its siblings within the project group |
 | ⇧⌘J | Shift-Command-J | Jump to the next session that needs input |
 | ⌃⇥ | Control-Tab | Open the most-recently-used switcher; hold ⌃ and press ⇥ again to advance |
@@ -72,8 +71,25 @@ the overview is open, so those surfaces keep the arrow keys.
 | ⌥⌘W | Option-Command-W | Worktrees overview |
 | ⌘, | Command-comma | Settings |
 | ⌘B | Command-B | Show or hide the sidebar |
-| ⇧⌘D | Shift-Command-D | Show or hide the inspector |
-| ⌘J | Command-J | Show or hide an auxiliary terminal below the selected agent's workbench |
+| ⌥⌘I | Option-Command-I | Show or hide the inspector |
+| ⌘J | Command-J | Show or hide a terminal pane below the focused pane |
+
+## Panes
+
+A tab is a split tree of panes and stays one sidebar row: the row shows the
+most urgent pane's state and a small pane count. New panes are terminals in the
+focused pane's directory, on the same host.
+
+| Shortcut | Keys | Action |
+| --- | --- | --- |
+| ⌘D | Command-D | Split right with a new terminal |
+| ⇧⌘D | Shift-Command-D | Split down with a new terminal |
+| ⌥⌘ arrows | Option-Command-arrow | Focus the nearest pane in that direction |
+| ⌘[ / ⌘] | Command-bracket | Focus the previous / next pane, wrapping |
+| ⇧⌘↵ | Shift-Command-Return | Zoom the focused pane, or restore the layout |
+| ⌃⌘= | Control-Command-equals | Equalize pane sizes |
+| ⌥⇧⌘ arrows | Option-Shift-Command-arrow | Resize the nearest divider by five percent |
+| ⌘W | Command-W | Close the focused terminal pane; on the agent's pane, close the tab |
 
 The command palette always lists ⌘T for the default agent. When Codex is not
 the default, its command also shows ⇧⌘N. The palette lists ⌥⌘T, ⌘P, ⇧⌘O,
@@ -206,14 +222,14 @@ falling back to the terminal:
   available.
 - **Settings and worktrees take everything** except ⇧⌘H, ⌘K, ⌘P and ⌘,.
 - **The switcher and the overview own the arrow keys** while they are visible, so
-  ⌥⌘↑, ⌘[ and ⌃⌘↑ stand down for as long as either is up.
+  ⌥⌘↑, ⇧⌘[ and ⌃⌘↑ stand down for as long as either is up.
 - **Esc is shared.** With the overview closed, Esc clears a multi-session sidebar
   selection but is deliberately not swallowed — the focused terminal still gets
   it, so pressing Esc in vim never depends on what the sidebar is doing.
-- **⌘W is three commands.** It closes a focused auxiliary terminal first;
+- **⌘W is three commands.** It closes the focused terminal pane first;
   otherwise the sidebar closes the selected session, and only with no session
   selected does it reach the window and close it.
-- **⌘J and ⇧⌘J are unrelated.** ⌘J toggles an auxiliary workbench terminal;
+- **⌘J and ⇧⌘J are unrelated.** ⌘J toggles a terminal pane;
   ⇧⌘J is the attention jump that used to live on plain ⌘J.
 
 The following bindings are internal or contextual rather than user-facing, and
