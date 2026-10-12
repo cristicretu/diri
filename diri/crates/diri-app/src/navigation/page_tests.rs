@@ -408,6 +408,49 @@ fn pending_project_search_cannot_change_a_new_page(cx: &mut TestAppContext) {
 }
 
 #[gpui::test]
+fn the_clear_button_empties_the_query_and_restores_every_row(cx: &mut TestAppContext) {
+    cx.update(|cx| cx.set_reduce_motion(true));
+    let (view, cx) = cx.add_window_view(|window, cx| {
+        let previous_focus = cx.focus_handle();
+        let overlay = cx.new(|cx| {
+            let mut overlay =
+                NavigationOverlay::opened_for_test(Arc::new(StoreRuntime::inert()), cx);
+            overlay.refresh_command_items();
+            overlay.focus_handle.focus(window, cx);
+            overlay
+        });
+        Harness {
+            overlay,
+            previous_focus,
+        }
+    });
+    cx.simulate_resize(size(px(800.0), px(700.0)));
+    cx.run_until_parked();
+    let overlay = view.read_with(cx, |view, _| view.overlay.clone());
+    let all_rows = overlay.read_with(cx, |overlay, _| overlay.visible_count());
+    assert!(
+        cx.debug_bounds("palette-clear").is_none(),
+        "an empty field offers escape, not clear"
+    );
+    assert!(cx.debug_bounds("palette-escape").is_some());
+
+    cx.simulate_keystrokes("v e r t i c a l");
+    cx.run_until_parked();
+    assert!(overlay.read_with(cx, |overlay, _| overlay.visible_count()) < all_rows);
+    assert!(cx.debug_bounds("palette-escape").is_none());
+    let clear = cx.debug_bounds("palette-clear").expect("clear button");
+    cx.simulate_click(clear.center(), gpui::Modifiers::default());
+    cx.run_until_parked();
+
+    overlay.read_with(cx, |overlay, _| {
+        assert!(overlay.query.is_empty());
+        assert_eq!(overlay.overlay, Some(Overlay::CommandPalette));
+        assert_eq!(overlay.visible_count(), all_rows);
+        assert_eq!(overlay.highlight, 0);
+    });
+}
+
+#[gpui::test]
 fn clicking_back_keeps_the_palette_open(cx: &mut TestAppContext) {
     cx.update(|cx| cx.set_reduce_motion(true));
     let (view, cx) = cx.add_window_view(|window, cx| {

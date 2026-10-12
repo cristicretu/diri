@@ -201,6 +201,13 @@ class Handler(BaseHTTPRequestHandler):
                 self.frame(field(1, field(1, field(1, 'slow part '))))
                 time.sleep(.5)
             answer = 'SLOWDONE'
+        elif 'TALL' in prompt:
+            # A streamed answer taller than the pane: Cursor's repaint then
+            # spans several PTY writes, which is where flicker comes from.
+            for i in range(60):
+                self.frame(field(1, field(1, field(1, f'- tall line {i:02d} streamed into a long answer\n'))))
+                time.sleep(.04)
+            answer = 'TALLDONE'
         else:
             answer = next(iter(re.findall(r'\b[A-Z]{4,}\b', prompt)), 'OK')
         self.frame(field(1, field(1, field(1, answer))))

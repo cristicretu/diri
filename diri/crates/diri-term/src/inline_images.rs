@@ -166,7 +166,9 @@ pub fn decode(
                 raw[..expected].to_vec()
             } else {
                 raw[..expected]
-                    .chunks_exact(3)
+                    .as_chunks::<3>()
+                    .0
+                    .iter()
                     .flat_map(|pixel| [pixel[0], pixel[1], pixel[2], 0xff])
                     .collect()
             };
@@ -184,7 +186,7 @@ pub fn decode(
         }
     };
     let mut bgra = rgba;
-    for pixel in bgra.chunks_exact_mut(4) {
+    for pixel in bgra.as_chunks_mut::<4>().0 {
         pixel.swap(0, 2);
     }
     Ok(Arc::new(RenderImage::new(vec![image::Frame::new(bgra)])))

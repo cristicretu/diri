@@ -107,6 +107,9 @@ impl Method {
     pub const ACCOUNT_CLAUDE_LOGIN: &'static str = "account.claude.login";
     pub const ACCOUNT_CLAUDE_CAPTURE: &'static str = "account.claude.capture";
     pub const ACCOUNT_SWITCH_ALL: &'static str = "account.switch_all";
+    pub const ACCOUNT_OVERVIEW: &'static str = "account.overview";
+    pub const ACCOUNT_ADOPT: &'static str = "account.adopt";
+    pub const ACCOUNT_ADD: &'static str = "account.add";
     pub const SESSION_CONTINUE_ACCOUNT: &'static str = "session.continue_with_account";
     pub const EVENTS_SUBSCRIBE: &'static str = "events.subscribe";
     pub const EVENTS_WAIT: &'static str = "events.wait";
@@ -1401,7 +1404,7 @@ mod base64_bytes {
             return Err("base64 length must be a multiple of four");
         }
         let mut decoded = Vec::with_capacity(bytes.len() / 4 * 3);
-        for (index, chunk) in bytes.chunks_exact(4).enumerate() {
+        for (index, chunk) in bytes.as_chunks::<4>().0.iter().enumerate() {
             let last = index + 1 == bytes.len() / 4;
             let a = value(chunk[0]).ok_or("invalid base64 character")?;
             let b = value(chunk[1]).ok_or("invalid base64 character")?;

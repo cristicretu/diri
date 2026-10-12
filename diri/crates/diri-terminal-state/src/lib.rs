@@ -1698,9 +1698,9 @@ impl HeadlessScreen {
             0x243f_6a88_85a3_08d3,
             0x1319_8a2e_0370_7344,
         ];
-        let mut chunks = cells.chunks_exact(4);
+        let (chunks, remainder) = cells.as_chunks::<4>();
         let mut column = 0;
-        for chunk in &mut chunks {
+        for chunk in chunks {
             let words = [
                 state.word(column, &chunk[0]),
                 state.word(column + 1, &chunk[1]),
@@ -1713,7 +1713,7 @@ impl HeadlessScreen {
             lanes[3] = fold_mix(lanes[3], words[3]);
             column += 4;
         }
-        for (offset, cell) in chunks.remainder().iter().enumerate() {
+        for (offset, cell) in remainder.iter().enumerate() {
             lanes[offset] = fold_mix(lanes[offset], state.word(column + offset, cell));
         }
         let mut digest = fold_mix(state.marks, cells.len() as u64);

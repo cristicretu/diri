@@ -651,7 +651,7 @@ mod swift_int_keyed_map {
                     ));
                 }
                 let mut map = BTreeMap::new();
-                for pair in flat.chunks_exact(2) {
+                for pair in flat.as_chunks::<2>().0 {
                     let key = i32::try_from(pair[0])
                         .map_err(|_| D::Error::custom("int-keyed map key out of i32 range"))?;
                     map.insert(key, pair[1]);

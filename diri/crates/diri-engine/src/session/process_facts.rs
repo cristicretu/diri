@@ -9,7 +9,7 @@ struct Admission;
 impl Admission {
     fn acquire() -> io::Result<Self> {
         ACTIVE_READS
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |count| {
+            .try_update(Ordering::AcqRel, Ordering::Acquire, |count| {
                 (count < 4).then_some(count + 1)
             })
             .map(|_| Self)

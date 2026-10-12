@@ -553,7 +553,6 @@ mod tests {
 
     use diri_notes::store::NoteStore;
     use diri_proto::SessionId;
-    use gpui::EntityInputHandler as _;
 
     use super::*;
     use crate::notes::{NotePane, PaneState};

@@ -221,7 +221,7 @@ struct Admission;
 impl Admission {
     fn acquire() -> Result<Self> {
         ACTIVE
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |n| {
+            .try_update(Ordering::AcqRel, Ordering::Acquire, |n| {
                 (n < 2).then_some(n + 1)
             })
             .map(|_| Self)
