@@ -10154,8 +10154,8 @@ mod tests {
             crate::fonts::init(cx);
             cx.set_reduce_motion(true);
         });
-        let item = |kind: ProtoAgentKind, label: &str, args: &[&str]| {
-            diri_proto::AgentReadinessItem {
+        let item =
+            |kind: ProtoAgentKind, label: &str, args: &[&str]| diri_proto::AgentReadinessItem {
                 binary: kind.id().to_owned(),
                 path: Some(format!("/opt/homebrew/bin/{}", kind.id())),
                 path_source: Some(diri_proto::AgentPathSource::SystemPath),
@@ -10167,12 +10167,11 @@ mod tests {
                 }),
                 kind,
                 ..Default::default()
-            }
-        };
+            };
         let window = cx
             .open_window(size(px(1200.0), px(700.0)), move |window, cx| {
-                let harness = cx
-                    .new(|cx| SettingsWorkbenchHarness::open_at(SettingsTab::Agents, window, cx));
+                let harness =
+                    cx.new(|cx| SettingsWorkbenchHarness::open_at(SettingsTab::Agents, window, cx));
                 harness.update(cx, |harness, cx| {
                     harness.surfaces.update(cx, |surfaces, cx| {
                         surfaces
@@ -10218,7 +10217,9 @@ mod tests {
         if let Some(parent) = output.parent() {
             std::fs::create_dir_all(parent).expect("create screenshot directory");
         }
-        screenshot.save(output).expect("save agents settings screenshot");
+        screenshot
+            .save(output)
+            .expect("save agents settings screenshot");
     }
 
     struct SettingsModalHarness {
