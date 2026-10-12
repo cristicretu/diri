@@ -12634,6 +12634,37 @@ mod tests {
                         asking.updated_at = diri_proto::DateMillis(now);
                         store.upsert_session(asking);
                     }
+                    // `DIRI_VISUAL_REMOTE_WORKTREES=1` replaces the fixture
+                    // with remote worktree Sessions an older Engine filed as
+                    // one project each, loaded through this build's Engine.
+                    if std::env::var_os("DIRI_VISUAL_REMOTE_WORKTREES").is_some() {
+                        let dir = tempfile::tempdir().expect("state dir");
+                        let state = dir.path().join("state.json");
+                        std::fs::write(
+                            &state,
+                            serde_json::to_vec(&crate::sidebar::fixture::remote_worktree_state())
+                                .expect("encode state"),
+                        )
+                        .expect("write state");
+                        let engine = Arc::new(diri_engine::ManifestEngine::new(Vec::new()));
+                        let mut registry = diri_engine::registry::Registry::new(engine, &state);
+                        registry.load().expect("load state");
+                        let mut sessions = registry.records();
+                        for session in &mut sessions {
+                            session.updated_at = diri_proto::DateMillis(now);
+                        }
+                        store.hydrate(diri_proto::SessionListResult {
+                            projects: registry
+                                .projects_raw()
+                                .iter()
+                                .map(|project| {
+                                    serde_json::from_value(project.clone()).expect("project")
+                                })
+                                .collect(),
+                            sessions,
+                        });
+                        store.select(SessionId::new("preview-slop-0"));
+                    }
                     store
                         .update_preferences(|prefs| {
                             prefs.terminal_theme = if light {

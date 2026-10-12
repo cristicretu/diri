@@ -646,6 +646,66 @@ const fn hours(value: f64) -> f64 {
     value * 3_600_000.0
 }
 
+/// The state file an Engine before PR #764 wrote after an Agent spawned seven
+/// worktree Agents on `forge`: each Session's project is its own worktree.
+/// The sidebar screenshot loads it through the Engine's `Registry`, so the
+/// picture is whatever that build's load does with it.
+#[cfg(all(test, target_os = "macos"))]
+pub(crate) fn remote_worktree_state() -> serde_json::Value {
+    let now = 1_750_000_000_000.0;
+    let anara = project("p_local_anara", "/Users/preview/fun/anara", "anara");
+    let parent = session(
+        "preview-slop-parent",
+        AgentKind::CLAUDE_CODE,
+        &anara,
+        "Slack slop complaints",
+        SessionStatus::Idle,
+        Some("main"),
+        now - hours(1.0),
+    )
+    .seen(now);
+    let mut projects = vec![serde_json::to_value(&anara).expect("project")];
+    let mut sessions = vec![SessionRecord::from(parent)];
+    for (index, (branch, title)) in [
+        ("slop/reader-settings-menu", "slop-reader-menu"),
+        ("slop/shimmer-budget", "slop-shimmer"),
+        ("slop/chat-search-field", "slop-chat-search"),
+        ("slop/invite-flow", "slop-invite"),
+        ("slop/folder-members", "slop-members"),
+        ("slop/trash-popover", "slop-trash"),
+        ("slop/settings-devices", "slop-devices"),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let root = format!("/home/cristi/code/anara-{}", branch.replace('/', "-"));
+        let name = root.rsplit('/').next().unwrap_or_default().to_owned();
+        let id = format!("p_forge_{index}");
+        projects.push(serde_json::json!({
+            "id": id, "root": root, "name": name, "host": "forge",
+        }));
+        let mut record = session(
+            &format!("preview-slop-{index}"),
+            AgentKind::CLAUDE_CODE,
+            &project(&id, &root, &name),
+            title,
+            if index < 3 {
+                SessionStatus::Working
+            } else {
+                SessionStatus::Idle
+            },
+            Some(branch),
+            now - minutes(50.0 - index as f64),
+        )
+        .seen(now)
+        .child_of(&SessionId::new("preview-slop-parent"));
+        record.0.host = Some("forge".into());
+        record.0.worktree_path = Some(root);
+        sessions.push(SessionRecord::from(record));
+    }
+    serde_json::json!({ "version": 1, "projects": projects, "sessions": sessions })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
