@@ -139,10 +139,12 @@ pub enum IconName {
     AlignLeft,
     AlignCenter,
     AlignRight,
+    Link,
+    Globe,
 }
 
 impl IconName {
-    pub const ALL: [Self; 93] = [
+    pub const ALL: [Self; 95] = [
         Self::Account,
         Self::Activity,
         Self::Archive,
@@ -236,6 +238,8 @@ impl IconName {
         Self::AlignLeft,
         Self::AlignCenter,
         Self::AlignRight,
+        Self::Link,
+        Self::Globe,
     ];
 
     pub const fn asset_path(self) -> &'static str {
@@ -333,6 +337,8 @@ impl IconName {
             Self::AlignLeft => "icons/align-left.svg",
             Self::AlignCenter => "icons/align-center.svg",
             Self::AlignRight => "icons/align-right.svg",
+            Self::Link => "icons/link.svg",
+            Self::Globe => "icons/globe.svg",
         }
     }
 
@@ -529,6 +535,8 @@ fn embedded_svg(path: &str) -> Option<&'static [u8]> {
         "icons/align-left.svg" => include_bytes!("../assets/icons/align-left.svg"),
         "icons/align-center.svg" => include_bytes!("../assets/icons/align-center.svg"),
         "icons/align-right.svg" => include_bytes!("../assets/icons/align-right.svg"),
+        "icons/link.svg" => include_bytes!("../assets/icons/link.svg"),
+        "icons/globe.svg" => include_bytes!("../assets/icons/globe.svg"),
         "icons/account.svg" => include_bytes!("../assets/icons/account.svg"),
         "icons/activity.svg" => include_bytes!("../assets/icons/activity.svg"),
         "icons/archive.svg" => include_bytes!("../assets/icons/archive.svg"),
