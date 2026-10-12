@@ -5840,12 +5840,12 @@ impl Render for RootView {
                 // Comfortable: an island on the chrome, like the terminal
                 // card beside it, whose own gap separates the two. Compact:
                 // flush, the hairline the only edge between two terminal fills.
-                // Anchored to the window edge, so opening slides the whole
-                // panel in rather than uncovering it from its left side.
+                // Pinned to the seam, so the panel's leading edge travels
+                // with the slide and the rest follows from off-window.
                 let panel = div()
                     .absolute()
                     .top(px(gap))
-                    .right(px(gap))
+                    .left(px(0.0))
                     .h(px(
                         (f32::from(window.viewport_size().height) - 2.0 * gap).max(0.0)
                     ))
@@ -10404,6 +10404,37 @@ mod tests {
                     cx.run_until_parked();
                 }
                 cx.run_until_parked();
+                // `DIRI_STYLE_SLIDE=1`: open the right sidebar and capture its
+                // slide at fixed points of the curve (a capture takes longer
+                // than the whole slide, so the start time is rewound instead).
+                if std::env::var_os("DIRI_STYLE_SLIDE").is_some() {
+                    for step in 0..=10 {
+                        let progress = step as f32 / 10.0;
+                        cx.update_window(window.into(), |root, _, cx| {
+                            let root = root.downcast::<RootView>().unwrap();
+                            root.update(cx, |root, cx| {
+                                if step == 0 {
+                                    root.set_inspector_open(true, cx);
+                                }
+                                root.inspector_slide = crate::seam::SeamSlide::begin_at(
+                                    0.0,
+                                    1.0,
+                                    std::time::Instant::now()
+                                        - crate::seam::SEAM_SLIDE.mul_f32(progress),
+                                );
+                                cx.notify();
+                            });
+                        })
+                        .unwrap();
+                        cx.capture_screenshot(window.into())
+                            .unwrap()
+                            .save(
+                                std::path::Path::new(&output)
+                                    .join(format!("{file}-slide-{step:02}.png")),
+                            )
+                            .unwrap();
+                    }
+                }
                 cx.capture_screenshot(window.into())
                     .unwrap()
                     .save(std::path::Path::new(&output).join(format!("{file}.png")))

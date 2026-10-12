@@ -176,6 +176,11 @@ impl StripMenu {
     }
 }
 
+/// Window x of the strip's first control when it shares the traffic
+/// lights' row: the lights end 74 pt in, and the control's glyph sits at
+/// its leading edge, so this leaves a clear 10 pt.
+const STRIP_FIRST_CONTROL_X: f32 = 84.0;
+
 impl Sidebar {
     /// Open a session or project context menu from the horizontal strip.
     pub(super) fn open_strip_menu(
@@ -313,9 +318,8 @@ impl Sidebar {
     }
 
     /// Room before the strip's first control. With the panel hidden the
-    /// strip shares the traffic lights' row, and its first control sits
-    /// where a session title bar puts its sidebar button: just past the
-    /// lights, at the same window x in either density.
+    /// strip shares the traffic lights' row, and its first control sits just
+    /// past the lights, at the same window x in either density.
     pub(super) fn strip_leading_inset(&self) -> f32 {
         if cfg!(target_os = "macos") && !self.ui.visible {
             let gap = self
@@ -325,8 +329,7 @@ impl Sidebar {
                 .preferences()
                 .pane_density
                 .island_gap();
-            diri_ui::Metrics::TOOLBAR_TRAFFIC_LIGHT_LANE + diri_ui::Metrics::TOOLBAR_EDGE_INSET
-                - gap
+            STRIP_FIRST_CONTROL_X - gap
         } else {
             10.0
         }
