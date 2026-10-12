@@ -23,7 +23,7 @@ use sha2::{Digest, Sha256};
 
 use super::bootstrap::{PackagedArtifact, PlatformProbe, RemoteInstallLayout, RemoteTarget};
 use super::executor::{CommandOutput, ProcessExecutor, SshChannel};
-use super::ssh::{HelperCommand, SshTransport};
+use super::ssh::{CommandSpec, HelperCommand, SshTransport};
 
 // These wall-clock bounds include time spent in Diri's native OpenSSH
 // authentication UI. Network establishment is independently bounded by
@@ -193,12 +193,7 @@ impl RemoteManager {
         control_dir: PathBuf,
     ) -> io::Result<Self> {
         let control_dir = normalized_control_dir(&control_dir);
-        validate_control_dir_if_present(&control_dir)?;
-        fs::create_dir_all(&control_dir)?;
-        // Recheck after creation to close the `/tmp` create race before chmod
-        // or any OpenSSH socket creation follows an attacker-placed symlink.
-        validate_control_dir_if_present(&control_dir)?;
-        fs::set_permissions(&control_dir, fs::Permissions::from_mode(0o700))?;
+        prepare_control_dir(&control_dir)?;
         Ok(Self {
             executor,
             artifacts,
@@ -271,7 +266,7 @@ impl RemoteManager {
     /// logout cleanup; any other failed teardown is a correctness error for a
     /// persistence probe.
     fn close_control_master(&self, transport: &SshTransport) -> io::Result<()> {
-        let output = self.executor.run(
+        let output = self.run_ssh(
             transport.control_exit(),
             Vec::new(),
             Duration::from_secs(2),
@@ -315,7 +310,7 @@ impl RemoteManager {
             self.forget_current_helper(host);
             return Ok(None);
         }
-        let output = self.executor.run(
+        let output = self.run_ssh(
             cached
                 .helper
                 .transport
@@ -376,7 +371,7 @@ impl RemoteManager {
         artifact.verify().map_err(io::Error::other)?;
 
         if !force_upload {
-            let final_probe = self.executor.run(
+            let final_probe = self.run_ssh(
                 transport
                     .helper_probe(&artifact.build_id)
                     .map_err(io::Error::other)?,
@@ -477,7 +472,7 @@ impl RemoteManager {
             ms = upload_started.elapsed(),
         );
         if install.is_err() {
-            let _ = self.executor.run(
+            let _ = self.run_ssh(
                 transport.cleanup_upload(&layout),
                 Vec::new(),
                 PROBE_TIMEOUT,
@@ -592,7 +587,7 @@ impl RemoteManager {
             return Ok(None);
         }
         let transport = self.transport(host);
-        let output = self.executor.run(
+        let output = self.run_ssh(
             transport
                 .helper_probe_then(&artifact.build_id, command)
                 .map_err(io::Error::other)?,
@@ -652,7 +647,7 @@ impl RemoteManager {
         // they are still remote actions. Gate them on the exact packaged
         // Helper so an app update synchronizes the host before doing work.
         self.ensure_helper(host)?;
-        self.executor.run(
+        self.run_ssh(
             self.transport(host).channel(script),
             input,
             timeout,
@@ -983,7 +978,7 @@ impl RemoteManager {
     }
 
     pub fn attach(&self, helper: &InstalledHelper) -> io::Result<SshChannel> {
-        self.executor.open(
+        self.open_ssh(
             helper
                 .transport
                 .helper_command(&helper.build_id, HelperCommand::Attach)
@@ -1019,7 +1014,7 @@ impl RemoteManager {
         input: Vec<u8>,
         timeout: Duration,
     ) -> io::Result<R> {
-        let output = self.executor.run(
+        let output = self.run_ssh(
             helper
                 .transport
                 .helper_command(&helper.build_id, command)
@@ -1036,6 +1031,26 @@ impl RemoteManager {
             ));
         }
         parse_json_line(&output.stdout)
+    }
+
+    /// Every OpenSSH invocation goes through here or `open_ssh`. The control
+    /// directory lives in `/tmp`, which macOS's periodic cleanup prunes after
+    /// three days without access, so a long-lived Engine re-establishes it
+    /// before each launch instead of trusting the check made at startup.
+    fn run_ssh(
+        &self,
+        spec: CommandSpec,
+        input: Vec<u8>,
+        timeout: Duration,
+        stdout_limit: usize,
+    ) -> io::Result<CommandOutput> {
+        prepare_control_dir(&self.control_dir)?;
+        self.executor.run(spec, input, timeout, stdout_limit)
+    }
+
+    fn open_ssh(&self, spec: CommandSpec) -> io::Result<SshChannel> {
+        prepare_control_dir(&self.control_dir)?;
+        self.executor.open(spec)
     }
 
     fn transport(&self, host: &HostEntry) -> SshTransport {
@@ -1172,6 +1187,15 @@ fn require_rpc_success(output: CommandOutput) -> io::Result<CommandOutput> {
         return Err(failure.into_io_error());
     }
     output.require_success("remote Helper RPC")
+}
+
+fn prepare_control_dir(path: &Path) -> io::Result<()> {
+    validate_control_dir_if_present(path)?;
+    fs::create_dir_all(path)?;
+    // Recheck after creation to close the `/tmp` create race before chmod
+    // or any OpenSSH socket creation follows an attacker-placed symlink.
+    validate_control_dir_if_present(path)?;
+    fs::set_permissions(path, fs::Permissions::from_mode(0o700))
 }
 
 fn validate_control_dir_if_present(path: &Path) -> io::Result<()> {
@@ -1394,6 +1418,46 @@ mod tests {
         assert!(first.starts_with("/tmp"));
         assert!(first.as_os_str().as_bytes().len() < MAX_CONTROL_DIRECTORY_BYTES);
         assert_ne!(first, normalized_control_dir(&requested.join("different")));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn ssh_launch_recreates_a_pruned_control_directory() {
+        let temporary = tempfile::tempdir_in("/tmp").expect("temp");
+        let fake_ssh = temporary.path().join("ssh");
+        fs::write(&fake_ssh, "#!/bin/sh\nexec cat\n").expect("fake ssh");
+        fs::set_permissions(&fake_ssh, fs::Permissions::from_mode(0o700)).expect("mode");
+        let control = temporary.path().join("control");
+        let manager = RemoteManager::new(
+            ProcessExecutor::new(&fake_ssh),
+            ArtifactCatalog {
+                artifacts: HashMap::new(),
+            },
+            control.clone(),
+        )
+        .expect("manager");
+        let host = HostEntry {
+            id: "fixture".into(),
+            name: None,
+            ssh: "fake-host".into(),
+            default_cwd: None,
+            node: None,
+        };
+        let helper = InstalledHelper {
+            target: RemoteTarget::LinuxX86_64,
+            build_id: "test-build".into(),
+            protocol: ProtocolVersion { major: 1, minor: 3 },
+            transport: manager.transport(&host),
+        };
+        // macOS's periodic `/tmp` cleanup removes the directory under a
+        // long-lived Engine; OpenSSH then cannot bind its ControlPath socket.
+        fs::remove_dir(&control).expect("prune control directory");
+
+        drop(manager.attach(&helper).expect("attach"));
+
+        let metadata = fs::symlink_metadata(&control).expect("control directory");
+        assert!(metadata.is_dir());
+        assert_eq!(metadata.permissions().mode() & 0o777, 0o700);
     }
 
     #[cfg(unix)]
