@@ -91,7 +91,7 @@ pub fn tool_definitions_for(kinds: &[String]) -> Vec<ToolDefinition> {
         ),
         ToolDefinition::new(
             "spawn_agent",
-            "Open a new Diri session running an agent or shell, locally or on a configured remote host. Use this whenever the user asks to spawn another agent, session, or terminal. Identical arguments are deduplicated for this caller; reuse operation_id on retries and supply a new operation_id only for an intentional additional session. Inspect spawn_receipt: unknown/failed must never be retried under a new identity blindly.",
+            "Open a new Diri session running an agent or shell, locally or on a configured remote host. Use this whenever the user asks to spawn another agent, session, or terminal. Pass split to open it as a pane beside your own (or beside_session_id's) instead of a separate tab: good for a dev server, test watcher, or log tail you want in view, or a child agent the user should watch work; leave it out for background work. Identical arguments are deduplicated for this caller; reuse operation_id on retries and supply a new operation_id only for an intentional additional session. Inspect spawn_receipt: unknown/failed must never be retried under a new identity blindly.",
             json!({
                 "type": "object",
                 "properties": {
@@ -105,7 +105,9 @@ pub fn tool_definitions_for(kinds: &[String]) -> Vec<ToolDefinition> {
                     "name": {"type": "string"},
                     "operation_id": message_id_schema(),
                     "task": {"type": "boolean", "description": "Deliver prompt as a tracked Diri task instead of an untracked initial prompt. The result then includes task.task_id for wait_any or wait_for_task."},
-                    "result_schema": result_schema()
+                    "result_schema": result_schema(),
+                    "split": split_schema(),
+                    "beside_session_id": beside_schema()
                 },
                 "required": ["kind", "cwd"]
             }),
@@ -145,7 +147,7 @@ pub fn tool_definitions_for(kinds: &[String]) -> Vec<ToolDefinition> {
         ),
         ToolDefinition::new(
             "spawn_agents",
-            "Fan out: open several sessions in one call (at most 8), concurrently. Each entry takes the same fields as spawn_agent (kind, cwd, worktree, branch, base, host, prompt, name, operation_id, task, result_schema) and is deduplicated the same way. Use worktree:true per entry for parallel edits. Returns one result per entry in order, plus the session_ids and task_ids to pass to wait_any.",
+            "Fan out: open several sessions in one call (at most 8), concurrently. Each entry takes the same fields as spawn_agent (kind, cwd, worktree, branch, base, host, prompt, name, operation_id, task, result_schema, split, beside_session_id) and is deduplicated the same way. Use worktree:true per entry for parallel edits. Returns one result per entry in order, plus the session_ids and task_ids to pass to wait_any.",
             json!({"type":"object","properties":{"agents":{"type":"array","items":spawn_entry_schema()}},"required":["agents"]}),
         ),
         ToolDefinition::new(
@@ -358,6 +360,25 @@ pub fn tool_definitions_for(kinds: &[String]) -> Vec<ToolDefinition> {
             "whoami",
             "Describe this session's identity, parent, ancestors, children, worktree, and cross-session write policy. origin_note, when present, is the note you were started from: read it first with read_note {\"note\":\"origin\"}.",
             json!({"type": "object", "properties": {}}),
+        ),
+        ToolDefinition::new(
+            "get_layout",
+            "Show the split-pane layout of the tab(s) that show a session (default yours): which sessions share the tab, side_by_side or stacked splits, the focused and zoomed session. Read it before manage_layout, or to check what the user sees beside you.",
+            json!({"type": "object", "properties": {"session_id": {"type": "string", "minLength": 1}}}),
+        ),
+        ToolDefinition::new(
+            "manage_layout",
+            "Arrange split panes by session id; panes are views, so nothing is started or stopped. split: move session_id's pane beside beside_session_id's (default yours), e.g. bring a child agent or a running server into view next to you. unsplit: give session_id its own tab again. close: take its pane off the tab (the session keeps running and stays in the sidebar). focus, zoom/unzoom (fill the tab with one pane), equalize (even out the tab's splits). session_id defaults to you. Split only when the user benefits from seeing both at once; do not rearrange panes the user did not ask about.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "action": {"type": "string", "enum": ["split", "unsplit", "close", "focus", "zoom", "unzoom", "equalize"]},
+                    "session_id": {"type": "string", "minLength": 1, "description": "The session whose pane to act on; defaults to the calling session."},
+                    "beside_session_id": {"type": "string", "minLength": 1, "description": "split only: the session to dock beside; defaults to the calling session."},
+                    "split": {"type": "string", "enum": ["right", "down", "left", "up"], "description": "split only: which side of beside_session_id's pane; default right."}
+                },
+                "required": ["action"]
+            }),
         ),
         ToolDefinition::new(
             "list_notes",
@@ -633,11 +654,23 @@ fn spawn_entry_schema() -> Value {
             "name": {"type": "string", "minLength": 1},
             "operation_id": message_id_schema(),
             "task": {"type": "boolean"},
-            "result_schema": result_schema()
+            "result_schema": result_schema(),
+            "split": split_schema(),
+            "beside_session_id": beside_schema()
         },
         "required": ["kind", "cwd"],
         "additionalProperties": false
     })
+}
+
+fn split_schema() -> Value {
+    json!({"type": "string", "enum": ["right", "down", "left", "up"],
+        "description": "Open as a split pane on this side of beside_session_id's pane (default your own) instead of a new tab. A tab holds at most 8 panes."})
+}
+
+fn beside_schema() -> Value {
+    json!({"type": "string", "minLength": 1,
+        "description": "Session whose pane to split; defaults to the calling session. Implies split right when split is omitted."})
 }
 
 fn message_id_schema() -> Value {
@@ -684,6 +717,8 @@ mod tests {
             "integrate",
             "fork_agent",
             "manage_agent",
+            "get_layout",
+            "manage_layout",
         ] {
             assert!(names.contains(&name.to_owned()), "{name}");
         }
@@ -735,6 +770,41 @@ mod tests {
             .is_err()
         );
         assert!(validate_arguments("wait_any", &json!({"task_ids": [], "since_ms": -1})).is_err());
+    }
+
+    #[test]
+    fn split_placement_is_validated_on_spawns_and_layout_calls() {
+        assert!(
+            validate_arguments(
+                "spawn_agent",
+                &json!({"kind": "shell", "cwd": "/tmp", "split": "down"})
+            )
+            .is_ok()
+        );
+        assert!(
+            validate_arguments(
+                "spawn_agent",
+                &json!({"kind": "shell", "cwd": "/tmp", "split": "sideways"})
+            )
+            .is_err()
+        );
+        assert!(
+            validate_arguments(
+                "spawn_agents",
+                &json!({"agents": [{"kind": "codex", "cwd": "/tmp", "split": "right", "beside_session_id": "s1"}]})
+            )
+            .is_ok()
+        );
+        assert!(validate_arguments("manage_layout", &json!({})).is_err());
+        assert!(
+            validate_arguments(
+                "manage_layout",
+                &json!({"action": "split", "session_id": "s2", "split": "up"})
+            )
+            .is_ok()
+        );
+        assert!(validate_arguments("manage_layout", &json!({"action": "shuffle"})).is_err());
+        assert!(validate_arguments("get_layout", &json!({})).is_ok());
     }
 
     #[test]

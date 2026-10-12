@@ -141,7 +141,13 @@ impl super::ControlServer {
             ));
         }
         let path = self.socket_path.with_file_name("operations-v1.sqlite");
-        let mut reservation = reserve(&path, &p.sender_id, &p.operation_id, &p.spawn)?;
+        // The placement names tab/pane ids resolved just before the call; a
+        // retry after the layout changed is still the same operation.
+        let mut fingerprint = p.spawn.clone();
+        if let Some(object) = fingerprint.as_object_mut() {
+            object.remove(diri_proto::workspace::SPAWN_PANE_FIELD);
+        }
+        let mut reservation = reserve(&path, &p.sender_id, &p.operation_id, &fingerprint)?;
         let worktree_branch = typed.new_worktree.unwrap_or(false).then(|| {
             typed
                 .worktree_branch

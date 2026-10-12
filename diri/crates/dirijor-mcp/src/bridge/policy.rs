@@ -12,7 +12,7 @@ use diri_proto::{Project, SessionRecord, SessionStatus};
 
 use super::{Lineage, Relation};
 
-pub(super) const WRITE_POLICY: &str = "Reads are open across all sessions. Root agents may write within their project and message direct children on any host; delegated agents may write only to their parent and direct children. Every write requires a live Diri session identity. Cross-lineage messages are attributed. Agents cannot target themselves. Root agents may release, hibernate, wake, resume, fork, or integrate only sessions in their project; delegated agents only their direct children. Delegation depth and live children per session are capped (DIRIJOR_MAX_SPAWN_DEPTH, default 3; DIRIJOR_MAX_LIVE_CHILDREN, default 16).";
+pub(super) const WRITE_POLICY: &str = "Reads are open across all sessions. Root agents may write within their project and message direct children on any host; delegated agents may write only to their parent and direct children. Every write requires a live Diri session identity. Cross-lineage messages are attributed. Agents cannot target themselves. Root agents may release, hibernate, wake, resume, fork, or integrate only sessions in their project; delegated agents only their direct children. Split-pane layout follows the same reach, plus the caller's own pane and splitting beside its parent. Delegation depth and live children per session are capped (DIRIJOR_MAX_SPAWN_DEPTH, default 3; DIRIJOR_MAX_LIVE_CHILDREN, default 16).";
 
 const DEFAULT_MAX_SPAWN_DEPTH: usize = 3;
 const DEFAULT_MAX_LIVE_CHILDREN: usize = 16;
@@ -36,6 +36,13 @@ pub(super) enum WriteAction<'a> {
         target: &'a str,
     },
     QuickOpenInclude,
+    /// Rearrange split panes: move/close/zoom `target`'s pane, or (with
+    /// `anchor`) dock another pane beside it. Panes are views; no process
+    /// is started or stopped.
+    Layout {
+        target: &'a str,
+        anchor: bool,
+    },
     SendPrompt {
         target: &'a str,
     },
@@ -139,6 +146,24 @@ impl<'a> McpPolicy<'a> {
                     return Err(format!(
                         "manage denied: {target} is {}; root agents may manage sessions in their project, delegated agents only direct children",
                         relation.as_str()
+                    ));
+                }
+                relation
+            }
+            WriteAction::Layout { target, anchor } => {
+                let (target_record, relation) = self.target(target)?;
+                let allowed = matches!(relation, Relation::Caller | Relation::Child)
+                    || self.can_release(target_record, relation)
+                    || (anchor && relation == Relation::Parent);
+                if !allowed {
+                    return Err(format!(
+                        "layout denied: {target} is {}; arrange your own pane, your children's, or (root agents) sessions in your project{}",
+                        relation.as_str(),
+                        if anchor {
+                            ", or split beside your parent"
+                        } else {
+                            ""
+                        }
                     ));
                 }
                 relation
@@ -449,6 +474,36 @@ mod tests {
         assert!(McpPolicy::new(&records, &projects, None).is_err());
         assert!(McpPolicy::new(&records, &projects, Some("gone")).is_err());
         assert!(McpPolicy::new(&records, &projects, Some("exited")).is_err());
+    }
+
+    #[test]
+    fn layout_reaches_own_children_and_parent_anchor_only() {
+        let records = vec![
+            record("root", "p", None),
+            record("child", "p", Some("root")),
+            record("sibling", "p", Some("root")),
+            record("grandchild", "p", Some("child")),
+            record("foreign", "q", None),
+        ];
+        let projects = vec![project("p"), project("q")];
+        let layout = |caller: &str, target: &str, anchor: bool| {
+            McpPolicy::new(&records, &projects, Some(caller))
+                .unwrap()
+                .authorize(WriteAction::Layout { target, anchor })
+                .is_ok()
+        };
+        // A root agent arranges itself and its project, never a foreign one.
+        assert!(layout("root", "root", false));
+        assert!(layout("root", "sibling", false));
+        assert!(!layout("root", "foreign", false));
+        assert!(!layout("root", "foreign", true));
+        // A delegated agent: itself and its children; its parent only as
+        // the pane it splits beside.
+        assert!(layout("child", "child", false));
+        assert!(layout("child", "grandchild", false));
+        assert!(layout("child", "root", true));
+        assert!(!layout("child", "root", false));
+        assert!(!layout("child", "sibling", true));
     }
 
     #[test]

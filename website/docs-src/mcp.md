@@ -14,6 +14,7 @@ The server ships inside the app. Claude Code, Codex and Cursor get it automatica
 | Read results | `read_output`, `get_status`, `summarize_children` | Read a helper's final answer from its transcript instead of scraping the screen. |
 | Review and merge | `get_diff`, `integrate`, `get_artifacts` | See which files a helper changed, spot overlaps, merge its branch, find its PR. |
 | Manage | `manage_agent`, `release_agent`, worktree tools | Hibernate an idle helper, resume an exited one, close it when done. |
+| Panes | `spawn_agent` with `split`, `manage_layout`, `get_layout` | Open a dev server or a helper agent in a split beside the agent, zoom it, or move it back to its own tab. |
 | Notes | `read_note`, `write_note`, `create_note`, `start_from_note` | Read a brief from a note, write findings back, tick its to-dos. |
 | Browser | `browser` | Drive a real browser isolated to the session. |
 
