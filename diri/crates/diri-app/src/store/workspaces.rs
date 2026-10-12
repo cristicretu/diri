@@ -1,5 +1,6 @@
 //! Revision-gated cache of the Engine's saved layout catalog. The UI never
-//! persists a second copy or retries a rejected edit against a new revision.
+//! persists a second copy. An edit refused only for a stale revision is
+//! replayed once on the refreshed layout; any other rejection is not retried.
 //! Nor does it resend an edit the Engine already rejected on its merits:
 //! navigation can request the same placement on every click, and a full tab
 //! limit rejects it identically until the layout or the sessions change.
@@ -35,6 +36,12 @@ pub struct WorkspaceCatalog {
     pub created_workspace: Option<(u64, diri_proto::workspace::WorkspaceId)>,
     pub create_request_id: u64,
     creating: bool,
+    /// An edit the Engine refused only because its revision moved (a pane
+    /// closing or a spawn docking in between). Nothing was written, so it is
+    /// sent once more on the refreshed layout.
+    replay: Option<WorkspaceMutation>,
+    /// The in-flight edit is that replay; a second conflict drops it.
+    replaying: bool,
 }
 
 impl Default for WorkspaceCatalog {
@@ -56,6 +63,8 @@ impl Default for WorkspaceCatalog {
             created_workspace: None,
             create_request_id: 0,
             creating: false,
+            replay: None,
+            replaying: false,
         }
     }
 }
@@ -257,6 +266,7 @@ impl SessionStore {
         }
         catalog.in_flight = Some(edit);
         catalog.editing = true;
+        catalog.replaying = std::mem::take(&mut catalog.replay).as_ref() == Some(&params.mutation);
         catalog.creating = matches!(&params.mutation, WorkspaceMutation::CreateWorkspace { .. });
         if catalog.creating {
             catalog.create_request_id = catalog.create_request_id.wrapping_add(1);
@@ -327,7 +337,19 @@ impl SessionStore {
                 }
             }
             Err(error) => {
-                if mutation {
+                let conflict = matches!(
+                    &error,
+                    ClientError::Control(error) if error.code == "workspace_revision_conflict"
+                );
+                if mutation && conflict {
+                    // Not an error the person can act on: the layout moved
+                    // under the edit. Replay it once, quietly, after the
+                    // refresh; a replay that conflicts again is dropped.
+                    if !std::mem::take(&mut catalog.replaying) {
+                        catalog.replay = attempted.map(|edit| edit.params.mutation);
+                    }
+                    catalog.refresh_again = true;
+                } else if mutation {
                     if deterministic_rejection(&error) {
                         catalog.rejected = attempted.map(|edit| RejectedEdit {
                             edit,
@@ -348,6 +370,12 @@ impl SessionStore {
         }
         if std::mem::take(&mut catalog.refresh_again) {
             self.refresh_workspaces();
+        } else if !mutation && let Some(replay) = self.workspaces.replay.clone() {
+            if self.workspaces.can_edit() {
+                self.edit_workspace(replay);
+            } else {
+                self.workspaces.replay = None;
+            }
         }
     }
 }
@@ -523,14 +551,65 @@ mod tests {
             Ok(StoreEffect::MutateWorkspace { .. })
         ));
         store.finish_workspace_request(generation, true, result);
-        // Settle the reload every failed edit asks for.
+        // Settle the reload every failed edit asks for, and the replay a
+        // conflict sends after it.
         let revision = store.workspace_catalog().snapshot().unwrap().revision;
         while let Ok(effect) = effects.try_recv() {
-            if matches!(effect, StoreEffect::RefreshWorkspaces { .. }) {
-                store.finish_workspace_request(generation, false, Ok(snapshot(revision)));
+            match effect {
+                StoreEffect::RefreshWorkspaces { .. } => {
+                    store.finish_workspace_request(generation, false, Ok(snapshot(revision)));
+                }
+                StoreEffect::MutateWorkspace { .. } => {
+                    store.finish_workspace_request(generation, true, Ok(snapshot(revision)));
+                }
+                _ => {}
             }
         }
         true
+    }
+
+    /// Closing a pane or docking a spawn moves the revision under an edit
+    /// the app already sent. That is not the person's problem: no toast, and
+    /// the edit lands on the refreshed layout, once.
+    #[test]
+    fn a_revision_conflict_replays_the_edit_once_without_an_error() {
+        let (mut store, mut effects, generation) = connected();
+        store.finish_workspace_request(generation, false, Ok(snapshot(9)));
+        let focus = WorkspaceMutation::FocusPane {
+            tab_id: diri_proto::workspace::TabId::new("tab"),
+            pane_id: diri_proto::workspace::PaneId::new("a"),
+        };
+        let conflict = || {
+            ClientError::Control(diri_proto::control::ControlError::new(
+                "workspace_revision_conflict",
+                "expected revision 9, current revision 10",
+            ))
+        };
+        assert!(store.edit_workspace(focus.clone()));
+        while effects.try_recv().is_ok() {}
+        store.finish_workspace_request(generation, true, Err(conflict()));
+        assert!(store.workspace_catalog().error.is_none(), "no toast");
+        assert!(matches!(
+            effects.try_recv(),
+            Ok(StoreEffect::RefreshWorkspaces { .. })
+        ));
+        store.finish_workspace_request(generation, false, Ok(snapshot(10)));
+        let Ok(StoreEffect::MutateWorkspace { params, .. }) = effects.try_recv() else {
+            panic!("the edit is replayed after the refresh")
+        };
+        assert_eq!(params.mutation, focus);
+        assert_eq!(params.expected_revision, 10);
+        while effects.try_recv().is_ok() {}
+        // A second conflict drops it rather than chasing the revision.
+        store.finish_workspace_request(generation, true, Err(conflict()));
+        store.finish_workspace_request(generation, false, Ok(snapshot(11)));
+        assert!(store.workspace_catalog().error.is_none());
+        while let Ok(effect) = effects.try_recv() {
+            assert!(
+                !matches!(effect, StoreEffect::MutateWorkspace { .. }),
+                "replayed only once"
+            );
+        }
     }
 
     /// A tab limit full of placements rejected every agent activation, and

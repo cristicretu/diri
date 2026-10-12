@@ -93,9 +93,10 @@ fn render_split_panes_screenshot() {
     let output = std::path::PathBuf::from(std::env::var("DIRI_SPLIT_SCREENSHOTS").unwrap());
     std::fs::create_dir_all(&output).unwrap();
     let horizontal = std::env::var_os("DIRI_SPLIT_HORIZONTAL").is_some();
-    for (name, density) in ["two", "three", "zoomed"].into_iter().flat_map(|name| {
-        crate::store::PaneDensity::ALL.map(|density| (name, density))
-    }) {
+    for (name, density) in ["two", "three", "zoomed"]
+        .into_iter()
+        .flat_map(|name| crate::store::PaneDensity::ALL.map(|density| (name, density)))
+    {
         let platform = gpui_platform::current_platform(true);
         let mut cx = HeadlessAppContext::with_platform(
             platform.text_system(),

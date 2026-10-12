@@ -4454,9 +4454,18 @@ impl TerminalPane {
 
     /// The top-left pane owns the native window-button lane when navigation
     /// chrome is hidden, including panes mounted by a saved split layout.
-    fn occupies_window_titlebar(&self) -> bool {
+    /// How far in from the window's left edge the pane starts when its
+    /// title bar shares the traffic lights' row: 0 when flush (compact),
+    /// the island gap in comfortable. `None` when the lights are elsewhere.
+    fn window_titlebar_inset(&self) -> Option<f32> {
+        // The lights start 20 pt in and are centred on the title bar.
         self.viewport
-            .is_some_and(|viewport| viewport.x < 0.5 && viewport.y < 0.5)
+            .filter(|viewport| viewport.x < 20.0 && viewport.y < Metrics::TITLE_BAR / 2.0)
+            .map(|viewport| viewport.x)
+    }
+
+    fn occupies_window_titlebar(&self) -> bool {
+        self.window_titlebar_inset().is_some()
     }
 
     fn shows_navigation_control(&self) -> bool {
@@ -4484,8 +4493,13 @@ impl TerminalPane {
             .gap(px(Metrics::TOOLBAR_ITEM_GAP))
             // The visible lights need more breathing room than their native
             // frames imply, so this is an intentional optical safe area.
-            .when(self.occupies_window_titlebar(), |control| {
-                control.child(div().w(px(Metrics::TOOLBAR_TRAFFIC_LIGHT_LANE)).flex_none())
+            .when_some(self.window_titlebar_inset(), |control, inset| {
+                // Clear the lights at the same window x in every density.
+                control.child(
+                    div()
+                        .w(px((Metrics::TOOLBAR_TRAFFIC_LIGHT_LANE - inset).max(0.0)))
+                        .flex_none(),
+                )
             })
             .child(crate::held_hints::below(
                 div()

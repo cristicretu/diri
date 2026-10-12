@@ -4289,8 +4289,11 @@ impl RootView {
         if terminal_in_workspace_panel && let Some(auxiliary) = &self.auxiliary_terminal {
             auxiliary.update(cx, |terminal, cx| {
                 terminal.set_shell_chrome(visible_sidebar, true, cx);
-                terminal.set_island_corners(false, cx);
+                terminal.set_island_corners(islands, cx);
                 terminal.set_header_trailing_inset(0.0, cx);
+                // Comfortable: the panel is an island inset by the gap, and
+                // its header is the gap shorter (see `inspector_island`).
+                let top = Metrics::TITLE_BAR - gap;
                 terminal.set_viewport(
                     TerminalViewport {
                         x: origin_x + card_width + gap,
@@ -4298,9 +4301,9 @@ impl RootView {
                         // that header in the height sizes the PTY past the
                         // painted grid, so a wrapped line parks the prompt on
                         // a row scrollback cannot reach.
-                        y: Metrics::TITLE_BAR,
-                        width: inspector_width,
-                        height: (f32::from(viewport_size.height) - Metrics::TITLE_BAR).max(0.0),
+                        y: top,
+                        width: (inspector_width - gap).max(0.0),
+                        height: (f32::from(viewport_size.height) - top - gap).max(0.0),
                     },
                     cx,
                 );
@@ -5798,6 +5801,41 @@ impl Render for RootView {
                 root = root.child(self.inspector_resize_handle(cx));
             }
             if let Some(inspector) = &self.inspector {
+                let density = self
+                    .window_store
+                    .read()
+                    .expect("session store lock poisoned")
+                    .preferences()
+                    .pane_density;
+                let islands = density.islands();
+                let gap = density.island_gap();
+                inspector.update(cx, |inspector, cx| inspector.set_island(islands, cx));
+                // Comfortable: an island on the chrome, like the terminal
+                // card beside it, whose own gap separates the two. Compact:
+                // flush, the hairline the only edge between two terminal fills.
+                let panel = div()
+                    .absolute()
+                    .top(px(gap))
+                    .left(px(0.0))
+                    .h(px(
+                        (f32::from(window.viewport_size().height) - 2.0 * gap).max(0.0)
+                    ))
+                    .w(px((inspector_panel_width - gap).max(0.0)))
+                    .child(
+                        inspector
+                            .clone()
+                            .cached(StyleRefinement::default().size_full()),
+                    )
+                    .when(islands, |panel| {
+                        panel.child(
+                            div()
+                                .absolute()
+                                .inset_0()
+                                .rounded(px(Radius::CARD))
+                                .border_1()
+                                .border_color(crate::right_panel::panel_divider(colors)),
+                        )
+                    });
                 root = root.child(
                     div()
                         .relative()
@@ -5806,23 +5844,14 @@ impl Render for RootView {
                         .w(px(inspector_seam))
                         .overflow_hidden()
                         .when(settings_over_glass, |panel| panel.invisible())
+                        .when(islands, |chrome| chrome.bg(colors.sidebar_surface()))
                         // The panel paints the terminal's own fill, so this
                         // hairline is all that separates the two surfaces.
-                        .border_l_1()
-                        .border_color(crate::right_panel::panel_divider(colors))
-                        .child(
-                            div()
-                                .absolute()
-                                .top(px(0.0))
-                                .left(px(0.0))
-                                .h_full()
-                                .w(px(inspector_panel_width))
-                                .child(
-                                    inspector
-                                        .clone()
-                                        .cached(StyleRefinement::default().size_full()),
-                                ),
-                        ),
+                        .when(!islands, |edge| {
+                            edge.border_l_1()
+                                .border_color(crate::right_panel::panel_divider(colors))
+                        })
+                        .child(panel),
                 );
             }
         }
@@ -10237,6 +10266,8 @@ mod tests {
                             prefs.set_interface_style(style);
                             prefs.pane_density = density;
                             prefs.sidebar_visible = sidebar;
+                            prefs.inspector_open =
+                                std::env::var_os("DIRI_STYLE_INSPECTOR").is_some();
                         })
                         .unwrap();
                     store.seed_workspace_snapshot_for_test(WorkspaceSnapshot {
@@ -11948,7 +11979,11 @@ mod tests {
             .debug_bounds("INSPECTOR_TOGGLE")
             .expect("an open panel carries the toggle in its own title bar");
         assert!(
-            toggle.right() >= px(1200.0 - Metrics::TOOLBAR_EDGE_INSET - 1.0),
+            toggle.right()
+                >= px(1200.0
+                    - Metrics::TOOLBAR_EDGE_INSET
+                    - crate::store::PaneDensity::default().island_gap()
+                    - 1.0),
             "the open panel's toggle ends the window's title bar: {toggle:?}"
         );
         assert!(
@@ -12074,6 +12109,50 @@ mod tests {
         assert!(
             !root.read_with(cx, |root, _| root.notification_panel_open),
             "clicking the notification trigger again must close the panel without reopening it"
+        );
+    }
+
+    #[gpui::test]
+    fn the_hidden_sidebar_button_clears_the_traffic_lights_in_both_densities(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let mut lefts = Vec::new();
+        for density in crate::store::PaneDensity::ALL {
+            let services = test_services();
+            let session = SidebarPreviewFixture::make(PreviewScenario::Typical)
+                .list
+                .sessions[0]
+                .clone();
+            {
+                let mut store = services.store.store.write().expect("store");
+                store.upsert_session(session.clone());
+                store.select(session.id);
+                store
+                    .update_preferences(|prefs| {
+                        prefs.pane_density = density;
+                        prefs.sidebar_visible = false;
+                    })
+                    .unwrap();
+            }
+            let (_root, cx) = cx.add_window_view(move |window, cx| {
+                RootView::new(services, false, PreviewScenario::Empty, window, cx)
+            });
+            cx.simulate_resize(size(px(1_000.0), px(700.0)));
+            cx.run_until_parked();
+            let button = cx
+                .debug_bounds("show-sidebar")
+                .expect("a hidden sidebar leaves its reveal button in the title bar");
+            // The lights span 20 pt to about 72 pt from the window's left edge.
+            assert!(
+                button.left() >= px(74.0),
+                "{density:?}: the button sits under the traffic lights: {button:?}"
+            );
+            lefts.push(button.left());
+        }
+        // Compact's 1 pt pane edge is the only difference.
+        assert!(
+            (lefts[0] - lefts[1]).abs() <= px(1.0),
+            "the button keeps its place across densities: {lefts:?}"
         );
     }
 

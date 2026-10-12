@@ -303,6 +303,7 @@ impl WorkspaceWorkbench {
 
     fn focus_pane(&mut self, pane: PaneId, window: &mut Window, cx: &mut Context<Self>) {
         self.pending_focus = Some(pane);
+        self.remember_focus();
         self.flush_focus();
         self.focus(window, cx);
         cx.notify();

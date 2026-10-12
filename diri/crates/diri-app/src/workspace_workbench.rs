@@ -15,7 +15,7 @@ use crate::{
 use diri_proto::{
     SessionId,
     workspace::{
-        DockEdge, LayoutAxis, LayoutNode, LayoutNodeId, PaneId, SplitId, WorkspaceMutation,
+        DockEdge, LayoutAxis, LayoutNode, LayoutNodeId, PaneId, SplitId, TabId, WorkspaceMutation,
         WorkspaceTab,
     },
 };
@@ -25,10 +25,13 @@ use gpui::{
     SharedString, StyleRefinement, Subscription, Window, div, prelude::*, px,
 };
 
-/// Compact panes meet at one hairline. Its grab area reaches this far into
-/// the panes on each side, so it is as easy to catch as the old 5 pt strip.
+/// Compact panes meet at one hairline.
 const COMPACT_SEAM: f32 = 1.0;
+/// The hairline's grab area reaches this far into the panes on each side,
+/// so it is as easy to catch as the old 5 pt strip.
 const COMPACT_SEAM_REACH: f32 = 2.0;
+/// Width of the line a hovered seam lights up.
+const SEAM_HIGHLIGHT: f32 = 2.0;
 
 #[derive(Clone)]
 pub(crate) enum WorkspaceWorkbenchEvent {
@@ -99,6 +102,10 @@ pub(crate) struct WorkspaceWorkbench {
     viewport: TerminalViewport,
     pending_focus: Option<PaneId>,
     sent_focus: Option<PaneId>,
+    /// Panes in the order they were focused, most recent last, per tab.
+    /// When the focused pane goes away (⌘W, ⌘J, its shell exiting) focus
+    /// returns to the one used before it, not the Engine's first pane.
+    focus_history: HashMap<TabId, Vec<PaneId>>,
     resize: Option<ResizeDraft>,
     /// What the drag in flight last snapped to: the pane a moved pane would
     /// land on, or the end of a divider's travel.
@@ -166,6 +173,7 @@ impl WorkspaceWorkbench {
             viewport: TerminalViewport::default(),
             pending_focus: None,
             sent_focus: None,
+            focus_history: HashMap::new(),
             resize: None,
             drag_haptic: haptics::Crossing::default(),
             _activation: activation,
@@ -203,6 +211,7 @@ impl WorkspaceWorkbench {
                 .is_some_and(|current| current.focused_pane != tab.focused_pane);
         let switched = self.tab.as_ref().is_none_or(|current| current.id != tab.id);
         let previous_tab = self.tab.clone();
+        let previous_focus = (!switched).then(|| self.focused_id().cloned()).flatten();
         let viewport_changed = self.viewport != viewport;
         if switched {
             self.pending_focus = None;
@@ -249,6 +258,23 @@ impl WorkspaceWorkbench {
                 self.sent_focus = None;
             }
         }
+        let mut focus_changed = focus_changed;
+        if let Some(gone) = previous_focus
+            && let Some(tab) = &self.tab
+            && !commands::contains_pane(&tab.layout, &gone)
+            && let Some(recent) = self.focus_history.get(&tab.id).and_then(|history| {
+                history
+                    .iter()
+                    .rev()
+                    .find(|pane| **pane != gone && commands::contains_pane(&tab.layout, pane))
+                    .cloned()
+            })
+            && recent != tab.focused_pane
+        {
+            self.pending_focus = Some(recent);
+            focus_changed = true;
+        }
+        self.remember_focus();
         let changed = previous_tab != self.tab || viewport_changed;
         self.reconcile(window, cx);
         self.flush_focus();
@@ -353,6 +379,7 @@ impl WorkspaceWorkbench {
             let focus = cx.on_focus(&focus_handle, window, move |this, window, cx| {
                 if window.is_window_active() {
                     this.pending_focus = Some(pane_id.clone());
+                    this.remember_focus();
                     this.flush_focus();
                     this.assign_visible_owners(window, cx);
                     cx.notify();
@@ -627,6 +654,20 @@ impl WorkspaceWorkbench {
             pane.terminal
                 .update(cx, |terminal, _| terminal.release_layout_control());
         }
+    }
+
+    /// Moves the focused pane to the end of its tab's history, dropping
+    /// panes the layout no longer has.
+    fn remember_focus(&mut self) {
+        let Some(tab) = &self.tab else {
+            return;
+        };
+        let Some(focused) = self.focused_id().cloned() else {
+            return;
+        };
+        let history = self.focus_history.entry(tab.id.clone()).or_default();
+        history.retain(|pane| *pane != focused && commands::contains_pane(&tab.layout, pane));
+        history.push(focused);
     }
 
     fn focused_id(&self) -> Option<&PaneId> {
@@ -953,6 +994,7 @@ impl Render for WorkspaceWorkbench {
                 bounds.height += 2.0 * reach;
             }
             let drag = divider.clone();
+            let group = SharedString::from(format!("workspace-seam-{}", divider.id.0));
             seams.push(
                 div()
                     .id(SharedString::from(format!(
@@ -985,7 +1027,33 @@ impl Render for WorkspaceWorkbench {
                                 .bg(colors.primary.alpha(0.10)),
                         )
                     })
-                    .hover(move |line| line.bg(gpui::rgba(0x4f83f1ff).alpha(0.6)))
+                    // Hover lights a 2 pt line down the middle, not the whole
+                    // grab area: the gap between islands is 6 pt wide.
+                    .group(group.clone())
+                    .child({
+                        let (along, across) = if horizontal {
+                            (bounds.height, bounds.width)
+                        } else {
+                            (bounds.width, bounds.height)
+                        };
+                        let offset = (across - SEAM_HIGHLIGHT) / 2.0;
+                        div()
+                            .absolute()
+                            .when(horizontal, |line| {
+                                line.top_0()
+                                    .left(px(offset))
+                                    .w(px(SEAM_HIGHLIGHT))
+                                    .h(px(along))
+                            })
+                            .when(!horizontal, |line| {
+                                line.left_0()
+                                    .top(px(offset))
+                                    .h(px(SEAM_HIGHLIGHT))
+                                    .w(px(along))
+                            })
+                            .rounded_full()
+                            .group_hover(group, |line| line.bg(gpui::rgba(0x4f83f1ff).alpha(0.8)))
+                    })
                     .on_drag(DraggedWorkspaceDivider, |_, _, _, cx| {
                         cx.stop_propagation();
                         cx.new(|_| DraggedWorkspaceDivider)
@@ -1439,6 +1507,44 @@ mod tests {
             .unwrap();
         first
             .update(cx, |_, window, _| window.remove_window())
+            .unwrap();
+        cx.run_until_parked();
+    }
+    /// ⌘W on the focused pane: the Engine refocuses its first pane, but
+    /// focus goes back to the pane used before the closed one.
+    #[gpui::test]
+    fn closing_the_focused_pane_returns_focus_to_the_last_used_one(cx: &mut TestAppContext) {
+        let (runtime, tokio, two) = fixture(false);
+        let pane = |id: &str, session: &str| LayoutNode::Pane {
+            id: PaneId::new(id),
+            session_id: SessionId::new(session),
+        };
+        let mut three = two.clone();
+        three.layout = LayoutNode::Split {
+            id: SplitId::new("outer"),
+            axis: LayoutAxis::Horizontal,
+            fraction: 0.5,
+            first: Box::new(two.layout.clone()),
+            second: Box::new(pane("c", "preview-cursor")),
+        };
+        let handle =
+            cx.add_window(|window, cx| WorkspaceWorkbench::new(runtime.clone(), tokio, window, cx));
+        handle
+            .update(cx, |workbench, window, cx| {
+                for (revision, focused) in [(2, "a"), (3, "b"), (4, "c")] {
+                    let mut tab = three.clone();
+                    tab.focused_pane = PaneId::new(focused);
+                    seed(&runtime, vec![tab.clone()], revision);
+                    workbench.set_tab(tab, viewport(), window, cx);
+                }
+                // "c" closes; the Engine's repair focuses the first pane.
+                let mut closed = two.clone();
+                closed.focused_pane = PaneId::new("a");
+                seed(&runtime, vec![closed.clone()], 5);
+                workbench.set_tab(closed, viewport(), window, cx);
+                assert_eq!(workbench.focused_id(), Some(&PaneId::new("b")));
+                window.remove_window();
+            })
             .unwrap();
         cx.run_until_parked();
     }
