@@ -326,9 +326,19 @@ commit=$(git rev-parse --verify --end-of-options "${base}^{commit}") || {
 }
 destination="${root}-${slug}"
 git worktree add -b "$branch" -- "$destination" "$commit" >&2
+root=$(pwd -P)
 cd "$destination"
-printf 'DIRI_WORKTREE_V1\000%s\000' "$(pwd -P)"
+printf 'DIRI_WORKTREE_V2\000%s\000%s\000' "$(pwd -P)" "$root"
 "#;
+
+/// A worktree created on a remote host, with the checkout it was linked
+/// from. The checkout is the Session's project: a linked worktree is an
+/// execution cwd, never a first-level sidebar project of its own.
+#[derive(Debug, Clone)]
+pub struct RemoteWorktree {
+    pub info: WorktreeInfo,
+    pub repo_root: String,
+}
 
 pub fn create_worktree_remote(
     manager: &RemoteManager,
@@ -336,7 +346,7 @@ pub fn create_worktree_remote(
     cwd: &str,
     branch: Option<&str>,
     base: Option<&str>,
-) -> std::io::Result<WorktreeInfo> {
+) -> std::io::Result<RemoteWorktree> {
     let branch = branch
         .map(str::to_owned)
         .unwrap_or_else(generated_branch_name);
@@ -366,24 +376,34 @@ fn worktree_input(cwd: &str, branch: &str, base: &str) -> std::io::Result<Vec<u8
     Ok(format!("{cwd}\n{branch}\n{base}\n{}\n", branch_to_path_slug(branch)).into_bytes())
 }
 
-fn parse_worktree_result(output: &[u8], branch: String) -> std::io::Result<WorktreeInfo> {
-    const MARKER: &[u8] = b"DIRI_WORKTREE_V1\0";
+fn parse_worktree_result(output: &[u8], branch: String) -> std::io::Result<RemoteWorktree> {
+    const MARKER: &[u8] = b"DIRI_WORKTREE_V2\0";
     let start = output
         .windows(MARKER.len())
         .rposition(|bytes| bytes == MARKER)
         .ok_or_else(|| std::io::Error::other("remote worktree response is missing"))?
         + MARKER.len();
-    let path = output[start..]
-        .strip_suffix(&[0])
-        .and_then(|bytes| std::str::from_utf8(bytes).ok())
-        .filter(|path| path.starts_with('/') && !path.chars().any(char::is_control))
-        .ok_or_else(|| std::io::Error::other("remote worktree returned an invalid path"))?;
-    Ok(WorktreeInfo {
-        path: path.to_owned(),
-        branch: Some(branch),
-        is_bare: false,
-        is_detached: false,
-        is_prunable: false,
+    let invalid = || std::io::Error::other("remote worktree returned an invalid path");
+    let fields = output[start..].strip_suffix(&[0]).ok_or_else(invalid)?;
+    let mut paths = fields.split(|byte| *byte == 0).map(|bytes| {
+        std::str::from_utf8(bytes)
+            .ok()
+            .filter(|path| path.starts_with('/') && !path.chars().any(char::is_control))
+    });
+    let (Some(Some(path)), Some(Some(repo_root)), None) =
+        (paths.next(), paths.next(), paths.next())
+    else {
+        return Err(invalid());
+    };
+    Ok(RemoteWorktree {
+        info: WorktreeInfo {
+            path: path.to_owned(),
+            branch: Some(branch),
+            is_bare: false,
+            is_detached: false,
+            is_prunable: false,
+        },
+        repo_root: repo_root.to_owned(),
     })
 }
 
@@ -852,7 +872,13 @@ mod tests {
             "{}",
             String::from_utf8_lossy(&output.stderr)
         );
-        let info = parse_worktree_result(&output.stdout, "phone/remote".into()).unwrap();
+        let created = parse_worktree_result(&output.stdout, "phone/remote".into()).unwrap();
+        let info = &created.info;
+        assert_eq!(
+            Path::new(&created.repo_root),
+            repo.canonicalize().unwrap(),
+            "the project is the linked-from checkout, not the new worktree"
+        );
         assert_eq!(
             run(&["rev-parse", "HEAD"], Path::new(&info.path)).unwrap(),
             run(&["rev-parse", "main"], &repo).unwrap()
@@ -868,8 +894,21 @@ mod tests {
             assert!(worktree_input("/repo", "phone/fix", field).is_err());
             assert!(worktree_input(field, "phone/fix", "main").is_err());
         }
-        assert!(parse_worktree_result(b"noise\nDIRI_WORKTREE_V1\0/tmp/repo\0", "b".into()).is_ok());
-        assert!(parse_worktree_result(b"DIRI_WORKTREE_V1\0relative\0", "b".into()).is_err());
+        assert!(
+            parse_worktree_result(
+                b"noise\nDIRI_WORKTREE_V2\0/tmp/repo-b\0/tmp/repo\0",
+                "b".into()
+            )
+            .is_ok()
+        );
+        for framing in [
+            &b"DIRI_WORKTREE_V2\0relative\0/tmp/repo\0"[..],
+            b"DIRI_WORKTREE_V2\0/tmp/repo-b\0relative\0",
+            b"DIRI_WORKTREE_V2\0/tmp/repo-b\0",
+            b"DIRI_WORKTREE_V2\0/tmp/repo-b\0/tmp/repo\0/extra\0",
+        ] {
+            assert!(parse_worktree_result(framing, "b".into()).is_err());
+        }
     }
 
     #[test]

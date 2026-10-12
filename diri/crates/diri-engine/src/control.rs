@@ -1916,7 +1916,7 @@ impl ControlServer {
                 p.worktree_base.as_deref(),
             )
             .map_err(io_control_error)?;
-            requested_cwd.clone_from(&info.path);
+            requested_cwd.clone_from(&info.info.path);
             Some(info)
         } else {
             None
@@ -2060,11 +2060,16 @@ impl ControlServer {
         record.kind = p.kind.clone();
         record.originating_prompt = p.initial_prompt.clone();
         record.host = Some(host.id.clone());
-        record.project_id = crate::registry::session_project_id(&captured.cwd, Some(&host.id));
+        // As on the local spawn path, a linked worktree is an execution cwd
+        // inside the checkout it came from, not a first-level project.
+        let project_root = worktree
+            .as_ref()
+            .map_or_else(|| captured.cwd.clone(), |created| created.repo_root.clone());
+        record.project_id = crate::registry::session_project_id(&project_root, Some(&host.id));
         record.remote_persistence = Some(persistence);
-        if let Some(info) = worktree {
-            record.worktree_path = Some(info.path);
-            record.git_branch = info.branch;
+        if let Some(created) = worktree {
+            record.worktree_path = Some(created.info.path);
+            record.git_branch = created.info.branch;
         }
         record.parent = p.parent.clone();
         record.agent_session_id = agent_session_id;
@@ -2099,7 +2104,7 @@ impl ControlServer {
                 registry.other_live_agent(&id),
             );
         }
-        self.ensure_published_project(&mut registry, &captured.cwd, Some(&host.id));
+        self.ensure_published_project(&mut registry, &project_root, Some(&host.id));
         if tracked {
             registry.persist_for_shutdown().map_err(io_control_error)?;
         } else {
