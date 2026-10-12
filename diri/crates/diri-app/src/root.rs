@@ -4291,7 +4291,9 @@ impl RootView {
             } else {
                 None
             };
-            let inspector_toggle = !self.inspector_open && !self.preview;
+            // Horizontal tabs carry the toggle beside their +, so no pane
+            // title bar repeats it.
+            let inspector_toggle = !self.inspector_open && !self.preview && tabs_height <= 0.0;
             workbench.update(cx, |workbench, _| {
                 workbench.set_external_owner(external_owner);
                 workbench.set_inspector_toggle(inspector_toggle);
@@ -4344,6 +4346,20 @@ impl RootView {
                     primary.update(cx, |terminal, cx| {
                         terminal.render_hosted_header_actions(sidebar_colors, held_hint, cx)
                     })
+                })
+                .or_else(|| {
+                    // A split workspace has no single pane to host; the strip
+                    // still ends with the right sidebar's toggle.
+                    (self.active_workspace.is_some() && !self.inspector_open && !self.preview).then(
+                        || {
+                            crate::right_panel::dispatching_toggle(
+                                "strip-toggle-inspector",
+                                false,
+                                sidebar_colors,
+                                held_hint,
+                            )
+                        },
+                    )
                 });
             let strip_height = self.sidebar.read(cx).tab_strip_height();
             let strip = self.sidebar.update(cx, |sidebar, cx| {
@@ -8000,7 +8016,8 @@ mod tests {
                     if horizontal {
                         let project = cx.debug_bounds("horizontal-tab-project").unwrap();
                         if cfg!(target_os = "macos") {
-                            assert!(project.left() >= px(92.0), "tabs overlap traffic lights");
+                            // The lights end about 72 pt from the window's left edge.
+                            assert!(project.left() >= px(74.0), "tabs overlap traffic lights");
                         }
                     }
                 }

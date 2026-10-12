@@ -1355,6 +1355,7 @@ impl Sidebar {
     pub(super) fn workspace_strip(
         &mut self,
         colors: SemanticColors,
+        trailing: Option<AnyElement>,
         cx: &mut Context<Self>,
     ) -> AnyElement {
         self.end_lift_if_released(cx);
@@ -1379,11 +1380,7 @@ impl Sidebar {
             ))
             .pb(px(6.0))
             .gap(px(0.0))
-            .pl(px(if cfg!(target_os = "macos") && !self.ui.visible {
-                92.0
-            } else {
-                10.0
-            }))
+            .pl(px(self.strip_leading_inset()))
             .pr(px(10.0))
             // Comfortable: the island below is the edge, so no hairline.
             .when(!self.islands(), |strip| {
@@ -1399,7 +1396,13 @@ impl Sidebar {
             })
             // Islands already paint this chrome; a second tint would darken it.
             .when(!self.islands(), |strip| strip.bg(colors.sidebar_surface()))
-            .child(self.project_control(colors, cx))
+            .child(
+                // A breath between the project control and the first tab.
+                div()
+                    .flex_none()
+                    .mr(px(diri_ui::Metrics::TOOLBAR_COMPACT_GAP + 2.0))
+                    .child(self.project_control(colors, cx)),
+            )
             .child(self.workspace_rows(true, colors, cx))
             .child(
                 div()
@@ -1418,6 +1421,16 @@ impl Sidebar {
                         cx.stop_propagation();
                     })),
             )
+            .when_some(trailing, |strip, trailing| {
+                strip.child(
+                    div()
+                        .flex_none()
+                        .ml(px(6.0))
+                        .flex()
+                        .items_center()
+                        .child(trailing),
+                )
+            })
             .into_any_element()
     }
 }

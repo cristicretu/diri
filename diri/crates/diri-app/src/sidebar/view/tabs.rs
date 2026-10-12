@@ -312,6 +312,26 @@ impl Sidebar {
         store.preferences().pane_density.islands()
     }
 
+    /// Room before the strip's first control. With the panel hidden the
+    /// strip shares the traffic lights' row, and its first control sits
+    /// where a session title bar puts its sidebar button: just past the
+    /// lights, at the same window x in either density.
+    pub(super) fn strip_leading_inset(&self) -> f32 {
+        if cfg!(target_os = "macos") && !self.ui.visible {
+            let gap = self
+                .store
+                .read()
+                .expect("store")
+                .preferences()
+                .pane_density
+                .island_gap();
+            diri_ui::Metrics::TOOLBAR_TRAFFIC_LIGHT_LANE + diri_ui::Metrics::TOOLBAR_EDGE_INSET
+                - gap
+        } else {
+            10.0
+        }
+    }
+
     /// The strip's height when it is on screen, else zero.
     pub fn horizontal_tabs_height(&self) -> f32 {
         if self.horizontal_tabs_visible() {
@@ -945,7 +965,7 @@ impl Sidebar {
             // selection made while they were away.
             self.tab_pill.forget();
             self.workspace_nav.available_width = available_width;
-            return self.workspace_strip(colors, cx);
+            return self.workspace_strip(colors, trailing, cx);
         }
         let rows = self.render_project_tab_rows(available_width, cx);
         let held_hint = self.strip_held_hint;
@@ -972,11 +992,7 @@ impl Sidebar {
             ))
             .pb(px(6.0))
             .gap(px(0.0))
-            .pl(px(if cfg!(target_os = "macos") && !self.ui.visible {
-                92.0
-            } else {
-                10.0
-            }))
+            .pl(px(self.strip_leading_inset()))
             .pr(px(10.0))
             // Comfortable: the island below is the edge, so no hairline.
             .when(!self.islands(), |strip| {
@@ -993,7 +1009,13 @@ impl Sidebar {
             // Islands already paint this chrome; a second tint would darken it.
             .when(!self.islands(), |strip| strip.bg(colors.sidebar_surface()))
             .text_color(colors.primary)
-            .child(self.project_control(colors, cx))
+            .child(
+                // A breath between the project control and the first tab.
+                div()
+                    .flex_none()
+                    .mr(px(diri_ui::Metrics::TOOLBAR_COMPACT_GAP + 2.0))
+                    .child(self.project_control(colors, cx)),
+            )
             .child(rows)
             .child(crate::held_hints::below(
                 div()
