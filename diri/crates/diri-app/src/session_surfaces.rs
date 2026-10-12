@@ -915,7 +915,7 @@ impl SessionSurfaces {
             .size_full()
             .flex()
             .flex_col()
-            .pt(px(42.0))
+            .pt(px(diri_ui::Metrics::TITLE_BAR))
             .bg(colors.background)
             .overflow_hidden()
             .occlude()
@@ -2788,7 +2788,7 @@ mod tests {
                 .child(
                     div()
                         .flex_none()
-                        .h(px(42.0))
+                        .h(px(diri_ui::Metrics::TITLE_BAR))
                         .flex()
                         .items_center()
                         .px(px(14.0))

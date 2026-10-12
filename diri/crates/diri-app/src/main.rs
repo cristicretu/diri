@@ -881,9 +881,10 @@ fn open_window(
                 title,
                 appears_transparent: cfg!(target_os = "macos"),
                 // GPUI uses top/left insets here: AppKit's native 8 pt origin plus the
-                // spec's +12 x / -6 frame-origin nudge maps to 20 pt left and 14 pt top.
+                // spec's +12 x / -6 frame-origin nudge maps to 20 pt left and 14 pt top,
+                // plus 3 pt so the 14 pt buttons centre on the 48 pt title bar.
                 traffic_light_position: cfg!(target_os = "macos")
-                    .then_some(point(px(20.0), px(14.0))),
+                    .then_some(point(px(20.0), px(17.0))),
             }),
             ..Default::default()
         },

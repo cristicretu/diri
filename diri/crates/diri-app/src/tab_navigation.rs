@@ -6,7 +6,16 @@ use diri_proto::{ProjectId, SessionRecord};
 
 use crate::store::SessionStore;
 
-pub const TAB_STRIP_HEIGHT: f32 = 42.0;
+/// The horizontal strip in compact density: one title bar tall, so its tabs
+/// centre on the traffic-light line.
+pub const TAB_STRIP_HEIGHT: f32 = diri_ui::Metrics::TITLE_BAR;
+
+/// The strip's height in `density`. A comfortable strip sits on the chrome
+/// inside the island gap and still ends where the title bar does, so its
+/// tabs stay on the traffic-light line and the island starts below it.
+pub fn tab_strip_height(density: crate::store::PaneDensity) -> f32 {
+    TAB_STRIP_HEIGHT - density.island_gap()
+}
 
 pub struct ProjectTabs {
     pub project: Option<ProjectId>,

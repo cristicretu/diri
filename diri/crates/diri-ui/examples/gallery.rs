@@ -503,7 +503,7 @@ fn main() {
                     titlebar: Some(TitlebarOptions {
                         title: Some("diri-ui gallery".into()),
                         appears_transparent: true,
-                        traffic_light_position: Some(point(px(20.0), px(14.0))),
+                        traffic_light_position: Some(point(px(20.0), px(17.0))),
                     }),
                     ..Default::default()
                 },

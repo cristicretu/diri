@@ -807,11 +807,7 @@ impl RootView {
                     this.sidebar_panel_width = this.sidebar_seam;
                     this.sidebar_float = 0.0;
                     this.tabs_slide = None;
-                    this.tabs_target = if this.sidebar.read(cx).horizontal_tabs_visible() {
-                        crate::tab_navigation::TAB_STRIP_HEIGHT
-                    } else {
-                        0.0
-                    };
+                    this.tabs_target = this.sidebar.read(cx).horizontal_tabs_height();
                     this.tabs_seam = this.tabs_target;
                 } else {
                     this.begin_sidebar_slide(cx);
@@ -1365,11 +1361,7 @@ impl RootView {
             0.0
         };
         let inspector_seam = if inspector_open { inspector_width } else { 0.0 };
-        let tabs_seam = if sidebar.read(cx).horizontal_tabs_visible() {
-            crate::tab_navigation::TAB_STRIP_HEIGHT
-        } else {
-            0.0
-        };
+        let tabs_seam = sidebar.read(cx).horizontal_tabs_height();
         #[cfg(target_os = "macos")]
         let (browser, mut browser_events) = NativeBrowser::new();
         #[cfg(target_os = "macos")]
@@ -4063,11 +4055,7 @@ impl RootView {
         let origin_y = gap;
         let card_width =
             (f32::from(viewport_size.width) - sidebar_width - inspector_width - 2.0 * gap).max(0.0);
-        let tabs_height = if self.sidebar.read(cx).horizontal_tabs_visible() {
-            crate::tab_navigation::TAB_STRIP_HEIGHT
-        } else {
-            0.0
-        };
+        let tabs_height = self.sidebar.read(cx).horizontal_tabs_height();
         let card_height = (f32::from(viewport_size.height) - tabs_height - 2.0 * gap).max(0.0);
         if self.tabs_target != tabs_height {
             self.tabs_target = tabs_height;
@@ -4136,6 +4124,9 @@ impl RootView {
         // In a workspace each pane is its own island, so the card itself is
         // only the chrome between them.
         let card_island = islands && self.active_workspace.is_none();
+        // Horizontal tabs in comfortable sit on the chrome above the island,
+        // so the body, not the whole card, is the island.
+        let strip_on_chrome = card_island && self.tabs_seam > 0.0;
         let mut card = div()
             .relative()
             .flex_1()
@@ -4149,10 +4140,12 @@ impl RootView {
             .when(!islands && inspector_seam <= 0.0, |card| {
                 card.rounded_tr(px(Radius::CARD))
             })
-            .when(card_island, |card| card.rounded(px(Radius::CARD)))
+            .when(card_island && !strip_on_chrome, |card| {
+                card.rounded(px(Radius::CARD))
+            })
             // A workspace's islands sit on the chrome painted around the
             // card, so the card itself stays clear there.
-            .when(!islands || card_island, |card| {
+            .when((!islands || card_island) && !strip_on_chrome, |card| {
                 card.bg(terminal.work_surface_nested())
             })
             .overflow_hidden()
@@ -4266,6 +4259,7 @@ impl RootView {
                         terminal.render_hosted_header_actions(sidebar_colors, held_hint, cx)
                     })
                 });
+            let strip_height = self.sidebar.read(cx).tab_strip_height();
             let strip = self.sidebar.update(cx, |sidebar, cx| {
                 sidebar.strip_held_hint = held_hint;
                 sidebar.render_horizontal_tabs(card_width, trailing, window, cx)
@@ -4280,8 +4274,8 @@ impl RootView {
                     .child(
                         div()
                             .relative()
-                            .top(px(self.tabs_seam - crate::tab_navigation::TAB_STRIP_HEIGHT))
-                            .h(px(crate::tab_navigation::TAB_STRIP_HEIGHT))
+                            .top(px(self.tabs_seam - strip_height))
+                            .h(px(strip_height))
                             .child(strip),
                     ),
             );
@@ -4471,7 +4465,11 @@ impl RootView {
                 }
             });
         }
-        let card = card.child(body).child(card_outline);
+        let card = if strip_on_chrome {
+            card.child(body.child(card_outline))
+        } else {
+            card.child(body).child(card_outline)
+        };
         if !islands {
             return card.into_any_element();
         }
@@ -7821,6 +7819,8 @@ mod tests {
                 .update_preferences(|prefs| {
                     prefs.active_workspace = Some(workspace);
                     prefs.sidebar_visible = true;
+                    // Edge-to-edge geometry is the compact contract.
+                    prefs.pane_density = crate::store::PaneDensity::Compact;
                 })
                 .unwrap();
         }
@@ -7976,7 +7976,8 @@ mod tests {
         });
         assert_eq!(
             horizontal.height,
-            before.height - crate::tab_navigation::TAB_STRIP_HEIGHT
+            before.height
+                - crate::tab_navigation::tab_strip_height(crate::store::PaneDensity::default())
         );
         assert!(horizontal.width > before.width);
         assert_eq!(horizontal.y, crate::tab_navigation::TAB_STRIP_HEIGHT);
@@ -8195,14 +8196,15 @@ mod tests {
             root.terminal.as_ref().unwrap().read(cx).header_hidden()
         }));
 
-        let trigger = cx.debug_bounds("session-links-trigger").unwrap().center();
+        let trigger_bounds = cx.debug_bounds("session-links-trigger").unwrap();
+        let trigger = trigger_bounds.center();
         cx.simulate_click(trigger, Modifiers::default());
         cx.run_until_parked();
         let panel = cx
             .debug_bounds("session-links-panel")
             .expect("the hosted trigger still opens the pane's links popover");
         assert!(
-            panel.top() >= strip.bottom(),
+            panel.top() >= trigger_bounds.bottom(),
             "the popover drops from the strip-hosted trigger: {panel:?}"
         );
         cx.simulate_click(trigger, Modifiers::default());
@@ -10095,6 +10097,11 @@ mod tests {
         let only = std::env::var("DIRI_STYLE_ONLY").ok();
         let sidebar = std::env::var("DIRI_STYLE_SIDEBAR").as_deref() != Ok("0");
         let single = std::env::var_os("DIRI_STYLE_SINGLE").is_some();
+        let orientation = if std::env::var_os("DIRI_STYLE_HORIZONTAL").is_some() {
+            crate::store::TabOrientation::Horizontal
+        } else {
+            crate::store::TabOrientation::Vertical
+        };
         let platform = gpui_platform::current_platform(true);
         let mut cx = HeadlessAppContext::with_platform(
             platform.text_system(),
@@ -10187,9 +10194,7 @@ mod tests {
                             let root =
                                 RootView::new(services, false, PreviewScenario::Empty, window, cx);
                             root.sidebar.update(cx, |sidebar, cx| {
-                                sidebar
-                                    .set_tab_orientation(crate::store::TabOrientation::Vertical, cx)
-                                    .unwrap();
+                                sidebar.set_tab_orientation(orientation, cx).unwrap();
                                 if !single {
                                     sidebar.activate_workspace(Some(workspace), cx);
                                 }

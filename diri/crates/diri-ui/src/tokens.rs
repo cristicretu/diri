@@ -607,7 +607,7 @@ impl Space {
 pub struct Metrics;
 
 impl Metrics {
-    pub const TITLE_BAR: f32 = 42.0;
+    pub const TITLE_BAR: f32 = 48.0;
     pub const TOOLBAR_EDGE_INSET: f32 = 12.0;
     pub const TOOLBAR_TRAFFIC_LIGHT_LANE: f32 = 66.0;
     pub const TOOLBAR_ITEM_GAP: f32 = 8.0;

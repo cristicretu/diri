@@ -121,17 +121,18 @@ impl InterfaceStyle {
     }
 }
 
-/// How terminal panes sit in the window. Field-level default so files
-/// written before density existed keep the flush layout.
+/// How terminal panes sit in the window. Comfortable is the default, for
+/// files written before density existed too.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub enum PaneDensity {
-    /// Each pane is a rounded island with a gap of window chrome around it.
-    Comfortable,
     /// Panes fill the window edge to edge, split by single hairlines.
+    Compact,
+    /// Each pane is a rounded island with a gap of window chrome around it.
+    /// Last because serde only takes `other` on the final variant.
     #[default]
     #[serde(other)]
-    Compact,
+    Comfortable,
 }
 
 impl PaneDensity {
@@ -578,7 +579,7 @@ impl Default for Prefs {
             window_material: WindowMaterial::Glass,
             window_transparency: window_transparency_default(),
             interface_style: None,
-            pane_density: PaneDensity::Compact,
+            pane_density: PaneDensity::Comfortable,
             window_placement: None,
             additional_windows: Vec::new(),
             sidebar_visible: false,
@@ -805,7 +806,7 @@ mod tests {
     fn files_from_before_interface_styles_keep_their_material() {
         let glass: Prefs = serde_json::from_str("{}").unwrap();
         assert_eq!(glass.interface_style(), InterfaceStyle::Blended);
-        assert_eq!(glass.pane_density, PaneDensity::Compact);
+        assert_eq!(glass.pane_density, PaneDensity::Comfortable);
         let opaque: Prefs = serde_json::from_str(r#"{"windowMaterial":"opaque"}"#).unwrap();
         assert_eq!(opaque.interface_style(), InterfaceStyle::Themed);
     }
@@ -815,12 +816,12 @@ mod tests {
         for style in InterfaceStyle::ALL {
             let mut prefs = Prefs::default();
             prefs.set_interface_style(style);
-            prefs.pane_density = PaneDensity::Comfortable;
+            prefs.pane_density = PaneDensity::Compact;
             assert_eq!(prefs.window_material, style.material());
             let read: Prefs =
                 serde_json::from_str(&serde_json::to_string(&prefs).unwrap()).unwrap();
             assert_eq!(read.interface_style(), style);
-            assert_eq!(read.pane_density, PaneDensity::Comfortable);
+            assert_eq!(read.pane_density, PaneDensity::Compact);
         }
     }
 
@@ -836,7 +837,7 @@ mod tests {
     #[test]
     fn unknown_density_and_style_names_fall_back() {
         let prefs: Prefs = serde_json::from_str(r#"{"paneDensity":"airy"}"#).unwrap();
-        assert_eq!(prefs.pane_density, PaneDensity::Compact);
+        assert_eq!(prefs.pane_density, PaneDensity::Comfortable);
         let prefs: Prefs = serde_json::from_str(r#"{"interfaceStyle":"neon"}"#).unwrap();
         assert_eq!(prefs.interface_style(), InterfaceStyle::Blended);
     }

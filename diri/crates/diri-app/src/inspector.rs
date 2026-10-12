@@ -2849,7 +2849,7 @@ impl WorkbenchInspector {
             .flex_col()
             .child(
                 div()
-                    .h(px(42.0))
+                    .h(px(Metrics::TITLE_BAR))
                     .flex_none()
                     .px(px(9.0))
                     .flex()

@@ -10037,7 +10037,13 @@ mod tests {
             .debug_bounds("settings-shell")
             .expect("settings shell should render");
 
-        assert_eq!(shell, root);
+        // Comfortable insets the page by the island gap on every side.
+        let gap = px(crate::store::PaneDensity::default().island_gap());
+        assert_eq!(shell.origin, root.origin + gpui::point(gap, gap));
+        assert_eq!(
+            shell.size,
+            gpui::size(root.size.width - gap * 2.0, root.size.height - gap * 2.0)
+        );
     }
 
     #[gpui::test]
@@ -10395,10 +10401,13 @@ mod tests {
         assert_eq!(navigation.size.width, sidebar.size.width);
         assert_eq!(
             shell.left(),
-            sidebar.right(),
-            "the settings page should begin where the sidebar ends"
+            sidebar.right() + px(crate::store::PaneDensity::default().island_gap()),
+            "the settings page should begin where the sidebar ends, past the island gap"
         );
-        assert_eq!(shell.right(), px(1200.0));
+        assert_eq!(
+            shell.right(),
+            px(1200.0 - crate::store::PaneDensity::default().island_gap())
+        );
         assert!(cx.debug_bounds("SETTINGS_TAB_General").is_some());
         harness.read_with(cx, |harness, cx| {
             assert!(harness.sidebar.read(cx).shows_settings());
@@ -10520,7 +10529,7 @@ mod tests {
         );
         assert_eq!(
             shell.left(),
-            px(320.0),
+            px(320.0) + px(crate::store::PaneDensity::default().island_gap()),
             "the page stays against the sidebar as the seam is dragged"
         );
     }

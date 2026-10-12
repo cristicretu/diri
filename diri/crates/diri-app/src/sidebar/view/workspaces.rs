@@ -1423,13 +1423,16 @@ impl Sidebar {
                     this.track_lift_pointer(event.event.position, cx);
                 },
             ))
-            .h(px(crate::tab_navigation::TAB_STRIP_HEIGHT))
+            .h(px(self.tab_strip_height()))
             .w_full()
             .flex_none()
             .flex()
             .items_center()
             .relative()
-            .py(px(6.0))
+            .pt(px(
+                6.0 + self.tab_strip_height() - crate::tab_navigation::TAB_STRIP_HEIGHT
+            ))
+            .pb(px(6.0))
             .gap(px(0.0))
             .pl(px(if cfg!(target_os = "macos") && !self.ui.visible {
                 92.0
@@ -1437,16 +1440,20 @@ impl Sidebar {
                 10.0
             }))
             .pr(px(10.0))
-            .child(
-                div()
-                    .absolute()
-                    .left(px(0.0))
-                    .right(px(0.0))
-                    .bottom(px(0.0))
-                    .h(px(1.0))
-                    .bg(colors.primary.alpha(0.07)),
-            )
-            .bg(colors.sidebar_surface())
+            // Comfortable: the island below is the edge, so no hairline.
+            .when(!self.islands(), |strip| {
+                strip.child(
+                    div()
+                        .absolute()
+                        .left(px(0.0))
+                        .right(px(0.0))
+                        .bottom(px(0.0))
+                        .h(px(1.0))
+                        .bg(colors.primary.alpha(0.07)),
+                )
+            })
+            // Islands already paint this chrome; a second tint would darken it.
+            .when(!self.islands(), |strip| strip.bg(colors.sidebar_surface()))
             .child(self.project_control(colors, cx))
             .child(self.workspace_rows(true, colors, cx))
             .child(

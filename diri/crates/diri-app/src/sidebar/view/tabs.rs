@@ -1,6 +1,6 @@
 use super::*;
 use crate::store::TabOrientation;
-use crate::tab_navigation::{TAB_STRIP_HEIGHT, selected_project_tabs};
+use crate::tab_navigation::selected_project_tabs;
 use diri_ui::title_fade;
 
 pub(super) const TAB_WIDTH: f32 = 164.0;
@@ -298,6 +298,27 @@ impl Sidebar {
             .expect("store")
             .preferences()
             .tab_orientation
+    }
+
+    /// The horizontal strip's height in the current density.
+    pub fn tab_strip_height(&self) -> f32 {
+        let store = self.store.read().expect("store");
+        crate::tab_navigation::tab_strip_height(store.preferences().pane_density)
+    }
+
+    /// Comfortable density: panes are islands on the chrome.
+    pub fn islands(&self) -> bool {
+        let store = self.store.read().expect("store");
+        store.preferences().pane_density.islands()
+    }
+
+    /// The strip's height when it is on screen, else zero.
+    pub fn horizontal_tabs_height(&self) -> f32 {
+        if self.horizontal_tabs_visible() {
+            self.tab_strip_height()
+        } else {
+            0.0
+        }
     }
 
     pub fn horizontal_tabs_visible(&self) -> bool {
@@ -941,12 +962,15 @@ impl Sidebar {
             .role(Role::TabList)
             .aria_label(t("sidebar.tabs.project_sessions"))
             .flex_none()
-            .h(px(TAB_STRIP_HEIGHT))
+            .h(px(self.tab_strip_height()))
             .w_full()
             .flex()
             .items_center()
             .relative()
-            .py(px(6.0))
+            .pt(px(
+                6.0 + self.tab_strip_height() - crate::tab_navigation::TAB_STRIP_HEIGHT
+            ))
+            .pb(px(6.0))
             .gap(px(0.0))
             .pl(px(if cfg!(target_os = "macos") && !self.ui.visible {
                 92.0
@@ -954,16 +978,20 @@ impl Sidebar {
                 10.0
             }))
             .pr(px(10.0))
-            .child(
-                div()
-                    .absolute()
-                    .left(px(0.0))
-                    .right(px(0.0))
-                    .bottom(px(0.0))
-                    .h(px(1.0))
-                    .bg(colors.primary.alpha(0.07)),
-            )
-            .bg(colors.sidebar_surface())
+            // Comfortable: the island below is the edge, so no hairline.
+            .when(!self.islands(), |strip| {
+                strip.child(
+                    div()
+                        .absolute()
+                        .left(px(0.0))
+                        .right(px(0.0))
+                        .bottom(px(0.0))
+                        .h(px(1.0))
+                        .bg(colors.primary.alpha(0.07)),
+                )
+            })
+            // Islands already paint this chrome; a second tint would darken it.
+            .when(!self.islands(), |strip| strip.bg(colors.sidebar_surface()))
             .text_color(colors.primary)
             .child(self.project_control(colors, cx))
             .child(rows)
