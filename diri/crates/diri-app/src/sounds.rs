@@ -359,7 +359,9 @@ mod tests {
             let seconds = frames as f64 / f64::from(SAMPLE_RATE);
             assert!(duration_range.contains(&seconds), "{event:?}: {seconds}s");
             let peak = wav[44..]
-                .chunks_exact(2)
+                .as_chunks::<2>()
+                .0
+                .iter()
                 .map(|bytes| i16::from_le_bytes([bytes[0], bytes[1]]).unsigned_abs())
                 .max()
                 .unwrap();

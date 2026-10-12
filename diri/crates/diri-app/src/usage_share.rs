@@ -502,8 +502,10 @@ mod macos {
             let input_row = &bitmap_bytes[output_y * bytes_per_row..][..pixel_w * 4];
             let output_row = &mut rgba[output_y * pixel_w * 4..][..pixel_w * 4];
             for (source, destination) in input_row
-                .chunks_exact(4)
-                .zip(output_row.chunks_exact_mut(4))
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .zip(output_row.as_chunks_mut::<4>().0.iter_mut())
             {
                 // NSBitmapFormat::empty() is RGBA, alpha last.
                 let (r, g, b, a) = (source[0], source[1], source[2], source[3]);

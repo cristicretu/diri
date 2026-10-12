@@ -26,7 +26,7 @@ impl Budget {
             }
         }
         self.active
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |active| {
+            .try_update(Ordering::AcqRel, Ordering::Acquire, |active| {
                 (active < MAX_ACTIVE).then_some(active + 1)
             })
             .ok()

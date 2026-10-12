@@ -24,7 +24,7 @@ pub struct FindReservation;
 impl FindReservation {
     pub fn acquire() -> Option<Arc<Self>> {
         VIEWS
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |count| {
+            .try_update(Ordering::AcqRel, Ordering::Acquire, |count| {
                 (count < RETAINED_FIND_VIEWS).then_some(count + 1)
             })
             .ok()?;
@@ -117,7 +117,7 @@ impl RetainedFindSnapshot {
             return Err("Search capture exceeds memory budget");
         }
         RETAINED
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
+            .try_update(Ordering::AcqRel, Ordering::Acquire, |current| {
                 (current.saturating_add(bytes) <= RETAINED_FIND_BYTES * RETAINED_FIND_VIEWS)
                     .then_some(current + bytes)
             })

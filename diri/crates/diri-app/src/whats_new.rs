@@ -232,7 +232,7 @@ fn decode(bytes: &'static [u8], still: bool, tx: &std::sync::mpsc::SyncSender<De
                 return;
             };
             // GPUI paints BGRA.
-            for pixel in frame.buffer_mut().chunks_exact_mut(4) {
+            for pixel in frame.buffer_mut().as_chunks_mut::<4>().0 {
                 pixel.swap(0, 2);
             }
             let delay = Duration::from(frame.delay()).max(Duration::from_millis(16));

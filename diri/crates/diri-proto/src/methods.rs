@@ -1401,7 +1401,7 @@ mod base64_bytes {
             return Err("base64 length must be a multiple of four");
         }
         let mut decoded = Vec::with_capacity(bytes.len() / 4 * 3);
-        for (index, chunk) in bytes.chunks_exact(4).enumerate() {
+        for (index, chunk) in bytes.as_chunks::<4>().0.iter().enumerate() {
             let last = index + 1 == bytes.len() / 4;
             let a = value(chunk[0]).ok_or("invalid base64 character")?;
             let b = value(chunk[1]).ok_or("invalid base64 character")?;
