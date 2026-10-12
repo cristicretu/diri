@@ -288,6 +288,7 @@ pub struct FloatingSurface {
     child: AnyElement,
     radius: f32,
     animate_entry: bool,
+    opaque: bool,
 }
 
 impl FloatingSurface {
@@ -297,7 +298,17 @@ impl FloatingSurface {
             child: child.into_any_element(),
             radius: Radius::PANEL,
             animate_entry: true,
+            opaque: false,
         }
+    }
+
+    /// Paints the fill fully opaque. For a surface drawn inside the window
+    /// over dense content (settings rows, text): nothing blurs behind it, and
+    /// the glass fill's last few percent of translucency let high-contrast
+    /// text read through.
+    pub const fn opaque(mut self, opaque: bool) -> Self {
+        self.opaque = opaque;
+        self
     }
 
     pub const fn radius(mut self, radius: f32) -> Self {
@@ -327,7 +338,11 @@ impl RenderOnce for FloatingSurface {
             // so live terminal content never competes with labels or controls.
             // Under glass the fill lifts a shade and the outline becomes the
             // pill hairline, so a menu reads as a sheet raised off the sidebar.
-            .bg(colors.floating_fill())
+            .bg(if self.opaque {
+                colors.floating_fill().alpha(1.0)
+            } else {
+                colors.floating_fill()
+            })
             .border_1()
             .border_color(colors.floating_stroke())
             .shadow(vec![

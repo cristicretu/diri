@@ -21,7 +21,7 @@
   "platform.this_mac_lowercase": "这台 Mac",
   "settings.keywords.accounts": "账户 配置 工作 个人 登录 认证 默认",
   "settings.keywords.agents": "智能体 可执行文件 已安装 命令行 快速创建 默认",
-  "settings.keywords.appearance": "外观 终端 颜色 主题 字体 字号 缩放",
+  "settings.keywords.appearance": "外观 终端 颜色 主题 字体 字号 缩放 shell 集成 zsh bash 提示符",
   "settings.keywords.general": "通用 默认 启动 登录 会话 关闭 确认 提示音 支持 诊断 隐私 遥测 快速打开 搜索 根目录 更新 导入 开发者 性能 语言 界面 中文 英文",
   "settings.keywords.phone": "手机 移动 配对 二维码 唤醒",
   "settings.keywords.remote": "远程 主机 机器 连接 执行 网络",

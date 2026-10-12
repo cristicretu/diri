@@ -3036,7 +3036,8 @@ impl WorkbenchInspector {
                 .into_any_element();
         };
 
-        let (project_name, host_name) = {
+        let kind = ui_agent_kind(session.effective_kind());
+        let (project_name, host_name, agent_name) = {
             let store = self
                 .runtime
                 .store
@@ -3051,9 +3052,18 @@ impl WorkbenchInspector {
                 .host
                 .as_deref()
                 .map(|host| store.host_display_name(host));
-            (project_name, host_name)
+            // The four brand kinds, terminals and notes keep their short
+            // label; any other Agent is called by its manifest or catalog name.
+            let agent_name = match kind {
+                AgentKind::Agent(_) | AgentKind::Generic => crate::notifications::display_name(
+                    session.effective_kind(),
+                    store.agent_descriptor(session.effective_kind()),
+                )
+                .to_owned(),
+                _ => kind.label().to_owned(),
+            };
+            (project_name, host_name, agent_name)
         };
-        let kind = ui_agent_kind(session.effective_kind());
         let (status_label, status_color) = session_status(session, colors);
         let artifact_total = artifact_count(session);
 
@@ -3100,7 +3110,7 @@ impl WorkbenchInspector {
                                     .child(status_label),
                             )
                             .child("·")
-                            .child(div().flex_none().child(kind.label()))
+                            .child(div().flex_none().child(agent_name))
                             .child("·")
                             .child(div().min_w(px(0.0)).truncate().child(project_name.clone())),
                     ),
@@ -6122,6 +6132,7 @@ fn status_evidence_explanation(source: diri_proto::StatusEvidenceSource) -> &'st
         diri_proto::StatusEvidenceSource::ProcessLiveness => "panel.evidence.source.process",
         diri_proto::StatusEvidenceSource::Staleness => "panel.evidence.source.staleness",
         diri_proto::StatusEvidenceSource::Transport => "panel.evidence.source.transport",
+        diri_proto::StatusEvidenceSource::ProgramStatus => "panel.evidence.source.program_status",
         diri_proto::StatusEvidenceSource::Unknown => "panel.evidence.source.unknown",
     })
 }
@@ -6254,7 +6265,7 @@ fn ui_agent_kind(kind: &ProtoAgentKind) -> AgentKind {
         ProtoAgentKind::CURSOR_ID => AgentKind::Cursor,
         ProtoAgentKind::GEMINI_ID => AgentKind::Gemini,
         ProtoAgentKind::SHELL_ID => AgentKind::Shell,
-        _ => AgentKind::Generic,
+        id => AgentKind::from_agent_id(id),
     }
 }
 

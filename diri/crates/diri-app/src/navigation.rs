@@ -34,8 +34,8 @@ use diri_proto::AgentKind;
 use diri_proto::{SessionId, SessionRecord};
 use diri_term::theme::TermTheme;
 use diri_ui::{
-    Fill, FloatingSurface, GlassMenuRow, HairlineDivider, Icon, IconName, Ink, LoadingIndicator,
-    Palette, Radius, SemanticColors, StatusGlyph,
+    Fill, FloatingSurface, GlassMenuRow, Icon, IconName, Ink, LoadingIndicator, Palette, Radius,
+    SemanticColors, StatusGlyph,
 };
 use gpui::{
     Animation, AnimationExt, AnyElement, App, Context, FocusHandle, Focusable, FontWeight,
@@ -45,13 +45,19 @@ use gpui::{
 };
 pub(crate) use notes_page::NoteOpened;
 
-/// The search field above the results, and the gap the surface keeps from the
-/// window edges. Everything else is measured against the live viewport so the
-/// list grows into a tall window and never overflows a short one.
-const SEARCH_HEIGHT: f32 = 48.0;
+/// The search header: an inset field pill plus the row inset above it.
+/// Everything else is measured against the live viewport so the list grows
+/// into a tall window and never overflows a short one.
+const SEARCH_HEIGHT: f32 = PALETTE_ROW_INSET + SEARCH_FIELD_HEIGHT;
+const SEARCH_FIELD_HEIGHT: f32 = 34.0;
+/// Header plus the list's vertical margins: the surface's fixed chrome.
+const CHROME_HEIGHT: f32 = SEARCH_HEIGHT + 2.0 * PALETTE_ROW_INSET;
+/// History and Notes rows carry agent logos and two-line snippets.
 const ROW_HEIGHT: f32 = 36.0;
+/// Single-line command, project, and theme rows.
+const COMPACT_ROW_HEIGHT: f32 = 30.0;
 const LIST_HEIGHT: f32 = ROW_HEIGHT * 9.0;
-const SURFACE_WIDTH: f32 = 540.0;
+const SURFACE_WIDTH: f32 = 460.0;
 const KEYCAP_WIDTH: f32 = 28.0;
 const KEYCAP_HEIGHT: f32 = 20.0;
 const CHAT_PREVIEW_LIMIT: usize = 5;
@@ -164,7 +170,8 @@ pub struct NavigationOverlay {
     back_stack: Vec<PageState>,
     page_generation: u64,
     page_direction: f32,
-    previous_page_rows: usize,
+    /// The list height of the page being left, for the page-change motion.
+    previous_list_height: f32,
     last_theme_id: String,
     theme_matches: Vec<TermTheme>,
     page_error: Option<String>,
@@ -297,7 +304,7 @@ impl NavigationOverlay {
             back_stack: Vec::new(),
             page_generation: 0,
             page_direction: 1.0,
-            previous_page_rows: 9,
+            previous_list_height: LIST_HEIGHT,
             last_theme_id: String::new(),
             theme_matches: Vec::new(),
             page_error: None,
@@ -358,7 +365,7 @@ impl NavigationOverlay {
             back_stack: Vec::new(),
             page_generation: 0,
             page_direction: 1.0,
-            previous_page_rows: 9,
+            previous_list_height: LIST_HEIGHT,
             last_theme_id: String::new(),
             theme_matches: Vec::new(),
             page_error: None,
@@ -499,7 +506,7 @@ impl NavigationOverlay {
                 .filter(|handle| handle != &self.focus_handle);
         }
         self.back_stack.clear();
-        self.previous_page_rows = self.page_rows();
+        self.previous_list_height = self.page_list_height();
         self.page_generation = if self.is_open() {
             self.page_generation + 1
         } else {
@@ -1292,7 +1299,7 @@ impl NavigationOverlay {
     }
 
     fn push_page(&mut self, page: Overlay, _window: &mut Window, cx: &mut Context<Self>) {
-        self.previous_page_rows = self.page_rows();
+        self.previous_list_height = self.page_list_height();
         if let Some(current) = self.overlay {
             self.back_stack.push(PageState {
                 page: current,
@@ -1307,7 +1314,7 @@ impl NavigationOverlay {
     }
 
     fn back(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        self.previous_page_rows = self.page_rows();
+        self.previous_list_height = self.page_list_height();
         if let Some(previous) = self.back_stack.pop() {
             self.prepare_page(previous.page, cx);
             self.query = previous.query;
@@ -1347,7 +1354,7 @@ impl NavigationOverlay {
 
     fn filter_themes(&mut self) {
         let query = self.query.text().trim().to_lowercase();
-        self.theme_matches = TermTheme::CATALOG
+        self.theme_matches = diri_term::themes::all()
             .into_iter()
             .filter(|theme| theme.name.to_lowercase().contains(&query))
             .collect();
@@ -1419,6 +1426,17 @@ impl NavigationOverlay {
         }
     }
 
+    fn row_height(&self) -> f32 {
+        match self.overlay {
+            Some(Overlay::History | Overlay::Notes) => ROW_HEIGHT,
+            _ => COMPACT_ROW_HEIGHT,
+        }
+    }
+
+    fn page_list_height(&self) -> f32 {
+        self.page_rows() as f32 * self.row_height()
+    }
+
     fn colors(&self) -> SemanticColors {
         crate::app_theme::sidebar_colors_in(
             &self.store.read().expect("session store lock poisoned"),
@@ -1430,12 +1448,8 @@ impl NavigationOverlay {
     fn palette_content(&mut self, layout: OverlayLayout, cx: &mut Context<Self>) -> AnyElement {
         let colors = self.colors();
         let panels = self.uses_floating_panel(cx);
-        let list_height = layout
-            .list_height
-            .min(px(self.page_rows() as f32 * ROW_HEIGHT));
-        let previous_list_height = layout
-            .list_height
-            .min(px(self.previous_page_rows as f32 * ROW_HEIGHT));
+        let list_height = layout.list_height.min(px(self.page_list_height()));
+        let previous_list_height = layout.list_height.min(px(self.previous_list_height));
         let count = self.visible_count();
         let entity = cx.entity();
         let page = self.overlay.expect("open palette");
@@ -1456,13 +1470,22 @@ impl NavigationOverlay {
             .id("palette-page")
             .flex()
             .flex_col()
+            // The field is its own inset pill, on the rows' inset and corner,
+            // so the header needs no rule beneath it.
             .child(
                 div()
-                    .h(px(SEARCH_HEIGHT))
-                    .px(px(16.0))
+                    .mt(px(PALETTE_ROW_INSET))
+                    .mx(px(PALETTE_ROW_INSET))
+                    .h(px(SEARCH_FIELD_HEIGHT))
+                    // Ten keeps the trailing keycap on the rows' keycap column
+                    // (a row's inset hairline plus its nine-point padding).
+                    .pl(px(4.0))
+                    .pr(px(10.0))
+                    .rounded(px(Radius::inner(PALETTE_RADIUS, PALETTE_ROW_INSET)))
+                    .bg(Fill::subtle(colors))
                     .flex()
                     .items_center()
-                    .gap(px(6.0))
+                    .gap(px(4.0))
                     .child(
                         div()
                             .id("palette-back")
@@ -1504,7 +1527,7 @@ impl NavigationOverlay {
                             .flex_1()
                             .min_w_0()
                             .overflow_hidden()
-                            .text_size(px(13.0))
+                            .text_size(px(14.0))
                             .text_color(if self.query.is_empty() {
                                 colors.secondary
                             } else {
@@ -1546,21 +1569,50 @@ impl NavigationOverlay {
                                 }),
                         )
                     })
-                    .child(
-                        keycap(colors)
-                            .id("close-palette")
-                            .debug_selector(|| "palette-escape".into())
-                            .cursor_pointer()
-                            .hover(move |style| style.bg(Fill::hover(colors, true)))
-                            .on_click(cx.listener(|this, _, window, cx| {
-                                this.in_main(window, cx, |this, window, cx| {
-                                    this.close_overlay(window, cx)
+                    .when(!self.query.is_empty(), |header| {
+                        header.child(
+                            div()
+                                .id("clear-palette-query")
+                                .debug_selector(|| "palette-clear".into())
+                                .flex_none()
+                                .size(px(16.0))
+                                .rounded_full()
+                                .flex()
+                                .items_center()
+                                .justify_center()
+                                .bg(colors.tertiary)
+                                .cursor_pointer()
+                                .hover(move |style| style.bg(colors.secondary))
+                                .warm_tooltip(move |_, cx| {
+                                    cx.new(|_| PaletteTooltip(t("nav.clear_query").into(), colors))
+                                        .into()
                                 })
-                            }))
-                            .child("esc"),
-                    ),
+                                .on_click(cx.listener(|this, _, window, cx| {
+                                    this.in_main(window, cx, |this, _, cx| {
+                                        this.query.clear();
+                                        this.query_changed(cx);
+                                        cx.notify();
+                                    })
+                                }))
+                                .child(sf_symbol("xmark", 8.0, colors.floating_fill())),
+                        )
+                    })
+                    .when(self.query.is_empty(), |header| {
+                        header.child(
+                            keycap(colors)
+                                .id("close-palette")
+                                .debug_selector(|| "palette-escape".into())
+                                .cursor_pointer()
+                                .hover(move |style| style.bg(Fill::hover(colors, true)))
+                                .on_click(cx.listener(|this, _, window, cx| {
+                                    this.in_main(window, cx, |this, window, cx| {
+                                        this.close_overlay(window, cx)
+                                    })
+                                }))
+                                .child("esc"),
+                        )
+                    }),
             )
-            .child(HairlineDivider::horizontal(colors))
             .when_some(error, |view, error| {
                 view.child(
                     div()
@@ -1636,7 +1688,7 @@ impl NavigationOverlay {
                     Animation::new(PAGE_DURATION).with_easing(ease_out_quint()),
                     move |view, value| {
                         view.opacity(value)
-                            .h(px(SEARCH_HEIGHT + 13.0)
+                            .h(px(CHROME_HEIGHT)
                                 + previous_list_height
                                 + (list_height - previous_list_height) * value)
                             .overflow_hidden()
@@ -1811,9 +1863,9 @@ impl NavigationOverlay {
             _ => div().into_any_element(),
         };
         div()
-            .h(px(ROW_HEIGHT))
-            .px(px(6.0))
-            .py(px(2.0))
+            .h(px(self.row_height()))
+            .px(px(PALETTE_ROW_INSET))
+            .py(px(1.0))
             // Separate the two result groups without introducing a selectable
             // header or changing uniform-list indices and shortcut numbering.
             .when(
@@ -1832,6 +1884,7 @@ impl NavigationOverlay {
         colors: SemanticColors,
         cx: &mut Context<Self>,
     ) -> AnyElement {
+        let ink = row_ink(colors, index == self.highlight);
         let theme = (self.overlay == Some(Overlay::Themes)).then(|| self.theme_matches[index]);
         let title = theme.map_or_else(
             || {
@@ -1852,7 +1905,7 @@ impl NavigationOverlay {
                         "gearshape"
                     },
                     13.0,
-                    colors.secondary,
+                    ink.secondary,
                 )
             },
             |theme| {
@@ -1889,10 +1942,10 @@ impl NavigationOverlay {
                         .preferences()
                         .terminal_theme
             }),
-            |row| row.child(sf_symbol("checkmark", 12.0, colors.secondary)),
+            |row| row.child(sf_symbol("checkmark", 12.0, ink.secondary)),
         )
         .when(theme.is_none(), |row| {
-            row.child(sf_symbol("chevron.right", 11.0, colors.tertiary))
+            row.child(sf_symbol("chevron.right", 11.0, ink.secondary))
         })
         .on_hover(cx.listener(move |this, hovered: &bool, _, cx| {
             if *hovered && this.highlight != index {
@@ -1917,6 +1970,7 @@ impl NavigationOverlay {
         colors: SemanticColors,
         cx: &mut Context<Self>,
     ) -> AnyElement {
+        let ink = row_ink(colors, index == self.highlight);
         let action = ranked.item;
         let command = action.command.clone();
         let enabled = action.enabled;
@@ -1948,8 +2002,8 @@ impl NavigationOverlay {
                 .collect()
         };
         palette_row(
-            highlighted_label(action.title, &ranked.title_matches),
-            sf_symbol(action.system_image, 12.5, colors.secondary),
+            palette_match_label(action.title, &ranked.title_matches),
+            sf_symbol(action.system_image, 12.5, ink.secondary),
             trailing,
             index == self.highlight,
             index,
@@ -1957,7 +2011,7 @@ impl NavigationOverlay {
             colors,
         )
         .when(opens_page, |row| {
-            row.child(sf_symbol("chevron.right", 11.0, colors.tertiary))
+            row.child(sf_symbol("chevron.right", 11.0, ink.secondary))
         })
         .on_hover(cx.listener(move |this, hovered: &bool, _, cx| {
             if *hovered && this.highlight != index {
@@ -1983,6 +2037,7 @@ impl NavigationOverlay {
         colors: SemanticColors,
         cx: &mut Context<Self>,
     ) -> AnyElement {
+        let ink = row_ink(colors, index == self.highlight);
         let session = ranked.item;
         let id = session.id.clone();
         let migrating = self
@@ -1992,16 +2047,15 @@ impl NavigationOverlay {
             .migrating()
             .contains(&id);
         let state = status_state(&session, migrating);
-        let identity =
-            StatusGlyph::new(ui_agent_kind(session.effective_kind()), state, 16.0, colors)
-                .rendered_mark();
+        let identity = StatusGlyph::new(ui_agent_kind(session.effective_kind()), state, 16.0, ink)
+            .rendered_mark();
         let trailing = session_shortcut(index)
             .map(SharedString::from)
             .into_iter()
             .collect();
         palette_row(
-            highlighted_label(session.title, &ranked.title_matches),
-            activity_mark(state, colors),
+            palette_match_label(session.title, &ranked.title_matches),
+            activity_mark(state, ink),
             trailing,
             index == self.highlight,
             index,
@@ -2031,6 +2085,7 @@ impl NavigationOverlay {
         colors: SemanticColors,
         cx: &mut Context<Self>,
     ) -> AnyElement {
+        let ink = row_ink(colors, index == self.highlight);
         let name = path
             .file_name()
             .map(|name| name.to_string_lossy().into_owned())
@@ -2050,7 +2105,7 @@ impl NavigationOverlay {
                     .min_w_0()
                     .truncate()
                     .text_size(px(11.0))
-                    .text_color(colors.tertiary)
+                    .text_color(ink.secondary)
                     .child(relative_parent(&path)),
             );
         let detail = tf(
@@ -2065,7 +2120,7 @@ impl NavigationOverlay {
         );
         palette_row(
             title.into_any_element(),
-            sf_symbol("plus", 13.0, colors.secondary),
+            sf_symbol("plus", 13.0, ink.secondary),
             Vec::new(),
             index == self.highlight,
             index,
@@ -2074,7 +2129,7 @@ impl NavigationOverlay {
         )
         .warm_tooltip(move |_, cx| cx.new(|_| PaletteTooltip(detail.clone(), colors)).into())
         .when(index == self.highlight, |row| {
-            row.child(keycap(colors).child(Icon::new(IconName::Return, 14.0, colors.secondary)))
+            row.child(keycap(ink).child(Icon::new(IconName::Return, 14.0, ink.secondary)))
         })
         .on_hover(cx.listener(move |this, hovered: &bool, _, cx| {
             if *hovered && this.highlight != index {
@@ -2102,6 +2157,7 @@ impl NavigationOverlay {
         colors: SemanticColors,
         cx: &mut Context<Self>,
     ) -> AnyElement {
+        let ink = row_ink(colors, index == self.highlight);
         let parent = relative_parent(&item.path);
         let title = div()
             .flex()
@@ -2111,7 +2167,7 @@ impl NavigationOverlay {
             .child(
                 div()
                     .flex_none()
-                    .child(highlighted_label(item.name, matches)),
+                    .child(palette_match_label(item.name, matches)),
             )
             .when(index == self.highlight, |title| {
                 title.child(
@@ -2119,7 +2175,7 @@ impl NavigationOverlay {
                         .min_w_0()
                         .truncate()
                         .text_size(px(11.0))
-                        .text_color(colors.tertiary)
+                        .text_color(ink.secondary)
                         .child(parent),
                 )
             });
@@ -2142,7 +2198,7 @@ impl NavigationOverlay {
                     "folder"
                 },
                 13.0,
-                colors.secondary,
+                ink.secondary,
             ),
             Vec::new(),
             index == self.highlight,
@@ -2152,7 +2208,7 @@ impl NavigationOverlay {
         )
         .warm_tooltip(move |_, cx| cx.new(|_| PaletteTooltip(detail.clone(), colors)).into())
         .when(index == self.highlight, |row| {
-            row.child(keycap(colors).child(Icon::new(IconName::Return, 14.0, colors.secondary)))
+            row.child(keycap(ink).child(Icon::new(IconName::Return, 14.0, ink.secondary)))
         })
         .on_hover(cx.listener(move |this, hovered: &bool, _, cx| {
             if *hovered && this.highlight != index {
@@ -2278,6 +2334,19 @@ pub(crate) fn highlighted_label(
     )
 }
 
+/// The palette's match style: matched characters set in bold in the row's
+/// own ink, so they stay legible on the solid selection.
+fn palette_match_label(text: impl Into<SharedString>, matches: &[Range<usize>]) -> AnyElement {
+    highlighted_label_styled(
+        text,
+        matches,
+        HighlightStyle {
+            font_weight: Some(FontWeight::BOLD),
+            ..HighlightStyle::default()
+        },
+    )
+}
+
 fn highlighted_label_styled(
     text: impl Into<SharedString>,
     matches: &[Range<usize>],
@@ -2292,6 +2361,28 @@ fn highlighted_label_styled(
         .into_any_element()
 }
 
+/// The highlighted palette row's fill: diri's clay deepened toward the ember
+/// of the app icon, so it reads as a solid selection in light and dark alike
+/// and a clay Claude mark on it stays visible.
+fn palette_selection() -> gpui::Rgba {
+    rgba(0x9c452eff)
+}
+
+/// Ink for everything painted on a palette row: the dark-appearance ink on
+/// the solid selection, the surface's own otherwise.
+fn row_ink(colors: SemanticColors, highlighted: bool) -> SemanticColors {
+    if highlighted {
+        // Icons and shortcuts lift toward the title: the fill already says
+        // which row is current, so its secondary ink need not recede as far.
+        let mut ink = SemanticColors::dark();
+        ink.secondary = ink.primary.alpha(0.82);
+        ink.tertiary = ink.primary.alpha(0.6);
+        ink
+    } else {
+        colors
+    }
+}
+
 fn palette_row(
     title: AnyElement,
     leading: AnyElement,
@@ -2302,6 +2393,7 @@ fn palette_row(
     enabled: bool,
     colors: SemanticColors,
 ) -> gpui::Stateful<gpui::Div> {
+    let ink = row_ink(colors, highlighted);
     div()
         .id(format!("palette-row-{index}"))
         .debug_selector(move || format!("palette-row-{index}"))
@@ -2311,26 +2403,34 @@ fn palette_row(
         // scrolling, and 40pt rows render as ~21pt of crammed text.
         .flex_none()
         .items_center()
-        .gap(px(6.0))
+        .gap(px(8.0))
         .h_full()
-        // Nine plus the pill hairline keeps a ten-point inset, so trailing
-        // keycaps stay on the header's escape column.
-        .px(px(9.0))
+        // Ten keeps trailing hints and keycaps on the search field's
+        // escape column.
+        .px(px(10.0))
         .rounded(px(Radius::inner(PALETTE_RADIUS, PALETTE_ROW_INSET)))
-        .glass_menu_row(colors, highlighted)
+        .map(|row| {
+            if highlighted {
+                row.bg(palette_selection())
+            } else {
+                row.hover(move |style| style.bg(Fill::hover(colors, true)))
+            }
+        })
         .opacity(if enabled { 1.0 } else { 0.48 })
         .when(enabled, |row| row.cursor_pointer())
         .text_size(px(13.0))
+        .text_color(ink.primary)
         .child(
             div()
                 .flex_1()
                 .flex()
                 .items_center()
-                .gap(px(6.0))
+                .gap(px(8.0))
                 .min_w_0()
                 .child(
                     div()
-                        .w(px(28.0))
+                        .w(px(16.0))
+                        .flex_none()
                         .flex()
                         .items_center()
                         .justify_center()
@@ -2350,25 +2450,24 @@ fn palette_row(
                     .flex_none()
                     .flex()
                     .items_center()
-                    .gap(px(4.0))
+                    .gap(px(8.0))
                     .children(
                         trailing
                             .into_iter()
-                            .map(|trailing| shortcut_hint(trailing, colors)),
+                            .map(|trailing| shortcut_hint(trailing, ink)),
                     ),
             )
         })
 }
 
+/// A shortcut or detail as plain glyph text, right-aligned, no keycap.
 fn shortcut_hint(text: impl Into<gpui::SharedString>, colors: SemanticColors) -> AnyElement {
     div()
-        .max_w(px(160.0))
+        .max_w(px(180.0))
         .overflow_hidden()
         .text_ellipsis()
-        .px(px(5.0))
-        .py(px(2.0))
-        .text_size(px(11.0))
-        .text_color(colors.tertiary)
+        .text_size(px(12.0))
+        .text_color(colors.secondary)
         .child(text.into())
         .into_any_element()
 }
@@ -2519,7 +2618,7 @@ mod tests {
         for (width, height) in [(1100.0, 700.0), (600.0, 360.0), (320.0, 180.0)] {
             let layout = OverlayLayout::command_palette(size(px(width), px(height)));
             assert!(layout.width <= px(width));
-            assert!(layout.top_inset + px(SEARCH_HEIGHT + 13.0) + layout.list_height <= px(height));
+            assert!(layout.top_inset + px(CHROME_HEIGHT) + layout.list_height <= px(height));
             assert!(layout.list_height <= px(LIST_HEIGHT));
         }
     }
@@ -2815,6 +2914,12 @@ mod tests {
                             );
                             overlay.highlight = overlay.visible_count().saturating_sub(1);
                         }
+                    }
+                    if let Some(row) = std::env::var("DIRI_VISUAL_HIGHLIGHT")
+                        .ok()
+                        .and_then(|row| row.parse().ok())
+                    {
+                        overlay.highlight = row;
                     }
                     overlay
                 });

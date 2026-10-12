@@ -391,6 +391,29 @@ fn spawn_params_host_field_is_wire_compatible() {
 }
 
 #[test]
+fn spawn_params_argv_is_additive_and_structured() {
+    let legacy: diri_proto::SessionSpawnParams =
+        serde_json::from_value(json!({"kind": {"shell": {}}, "cwd": "/tmp"})).unwrap();
+    assert_eq!(legacy.argv, None);
+    assert!(serde_json::to_value(&legacy).unwrap().get("argv").is_none());
+
+    let ssh = diri_proto::SessionSpawnParams {
+        argv: Some(vec![
+            "/usr/bin/ssh".into(),
+            "--".into(),
+            "host; rm -rf ~".into(),
+        ]),
+        ..legacy
+    };
+    let encoded = serde_json::to_value(&ssh).unwrap();
+    assert_eq!(
+        encoded["argv"],
+        json!(["/usr/bin/ssh", "--", "host; rm -rf ~"])
+    );
+    typed_round_trip(&ssh);
+}
+
+#[test]
 fn migration_and_host_methods_use_the_swift_wire_names() {
     // session.migrate: sessionID spelling, targetHost skip-if-none.
     let to_local = diri_proto::SessionMigrateParams {

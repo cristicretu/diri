@@ -270,6 +270,8 @@ fn message_kinds(messages: &[RemoteMessage]) -> String {
             RemoteMessage::InputModes(_) => "InputModes",
             RemoteMessage::TerminalReset(_) => "TerminalReset",
             RemoteMessage::TerminalResetState(_) => "TerminalResetState",
+            RemoteMessage::ImageRequest(_) => "ImageRequest",
+            RemoteMessage::ImageResponse(_) => "ImageResponse",
         })
         .collect::<Vec<_>>()
         .join(",")

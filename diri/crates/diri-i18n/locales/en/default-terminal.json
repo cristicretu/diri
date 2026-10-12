@@ -1,0 +1,19 @@
+{
+  "default_terminal.failed": "macOS did not change the default terminal (error {code}).",
+  "default_terminal.is_default": "ssh://, telnet:// and man page links and .command files open in a new diri tab.",
+  "default_terminal.make_default": "Make default",
+  "default_terminal.not_default": "Another app opens ssh://, telnet:// and man page links and .command files.",
+  "default_terminal.title": "Default terminal",
+  "default_terminal.unavailable": "Available when diri runs from the installed app.",
+  "open_handler.error.host": "The link's host name is not valid.",
+  "open_handler.error.not_executable": "{name} is not executable. Make it executable with chmod +x, then open it again.",
+  "open_handler.error.not_found": "{name} does not exist.",
+  "open_handler.error.page": "The link does not name a valid manual page.",
+  "open_handler.error.port": "The link's port is not valid.",
+  "open_handler.error.quarantined": "{name} was downloaded from the internet, so diri will not run it. Check it, then run it from a terminal.",
+  "open_handler.error.telnet": "telnet is not installed. Install it with Homebrew: brew install telnet.",
+  "open_handler.error.too_long": "The link is too long.",
+  "open_handler.error.unsupported": "diri opens ssh://, telnet:// and man page links, and .command, .tool and .sh files.",
+  "open_handler.error.user": "The link's user name is not valid.",
+  "open_handler.failed_title": "Could not open that in diri"
+}

@@ -690,6 +690,111 @@ fn a_shell_lends_its_status_to_an_agent_in_its_foreground() {
     assert_eq!(outcome.status_change, Some(SessionStatus::Working));
 }
 
+/// Streams output every 100 ms from `from` for `span`, then ticks; returns
+/// the time of the last frame and whether any reduction finished a turn.
+fn stream(reducer: &mut StatusReducer, from: SystemTime, span: Duration) -> (SystemTime, bool) {
+    let mut at = from;
+    let mut completed = false;
+    while at < from + span {
+        completed |= reducer
+            .reduce(StatusSignal::PtyOutputActivity, at)
+            .turn_completed;
+        completed |= reducer.reduce(StatusSignal::Tick, at).turn_completed;
+        at += Duration::from_millis(100);
+    }
+    (at, completed)
+}
+
+/// An Agent the catalog knows only by name (`goose`) has no screen rules:
+/// while it holds the shell's foreground, sustained output is Working and a
+/// still terminal is Idle. A turn the user asked for ends with an
+/// announcement; being recognised, or redrawing on its own, does not.
+#[test]
+fn an_agent_known_by_name_is_read_from_its_output() {
+    let mut reducer =
+        StatusReducer::new(Authority::ProcessOnly, t0()).with_manifest("shell", Some("1"));
+    let now = t0() + Duration::from_secs(1);
+    reducer.reduce(StatusSignal::ForegroundJob { running: true }, now);
+    let outcome = reducer.lend_to_activity("goose", now);
+    assert_eq!(outcome.status_change, Some(SessionStatus::Idle));
+    assert_eq!(reducer.foreground_agent(), Some("goose"));
+    assert_eq!(
+        reducer.lend_to_activity("goose", now),
+        ReducerOutcome::default()
+    );
+
+    // Its banner and composer paint in one short burst: not work.
+    let (at, _) = stream(&mut reducer, now, Duration::from_millis(300));
+    assert_eq!(reducer.status(), &SessionStatus::Idle);
+
+    // Typing echoes; that is not work either, however long it goes on.
+    let mut at = at + Duration::from_secs(5);
+    for _ in 0..20 {
+        reducer.reduce(StatusSignal::UserKeystroke, at);
+        reducer.reduce(
+            StatusSignal::PtyOutputActivity,
+            at + Duration::from_millis(20),
+        );
+        at += Duration::from_millis(100);
+    }
+    assert_eq!(reducer.status(), &SessionStatus::Idle);
+
+    // Enter, then a reply streams: Working, then Idle with an announcement.
+    reducer.reduce(StatusSignal::UserSubmission, at);
+    let (at, completed) = stream(
+        &mut reducer,
+        at + Duration::from_millis(300),
+        Duration::from_secs(4),
+    );
+    assert_eq!(reducer.status(), &SessionStatus::Working);
+    assert!(!completed);
+    // A silent wait between chunks keeps it Working.
+    let outcome = reducer.reduce(StatusSignal::Tick, at + Duration::from_secs(2));
+    assert_eq!(outcome.status_change, None);
+    let outcome = reducer.reduce(StatusSignal::Tick, at + Duration::from_secs(3));
+    assert_eq!(outcome.status_change, Some(SessionStatus::Idle));
+    assert!(outcome.turn_completed, "the turn the user asked for ends");
+    let evidence = reducer.evidence().expect("evidence");
+    assert_eq!(evidence.manifest_id.as_deref(), Some("goose"));
+    assert_eq!(evidence.status, SessionStatus::Idle);
+
+    // Output nobody asked for (a background refresh) is work, not a turn.
+    let at = at + Duration::from_secs(10);
+    let (at, _) = stream(&mut reducer, at, Duration::from_secs(1));
+    assert_eq!(reducer.status(), &SessionStatus::Working);
+    let outcome = reducer.reduce(StatusSignal::Tick, at + Duration::from_secs(4));
+    assert_eq!(outcome.status_change, Some(SessionStatus::Idle));
+    assert!(!outcome.turn_completed);
+
+    // Leaving hands the shell back its job tracking.
+    reducer.return_from_agent(false, at + Duration::from_secs(5));
+    assert_eq!(reducer.foreground_agent(), None);
+    assert_eq!(reducer.authority(), Authority::ProcessOnly);
+    let outcome = reducer.reduce(
+        StatusSignal::ForegroundJob { running: true },
+        at + Duration::from_secs(6),
+    );
+    assert_eq!(outcome.status_change, Some(SessionStatus::Working));
+}
+
+/// An Agent with screen rules recognised after one read by its output (a
+/// new job in the same shell) is read by its rules, not by its output.
+#[test]
+fn a_screen_agent_replaces_an_activity_reading() {
+    let mut reducer =
+        StatusReducer::new(Authority::ProcessOnly, t0()).with_manifest("shell", Some("1"));
+    let now = t0() + Duration::from_secs(1);
+    reducer.lend_to_activity("goose", now);
+    reducer.lend_to_agent("kimi", Some("1"), now);
+    assert_eq!(reducer.foreground_agent(), Some("kimi"));
+    let (_, _) = stream(&mut reducer, now, Duration::from_secs(2));
+    assert_eq!(
+        reducer.status(),
+        &SessionStatus::Idle,
+        "bytes alone are not a screen Agent's work"
+    );
+}
+
 fn shell_running_a_job(now: SystemTime) -> StatusReducer {
     let mut reducer =
         StatusReducer::new(Authority::ProcessOnly, t0()).with_manifest("shell", Some("1"));
@@ -1315,4 +1420,280 @@ fn cursor_transcript_cannot_finish_a_live_spinner() {
     let outcome = reducer.reduce(StatusSignal::Tick, now + Duration::from_secs(1));
     assert_eq!(reducer.status(), &SessionStatus::Working);
     assert!(!outcome.turn_completed);
+}
+
+fn program(state: ProgramState) -> StatusSignal {
+    StatusSignal::ProgramStatus(Some(ProgramRecord {
+        state,
+        kind: None,
+        progress: None,
+        app: None,
+        title: None,
+        msg: None,
+    }))
+}
+
+/// `OSC 7501` is the program saying what it is doing. While it reports work,
+/// a screen that happens to read idle (a spinner between frames, a finished
+/// sub-step) does not end the turn; its own `done` does, exactly once.
+#[test]
+fn a_program_reporting_work_outranks_the_screen_until_it_reports_done() {
+    let mut reducer =
+        StatusReducer::new(Authority::ScreenPrimary, t0()).with_manifest("codex", Some("1"));
+    let now = settled(&mut reducer, t0());
+
+    let outcome = reducer.reduce(program(ProgramState::Working), now);
+    assert_eq!(outcome.status_change, Some(SessionStatus::Working));
+    assert_eq!(
+        outcome.status_evidence.map(|evidence| evidence.source),
+        Some(StatusEvidenceSource::ProgramStatus)
+    );
+
+    for seq in 1..=5 {
+        let at = now + Duration::from_secs(seq);
+        reducer.reduce(
+            StatusSignal::Screen(observation(ManifestState::Idle, seq)),
+            at,
+        );
+        reducer.reduce(StatusSignal::Tick, at);
+    }
+    // Quiet for longer than staleness allows, and still working.
+    reducer.reduce(StatusSignal::Tick, now + Duration::from_secs(600));
+    assert_eq!(*reducer.status(), SessionStatus::Working);
+
+    let outcome = reducer.reduce(program(ProgramState::Done), now + Duration::from_secs(601));
+    assert_eq!(outcome.status_change, Some(SessionStatus::Idle));
+    assert!(outcome.turn_completed);
+    let again = reducer.reduce(program(ProgramState::Idle), now + Duration::from_secs(602));
+    assert!(!again.turn_completed);
+    // A stale prompt still on screen does not outvote the program's result.
+    reducer.reduce(
+        StatusSignal::Screen(observation(ManifestState::BlockedQuestion, 98)),
+        now + Duration::from_secs(602),
+    );
+    assert_eq!(*reducer.status(), SessionStatus::Idle);
+
+    // Once the program stops reporting, the screen is read again.
+    reducer.reduce(
+        StatusSignal::ProgramStatus(None),
+        now + Duration::from_secs(603),
+    );
+    let outcome = reducer.reduce(
+        StatusSignal::Screen(observation(ManifestState::BlockedQuestion, 99)),
+        now + Duration::from_secs(603),
+    );
+    assert_eq!(
+        outcome.status_change,
+        Some(SessionStatus::NeedsInput(NeedsInputKind::Question))
+    );
+}
+
+#[test]
+fn a_blocked_program_needs_input_with_its_own_message() {
+    let mut reducer =
+        StatusReducer::new(Authority::ProcessOnly, t0()).with_manifest("aider", Some("1"));
+    reducer.reduce(StatusSignal::PtyOutputActivity, t0());
+    let report = StatusSignal::ProgramStatus(Some(ProgramRecord {
+        state: ProgramState::Blocked,
+        kind: Some(BlockedKind::Permission),
+        progress: None,
+        app: Some("terraform".into()),
+        title: None,
+        msg: Some("Apply 3 to add, 1 to change, 0 to destroy?".into()),
+    }));
+    let outcome = reducer.reduce(report.clone(), t0());
+    assert_eq!(
+        outcome.status_change,
+        Some(SessionStatus::NeedsInput(NeedsInputKind::Permission))
+    );
+    let detail = outcome.needs_input.expect("a needs-input detail");
+    assert_eq!(detail.source, NeedsInputSource::ProgramStatus);
+    assert_eq!(detail.summary, "Apply 3 to add, 1 to change, 0 to destroy?");
+    assert_eq!(detail.tool_name.as_deref(), Some("terraform"));
+
+    // The same report again is not a second question.
+    assert_eq!(reducer.reduce(report, t0()).needs_input, None);
+
+    // A process-only agent that stops reporting is running, not idle.
+    let outcome = reducer.reduce(StatusSignal::ProgramStatus(None), t0());
+    assert_eq!(outcome.status_change, Some(SessionStatus::Working));
+    assert!(!outcome.turn_completed);
+}
+
+#[test]
+fn a_shell_follows_a_reporting_job_and_returns_to_idle_when_it_stops() {
+    let mut reducer =
+        StatusReducer::new(Authority::ProcessOnly, t0()).with_manifest("shell", Some("1"));
+    let now = t0() + Duration::from_secs(1);
+    reducer.reduce(StatusSignal::PtyOutputActivity, now);
+    reducer.reduce(StatusSignal::ForegroundJob { running: true }, now);
+
+    let outcome = reducer.reduce(
+        StatusSignal::ProgramStatus(Some(ProgramRecord {
+            state: ProgramState::Blocked,
+            kind: Some(BlockedKind::Auth),
+            progress: None,
+            app: None,
+            title: None,
+            msg: None,
+        })),
+        now,
+    );
+    assert_eq!(outcome.needs_input.unwrap().summary, "Waiting for sign-in");
+    // The job is still in the foreground and not reading a line, which on
+    // its own would read as Working.
+    reducer.reduce(StatusSignal::TerminalLine(None), now);
+    reducer.reduce(StatusSignal::ForegroundJob { running: true }, now);
+    assert_eq!(
+        *reducer.status(),
+        SessionStatus::NeedsInput(NeedsInputKind::Question)
+    );
+
+    // The job ended without a result: the Engine drops its records.
+    let outcome = reducer.reduce(StatusSignal::ProgramStatus(None), now);
+    assert_eq!(outcome.status_change, Some(SessionStatus::Idle));
+    assert!(!outcome.turn_completed);
+
+    // Inference is back.
+    let outcome = reducer.reduce(StatusSignal::ForegroundJob { running: true }, now);
+    assert_eq!(outcome.status_change, Some(SessionStatus::Working));
+}
+
+#[test]
+fn a_program_error_is_a_result_that_ends_the_turn() {
+    let mut reducer =
+        StatusReducer::new(Authority::ProcessOnly, t0()).with_manifest("aider", Some("1"));
+    reducer.reduce(StatusSignal::PtyOutputActivity, t0());
+    reducer.reduce(program(ProgramState::Working), t0());
+    let outcome = reducer.reduce(program(ProgramState::Error), t0() + Duration::from_secs(1));
+    assert_eq!(outcome.status_change, Some(SessionStatus::Idle));
+    assert!(outcome.turn_completed);
+    // Still running and no longer reporting: process-only reads as working.
+    let outcome = reducer.reduce(
+        StatusSignal::ProgramStatus(None),
+        t0() + Duration::from_secs(2),
+    );
+    assert_eq!(outcome.status_change, Some(SessionStatus::Working));
+    assert!(!outcome.turn_completed);
+}
+
+/// Claude Code and Codex are adding `OSC 7501` while keeping their hooks and
+/// notify events. Two sources racing would flip a tab between working and
+/// idle; the program's report is the one it keeps current, so it decides.
+#[test]
+fn hooks_do_not_race_a_program_that_reports_its_status() {
+    let mut reducer =
+        StatusReducer::new(Authority::HooksPrimary, t0()).with_manifest("claude-code", Some("4"));
+    let now = settled(&mut reducer, t0());
+    reducer.reduce(program(ProgramState::Working), now);
+
+    // A Stop for the foreground response while background work still runs.
+    let outcome = reducer.reduce(hook(ClaudeHook::Stop), now + Duration::from_millis(10));
+    assert_eq!(outcome.status_change, None);
+    assert!(!outcome.turn_completed);
+    reducer.reduce(StatusSignal::Tick, now + Duration::from_secs(5));
+    assert_eq!(*reducer.status(), SessionStatus::Working);
+
+    let outcome = reducer.reduce(program(ProgramState::Done), now + Duration::from_secs(6));
+    assert_eq!(outcome.status_change, Some(SessionStatus::Idle));
+    assert!(outcome.turn_completed);
+
+    // A late tool hook from the finished turn does not reopen it.
+    let outcome = reducer.reduce(hook(ClaudeHook::PostToolUse), now + Duration::from_secs(7));
+    assert_eq!(outcome.status_change, None);
+    let outcome = reducer.reduce(
+        StatusSignal::CodexTurnComplete,
+        now + Duration::from_secs(7),
+    );
+    assert_eq!(outcome.status_change, None);
+    assert_eq!(*reducer.status(), SessionStatus::Idle);
+}
+
+/// A permission hook names the tool and command; a report that follows says
+/// only that the program is blocked. The richer detail stays.
+#[test]
+fn a_blocking_hook_keeps_its_detail_under_the_programs_report() {
+    let mut reducer =
+        StatusReducer::new(Authority::HooksPrimary, t0()).with_manifest("claude-code", Some("4"));
+    let now = settled(&mut reducer, t0());
+    reducer.reduce(program(ProgramState::Working), now);
+
+    let outcome = reducer.reduce(
+        hook(ClaudeHook::PermissionRequest {
+            tool_name: Some("Bash".into()),
+            input_summary: Some("rm -rf build".into()),
+        }),
+        now + Duration::from_millis(5),
+    );
+    assert_eq!(
+        outcome.status_change,
+        Some(SessionStatus::NeedsInput(NeedsInputKind::Permission))
+    );
+
+    let blocked = StatusSignal::ProgramStatus(Some(ProgramRecord {
+        state: ProgramState::Blocked,
+        kind: Some(BlockedKind::Permission),
+        progress: None,
+        app: Some("claude-code".into()),
+        title: None,
+        msg: Some("Allow Bash?".into()),
+    }));
+    let outcome = reducer.reduce(blocked, now + Duration::from_millis(10));
+    assert_eq!(outcome.status_change, None);
+    assert_eq!(outcome.needs_input, None, "not a second request");
+
+    // Approved: the program says it is working again.
+    let outcome = reducer.reduce(program(ProgramState::Working), now + Duration::from_secs(1));
+    assert_eq!(outcome.status_change, Some(SessionStatus::Working));
+}
+
+/// A report says the program waits; the screen says what it offers. The
+/// choices reach the request whichever arrives first.
+#[test]
+fn a_blocked_report_borrows_the_choices_on_screen() {
+    let choices = vec!["Yes".to_owned(), "No".to_owned()];
+    let blocked = || {
+        StatusSignal::ProgramStatus(Some(ProgramRecord {
+            state: ProgramState::Blocked,
+            kind: Some(BlockedKind::Permission),
+            progress: None,
+            app: None,
+            title: None,
+            msg: Some("Run the migration?".into()),
+        }))
+    };
+    let dialog = |seq| {
+        let mut shown = observation(ManifestState::BlockedPermission, seq);
+        shown.options = Some(vec!["Yes".to_owned(), "No".to_owned()]);
+        StatusSignal::Screen(shown)
+    };
+
+    // The dialog renders first.
+    let mut reducer =
+        StatusReducer::new(Authority::ScreenPrimary, t0()).with_manifest("codex", Some("1"));
+    let now = settled(&mut reducer, t0());
+    reducer.reduce(program(ProgramState::Working), now);
+    assert_eq!(reducer.reduce(dialog(1), now).status_change, None);
+    let outcome = reducer.reduce(blocked(), now);
+    let detail = outcome.needs_input.expect("a request");
+    assert_eq!(detail.summary, "Run the migration?");
+    assert_eq!(detail.options.as_ref(), Some(&choices));
+
+    // The report arrives first.
+    let mut reducer =
+        StatusReducer::new(Authority::ScreenPrimary, t0()).with_manifest("codex", Some("1"));
+    let now = settled(&mut reducer, t0());
+    reducer.reduce(program(ProgramState::Working), now);
+    assert_eq!(
+        reducer.reduce(blocked(), now).needs_input.unwrap().options,
+        None
+    );
+    let outcome = reducer.reduce(dialog(2), now);
+    assert_eq!(outcome.status_change, None);
+    assert_eq!(
+        outcome.needs_input.unwrap().options.as_ref(),
+        Some(&choices)
+    );
+    // Once only.
+    assert_eq!(reducer.reduce(dialog(3), now).needs_input, None);
 }

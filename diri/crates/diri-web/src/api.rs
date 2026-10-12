@@ -262,6 +262,7 @@ impl Api {
             same_repo_as: None,
             start_directory: None,
             note_id: None,
+            argv: None,
         };
 
         match self

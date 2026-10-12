@@ -328,6 +328,7 @@ string_enum! {
         CodexNotify => "codexNotify",
         ScreenScrape => "screenScrape",
         TerminalLine => "terminalLine",
+        ProgramStatus => "programStatus",
     }
 }
 
@@ -344,6 +345,7 @@ string_enum! {
         ProcessLiveness => "processLiveness",
         Staleness => "staleness",
         Transport => "transport",
+        ProgramStatus => "programStatus",
     }
 }
 

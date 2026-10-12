@@ -1,7 +1,7 @@
 # Diri VTE patch
 
 Source: crates.io `vte` 0.15.0, copied from the Cargo registry. Original
-Apache-2.0/MIT licenses and upstream tests are retained. There are four
+Apache-2.0/MIT licenses and upstream tests are retained. There are five
 production changes. The first is `SyncState::default`: its byte buffer starts empty instead of reserving
 the 2 MiB synchronization limit for every terminal, including idle shells.
 
@@ -68,3 +68,11 @@ complete redraw from a half-drawn one: a keystroke answered by a closed
 synchronized update is published at once even when the redraw removed cells.
 Parsing is unchanged; the counter is one field and one increment per ESU.
 Test: `completed_synchronized_updates_are_counted`.
+
+## Cell size query
+
+`CSI 16 t` (XTWINOPS: report the cell size in pixels) dispatches to a new
+`Handler::cell_size_pixels`, whose default does nothing, beside the existing
+14 (text area in pixels) and 18 (text area in cells). Image tools such as
+`chafa` and `timg` size their output from it. Only Diri's local Engine answers,
+and only for terminals that place inline images; others ignore it as before.

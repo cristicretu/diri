@@ -27,6 +27,10 @@ pub(crate) struct NotificationParser {
     /// Exit status the Engine's `returnToLoginShell` wrapper reported for its
     /// agent ([`AGENT_EXIT_OSC`]), not yet taken.
     pub agent_exit: Option<i32>,
+    /// `OSC 7501` program-status records.
+    pub program: crate::program_status::ProgramStatusTable,
+    /// Answers owed to the child, moved to the screen's replies after a feed.
+    pub replies: Vec<u8>,
 }
 
 /// `OSC 6973;agent-exit;<status> BEL`: the status the login-shell wrapper's
@@ -63,6 +67,11 @@ impl NotificationParser {
                     }
                 }
                 1 => {
+                    if byte == b'c' {
+                        // RIS ends every program-status record; a soft reset
+                        // (DECSTR) and screen switches keep them.
+                        self.program.end_program();
+                    }
                     self.state = match byte {
                         b']' => 2,
                         b'P' | b'_' | b'^' | b'X' => 4,
@@ -132,6 +141,15 @@ impl NotificationParser {
                 && (0..=255).contains(&status)
             {
                 self.agent_exit = Some(status);
+            }
+            return;
+        }
+        if let Some(report) = payload.strip_prefix(crate::program_status::PREFIX) {
+            if report == crate::program_status::QUERY {
+                self.replies
+                    .extend_from_slice(crate::program_status::QUERY_REPLY);
+            } else {
+                self.program.apply(report);
             }
             return;
         }
@@ -344,5 +362,47 @@ mod tests {
         let mut parser = NotificationParser::default();
         parser.feed(b"\x1bPignored\x1b]9;not an alert\x1b\\");
         assert!(parser.ready.is_empty());
+    }
+
+    #[test]
+    fn program_status_is_live_only_and_answers_its_query() {
+        use crate::ProgramState;
+        let mut screen = crate::HeadlessScreen::new(80, 24).with_notifications();
+        // History: a stale report and a query asked by a program long gone.
+        let old = b"\x1b]7501;state=blocked\x07\x1b]7501;?\x07";
+        let live = b"\x1b]7501;state=working:progress=5\x1b\\\x1b]7501;?\x1b\\\x1b[c";
+        let bytes: Vec<_> = old.iter().chain(live).copied().collect();
+        screen.feed_with_history(&bytes, old.len());
+        let status = screen.program_status().unwrap();
+        assert_eq!(status.state, ProgramState::Working);
+        assert_eq!(status.progress, Some(5));
+        let replies = screen.take_replies();
+        // One answer for the live query, ahead of the device attributes.
+        assert!(replies.starts_with(b"\x1b]7501;?\x1b\\"), "{replies:?}");
+        assert_eq!(replies.windows(5).filter(|w| w == b"7501;").count(), 1);
+        assert!(replies.len() > 9, "device attributes still answered");
+
+        let generation = screen.program_status_generation();
+        screen.feed(b"plain output");
+        assert_eq!(screen.program_status_generation(), generation);
+        assert!(screen.end_program_status());
+        assert_eq!(screen.program_status(), None);
+    }
+
+    #[test]
+    fn a_full_reset_clears_program_status() {
+        let mut screen = crate::HeadlessScreen::new(80, 24).with_notifications();
+        screen.feed(b"\x1b]7501;state=working\x07\x1b[!p\x1b[?1049h");
+        assert!(screen.program_status().is_some(), "DECSTR and 1049 keep it");
+        screen.feed(b"\x1bc");
+        assert_eq!(screen.program_status(), None);
+    }
+
+    #[test]
+    fn a_screen_without_notifications_ignores_program_status() {
+        let mut screen = crate::HeadlessScreen::new(80, 24);
+        screen.feed(b"\x1b]7501;state=working\x07\x1b]7501;?\x07");
+        assert_eq!(screen.program_status(), None);
+        assert!(screen.take_replies().is_empty());
     }
 }

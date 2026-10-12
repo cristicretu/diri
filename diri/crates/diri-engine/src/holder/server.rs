@@ -25,9 +25,10 @@ use super::guard::GroupGuard;
 use super::process_tree;
 use super::protocol::{
     HOLDER_OUTPUT_STREAM_VERSION, HOLDER_STREAM_ACK, HOLDER_STREAM_INPUT,
-    HOLDER_STREAM_MAX_PAYLOAD, HOLDER_STREAM_RESIZE, HOLDER_STREAM_VERSION, HolderChildRecord,
-    HolderExitMarker, HolderExitReason, HolderExitStatus, HolderLaunchSpec, HolderOperation,
-    HolderRequest, HolderResponse, HolderStat,
+    HOLDER_STREAM_MAX_PAYLOAD, HOLDER_STREAM_RESIZE, HOLDER_STREAM_RESIZE_PIXELS,
+    HOLDER_STREAM_VERSION, HOLDER_STREAM_VERSION_PIXELS, HolderChildRecord, HolderExitMarker,
+    HolderExitReason, HolderExitStatus, HolderLaunchSpec, HolderOperation, HolderRequest,
+    HolderResponse, HolderStat,
 };
 use super::socket;
 use super::{HolderError, HolderResult};
@@ -358,10 +359,12 @@ impl HolderServer {
                     }
                 }
                 Ok(request) if request.op == HolderOperation::Stream => {
-                    if request.stream_version != Some(HOLDER_STREAM_VERSION) {
-                        HolderResponse::failure("unsupported Holder input stream version")
-                    } else {
-                        let response = HolderResponse::stream(HOLDER_STREAM_VERSION);
+                    let version = request.stream_version.filter(|version| {
+                        *version == HOLDER_STREAM_VERSION
+                            || *version == HOLDER_STREAM_VERSION_PIXELS
+                    });
+                    if let Some(version) = version {
+                        let response = HolderResponse::stream(version);
                         if socket::write_json_line(&mut client, &response).is_ok() {
                             let client = Arc::new(client);
                             let mut streams = shared.input_streams.lock().expect("input streams");
@@ -374,6 +377,8 @@ impl HolderServer {
                                 .spawn(move || serve_input_stream(&shared, client));
                         }
                         continue;
+                    } else {
+                        HolderResponse::failure("unsupported Holder input stream version")
                     }
                 }
                 Ok(request) => handle(&shared, &request)
@@ -880,7 +885,12 @@ fn handle(shared: &Shared, request: &HolderRequest) -> HolderResult<HolderRespon
                     "signal requires a valid sig".into(),
                 ));
             }
-            let tree = process_tree::signal(shared.child_pid, signal);
+            let tree = if signal == libc::SIGCONT {
+                let frozen = shared.frozen.lock().expect("frozen").clone();
+                process_tree::resume(shared.child_pid, &frozen)
+            } else {
+                process_tree::signal(shared.child_pid, signal)
+            };
             if matches!(signal, libc::SIGSTOP | libc::SIGCONT) {
                 let mut frozen = shared.frozen.lock().expect("frozen");
                 if let Some(guard) = &shared.guard {
@@ -936,15 +946,31 @@ fn serve_input_stream(shared: &Shared, stream: Arc<std::os::unix::net::UnixStrea
         }
         let result = match header[0] {
             HOLDER_STREAM_INPUT => write_pty(shared, &payload),
-            HOLDER_STREAM_RESIZE if payload.len() == 4 => {
-                let cols = u16::from_be_bytes([payload[0], payload[1]]);
-                let rows = u16::from_be_bytes([payload[2], payload[3]]);
+            HOLDER_STREAM_RESIZE | HOLDER_STREAM_RESIZE_PIXELS
+                if payload.len()
+                    == if header[0] == HOLDER_STREAM_RESIZE {
+                        4
+                    } else {
+                        8
+                    } =>
+            {
+                let word = |at: usize| u16::from_be_bytes([payload[at], payload[at + 1]]);
+                let (cols, rows) = (word(0), word(2));
+                let pixels = if payload.len() == 8 {
+                    (word(4), word(6))
+                } else {
+                    (0, 0)
+                };
                 if cols < 2 || rows < 2 {
                     Err(HolderError::InvalidRequest(
                         "resize requires cols/rows >= 2".into(),
                     ))
                 } else {
-                    let _ = shared.pty.lock().expect("pty").resize(cols, rows);
+                    let _ = shared
+                        .pty
+                        .lock()
+                        .expect("pty")
+                        .resize_with_pixels(cols, rows, pixels);
                     Ok(())
                 }
             }
@@ -1651,6 +1677,158 @@ mod tests {
             cols: 80,
             rows: 24,
             disk_capacity: 4096,
+        }
+    }
+
+    /// A terminal tab: interactive zsh running an agent as its foreground
+    /// job, and the agent's own children (MCP servers, tool shells) started
+    /// after it. Every wake must leave the agent in the foreground; a zsh
+    /// that resumes first reaps it as suspended and takes the tab, and the
+    /// agent's mouse tracking then types into the prompt. macOS-only because
+    /// `/bin/zsh` is the default shell there.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_woken_job_control_shell_keeps_its_job_in_the_foreground() {
+        let root = tempfile::tempdir().unwrap();
+        let pids = root.path().join("pids");
+        let mut spec = held(root.path(), "s_job", "");
+        spec.argv = vec!["/bin/zsh".into(), "-f".into(), "-i".into()];
+        let client = HolderClient::new(&spec.socket_path);
+        let server = std::thread::spawn(move || HolderServer::run(spec));
+        // A timed-out wait must not leave zsh and 150 stopped sleeps behind.
+        let _cleanup = KillTreeOnDrop(&client);
+        wait_until("holder ready", || client.is_alive());
+        client
+            .write(
+                format!(
+                    "/bin/sh -c 'i=0; while [ $i -lt 150 ]; do sleep 1000 & i=$((i+1)); done; echo $$ > {pids}.tmp && mv {pids}.tmp {pids} && wait'\n",
+                    pids = pids.display()
+                )
+                .as_bytes(),
+            )
+            .expect("start the job");
+        let mut job = 0;
+        wait_until("job running", || {
+            job = read_pids(&pids).map_or(0, |pids| pids[0]);
+            job > 0 && process_state(job).is_some_and(|state| state.contains('+'))
+        });
+
+        let taken = (0..20).find_map(|round| {
+            client.signal(libc::SIGSTOP).expect("hibernate");
+            wait_until("job stopped", || {
+                process_state(job).is_some_and(|state| state.starts_with('T'))
+            });
+            client.signal(libc::SIGCONT).expect("wake");
+            // There is no event for "zsh left it alone", so watch long
+            // enough for a loaded zsh to have reaped the job and taken the
+            // terminal if it was going to.
+            let deadline = std::time::Instant::now() + Duration::from_millis(250);
+            loop {
+                let state = process_state(job).unwrap_or_default();
+                if !state.contains('+') || state.starts_with('T') {
+                    break Some((round, state));
+                }
+                if std::time::Instant::now() >= deadline {
+                    break None;
+                }
+                std::thread::sleep(Duration::from_millis(10));
+            }
+        });
+
+        client.kill_tree().expect("kill-tree");
+        wait_until("holder finished", || server.is_finished());
+        server.join().expect("join").expect("clean holder exit");
+        assert_eq!(taken, None, "the shell took the terminal from its job");
+    }
+
+    /// A hibernated agent's helper that left the group (an MCP watchdog in
+    /// its own session) loses its parent while stopped, so the wake's walk
+    /// from the leader no longer reaches it. The wake must still continue
+    /// it: it was frozen, and after the wake nothing remembers it.
+    #[test]
+    fn a_wake_continues_a_frozen_process_the_tree_lost() {
+        let root = tempfile::tempdir().unwrap();
+        let pids = root.path().join("pids");
+        let agent = root.path().join("agent.sh");
+        std::fs::write(
+            &agent,
+            format!(
+                "perl -e 'use POSIX; POSIX::setsid(); sleep 1000' &\n\
+                 echo $$ $! > {pids}.tmp && mv {pids}.tmp {pids}\n\
+                 wait\n",
+                pids = pids.display()
+            ),
+        )
+        .unwrap();
+        let spec = held(
+            root.path(),
+            "s_lost",
+            &format!("/bin/sh {}", agent.display()),
+        );
+        let client = HolderClient::new(&spec.socket_path);
+        let server = std::thread::spawn(move || HolderServer::run(spec));
+        let _cleanup = KillTreeOnDrop(&client);
+        wait_until("holder ready", || client.is_alive());
+        let mut tree = Vec::new();
+        wait_until("agent tree", || {
+            tree = read_pids(&pids).unwrap_or_default();
+            tree.len() == 2
+        });
+        let (agent, helper) = (tree[0], tree[1]);
+        let _helper = KillOnDrop(helper);
+        wait_until("helper in its own session", || {
+            // SAFETY: getpgid on a pid we started; read-only.
+            unsafe { libc::getpgid(helper) == helper }
+        });
+
+        client.signal(libc::SIGSTOP).expect("hibernate");
+        wait_until("helper stopped", || {
+            process_state(helper).is_some_and(|state| state.starts_with('T'))
+        });
+        // SAFETY: plain kill(2) on this test's own process.
+        unsafe { libc::kill(agent, libc::SIGKILL) };
+        wait_until("helper orphaned", || {
+            // SAFETY: plain kill(2) probe of this test's own process.
+            dead(agent) && unsafe { libc::kill(helper, 0) } == 0
+        });
+
+        client.signal(libc::SIGCONT).expect("wake");
+        wait_until("helper continued", || {
+            process_state(helper).is_some_and(|state| !state.starts_with('T'))
+        });
+
+        // The leader's death may already have ended the session (Linux
+        // reports it at once), taking the socket with it; then there is
+        // nothing left to kill.
+        if let Err(error) = client.kill_tree() {
+            assert!(
+                server.is_finished() || !client.is_alive(),
+                "kill-tree on a live holder: {error:?}"
+            );
+        }
+        wait_until("holder finished", || server.is_finished());
+        server.join().expect("join").expect("clean holder exit");
+    }
+
+    /// Kills a test's held tree if the test panics before its own cleanup.
+    struct KillTreeOnDrop<'a>(&'a HolderClient);
+
+    impl Drop for KillTreeOnDrop<'_> {
+        fn drop(&mut self) {
+            let _ = self.0.kill_tree();
+        }
+    }
+
+    /// Kills a process the held tree no longer reaches.
+    struct KillOnDrop(i32);
+
+    impl Drop for KillOnDrop {
+        fn drop(&mut self) {
+            // SAFETY: cleanup of this test's own process.
+            unsafe {
+                libc::kill(self.0, libc::SIGKILL);
+                libc::kill(self.0, libc::SIGCONT);
+            }
         }
     }
 

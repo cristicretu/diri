@@ -47,6 +47,17 @@ impl TermColor {
     }
 }
 
+/// The outcome an OSC 133 D mark reports.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub enum CommandEnd {
+    /// Exit status 0.
+    Succeeded,
+    /// A non-zero exit status.
+    Failed,
+    /// The shell did not report a usable status.
+    Unknown,
+}
+
 #[derive(Clone, Copy, Debug, Default, Eq, Hash, PartialEq)]
 #[repr(transparent)]
 pub struct TermStyle(u16);
@@ -65,6 +76,14 @@ impl TermStyle {
     pub const SOFT_WRAP: Self = Self(1 << 8);
     pub const WIDE_SPACER: Self = Self(1 << 9);
     pub const PROMPT_START: Self = Self(1 << 10);
+    /// OSC 133 B/C/D shell-integration marks, carried like PROMPT_START.
+    /// A command end is `COMMAND_SUCCEEDED`, `COMMAND_FAILED`, or both
+    /// when the shell reported no status: see [`Self::command_end`].
+    pub const INPUT_START: Self = Self(1 << 11);
+    pub const OUTPUT_START: Self = Self(1 << 12);
+    pub const COMMAND_SUCCEEDED: Self = Self(1 << 13);
+    pub const COMMAND_FAILED: Self = Self(1 << 14);
+    pub const COMMAND_END: Self = Self(Self::COMMAND_SUCCEEDED.0 | Self::COMMAND_FAILED.0);
 
     #[must_use]
     pub const fn empty() -> Self {
@@ -89,6 +108,20 @@ impl TermStyle {
     #[must_use]
     pub const fn is_empty(self) -> bool {
         self.0 == 0
+    }
+
+    /// How the command whose end (OSC 133 D) is marked on this cell ended.
+    #[must_use]
+    pub const fn command_end(self) -> Option<CommandEnd> {
+        match (
+            self.0 & Self::COMMAND_SUCCEEDED.0 != 0,
+            self.0 & Self::COMMAND_FAILED.0 != 0,
+        ) {
+            (false, false) => None,
+            (true, false) => Some(CommandEnd::Succeeded),
+            (false, true) => Some(CommandEnd::Failed),
+            (true, true) => Some(CommandEnd::Unknown),
+        }
     }
 }
 

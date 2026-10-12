@@ -869,6 +869,7 @@ mod tests {
                 same_repo_as: None,
                 start_directory: None,
                 note_id: None,
+                argv: None,
             })
         );
     }

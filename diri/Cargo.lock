@@ -1539,7 +1539,7 @@ dependencies = [
 
 [[package]]
 name = "diri-app"
-version = "0.9.5"
+version = "0.9.6"
 dependencies = [
  "base64 0.23.1",
  "block2 0.6.2",
@@ -1675,12 +1675,14 @@ version = "0.1.0"
 dependencies = [
  "diri-proto",
  "libc",
+ "tempfile",
 ]
 
 [[package]]
 name = "diri-remote"
 version = "0.1.0"
 dependencies = [
+ "base64 0.23.1",
  "diri-engine",
  "diri-proto",
  "diri-pty",
@@ -1718,6 +1720,11 @@ dependencies = [
  "diri-terminal-state",
  "gpui",
  "gpui_platform",
+ "image",
+ "miniz_oxide",
+ "plist",
+ "serde",
+ "serde_json",
  "unicode-width",
 ]
 

@@ -21,7 +21,7 @@
   "platform.this_mac_lowercase": "this Mac",
   "settings.keywords.accounts": "accounts profiles work personal login authentication codex claude default config home",
   "settings.keywords.agents": "agents codex claude cursor gemini executable installed command line quick create default",
-  "settings.keywords.appearance": "terminal appearance color theme font text size zoom",
+  "settings.keywords.appearance": "terminal appearance color theme font text size zoom shell integration zsh bash prompt marks",
   "settings.keywords.general": "general default startup login sessions close confirmation sounds chimes support diagnostics privacy telemetry share report name support id quick open search roots choose folder finder picker updates diri-include include gitignore worktrees hidden folders import herdr migrate move tmux developer performance perf overlay fps frame rate render counters debug language interface english chinese",
   "settings.keywords.phone": "phone iphone ios mobile pairing qr tailscale awake",
   "settings.keywords.remote": "remote ssh openssh hosts machines connections execution tailscale network",

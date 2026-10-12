@@ -1,0 +1,19 @@
+{
+  "default_terminal.failed": "macOS no cambió el terminal predeterminado (error {code}).",
+  "default_terminal.is_default": "Los enlaces ssh://, telnet:// y de páginas de manual, y los archivos .command, se abren en una pestaña nueva de diri.",
+  "default_terminal.make_default": "Usar como predeterminado",
+  "default_terminal.not_default": "Otra app abre los enlaces ssh://, telnet:// y de páginas de manual, y los archivos .command.",
+  "default_terminal.title": "Terminal predeterminado",
+  "default_terminal.unavailable": "Disponible cuando diri se ejecuta desde la app instalada.",
+  "open_handler.error.host": "El nombre de host del enlace no es válido.",
+  "open_handler.error.not_executable": "{name} no es ejecutable. Hazlo ejecutable con chmod +x y vuelve a abrirlo.",
+  "open_handler.error.not_found": "{name} no existe.",
+  "open_handler.error.page": "El enlace no indica una página de manual válida.",
+  "open_handler.error.port": "El puerto del enlace no es válido.",
+  "open_handler.error.quarantined": "{name} se descargó de internet, así que diri no lo ejecutará. Revísalo y ejecútalo desde un terminal.",
+  "open_handler.error.telnet": "telnet no está instalado. Instálalo con Homebrew: brew install telnet.",
+  "open_handler.error.too_long": "El enlace es demasiado largo.",
+  "open_handler.error.unsupported": "diri abre enlaces ssh://, telnet:// y de páginas de manual, y archivos .command, .tool y .sh.",
+  "open_handler.error.user": "El nombre de usuario del enlace no es válido.",
+  "open_handler.failed_title": "No se pudo abrir en diri"
+}

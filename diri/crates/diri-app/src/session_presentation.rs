@@ -100,8 +100,8 @@ pub(crate) fn is_loading(session: &SessionRecord, migrating: bool) -> bool {
 }
 
 pub(crate) fn ui_agent_kind(kind: &ProtoAgentKind) -> AgentKind {
-    // Brand vocabulary, not a protocol type: a manifest agent the client has
-    // no hand-drawn mark for falls back to the generic terminal treatment.
+    // Brand vocabulary, not a protocol type: any other Agent takes its mark
+    // from the catalog, and one without a mark the generic terminal treatment.
     match kind.id() {
         ProtoAgentKind::CLAUDE_CODE_ID => AgentKind::ClaudeCode,
         ProtoAgentKind::CODEX_ID => AgentKind::Codex,
@@ -109,7 +109,7 @@ pub(crate) fn ui_agent_kind(kind: &ProtoAgentKind) -> AgentKind {
         ProtoAgentKind::GEMINI_ID => AgentKind::Gemini,
         ProtoAgentKind::SHELL_ID => AgentKind::Shell,
         ProtoAgentKind::NOTE_ID => AgentKind::Note,
-        _ => AgentKind::Generic,
+        id => AgentKind::from_agent_id(id),
     }
 }
 
@@ -143,6 +143,158 @@ mod tests {
         assert!(is_loading(&session, false));
         assert_eq!(status_state(&session, false), StatusState::Working);
         assert!(!is_loading(&session, true));
+    }
+
+    /// Every Agent Diri can launch or recognise has its own mark, and every
+    /// bundled mark belongs to one: no Agent is left on the generic terminal
+    /// treatment, and no mark is dead weight.
+    #[test]
+    fn every_agent_has_its_own_mark() {
+        let (manifests, _) =
+            diri_engine::ManifestEngine::load_dir(&diri_engine::detect::bundled_manifest_dir())
+                .unwrap();
+        let mut ids: std::collections::BTreeSet<&str> = manifests.ids().into_iter().collect();
+        ids.extend(
+            diri_engine::recognition::CATALOG
+                .iter()
+                .map(|agent| agent.id),
+        );
+        for id in &ids {
+            let kind = ui_agent_kind(&ProtoAgentKind::new(*id));
+            match *id {
+                ProtoAgentKind::GENERIC_ID => assert_eq!(kind, AgentKind::Generic),
+                ProtoAgentKind::SHELL_ID => assert_eq!(kind, AgentKind::Shell),
+                _ => assert!(kind.brand_mark().is_some(), "{id} has no mark"),
+            }
+        }
+        for mark in &diri_ui::AGENT_MARKS {
+            assert!(ids.contains(mark.id()), "{} is no Agent's mark", mark.id());
+            assert_eq!(
+                ui_agent_kind(&ProtoAgentKind::new(mark.id())),
+                AgentKind::Agent(mark)
+            );
+        }
+        // An id from a newer Engine falls back to the terminal treatment.
+        assert_eq!(
+            ui_agent_kind(&ProtoAgentKind::new("some-future-agent")),
+            AgentKind::Generic
+        );
+    }
+
+    /// Every Agent mark next to the four brand marks, as the sidebar draws
+    /// them (a 16 px status glyph, rasterized by CoreGraphics) and at 32 px
+    /// to judge their shapes, on a dark, a light and two themed palettes.
+    ///
+    /// `DIRI_VISUAL_OUTPUT=/tmp/marks.png cargo test -p diri-app
+    /// render_agent_marks_screenshot -- --ignored`
+    #[cfg(target_os = "macos")]
+    #[test]
+    #[ignore = "writes the Agent mark grid screenshot"]
+    fn render_agent_marks_screenshot() {
+        use diri_term::theme::TermTheme;
+        use diri_ui::{SemanticColors, StatusGlyph, Typo};
+        use gpui::{HeadlessAppContext, Render, Window, size};
+        use std::sync::Arc;
+
+        struct Grid {
+            panels: Vec<SemanticColors>,
+            marks: Vec<(AgentKind, String)>,
+        }
+
+        impl Render for Grid {
+            fn render(&mut self, _: &mut Window, _: &mut gpui::Context<Self>) -> impl IntoElement {
+                let panel = |colors: SemanticColors, marks: &[(AgentKind, String)]| {
+                    let cell = |(kind, name): &(AgentKind, String)| {
+                        div()
+                            .w(px(150.0))
+                            .h(px(36.0))
+                            .flex()
+                            .items_center()
+                            .gap(px(8.0))
+                            .child(
+                                StatusGlyph::new(*kind, StatusState::IdleSeen, 16.0, colors)
+                                    .rendered_mark(),
+                            )
+                            .child(
+                                StatusGlyph::new(*kind, StatusState::IdleSeen, 32.0, colors)
+                                    .rendered_mark(),
+                            )
+                            .child(
+                                div()
+                                    .text_size(px(Typo::META.size))
+                                    .text_color(colors.primary)
+                                    .child(name.clone()),
+                            )
+                    };
+                    div()
+                        .w(px(620.0))
+                        .p(px(14.0))
+                        .flex()
+                        .flex_wrap()
+                        .bg(colors.background)
+                        .children(marks.iter().map(cell))
+                };
+                div()
+                    .flex()
+                    .flex_wrap()
+                    .size_full()
+                    .children(self.panels.iter().map(|colors| panel(*colors, &self.marks)))
+            }
+        }
+
+        let output = std::env::var("DIRI_VISUAL_OUTPUT").expect("set DIRI_VISUAL_OUTPUT");
+        diri_ui::set_mark_rasterizer(crate::macos::brand_raster::raster_mark_for_fixture);
+        let (manifests, _) =
+            diri_engine::ManifestEngine::load_dir(&diri_engine::detect::bundled_manifest_dir())
+                .unwrap();
+        let mut marks: Vec<(AgentKind, String)> = [
+            ProtoAgentKind::CLAUDE_CODE,
+            ProtoAgentKind::CODEX,
+            ProtoAgentKind::CURSOR,
+            ProtoAgentKind::GEMINI,
+        ]
+        .iter()
+        .map(|kind| (ui_agent_kind(kind), ui_agent_kind(kind).label().to_owned()))
+        .collect();
+        marks.extend(diri_ui::AGENT_MARKS.iter().map(|mark| {
+            let name = diri_proto::agent_names::recognized_agent_name(mark.id())
+                .map(str::to_owned)
+                .or_else(|| {
+                    let raw = manifests.raw_agent(mark.id())?.clone();
+                    serde_json::from_value::<diri_proto::AgentDescriptor>(raw)
+                        .ok()
+                        .map(|descriptor| descriptor.display_name)
+                })
+                .unwrap_or_else(|| mark.id().to_owned());
+            (AgentKind::Agent(mark), name)
+        }));
+        let panels = [
+            TermTheme::DIRIJOR_DARK.id,
+            TermTheme::DIRIJOR_LIGHT.id,
+            TermTheme::TOKYO_NIGHT.id,
+            TermTheme::SOLARIZED_LIGHT.id,
+        ]
+        .into_iter()
+        .map(crate::app_theme::sidebar_colors)
+        .collect();
+
+        let platform = gpui_platform::current_platform(true);
+        let mut cx = HeadlessAppContext::with_platform(
+            platform.text_system(),
+            Arc::new(diri_ui::IconAssets),
+            gpui_platform::current_headless_renderer,
+        );
+        cx.update(|cx| crate::fonts::init(cx));
+        let window = cx
+            .open_window(size(px(1240.0), px(1120.0)), |_, cx| {
+                cx.new(|_| Grid { panels, marks })
+            })
+            .unwrap();
+        cx.run_until_parked();
+        cx.capture_screenshot(window.into())
+            .unwrap()
+            .save(output)
+            .unwrap();
     }
 
     #[test]

@@ -16,7 +16,7 @@ use objc2::rc::Retained;
 use objc2::{AnyThread, MainThreadMarker};
 use objc2_app_kit::{
     NSBezierPath, NSBitmapFormat, NSBitmapImageRep, NSColor, NSDeviceRGBColorSpace,
-    NSGraphicsContext, NSImage, NSLineCapStyle, NSLineJoinStyle,
+    NSGraphicsContext, NSImage, NSLineCapStyle, NSLineJoinStyle, NSWindingRule,
 };
 use objc2_foundation::{NSPoint, NSRect, NSSize};
 
@@ -36,6 +36,19 @@ static CACHE: LazyLock<Mutex<HashMap<MarkKey, Option<Arc<RenderImage>>>>> =
 /// `diri_ui::set_mark_rasterizer` target: crisp raster for solid-color marks.
 pub fn raster_mark(kind: BrandMarkKind, size: f32, inset: f32, color: Rgba) -> Option<AnyElement> {
     let image = cached_mark(kind, size, inset, color)?;
+    Some(img(image).flex_none().size(px(size)).into_any_element())
+}
+
+/// [`raster_mark`] for headless fixtures, which run off the main thread:
+/// AppKit's bitmap drawing is fine there, only the guard is not.
+#[cfg(test)]
+pub fn raster_mark_for_fixture(
+    kind: BrandMarkKind,
+    size: f32,
+    inset: f32,
+    color: Rgba,
+) -> Option<AnyElement> {
+    let image = rasterize(kind, size.max(1.0), inset, color)?;
     Some(img(image).flex_none().size(px(size)).into_any_element())
 }
 
@@ -75,6 +88,9 @@ fn rasterize(kind: BrandMarkKind, size: f32, inset: f32, color: Rgba) -> Option<
     let origin = (pixels as f32 - 24.0 * scale) / 2.0;
 
     let path = NSBezierPath::bezierPath();
+    if kind.even_odd() {
+        path.setWindingRule(NSWindingRule::EvenOdd);
+    }
     let map = |x: f32, y: f32| svg_point(x, y, origin, scale);
     let mut current = (0.0_f32, 0.0_f32);
     for command in kind.path_commands() {
@@ -196,6 +212,9 @@ pub fn template_ns_image(kind: BrandMarkKind, point_size: f32) -> Option<Retaine
     let origin = (pixels as f32 - 24.0 * scale) / 2.0;
 
     let path = NSBezierPath::bezierPath();
+    if kind.even_odd() {
+        path.setWindingRule(NSWindingRule::EvenOdd);
+    }
     let map = |x: f32, y: f32| svg_point(x, y, origin, scale);
     let mut current = (0.0_f32, 0.0_f32);
     for command in kind.path_commands() {

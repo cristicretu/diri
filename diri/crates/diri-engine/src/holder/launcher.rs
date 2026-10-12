@@ -222,10 +222,32 @@ pub(crate) fn mark_launchd_unavailable(directory: &Path, executable: &Path) {
 /// How a manager was started.
 enum Started {
     Direct,
-    /// As this launchd job (macOS, bundled).
+    /// As a launchd job (macOS, bundled), through a relay job (see
+    /// [`RELAY_FLAG`]).
     #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
-    Launchd(String),
+    Launchd {
+        /// The one-shot job that submits the manager's job, then exits.
+        relay: String,
+        /// The manager's own job.
+        manager: String,
+    },
 }
+
+/// `diri-holder --relay <label> <manager arguments…>`: submits the manager as
+/// launchd job `<label>`, then exits.
+///
+/// loginwindow remembers every launchd job a process of diri.app's coalition
+/// submits as one of the app's "one-shot jobs". When diri.app exits while
+/// macOS Background Task Management does not allow it to keep running (Login
+/// Items › Allow in the Background switched off), loginwindow unloads those
+/// jobs along with the coalition: a manager job submitted by the Engine took
+/// every Holder, and with them every Agent, at each quit
+/// (`launchJobCheck: … job com.dirijor.diri.holders.… agent not managed by
+/// BTM so is not allowed` → `Unloading one-shot jobs for application "diri"`).
+/// The Agents' own jobs, which the manager submits from its own coalition,
+/// were left alone. So the Engine submits only this relay, which exits at
+/// once; the manager's job is submitted from the relay's coalition.
+pub const RELAY_FLAG: &str = "--relay";
 
 /// Starts a manager and waits until it answers. Must hold the launch lock.
 ///
@@ -243,8 +265,10 @@ fn start_manager(
     // waiting for it then rather than at the deadline.
     #[cfg(target_os = "macos")]
     let mut job_exited = {
+        // The relay job exits by design; only the manager's job exiting
+        // means the manager will not answer.
         let label = match &started {
-            Started::Launchd(label) => Some(label.clone()),
+            Started::Launchd { manager, .. } => Some(manager.clone()),
             Started::Direct => None,
         };
         let mut checks = 0u32;
@@ -264,12 +288,17 @@ fn start_manager(
         return Ok(());
     }
     #[cfg(target_os = "macos")]
-    if let Started::Launchd(label) = started {
+    if let Started::Launchd {
+        relay,
+        manager: label,
+    } = started
+    {
         if manager.is_alive() {
             return Ok(()); // just made it
         }
         let status = diri_pty::detached::job_status(&label);
         let bootout = diri_pty::detached::bootout_job(&label);
+        let _ = diri_pty::detached::bootout_job(&relay);
         // A launchd that never runs the manager does not run the Agents'
         // jobs either: the direct manager starts them as its children.
         mark_launchd_unavailable(directory, executable_path);
@@ -350,11 +379,12 @@ fn spawn_manager(executable_path: &Path, directory: &Path) -> HolderResult<Start
     // with it every PTY. One process either way; launchd reaps it.
     #[cfg(target_os = "macos")]
     if agent_launcher.is_some() {
-        let label = format!(
-            "{MANAGER_LABEL_PREFIX}{}",
-            diri_pty::detached::label_suffix()
-        );
-        let mut program: Vec<&std::ffi::OsStr> = vec![executable_path.as_os_str()];
+        let (relay, label) = relay_and_manager_labels(&diri_pty::detached::label_suffix());
+        let mut program: Vec<&std::ffi::OsStr> = vec![
+            executable_path.as_os_str(),
+            RELAY_FLAG.as_ref(),
+            label.as_ref(),
+        ];
         program.extend(arguments.iter().map(std::ffi::OsString::as_os_str));
         // A job starts with launchd's environment; carry over only the few
         // settings the manager reads.
@@ -362,7 +392,7 @@ fn spawn_manager(executable_path: &Path, directory: &Path) -> HolderResult<Start
             .iter()
             .filter_map(|&name| std::env::var(name).ok().map(|value| (name, value)))
             .collect();
-        match diri_pty::detached::bootstrap_job(&label, &program, &environment, directory) {
+        match diri_pty::detached::bootstrap_job(&relay, &program, &environment, directory) {
             Ok(()) => {
                 let _ = std::thread::Builder::new()
                     .name("holder-job-sweep".into())
@@ -372,7 +402,10 @@ fn spawn_manager(executable_path: &Path, directory: &Path) -> HolderResult<Start
                             std::time::Duration::from_secs(120),
                         );
                     });
-                return Ok(Started::Launchd(label));
+                return Ok(Started::Launchd {
+                    relay,
+                    manager: label,
+                });
             }
             Err(error) => {
                 eprintln!("diri-engine: launchd holder manager unavailable, spawning it: {error}");
@@ -436,6 +469,55 @@ fn spawn_manager(executable_path: &Path, directory: &Path) -> HolderResult<Start
     Ok(Started::Direct)
 }
 
+/// The relay's and the manager's job labels for one launch. Both keep the
+/// hex-millis suffix [`diri_pty::detached::sweep_finished_jobs`] ages by;
+/// the manager's is one millisecond later so the two never collide.
+#[cfg(target_os = "macos")]
+fn relay_and_manager_labels(suffix: &str) -> (String, String) {
+    let millis = u64::from_str_radix(suffix, 16).unwrap_or_default();
+    (
+        format!("{MANAGER_LABEL_PREFIX}{millis:x}"),
+        format!("{MANAGER_LABEL_PREFIX}{:x}", millis + 1),
+    )
+}
+
+/// Runs the relay job (see [`RELAY_FLAG`]): `arguments` are what follows the
+/// flag, the manager's job label and then the manager's own arguments.
+/// Submits the manager's job and returns. Should launchd refuse it, the
+/// relay becomes the manager itself, as every manager was before the relay;
+/// an error means even that failed.
+#[cfg(target_os = "macos")]
+pub fn run_relay(executable: &Path, arguments: &[String]) -> std::io::Result<()> {
+    use std::os::unix::process::CommandExt;
+    let Some((label, manager_arguments)) = arguments.split_first() else {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "relay needs a label",
+        ));
+    };
+    let mut program: Vec<&std::ffi::OsStr> = vec![executable.as_os_str()];
+    program.extend(manager_arguments.iter().map(std::ffi::OsStr::new));
+    // The relay's job carried exactly these from the Engine.
+    let environment: Vec<(&str, String)> = MANAGER_ENVIRONMENT
+        .iter()
+        .filter_map(|&name| std::env::var(name).ok().map(|value| (name, value)))
+        .collect();
+    let directory = manager_arguments
+        .iter()
+        .position(|argument| argument == "--manager")
+        .and_then(|index| manager_arguments.get(index + 1))
+        .map_or_else(std::env::temp_dir, PathBuf::from);
+    match diri_pty::detached::bootstrap_job(label, &program, &environment, &directory) {
+        Ok(()) => Ok(()),
+        Err(error) => {
+            eprintln!("diri-holder: relay could not submit {label} ({error}); serving directly");
+            Err(std::process::Command::new(executable)
+                .args(manager_arguments)
+                .exec())
+        }
+    }
+}
+
 fn read_pid_file(path: &Path) -> Option<i32> {
     let pid = std::fs::read_to_string(path)
         .ok()?
@@ -462,6 +544,13 @@ fn is_executable(path: &Path) -> bool {
 #[cfg(all(test, target_os = "macos"))]
 mod tests {
     use super::*;
+
+    #[test]
+    fn relay_and_manager_jobs_get_distinct_sweepable_labels() {
+        let (relay, manager) = relay_and_manager_labels("1a1162879da");
+        assert_eq!(relay, "com.dirijor.diri.holders.1a1162879da");
+        assert_eq!(manager, "com.dirijor.diri.holders.1a1162879db");
+    }
 
     #[test]
     fn the_launchd_marker_names_one_build_of_the_holder() {

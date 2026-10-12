@@ -18,7 +18,8 @@ use crate::grid::{GridCodecError, GridUpdate};
 use crate::terminal::MouseModes;
 
 pub const PROTOCOL_MAJOR: u16 = 1;
-pub const PROTOCOL_MINOR: u16 = 15;
+pub const PROTOCOL_MINOR: u16 = 16;
+pub const INLINE_IMAGES_PROTOCOL_MINOR: u16 = 16;
 pub const TERMINAL_RESET_PROTOCOL_MINOR: u16 = 15;
 pub const ENHANCED_KEYBOARD_PROTOCOL_MINOR: u16 = 14;
 pub const PROCESS_FACTS_PROTOCOL_MINOR: u16 = 13;
@@ -40,6 +41,12 @@ pub const MAX_DIRECTORY_ENTRIES: usize = 512;
 pub const MAX_DIRECTORY_SCANNED_ENTRIES: usize = 16_384;
 pub const MAX_DIRECTORY_RESPONSE_BYTES: usize = 512 * 1024;
 pub const MAX_EXECUTABLE_QUERIES: usize = 128;
+/// Image bytes per `ImageResponse`. Small enough that one read never holds
+/// interactive output behind it for long on a slow link; the Engine asks for
+/// the next chunk only after this one arrived.
+pub const MAX_IMAGE_CHUNK_BYTES: usize = 256 * 1024;
+/// An `ImageResponse` frame: one chunk plus its small JSON header.
+pub const MAX_IMAGE_RESPONSE_FRAME_BYTES: usize = MAX_IMAGE_CHUNK_BYTES + 4 * 1024;
 
 const HEADER_BYTES: usize = 5;
 const FULL_SNAPSHOT_FIXED_BYTES: usize = 9;
@@ -61,6 +68,9 @@ const KIND_INPUT_MODES: u8 = 46;
 const KIND_STOP_SESSION: u8 = 47;
 const KIND_TERMINAL_RESET: u8 = 48;
 const KIND_TERMINAL_RESET_STATE: u8 = 49;
+const KIND_IMAGE_REQUEST: u8 = 50;
+const KIND_IMAGE_RESPONSE: u8 = 51;
+const IMAGE_RESPONSE_HEADER_LENGTH_BYTES: usize = 4;
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -100,6 +110,10 @@ pub enum RemoteCapability {
     StopSession,
     #[serde(rename = "terminal-reset-v1")]
     TerminalReset,
+    /// The Holder intercepts Kitty graphics and iTerm2 inline images, answers
+    /// their support probes and serves stored pixels by `ImageRequest`.
+    #[serde(rename = "inline-images-v1")]
+    InlineImages,
     IncrementalGrid,
     ProcessExit,
     Signal,
@@ -143,6 +157,7 @@ impl RemoteCapability {
             Self::ProcessFacts => "process-facts-v1",
             Self::StopSession => "stop-session-v1",
             Self::TerminalReset => "terminal-reset-v1",
+            Self::InlineImages => "inline-images-v1",
             Self::FullSnapshot => "full-snapshot",
             Self::IncrementalGrid => "incremental-grid",
             Self::ProcessExit => "process-exit",
@@ -210,6 +225,7 @@ pub const ANNOTATED_HOLDER_CAPABILITIES: &[RemoteCapability] = &[
     RemoteCapability::ProcessIdentity,
     RemoteCapability::StopSession,
     RemoteCapability::TerminalReset,
+    RemoteCapability::InlineImages,
 ];
 pub const ANNOTATED_HELPER_CAPABILITIES: &[RemoteCapability] = &[
     RemoteCapability::ProcessFacts,
@@ -232,6 +248,7 @@ pub const ANNOTATED_HELPER_CAPABILITIES: &[RemoteCapability] = &[
     RemoteCapability::ProcessIdentity,
     RemoteCapability::StopSession,
     RemoteCapability::TerminalReset,
+    RemoteCapability::InlineImages,
 ];
 
 /// Authentication bearer shared only by the local Engine and one Holder.
@@ -963,6 +980,117 @@ pub struct ScrollbackResponse {
     pub result: crate::ReadScrollbackCellsResult,
 }
 
+/// One chunk of a stored inline image, by anchor key. Sent only on a
+/// controller connection that negotiated `inline-images-v1`; an older Holder
+/// rejects the frame kind as unknown.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ImageRequest {
+    pub request_id: u64,
+    pub key: String,
+    pub offset: u64,
+}
+
+impl ImageRequest {
+    pub fn validate(&self) -> Result<(), RemoteCodecError> {
+        if self.request_id == 0
+            || !crate::inline_image::valid_key(&self.key)
+            || self.offset > crate::inline_image::MAX_IMAGE_BYTES as u64
+        {
+            return Err(RemoteCodecError::InvalidControlPayload {
+                kind: KIND_IMAGE_REQUEST,
+                detail: "image request id, key or offset is invalid".into(),
+            });
+        }
+        Ok(())
+    }
+}
+
+/// `image: None` when the key names no stored image (evicted, deleted, or
+/// from a previous Holder). The wire form is a length-prefixed JSON header
+/// followed by the raw chunk bytes, so pixels are never base64-inflated.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ImageResponse {
+    pub request_id: u64,
+    pub image: Option<ImageChunk>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ImageChunk {
+    pub format: crate::inline_image::InlineImageFormat,
+    pub compressed: bool,
+    pub width: u32,
+    pub height: u32,
+    /// Length of the whole stored image.
+    pub total: u64,
+    pub offset: u64,
+    pub data: Vec<u8>,
+}
+
+impl ImageChunk {
+    /// The chunk of `data` starting at `offset`, at most
+    /// [`MAX_IMAGE_CHUNK_BYTES`] long.
+    #[must_use]
+    pub fn slice(
+        format: crate::inline_image::InlineImageFormat,
+        compressed: bool,
+        width: u32,
+        height: u32,
+        data: &[u8],
+        offset: u64,
+    ) -> Self {
+        let start = usize::try_from(offset)
+            .unwrap_or(usize::MAX)
+            .min(data.len());
+        let end = start.saturating_add(MAX_IMAGE_CHUNK_BYTES).min(data.len());
+        Self {
+            format,
+            compressed,
+            width,
+            height,
+            total: data.len() as u64,
+            offset: start as u64,
+            data: data[start..end].to_vec(),
+        }
+    }
+
+    fn validate(&self) -> Result<(), RemoteCodecError> {
+        let end = self.offset.checked_add(self.data.len() as u64);
+        if self.data.len() > MAX_IMAGE_CHUNK_BYTES
+            || self.total > crate::inline_image::MAX_IMAGE_BYTES as u64
+            || end.is_none_or(|end| end > self.total)
+            || self.width == 0
+            || self.height == 0
+        {
+            return Err(RemoteCodecError::InvalidControlPayload {
+                kind: KIND_IMAGE_RESPONSE,
+                detail: "image chunk exceeds its bounds".into(),
+            });
+        }
+        Ok(())
+    }
+}
+
+#[derive(Deserialize, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct ImageResponseHeader {
+    request_id: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    image: Option<ImageChunkHeader>,
+}
+
+#[derive(Deserialize, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct ImageChunkHeader {
+    format: crate::inline_image::InlineImageFormat,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    compressed: bool,
+    width: u32,
+    height: u32,
+    total: u64,
+    offset: u64,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum RemoteMessage {
     Terminal(Frame),
@@ -984,6 +1112,8 @@ pub enum RemoteMessage {
     Error(RemoteError),
     ForegroundProcess(ForegroundProcess),
     InputModes(InputModes),
+    ImageRequest(ImageRequest),
+    ImageResponse(ImageResponse),
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -1184,6 +1314,43 @@ impl RemoteCodec {
             RemoteMessage::ForegroundProcess(value) => {
                 append_json(KIND_FOREGROUND_PROCESS, value, output, start)
             }
+            RemoteMessage::ImageRequest(value) => {
+                value.validate()?;
+                append_json(KIND_IMAGE_REQUEST, value, output, start)
+            }
+            RemoteMessage::ImageResponse(value) => {
+                if let Some(image) = &value.image {
+                    image.validate()?;
+                }
+                output[start] = KIND_IMAGE_RESPONSE;
+                let header = ImageResponseHeader {
+                    request_id: value.request_id,
+                    image: value.image.as_ref().map(|image| ImageChunkHeader {
+                        format: image.format,
+                        compressed: image.compressed,
+                        width: image.width,
+                        height: image.height,
+                        total: image.total,
+                        offset: image.offset,
+                    }),
+                };
+                let length_at = output.len();
+                output.extend_from_slice(&[0; IMAGE_RESPONSE_HEADER_LENGTH_BYTES]);
+                serde_json::to_writer(&mut *output, &header).map_err(|error| {
+                    RemoteCodecError::InvalidControlPayload {
+                        kind: KIND_IMAGE_RESPONSE,
+                        detail: error.to_string(),
+                    }
+                })?;
+                let header_length =
+                    (output.len() - length_at - IMAGE_RESPONSE_HEADER_LENGTH_BYTES) as u32;
+                output[length_at..length_at + IMAGE_RESPONSE_HEADER_LENGTH_BYTES]
+                    .copy_from_slice(&header_length.to_be_bytes());
+                if let Some(image) = &value.image {
+                    output.extend_from_slice(&image.data);
+                }
+                Ok(())
+            }
         })();
 
         if let Err(error) = result {
@@ -1202,19 +1369,15 @@ impl RemoteCodec {
                 },
             );
         }
-        if output[start] >= KIND_HELLO
-            && !matches!(
-                output[start],
-                KIND_FULL_SNAPSHOT | KIND_GRID_DELTA | KIND_SCROLLBACK_RESPONSE
-            )
-            && payload_length > MAX_CONTROL_FRAME_BYTES
+        if let Some(max) = control_frame_limit(output[start])
+            && payload_length > max
         {
             return rollback(
                 output,
                 start,
                 RemoteCodecError::ControlFrameTooLarge {
                     length: payload_length,
-                    max: MAX_CONTROL_FRAME_BYTES,
+                    max,
                 },
             );
         }
@@ -1243,17 +1406,11 @@ impl RemoteCodec {
                     max: MAX_FRAME_BYTES,
                 });
             }
-            if kind >= KIND_HELLO
-                && !matches!(
-                    kind,
-                    KIND_FULL_SNAPSHOT | KIND_GRID_DELTA | KIND_SCROLLBACK_RESPONSE
-                )
-                && length > MAX_CONTROL_FRAME_BYTES
+            // Checked from the header alone, before the body is buffered.
+            if let Some(max) = control_frame_limit(kind)
+                && length > max
             {
-                return Err(RemoteCodecError::ControlFrameTooLarge {
-                    length,
-                    max: MAX_CONTROL_FRAME_BYTES,
-                });
+                return Err(RemoteCodecError::ControlFrameTooLarge { length, max });
             }
             let frame_end = consumed + HEADER_BYTES + length;
             if self.buffer.len() < frame_end {
@@ -1276,6 +1433,55 @@ impl RemoteCodec {
     pub fn buffered_len(&self) -> usize {
         self.buffer.len()
     }
+}
+
+/// The largest payload a remote-only frame kind may carry; `None` for the
+/// terminal kinds and grid publications, bounded by `MAX_FRAME_BYTES` alone.
+fn control_frame_limit(kind: u8) -> Option<usize> {
+    match kind {
+        _ if kind < KIND_HELLO => None,
+        KIND_FULL_SNAPSHOT | KIND_GRID_DELTA | KIND_SCROLLBACK_RESPONSE => None,
+        KIND_IMAGE_RESPONSE => Some(MAX_IMAGE_RESPONSE_FRAME_BYTES),
+        _ => Some(MAX_CONTROL_FRAME_BYTES),
+    }
+}
+
+fn decode_image_response(payload: &[u8]) -> Result<ImageResponse, RemoteCodecError> {
+    let invalid = |detail: &str| RemoteCodecError::InvalidControlPayload {
+        kind: KIND_IMAGE_RESPONSE,
+        detail: detail.into(),
+    };
+    let length = payload
+        .get(..IMAGE_RESPONSE_HEADER_LENGTH_BYTES)
+        .ok_or_else(|| invalid("image response header length is missing"))?;
+    let length = u32::from_be_bytes(length.try_into().expect("length checked")) as usize;
+    let body = &payload[IMAGE_RESPONSE_HEADER_LENGTH_BYTES..];
+    if length > body.len() || length > MAX_CONTROL_FRAME_BYTES {
+        return Err(invalid("image response header length is invalid"));
+    }
+    let header: ImageResponseHeader = decode_json(KIND_IMAGE_RESPONSE, &body[..length])?;
+    let data = &body[length..];
+    let image = match header.image {
+        Some(chunk) => {
+            let image = ImageChunk {
+                format: chunk.format,
+                compressed: chunk.compressed,
+                width: chunk.width,
+                height: chunk.height,
+                total: chunk.total,
+                offset: chunk.offset,
+                data: data.to_vec(),
+            };
+            image.validate()?;
+            Some(image)
+        }
+        None if data.is_empty() => None,
+        None => return Err(invalid("a missing image carries no bytes")),
+    };
+    Ok(ImageResponse {
+        request_id: header.request_id,
+        image,
+    })
 }
 
 fn append_json<T: Serialize>(
@@ -1398,13 +1604,21 @@ fn decode_message(kind: u8, payload: &[u8]) -> Result<RemoteMessage, RemoteCodec
         KIND_FOREGROUND_PROCESS => Ok(RemoteMessage::ForegroundProcess(decode_json(
             kind, payload,
         )?)),
+        KIND_IMAGE_REQUEST => {
+            let value: ImageRequest = decode_json(kind, payload)?;
+            value.validate()?;
+            Ok(RemoteMessage::ImageRequest(value))
+        }
+        KIND_IMAGE_RESPONSE => Ok(RemoteMessage::ImageResponse(decode_image_response(
+            payload,
+        )?)),
         _ => Err(RemoteCodecError::UnknownMessageType(kind)),
     }
 }
 
 fn validate_kind(kind: u8) -> Result<(), RemoteCodecError> {
     if (1..=FrameType::Mouse as u8).contains(&kind)
-        || (KIND_HELLO..=KIND_TERMINAL_RESET_STATE).contains(&kind)
+        || (KIND_HELLO..=KIND_IMAGE_RESPONSE).contains(&kind)
     {
         Ok(())
     } else {
@@ -1892,6 +2106,156 @@ mod tests {
                 max: MAX_FRAME_BYTES,
             })
         );
+    }
+
+    fn image_response(data: Vec<u8>, total: u64) -> ImageResponse {
+        ImageResponse {
+            request_id: 7,
+            image: Some(ImageChunk {
+                format: crate::inline_image::InlineImageFormat::Rgba,
+                compressed: true,
+                width: 3,
+                height: 2,
+                total,
+                offset: 0,
+                data,
+            }),
+        }
+    }
+
+    #[test]
+    fn image_frames_round_trip_with_raw_bytes() {
+        let request = RemoteMessage::ImageRequest(ImageRequest {
+            request_id: 3,
+            key: "1a2b3c4d.7".into(),
+            offset: 512,
+        });
+        let full = RemoteMessage::ImageResponse(image_response((0..=255).collect(), 1024));
+        let missing = RemoteMessage::ImageResponse(ImageResponse {
+            request_id: 9,
+            image: None,
+        });
+        let mut stream = Vec::new();
+        for message in [&request, &full, &missing] {
+            RemoteCodec::encode_into(message, &mut stream).expect("encode");
+        }
+        // Pixels travel raw: header, a short JSON header, then the bytes.
+        assert!(stream.len() < 256 + 200 + 120, "{}", stream.len());
+        let mut codec = RemoteCodec::new();
+        let mut decoded = Vec::new();
+        for byte in &stream {
+            decoded.extend(codec.feed(std::slice::from_ref(byte)).expect("decode"));
+        }
+        assert_eq!(decoded, vec![request, full, missing]);
+    }
+
+    #[test]
+    fn image_frames_reject_oversized_and_inconsistent_chunks() {
+        // Encoding refuses a chunk over the bound, or one past its total.
+        for response in [
+            image_response(vec![0; MAX_IMAGE_CHUNK_BYTES + 1], 64 << 20),
+            image_response(vec![0; 10], 9),
+        ] {
+            assert!(matches!(
+                RemoteCodec::encode(&RemoteMessage::ImageResponse(response)),
+                Err(RemoteCodecError::InvalidControlPayload { .. })
+            ));
+        }
+        // A peer's oversized response fails from its header alone, before
+        // the body is buffered.
+        let mut header = vec![KIND_IMAGE_RESPONSE];
+        header.extend_from_slice(&(MAX_IMAGE_RESPONSE_FRAME_BYTES as u32 + 1).to_be_bytes());
+        assert_eq!(
+            RemoteCodec::new().feed(&header),
+            Err(RemoteCodecError::ControlFrameTooLarge {
+                length: MAX_IMAGE_RESPONSE_FRAME_BYTES + 1,
+                max: MAX_IMAGE_RESPONSE_FRAME_BYTES,
+            })
+        );
+        // Requests keep the ordinary control bound.
+        let mut header = vec![KIND_IMAGE_REQUEST];
+        header.extend_from_slice(&(MAX_CONTROL_FRAME_BYTES as u32 + 1).to_be_bytes());
+        assert!(matches!(
+            RemoteCodec::new().feed(&header),
+            Err(RemoteCodecError::ControlFrameTooLarge { .. })
+        ));
+        // A body that lies about its chunk, or a miss that carries bytes.
+        let mut encoded =
+            RemoteCodec::encode(&RemoteMessage::ImageResponse(image_response(vec![1; 4], 4)))
+                .expect("encode");
+        encoded.push(0);
+        let length = (encoded.len() - HEADER_BYTES) as u32;
+        encoded[1..HEADER_BYTES].copy_from_slice(&length.to_be_bytes());
+        assert!(
+            RemoteCodec::new().feed(&encoded).is_err(),
+            "offset + data > total"
+        );
+        let mut miss = RemoteCodec::encode(&RemoteMessage::ImageResponse(ImageResponse {
+            request_id: 1,
+            image: None,
+        }))
+        .expect("encode");
+        miss.push(0);
+        let length = (miss.len() - HEADER_BYTES) as u32;
+        miss[1..HEADER_BYTES].copy_from_slice(&length.to_be_bytes());
+        assert!(RemoteCodec::new().feed(&miss).is_err());
+        // Bad request ids, keys and offsets never reach a Holder.
+        for request in [
+            ImageRequest {
+                request_id: 0,
+                key: "k".into(),
+                offset: 0,
+            },
+            ImageRequest {
+                request_id: 1,
+                key: "../etc".into(),
+                offset: 0,
+            },
+            ImageRequest {
+                request_id: 1,
+                key: "k".into(),
+                offset: crate::inline_image::MAX_IMAGE_BYTES as u64 + 1,
+            },
+        ] {
+            assert!(RemoteCodec::encode(&RemoteMessage::ImageRequest(request)).is_err());
+        }
+    }
+
+    #[test]
+    fn image_kinds_are_new_to_this_minor() {
+        // A Holder from before inline-images-v1 accepted kinds up to 49 and
+        // fails closed on anything above; the Engine must therefore never
+        // send an ImageRequest without the negotiated capability.
+        const {
+            assert!(KIND_TERMINAL_RESET_STATE == 49);
+            assert!(KIND_IMAGE_REQUEST > KIND_TERMINAL_RESET_STATE);
+            assert!(INLINE_IMAGES_PROTOCOL_MINOR == PROTOCOL_MINOR);
+        }
+        assert_eq!(
+            serde_json::to_string(&RemoteCapability::InlineImages).unwrap(),
+            "\"inline-images-v1\""
+        );
+        assert_eq!(
+            RemoteCapability::InlineImages.wire_name(),
+            "inline-images-v1"
+        );
+        assert!(!PHASE_ONE_HOLDER_CAPABILITIES.contains(&RemoteCapability::InlineImages));
+    }
+
+    #[test]
+    fn image_chunk_slices_are_bounded() {
+        let data = vec![5; MAX_IMAGE_CHUNK_BYTES + 10];
+        let format = crate::inline_image::InlineImageFormat::Png;
+        let first = ImageChunk::slice(format, false, 1, 1, &data, 0);
+        assert_eq!(first.data.len(), MAX_IMAGE_CHUNK_BYTES);
+        let rest = ImageChunk::slice(format, false, 1, 1, &data, MAX_IMAGE_CHUNK_BYTES as u64);
+        assert_eq!(
+            (rest.offset, rest.data.len()),
+            (MAX_IMAGE_CHUNK_BYTES as u64, 10)
+        );
+        let past = ImageChunk::slice(format, false, 1, 1, &data, u64::MAX);
+        assert_eq!((past.offset, past.data.len()), (data.len() as u64, 0));
+        assert!(past.validate().is_ok());
     }
 }
 

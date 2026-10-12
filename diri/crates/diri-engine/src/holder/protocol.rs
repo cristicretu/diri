@@ -42,6 +42,12 @@ pub const DEFAULT_DISK_CAPACITY: i64 = 32 << 20;
 pub const HOLDER_STREAM_VERSION: u16 = 1;
 pub const HOLDER_STREAM_INPUT: u8 = 1;
 pub const HOLDER_STREAM_RESIZE: u8 = 2;
+/// Version 2 adds [`HOLDER_STREAM_RESIZE_PIXELS`]. A Holder that predates it
+/// refuses the version, and its client asks again for version 1.
+pub const HOLDER_STREAM_VERSION_PIXELS: u16 = 2;
+/// `[cols u16][rows u16][width px u16][height px u16]`: a resize that also
+/// sets the PTY's pixel size. Version 2 streams only.
+pub const HOLDER_STREAM_RESIZE_PIXELS: u8 = 3;
 pub const HOLDER_STREAM_ACK: u8 = 0;
 pub const HOLDER_STREAM_MAX_PAYLOAD: usize = 1 << 20;
 

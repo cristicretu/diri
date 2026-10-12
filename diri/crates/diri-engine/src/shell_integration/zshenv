@@ -1,0 +1,23 @@
+# Diri shell integration: zsh reads this file because Diri started the shell
+# with ZDOTDIR pointing at its directory. It puts ZDOTDIR back the way the
+# shell would have had it, sources the user's own .zshenv, and loads the
+# OSC 133 hooks in interactive shells. zsh then reads .zprofile, .zshrc and
+# .zlogin from the restored ZDOTDIR exactly as it always does, so nothing
+# below this file sees Diri's directory.
+builtin typeset _diri_dir="${ZDOTDIR-}"
+if [[ -n "${DIRI_ZSH_ZDOTDIR+X}" ]]; then
+    builtin export ZDOTDIR="$DIRI_ZSH_ZDOTDIR"
+    builtin unset DIRI_ZSH_ZDOTDIR
+else
+    builtin unset ZDOTDIR
+fi
+
+{
+    builtin typeset _diri_file="${ZDOTDIR-$HOME}/.zshenv"
+    [[ ! -r "$_diri_file" ]] || builtin source -- "$_diri_file"
+} always {
+    if [[ -o interactive && -r "$_diri_dir/diri.zsh" ]]; then
+        builtin source -- "$_diri_dir/diri.zsh"
+    fi
+    builtin unset _diri_file _diri_dir
+}

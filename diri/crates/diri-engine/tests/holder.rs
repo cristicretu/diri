@@ -738,3 +738,109 @@ fn a_development_manager_ends_sessions_no_engine_returns_for() {
         manager.try_wait().unwrap().is_some()
     });
 }
+
+/// Child half of the pixel-size tests: run as a held process, it waits for a
+/// line and prints the terminal size its PTY reports. A no-op when the test
+/// harness runs it directly.
+#[test]
+fn winsize_probe() {
+    if std::env::var_os("DIRI_WINSIZE_PROBE").is_none() {
+        return;
+    }
+    let mut line = String::new();
+    std::io::stdin().read_line(&mut line).expect("line");
+    // SAFETY: zeroed POD out-parameter for TIOCGWINSZ on stdin.
+    let mut size: libc::winsize = unsafe { std::mem::zeroed() };
+    // SAFETY: fd 0 is the PTY and `size` is a valid out-pointer.
+    assert_eq!(unsafe { libc::ioctl(0, libc::TIOCGWINSZ, &mut size) }, 0);
+    println!(
+        "winsize={}x{}/{}x{}",
+        size.ws_col, size.ws_row, size.ws_xpixel, size.ws_ypixel
+    );
+}
+
+#[test]
+fn a_resize_carries_the_text_area_in_pixels() {
+    let root = holders_dir("pixels");
+    let logs = root.join("logs");
+    let paths = HolderPaths::new(&root, "s_pixels");
+    let probe = std::env::current_exe().expect("test binary");
+    let mut launch = spec(
+        &paths,
+        &logs,
+        &[
+            probe.to_str().unwrap(),
+            "--exact",
+            "winsize_probe",
+            "--nocapture",
+            "--test-threads=1",
+        ],
+    );
+    launch
+        .environment
+        .insert("DIRI_WINSIZE_PROBE".into(), "1".into());
+    let server = std::thread::spawn(move || HolderServer::run(launch));
+    let client = HolderClient::new(paths.socket());
+    wait_until("holder ready", Duration::from_secs(5), || client.is_alive());
+
+    client
+        .resize_with_pixels(100, 30, (1600, 1020))
+        .expect("resize");
+    client.write(b"\n").expect("line");
+    wait_until("the child's size", Duration::from_secs(10), || {
+        String::from_utf8_lossy(&log_bytes(&logs, "s_pixels")).contains("winsize=100x30/1600x1020")
+    });
+
+    let _ = client.kill_tree();
+    let _ = server.join();
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// A Holder from before pixel resizes refuses input stream version 2 and
+/// knows only the four-byte resize. The client asks again for version 1 and
+/// sends that.
+#[test]
+fn a_holder_without_pixel_resizes_still_resizes() {
+    use std::io::BufRead;
+    use std::os::unix::net::UnixListener;
+
+    let root = holders_dir("pixels-old");
+    let socket = root.join("old.sock");
+    let listener = UnixListener::bind(&socket).expect("bind");
+    let old = std::thread::spawn(move || {
+        let mut frames = Vec::new();
+        for connection in listener.incoming().take(2) {
+            let mut connection = connection.expect("connection");
+            let mut reader = std::io::BufReader::new(connection.try_clone().unwrap());
+            let mut line = String::new();
+            reader.read_line(&mut line).expect("request");
+            let request: HolderRequest = serde_json::from_str(&line).expect("request json");
+            assert_eq!(request.op, HolderOperation::Stream);
+            if request.stream_version != Some(1) {
+                let refusal = HolderResponse::failure("unsupported Holder input stream version");
+                let mut json = serde_json::to_vec(&refusal).unwrap();
+                json.push(b'\n');
+                connection.write_all(&json).unwrap();
+                continue;
+            }
+            let mut json = serde_json::to_vec(&HolderResponse::stream(1)).unwrap();
+            json.push(b'\n');
+            connection.write_all(&json).unwrap();
+            let mut header = [0u8; 5];
+            reader.read_exact(&mut header).expect("frame");
+            let mut payload =
+                vec![0u8; u32::from_be_bytes(header[1..].try_into().unwrap()) as usize];
+            reader.read_exact(&mut payload).expect("payload");
+            frames.push((header[0], payload));
+            connection.write_all(&[0]).unwrap();
+        }
+        frames
+    });
+
+    HolderClient::new(&socket)
+        .resize_with_pixels(100, 30, (1600, 1020))
+        .expect("resize through the old protocol");
+    let frames = old.join().unwrap();
+    assert_eq!(frames, vec![(2, vec![0, 100, 0, 30])]);
+    let _ = std::fs::remove_dir_all(&root);
+}

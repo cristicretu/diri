@@ -66,6 +66,9 @@ impl From<&StatusSignal> for Evidence {
                         pending_work: None | Some(false),
                         ..
                     }
+            ) || matches!(
+                signal,
+                StatusSignal::ProgramStatus(Some(record)) if !record.state.is_transient()
             ),
             queued: matches!(signal, StatusSignal::Screen(observation) if observation.matched_rule_id == "queued-follow-up-question"),
             subagent: matches!(

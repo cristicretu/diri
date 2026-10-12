@@ -48,6 +48,7 @@ impl Bridge {
             same_repo_as: None,
             start_directory: None,
             note_id: None,
+            argv: None,
         };
         let title = optional_string(args, "name").unwrap_or_else(|| {
             let first_line = prompt.lines().next().unwrap_or("Scheduled task");

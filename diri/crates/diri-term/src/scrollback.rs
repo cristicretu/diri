@@ -16,7 +16,7 @@ use std::future::Future;
 use std::ops::Range;
 use std::pin::Pin;
 
-use diri_proto::grid::{GridCell, GridCodecError, GridRowCodec, RowMetadata};
+use diri_proto::grid::{GridCell, GridCodecError, GridRowCodec, LinkSpan, RowMetadata};
 use diri_proto::methods::ReadScrollbackCellsResult;
 use diri_proto::model::SessionId;
 use diri_proto::terminal::MouseModes;
@@ -458,6 +458,12 @@ impl ScrollbackViewport {
             .unwrap_or_default()
     }
 
+    /// The row's links without copying its metadata.
+    pub fn row_links<'a>(&'a self, buffer: &'a GridBuffer, row: i64) -> &'a [LinkSpan] {
+        self.row_metadata_ref(buffer, row)
+            .map_or(&[], |metadata| metadata.links.as_slice())
+    }
+
     pub fn row_graphemes<'a>(&'a self, buffer: &'a GridBuffer, row: i64) -> &'a [(u16, String)] {
         self.row_metadata_ref(buffer, row)
             .map_or(&[], |metadata| metadata.graphemes.as_slice())
@@ -516,6 +522,17 @@ impl ScrollbackViewport {
             self.cache.get(&absolute_row).map(Vec::as_slice)
         };
         source.unwrap_or_default()
+    }
+
+    /// The stored cells behind `absolute_row`, or `None` when the row is
+    /// beyond the screen or not fetched. Never pads or allocates.
+    #[must_use]
+    pub fn stored_row<'a>(
+        &'a self,
+        buffer: &'a GridBuffer,
+        absolute_row: i64,
+    ) -> Option<&'a [GridCell]> {
+        Some(self.row_source(buffer, absolute_row)).filter(|cells| !cells.is_empty())
     }
 
     #[must_use]
