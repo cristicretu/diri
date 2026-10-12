@@ -32,7 +32,7 @@ continue to take precedence.
 
 Hold ⌘ on its own for a moment (700 ms) and the ⌘ shortcuts appear on the
 controls they operate: ⌘1 … ⌘9 on session rows and tabs, ⌘T on New Agent and
-the new-tab button, ⌘B on the sidebar toggle, ⌥⌘I on the inspector toggle, ⇧⌘H
+the new-tab button, ⌘B on the sidebar toggle, ⌥⌘B on the inspector toggle, ⇧⌘H
 on search and ⌘W under the selected tab's close button. Release ⌘ and they fade
 out. Pressing any key or clicking while ⌘ is down is treated as a shortcut, so
 the labels never flash during ⌘C or ⌘T. They follow your custom bindings, and a
@@ -71,7 +71,7 @@ the overview is open, so those surfaces keep the arrow keys.
 | ⌥⌘W | Option-Command-W | Worktrees overview |
 | ⌘, | Command-comma | Settings |
 | ⌘B | Command-B | Show or hide the sidebar |
-| ⌥⌘I | Option-Command-I | Show or hide the inspector |
+| ⌥⌘B | Option-Command-B | Show or hide the inspector (right sidebar) |
 | ⌘J | Command-J | Show or hide a terminal pane below the focused pane |
 
 ## Panes

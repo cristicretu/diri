@@ -855,8 +855,8 @@ pub const COMMANDS: &[CommandSpec] = &[
     spec!(
         ToggleInspector,
         "toggle-inspector",
-        Some("cmd-alt-i"),
-        Some("⌥⌘I"),
+        Some("cmd-alt-b"),
+        Some("⌥⌘B"),
         Some(APP_CONTEXT)
     ),
     spec!(
@@ -2497,7 +2497,7 @@ mod tests {
             (CommandId::FocusNextPane, "cmd-]"),
             (CommandId::TogglePaneZoom, "cmd-shift-enter"),
             (CommandId::EqualizePanes, "cmd-ctrl-="),
-            (CommandId::ToggleInspector, "cmd-alt-i"),
+            (CommandId::ToggleInspector, "cmd-alt-b"),
         ] {
             assert_eq!(command(id).keystroke, Some(key), "{id:?}");
         }

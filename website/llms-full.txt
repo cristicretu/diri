@@ -289,7 +289,7 @@ On Linux, ⌘ becomes Ctrl and ⌃⌘ becomes Ctrl+Shift. A few bindings move to
 
 | Command | macOS | Linux |
 | --- | --- | --- |
-| Toggle inspector | ⌥⌘I | Ctrl+Alt+I |
+| Toggle inspector | ⌥⌘B | Ctrl+Alt+B |
 | Previous / next session | ⇧⌘[ / ⇧⌘] | Ctrl+Alt+← / → |
 | Delegate session | ⌃⌘D | Ctrl+Alt+D |
 | To-dos | ⌃⌘T | Ctrl+Alt+Shift+T |
@@ -298,7 +298,7 @@ On Linux, ⌘ becomes Ctrl and ⌃⌘ becomes Ctrl+Shift. A few bindings move to
 | Hide diri | ⌘H | none |
 
 ## See shortcuts in place
-Hold ⌘ on its own for a moment (700 ms) and the ⌘ shortcuts appear on the controls they operate: ⌘1 … ⌘9 on session rows and tabs, ⌘T on New Agent and the new-tab button, ⌘B on the sidebar toggle, ⌥⌘I on the inspector toggle, ⇧⌘H on search, and ⌘W under the selected tab's close button. Release ⌘ and they fade out.
+Hold ⌘ on its own for a moment (700 ms) and the ⌘ shortcuts appear on the controls they operate: ⌘1 … ⌘9 on session rows and tabs, ⌘T on New Agent and the new-tab button, ⌘B on the sidebar toggle, ⌥⌘B on the inspector toggle, ⇧⌘H on search, and ⌘W under the selected tab's close button. Release ⌘ and they fade out.
 
 Pressing another key or clicking while ⌘ is down counts as a shortcut, so the labels never flash during ⌘C or ⌘T. A command rebound away from ⌘ shows nothing. With Reduce Motion they appear and disappear without a fade.
 

@@ -12015,7 +12015,7 @@ mod tests {
             cx.notify();
         });
         cx.run_until_parked();
-        cx.simulate_keystrokes(&commands::test_chords("cmd-alt-i"));
+        cx.simulate_keystrokes(&commands::test_chords("cmd-alt-b"));
         cx.run_until_parked();
         assert!(
             root.read_with(cx, |root, _| root.inspector_open),
