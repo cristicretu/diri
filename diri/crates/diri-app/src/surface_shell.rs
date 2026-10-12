@@ -3189,6 +3189,11 @@ impl UtilitySurfaces {
             .size_full()
             .pt(px(Metrics::TITLE_BAR))
             .overflow_hidden()
+            // In comfortable this fills a rounded island, and GPUI clips to
+            // rectangles, so the fill rounds itself.
+            .when(self.prefs.pane_density.islands(), |shell| {
+                shell.rounded(px(Radius::CARD))
+            })
             .bg(colors.work_surface())
             .flex()
             // Settings owns the workbench beside the sidebar. Clicking inside
