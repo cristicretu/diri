@@ -609,7 +609,11 @@ impl WorkbenchInspector {
         }
         self.visible = visible;
         if visible {
+            // The panel slides in carrying its content, as the left sidebar
+            // does; a tab transition on top would fade and shift it mid-slide.
+            let transition = self.tab_transition_generation;
             self.seed_default_workspace(cx);
+            self.tab_transition_generation = transition;
             self.sync_workspace_follow(true, cx);
             // One-shot, every tab. Info renders the Git summary and the header
             // renders the Changes badge, so becoming visible always needs one
