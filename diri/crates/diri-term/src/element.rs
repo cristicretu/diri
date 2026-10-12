@@ -1827,13 +1827,18 @@ impl TerminalElement {
         metrics: CellMetrics,
         window: &mut Window,
     ) -> ShapedLine {
-        let (text, runs) = self.row_text_and_runs(row, graphemes, tints);
-        window.text_system().shape_line(
+        let mut cell_starts = Vec::new();
+        let (text, runs) = self.row_text(row, graphemes, tints, Some(&mut cell_starts));
+        let mut line = window.text_system().shape_line(
             SharedString::from(text),
             self.font_size,
             &runs,
             Some(metrics.cell_width),
-        )
+        );
+        if !reorders(row, graphemes) {
+            anchor_glyphs_to_cells(&mut line, &cell_starts, metrics.cell_width);
+        }
+        line
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1882,11 +1887,7 @@ impl TerminalElement {
     /// A row with right-to-left text is positioned from the whole line and is
     /// shaped whole.
     fn shaped_cells(&self, row: &[GridCell], graphemes: &[(u16, String)]) -> usize {
-        let reorders = row.iter().any(|cell| is_bidi_sensitive(cell.scalar))
-            || graphemes
-                .iter()
-                .any(|(_, text)| text.chars().any(|ch| is_bidi_sensitive(u32::from(ch))));
-        if reorders {
+        if reorders(row, graphemes) {
             return row.len();
         }
         let last_glyph = row.iter().enumerate().rposition(|(column, cell)| {
@@ -1899,11 +1900,24 @@ impl TerminalElement {
         last_glyph.map_or(1, |last| last + 2).min(row.len())
     }
 
+    #[cfg(test)]
     fn row_text_and_runs(
         &self,
         row: &[GridCell],
         graphemes: &[(u16, String)],
         tints: &[Tint],
+    ) -> (String, Vec<TextRun>) {
+        self.row_text(row, graphemes, tints, None)
+    }
+
+    /// The shaped text of `row` and its runs; `cell_starts` receives the byte
+    /// offset where each shaped cell begins.
+    fn row_text(
+        &self,
+        row: &[GridCell],
+        graphemes: &[(u16, String)],
+        tints: &[Tint],
+        mut cell_starts: Option<&mut Vec<usize>>,
     ) -> (String, Vec<TextRun>) {
         let row = &row[..self.shaped_cells(row, graphemes)];
         let mut text = String::with_capacity(row.len());
@@ -1914,6 +1928,9 @@ impl TerminalElement {
             let resolved = self.theme.resolve_cell_under(*cell, tint_at(tints, column));
             let ch = render_char(*cell, resolved.visible);
             let mut byte_len = ch.len_utf8();
+            if let Some(starts) = cell_starts.as_deref_mut() {
+                starts.push(text.len());
+            }
             text.push(ch);
             while graphemes
                 .peek()
@@ -3536,6 +3553,78 @@ fn paint_line_around_cursor(
             );
         });
     }
+}
+
+/// Whether glyph order and position in `row` are a property of the whole line.
+fn reorders(row: &[GridCell], graphemes: &[(u16, String)]) -> bool {
+    row.iter().any(|cell| is_bidi_sensitive(cell.scalar))
+        || graphemes
+            .iter()
+            .any(|(_, text)| text.chars().any(|ch| is_bidi_sensitive(u32::from(ch))))
+}
+
+/// Pins each cell's glyphs to that cell's column.
+///
+/// The shaper's own grid snap counts glyphs and treats any glyph drawn less
+/// than half a cell after the previous one as a combining mark. A cell whose
+/// glyph has no advance (U+00AD SOFT HYPHEN, U+2028) or a narrow fallback
+/// advance is one column on the grid but not to that count, so every glyph
+/// after it is drawn a column early: under the next cell's cursor and
+/// background, with the cursor showing the glyph to its left. Glyph byte
+/// indexes name their cell exactly, so the layout is copied only for a row
+/// that is actually off the grid.
+fn anchor_glyphs_to_cells(line: &mut ShapedLine, cell_starts: &[usize], cell_width: Pixels) {
+    if glyph_shifts(line, cell_starts, cell_width).all(|shift| shift == px(0.0)) {
+        return;
+    }
+    let shifts: Vec<Pixels> = glyph_shifts(line, cell_starts, cell_width).collect();
+    let mut runs = line.runs.clone();
+    for (glyph, shift) in runs
+        .iter_mut()
+        .flat_map(|run| run.glyphs.iter_mut())
+        .zip(shifts)
+    {
+        glyph.position.x += shift;
+    }
+    let layout: &mut Arc<gpui::LineLayout> = line;
+    *layout = Arc::new(gpui::LineLayout {
+        font_size: layout.font_size,
+        width: layout.width,
+        ascent: layout.ascent,
+        descent: layout.descent,
+        runs,
+        len: layout.len,
+    });
+}
+
+/// How far each glyph of `line` must move to sit on its cell. A cell's first
+/// glyph sets the shift and the rest of the cell (its combining marks) follow;
+/// a glyph within a pixel of its column keeps the shaper's position.
+fn glyph_shifts<'a>(
+    line: &'a ShapedLine,
+    cell_starts: &'a [usize],
+    cell_width: Pixels,
+) -> impl Iterator<Item = Pixels> + 'a {
+    let mut cell = usize::MAX;
+    let mut shift = px(0.0);
+    line.runs
+        .iter()
+        .flat_map(|run| run.glyphs.iter())
+        .map(move |glyph| {
+            let column = cell_starts
+                .partition_point(|&start| start <= glyph.index)
+                .saturating_sub(1);
+            if column != cell {
+                cell = column;
+                let target = cell_width * column as f32;
+                shift = if (glyph.position.x - target).abs() > px(1.0) {
+                    target - glyph.position.x
+                } else {
+                    px(0.0)
+                };
+            }
+            shift
+        })
 }
 
 fn styled_font(base: &Font, style: ResolvedCellStyle) -> Font {
