@@ -465,7 +465,7 @@ impl WorkspaceWorkbench {
     /// Seeds each mounted pane with its own coloured page (a git UI, a
     /// lockfile, a shell prompt, a test run) so style screenshots show how a
     /// theme's ANSI colours sit on every surface.
-    #[cfg(test)]
+    #[cfg(all(test, target_os = "macos"))]
     pub(crate) fn seed_styled_panes_for_test(&self, cx: &mut Context<Self>) {
         use diri_proto::grid::TermColor;
         type Span = (&'static str, Option<u8>);

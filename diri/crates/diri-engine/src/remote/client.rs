@@ -1204,8 +1204,10 @@ mod tests {
         assert_eq!(reader.join().unwrap().unwrap(), Some(chunk));
 
         // A reconnect forgets the capability until the next HelloAck says so,
-        // even when the reconnect itself fails.
-        assert!(client.connect(0, None).is_err());
+        // whether or not it gets that far. The fixture's `/bin/false` channel
+        // usually fails the Hello write, but on Linux the write can land in
+        // the pipe before the child exits, so the outcome itself is a race.
+        let _ = client.connect(0, None);
         assert!(!client.supports_inline_images());
     }
 
