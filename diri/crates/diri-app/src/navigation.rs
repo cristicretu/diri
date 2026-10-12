@@ -57,7 +57,7 @@ const ROW_HEIGHT: f32 = 36.0;
 /// Single-line command, project, and theme rows.
 const COMPACT_ROW_HEIGHT: f32 = 30.0;
 const LIST_HEIGHT: f32 = ROW_HEIGHT * 9.0;
-const SURFACE_WIDTH: f32 = 540.0;
+const SURFACE_WIDTH: f32 = 460.0;
 const KEYCAP_WIDTH: f32 = 28.0;
 const KEYCAP_HEIGHT: f32 = 20.0;
 const CHAT_PREVIEW_LIMIT: usize = 5;
