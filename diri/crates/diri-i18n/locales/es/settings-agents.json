@@ -1,5 +1,8 @@
 {
   "settings.agents.add": "Añadir…",
+  "settings.agents.args": "Argumentos",
+  "settings.agents.args_label": "Se añaden cada vez que se inicia este agente, p. ej. --dangerously-skip-permissions. Déjalo vacío si no quieres ninguno.",
+  "settings.agents.args_unbalanced": "Cierra la comilla o quita la barra invertida final.",
   "settings.agents.cancel": "Cancelar",
   "settings.agents.change": "Cambiar",
   "settings.agents.checking": "Comprobando…",
@@ -24,6 +27,7 @@
   "settings.agents.quick": "Rápido",
   "settings.agents.refresh": "Actualizar",
   "settings.agents.remote_path_label": "Ruta del ejecutable remoto (absoluta o ~/…)",
+  "settings.agents.save_args": "Guardar argumentos",
   "settings.agents.save_path": "Guardar ruta",
   "settings.agents.status_installed": "Instalado",
   "settings.agents.status_manual": "Manual",

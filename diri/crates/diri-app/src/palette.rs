@@ -988,6 +988,7 @@ mod tests {
             configured_path: None,
             path_source: available.then_some(AgentPathSource::SystemPath),
             show_in_quick_create: available,
+            launch_args: Vec::new(),
             error: None,
             signed_in: None,
             descriptor: Some(AgentDescriptor {

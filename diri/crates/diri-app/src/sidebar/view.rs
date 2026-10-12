@@ -13078,6 +13078,7 @@ mod tests {
                         configured_path: None,
                         path_source: Some(diri_proto::AgentPathSource::SystemPath),
                         show_in_quick_create: true,
+                        launch_args: Vec::new(),
                         error: None,
                         signed_in: None,
                         descriptor: Some(diri_proto::AgentDescriptor {

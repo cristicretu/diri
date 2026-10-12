@@ -1,5 +1,8 @@
 {
   "settings.agents.add": "添加…",
+  "settings.agents.args": "参数",
+  "settings.agents.args_label": "每次启动此代理时添加，例如 --dangerously-skip-permissions。留空表示不添加。",
+  "settings.agents.args_unbalanced": "请补全引号或删除末尾的反斜杠。",
   "settings.agents.cancel": "取消",
   "settings.agents.change": "更改",
   "settings.agents.checking": "正在检查…",
@@ -24,6 +27,7 @@
   "settings.agents.quick": "快捷",
   "settings.agents.refresh": "刷新",
   "settings.agents.remote_path_label": "远程可执行文件路径（绝对路径或 ~/…）",
+  "settings.agents.save_args": "保存参数",
   "settings.agents.save_path": "保存路径",
   "settings.agents.status_installed": "已安装",
   "settings.agents.status_manual": "手动",

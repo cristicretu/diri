@@ -921,6 +921,7 @@ mod tests {
                 crate::agent_catalog::AgentPreference {
                     executable_path: Some(executable.to_string_lossy().into_owned()),
                     show_in_quick_create: Some(true),
+                    launch_args: Vec::new(),
                 },
             )
             .unwrap();

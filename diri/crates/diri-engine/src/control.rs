@@ -1367,6 +1367,7 @@ impl ControlServer {
         let mut mcp_http_token = None;
         if descriptor.binary.is_some() {
             launch_args.extend(descriptor.spawn_args.iter().cloned());
+            launch_args.extend(self.configured_launch_args(None, &kind)?);
             if let Some(injection) = &self.injection {
                 let injected = crate::inject::injection_args_full(
                     &descriptor.injection,
@@ -1971,6 +1972,7 @@ impl ControlServer {
         let mut launch_args = caller_argv.clone();
         if descriptor.binary.is_some() {
             launch_args.extend(descriptor.spawn_args.iter().cloned());
+            launch_args.extend(self.configured_launch_args(Some(&host.id), &kind)?);
             let minted = descriptor
                 .mints_conversation_id()
                 .then(crate::inject::uuid_v4);
@@ -3826,6 +3828,7 @@ impl ControlServer {
             ));
         }
         let mut launch_args = descriptor.spawn_args.clone();
+        launch_args.extend(self.configured_launch_args(Some(&host.id), kind.id())?);
         let provider_dir = captured
             .environment
             .iter()
@@ -4141,6 +4144,7 @@ impl ControlServer {
         let binary = descriptor.binary.clone().expect("checked above");
         descriptor.binary = Some(self.resolve_local_agent_executable(kind, &binary)?);
         let mut launch_args = descriptor.spawn_args.clone();
+        launch_args.extend(self.configured_launch_args(None, kind)?);
         let mut mcp_http_token = None;
         if let Some(injection) = &self.injection {
             let injected = crate::inject::injection_args_full(
@@ -4279,6 +4283,21 @@ impl ControlServer {
         encode(&self.agent_catalog(&p, false)?)
     }
 
+    /// The user's extra arguments for `kind` on `host`, appended after the
+    /// manifest's own `spawnArgs` on every spawn and resume.
+    fn configured_launch_args(
+        &self,
+        host: Option<&str>,
+        kind: &str,
+    ) -> Result<Vec<String>, ControlError> {
+        Ok(self
+            .agent_catalog
+            .lock()
+            .map_err(poisoned)?
+            .preference(host, kind)
+            .launch_args)
+    }
+
     fn resolve_local_agent_executable(
         &self,
         kind: &str,
@@ -4372,15 +4391,21 @@ impl ControlServer {
         if let Some(host) = p.host.as_deref() {
             self.resolve_host(host)?;
         }
-        let preference = crate::agent_catalog::AgentPreference {
-            executable_path: p.executable_path,
-            show_in_quick_create: Some(p.show_in_quick_create),
-        };
-        self.agent_catalog
-            .lock()
-            .map_err(poisoned)?
-            .configure(p.host.as_deref(), &kind, preference)
-            .map_err(io_control_error)?;
+        {
+            let mut catalog = self.agent_catalog.lock().map_err(poisoned)?;
+            let launch_args = match p.launch_args {
+                Some(args) => args,
+                None => catalog.preference(p.host.as_deref(), &kind).launch_args,
+            };
+            let preference = crate::agent_catalog::AgentPreference {
+                executable_path: p.executable_path,
+                show_in_quick_create: Some(p.show_in_quick_create),
+                launch_args,
+            };
+            catalog
+                .configure(p.host.as_deref(), &kind, preference)
+                .map_err(io_control_error)?;
+        }
         let result = self.agent_catalog(
             &diri_proto::AgentReadinessParams {
                 host: p.host,
@@ -4567,6 +4592,7 @@ impl ControlServer {
                 configured_path: preference.executable_path,
                 path_source,
                 show_in_quick_create: show,
+                launch_args: preference.launch_args,
                 error: resolution.configured_error,
                 descriptor,
             });
@@ -8049,6 +8075,7 @@ mod tests {
                 crate::agent_catalog::AgentPreference {
                     executable_path: Some(executable.to_string_lossy().into_owned()),
                     show_in_quick_create: Some(true),
+                    launch_args: vec!["--dangerously-skip-permissions".into()],
                 },
             )
             .expect("bind fake claude executable");
@@ -8064,6 +8091,10 @@ mod tests {
             command.contains(&format!("{}'", executable.display()))
                 && command.contains("'--resume' 'uuid-1'"),
             "resume flags must reach the agent: {command:?}"
+        );
+        assert!(
+            command.contains("'--dangerously-skip-permissions' '--resume' 'uuid-1'"),
+            "configured launch arguments precede the resume grammar: {command:?}"
         );
 
         let fork = server
@@ -8081,6 +8112,45 @@ mod tests {
             command.contains("'--resume' 'uuid-1' '--fork-session'"),
             "fork grammar must reach the agent: {command:?}"
         );
+        assert!(
+            command.contains("'--dangerously-skip-permissions'"),
+            "forks keep the configured launch arguments: {command:?}"
+        );
+    }
+
+    #[test]
+    fn configuring_an_agent_without_launch_args_keeps_them() {
+        let temp = tempfile::tempdir().expect("temp");
+        let server = server(temp.path());
+        let configure = |args: serde_json::Value| {
+            let mut params = json!({
+                "kind": "claude-code",
+                "executablePath": "/usr/bin/true",
+                "showInQuickCreate": true,
+            });
+            if !args.is_null() {
+                params["launchArgs"] = args;
+            }
+            let result: diri_proto::AgentConfigureResult =
+                serde_json::from_value(server.agent_configure(Some(params)).expect("configure"))
+                    .expect("result");
+            result
+                .agents
+                .into_iter()
+                .find(|item| item.kind.id() == "claude-code")
+                .expect("claude row")
+                .launch_args
+        };
+        assert_eq!(
+            configure(json!(["--dangerously-skip-permissions"])),
+            ["--dangerously-skip-permissions"]
+        );
+        assert_eq!(
+            configure(serde_json::Value::Null),
+            ["--dangerously-skip-permissions"],
+            "a client that only edits the path must not clear the arguments"
+        );
+        assert!(configure(json!([])).is_empty(), "an empty list clears them");
     }
 
     #[test]
@@ -8105,6 +8175,7 @@ mod tests {
                 crate::agent_catalog::AgentPreference {
                     executable_path: Some(executable.to_string_lossy().into_owned()),
                     show_in_quick_create: Some(true),
+                    launch_args: Vec::new(),
                 },
             )
             .unwrap();
@@ -8221,6 +8292,7 @@ mod tests {
                 crate::agent_catalog::AgentPreference {
                     executable_path: Some(configured.to_string_lossy().into_owned()),
                     show_in_quick_create: Some(true),
+                    launch_args: Vec::new(),
                 },
             )
             .expect("bind fake claude executable");

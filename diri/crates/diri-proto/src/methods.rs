@@ -373,6 +373,9 @@ pub struct AgentReadinessItem {
     pub path_source: Option<AgentPathSource>,
     #[serde(default = "default_true")]
     pub show_in_quick_create: bool,
+    /// User-configured arguments appended to every launch on this target.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub launch_args: Vec<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
     /// The agent's manifest descriptor. This is how the AGENT CATALOG reaches
@@ -470,6 +473,12 @@ pub struct AgentConfigureParams {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub executable_path: Option<String>,
     pub show_in_quick_create: bool,
+    /// Extra arguments for every launch of this Agent on this target, e.g.
+    /// `--dangerously-skip-permissions`. Absent keeps the stored arguments,
+    /// so clients that only edit the path never clear them; an empty list
+    /// clears them.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub launch_args: Option<Vec<String>>,
 }
 
 pub type AgentConfigureResult = AgentReadinessResult;

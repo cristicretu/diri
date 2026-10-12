@@ -37,6 +37,11 @@ pub struct AgentPreference {
     pub executable_path: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub show_in_quick_create: Option<bool>,
+    /// Appended to the manifest's argv on every spawn and resume, e.g.
+    /// `--dangerously-skip-permissions`. Each entry is one argv element; none
+    /// of them is ever interpreted by a shell.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub launch_args: Vec<String>,
 }
 
 #[derive(Clone)]
@@ -118,6 +123,7 @@ impl AgentCatalogStore {
         if let Some(path) = preference.executable_path.as_deref() {
             validate_user_path(path)?;
         }
+        validate_launch_args(&preference.launch_args)?;
         let key = target_key(host);
         let previous = self.config.clone();
         self.config
@@ -278,6 +284,24 @@ fn validate_user_path(path: &str) -> io::Result<()> {
     Ok(())
 }
 
+const MAX_LAUNCH_ARGS: usize = 64;
+
+fn validate_launch_args(args: &[String]) -> io::Result<()> {
+    if args.len() > MAX_LAUNCH_ARGS
+        || args
+            .iter()
+            .any(|arg| arg.is_empty() || arg.len() > 4_096 || arg.as_bytes().contains(&0))
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!(
+                "launch arguments must be at most {MAX_LAUNCH_ARGS} non-empty, NUL-free values of at most 4096 bytes"
+            ),
+        ));
+    }
+    Ok(())
+}
+
 fn validate_component(label: &str, value: &str) -> io::Result<()> {
     if value.is_empty()
         || value.len() > 128
@@ -321,6 +345,7 @@ mod tests {
                 AgentPreference {
                     executable_path: Some("/usr/bin/true".into()),
                     show_in_quick_create: Some(false),
+                    launch_args: Vec::new(),
                 },
             )
             .expect("configure");
@@ -333,6 +358,61 @@ mod tests {
         assert_eq!(
             loaded.preference(None, "codex").executable_path.as_deref(),
             Some("/usr/bin/true")
+        );
+    }
+
+    #[test]
+    fn launch_args_persist_per_target_and_reject_unsafe_values() {
+        let temp = tempfile::tempdir().expect("temp");
+        let path = temp.path().join("agents.json");
+        let mut store = AgentCatalogStore::new(&path).expect("store");
+        let args = vec![
+            "--dangerously-skip-permissions".to_owned(),
+            "--append-system-prompt".to_owned(),
+            "be terse; $(no shell)".to_owned(),
+        ];
+        store
+            .configure(
+                None,
+                "claude-code",
+                AgentPreference {
+                    launch_args: args.clone(),
+                    ..AgentPreference::default()
+                },
+            )
+            .expect("configure");
+        let loaded = AgentCatalogStore::new(&path).expect("reload");
+        assert_eq!(loaded.preference(None, "claude-code").launch_args, args);
+        assert!(
+            loaded
+                .preference(Some("forge"), "claude-code")
+                .launch_args
+                .is_empty(),
+            "arguments are per execution target"
+        );
+
+        for bad in [
+            vec![String::new()],
+            vec!["a\0b".to_owned()],
+            vec!["x".repeat(4_097)],
+            vec!["-v".to_owned(); MAX_LAUNCH_ARGS + 1],
+        ] {
+            let error = store
+                .configure(
+                    None,
+                    "claude-code",
+                    AgentPreference {
+                        launch_args: bad,
+                        ..AgentPreference::default()
+                    },
+                )
+                .expect_err("invalid arguments are refused");
+            assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+        }
+        assert_eq!(
+            store.preference(None, "claude-code").launch_args,
+            args,
+            "a refused change keeps the stored arguments"
         );
     }
 }

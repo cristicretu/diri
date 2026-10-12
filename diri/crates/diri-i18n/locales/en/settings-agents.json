@@ -1,5 +1,8 @@
 {
   "settings.agents.add": "Add…",
+  "settings.agents.args": "Arguments",
+  "settings.agents.args_label": "Added every time this agent starts, e.g. --dangerously-skip-permissions. Leave empty for none.",
+  "settings.agents.args_unbalanced": "Close the quote or remove the trailing backslash.",
   "settings.agents.cancel": "Cancel",
   "settings.agents.change": "Change",
   "settings.agents.checking": "Checking…",
@@ -24,6 +27,7 @@
   "settings.agents.quick": "Quick",
   "settings.agents.refresh": "Refresh",
   "settings.agents.remote_path_label": "Remote executable path (absolute or ~/…)",
+  "settings.agents.save_args": "Save Arguments",
   "settings.agents.save_path": "Save Path",
   "settings.agents.status_installed": "Installed",
   "settings.agents.status_manual": "Manual",

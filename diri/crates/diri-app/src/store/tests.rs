@@ -1848,6 +1848,7 @@ fn a_configure_issued_during_an_inflight_scan_still_reaches_the_engine() {
         kind: AgentKind::CLAUDE_CODE,
         executable_path: None,
         show_in_quick_create: false,
+        launch_args: None,
     });
     assert!(matches!(
         effects.try_recv(),

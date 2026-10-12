@@ -279,9 +279,20 @@ struct HostEditor {
 struct AgentPathEditor {
     kind: ProtoAgentKind,
     host: Option<String>,
+    /// What `path` edits: the remote executable path, or the launch arguments.
+    field: AgentEditorField,
+    /// The executable path saved alongside a launch-arguments edit, so the
+    /// row's binding is unchanged.
+    configured_path: Option<String>,
     path: QueryEditor,
     show_in_quick_create: bool,
     error: Option<String>,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum AgentEditorField {
+    Path,
+    Arguments,
 }
 
 /// One line for an import that failed: which file, and why in words the
@@ -1723,26 +1734,7 @@ impl UtilitySurfaces {
                 cx.notify();
             }
             "enter" => {
-                let Some(editor) = &self.agent_path_editor else {
-                    return true;
-                };
-                let path = editor.path.text().trim();
-                if path.is_empty() {
-                    if let Some(editor) = &mut self.agent_path_editor {
-                        editor.error = Some(t("settings.agents.path_required").into());
-                    }
-                } else {
-                    self.store
-                        .write()
-                        .expect("session store lock poisoned")
-                        .configure_agent(diri_proto::AgentConfigureParams {
-                            host: editor.host.clone(),
-                            kind: editor.kind.clone(),
-                            executable_path: Some(path.to_owned()),
-                            show_in_quick_create: editor.show_in_quick_create,
-                        });
-                    self.agent_path_editor = None;
-                }
+                self.save_agent_editor();
                 cx.notify();
             }
             _ => {
@@ -4530,6 +4522,7 @@ impl UtilitySurfaces {
                                 kind: toggle_kind.clone(),
                                 executable_path: toggle_path.clone(),
                                 show_in_quick_create: !show,
+                                launch_args: None,
                             });
                         cx.notify();
                     }))
@@ -4615,6 +4608,41 @@ impl UtilitySurfaces {
                     ),
             );
         }
+        let args_kind = item.kind.clone();
+        let args_host = self.agents_host.clone();
+        let args_path = item.configured_path.clone();
+        let args_text = crate::agent_catalog::join_launch_args(&item.launch_args);
+        let args_show = item.show_in_quick_create;
+        actions = actions.child(
+            div()
+                .id(format!("agent-args-{index}"))
+                .h(px(24.0))
+                .px(px(7.0))
+                .rounded(px(Radius::CHIP))
+                .bg(colors.primary.alpha(0.06))
+                .cursor_pointer()
+                .hover(move |button| button.bg(colors.primary.alpha(0.09)))
+                .on_click(cx.listener(move |this, _, _, cx| {
+                    this.agent_path_editor = Some(AgentPathEditor {
+                        kind: args_kind.clone(),
+                        host: args_host.clone(),
+                        field: AgentEditorField::Arguments,
+                        configured_path: args_path.clone(),
+                        path: text_editor(&args_text),
+                        show_in_quick_create: args_show,
+                        error: None,
+                    });
+                    cx.notify();
+                }))
+                .flex()
+                .items_center()
+                .child(
+                    div()
+                        .text_size(px(10.0))
+                        .text_color(colors.secondary)
+                        .child(t("settings.agents.args")),
+                ),
+        );
         let edit_kind = item.kind.clone();
         let edit_path = item.configured_path.clone().unwrap_or_default();
         let edit_host = self.agents_host.clone();
@@ -4653,6 +4681,7 @@ impl UtilitySurfaces {
                                         kind: kind.clone(),
                                         executable_path: Some(path.to_string_lossy().into_owned()),
                                         show_in_quick_create: edit_show,
+                                        launch_args: None,
                                     });
                                 cx.notify();
                             });
@@ -4662,6 +4691,8 @@ impl UtilitySurfaces {
                         this.agent_path_editor = Some(AgentPathEditor {
                             kind: edit_kind.clone(),
                             host: edit_host.clone(),
+                            field: AgentEditorField::Path,
+                            configured_path: None,
                             path: text_editor(&edit_path),
                             show_in_quick_create: edit_show,
                             error: None,
@@ -4705,6 +4736,7 @@ impl UtilitySurfaces {
                                 kind: reset_kind.clone(),
                                 executable_path: None,
                                 show_in_quick_create: reset_show,
+                                launch_args: None,
                             });
                         cx.notify();
                     }))
@@ -4754,11 +4786,55 @@ impl UtilitySurfaces {
                             } else {
                                 colors.tertiary
                             })
-                            .child(item.error.unwrap_or(path)),
+                            .child(item.error.unwrap_or_else(|| {
+                                if item.launch_args.is_empty() {
+                                    path
+                                } else {
+                                    format!(
+                                        "{path} {}",
+                                        crate::agent_catalog::join_launch_args(&item.launch_args)
+                                    )
+                                }
+                            })),
                     ),
             )
             .child(actions)
             .into_any_element()
+    }
+
+    /// Saves the open path or arguments editor, or leaves it open with the
+    /// reason it cannot be saved.
+    fn save_agent_editor(&mut self) {
+        let Some(editor) = &mut self.agent_path_editor else {
+            return;
+        };
+        let text = editor.path.text().trim().to_owned();
+        let (executable_path, launch_args) = match editor.field {
+            AgentEditorField::Path if text.is_empty() => {
+                editor.error = Some(t("settings.agents.path_required").into());
+                return;
+            }
+            AgentEditorField::Path => (Some(text), None),
+            AgentEditorField::Arguments => {
+                let Some(mut args) = crate::agent_catalog::split_launch_args(&text) else {
+                    editor.error = Some(t("settings.agents.args_unbalanced").into());
+                    return;
+                };
+                args.retain(|arg| !arg.is_empty());
+                (editor.configured_path.clone(), Some(args))
+            }
+        };
+        self.store
+            .write()
+            .expect("session store lock poisoned")
+            .configure_agent(diri_proto::AgentConfigureParams {
+                host: editor.host.clone(),
+                kind: editor.kind.clone(),
+                executable_path,
+                show_in_quick_create: editor.show_in_quick_create,
+                launch_args,
+            });
+        self.agent_path_editor = None;
     }
 
     fn agent_path_editor_row(
@@ -4779,7 +4855,10 @@ impl UtilitySurfaces {
                 div()
                     .text_size(px(10.0))
                     .text_color(colors.secondary)
-                    .child(t("settings.agents.remote_path_label")),
+                    .child(match editor.field {
+                        AgentEditorField::Path => t("settings.agents.remote_path_label"),
+                        AgentEditorField::Arguments => t("settings.agents.args_label"),
+                    }),
             )
             .child(
                 div()
@@ -4818,32 +4897,15 @@ impl UtilitySurfaces {
                     },
                 ))
                 .child(surface_button(
-                    t("settings.agents.save_path"),
+                    match editor.field {
+                        AgentEditorField::Path => t("settings.agents.save_path"),
+                        AgentEditorField::Arguments => t("settings.agents.save_args"),
+                    },
                     "save-agent-path",
                     colors,
                     cx,
                     |this, cx| {
-                        let Some(editor) = &this.agent_path_editor else {
-                            return;
-                        };
-                        let path = editor.path.text().trim();
-                        if path.is_empty() {
-                            if let Some(editor) = &mut this.agent_path_editor {
-                                editor.error = Some(t("settings.agents.path_required").into());
-                            }
-                            cx.notify();
-                            return;
-                        }
-                        this.store
-                            .write()
-                            .expect("session store lock poisoned")
-                            .configure_agent(diri_proto::AgentConfigureParams {
-                                host: editor.host.clone(),
-                                kind: editor.kind.clone(),
-                                executable_path: Some(path.to_owned()),
-                                show_in_quick_create: editor.show_in_quick_create,
-                            });
-                        this.agent_path_editor = None;
+                        this.save_agent_editor();
                         cx.notify();
                     },
                 )),
@@ -10071,6 +10133,92 @@ mod tests {
             std::fs::create_dir_all(parent).expect("create screenshot directory");
         }
         screenshot.save(output).expect("save appearance screenshot");
+    }
+
+    /// Renders Settings > Agents with launch arguments on one Agent and the
+    /// arguments editor open, for reviewing the row and editor together.
+    #[cfg(target_os = "macos")]
+    #[test]
+    #[ignore = "writes the deterministic agents-settings screenshot artifact"]
+    fn render_agents_settings_preview_screenshot() {
+        let output = std::env::var_os("DIRI_VISUAL_OUTPUT")
+            .map(PathBuf::from)
+            .expect("set DIRI_VISUAL_OUTPUT to the target PNG path");
+        let platform = gpui_platform::current_platform(true);
+        let mut cx = HeadlessAppContext::with_platform(
+            platform.text_system(),
+            Arc::new(diri_ui::IconAssets),
+            gpui_platform::current_headless_renderer,
+        );
+        cx.update(|cx| {
+            crate::fonts::init(cx);
+            cx.set_reduce_motion(true);
+        });
+        let item = |kind: ProtoAgentKind, label: &str, args: &[&str]| {
+            diri_proto::AgentReadinessItem {
+                binary: kind.id().to_owned(),
+                path: Some(format!("/opt/homebrew/bin/{}", kind.id())),
+                path_source: Some(diri_proto::AgentPathSource::SystemPath),
+                show_in_quick_create: true,
+                launch_args: args.iter().map(|arg| (*arg).to_owned()).collect(),
+                descriptor: Some(diri_proto::AgentDescriptor {
+                    display_name: label.to_owned(),
+                    ..Default::default()
+                }),
+                kind,
+                ..Default::default()
+            }
+        };
+        let window = cx
+            .open_window(size(px(1200.0), px(700.0)), move |window, cx| {
+                let harness = cx
+                    .new(|cx| SettingsWorkbenchHarness::open_at(SettingsTab::Agents, window, cx));
+                harness.update(cx, |harness, cx| {
+                    harness.surfaces.update(cx, |surfaces, cx| {
+                        surfaces
+                            .store
+                            .write()
+                            .expect("session store lock poisoned")
+                            .set_agent_catalog(diri_proto::AgentReadinessResult {
+                                agents: vec![
+                                    item(
+                                        ProtoAgentKind::CLAUDE_CODE,
+                                        "Claude Code",
+                                        &["--dangerously-skip-permissions"],
+                                    ),
+                                    item(ProtoAgentKind::CODEX, "Codex", &[]),
+                                ],
+                                ..Default::default()
+                            });
+                        if std::env::var_os("DIRI_AGENTS_ARGS_EDITOR").is_some() {
+                            surfaces.agent_path_editor = Some(AgentPathEditor {
+                                kind: ProtoAgentKind::CODEX,
+                                host: None,
+                                field: AgentEditorField::Arguments,
+                                configured_path: None,
+                                path: text_editor("--yolo"),
+                                show_in_quick_create: true,
+                                error: None,
+                            });
+                        }
+                        cx.notify();
+                    });
+                });
+                harness
+            })
+            .expect("open headless agents settings window");
+        cx.run_until_parked();
+        cx.advance_clock(SETTINGS_TRANSITION_DURATION + Duration::from_millis(300));
+        cx.update_window(window.into(), |_, window, _| window.refresh())
+            .expect("refresh agents settings window");
+        cx.run_until_parked();
+        let screenshot = cx
+            .capture_screenshot(window.into())
+            .expect("capture agents settings screenshot");
+        if let Some(parent) = output.parent() {
+            std::fs::create_dir_all(parent).expect("create screenshot directory");
+        }
+        screenshot.save(output).expect("save agents settings screenshot");
     }
 
     struct SettingsModalHarness {
