@@ -13,8 +13,8 @@ use diri_proto::frames::{Frame, FrameType, MAX_FRAME_BYTES};
 use diri_proto::remote_pty::{
     ANNOTATED_HOLDER_CAPABILITIES, ControlGranted, ControlRevoked,
     FOREGROUND_PROCESS_PROTOCOL_MINOR, ForegroundProcess, FullSnapshot, GridDelta, Hello, HelloAck,
-    LaunchRequest, LaunchResult, ProcessExit, RemoteCodec, RemoteError, RemoteMessage,
-    RemoteProcessState, ScrollbackResponse, validate_terminal_dimensions,
+    ImageChunk, ImageResponse, LaunchRequest, LaunchResult, ProcessExit, RemoteCodec, RemoteError,
+    RemoteMessage, RemoteProcessState, ScrollbackResponse, validate_terminal_dimensions,
 };
 use diri_pty::{Exit, ExitWatcher, Pty, PtySpec, PtyStream};
 use diri_terminal_state::HeadlessScreen;
@@ -479,14 +479,18 @@ impl Holder {
                 ));
             }
         };
+        // Image tools size their output from the PTY's pixel size; report
+        // the cell size this Holder places images with.
+        let _ = pty.resize_with_pixels(
+            start.request.cols,
+            start.request.rows,
+            text_area_pixels(start.request.cols, start.request.rows),
+        );
         let pty_reader = pty.reader()?;
         pty_reader.set_nonblocking(true)?;
         let pty_writer = pty.writer()?;
         let exit_watcher = ExitWatcher::new(process_pid)?;
-        let screen = HeadlessScreen::new(
-            usize::from(start.request.cols),
-            usize::from(start.request.rows),
-        );
+        let screen = holder_screen(start.request.cols, start.request.rows);
         let log = OutputLog::open(&paths.output)?;
         let mut state = SessionState::new(
             &start.request,
@@ -784,6 +788,7 @@ impl Holder {
         let offset = self.log.append(bytes)?;
         self.state.output_offset = self.log.tail_offset();
         self.screen.feed(bytes);
+        self.answer_image_queries();
         if self.dirty_since.is_none() {
             self.dirty_since = Some(Instant::now());
         }
@@ -817,6 +822,23 @@ impl Holder {
             self.last_persisted_offset = self.state.output_offset;
         }
         Ok(())
+    }
+
+    /// Writes the emulator's answers to inline-image support probes back to
+    /// the program, which is waiting on them. The screen keeps no other
+    /// replies (see [`holder_screen`]). Answers that do not fit the bounded
+    /// input queue are dropped: the program's probe then times out, exactly
+    /// as it did before this Holder answered at all.
+    fn answer_image_queries(&mut self) {
+        let replies = self.screen.take_replies();
+        if replies.is_empty()
+            || self.pending_input.len().saturating_add(replies.len()) > MAX_PENDING_INPUT_BYTES
+        {
+            return;
+        }
+        self.pending_input.push(&replies);
+        // A failed write surfaces again on the next poll of the PTY.
+        let _ = self.flush_input();
     }
 
     fn read_connection(&mut self) -> io::Result<()> {
@@ -968,7 +990,8 @@ impl Holder {
                             "Resize dimensions are invalid",
                         ));
                     }
-                    self.pty.resize(cols, rows)?;
+                    self.pty
+                        .resize_with_pixels(cols, rows, text_area_pixels(cols, rows))?;
                     self.screen.resize(usize::from(cols), usize::from(rows));
                     self.state.cols = cols;
                     self.state.rows = rows;
@@ -1082,6 +1105,34 @@ impl Holder {
                     result,
                 }))
             }
+            RemoteMessage::ImageRequest(request) => {
+                if !connection.inline_images {
+                    return Err(io::Error::new(
+                        io::ErrorKind::PermissionDenied,
+                        "inline-images-v1 was not negotiated",
+                    ));
+                }
+                if connection.outbound.len() > MAX_OUTBOUND_BYTES {
+                    return Err(io::Error::new(
+                        io::ErrorKind::WouldBlock,
+                        "image output queue is full",
+                    ));
+                }
+                let image = self.screen.inline_image(&request.key).map(|image| {
+                    ImageChunk::slice(
+                        image.format,
+                        image.compressed,
+                        image.width,
+                        image.height,
+                        &image.data,
+                        request.offset,
+                    )
+                });
+                connection.queue(RemoteMessage::ImageResponse(ImageResponse {
+                    request_id: request.request_id,
+                    image,
+                }))
+            }
             RemoteMessage::ReleaseControl(release) => {
                 if release.controller_epoch != epoch {
                     return Err(io::Error::new(
@@ -1174,6 +1225,8 @@ impl Holder {
             ));
         }
         connection.terminal_reset = reset_requested;
+        connection.inline_images =
+            hello.protocol.minor >= diri_proto::remote_pty::INLINE_IMAGES_PROTOCOL_MINOR;
         ensure_keyboard_controller(self.screen.input_keyboard_state(), enhanced_keyboard)?;
         connection.enhanced_keyboard = enhanced_keyboard;
         self.state.controller_epoch = self.state.controller_epoch.saturating_add(1);
@@ -1590,9 +1643,34 @@ fn ensure_keyboard_controller(
     Ok(())
 }
 
+/// The Holder's emulator. It places inline images (the shared Kitty/iTerm2
+/// interception) and answers only their support probes: every other reply a
+/// remote program gets is the Engine's, and before `inline-images-v1` this
+/// terminal answered nothing.
+fn holder_screen(cols: u16, rows: u16) -> HeadlessScreen {
+    HeadlessScreen::new(usize::from(cols), usize::from(rows))
+        .with_inline_images()
+        .answering_image_queries_only()
+}
+
+/// `ws_xpixel`/`ws_ypixel` at the cell size images are placed with.
+fn text_area_pixels(cols: u16, rows: u16) -> (u16, u16) {
+    let (width, height) = diri_terminal_state::DEFAULT_CELL_PIXELS;
+    (cols.saturating_mul(width), rows.saturating_mul(height))
+}
+
+fn strip_image_anchors(metadata: &mut diri_proto::grid::RowMetadata) {
+    metadata
+        .links
+        .retain(|link| !diri_proto::inline_image::is_anchor(&link.uri));
+}
+
 struct Connection {
     enhanced_keyboard: bool,
     terminal_reset: bool,
+    /// The controller speaks `inline-images-v1`: it may read images, and
+    /// image anchors in the grid are meaningful to it.
+    inline_images: bool,
     reset_state: Option<diri_proto::remote_pty::TerminalResetState>,
     protocol_minor: u16,
     keyboard: Option<diri_proto::terminal_input::KeyboardState>,
@@ -1608,6 +1686,7 @@ impl Connection {
         Self {
             enhanced_keyboard: false,
             terminal_reset: false,
+            inline_images: false,
             reset_state: None,
             protocol_minor: 0,
             keyboard: Some(Default::default()),
@@ -1652,6 +1731,33 @@ impl Connection {
             value.capabilities.retain(|capability| {
                 *capability != diri_proto::remote_pty::RemoteCapability::EnhancedKeyboard
             });
+        }
+        if !self.inline_images {
+            match &mut message {
+                RemoteMessage::HelloAck(value) => value.capabilities.retain(|capability| {
+                    *capability != diri_proto::remote_pty::RemoteCapability::InlineImages
+                }),
+                // A controller that cannot read pixels gets plain blanks, not
+                // links it cannot resolve.
+                RemoteMessage::FullSnapshot(value) => {
+                    for row in &mut value.grid.changed_rows {
+                        strip_image_anchors(&mut row.metadata);
+                    }
+                }
+                RemoteMessage::GridDelta(value) => {
+                    for row in &mut value.grid.changed_rows {
+                        strip_image_anchors(&mut row.metadata);
+                    }
+                }
+                RemoteMessage::ScrollbackResponse(value) => {
+                    value
+                        .result
+                        .metadata
+                        .iter_mut()
+                        .for_each(strip_image_anchors);
+                }
+                _ => {}
+            }
         }
         if !self.terminal_reset
             && let RemoteMessage::HelloAck(value) = &mut message
@@ -2061,6 +2167,10 @@ mod tests {
     }
 
     fn waiting_holder() -> (tempfile::TempDir, Holder, LaunchRequest) {
+        waiting_holder_running(&["/bin/sh", "-c", "read -r go; printf final-tail; exit 42"])
+    }
+
+    fn waiting_holder_running(argv: &[&str]) -> (tempfile::TempDir, Holder, LaunchRequest) {
         let temp = tempfile::tempdir().unwrap();
         let roots = StatePaths::from_root(temp.path().join("state")).unwrap();
         let request = LaunchRequest {
@@ -2069,11 +2179,7 @@ mod tests {
                 "0123456789abcdef0123456789abcdef",
             )
             .unwrap(),
-            argv: vec![
-                "/bin/sh".into(),
-                "-c".into(),
-                "read -r go; printf final-tail; exit 42".into(),
-            ],
+            argv: argv.iter().map(|argument| (*argument).to_owned()).collect(),
             cwd: "/".into(),
             environment: vec![],
             cols: 80,
@@ -2554,6 +2660,323 @@ mod tests {
         assert!(holder.advance_stop().unwrap());
         drop(holder);
         let _ = fs::remove_file(socket);
+    }
+
+    fn image_hello(request: &LaunchRequest, incarnation: &str, minor: u16) -> Hello {
+        Hello {
+            protocol: diri_proto::remote_pty::ProtocolVersion {
+                major: diri_proto::remote_pty::PROTOCOL_MAJOR,
+                minor,
+            },
+            local_build_id: "fixture".into(),
+            session_id: request.session_id.clone(),
+            session_token: request.session_token.clone(),
+            expected_incarnation: Some(incarnation.to_owned()),
+            requested_role: diri_proto::remote_pty::RemoteRole::Controller,
+            client_nonce: "fixture-nonce".into(),
+            required_capabilities: vec![],
+            last_acknowledged_output_offset: None,
+            last_acknowledged_grid_sequence: None,
+        }
+    }
+
+    /// A Kitty transmit-and-display of raw RGBA pixels.
+    fn kitty_rgba(width: u32, height: u32, pixels: &[u8]) -> Vec<u8> {
+        use base64::Engine as _;
+        format!(
+            "\x1b_Ga=T,f=32,s={width},v={height},i=5,q=2;{}\x1b\\",
+            base64::engine::general_purpose::STANDARD.encode(pixels)
+        )
+        .into_bytes()
+    }
+
+    fn image_anchor_keys(messages: &[RemoteMessage]) -> Vec<String> {
+        messages
+            .iter()
+            .filter_map(|message| match message {
+                RemoteMessage::FullSnapshot(snapshot) => Some(&snapshot.grid),
+                RemoteMessage::GridDelta(delta) => Some(&delta.grid),
+                _ => None,
+            })
+            .flat_map(|grid| &grid.changed_rows)
+            .flat_map(|row| &row.metadata.links)
+            .filter_map(|link| diri_proto::inline_image::ImageAnchor::parse(&link.uri))
+            .map(|anchor| anchor.key)
+            .collect()
+    }
+
+    fn read_image(
+        holder: &mut Holder,
+        connection: &mut Connection,
+        key: &str,
+        offset: u64,
+    ) -> Option<ImageChunk> {
+        connection.outbound.clear();
+        holder
+            .handle_message(
+                connection,
+                RemoteMessage::ImageRequest(diri_proto::remote_pty::ImageRequest {
+                    request_id: 11,
+                    key: key.to_owned(),
+                    offset,
+                }),
+            )
+            .unwrap();
+        let mut published = RemoteCodec::new().feed(&connection.outbound).unwrap();
+        assert_eq!(published.len(), 1);
+        let Some(RemoteMessage::ImageResponse(response)) = published.pop() else {
+            panic!("image response");
+        };
+        assert_eq!(response.request_id, 11);
+        response.image
+    }
+
+    #[test]
+    fn inline_images_are_negotiated_per_controller_and_served_in_bounded_chunks() {
+        use diri_proto::remote_pty::{INLINE_IMAGES_PROTOCOL_MINOR, RemoteCapability};
+        let (_temp, mut holder, request) = waiting_holder();
+        initialize_auth(&holder.paths, &request.session_token).unwrap();
+        holder.screen = holder_screen(80, 24);
+        let incarnation = holder.state.session_incarnation.clone();
+        // 300×300 RGBA: larger than one chunk, so it takes two reads.
+        let pixels: Vec<u8> = (0..300 * 300 * 4)
+            .map(|index| (index % 251) as u8)
+            .collect();
+        assert!(pixels.len() > diri_proto::remote_pty::MAX_IMAGE_CHUNK_BYTES);
+        holder
+            .consume_output(&kitty_rgba(300, 300, &pixels))
+            .unwrap();
+        assert_eq!(holder.screen.inline_image_bytes(), pixels.len());
+
+        // A controller from before inline-images-v1 (an older Engine) is
+        // never told about the capability, never sees an anchor it cannot
+        // resolve, and cannot read pixels.
+        let (stream, _peer) = UnixStream::pair().unwrap();
+        let mut old = Connection::new(stream);
+        holder
+            .handshake(
+                &mut old,
+                image_hello(&request, &incarnation, INLINE_IMAGES_PROTOCOL_MINOR - 1),
+            )
+            .unwrap();
+        assert!(!old.inline_images);
+        let published = RemoteCodec::new().feed(&old.outbound).unwrap();
+        let RemoteMessage::HelloAck(acknowledgement) = &published[0] else {
+            panic!("HelloAck first: {published:?}");
+        };
+        assert!(
+            !acknowledgement
+                .capabilities
+                .contains(&RemoteCapability::InlineImages)
+        );
+        assert!(image_anchor_keys(&published).is_empty());
+        assert_eq!(
+            holder
+                .handle_message(
+                    &mut old,
+                    RemoteMessage::ImageRequest(diri_proto::remote_pty::ImageRequest {
+                        request_id: 1,
+                        key: "00000000.1".into(),
+                        offset: 0,
+                    }),
+                )
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::PermissionDenied
+        );
+
+        // A capable controller is told, sees the anchors and reads the
+        // pixels back exactly, one bounded chunk at a time.
+        let (stream, _peer) = UnixStream::pair().unwrap();
+        let mut capable = Connection::new(stream);
+        holder
+            .handshake(
+                &mut capable,
+                image_hello(&request, &incarnation, INLINE_IMAGES_PROTOCOL_MINOR),
+            )
+            .unwrap();
+        assert!(capable.inline_images);
+        let published = RemoteCodec::new().feed(&capable.outbound).unwrap();
+        let RemoteMessage::HelloAck(acknowledgement) = &published[0] else {
+            panic!("HelloAck first: {published:?}");
+        };
+        assert!(
+            acknowledgement
+                .capabilities
+                .contains(&RemoteCapability::InlineImages)
+        );
+        let keys = image_anchor_keys(&published);
+        assert!(!keys.is_empty());
+        let key = keys[0].clone();
+        assert!(keys.iter().all(|other| *other == key));
+
+        let mut read = Vec::new();
+        while read.len() < pixels.len() {
+            let chunk = read_image(&mut holder, &mut capable, &key, read.len() as u64)
+                .expect("stored image");
+            assert_eq!(
+                chunk.format,
+                diri_proto::inline_image::InlineImageFormat::Rgba
+            );
+            assert_eq!((chunk.width, chunk.height), (300, 300));
+            assert_eq!(chunk.total, pixels.len() as u64);
+            assert_eq!(chunk.offset, read.len() as u64);
+            assert!(!chunk.data.is_empty());
+            assert!(chunk.data.len() <= diri_proto::remote_pty::MAX_IMAGE_CHUNK_BYTES);
+            read.extend_from_slice(&chunk.data);
+        }
+        assert_eq!(read, pixels);
+        // An unknown or evicted key is a miss, not an error.
+        assert_eq!(read_image(&mut holder, &mut capable, "00000000.1", 0), None);
+        // The program asked for no reply (q=2), so the child got none.
+        assert!(holder.pending_input.is_empty());
+    }
+
+    #[test]
+    fn a_remote_program_probing_for_images_gets_its_answer_from_the_holder() {
+        let temp = tempfile::tempdir().unwrap();
+        let answers = temp.path().join("answers");
+        // kitten's probe: a Kitty query, then primary device attributes; the
+        // program reads back exactly the two answers and records them.
+        let script = format!(
+            "stty raw -echo; printf '\\033_Gi=31,s=1,v=1,a=q,t=d,f=24;AAAA\\033\\\\\\033[c'; \
+             dd bs=1 count=21 of='{}' 2>/dev/null; printf done; read -r go",
+            answers.display()
+        );
+        let (_holder_temp, mut holder, request) =
+            waiting_holder_running(&["/bin/sh", "-c", &script]);
+        holder.screen = holder_screen(80, 24);
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !holder
+            .screen
+            .lines()
+            .iter()
+            .any(|line| line.contains("done"))
+        {
+            assert!(
+                Instant::now() < deadline,
+                "probe unanswered: {:?}",
+                holder.screen.lines()
+            );
+            holder.drain_pty().unwrap();
+            holder.flush_input().unwrap();
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        assert_eq!(
+            fs::read(&answers).unwrap(),
+            b"\x1b_Gi=31;OK\x1b\\\x1b[?62;22c"
+        );
+        // A resize reports the pixel size images are placed with.
+        initialize_auth(&holder.paths, &request.session_token).unwrap();
+        let incarnation = holder.state.session_incarnation.clone();
+        let (stream, _peer) = UnixStream::pair().unwrap();
+        let mut connection = Connection::new(stream);
+        holder
+            .handshake(
+                &mut connection,
+                image_hello(
+                    &request,
+                    &incarnation,
+                    diri_proto::remote_pty::INLINE_IMAGES_PROTOCOL_MINOR,
+                ),
+            )
+            .unwrap();
+        holder
+            .handle_message(
+                &mut connection,
+                RemoteMessage::Terminal(Frame::resize(100, 30)),
+            )
+            .unwrap();
+        let (cell_width, cell_height) = diri_terminal_state::DEFAULT_CELL_PIXELS;
+        let mut size: libc::winsize = unsafe { std::mem::zeroed() };
+        let master = holder.pty_reader.as_ref().unwrap().as_raw_fd();
+        // SAFETY: `master` is the live PTY master; `size` is a valid winsize.
+        assert_eq!(
+            unsafe { libc::ioctl(master, libc::TIOCGWINSZ, &mut size) },
+            0
+        );
+        assert_eq!(
+            (size.ws_xpixel, size.ws_ypixel),
+            (100 * cell_width, 30 * cell_height)
+        );
+        holder.pty.kill_group(libc::SIGKILL).unwrap();
+    }
+
+    #[test]
+    fn a_slow_controller_never_holds_image_reads_or_output_hostage() {
+        use diri_proto::remote_pty::INLINE_IMAGES_PROTOCOL_MINOR;
+        let (_temp, mut holder, request) = waiting_holder();
+        initialize_auth(&holder.paths, &request.session_token).unwrap();
+        holder.screen = holder_screen(80, 24);
+        let incarnation = holder.state.session_incarnation.clone();
+        let (stream, _peer) = UnixStream::pair().unwrap();
+        let mut connection = Connection::new(stream);
+        holder
+            .handshake(
+                &mut connection,
+                image_hello(&request, &incarnation, INLINE_IMAGES_PROTOCOL_MINOR),
+            )
+            .unwrap();
+        let pixels = vec![7; 64 * 64 * 4];
+        holder.consume_output(&kitty_rgba(64, 64, &pixels)).unwrap();
+        let key = {
+            holder.connection = Some(connection);
+            holder.emit_grid_delta().unwrap();
+            let connection = holder.connection.as_ref().unwrap();
+            let published = RemoteCodec::new().feed(&connection.outbound).unwrap();
+            image_anchor_keys(&published).remove(0)
+        };
+        let mut connection = holder.connection.take().unwrap();
+
+        // A controller that stopped reading cannot queue unbounded image
+        // bytes: past the outbound bound the read is refused (the Bridge is
+        // closed and the Engine reconnects), and nothing is queued.
+        connection.outbound.resize(MAX_OUTBOUND_BYTES + 1, 0);
+        let queued = connection.outbound.len();
+        assert_eq!(
+            holder
+                .handle_message(
+                    &mut connection,
+                    RemoteMessage::ImageRequest(diri_proto::remote_pty::ImageRequest {
+                        request_id: 2,
+                        key: key.clone(),
+                        offset: 0,
+                    }),
+                )
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::WouldBlock
+        );
+        assert_eq!(connection.outbound.len(), queued);
+
+        // Output overflow while a large image response is queued reseeds
+        // the controller with a FullSnapshot that still carries the anchor,
+        // and the image stays readable: only the queued bytes were dropped.
+        connection.outbound.clear();
+        let _ = read_image(&mut holder, &mut connection, &key, 0).expect("stored");
+        connection.outbound.resize(MAX_OUTBOUND_BYTES, 0);
+        holder.connection = Some(connection);
+        holder.consume_output(b"more output").unwrap();
+        holder.flush_output().unwrap();
+        let mut connection = holder.connection.take().expect("reseeded, not dropped");
+        let published = RemoteCodec::new().feed(&connection.outbound).unwrap();
+        assert!(matches!(
+            &published[0],
+            RemoteMessage::Error(error) if error.code == "slow_client_reseed" && !error.fatal
+        ));
+        assert!(
+            published
+                .iter()
+                .any(|message| matches!(message, RemoteMessage::FullSnapshot(_)))
+        );
+        let keys = image_anchor_keys(&published);
+        assert!(!keys.is_empty() && keys.iter().all(|other| *other == key));
+        let chunk = read_image(&mut holder, &mut connection, &key, 0).expect("still stored");
+        assert_eq!(chunk.data, pixels);
+        assert!(
+            holder.pty.try_wait().unwrap().is_none(),
+            "the child is untouched"
+        );
     }
 
     #[test]

@@ -10,6 +10,18 @@ updates, instead of adding a second escape-sequence parser or guessing boundarie
 from terminal text. No new runtime dependency. The source participates in the
 Remote Helper Build ID. Revisit this small patch when updating the parser.
 
+## Shell command marks
+
+`Flags` widens from u16 to u32 for four more cell flags set by
+`Handler::mark_shell_command`: `INPUT_START` (OSC 133 B), `OUTPUT_START` (C),
+and `COMMAND_SUCCEEDED` / `COMMAND_FAILED` (D; both together when the status is
+unknown, and a later D on the same cell replaces the earlier one). Like
+`PROMPT_START` they mark the cursor cell, are ignored on the alternate screen,
+survive overwriting by printed characters (`Flags::SHELL_MARKS`), and follow
+erase, scroll and reflow. `Cell` stays 24 bytes (`cell_size_is_below_cap`). The
+compact history codec writes style flags as a varint, so ordinary styles still
+take one byte. The codec is process-local, so no stored format changes.
+
 ## Deferred alternate-screen allocation
 
 The pristine alternate grid is represented by `None` until the first screen
@@ -217,3 +229,12 @@ such a reset can keep, so it is no oracle there),
 checks each greedy line against `Grid::resize`),
 `grow_pulls_kept_history_into_the_viewport_like_dense_storage` and
 `column_changes_after_the_first_decode_only_new_history`.
+
+## Cell size request
+
+`Term` implements `Handler::cell_size_pixels` (`CSI 16 t`, see the VTE patch)
+by sending `Event::CellSizeRequest` with a formatter for `CSI 6 ; height ;
+width t`. It is a separate event from `TextAreaSizeRequest` so a host that
+does not know its cell size (the Remote Helper, a terminal without inline
+images) can leave the query unanswered exactly as before. No wire, checkpoint
+or protocol change.

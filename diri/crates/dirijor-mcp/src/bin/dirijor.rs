@@ -2,6 +2,8 @@
 mod notes;
 #[path = "dirijor/organization.rs"]
 mod organization;
+#[path = "dirijor/script.rs"]
+mod script;
 
 use std::collections::BTreeMap;
 #[cfg(not(unix))]
@@ -18,6 +20,7 @@ const EXIT_FAILURE: i32 = 1;
 const EXIT_TIMEOUT: i32 = 2;
 const EXIT_NOT_FOUND: i32 = 3;
 const EXIT_UNREACHABLE: i32 = 4;
+const EXIT_AMBIGUOUS: i32 = 5;
 
 fn main() {
     let arguments: Vec<String> = std::env::args().skip(1).collect();
@@ -71,6 +74,11 @@ fn run(arguments: &[String]) -> Result<(), CliError> {
         "mcp-tools" => mcp_tools(),
         "mcp-call" => mcp_call(arguments.get(1..).unwrap_or_default()),
         "status" => session_list(arguments.get(1..).unwrap_or_default(), true),
+        "list" | "ls" => script::list(arguments.get(1..).unwrap_or_default()),
+        "new" => script::new(arguments.get(1..).unwrap_or_default()),
+        "send" => script::send(arguments.get(1..).unwrap_or_default()),
+        "capture" => script::capture(arguments.get(1..).unwrap_or_default()),
+        "run" => script::run(arguments.get(1..).unwrap_or_default()),
         "activity" => activity(arguments.get(1..).unwrap_or_default()),
         "session" => session(arguments.get(1..).unwrap_or_default()),
         "worktree" => worktree(arguments.get(1..).unwrap_or_default()),
@@ -109,7 +117,9 @@ fn print_help() {
          dirijor session reset-terminal ID\n  \
          Resets the emulator (screen, history, modes, title) without touching the process.\n\n\
          Deferred on Linux: companion forwarding (dirijor forward).\n\n\
+         {}\n\n\
          Notes (Markdown files; new notes appear in the sidebar when Diri is running):\n  {}",
+        script::HELP,
         notes::HELP
     );
 }
@@ -1556,13 +1566,19 @@ fn resolve_session<'a>(
     if let Some(exact) = sessions.iter().find(|record| record.id.0 == needle) {
         return Ok(exact);
     }
-    let mut prefixes = sessions
+    let prefixes: Vec<_> = sessions
         .iter()
-        .filter(|record| record.id.0.starts_with(needle));
-    if let Some(first) = prefixes.next()
-        && prefixes.next().is_none()
-    {
-        return Ok(first);
+        .filter(|record| record.id.0.starts_with(needle))
+        .collect();
+    match prefixes.as_slice() {
+        [record] => return Ok(record),
+        [] => {}
+        _ => {
+            return Err(CliError {
+                code: EXIT_AMBIGUOUS,
+                message: format!("session id prefix {needle:?} is ambiguous"),
+            });
+        }
     }
     let needle = needle.to_ascii_lowercase();
     let matches: Vec<_> = sessions
@@ -1574,9 +1590,10 @@ fn resolve_session<'a>(
         [] => Err(CliError::not_found(format!(
             "no session matches {needle:?}"
         ))),
-        _ => Err(CliError::failure(format!(
-            "session target {needle:?} is ambiguous"
-        ))),
+        _ => Err(CliError {
+            code: EXIT_AMBIGUOUS,
+            message: format!("session target {needle:?} is ambiguous"),
+        }),
     }
 }
 

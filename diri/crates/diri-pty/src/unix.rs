@@ -195,6 +195,13 @@ impl Pty {
     }
 
     pub fn resize(&self, cols: u16, rows: u16) -> io::Result<()> {
+        self.resize_with_pixels(cols, rows, (0, 0))
+    }
+
+    /// Resizes and reports the text area's size in pixels (`ws_xpixel`,
+    /// `ws_ypixel`), which image tools read to size their output. `(0, 0)`
+    /// means unknown.
+    pub fn resize_with_pixels(&self, cols: u16, rows: u16, pixels: (u16, u16)) -> io::Result<()> {
         if cols == 0 || rows == 0 {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
@@ -204,8 +211,8 @@ impl Pty {
         let winsize = libc::winsize {
             ws_row: rows,
             ws_col: cols,
-            ws_xpixel: 0,
-            ws_ypixel: 0,
+            ws_xpixel: pixels.0,
+            ws_ypixel: pixels.1,
         };
         // SAFETY: `master` remains owned for the call and `winsize` is a valid
         // initialized input buffer for `TIOCSWINSZ`.

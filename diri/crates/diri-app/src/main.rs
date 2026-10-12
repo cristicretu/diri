@@ -12,6 +12,7 @@ mod commands;
 mod composer;
 #[cfg(unix)]
 mod daemon_launch;
+mod default_terminal;
 mod delegation;
 mod details_ui;
 mod dev_build;
@@ -36,6 +37,7 @@ mod herdr_import;
 pub mod history;
 mod i18n;
 mod icons;
+mod imported_themes;
 mod inspector;
 mod launch_recipe;
 mod launcher;
@@ -49,6 +51,7 @@ mod notes;
 mod notification_feed;
 pub mod notifications;
 mod number_flow;
+mod open_handler;
 #[cfg(test)]
 mod overview_fixture;
 mod overview_zoom;
@@ -459,6 +462,15 @@ fn main() {
         }
         cx.activate(true);
     });
+    // Links and files macOS sends diri as the default terminal (`ssh://`,
+    // `x-man-page://`, `.command`, …). They can arrive before the first window
+    // exists, so they queue until the app below is ready for them.
+    let (open_links_tx, mut open_links_rx) = tokio::sync::mpsc::unbounded_channel::<Vec<String>>();
+    if !preview {
+        app.on_open_urls(move |links| {
+            let _ = open_links_tx.send(links);
+        });
+    }
     app.run(move |cx: &mut App| {
         load_system_fonts(cx);
         telemetry::install(cx);
@@ -491,6 +503,57 @@ fn main() {
             .clone();
         commands::bind_keys(cx, &shortcut_overrides);
         install_app_menus(cx);
+        let activation_services = Arc::clone(&services);
+        cx.on_action(move |_: &commands::ShowApp, cx| {
+            let mut windows = cx.windows();
+            if let Some(active) = cx.active_window() {
+                windows.retain(|handle| *handle != active);
+                windows.insert(0, active);
+            }
+            let main = windows.into_iter().find(|handle| {
+                handle
+                    .update(cx, |root, _, _| root.downcast::<RootView>().is_ok())
+                    .unwrap_or(false)
+            });
+            if let Some(handle) = main {
+                #[cfg(target_os = "macos")]
+                if handle
+                    .update(cx, |_, window, _| {
+                        macos::global_shortcut::should_hide(window)
+                    })
+                    .unwrap_or(false)
+                {
+                    cx.hide();
+                    return;
+                }
+                let _ = handle.update(cx, |_, window, _| {
+                    #[cfg(target_os = "macos")]
+                    macos::global_shortcut::reveal(window);
+                    #[cfg(not(target_os = "macos"))]
+                    window.activate_window();
+                });
+            } else {
+                open_main_window(
+                    cx,
+                    Arc::clone(&activation_services),
+                    preview,
+                    scenario,
+                    RestorePolicy::FRAME_ONLY,
+                );
+            }
+            cx.activate(true);
+        });
+        #[cfg(target_os = "macos")]
+        {
+            let prefs = services
+                .store
+                .store
+                .read()
+                .expect("session store lock poisoned")
+                .preferences()
+                .clone();
+            macos::global_shortcut::install(cx, &prefs);
+        }
         let window_services = services.clone();
         cx.on_action(move |_: &commands::NewWindow, cx| {
             let context = cx.active_window().and_then(|handle| {
@@ -615,6 +678,13 @@ fn main() {
         if let Some(startup) = services.daemon_startup.as_ref() {
             startup.after_window_open(&services.tokio, Arc::clone(services.store.client()));
         }
+        let open_services = Arc::clone(&services);
+        cx.spawn(async move |cx| {
+            while let Some(links) = open_links_rx.recv().await {
+                cx.update(|cx| open_links(cx, &open_services, scenario, &links));
+            }
+        })
+        .detach();
         if smoke_test {
             cx.spawn(async move |cx| {
                 cx.background_executor()
@@ -775,6 +845,56 @@ enum WindowOpen {
     Restore(RestorePolicy),
     /// A live window's state (⌘N) or a window brought back beside the key one.
     Context(NativeWindowContext),
+}
+
+/// Opens each link in a new terminal tab of the frontmost diri window,
+/// opening a window first when none is left.
+fn open_links(
+    cx: &mut App,
+    services: &Arc<AppServices>,
+    scenario: PreviewScenario,
+    links: &[String],
+) {
+    let requests: Vec<_> = links
+        .iter()
+        .map(|link| open_handler::request_for(link, &open_handler::LocalSystem))
+        .collect();
+    let mut windows = cx.windows();
+    if let Some(active) = cx.active_window() {
+        windows.retain(|handle| *handle != active);
+        windows.insert(0, active);
+    }
+    let opened = windows.into_iter().any(|handle| {
+        handle
+            .update(cx, |root, window, cx| {
+                let Ok(root) = root.downcast::<RootView>() else {
+                    return false;
+                };
+                window.activate_window();
+                root.update(cx, |root, cx| {
+                    for request in &requests {
+                        root.open_external(request.clone(), cx);
+                    }
+                });
+                true
+            })
+            .unwrap_or(false)
+    });
+    if !opened {
+        let handle = open_main_window(
+            cx,
+            Arc::clone(services),
+            false,
+            scenario,
+            RestorePolicy::FRAME_ONLY,
+        );
+        let _ = handle.update(cx, |root, _, cx| {
+            for request in requests {
+                root.open_external(request, cx);
+            }
+        });
+    }
+    cx.activate(true);
 }
 
 fn open_main_window(

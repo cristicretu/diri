@@ -5,15 +5,16 @@ use std::io::{self, Write};
 use std::os::fd::{AsFd, AsRawFd, OwnedFd};
 use std::os::unix::net::UnixStream;
 use std::process::{Child, ChildStdin, ChildStdout};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
 
 use diri_proto::frames::Frame;
 use diri_proto::remote_pty::{
-    Hello, HelloAck, PHASE_ONE_HOLDER_CAPABILITIES, ProtocolVersion, RemoteCodec, RemoteMessage,
-    RemoteProcessState, RemoteRole, ScrollbackRequest, ScrollbackResponse, SessionInspection,
-    SessionSelector, SessionToken, Signal, validate_terminal_dimensions,
+    Hello, HelloAck, ImageChunk, ImageRequest, ImageResponse, PHASE_ONE_HOLDER_CAPABILITIES,
+    ProtocolVersion, RemoteCodec, RemoteMessage, RemoteProcessState, RemoteRole, ScrollbackRequest,
+    ScrollbackResponse, SessionInspection, SessionSelector, SessionToken, Signal,
+    validate_terminal_dimensions,
 };
 
 use super::binding::RemoteBindingStore;
@@ -23,6 +24,9 @@ use super::manager::{InstalledHelper, RemoteManager};
 
 const MAX_QUEUED_INPUT: usize = 1024 * 1024;
 const OFFSET_PERSIST_INTERVAL: u64 = 1024 * 1024;
+/// One image chunk is at most 256 KiB; this allows a slow link (about
+/// 200 kbit/s) to deliver it behind ordinary output.
+const IMAGE_READ_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 const REQUIRED_CAPABILITIES: &[diri_proto::remote_pty::RemoteCapability] =
     PHASE_ONE_HOLDER_CAPABILITIES;
 
@@ -69,6 +73,11 @@ pub struct RemoteSessionClient {
     next_request_id: AtomicU64,
     reset_generation: AtomicU64,
     scrollback_requests: Mutex<HashMap<u64, mpsc::Sender<diri_proto::ReadScrollbackCellsResult>>>,
+    /// The current Bridge's HelloAck confirmed `inline-images-v1`. Cleared
+    /// on every connect, so a request is never sent before the Holder said
+    /// it understands one (an older Holder fails closed on the frame kind).
+    inline_images: AtomicBool,
+    image_requests: Mutex<HashMap<u64, mpsc::Sender<Option<ImageChunk>>>>,
 }
 
 impl RemoteSessionClient {
@@ -112,6 +121,8 @@ impl RemoteSessionClient {
             next_request_id: AtomicU64::new(1),
             reset_generation: AtomicU64::new(0),
             scrollback_requests: Mutex::new(HashMap::new()),
+            inline_images: AtomicBool::new(false),
+            image_requests: Mutex::new(HashMap::new()),
         })
     }
 
@@ -123,6 +134,7 @@ impl RemoteSessionClient {
             .lock()
             .expect("scrollback requests")
             .clear();
+        self.image_requests.lock().expect("image requests").clear();
     }
 
     /// Explicit recovery only, after the previous pump has joined. Old input,
@@ -173,6 +185,7 @@ impl RemoteSessionClient {
         grid_sequence: Option<u64>,
     ) -> io::Result<(u64, ChildStdout)> {
         ensure_available(&self.writer.lock().expect("remote writer"))?;
+        self.inline_images.store(false, Ordering::SeqCst);
         let mut channel = self.manager.attach(&self.helper)?;
         let setup = (|| {
             let mut required_capabilities = REQUIRED_CAPABILITIES.to_vec();
@@ -639,6 +652,79 @@ impl RemoteSessionClient {
         }
     }
 
+    /// Records whether this Bridge's Holder serves inline images. Only an
+    /// accepted HelloAck at protocol minor 16 naming `inline-images-v1` does.
+    pub(crate) fn observe_hello_capabilities(&self, acknowledgement: &HelloAck) {
+        let capable = acknowledgement.protocol.minor
+            >= diri_proto::remote_pty::INLINE_IMAGES_PROTOCOL_MINOR
+            && acknowledgement
+                .capabilities
+                .contains(&diri_proto::remote_pty::RemoteCapability::InlineImages);
+        self.inline_images.store(capable, Ordering::SeqCst);
+    }
+
+    pub(crate) fn supports_inline_images(&self) -> bool {
+        self.inline_images.load(Ordering::SeqCst)
+    }
+
+    /// One chunk of an image the Holder stored, or `None` for a key it does
+    /// not hold. Fails with `Unsupported` unless the live Holder negotiated
+    /// `inline-images-v1`, without sending anything.
+    pub fn read_image(&self, key: &str, offset: u64) -> io::Result<Option<ImageChunk>> {
+        if !self.supports_inline_images() {
+            return Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "live Holder does not serve inline images",
+            ));
+        }
+        let request_id = self.next_request_id.fetch_add(1, Ordering::Relaxed);
+        let request = RemoteMessage::ImageRequest(ImageRequest {
+            request_id,
+            key: key.to_owned(),
+            offset,
+        });
+        let (sender, receiver) = mpsc::channel();
+        self.image_requests
+            .lock()
+            .expect("image requests")
+            .insert(request_id, sender);
+        let sent = {
+            let mut writer = self.writer.lock().expect("remote writer");
+            if !writer.control_granted || !self.supports_inline_images() {
+                Err(io::Error::new(
+                    io::ErrorKind::NotConnected,
+                    "remote controller is reconnecting",
+                ))
+            } else {
+                write_message(&mut writer, &request)
+            }
+        };
+        if let Err(error) = sent {
+            self.image_requests
+                .lock()
+                .expect("image requests")
+                .remove(&request_id);
+            return Err(error);
+        }
+        let result = receiver.recv_timeout(IMAGE_READ_TIMEOUT);
+        self.image_requests
+            .lock()
+            .expect("image requests")
+            .remove(&request_id);
+        result.map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "remote image read timed out"))
+    }
+
+    pub fn complete_image(&self, response: ImageResponse) {
+        if let Some(sender) = self
+            .image_requests
+            .lock()
+            .expect("image requests")
+            .remove(&response.request_id)
+        {
+            let _ = sender.send(response.image);
+        }
+    }
+
     pub fn complete_scrollback(&self, response: ScrollbackResponse) {
         if let Some(sender) = self
             .scrollback_requests
@@ -688,6 +774,7 @@ impl RemoteSessionClient {
             .lock()
             .expect("scrollback requests")
             .clear();
+        self.image_requests.lock().expect("image requests").clear();
         self.persist_observed_output_offset();
     }
 
@@ -986,6 +1073,140 @@ mod tests {
                 assert!(client.validate_hello(&ack).is_err());
             }
         }
+    }
+
+    #[test]
+    fn inline_image_reads_are_sent_only_after_the_holder_negotiated_them() {
+        use crate::remote::{
+            executor::ProcessExecutor, manager::ArtifactCatalog, ssh::SshTransport,
+        };
+        use diri_proto::inline_image::InlineImageFormat;
+        use diri_proto::remote_pty::{INLINE_IMAGES_PROTOCOL_MINOR, RemoteCapability};
+        use std::io::Read as _;
+        let temp = tempfile::tempdir().unwrap();
+        let host = diri_proto::HostEntry {
+            id: "fixture".into(),
+            name: None,
+            ssh: "fixture".into(),
+            default_cwd: None,
+            node: None,
+        };
+        let manager = Arc::new(
+            RemoteManager::new(
+                ProcessExecutor::new("/bin/false"),
+                ArtifactCatalog::without_artifacts_for_test(),
+                temp.path().join("control"),
+            )
+            .unwrap(),
+        );
+        let client = Arc::new(
+            RemoteSessionClient::new(
+                manager,
+                InstalledHelper {
+                    target: RemoteTarget::MacosAarch64,
+                    build_id: "fixture".into(),
+                    protocol: ProtocolVersion::CURRENT,
+                    transport: SshTransport::new(&host, temp.path().join("control/socket")),
+                },
+                "fixture".into(),
+                SessionToken::new("fixture-token-long-enough").unwrap(),
+                "incarnation".into(),
+                RemoteBindingStore::new(temp.path().join("binding")).unwrap(),
+                0,
+            )
+            .unwrap(),
+        );
+        let ack = |minor: u16, capable: bool| {
+            let mut capabilities = REQUIRED_CAPABILITIES.to_vec();
+            if capable {
+                capabilities.push(RemoteCapability::InlineImages);
+            }
+            HelloAck {
+                protocol: ProtocolVersion { major: 1, minor },
+                holder_build_id: "fixture".into(),
+                session_incarnation: "incarnation".into(),
+                capabilities,
+                controller_epoch: 1,
+                process_state: RemoteProcessState::Running { pid: 123 },
+                child_identity: None,
+                output_offset: 0,
+                snapshot_sequence: 1,
+                foreground_pid: None,
+            }
+        };
+        let (writer, mut output) = pipe_writer();
+        *client.writer.lock().unwrap() = writer;
+        let mut sent = [0_u8; 4096];
+
+        // Every live Holder from before inline-images-v1 (forge runs several)
+        // and any Holder that does not name the capability: the read fails
+        // locally and nothing reaches the wire, because such a Holder would
+        // close the Bridge on the unknown frame kind.
+        for (minor, capable) in [
+            (INLINE_IMAGES_PROTOCOL_MINOR - 1, false),
+            (INLINE_IMAGES_PROTOCOL_MINOR - 1, true),
+            (INLINE_IMAGES_PROTOCOL_MINOR, false),
+        ] {
+            client.observe_hello_capabilities(&ack(minor, capable));
+            assert!(!client.supports_inline_images());
+            assert_eq!(
+                client.read_image("1a2b3c4d.3", 0).unwrap_err().kind(),
+                io::ErrorKind::Unsupported
+            );
+            assert_eq!(
+                output.read(&mut sent).unwrap_err().kind(),
+                io::ErrorKind::WouldBlock
+            );
+        }
+
+        client.observe_hello_capabilities(&ack(INLINE_IMAGES_PROTOCOL_MINOR, true));
+        assert!(client.supports_inline_images());
+        let reader = {
+            let client = Arc::clone(&client);
+            std::thread::spawn(move || client.read_image("1a2b3c4d.3", 5))
+        };
+        let mut codec = RemoteCodec::new();
+        let request = loop {
+            match output.read(&mut sent) {
+                Ok(count) => {
+                    if let Some(message) = codec.feed(&sent[..count]).unwrap().pop() {
+                        break message;
+                    }
+                }
+                Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                    std::thread::sleep(std::time::Duration::from_millis(1));
+                }
+                Err(error) => panic!("{error}"),
+            }
+        };
+        let RemoteMessage::ImageRequest(request) = request else {
+            panic!("image request: {request:?}");
+        };
+        assert_eq!((request.key.as_str(), request.offset), ("1a2b3c4d.3", 5));
+        let chunk = ImageChunk {
+            format: InlineImageFormat::Png,
+            compressed: false,
+            width: 2,
+            height: 1,
+            total: 8,
+            offset: 5,
+            data: vec![1, 2, 3],
+        };
+        // A response to some other request is not this read's answer.
+        client.complete_image(ImageResponse {
+            request_id: request.request_id + 1,
+            image: None,
+        });
+        client.complete_image(ImageResponse {
+            request_id: request.request_id,
+            image: Some(chunk.clone()),
+        });
+        assert_eq!(reader.join().unwrap().unwrap(), Some(chunk));
+
+        // A reconnect forgets the capability until the next HelloAck says so,
+        // even when the reconnect itself fails.
+        assert!(client.connect(0, None).is_err());
+        assert!(!client.supports_inline_images());
     }
 
     #[test]

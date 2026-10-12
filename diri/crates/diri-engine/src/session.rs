@@ -412,6 +412,9 @@ struct Shared {
     prompt_input: Mutex<PromptInputState>,
     log: Mutex<OutputLog>,
     screen: Mutex<HeadlessScreen>,
+    /// Device pixels per cell this session's terminal sizes images with, so
+    /// the PTY can report its text area in pixels; `None` for remote.
+    cell_pixels: Option<(u16, u16)>,
     /// The newest size the PTY was given whose emulator reflow has not run
     /// yet. See [`MirrorResize`].
     requested_size: Mutex<Option<(u16, u16)>>,
@@ -493,6 +496,8 @@ struct ForegroundProgram {
     group_seen_at: Option<Instant>,
     /// The job's program name, read once per group.
     name: Option<String>,
+    /// The Agent that name was recognised as, decided with it.
+    agent: Option<ForegroundAgent>,
     cwd: Option<String>,
     cwd_read_at: Option<Instant>,
     /// The TCP ports the job listens on: a dev server's address.
@@ -500,6 +505,42 @@ struct ForegroundProgram {
     ports_read_at: Option<Instant>,
     /// The Agent manifest the screen is read with while the reducer is lent.
     read_as: Option<String>,
+}
+
+/// An Agent recognised in a shell's foreground.
+#[derive(Clone, Copy)]
+enum ForegroundAgent {
+    /// One with a launch manifest, by its index in `known_agents`.
+    Manifest(usize),
+    /// One the recognition catalog names, whose status follows its output.
+    Activity(&'static str),
+}
+
+/// How a shell's status is read while an Agent holds its foreground.
+enum Lend<'a> {
+    Screen(&'a KnownAgent),
+    Activity(&'static str),
+}
+
+/// What the program `name` leading group `group` is, if an Agent: a
+/// manifest's own binary first, then the recognition catalog, whose entries
+/// that share a manifest's id are read with that manifest. The npm package is
+/// read only for a short name that needs one.
+fn recognize_agent(known: &[KnownAgent], name: &str, group: i32) -> Option<ForegroundAgent> {
+    if let Some(index) = known.iter().position(|agent| agent.binary == name) {
+        return Some(ForegroundAgent::Manifest(index));
+    }
+    let id = crate::recognition::recognize(name, || {
+        diri_pty::foreground::npm_package(group as u32)
+            .ok()
+            .flatten()
+    })?;
+    Some(
+        match known.iter().position(|agent| agent.manifest_id == id) {
+            Some(index) => ForegroundAgent::Manifest(index),
+            None => ForegroundAgent::Activity(id),
+        },
+    )
 }
 
 /// An Agent a shell can recognise in its foreground.
@@ -1928,6 +1969,8 @@ impl Session {
 
     fn spawn_direct(spec: SessionSpec, engine: Arc<ManifestEngine>) -> std::io::Result<Self> {
         let pty = Pty::spawn(&spec.pty)?;
+        let (cols, rows) = (spec.pty.cols, spec.pty.rows);
+        let _ = pty.resize_with_pixels(cols, rows, launch_pixels(cols, rows));
         let log = OutputLog::writer(&spec.logs_dir, &spec.id)?;
         let shared = new_shared(&spec, log, &engine, true);
         shared.child_pid.store(pty.pid() as i32, Ordering::SeqCst);
@@ -1989,6 +2032,11 @@ impl Session {
         let client = HolderClient::new(paths.socket());
         let (floor, stat) = wait_for_holder(&client, &spec.logs_dir, &spec.id, pre_spawn_tail)
             .map_err(holder_io_error)?;
+        let _ = client.resize_with_pixels(
+            launch.cols,
+            launch.rows,
+            launch_pixels(launch.cols, launch.rows),
+        );
         Self::attach(spec, client, floor, engine, true, stat.as_ref())
     }
 
@@ -2082,6 +2130,13 @@ impl Session {
                         cols = pty.cols,
                         rows = pty.rows,
                     );
+                    // The launch spec carries no pixel size; an older Holder
+                    // manager would not pass one on.
+                    let _ = client.resize_with_pixels(
+                        pty.cols,
+                        pty.rows,
+                        text_area_pixels(&shared, pty.cols, pty.rows),
+                    );
                     if return_to_shell {
                         watch_early_return_to_shell(&shared, &client);
                     }
@@ -2111,7 +2166,12 @@ impl Session {
                     if let Some((cols, rows)) = handoff.late_size {
                         // A size proposed while the exec was in flight: apply
                         // as an ordinary resize now that the PTY exists.
-                        let _ = client.resize(cols.max(2), rows.max(2));
+                        let (cols, rows) = (cols.max(2), rows.max(2));
+                        let _ = client.resize_with_pixels(
+                            cols,
+                            rows,
+                            text_area_pixels(&shared, cols, rows),
+                        );
                         shared
                             .screen
                             .lock()
@@ -2271,12 +2331,11 @@ impl Session {
             .clone();
         let (foreground_program, foreground_agent, terminal_cwd, foreground_ports) = {
             let foreground = self.shared.foreground.lock().expect("foreground");
-            let agent = foreground.name.as_deref().and_then(|name| {
-                self.shared
-                    .known_agents
-                    .iter()
-                    .find(|agent| agent.binary == name)
-                    .map(|agent| agent.manifest_id.clone())
+            let agent = foreground.agent.map(|agent| match agent {
+                ForegroundAgent::Manifest(index) => {
+                    self.shared.known_agents[index].manifest_id.clone()
+                }
+                ForegroundAgent::Activity(id) => id.to_owned(),
             });
             (
                 foreground.name.clone(),
@@ -3174,6 +3233,24 @@ impl Session {
         self.shared.reset_generation.load(Ordering::SeqCst)
     }
 
+    /// An inline image this session's terminal placed, by anchor key.
+    /// `None` for a remote session, an unknown key or an evicted image.
+    pub fn inline_image(&self, key: &str) -> Option<diri_terminal_state::StoredImage> {
+        self.shared.screen.lock().expect("screen").inline_image(key)
+    }
+
+    /// The remote client that serves this session's inline images, when its
+    /// live Holder negotiated `inline-images-v1`. Reads through it wait on
+    /// the network, so callers must not hold the Registry while they do.
+    pub fn remote_inline_images(&self) -> Option<Arc<RemoteSessionClient>> {
+        match &self.transport {
+            Transport::Remote(client) if client.supports_inline_images() => {
+                Some(Arc::clone(client))
+            }
+            _ => None,
+        }
+    }
+
     pub fn resize(&self, cols: u16, rows: u16) -> std::io::Result<()> {
         if let Some(reflow) = self.resize_pty(cols, rows)? {
             reflow.apply();
@@ -3195,9 +3272,15 @@ impl Session {
         {
             return Ok(None);
         }
+        let pixels = text_area_pixels(&self.shared, cols, rows);
         match &self.transport {
-            Transport::Direct(pty) => pty.lock().expect("pty").resize(cols, rows)?,
-            Transport::Held(client) => client.resize(cols, rows).map_err(holder_io_error)?,
+            Transport::Direct(pty) => pty
+                .lock()
+                .expect("pty")
+                .resize_with_pixels(cols, rows, pixels)?,
+            Transport::Held(client) => client
+                .resize_with_pixels(cols, rows, pixels)
+                .map_err(holder_io_error)?,
             Transport::Remote(client) => client.resize(cols, rows)?,
         }
         // Recorded in PTY order: callers resize the PTY under the Registry
@@ -3335,6 +3418,23 @@ impl Drop for Session {
     }
 }
 
+/// The PTY's text area in pixels (`ws_xpixel`/`ws_ypixel`): what image tools
+/// such as `kitten icat` size their output from. Zero where unknown.
+fn text_area_pixels(shared: &Shared, cols: u16, rows: u16) -> (u16, u16) {
+    shared
+        .cell_pixels
+        .map_or((0, 0), |cell| scale_cells(cell, cols, rows))
+}
+
+/// [`text_area_pixels`] for a local PTY spawned before its session state.
+fn launch_pixels(cols: u16, rows: u16) -> (u16, u16) {
+    scale_cells(diri_terminal_state::DEFAULT_CELL_PIXELS, cols, rows)
+}
+
+fn scale_cells((width, height): (u16, u16), cols: u16, rows: u16) -> (u16, u16) {
+    (cols.saturating_mul(width), rows.saturating_mul(height))
+}
+
 fn new_shared(
     spec: &SessionSpec,
     log: OutputLog,
@@ -3390,10 +3490,23 @@ fn new_shared(
         prompt_title: Mutex::new(None),
         prompt_input: Mutex::new(PromptInputState::default()),
         log: Mutex::new(log),
-        screen: Mutex::new(
-            HeadlessScreen::new(spec.pty.cols as usize, spec.pty.rows as usize)
-                .with_notifications(),
-        ),
+        screen: Mutex::new({
+            let screen = HeadlessScreen::new(spec.pty.cols as usize, spec.pty.rows as usize)
+                .with_notifications();
+            // Only a local session's own emulator feeds the client grid; a
+            // remote session's grid, image anchors and pixels come from its
+            // Holder (`inline-images-v1`), so storing images here too would
+            // cost memory for pixels nobody reads.
+            if spec.remote.is_none() {
+                screen.with_inline_images()
+            } else {
+                screen
+            }
+        }),
+        cell_pixels: spec
+            .remote
+            .is_none()
+            .then_some(diri_terminal_state::DEFAULT_CELL_PIXELS),
         requested_size: Mutex::new(None),
         reducer: Mutex::new(reducer),
         exit: Mutex::new(None),
@@ -3667,9 +3780,10 @@ fn apply_foreground_sample(
     let outcome = {
         let mut reducer = shared.reducer.lock().expect("reducer");
         let outcome = match agent {
-            Some(agent) => {
+            Some(Lend::Screen(agent)) => {
                 reducer.lend_to_agent(&agent.manifest_id, Some(&agent.manifest_version), now)
             }
+            Some(Lend::Activity(id)) => reducer.lend_to_activity(id, now),
             None if reducer.foreground_agent().is_some() => reducer.return_from_agent(running, now),
             None => reducer.reduce(StatusSignal::ForegroundJob { running }, now),
         };
@@ -3681,7 +3795,9 @@ fn apply_foreground_sample(
 }
 
 /// Names a local shell's foreground job and reads its working directory,
-/// returning the Agent that job is when it is one whose screen can be read.
+/// returning how to read the Agent that job is, when it is one: by its
+/// manifest's screen rules, or by its output when it is known only by name.
+/// A manifest Agent without screen rules is left to the shell's job tracking.
 ///
 /// A job's name is read once per process group. A group seen before its
 /// leader has exec'd still carries the shell's own name; that read is not
@@ -3692,7 +3808,7 @@ fn observe_foreground_program(
     child_pid: i32,
     foreground_pgid: Option<i32>,
     running: bool,
-) -> Option<&KnownAgent> {
+) -> Option<Lend<'_>> {
     let job = foreground_pgid.filter(|_| running);
     let mut changed = false;
     let mut foreground = shared.foreground.lock().expect("foreground");
@@ -3701,6 +3817,7 @@ fn observe_foreground_program(
         foreground.group_seen_at = Some(Instant::now());
         foreground.ports_read_at = None;
         changed |= foreground.name.take().is_some();
+        foreground.agent = None;
         changed |= !std::mem::take(&mut foreground.ports).is_empty();
     }
     // What the job serves, read on the same terms as its name: once it has
@@ -3729,6 +3846,7 @@ fn observe_foreground_program(
         && let Ok(name) = diri_pty::foreground::program_name(group as u32)
         && diri_pty::foreground::program_name(child_pid as u32).ok() != Some(name.clone())
     {
+        foreground.agent = recognize_agent(&shared.known_agents, &name, group);
         foreground.name = Some(name);
         changed = true;
     }
@@ -3744,11 +3862,12 @@ fn observe_foreground_program(
             changed = true;
         }
     }
-    let agent = foreground.name.as_deref().and_then(|name| {
-        shared
-            .known_agents
-            .iter()
-            .find(|agent| agent.binary == name && agent.reads_screen)
+    let agent = foreground.agent.and_then(|agent| match agent {
+        ForegroundAgent::Manifest(index) => {
+            let agent = &shared.known_agents[index];
+            agent.reads_screen.then_some(Lend::Screen(agent))
+        }
+        ForegroundAgent::Activity(id) => Some(Lend::Activity(id)),
     });
     drop(foreground);
     if changed {
@@ -4248,6 +4367,7 @@ fn handle_remote_message(
             {
                 return RemoteConnectionDisposition::Fatal;
             }
+            client.observe_hello_capabilities(&acknowledgement);
             if let RemoteProcessState::Exited { code, signal } = acknowledgement.process_state {
                 record_remote_exit(shared, ProcessExit { code, signal });
                 return RemoteConnectionDisposition::Exited;
@@ -4383,6 +4503,10 @@ fn handle_remote_message(
         }
         RemoteMessage::ScrollbackResponse(response) => {
             client.complete_scrollback(response);
+            RemoteConnectionDisposition::Continue
+        }
+        RemoteMessage::ImageResponse(response) if client.supports_inline_images() => {
+            client.complete_image(response);
             RemoteConnectionDisposition::Continue
         }
         RemoteMessage::Error(error) => {
@@ -8053,6 +8177,82 @@ mod foreground_program_tests {
         let sub = root.join("sub").to_string_lossy().into_owned();
         wait_until("cd to be followed", || {
             session.view().terminal_cwd.as_deref() == Some(sub.as_str())
+        });
+        let _ = session.terminate(Duration::from_secs(2));
+    }
+
+    /// An Agent with no launch manifest, typed at the prompt, is recognised
+    /// by name from the catalog and its status follows its output.
+    #[test]
+    fn a_shell_recognises_an_agent_known_only_by_name() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        let bin = root.join("bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        let fake_goose = bin.join("goose");
+        // Streams a reply for a while after each line, as an Agent does.
+        std::fs::write(
+            &fake_goose,
+            "#!/bin/sh\necho ready\nwhile read -r line; do\n  i=0\n  while [ $i -lt 15 ]; do echo \"working $i\"; sleep 0.1; i=$((i+1)); done\ndone\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(
+            &fake_goose,
+            std::os::unix::fs::PermissionsExt::from_mode(0o755),
+        )
+        .unwrap();
+        let (engine, _) = ManifestEngine::load_dir(&crate::detect::bundled_manifest_dir()).unwrap();
+        let logs = root.join("logs");
+        std::fs::create_dir_all(&logs).unwrap();
+        let spec = SessionSpec {
+            id: "foreground-goose".into(),
+            pty: PtySpec::new(vec!["/bin/sh".into(), "-i".into()], &root)
+                .env("PATH", &format!("{}:/usr/bin:/bin", bin.display()))
+                .env("PS1", "$ ")
+                .size(80, 24),
+            manifest_id: "shell".into(),
+            authority: Authority::ProcessOnly,
+            logs_dir: logs,
+            holder: None,
+            remote: None,
+            defer_launch: false,
+        };
+        let mut session = Session::spawn(spec, Arc::new(engine)).expect("spawn");
+        let root_text = root.to_string_lossy().into_owned();
+        wait_until("the prompt's directory", || {
+            session.view().terminal_cwd.as_deref() == Some(root_text.as_str())
+        });
+
+        session.write_input(b"goose\r").unwrap();
+        wait_until("the Agent to be recognised", || {
+            let view = session.view();
+            view.foreground_program.as_deref() == Some("goose")
+                && view.foreground_agent.as_deref() == Some("goose")
+        });
+        wait_until("the reducer to be lent and idle", || {
+            session.shared.reducer.lock().unwrap().foreground_agent() == Some("goose")
+                && session.status() == SessionStatus::Idle
+        });
+
+        session.write_input(b"go\r").unwrap();
+        wait_until("its reply to read as work", || {
+            session.status() == SessionStatus::Working
+        });
+        wait_until("its quiet to read as idle", || {
+            session.status() == SessionStatus::Idle
+        });
+
+        session.write_input(b"\x03").unwrap();
+        wait_until("the shell to take its status back", || {
+            let view = session.view();
+            view.foreground_agent.is_none()
+                && session
+                    .shared
+                    .reducer
+                    .lock()
+                    .unwrap()
+                    .foreground_agent()
+                    .is_none()
         });
         let _ = session.terminate(Duration::from_secs(2));
     }

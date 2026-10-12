@@ -1,0 +1,19 @@
+{
+  "default_terminal.failed": "macOS 未能更改默认终端（错误 {code}）。",
+  "default_terminal.is_default": "ssh://、telnet:// 和手册页链接以及 .command 文件会在新的 diri 标签页中打开。",
+  "default_terminal.make_default": "设为默认",
+  "default_terminal.not_default": "ssh://、telnet:// 和手册页链接以及 .command 文件目前由其他应用打开。",
+  "default_terminal.title": "默认终端",
+  "default_terminal.unavailable": "从已安装的应用运行 diri 时可用。",
+  "open_handler.error.host": "链接中的主机名无效。",
+  "open_handler.error.not_executable": "{name} 不可执行。请用 chmod +x 将其设为可执行后再打开。",
+  "open_handler.error.not_found": "{name} 不存在。",
+  "open_handler.error.page": "链接未指向有效的手册页。",
+  "open_handler.error.port": "链接中的端口无效。",
+  "open_handler.error.quarantined": "{name} 是从互联网下载的，diri 不会运行它。请先检查，再从终端运行。",
+  "open_handler.error.telnet": "未安装 telnet。请用 Homebrew 安装：brew install telnet。",
+  "open_handler.error.too_long": "链接太长。",
+  "open_handler.error.unsupported": "diri 可打开 ssh://、telnet:// 和手册页链接，以及 .command、.tool 和 .sh 文件。",
+  "open_handler.error.user": "链接中的用户名无效。",
+  "open_handler.failed_title": "无法在 diri 中打开"
+}

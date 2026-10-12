@@ -23,6 +23,7 @@ use diri_proto::{
     AgentDescriptor, AgentKind, AgentReadinessResult, AttentionLevel, DateMillis, EventName,
     ExitReason, GovernorConfigureParams, HelloResult, HostEntry, HostsConfig, Project, ProjectId,
     SessionId, SessionListResult, SessionRecord, SessionSpawnParams, SessionStatus,
+    TerminalConfigureParams,
 };
 use tokio::sync::{Notify, broadcast, mpsc};
 use tokio::task::JoinHandle;
@@ -247,6 +248,7 @@ pub enum StoreEffect {
     ReopenLast,
     SetActive(bool),
     ConfigureGovernor(GovernorConfigureParams),
+    ConfigureTerminal(TerminalConfigureParams),
     /// T11 consumes this by closing and dropping the corresponding attachment.
     DetachAttachment(SessionId),
     /// T15 consumes this without involving daemon lifecycle operations.
@@ -357,6 +359,9 @@ pub struct SpawnOptions {
     /// the SAME repository as this session on the target host (matched by
     /// origin URL), falling back to `cwd` / defaultCwd when not cloned there.
     pub same_repo_as: Option<SessionId>,
+    /// A terminal that runs this argv instead of the login shell (an `ssh://`
+    /// link, a man page, an opened `.command` file). Local terminals only.
+    pub argv: Option<Vec<String>>,
 }
 
 /// Async resolution state for "the active session's repo on host X" — drives
@@ -1297,6 +1302,17 @@ impl SessionStore {
         });
     }
 
+    /// A link or file macOS sent diri that it will not open.
+    pub(crate) fn report_open_failure(&mut self, detail: String) {
+        self.last_action_failure = Some(ActionFailure {
+            title: crate::i18n::t("open_handler.failed_title").to_owned(),
+            detail,
+            retrying: false,
+            retry: None,
+        });
+        self.emit(StoreEffect::UiChanged);
+    }
+
     pub fn dismiss_action_failure(&mut self) {
         self.last_action_failure = None;
         self.emit(StoreEffect::UiChanged);
@@ -1382,6 +1398,7 @@ impl SessionStore {
         self.invalidate_projection();
         if matches!(self.daemon_state, DaemonState::Connected) {
             self.emit(StoreEffect::ConfigureGovernor(self.governor_settings()));
+            self.emit(StoreEffect::ConfigureTerminal(self.terminal_settings()));
         }
         Ok(())
     }
@@ -1620,6 +1637,12 @@ impl SessionStore {
                 .memory_hard_limit_gb
                 .saturating_mul(1024 * 1024 * 1024),
         )
+    }
+
+    pub fn terminal_settings(&self) -> TerminalConfigureParams {
+        TerminalConfigureParams {
+            shell_integration: self.prefs.terminal_shell_integration,
+        }
     }
 
     pub fn sidebar_projection(&mut self) -> Arc<SidebarProjection> {
@@ -2847,6 +2870,7 @@ impl SessionStore {
                 same_repo_as: None,
                 start_directory: None,
                 note_id: None,
+                argv: None,
             },
         });
         true
@@ -2960,6 +2984,7 @@ impl SessionStore {
             same_repo_as: options.same_repo_as,
             start_directory,
             note_id: None,
+            argv: options.argv,
         }
     }
 
@@ -3410,6 +3435,7 @@ impl StoreRuntime {
     }
 
     pub fn start_default(client: Arc<DaemonClient>) -> io::Result<Self> {
+        crate::imported_themes::load_into_registry(&crate::imported_themes::default_dir());
         Self::start(client, Prefs::path())
     }
 
@@ -3418,6 +3444,7 @@ impl StoreRuntime {
     /// Engine off the GPUI thread; the supervisor starts the client exactly
     /// once after that authoritative decision finishes.
     pub(crate) fn start_default_deferred(client: Arc<DaemonClient>) -> io::Result<Self> {
+        crate::imported_themes::load_into_registry(&crate::imported_themes::default_dir());
         let (store, effects) = SessionStore::load(Prefs::path())?;
         Ok(Self::start_with_store(
             client,
@@ -3645,12 +3672,17 @@ impl StoreRuntime {
                             };
                             state_snapshots.send_replace(snapshot);
                         }
-                        let (active, governor) = {
+                        let (active, governor, terminal) = {
                             let store = state_store.read().expect("session store lock poisoned");
-                            (store.app_is_active, store.governor_settings())
+                            (
+                                store.app_is_active,
+                                store.governor_settings(),
+                                store.terminal_settings(),
+                            )
                         };
                         let _ = state_client.set_active(active).await;
                         let _ = state_client.configure_governor(governor).await;
+                        let _ = state_client.configure_terminal(terminal).await;
                         // Warm the default remote only after local catalog,
                         // session hydration and lifecycle state have completed.
                         // A slow SSH login can then never delay first paint.
@@ -4243,6 +4275,7 @@ async fn run_effects(
             },
             StoreEffect::SetActive(active) => client.set_active(active).await,
             StoreEffect::ConfigureGovernor(settings) => client.configure_governor(settings).await,
+            StoreEffect::ConfigureTerminal(settings) => client.configure_terminal(settings).await,
             StoreEffect::DetachAttachment(id) => {
                 let _ = detach_tx.send(id);
                 Ok(())
@@ -4325,6 +4358,7 @@ fn action_context(effect: &StoreEffect) -> Option<ActionContext> {
         | StoreEffect::ListDirectories { .. }
         | StoreEffect::SetActive(_)
         | StoreEffect::ConfigureGovernor(_)
+        | StoreEffect::ConfigureTerminal(_)
         | StoreEffect::DetachAttachment(_)
         | StoreEffect::StatusTransition(_) => return None,
         // Catalog failures land in `agent_catalog_errors`, which the Agents

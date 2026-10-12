@@ -45,6 +45,11 @@ pub enum Event {
     /// Request to write the text area size.
     TextAreaSizeRequest(Arc<dyn Fn(WindowSize) -> String + Sync + Send + 'static>),
 
+    /// Diri: request to write the size of one cell in pixels. Kept apart
+    /// from [`Event::TextAreaSizeRequest`] so a host that does not know its
+    /// cell size can leave the query unanswered, as before.
+    CellSizeRequest(Arc<dyn Fn(WindowSize) -> String + Sync + Send + 'static>),
+
     /// Cursor blinking state has changed.
     CursorBlinkingChange,
 
@@ -67,6 +72,7 @@ impl Debug for Event {
             Event::ClipboardStore(ty, text) => write!(f, "ClipboardStore({ty:?}, {text})"),
             Event::ClipboardLoad(ty, _) => write!(f, "ClipboardLoad({ty:?})"),
             Event::TextAreaSizeRequest(_) => write!(f, "TextAreaSizeRequest"),
+            Event::CellSizeRequest(_) => write!(f, "CellSizeRequest"),
             Event::ColorRequest(index, _) => write!(f, "ColorRequest({index})"),
             Event::PtyWrite(text) => write!(f, "PtyWrite({text})"),
             Event::Title(title) => write!(f, "Title({title})"),

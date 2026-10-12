@@ -489,7 +489,9 @@ where
         AgentKind::CURSOR_ID => "Cursor",
         AgentKind::GEMINI_ID => "Gemini",
         AgentKind::SHELL_ID => t("notify.agent_terminal"),
-        _ => t("notify.agent_generic"),
+        // One recognised in a shell with no manifest: "Goose finished".
+        id => diri_proto::agent_names::recognized_agent_name(id)
+            .unwrap_or_else(|| t("notify.agent_generic")),
     }
 }
 
@@ -583,6 +585,26 @@ pub fn reply_refused_transition(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn an_agent_known_only_by_name_is_called_by_it() {
+        assert_eq!(display_name(&AgentKind::new("goose"), None), "Goose");
+        assert_eq!(
+            display_name(&AgentKind::new("command-code"), None),
+            "Command Code"
+        );
+        assert_eq!(display_name(&AgentKind::CLAUDE_CODE, None), "Claude Code");
+        // A manifest's Agent without its descriptor yet, and an id nobody
+        // knows, stay generic rather than guessing.
+        assert_eq!(
+            display_name(&AgentKind::new("aider"), None),
+            t("notify.agent_generic")
+        );
+        assert_eq!(
+            display_name(&AgentKind::new("some-future-agent"), None),
+            t("notify.agent_generic")
+        );
+    }
 
     #[test]
     fn replies_reach_only_the_same_session_still_waiting_on_a_question() {

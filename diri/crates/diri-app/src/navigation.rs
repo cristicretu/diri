@@ -1348,7 +1348,7 @@ impl NavigationOverlay {
 
     fn filter_themes(&mut self) {
         let query = self.query.text().trim().to_lowercase();
-        self.theme_matches = TermTheme::CATALOG
+        self.theme_matches = diri_term::themes::all()
             .into_iter()
             .filter(|theme| theme.name.to_lowercase().contains(&query))
             .collect();

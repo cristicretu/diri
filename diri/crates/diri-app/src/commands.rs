@@ -21,7 +21,14 @@ static ACTIVE_SHORTCUT_OVERRIDES: OnceLock<RwLock<ShortcutOverrides>> = OnceLock
 
 actions!(
     diri_app,
-    [Quit, HideApp, NewWindow, CloseWindow, ReportProblem]
+    [
+        Quit,
+        HideApp,
+        ShowApp,
+        NewWindow,
+        CloseWindow,
+        ReportProblem
+    ]
 );
 
 actions!(
@@ -129,6 +136,7 @@ actions!(
         ExportScrollback,
         PreviousPrompt,
         NextPrompt,
+        CopyLastCommandOutput,
     ]
 );
 
@@ -136,6 +144,7 @@ actions!(
 pub enum CommandId {
     Quit,
     HideApp,
+    ShowApp,
     CloseWindow,
     NewWindow,
     CloseSession,
@@ -224,6 +233,7 @@ pub enum CommandId {
     ExportScrollback,
     PreviousPrompt,
     NextPrompt,
+    CopyLastCommandOutput,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -342,6 +352,8 @@ macro_rules! spec_with_alternates {
 pub const COMMANDS: &[CommandSpec] = &[
     spec!(Quit, "quit", Some("cmd-q"), Some("⌘Q"), None),
     spec!(HideApp, "hide-app", Some("cmd-h"), Some("⌘H"), None),
+    #[cfg(target_os = "macos")]
+    spec!(ShowApp, "show-app", None, None, None),
     spec!(
         NewWindow,
         "new-window",
@@ -1129,6 +1141,16 @@ pub const COMMANDS: &[CommandSpec] = &[
         "arrow.down",
         "terminal message prompt next conversation"
     ),
+    spec!(
+        CopyLastCommandOutput,
+        "terminal-copy-last-command-output",
+        Some("cmd-alt-o"),
+        Some("⌘⌥O"),
+        Some(TERMINAL_CONTEXT),
+        "command.copy_last_command_output.palette_title",
+        "doc.on.doc",
+        "terminal shell command output copy last osc 133"
+    ),
 ];
 
 pub fn command(id: CommandId) -> &'static CommandSpec {
@@ -1196,6 +1218,10 @@ fn set_active_shortcut_overrides(overrides: &ShortcutOverrides) {
 
 impl CommandSpec {
     fn key_bindings(&self, overrides: &ShortcutOverrides) -> Vec<KeyBinding> {
+        // The system owns this binding, including while Diri is inactive.
+        if self.id == CommandId::ShowApp {
+            return Vec::new();
+        }
         self.effective_keystrokes(overrides)
             .into_iter()
             .map(|key| self.key_binding(&key))
@@ -1291,6 +1317,7 @@ impl CommandSpec {
         match self.id {
             CommandId::Quit => KeyBinding::new(key, Quit, context),
             CommandId::HideApp => KeyBinding::new(key, HideApp, context),
+            CommandId::ShowApp => KeyBinding::new(key, ShowApp, context),
             CommandId::CloseWindow => KeyBinding::new(key, CloseWindow, context),
             CommandId::NewWindow => KeyBinding::new(key, NewWindow, context),
             CommandId::CloseSession => KeyBinding::new(key, CloseSession, context),
@@ -1398,6 +1425,9 @@ impl CommandSpec {
             CommandId::ExportScrollback => KeyBinding::new(key, ExportScrollback, context),
             CommandId::PreviousPrompt => KeyBinding::new(key, PreviousPrompt, context),
             CommandId::NextPrompt => KeyBinding::new(key, NextPrompt, context),
+            CommandId::CopyLastCommandOutput => {
+                KeyBinding::new(key, CopyLastCommandOutput, context)
+            }
         }
     }
 }
@@ -1973,6 +2003,11 @@ impl CommandId {
                 description: t("command.next_prompt.description"),
                 category: ShortcutCategory::Terminal,
             },
+            Self::CopyLastCommandOutput => ShortcutMetadata {
+                title: t("command.copy_last_command_output.title"),
+                description: t("command.copy_last_command_output.description"),
+                category: ShortcutCategory::Terminal,
+            },
             Self::CopySelection => ShortcutMetadata {
                 title: t("command.copy_selection.title"),
                 description: t("command.copy_selection.description"),
@@ -2018,6 +2053,11 @@ impl CommandId {
                 description: t("command.hide_app.description"),
                 category: Application,
             },
+            Self::ShowApp => ShortcutMetadata {
+                title: t("command.show_app.title"),
+                description: t("command.show_app.description"),
+                category: Application,
+            },
             Self::Quit => ShortcutMetadata {
                 title: t("command.quit.title"),
                 description: t("command.quit.description"),
@@ -2040,6 +2080,7 @@ impl CommandId {
         match self {
             Self::Quit => Box::new(Quit),
             Self::HideApp => Box::new(HideApp),
+            Self::ShowApp => Box::new(ShowApp),
             Self::CloseWindow => Box::new(CloseWindow),
             Self::NewWindow => Box::new(NewWindow),
             Self::CloseSession => Box::new(CloseSession),
@@ -2129,6 +2170,7 @@ impl CommandId {
             Self::ExportScrollback => Box::new(ExportScrollback),
             Self::PreviousPrompt => Box::new(PreviousPrompt),
             Self::NextPrompt => Box::new(NextPrompt),
+            Self::CopyLastCommandOutput => Box::new(CopyLastCommandOutput),
         }
     }
 }

@@ -54,6 +54,10 @@ impl Method {
     pub const SESSION_READ_SCROLLBACK: &'static str = "session.read_scrollback";
     pub const SESSION_READ_SCROLLBACK_CELLS: &'static str = "session.read_scrollback_cells";
     pub const SESSION_READ_DIFF: &'static str = "session.read_diff";
+    /// One chunk of an inline image a terminal placed. A remote session's is
+    /// read from its Holder (`inline-images-v1`) in smaller chunks; unknown
+    /// keys, evicted images and older Holders answer `image_not_found`.
+    pub const SESSION_READ_IMAGE: &'static str = "session.read_image";
     pub const SESSION_READ_TRANSCRIPT: &'static str = "session.read_transcript";
     pub const SESSION_MARK_SEEN: &'static str = "session.mark_seen";
     /// Returns a completed turn to "done · unseen", like marking a chat
@@ -92,6 +96,7 @@ impl Method {
     pub const PROJECT_ADD: &'static str = "project.add";
     pub const CLIENT_SET_ACTIVE: &'static str = "client.set_active";
     pub const GOVERNOR_CONFIGURE: &'static str = "governor.configure";
+    pub const TERMINAL_CONFIGURE: &'static str = "terminal.configure";
     pub const AGENT_READINESS: &'static str = "agent.readiness";
     pub const AGENT_CONFIGURE: &'static str = "agent.configure";
     pub const ACCOUNT_PROFILES_LIST: &'static str = "account.profiles.list";
@@ -517,6 +522,12 @@ pub struct SessionSpawnParams {
     /// leaves that question to the user.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub appearance: Option<TerminalAppearance>,
+    /// What a binary-free kind (a `shell` terminal) runs instead of the login
+    /// shell: one structured argv, exec'd directly in the PTY, never joined
+    /// into a shell command. The Engine validates it before any side effect.
+    /// Absent keeps the manifest's launch.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub argv: Option<Vec<String>>,
 }
 
 /// The light or dark family of the terminal theme a Session is shown in.
@@ -1270,6 +1281,19 @@ pub struct HookReportParams {
 pub type HookReportResult = EmptyResult;
 pub type GovernorConfigureParams = GovernorSettingsParams;
 pub type GovernorConfigureResult = EmptyResult;
+
+/// Engine-side terminal settings the app owns. The Engine keeps the last
+/// value it was sent, so terminals it restarts before the app connects follow
+/// it too.
+#[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TerminalConfigureParams {
+    /// Whether new zsh and bash terminals get Diri's OSC 133 prompt and
+    /// command marks without any setup.
+    pub shell_integration: bool,
+}
+
+pub type TerminalConfigureResult = EmptyResult;
 pub type ClientSetActiveResult = EmptyResult;
 pub type DaemonPrepareShutdownParams = EmptyParams;
 pub type DaemonPrepareShutdownResult = EmptyResult;
@@ -1297,6 +1321,33 @@ pub struct ForwardRequest {
     pub forward: u16,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub token: Option<String>,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SessionReadImageParams {
+    #[serde(rename = "sessionID")]
+    pub session_id: SessionId,
+    /// The key of an [`crate::inline_image::ImageAnchor`].
+    pub key: String,
+    #[serde(default)]
+    pub offset: u64,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SessionReadImageResult {
+    pub format: crate::inline_image::InlineImageFormat,
+    /// Raw formats are zlib-compressed (Kitty `o=z`).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub compressed: bool,
+    pub width: u32,
+    pub height: u32,
+    /// Length of the whole stored image; read on while `offset + data` is short.
+    pub total: u64,
+    pub offset: u64,
+    #[serde(with = "base64_bytes")]
+    pub data: Vec<u8>,
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]

@@ -1774,7 +1774,7 @@ ln -sf /Applications/diri.app/Contents/Resources/bin/dirijor ~/.local/bin/dirijo
 The CLI finds the Engine through its socket. Set `DIRIJOR_SOCKET` to point at a different one.
 
 ## Conventions
-- **Targets.** Most `session` commands take a target: a full session id, a unique id prefix, or a unique part of the session title (case-insensitive). Commands documented with `ID` need the id itself.
+- **Targets.** Most commands take a target: a full session id, a unique id prefix, or a unique part of the session title (case-insensitive). Commands documented with `ID` need the id itself. Every terminal diri opens has its own id in `$DIRIJOR_SESSION_ID`.
 - **`--json`.** Prints one line of JSON instead of a table.
 - **Arguments are literal.** `session run` passes everything after `--` as separate arguments. Nothing is run through a shell.
 
@@ -1783,15 +1783,19 @@ The CLI finds the Engine through its socket. Set `DIRIJOR_SOCKET` to point at a 
 | Code | Meaning |
 | --- | --- |
 | `0` | Success |
-| `1` | Failure, including an ambiguous target or bad arguments |
+| `1` | Failure, including bad arguments |
 | `2` | Timed out |
 | `3` | Session not found |
 | `4` | Engine unreachable |
+| `5` | Ambiguous target: the id prefix or title matches more than one session |
+
+`run --wait` is the exception: it exits with the command's own status (`128 + N` when signal `N` ended it), `124` when `--timeout` passes, and `125` when `dirijor` itself fails.
 
 ## Overview
 
 | Command | What it does |
 | --- | --- |
+| `dirijor list`, `new`, `send`, `capture`, `run` | Short scripting verbs. See [Scripting](#scripting). |
 | `dirijor status [--json]` | List every session, archived ones included. |
 | `dirijor activity [--limit N] [--json]` | Recent activity. `N` is 1 to 300, default 50. |
 | `dirijor session ...` | List, read, drive, start and stop sessions. |
@@ -1809,6 +1813,27 @@ The CLI finds the Engine through its socket. Set `DIRIJOR_SOCKET` to point at a 
 
 `dirijor hook`, `dirijor notify JSON` and `dirijor mcp-stdio` are called by agents that diri launches. You do not need to run them.
 
+## Scripting
+Short verbs for shell scripts, modelled on tmux. They do the same things as the `session` commands below.
+
+| Command | Flags | What it does |
+| --- | --- | --- |
+| `list` | `--all`, `--json` | List sessions. Same as `session list`. |
+| `new` | `--kind KIND` (default `shell`), `--cwd PATH`, `--name TEXT`, `--prompt TEXT`, `--host ID`, `--json` | Open a shell or agent tab. Prints only the new session id. |
+| `send TARGET [--] TOKEN...` | `-l`, `--json` | Type into a session, like `tmux send-keys`. Each token is a key name or literal text; text tokens are joined without spaces. Reads stdin as literal text when no tokens are given. `-l` types every token literally. |
+| `capture TARGET` | `--lines N`, `--scrollback`, `--json` | Print the visible screen as plain text, or the whole scrollback. Trailing blanks and empty rows are dropped, so `--lines N` gives the last N rows of output. |
+| `run -- PROGRAM [ARG...]` | `--wait`, `--timeout SECONDS`, `--rm`, `--cwd PATH`, `--name TEXT`, `--host ID`, `--json` | Run a command in a new terminal tab and print its id. With `--wait`, block until it exits, print its output and exit with its status. `--rm` closes the tab afterwards. |
+
+`send` key names (case-insensitive): `Enter`, `Tab`, `Escape`, `BSpace`, `Space`, `Up`, `Down`, `Left`, `Right`, `Home`, `End`, `PageUp`, `PageDown`, `Insert`, `Delete`, `F1` to `F12`. Prefix `C-` for Control, `M-` for Alt and `S-` for Shift, for example `C-c`, `M-b` or `S-Tab`. Anything else is typed as text.
+
+```sh
+id=$(dirijor new --cwd ~/code/app)
+dirijor send "$id" "npm run dev" Enter
+dirijor capture "$id" --lines 5
+dirijor send "$id" C-c
+dirijor run --wait --rm -- cargo test --workspace && echo green
+```
+
 ## Sessions
 `dirijor session` with no action is the same as `dirijor session list`.
 
@@ -1818,7 +1843,7 @@ The CLI finds the Engine through its socket. Set `DIRIJOR_SOCKET` to point at a 
 | `session get TARGET` | `--json` | Show id, title, agent, status, folder and host. |
 | `session read TARGET` | `--source screen` or `scrollback`, `--lines N`, `--json` | Print the visible screen (default) or scrollback. `--lines` keeps the last N lines. |
 | `session send TARGET [TEXT...]` | `--no-submit`, `--json` | Type text and press Return. Reads stdin when no text is given. `--no-submit` leaves it unsent. |
-| `session key ID KEY` | `--ctrl`, `--alt`, `--shift`, `--cmd`, `--repeat`, `--json` | Press one key. |
+| `session key ID KEY` | `--ctrl`, `--alt`, `--shift`, `--cmd`, `--repeat`, `--json` | Press one key. `send` takes any target and several keys. |
 | `session wait TARGET` | `--until STATUS` (repeatable), `--timeout SECONDS`, `--json` | Block until the session reaches a status. Default `--until done`, default timeout 600 seconds. |
 | `session spawn KIND` | `--cwd PATH`, `--worktree`, `--branch NAME`, `--prompt TEXT`, `--title TEXT`, `--host ID`, `--json` | Start an agent, for example `claude` or `codex`. The folder defaults to the current one. |
 | `session run -- PROGRAM [ARG...]` | `--cwd PATH`, `--host ID`, `--title TEXT`, `--json` | Run a command in a new terminal session. A remote run needs `--cwd` with an absolute path on that host. |

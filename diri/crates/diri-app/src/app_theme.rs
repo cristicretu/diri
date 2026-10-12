@@ -13,10 +13,7 @@ pub(crate) fn terminal_theme(id: &str) -> TermTheme {
 }
 
 fn catalog_theme(id: &str) -> TermTheme {
-    TermTheme::CATALOG
-        .into_iter()
-        .find(|theme| theme.id == id)
-        .unwrap_or_default()
+    diri_term::themes::find(id).unwrap_or_default()
 }
 
 /// Whether a theme reads as light or dark, as an Agent's first-run "text

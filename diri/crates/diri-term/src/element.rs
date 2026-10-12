@@ -3,7 +3,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, RwLock, RwLockReadGuard, RwLockWriteGuard};
 use std::time::{Duration, Instant};
 
-use diri_proto::grid::{GridCell, GridUpdate};
+use diri_proto::grid::{CommandEnd, GridCell, GridUpdate};
 use diri_proto::terminal::MouseModes;
 use gpui::{
     App, Bounds, ContentMask, Element, ElementId, FocusHandle, Font, FontFallbacks, FontId,
@@ -19,6 +19,7 @@ use crate::find::{
     FindSnapshot, FindSpan, NavigationTarget, SearchJob, SearchRequest, SearchResult,
     TerminalFindModel,
 };
+use crate::inline_images::{DrawGrid, ImageDraw, InlineImageCache, append_row_draws};
 use crate::metrics::CellMetrics;
 use crate::scrollback::{
     ScrollRouter, ScrollbackApplyError, ScrollbackRequest, ScrollbackViewport, ScrolledState,
@@ -385,9 +386,34 @@ struct ElementSharedState {
     content_paint: Mutex<Option<ArmedContentPaint>>,
     /// The message a jump just brought into view, briefly marked.
     message_flash: Mutex<Option<MessageFlash>>,
+    /// How the finished shell commands on screen ended, kept until the rows
+    /// or the window over them change.
+    command_marks: Mutex<CommandMarkCache>,
     /// Advances whenever the user types, scrolls or starts a selection, so a
     /// jump in flight can tell it no longer owns the view.
     interactions: AtomicU64,
+    /// Decoded inline images; empty and inert until a host installs a
+    /// requester.
+    inline_images: Arc<InlineImageCache>,
+}
+
+/// Rows an OSC 133 end is looked for below the window, so a prompt near the
+/// bottom still shows how its command ended once the end scrolls out of view.
+const COMMAND_END_LOOKAHEAD: usize = 512;
+
+/// Width left of the grid that command marks may draw in. Hosts pad the grid
+/// by at least this much; without padding the marks are clipped away.
+pub const COMMAND_MARK_GUTTER: f32 = 10.0;
+
+/// Rows a command-output lookup reads either way from the pointer.
+const COMMAND_OUTPUT_SEARCH_ROWS: usize = 20_000;
+
+#[derive(Default)]
+struct CommandMarkCache {
+    /// Buffer generation, window top, painted rows, history cache sequence
+    /// and size, and whether the view reads history.
+    key: Option<(u64, i64, usize, Option<u64>, usize, bool)>,
+    marks: Vec<(i64, CommandEnd)>,
 }
 
 /// A band over a message Diri just brought into view: it holds, then fades.
@@ -686,6 +712,8 @@ pub struct TerminalPrepaintState {
     decoration_quads: Vec<PaintQuad>,
     sprite_shapes: Vec<AntialiasedShape>,
     overlay_quads: Vec<PaintQuad>,
+    /// Shell command marks, drawn in the padding left of the grid.
+    gutter_quads: Vec<PaintQuad>,
     selection: SelectionPaint,
     /// Reading path: window row and the absolute row whose shape paint reads
     /// from the history cache, as the live path reads the row cache.
@@ -698,6 +726,8 @@ pub struct TerminalPrepaintState {
     /// composed copies, so an unchanged frame clones nothing.
     paint_from_cache: bool,
     scroll: Option<ScrollPaint>,
+    /// Inline images over the rows that carry them, already scrolled.
+    images: Vec<ImageDraw>,
 }
 
 /// A reading view resting between rows. Everything row-positioned is built
@@ -777,7 +807,9 @@ impl TerminalElement {
                 paints: AtomicU64::new(0),
                 content_paint: Mutex::new(None),
                 message_flash: Mutex::new(None),
+                command_marks: Mutex::default(),
                 interactions: AtomicU64::new(0),
+                inline_images: Arc::default(),
             }),
             theme: TermTheme::default(),
             background_opacity: 1.0,
@@ -793,6 +825,13 @@ impl TerminalElement {
             reduce_motion: false,
             cursor_hidden: false,
         }
+    }
+
+    /// This terminal's inline-image cache, for the host to install a
+    /// requester and deliver decoded images. Clones share it.
+    #[must_use]
+    pub fn inline_images(&self) -> Arc<InlineImageCache> {
+        Arc::clone(&self.shared.inline_images)
     }
 
     #[must_use]
@@ -1060,6 +1099,63 @@ impl TerminalElement {
             ));
         }
         true
+    }
+
+    /// Draws a short bar in the padding left of each finished shell command's
+    /// prompt row: green when it exited 0, red otherwise. Commands whose
+    /// shell reported no status stay unmarked.
+    fn paint_command_marks(
+        &self,
+        viewport: &ScrollbackViewport,
+        painted_rows: usize,
+        origin: Point<Pixels>,
+        metrics: CellMetrics,
+        quads: &mut Vec<PaintQuad>,
+    ) {
+        // The alternate screen never holds marks, so it draws none.
+        let buffer = read_lock(&self.buffer);
+        let top = viewport.absolute_row(0);
+        let key = (
+            buffer.generation(),
+            top,
+            painted_rows,
+            viewport.cache_seq(),
+            viewport.cached_row_count(),
+            viewport.is_reading(),
+        );
+        let mut cache = mutex_lock(&self.shared.command_marks);
+        if cache.key != Some(key) {
+            cache.marks = crate::command_marks::finished_prompts(
+                top,
+                painted_rows,
+                COMMAND_END_LOOKAHEAD,
+                |row| viewport.stored_row(&buffer, row),
+            );
+            cache.key = Some(key);
+        }
+        drop(buffer);
+        let inset = metrics.line_height * 0.2;
+        for &(absolute, end) in &cache.marks {
+            let color = match end {
+                CommandEnd::Succeeded => self.theme.ansi[2],
+                CommandEnd::Failed => self.theme.ansi[1],
+                CommandEnd::Unknown => continue,
+            };
+            let row = (absolute - top) as u16;
+            quads.push(fill(
+                Bounds::new(
+                    point(
+                        origin.x - px(COMMAND_MARK_GUTTER) + px(4.0),
+                        origin.y + metrics.y_for_row(row) + inset,
+                    ),
+                    size(px(2.0), metrics.line_height - inset * 2.0),
+                ),
+                gpui::Rgba {
+                    a: color.a * 0.8,
+                    ..color
+                },
+            ));
+        }
     }
 
     /// Drives cursor motion from a caller-owned clock instead of the wall
@@ -1419,6 +1515,34 @@ impl TerminalElement {
         mutex_lock(&self.shared.selection).clear();
     }
 
+    /// The output of the finished shell command under a window cell, found
+    /// from OSC 133 marks in the rows this view holds.
+    #[must_use]
+    pub fn command_output_at(
+        &self,
+        col: usize,
+        window_row: usize,
+    ) -> Option<crate::command_marks::CommandOutput> {
+        let viewport = mutex_lock(&self.shared.viewport);
+        let buffer = read_lock(&self.buffer);
+        let at = SelectionPoint {
+            row: viewport.absolute_row(window_row),
+            col,
+        };
+        crate::command_marks::command_output_at(at, COMMAND_OUTPUT_SEARCH_ROWS, |row| {
+            viewport.stored_row(&buffer, row)
+        })
+    }
+
+    /// Selects a range of absolute cells, as a programmatic selection: no
+    /// sheen, and the caller copies it if it wants to.
+    pub fn select_range(&self, start: SelectionPoint, end: SelectionPoint) {
+        self.note_interaction();
+        let mut selection = mutex_lock(&self.shared.selection);
+        selection.begin(start);
+        selection.drag_to(end);
+    }
+
     /// The web URL whose text spans the given window cell, if any.
     #[must_use]
     pub fn link_at(&self, col: usize, window_row: usize) -> Option<String> {
@@ -1450,6 +1574,11 @@ impl TerminalElement {
             .iter()
             .find(|link| usize::from(link.start) <= col && col < usize::from(link.end))
         {
+            // An inline image's cells are not a link, and their blanks hold
+            // nothing to resolve either.
+            if diri_proto::inline_image::is_anchor(&link.uri) {
+                return None;
+            }
             return reference_from_run(&link.uri).map(|reference| ReferenceHit {
                 reference,
                 spans: vec![(absolute_row, usize::from(link.start), usize::from(link.end))],
@@ -2206,6 +2335,7 @@ impl Element for TerminalElement {
                 decoration_quads: Vec::new(),
                 sprite_shapes: Vec::new(),
                 overlay_quads: Vec::new(),
+                gutter_quads: Vec::new(),
                 selection: SelectionPaint::default(),
                 lines: Vec::new(),
                 metrics: None,
@@ -2214,6 +2344,7 @@ impl Element for TerminalElement {
                 cache_misses: 0,
                 paint_from_cache: false,
                 scroll: None,
+                images: Vec::new(),
             };
         }
 
@@ -2233,6 +2364,7 @@ impl Element for TerminalElement {
                 decoration_quads: Vec::new(),
                 sprite_shapes: Vec::new(),
                 overlay_quads: Vec::new(),
+                gutter_quads: Vec::new(),
                 selection: SelectionPaint::default(),
                 lines: Vec::new(),
                 metrics: None,
@@ -2241,6 +2373,7 @@ impl Element for TerminalElement {
                 cache_misses: 0,
                 paint_from_cache: false,
                 scroll: None,
+                images: Vec::new(),
             };
         }
 
@@ -2289,6 +2422,7 @@ impl Element for TerminalElement {
         let mut decoration_quads = Vec::new();
         let mut sprite_shapes = Vec::new();
         let mut overlay_quads = Vec::new();
+        let mut gutter_quads = Vec::new();
         let mut lines = Vec::with_capacity(visible_rows);
         let grid = SpriteGrid::new(bounds.origin, metrics, window.scale_factor());
         let cursor;
@@ -2578,6 +2712,13 @@ impl Element for TerminalElement {
         }
 
         drop(highlights);
+        self.paint_command_marks(
+            &viewport,
+            painted_rows,
+            bounds.origin,
+            metrics,
+            &mut gutter_quads,
+        );
         if self.paint_message_flash(
             &viewport,
             painted_rows,
@@ -2663,11 +2804,37 @@ impl Element for TerminalElement {
         };
         let cursor = self.animate_cursor(cursor, focused, metrics, visible_cols, window);
 
+        // Rows carry their images' anchors; most carry no links at all.
+        let mut images = Vec::new();
+        {
+            let buffer = read_lock(&self.buffer);
+            let grid = DrawGrid {
+                origin: point(bounds.left(), bounds.top() - scroll_shift),
+                cell_width: metrics.cell_width,
+                line_height: metrics.line_height,
+                visible_cols,
+                scale_factor: window.scale_factor(),
+            };
+            for window_row in 0..painted_rows {
+                let links = viewport.row_links(&buffer, viewport.absolute_row(window_row));
+                if !links.is_empty() {
+                    append_row_draws(
+                        &self.shared.inline_images,
+                        links,
+                        window_row,
+                        grid,
+                        &mut images,
+                    );
+                }
+            }
+        }
+
         let scroll = (scroll_shift > px(0.0)).then(|| {
             let backdrop = background_quads.remove(0);
             for quad in background_quads
                 .iter_mut()
                 .chain(&mut overlay_quads)
+                .chain(&mut gutter_quads)
                 .chain(&mut decoration_quads)
             {
                 quad.bounds.origin.y -= scroll_shift;
@@ -2695,6 +2862,7 @@ impl Element for TerminalElement {
             decoration_quads,
             sprite_shapes,
             overlay_quads,
+            gutter_quads,
             selection,
             lines,
             metrics: Some(metrics),
@@ -2703,6 +2871,7 @@ impl Element for TerminalElement {
             cache_misses,
             paint_from_cache,
             scroll,
+            images,
         }
     }
 
@@ -2770,6 +2939,17 @@ impl Element for TerminalElement {
         if let Some(scroll) = &prepaint.scroll {
             window.with_content_mask(Some(ContentMask { bounds }), |window| {
                 window.paint_quad(scroll.backdrop.clone());
+            });
+        }
+        if !prepaint.gutter_quads.is_empty() {
+            let gutter = Bounds::new(
+                point(bounds.left() - px(COMMAND_MARK_GUTTER), content.top()),
+                size(px(COMMAND_MARK_GUTTER), content.size.height),
+            );
+            window.with_content_mask(Some(ContentMask { bounds: gutter }), |window| {
+                for quad in prepaint.gutter_quads.drain(..) {
+                    window.paint_quad(quad);
+                }
             });
         }
         window.with_content_mask(Some(ContentMask { bounds: content }), |window| {
@@ -2915,6 +3095,16 @@ impl Element for TerminalElement {
                     shape.paint(window);
                 }
             });
+
+            for image in self.shared.inline_images.take_retired() {
+                let _ = window.drop_image(image);
+            }
+            for draw in prepaint.images.drain(..) {
+                window.with_content_mask(Some(ContentMask { bounds: draw.clip }), |window| {
+                    let _ =
+                        window.paint_image(draw.bounds, Default::default(), draw.image, 0, false);
+                });
+            }
 
             let cursor_schedule = prepaint
                 .cursor

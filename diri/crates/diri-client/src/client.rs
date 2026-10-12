@@ -653,6 +653,39 @@ impl DaemonClient {
             .await
     }
 
+    /// The whole of an inline image a terminal placed, read in chunks.
+    /// Errors with `image_not_found` once the Engine (or a remote session's
+    /// Holder) evicted it.
+    pub async fn read_image(
+        &self,
+        session_id: &SessionId,
+        key: &str,
+    ) -> Result<diri_proto::SessionReadImageResult, ClientError> {
+        let mut params = diri_proto::SessionReadImageParams {
+            session_id: session_id.clone(),
+            key: key.to_owned(),
+            offset: 0,
+        };
+        let mut image: diri_proto::SessionReadImageResult =
+            self.typed(Method::SESSION_READ_IMAGE, &params).await?;
+        let total = usize::try_from(image.total)
+            .unwrap_or(usize::MAX)
+            .min(diri_proto::inline_image::MAX_IMAGE_BYTES);
+        while image.data.len() < total {
+            params.offset = image.data.len() as u64;
+            let chunk: diri_proto::SessionReadImageResult =
+                self.typed(Method::SESSION_READ_IMAGE, &params).await?;
+            // A replaced image under the same key cannot happen (keys are
+            // never reused); an empty chunk would otherwise loop forever.
+            if chunk.data.is_empty() || chunk.offset != params.offset {
+                break;
+            }
+            image.data.extend_from_slice(&chunk.data);
+        }
+        image.data.truncate(total);
+        Ok(image)
+    }
+
     pub async fn process_info(
         &self,
         session_id: &SessionId,
@@ -918,6 +951,13 @@ impl DaemonClient {
         params: GovernorConfigureParams,
     ) -> Result<(), ClientError> {
         self.empty(Method::GOVERNOR_CONFIGURE, &params).await
+    }
+
+    pub async fn configure_terminal(
+        &self,
+        params: TerminalConfigureParams,
+    ) -> Result<(), ClientError> {
+        self.empty(Method::TERMINAL_CONFIGURE, &params).await
     }
 
     /// `agent.readiness`: PATH metadata locally, but a remote target crosses
@@ -1825,6 +1865,7 @@ mod tests {
                     same_repo_as: None,
                     start_directory: None,
                     note_id: None,
+                    argv: None,
                 })
                 .await?;
 

@@ -267,6 +267,38 @@ pub struct StatusReducer {
     /// reports, which its `OSC 7501` record does not carry. See
     /// [`Self::note_screen_while_program_reports`].
     program_screen_choices: Option<(NeedsInputKind, Vec<String>)>,
+    /// Set while the reducer is lent to an Agent known by name alone, whose
+    /// status follows the terminal's output. See [`Self::lend_to_activity`].
+    activity: Option<ActivityRead>,
+}
+
+/// How long output must keep coming before an Agent known only by name is
+/// Working. One redraw (a resize, a clock, a short reply) is not work.
+const ACTIVITY_WORKING_AFTER: Duration = Duration::from_millis(500);
+
+/// A pause in output longer than this starts a new burst.
+const ACTIVITY_BURST_GAP: Duration = Duration::from_secs(1);
+
+/// How long its terminal must be still before such an Agent is Idle. Long
+/// enough to ride out a model's silent wait between streamed chunks.
+const ACTIVITY_IDLE_AFTER: Duration = Duration::from_secs(3);
+
+/// Output this soon after a keystroke is its echo, not the Agent's work.
+const ACTIVITY_ECHO: Duration = Duration::from_millis(250);
+
+/// What output-activity reading remembers. See [`StatusReducer::lend_to_activity`].
+#[derive(Debug, Default)]
+struct ActivityRead {
+    burst_since: Option<SystemTime>,
+    output_at: Option<SystemTime>,
+    typed_at: Option<SystemTime>,
+    /// The user submitted something since the last turn: the next stretch
+    /// of work is a turn whose end is worth announcing.
+    asked: bool,
+}
+
+fn elapsed(since: SystemTime, now: SystemTime) -> Duration {
+    now.duration_since(since).unwrap_or_default()
 }
 
 impl StatusReducer {
@@ -283,6 +315,7 @@ impl StatusReducer {
             lent_from: None,
             program_active: false,
             program_screen_choices: None,
+            activity: None,
         }
     }
 
@@ -366,6 +399,7 @@ impl StatusReducer {
         self.authority = Authority::ScreenPrimary;
         self.manifest_id = Some(manifest_id.to_owned());
         self.manifest_version = manifest_version.map(str::to_owned);
+        self.activity = None;
         self.forget_screen(now);
         self.set_status(SessionStatus::Idle, &mut outcome);
         self.publish_evidence(
@@ -378,12 +412,32 @@ impl StatusReducer {
         outcome
     }
 
+    /// Hands a shell's status to an Agent recognised by its program name
+    /// alone, with no manifest whose screen rules could read it.
+    ///
+    /// Its status follows the terminal's output instead: output that keeps
+    /// coming for [`ACTIVITY_WORKING_AFTER`] is Working, and a terminal still
+    /// for [`ACTIVITY_IDLE_AFTER`] is Idle. The echo of typing is not work,
+    /// and only work that follows a submission is a turn whose end is
+    /// announced. It never reads a question or a permission prompt.
+    pub fn lend_to_activity(&mut self, agent_id: &str, now: SystemTime) -> ReducerOutcome {
+        if self.activity.is_some() && self.foreground_agent() == Some(agent_id) {
+            return ReducerOutcome::default();
+        }
+        let outcome = self.lend_to_agent(agent_id, None, now);
+        if self.foreground_agent() == Some(agent_id) {
+            self.activity = Some(ActivityRead::default());
+        }
+        outcome
+    }
+
     /// Returns a lent reducer to its shell, whose job state `running` is.
     pub fn return_from_agent(&mut self, running: bool, now: SystemTime) -> ReducerOutcome {
         let mut outcome = ReducerOutcome::default();
         let Some((authority, manifest_id, manifest_version)) = self.lent_from.take() else {
             return outcome;
         };
+        self.activity = None;
         self.authority = authority;
         self.manifest_id = manifest_id;
         self.manifest_version = manifest_version;
@@ -588,6 +642,11 @@ impl StatusReducer {
             }
         }
 
+        if self.activity.is_some() {
+            self.reduce_activity(signal, now, &mut outcome);
+            return outcome;
+        }
+
         // processOnly: starting → working on first output, then only exit
         // moves it. A shell is still process-only, but an idle login prompt
         // is not work: Working follows the foreground process group.
@@ -781,6 +840,64 @@ impl StatusReducer {
             self.evidence = Some(candidate.clone());
             outcome.status_evidence = Some(candidate);
         }
+    }
+
+    fn reduce_activity(
+        &mut self,
+        signal: StatusSignal,
+        now: SystemTime,
+        outcome: &mut ReducerOutcome,
+    ) {
+        let Some(read) = self.activity.as_mut() else {
+            return;
+        };
+        match signal {
+            StatusSignal::UserKeystroke => read.typed_at = Some(now),
+            StatusSignal::UserSubmission => {
+                read.typed_at = Some(now);
+                read.asked = true;
+            }
+            StatusSignal::PtyOutputActivity => {
+                if read
+                    .typed_at
+                    .is_some_and(|typed_at| elapsed(typed_at, now) < ACTIVITY_ECHO)
+                {
+                    return;
+                }
+                if read
+                    .output_at
+                    .is_none_or(|output_at| elapsed(output_at, now) >= ACTIVITY_BURST_GAP)
+                {
+                    read.burst_since = Some(now);
+                }
+                read.output_at = Some(now);
+                let sustained = read
+                    .burst_since
+                    .is_some_and(|since| elapsed(since, now) >= ACTIVITY_WORKING_AFTER);
+                if sustained && self.status != SessionStatus::Working {
+                    self.state.turn_in_flight = std::mem::take(&mut read.asked);
+                    self.state.last_signal_at = now;
+                    self.set_status(SessionStatus::Working, outcome);
+                }
+            }
+            StatusSignal::Tick => {
+                let still = read
+                    .output_at
+                    .is_none_or(|output_at| elapsed(output_at, now) >= ACTIVITY_IDLE_AFTER);
+                if self.status == SessionStatus::Working && still {
+                    self.state.pending_turn_completed = self.state.turn_in_flight;
+                    self.commit_idle(now, outcome);
+                }
+            }
+            _ => return,
+        }
+        self.publish_evidence(
+            StatusEvidenceSource::ProcessLiveness,
+            None,
+            Some(StatusFallbackReason::ProcessOnly),
+            now,
+            outcome,
+        );
     }
 
     fn reduce_process_only(

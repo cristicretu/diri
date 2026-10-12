@@ -25,9 +25,10 @@ use super::guard::GroupGuard;
 use super::process_tree;
 use super::protocol::{
     HOLDER_OUTPUT_STREAM_VERSION, HOLDER_STREAM_ACK, HOLDER_STREAM_INPUT,
-    HOLDER_STREAM_MAX_PAYLOAD, HOLDER_STREAM_RESIZE, HOLDER_STREAM_VERSION, HolderChildRecord,
-    HolderExitMarker, HolderExitReason, HolderExitStatus, HolderLaunchSpec, HolderOperation,
-    HolderRequest, HolderResponse, HolderStat,
+    HOLDER_STREAM_MAX_PAYLOAD, HOLDER_STREAM_RESIZE, HOLDER_STREAM_RESIZE_PIXELS,
+    HOLDER_STREAM_VERSION, HOLDER_STREAM_VERSION_PIXELS, HolderChildRecord, HolderExitMarker,
+    HolderExitReason, HolderExitStatus, HolderLaunchSpec, HolderOperation, HolderRequest,
+    HolderResponse, HolderStat,
 };
 use super::socket;
 use super::{HolderError, HolderResult};
@@ -358,10 +359,12 @@ impl HolderServer {
                     }
                 }
                 Ok(request) if request.op == HolderOperation::Stream => {
-                    if request.stream_version != Some(HOLDER_STREAM_VERSION) {
-                        HolderResponse::failure("unsupported Holder input stream version")
-                    } else {
-                        let response = HolderResponse::stream(HOLDER_STREAM_VERSION);
+                    let version = request.stream_version.filter(|version| {
+                        *version == HOLDER_STREAM_VERSION
+                            || *version == HOLDER_STREAM_VERSION_PIXELS
+                    });
+                    if let Some(version) = version {
+                        let response = HolderResponse::stream(version);
                         if socket::write_json_line(&mut client, &response).is_ok() {
                             let client = Arc::new(client);
                             let mut streams = shared.input_streams.lock().expect("input streams");
@@ -374,6 +377,8 @@ impl HolderServer {
                                 .spawn(move || serve_input_stream(&shared, client));
                         }
                         continue;
+                    } else {
+                        HolderResponse::failure("unsupported Holder input stream version")
                     }
                 }
                 Ok(request) => handle(&shared, &request)
@@ -941,15 +946,31 @@ fn serve_input_stream(shared: &Shared, stream: Arc<std::os::unix::net::UnixStrea
         }
         let result = match header[0] {
             HOLDER_STREAM_INPUT => write_pty(shared, &payload),
-            HOLDER_STREAM_RESIZE if payload.len() == 4 => {
-                let cols = u16::from_be_bytes([payload[0], payload[1]]);
-                let rows = u16::from_be_bytes([payload[2], payload[3]]);
+            HOLDER_STREAM_RESIZE | HOLDER_STREAM_RESIZE_PIXELS
+                if payload.len()
+                    == if header[0] == HOLDER_STREAM_RESIZE {
+                        4
+                    } else {
+                        8
+                    } =>
+            {
+                let word = |at: usize| u16::from_be_bytes([payload[at], payload[at + 1]]);
+                let (cols, rows) = (word(0), word(2));
+                let pixels = if payload.len() == 8 {
+                    (word(4), word(6))
+                } else {
+                    (0, 0)
+                };
                 if cols < 2 || rows < 2 {
                     Err(HolderError::InvalidRequest(
                         "resize requires cols/rows >= 2".into(),
                     ))
                 } else {
-                    let _ = shared.pty.lock().expect("pty").resize(cols, rows);
+                    let _ = shared
+                        .pty
+                        .lock()
+                        .expect("pty")
+                        .resize_with_pixels(cols, rows, pixels);
                     Ok(())
                 }
             }
