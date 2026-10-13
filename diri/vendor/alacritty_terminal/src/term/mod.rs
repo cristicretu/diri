@@ -30,6 +30,7 @@ pub mod cell;
 pub mod color;
 pub mod keyboard;
 pub mod search;
+mod spacing_marks;
 
 /// Minimum number of columns.
 ///
@@ -1341,8 +1342,10 @@ impl<T: EventListener> Handler for Term<T> {
     /// A character to be displayed.
     #[inline(never)]
     fn input(&mut self, c: char) {
-        // Number of cells the char will occupy.
+        // Number of cells the char will occupy. Spacing marks join the
+        // previous cell, the way Claude Code measures them.
         let width = match c.width() {
+            Some(1) if spacing_marks::is_spacing_mark(c) => 0,
             Some(width) => width,
             None => return,
         };

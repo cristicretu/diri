@@ -3385,6 +3385,26 @@ mod qol_tests {
     }
 
     #[test]
+    fn spacing_vowel_signs_share_their_base_cell_like_claude_code() {
+        // Claude Code (Bun's stringWidth) measures "রগুলো" as three columns. A
+        // fourth column for the vowel sign shifts every later relative cursor
+        // move and leaves fragments of earlier frames on screen.
+        let mut screen = HeadlessScreen::new(20, 3);
+        screen.feed("রগুলো|".as_bytes());
+        assert_eq!(screen.cursor().0, 4);
+        assert_eq!(screen.lines(), vec!["রগুলো|"]);
+
+        // Repaint in place: up one line, three columns right, overwrite.
+        screen.feed("\r\nনমস্তে\x1b[1A\r\x1b[3CX".as_bytes());
+        assert_eq!(screen.lines(), vec!["রগুলোX", "নমস্তে"]);
+        assert_eq!(screen.cursor().0, 4);
+
+        let mut restored = HeadlessScreen::new(20, 3);
+        assert!(restored.restore(&[], &screen.full_snapshot(), false, false, MouseModes::OFF));
+        assert_eq!(restored.lines(), screen.lines());
+    }
+
+    #[test]
     fn visible_text_keeps_real_spaces_after_overwriting_a_wide_glyph() {
         let mut screen = HeadlessScreen::new(8, 2);
         screen.feed("界X\rA".as_bytes());
