@@ -71,7 +71,7 @@ fn aggregates_costs_dedupes_claude_and_preserves_provider_totals() {
     let fixture = Fixture::new();
     let claude_message = claude_line(
         "2026-07-22T10:12:00.000Z",
-        "claude-sonnet-5-20260701",
+        "claude-sonnet-4-6-20260701",
         "message-1",
         "request-1",
         1_000,
@@ -411,15 +411,14 @@ fn buckets_local_day_month_and_five_hour_blocks_like_swift() {
 }
 
 #[test]
-fn ordered_pricing_table_and_fnv_hash_match_expected_values() {
-    assert_eq!(super::PRICING_ENTRY_COUNT, 16);
+fn pricing_families_and_fnv_hash_match_expected_values() {
     for (model, input, output) in [
         ("claude-fable", 10.0, 50.0),
         ("claude-mythos", 10.0, 50.0),
         ("claude-opus-4-1", 15.0, 75.0),
         ("claude-opus-4-20250514", 15.0, 75.0),
         ("claude-opus-4-5", 5.0, 25.0),
-        ("claude-sonnet-5", 3.0, 15.0),
+        ("claude-sonnet-5", 2.0, 10.0),
         ("claude-haiku-4", 1.0, 5.0),
         ("claude-3-5-haiku", 0.8, 4.0),
         ("claude-haiku-3", 0.25, 1.25),
@@ -436,7 +435,8 @@ fn ordered_pricing_table_and_fnv_hash_match_expected_values() {
         ("gpt-5.3-codex", 1.75, 14.0),
         ("gpt-5-mini", 0.25, 2.0),
         ("gpt-5-nano", 0.05, 0.4),
-        ("gpt-5.2", 1.25, 10.0),
+        ("gpt-5.2", 1.75, 14.0),
+        ("gpt-5.2-preview", 1.25, 10.0),
     ] {
         let pricing = match_openai(model).unwrap();
         assert_eq!((pricing.input, pricing.output), (input, output));
@@ -634,7 +634,7 @@ fn dashboard_preserves_deduplication_model_changes_and_cached_history() {
     let fixture = Fixture::new();
     let message = claude_line(
         "2026-07-22T10:00:00Z",
-        "claude-sonnet-5",
+        "claude-sonnet-4-6",
         "m",
         "r",
         100,

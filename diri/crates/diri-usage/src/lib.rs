@@ -3,123 +3,169 @@
 //! These values are estimates, never authoritative provider billing. Callers
 //! must label them accordingly and prefer billed spend when available.
 
-pub const PRICING_ENTRY_COUNT: usize = 16;
+use std::{collections::HashMap, sync::OnceLock};
+
+/// USD per million tokens, regenerated from LiteLLM by
+/// `diri/scripts/sync-model-prices.py` (the "Model prices" workflow).
+const PRICES: &str = include_str!("../prices.json");
+/// Hand-kept rates for ids the generated table lacks. These win.
+const OVERRIDES: &str = include_str!("../price-overrides.json");
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct ModelPricing {
     pub input: f64,
     pub output: f64,
+    cache_read: f64,
+    cache_write_5m: f64,
+    cache_write_1h: f64,
 }
 
 impl ModelPricing {
     pub const fn cache_read(self) -> f64 {
-        self.input * 0.1
+        self.cache_read
     }
 
     pub const fn cache_write_5m(self) -> f64 {
-        self.input * 1.25
+        self.cache_write_5m
     }
 
     pub const fn cache_write_1h(self) -> f64 {
-        self.input * 2.0
+        self.cache_write_1h
     }
 }
 
-/// Match Claude model names in specific-to-generic order.
+#[derive(serde::Deserialize)]
+struct PriceRow {
+    input: f64,
+    output: f64,
+    cache_read: Option<f64>,
+    cache_write_5m: Option<f64>,
+    cache_write_1h: Option<f64>,
+}
+
+impl From<PriceRow> for ModelPricing {
+    /// Unpublished cache rates use Anthropic's standard multipliers.
+    fn from(row: PriceRow) -> Self {
+        Self {
+            input: row.input,
+            output: row.output,
+            cache_read: row.cache_read.unwrap_or(row.input * 0.1),
+            cache_write_5m: row.cache_write_5m.unwrap_or(row.input * 1.25),
+            cache_write_1h: row.cache_write_1h.unwrap_or(row.input * 2.0),
+        }
+    }
+}
+
+#[derive(serde::Deserialize)]
+struct Overrides {
+    models: HashMap<String, PriceRow>,
+}
+
+fn table() -> &'static HashMap<String, ModelPricing> {
+    static TABLE: OnceLock<HashMap<String, ModelPricing>> = OnceLock::new();
+    TABLE.get_or_init(|| {
+        let generated: HashMap<String, PriceRow> =
+            serde_json::from_str(PRICES).expect("bundled prices.json");
+        let overrides: Overrides =
+            serde_json::from_str(OVERRIDES).expect("bundled price-overrides.json");
+        generated
+            .into_iter()
+            .chain(overrides.models)
+            .map(|(model, row)| (model, row.into()))
+            .collect()
+    })
+}
+
+/// Reduce provider spellings to the first-party id: `[1m]` context tags,
+/// `vertex_ai/` or `us.anthropic.` prefixes, Bedrock `-v1:0` and Vertex
+/// `@date` suffixes. Dated ids fall back to their undated alias.
+fn lookup(model: &str, claude: bool) -> Option<ModelPricing> {
+    let mut id = model.trim().to_ascii_lowercase();
+    if let Some(open) = id.find('[') {
+        id.truncate(open);
+    }
+    if let Some(slash) = id.rfind('/') {
+        id.drain(..=slash);
+    }
+    if let Some(at) = id.find("anthropic.") {
+        id.drain(..at + "anthropic.".len());
+    }
+    if let Some(at) = id.find('@') {
+        id.truncate(at);
+    }
+    if let Some(version) = id.rfind("-v")
+        && id[version + 2..]
+            .split(':')
+            .all(|part| !part.is_empty() && part.bytes().all(|b| b.is_ascii_digit()))
+    {
+        id.truncate(version);
+    }
+    if id.starts_with("claude-") != claude {
+        return None;
+    }
+    let table = table();
+    table
+        .get(&id)
+        .or_else(|| table.get(strip_date(&id)?))
+        .copied()
+}
+
+fn strip_date(id: &str) -> Option<&str> {
+    let digits = |s: &str| s.bytes().all(|b| b.is_ascii_digit());
+    let (head, tail) = id.rsplit_once('-')?;
+    if tail.len() == 8 && digits(tail) {
+        return Some(head);
+    }
+    // OpenAI dates: gpt-5.4-2026-03-05.
+    let (head, day) = head
+        .rsplit_once('-')
+        .filter(|_| tail.len() == 2 && digits(tail))?;
+    let (head, year) = head
+        .rsplit_once('-')
+        .filter(|_| day.len() == 2 && digits(day))?;
+    (year.len() == 4 && digits(year)).then_some(head)
+}
+
+/// Families for ids the table does not name, specific to generic. Each maps
+/// to a table row, so the guess still follows synced prices.
+const CLAUDE_FAMILIES: &[(&[&str], &str)] = &[
+    (&["fable"], "claude-fable-5-1"),
+    (&["mythos"], "claude-mythos-5-1"),
+    (&["opus-4-1", "opus-4-2025"], "claude-opus-4-1"),
+    (&["opus"], "claude-opus-4-8"),
+    (&["sonnet"], "claude-sonnet-4-6"),
+    (&["haiku-4"], "claude-haiku-4-5"),
+    (&["3-5-haiku"], "claude-3-5-haiku"),
+    (&["haiku"], "claude-3-haiku"),
+];
+
+const OPENAI_FAMILIES: &[(&[&str], &str)] = &[
+    (&["gpt-5.4-mini"], "gpt-5.4-mini"),
+    (&["gpt-5.4"], "gpt-5.4"),
+    (&["gpt-5.5"], "gpt-5.5"),
+    (&["codex-mini"], "codex-mini-latest"),
+    (&["codex"], "gpt-5.2-codex"),
+    (&["mini"], "gpt-5-mini"),
+    (&["nano"], "gpt-5-nano"),
+    (&["gpt-5"], "gpt-5"),
+];
+
+fn family(model: &str, families: &[(&[&str], &str)]) -> Option<ModelPricing> {
+    families
+        .iter()
+        .find(|(needles, _)| needles.iter().any(|needle| model.contains(needle)))
+        .and_then(|(_, key)| table().get(*key).copied())
+}
+
+/// Exact (normalized) Claude id first, then family.
 pub fn match_claude(model: &str) -> Option<ModelPricing> {
-    if model.contains("fable") || model.contains("mythos") {
-        Some(ModelPricing {
-            input: 10.0,
-            output: 50.0,
-        })
-    } else if model.contains("opus-4-1") || model.contains("opus-4-2025") {
-        Some(ModelPricing {
-            input: 15.0,
-            output: 75.0,
-        })
-    } else if model.contains("opus") {
-        Some(ModelPricing {
-            input: 5.0,
-            output: 25.0,
-        })
-    } else if model.contains("sonnet") {
-        Some(ModelPricing {
-            input: 3.0,
-            output: 15.0,
-        })
-    } else if model.contains("haiku-4") {
-        Some(ModelPricing {
-            input: 1.0,
-            output: 5.0,
-        })
-    } else if model.contains("3-5-haiku") {
-        Some(ModelPricing {
-            input: 0.8,
-            output: 4.0,
-        })
-    } else if model.contains("haiku") {
-        Some(ModelPricing {
-            input: 0.25,
-            output: 1.25,
-        })
-    } else {
-        None
-    }
+    lookup(model, true).or_else(|| family(model, CLAUDE_FAMILIES))
 }
 
-/// Match OpenAI model names in specific-to-generic order.
+/// Exact (normalized) OpenAI id first, then family. gpt-6 ids have no family
+/// fallback, so `gpt-6.1-sol-fast` stays unpriced rather than borrowing Sol.
 pub fn match_openai(model: &str) -> Option<ModelPricing> {
-    if model == "gpt-6-astra" {
-        // Standard API-equivalent rates, verified 2026-09-13:
-        // https://developers.openai.com/api/docs/models/gpt-6-astra
-        // These base estimates exclude service-tier and long-context premiums.
-        Some(ModelPricing {
-            input: 10.0,
-            output: 50.0,
-        })
-    } else if model.contains("gpt-5.4-mini") {
-        Some(ModelPricing {
-            input: 0.75,
-            output: 4.5,
-        })
-    } else if model.contains("gpt-5.4") {
-        Some(ModelPricing {
-            input: 2.5,
-            output: 15.0,
-        })
-    } else if model.contains("gpt-5.5") {
-        Some(ModelPricing {
-            input: 5.0,
-            output: 30.0,
-        })
-    } else if model.contains("codex-mini") {
-        Some(ModelPricing {
-            input: 1.5,
-            output: 6.0,
-        })
-    } else if model.contains("codex") {
-        Some(ModelPricing {
-            input: 1.75,
-            output: 14.0,
-        })
-    } else if model.contains("mini") {
-        Some(ModelPricing {
-            input: 0.25,
-            output: 2.0,
-        })
-    } else if model.contains("nano") {
-        Some(ModelPricing {
-            input: 0.05,
-            output: 0.4,
-        })
-    } else if model.contains("gpt-5") {
-        Some(ModelPricing {
-            input: 1.25,
-            output: 10.0,
-        })
-    } else {
-        None
-    }
+    lookup(model, false).or_else(|| family(model, OPENAI_FAMILIES))
 }
 
 pub fn openai_estimate(
@@ -157,24 +203,6 @@ pub fn claude_estimate(
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn astra_usage_has_a_standard_cost_estimate() {
-        // 60 uncached input + 40 cached input + 20 output tokens.
-        let cost = openai_estimate("gpt-6-astra", 60, 20, 40).expect("Astra usage must be priced");
-        assert!((cost - 0.001_64).abs() < 1e-12);
-        assert_eq!(match_openai("gpt-6-unknown"), None);
-    }
-
-    #[test]
-    fn estimates_keep_cache_rates_distinct() {
-        let price = claude_estimate("claude-sonnet", 1_000_000, 0, 0, 0, 0).expect("known model");
-        assert_eq!(price, 3.0);
-        let cached = openai_estimate("codex", 0, 0, 1_000_000).expect("known model");
-        assert!((cached - 0.175).abs() < 1e-12);
-    }
-}
+mod tests;
 
 pub mod transcripts;

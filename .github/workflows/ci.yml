@@ -166,6 +166,7 @@ jobs:
           bash scripts/test-publish-homebrew-cask.sh
           bash scripts/test-linux-signatures.sh
           python3 scripts/test-linux-release-manifest.py
+          python3 -m py_compile scripts/sync-model-prices.py
           python3 ../ios/scripts/test-prepare-simulator.py
       - name: Check dependency license policy
         run: python3 ../scripts/check-licenses.py

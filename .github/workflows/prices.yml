@@ -1,0 +1,88 @@
+name: Model prices
+
+# Keeps diri/crates/diri-usage/prices.json in step with LiteLLM's published
+# price table (the same source ccusage uses). Prices are compiled into the
+# app, so nothing is fetched at runtime; a change reaches users in the next
+# release after its pull request merges.
+#
+# Pull requests opened with the default GITHUB_TOKEN do not trigger ci.yml, so
+# the required checks would never report. Set MODEL_PRICES_TOKEN to a
+# fine-grained token with contents + pull-requests write on this repository
+# and the pull request runs CI like any other. Without it the workflow falls
+# back to GITHUB_TOKEN, which also needs "Allow GitHub Actions to create and
+# approve pull requests" enabled in the repository settings.
+
+on:
+  schedule:
+    - cron: "17 6 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  pull-requests: write
+
+concurrency:
+  group: model-prices
+  cancel-in-progress: false
+
+env:
+  BRANCH: bot/model-prices
+  CARGO_PROFILE_TEST_DEBUG: line-tables-only
+  CARGO_TERM_COLOR: always
+
+jobs:
+  sync:
+    name: Sync model prices
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    defaults:
+      run:
+        working-directory: diri
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          token: ${{ secrets.MODEL_PRICES_TOKEN || github.token }}
+      - name: Regenerate prices.json
+        id: sync
+        run: |
+          python3 scripts/sync-model-prices.py | tee "$RUNNER_TEMP/sync.log"
+          if git diff --quiet -- crates/diri-usage/prices.json; then
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+            git diff --stat -- crates/diri-usage/prices.json
+          fi
+      # A sync that drops a model an agent reports today fails here rather
+      # than opening a pull request that blanks the cost column.
+      - name: Test pricing
+        if: steps.sync.outputs.changed == 'true'
+        run: cargo test --locked -p diri-usage --lib
+      - name: Open or update pull request
+        if: steps.sync.outputs.changed == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.MODEL_PRICES_TOKEN || github.token }}
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git switch -C "$BRANCH"
+          git commit -q -m "Sync model prices from LiteLLM" -- crates/diri-usage/prices.json
+          git push --force origin "$BRANCH"
+
+          body="$RUNNER_TEMP/body.md"
+          {
+            echo "Daily sync of \`diri/crates/diri-usage/prices.json\` from [LiteLLM's price table](https://github.com/BerriAI/litellm/blob/main/model_prices_and_context_window.json)."
+            echo
+            echo "Check the diff against the provider pricing pages before merging. Hand-kept rates for ids LiteLLM lacks live in \`price-overrides.json\`."
+            echo
+            echo '```'
+            git diff --stat HEAD~1 -- crates/diri-usage/prices.json
+            cat "$RUNNER_TEMP/sync.log"
+            echo '```'
+          } > "$body"
+
+          if gh pr view "$BRANCH" --json state --jq .state 2>/dev/null | grep -q OPEN; then
+            gh pr edit "$BRANCH" --body-file "$body"
+          else
+            gh pr create --base main --head "$BRANCH" \
+              --title "Sync model prices from LiteLLM" --body-file "$body"
+          fi

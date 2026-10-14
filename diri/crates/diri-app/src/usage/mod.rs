@@ -4,7 +4,6 @@
 //! Only aggregates cross SSH. The separate limits reader queries provider-reported subscription
 //! windows without deriving quota percentages from these estimates.
 
-pub use diri_usage::PRICING_ENTRY_COUNT;
 pub use diri_usage::transcripts::{
     Clock, ClockReading, ProviderUsage, RefreshStats, ScanPaths, SystemClock, UsageFormat,
     UsageHourAgg, UsageProvider, UsageStore, UsageTotals, dashboard,

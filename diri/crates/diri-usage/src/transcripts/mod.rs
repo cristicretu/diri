@@ -17,7 +17,5 @@ pub use store::{
 #[cfg(test)]
 mod tests;
 
-pub use crate::PRICING_ENTRY_COUNT;
-
 pub mod cursor;
 pub use cache::CursorFetchWindow;
