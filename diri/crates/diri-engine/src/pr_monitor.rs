@@ -48,6 +48,16 @@ const RECENTLY_SEEN: Duration = Duration::from_secs(600);
 /// only and does not imply a GitHub request when nothing is due.
 const IDLE_RECONCILE_INTERVAL: Duration = Duration::from_secs(30 * 60);
 const STOP_CHECK_INTERVAL: Duration = Duration::from_secs(1);
+/// Pull requests per session that keep their body, checks and discussion.
+/// The rest keep their summary (state, counts, review decision). A record's
+/// list only ever grows, and every record travels whole in `session.list`
+/// and `session.updated`: one long-lived session with 63 detailed PRs was
+/// 2 MB and pushed the list past the control frame limit.
+pub(crate) const DETAILED_PRS_PER_SESSION: usize = 4;
+/// Per-PR detail bounds, so a single PR cannot grow a record without limit.
+const MAX_BODY_BYTES: usize = 16 * 1024;
+const MAX_DISCUSSION_ITEMS: usize = 30;
+const MAX_DISCUSSION_BODY_BYTES: usize = 2 * 1024;
 
 fn initial_sweep_delay() -> Duration {
     Duration::ZERO
@@ -279,6 +289,9 @@ fn sweep(
         .unwrap_or_default()
         .as_millis() as f64;
     let mut wanted: Vec<(String, Vec<String>)> = Vec::new();
+    // Per session, how many of its URLs (a prefix) came from its artifacts;
+    // the rest are older PRs whose artifacts were capped away.
+    let mut artifact_urls: HashMap<String, usize> = HashMap::new();
     let mut targets: HashMap<String, PollInterest> = HashMap::new();
     for record in &records {
         let recently_seen = record
@@ -289,13 +302,18 @@ fn sweep(
         let explicitly_viewed = pending.sessions.contains(&record.id.0);
         let eligible = attached || recently_seen;
         let mut seen_urls = HashSet::new();
-        let urls: Vec<String> = record
+        let from_artifacts: Vec<String> = record
             .artifacts
             .as_deref()
             .unwrap_or_default()
             .iter()
             .filter(|artifact| artifact.kind == ArtifactKind::PullRequest)
             .map(|artifact| artifact.url.clone())
+            .filter(|url| seen_urls.insert(url.clone()))
+            .collect();
+        artifact_urls.insert(record.id.0.clone(), from_artifacts.len());
+        let urls: Vec<String> = from_artifacts
+            .into_iter()
             .chain(
                 record
                     .pull_requests
@@ -334,6 +352,8 @@ fn sweep(
     if targets.is_empty() {
         forced_urls.clear();
         fallback.clear();
+        // Nothing to fetch, but records still get the bounded detail.
+        apply_statuses(registry, events, wanted, &artifact_urls, cache);
         return IDLE_RECONCILE_INTERVAL;
     }
     forced_urls.retain(|url| targets.contains_key(url));
@@ -409,14 +429,48 @@ fn sweep(
         }
     }
 
+    if !apply_statuses(registry, events, wanted, &artifact_urls, cache) {
+        return IDLE_RECONCILE_INTERVAL;
+    }
+
+    if !fallback.is_empty() {
+        return Duration::ZERO;
+    }
+    next_refresh_delay(&targets, refresh, cache, forced_urls, Instant::now())
+}
+
+/// Writes each session's cached statuses to its record, with detail bounded
+/// per session, publishing the records that changed. False when the
+/// registry lock is poisoned.
+fn apply_statuses(
+    registry: &Arc<Mutex<Registry>>,
+    events: &EventBus,
+    wanted: Vec<(String, Vec<String>)>,
+    artifact_urls: &HashMap<String, usize>,
+    cache: &HashMap<String, PullRequestStatus>,
+) -> bool {
     for (id, urls) in wanted {
-        let statuses: Vec<PullRequestStatus> = urls
+        let from_artifacts = artifact_urls.get(&id).copied().unwrap_or(urls.len());
+        let (newer, older): (Vec<_>, Vec<_>) = urls
             .iter()
-            .filter_map(|url| cache.get(url).cloned())
+            .enumerate()
+            .filter_map(|(position, url)| Some((position, cache.get(url)?.clone())))
+            .partition(|(position, _)| *position < from_artifacts);
+        // Both runs are oldest first, and every artifact URL is newer than the
+        // URLs after it, whose artifacts were capped away.
+        let newest_first: Vec<usize> = (0..newer.len())
+            .rev()
+            .chain((newer.len()..newer.len() + older.len()).rev())
             .collect();
+        let mut statuses: Vec<PullRequestStatus> = newer
+            .into_iter()
+            .chain(older)
+            .map(|(_, status)| status)
+            .collect();
+        bound_detail(&mut statuses, &newest_first);
         let record = {
             let Ok(mut guard) = registry.lock() else {
-                return IDLE_RECONCILE_INTERVAL;
+                return false;
             };
             let changed = guard.apply_pull_request_statuses(&id, statuses);
             if changed {
@@ -430,11 +484,7 @@ fn sweep(
             events.publish_encoded(diri_proto::EventName::SESSION_UPDATED, &record, Some(&id));
         }
     }
-
-    if !fallback.is_empty() {
-        return Duration::ZERO;
-    }
-    next_refresh_delay(&targets, refresh, cache, forced_urls, Instant::now())
+    true
 }
 
 /// Refreshes one pull request the per-PR way: `gh pr view`, plus the thread
@@ -576,6 +626,45 @@ fn next_refresh_delay(
         })
         .min()
         .unwrap_or(IDLE_RECONCILE_INTERVAL)
+}
+
+/// Strips body, checks and discussion from all but the
+/// [`DETAILED_PRS_PER_SESSION`] most relevant statuses: open PRs first, then
+/// the newest. `newest_first` lists every index of `statuses` by recency.
+fn bound_detail(statuses: &mut [PullRequestStatus], newest_first: &[usize]) {
+    let open = |index: &&usize| statuses[**index].state == "OPEN";
+    let keep: HashSet<usize> = newest_first
+        .iter()
+        .filter(open)
+        .chain(newest_first.iter().filter(|index| !open(index)))
+        .take(DETAILED_PRS_PER_SESSION)
+        .copied()
+        .collect();
+    for (index, status) in statuses.iter_mut().enumerate() {
+        if !keep.contains(&index) {
+            drop_detail(status);
+        }
+    }
+}
+
+/// Leaves a status's summary: state, review decision and every count.
+pub(crate) fn drop_detail(status: &mut PullRequestStatus) {
+    status.body = None;
+    status.checks = None;
+    status.discussion = None;
+}
+
+/// Cuts `text` to at most `max` bytes on a char boundary, marking the cut.
+fn truncate_text(text: &mut String, max: usize) {
+    if text.len() <= max {
+        return;
+    }
+    let mut end = max;
+    while !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    text.truncate(end);
+    text.push('…');
 }
 
 fn status_materially_same(a: &PullRequestStatus, b: &PullRequestStatus) -> bool {
@@ -1071,13 +1160,22 @@ fn parse_view(view: &Value, url: &str, fetched_at: DateMillis) -> Option<PullReq
             .partial_cmp(&time(b))
             .unwrap_or(std::cmp::Ordering::Equal)
     });
+    // The newest items, each bounded; the counts above stay exact.
+    discussion.drain(..discussion.len().saturating_sub(MAX_DISCUSSION_ITEMS));
+    for item in &mut discussion {
+        truncate_text(&mut item.body, MAX_DISCUSSION_BODY_BYTES);
+    }
+    let body = string(&view["body"]).map(|mut body| {
+        truncate_text(&mut body, MAX_BODY_BYTES);
+        body
+    });
 
     Some(PullRequestStatus {
         url: url.to_string(),
         number,
         title: string(&view["title"]),
         author: string(&view["author"]["login"]),
-        body: string(&view["body"]),
+        body,
         base_ref_name: string(&view["baseRefName"]),
         head_ref_name: string(&view["headRefName"]),
         state: view["state"].as_str().unwrap_or("OPEN").to_string(),
@@ -1300,6 +1398,88 @@ mod tests {
             DateMillis(0.0),
         )
         .unwrap()
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_session_keeps_detail_on_its_open_and_newest_pull_requests_only() {
+        let url = |number: i64| format!("https://github.com/o/r/pull/{number}");
+        let statuses: Vec<PullRequestStatus> = (1..=12)
+            .map(|number| {
+                let view = serde_json::json!({
+                    "number": number,
+                    "state": if number == 1 { "OPEN" } else { "MERGED" },
+                    "body": "why",
+                    "statusCheckRollup": [{ "name": "ci", "conclusion": "SUCCESS" }],
+                    "comments": [{ "author": { "login": "a" }, "body": "lgtm" }],
+                });
+                parse(view.to_string().as_bytes(), &url(number), DateMillis(0.0)).unwrap()
+            })
+            .collect();
+        // Not seen, so nothing is fetched; the bound still reaches the record.
+        let mut harness = Harness::new(
+            &[("s", false, statuses)],
+            "#!/bin/sh\necho \"$@\" >> $LOG\nexit 1\n",
+        );
+        harness.sweep(PendingWake::default());
+
+        let record = harness.registry.lock().unwrap().record("s").unwrap();
+        let prs = record.pull_requests.unwrap();
+        assert_eq!(
+            prs.iter().map(|pr| pr.number).collect::<Vec<_>>(),
+            (1..=12).collect::<Vec<_>>(),
+            "every pull request stays, in order"
+        );
+        let detailed: Vec<i64> = prs
+            .iter()
+            .filter(|pr| pr.body.is_some() && pr.checks.is_some() && pr.discussion.is_some())
+            .map(|pr| pr.number)
+            .collect();
+        assert_eq!(detailed, [1, 10, 11, 12], "the open one, then the newest");
+        assert!(
+            prs.iter()
+                .all(|pr| pr.checks_passed == 1 && pr.comment_count == 1),
+            "summaries keep their counts"
+        );
+        assert!(harness.gh_calls().is_empty());
+    }
+
+    #[test]
+    fn a_pull_request_body_and_discussion_are_bounded() {
+        let comments: Vec<Value> = (0..40)
+            .map(|second| {
+                serde_json::json!({
+                    "author": { "login": "a" },
+                    "body": "é".repeat(2_000),
+                    "createdAt": format!("2026-01-01T00:00:{second:02}Z"),
+                })
+            })
+            .collect();
+        let view = serde_json::json!({
+            "number": 1, "state": "OPEN", "body": "é".repeat(20_000), "comments": comments,
+        });
+        let status = parse(
+            view.to_string().as_bytes(),
+            "https://github.com/o/r/pull/1",
+            DateMillis(0.0),
+        )
+        .unwrap();
+
+        let body = status.body.unwrap();
+        assert!(body.len() <= MAX_BODY_BYTES + '…'.len_utf8() && body.ends_with('…'));
+        assert_eq!(status.comment_count, 40, "the count stays exact");
+        let discussion = status.discussion.unwrap();
+        assert_eq!(discussion.len(), MAX_DISCUSSION_ITEMS);
+        assert_eq!(
+            discussion[0].created_at,
+            parse_github_date("2026-01-01T00:00:10Z"),
+            "the newest items are kept"
+        );
+        assert!(
+            discussion
+                .iter()
+                .all(|item| item.body.len() <= MAX_DISCUSSION_BODY_BYTES + '…'.len_utf8())
+        );
     }
 
     /// A GraphQL `PullRequest` node as the batch query returns it.

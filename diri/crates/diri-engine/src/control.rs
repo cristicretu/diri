@@ -2756,8 +2756,10 @@ impl ControlServer {
     /// plus the project list, exactly as the Swift daemon answers them.
     fn session_list(&self) -> Result<JsonValue, ControlError> {
         let registry = self.registry.lock().map_err(poisoned)?;
+        let mut sessions = registry.records();
+        fit_session_list(&mut sessions);
         serde_json::to_value(json!({
-            "sessions": registry.records(),
+            "sessions": sessions,
             "projects": registry.projects_raw(),
         }))
         .map_err(|error| ControlError::internal(error.to_string()))
@@ -5517,6 +5519,43 @@ fn write_event_frame(
     stream.flush()
 }
 
+/// Share of the control frame a `session.list` reply may use with full pull
+/// request detail. Every client rejects a line over
+/// [`MAX_CONTROL_LINE_BYTES`], so an over-limit list broke the app's snapshot
+/// and every MCP tool at once ("daemon message exceeds the frame limit").
+const SESSION_LIST_DETAIL_BUDGET: usize = MAX_CONTROL_LINE_BYTES / 4 * 3;
+
+/// Drops pull request bodies, checks and discussion from a list that would
+/// not fit [`SESSION_LIST_DETAIL_BUDGET`]. Summaries and counts stay, and
+/// `session.updated` still carries each record's detail.
+fn fit_session_list(sessions: &mut [diri_proto::SessionRecord]) {
+    if encoded_len(&sessions) <= SESSION_LIST_DETAIL_BUDGET {
+        return;
+    }
+    for status in sessions
+        .iter_mut()
+        .filter_map(|session| session.pull_requests.as_mut())
+        .flatten()
+    {
+        crate::pr_monitor::drop_detail(status);
+    }
+}
+
+fn encoded_len(value: &impl serde::Serialize) -> usize {
+    struct Count(usize);
+    impl std::io::Write for Count {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.0 += bytes.len();
+            Ok(bytes.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    let mut count = Count(0);
+    let _ = serde_json::to_writer(&mut count, value);
+    count.0
+}
 fn poisoned<T>(_: T) -> ControlError {
     ControlError::internal("engine state is poisoned")
 }
@@ -6924,6 +6963,56 @@ mod tests {
     mod reconnect_tests;
     #[cfg(unix)]
     mod send_key_tests;
+
+    #[test]
+    fn an_over_budget_session_list_drops_only_pull_request_detail() {
+        let fixture: JsonValue = serde_json::from_str(include_str!(
+            "../../diri-proto/tests/fixtures/session_list_response.json"
+        ))
+        .unwrap();
+        let template: diri_proto::SessionRecord =
+            serde_json::from_value(fixture["ok"]["sessions"][0].clone()).unwrap();
+        let view = json!({
+            "number": 1, "state": "MERGED", "body": "x".repeat(15 * 1024),
+            "statusCheckRollup": [{ "name": "ci", "conclusion": "SUCCESS" }],
+        });
+        let status = crate::pr_monitor::parse(
+            view.to_string().as_bytes(),
+            "https://github.com/o/r/pull/1",
+            diri_proto::DateMillis(0.0),
+        )
+        .unwrap();
+        let list = |count: usize| -> Vec<diri_proto::SessionRecord> {
+            (0..count)
+                .map(|index| {
+                    let mut record = template.clone();
+                    record.id.0 = format!("s_{index}");
+                    record.pull_requests = Some(vec![status.clone(); 8]);
+                    record
+                })
+                .collect()
+        };
+
+        let mut small = list(2);
+        fit_session_list(&mut small);
+        assert_eq!(small, list(2), "a list that fits is untouched");
+
+        // 30 sessions x 8 PRs x 15 KiB of body is past the budget.
+        let mut large = list(30);
+        assert!(encoded_len(&large) > SESSION_LIST_DETAIL_BUDGET);
+        fit_session_list(&mut large);
+        assert!(encoded_len(&large) <= SESSION_LIST_DETAIL_BUDGET);
+        let prs = large
+            .iter()
+            .flat_map(|record| record.pull_requests.iter().flatten());
+        for pr in prs {
+            assert!(pr.body.is_none() && pr.checks.is_none() && pr.discussion.is_none());
+            assert_eq!(
+                (pr.number, pr.state.as_str(), pr.checks_passed),
+                (1, "MERGED", 1)
+            );
+        }
+    }
 
     #[test]
     fn antigravity_trust_setup_and_composer_screens_are_told_apart() {
