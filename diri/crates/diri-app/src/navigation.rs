@@ -43,7 +43,6 @@ use gpui::{
     StatefulInteractiveElement, StyledText, Task, UniformListScrollHandle, Window, div,
     ease_out_quint, prelude::*, px, rgba, uniform_list,
 };
-pub(crate) use history_page::relative_time;
 pub(crate) use notes_page::NoteOpened;
 
 /// The search header: an inset field pill plus the row inset above it.
