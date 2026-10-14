@@ -3,17 +3,35 @@
 //! These values are estimates, never authoritative provider billing. Callers
 //! must label them accordingly and prefer billed spend when available.
 
-pub const PRICING_ENTRY_COUNT: usize = 16;
+pub const PRICING_ENTRY_COUNT: usize = 17;
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct ModelPricing {
     pub input: f64,
     pub output: f64,
+    /// Published cached-input price as a fraction of `input`. Most bundled
+    /// models use 10%; gpt-6.1-sol's published rate is 5%.
+    cache_read_ratio: f64,
 }
 
 impl ModelPricing {
+    const fn new(input: f64, output: f64) -> Self {
+        Self {
+            input,
+            output,
+            cache_read_ratio: 0.1,
+        }
+    }
+
+    const fn with_cache_read_ratio(self, cache_read_ratio: f64) -> Self {
+        Self {
+            cache_read_ratio,
+            ..self
+        }
+    }
+
     pub const fn cache_read(self) -> f64 {
-        self.input * 0.1
+        self.input * self.cache_read_ratio
     }
 
     pub const fn cache_write_5m(self) -> f64 {
@@ -28,40 +46,19 @@ impl ModelPricing {
 /// Match Claude model names in specific-to-generic order.
 pub fn match_claude(model: &str) -> Option<ModelPricing> {
     if model.contains("fable") || model.contains("mythos") {
-        Some(ModelPricing {
-            input: 10.0,
-            output: 50.0,
-        })
+        Some(ModelPricing::new(10.0, 50.0))
     } else if model.contains("opus-4-1") || model.contains("opus-4-2025") {
-        Some(ModelPricing {
-            input: 15.0,
-            output: 75.0,
-        })
+        Some(ModelPricing::new(15.0, 75.0))
     } else if model.contains("opus") {
-        Some(ModelPricing {
-            input: 5.0,
-            output: 25.0,
-        })
+        Some(ModelPricing::new(5.0, 25.0))
     } else if model.contains("sonnet") {
-        Some(ModelPricing {
-            input: 3.0,
-            output: 15.0,
-        })
+        Some(ModelPricing::new(3.0, 15.0))
     } else if model.contains("haiku-4") {
-        Some(ModelPricing {
-            input: 1.0,
-            output: 5.0,
-        })
+        Some(ModelPricing::new(1.0, 5.0))
     } else if model.contains("3-5-haiku") {
-        Some(ModelPricing {
-            input: 0.8,
-            output: 4.0,
-        })
+        Some(ModelPricing::new(0.8, 4.0))
     } else if model.contains("haiku") {
-        Some(ModelPricing {
-            input: 0.25,
-            output: 1.25,
-        })
+        Some(ModelPricing::new(0.25, 1.25))
     } else {
         None
     }
@@ -73,50 +70,29 @@ pub fn match_openai(model: &str) -> Option<ModelPricing> {
         // Standard API-equivalent rates, verified 2026-09-13:
         // https://developers.openai.com/api/docs/models/gpt-6-astra
         // These base estimates exclude service-tier and long-context premiums.
-        Some(ModelPricing {
-            input: 10.0,
-            output: 50.0,
-        })
+        Some(ModelPricing::new(10.0, 50.0))
+    } else if model == "gpt-6.1-sol" {
+        // Standard short-context rates, verified 2026-10-13:
+        // https://developers.openai.com/api/docs/models/gpt-6.1-sol
+        // Cached input is $0.10/M (5% of input), not the 10% factor used above.
+        // These base estimates exclude service-tier and long-context premiums.
+        Some(ModelPricing::new(2.0, 10.0).with_cache_read_ratio(0.05))
     } else if model.contains("gpt-5.4-mini") {
-        Some(ModelPricing {
-            input: 0.75,
-            output: 4.5,
-        })
+        Some(ModelPricing::new(0.75, 4.5))
     } else if model.contains("gpt-5.4") {
-        Some(ModelPricing {
-            input: 2.5,
-            output: 15.0,
-        })
+        Some(ModelPricing::new(2.5, 15.0))
     } else if model.contains("gpt-5.5") {
-        Some(ModelPricing {
-            input: 5.0,
-            output: 30.0,
-        })
+        Some(ModelPricing::new(5.0, 30.0))
     } else if model.contains("codex-mini") {
-        Some(ModelPricing {
-            input: 1.5,
-            output: 6.0,
-        })
+        Some(ModelPricing::new(1.5, 6.0))
     } else if model.contains("codex") {
-        Some(ModelPricing {
-            input: 1.75,
-            output: 14.0,
-        })
+        Some(ModelPricing::new(1.75, 14.0))
     } else if model.contains("mini") {
-        Some(ModelPricing {
-            input: 0.25,
-            output: 2.0,
-        })
+        Some(ModelPricing::new(0.25, 2.0))
     } else if model.contains("nano") {
-        Some(ModelPricing {
-            input: 0.05,
-            output: 0.4,
-        })
+        Some(ModelPricing::new(0.05, 0.4))
     } else if model.contains("gpt-5") {
-        Some(ModelPricing {
-            input: 1.25,
-            output: 10.0,
-        })
+        Some(ModelPricing::new(1.25, 10.0))
     } else {
         None
     }
@@ -166,6 +142,17 @@ mod tests {
         let cost = openai_estimate("gpt-6-astra", 60, 20, 40).expect("Astra usage must be priced");
         assert!((cost - 0.001_64).abs() < 1e-12);
         assert_eq!(match_openai("gpt-6-unknown"), None);
+    }
+
+    #[test]
+    fn sol_usage_uses_the_published_standard_rate() {
+        let pricing = match_openai("gpt-6.1-sol").expect("Sol must be priced");
+        assert_eq!((pricing.input, pricing.output), (2.0, 10.0));
+        assert!((pricing.cache_read() - 0.1).abs() < 1e-12);
+        // 60 uncached input + 40 cached input + 20 output tokens.
+        let cost = openai_estimate("gpt-6.1-sol", 60, 20, 40).expect("Sol usage must be priced");
+        assert!((cost - 0.000_324).abs() < 1e-12);
+        assert_eq!(match_openai("gpt-6.1-sol-fast"), None);
     }
 
     #[test]

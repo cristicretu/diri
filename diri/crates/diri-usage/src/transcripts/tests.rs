@@ -412,7 +412,7 @@ fn buckets_local_day_month_and_five_hour_blocks_like_swift() {
 
 #[test]
 fn ordered_pricing_table_and_fnv_hash_match_expected_values() {
-    assert_eq!(super::PRICING_ENTRY_COUNT, 16);
+    assert_eq!(super::PRICING_ENTRY_COUNT, 17);
     for (model, input, output) in [
         ("claude-fable", 10.0, 50.0),
         ("claude-mythos", 10.0, 50.0),
@@ -429,6 +429,7 @@ fn ordered_pricing_table_and_fnv_hash_match_expected_values() {
     }
     for (model, input, output) in [
         ("gpt-6-astra", 10.0, 50.0),
+        ("gpt-6.1-sol", 2.0, 10.0),
         ("gpt-5.4-mini", 0.75, 4.5),
         ("gpt-5.4", 2.5, 15.0),
         ("gpt-5.5", 5.0, 30.0),
