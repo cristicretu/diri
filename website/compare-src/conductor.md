@@ -11,7 +11,7 @@ Conductor is a Mac app for running Claude Code, Codex, Cursor and OpenCode in pa
 | --- | --- | --- |
 | Platforms | macOS 15 or newer (universal), Linux beta on x86_64 Ubuntu, iPhone companion beta | Mac; a mobile app is listed on the Pro plan |
 | Price | Free | Free plan; Pro $50/mo; Teams $60/mo per user (invite-only); Enterprise custom |
-| License | Apache-2.0, open source | Not documented on its site |
+| License | AGPL-3.0, open source | Not documented on its site |
 | Agents | 21 terminal agents, including Claude Code, Codex, Cursor, Gemini, Copilot CLI, OpenCode, Amp and Aider, plus custom manifests | Claude Code, Codex, Cursor and OpenCode |
 | How agents appear | The agent's own terminal UI | A chat composer with model picker and modes, plus a terminal for ad hoc commands |
 | Isolation | Optional git worktree per agent (from an agent, a recipe or the CLI) | A git worktree and branch for every workspace, created by default |

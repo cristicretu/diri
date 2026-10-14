@@ -99,7 +99,7 @@ CI must pass before merge. Reviews weigh correctness and session continuity
 first, then performance and interface clarity. Keep new controls and
 configuration justified by the problem they solve.
 
-Contributions use [Apache 2.0](LICENSE); there is no CLA.
+Contributions are licensed under [AGPL-3.0-only](LICENSE); there is no CLA.
 [Governance](GOVERNANCE.md) covers project decisions, the
 [Code of Conduct](CODE_OF_CONDUCT.md) covers participation, and
 [Security](SECURITY.md) explains private vulnerability reporting.

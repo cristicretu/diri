@@ -1,6 +1,6 @@
 {
   "schema": 1,
-  "project_license": "Apache-2.0",
+  "project_license": "AGPL-3.0-only",
   "rust_missing_metadata": [
     {
       "name": "gpui_shared_string",
@@ -34,7 +34,7 @@
     }
   ],
   "notes": [
-    "Diri's original code remains Apache-2.0; distributed builds are also subject to dependency licenses.",
+    "Diri's original code is AGPL-3.0-only; distributed builds are also subject to dependency licenses.",
     "The GPL-marked zlog/ztracing packages are replaced by the Apache-2.0 no-op compatibility crates under diri/vendor.",
     "This inventory is an engineering control, not legal advice. Re-review it when the pinned Zed revision changes.",
     "telemetry/worker and telemetry/cli have no runtime npm dependencies; their devDependencies are local build/test tooling (Worker bundle and CLI ship only first-party code). check-licenses.py fails if a runtime dependency is added."

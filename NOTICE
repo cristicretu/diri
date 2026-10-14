@@ -1,10 +1,16 @@
 Diri (https://github.com/cristicretu/diri)
 Copyright 2026 Cristian Crețu and the Diri contributors
 
-This product is Diri, originally created by Cristian Crețu. Under section 4 of
-the Apache License 2.0, any redistribution of this work or a derivative of it,
-in source or binary form, must retain this NOTICE file, including the
-copyright line above, and must mark files that were modified.
+This product is Diri, originally created by Cristian Crețu. Diri is licensed
+under the GNU Affero General Public License, version 3 (AGPL-3.0-only); see
+LICENSE. Any conveyed copy or modified version, in source or binary form, must
+keep this NOTICE file and the copyright line above (AGPL-3.0 sections 4, 5 and
+7(b)), carry prominent notices stating that it was modified and when (section
+5(a)), and make its complete corresponding source available under the same
+license, including to users who interact with it over a network (section 13).
+
+Code released before this change remains available under Apache-2.0 at the
+commits where it was published.
 
 Dirijor — third-party attributions
 ==================================

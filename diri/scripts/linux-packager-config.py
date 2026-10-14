@@ -59,7 +59,7 @@ def main() -> int:
             },
             {
                 "src": str(repository / "LICENSE"),
-                "target": "licenses/Apache-2.0.txt",
+                "target": "licenses/AGPL-3.0.txt",
             },
             {
                 "src": str(repository / "NOTICE"),

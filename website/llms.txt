@@ -1,6 +1,6 @@
 # Diri
 
-> Diri is a native desktop app for running many coding agents (Claude Code, Codex, Cursor, Gemini and 16 more) side by side, with live status, git worktrees, review, notes, remote SSH hosts, and an MCP server that lets agents start and coordinate other agents. Free and open source (Apache-2.0).
+> Diri is a native desktop app for running many coding agents (Claude Code, Codex, Cursor, Gemini and 16 more) side by side, with live status, git worktrees, review, notes, remote SSH hosts, and an MCP server that lets agents start and coordinate other agents. Free and open source (AGPL-3.0).
 
 Each page is available as Markdown at the URL below. The docs are concatenated in https://diri.sh/llms-full.txt. A read-only docs MCP server is at https://diri.sh/mcp.
 
@@ -65,7 +65,7 @@ Each page is available as Markdown at the URL below. The docs are concatenated i
 - [diri vs cmux](https://diri.sh/compare/cmux.md): cmux is a free, scriptable Ghostty-based Mac terminal for agents; diri adds agent status, worktrees, review and agent-to-agent tasks, with sessions that outlive the app.
 - [diri vs Conductor](https://diri.sh/compare/conductor.md): Conductor runs four agents behind a Mac chat interface with a PR flow and paid cloud workspaces; diri runs 21 agent CLIs as real terminals, free and open source.
 - [diri vs herdr](https://diri.sh/compare/herdr.md): herdr is a cross-platform terminal multiplexer for agents with a socket API; diri is a native GUI with review, notes and MCP tasks, and sessions that survive Engine restarts.
-- [diri vs Superset](https://diri.sh/compare/superset.md): Both run many terminal agents in parallel; Superset adds an in-app browser, a hosted MCP and paid remote access, while diri is native, Apache-2.0 and uses plain SSH.
+- [diri vs Superset](https://diri.sh/compare/superset.md): Both run many terminal agents in parallel; Superset adds an in-app browser, a hosted MCP and paid remote access, while diri is native, AGPL-3.0 and uses plain SSH.
 
 ## Releases
 
@@ -74,4 +74,4 @@ Each page is available as Markdown at the URL below. The docs are concatenated i
 ## Optional
 
 - [Guides](https://diri.sh/guides/): Beginner walkthroughs with screenshots.
-- [Source code](https://github.com/cristicretu/diri): Apache-2.0.
+- [Source code](https://github.com/cristicretu/diri): AGPL-3.0.

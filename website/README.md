@@ -69,7 +69,7 @@ The window layout follows a headless render of the current app (`render_workspac
 
 The page background is plain. The only backdrop is the painted desktop behind the window (CSS gradients plus a static SVG grain), so the window's glass has something to blur. Tints follow the app's measured glass density: window fill about .56, sidebar clear over it, terminal about .65 on top. Reduced transparency uses opaque surfaces. There is no WebGL or animation behind the page.
 
-Agent presentation references: [Claude Code](https://github.com/anthropics/claude-code), [Cursor CLI](https://cursor.com/cli), the local Codex CLI and Diri screenshot, and [Gemini CLI](https://github.com/google-gemini/gemini-cli). The Gemini ASCII mark is adapted from `packages/cli/src/ui/components/AsciiArt.ts`, copyright 2025 Google LLC, licensed under Apache-2.0 (see the repository LICENSE). The compact account footer uses the supplied name and illustrative daily cost; it does not fetch account data.
+Agent presentation references: [Claude Code](https://github.com/anthropics/claude-code), [Cursor CLI](https://cursor.com/cli), the local Codex CLI and Diri screenshot, and [Gemini CLI](https://github.com/google-gemini/gemini-cli). The Gemini ASCII mark is adapted from `packages/cli/src/ui/components/AsciiArt.ts`, copyright 2025 Google LLC, licensed under Apache-2.0 (see `docs/third-party/Apache-2.0.txt`). The compact account footer uses the supplied name and illustrative daily cost; it does not fetch account data.
 
 ## Feature coverage
 

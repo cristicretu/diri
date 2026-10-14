@@ -25,7 +25,7 @@ resolver = "2"
 [workspace.package]
 edition = "2024"
 rust-version = "1.95"
-license = "Apache-2.0"
+license = "AGPL-3.0-only"
 
 [workspace.dependencies]
 alacritty_terminal = { path = "vendor/alacritty_terminal", default-features = false }

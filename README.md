@@ -73,6 +73,6 @@ Read the [contributor guide](CONTRIBUTING.md) for setup and review expectations.
 
 ---
 
-Copyright 2026 Cristian Crețu and the Diri contributors · [Apache 2.0](LICENSE) ·
+Copyright 2026 Cristian Crețu and the Diri contributors · [AGPL-3.0](LICENSE) ·
 [Notices](NOTICE) ·
 [Privacy](PRIVACY.md) · [Security](SECURITY.md)

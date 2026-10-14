@@ -2,14 +2,14 @@
 
 > herdr is a cross-platform terminal multiplexer for agents with a socket API; diri is a native GUI with review, notes and MCP tasks, and sessions that survive Engine restarts.
 
-herdr is an open-source terminal multiplexer for coding agents: one Rust binary with a TUI, a background server that keeps agent terminals alive when you detach, status detection for over 20 agent CLIs, SSH machines in the same window, plugins, and a socket API agents can drive. diri is an open-source native desktop app with the same core idea, agents that keep running and tell you when they need you, plus a Review panel, notes, account switching and an MCP server for agent-to-agent tasks. Both are Apache-2.0 and written in Rust; the main split is TUI versus GUI.
+herdr is an open-source terminal multiplexer for coding agents: one Rust binary with a TUI, a background server that keeps agent terminals alive when you detach, status detection for over 20 agent CLIs, SSH machines in the same window, plugins, and a socket API agents can drive. diri is an open-source native desktop app with the same core idea, agents that keep running and tell you when they need you, plus a Review panel, notes, account switching and an MCP server for agent-to-agent tasks. Both are open source (diri AGPL-3.0, herdr Apache-2.0) and written in Rust; the main split is TUI versus GUI.
 
 ## At a glance
 | | diri | herdr |
 | --- | --- | --- |
 | Interface | Native desktop app (GPUI) | TUI in any terminal, keyboard and mouse |
 | Platforms | macOS 15 or newer (universal), Linux beta on x86_64 Ubuntu, iPhone companion beta | macOS, Linux, Windows |
-| License | Apache-2.0 | Apache-2.0 |
+| License | AGPL-3.0 | Apache-2.0 |
 | Agents | 20 agents by manifest, plus custom manifests | Over 20 agent CLIs detected by screen manifests, plus agents that self-report their state |
 | Status | Hooks for Claude Code, turn notify for Codex, screen rules for the rest; working, needs you, done | Screen reading, replaced by integration reports where available; working, blocked, idle |
 | Isolation | Optional git worktree per agent | Worktree methods in the socket API open checkouts as workspaces |

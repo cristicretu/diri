@@ -33,7 +33,7 @@ for path in \
     usr/lib/diri/manifests/codex.json \
     usr/lib/diri/sidecar/server.js \
     usr/lib/diri/licenses/THIRD-PARTY-LICENSES.json \
-    usr/lib/diri/licenses/Apache-2.0.txt \
+    usr/lib/diri/licenses/AGPL-3.0.txt \
     usr/share/applications/diri.desktop; do
     test -e "${deb_root}/${path}"
 done
@@ -55,7 +55,7 @@ for path in \
     usr/lib/diri/manifests/codex.json \
     usr/lib/diri/sidecar/server.js \
     usr/lib/diri/licenses/THIRD-PARTY-LICENSES.json \
-    usr/lib/diri/licenses/Apache-2.0.txt; do
+    usr/lib/diri/licenses/AGPL-3.0.txt; do
     test -e "${app_root}/${path}"
 done
 

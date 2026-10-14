@@ -11,7 +11,7 @@ cmux is a free, open-source macOS terminal built on libghostty, with vertical ta
 | --- | --- | --- |
 | Platforms | macOS 15 or newer (universal), Linux beta on x86_64 Ubuntu, iPhone companion beta | macOS only for now; iOS app in TestFlight beta |
 | Price | Free | Free; a Founder's Edition offers early access features |
-| License | Apache-2.0 | GPL-3.0-or-later for the client; server components under BSL 1.1 |
+| License | AGPL-3.0 | GPL-3.0-or-later for the client; server components under BSL 1.1 |
 | Built with | Rust and GPUI | Swift and AppKit on libghostty |
 | Agents | 21 agents with manifests for launch, resume and status, plus any shell | Any agent that runs in a terminal |
 | Status and attention | Working, needs you, done per session, from hooks or screen rules; notifications and an inbox | Notification rings and unread badges, triggered by OSC 9/99/777, the CLI or agent hooks |

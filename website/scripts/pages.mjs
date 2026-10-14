@@ -112,7 +112,7 @@ ${RESUME[agent.resume]} Quitting diri never ends a session in the first place.
 Yes. Install and sign in to ${n} on any machine you reach with \`ssh\`, then pick it as the machine in **New Agent**. diri needs no tmux, sudo or service there. See [Remote hosts](/docs/remote-hosts/).
 
 ### What does diri cost?
-Nothing. diri is free and open source under Apache 2.0. You pay for ${n} as you do today.
+Nothing. diri is free and open source under AGPL-3.0. You pay for ${n} as you do today.
 
 ## Other agents
 

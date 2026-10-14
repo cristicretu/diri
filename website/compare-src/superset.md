@@ -1,6 +1,6 @@
 ---
 title: diri vs Superset
-description: Both run many terminal agents in parallel; Superset adds an in-app browser, a hosted MCP and paid remote access, while diri is native, Apache-2.0 and uses plain SSH.
+description: Both run many terminal agents in parallel; Superset adds an in-app browser, a hosted MCP and paid remote access, while diri is native, AGPL-3.0 and uses plain SSH.
 competitor: Superset
 checked: 2026-10-01
 ---
@@ -11,7 +11,7 @@ Superset is a desktop workspace for running many coding agents in parallel, each
 | --- | --- | --- |
 | Platforms | macOS 15 or newer (universal), Linux beta on x86_64 and arm64 Ubuntu, iPhone companion beta | macOS (Apple silicon or Intel), experimental Linux x64 AppImage, iPhone app with Pro; no Windows |
 | Price | Free | Free tier; Pro $20/mo, or $15 per user per month billed yearly; Enterprise custom |
-| License | Apache-2.0, open source | Elastic License 2.0, source-available (not OSI-approved) |
+| License | AGPL-3.0, open source | Elastic License 2.0, source-available (not OSI-approved) |
 | App stack | Rust and GPUI | Electron and React |
 | Agents | 21 terminal agents plus custom JSON manifests | 21 listed agents; says any CLI agent works without configuration; built-in chat pane too |
 | Isolation | Optional git worktree per agent | A git worktree for every workspace |
@@ -31,7 +31,7 @@ diri reaches a server the way you already do, with your OpenSSH config, keys and
 diri's MCP server is a local binary inside the app, connected to Claude Code, Codex and Cursor automatically. Agents can fan work out to helpers in separate worktrees, wait for whichever finishes, review each diff and merge it with `integrate`. Writes follow the session tree with depth and child caps, and nothing goes through a hosted service. See [MCP server](/docs/mcp/) and the [security model](/docs/security/).
 
 ### Native, and permissive license
-diri is a native app written in Rust with GPUI, licensed Apache-2.0, which allows any use including commercial redistribution. Superset's ELv2 lets you fork and self-host for your team but not offer it as a service.
+diri is a native app written in Rust with GPUI, licensed AGPL-3.0, which allows any use including commercial use, as long as modified versions, including hosted ones, publish their source under the same license. Superset's ELv2 lets you fork and self-host for your team but not offer it as a service.
 
 ### Status and accounts
 diri reads status through Claude Code hooks, Codex turn notifications, and screen rules for every other agent, and flags destructive-looking permission prompts in red. It can also keep several Claude Code or Codex logins and switch every open tab to another account in one click. See [Sessions](/docs/sessions/) and [Accounts and usage](/docs/accounts/).

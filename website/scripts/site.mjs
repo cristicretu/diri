@@ -18,13 +18,13 @@ export async function buildSite() {
   const pages = await buildPages();
   const outputs = new Map([...docs.outputs, ...pages.outputs]);
 
-  const llms = [`# Diri\n\n> Diri is a native desktop app for running many coding agents (Claude Code, Codex, Cursor, Gemini and 16 more) side by side, with live status, git worktrees, review, notes, remote SSH hosts, and an MCP server that lets agents start and coordinate other agents. Free and open source (Apache-2.0).\n\nEach page is available as Markdown at the URL below. The docs are concatenated in ${site}/llms-full.txt. A read-only docs MCP server is at ${site}/mcp.\n`, ...docs.llms];
+  const llms = [`# Diri\n\n> Diri is a native desktop app for running many coding agents (Claude Code, Codex, Cursor, Gemini and 16 more) side by side, with live status, git worktrees, review, notes, remote SSH hosts, and an MCP server that lets agents start and coordinate other agents. Free and open source (AGPL-3.0).\n\nEach page is available as Markdown at the URL below. The docs are concatenated in ${site}/llms-full.txt. A read-only docs MCP server is at ${site}/mcp.\n`, ...docs.llms];
   for (const group of ['Agents', 'Compare', 'Releases']) {
     const list = pages.entries.filter(entry => entry.group === group);
     if (!list.length) continue;
     llms.push(`\n## ${group}\n`, ...list.map(entry => `- [${entry.title}](${site}${entry.md || entry.url}): ${entry.description}`));
   }
-  outputs.set('llms.txt', llms.join('\n') + `\n\n## Optional\n\n- [Guides](${site}/guides/): Beginner walkthroughs with screenshots.\n- [Source code](${repo}): Apache-2.0.\n`);
+  outputs.set('llms.txt', llms.join('\n') + `\n\n## Optional\n\n- [Guides](${site}/guides/): Beginner walkthroughs with screenshots.\n- [Source code](${repo}): AGPL-3.0.\n`);
   outputs.set('llms-full.txt', `# Diri documentation\n${docs.full}\n`);
 
   // Sitemap: hand-written pages stay as listed; generated sections are rebuilt.
