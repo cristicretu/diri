@@ -73,5 +73,6 @@ Read the [contributor guide](CONTRIBUTING.md) for setup and review expectations.
 
 ---
 
-[Apache 2.0](LICENSE) · [Third-party notices](NOTICE) ·
+Copyright 2026 Cristian Crețu and the Diri contributors · [Apache 2.0](LICENSE) ·
+[Notices](NOTICE) ·
 [Privacy](PRIVACY.md) · [Security](SECURITY.md)
