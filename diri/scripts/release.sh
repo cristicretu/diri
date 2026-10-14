@@ -26,6 +26,7 @@
 #   SKIP_GATES=1        skip the CI gate (for re-running a failed publish)
 #   DIRI_LOCAL_GATES=1  run cargo clippy/test here instead of trusting CI's run
 #   SKIP_PERF_GATE=1   skip packaged app memory/idle-CPU probe
+#   SKIP_PRICE_CHECK=1  release even if diri-usage/prices.json is behind LiteLLM
 #   DIRI_LINUX_DIST     use this Linux CI artifact directory instead of fetching
 #                       (it must carry CI's .sigstore.json signature bundles)
 #   DIRI_MERGE_TIMEOUT_SECONDS  how long --wait-for-merge waits (default 3600)
@@ -151,6 +152,25 @@ claim success unless its cask is pushed and verified. Use SKIP_CASK=1 only when
 you intentionally do not want this release offered through Homebrew.
 EOF
     exit 1
+fi
+
+# Usage cost estimates ship the price table compiled into this tree, and a
+# release builds the tree exactly as reviewed, so stale prices are synced in
+# the bump PR (promote-nightly.sh does it in its bump commit), not here.
+if [ "${SKIP_PRICE_CHECK:-0}" != "1" ]; then
+    PRICE_STATUS=0
+    python3 "$WORKSPACE/scripts/sync-model-prices.py" --check || PRICE_STATUS=$?
+    if [ "$PRICE_STATUS" = 3 ]; then
+        cat >&2 <<EOF
+error: diri-usage/prices.json is behind LiteLLM's published prices.
+
+  Run diri/scripts/sync-model-prices.py, commit the result in the version-bump
+  PR, and re-run. SKIP_PRICE_CHECK=1 releases with the bundled prices.
+EOF
+        exit 1
+    elif [ "$PRICE_STATUS" != 0 ]; then
+        echo "warning: could not check model prices against LiteLLM; releasing with the bundled table" >&2
+    fi
 fi
 
 # ----------------------------------------------------------------------------

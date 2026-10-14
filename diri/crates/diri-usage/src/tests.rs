@@ -74,9 +74,9 @@ fn every_family_points_at_a_priced_row() {
     }
 }
 
-/// Ids the bundled agents report today. A sync that drops one of these
-/// fails here, before the price PR can merge, instead of silently blanking
-/// the cost column.
+/// Ids the bundled agents report today. A release-time sync that drops one
+/// of these fails CI on the bump PR instead of silently blanking the cost
+/// column.
 #[test]
 fn current_agent_models_are_priced_exactly() {
     for model in [

@@ -163,7 +163,8 @@ script:
 
 1. Finds the nightly's commit in the nightly feed. A nightly younger than 24 h
    is refused (`PROMOTE_MIN_SOAK_HOURS`, or `PROMOTE_FORCE=1`).
-2. Creates `stable/<version>` at that commit plus one version-bump commit, in
+2. Creates `stable/<version>` at that commit plus one version-bump commit
+   (which also syncs `diri-usage/prices.json` from LiteLLM), in
    `../dirijor-stable-<version>`, and pushes it. The push runs CI (`ci.yml`)
    and the Nightly workflow's signed Linux package jobs on the branch.
 3. Runs `release.sh <version>` there. When `origin/stable/<version>` exists,
@@ -191,7 +192,10 @@ packages keylessly (see [PACKAGING.md](PACKAGING.md#linux-signatures)).
 A release takes about five minutes from the bump to a published macOS build:
 
 1. Open a pull request that only bumps the `diri-app` version and lockfile,
-   based on the current `main`.
+   based on the current `main`. Run `diri/scripts/sync-model-prices.py` and
+   include any change to `diri-usage/prices.json`: `release.sh` refuses to
+   build when the bundled usage prices are behind LiteLLM's
+   (`SKIP_PRICE_CHECK=1` overrides).
 2. Check out that branch in a clean worktree and run
 
    ```sh

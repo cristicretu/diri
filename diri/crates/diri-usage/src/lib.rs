@@ -6,7 +6,7 @@
 use std::{collections::HashMap, sync::OnceLock};
 
 /// USD per million tokens, regenerated from LiteLLM by
-/// `diri/scripts/sync-model-prices.py` (the "Model prices" workflow).
+/// `diri/scripts/sync-model-prices.py` at release time (see UPDATING.md).
 const PRICES: &str = include_str!("../prices.json");
 /// Hand-kept rates for ids the generated table lacks. These win.
 const OVERRIDES: &str = include_str!("../price-overrides.json");

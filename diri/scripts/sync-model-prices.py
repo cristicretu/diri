@@ -1,11 +1,16 @@
 #!/usr/bin/env python3
 """Regenerate diri-usage/prices.json from LiteLLM's published price table.
 
+Run at release time: promote-nightly.sh folds it into its version-bump
+commits, and release.sh refuses to build when the bundled table is stale.
+
 Usage: sync-model-prices.py [--source PATH_OR_URL] [--check]
 
 Keeps first-party Anthropic and OpenAI chat models (no provider prefix), converts
 per-token USD to per-million, and writes a sorted, stable JSON file so a price
-change shows up as a one-line diff. --check exits 1 when the file would change.
+change shows up as a one-line diff. --check exits 3 when the file would
+change and 1 on any other failure, so release.sh can tell stale prices from
+an unreachable source.
 """
 
 import argparse
@@ -99,7 +104,8 @@ def main():
         print(f"{OUTPUT.name}: up to date ({len(models)} models)")
         return
     if args.check:
-        sys.exit(f"{OUTPUT.name} is stale; run diri/scripts/sync-model-prices.py")
+        print(f"{OUTPUT.name} is stale; run diri/scripts/sync-model-prices.py", file=sys.stderr)
+        sys.exit(3)
     OUTPUT.write_text(text)
     print(f"{OUTPUT.name}: wrote {len(models)} models")
 

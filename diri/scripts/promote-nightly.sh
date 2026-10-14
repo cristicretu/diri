@@ -14,7 +14,7 @@
 #      A nightly younger than PROMOTE_MIN_SOAK_HOURS (default 24) is refused
 #      unless PROMOTE_FORCE=1.
 #   2. Creates stable/<X.Y.Z> at that commit, plus one commit that bumps
-#      diri-app to X.Y.Z, in a worktree next to the main checkout
+#      diri-app to X.Y.Z and syncs model prices, in a worktree next to the main checkout
 #      (../dirijor-stable-<X.Y.Z>), and pushes the branch. The push runs CI and
 #      the Nightly workflow's signed Linux package jobs on the branch.
 #   3. Runs release.sh <X.Y.Z> from that worktree. release.sh sees
@@ -77,6 +77,15 @@ if count != 1:
     raise SystemExit("error: Cargo.lock has no diri-app entry")
 path.write_text(text)
 PY
+}
+
+# Refreshes <workspace>'s bundled model prices from LiteLLM. Prices only feed
+# cost estimates, so an unreachable source keeps the old table, not the release.
+sync_prices() {
+    if [ -f "$1/scripts/sync-model-prices.py" ]; then
+        python3 "$1/scripts/sync-model-prices.py" \
+            || log "warning: model price sync failed; keeping the bundled prices"
+    fi
 }
 
 # ----------------------------------------------------------------------------
@@ -164,6 +173,7 @@ else
     log "Creating $BRANCH at $COMMIT in $RELEASE_ROOT"
     git -C "$MAIN_REPO" worktree add --quiet -b "$BRANCH" "$RELEASE_ROOT" "$COMMIT"
     set_app_version "$RELEASE_ROOT/diri" "$VERSION"
+    sync_prices "$RELEASE_ROOT/diri"
     git -C "$RELEASE_ROOT" commit --quiet -am "Release $VERSION from nightly $NIGHTLY"
     git -C "$RELEASE_ROOT" push --quiet -u origin "$BRANCH"
     log "Pushed $BRANCH; CI and the Linux package jobs are starting on it"
@@ -192,6 +202,7 @@ if python3 -c 'import sys; a, b = (tuple(int(p) for p in v.split("-")[0].split("
     log "Opening a PR that bumps main from $MAIN_VERSION to $VERSION"
     git -C "$MAIN_REPO" worktree add --quiet -b "$BUMP_BRANCH" "$BUMP_ROOT" origin/main
     set_app_version "$BUMP_ROOT/diri" "$VERSION"
+    sync_prices "$BUMP_ROOT/diri"
     git -C "$BUMP_ROOT" commit --quiet -am "Bump diri-app to $VERSION after promoting $NIGHTLY"
     git -C "$BUMP_ROOT" push --quiet -u origin "$BUMP_BRANCH"
     gh pr create -R "$GH_REPO" --base main --head "$BUMP_BRANCH" \
