@@ -66,6 +66,7 @@ MONOGRAMS = {
     "crush": "C",
     "devin": "D",
     "droid": "Dr",
+    "fx": "fx",
     "hermes": "H",
     "maki": "M",
     "mcode": "Mc",

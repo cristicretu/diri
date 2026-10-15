@@ -1,0 +1,156 @@
+{
+  "_notice": "Launch and resume grammar verified against fx 0.0.13 (`fx --help`) and the official CLI source at https://github.com/vercel-labs/fx. Screen predicates are a fallback for fx's native OSC 7501 program-status reports.",
+  "schemaVersion": 2,
+  "id": "fx",
+  "version": "2026.10.15.1",
+  "statusModel": "full",
+  "agent": {
+    "id": "fx",
+    "displayName": "fx",
+    "shortLabel": "fx",
+    "glyph": "ƒ",
+    "aliases": [
+      "fx",
+      "fx-cli"
+    ],
+    "firstClass": true,
+    "setup": {
+      "url": "https://fx.sh/docs",
+      "installHint": "Install fx with its official setup script.",
+      "signInHint": "Run fx login, fx login codex, or fx login grok.",
+      "installCommand": "curl -fsSL https://fx.sh/setup.sh | bash"
+    },
+    "statusAuthority": "screen",
+    "binary": "fx",
+    "resume": {
+      "style": "flag",
+      "token": "resume"
+    },
+    "conversation": {
+      "resume": {
+        "latestArgs": [
+          "resume",
+          "last"
+        ]
+      },
+      "stripArgs": [
+        {
+          "token": "resume",
+          "value": "nonoption"
+        },
+        {
+          "token": "--resume",
+          "value": "nonoption"
+        },
+        {
+          "token": "--resume-last"
+        },
+        {
+          "token": "--continue"
+        },
+        {
+          "token": "-c"
+        },
+        {
+          "token": "-r"
+        }
+      ]
+    },
+    "_resumeNotice": "fx supports exact IDs with `fx resume <id>`, but it does not accept a caller-minted ID or expose a fresh session ID to Diri. Diri therefore uses the documented `fx resume last` form for the current workspace.",
+    "returnToLoginShell": true,
+    "foregroundExecNames": [
+      "fx"
+    ],
+    "approve": {
+      "text": "",
+      "submit": true
+    },
+    "deny": {
+      "text": "\u001b",
+      "submit": false
+    },
+    "envScrubPrefixes": [
+      "DIRI_",
+      "DIRIJOR_"
+    ]
+  },
+  "_statusNotice": "fx 0.0.13 reports working, blocked permission/question/auth, idle, done, and error through OSC 7501. Diri treats those records as authoritative. These source-verified footer rules preserve useful state detection if a terminal path strips the reports.",
+  "rules": [
+    {
+      "id": "blocked-permission-panel",
+      "state": "blockedPermission",
+      "priority": 400,
+      "region": "bottom_non_empty_lines",
+      "regionLines": 20,
+      "when": {
+        "lineRegex": "^\\s*Permission needed · (Choose one|Review (file|change))\\s*$"
+      },
+      "flags": [
+        "visible_blocker"
+      ],
+      "capture": {
+        "region": "bottom_non_empty_lines",
+        "regionLines": 20,
+        "maxChars": 400
+      }
+    },
+    {
+      "id": "blocked-question-panel",
+      "state": "blockedQuestion",
+      "priority": 390,
+      "region": "bottom_non_empty_lines",
+      "regionLines": 20,
+      "when": {
+        "all": [
+          {
+            "contains": "enter answer"
+          },
+          {
+            "contains": "esc cancel"
+          }
+        ]
+      },
+      "flags": [
+        "visible_blocker"
+      ],
+      "capture": {
+        "region": "bottom_non_empty_lines",
+        "regionLines": 20,
+        "maxChars": 400
+      }
+    },
+    {
+      "id": "working-activity",
+      "state": "working",
+      "priority": 100,
+      "region": "bottom_non_empty_lines",
+      "regionLines": 12,
+      "when": {
+        "lineRegex": "^\\s*[•▲]?\\s*(Thinking|Generating|Running|Preparing compaction|Compacting|Stopping compaction)(\\s*\\(|\\s*$)"
+      },
+      "flags": [
+        "turn_started"
+      ]
+    },
+    {
+      "id": "idle-composer",
+      "state": "idle",
+      "priority": 50,
+      "region": "bottom_non_empty_lines",
+      "regionLines": 8,
+      "when": {
+        "all": [
+          {
+            "lineRegex": "^\\s*─{10,}\\s*$"
+          },
+          {
+            "lineRegex": "^\\s*❯.*$"
+          }
+        ]
+      },
+      "flags": [
+        "stale_after_submit"
+      ]
+    }
+  ]
+}

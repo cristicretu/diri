@@ -86,6 +86,7 @@ marks![
     "crush",
     "devin",
     "droid",
+    "fx",
     "goose",
     "grok",
     "hermes",
