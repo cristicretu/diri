@@ -370,7 +370,7 @@ mod tests {
 
         // The whole catalog, by name. A shrunken catalog does not error: a
         // missing agent just spawns as a bare login shell, which is how this
-        // shipped broken once already. Spelling out all twenty-three ids means a
+        // shipped broken once already. Spelling out all twenty-four ids means a
         // dropped manifest fails here instead of in someone's terminal.
         let mut ids = engine.ids();
         ids.sort_unstable();
@@ -387,6 +387,7 @@ mod tests {
                 "cursor",
                 "devin",
                 "droid",
+                "fx",
                 "gemini",
                 "generic",
                 "grok",
@@ -411,7 +412,7 @@ mod tests {
             .into_iter()
             .map(|id| engine.manifest(id).expect("manifest").rules.len())
             .sum();
-        assert_eq!(rules, 135, "the shipped ruleset lost rules");
+        assert_eq!(rules, 139, "the shipped ruleset lost rules");
 
         for id in engine.ids() {
             let expected_empty = matches!(id, "shell" | "generic");
@@ -427,7 +428,7 @@ mod tests {
     /// decodes it as `diri_proto::AgentDescriptor`. That type needs `id` and
     /// `displayName`, and a single manifest missing either fails the *whole*
     /// response — leaving the client with no catalog and every agent spawning
-    /// as a bare shell. Decode all twenty-three the way the client will.
+    /// as a bare shell. Decode all twenty-four the way the client will.
     #[test]
     fn every_shipped_descriptor_decodes_the_way_the_client_decodes_it() {
         let engine = engine();
@@ -1983,6 +1984,53 @@ mod tests {
     }
 
     #[test]
+    fn fx_fallback_rules_cover_permissions_questions_work_and_idle() {
+        let engine = engine();
+        let cases = [
+            (
+                vec![
+                    "Permission needed · Choose one",
+                    "  ❯ 1  Run once",
+                    "    2  Run + allow for this session",
+                    "    3  Don't run",
+                    "1–3 choose now    ↑↓ or tab options    enter confirm    esc cancel",
+                ],
+                ManifestState::BlockedPermission,
+            ),
+            (
+                vec![
+                    "  Which checks should run?",
+                    "    1) Unit tests",
+                    "    2) Full suite",
+                    "1–2 choose now    ↑↓ options    tab questions    enter answer    esc cancel",
+                ],
+                ManifestState::BlockedQuestion,
+            ),
+            (
+                vec![
+                    "• Thinking (3s)",
+                    "────────────────",
+                    "❯",
+                    "────────────────",
+                    "auto · gpt-5",
+                ],
+                ManifestState::Working,
+            ),
+            (
+                vec!["────────────────", "❯", "────────────────", "auto · gpt-5"],
+                ManifestState::Idle,
+            ),
+        ];
+
+        for (lines, expected) in cases {
+            let observation = engine
+                .evaluate(&ScreenSnapshot::from_lines(lines), "fx")
+                .expect("fx rule");
+            assert_eq!(observation.state, expected);
+        }
+    }
+
+    #[test]
     fn first_class_agents_ship_verified_official_setup_links() {
         let engine = engine();
         let mut first_class_count = 0;
@@ -2069,6 +2117,11 @@ mod tests {
             (
                 "codex",
                 "curl -fsSL https://chatgpt.com/codex/install.sh | sh",
+                None,
+            ),
+            (
+                "fx",
+                "curl -fsSL https://fx.sh/setup.sh | bash",
                 None,
             ),
             (

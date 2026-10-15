@@ -921,7 +921,7 @@ mod tests {
         );
     }
 
-    /// Twenty of the twenty-three shipped manifests declare `returnToLoginShell`;
+    /// Twenty-one of the twenty-four shipped manifests declare `returnToLoginShell`;
     /// only `cursor` and the two command-less manifests do not. The
     /// flag has been lost wholesale once already, so assert the whole set
     /// rather than a sample: a port that drops it fails here.
@@ -954,6 +954,7 @@ mod tests {
                 "copilot",
                 "devin",
                 "droid",
+                "fx",
                 "gemini",
                 "grok",
                 "hermes",
@@ -1351,6 +1352,11 @@ mod tests {
         assert_eq!(
             descriptor("codex").resume_args(None),
             Some(vec!["resume".into(), "--last".into()])
+        );
+        assert_eq!(
+            descriptor("fx").resume_args(None),
+            Some(vec!["resume".into(), "last".into()]),
+            "fx resumes the latest session in the current workspace"
         );
     }
 
