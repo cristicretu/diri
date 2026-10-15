@@ -76,6 +76,7 @@ pub fn agent_display_name(kind_id: &str) -> String {
         "claude-code" | "claude" => "Claude Code".to_owned(),
         "codex" => "Codex".to_owned(),
         "cursor" => "Cursor".to_owned(),
+        "fx" => "fx".to_owned(),
         "gemini" => "Gemini".to_owned(),
         "opencode" => "OpenCode".to_owned(),
         "whipcode" => "WhipCode".to_owned(),
