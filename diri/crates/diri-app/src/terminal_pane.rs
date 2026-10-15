@@ -689,6 +689,7 @@ struct ResidentTerminal {
 /// A visible pane whose live session has shown nothing this long after it
 /// was mounted records `pane.blank`: the "session does not render" bug.
 const PANE_BLANK_AFTER: Duration = Duration::from_secs(10);
+const SUBMIT_AFTER_PASTE: Duration = Duration::from_millis(80);
 
 /// How long a pane suspected blank has to draw the frame it was asked for.
 /// A pane no frame draws in this time is not on screen.
@@ -3896,6 +3897,21 @@ impl TerminalPane {
             record("review", "text", text.len(), bracketed);
             return;
         }
+        // "… send to agent" at the end of a dictated answer submits it.
+        // When the voice listener heard the phrase, Wispr Flow's paste is
+        // the answer even if the phrase itself was cut off.
+        let submission = if crate::voice::take_armed_submit(&id) {
+            Some(crate::voice::heard_submission(&text).to_owned())
+        } else {
+            self.runtime
+                .store
+                .read()
+                .expect("session store lock poisoned")
+                .preferences()
+                .talk_dictation
+                .then(|| crate::voice::dictated_submission(&text).map(str::to_owned))
+                .flatten()
+        };
         let now = self.started_at.elapsed();
         let Some(resident) = self.residents.get_mut(&id) else {
             record("no_terminal", "text", text.len(), bracketed);
@@ -3921,6 +3937,21 @@ impl TerminalPane {
                 resident.element.set_find_highlights(Vec::new());
             }
             self.schedule_query_search(id, window, cx);
+        } else if let Some(message) = submission {
+            if !message.is_empty() {
+                resident.send_user_input(terminal_paste(&message, resident.bracketed_paste));
+            }
+            // Enter a beat after the paste, so the agent takes it as a submit
+            // rather than part of the pasted text.
+            cx.spawn(async move |this, cx| {
+                cx.background_executor().timer(SUBMIT_AFTER_PASTE).await;
+                let _ = this.update(cx, |this, _| {
+                    if let Some(resident) = this.residents.get(&id) {
+                        resident.send_user_input(b"\r".to_vec());
+                    }
+                });
+            })
+            .detach();
         } else {
             resident.send_user_input(terminal_paste(&text, resident.bracketed_paste));
         }

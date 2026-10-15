@@ -142,5 +142,8 @@
   "toast.workspace_layout_changed_resize": "The layout changed mid-resize. Try again.",
   "toast.workspace_open_to_arrange": "Open a workspace to arrange its panes",
   "toast.workspace_rejected": "Workspace change wasn’t saved",
-  "toast.workspace_target_gone": "That target is gone. Open the palette to pick again."
+  "toast.workspace_target_gone": "That target is gone. Open the palette to pick again.",
+  "voice.finished": "{title} finished.",
+  "voice.reading": "{title}. {text}",
+  "voice.sample": "This is how Diri will read your agent’s replies."
 }

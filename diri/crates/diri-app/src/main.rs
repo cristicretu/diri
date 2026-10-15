@@ -99,6 +99,7 @@ mod tooltip_warmth;
 pub mod transcript;
 pub mod updates;
 pub mod usage;
+mod voice;
 mod whats_new;
 mod window_chrome;
 mod window_restore;

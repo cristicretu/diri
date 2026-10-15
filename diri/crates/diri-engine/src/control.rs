@@ -3428,6 +3428,7 @@ impl ControlServer {
             return Ok(json!({}));
         };
         let session_end = p.kind == "claude-hook" && p.event.as_deref() == Some("SessionEnd");
+        let prompt = p.kind == "claude-hook" && p.event.as_deref() == Some("UserPromptSubmit");
         // Never wait on the Registry here: the Agent is blocked on this reply.
         self.hook_reports
             .submit(
@@ -3441,6 +3442,9 @@ impl ControlServer {
                 },
             )
             .map_err(poisoned)?;
+        if prompt && talk_with_agent_enabled() {
+            return Ok(json!({ "additionalContext": diri_proto::voice::SPOKEN_INSTRUCTION }));
+        }
         Ok(json!({}))
     }
 
@@ -6950,6 +6954,14 @@ fn verification_probe(prompt: &str, before: &str) -> Option<String> {
 /// composer breaks mid-word.
 const MIN_PROBE_CHARS: usize = 4;
 const MAX_PROBE_CHARS: usize = 20;
+
+/// "Talk with your agent" is an app preference; the Engine reads it from the
+/// app's file on each prompt so turning it off takes effect on the next one.
+fn talk_with_agent_enabled() -> bool {
+    std::env::var_os("HOME")
+        .and_then(|home| std::fs::read(diri_proto::paths::DirijorPaths::prefs_file(home)).ok())
+        .is_some_and(|prefs| diri_proto::voice::talk_with_agent_enabled(&prefs))
+}
 
 #[cfg(test)]
 mod tests {

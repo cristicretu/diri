@@ -142,5 +142,8 @@
   "toast.workspace_layout_changed_resize": "调整大小过程中布局已更改。请重试。",
   "toast.workspace_open_to_arrange": "打开一个工作区来排列其窗格",
   "toast.workspace_rejected": "工作区更改未保存",
-  "toast.workspace_target_gone": "该目标已不存在。打开命令面板重新选择。"
+  "toast.workspace_target_gone": "该目标已不存在。打开命令面板重新选择。",
+  "voice.finished": "{title} 已完成。",
+  "voice.reading": "{title}。{text}",
+  "voice.sample": "Diri 会用这个声音朗读智能体的回复。"
 }

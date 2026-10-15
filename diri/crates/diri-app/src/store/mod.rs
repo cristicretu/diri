@@ -504,6 +504,8 @@ pub struct SessionStore {
     /// Text terminal programs copied with OSC 52, for the application to put
     /// on the system clipboard.
     terminal_clipboard: broadcast::Sender<String>,
+    /// Turns that just finished, for reading the reply aloud (`voice`).
+    turn_completions: broadcast::Sender<crate::voice::TurnCompletion>,
     effects: mpsc::UnboundedSender<StoreEffect>,
 }
 
@@ -599,6 +601,7 @@ impl SessionStore {
                 notification_feed,
                 attention_wake: Arc::new(Notify::new()),
                 terminal_clipboard: broadcast::channel(4).0,
+                turn_completions: broadcast::channel(8).0,
                 effects,
             },
             receiver,
@@ -611,6 +614,10 @@ impl SessionStore {
 
     pub fn terminal_clipboard_writes(&self) -> broadcast::Receiver<String> {
         self.terminal_clipboard.subscribe()
+    }
+
+    pub fn turn_completions(&self) -> broadcast::Receiver<crate::voice::TurnCompletion> {
+        self.turn_completions.subscribe()
     }
 
     /// Relays an OSC 52 copy while the user is in Diri. A write from a session
@@ -2046,6 +2053,15 @@ impl SessionStore {
         {
             self.notification_change(Vec::new());
             self.attention_wake.notify_one();
+        }
+        if self.prefs.talk_with_agent
+            && !self.closing.contains(&id)
+            && let Some(turn) = crate::voice::completed_turn(previous.as_deref(), current)
+        {
+            let _ = self.turn_completions.send(crate::voice::TurnCompletion {
+                session_id: id.clone(),
+                turn,
+            });
         }
         // Spawn selects the id before the authoritative record arrives, and
         // only focus_session grants terminal residency -- without this, a

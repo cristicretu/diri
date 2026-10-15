@@ -171,6 +171,14 @@ for helper in dirijor dirijor-mcp; do
     fi
 done
 
+# The "Talk with your agent" helper needs Xcode 26's SDK. Without it the app
+# still reads replies aloud, with a plain cut instead of the on-device digest.
+voice_helper="${target_dir}/diri-voice/diri-voice"
+if ! "${workspace_dir}/scripts/build-voice-helper.sh" "${voice_helper}" >/dev/null; then
+    echo "==> Skipping diri-voice; Talk with your agent falls back to plain readings"
+    voice_helper=""
+fi
+
 # Every invocation gets a fresh bundle. Replacing a bundle beneath a still-
 # running process invalidates its code signature, which is especially easy to
 # do when judging two builds side by side.
@@ -203,6 +211,8 @@ cat > "${contents}/Info.plist" <<PLIST
     <key>LSMinimumSystemVersion</key><string>15.0</string>
     <key>NSHighResolutionCapable</key><true/>
     <key>NSPrincipalClass</key><string>NSApplication</string>
+    <key>NSMicrophoneUsageDescription</key><string>diri listens for the end of your spoken answer to an agent, on this Mac, when Talk with your agent is on.</string>
+    <key>NSSpeechRecognitionUsageDescription</key><string>diri recognizes “send to agent” on this Mac to end and send a spoken answer.</string>
 </dict>
 </plist>
 PLIST
@@ -222,6 +232,9 @@ launch_environment=(
 )
 if [[ -n "${settings_preview}" ]]; then
     launch_environment+=("DIRI_SETTINGS_PREVIEW=${settings_preview}")
+fi
+if [[ -n "${voice_helper}" ]]; then
+    launch_environment+=("DIRI_VOICE_PATH=${voice_helper}")
 fi
 
 # The Rust app fail-closes unless Hello reports engineKind=diri-rust-engine.

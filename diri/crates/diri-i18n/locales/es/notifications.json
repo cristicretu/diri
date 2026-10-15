@@ -142,5 +142,8 @@
   "toast.workspace_layout_changed_resize": "La disposición cambió al redimensionar. Inténtalo de nuevo.",
   "toast.workspace_open_to_arrange": "Abre un espacio de trabajo para organizar sus paneles",
   "toast.workspace_rejected": "No se guardó el cambio del espacio de trabajo",
-  "toast.workspace_target_gone": "Ese destino ya no está. Abre la paleta para elegir de nuevo."
+  "toast.workspace_target_gone": "Ese destino ya no está. Abre la paleta para elegir de nuevo.",
+  "voice.finished": "{title} terminó.",
+  "voice.reading": "{title}. {text}",
+  "voice.sample": "Así leerá Diri las respuestas de tu agente."
 }

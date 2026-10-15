@@ -135,6 +135,7 @@ enum SettingsMenu {
     UpdateChannel,
     InterfaceStyle,
     PaneDensity,
+    TalkVoice,
 }
 
 /// Update channels, in menu order.
@@ -499,6 +500,9 @@ pub struct UtilitySurfaces {
     terminal_font_families: std::rc::Rc<[String]>,
     /// The listing that picker opening started, off the main thread.
     terminal_font_listing: Option<Task<()>>,
+    /// Voices for "Talk with your agent", read from the helper when the
+    /// menu opens.
+    talk_voices: Vec<crate::voice::VoiceOption>,
     skills: gpui::Entity<crate::skills_page::SkillsPage>,
     schedules: gpui::Entity<crate::schedules_page::SchedulesPage>,
     accounts: AccountsState,
@@ -833,6 +837,7 @@ impl UtilitySurfaces {
             show_version_picker: false,
             terminal_font_families: std::rc::Rc::from([]),
             terminal_font_listing: None,
+            talk_voices: Vec::new(),
             activity: "Connected client · shared daemon remains untouched".to_owned(),
             diagnostics_report,
             privacy: Default::default(),
@@ -3734,6 +3739,189 @@ impl UtilitySurfaces {
         )
     }
 
+    fn voice_settings(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let colors = self.settings_colors();
+        #[cfg(target_os = "macos")]
+        let wispr = crate::voice::wispr_flow_installed();
+        #[cfg(not(target_os = "macos"))]
+        let wispr = false;
+        setting_section(
+            t("settings.general.voice"),
+            div()
+                .flex()
+                .flex_col()
+                .child(toggle_row(
+                    t("settings.general.talk"),
+                    t("settings.general.talk_detail"),
+                    self.prefs.talk_with_agent,
+                    "toggle-talk-with-agent",
+                    colors,
+                    cx,
+                    |this, cx| {
+                        let enabled = !this.prefs.talk_with_agent;
+                        this.update_prefs(move |prefs| prefs.talk_with_agent = enabled);
+                        cx.notify();
+                    },
+                ))
+                .when(
+                    cfg!(target_os = "macos") && self.prefs.talk_with_agent,
+                    |section| {
+                        section.child(setting_divider(colors)).child(setting_row(
+                            t("settings.general.talk_voice"),
+                            t("settings.general.talk_voice_detail"),
+                            self.talk_voice_dropdown(cx),
+                            colors,
+                        ))
+                    },
+                )
+                .when(wispr && self.prefs.talk_with_agent, |section| {
+                    section.child(setting_divider(colors)).child(toggle_row(
+                        t("settings.general.talk_dictation"),
+                        t("settings.general.talk_dictation_detail"),
+                        self.prefs.talk_dictation,
+                        "toggle-talk-dictation",
+                        colors,
+                        cx,
+                        |this, cx| {
+                            let enabled = !this.prefs.talk_dictation;
+                            this.update_prefs(move |prefs| prefs.talk_dictation = enabled);
+                            cx.notify();
+                        },
+                    ))
+                }),
+            colors,
+        )
+    }
+
+    #[cfg(target_os = "macos")]
+    fn load_talk_voices(&mut self, cx: &mut Context<Self>) {
+        let language = crate::i18n::resolve(self.prefs.ui_language).tag();
+        cx.spawn(async move |this, cx| {
+            let voices = cx
+                .background_spawn(async move { crate::voice::installed_voices(language) })
+                .await;
+            let _ = this.update(cx, |this, cx| {
+                this.talk_voices = voices;
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    /// Plays a sample of a newly chosen voice. A Kokoro voice is downloaded
+    /// first, its progress shown in the menu, and played once it is ready.
+    #[cfg(target_os = "macos")]
+    fn choose_talk_voice(&mut self, id: &str, cx: &mut Context<Self>) {
+        use crate::voice::KokoroState;
+        crate::voice::ensure_kokoro(id);
+        if !matches!(
+            crate::voice::kokoro_state(id),
+            Some(KokoroState::Downloading(_))
+        ) {
+            crate::voice::preview_voice(id, t("voice.sample"));
+            return;
+        }
+        let id = id.to_owned();
+        cx.spawn(async move |this, cx| {
+            loop {
+                cx.background_executor()
+                    .timer(Duration::from_millis(300))
+                    .await;
+                if this.update(cx, |_, cx| cx.notify()).is_err() {
+                    return;
+                }
+                match crate::voice::kokoro_state(&id) {
+                    Some(KokoroState::Downloading(_)) => continue,
+                    Some(KokoroState::Ready) => {
+                        let still_chosen = this
+                            .update(cx, |this, _| this.prefs.talk_voice == id)
+                            .unwrap_or(false);
+                        if still_chosen {
+                            crate::voice::preview_voice(&id, t("voice.sample"));
+                        }
+                        return;
+                    }
+                    _ => return,
+                }
+            }
+        })
+        .detach();
+    }
+
+    fn talk_voice_label(&self, id: &str) -> String {
+        if id.is_empty() {
+            return t("settings.general.talk_voice_automatic").to_string();
+        }
+        match self.talk_voices.iter().find(|voice| voice.id == id) {
+            Some(voice) => talk_voice_option_label(voice),
+            None => crate::voice::voice_name_from_id(id),
+        }
+    }
+
+    fn talk_voice_dropdown(&self, cx: &mut Context<Self>) -> AnyElement {
+        let colors = self.settings_colors();
+        let open = self.settings_menu == Some(SettingsMenu::TalkVoice);
+        let mut control = div()
+            .relative()
+            .min_w(px(154.0))
+            .child(settings_select_button(
+                self.talk_voice_label(&self.prefs.talk_voice),
+                "talk-voice-dropdown",
+                open,
+                SettingsMenu::TalkVoice,
+                colors,
+                cx,
+            ));
+        if open {
+            control = control.child(self.settings_menu_host(cx));
+        }
+        control.into_any_element()
+    }
+
+    fn talk_voice_options(&self, colors: SemanticColors, cx: &mut Context<Self>) -> AnyElement {
+        let mut options = div()
+            .id("talk-voice-options")
+            .max_h(px(300.0))
+            .overflow_y_scroll()
+            .p(px(4.0))
+            .flex()
+            .flex_col();
+        let choices = std::iter::once(String::new())
+            .chain(self.talk_voices.iter().map(|voice| voice.id.clone()));
+        for (index, id) in choices.enumerate() {
+            let label = self.talk_voice_label(&id);
+            options = options.child(settings_choice_row(
+                format!("talk-voice-option-{index}"),
+                label,
+                id == self.prefs.talk_voice,
+                colors,
+                cx,
+                move |this, cx| {
+                    this.settings_menu = None;
+                    let voice = id.clone();
+                    #[cfg(target_os = "macos")]
+                    this.choose_talk_voice(&voice, cx);
+                    this.update_prefs(move |prefs| prefs.talk_voice = voice);
+                    cx.notify();
+                },
+            ));
+        }
+        options = options.child(settings_choice_row(
+            "talk-voice-more",
+            t("settings.general.talk_voice_more"),
+            false,
+            colors,
+            cx,
+            |this, cx| {
+                this.settings_menu = None;
+                #[cfg(target_os = "macos")]
+                crate::voice::open_voice_downloads();
+                cx.notify();
+            },
+        ));
+        options.into_any_element()
+    }
+
     fn general_settings(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let colors = self.settings_colors();
         settings_page(
@@ -3827,6 +4015,9 @@ impl UtilitySurfaces {
                         )),
                     colors,
                 ))
+                .when(cfg!(target_os = "macos"), |page| {
+                    page.child(self.voice_settings(cx))
+                })
                 .child(self.import_settings(cx))
                 .child(self.update_settings(cx))
                 .child(setting_section(
@@ -4963,6 +5154,7 @@ impl UtilitySurfaces {
             SettingsMenu::UpdateChannel => (self.update_channel_options(colors, cx), 132.0),
             SettingsMenu::InterfaceStyle => (self.interface_style_options(colors, cx), 172.0),
             SettingsMenu::PaneDensity => (self.pane_density_options(colors, cx), 172.0),
+            SettingsMenu::TalkVoice => (self.talk_voice_options(colors, cx), 400.0),
         })
     }
 
@@ -8484,6 +8676,42 @@ fn settings_stepper(
         .into_any_element()
 }
 
+/// "Zoe · English (United States) · Premium": names repeat across accents,
+/// and quality is what separates a natural voice from a robotic one.
+fn talk_voice_option_label(voice: &crate::voice::VoiceOption) -> String {
+    let quality = match voice.quality {
+        4 => Some("Kokoro"),
+        3 => Some(t("settings.general.talk_voice_premium")),
+        2 => Some(t("settings.general.talk_voice_enhanced")),
+        _ => None,
+    };
+    let mut label = match quality {
+        Some(quality) => format!("{} · {} · {quality}", voice.name, voice.language_name),
+        None => format!("{} · {}", voice.name, voice.language_name),
+    };
+    #[cfg(target_os = "macos")]
+    {
+        use crate::voice::KokoroState;
+        let state = match crate::voice::kokoro_state(&voice.id) {
+            Some(KokoroState::Missing) => {
+                Some(t("settings.general.talk_voice_not_downloaded").to_string())
+            }
+            Some(KokoroState::Downloading(percent)) => Some(tf(
+                "settings.general.talk_voice_downloading",
+                &[("percent", &percent.to_string())],
+            )),
+            Some(KokoroState::Failed) => {
+                Some(t("settings.general.talk_voice_download_failed").to_string())
+            }
+            Some(KokoroState::Ready) | None => None,
+        };
+        if let Some(state) = state {
+            label = format!("{label} · {state}");
+        }
+    }
+    label
+}
+
 fn settings_select_button(
     label: impl Into<SharedString>,
     id: impl Into<SharedString>,
@@ -8519,6 +8747,11 @@ fn settings_select_button(
                 // Read on open, so a font installed while diri runs shows up;
                 // the last listing shows meanwhile.
                 this.refresh_terminal_font_families(cx);
+            }
+            #[cfg(target_os = "macos")]
+            if this.settings_menu == Some(SettingsMenu::TalkVoice) {
+                // Also on open, so a voice downloaded meanwhile shows up.
+                this.load_talk_voices(cx);
             }
             cx.notify();
         }))
@@ -9171,8 +9404,12 @@ mod tests {
             cx.set_reduce_motion(true);
         });
 
+        let height = std::env::var("DIRI_VISUAL_HEIGHT")
+            .ok()
+            .and_then(|value| value.parse::<f32>().ok())
+            .unwrap_or(800.0);
         let window = cx
-            .open_window(size(px(1200.0), px(800.0)), move |window, cx| {
+            .open_window(size(px(1200.0), px(height)), move |window, cx| {
                 // Exercise the requested destination from a sidebar the user
                 // had previously widened. Remote remains the default capture.
                 let harness = cx.new(|cx| SettingsWorkbenchHarness::open_at(tab, window, cx));
@@ -9180,6 +9417,32 @@ mod tests {
                     harness
                         .sidebar
                         .update(cx, |sidebar, cx| sidebar.set_width(320.0, cx));
+                    // `DIRI_VISUAL_TALK` turns on "Talk with your agent" and
+                    // opens its Voice menu over a fixed list of voices.
+                    if std::env::var_os("DIRI_VISUAL_TALK").is_some() {
+                        harness.surfaces.update(cx, |surfaces, cx| {
+                            surfaces.prefs.talk_with_agent = true;
+                            surfaces.prefs.talk_dictation = true;
+                            surfaces.prefs.talk_voice = "kokoro:af_heart".into();
+                            let voice = |id: &str, name: &str, language: &str, quality| {
+                                crate::voice::VoiceOption {
+                                    id: id.into(),
+                                    name: name.into(),
+                                    language_name: language.into(),
+                                    quality,
+                                }
+                            };
+                            surfaces.talk_voices = vec![
+                                voice("kokoro:af_heart", "Heart", "English (United States)", 4),
+                                voice("kokoro:af_bella", "Bella", "English (United States)", 4),
+                                voice("kokoro:bm_george", "George", "English (United Kingdom)", 4),
+                                voice("com.apple.voice.premium.en-US.Zoe", "Zoe", "English (United States)", 3),
+                                voice("com.apple.voice.compact.en-US.Samantha", "Samantha", "English (United States)", 1),
+                            ];
+                            surfaces.settings_menu = Some(SettingsMenu::TalkVoice);
+                            cx.notify();
+                        });
+                    }
                 });
                 harness
             })

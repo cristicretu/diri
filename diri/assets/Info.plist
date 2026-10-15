@@ -71,6 +71,10 @@
     <true/>
     <key>NSPrincipalClass</key>
     <string>NSApplication</string>
+    <key>NSMicrophoneUsageDescription</key>
+    <string>diri listens for the end of your spoken answer to an agent, on this Mac, when Talk with your agent is on.</string>
+    <key>NSSpeechRecognitionUsageDescription</key>
+    <string>diri recognizes “send to agent” on this Mac to end and send a spoken answer.</string>
     <key>NSUserNotificationAlertStyle</key>
     <string>alert</string>
     <key>NSUserNotificationUsageDescription</key>

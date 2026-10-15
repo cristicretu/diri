@@ -396,6 +396,17 @@ pub struct Prefs {
     pub confirm_before_closing_session: bool,
     pub status_sounds: bool,
     pub status_notifications: bool,
+    /// Read the relevant part of a finished turn's reply aloud (`crate::voice`).
+    #[serde(default)]
+    pub talk_with_agent: bool,
+    /// After a reading, start Wispr Flow's hands-free dictation for the
+    /// session in front of the user.
+    #[serde(default)]
+    pub talk_dictation: bool,
+    /// The system voice for readings, by identifier; empty picks the best
+    /// installed voice for each reply's language.
+    #[serde(default)]
+    pub talk_voice: String,
     pub muted_notification_sessions: std::collections::BTreeSet<String>,
     /// Names the user gave conversations, by the Agent's own conversation id.
     /// History reads them after the tab that carried the rename has closed:
@@ -563,6 +574,9 @@ impl Default for Prefs {
             confirm_before_closing_session: true,
             status_sounds: true,
             status_notifications: true,
+            talk_with_agent: false,
+            talk_dictation: false,
+            talk_voice: String::new(),
             muted_notification_sessions: Default::default(),
             conversation_titles: BTreeMap::new(),
             automatic_updates: true,

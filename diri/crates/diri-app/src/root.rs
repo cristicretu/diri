@@ -1103,6 +1103,10 @@ impl RootView {
             menu_bar.refresh();
         }
         crate::application_notifications::install(services.clone(), preview, preview_scenario, cx);
+        #[cfg(target_os = "macos")]
+        if !preview {
+            crate::voice::install(Arc::clone(&services.store));
+        }
         // Once, the first time a build that records runs: say so, and where
         // to turn it off. The standard toast, held a little longer.
         if !preview && crate::telemetry::take_first_run_notice() {
