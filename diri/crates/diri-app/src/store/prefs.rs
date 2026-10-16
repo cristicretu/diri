@@ -30,6 +30,49 @@ impl UiLanguage {
     }
 }
 
+/// Who listens for a spoken answer after a reading.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum TalkAnswer {
+    /// Wispr Flow's hands-free dictation, through its URL scheme.
+    #[default]
+    WisprFlow,
+    /// Diri's own on-device recognition: the answer is sent to the agent
+    /// directly, so no window needs to be in front.
+    Diri,
+    /// Any dictation app (macOS Dictation, Superwhisper, …), started and
+    /// stopped by pressing its shortcut.
+    Shortcut,
+}
+
+/// A recorded shortcut: its label as Diri writes shortcuts (`cmd-alt-d`)
+/// and the macOS virtual key code to press.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DictationShortcut {
+    pub label: String,
+    pub key_code: u16,
+}
+
+impl DictationShortcut {
+    /// The modifiers in the label, as `diri-voice press` takes them.
+    pub fn modifiers(&self) -> Vec<&'static str> {
+        let parts: Vec<&str> = self.label.split('-').collect();
+        let held = &parts[..parts.len().saturating_sub(1)];
+        [
+            ("cmd", "cmd"),
+            ("ctrl", "ctrl"),
+            ("alt", "alt"),
+            ("shift", "shift"),
+            ("fn", "fn"),
+        ]
+        .into_iter()
+        .filter(|(name, _)| held.contains(name))
+        .map(|(_, flag)| flag)
+        .collect()
+    }
+}
+
 impl Serialize for UiLanguage {
     fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
         serializer.serialize_str(self.tag())
@@ -404,9 +447,21 @@ pub struct Prefs {
     #[serde(default)]
     pub talk_dictation: bool,
     /// The system voice for readings, by identifier; empty picks the best
-    /// installed voice for each reply's language.
+    /// installed voice for each reply's language; `command` pipes readings
+    /// to [`Self::talk_voice_command`].
     #[serde(default)]
     pub talk_voice: String,
+    /// A shell command that speaks its standard input, for any TTS a user
+    /// has (`say -v Ava`, Piper, a script calling a speech API).
+    #[serde(default)]
+    pub talk_voice_command: String,
+    /// What takes the spoken answer when [`Self::talk_dictation`] is on.
+    #[serde(default)]
+    pub talk_answer: TalkAnswer,
+    /// The start/stop shortcut of the user's dictation app, for
+    /// [`TalkAnswer::Shortcut`].
+    #[serde(default)]
+    pub talk_answer_shortcut: Option<DictationShortcut>,
     pub muted_notification_sessions: std::collections::BTreeSet<String>,
     /// Names the user gave conversations, by the Agent's own conversation id.
     /// History reads them after the tab that carried the rename has closed:
@@ -577,6 +632,9 @@ impl Default for Prefs {
             talk_with_agent: false,
             talk_dictation: false,
             talk_voice: String::new(),
+            talk_voice_command: String::new(),
+            talk_answer: TalkAnswer::default(),
+            talk_answer_shortcut: None,
             muted_notification_sessions: Default::default(),
             conversation_titles: BTreeMap::new(),
             automatic_updates: true,

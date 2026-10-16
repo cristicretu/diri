@@ -39,9 +39,9 @@ use crate::switcher::{
 };
 
 pub use prefs::{
-    FileEditor, InspectorTab, InterfaceStyle, NewAgentStart, PaneDensity, Prefs, SavedWindow,
-    SidebarGrouping, SidebarOrdering, TabOrientation, UiLanguage, WindowMaterial, WindowMode,
-    WindowPlacement,
+    DictationShortcut, FileEditor, InspectorTab, InterfaceStyle, NewAgentStart, PaneDensity, Prefs,
+    SavedWindow, SidebarGrouping, SidebarOrdering, TabOrientation, TalkAnswer, UiLanguage,
+    WindowMaterial, WindowMode, WindowPlacement,
 };
 pub use projection::{SidebarProject, SidebarProjection, SidebarRow};
 pub use residency::{ResidencyUpdate, TerminalResidency};

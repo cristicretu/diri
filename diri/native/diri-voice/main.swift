@@ -24,6 +24,13 @@
 //                       this Mac only; without it, only the pause counts. Exit 4
 //                       means no microphone access.
 //   diri-voice language prints the dominant language of stdin ("en", "es").
+//   diri-voice transcribe [the listen options]
+//                       listens the same way and prints {"reason", "text"}: the
+//                       answer itself, for Diri to send without another app.
+//                       Exit 3 means on-device recognition is unavailable.
+//   diri-voice press --code KEYCODE [--modifiers cmd,ctrl,alt,shift,fn]
+//                       presses a shortcut, as a dictation app's start/stop
+//                       key. Exit 5 means Accessibility permission is missing.
 //   diri-voice voices [--language CODE]...
 //                       prints the voices worth offering as JSON, best first:
 //                       every enhanced or premium voice, and the basic voices
@@ -33,6 +40,7 @@
 // AVSpeechSynthesizer for the voice. Nothing is sent anywhere.
 
 import AVFoundation
+import ApplicationServices
 import Foundation
 import NaturalLanguage
 import Speech
@@ -251,6 +259,9 @@ func values(_ name: String, in arguments: [String]) -> [String] {
 final class AnswerListener: @unchecked Sendable {
     private let phrases: [String]
     private let silence: TimeInterval
+    /// Report the words heard, not only why listening ended.
+    private let transcribe: Bool
+    private var heard = ""
     private let engine = AVAudioEngine()
     private let lock = NSLock()
     private var heardSpeech = false
@@ -258,13 +269,20 @@ final class AnswerListener: @unchecked Sendable {
     private var noiseFloor: Float?
     private var task: SFSpeechRecognitionTask?
 
-    init(phrases: [String], silence: TimeInterval) {
+    init(phrases: [String], silence: TimeInterval, transcribe: Bool) {
         self.phrases = phrases.map { $0.lowercased() }
         self.silence = silence
+        self.transcribe = transcribe
     }
 
     func finish(_ reason: String) -> Never {
-        print(reason)
+        if transcribe {
+            let text = lock.withLock { heard }
+            let data = try? JSONSerialization.data(withJSONObject: ["reason": reason, "text": text])
+            FileHandle.standardOutput.write(data ?? Data())
+        } else {
+            print(reason)
+        }
         fflush(stdout)
         exit(0)
     }
@@ -274,7 +292,8 @@ final class AnswerListener: @unchecked Sendable {
         request.shouldReportPartialResults = true
         request.requiresOnDeviceRecognition = true
         request.contextualStrings = phrases
-        if #available(macOS 13.0, *) { request.addsPunctuation = false }
+        // A transcribed answer is sent as typed, so it gets punctuation.
+        if #available(macOS 13.0, *) { request.addsPunctuation = transcribe }
         let input = engine.inputNode
         input.installTap(onBus: 0, bufferSize: 1024, format: input.outputFormat(forBus: 0)) {
             [weak self] buffer, _ in
@@ -287,9 +306,15 @@ final class AnswerListener: @unchecked Sendable {
         } catch {
             fail("microphone unavailable: \(error)")
         }
-        task = recognizer?.recognitionTask(with: request) { [weak self] result, _ in
+        let debug = ProcessInfo.processInfo.environment["DIRI_VOICE_DEBUG"] != nil
+        task = recognizer?.recognitionTask(with: request) { [weak self] result, error in
+            if debug {
+                FileHandle.standardError.write(Data("diri-voice: heard \(result?.bestTranscription.formattedString ?? "-") error \(error.map { "\($0)" } ?? "-")\n".utf8))
+            }
             guard let self, let result else { return }
-            let heard = result.bestTranscription.formattedString.lowercased()
+            let text = result.bestTranscription.formattedString
+            self.lock.withLock { self.heard = text }
+            let heard = text.lowercased()
                 .trimmingCharacters(in: .whitespacesAndNewlines.union(.punctuationCharacters))
             if self.phrases.contains(where: { heard.hasSuffix($0) }) {
                 self.finish("phrase")
@@ -352,18 +377,48 @@ func onDeviceRecognizer(language: String) async -> SFSpeechRecognizer? {
     return nil
 }
 
-func runListen(_ arguments: [String]) async {
+func runListen(_ arguments: [String], transcribe: Bool = false) async {
     guard await microphoneAccess() else { fail("no microphone access", code: 4) }
     let phrases = values("--phrase", in: arguments)
     let language = values("--language", in: arguments).first ?? "en"
     let silence = values("--silence", in: arguments).first.flatMap(Double.init) ?? 8
     let limit = values("--limit", in: arguments).first.flatMap(Double.init) ?? 110
-    let recognizer = phrases.isEmpty ? nil : await onDeviceRecognizer(language: language)
+    let recognizer = phrases.isEmpty && !transcribe ? nil : await onDeviceRecognizer(language: language)
+    if transcribe && recognizer == nil {
+        fail("on-device speech recognition unavailable", code: exitUnavailable)
+    }
     if recognizer == nil {
         FileHandle.standardError.write(Data("diri-voice: listening for pauses only\n".utf8))
     }
-    let listener = AnswerListener(phrases: phrases, silence: silence)
+    let listener = AnswerListener(phrases: phrases, silence: silence, transcribe: transcribe)
     await listener.run(recognizer: recognizer, limit: limit)
+}
+
+/// Presses one shortcut: key down then up, with its modifiers. Posting
+/// keyboard events needs Accessibility permission, which macOS asks for once.
+func runPress(_ arguments: [String]) {
+    guard let code = values("--code", in: arguments).first.flatMap(UInt16.init) else {
+        fail("usage: diri-voice press --code KEYCODE [--modifiers cmd,ctrl,alt,shift,fn]", code: 64)
+    }
+    let prompt = kAXTrustedCheckOptionPrompt.takeUnretainedValue() as String
+    guard AXIsProcessTrustedWithOptions([prompt: true] as CFDictionary) else {
+        fail("Accessibility permission is needed to press the dictation shortcut", code: 5)
+    }
+    let modifiers = Set((values("--modifiers", in: arguments).first ?? "").split(separator: ",").map(String.init))
+    var flags = CGEventFlags()
+    for (name, flag) in [("cmd", CGEventFlags.maskCommand), ("ctrl", .maskControl), ("alt", .maskAlternate),
+                         ("shift", .maskShift), ("fn", .maskSecondaryFn)] where modifiers.contains(name) {
+        flags.insert(flag)
+    }
+    let source = CGEventSource(stateID: .hidSystemState)
+    for down in [true, false] {
+        guard let event = CGEvent(keyboardEventSource: source, virtualKey: code, keyDown: down) else {
+            fail("could not create the key event")
+        }
+        event.flags = flags
+        event.post(tap: .cghidEventTap)
+        usleep(20_000)
+    }
 }
 
 @main
@@ -394,6 +449,10 @@ struct DiriVoice {
             runPhonemes(Array(CommandLine.arguments.dropFirst(2)))
         case "listen":
             await runListen(Array(CommandLine.arguments.dropFirst(2)))
+        case "transcribe":
+            await runListen(Array(CommandLine.arguments.dropFirst(2)), transcribe: true)
+        case "press":
+            runPress(Array(CommandLine.arguments.dropFirst(2)))
         case "language":
             let recognizer = NLLanguageRecognizer()
             recognizer.processString(readInput())
@@ -405,7 +464,7 @@ struct DiriVoice {
                 .map { arguments[$0 + 1] }
             listVoices(extra: languages)
         default:
-            fail("usage: diri-voice digest|say|listen|voices|language|kokoro-download|phonemes", code: 64)
+            fail("usage: diri-voice digest|say|listen|transcribe|press|voices|language|kokoro-download|phonemes", code: 64)
         }
     }
 }

@@ -82,6 +82,25 @@ pub(crate) fn with_spoken_request(message: String, kind: Option<&diri_proto::Age
     format!("{message}\n\n({})", diri_proto::voice::SPOKEN_REQUEST)
 }
 
+/// The `talk_voice` that pipes readings to the user's own speech command.
+pub(crate) const COMMAND_VOICE: &str = "command";
+
+/// What `diri-voice transcribe` heard, as the message to send and whether to
+/// submit it: the send phrase submits (and is removed), a pause only types
+/// the answer in. `None` when nothing was said.
+pub(crate) fn transcribed_answer(output: &str) -> Option<(String, bool)> {
+    let value: serde_json::Value = serde_json::from_str(output.trim()).ok()?;
+    let text = value.get("text")?.as_str()?.trim();
+    if text.is_empty() {
+        return None;
+    }
+    if value.get("reason").and_then(serde_json::Value::as_str) == Some("phrase") {
+        let message = heard_submission(text).trim().to_owned();
+        return (!message.is_empty()).then_some((message, true));
+    }
+    Some((text.to_owned(), false))
+}
+
 /// The session whose next paste is a spoken answer to submit: the listener
 /// heard a send phrase there and stopped Wispr Flow, which pastes next.
 static ARMED_SUBMIT: std::sync::Mutex<Option<(SessionId, std::time::Instant)>> =
@@ -534,7 +553,7 @@ mod macos {
         TurnCompletion, digest_input, fallback_cut, inline_prose_lines, speakable, spoken_title,
     };
     use crate::i18n::tf;
-    use crate::store::{SessionStore, StoreRuntime};
+    use crate::store::{DictationShortcut, SessionStore, StoreRuntime, TalkAnswer};
 
     const DIGEST_TIMEOUT: Duration = Duration::from_secs(20);
     const TERMINAL_READ_TIMEOUT: Duration = Duration::from_secs(3);
@@ -556,6 +575,10 @@ mod macos {
     const ANSWER_SILENCE: &str = "8";
     /// The listener gives up a little before the answer wait does.
     const LISTEN_LIMIT: &str = "110";
+    /// How long a dictation app gets to type its text after being stopped.
+    const TYPED_TEXT_SETTLE: Duration = Duration::from_millis(1500);
+    const LISTENING_SOUND: &str = "/System/Library/Sounds/Tink.aiff";
+    const SENT_SOUND: &str = "/System/Library/Sounds/Pop.aiff";
     /// Lets the window show the agent that just spoke before dictation
     /// starts, so Wispr Flow pastes the answer into its terminal.
     const FOCUS_SETTLE: Duration = Duration::from_millis(300);
@@ -581,6 +604,7 @@ mod macos {
             .unwrap_or_default();
         let reader_store = Arc::clone(&store);
         let reader_runtime = Arc::clone(&runtime);
+        let speaker_tokio = tokio.clone();
         let spawned = thread::Builder::new()
             .name("diri-voice-reader".into())
             .spawn(move || {
@@ -616,7 +640,7 @@ mod macos {
             .name("diri-voice-speaker".into())
             .spawn(move || {
                 while let Ok(utterance) = speech_rx.recv() {
-                    speak(&runtime, &utterance);
+                    speak(&runtime, &speaker_tokio, &utterance);
                 }
             });
     }
@@ -850,7 +874,7 @@ mod macos {
     /// session forward and hands the microphone to Wispr Flow, then waits
     /// for the answer before the next agent speaks: a conversation with each
     /// agent in turn.
-    fn speak(runtime: &StoreRuntime, utterance: &Utterance) {
+    fn speak(runtime: &StoreRuntime, tokio: &tokio::runtime::Handle, utterance: &Utterance) {
         let store = &runtime.store;
         let wanted = || {
             let store = store.read().expect("store");
@@ -863,13 +887,12 @@ mod macos {
         if !wanted() {
             return;
         }
-        let voice = store
-            .read()
-            .expect("store")
-            .preferences()
-            .talk_voice
-            .clone();
-        let Ok(mut child) = speech_command(&voice, &utterance.text)
+        let (voice, command) = {
+            let store = store.read().expect("store");
+            let prefs = store.preferences();
+            (prefs.talk_voice.clone(), prefs.talk_voice_command.clone())
+        };
+        let Ok(mut child) = speech_command(&voice, &command)
             .stdin(Stdio::piped())
             .spawn()
         else {
@@ -881,15 +904,48 @@ mod macos {
         if !wait_while(&mut child, wanted) {
             return;
         }
-        let (dictate, selected) = {
+        answer(runtime, tokio, utterance);
+    }
+
+    /// After a reading, takes the user's spoken answer for that agent with
+    /// whichever listener they chose.
+    fn answer(runtime: &StoreRuntime, tokio: &tokio::runtime::Handle, utterance: &Utterance) {
+        let store = &runtime.store;
+        let (on, mut with, shortcut, active, selected, language) = {
             let store = store.read().expect("store");
-            let dictate = store.preferences().talk_dictation && store.app_is_active();
+            let prefs = store.preferences();
             (
-                dictate,
+                prefs.talk_dictation,
+                prefs.talk_answer,
+                prefs.talk_answer_shortcut.clone(),
+                store.app_is_active(),
                 store.selected_session_id() == Some(&utterance.session_id),
+                crate::i18n::resolve(prefs.ui_language).tag(),
             )
         };
-        if !dictate || !wispr_flow_installed() {
+        if !on {
+            return;
+        }
+        if with == TalkAnswer::WisprFlow && !wispr_flow_installed() {
+            with = TalkAnswer::Diri;
+        }
+        if with == TalkAnswer::Diri {
+            answer_in_diri(runtime, tokio, utterance, language);
+            return;
+        }
+        // Wispr Flow and dictation apps type into the focused window: only
+        // while the user is in Diri, with that agent's session in front.
+        let start_stop: Box<dyn Fn()> = match (with, shortcut) {
+            (TalkAnswer::Shortcut, Some(shortcut)) => Box::new(move || press(&shortcut)),
+            (TalkAnswer::Shortcut, None) => return,
+            _ => Box::new(|| {
+                let _ = Command::new("/usr/bin/open")
+                    .arg("-g")
+                    .arg(WISPR_START)
+                    .status();
+            }),
+        };
+        if !active {
             return;
         }
         if !selected {
@@ -900,25 +956,94 @@ mod macos {
             runtime.publish_local_change();
             thread::sleep(FOCUS_SETTLE);
         }
-        let _ = Command::new("/usr/bin/open")
-            .arg("-g")
-            .arg(WISPR_START)
-            .status();
-        let language =
-            crate::i18n::resolve(store.read().expect("store").preferences().ui_language).tag();
-        let mut listener = listen_for_answer_end(language);
-        await_answer(store, utterance, &mut listener);
+        start_stop();
+        let stop: Box<dyn Fn()> = if with == TalkAnswer::Shortcut {
+            start_stop
+        } else {
+            Box::new(|| {
+                let _ = Command::new("/usr/bin/open")
+                    .arg("-g")
+                    .arg(WISPR_STOP)
+                    .status();
+            })
+        };
+        let mut listener = listen_for_answer_end("listen", language);
+        let heard_phrase = await_answer(store, utterance, &mut listener, &*stop);
         if let Some(mut child) = listener {
-            let _ = child.kill();
-            let _ = child.wait();
+            stop_process(&mut child);
+        }
+        // A dictation app that types its text (macOS Dictation) never pastes,
+        // so the armed submit is still waiting: press Enter for it.
+        if heard_phrase && with == TalkAnswer::Shortcut {
+            thread::sleep(TYPED_TEXT_SETTLE);
+            if super::take_armed_submit(&utterance.session_id) {
+                let _ = tokio.block_on(runtime.client().send_text(
+                    &utterance.session_id,
+                    String::new(),
+                    true,
+                ));
+            }
         }
     }
 
-    /// Listens alongside Wispr Flow for the user saying a send phrase or
-    /// going quiet (`diri-voice listen`).
-    fn listen_for_answer_end(language: &str) -> Option<Child> {
+    /// Diri's own listener: transcribes the answer on this Mac and sends it
+    /// to the agent itself, so it works with Diri in the background. A sound
+    /// says it is listening; "send to agent" submits, a pause types it in.
+    fn answer_in_diri(
+        runtime: &StoreRuntime,
+        tokio: &tokio::runtime::Handle,
+        utterance: &Utterance,
+        language: &str,
+    ) {
+        let Some(mut child) = listen_for_answer_end("transcribe", language) else {
+            return;
+        };
+        cue(LISTENING_SOUND);
+        let deadline = Instant::now() + ANSWER_LIMIT;
+        let status = loop {
+            match child.try_wait() {
+                Ok(Some(status)) => break status,
+                Ok(None) => {}
+                Err(_) => return,
+            }
+            let still_wanted = {
+                let store = runtime.store.read().expect("store");
+                speaks(&store, &utterance.session_id)
+                    && store
+                        .sessions()
+                        .get(&utterance.session_id)
+                        .is_some_and(|record| is_latest_turn(record, utterance.turn))
+            };
+            if !still_wanted || Instant::now() >= deadline {
+                stop_process(&mut child);
+                return;
+            }
+            thread::sleep(ANSWER_POLL);
+        };
+        if !status.success() {
+            return;
+        }
+        let mut output = String::new();
+        if let Some(mut stdout) = child.stdout.take() {
+            let _ = stdout.read_to_string(&mut output);
+        }
+        let Some((message, submit)) = super::transcribed_answer(&output) else {
+            return;
+        };
+        if tokio
+            .block_on(runtime.client().send_text(&utterance.session_id, message, submit))
+            .is_ok()
+            && submit
+        {
+            cue(SENT_SOUND);
+        }
+    }
+
+    /// Listens for the user saying a send phrase or going quiet: `listen`
+    /// alongside a dictation app, `transcribe` to also take the words.
+    fn listen_for_answer_end(mode: &str, language: &str) -> Option<Child> {
         let mut command = Command::new(helper_path()?);
-        command.args(["listen", "--language", language]);
+        command.args([mode, "--language", language]);
         for phrase in super::SEND_PHRASES {
             command.args(["--phrase", phrase]);
         }
@@ -931,43 +1056,70 @@ mod macos {
             .ok()
     }
 
-    /// When the listener has finished, why: stops Wispr Flow so it pastes
-    /// the answer. A failed listener (no microphone access) leaves dictation
-    /// to the user.
-    fn answer_ended(listener: &mut Option<Child>, session: &SessionId) {
-        let Some(child) = listener.as_mut() else {
+    /// Presses the user's dictation shortcut (`diri-voice press`).
+    fn press(shortcut: &DictationShortcut) {
+        let Some(helper) = helper_path() else {
             return;
         };
+        let _ = Command::new(helper)
+            .args(["press", "--code", &shortcut.key_code.to_string()])
+            .args(["--modifiers", &shortcut.modifiers().join(",")])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status();
+    }
+
+    /// A short system sound, for listening that has no window of its own.
+    fn cue(sound: &'static str) {
+        thread::spawn(move || {
+            let _ = Command::new("/usr/bin/afplay")
+                .arg(sound)
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .status();
+        });
+    }
+
+    /// When the listener has finished, why: stops the dictation app so it
+    /// pastes the answer, and arms the submit when the phrase was heard. A
+    /// failed listener (no microphone access) leaves dictation to the user.
+    fn answer_ended(listener: &mut Option<Child>, session: &SessionId, stop: &dyn Fn()) -> bool {
+        let Some(child) = listener.as_mut() else {
+            return false;
+        };
         let Ok(Some(status)) = child.try_wait() else {
-            return;
+            return false;
         };
         let mut reason = String::new();
         if let Some(mut stdout) = child.stdout.take() {
             let _ = stdout.read_to_string(&mut reason);
         }
         *listener = None;
-        if reason.trim() == "phrase" {
+        let phrase = reason.trim() == "phrase";
+        if phrase {
             super::arm_submit(session.clone());
         }
         if status.success() {
-            let _ = Command::new("/usr/bin/open")
-                .arg("-g")
-                .arg(WISPR_STOP)
-                .status();
+            stop();
         }
+        phrase
     }
 
     /// Holds the next reading until the user sends this agent something,
-    /// moves to another session or app, or lets it go unanswered.
+    /// moves to another session or app, or lets it go unanswered. Whether
+    /// the send phrase was heard.
     fn await_answer(
         store: &RwLock<SessionStore>,
         utterance: &Utterance,
         listener: &mut Option<Child>,
-    ) {
+        stop: &dyn Fn(),
+    ) -> bool {
         let deadline = Instant::now() + ANSWER_LIMIT;
+        let mut heard_phrase = false;
         while Instant::now() < deadline {
             thread::sleep(ANSWER_POLL);
-            answer_ended(listener, &utterance.session_id);
+            heard_phrase |= answer_ended(listener, &utterance.session_id, stop);
             let store = store.read().expect("store");
             let waiting = speaks(&store, &utterance.session_id)
                 && store.app_is_active()
@@ -976,13 +1128,14 @@ mod macos {
                     .sessions()
                     .get(&utterance.session_id)
                     .is_some_and(|record| is_latest_turn(record, utterance.turn));
-            if !waiting {
-                return;
+            if !waiting || (heard_phrase && listener.is_none()) {
+                return heard_phrase;
             }
         }
+        heard_phrase
     }
 
-    /// Waits for `child` to finish; kills it and returns false once `wanted`
+    /// Waits for `child` to finish; stops it and returns false once `wanted`
     /// turns false.
     fn wait_while(child: &mut Child, wanted: impl Fn() -> bool) -> bool {
         loop {
@@ -990,19 +1143,43 @@ mod macos {
                 Ok(Some(status)) => return status.success(),
                 Ok(None) if wanted() => thread::sleep(SPEECH_POLL),
                 _ => {
-                    let _ = child.kill();
-                    let _ = child.wait();
+                    stop_process(child);
                     return false;
                 }
             }
         }
     }
 
+    /// Ends a child and everything it started: a speech command such as
+    /// `curl … | afplay` runs as its own process group.
+    fn stop_process(child: &mut Child) {
+        if let Ok(group) = i32::try_from(child.id()) {
+            // SAFETY: signalling a process group we created.
+            unsafe {
+                libc::killpg(group, libc::SIGTERM);
+            }
+        }
+        let _ = child.kill();
+        let _ = child.wait();
+    }
+
     /// Speech for `text` in `voice`: a system voice identifier, a
     /// "kokoro:<name>" voice (the helper uses a system voice until Kokoro's
     /// files are downloaded, and for replies that are not English), or empty
     /// for the best installed voice for the text's language.
-    fn speech_command(voice: &str, _text: &str) -> Command {
+    fn speech_command(voice: &str, shell_command: &str) -> Command {
+        use std::os::unix::process::CommandExt as _;
+        if voice == super::COMMAND_VOICE && !shell_command.trim().is_empty() {
+            let mut command = Command::new("/bin/sh");
+            command
+                .arg("-c")
+                .arg(shell_command)
+                .process_group(0)
+                .stdout(Stdio::null())
+                .stderr(Stdio::null());
+            return command;
+        }
+        let voice = if voice == super::COMMAND_VOICE { "" } else { voice };
         let mut command = match helper_path() {
             Some(helper) => {
                 let mut command = Command::new(helper);
@@ -1015,7 +1192,10 @@ mod macos {
             // `say` reads stdin when given no text.
             None => Command::new("/usr/bin/say"),
         };
-        command.stdout(Stdio::null()).stderr(Stdio::null());
+        command
+            .process_group(0)
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
         command
     }
 
@@ -1042,6 +1222,19 @@ mod macos {
             candidates.into_iter().find(|path| path.is_file())
         })
         .as_deref()
+    }
+
+    /// Starts the user's speech command and stops it again, for tests.
+    #[cfg(test)]
+    pub(super) fn stop_speech_command_for_test(shell_command: &str) -> i32 {
+        let mut child = speech_command(super::COMMAND_VOICE, shell_command)
+            .stdin(Stdio::null())
+            .spawn()
+            .expect("spawn");
+        let group = i32::try_from(child.id()).expect("pid");
+        thread::sleep(Duration::from_millis(200));
+        stop_process(&mut child);
+        group
     }
 
     #[cfg(test)]
@@ -1224,14 +1417,16 @@ mod macos {
 
     /// Reads `text` in `voice` so a choice can be heard, cutting off the
     /// previous sample.
-    pub(crate) fn preview_voice(voice: &str, text: &str) {
+    pub(crate) fn preview_voice(voice: &str, shell_command: &str, text: &str) {
         static SAMPLE: std::sync::Mutex<Option<Child>> = std::sync::Mutex::new(None);
         let mut sample = SAMPLE.lock().unwrap_or_else(|error| error.into_inner());
         if let Some(mut previous) = sample.take() {
-            let _ = previous.kill();
-            let _ = previous.wait();
+            stop_process(&mut previous);
         }
-        let Ok(mut child) = speech_command(voice, text).stdin(Stdio::piped()).spawn() else {
+        let Ok(mut child) = speech_command(voice, shell_command)
+            .stdin(Stdio::piped())
+            .spawn()
+        else {
             return;
         };
         if let Some(mut stdin) = child.stdin.take() {
@@ -1528,6 +1723,48 @@ mod tests {
         let reply = terminal_reply(&lines).expect("reply");
         assert!(reply.ends_with("23 times 4 is 92."), "{reply}");
         assert!(!reply.contains("GPT-6"), "{reply}");
+    }
+
+    #[test]
+    fn a_transcribed_answer_is_sent_on_the_phrase_and_typed_on_a_pause() {
+        assert_eq!(
+            transcribed_answer(r#"{"reason":"phrase","text":"Run the tests, send to agent"}"#),
+            Some(("Run the tests".to_owned(), true))
+        );
+        assert_eq!(
+            transcribed_answer(r#"{"reason":"silence","text":"Run the tests"}"#),
+            Some(("Run the tests".to_owned(), false))
+        );
+        assert_eq!(transcribed_answer(r#"{"reason":"limit","text":""}"#), None);
+        assert_eq!(
+            transcribed_answer(r#"{"reason":"phrase","text":"Send to agent"}"#),
+            None
+        );
+        assert_eq!(transcribed_answer("not json"), None);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn stopping_a_speech_command_stops_its_whole_pipeline() {
+        let group = macos::stop_speech_command_for_test("sleep 30 | sleep 30");
+        std::thread::sleep(std::time::Duration::from_millis(200));
+        // SAFETY: signal 0 only asks whether the group still has members.
+        let alive = unsafe { libc::killpg(group, 0) } == 0;
+        assert!(!alive, "a process of the speech command outlived the stop");
+    }
+
+    #[test]
+    fn a_shortcut_names_its_modifiers() {
+        let shortcut = crate::store::DictationShortcut {
+            label: "cmd-alt-d".into(),
+            key_code: 2,
+        };
+        assert_eq!(shortcut.modifiers(), vec!["cmd", "alt"]);
+        let bare = crate::store::DictationShortcut {
+            label: "f5".into(),
+            key_code: 96,
+        };
+        assert!(bare.modifiers().is_empty());
     }
 
     #[test]

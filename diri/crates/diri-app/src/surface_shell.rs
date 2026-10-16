@@ -28,6 +28,7 @@ use crate::settings::{
 mod account_settings;
 mod import_settings;
 mod privacy_settings;
+mod voice_settings;
 use crate::sidebar::DraggedSidebarItem;
 use crate::store::{Prefs, SessionStore, StoreRuntime, WindowMaterial};
 use crate::updates::{UpdateCommand, UpdateHandle, UpdatePhase};
@@ -136,6 +137,7 @@ enum SettingsMenu {
     InterfaceStyle,
     PaneDensity,
     TalkVoice,
+    TalkAnswer,
 }
 
 /// Update channels, in menu order.
@@ -609,6 +611,7 @@ pub struct UtilitySurfaces {
     activity: String,
     diagnostics_report: Option<String>,
     privacy: privacy_settings::PrivacyState,
+    voice_fields: voice_settings::VoiceFieldsState,
     _update_changes: Task<()>,
     _store_changes: Task<()>,
 }
@@ -841,6 +844,7 @@ impl UtilitySurfaces {
             activity: "Connected client · shared daemon remains untouched".to_owned(),
             diagnostics_report,
             privacy: Default::default(),
+            voice_fields: Default::default(),
             _update_changes: update_changes,
             _store_changes: store_changes,
         };
@@ -2649,6 +2653,7 @@ impl UtilitySurfaces {
         }
         if self.handle_account_key(event, cx)
             || self.handle_privacy_name_key(event, cx)
+            || self.handle_voice_fields_key(event, cx)
             || self.handle_include_key(event, cx)
             || self.handle_roots_key(event, cx)
             || self.handle_agent_path_key(event, cx)
@@ -3741,10 +3746,6 @@ impl UtilitySurfaces {
 
     fn voice_settings(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let colors = self.settings_colors();
-        #[cfg(target_os = "macos")]
-        let wispr = crate::voice::wispr_flow_installed();
-        #[cfg(not(target_os = "macos"))]
-        let wispr = false;
         setting_section(
             t("settings.general.voice"),
             div()
@@ -3774,7 +3775,20 @@ impl UtilitySurfaces {
                         ))
                     },
                 )
-                .when(wispr && self.prefs.talk_with_agent, |section| {
+                .when(
+                    cfg!(target_os = "macos")
+                        && self.prefs.talk_with_agent
+                        && self.prefs.talk_voice == crate::voice::COMMAND_VOICE,
+                    |section| {
+                        section.child(setting_divider(colors)).child(setting_row(
+                            t("settings.general.talk_voice_command"),
+                            t("settings.general.talk_voice_command_detail"),
+                            self.voice_command_field(cx),
+                            colors,
+                        ))
+                    },
+                )
+                .when(cfg!(target_os = "macos") && self.prefs.talk_with_agent, |section| {
                     section.child(setting_divider(colors)).child(toggle_row(
                         t("settings.general.talk_dictation"),
                         t("settings.general.talk_dictation_detail"),
@@ -3788,7 +3802,34 @@ impl UtilitySurfaces {
                             cx.notify();
                         },
                     ))
-                }),
+                })
+                .when(
+                    cfg!(target_os = "macos")
+                        && self.prefs.talk_with_agent
+                        && self.prefs.talk_dictation,
+                    |section| {
+                        section.child(setting_divider(colors)).child(setting_row(
+                            t("settings.general.talk_answer_with"),
+                            t("settings.general.talk_answer_with_detail"),
+                            self.talk_answer_dropdown(cx),
+                            colors,
+                        ))
+                    },
+                )
+                .when(
+                    cfg!(target_os = "macos")
+                        && self.prefs.talk_with_agent
+                        && self.prefs.talk_dictation
+                        && self.prefs.talk_answer == crate::store::TalkAnswer::Shortcut,
+                    |section| {
+                        section.child(setting_divider(colors)).child(setting_row(
+                            t("settings.general.talk_shortcut"),
+                            t("settings.general.talk_shortcut_detail"),
+                            self.dictation_shortcut_field(cx),
+                            colors,
+                        ))
+                    },
+                ),
             colors,
         )
     }
@@ -3818,7 +3859,7 @@ impl UtilitySurfaces {
             crate::voice::kokoro_state(id),
             Some(KokoroState::Downloading(_))
         ) {
-            crate::voice::preview_voice(id, t("voice.sample"));
+            crate::voice::preview_voice(id, &self.prefs.talk_voice_command, t("voice.sample"));
             return;
         }
         let id = id.to_owned();
@@ -3837,7 +3878,7 @@ impl UtilitySurfaces {
                             .update(cx, |this, _| this.prefs.talk_voice == id)
                             .unwrap_or(false);
                         if still_chosen {
-                            crate::voice::preview_voice(&id, t("voice.sample"));
+                            crate::voice::preview_voice(&id, "", t("voice.sample"));
                         }
                         return;
                     }
@@ -3851,6 +3892,9 @@ impl UtilitySurfaces {
     fn talk_voice_label(&self, id: &str) -> String {
         if id.is_empty() {
             return t("settings.general.talk_voice_automatic").to_string();
+        }
+        if id == crate::voice::COMMAND_VOICE {
+            return t("settings.general.talk_voice_command_option").to_string();
         }
         match self.talk_voices.iter().find(|voice| voice.id == id) {
             Some(voice) => talk_voice_option_label(voice),
@@ -3887,7 +3931,8 @@ impl UtilitySurfaces {
             .flex()
             .flex_col();
         let choices = std::iter::once(String::new())
-            .chain(self.talk_voices.iter().map(|voice| voice.id.clone()));
+            .chain(self.talk_voices.iter().map(|voice| voice.id.clone()))
+            .chain(std::iter::once(crate::voice::COMMAND_VOICE.to_owned()));
         for (index, id) in choices.enumerate() {
             let label = self.talk_voice_label(&id);
             options = options.child(settings_choice_row(
@@ -4109,6 +4154,7 @@ impl UtilitySurfaces {
                                     cx.listener(|this, _, window, cx| {
                                         this.roots_editor_active = true;
                                         this.deactivate_privacy_name();
+                                        this.deactivate_voice_fields();
                                         this.include_editor_active = false;
                                         this.settings_search_active = false;
                                         this.focus.focus(window, cx);
@@ -4245,6 +4291,7 @@ impl UtilitySurfaces {
                                     cx.listener(|this, _, window, cx| {
                                         this.include_editor_active = true;
                                         this.deactivate_privacy_name();
+                                        this.deactivate_voice_fields();
                                         this.roots_editor_active = false;
                                         this.settings_search_active = false;
                                         this.focus.focus(window, cx);
@@ -5155,6 +5202,7 @@ impl UtilitySurfaces {
             SettingsMenu::InterfaceStyle => (self.interface_style_options(colors, cx), 172.0),
             SettingsMenu::PaneDensity => (self.pane_density_options(colors, cx), 172.0),
             SettingsMenu::TalkVoice => (self.talk_voice_options(colors, cx), 400.0),
+            SettingsMenu::TalkAnswer => (self.talk_answer_options(colors, cx), 204.0),
         })
     }
 
@@ -9423,7 +9471,14 @@ mod tests {
                         harness.surfaces.update(cx, |surfaces, cx| {
                             surfaces.prefs.talk_with_agent = true;
                             surfaces.prefs.talk_dictation = true;
-                            surfaces.prefs.talk_voice = "kokoro:af_heart".into();
+                            surfaces.prefs.talk_voice = crate::voice::COMMAND_VOICE.into();
+                            surfaces.prefs.talk_voice_command = "say -v Ava".into();
+                            surfaces.prefs.talk_answer = crate::store::TalkAnswer::Shortcut;
+                            surfaces.prefs.talk_answer_shortcut =
+                                Some(crate::store::DictationShortcut {
+                                    label: "cmd-alt-d".into(),
+                                    key_code: 2,
+                                });
                             let voice = |id: &str, name: &str, language: &str, quality| {
                                 crate::voice::VoiceOption {
                                     id: id.into(),
@@ -9439,7 +9494,10 @@ mod tests {
                                 voice("com.apple.voice.premium.en-US.Zoe", "Zoe", "English (United States)", 3),
                                 voice("com.apple.voice.compact.en-US.Samantha", "Samantha", "English (United States)", 1),
                             ];
-                            surfaces.settings_menu = Some(SettingsMenu::TalkVoice);
+                            // `DIRI_VISUAL_TALK=menu` also opens the voice menu.
+                            if std::env::var("DIRI_VISUAL_TALK").as_deref() == Ok("menu") {
+                                surfaces.settings_menu = Some(SettingsMenu::TalkVoice);
+                            }
                             cx.notify();
                         });
                     }
