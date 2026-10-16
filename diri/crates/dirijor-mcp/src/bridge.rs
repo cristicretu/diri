@@ -105,7 +105,15 @@ impl Bridge {
         kinds.sort();
         kinds.dedup();
         kinds.push("shell".into());
-        Ok(tool_definitions_for(&kinds))
+        let mut tools = tool_definitions_for(&kinds);
+        // Offered only while "Talk with your agent" is on, so Agents do not
+        // spend a call every turn for nothing.
+        let voice: Result<diri_proto::voice::VoiceStateResult, String> =
+            self.request_typed(Method::VOICE_STATE, json!({}), DEFAULT_TIMEOUT);
+        if voice.is_ok_and(|voice| voice.talk_with_agent) {
+            tools.push(crate::tools::speak_tool());
+        }
+        Ok(tools)
     }
 
     pub fn call(&self, tool: &str, arguments: &Value) -> Result<Value, String> {
@@ -160,6 +168,7 @@ impl Bridge {
             "create_note" => self.create_note(arguments),
             "start_from_note" => self.start_from_note(arguments),
             "note_history" => self.note_history(arguments),
+            diri_proto::voice::SPEAK_TOOL => self.speak(arguments),
             other => Err(format!("unknown tool: {other}")),
         }
     }
@@ -1009,6 +1018,14 @@ impl Bridge {
             "receipt": receipt,
             "recorded_on_task": task,
         }))
+    }
+
+    fn speak(&self, arguments: &Value) -> Result<Value, String> {
+        self.request(
+            Method::VOICE_SPEAK,
+            json!({"sessionID": self.require_caller()?, "text": required_string(arguments, "text")?}),
+            DEFAULT_TIMEOUT,
+        )
     }
 
     fn require_caller(&self) -> Result<&str, String> {

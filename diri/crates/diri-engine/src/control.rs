@@ -186,6 +186,9 @@ pub struct ControlServer {
     session_operations: Mutex<std::collections::HashSet<String>>,
     agent_scans: Arc<Mutex<std::collections::HashMap<String, Arc<Mutex<()>>>>>,
     hook_reports: hook_queue::HookQueue,
+    /// Each session's spoken summary (Diri's `speak` tool) and the turn it
+    /// was given in, until the app's reader collects it.
+    spoken: Mutex<SpokenSummaries>,
     /// Where note Sessions keep their files; `None` resolves the standard
     /// notes directory (tests pin a temporary one).
     notes_dir: Option<PathBuf>,
@@ -311,6 +314,7 @@ impl ControlServer {
             session_operations: Mutex::new(std::collections::HashSet::new()),
             agent_scans: Arc::new(Mutex::new(std::collections::HashMap::new())),
             hook_reports: hook_queue::HookQueue::new(),
+            spoken: Mutex::new(SpokenSummaries::default()),
             notes_dir: None,
             scheduler: Arc::new(schedules::Scheduler::default()),
         }
@@ -1190,6 +1194,11 @@ impl ControlServer {
             Method::SESSION_REPARENT_WORKTREE => self.session_reparent_worktree(params),
             Method::HOST_LOCATE_REPO => self.host_locate_repo(params),
             Method::HOOK_REPORT => self.hook_report(params),
+            Method::VOICE_STATE => encode(&diri_proto::voice::VoiceStateResult {
+                talk_with_agent: talk_with_agent_enabled(),
+            }),
+            Method::VOICE_SPEAK => self.voice_speak(params),
+            Method::VOICE_SPOKEN => self.voice_spoken(params),
             Method::SESSION_RESUME => self.session_resume(params),
             Method::SESSION_PROCESS_INFO => self.session_process_info(params),
             Method::SESSION_RECONNECT => self.session_reconnect(params),
@@ -3447,6 +3456,53 @@ impl ControlServer {
             return Ok(json!({ "additionalContext": diri_proto::voice::SPOKEN_INSTRUCTION }));
         }
         Ok(json!({}))
+    }
+
+    /// Keeps an Agent's spoken summary for the turn it is in, for the app to
+    /// read aloud when that turn ends. Ignored while the setting is off.
+    fn voice_speak(&self, params: Option<JsonValue>) -> Result<JsonValue, ControlError> {
+        let p: diri_proto::voice::SpeakParams = decode(params)?;
+        if !talk_with_agent_enabled() {
+            return Ok(json!({
+                "spoken": false,
+                "note": "Talk with your agent is off; there is no need to call speak."
+            }));
+        }
+        let text: String = p
+            .text
+            .trim()
+            .chars()
+            .take(diri_proto::voice::MAX_SPOKEN_CHARS)
+            .collect();
+        if text.is_empty() {
+            return Err(ControlError::bad_request("speak needs some text"));
+        }
+        let turn = {
+            let registry = self.registry.lock().map_err(poisoned)?;
+            let record = registry
+                .record(&p.session_id)
+                .ok_or_else(|| ControlError::not_found(p.session_id.clone()))?;
+            record
+                .attention_state
+                .as_ref()
+                .map_or(0, |state| state.turn)
+        };
+        self.spoken
+            .lock()
+            .map_err(poisoned)?
+            .keep(p.session_id, turn, text);
+        Ok(json!({ "spoken": true }))
+    }
+
+    /// Hands the reader the summary given during `turn`, once.
+    fn voice_spoken(&self, params: Option<JsonValue>) -> Result<JsonValue, ControlError> {
+        let p: diri_proto::voice::SpokenParams = decode(params)?;
+        let text = self
+            .spoken
+            .lock()
+            .map_err(poisoned)?
+            .take(&p.session_id, p.turn);
+        encode(&diri_proto::voice::SpokenResult { text })
     }
 
     fn session_process_info(&self, params: Option<JsonValue>) -> Result<JsonValue, ControlError> {
@@ -6956,6 +7012,42 @@ fn verification_probe(prompt: &str, before: &str) -> Option<String> {
 /// composer breaks mid-word.
 const MIN_PROBE_CHARS: usize = 4;
 const MAX_PROBE_CHARS: usize = 20;
+
+/// The latest spoken summary per session, with the turn it belongs to. A
+/// newer one replaces it; asking for another turn leaves it.
+#[derive(Default)]
+struct SpokenSummaries(std::collections::HashMap<String, (u64, String)>);
+
+impl SpokenSummaries {
+    fn keep(&mut self, session: String, turn: u64, text: String) {
+        self.0.insert(session, (turn, text));
+    }
+
+    fn take(&mut self, session: &str, turn: u64) -> Option<String> {
+        if self.0.get(session).is_some_and(|(kept, _)| *kept == turn) {
+            return self.0.remove(session).map(|(_, text)| text);
+        }
+        None
+    }
+}
+
+#[cfg(test)]
+mod spoken_summary_tests {
+    use super::SpokenSummaries;
+
+    #[test]
+    fn a_summary_is_read_once_and_only_for_its_turn() {
+        let mut spoken = SpokenSummaries::default();
+        spoken.keep("s_a".into(), 3, "Fixed it.".into());
+        assert_eq!(spoken.take("s_a", 2), None);
+        assert_eq!(spoken.take("s_b", 3), None);
+        assert_eq!(spoken.take("s_a", 3).as_deref(), Some("Fixed it."));
+        assert_eq!(spoken.take("s_a", 3), None);
+        spoken.keep("s_a".into(), 4, "First.".into());
+        spoken.keep("s_a".into(), 4, "Second.".into());
+        assert_eq!(spoken.take("s_a", 4).as_deref(), Some("Second."));
+    }
+}
 
 /// Codex has no prompt hook, so while "Talk with your agent" is on its
 /// launch carries the request for a closing `Spoken:` paragraph as

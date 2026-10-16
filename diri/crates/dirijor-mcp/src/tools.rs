@@ -514,12 +514,22 @@ pub fn tool_definitions_for(kinds: &[String]) -> Vec<ToolDefinition> {
     tools
 }
 
+/// Diri's `speak` tool, listed only while "Talk with your agent" is on.
+pub fn speak_tool() -> ToolDefinition {
+    ToolDefinition::new(
+        diri_proto::voice::SPEAK_TOOL,
+        diri_proto::voice::SPEAK_TOOL_DESCRIPTION,
+        json!({"type":"object","properties":{"text":{"type":"string","minLength":1,"maxLength":diri_proto::voice::MAX_SPOKEN_CHARS}},"required":["text"]}),
+    )
+}
+
 /// Validate the advertised argument contract before discovery, authorization,
 /// or any Engine call. Wrong optional types must never silently select defaults
 /// (especially submit, force, host, or the selection of child sessions).
 pub(crate) fn validate_arguments(tool: &str, arguments: &Value) -> Result<(), String> {
     let mut definition = tool_definitions_for(&[])
         .into_iter()
+        .chain(std::iter::once(speak_tool()))
         .find(|definition| definition.name == tool)
         .ok_or_else(|| format!("unknown or unavailable tool: {tool}"))?;
     // Kind aliases/custom commands are resolved against the live catalog by
@@ -680,6 +690,14 @@ fn message_id_schema() -> Value {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn speak_takes_a_short_text() {
+        assert!(validate_arguments("speak", &json!({"text": "I fixed it."})).is_ok());
+        assert!(validate_arguments("speak", &json!({})).is_err());
+        assert!(validate_arguments("speak", &json!({"text": ""})).is_err());
+    }
+
     use super::*;
 
     #[test]

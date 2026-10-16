@@ -114,6 +114,11 @@ impl Method {
     pub const EVENTS_SUBSCRIBE: &'static str = "events.subscribe";
     pub const EVENTS_WAIT: &'static str = "events.wait";
     pub const HOOK_REPORT: &'static str = "hook.report";
+    /// "Talk with your agent": whether it is on, an Agent's spoken summary
+    /// of its turn (Diri's `speak` tool), and the reader collecting it.
+    pub const VOICE_STATE: &'static str = "voice.state";
+    pub const VOICE_SPEAK: &'static str = "voice.speak";
+    pub const VOICE_SPOKEN: &'static str = "voice.spoken";
     pub const TEST_RUN: &'static str = "test.run";
     pub const STATE_SNAPSHOT: &'static str = "state.snapshot";
     pub const DAEMON_PREPARE_SHUTDOWN: &'static str = "daemon.prepare_shutdown";
