@@ -121,6 +121,17 @@ part of the CI-tested matrix. Run it without installing:
 nix run github:cristicretu/diri
 ```
 
+The package's graphics libraries come from nixpkgs, so outside NixOS they
+cannot load the host's GPU drivers and the window fails to open. On other
+distributions, run it through [nixGL](https://github.com/nix-community/nixGL):
+
+```sh
+nix run --impure github:nix-community/nixGL -- nix run github:cristicretu/diri
+```
+
+nixGL works by setting `LD_LIBRARY_PATH`, which the terminals Diri starts
+inherit.
+
 The first build clones Zed's full Git history (about 1.6 GB) for the pinned
 GPUI revision; later builds reuse Nix's Git cache. On NixOS, add the overlay and install
 `pkgs.diri`:
@@ -144,8 +155,8 @@ GPUI revision; later builds reuse Nix's Git cache. On NixOS, add the overlay and
 The package contains the same commands as the Debian package, but not the
 browser sidecar, so the browser tool reports itself unavailable. For
 development, `nix develop` provides Rust, Clippy, rustfmt and the native
-libraries; then run `cargo` from `diri/` as usual. It uses nixpkgs' Rust
-rather than the version pinned in `rust-toolchain.toml`.
+libraries, with the Rust version pinned in `rust-toolchain.toml`; then run
+`cargo` from `diri/` as usual.
 
 ## User files
 
