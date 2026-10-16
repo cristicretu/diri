@@ -12,10 +12,10 @@ use serde::{Deserialize, Serialize};
 /// Diri's MCP tool an Agent calls with its spoken summary.
 pub const SPEAK_TOOL: &str = "speak";
 
-pub const SPEAK_TOOL_DESCRIPTION: &str = "The developer has Diri read each of your turns aloud and may be away from the screen. At the end of every turn, after your work and before your final message, call this once with two to four short sentences meant to be heard, not read: what you did, the result, and anything you need from the developer. No code, commands, file names, paths, links or Markdown. Use the language of your reply.";
+pub const SPEAK_TOOL_DESCRIPTION: &str = "The developer has Diri read each of your turns aloud and may be away from the screen. At the end of every turn, after your work and before your final message, call this once with a spoken summary meant to be heard, not read, that lets the developer follow without the screen: what you did and the result, each option or decision you are offering (named briefly, one by one), and what you need from them. Usually three to eight sentences; fewer when there is little to say. No code, commands, file names, paths, links or Markdown. Use the language of your reply.";
 
-/// Longest summary kept; a spoken summary is a few sentences.
-pub const MAX_SPOKEN_CHARS: usize = 2000;
+/// Longest summary kept: a spoken summary is up to a long paragraph.
+pub const MAX_SPOKEN_CHARS: usize = 3000;
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -48,11 +48,11 @@ pub const SPOKEN_MARKER: &str = "Spoken:";
 /// Context added to each Claude Code prompt (its hook) and to Codex's
 /// developer instructions (its launch) while the setting is on. Both have
 /// Diri's MCP server; the paragraph covers a session where it failed.
-pub const SPOKEN_INSTRUCTION: &str = "The developer has Diri read each of your turns aloud and may be away from the screen. At the end of every turn, call Diri's speak tool once with two to four short sentences meant to be heard, not read: what you did, the result, and anything you need from the developer. No code, commands, file names, paths, links or Markdown. If the speak tool is unavailable, end your reply with a final paragraph starting \"Spoken:\" with those sentences instead.";
+pub const SPOKEN_INSTRUCTION: &str = "The developer has Diri read each of your turns aloud and may be away from the screen. At the end of every turn, call Diri's speak tool once with a spoken summary meant to be heard, not read, that lets the developer follow without the screen: what you did and the result, each option or decision you are offering (named briefly, one by one), and what you need from them. Usually three to eight sentences; fewer when there is little to say. No code, commands, file names, paths, links or Markdown. If the speak tool is unavailable, end your reply with a final paragraph starting \"Spoken:\" saying the same instead.";
 
 /// The short form, added to a spoken answer for agents Diri has no other
 /// way to ask.
-pub const SPOKEN_REQUEST: &str = "End your reply with a short paragraph starting \"Spoken:\" that says, in plain words for listening, what you did and what you need from me.";
+pub const SPOKEN_REQUEST: &str = "End your reply with a paragraph starting \"Spoken:\" that says, in plain words for listening, what you did, the options you offer if any, and what you need from me.";
 
 /// Whether the app's preferences file has the setting on. A missing or
 /// unreadable file means off.

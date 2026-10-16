@@ -76,7 +76,7 @@ func fail(_ message: String, code: Int32 = 1) -> Never {
     @available(macOS 26.0, *)
     @Generable
     struct Spoken {
-        @Guide(description: "What the agent did and what it found or changed, in its own words, as two to four short first-person sentences of at most 60 words in total. Lead with the result. Keep its hedges: if it did not check something, say so")
+        @Guide(description: "What the agent did and what it found or changed, in its own words, as three to six short first-person sentences of at most 100 words in total. Lead with the result. If it offers options or asks for a decision, name each option briefly. Keep its hedges: if it did not check something, say so")
         var outcome: String
         @Guide(description: "What the agent says it could not do or what failed, in its own words, as one short first-person sentence; an empty string when nothing failed")
         var problem: String
