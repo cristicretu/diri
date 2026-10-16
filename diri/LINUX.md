@@ -112,6 +112,41 @@ sudo apt install build-essential clang cmake libasound2-dev libfontconfig-dev \
 Creating distribution artifacts additionally needs Node.js 20 or newer and
 `cargo-packager` 0.11.8, then `diri/scripts/package-linux.sh`.
 
+## Nix
+
+The repository's flake builds Diri from source for x86_64 Linux. It is not
+part of the CI-tested matrix. Run it without installing:
+
+```sh
+nix run github:cristicretu/diri
+```
+
+The first build clones Zed's full Git history (about 1.6 GB) for the pinned
+GPUI revision; later builds reuse Nix's Git cache. On NixOS, add the overlay and install
+`pkgs.diri`:
+
+```nix
+{
+  inputs.diri.url = "github:cristicretu/diri";
+
+  outputs = { nixpkgs, diri, ... }: {
+    nixosConfigurations.my-host = nixpkgs.lib.nixosSystem {
+      system = "x86_64-linux";
+      modules = [
+        { nixpkgs.overlays = [ diri.overlays.default ]; }
+        ({ pkgs, ... }: { environment.systemPackages = [ pkgs.diri ]; })
+      ];
+    };
+  };
+}
+```
+
+The package contains the same commands as the Debian package, but not the
+browser sidecar, so the browser tool reports itself unavailable. For
+development, `nix develop` provides Rust, Clippy, rustfmt and the native
+libraries; then run `cargo` from `diri/` as usual. It uses nixpkgs' Rust
+rather than the version pinned in `rust-toolchain.toml`.
+
 ## User files
 
 Diri follows the XDG base-directory specification. The defaults are:

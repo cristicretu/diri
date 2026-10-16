@@ -16,3 +16,6 @@ diri/.build-detect/
 ios/DiriPhone.xcodeproj/
 ios/DerivedData/
 ios/build/
+
+# `nix build` output link.
+/result
