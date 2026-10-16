@@ -292,6 +292,17 @@ pub fn injection_args_full(
             ));
             argv.push("-c".into());
             argv.push(format!("mcp_servers.dirijor.args=[{encoded_args}]"));
+            // Codex starts stdio MCP servers with a scrubbed environment, so
+            // the bridge would not know which session is calling and refuse
+            // every write. Name it explicitly.
+            if let Some(identity) = cursor.as_ref() {
+                argv.push("-c".into());
+                argv.push(format!(
+                    "mcp_servers.dirijor.env={{DIRIJOR_SESSION_ID={}, DIRIJOR_SOCKET={}}}",
+                    toml_string(identity.session_id),
+                    toml_string(&identity.socket_path.to_string_lossy())
+                ));
+            }
         }
     }
     // Cursor stays on stdio: cursor-agent 2025.09.12 sends no configured
@@ -654,6 +665,22 @@ mod tests {
         };
 
         // Endpoint up but the Claude HTTP config never written: stdio.
+        // Codex on stdio scrubs its MCP server's environment: the session
+        // identity has to travel in the server's own env table.
+        let identity = CursorInject {
+            session_id: "s_1",
+            socket_path: Path::new("/tmp/d.sock"),
+        };
+        let stdio = injection_args_full(&codex, temp.path(), &cli, Some(identity), None);
+        assert!(
+            stdio.argv.contains(
+                &"mcp_servers.dirijor.env={DIRIJOR_SESSION_ID=\"s_1\", DIRIJOR_SOCKET=\"/tmp/d.sock\"}"
+                    .to_owned()
+            ),
+            "{:?}",
+            stdio.argv
+        );
+
         let injected = injection_args_full(&claude, temp.path(), &cli, None, Some(url));
         assert!(!injected.mcp_http);
         assert!(injected.argv[1].ends_with("claude-mcp.json"));
