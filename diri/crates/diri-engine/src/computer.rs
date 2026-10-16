@@ -37,8 +37,23 @@ const MAX_IMAGE_DIMENSION: u64 = 2560;
 /// Results are relayed on the control socket, one line of at most
 /// `MAX_CONTROL_LINE_BYTES`; leave room for the envelope.
 const MAX_RESULT_BYTES: usize = diri_proto::control::MAX_CONTROL_LINE_BYTES - 64 * 1024;
+/// The driver runs every session's calls through one queue (measured on
+/// 0.36: a second daemon barely helps), so one long batch would hold up
+/// every other Agent. Batches stay short enough to interleave.
+const MAX_BATCH_STEPS: usize = 20;
 /// Cua caps badge labels at 28 characters.
 const MAX_LABEL_CHARS: usize = 28;
+/// The driver binds a session name to the pipe that first used it and never
+/// lets another pipe reuse it, even after it ends, so every pipe gets fresh
+/// names: the visible badge plus a tag of zero-width characters that renders
+/// as nothing.
+const NAME_TAG: [char; 4] = ['\u{200B}', '\u{200C}', '\u{200D}', '\u{2060}'];
+const NAME_TAG_LEN: usize = 4;
+const NAME_ATTEMPTS: u64 = 4;
+/// Each session's cursor glides quickly and does not linger. Measured on
+/// Cua Driver 0.36: an action costs ~1.27 s with the default motion and
+/// ~0.8 s with this one; ~0.72 s of every action is the driver's own floor.
+const CURSOR_GLIDE_MS: u64 = 100;
 
 /// Driver tools Diri does not hand to Agents: Diri owns each session's
 /// lifecycle and cursor, and driver-wide configuration is the person's.
@@ -106,6 +121,8 @@ pub const UNAVAILABLE: &str = "computer_unavailable";
 pub const APP_BUSY: &str = "computer_app_busy";
 /// The tool is unknown or not offered to Agents.
 pub const UNKNOWN_TOOL: &str = "computer_unknown_tool";
+/// A `run_steps` batch longer than other Agents should wait for.
+pub const BATCH_TOO_LONG: &str = "computer_batch_too_long";
 /// The driver process failed, timed out, or answered out of protocol.
 pub const DRIVER_ERROR: &str = "computer_driver";
 
@@ -153,6 +170,9 @@ struct Inner {
 #[derive(Default, Debug)]
 struct Sessions {
     labels: HashMap<String, String>,
+    /// Each session's driver session name on the current pipe: its badge
+    /// plus an invisible tag.
+    driver_names: HashMap<String, String>,
     leases: HashMap<i64, Lease>,
 }
 
@@ -170,7 +190,8 @@ impl Sessions {
         if let Some(label) = self.labels.get(caller.session_id) {
             return label.clone();
         }
-        let base = truncate_label(caller.badge.trim(), MAX_LABEL_CHARS);
+        let budget = MAX_LABEL_CHARS - NAME_TAG_LEN;
+        let base = truncate_label(caller.badge.trim(), budget);
         let base = if base.is_empty() {
             "Diri agent".to_owned()
         } else {
@@ -183,7 +204,7 @@ impl Sessions {
             let suffix = format!(" {n}");
             label = format!(
                 "{}{suffix}",
-                truncate_label(&base, MAX_LABEL_CHARS - suffix.chars().count())
+                truncate_label(&base, budget - suffix.chars().count())
             );
             n += 1;
         }
@@ -235,8 +256,20 @@ impl Sessions {
         Ok(())
     }
 
+    /// Restarts the clock on the caller's own leases among `pids`.
+    fn renew(&mut self, session_id: &str, pids: &[i64], now: Instant) {
+        for pid in pids {
+            if let Some(lease) = self.leases.get_mut(pid)
+                && lease.session_id == session_id
+            {
+                lease.touched = now;
+            }
+        }
+    }
+
     fn forget_session(&mut self, session_id: &str) {
         self.labels.remove(session_id);
+        self.driver_names.remove(session_id);
         self.leases
             .retain(|_, lease| lease.session_id != session_id);
     }
@@ -307,6 +340,19 @@ impl ComputerUse {
                 ));
             }
         };
+        if tool == "run_steps"
+            && let Some(steps) = args.get("steps").and_then(Value::as_array)
+            && steps.len() > MAX_BATCH_STEPS
+        {
+            return Err(ComputerError::new(
+                BATCH_TOO_LONG,
+                format!(
+                    "run_steps takes at most {MAX_BATCH_STEPS} steps per call ({} given): other \
+                     agents share this Mac's driver and wait while a batch runs. Split it.",
+                    steps.len()
+                ),
+            ));
+        }
         let catalog = self.catalog()?;
         if !catalog.iter().any(|entry| entry["name"] == tool) {
             return Err(ComputerError::new(
@@ -315,18 +361,24 @@ impl ComputerUse {
             ));
         }
 
-        let label = {
+        let pids = mentioned_pids(&Value::Object(args.clone()));
+        let (label, start) = {
             let mut inner = self.lock();
             let label = inner.state.label_for(caller);
             if !READ_ONLY_TOOLS.contains(&tool) {
-                let pids = mentioned_pids(&Value::Object(args.clone()));
                 inner
                     .state
                     .lease(caller.session_id, &label, &pids, Instant::now(), is_live)?;
             }
-            label
+            let name = inner.state.driver_names.get(caller.session_id).cloned();
+            (label, name)
         };
-        args.insert("session".into(), Value::String(label.clone()));
+        // Only once the call is going ahead: a refused call starts nothing.
+        let name = match start {
+            Some(name) => name,
+            None => self.start_driver_session(caller.session_id, &label),
+        };
+        args.insert("session".into(), Value::String(name));
         bound_screenshot(tool, &mut args);
 
         let result = self
@@ -337,18 +389,56 @@ impl ComputerUse {
             )
             .map_err(ComputerError::driver)?;
 
-        // A launched app belongs to whoever launched it.
-        if tool == "launch_app"
-            && let Some(pid) = result["structuredContent"]["pid"].as_i64()
         {
             let mut inner = self.lock();
-            let _ = inner
-                .state
-                .lease(caller.session_id, &label, &[pid], Instant::now(), &|_| {
-                    false
-                });
+            // A lease counts from the end of its holder's last call, reads
+            // included: a long batch or a careful look keeps the app.
+            inner.state.renew(caller.session_id, &pids, Instant::now());
+            // A launched app belongs to whoever launched it.
+            if tool == "launch_app"
+                && let Some(pid) = result["structuredContent"]["pid"].as_i64()
+            {
+                let _ =
+                    inner
+                        .state
+                        .lease(caller.session_id, &label, &[pid], Instant::now(), &|_| {
+                            false
+                        });
+            }
         }
         fit_result(result)
+    }
+
+    /// Starts the caller's driver session with Diri's quick cursor under a
+    /// name no earlier pipe has used, and remembers it for this pipe. Best
+    /// effort: a driver that refuses keeps its default motion and the call
+    /// goes ahead under the last name tried.
+    fn start_driver_session(&self, session_id: &str, label: &str) -> String {
+        let hasher = std::collections::hash_map::RandomState::new();
+        let mut name = String::new();
+        for attempt in 0..NAME_ATTEMPTS {
+            let seed = std::hash::BuildHasher::hash_one(&hasher, (session_id, attempt));
+            name = tagged(label, seed);
+            let reply = self.request(
+                "tools/call",
+                json!({"name": "start_session", "arguments": {
+                    "session": name,
+                    "cursor_motion": {"glide_duration_ms": CURSOR_GLIDE_MS, "dwell_after_click_ms": 0},
+                }}),
+                HANDSHAKE_TIMEOUT,
+            );
+            let taken = reply
+                .as_ref()
+                .is_ok_and(|reply| reply["structuredContent"]["code"] == "session_unavailable");
+            if !taken {
+                break;
+            }
+        }
+        self.lock()
+            .state
+            .driver_names
+            .insert(session_id.to_owned(), name.clone());
+        name
     }
 
     /// Lets go of a session's badge and leases (its tab closed).
@@ -464,7 +554,7 @@ impl ComputerUse {
         inner.catalog = None;
         // A new pipe is a new driver transport: its sessions start fresh, so
         // badges from the last one no longer exist there.
-        inner.state.labels.clear();
+        inner.state.driver_names.clear();
         let incarnation = inner.incarnation;
         let shared = Arc::downgrade(&self.shared);
         std::thread::Builder::new()
@@ -758,6 +848,21 @@ fn fit_result(result: Value) -> Result<Value, ComputerError> {
         "the result is {size} bytes, more than Diri can relay; narrow it (query, max_elements, \
          include_screenshot:false)"
     )))
+}
+
+/// `label` followed by an invisible tag drawn from `seed`.
+fn tagged(label: &str, seed: u64) -> String {
+    let mut name = label.to_owned();
+    for i in 0..NAME_TAG_LEN {
+        name.push(NAME_TAG[((seed >> (2 * i)) & 3) as usize]);
+    }
+    name
+}
+
+/// What a person sees of a driver session name.
+#[cfg(test)]
+fn visible(name: &str) -> String {
+    name.chars().filter(|c| !NAME_TAG.contains(c)).collect()
 }
 
 fn strip_session(mut schema: Value) -> Value {

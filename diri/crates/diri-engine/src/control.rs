@@ -2237,12 +2237,7 @@ impl ControlServer {
                 .and_then(|agent| agent.display_name.clone())
                 .filter(|name| !name.is_empty())
                 .unwrap_or_else(|| record.kind.id().to_owned());
-            let title = record.title.trim();
-            let badge = if title.is_empty() || title.eq_ignore_ascii_case(&agent) {
-                agent
-            } else {
-                format!("{agent} · {title}")
-            };
+            let badge = cursor_badge(&agent, &record.title);
             let live: std::collections::HashSet<String> = registry
                 .records()
                 .into_iter()
@@ -5407,6 +5402,26 @@ impl Drop for ActiveConnectionGuard {
     }
 }
 
+/// The words under a session's agent cursor: the agent and the tab, without
+/// saying the agent twice when the tab already names it ("Codex · fix" not
+/// "Codex · Codex · fix"; "Claude · x" for Claude Code).
+fn cursor_badge(agent: &str, title: &str) -> String {
+    let title = title.trim();
+    let first_word = agent.split_whitespace().next().unwrap_or(agent);
+    let named = |word: &str| {
+        title
+            .get(..word.len())
+            .is_some_and(|prefix| prefix.eq_ignore_ascii_case(word))
+    };
+    if title.is_empty() {
+        agent.to_owned()
+    } else if named(agent) || named(first_word) {
+        title.to_owned()
+    } else {
+        format!("{agent} · {title}")
+    }
+}
+
 /// The last steps of an Engine that has nothing left to look after. Callers
 /// have already persisted the registry and checked that no session is live.
 fn release_idle_engine(
@@ -7007,6 +7022,21 @@ mod tests {
     mod reconnect_tests;
     #[cfg(unix)]
     mod send_key_tests;
+
+    #[test]
+    fn cursor_badges_name_the_agent_once() {
+        assert_eq!(cursor_badge("Codex", "fix login"), "Codex · fix login");
+        assert_eq!(
+            cursor_badge("Codex", "Codex · calculator"),
+            "Codex · calculator"
+        );
+        assert_eq!(
+            cursor_badge("Claude Code", "Claude · settings"),
+            "Claude · settings"
+        );
+        assert_eq!(cursor_badge("Claude Code", "claude code"), "claude code");
+        assert_eq!(cursor_badge("Gemini", "  "), "Gemini");
+    }
 
     #[test]
     fn an_over_budget_session_list_drops_only_pull_request_detail() {

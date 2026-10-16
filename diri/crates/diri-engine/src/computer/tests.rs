@@ -14,10 +14,13 @@ fn badges_are_stable_unique_and_fit_the_driver_cap() {
     assert_eq!(b, "Codex · fix login 2");
 
     let long = sessions.label_for(&caller("c", "Claude · a very long tab title that goes on"));
-    assert_eq!(long.chars().count(), MAX_LABEL_CHARS);
+    assert_eq!(long.chars().count(), MAX_LABEL_CHARS - NAME_TAG_LEN);
     assert!(long.ends_with('…'));
     let long_twin = sessions.label_for(&caller("d", "Claude · a very long tab title that goes on"));
-    assert!(long_twin.chars().count() <= MAX_LABEL_CHARS, "{long_twin}");
+    assert!(
+        long_twin.chars().count() <= MAX_LABEL_CHARS - NAME_TAG_LEN,
+        "{long_twin}"
+    );
     assert!(long_twin.ends_with(" 2"), "{long_twin}");
 
     assert_eq!(sessions.label_for(&caller("e", "  ")), "Diri agent");
@@ -42,15 +45,25 @@ fn an_app_belongs_to_one_session_until_it_goes_quiet_or_away() {
     // A refused call takes nothing, not even the free pid it also named.
     assert!(!sessions.leases.contains_key(&11));
 
+    // Renewal restarts the holder's clock and never touches someone else's.
+    let later = now + Duration::from_secs(5) + LEASE_IDLE - Duration::from_secs(1);
+    sessions.renew("a", &[10], later);
+    sessions.renew("b", &[10], later + Duration::from_secs(100));
+    assert!(
+        sessions
+            .lease(
+                "b",
+                "B",
+                &[10],
+                later + LEASE_IDLE - Duration::from_secs(1),
+                &live
+            )
+            .is_err()
+    );
+
     // A quiet holder loses it.
     sessions
-        .lease(
-            "b",
-            "B",
-            &[10],
-            now + Duration::from_secs(5) + LEASE_IDLE,
-            &live,
-        )
+        .lease("b", "B", &[10], later + LEASE_IDLE, &live)
         .unwrap();
     assert_eq!(sessions.leases[&10].session_id, "b");
 
@@ -63,6 +76,16 @@ fn an_app_belongs_to_one_session_until_it_goes_quiet_or_away() {
     sessions.forget_session("d");
     assert!(!sessions.leases.contains_key(&20));
     assert!(!sessions.labels.contains_key("d"));
+}
+
+#[test]
+fn tags_are_invisible_and_fit_the_badge() {
+    let mut sessions = Sessions::default();
+    let label = sessions.label_for(&caller("a", "Claude · a very long tab title that goes on"));
+    let name = tagged(&label, 0b1110_0100);
+    assert_eq!(name.chars().count(), MAX_LABEL_CHARS);
+    assert_eq!(visible(&name), label);
+    assert_ne!(tagged(&label, 1), tagged(&label, 2));
 }
 
 #[test]
@@ -125,6 +148,7 @@ fn summaries_end_at_the_first_sentence() {
 const FAKE_DRIVER: &str = r#"#!/bin/sh
 [ "$1" = mcp ] || exit 2
 while IFS= read -r line; do
+  printf '%s\n' "$line" >> "$0.log"
   id=$(printf '%s' "$line" | sed -n 's/.*"id":\([0-9][0-9]*\).*/\1/p')
   [ -z "$id" ] && continue
   case "$line" in
@@ -132,6 +156,14 @@ while IFS= read -r line; do
       printf '{"jsonrpc":"2.0","id":%s,"result":{"protocolVersion":"2025-06-18","capabilities":{"tools":{}}}}\n' "$id" ;;
     *'"method":"tools/list"'*)
       printf '{"jsonrpc":"2.0","id":%s,"result":{"tools":[{"name":"launch_app","description":"Launch a macOS app in the background. More.","inputSchema":{"type":"object","properties":{"session":{"type":"string"},"bundle_id":{"type":"string"}}}},{"name":"click","description":"Click a target pid.","inputSchema":{"type":"object"}},{"name":"get_window_state","description":"Snapshot a window.","inputSchema":{"type":"object"}},{"name":"set_config","description":"Driver-wide.","inputSchema":{"type":"object"}}]}}\n' "$id" ;;
+    *'"name":"start_session"'*)
+      # The first name asked for belongs to an earlier pipe.
+      if [ ! -e "$0.taken" ]; then
+        : > "$0.taken"
+        printf '{"jsonrpc":"2.0","id":%s,"result":{"content":[{"type":"text","text":"session is not available to this transport"}],"isError":true,"structuredContent":{"code":"session_unavailable"}}}\n' "$id"
+      else
+        printf '{"jsonrpc":"2.0","id":%s,"result":{"content":[{"type":"text","text":"active"}],"structuredContent":{"active":true}}}\n' "$id"
+      fi ;;
     *'"name":"launch_app"'*)
       printf '{"jsonrpc":"2.0","id":%s,"result":{"content":[{"type":"text","text":"launched"}],"structuredContent":{"pid":4242,"echo":%s}}}\n' "$id" "$line" ;;
     *'"x":-1'*'"name":"click"'*)
@@ -186,10 +218,8 @@ fn agents_share_one_driver_with_their_own_badges_and_apps() {
         )
         .unwrap();
     let echo = &launched["mcpToolResult"]["structuredContent"]["echo"];
-    assert_eq!(
-        echo["params"]["arguments"]["session"],
-        "Codex · checkout flow"
-    );
+    let codex_name = echo["params"]["arguments"]["session"].as_str().unwrap();
+    assert_eq!(visible(codex_name), "Codex · checkout flow");
 
     // The launcher owns the new pid; the other Agent may look but not act.
     let busy = computer
@@ -206,7 +236,7 @@ fn agents_share_one_driver_with_their_own_badges_and_apps() {
         .unwrap();
     let echo = &looked["mcpToolResult"]["structuredContent"]["echo"];
     assert_eq!(
-        echo["params"]["arguments"]["session"],
+        visible(echo["params"]["arguments"]["session"].as_str().unwrap()),
         "Claude · settings page"
     );
     assert_eq!(
@@ -216,6 +246,33 @@ fn agents_share_one_driver_with_their_own_badges_and_apps() {
     computer
         .act(&codex, "click", json!({"pid":4242,"x":1,"y":2}), &live)
         .unwrap();
+
+    // Each badge's driver session starts once, with Diri's quick cursor,
+    // under a name no earlier pipe holds: a taken name is retried with
+    // another invisible tag.
+    let log = std::fs::read_to_string(temp.path().join("cua-driver.log")).unwrap();
+    let starts: Vec<Value> = log
+        .lines()
+        .map(|line| serde_json::from_str::<Value>(line).unwrap())
+        .filter(|message| message["params"]["name"] == "start_session")
+        .collect();
+    assert_eq!(starts.len(), 3, "{starts:?}");
+    let first = starts[0]["params"]["arguments"]["session"]
+        .as_str()
+        .unwrap();
+    let second = starts[1]["params"]["arguments"]["session"]
+        .as_str()
+        .unwrap();
+    assert_ne!(first, second);
+    assert_eq!(visible(first), visible(second));
+    assert_eq!(
+        second, codex_name,
+        "the call runs under the name that started"
+    );
+    assert_eq!(
+        starts[0]["params"]["arguments"]["cursor_motion"]["glide_duration_ms"],
+        CURSOR_GLIDE_MS
+    );
 
     // Driver-wide tools stay with the person; unknown tools say so.
     assert_eq!(
@@ -231,6 +288,17 @@ fn agents_share_one_driver_with_their_own_badges_and_apps() {
             .unwrap_err()
             .code,
         UNKNOWN_TOOL
+    );
+    // Long batches are split so other Agents' actions interleave.
+    let steps: Vec<Value> = (0..=MAX_BATCH_STEPS)
+        .map(|_| json!({"click": {"pid": 4242}}))
+        .collect();
+    assert_eq!(
+        computer
+            .act(&codex, "run_steps", json!({"steps": steps}), &live)
+            .unwrap_err()
+            .code,
+        BATCH_TOO_LONG
     );
     // A driver error reaches the Agent as a driver error.
     let failed = computer
@@ -258,11 +326,12 @@ fn concurrent_agents_are_answered_by_one_pipe() {
                         &|_: &str| true,
                     )
                     .map(|result| {
-                        result["mcpToolResult"]["structuredContent"]["echo"]["params"]["arguments"]
-                            ["session"]
-                            .as_str()
-                            .unwrap()
-                            .to_owned()
+                        visible(
+                            result["mcpToolResult"]["structuredContent"]["echo"]["params"]
+                                ["arguments"]["session"]
+                                .as_str()
+                                .unwrap(),
+                        )
                     })
             })
         })
@@ -280,22 +349,33 @@ fn a_driver_that_dies_is_relaunched_on_the_next_call() {
     let computer = ComputerUse::with_binary(Some(fake_driver(temp.path())));
     let live = |_: &str| true;
     let agent = caller("s", "Agent");
-    computer.act(&agent, "tools", json!({}), &live).unwrap();
+    let name_on = |result: Value| {
+        result["mcpToolResult"]["structuredContent"]["echo"]["params"]["arguments"]["session"]
+            .as_str()
+            .unwrap()
+            .to_owned()
+    };
+    let read = json!({"pid":1,"window_id":1});
+    let before = name_on(
+        computer
+            .act(&agent, "get_window_state", read.clone(), &live)
+            .unwrap(),
+    );
     {
         let mut inner = computer.lock();
         let child = inner.child.as_mut().unwrap();
         child.kill().unwrap();
         child.wait().unwrap();
     }
-    computer
-        .act(
-            &agent,
-            "get_window_state",
-            json!({"pid":1,"window_id":1}),
-            &live,
-        )
-        .unwrap();
+    let after = name_on(
+        computer
+            .act(&agent, "get_window_state", read, &live)
+            .unwrap(),
+    );
     assert_eq!(computer.lock().incarnation, 2);
+    // The old pipe's names died with it; the badge reads the same.
+    assert_ne!(before, after);
+    assert_eq!(visible(&before), visible(&after));
 }
 
 #[test]
