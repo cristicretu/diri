@@ -4301,3 +4301,18 @@ mod split_panes {
         assert_ne!(store.selected_session_id(), Some(&id("shown")));
     }
 }
+
+#[test]
+fn muting_a_chat_also_stops_it_being_read_aloud() {
+    let record = session("talky", "p", 1.0);
+    let prefs = Prefs {
+        talk_with_agent: true,
+        ..Prefs::default()
+    };
+    let (mut store, _effects) = hydrated(vec![record.clone()], vec![project("p", "P")], prefs);
+    assert!(store.reads_aloud(&record.id));
+    store.toggle_notification_mute(record.id.clone());
+    assert!(!store.reads_aloud(&record.id));
+    store.toggle_notification_mute(record.id.clone());
+    assert!(store.reads_aloud(&record.id));
+}

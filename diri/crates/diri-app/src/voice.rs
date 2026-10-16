@@ -628,11 +628,15 @@ mod macos {
         completion: &TurnCompletion,
     ) -> Option<Arc<SessionRecord>> {
         let store = store.read().expect("store");
-        if !store.preferences().talk_with_agent {
+        if !speaks(&store, &completion.session_id) {
             return None;
         }
         let record = store.sessions().get(&completion.session_id)?;
         is_latest_turn(record, completion.turn).then(|| Arc::clone(record))
+    }
+
+    fn speaks(store: &SessionStore, session: &SessionId) -> bool {
+        store.reads_aloud(session)
     }
 
     fn is_latest_turn(record: &SessionRecord, turn: u64) -> bool {
@@ -850,7 +854,7 @@ mod macos {
         let store = &runtime.store;
         let wanted = || {
             let store = store.read().expect("store");
-            store.preferences().talk_with_agent
+            speaks(&store, &utterance.session_id)
                 && store
                     .sessions()
                     .get(&utterance.session_id)
@@ -965,7 +969,7 @@ mod macos {
             thread::sleep(ANSWER_POLL);
             answer_ended(listener, &utterance.session_id);
             let store = store.read().expect("store");
-            let waiting = store.preferences().talk_with_agent
+            let waiting = speaks(&store, &utterance.session_id)
                 && store.app_is_active()
                 && store.selected_session_id() == Some(&utterance.session_id)
                 && store

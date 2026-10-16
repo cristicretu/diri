@@ -744,6 +744,13 @@ impl SessionStore {
         self.emit(StoreEffect::PublishSnapshot);
     }
 
+    /// Whether "Talk with your agent" reads `session` aloud: the setting is
+    /// on and the chat is not muted. One per-chat mute silences both its
+    /// notifications and its readings.
+    pub fn reads_aloud(&self, session: &SessionId) -> bool {
+        self.prefs.talk_with_agent && !self.prefs.muted_notification_sessions.contains(&session.0)
+    }
+
     pub fn toggle_notification_mute(&mut self, session: SessionId) {
         if !self.prefs.muted_notification_sessions.remove(&session.0) {
             self.prefs
