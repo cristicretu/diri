@@ -75,6 +75,7 @@ impl Method {
     /// (`SessionOpenApiRequestParams`); the Engine re-publishes it as the
     /// `session.api_request` event. Nothing is sent by the Engine.
     pub const SESSION_OPEN_API_REQUEST: &'static str = "session.open_api_request";
+    pub const COMPUTER_ACT: &'static str = "computer.act";
     pub const SESSION_MIGRATE: &'static str = "session.migrate";
     pub const SESSION_REPARENT_WORKTREE: &'static str = "session.reparent_worktree";
     pub const HOST_SYNC_PREFS: &'static str = "host.sync_prefs";

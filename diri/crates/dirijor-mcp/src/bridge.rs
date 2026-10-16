@@ -142,6 +142,7 @@ impl Bridge {
             "release_agent" => self.release_agent(arguments),
             "test_run" => self.test_run(arguments),
             "browser" => self.browser(arguments),
+            "computer" => self.computer(arguments),
             "open_api_request" => self.open_api_request(arguments),
             "quick_open_include" => self.quick_open_include(arguments),
             "whoami" => self.whoami(),
@@ -607,6 +608,30 @@ impl Bridge {
             "browser.act",
             Value::Object(params),
             Duration::from_secs(60),
+        )
+    }
+
+    /// Relays one Cua Driver call; the Engine owns the driver, the caller's
+    /// cursor badge, and which session may act on which app.
+    fn computer(&self, arguments: &Value) -> Result<Value, String> {
+        let snapshot = self.snapshot()?;
+        McpPolicy::new(
+            &snapshot.sessions,
+            &snapshot.projects,
+            self.caller.as_deref(),
+        )?
+        .authorize(WriteAction::Computer)?;
+        let caller = self.caller.as_ref().expect("policy requires a caller");
+        let tool = required_string(arguments, "tool")?;
+        self.request(
+            Method::COMPUTER_ACT,
+            json!({
+                "sessionID": caller,
+                "tool": tool,
+                "args": arguments.get("args").cloned().unwrap_or_else(|| json!({})),
+            }),
+            // The Engine waits up to two minutes for a batched action.
+            Duration::from_secs(130),
         )
     }
 

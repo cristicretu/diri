@@ -174,6 +174,7 @@ pub struct ControlServer {
     cli_versions: crate::cli_version::CliVersions,
     governor: std::sync::Arc<Mutex<crate::governor::GovernorConfig>>,
     browser: std::sync::OnceLock<crate::browser::BrowserPool>,
+    computer: crate::computer::ComputerUse,
     active_connections: Arc<AtomicUsize>,
     background_requests: Arc<AtomicUsize>,
     worktree_scan: crate::worktree_scan::ScanStore,
@@ -300,6 +301,7 @@ impl ControlServer {
             cli_versions: Default::default(),
             governor: std::sync::Arc::new(Mutex::new(crate::governor::GovernorConfig::default())),
             browser: std::sync::OnceLock::new(),
+            computer: Default::default(),
             active_connections: Arc::new(AtomicUsize::new(0)),
             background_requests: Arc::new(AtomicUsize::new(0)),
             worktree_scan: Default::default(),
@@ -1180,6 +1182,7 @@ impl ControlServer {
             Method::WORKTREE_OVERVIEW => self.worktree_overview(),
             Method::TEST_RUN => self.browser_call("run", params),
             "browser.act" => self.browser_call("browser", params),
+            Method::COMPUTER_ACT => self.computer_act(params),
             Method::EVENTS_WAIT => self.events_wait(params),
             Method::HOST_SYNC_PREFS => self.host_sync_prefs(params),
             Method::HOST_INITIALIZE => self.host_initialize(params),
@@ -2214,6 +2217,47 @@ impl ControlServer {
             code: "browser_pool".into(),
             message: error,
         })
+    }
+
+    /// `computer.act`: one Cua Driver call on behalf of a live session, under
+    /// that session's own cursor badge and app leases.
+    fn computer_act(&self, params: Option<JsonValue>) -> Result<JsonValue, ControlError> {
+        let p: diri_proto::ComputerActParams = decode(params)?;
+        let id = p.session_id.0.clone();
+        let (badge, live) = {
+            let registry = self.registry.lock().map_err(poisoned)?;
+            let record = registry
+                .record(&id)
+                .filter(|record| !record.is_archived())
+                .ok_or_else(|| ControlError::not_found(format!("no session {id}")))?;
+            let agent = registry
+                .engine()
+                .manifest(record.kind.id())
+                .and_then(|manifest| manifest.agent.as_ref())
+                .and_then(|agent| agent.display_name.clone())
+                .filter(|name| !name.is_empty())
+                .unwrap_or_else(|| record.kind.id().to_owned());
+            let title = record.title.trim();
+            let badge = if title.is_empty() || title.eq_ignore_ascii_case(&agent) {
+                agent
+            } else {
+                format!("{agent} · {title}")
+            };
+            let live: std::collections::HashSet<String> = registry
+                .records()
+                .into_iter()
+                .filter(|record| !record.is_archived() && registry.is_live(&record.id.0))
+                .map(|record| record.id.0)
+                .collect();
+            (badge, live)
+        };
+        let caller = crate::computer::Caller {
+            session_id: &id,
+            badge: &badge,
+        };
+        self.computer
+            .act(&caller, &p.tool, p.args, &|session| live.contains(session))
+            .map_err(|error| ControlError::new(error.code, error.message))
     }
 
     /// The aggregated staleness view: every worktree of every project,

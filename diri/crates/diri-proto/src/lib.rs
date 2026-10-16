@@ -4,11 +4,13 @@ pub mod accounts;
 pub mod agent_names;
 pub mod api_request;
 pub mod attention;
+pub mod computer;
 pub use accounts::*;
 pub use api_request::{
     ApiEnvironmentDraft, ApiHeaderDraft, ApiRequestDraft, ApiVariableDraft,
     SessionOpenApiRequestParams,
 };
+pub use computer::ComputerActParams;
 pub mod control;
 pub mod frames;
 pub mod grid;
