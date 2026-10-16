@@ -221,9 +221,8 @@ impl<C: Clock> UsageStore<C> {
         cursor.last_event_ms = last_event_ms;
         // Save aggregates and progress together. A failed write is retried by the
         // normal ledger refresh; replay after a crash is deduplicated.
-        if self.ledger.dirty && cache::save(&self.paths.cache_file, &self.ledger.cache).is_ok() {
-            self.ledger.dirty = false;
-        }
+        self.ledger
+            .persist(&self.paths.cache_file, reading.unix_seconds, false);
         provider_from_hours(&self.ledger.cache.cursor.hours, reading)
     }
 
@@ -239,13 +238,40 @@ impl<C: Clock> UsageStore<C> {
 struct TranscriptLedger {
     cache: UsageCacheFile,
     dirty: bool,
+    /// When the cache was last written (the store clock's Unix seconds).
+    saved_at: Option<i64>,
 }
+
+/// Agents append to transcripts every few seconds, and the cache runs to
+/// megabytes: write it at most this often while it changes. A crash loses at
+/// most this much progress, which the next scan replays (deduplicated).
+const SAVE_INTERVAL_SECONDS: i64 = 60;
 
 impl TranscriptLedger {
     fn load(path: &Path) -> Self {
         Self {
             cache: cache::load(path),
             dirty: false,
+            saved_at: None,
+        }
+    }
+
+    /// Writes the cache when it changed, at most every
+    /// [`SAVE_INTERVAL_SECONDS`] unless `force`.
+    fn persist(&mut self, path: &Path, now: i64, force: bool) {
+        if !self.dirty {
+            return;
+        }
+        if !force
+            && self
+                .saved_at
+                .is_some_and(|saved| now.saturating_sub(saved) < SAVE_INTERVAL_SECONDS)
+        {
+            return;
+        }
+        if cache::save(path, &self.cache).is_ok() {
+            self.dirty = false;
+            self.saved_at = Some(now);
         }
     }
 
@@ -257,10 +283,20 @@ impl TranscriptLedger {
     ) -> (UsageSnapshot, RefreshStats) {
         let (snapshot, stats, changed) = scan(paths, reading, &mut self.cache, invalidated);
         self.dirty |= changed;
-        if self.dirty && cache::save(&paths.cache_file, &self.cache).is_ok() {
-            self.dirty = false;
-        }
+        self.persist(&paths.cache_file, reading.unix_seconds, false);
         (snapshot, stats)
+    }
+}
+
+impl<C> Drop for UsageStore<C> {
+    /// Writes what the throttle held back.
+    fn drop(&mut self) {
+        let now = self
+            .ledger
+            .saved_at
+            .unwrap_or(0)
+            .saturating_add(SAVE_INTERVAL_SECONDS);
+        self.ledger.persist(&self.paths.cache_file, now, true);
     }
 }
 

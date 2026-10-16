@@ -199,6 +199,9 @@ fn refresh_reads_only_appended_complete_bytes_and_retains_codex_model() {
     assert_eq!(completed.codex.today.input_tokens, 289);
     assert_eq!(completed.codex.today.output_tokens, 61);
 
+    // Saves are throttled while transcripts keep changing; dropping the store
+    // writes what was held back.
+    drop(store);
     let cache: Value = serde_json::from_slice(&fs::read(&fixture.cache).unwrap()).unwrap();
     let entry = cache["files"].as_object().unwrap().values().next().unwrap();
     assert_eq!(entry["offset"], fs::metadata(&rollout).unwrap().len());
@@ -1075,4 +1078,32 @@ fn remote_scan_is_incremental_and_rejects_oversized_or_linked_history() {
         .unwrap();
         assert!(store.refresh_remote().is_err());
     }
+}
+
+#[test]
+fn saves_are_throttled_while_transcripts_keep_changing() {
+    let fixture = Fixture::new();
+    let rollout = fixture.codex.join("rollout.jsonl");
+    let event = |input: u64| json!({"timestamp":"2026-07-22T09:15:00Z","type":"event_msg","payload":{"type":"token_count","info":{"last_token_usage":{"input_tokens":input,"cached_input_tokens":0,"output_tokens":1}}}});
+    write_lines(&rollout, &[event(10)]);
+    let mut store = fixture.store(
+        "2026-07-22T10:00:00Z",
+        "2026-07-22T00:00:00Z",
+        "2026-07-01T00:00:00Z",
+    );
+    let _ = store.refresh();
+    let first_save = fs::read(&fixture.cache).expect("the first change is saved at once");
+    append(&rollout, &line_bytes(&event(20)));
+    let _ = store.refresh();
+    assert_eq!(
+        fs::read(&fixture.cache).unwrap(),
+        first_save,
+        "a second change within the interval waits"
+    );
+    drop(store);
+    assert_ne!(
+        fs::read(&fixture.cache).unwrap(),
+        first_save,
+        "dropping the store writes it"
+    );
 }
