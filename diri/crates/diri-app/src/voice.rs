@@ -30,8 +30,16 @@ pub struct VoiceOption {
 }
 
 /// Spoken at the end of a dictated answer to submit it. Each interface
-/// language's phrase, plus English, which works in any of them.
-const SEND_PHRASES: [&str; 3] = ["send to agent", "enviar al agente", "发送给智能体"];
+/// language's phrase, plus English, which works in any of them. Dictation
+/// often hears "send" as "sent", and people add "the".
+const SEND_PHRASES: [&str; 6] = [
+    "send to agent",
+    "sent to agent",
+    "send to the agent",
+    "sent to the agent",
+    "enviar al agente",
+    "发送给智能体",
+];
 
 /// The message to submit when dictated `text` ends with a send phrase, the
 /// phrase and its trailing punctuation removed; `None` when it does not.
@@ -108,7 +116,7 @@ pub(crate) fn heard_submission(text: &str) -> &str {
         c.is_whitespace() || matches!(c, '.' | '!' | '?' | ',' | '。' | '！' | '，')
     });
     let lower = trimmed.to_lowercase();
-    for cut in ["send to the", "send to", "send"] {
+    for cut in ["send to the", "sent to the", "send to", "sent to", "send", "sent"] {
         if lower.len() == trimmed.len()
             && lower.ends_with(cut)
             && lower[..lower.len() - cut.len()]
@@ -1427,6 +1435,13 @@ mod tests {
         );
         assert_eq!(dictated_submission("Explain how send to agent works"), None);
         assert_eq!(dictated_submission("resend to agent"), None);
+        // Dictation hears "sent", and people say "the agent".
+        assert_eq!(
+            dictated_submission("I quit it, sent to agent."),
+            Some("I quit it")
+        );
+        assert_eq!(dictated_submission("Ship it. Send to the agent."), Some("Ship it."));
+        assert_eq!(dictated_submission("It was sent to agents"), None);
     }
 
     #[test]
@@ -1437,6 +1452,7 @@ mod tests {
         );
         assert_eq!(heard_submission("Run the tests, send to"), "Run the tests");
         assert_eq!(heard_submission("Run the tests. Send."), "Run the tests.");
+        assert_eq!(heard_submission("Run the tests, sent to"), "Run the tests");
         assert_eq!(heard_submission("Run the tests."), "Run the tests.");
         assert_eq!(heard_submission("Run the resend"), "Run the resend");
     }

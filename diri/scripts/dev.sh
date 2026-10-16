@@ -125,6 +125,12 @@ bundle_id="com.dirijor.diri.dev.${short_sha}"
 display_name="diri dev ${short_sha}"
 preferred_app_support="${target_dir}/diri-dev-${short_sha}-support"
 dev_app_support="$(choose_dev_app_support "${target_dir}" "${short_sha}")"
+# Pin the support directory across commits: the Engine finds a session's live
+# Holder under a hash of this exact path, so a new commit's default directory
+# would start an empty Engine that cannot see sessions already running.
+if [[ -n "${DIRI_DEV_APP_SUPPORT:-}" ]]; then
+    dev_app_support="${DIRI_DEV_APP_SUPPORT}"
+fi
 if [[ "${dev_app_support}" != "${preferred_app_support}" ]]; then
     echo "==> App support exceeds the Unix socket limit; using ${dev_app_support}"
 fi
