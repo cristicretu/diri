@@ -165,6 +165,8 @@ pub enum StoreEffect {
     /// Push one fresh snapshot to watch subscribers. The menu-bar panel skips
     /// rebuilds while hidden, so opening it asks for a current snapshot.
     PublishSnapshot,
+    /// The window's answer to an Agent's sidebar Browser action.
+    BrowserPaneReply(diri_proto::BrowserPaneReply),
     MarkSeen(SessionId),
     MarkUnread(SessionId),
     Remove(SessionId),
@@ -482,6 +484,8 @@ pub struct SessionStore {
     pending_open_settings: bool,
     /// Requests agents asked to open in their API tab, oldest first.
     pending_api_requests: VecDeque<diri_proto::SessionOpenApiRequestParams>,
+    /// Agents' actions on their sidebar Browser page, oldest first.
+    pending_browser_pane: VecDeque<diri_proto::BrowserPaneRequest>,
     /// Remote host catalog from hosts.json. Empty when the file is absent or
     /// invalid (pickers show Local only). Reloaded on picker open.
     hosts: Vec<HostEntry>,
@@ -596,6 +600,7 @@ impl SessionStore {
                 pending_open_launcher: false,
                 pending_open_settings: false,
                 pending_api_requests: VecDeque::new(),
+                pending_browser_pane: VecDeque::new(),
                 hosts: Vec::new(),
                 agents: HashMap::new(),
                 agent_catalog_scans: HashMap::new(),
@@ -1868,6 +1873,14 @@ impl SessionStore {
                 }
                 return StoreEventChange::None;
             }
+            EventName::SESSION_BROWSER_PANE => {
+                if let Ok(request) =
+                    serde_json::from_value::<diri_proto::BrowserPaneRequest>(event.params)
+                {
+                    self.accept_browser_pane(request);
+                }
+                return StoreEventChange::None;
+            }
             EventName::SESSION_CLIPBOARD => {
                 if let Ok(event) =
                     serde_json::from_value::<diri_proto::SessionClipboardEvent>(event.params)
@@ -2768,12 +2781,47 @@ impl SessionStore {
         self.pending_api_requests.drain(..).collect()
     }
 
+    /// Queues an Agent's sidebar Browser action for the UI sync loop
+    /// ([`Self::take_browser_pane_requests`]). One for an unknown Session is
+    /// answered at once, so the Agent is not left waiting for a timeout.
+    fn accept_browser_pane(&mut self, request: diri_proto::BrowserPaneRequest) {
+        const MAX_PENDING: usize = 32;
+        let known = self
+            .sessions
+            .get(&request.session_id)
+            .is_some_and(|session| !session.is_archived());
+        if !known {
+            return;
+        }
+        if self.pending_browser_pane.len() >= MAX_PENDING
+            && let Some(dropped) = self.pending_browser_pane.pop_front()
+        {
+            self.reply_browser_pane(diri_proto::BrowserPaneReply {
+                request_id: dropped.request_id,
+                result: None,
+                error: Some("Too many sidebar Browser actions at once; retry.".into()),
+            });
+        }
+        self.pending_browser_pane.push_back(request);
+        self.emit(StoreEffect::PublishSnapshot);
+    }
+
+    pub fn take_browser_pane_requests(&mut self) -> Vec<diri_proto::BrowserPaneRequest> {
+        self.pending_browser_pane.drain(..).collect()
+    }
+
+    /// Sends a window's answer to the Engine.
+    pub fn reply_browser_pane(&self, reply: diri_proto::BrowserPaneReply) {
+        self.emit(StoreEffect::BrowserPaneReply(reply));
+    }
+
     /// Cheap read-lock probe so the UI sync loop only takes a write lock on the
     /// rare tick that actually has a menu-bar request to drain.
     pub fn has_pending_ui_request(&self) -> bool {
         self.pending_open_launcher
             || self.pending_open_settings
             || !self.pending_api_requests.is_empty()
+            || !self.pending_browser_pane.is_empty()
     }
 
     pub fn rename(&mut self, id: SessionId, title: impl Into<String>) {
@@ -4071,6 +4119,14 @@ async fn run_effects(
         );
         let result: Result<(), ClientError> = match effect {
             StoreEffect::UiChanged | StoreEffect::PublishSnapshot => Ok(()),
+            StoreEffect::BrowserPaneReply(reply) => client
+                .request(
+                    diri_proto::Method::BROWSER_PANE_REPLY,
+                    Some(&reply),
+                    Some(std::time::Duration::from_secs(10)),
+                )
+                .await
+                .map(|_| ()),
             StoreEffect::RefreshWorkspaces { generation } => {
                 if !store
                     .read()
@@ -4572,6 +4628,7 @@ fn action_context(effect: &StoreEffect) -> Option<ActionContext> {
         | StoreEffect::RefreshWorkspaces { .. }
         | StoreEffect::MutateWorkspace { .. }
         | StoreEffect::PublishSnapshot
+        | StoreEffect::BrowserPaneReply(_)
         | StoreEffect::MarkSeen(_)
         | StoreEffect::MarkUnread(_)
         | StoreEffect::RetryConnection

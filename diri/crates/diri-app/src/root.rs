@@ -1330,20 +1330,25 @@ impl RootView {
                                 .read()
                                 .expect("session store lock poisoned")
                                 .has_pending_ui_request();
-                            let (open_launcher, open_settings, api_requests) = if pending {
-                                let mut store = this
-                                    .window_store
-                                    .write()
-                                    .expect("session store lock poisoned");
-                                (
-                                    store.take_open_launcher_request(),
-                                    store.take_open_settings_request(),
-                                    store.take_api_requests(),
-                                )
-                            } else {
-                                (false, false, Vec::new())
-                            };
+                            let (open_launcher, open_settings, api_requests, pane_requests) =
+                                if pending {
+                                    let mut store = this
+                                        .window_store
+                                        .write()
+                                        .expect("session store lock poisoned");
+                                    (
+                                        store.take_open_launcher_request(),
+                                        store.take_open_settings_request(),
+                                        store.take_api_requests(),
+                                        store.take_browser_pane_requests(),
+                                    )
+                                } else {
+                                    (false, false, Vec::new(), Vec::new())
+                                };
                             this.open_api_requests(api_requests, cx);
+                            for request in pane_requests {
+                                this.run_browser_pane(request, window, cx);
+                            }
                             // The sidebar opens the selected session's
                             // workspace while it renders; a hidden or idle
                             // sidebar would leave ⌘D with no workspace until
@@ -3960,6 +3965,142 @@ impl RootView {
         }
     }
 
+    /// Runs one Agent action on its Session's sidebar Browser page and
+    /// answers the Engine (see `crate::browser_pane`).
+    fn run_browser_pane(
+        &mut self,
+        request: diri_proto::BrowserPaneRequest,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let reply = |this: &Self, request_id: String, outcome: Result<serde_json::Value, String>| {
+            let (result, error) = match outcome {
+                Ok(result) => (Some(result), None),
+                Err(error) => (None, Some(error)),
+            };
+            this.window_store
+                .read()
+                .expect("session store lock poisoned")
+                .reply_browser_pane(diri_proto::BrowserPaneReply {
+                    request_id,
+                    result,
+                    error,
+                });
+        };
+        #[cfg(not(target_os = "macos"))]
+        {
+            let _ = (window, cx);
+            reply(
+                self,
+                request.request_id,
+                Err("The sidebar Browser is available on macOS.".into()),
+            );
+        }
+        #[cfg(target_os = "macos")]
+        {
+            use crate::browser_pane::{GLIDE_MS, Plan, World, plan, point_script, result_value};
+            use serde_json::json;
+            let request_id = request.request_id.clone();
+            let plan = match plan(&request.action, &request.args) {
+                Ok(plan) => plan,
+                Err(error) => return reply(self, request_id, Err(error)),
+            };
+            let Some(inspector) = self.inspector.clone() else {
+                return reply(self, request_id, Err("This Diri window has no side panel.".into()));
+            };
+            let session = request.session_id.clone();
+            let no_tab = "No Browser tab is open for this session; use open {url} first.";
+            match plan {
+                Plan::Open { url } => {
+                    let opened = inspector.update(cx, |inspector, cx| {
+                        inspector.open_agent_browser_tab(session, cx)
+                    });
+                    let Some((id, front)) = opened else {
+                        return reply(self, request_id, Err("That session is not open.".into()));
+                    };
+                    self.browser.borrow_mut().load_tab(id, url.clone());
+                    if front {
+                        self.reveal_inspector(cx);
+                    }
+                    reply(
+                        self,
+                        request_id,
+                        Ok(json!({"opened": url, "in_front": front,
+                                  "next": "wait for it to load (wait {text}), then snapshot"})),
+                    );
+                }
+                Plan::State => {
+                    let tab = inspector.read(cx).agent_browser_tab(&session);
+                    let state = tab.and_then(|(id, front)| {
+                        self.browser.borrow().tab_state(id).map(|state| (state, front))
+                    });
+                    let value = match state {
+                        None => json!({"open": false, "hint": no_tab}),
+                        Some((state, front)) => json!({
+                            "open": true, "url": state.url, "title": state.title,
+                            "loading": state.is_loading, "error": state.error,
+                            "in_front": front,
+                        }),
+                    };
+                    reply(self, request_id, Ok(value));
+                }
+                Plan::Screenshot | Plan::Script { .. } => {
+                    let Some((id, _)) = inspector.read(cx).agent_browser_tab(&session) else {
+                        return reply(self, request_id, Err(no_tab.into()));
+                    };
+                    let view = match self.browser.borrow_mut().script_view(id, window) {
+                        Ok(view) => view,
+                        Err(error) => return reply(self, request_id, Err(error)),
+                    };
+                    let badge = request.badge;
+                    cx.spawn_in(window, async move |this, cx| {
+                        let outcome = match plan {
+                            Plan::Screenshot => {
+                                let mut shot = capture(&view, 1568.0).await;
+                                // Keep it well inside one control message.
+                                if matches!(&shot, Ok((png, _, _)) if png.len() > 2_400_000) {
+                                    shot = capture(&view, 1024.0).await;
+                                }
+                                shot.map(|(png, width, height)| {
+                                    use base64::Engine as _;
+                                    json!({
+                                        "image": base64::engine::general_purpose::STANDARD.encode(png),
+                                        "mimeType": "image/png", "width": width, "height": height,
+                                    })
+                                })
+                            }
+                            Plan::Script { point, body, world } => {
+                                let mut pointed = Ok(String::new());
+                                if let Some(reference) = point {
+                                    pointed = evaluate(
+                                        &view,
+                                        point_script(&reference, &badge),
+                                        World::Client,
+                                    )
+                                    .await;
+                                    if pointed.is_ok() {
+                                        cx.background_executor()
+                                            .timer(Duration::from_millis(GLIDE_MS))
+                                            .await;
+                                    }
+                                }
+                                match pointed {
+                                    Err(error) => Err(error),
+                                    Ok(_) => evaluate(&view, body, world)
+                                        .await
+                                        .map(|json| result_value(&json)),
+                                }
+                            }
+                            Plan::State | Plan::Open { .. } => unreachable!("answered above"),
+                        };
+                        let _ = this.update(cx, |this, _| reply(this, request_id, outcome));
+                    })
+                    .detach();
+                }
+            }
+        }
+    }
+
     fn toggle_inspector(&mut self, cx: &mut Context<Self>) {
         self.set_inspector_open(!self.inspector_open, cx);
     }
@@ -6188,6 +6329,37 @@ fn preview_hint(system_image: &str, label: &str, colors: SemanticColors) -> AnyE
                 .child(label.to_owned()),
         )
         .into_any_element()
+}
+
+/// One script on a sidebar Browser page, awaited.
+#[cfg(target_os = "macos")]
+async fn evaluate(
+    view: &objc2::rc::Retained<objc2_web_kit::WKWebView>,
+    body: String,
+    world: crate::browser_pane::World,
+) -> Result<String, String> {
+    let (sender, receiver) = tokio::sync::oneshot::channel();
+    crate::macos::browser::call_async(view, &body, world, move |outcome| {
+        let _ = sender.send(outcome);
+    });
+    receiver
+        .await
+        .unwrap_or_else(|_| Err("the page went away".into()))
+}
+
+/// A PNG of a sidebar Browser page, awaited.
+#[cfg(target_os = "macos")]
+async fn capture(
+    view: &objc2::rc::Retained<objc2_web_kit::WKWebView>,
+    max_edge: f64,
+) -> Result<(Vec<u8>, i64, i64), String> {
+    let (sender, receiver) = tokio::sync::oneshot::channel();
+    crate::macos::browser::snapshot_png(view, max_edge, move |outcome| {
+        let _ = sender.send(outcome);
+    });
+    receiver
+        .await
+        .unwrap_or_else(|_| Err("the page went away".into()))
 }
 
 #[cfg(test)]
@@ -13109,3 +13281,4 @@ mod tests {
         assert!(!is_quote_target(&exited));
     }
 }
+

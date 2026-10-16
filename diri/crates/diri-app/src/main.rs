@@ -2,6 +2,7 @@ mod agent_catalog;
 mod agent_setup;
 mod alerts;
 mod api_client;
+mod browser_pane;
 mod app_theme;
 mod application_notifications;
 mod clipboard_transfer;
@@ -270,6 +271,11 @@ fn main() {
     #[cfg(all(target_os = "macos", debug_assertions))]
     if std::env::var_os("DIRI_NATIVE_BROWSER_SMOKE").is_some() {
         macos::browser::smoke_test();
+        return;
+    }
+    #[cfg(all(target_os = "macos", debug_assertions))]
+    if std::env::var_os("DIRI_BROWSER_PANE_SMOKE").is_some() {
+        macos::browser_pane_fixture::smoke_test();
         return;
     }
     if std::env::var_os("DIRI_PROBE_SYMBOLS").is_some() {
@@ -682,7 +688,9 @@ fn main() {
             // The window that was key at quit is key again.
             let _ = key_window.update(cx, |_, window, _| window.activate_window());
         }
-        cx.activate(true);
+        if !dev_build::launches_in_background() {
+            cx.activate(true);
+        }
         // `open_main_window` must stay before this call. The supervisor can
         // spend up to five seconds probing and retiring an outdated Engine;
         // it runs on Tokio's blocking pool and releases the reconnect loop

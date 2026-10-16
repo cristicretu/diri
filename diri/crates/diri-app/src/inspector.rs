@@ -2729,24 +2729,7 @@ impl WorkbenchInspector {
     }
 
     fn browser_url(&self) -> Option<String> {
-        let typed = self.browser_query.text().trim();
-        if typed.is_empty() {
-            return None;
-        }
-        crate::agent_catalog::normal_web_url(typed).or_else(|| {
-            let candidate = url::Url::parse(&format!("https://{typed}")).ok()?;
-            let local = candidate.host_str().is_some_and(|host| {
-                host == "localhost"
-                    || host == "[::1]"
-                    || host
-                        .parse::<std::net::IpAddr>()
-                        .is_ok_and(|ip| ip.is_loopback())
-            });
-            crate::agent_catalog::normal_web_url(&format!(
-                "{}://{typed}",
-                if local { "http" } else { "https" }
-            ))
-        })
+        crate::browser_pane::typed_web_url(self.browser_query.text())
     }
 
     pub(crate) fn focus_browser_address(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -5969,6 +5952,95 @@ impl WorkbenchInspector {
             && self
                 .active_api()
                 .is_some_and(|api| api.read(cx).has_focus(window))
+    }
+
+    /// The Browser tab an Agent's `sidebar_browser` acts on for `session`:
+    /// its active tab when that is a Browser, else its newest Browser tab.
+    /// The flag says whether that session's workspace is the one in front.
+    pub(crate) fn agent_browser_tab(&self, session: &SessionId) -> Option<(u64, bool)> {
+        let pick = |tabs: &[WorkspaceTab], active: Option<u64>| {
+            active
+                .filter(|id| {
+                    tabs.iter()
+                        .any(|tab| tab.id == *id && tab.surface == WorkspaceSurface::Browser)
+                })
+                .or_else(|| {
+                    tabs.iter()
+                        .rev()
+                        .find(|tab| tab.surface == WorkspaceSurface::Browser)
+                        .map(|tab| tab.id)
+                })
+        };
+        if self.workspace_session.as_ref() == Some(session) {
+            return pick(&self.workspace_tabs, self.workspace_active).map(|id| (id, true));
+        }
+        let workspace = self.session_workspaces.get(&Some(session.clone()))?;
+        pick(&workspace.tabs, workspace.active).map(|id| (id, false))
+    }
+
+    /// Finds or makes `session`'s Browser tab for an Agent's `open`. For the
+    /// session in front it becomes the active tab without taking the
+    /// keyboard (the caller loads the page and reveals the panel); for
+    /// another session it waits as that session's active tab.
+    pub(crate) fn open_agent_browser_tab(
+        &mut self,
+        session: SessionId,
+        cx: &mut Context<Self>,
+    ) -> Option<(u64, bool)> {
+        self.sync_workspace_session(cx);
+        let known = self
+            .runtime
+            .store
+            .read()
+            .expect("session store lock poisoned")
+            .sessions()
+            .get(&session)
+            .is_some_and(|record| !record.is_archived());
+        if !known {
+            return None;
+        }
+        let front = self.workspace_session.as_ref() == Some(&session);
+        let id = match self.agent_browser_tab(&session) {
+            Some((id, _)) => id,
+            None if front => {
+                let tab = self.new_workspace_tab(WorkspaceSurface::Browser, cx);
+                let id = tab.id;
+                self.workspace_tabs.push(tab);
+                id
+            }
+            None => {
+                let id = self.next_workspace_id;
+                self.next_workspace_id += 1;
+                let details = self.next_workspace_id;
+                self.next_workspace_id += 1;
+                let workspace = self
+                    .session_workspaces
+                    .entry(Some(session))
+                    .or_insert_with(|| SessionWorkspace {
+                        tabs: vec![WorkspaceTab::new(details, WorkspaceSurface::Details)],
+                        active: None,
+                        visible: true,
+                        next_terminal_slot: 0,
+                    });
+                workspace
+                    .tabs
+                    .push(WorkspaceTab::new(id, WorkspaceSurface::Browser));
+                workspace.active = Some(id);
+                workspace.visible = true;
+                return Some((id, false));
+            }
+        };
+        if front {
+            if self.workspace_active == Some(id) {
+                cx.notify();
+            } else if let Some(surface) = self.load_workspace(id, cx) {
+                cx.emit(InspectorEvent::WorkspaceRestored(surface));
+            }
+        } else if let Some(workspace) = self.session_workspaces.get_mut(&Some(session)) {
+            workspace.active = Some(id);
+            workspace.visible = true;
+        }
+        Some((id, front))
     }
 
     /// Opens a request an agent sent with `open_api_request` in that

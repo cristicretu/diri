@@ -15,7 +15,10 @@ use objc2_foundation::{
     NSObjectNSKeyValueObserverRegistration, NSObjectProtocol, NSPoint, NSRect, NSSize, NSString,
     NSURL, NSURLRequest,
 };
-use objc2_web_kit::{WKNavigation, WKNavigationDelegate, WKWebView, WKWebViewConfiguration};
+use objc2_web_kit::{
+    WKContentWorld, WKNavigation, WKNavigationDelegate, WKSnapshotConfiguration, WKUserScript,
+    WKUserScriptInjectionTime, WKWebView, WKWebViewConfiguration,
+};
 use raw_window_handle::{HasWindowHandle, RawWindowHandle};
 use std::cell::{Cell, RefCell};
 use std::rc::Rc;
@@ -102,6 +105,82 @@ impl NativeBrowser {
         } else {
             self.pages.remove(&id);
         }
+    }
+
+    fn page_of(&self, id: u64) -> Option<&BrowserPage> {
+        if self.active == Some(id) {
+            Some(&self.page)
+        } else {
+            self.pages.get(&id)
+        }
+    }
+
+    /// The navigation state of workspace tab `id`, when it has a page.
+    pub fn tab_state(&self, id: u64) -> Option<BrowserState> {
+        self.page_of(id)
+            .filter(|page| page.has_page())
+            .map(BrowserPage::state)
+    }
+
+    /// Loads `url` in workspace tab `id`, whether or not it is in front.
+    pub fn load_tab(&mut self, id: u64, url: String) {
+        if self.active == Some(id) {
+            self.page.load(url);
+            return;
+        }
+        let events = self.page.events.clone();
+        self.pages
+            .entry(id)
+            .or_insert_with(|| BrowserPage::new(events))
+            .load(url);
+    }
+
+    /// The live web view of tab `id`, for an Agent's script. A page that has
+    /// never been on screen gets its view now, hidden, in this window, sized
+    /// like the visible one so its layout matches what the person would see.
+    pub fn script_view(
+        &mut self,
+        id: u64,
+        window: &impl HasWindowHandle,
+    ) -> Result<Retained<WKWebView>, String> {
+        let host = self
+            .page
+            .parent
+            .or_else(|| self.pages.values().find_map(|page| page.parent))
+            .or_else(|| parent_view(window));
+        let frame = self
+            .page
+            .web_view
+            .as_ref()
+            .map(|view| view.frame())
+            .filter(|frame| frame.size.width > 1.0 && frame.size.height > 1.0)
+            .unwrap_or(NSRect::new(
+                NSPoint::new(0.0, 0.0),
+                NSSize::new(480.0, 820.0),
+            ));
+        let page = if self.active == Some(id) {
+            &mut self.page
+        } else {
+            self.pages
+                .get_mut(&id)
+                .ok_or("No page is open in this session's sidebar Browser; use open {url}.")?
+        };
+        if !page.has_page() {
+            return Err("No page is open in this session's sidebar Browser; use open {url}.".into());
+        }
+        if page.web_view.is_none() {
+            let host = host.ok_or("Diri's window is not ready for the sidebar Browser yet.")?;
+            let visible = page.visible;
+            let view = page
+                .ensure_view(host)
+                .ok_or("could not create the web view")?;
+            view.setFrame(frame);
+            if !visible {
+                view.setHidden(true);
+            }
+        }
+        let view = page.web_view.clone().ok_or("could not create the web view")?;
+        Ok(Retained::into_super(view))
     }
 
     /// Native content shares the measured GPUI body, including its borders,
@@ -336,6 +415,17 @@ impl BrowserPage {
         if self.web_view.is_none() {
             let mtm = MainThreadMarker::new()?;
             let configuration = unsafe { WKWebViewConfiguration::new(mtm) };
+            // Agents read the page's console (`sidebar_browser` console), so
+            // record it from the first script on.
+            unsafe {
+                let script = WKUserScript::initWithSource_injectionTime_forMainFrameOnly(
+                    mtm.alloc(),
+                    &NSString::from_str(crate::browser_pane::CONSOLE_HOOK),
+                    WKUserScriptInjectionTime::AtDocumentStart,
+                    true,
+                );
+                configuration.userContentController().addUserScript(&script);
+            }
             let view = BrowserWebView::new(mtm, &configuration, self.pointer_passthrough);
             let delegate = BrowserDelegate::new(mtm, self.events.clone());
             unsafe {
@@ -429,6 +519,112 @@ impl BrowserWebView {
         });
         let frame = NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(1.0, 1.0));
         unsafe { msg_send![super(this), initWithFrame: frame, configuration: configuration] }
+    }
+}
+
+/// Runs `body` as an async function in `world` of `view`'s main frame and
+/// hands its result, a JSON string, to `done` on the main thread.
+pub fn call_async(
+    view: &WKWebView,
+    body: &str,
+    world: crate::browser_pane::World,
+    done: impl FnOnce(Result<String, String>) + 'static,
+) {
+    let Some(mtm) = MainThreadMarker::new() else {
+        done(Err("web view work must run on the main thread".into()));
+        return;
+    };
+    let world = unsafe {
+        match world {
+            crate::browser_pane::World::Client => WKContentWorld::defaultClientWorld(mtm),
+            crate::browser_pane::World::Page => WKContentWorld::pageWorld(mtm),
+        }
+    };
+    let done = Cell::new(Some(done));
+    let completion = block2::RcBlock::new(
+        move |value: *mut objc2::runtime::AnyObject, error: *mut NSError| {
+            let Some(done) = done.take() else { return };
+            if let Some(error) = unsafe { error.as_ref() } {
+                done(Err(script_error(error)));
+                return;
+            }
+            let text = unsafe { value.as_ref() }
+                .and_then(|value| value.downcast_ref::<NSString>())
+                .map(|value| value.to_string())
+                .unwrap_or_else(|| "null".to_owned());
+            done(Ok(text));
+        },
+    );
+    unsafe {
+        view.callAsyncJavaScript_arguments_inFrame_inContentWorld_completionHandler(
+            &NSString::from_str(body),
+            None,
+            None,
+            &world,
+            Some(&completion),
+        );
+    }
+}
+
+/// The page's own words for a failed script, not WebKit's generic ones.
+fn script_error(error: &NSError) -> String {
+    let info = error.userInfo();
+    let message = info
+        .objectForKey(&NSString::from_str("WKJavaScriptExceptionMessage"))
+        .and_then(|value| value.downcast::<NSString>().ok())
+        .map(|value| value.to_string());
+    message.unwrap_or_else(|| error.localizedDescription().to_string())
+}
+
+/// A PNG of what `view` shows, at most `max_edge` pixels on its long side.
+pub fn snapshot_png(
+    view: &WKWebView,
+    max_edge: f64,
+    done: impl FnOnce(Result<(Vec<u8>, i64, i64), String>) + 'static,
+) {
+    let Some(mtm) = MainThreadMarker::new() else {
+        done(Err("web view work must run on the main thread".into()));
+        return;
+    };
+    let size = view.frame().size;
+    let scale = view
+        .window()
+        .map_or(2.0, |window| window.backingScaleFactor());
+    let long = size.width.max(size.height) * scale;
+    let width = if long > max_edge {
+        size.width * max_edge / long
+    } else {
+        size.width
+    };
+    let configuration = unsafe { WKSnapshotConfiguration::new(mtm) };
+    unsafe {
+        configuration.setSnapshotWidth(Some(&objc2_foundation::NSNumber::new_f64(width)));
+    }
+    let done = Cell::new(Some(done));
+    let completion = block2::RcBlock::new(
+        move |image: *mut objc2_app_kit::NSImage, error: *mut NSError| {
+            let Some(done) = done.take() else { return };
+            if let Some(error) = unsafe { error.as_ref() } {
+                done(Err(error.localizedDescription().to_string()));
+                return;
+            }
+            let png = unsafe { image.as_ref() }
+                .and_then(|image| image.TIFFRepresentation())
+                .and_then(|tiff| objc2_app_kit::NSBitmapImageRep::imageRepWithData(&tiff))
+                .and_then(|bitmap| {
+                    let data = unsafe {
+                        bitmap.representationUsingType_properties(
+                            objc2_app_kit::NSBitmapImageFileType::PNG,
+                            &NSDictionary::new(),
+                        )
+                    }?;
+                    Some((data.to_vec(), bitmap.pixelsWide() as i64, bitmap.pixelsHigh() as i64))
+                });
+            done(png.ok_or_else(|| "the page could not be captured".to_owned()));
+        },
+    );
+    unsafe {
+        view.takeSnapshotWithConfiguration_completionHandler(Some(&configuration), &completion);
     }
 }
 

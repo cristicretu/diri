@@ -192,8 +192,13 @@ objc2-web-kit = { version = "=0.3.2", default-features = false, features = [
     "objc2-app-kit",
     "objc2-core-foundation",
     "block2",
+    "WKContentWorld",
+    "WKFrameInfo",
     "WKNavigation",
     "WKNavigationDelegate",
+    "WKSnapshotConfiguration",
+    "WKUserContentController",
+    "WKUserScript",
     "WKWebView",
     "WKWebViewConfiguration",
 ] }

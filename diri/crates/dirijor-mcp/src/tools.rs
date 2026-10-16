@@ -333,6 +333,25 @@ pub fn tool_definitions_for(kinds: &[String]) -> Vec<ToolDefinition> {
             }),
         ),
         ToolDefinition::new(
+            "sidebar_browser",
+            SIDEBAR_BROWSER_DESCRIPTION,
+            json!({
+                "type": "object",
+                "properties": {
+                    "action": {"type": "string", "enum": ["state", "open", "snapshot", "click", "fill", "press", "scroll", "eval", "console", "screenshot", "wait"]},
+                    "url": {"type": "string", "maxLength": 8192, "description": "open: http(s) URL; no scheme means http:// for localhost."},
+                    "ref": {"type": "string", "maxLength": 32, "description": "An element ref from the latest snapshot, e.g. e12."},
+                    "value": {"type": "string", "maxLength": 65536, "description": "fill: the text to put in the field."},
+                    "key": {"type": "string", "maxLength": 32, "description": "press: a key name (Enter, Tab, Escape, ArrowDown, a, ...)."},
+                    "dy": {"type": "number", "description": "scroll: pixels down (negative scrolls up) when no ref is given."},
+                    "script": {"type": "string", "maxLength": 65536, "description": "eval: a JavaScript expression or function body; the result is returned as JSON."},
+                    "text": {"type": "string", "maxLength": 1024, "description": "wait: until this text is on the page."},
+                    "ms": {"type": "number", "minimum": 0, "maximum": 10000, "description": "wait: the most to wait, in milliseconds (default 5000)."}
+                },
+                "required": ["action"]
+            }),
+        ),
+        ToolDefinition::new(
             "open_api_request",
             "Open an HTTP request in the API tab of YOUR session's right panel in Diri, prefilled, so the person can inspect, edit and send it. Use it whenever you build, run or debug an HTTP API: after starting a dev server, open the endpoint you just added or changed (e.g. GET http://localhost:3000/api/health) instead of only pasting a curl command. Put {{name}} placeholders in url/headers/body and pass their values in variables (marking tokens in secrets so they are masked); they land in the project's environment (environment names it, default the active one or \"Local\"). json sets a JSON body and its Content-Type; body sends text as written. auto_send:true sends a GET immediately and shows the response; any other method is never sent until the person presses Send. The call returns once the tab is open, without the response.",
             json!({
@@ -615,6 +634,15 @@ fn string_array() -> Value {
     json!({"type": "array", "items": {"type": "string"}})
 }
 
+const SIDEBAR_BROWSER_DESCRIPTION: &str = "Test the web page the person opened in YOUR session's \
+sidebar Browser in Diri (or open one there), straight through its web view: fast, exact, and \
+visible to them as your labelled cursor on the page. Loop: state (or open {url}) -> snapshot \
+returns an outline of the page with element refs (e1, e2, ...) -> act by ref: click {ref}, \
+fill {ref, value}, press {key}, scroll {ref | dy} -> snapshot again to check the result before \
+going on; refs from an older snapshot may be stale. console returns the page's console messages \
+and uncaught errors; eval {script} runs JavaScript in the page; screenshot returns an image when \
+the look matters; wait {text, ms} waits for text to appear. For other apps use computer.";
+
 const COMPUTER_DESCRIPTION: &str = "Use this Mac's apps the way a person would, in the background: \
 any native app (Simulator, TextEdit, Xcode, Finder, the app you are building) and browser pages. \
 The person's cursor, keyboard and focus stay theirs; your actions show as your own labelled cursor. \
@@ -747,6 +775,17 @@ mod tests {
         ] {
             assert!(names.contains(&name.to_owned()), "{name}");
         }
+    }
+
+    #[test]
+    fn sidebar_browser_takes_known_actions_and_bounded_waits() {
+        let ok = |args: Value| validate_arguments("sidebar_browser", &args);
+        assert!(ok(json!({"action": "click", "ref": "e3"})).is_ok());
+        assert!(ok(json!({"action": "fill", "ref": "e4", "value": "a@b.c"})).is_ok());
+        assert!(ok(json!({"action": "drag"})).is_err());
+        assert!(ok(json!({"action": "wait", "ms": 60000})).is_err());
+        assert!(ok(json!({"ref": "e3"})).is_err(), "action is required");
+        assert!(ok(json!({"action": "state", "selector": "#x"})).is_err());
     }
 
     #[test]

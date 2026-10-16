@@ -11,8 +11,9 @@ pub use api_request::{
     SessionOpenApiRequestParams,
 };
 pub use computer::{
-    ComputerActParams, ComputerSetupAction, ComputerSetupNeededEvent, ComputerSetupParams,
-    ComputerStatus, ComputerStatusParams,
+    BrowserPaneParams, BrowserPaneReply, BrowserPaneRequest, ComputerActParams,
+    ComputerSetupAction, ComputerSetupNeededEvent, ComputerSetupParams, ComputerStatus,
+    ComputerStatusParams,
 };
 pub mod control;
 pub mod frames;

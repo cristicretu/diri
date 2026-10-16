@@ -175,6 +175,7 @@ pub struct ControlServer {
     governor: std::sync::Arc<Mutex<crate::governor::GovernorConfig>>,
     browser: std::sync::OnceLock<crate::browser::BrowserPool>,
     computer: crate::computer::ComputerUse,
+    browser_pane: crate::browser_pane::Waiters,
     active_connections: Arc<AtomicUsize>,
     background_requests: Arc<AtomicUsize>,
     worktree_scan: crate::worktree_scan::ScanStore,
@@ -302,6 +303,7 @@ impl ControlServer {
             governor: std::sync::Arc::new(Mutex::new(crate::governor::GovernorConfig::default())),
             browser: std::sync::OnceLock::new(),
             computer: Default::default(),
+            browser_pane: Default::default(),
             active_connections: Arc::new(AtomicUsize::new(0)),
             background_requests: Arc::new(AtomicUsize::new(0)),
             worktree_scan: Default::default(),
@@ -1196,6 +1198,8 @@ impl ControlServer {
                     .map_err(|error| ControlError::new(error.code, error.message))
                     .and_then(|status| encode(&status))
             }
+            Method::BROWSER_PANE => self.browser_pane(params),
+            Method::BROWSER_PANE_REPLY => self.browser_pane_reply(params),
             Method::EVENTS_WAIT => self.events_wait(params),
             Method::HOST_SYNC_PREFS => self.host_sync_prefs(params),
             Method::HOST_INITIALIZE => self.host_initialize(params),
@@ -2243,14 +2247,7 @@ impl ControlServer {
                 .record(&id)
                 .filter(|record| !record.is_archived())
                 .ok_or_else(|| ControlError::not_found(format!("no session {id}")))?;
-            let agent = registry
-                .engine()
-                .manifest(record.kind.id())
-                .and_then(|manifest| manifest.agent.as_ref())
-                .and_then(|agent| agent.display_name.clone())
-                .filter(|name| !name.is_empty())
-                .unwrap_or_else(|| record.kind.id().to_owned());
-            let badge = cursor_badge(&agent, &record.title);
+            let badge = agent_badge(&registry, &record);
             let live: std::collections::HashSet<String> = registry
                 .records()
                 .into_iter()
@@ -2284,6 +2281,56 @@ impl ControlServer {
             );
         }
         result.map_err(|error| ControlError::new(error.code, error.message))
+    }
+
+    /// `browser.pane`: relays one action to the window holding the
+    /// Session's sidebar Browser page and waits for its answer.
+    fn browser_pane(&self, params: Option<JsonValue>) -> Result<JsonValue, ControlError> {
+        let p: diri_proto::BrowserPaneParams = decode(params)?;
+        let id = p.session_id.0.clone();
+        let badge = {
+            let registry = self.registry.lock().map_err(poisoned)?;
+            let record = registry
+                .record(&id)
+                .filter(|record| !record.is_archived())
+                .ok_or_else(|| ControlError::not_found(format!("no session {id}")))?;
+            agent_badge(&registry, &record)
+        };
+        let timeout = crate::browser_pane::timeout_for(&p.action, &p.args);
+        let (request_id, receiver) = self.browser_pane.register();
+        let request = diri_proto::BrowserPaneRequest {
+            session_id: p.session_id,
+            request_id: request_id.clone(),
+            action: p.action,
+            args: p.args,
+            badge,
+        };
+        self.events.publish_encoded(
+            diri_proto::EventName::SESSION_BROWSER_PANE,
+            &request,
+            Some(&id),
+        );
+        match self.browser_pane.wait(&request_id, &receiver, timeout) {
+            Some(Ok(result)) => Ok(pane_result(result)),
+            Some(Err(message)) => Err(ControlError::new("browser_pane", message)),
+            None => Err(ControlError::new(
+                diri_proto::control::BROWSER_PANE_UNAVAILABLE,
+                "No Diri window answered. The sidebar Browser lives in Diri's window: \
+                 make sure Diri is open, then retry.",
+            )),
+        }
+    }
+
+    /// `browser.pane_reply`: the app's answer; only the first one counts.
+    fn browser_pane_reply(&self, params: Option<JsonValue>) -> Result<JsonValue, ControlError> {
+        let reply: diri_proto::BrowserPaneReply = decode(params)?;
+        let outcome = match (reply.result, reply.error) {
+            (_, Some(error)) => Err(error),
+            (Some(result), None) => Ok(result),
+            (None, None) => Ok(JsonValue::Null),
+        };
+        let delivered = self.browser_pane.resolve(&reply.request_id, outcome);
+        Ok(json!({ "delivered": delivered }))
     }
 
     /// The aggregated staleness view: every worktree of every project,
@@ -5453,6 +5500,42 @@ fn cursor_badge(agent: &str, title: &str) -> String {
     }
 }
 
+/// The badge for a Session's agent cursor, from its Agent's display name
+/// and its tab title (see [`cursor_badge`]).
+fn agent_badge(registry: &Registry, record: &diri_proto::SessionRecord) -> String {
+    let agent = registry
+        .engine()
+        .manifest(record.kind.id())
+        .and_then(|manifest| manifest.agent.as_ref())
+        .and_then(|agent| agent.display_name.clone())
+        .filter(|name| !name.is_empty())
+        .unwrap_or_else(|| record.kind.id().to_owned());
+    cursor_badge(&agent, &record.title)
+}
+
+/// A page screenshot becomes an MCP image block; every other answer is
+/// relayed as the plain JSON the app produced.
+fn pane_result(result: JsonValue) -> JsonValue {
+    let Some(image) = result.get("image").and_then(JsonValue::as_str) else {
+        return result;
+    };
+    let mime = result
+        .get("mimeType")
+        .and_then(JsonValue::as_str)
+        .unwrap_or("image/png");
+    let mut meta = result.clone();
+    if let Some(meta) = meta.as_object_mut() {
+        meta.remove("image");
+    }
+    json!({"mcpToolResult": {
+        "content": [
+            {"type": "image", "data": image, "mimeType": mime},
+            {"type": "text", "text": meta.to_string()},
+        ],
+        "structuredContent": meta,
+    }})
+}
+
 /// The last steps of an Engine that has nothing left to look after. Callers
 /// have already persisted the registry and checked that no session is live.
 fn release_idle_engine(
@@ -7240,6 +7323,68 @@ mod tests {
             .unwrap_err();
         assert_eq!(invalid.code, "bad_request");
         assert!(stream.try_recv().is_none(), "refusals publish nothing");
+    }
+
+    #[test]
+    fn browser_pane_round_trips_through_the_app_and_screenshots_become_images() {
+        let temp = tempfile::tempdir().unwrap();
+        let server = server(temp.path());
+        server
+            .registry
+            .lock()
+            .unwrap()
+            .insert_record(test_record("agent"));
+        let stream = server.events.subscribe(
+            None,
+            crate::events::Filter::new(
+                None,
+                Some(vec![diri_proto::EventName::SESSION_BROWSER_PANE.to_owned()]),
+            ),
+        );
+        let caller = Arc::clone(&server);
+        let call = std::thread::spawn(move || {
+            caller.dispatch(
+                Method::BROWSER_PANE,
+                Some(json!({"sessionID": "agent", "action": "screenshot", "args": {}})),
+            )
+        });
+        let event = stream
+            .recv(Duration::from_secs(5))
+            .expect("relayed to the app");
+        assert_eq!(event.session_id.as_deref(), Some("agent"));
+        let request: diri_proto::BrowserPaneRequest =
+            serde_json::from_slice(&event.encoded).unwrap();
+        assert_eq!(request.action, "screenshot");
+        assert!(!request.badge.is_empty(), "the in-page cursor needs words");
+        let reply = |result: JsonValue| json!({"requestId": request.request_id, "result": result});
+        let first = server
+            .dispatch(
+                Method::BROWSER_PANE_REPLY,
+                Some(reply(
+                    json!({"image": "AAAA", "mimeType": "image/png", "width": 2}),
+                )),
+            )
+            .unwrap();
+        assert_eq!(first["delivered"], true);
+        let second = server
+            .dispatch(Method::BROWSER_PANE_REPLY, Some(reply(json!({}))))
+            .unwrap();
+        assert_eq!(second["delivered"], false, "a second window is ignored");
+
+        let result = call.join().unwrap().unwrap();
+        let relayed = &result["mcpToolResult"];
+        assert_eq!(relayed["content"][0]["type"], "image");
+        assert_eq!(relayed["content"][0]["data"], "AAAA");
+        assert_eq!(relayed["structuredContent"]["width"], 2);
+        assert!(relayed["structuredContent"].get("image").is_none());
+
+        let missing = server
+            .dispatch(
+                Method::BROWSER_PANE,
+                Some(json!({"sessionID": "gone", "action": "state"})),
+            )
+            .unwrap_err();
+        assert_eq!(missing.code, "not_found");
     }
 
     #[test]

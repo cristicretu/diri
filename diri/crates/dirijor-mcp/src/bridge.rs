@@ -143,6 +143,7 @@ impl Bridge {
             "test_run" => self.test_run(arguments),
             "browser" => self.browser(arguments),
             "computer" => self.computer(arguments),
+            "sidebar_browser" => self.sidebar_browser(arguments),
             "open_api_request" => self.open_api_request(arguments),
             "quick_open_include" => self.quick_open_include(arguments),
             "whoami" => self.whoami(),
@@ -632,6 +633,28 @@ impl Bridge {
             }),
             // The Engine waits up to two minutes for a batched action.
             Duration::from_secs(130),
+        )
+    }
+
+    /// Relays one action to the page in the caller's sidebar Browser; the
+    /// Engine hands it to the Diri window holding that page.
+    fn sidebar_browser(&self, arguments: &Value) -> Result<Value, String> {
+        let snapshot = self.snapshot()?;
+        McpPolicy::new(
+            &snapshot.sessions,
+            &snapshot.projects,
+            self.caller.as_deref(),
+        )?
+        .authorize(WriteAction::SidebarBrowser)?;
+        let caller = self.caller.as_ref().expect("policy requires a caller");
+        let action = required_string(arguments, "action")?;
+        let mut args = arguments.as_object().cloned().unwrap_or_default();
+        args.remove("action");
+        self.request(
+            Method::BROWSER_PANE,
+            json!({"sessionID": caller, "action": action, "args": Value::Object(args)}),
+            // The Engine's reply budget plus the longest `wait`.
+            Duration::from_secs(35),
         )
     }
 
