@@ -65,23 +65,6 @@ pub(crate) fn dictated_submission(text: &str) -> Option<&str> {
     )
 }
 
-/// A spoken answer, with the request for a closing `Spoken:` paragraph
-/// appended for agents that are not already asked (Claude Code through its
-/// prompt hook, Codex through its launch). An empty answer, which only
-/// submits what is already typed, is left alone.
-pub(crate) fn with_spoken_request(message: String, kind: Option<&diri_proto::AgentKind>) -> String {
-    let asked = kind.is_some_and(|kind| {
-        matches!(
-            kind.id(),
-            diri_proto::AgentKind::CLAUDE_CODE_ID | diri_proto::AgentKind::CODEX_ID
-        )
-    });
-    if asked || message.trim().is_empty() {
-        return message;
-    }
-    format!("{message}\n\n({})", diri_proto::voice::SPOKEN_REQUEST)
-}
-
 /// The `talk_voice` that pipes readings to the user's own speech command.
 pub(crate) const COMMAND_VOICE: &str = "command";
 
@@ -1701,17 +1684,6 @@ mod tests {
             terminal_reply(&lines).as_deref(),
             Some("Fixed the guard in two files.\nTests pass.")
         );
-    }
-
-    #[test]
-    fn agents_without_a_hook_are_asked_in_the_answer() {
-        let claude = diri_proto::AgentKind::CLAUDE_CODE;
-        let gemini = diri_proto::AgentKind::new("gemini");
-        assert_eq!(with_spoken_request("Run it.".into(), Some(&claude)), "Run it.");
-        let asked = with_spoken_request("Run it.".into(), Some(&gemini));
-        assert!(asked.starts_with("Run it.\n\n("), "{asked}");
-        assert!(asked.contains("Spoken:"), "{asked}");
-        assert_eq!(with_spoken_request(String::new(), Some(&gemini)), "");
     }
 
     #[test]

@@ -3912,13 +3912,6 @@ impl TerminalPane {
                 .then(|| crate::voice::dictated_submission(&text).map(str::to_owned))
                 .flatten()
         };
-        // Agents Diri cannot ask through a hook or launch flag are asked in
-        // the spoken answer itself, so their reply ends readable too.
-        let submission = submission.map(|message| {
-            let store = self.runtime.store.read().expect("session store lock poisoned");
-            let kind = store.sessions().get(&id).map(|record| record.effective_kind().clone());
-            crate::voice::with_spoken_request(message, kind.as_ref())
-        });
         let now = self.started_at.elapsed();
         let Some(resident) = self.residents.get_mut(&id) else {
             record("no_terminal", "text", text.len(), bracketed);

@@ -3,9 +3,10 @@
 //!
 //! Agents with Diri's MCP server call its [`SPEAK_TOOL`]; the Engine keeps
 //! the text for that session's turn ([`SpeakParams`]) until the app collects
-//! it when the turn ends ([`SpokenParams`]). Agents without it end their
-//! reply with a paragraph starting [`SPOKEN_MARKER`], which the app reads
-//! from the transcript or the terminal.
+//! it when the turn ends ([`SpokenParams`]). Nothing is added to what the
+//! agent shows: for agents without the tool, or a turn that skipped it, the
+//! app summarizes the reply on this Mac. A reply that does end with a
+//! paragraph starting [`SPOKEN_MARKER`] is still read as written.
 
 use serde::{Deserialize, Serialize};
 
@@ -46,13 +47,9 @@ pub struct SpokenResult {
 pub const SPOKEN_MARKER: &str = "Spoken:";
 
 /// Context added to each Claude Code prompt (its hook) and to Codex's
-/// developer instructions (its launch) while the setting is on. Both have
-/// Diri's MCP server; the paragraph covers a session where it failed.
-pub const SPOKEN_INSTRUCTION: &str = "The developer has Diri read each of your turns aloud and may be away from the screen. At the end of every turn, call Diri's speak tool once with a spoken summary meant to be heard, not read, that lets the developer follow without the screen: what you did and the result, each option or decision you are offering (named briefly, one by one), and what you need from them. Usually three to eight sentences; fewer when there is little to say. No code, commands, file names, paths, links or Markdown. If the speak tool is unavailable, end your reply with a final paragraph starting \"Spoken:\" saying the same instead.";
-
-/// The short form, added to a spoken answer for agents Diri has no other
-/// way to ask.
-pub const SPOKEN_REQUEST: &str = "End your reply with a paragraph starting \"Spoken:\" that says, in plain words for listening, what you did, the options you offer if any, and what you need from me.";
+/// developer instructions (its launch) while the setting is on: a reminder
+/// to call the [`SPEAK_TOOL`]. It never asks for text in the reply itself.
+pub const SPOKEN_INSTRUCTION: &str = "The developer has Diri read each of your turns aloud and may be away from the screen. At the end of every turn, call Diri's speak tool once with a spoken summary meant to be heard, not read, that lets the developer follow without the screen: what you did and the result, each option or decision you are offering (named briefly, one by one), and what you need from them. Usually three to eight sentences; fewer when there is little to say. No code, commands, file names, paths, links or Markdown. If the speak tool is unavailable, skip it; do not add the summary to your reply.";
 
 /// Whether the app's preferences file has the setting on. A missing or
 /// unreadable file means off.
