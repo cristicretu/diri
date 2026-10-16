@@ -1105,7 +1105,7 @@ impl RootView {
         crate::application_notifications::install(services.clone(), preview, preview_scenario, cx);
         #[cfg(target_os = "macos")]
         if !preview {
-            crate::voice::install(Arc::clone(&services.store));
+            crate::voice::install(Arc::clone(&services.store), services.tokio.handle().clone());
         }
         // Once, the first time a build that records runs: say so, and where
         // to turn it off. The standard toast, held a little longer.

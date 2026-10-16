@@ -1419,6 +1419,7 @@ impl ControlServer {
                     self.mcp_http_url_for(&descriptor),
                 );
                 launch_args.extend(injected.argv);
+                launch_args.extend(spoken_summary_args(&descriptor.injection));
                 mcp_http_token = injected
                     .mcp_http
                     .then(|| self.mcp_http.get().map(|endpoint| endpoint.token(&id)))
@@ -4227,6 +4228,7 @@ impl ControlServer {
                 self.mcp_http_url_for(&descriptor),
             );
             launch_args.extend(injected.argv);
+            launch_args.extend(spoken_summary_args(&descriptor.injection));
             mcp_http_token = injected
                 .mcp_http
                 .then(|| self.mcp_http.get().map(|endpoint| endpoint.token(id)))
@@ -6954,6 +6956,20 @@ fn verification_probe(prompt: &str, before: &str) -> Option<String> {
 /// composer breaks mid-word.
 const MIN_PROBE_CHARS: usize = 4;
 const MAX_PROBE_CHARS: usize = 20;
+
+/// Codex has no prompt hook, so while "Talk with your agent" is on its
+/// launch carries the request for a closing `Spoken:` paragraph as
+/// developer instructions, which add to its own rather than replace them.
+/// It applies from the next launch; Claude Code is asked on every prompt.
+fn spoken_summary_args(injection: &crate::agent::InjectionSpec) -> Vec<String> {
+    if !injection.codex_notify || !talk_with_agent_enabled() {
+        return Vec::new();
+    }
+    vec![
+        "-c".into(),
+        crate::inject::codex_developer_instructions(diri_proto::voice::SPOKEN_INSTRUCTION),
+    ]
+}
 
 /// "Talk with your agent" is an app preference; the Engine reads it from the
 /// app's file on each prompt so turning it off takes effect on the next one.

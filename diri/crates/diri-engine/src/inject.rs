@@ -313,6 +313,11 @@ pub fn injection_args_full(
     Injected { argv, mcp_http }
 }
 
+/// A Codex `-c` override adding `text` to its developer instructions.
+pub fn codex_developer_instructions(text: &str) -> String {
+    format!("developer_instructions={}", toml_string(text))
+}
+
 /// Writes `<inject>/cursor-plugin/<session>/` with plugin manifest, optional
 /// `mcp.json`, and optional `hooks/hooks.json`. Returns the plugin directory.
 ///
@@ -489,6 +494,19 @@ fn write_atomic(path: &Path, contents: &[u8]) -> io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_spoken_instruction_reaches_codex_as_one_toml_string() {
+        let override_ = codex_developer_instructions(diri_proto::voice::SPOKEN_INSTRUCTION);
+        let (key, value) = override_.split_once('=').expect("key=value");
+        assert_eq!(key, "developer_instructions");
+        let parsed: toml_edit::DocumentMut =
+            format!("v = {value}").parse().expect("valid TOML value");
+        assert_eq!(
+            parsed["v"].as_str(),
+            Some(diri_proto::voice::SPOKEN_INSTRUCTION)
+        );
+    }
 
     #[test]
     fn uuids_are_v4_and_unique() {

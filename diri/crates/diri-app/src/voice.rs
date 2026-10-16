@@ -57,6 +57,23 @@ pub(crate) fn dictated_submission(text: &str) -> Option<&str> {
     )
 }
 
+/// A spoken answer, with the request for a closing `Spoken:` paragraph
+/// appended for agents that are not already asked (Claude Code through its
+/// prompt hook, Codex through its launch). An empty answer, which only
+/// submits what is already typed, is left alone.
+pub(crate) fn with_spoken_request(message: String, kind: Option<&diri_proto::AgentKind>) -> String {
+    let asked = kind.is_some_and(|kind| {
+        matches!(
+            kind.id(),
+            diri_proto::AgentKind::CLAUDE_CODE_ID | diri_proto::AgentKind::CODEX_ID
+        )
+    });
+    if asked || message.trim().is_empty() {
+        return message;
+    }
+    format!("{message}\n\n({})", diri_proto::voice::SPOKEN_REQUEST)
+}
+
 /// The session whose next paste is a spoken answer to submit: the listener
 /// heard a send phrase there and stopped Wispr Flow, which pastes next.
 static ARMED_SUBMIT: std::sync::Mutex<Option<(SessionId, std::time::Instant)>> =
@@ -293,6 +310,76 @@ pub(crate) fn spoken_paragraph(reply: &str) -> Option<String> {
     (!text.is_empty()).then(|| text.to_owned())
 }
 
+/// Glyphs agents' terminal interfaces draw around text: message bullets,
+/// prompts, box sides and tree branches.
+const TERMINAL_DECORATION: &[char] = &[
+    '⏺', '●', '•', '◆', '◇', '✦', '✧', '◉', '○', '❯', '›', '»', '>', '│', '┃', '║', '|', '⎿',
+    '└', '├', '╭', '╰', '╮', '╯', '▌', '▐', '*', '-',
+];
+
+/// A terminal line without the interface drawn around its text.
+fn terminal_text(line: &str) -> &str {
+    line.trim()
+        .trim_start_matches(|c: char| TERMINAL_DECORATION.contains(&c) || c.is_whitespace())
+        .trim_end_matches(|c: char| matches!(c, '│' | '┃' | '║') || c.is_whitespace())
+}
+
+/// Status bars, rules and key hints: interface, not reply.
+fn is_terminal_chrome(line: &str) -> bool {
+    let text = terminal_text(line);
+    let lower = text.to_lowercase();
+    text.is_empty()
+        || text
+            .chars()
+            .all(|c| "─━═-╌┄·╭╮╰╯┌┐└┘ ".contains(c))
+        || ["esc to", "shift+tab", "? for shortcuts", "ctrl+", "tokens", "auto mode", "accept edits"]
+            .iter()
+            .any(|hint| lower.contains(hint))
+}
+
+/// The last `Spoken:` paragraph on an agent's terminal: the marker line and
+/// the wrapped lines under it, up to a blank line or interface chrome.
+/// Works for any agent, since it reads what the agent printed.
+pub(crate) fn terminal_spoken_paragraph(lines: &[String]) -> Option<String> {
+    let marker = diri_proto::voice::SPOKEN_MARKER;
+    let starts_with_marker = |line: &str| {
+        terminal_text(line)
+            .get(..marker.len())
+            .is_some_and(|head| head.eq_ignore_ascii_case(marker))
+    };
+    let start = lines.iter().rposition(|line| starts_with_marker(line))?;
+    let paragraph = lines[start..]
+        .iter()
+        .enumerate()
+        .take_while(|(index, line)| *index == 0 || !is_terminal_chrome(line))
+        .take_while(|(index, line)| *index == 0 || !starts_with_marker(line))
+        .map(|(_, line)| inline_prose(terminal_text(line)))
+        .collect::<Vec<_>>()
+        .join(" ");
+    let text = paragraph.get(marker.len()..)?.trim();
+    (!text.is_empty()).then(|| text.to_owned())
+}
+
+/// What an agent printed since the user's last prompt, without interface
+/// chrome: for the on-device digest when there is no transcript to read.
+pub(crate) fn terminal_reply(lines: &[String]) -> Option<String> {
+    // A prompt glyph followed by text is the user's message echoed back.
+    let prompt = |line: &str| {
+        let trimmed = line.trim_start();
+        ['❯', '›', '>']
+            .iter()
+            .any(|glyph| trimmed.strip_prefix(*glyph).is_some_and(|rest| !rest.trim().is_empty()))
+    };
+    let start = lines.iter().rposition(|line| prompt(line)).map_or(0, |index| index + 1);
+    let text = lines[start..]
+        .iter()
+        .filter(|line| !is_terminal_chrome(line))
+        .map(|line| terminal_text(line))
+        .collect::<Vec<_>>()
+        .join("\n");
+    (!text.trim().is_empty()).then_some(text)
+}
+
 /// What the on-device model reads: the speakable reply, its middle elided
 /// when it would not fit in one request.
 pub(crate) fn digest_input(speakable: &str) -> String {
@@ -411,6 +498,9 @@ mod macos {
     use crate::store::{SessionStore, StoreRuntime};
 
     const DIGEST_TIMEOUT: Duration = Duration::from_secs(20);
+    const TERMINAL_READ_TIMEOUT: Duration = Duration::from_secs(3);
+    /// A finished reply and its closing paragraph fit well inside this.
+    const TERMINAL_READ_LINES: usize = 300;
     /// Claude Code reports a finished turn a few milliseconds before its
     /// final message reaches the transcript. Read once the file has been
     /// quiet this long, or after `SETTLE_LIMIT` whatever its state.
@@ -442,7 +532,7 @@ mod macos {
 
     /// Starts the reader and speaker threads. Both sleep on channels; nothing
     /// runs while no turn finishes.
-    pub(crate) fn install(runtime: Arc<StoreRuntime>) {
+    pub(crate) fn install(runtime: Arc<StoreRuntime>, tokio: tokio::runtime::Handle) {
         let store = Arc::clone(&runtime.store);
         ensure_kokoro(&store.read().expect("store").preferences().talk_voice);
         let mut completions = store.read().expect("store").turn_completions();
@@ -451,6 +541,7 @@ mod macos {
             .map(PathBuf::from)
             .unwrap_or_default();
         let reader_store = Arc::clone(&store);
+        let reader_runtime = Arc::clone(&runtime);
         let spawned = thread::Builder::new()
             .name("diri-voice-reader".into())
             .spawn(move || {
@@ -463,7 +554,8 @@ mod macos {
                     let Some(record) = current_record(&reader_store, &completion) else {
                         continue;
                     };
-                    if let Some(text) = reading(&home, &record)
+                    let terminal = || terminal_lines(&reader_runtime, &tokio, &record.id);
+                    if let Some(text) = reading(&home, &record, terminal)
                         && speech_tx
                             .send(Utterance {
                                 session_id: completion.session_id,
@@ -509,21 +601,59 @@ mod macos {
             .is_some_and(|state| state.turn == turn && !state.working)
     }
 
-    /// What to say for one finished turn, or `None` to stay quiet.
-    fn reading(home: &Path, record: &SessionRecord) -> Option<String> {
+    /// The last lines of a session's terminal, local or remote, from the
+    /// Engine. Any agent's reply is there, whatever its transcript format.
+    fn terminal_lines(
+        runtime: &StoreRuntime,
+        tokio: &tokio::runtime::Handle,
+        session: &SessionId,
+    ) -> Option<Vec<String>> {
+        let params = serde_json::json!({ "sessionID": session });
+        let value = tokio
+            .block_on(runtime.client().request(
+                diri_proto::Method::SESSION_READ_SCROLLBACK,
+                Some(&params),
+                Some(TERMINAL_READ_TIMEOUT),
+            ))
+            .ok()?;
+        let mut lines = serde_json::from_value::<diri_proto::ReadScrollbackResult>(value)
+            .ok()?
+            .lines;
+        let keep = lines.len().saturating_sub(TERMINAL_READ_LINES);
+        lines.drain(..keep);
+        Some(lines)
+    }
+
+    /// What to say for one finished turn, or `None` to stay quiet. The
+    /// agent's own `Spoken:` paragraph wins, from its transcript (Claude
+    /// Code, Codex) or else its terminal (every agent, remote ones too);
+    /// otherwise the on-device digest of what it wrote.
+    fn reading(
+        home: &Path,
+        record: &SessionRecord,
+        terminal: impl FnOnce() -> Option<Vec<String>>,
+    ) -> Option<String> {
         let title = spoken_title(&record.title);
         settle(record);
         let messages = turn_messages(home, record);
+        let spoken_reading =
+            |spoken: String| Some(tf("voice.reading", &[("title", &title), ("text", &spoken)]));
         if let Some(spoken) = messages
             .as_ref()
             .and_then(|messages| messages.last())
             .and_then(|last| super::spoken_paragraph(last))
         {
-            return Some(tf("voice.reading", &[("title", &title), ("text", &spoken)]));
+            return spoken_reading(spoken);
         }
-        let Some(reply) = messages.map(|messages| messages.join("\n\n")) else {
-            // Agents whose transcripts Diri cannot read, and remote sessions,
-            // still get a spoken "finished".
+        let screen = if messages.is_none() { terminal() } else { None };
+        if let Some(spoken) = screen.as_deref().and_then(super::terminal_spoken_paragraph) {
+            return spoken_reading(spoken);
+        }
+        let reply = messages
+            .map(|messages| messages.join("\n\n"))
+            .or_else(|| screen.as_deref().and_then(super::terminal_reply));
+        let Some(reply) = reply else {
+            // Nothing readable at all: still say which agent finished.
             return Some(tf("voice.finished", &[("title", &title)]));
         };
         let prose = speakable(&reply);
@@ -1257,6 +1387,53 @@ mod tests {
         );
         assert_eq!(macos::download_percent_for_test("progress 5 0"), None);
         assert_eq!(macos::download_percent_for_test("ready"), None);
+    }
+
+    fn screen(text: &str) -> Vec<String> {
+        text.lines().map(str::to_owned).collect()
+    }
+
+    #[test]
+    fn any_agents_spoken_paragraph_is_read_from_its_terminal() {
+        // Claude Code: bullets, two-space continuation, a status bar below.
+        let claude = screen(
+            "⏺ I fixed the race.\n\n  Spoken: I fixed the race in the voice reader and the\n  tests pass. Tell me if I should commit.\n\n✳ Thinking… (esc to interrupt)\n────────\n❯",
+        );
+        assert_eq!(
+            terminal_spoken_paragraph(&claude).as_deref(),
+            Some("I fixed the race in the voice reader and the tests pass. Tell me if I should commit.")
+        );
+        // A boxed interface (Gemini-style) and Markdown emphasis.
+        let boxed = screen(
+            "╭──────────────╮\n│ ✦ Done.      │\n│ **Spoken:** The build is green. │\n│ Nothing else to do. │\n╰──────────────╯",
+        );
+        assert_eq!(
+            terminal_spoken_paragraph(&boxed).as_deref(),
+            Some("The build is green. Nothing else to do.")
+        );
+        assert_eq!(terminal_spoken_paragraph(&screen("⏺ No marker here.")), None);
+    }
+
+    #[test]
+    fn a_terminal_reply_starts_after_the_users_prompt() {
+        let lines = screen(
+            "❯ old question\n⏺ old answer\n› fix the login loop\n• Fixed the guard in two files.\n  Tests pass.\n\n  ⏵⏵ auto mode on (shift+tab to cycle)\n›",
+        );
+        assert_eq!(
+            terminal_reply(&lines).as_deref(),
+            Some("Fixed the guard in two files.\nTests pass.")
+        );
+    }
+
+    #[test]
+    fn agents_without_a_hook_are_asked_in_the_answer() {
+        let claude = diri_proto::AgentKind::CLAUDE_CODE;
+        let gemini = diri_proto::AgentKind::new("gemini");
+        assert_eq!(with_spoken_request("Run it.".into(), Some(&claude)), "Run it.");
+        let asked = with_spoken_request("Run it.".into(), Some(&gemini));
+        assert!(asked.starts_with("Run it.\n\n("), "{asked}");
+        assert!(asked.contains("Spoken:"), "{asked}");
+        assert_eq!(with_spoken_request(String::new(), Some(&gemini)), "");
     }
 
     #[test]

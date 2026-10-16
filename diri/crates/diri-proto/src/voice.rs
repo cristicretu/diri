@@ -10,6 +10,10 @@ pub const SPOKEN_MARKER: &str = "Spoken:";
 /// Context added to each prompt while the setting is on.
 pub const SPOKEN_INSTRUCTION: &str = "The developer has Diri read the end of each of your turns aloud and may be away from the screen. End every reply with a final paragraph that starts with \"Spoken:\" followed by two to four short sentences meant to be heard, not read: what you did, the result, and anything you need from the developer. No code, commands, file names, paths, links or Markdown in that paragraph. Write it in the language of your reply, but keep the word \"Spoken:\" as is.";
 
+/// The short form, added to a spoken answer for agents Diri has no other
+/// way to ask.
+pub const SPOKEN_REQUEST: &str = "End your reply with a short paragraph starting \"Spoken:\" that says, in plain words for listening, what you did and what you need from me.";
+
 /// Whether the app's preferences file has the setting on. A missing or
 /// unreadable file means off.
 pub fn talk_with_agent_enabled(prefs: &[u8]) -> bool {
