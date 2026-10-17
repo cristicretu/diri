@@ -22,6 +22,7 @@
     },
     "statusAuthority": "screen",
     "binary": "opencode",
+    "profile": {"environment": {"XDG_CONFIG_HOME": "{home}/config", "XDG_DATA_HOME": "{home}/data", "XDG_STATE_HOME": "{home}/state", "XDG_CACHE_HOME": "{home}/cache"}, "unsetEnvironment": ["OPENROUTER_API_KEY", "GROQ_API_KEY", "GEMINI_API_KEY", "GOOGLE_API_KEY"]},
     "resume": {
       "style": "flag",
       "token": "--continue"

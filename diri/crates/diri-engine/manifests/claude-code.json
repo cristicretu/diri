@@ -23,6 +23,7 @@
     },
     "statusAuthority": "hooks",
     "binary": "claude",
+    "profile": {"environment": {"CLAUDE_CONFIG_DIR": "{home}"}},
     "returnToLoginShell": true,
     "sessionIDFlag": "--session-id",
     "resume": {

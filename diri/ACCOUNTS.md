@@ -1,5 +1,39 @@
 # Account profiles
 
+Diri also manages isolated launch profiles for every manifest-backed coding
+agent. Each profile belongs to one Agent and execution host and records a
+directory, path-valued environment assignments, inherited variable names to
+clear, and optional argv tokens. Select a profile in the launcher or save it as
+the default for that Agent on that host. The Engine binds the selection to the
+session record, so resume and fork keep using the same profile if the default
+later changes. A profile can
+also be opened directly from Settings › Accounts to sign in with that Agent's
+normal CLI flow. Diri does not inspect or copy credentials in these directories.
+
+Create **Work** and **Personal** as two profiles for the same Agent. The GUI
+offers the Agents in Diri's manifest catalog and fills known path selectors:
+
+| Agent | Profile environment |
+| --- | --- |
+| Codex | `CODEX_HOME={home}` |
+| Claude Code | `CLAUDE_CONFIG_DIR={home}` |
+| Gemini CLI | `GEMINI_CLI_HOME={home}` (Gemini creates `.gemini` beneath it) |
+| OpenCode | `XDG_CONFIG_HOME={home}/config`, `XDG_DATA_HOME={home}/data`, `XDG_STATE_HOME={home}/state`, `XDG_CACHE_HOME={home}/cache` |
+
+For other catalog Agents, enter the config path environment assignments or
+launch arguments their CLI supports, and clear any inherited authentication or
+routing variables that could override them. `{home}` expands to the profile's
+chosen directory on the execution host; each argument is passed as one argv element.
+A CLI with no way to relocate every state and credential file cannot promise
+full isolation. Verify the CLI's own config and auth path behavior before
+relying on a custom profile. Diri keeps its profile binding even when the CLI
+does not honor a selector.
+
+The shared-login switch below is retained for existing local Claude Code and
+Codex accounts. It changes one shared Agent login and resumes open tabs. An
+isolated launch profile instead selects separate CLI files for each session;
+changing its default affects future launches, not running sessions.
+
 The bottom-left account menu switches the login for every open Claude or Codex
 tab on this Mac while keeping one shared conversation home per Agent
 (`~/.claude`, `~/.codex`). Open tabs relaunch on their existing conversations;
@@ -101,7 +135,8 @@ Diri cannot turn an account-side grant into a portable credential file.
 
 ## Storage and recovery
 
-The Engine stores the catalog in `accounts.json` beside its socket (version 1,
+The Engine stores the catalog in `accounts.json` beside its socket (version 2;
+version 1 is read without conversion until the next save,
 0600). Local Codex logins are stored under `codex-logins/<profile-id>/auth.json`
 beside that catalog; local Claude stores live under `claude-logins/<profile-id>`
 (the Keychain item name is derived from that path on macOS, and the profile
@@ -134,15 +169,16 @@ uses now into the profile already holding that account, or a new one;
 `account.add` takes `{agent}`, creates a profile and returns its sign-in
 SessionRecord. No credential material is part of these responses.
 
-## Other profiles
+## Isolated profiles and remote hosts
 
-Remote profiles and legacy isolated-home profiles retain their directory-based
-launch behavior. The Engine binds `CLAUDE_CONFIG_DIR` or `CODEX_HOME`, clears
-ambient provider authentication/routing overrides and reasserts the binding
-after shell startup. They can use **Open Agent** for sign-in. Existing explicit
-Claude single-conversation continuation remains available for isolated-home
-profiles; it does not transfer MCP grants. Remote profiles stay scoped to one
-Agent and host, and use the existing structured Remote PTY Holder launch path.
+The Engine expands the selected profile against the execution host's HOME,
+prepares its directory, removes known ambient provider authentication/routing
+overrides, and applies the profile environment after shell startup. It sends
+argv as structured tokens, including for remote sessions. Profiles use
+**Open Agent** for sign-in. Existing explicit Claude single-conversation
+continuation remains available for isolated-home profiles; it does not transfer
+MCP grants. Remote profiles stay scoped to one Agent and host and use the
+existing structured Remote PTY Holder launch path.
 
 ## Verification
 

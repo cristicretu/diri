@@ -23,6 +23,7 @@
     },
     "statusAuthority": "screen",
     "binary": "gemini",
+    "profile": {"environment": {"GEMINI_CLI_HOME": "{home}"}, "unsetEnvironment": ["GEMINI_API_KEY", "GOOGLE_API_KEY", "GOOGLE_APPLICATION_CREDENTIALS", "GOOGLE_GENAI_USE_VERTEXAI"]},
     "sessionIDFlag": "--session-id",
     "resume": {
       "style": "flag",

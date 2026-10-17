@@ -436,7 +436,10 @@ mod tests {
             host: None,
             config_home: home.to_string_lossy().into_owned(),
             is_default: false,
+            unset_environment: Vec::new(),
             login_store: None,
+            environment: Default::default(),
+            launch_args: Vec::new(),
         };
         server
             .accounts
@@ -524,7 +527,10 @@ mod tests {
             host: None,
             config_home: home.to_string_lossy().into_owned(),
             is_default: false,
+            unset_environment: Vec::new(),
             login_store: None,
+            environment: Default::default(),
+            launch_args: Vec::new(),
         });
         for p in &profiles {
             server.accounts.lock().unwrap().upsert(p.clone()).unwrap();
@@ -687,7 +693,10 @@ mod tests {
             host: None,
             config_home: home.to_string_lossy().into_owned(),
             is_default: false,
+            unset_environment: Vec::new(),
             login_store: None,
+            environment: Default::default(),
+            launch_args: Vec::new(),
         });
         for p in &profiles {
             server.accounts.lock().unwrap().upsert(p.clone()).unwrap();

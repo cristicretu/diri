@@ -122,12 +122,16 @@ impl ControlServer {
             self.remote_resume_spec(&target)?
         } else {
             let registry = self.registry.lock().map_err(poisoned)?;
-            self.resume_spec(
+            self.local_conversation_spec(
                 &registry,
                 &source.id.0,
                 source.kind.id(),
                 &source.cwd,
                 Some(conversation),
+                LocalConversationLaunch {
+                    action: ConversationAction::Resume,
+                    profile: Some(&profile),
+                },
             )?
         };
         if source.host.is_none() {
@@ -766,7 +770,10 @@ mod tests {
             host: None,
             config_home: temp.path().join(id).to_string_lossy().into_owned(),
             is_default: false,
+            unset_environment: Vec::new(),
             login_store: None,
+            environment: Default::default(),
+            launch_args: Vec::new(),
         });
         for profile in &profiles {
             server

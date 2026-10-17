@@ -247,12 +247,33 @@ fn new_profile_id(catalog: &AgentAccountCatalog, agent: &str) -> String {
     }
 }
 
-fn shares_home(profile: &AgentAccountProfile) -> bool {
-    profile.host.is_none()
-        && matches!(
-            profile.agent.as_str(),
-            AgentKind::CODEX_ID | AgentKind::CLAUDE_CODE_ID
-        )
+pub(super) fn shares_home(profile: &AgentAccountProfile) -> bool {
+    Homes::detect().is_ok_and(|homes| shares_home_at(profile, &homes))
+}
+
+fn shares_home_at(profile: &AgentAccountProfile, homes: &Homes) -> bool {
+    let path = if profile.agent == AgentKind::CODEX_ID {
+        &homes.codex
+    } else {
+        &homes.claude
+    };
+    shares_home_for(profile, path)
+}
+
+fn shares_home_for(profile: &AgentAccountProfile, home: &Path) -> bool {
+    if profile.host.is_some()
+        || !profile.environment.is_empty()
+        || !profile.unset_environment.is_empty()
+        || !profile.launch_args.is_empty()
+    {
+        return false;
+    }
+    let default = match profile.agent.as_str() {
+        AgentKind::CODEX_ID => ".codex",
+        AgentKind::CLAUDE_CODE_ID => ".claude",
+        _ => return false,
+    };
+    profile.config_home == format!("~/{default}") || home == Path::new(&profile.config_home)
 }
 
 fn expand_home(path: &str) -> PathBuf {
@@ -323,7 +344,7 @@ impl ControlServer {
 
         let mut logins = Vec::new();
         let mut knowns: Vec<(String, Known)> = Vec::new();
-        for profile in catalog.profiles.iter().filter(|p| shares_home(p)) {
+        for profile in catalog.profiles.iter().filter(|p| shares_home_at(p, homes)) {
             let (login, known) = if profile.agent == AgentKind::CODEX_ID {
                 self.codex_login(profile, homes, &open)
             } else {
@@ -353,7 +374,7 @@ impl ControlServer {
             let owner = catalog
                 .profiles
                 .iter()
-                .filter(|p| p.agent == AgentKind::CODEX_ID && shares_home(p))
+                .filter(|p| p.agent == AgentKind::CODEX_ID && shares_home_at(p, homes))
                 .filter(|p| known_of(&p.id).is_some_and(|k| k.same_account(&known)))
                 .max_by_key(|p| p.is_default)
                 .map(|p| p.id.clone());
@@ -393,7 +414,7 @@ impl ControlServer {
             let owner = catalog
                 .profiles
                 .iter()
-                .filter(|p| p.agent == AgentKind::CLAUDE_CODE_ID && shares_home(p))
+                .filter(|p| p.agent == AgentKind::CLAUDE_CODE_ID && shares_home_at(p, homes))
                 .find(|p| known_of(&p.id).is_some_and(|k| k.same_account(&known)))
                 .map(|p| p.id.clone());
             live.push(AgentLiveLogin {
@@ -634,7 +655,7 @@ impl ControlServer {
         let existing = catalog
             .profiles
             .iter()
-            .filter(|p| p.agent == AgentKind::CODEX_ID && shares_home(p))
+            .filter(|p| p.agent == AgentKind::CODEX_ID && shares_home_for(p, &home))
             .find(|p| {
                 self.slot_dir(AgentKind::CODEX_ID, &p.id)
                     .and_then(|slot| codex::read(&slot.join("auth.json")).ok().flatten())
@@ -664,7 +685,10 @@ impl ControlServer {
             host: None,
             config_home: String::new(),
             is_default: false,
+            unset_environment: Vec::new(),
             login_store: None,
+            environment: Default::default(),
+            launch_args: Vec::new(),
         });
         let slot = self.codex_slot(&profile.id)?;
         codex::write(&slot.join("auth.json"), &bytes)?;
@@ -702,7 +726,7 @@ impl ControlServer {
             catalog
                 .profiles
                 .iter()
-                .filter(|p| p.agent == AgentKind::CLAUDE_CODE_ID && shares_home(p))
+                .filter(|p| p.agent == AgentKind::CLAUDE_CODE_ID && shares_home_for(p, home))
                 .find(|p| {
                     p.login_store
                         .as_deref()
@@ -727,7 +751,10 @@ impl ControlServer {
             host: None,
             config_home: String::new(),
             is_default: false,
+            unset_environment: Vec::new(),
             login_store: None,
+            environment: Default::default(),
+            launch_args: Vec::new(),
         });
         let slot = self.claude_slot(&profile.id)?;
         let store = slot.to_string_lossy().into_owned();
@@ -772,7 +799,10 @@ impl ControlServer {
             host: None,
             config_home: home.to_string_lossy().into_owned(),
             is_default: false,
+            unset_environment: Vec::new(),
             login_store: None,
+            environment: Default::default(),
+            launch_args: Vec::new(),
         };
         accounts.upsert(profile.clone())?;
         drop(accounts);
@@ -890,7 +920,10 @@ mod tests {
             host: None,
             config_home: "~/.codex".into(),
             is_default: false,
+            unset_environment: Vec::new(),
             login_store: None,
+            environment: Default::default(),
+            launch_args: Vec::new(),
         };
         let catalog = AgentAccountCatalog {
             profiles: vec![
@@ -1182,7 +1215,10 @@ mod tests {
                 host: None,
                 config_home: homes.claude.to_string_lossy().into_owned(),
                 is_default: false,
+                unset_environment: Vec::new(),
                 login_store: Some(slot.to_string_lossy().into_owned()),
+                environment: Default::default(),
+                launch_args: Vec::new(),
             })
             .unwrap();
         let overview = server.overview_at(&homes).unwrap();
@@ -1241,7 +1277,10 @@ mod tests {
                 host: None,
                 config_home: homes.claude.to_string_lossy().into_owned(),
                 is_default: false,
+                unset_environment: Vec::new(),
                 login_store: Some(slot.to_string_lossy().into_owned()),
+                environment: Default::default(),
+                launch_args: Vec::new(),
             })
             .unwrap();
         for _ in 0..2 {
