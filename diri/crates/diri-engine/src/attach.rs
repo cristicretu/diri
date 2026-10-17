@@ -1736,6 +1736,7 @@ mod tests {
             .terminate("finished", Duration::from_millis(500));
     }
 
+    #[cfg(unix)]
     #[test]
     fn a_completed_run_whose_terminal_was_never_retained_is_refused() {
         // A reboot ends the Holder before the final checkpoint is published:
@@ -1769,6 +1770,7 @@ mod tests {
         serve.join().unwrap();
     }
 
+    #[cfg(unix)]
     #[test]
     fn keyboard_publication_preserves_legacy_bytes_and_shares_grid() {
         let hub = AttachHub::new();
@@ -2233,6 +2235,7 @@ mod tests {
         assert_eq!(kinds, [FrameType::Input, FrameType::Pong, FrameType::Ping]);
     }
 
+    #[cfg(unix)]
     #[test]
     fn a_reseedable_sink_survives_backlog_and_is_dropped_only_when_wedged() {
         let (mut output, _reader) = constrained_output();
@@ -2391,6 +2394,7 @@ mod tests {
             .unwrap();
     }
 
+    #[cfg(unix)]
     #[test]
     fn small_frames_are_count_bounded_and_stalled_sinks_close() {
         let (mut output, _) = constrained_output();

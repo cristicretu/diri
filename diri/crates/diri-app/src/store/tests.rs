@@ -2836,6 +2836,7 @@ async fn deferred_client_start_keeps_first_paint_in_connecting_state() {
     runtime.shutdown().await;
 }
 
+#[cfg(unix)]
 /// How the fake Engine answers `session.remove`.
 #[derive(Clone, Copy)]
 enum FakeRemove {
@@ -2846,6 +2847,7 @@ enum FakeRemove {
     LoseReply,
 }
 
+#[cfg(unix)]
 /// A control-socket Engine that stays connected across a failed removal.
 struct FakeRemoveEngine {
     _home: tempfile::TempDir,
@@ -2856,6 +2858,7 @@ struct FakeRemoveEngine {
     held_lookup: Arc<std::sync::Mutex<Option<(u64, std::os::unix::net::UnixStream)>>>,
 }
 
+#[cfg(unix)]
 impl FakeRemoveEngine {
     fn start(sessions: Vec<SessionRecord>, behavior: FakeRemove) -> Self {
         use std::io::{BufRead as _, Write as _};
@@ -2985,6 +2988,7 @@ impl FakeRemoveEngine {
     }
 }
 
+#[cfg(unix)]
 async fn eventually(what: &str, mut condition: impl FnMut() -> bool) {
     let deadline = Instant::now() + Duration::from_secs(10);
     while !condition() {
@@ -2993,6 +2997,7 @@ async fn eventually(what: &str, mut condition: impl FnMut() -> bool) {
     }
 }
 
+#[cfg(unix)]
 fn visible_ids(store: &mut SessionStore) -> Vec<SessionId> {
     store
         .ordered_sessions()
@@ -3001,6 +3006,7 @@ fn visible_ids(store: &mut SessionStore) -> Vec<SessionId> {
         .collect()
 }
 
+#[cfg(unix)]
 #[tokio::test(flavor = "multi_thread")]
 async fn a_rejected_close_restores_the_retained_session_and_allows_a_retry() {
     use std::sync::atomic::Ordering;
@@ -3046,6 +3052,7 @@ async fn a_rejected_close_restores_the_retained_session_and_allows_a_retry() {
     runtime.shutdown().await;
 }
 
+#[cfg(unix)]
 #[tokio::test(flavor = "multi_thread")]
 async fn a_slow_repository_lookup_does_not_hold_up_an_unrelated_close() {
     use std::sync::atomic::Ordering;
@@ -3105,6 +3112,7 @@ async fn a_slow_repository_lookup_does_not_hold_up_an_unrelated_close() {
     runtime.shutdown().await;
 }
 
+#[cfg(unix)]
 #[tokio::test(flavor = "multi_thread")]
 async fn a_lost_close_reply_is_settled_by_the_engine_not_assumed_to_have_failed() {
     let engine = FakeRemoveEngine::start(

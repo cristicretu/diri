@@ -8,7 +8,7 @@ use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 use super::http::{self, HttpError, Outgoing};
 use super::json::{PrettyJson, Token};
 use super::model::*;
-use super::storage::{self, ApiProject};
+use super::storage;
 use super::*;
 
 // MARK: URL ⇄ params
@@ -418,8 +418,10 @@ fn history_moves_repeats_up_and_is_bounded() {
     );
 }
 
+#[cfg(unix)]
 #[test]
 fn the_store_round_trips_with_owner_only_permissions() {
+    use super::storage::ApiProject;
     use std::os::unix::fs::PermissionsExt as _;
     let temp = tempfile::tempdir().unwrap();
     let root = temp.path().join("api");

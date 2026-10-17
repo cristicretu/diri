@@ -134,7 +134,7 @@ pub struct Registry {
     /// session id. Such a connection is read-only and swallows input, so a
     /// Session installed under that id closes it and the client reattaches
     /// to the live run instead of typing into the dead one.
-    completed_views: HashMap<String, Vec<(u64, std::os::unix::net::UnixStream)>>,
+    completed_views: HashMap<String, Vec<(u64, diri_platform::ipc::UnixStream)>>,
 }
 
 /// Immutable input for a Cursor provider-store scan. The events watcher builds
@@ -714,7 +714,7 @@ impl Registry {
         &mut self,
         id: &str,
         view: u64,
-        stream: std::os::unix::net::UnixStream,
+        stream: diri_platform::ipc::UnixStream,
     ) {
         self.completed_views
             .entry(id.to_owned())

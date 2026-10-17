@@ -7225,9 +7225,10 @@ mod tests {
             )
             .unwrap();
         assert!(server.terminal_shell_integration().is_none());
-        let settings = temp.path().join(TERMINAL_SETTINGS_FILE);
+        #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
+            let settings = temp.path().join(TERMINAL_SETTINGS_FILE);
             let mode = std::fs::metadata(&settings).unwrap().permissions().mode();
             assert_eq!(mode & 0o777, 0o600);
         }

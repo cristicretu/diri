@@ -707,7 +707,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_refusal_reaches_the_caller_before_the_channel_ends() {
-        let (client, server) = tokio::net::UnixStream::pair().unwrap();
+        let (client, server) = UnixStream::pair().unwrap();
         let peer = tokio::spawn(async move {
             let mut server = BufReader::new(server);
             let mut line = String::new();

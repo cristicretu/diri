@@ -539,6 +539,7 @@ fn verify_staged_version(app: &Path, release: &Release) -> Result<()> {
 
 /// Holds the staged bundle to exactly the promised version, nightly stamp
 /// included: one nightly's feed row must not install another night's build.
+#[cfg(any(not(windows), test))]
 fn staged_version_matches(found: &str, release: &Release) -> Result<()> {
     let found = Version::parse(found.trim())
         .ok_or_else(|| UpdateError::Integrity(format!("unparseable staged version {found:?}")))?;

@@ -14,7 +14,6 @@
 
 use std::fs;
 use std::io;
-use std::os::unix::fs::{OpenOptionsExt as _, PermissionsExt as _};
 use std::path::Path;
 
 const CONFIG_FILES: [&str; 2] = ["agents.json", "accounts.json"];
@@ -83,11 +82,17 @@ fn move_file(from: &Path, to: &Path) -> io::Result<bool> {
         return Ok(false);
     }
     let bytes = fs::read(from)?;
-    let mut file = fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .mode(0o600)
-        .open(to)?;
+    #[cfg(unix)]
+    let mut file = {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(to)?
+    };
+    #[cfg(not(unix))]
+    let mut file = diri_platform::security::create_private(to)?;
     io::Write::write_all(&mut file, &bytes)?;
     file.sync_all()?;
     fs::remove_file(from)?;
@@ -96,13 +101,16 @@ fn move_file(from: &Path, to: &Path) -> io::Result<bool> {
 
 fn create_private_dir(path: &Path) -> io::Result<()> {
     fs::create_dir_all(path)?;
-    fs::set_permissions(path, fs::Permissions::from_mode(0o700))
+    diri_platform::security::owner_only(path, true)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(unix)]
+    use std::os::unix::fs::PermissionsExt as _;
 
+    #[cfg(unix)]
     #[test]
     fn moves_linux_runtime_files_into_config_and_state() {
         let root = tempfile::tempdir().unwrap();
@@ -154,6 +162,7 @@ mod tests {
         assert_eq!(mode & 0o777, 0o600);
     }
 
+    #[cfg(unix)]
     #[test]
     fn never_overwrites_a_newer_file_or_follows_a_symlink() {
         let root = tempfile::tempdir().unwrap();

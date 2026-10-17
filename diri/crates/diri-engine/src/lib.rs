@@ -75,7 +75,6 @@ mod state_file;
 pub mod status;
 pub mod telemetry;
 pub mod transcript;
-#[cfg(unix)]
 pub mod wake;
 pub mod workspace;
 mod worktree_health;

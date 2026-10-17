@@ -169,7 +169,7 @@ fn record_switch(agent: &str, value: &Value) {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 mod tests {
     use super::sign_in_argv;
     use std::os::unix::fs::PermissionsExt;
