@@ -174,6 +174,7 @@ impl UtilitySurfaces {
 
     /// Screenshot fixtures: one named setup state, no Engine behind it.
     #[cfg(test)]
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
     pub(super) fn seed_computer_preview(&mut self, state: &str) {
         let mut status = diri_proto::ComputerStatus {
             supported: true,

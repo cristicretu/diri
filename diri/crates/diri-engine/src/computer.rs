@@ -1054,5 +1054,6 @@ fn is_executable(path: &Path) -> bool {
     }
 }
 
-#[cfg(test)]
+// The fake driver is a shell script.
+#[cfg(all(test, unix))]
 mod tests;
