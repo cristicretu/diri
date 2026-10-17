@@ -10,9 +10,11 @@
 # decide whether that is fatal (release) or fine (dev, plain-text fallback).
 #
 # Kokoro, the open-weights voice, runs on ONNX Runtime, which ships for Apple
-# silicon only: the arm64 slice links it and the x86_64 slice is built without
-# Kokoro (`#if KOKORO`). The pinned runtime is downloaded once into
-# target/ and its dylib is copied next to <output-path>.
+# silicon only: the arm64 slice is built against its C headers and the x86_64
+# slice without Kokoro (`#if KOKORO`). The runtime is not linked or bundled:
+# the helper downloads Diri's signed copy with Kokoro's model and dlopens it
+# (Kokoro.swift; scripts/publish-onnxruntime.sh publishes it). The pinned
+# release is downloaded once into target/ for its headers and licenses.
 set -euo pipefail
 
 output="${1:?usage: build-voice-helper.sh <output-path>}"
@@ -66,8 +68,6 @@ for arch in arm64 x86_64; do
             -D KOKORO
             -import-objc-header "${source_dir}/onnxruntime-bridge.h"
             -Xcc -I"${ort_dir}/include"
-            -L"${ort_dir}/lib" -lonnxruntime
-            -Xlinker -rpath -Xlinker @executable_path
         )
     fi
     xcrun --sdk macosx swiftc -O -parse-as-library -swift-version 5 \
@@ -79,8 +79,11 @@ for arch in arm64 x86_64; do
 done
 mkdir -p "$(dirname "${output}")"
 lipo -create "${work}/diri-voice-arm64" "${work}/diri-voice-x86_64" -output "${output}"
-# The arm64 slice loads it from beside itself (@rpath = @executable_path).
-cp "${ort_dir}/lib/${ort_dylib}" "$(dirname "${output}")/libonnxruntime.1.dylib"
+# Loaded at runtime from the download, never at launch.
+if otool -L "${output}" | grep -q onnxruntime; then
+    echo "build-voice-helper: ONNX Runtime is linked; Kokoro must dlopen it" >&2
+    exit 1
+fi
 
 # A strong link would stop the helper from loading at all on macOS 15.
 if otool -l "${output}" | grep -A2 LC_LOAD_DYLIB | grep -q FoundationModels; then

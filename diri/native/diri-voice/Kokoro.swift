@@ -4,7 +4,9 @@
 //
 // Files live in one directory the app chooses (see KokoroFiles); `kokoro-download`
 // fetches them, pinned by revision and SHA-256, the first time a Kokoro voice is
-// picked. Speech is synthesized a sentence at a time and played while the next
+// picked. ONNX Runtime is one of them rather than part of the app bundle: Diri's
+// own Developer ID-signed copy, which the hardened runtime's library validation
+// accepts, loaded with dlopen only when Kokoro speaks. Speech is synthesized a sentence at a time and played while the next
 // sentence is synthesized.
 
 import AVFoundation
@@ -45,6 +47,15 @@ enum KokoroFiles {
         "bm_fable": "f889083196807b4adb15e9204252165f503b8d33d3982e681c52443c49d798f1",
     ]
 
+    /// ONNX Runtime 1.31.0 (MIT) for Apple silicon, unmodified from Microsoft's
+    /// release and signed with Diri's Developer ID (scripts/publish-onnxruntime.sh).
+    static let runtime = Asset(
+        name: "runtime/libonnxruntime.1.31.0.dylib",
+        url: "https://github.com/cristicretu/diri/releases/download/onnxruntime-1.31.0/libonnxruntime.1.31.0.dylib",
+        sha256: "38aec2774e8ca5ce7ffd606a00be092598b8c23dbf750a2d63a374c3c9a6d129",
+        size: 44_555_072
+    )
+
     static func voice(_ name: String) -> Asset? {
         guard let sha256 = voices[name] else { return nil }
         return Asset(
@@ -75,7 +86,7 @@ enum KokoroFiles {
     static func isBritish(_ voice: String) -> Bool { voice.hasPrefix("b") }
 
     static func assets(voice: String) -> [Asset] {
-        [model] + (KokoroFiles.voice(voice).map { [$0] } ?? []) + lexicons(british: isBritish(voice))
+        [runtime, model] + (KokoroFiles.voice(voice).map { [$0] } ?? []) + lexicons(british: isBritish(voice))
     }
 
     static func missing(in dir: URL, voice: String) -> [Asset] {
@@ -221,6 +232,24 @@ enum KokoroError: Error, CustomStringConvertible {
     }
 }
 
+/// ONNX Runtime's API table from the downloaded library. Library validation
+/// refuses a copy not signed by Diri's team, so dlopen failing is the check.
+func onnxRuntimeAPI(dir: URL) throws -> OrtApi {
+    let path = dir.appendingPathComponent(KokoroFiles.runtime.name).path
+    guard let library = dlopen(path, RTLD_NOW | RTLD_LOCAL) else {
+        let reason = dlerror().map { String(cString: $0) } ?? "unknown error"
+        throw KokoroError.runtime("ONNX Runtime did not load: \(reason)")
+    }
+    typealias GetApiBase = @convention(c) () -> UnsafePointer<OrtApiBase>?
+    guard let symbol = dlsym(library, "OrtGetApiBase"),
+        let base = unsafeBitCast(symbol, to: GetApiBase.self)(),
+        let api = base.pointee.GetApi(UInt32(ORT_API_VERSION))
+    else {
+        throw KokoroError.runtime("ONNX Runtime \(ORT_API_VERSION) API unavailable")
+    }
+    return api.pointee
+}
+
 /// One loaded model and voice. Not thread-safe; one per process.
 final class KokoroVoice {
     static let sampleRate = 24_000.0
@@ -236,13 +265,10 @@ final class KokoroVoice {
     private let g2p: EnglishG2P
 
     init(dir: URL, voice: String) throws {
-        guard let base = OrtGetApiBase(), let api = base.pointee.GetApi(UInt32(ORT_API_VERSION)) else {
-            throw KokoroError.runtime("ONNX Runtime unavailable")
-        }
-        self.api = api.pointee
         guard let voiceAsset = KokoroFiles.voice(voice) else { throw KokoroError.files("unknown voice \(voice)") }
         let missing = KokoroFiles.missing(in: dir, voice: voice)
         guard missing.isEmpty else { throw KokoroError.files("missing \(missing.map(\.name))") }
+        api = try onnxRuntimeAPI(dir: dir)
         let voiceData = try Data(contentsOf: dir.appendingPathComponent(voiceAsset.name))
         styles = voiceData.withUnsafeBytes { Array($0.bindMemory(to: Float.self)) }
         let lexicons = KokoroFiles.lexicons(british: KokoroFiles.isBritish(voice))

@@ -350,7 +350,7 @@ jobs:
           lipo "${app}/Contents/Resources/bin/diri-holder" -verify_arch arm64 x86_64
           lipo "${app}/Contents/Resources/bin/diri-ssh-askpass" -verify_arch arm64 x86_64
           lipo "${app}/Contents/Resources/bin/diri-voice" -verify_arch arm64 x86_64
-          lipo "${app}/Contents/Resources/bin/libonnxruntime.1.dylib" -verify_arch arm64
+          test ! -e "${app}/Contents/Resources/bin/libonnxruntime.1.dylib"
           test -f "${app}/Contents/Resources/bin/remote-helpers/manifest.json"
           test "$(find "${app}/Contents/Resources/bin/remote-helpers/artifacts" -name diri-remote -type f | wc -l | tr -d ' ')" = 3
           codesign --verify --deep --strict "${app}"

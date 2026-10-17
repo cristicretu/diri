@@ -173,9 +173,12 @@ cp "${universal_wake_helper_binary}" "${app_bin_dir}/diri-wake-helper"
 echo "==> Building the voice helper (universal)"
 "${workspace_dir}/scripts/build-voice-helper.sh" "${app_bin_dir}/diri-voice"
 verify_universal "${app_bin_dir}/diri-voice"
-# Kokoro's runtime, which the helper's arm64 slice loads from beside itself.
-# ONNX Runtime ships for Apple silicon only, so this one is arm64 alone.
-lipo "${app_bin_dir}/libonnxruntime.1.dylib" -verify_arch arm64
+# Kokoro's runtime is downloaded with its model, not bundled
+# (scripts/publish-onnxruntime.sh); its notices still ship with the app.
+if [[ -e "${app_bin_dir}/libonnxruntime.1.dylib" ]]; then
+    echo "package: ONNX Runtime must not be bundled" >&2
+    exit 1
+fi
 ort_dir="${CARGO_TARGET_DIR:-${workspace_dir}/target}/onnxruntime-osx-arm64-1.31.0"
 cp "${ort_dir}/LICENSE" "${license_dir}/ONNXRuntime-MIT.txt"
 cp "${ort_dir}/ThirdPartyNotices.txt" "${license_dir}/ONNXRuntime-ThirdPartyNotices.txt"
@@ -241,7 +244,6 @@ codesign --force --options runtime "${ts_flag[@]}" --sign "${sign_id}" "${app_bi
 codesign --force --options runtime "${ts_flag[@]}" --sign "${sign_id}" "${app_bin_dir}/dirijord-rs"
 codesign --force --options runtime "${ts_flag[@]}" --sign "${sign_id}" "${app_bin_dir}/diri-holder"
 codesign --force --options runtime "${ts_flag[@]}" --sign "${sign_id}" "${app_bin_dir}/diri-ssh-askpass"
-codesign --force --options runtime "${ts_flag[@]}" --sign "${sign_id}" "${app_bin_dir}/libonnxruntime.1.dylib"
 # The hardened runtime blocks the microphone without this entitlement.
 codesign --force --options runtime "${ts_flag[@]}" \
     --entitlements "${workspace_dir}/assets/diri-voice.entitlements" \

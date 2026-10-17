@@ -110,10 +110,11 @@ overlays were derived from it, and ten themes whose default text is below
 ONNX Runtime (https://github.com/microsoft/onnxruntime)
 -------------------------------------------------------
 Copyright (c) Microsoft Corporation. Licensed under the MIT License.
-Bundled unmodified as Contents/Resources/bin/libonnxruntime.1.dylib (Apple
-silicon) to run the Kokoro voice. Its license and third-party notices ship in
-Contents/Resources/licenses/ONNXRuntime-MIT.txt and
-ONNXRuntime-ThirdPartyNotices.txt.
+Not bundled: when a Kokoro voice is chosen on Apple silicon, Diri downloads
+Microsoft's unmodified libonnxruntime.1.31.0.dylib, signed with Diri's
+Developer ID and pinned by SHA-256, to run the voice. Its license and
+third-party notices ship in Contents/Resources/licenses/ONNXRuntime-MIT.txt
+and ONNXRuntime-ThirdPartyNotices.txt.
 
 Kokoro-82M (https://huggingface.co/hexgrad/Kokoro-82M)
 ------------------------------------------------------

@@ -1262,6 +1262,7 @@ mod macos {
         };
         let accent = if voice.starts_with('b') { "gb" } else { "us" };
         [
+            "runtime/libonnxruntime.1.31.0.dylib".to_owned(),
             "model_quantized.onnx".to_owned(),
             format!("voices/{voice}.bin"),
             format!("lexicon/{accent}_gold.json"),
