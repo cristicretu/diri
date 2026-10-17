@@ -64,22 +64,58 @@ pub mod job;
 
 pub mod child;
 
-pub fn curl_executable() -> std::path::PathBuf {
-    #[cfg(windows)]
-    {
-        std::path::PathBuf::from(
-            std::env::var_os("SystemRoot").unwrap_or_else(|| "C:\\Windows".into()),
-        )
-        .join("System32/curl.exe")
-    }
-    #[cfg(unix)]
-    {
-        // NixOS and Guix have no /usr/bin/curl; theirs is on PATH.
-        let system = std::path::Path::new("/usr/bin/curl");
-        if system.exists() {
-            system.to_path_buf()
-        } else {
-            "curl".into()
+/// The `curl` every HTTPS request goes through, resolved once per process.
+pub fn curl_executable() -> &'static std::path::Path {
+    static CURL: std::sync::OnceLock<std::path::PathBuf> = std::sync::OnceLock::new();
+    CURL.get_or_init(|| {
+        #[cfg(windows)]
+        {
+            std::path::PathBuf::from(
+                std::env::var_os("SystemRoot").unwrap_or_else(|| "C:\\Windows".into()),
+            )
+            .join("System32/curl.exe")
         }
+        #[cfg(not(windows))]
+        {
+            system_tool("curl", option_env!("DIRI_CURL"))
+        }
+    })
+}
+
+/// The `gzip` telemetry compresses with, resolved once per process.
+pub fn gzip_executable() -> &'static std::path::Path {
+    static GZIP: std::sync::OnceLock<std::path::PathBuf> = std::sync::OnceLock::new();
+    GZIP.get_or_init(|| system_tool("gzip", option_env!("DIRI_GZIP")))
+}
+
+/// A path pinned at build time (the Nix package sets `DIRI_CURL`/`DIRI_GZIP`
+/// to store paths), else `/usr/bin/<name>`, else `<name>` on `PATH` for
+/// systems without `/usr/bin` tools such as NixOS and Guix.
+fn system_tool(name: &str, pinned: Option<&str>) -> std::path::PathBuf {
+    if let Some(pinned) = pinned.filter(|path| !path.is_empty()) {
+        return pinned.into();
+    }
+    let system = std::path::Path::new("/usr/bin").join(name);
+    if system.exists() { system } else { name.into() }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::system_tool;
+
+    #[test]
+    fn system_tool_prefers_the_build_time_path() {
+        assert_eq!(
+            system_tool("curl", Some("/nix/store/x-curl/bin/curl")),
+            std::path::Path::new("/nix/store/x-curl/bin/curl"),
+        );
+    }
+
+    #[test]
+    fn system_tool_falls_back_to_path_without_usr_bin() {
+        assert_eq!(
+            system_tool("diri-no-such-tool", Some("")),
+            std::path::Path::new("diri-no-such-tool"),
+        );
     }
 }

@@ -3,7 +3,7 @@
 //! Why `curl` and not an in-process client: the workspace links no HTTP or
 //! TLS stack, and adding one (hyper + rustls, or reqwest) to a GPUI app brings
 //! a large dependency tree and its own certificate story. diri already sends
-//! its HTTPS through `/usr/bin/curl` (`diri-updater::net`, usage limits), which
+//! its HTTPS through the system `curl` (`diri-updater::net`, usage limits), which
 //! uses the system trust store, speaks HTTP/1.1 and HTTP/2, follows
 //! redirects, and decompresses. This module drives it the same hardened way:
 //!
@@ -18,7 +18,7 @@
 //! Nothing here logs: headers and bodies routinely carry tokens.
 
 use std::io::Write as _;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::process::Stdio;
 use std::time::{Duration, Instant};
 
@@ -117,7 +117,7 @@ impl HttpError {
     pub fn message(&self) -> String {
         match self {
             HttpError::Invalid(reason) => reason.clone(),
-            HttpError::Unavailable => "curl is not available on this Mac".to_owned(),
+            HttpError::Unavailable => "curl isn’t installed".to_owned(),
             HttpError::Resolve => "Couldn’t find that host".to_owned(),
             HttpError::Connect => "Couldn’t connect — is the server running?".to_owned(),
             HttpError::Timeout => "The request timed out".to_owned(),
@@ -126,15 +126,6 @@ impl HttpError {
             HttpError::Cancelled => "Cancelled".to_owned(),
             HttpError::Transfer(code) => format!("The request failed (curl error {code})"),
         }
-    }
-}
-
-fn curl_path() -> PathBuf {
-    let system = Path::new("/usr/bin/curl");
-    if system.exists() {
-        system.to_path_buf()
-    } else {
-        PathBuf::from("curl")
     }
 }
 
@@ -278,7 +269,7 @@ pub async fn send(
     outgoing: Outgoing,
     cancel: tokio::sync::oneshot::Receiver<()>,
 ) -> Result<ApiResponse, HttpError> {
-    send_with(&curl_path(), outgoing, cancel).await
+    send_with(diri_platform::curl_executable(), outgoing, cancel).await
 }
 
 pub(crate) async fn send_with(
