@@ -74,6 +74,12 @@ pub fn curl_executable() -> std::path::PathBuf {
     }
     #[cfg(unix)]
     {
-        "/usr/bin/curl".into()
+        // NixOS and Guix have no /usr/bin/curl; theirs is on PATH.
+        let system = std::path::Path::new("/usr/bin/curl");
+        if system.exists() {
+            system.to_path_buf()
+        } else {
+            "curl".into()
+        }
     }
 }

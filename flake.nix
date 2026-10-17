@@ -89,6 +89,7 @@
           imagemagick,
           copyDesktopItems,
           makeDesktopItem,
+          curl,
           fontconfig,
           freetype,
           libxkbcommon,
@@ -159,6 +160,13 @@
         rustPlatform.buildRustPackage {
           pname = "diri";
           inherit version src cargoDeps;
+
+          # Usage limits are fetched with curl at a fixed path; NixOS has no
+          # /usr/bin/curl, so point it into the store.
+          postPatch = ''
+            substituteInPlace crates/diri-platform/src/lib.rs \
+              --replace-fail '"/usr/bin/curl"' '"${lib.getExe curl}"'
+          '';
 
           buildPhase = ''
             runHook preBuild
