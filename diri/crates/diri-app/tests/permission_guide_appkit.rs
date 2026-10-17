@@ -36,7 +36,9 @@ fn show(pane: &str) {
     // No Dock icon, and never the active app: Settings keeps focus.
     app.setActivationPolicy(NSApplicationActivationPolicy::Accessory);
     if let Some(dir) = pane.strip_prefix("render:") {
-        let bundle = PathBuf::from("/Applications/Diri.app");
+        let bundle = std::env::var_os("DIRI_TEST_PERMISSION_GUIDE_APP")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from("/Applications/Diri.app"));
         for (dark, file) in [(false, "guide-light.png"), (true, "guide-dark.png")] {
             let path = PathBuf::from(dir).join(file);
             assert!(
