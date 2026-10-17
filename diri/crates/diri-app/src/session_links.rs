@@ -2011,6 +2011,7 @@ mod tests {
 
     /// A long agent session the way they really look: two PRs, three dev
     /// servers, a dozen dashboards on the same two hosts, ids for titles.
+    #[cfg(target_os = "macos")]
     fn busy_session(session: &mut SessionRecord) {
         let urls = [
             "https://linear.app/acme/issue/PRD-8201/bring-extraction-to-the-reader",
