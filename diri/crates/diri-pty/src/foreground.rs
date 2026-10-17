@@ -631,10 +631,24 @@ mod tests {
         std::fs::copy(std::env::current_exe().unwrap(), &real).unwrap();
         let link = root.join("bin/cb");
         std::os::unix::fs::symlink(&real, &link).unwrap();
-        let child = std::process::Command::new(&link)
-            .args(["--ignored", "--exact", "foreground::tests::sleeper"])
-            .spawn()
-            .unwrap();
+        // Another test thread forking while the copy was open for writing
+        // inherits that descriptor, and Linux refuses to exec a file open for
+        // writing (ETXTBSY) until that child execs or exits.
+        let mut attempts = 0;
+        let child = loop {
+            match std::process::Command::new(&link)
+                .args(["--ignored", "--exact", "foreground::tests::sleeper"])
+                .spawn()
+            {
+                Err(error)
+                    if error.kind() == io::ErrorKind::ExecutableFileBusy && attempts < 100 =>
+                {
+                    attempts += 1;
+                    std::thread::sleep(std::time::Duration::from_millis(20));
+                }
+                result => break result.unwrap(),
+            }
+        };
         let package = package_once_execd(child);
         assert_eq!(package.unwrap().as_deref(), Some("codebuff"));
 
