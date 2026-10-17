@@ -77,7 +77,7 @@ struct LinkRow {
     /// A PR's glyph wears its state's color, so open and merged differ at a
     /// glance rather than only in the status word.
     icon_tint: Option<gpui::Rgba>,
-    /// Merged or closed: listed after the open ones, in quieter ink.
+    /// Merged or closed: listed after the open ones.
     settled: bool,
     status: Option<(String, gpui::Rgba)>,
     action: LinkAction,
@@ -1004,11 +1004,7 @@ impl TerminalPane {
                     })
                     .cursor_pointer()
                     .text_size(px(13.0))
-                    .text_color(if row.settled && !selected {
-                        ink.secondary
-                    } else {
-                        ink.primary
-                    })
+                    .text_color(ink.primary)
                     .child(
                         div()
                             .w(px(16.0))
@@ -2185,6 +2181,46 @@ mod tests {
         if std::env::var_os("DIRI_VISUAL_MERGED").is_some() {
             session.pull_requests.as_mut().unwrap()[0].state = "MERGED".into();
         }
+        // A long session's PRs: most merged, a few still open, one closed.
+        if std::env::var_os("DIRI_VISUAL_PR_MIX").is_some() {
+            let mix = [
+                (188, "Draw the find bar over the grid", "OPEN", false, 0),
+                (187, "Keep scrollback across reattach", "MERGED", false, 0),
+                (186, "Resize panes without a blank frame", "OPEN", false, 1),
+                (185, "Name shell tabs after their program", "MERGED", false, 0),
+                (184, "Try a second selection color", "CLOSED", false, 0),
+                (183, "Quiet the reconnect toast", "MERGED", false, 0),
+                (182, "Split the sidebar into islands", "OPEN", true, 0),
+            ];
+            let prs: Vec<_> = mix
+                .iter()
+                .map(|&(number, title, state, draft, failed)| {
+                    let url = format!("https://github.com/diri/app/pull/{number}");
+                    let mut pr = super::super::tests::pull_request(&url);
+                    pr.number = number;
+                    pr.title = Some(title.into());
+                    pr.state = state.into();
+                    pr.is_draft = draft;
+                    pr.checks_failed = failed;
+                    pr.checks_pending = 0;
+                    pr.checks_passed = 5;
+                    pr
+                })
+                .collect();
+            session.artifacts = Some(
+                prs.iter()
+                    .map(|pr| SessionArtifact {
+                        kind: ArtifactKind::PullRequest,
+                        url: pr.url.clone(),
+                        first_seen_at: DateMillis(0.0),
+                    })
+                    .chain(session.artifacts.take().unwrap_or_default().into_iter().filter(
+                        |artifact| artifact.kind != ArtifactKind::PullRequest,
+                    ))
+                    .collect(),
+            );
+            session.pull_requests = Some(prs);
+        }
         let (runtime, tokio) = runtime(session);
         if std::env::var_os("DIRI_VISUAL_LIGHT").is_some() {
             runtime
@@ -2209,6 +2245,12 @@ mod tests {
                 cx.new(|cx| {
                     let mut pane = TerminalPane::new(runtime, tokio, window, cx);
                     pane.session_links.open = true;
+                    if let Some(row) = std::env::var("DIRI_VISUAL_SELECTED")
+                        .ok()
+                        .and_then(|row| row.parse().ok())
+                    {
+                        pane.session_links.selected = row;
+                    }
                     if let Some(query) = std::env::var_os("DIRI_VISUAL_QUERY") {
                         pane.session_links.query.insert(&query.to_string_lossy());
                     }
