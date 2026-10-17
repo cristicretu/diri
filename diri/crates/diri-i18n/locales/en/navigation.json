@@ -535,6 +535,8 @@
   "terminal.path_copied": "Path copied",
   "terminal.preparing": "Preparing terminal…",
   "terminal.prompt.none": "No shell prompt that way (needs OSC 133 marks)",
+  "terminal.read_aloud.start": "Read this tab aloud",
+  "terminal.read_aloud.stop": "Stop reading this tab aloud",
   "terminal.reconnect.connecting": "Connecting…",
   "terminal.reconnect.input_dropped": "Queued input was dropped; it may not have arrived",
   "terminal.reconnect.lost_last": "Connection lost · Last received screen",

@@ -17,6 +17,7 @@ mod messages;
 mod messages_tests;
 mod path_picker;
 mod qol;
+mod read_aloud;
 mod reconnect;
 use qol::QolState;
 
@@ -4661,6 +4662,7 @@ impl TerminalPane {
                             .text_color(colors.primary)
                             .child(session.title.clone()),
                     )
+                    .children(self.render_read_aloud_toggle(session, colors, cx))
                     .child(self.render_session_links_trigger(session, colors, cx)),
             )
             .child(
@@ -4824,7 +4826,9 @@ impl TerminalPane {
                 .items_center()
                 .gap(px(Metrics::TOOLBAR_COMPACT_GAP))
                 .when_some(session, |actions, session| {
-                    actions.child(self.render_session_links_trigger(&session, colors, cx))
+                    actions
+                        .children(self.render_read_aloud_toggle(&session, colors, cx))
+                        .child(self.render_session_links_trigger(&session, colors, cx))
                 })
                 .child(self.render_notification_button(colors, held_hint))
                 .children(self.render_inspector_toggle(colors, held_hint))

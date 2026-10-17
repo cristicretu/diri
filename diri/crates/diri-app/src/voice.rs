@@ -576,8 +576,13 @@ mod macos {
     }
 
     /// Starts the reader and speaker threads. Both sleep on channels; nothing
-    /// runs while no turn finishes.
+    /// runs while no turn finishes. Once per app: every window's RootView
+    /// calls this, and a second reader would read each reply again.
     pub(crate) fn install(runtime: Arc<StoreRuntime>, tokio: tokio::runtime::Handle) {
+        static INSTALLED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+        if INSTALLED.swap(true, std::sync::atomic::Ordering::SeqCst) {
+            return;
+        }
         let store = Arc::clone(&runtime.store);
         ensure_kokoro(&store.read().expect("store").preferences().talk_voice);
         let mut completions = store.read().expect("store").turn_completions();
@@ -703,39 +708,39 @@ mod macos {
     /// order: what the agent gave Diri's `speak` tool; its `Spoken:`
     /// paragraph, from its transcript (Claude Code, Codex) or else its
     /// terminal (any agent, remote ones too); the on-device digest of what
-    /// it wrote.
+    /// it wrote. Only the reply is read: the tab's title is usually the
+    /// user's own first message, so it is said only when there is nothing
+    /// else to say.
     fn reading(
         home: &Path,
         record: &SessionRecord,
         spoken: impl FnOnce() -> Option<String>,
         terminal: impl FnOnce() -> Option<Vec<String>>,
     ) -> Option<String> {
-        let title = spoken_title(&record.title);
         if let Some(text) = spoken().map(|text| inline_prose_lines(&text))
             && !text.is_empty()
         {
-            return Some(tf("voice.reading", &[("title", &title), ("text", &text)]));
+            return Some(text);
         }
         settle(record);
         let messages = turn_messages(home, record);
-        let spoken_reading =
-            |spoken: String| Some(tf("voice.reading", &[("title", &title), ("text", &spoken)]));
         if let Some(spoken) = messages
             .as_ref()
             .and_then(|messages| messages.last())
             .and_then(|last| super::spoken_paragraph(last))
         {
-            return spoken_reading(spoken);
+            return Some(spoken);
         }
         let screen = if messages.is_none() { terminal() } else { None };
         if let Some(spoken) = screen.as_deref().and_then(super::terminal_spoken_paragraph) {
-            return spoken_reading(spoken);
+            return Some(spoken);
         }
         let reply = messages
             .map(|messages| messages.join("\n\n"))
             .or_else(|| screen.as_deref().and_then(super::terminal_reply));
         let Some(reply) = reply else {
             // Nothing readable at all: still say which agent finished.
+            let title = spoken_title(&record.title);
             return Some(tf("voice.finished", &[("title", &title)]));
         };
         let prose = speakable(&reply);
@@ -747,7 +752,7 @@ mod macos {
             Digest::Quiet => return None,
             Digest::Unavailable => fallback_cut(&prose),
         };
-        (!body.is_empty()).then(|| tf("voice.reading", &[("title", &title), ("text", &body)]))
+        (!body.is_empty()).then_some(body)
     }
 
     /// Waits until the transcript stops growing, so the turn's last message

@@ -410,6 +410,20 @@ fn repo_target_key(host: Option<&str>) -> String {
     host.unwrap_or("local").to_owned()
 }
 
+/// How the palette and the title bar's speaker change which tabs are read
+/// aloud ([`SessionStore::set_read_aloud`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ReadAloudChoice {
+    /// This tab flips; the others keep their choice.
+    Toggle,
+    /// Read this tab and no other.
+    Only,
+    /// Read every tab but this one.
+    AllExcept,
+    /// Read every tab.
+    All,
+}
+
 /// Pure application model. Side effects are emitted onto a channel for the daemon adapter.
 pub struct SessionStore {
     workspaces: WorkspaceCatalog,
@@ -752,10 +766,40 @@ impl SessionStore {
     }
 
     /// Whether "Talk with your agent" reads `session` aloud: the setting is
-    /// on and the chat is not muted. One per-chat mute silences both its
-    /// notifications and its readings.
+    /// on, the tab's speaker is not off, and the chat is not muted (muting a
+    /// chat silences both its notifications and its readings).
     pub fn reads_aloud(&self, session: &SessionId) -> bool {
-        self.prefs.talk_with_agent && !self.prefs.muted_notification_sessions.contains(&session.0)
+        self.prefs.talk_with_agent
+            && self.tab_reads_aloud(session)
+            && !self.prefs.muted_notification_sessions.contains(&session.0)
+    }
+
+    /// The tab's own read-aloud choice, whether or not the setting is on.
+    pub fn tab_reads_aloud(&self, session: &SessionId) -> bool {
+        self.prefs.talk_reads_by_default != self.prefs.talk_exceptions.contains(&session.0)
+    }
+
+    /// Which tabs "Talk with your agent" reads, without touching their
+    /// notifications. Choosing which tabs to read also turns the setting on.
+    pub fn set_read_aloud(&mut self, session: SessionId, choice: ReadAloudChoice) {
+        let prefs = &mut self.prefs;
+        match choice {
+            ReadAloudChoice::Toggle => {
+                if !prefs.talk_exceptions.remove(&session.0) {
+                    prefs.talk_exceptions.insert(session.0);
+                }
+            }
+            ReadAloudChoice::Only | ReadAloudChoice::AllExcept | ReadAloudChoice::All => {
+                prefs.talk_with_agent = true;
+                prefs.talk_reads_by_default = choice != ReadAloudChoice::Only;
+                prefs.talk_exceptions.clear();
+                if choice != ReadAloudChoice::All {
+                    prefs.talk_exceptions.insert(session.0);
+                }
+            }
+        }
+        let _ = self.persist_preferences();
+        self.emit(StoreEffect::PublishSnapshot);
     }
 
     pub fn toggle_notification_mute(&mut self, session: SessionId) {

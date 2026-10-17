@@ -127,6 +127,14 @@
   "toast.quote_select_agent": "Selecciona un agente en el que citar",
   "toast.quote_session_gone": "Esa sesión ya no está. Elige otra.",
   "toast.quote_session_missing": "Esa sesión ya no existe",
+  "toast.read_aloud_all_except_tab": "Leyendo en voz alta todas las pestañas menos esta",
+  "toast.read_aloud_all_tabs": "Leyendo en voz alta todas las pestañas",
+  "toast.read_aloud_failed": "No se pudo cambiar la lectura en voz alta",
+  "toast.read_aloud_off": "Ya no se leen las respuestas en voz alta",
+  "toast.read_aloud_on": "Leyendo respuestas en voz alta",
+  "toast.read_aloud_only_tab": "Leyendo en voz alta solo esta pestaña",
+  "toast.read_aloud_tab_off": "Ya no se lee esta pestaña en voz alta",
+  "toast.read_aloud_tab_on": "Leyendo esta pestaña en voz alta",
   "toast.reconnecting": "Reconectando…",
   "toast.reconnecting_body": "Reintentando automáticamente. Las sesiones siguen legibles.",
   "toast.reply_not_sent": "Respuesta no enviada",
@@ -148,6 +156,5 @@
   "toast.workspace_rejected": "No se guardó el cambio del espacio de trabajo",
   "toast.workspace_target_gone": "Ese destino ya no está. Abre la paleta para elegir de nuevo.",
   "voice.finished": "{title} terminó.",
-  "voice.reading": "{title}. {text}",
   "voice.sample": "Así leerá Diri las respuestas de tu agente."
 }

@@ -127,6 +127,14 @@
   "toast.quote_select_agent": "选择要引用到的智能体",
   "toast.quote_session_gone": "该会话已不存在。请另选一个。",
   "toast.quote_session_missing": "该会话已不存在",
+  "toast.read_aloud_all_except_tab": "朗读除此之外的所有标签页",
+  "toast.read_aloud_all_tabs": "朗读所有标签页",
+  "toast.read_aloud_failed": "无法更改朗读设置",
+  "toast.read_aloud_off": "已停止朗读回复",
+  "toast.read_aloud_on": "正在朗读回复",
+  "toast.read_aloud_only_tab": "只朗读此标签页",
+  "toast.read_aloud_tab_off": "已停止朗读此标签页",
+  "toast.read_aloud_tab_on": "正在朗读此标签页",
   "toast.reconnecting": "正在重新连接…",
   "toast.reconnecting_body": "正在自动重试。会话仍可查看。",
   "toast.reply_not_sent": "回复未发送",
@@ -148,6 +156,5 @@
   "toast.workspace_rejected": "工作区更改未保存",
   "toast.workspace_target_gone": "该目标已不存在。打开命令面板重新选择。",
   "voice.finished": "{title} 已完成。",
-  "voice.reading": "{title}。{text}",
   "voice.sample": "Diri 会用这个声音朗读智能体的回复。"
 }

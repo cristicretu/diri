@@ -106,13 +106,10 @@ impl Bridge {
         kinds.dedup();
         kinds.push("shell".into());
         let mut tools = tool_definitions_for(&kinds);
-        // Offered only while "Talk with your agent" is on, so Agents do not
-        // spend a call every turn for nothing.
-        let voice: Result<diri_proto::voice::VoiceStateResult, String> =
-            self.request_typed(Method::VOICE_STATE, json!({}), DEFAULT_TIMEOUT);
-        if voice.is_ok_and(|voice| voice.talk_with_agent) {
-            tools.push(crate::tools::speak_tool());
-        }
+        // Always listed: Agents read the tool list once, when they start, and
+        // "Talk with your agent" may be turned on later. Its description says
+        // to call it only when Diri's prompt context asks for a summary.
+        tools.push(crate::tools::speak_tool());
         Ok(tools)
     }
 

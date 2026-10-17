@@ -14,6 +14,14 @@ pub(super) struct VoiceFieldsState {
 
 const ANSWER_OPTIONS: [TalkAnswer; 3] = [TalkAnswer::Diri, TalkAnswer::WisprFlow, TalkAnswer::Shortcut];
 
+fn tabs_label(all: bool) -> &'static str {
+    t(if all {
+        "settings.general.talk_tabs_all"
+    } else {
+        "settings.general.talk_tabs_picked"
+    })
+}
+
 fn answer_label(answer: TalkAnswer) -> &'static str {
     match answer {
         TalkAnswer::Diri => t("settings.general.talk_answer_diri"),
@@ -166,6 +174,56 @@ impl UtilitySurfaces {
                 cx.notify();
             }))
             .child(label)
+    }
+
+    /// Which tabs are read: every tab, or only the ones turned on with a
+    /// tab's speaker or ⌘K. Switching starts over from no exceptions.
+    pub(super) fn talk_tabs_dropdown(&self, cx: &mut Context<Self>) -> AnyElement {
+        let colors = self.settings_colors();
+        let open = self.settings_menu == Some(SettingsMenu::TalkTabs);
+        let mut control = div()
+            .relative()
+            .min_w(px(154.0))
+            .child(settings_select_button(
+                tabs_label(self.prefs.talk_reads_by_default),
+                "talk-tabs-dropdown",
+                open,
+                SettingsMenu::TalkTabs,
+                colors,
+                cx,
+            ));
+        if open {
+            control = control.child(self.settings_menu_host(cx));
+        }
+        control.into_any_element()
+    }
+
+    pub(super) fn talk_tabs_options(
+        &self,
+        colors: SemanticColors,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let mut options = div().p(px(4.0)).flex().flex_col();
+        for (index, all) in [true, false].into_iter().enumerate() {
+            options = options.child(settings_choice_row(
+                format!("talk-tabs-option-{index}"),
+                tabs_label(all),
+                all == self.prefs.talk_reads_by_default,
+                colors,
+                cx,
+                move |this, cx| {
+                    this.settings_menu = None;
+                    if all != this.prefs.talk_reads_by_default {
+                        this.update_prefs(move |prefs| {
+                            prefs.talk_reads_by_default = all;
+                            prefs.talk_exceptions.clear();
+                        });
+                    }
+                    cx.notify();
+                },
+            ));
+        }
+        options.into_any_element()
     }
 
     pub(super) fn talk_answer_dropdown(&self, cx: &mut Context<Self>) -> AnyElement {

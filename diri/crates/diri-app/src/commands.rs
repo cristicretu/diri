@@ -99,6 +99,11 @@ actions!(
         SelectNextAttentionSession,
         CheckForUpdates,
         ShowWhatsNew,
+        ToggleReadAloud,
+        ToggleReadThisTab,
+        ReadOnlyThisTab,
+        ReadAllExceptThisTab,
+        ReadAllTabs,
         TogglePerfOverlay,
         ToggleRenderCounters,
         SelectPreviousSession,
@@ -210,6 +215,11 @@ pub enum CommandId {
     SelectNextAttentionSession,
     CheckForUpdates,
     ShowWhatsNew,
+    ToggleReadAloud,
+    ToggleReadThisTab,
+    ReadOnlyThisTab,
+    ReadAllExceptThisTab,
+    ReadAllTabs,
     TogglePerfOverlay,
     ToggleRenderCounters,
     SelectPreviousSession,
@@ -948,6 +958,56 @@ pub const COMMANDS: &[CommandSpec] = &[
         "whats new release highlights features changelog demo video tour"
     ),
     spec!(
+        ToggleReadAloud,
+        "toggle-read-aloud",
+        Some("cmd-alt-s"),
+        Some("⌥⌘S"),
+        Some(APP_CONTEXT),
+        "command.toggle_read_aloud.palette_title",
+        "speaker.wave.2",
+        "talk with your agent voice speech speak read aloud mute unmute tts dictation wispr"
+    ),
+    spec!(
+        ToggleReadThisTab,
+        "toggle-read-this-tab",
+        None,
+        None,
+        Some(APP_CONTEXT),
+        "command.toggle_read_this_tab.palette_title",
+        "speaker.wave.2",
+        "read aloud this tab mute unmute speaker voice talk"
+    ),
+    spec!(
+        ReadOnlyThisTab,
+        "read-only-this-tab",
+        None,
+        None,
+        Some(APP_CONTEXT),
+        "command.read_only_this_tab.palette_title",
+        "speaker.wave.2",
+        "read aloud only this tab solo mute others speaker voice talk"
+    ),
+    spec!(
+        ReadAllExceptThisTab,
+        "read-all-except-this-tab",
+        None,
+        None,
+        Some(APP_CONTEXT),
+        "command.read_all_except_this_tab.palette_title",
+        "speaker.slash",
+        "read aloud all tabs except this one mute this speaker voice talk"
+    ),
+    spec!(
+        ReadAllTabs,
+        "read-all-tabs",
+        None,
+        None,
+        Some(APP_CONTEXT),
+        "command.read_all_tabs.palette_title",
+        "speaker.wave.2",
+        "read aloud all tabs unmute every speaker voice talk"
+    ),
+    spec!(
         TogglePerfOverlay,
         "toggle-perf-overlay",
         Some("cmd-alt-p"),
@@ -1429,6 +1489,11 @@ impl CommandSpec {
             }
             CommandId::CheckForUpdates => KeyBinding::new(key, CheckForUpdates, context),
             CommandId::ShowWhatsNew => KeyBinding::new(key, ShowWhatsNew, context),
+            CommandId::ToggleReadAloud => KeyBinding::new(key, ToggleReadAloud, context),
+            CommandId::ToggleReadThisTab => KeyBinding::new(key, ToggleReadThisTab, context),
+            CommandId::ReadOnlyThisTab => KeyBinding::new(key, ReadOnlyThisTab, context),
+            CommandId::ReadAllExceptThisTab => KeyBinding::new(key, ReadAllExceptThisTab, context),
+            CommandId::ReadAllTabs => KeyBinding::new(key, ReadAllTabs, context),
             CommandId::TogglePerfOverlay => KeyBinding::new(key, TogglePerfOverlay, context),
             CommandId::ToggleRenderCounters => KeyBinding::new(key, ToggleRenderCounters, context),
             CommandId::SelectPreviousSession => {
@@ -2093,6 +2158,19 @@ impl CommandId {
                 description: t("command.show_whats_new.description"),
                 category: Application,
             },
+            Self::ToggleReadThisTab
+            | Self::ReadOnlyThisTab
+            | Self::ReadAllExceptThisTab
+            | Self::ReadAllTabs => ShortcutMetadata {
+                title: t("command.read_aloud_tabs.title"),
+                description: t("command.read_aloud_tabs.description"),
+                category: Application,
+            },
+            Self::ToggleReadAloud => ShortcutMetadata {
+                title: t("command.toggle_read_aloud.title"),
+                description: t("command.toggle_read_aloud.description"),
+                category: Application,
+            },
             Self::TogglePerfOverlay => ShortcutMetadata {
                 title: t("command.toggle_perf_overlay.title"),
                 description: t("command.toggle_perf_overlay.description"),
@@ -2209,6 +2287,11 @@ impl CommandId {
             Self::SelectNextAttentionSession => Box::new(SelectNextAttentionSession),
             Self::CheckForUpdates => Box::new(CheckForUpdates),
             Self::ShowWhatsNew => Box::new(ShowWhatsNew),
+            Self::ToggleReadAloud => Box::new(ToggleReadAloud),
+            Self::ToggleReadThisTab => Box::new(ToggleReadThisTab),
+            Self::ReadOnlyThisTab => Box::new(ReadOnlyThisTab),
+            Self::ReadAllExceptThisTab => Box::new(ReadAllExceptThisTab),
+            Self::ReadAllTabs => Box::new(ReadAllTabs),
             Self::TogglePerfOverlay => Box::new(TogglePerfOverlay),
             Self::ToggleRenderCounters => Box::new(ToggleRenderCounters),
             Self::SelectPreviousSession => Box::new(SelectPreviousSession),

@@ -139,6 +139,7 @@ enum SettingsMenu {
     PaneDensity,
     TalkVoice,
     TalkAnswer,
+    TalkTabs,
 }
 
 /// Update channels, in menu order.
@@ -3778,6 +3779,14 @@ impl UtilitySurfaces {
                         ))
                     },
                 )
+                .when(self.prefs.talk_with_agent, |section| {
+                    section.child(setting_divider(colors)).child(setting_row(
+                        t("settings.general.talk_tabs"),
+                        t("settings.general.talk_tabs_detail"),
+                        self.talk_tabs_dropdown(cx),
+                        colors,
+                    ))
+                })
                 .when(
                     cfg!(target_os = "macos")
                         && self.prefs.talk_with_agent
@@ -5207,6 +5216,7 @@ impl UtilitySurfaces {
             SettingsMenu::PaneDensity => (self.pane_density_options(colors, cx), 172.0),
             SettingsMenu::TalkVoice => (self.talk_voice_options(colors, cx), 400.0),
             SettingsMenu::TalkAnswer => (self.talk_answer_options(colors, cx), 204.0),
+            SettingsMenu::TalkTabs => (self.talk_tabs_options(colors, cx), 204.0),
         })
     }
 

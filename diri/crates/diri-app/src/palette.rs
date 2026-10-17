@@ -359,6 +359,11 @@ fn append_management_actions(
                             | CommandId::OpenSettings
                             | CommandId::ToggleHistory
                             | CommandId::ToggleNotifications
+                            | CommandId::ToggleReadAloud
+                            | CommandId::ToggleReadThisTab
+                            | CommandId::ReadOnlyThisTab
+                            | CommandId::ReadAllExceptThisTab
+                            | CommandId::ReadAllTabs
                             | CommandId::CheckForUpdates
                             | CommandId::ShowWhatsNew
                             | CommandId::TogglePerfOverlay
@@ -657,6 +662,18 @@ pub fn actions_for_default_host(
         registered_action(CommandId::OpenSettings),
         registered_action(CommandId::ToggleHistory),
         registered_action(CommandId::ToggleNotifications),
+        registered_action(CommandId::ToggleReadAloud),
+    ]);
+    // Per-tab reading needs a tab to act on.
+    if selected.is_some() {
+        result.extend([
+            registered_action(CommandId::ToggleReadThisTab),
+            registered_action(CommandId::ReadOnlyThisTab),
+            registered_action(CommandId::ReadAllExceptThisTab),
+            registered_action(CommandId::ReadAllTabs),
+        ]);
+    }
+    result.extend([
         PaletteAction {
             id: "color-theme".into(),
             title: t("palette.color_theme").into(),
@@ -1326,6 +1343,7 @@ mod tests {
                 "settings",
                 "history",
                 "toggle-notifications",
+                "toggle-read-aloud",
                 "color-theme",
                 "interface-style",
                 "comfortable-density",

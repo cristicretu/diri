@@ -463,6 +463,13 @@ pub struct Prefs {
     #[serde(default)]
     pub talk_answer_shortcut: Option<DictationShortcut>,
     pub muted_notification_sessions: std::collections::BTreeSet<String>,
+    /// Whether "Talk with your agent" reads a tab unless it is one of
+    /// [`Self::talk_exceptions`]. False with one exception is "read only
+    /// this tab"; new tabs follow this default.
+    pub talk_reads_by_default: bool,
+    /// Tabs that do the opposite of [`Self::talk_reads_by_default`]: the
+    /// title bar's speaker button and the palette's read-aloud commands.
+    pub talk_exceptions: std::collections::BTreeSet<String>,
     /// Names the user gave conversations, by the Agent's own conversation id.
     /// History reads them after the tab that carried the rename has closed:
     /// provider transcripts never learn a Diri rename.
@@ -636,6 +643,8 @@ impl Default for Prefs {
             talk_answer: TalkAnswer::default(),
             talk_answer_shortcut: None,
             muted_notification_sessions: Default::default(),
+            talk_reads_by_default: true,
+            talk_exceptions: Default::default(),
             conversation_titles: BTreeMap::new(),
             automatic_updates: true,
             skipped_update_version: String::new(),
