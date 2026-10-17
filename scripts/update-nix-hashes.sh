@@ -87,16 +87,22 @@ pkgs.fetchgit {
   hash = pkgs.lib.fakeHash;
 }'
 
-sources="$("${nix_cmd[@]}" eval --raw --impure --expr "${sources_expr}" \
-    --argstr root "${root}" --argstr refresh "${refresh}")"
+# `nix eval` and `nix build` do not apply --argstr to an --expr function, so
+# each expression is called here with values read from the environment.
+call() {
+    printf '(%s) { %s }' "$1" "$2"
+}
+sources="$(DIRI_NIX_ROOT="${root}" DIRI_NIX_REFRESH="${refresh}" "${nix_cmd[@]}" eval --raw --impure \
+    --expr "$(call "${sources_expr}" 'root = builtins.getEnv "DIRI_NIX_ROOT"; refresh = builtins.getEnv "DIRI_NIX_REFRESH";')")"
 
 entries=""
 while IFS=$'\t' read -r source url rev hash; do
     [[ -n "${source}" ]] || continue
     if [[ -z "${hash}" ]]; then
         echo "==> ${url} ${rev}" >&2
-        log="$("${nix_cmd[@]}" build --no-link --impure \
-            --expr "${fetch_expr}" --argstr root "${root}" --argstr url "${url}" --argstr rev "${rev}" \
+        log="$(DIRI_NIX_ROOT="${root}" DIRI_NIX_URL="${url}" DIRI_NIX_REV="${rev}" \
+            "${nix_cmd[@]}" build --no-link --impure \
+            --expr "$(call "${fetch_expr}" 'root = builtins.getEnv "DIRI_NIX_ROOT"; url = builtins.getEnv "DIRI_NIX_URL"; rev = builtins.getEnv "DIRI_NIX_REV";')" \
             </dev/null 2>&1)" || true
         hash="$(sed -n 's/^ *got: *\(sha256-[^ ]*\).*/\1/p' <<<"${log}")"
         if [[ -z "${hash}" ]]; then
