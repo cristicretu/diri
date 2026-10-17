@@ -181,7 +181,9 @@ while IFS= read -r line; do
       fi ;;
     *'"name":"launch_app"'*)
       printf '{"jsonrpc":"2.0","id":%s,"result":{"content":[{"type":"text","text":"launched"}],"structuredContent":{"pid":4242,"echo":%s}}}\n' "$id" "$line" ;;
-    *'"x":-1'*'"name":"click"'*)
+    # Either key order: serde_json keeps insertion order when another crate
+    # in the build enables `preserve_order`.
+    *'"x":-1'*'"name":"click"'* | *'"name":"click"'*'"x":-1'*)
       printf '{"jsonrpc":"2.0","id":%s,"error":{"code":-32000,"message":"no such point"}}\n' "$id" ;;
     *)
       printf '{"jsonrpc":"2.0","id":%s,"result":{"content":[{"type":"text","text":"ok"}],"structuredContent":{"echo":%s}}}\n' "$id" "$line" ;;

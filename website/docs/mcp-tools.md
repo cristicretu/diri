@@ -527,6 +527,15 @@ Read one of Diri's skills: the detailed rules for a Diri capability, as Markdown
 | --- | --- | --- |
 | `name` | `scheduling`, `notes`, `orchestration`, `api` | **Required.** |
 
+### `computer`
+
+Use this Mac's apps the way a person would, in the background: any native app (Simulator, TextEdit, Xcode, Finder, the app you are building) and browser pages. The person's cursor, keyboard and focus stay theirs; your actions show as your own labelled cursor. Pass tool and args. Loop: (1) launch_app {bundle_id or name, creates_new_application_instance:true} returns your own pid and windows (or list_windows {pid}); (2) get_window_state {pid, window_id} returns accessibility rows [N] plus a screenshot; (3) act with element_token "<snapshot_id>:N" (click, type_text {text}, set_value, press_key {key}, hotkey {keys}, scroll) or with pixel x,y from that screenshot; (4) re-read with get_window_state {since:"latest"} and check the change before going on. run_steps runs several actions in one call. Act only on apps you launched or the person pointed you to: an app another agent is driving returns computer_app_busy. computer_unavailable or computer_permissions means only the person can finish setup (Diri Settings › Agents › Computer use): tell them, and don't try to install or grant anything yourself. tool "tools" lists every tool.
+
+| Argument | Type | Notes |
+| --- | --- | --- |
+| `tool` | string | **Required.** A computer tool, e.g. launch_app, list_windows, get_window_state, click, type_text, press_key, hotkey, scroll, run_steps; or "tools" for the list. |
+| `args` | object | That tool's arguments. Ask {"tool":"tools","args":{"name":"<tool>"}} for one tool's full arguments. |
+
 ### `open_api_request`
 
 Open an HTTP request in the API tab of YOUR session's right panel in Diri, prefilled, so the person can inspect, edit and send it. Use it whenever you build, run or debug an HTTP API: after starting a dev server, open the endpoint you just added or changed (e.g. GET http://localhost:3000/api/health) instead of only pasting a curl command. Put {{name}} placeholders in url/headers/body and pass their values in variables (marking tokens in secrets so they are masked); they land in the project's environment (environment names it, default the active one or "Local"). json sets a JSON body and its Content-Type; body sends text as written. auto_send:true sends a GET immediately and shows the response; any other method is never sent until the person presses Send. The call returns once the tab is open, without the response.

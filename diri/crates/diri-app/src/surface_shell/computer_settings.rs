@@ -50,6 +50,7 @@ impl GrantStep {
             .find(|step| !step.granted(status))
     }
 
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
     fn title(self, app: &str) -> String {
         let key = match self {
             Self::Accessibility => "settings.computer.guide_accessibility",
@@ -444,6 +445,7 @@ fn own_bundle() -> Option<std::path::PathBuf> {
 }
 
 /// "Diri", or "Diri Dev": the name System Settings lists the bundle under.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 fn bundle_name(app: &std::path::Path) -> String {
     app.file_stem()
         .map(|stem| stem.to_string_lossy().into_owned())
