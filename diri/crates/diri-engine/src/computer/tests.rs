@@ -319,7 +319,7 @@ fn agents_share_one_driver_with_their_own_badges_and_apps() {
     let failed = computer
         .act(&codex, "click", json!({"pid":4242,"x":-1}), &live)
         .unwrap_err();
-    assert_eq!(failed.code, DRIVER_ERROR);
+    assert_eq!(failed.code, DRIVER_ERROR, "{failed:?}");
     assert!(failed.message.contains("no such point"));
 }
 
@@ -484,11 +484,9 @@ fn a_driver_without_grants_is_not_asked_to_act() {
 }
 
 #[test]
-fn status_reads_version_bundle_and_grants() {
+fn status_reads_version_and_grants() {
     let temp = tempfile::tempdir().unwrap();
-    let macos = temp.path().join("CuaDriver.app/Contents/MacOS");
-    std::fs::create_dir_all(&macos).unwrap();
-    let driver = fake_driver(&macos);
+    let driver = fake_driver(temp.path());
     let computer = ComputerUse::with_binary(Some(driver.clone()));
     let grants = driver.with_extension("grants");
     std::fs::write(
@@ -501,14 +499,6 @@ fn status_reads_version_bundle_and_grants() {
     assert!(status.supported);
     assert_eq!(status.version.as_deref(), Some("0.36.0"));
     assert!(!status.outdated);
-    assert_eq!(
-        status.app_path.as_deref().map(Path::new),
-        Some(
-            std::fs::canonicalize(temp.path().join("CuaDriver.app"))
-                .unwrap()
-                .as_path()
-        )
-    );
     assert_eq!(status.accessibility, Some(false));
     assert_eq!(status.screen_recording, Some(false));
     assert!(!status.ready());
@@ -526,28 +516,54 @@ fn status_reads_version_bundle_and_grants() {
     assert!(!old.ready(), "an outdated driver is offered an update");
 }
 
+/// A release archive holding the fake driver, as Cua publishes it.
+fn fake_release(dir: &Path) -> (String, String) {
+    let staging = dir.join("release");
+    std::fs::create_dir_all(&staging).unwrap();
+    fake_driver(&staging);
+    std::fs::write(staging.join("libcua_driver_sdk.dylib"), "not needed").unwrap();
+    let archive = dir.join("cua-driver-rs-darwin-universal-binary.tar.gz");
+    let status = std::process::Command::new("/usr/bin/tar")
+        .arg("-czf")
+        .arg(&archive)
+        .arg("-C")
+        .arg(&staging)
+        .args(["cua-driver", "libcua_driver_sdk.dylib"])
+        .status()
+        .unwrap();
+    assert!(status.success());
+    let bytes = std::fs::read(&archive).unwrap();
+    let digest = {
+        use sha2::{Digest, Sha256};
+        Sha256::digest(&bytes)
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>()
+    };
+    (format!("file://{}", archive.display()), digest)
+}
+
 #[test]
-fn install_runs_in_the_background_and_reports_the_result() {
+fn setup_downloads_verifies_and_installs_in_the_background() {
     use std::os::unix::fs::PermissionsExt as _;
     let temp = tempfile::tempdir().unwrap();
-    let driver = temp.path().join("bin/cua-driver");
-    // Stands in for cua.ai's script: checks Diri's pins, then "installs".
-    let installer = temp.path().join("install.sh");
-    std::fs::write(
-        &installer,
-        format!(
-            "echo \"==> installing $CUA_DRIVER_RS_VERSION telemetry=$CUA_DRIVER_RS_TELEMETRY_ENABLED args=$*\"\n\
-             [ \"$CUA_DRIVER_RS_NO_MODIFY_PATH\" = 1 ] || exit 3\n\
-             mkdir -p {bin}\n\
-             cat > {driver} <<'FAKE'\n{FAKE_DRIVER}FAKE\n\
-             chmod +x {driver}\n",
-            bin = temp.path().join("bin").display(),
-            driver = driver.display(),
-        ),
-    )
-    .unwrap();
-    let computer = ComputerUse::with_driver(Some(driver.clone()), Some(installer.clone()));
-    assert!(!computer.status(false).installed());
+    let (url, sha256) = fake_release(temp.path());
+    let root = temp.path().join("computer-use");
+    // A driver from an older setup, replaced by this one.
+    std::fs::create_dir_all(root.join("0.35.0")).unwrap();
+    let old = fake_driver(&root.join("0.35.0"));
+    std::fs::write(old.with_extension("version"), "0.35.0").unwrap();
+    let computer = ComputerUse::with_paths(
+        None,
+        root.clone(),
+        temp.path().join("d.sock"),
+        Download {
+            url,
+            sha256,
+            team: None,
+        },
+    );
+    assert!(computer.status(false).outdated);
 
     let started = computer
         .setup(diri_proto::ComputerSetupAction::Install)
@@ -559,21 +575,46 @@ fn install_runs_in_the_background_and_reports_the_result() {
     assert!(started.installing || done.installed());
     assert_eq!(done.install_error, None, "{:?}", done.install_log);
     assert_eq!(done.version.as_deref(), Some(TESTED_VERSION));
-    let log = done.install_log.unwrap();
-    assert!(
-        log.contains(&format!(
-            "installing {TESTED_VERSION} telemetry=0 args=--no-modify-path"
-        )),
-        "{log}"
+    assert!(!done.outdated);
+    let installed = root.join(TESTED_VERSION).join("cua-driver");
+    assert_eq!(
+        std::fs::metadata(&installed).unwrap().permissions().mode() & 0o777,
+        0o700
     );
+    assert_eq!(
+        std::fs::metadata(root.join(TESTED_VERSION))
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777,
+        0o700
+    );
+    assert!(!root.join("0.35.0").exists(), "the old driver is removed");
+    // Only the driver is unpacked, and nothing is left half-done.
+    let leftovers: Vec<_> = std::fs::read_dir(&root)
+        .unwrap()
+        .flatten()
+        .map(|entry| entry.file_name())
+        .collect();
+    assert_eq!(leftovers, vec![std::ffi::OsString::from(TESTED_VERSION)]);
+    assert!(done.install_log.unwrap().contains("sha256"));
+}
 
-    // A failing installer leaves its words for the person, and the log.
-    std::fs::write(
-        &installer,
-        "echo 'error: /Applications is not writable. Re-run'; exit 1\n",
-    )
-    .unwrap();
-    std::fs::set_permissions(&installer, std::fs::Permissions::from_mode(0o644)).unwrap();
+#[test]
+fn a_download_that_does_not_match_is_not_used() {
+    let temp = tempfile::tempdir().unwrap();
+    let (url, _) = fake_release(temp.path());
+    let root = temp.path().join("computer-use");
+    let computer = ComputerUse::with_paths(
+        None,
+        root.clone(),
+        temp.path().join("d.sock"),
+        Download {
+            url,
+            sha256: "0".repeat(64),
+            team: None,
+        },
+    );
     computer
         .setup(diri_proto::ComputerSetupAction::Install)
         .unwrap();
@@ -581,8 +622,59 @@ fn install_runs_in_the_background_and_reports_the_result() {
         let status = computer.status(false);
         (!status.installing).then_some(status)
     });
-    assert!(failed.install_error.unwrap().contains("administrator"));
-    assert!(failed.install_log.unwrap().contains("not writable"));
+    assert!(!failed.installed());
+    assert!(failed.install_error.unwrap().contains("didn't match"));
+    assert!(std::fs::read_dir(&root).unwrap().next().is_none());
+
+    // Unreachable: says what to do.
+    let computer = ComputerUse::with_paths(
+        None,
+        root.clone(),
+        temp.path().join("d.sock"),
+        Download {
+            url: format!("file://{}", temp.path().join("missing.tar.gz").display()),
+            sha256: "0".repeat(64),
+            team: None,
+        },
+    );
+    computer
+        .setup(diri_proto::ComputerSetupAction::Install)
+        .unwrap();
+    let failed = wait_for(|| {
+        let status = computer.status(false);
+        (!status.installing).then_some(status)
+    });
+    assert!(failed.install_error.unwrap().contains("connection"));
+}
+
+#[test]
+fn an_unsigned_download_is_refused() {
+    let temp = tempfile::tempdir().unwrap();
+    let (url, sha256) = fake_release(temp.path());
+    let computer = ComputerUse::with_paths(
+        None,
+        temp.path().join("computer-use"),
+        temp.path().join("d.sock"),
+        Download {
+            url,
+            sha256,
+            team: Some("YCK386LBJ7".into()),
+        },
+    );
+    computer
+        .setup(diri_proto::ComputerSetupAction::Install)
+        .unwrap();
+    let failed = wait_for(|| {
+        let status = computer.status(false);
+        (!status.installing).then_some(status)
+    });
+    assert!(
+        failed
+            .install_error
+            .unwrap()
+            .contains("isn't signed by Cua"),
+        "a shell script is not Cua's signed binary"
+    );
 }
 
 fn wait_for<T>(mut probe: impl FnMut() -> Option<T>) -> T {
@@ -597,27 +689,28 @@ fn wait_for<T>(mut probe: impl FnMut() -> Option<T>) -> T {
 }
 
 #[test]
-fn installer_failures_read_as_what_to_do() {
-    assert!(
-        setup::install_failure("curl: (6) Could not resolve host: github.com")
-            .contains("connection")
-    );
-    assert_eq!(
-        setup::install_failure(
-            "==> x\nerror: downloaded CuaDriver.app failed signature verification\n"
-        ),
-        "The installer stopped: downloaded CuaDriver.app failed signature verification"
-    );
-    assert!(setup::install_failure("").contains("Show the log"));
-}
-
-#[test]
 fn versions_compare_numerically() {
     assert!(setup::older_than("0.9.0", "0.36.0"));
     assert!(setup::older_than("0.35.9", "0.36.0"));
     assert!(!setup::older_than("0.36.0", "0.36.0"));
     assert!(!setup::older_than("0.36.1-nightly.2", "0.36.0"));
     assert!(!setup::older_than("1.0.0", "0.36.0"));
+}
+
+#[test]
+fn the_newest_downloaded_driver_is_used() {
+    let temp = tempfile::tempdir().unwrap();
+    for version in ["0.9.0", "0.36.0", "0.10.2"] {
+        std::fs::create_dir_all(temp.path().join(version)).unwrap();
+        fake_driver(&temp.path().join(version));
+    }
+    std::fs::create_dir_all(temp.path().join(".download-1")).unwrap();
+    fake_driver(&temp.path().join(".download-1"));
+    assert_eq!(
+        setup::installed(temp.path()),
+        Some(temp.path().join("0.36.0/cua-driver"))
+    );
+    assert_eq!(setup::installed(&temp.path().join("none")), None);
 }
 
 #[test]
@@ -636,38 +729,31 @@ fn grants_parse_from_either_shape() {
 }
 
 #[test]
-fn the_app_bundle_is_found_through_the_cli_symlink() {
-    let temp = tempfile::tempdir().unwrap();
-    let macos = temp.path().join("CuaDriver.app/Contents/MacOS");
-    std::fs::create_dir_all(&macos).unwrap();
-    let binary = fake_driver(&macos);
-    let link = temp.path().join("cua-driver");
-    std::os::unix::fs::symlink(&binary, &link).unwrap();
-    let app = std::fs::canonicalize(temp.path().join("CuaDriver.app")).unwrap();
-    assert_eq!(setup::app_bundle(&link), Some(app.clone()));
-    assert_eq!(setup::app_bundle(&binary), Some(app));
+fn the_host_app_is_the_bundle_the_engine_ships_in() {
     assert_eq!(
-        setup::app_bundle(&temp.path().join("cua-driver-elsewhere")),
+        setup::app_containing(Path::new(
+            "/Applications/Diri.app/Contents/Resources/bin/dirijord-rs"
+        )),
+        Some(PathBuf::from("/Applications/Diri.app"))
+    );
+    assert_eq!(
+        setup::app_containing(Path::new("/Users/me/diri/target/debug/dirijord-rs")),
         None
     );
 }
 
-/// Against the real Cua Driver on this Mac. With `DIRI_CUA_DRIVER_SOCKET`
-/// pointing at a daemon started without grants, expects them missing.
+/// Against the real Cua Driver (`DIRI_CUA_DRIVER`, or the one setup
+/// downloaded). Grants are those of whatever launched the test; with
+/// `DIRI_CUA_DRIVER_SOCKET` pointing at a daemon started without grants,
+/// expects them missing.
 /// `cargo test -p diri-engine --lib real_driver_status -- --ignored --nocapture`
 #[test]
-#[ignore = "needs Cua Driver installed"]
+#[ignore = "needs a real Cua Driver"]
 fn real_driver_status() {
     let computer = ComputerUse::new();
     let status = computer.status(true);
     eprintln!("{status:#?}");
     assert!(status.installed());
-    assert!(
-        status
-            .app_path
-            .as_deref()
-            .is_some_and(|app| app.ends_with("CuaDriver.app"))
-    );
     let expect_granted = setup::socket_override().is_none();
     assert_eq!(status.accessibility, Some(expect_granted));
     if !expect_granted {
@@ -694,4 +780,56 @@ fn finder_pid() -> i64 {
         .trim()
         .parse()
         .unwrap()
+}
+
+/// The real download from GitHub into a temporary directory, then the real
+/// daemon in embedded mode. Grants are those of whatever launched the test.
+/// `cargo test -p diri-engine --lib real_setup -- --ignored --nocapture`
+#[test]
+#[ignore = "downloads the real driver (~52 MB)"]
+fn real_setup() {
+    let temp = tempfile::tempdir().unwrap();
+    // Short: Unix socket paths are capped at 104 bytes.
+    let socket = PathBuf::from(format!("/tmp/diri-cua-test-{}.sock", std::process::id()));
+    let computer = ComputerUse::with_paths(
+        None,
+        temp.path().join("computer-use"),
+        socket.clone(),
+        Download::default(),
+    );
+    let started = Instant::now();
+    computer
+        .setup(diri_proto::ComputerSetupAction::Install)
+        .unwrap();
+    let done = wait_for_long(|| {
+        let status = computer.status(false);
+        (!status.installing).then_some(status)
+    });
+    eprintln!(
+        "installed in {:?}\n{}",
+        started.elapsed(),
+        done.install_log.clone().unwrap_or_default()
+    );
+    assert_eq!(done.install_error, None);
+    assert_eq!(done.version.as_deref(), Some(TESTED_VERSION));
+    let started = Instant::now();
+    let status = computer.status(true);
+    eprintln!("probe in {:?}: {status:#?}", started.elapsed());
+    assert!(
+        status.accessibility.is_some(),
+        "the embedded daemon answered"
+    );
+    computer.stop_daemon();
+    assert!(!socket.exists() || !setup::daemon_listening(&socket));
+}
+
+fn wait_for_long<T>(mut probe: impl FnMut() -> Option<T>) -> T {
+    let deadline = Instant::now() + Duration::from_secs(600);
+    loop {
+        if let Some(value) = probe() {
+            return value;
+        }
+        assert!(Instant::now() < deadline, "timed out");
+        std::thread::sleep(Duration::from_millis(100));
+    }
 }

@@ -1,10 +1,10 @@
 //! Computer use behind `computer.act`: every Agent drives Mac apps through
 //! one shared, lazily-launched Cua Driver.
 //!
-//! The Engine owns a single `cua-driver mcp` child (stdio JSON-RPC). On macOS
-//! that process proxies to the CuaDriver.app daemon, which holds the
-//! Accessibility and Screen Recording grants, so ten Agents cost one pipe,
-//! not ten processes. Each Diri session gets its own named Cua session: its
+//! The Engine owns a single `cua-driver mcp` child (stdio JSON-RPC), a proxy
+//! to the driver daemon it also starts (see `setup`), which runs under
+//! Diri's own Accessibility and Screen Recording grants, so ten Agents cost
+//! one pipe, not ten processes. Each Diri session gets its own named Cua session: its
 //! own agent cursor, badged with the tab's name. Apps are leased per process:
 //! a session that acts on a pid holds it until it goes quiet, so two Agents
 //! never type into the same window. The child is recycled after a quiet
@@ -22,7 +22,7 @@ use std::time::{Duration, Instant};
 use serde_json::{Map, Value, json};
 
 mod setup;
-pub use setup::TESTED_VERSION;
+pub use setup::{Download, TESTED_VERSION};
 
 /// No calls for this long → close the driver pipe. Matches the daemon's own
 /// session expiry, so cursors and the pipe go away together.
@@ -155,8 +155,11 @@ struct Shared {
     /// The live launch, readable without `inner` (see `read_replies`).
     incarnation: AtomicU64,
     binary: Option<PathBuf>,
-    /// A local installer script in place of cua.ai's (tests).
-    installer: Option<PathBuf>,
+    /// Where setup keeps downloaded drivers, one directory per version.
+    root: PathBuf,
+    /// Diri's daemon socket.
+    socket: PathBuf,
+    download: Download,
     setup: Mutex<setup::SetupState>,
 }
 
@@ -172,9 +175,8 @@ struct Inner {
     idle_sweeper_running: bool,
     /// The driver's `tools/list`, fetched once per launch.
     catalog: Option<Vec<Value>>,
-    /// The CuaDriver daemon was not running until Diri needed it, so an
-    /// idle Diri stops it again rather than leave it resident.
-    started_daemon: bool,
+    /// The driver daemon Diri started; stopped again when idle.
+    daemon: Option<Child>,
     /// When the driver last confirmed both grants.
     granted_at: Option<Instant>,
     /// When each session last asked the app to offer setup.
@@ -300,23 +302,44 @@ impl Sessions {
 
 impl ComputerUse {
     pub fn new() -> Self {
-        Self::with_binary(None)
+        let home = diri_platform::home_dir().unwrap_or_else(std::env::temp_dir);
+        let mut socket =
+            diri_proto::paths::DirijorPaths::runtime_dir(&home).join("cua-driver.sock");
+        // Unix socket paths are capped at 104 bytes; a long home misses it.
+        if socket.as_os_str().len() > 100 {
+            socket = std::env::temp_dir().join("diri-cua-driver.sock");
+        }
+        Self::with_paths(
+            None,
+            diri_proto::paths::DirijorPaths::app_support(&home).join("computer-use"),
+            socket,
+            Download::default(),
+        )
     }
 
     /// Tests point this at a fake driver.
     pub fn with_binary(binary: Option<PathBuf>) -> Self {
-        Self::with_driver(binary, None)
+        let root = std::env::temp_dir().join("diri-computer-use-unused");
+        let socket = root.join("cua-driver.sock");
+        Self::with_paths(binary, root, socket, Download::default())
     }
 
-    /// Tests: a fake driver, and a local script standing in for the installer.
-    pub fn with_driver(binary: Option<PathBuf>, installer: Option<PathBuf>) -> Self {
+    /// Tests: a fake driver, where setup downloads to, and from where.
+    pub fn with_paths(
+        binary: Option<PathBuf>,
+        root: PathBuf,
+        socket: PathBuf,
+        download: Download,
+    ) -> Self {
         Self {
             shared: Arc::new(Shared {
                 inner: Mutex::new(Inner::default()),
                 pending: Mutex::new(HashMap::new()),
                 incarnation: AtomicU64::new(0),
                 binary,
-                installer,
+                root,
+                socket,
+                download,
                 setup: Mutex::new(setup::SetupState::default()),
             }),
         }
@@ -329,7 +352,7 @@ impl ComputerUse {
     pub fn unavailable_reason(&self) -> Option<String> {
         self.binary().is_none().then(|| {
             "Computer use isn't set up on this Mac yet. Ask the user to open Diri Settings \
-             › Agents › Computer use and click Set up; it takes about a minute. Don't try \
+             › Agents › Computer use and click Set up; it takes a few seconds. Don't try \
              to install anything yourself."
                 .to_owned()
         })
@@ -592,8 +615,7 @@ impl ComputerUse {
     }
 
     fn request(&self, method: &str, params: Value, timeout: Duration) -> Result<Value, String> {
-        // Before the pipe: `cua-driver mcp` would otherwise launch the
-        // daemon with its permission gate, which opens System Settings.
+        // Before the pipe: the proxy only connects; Diri owns the daemon.
         self.start_daemon();
         let (id, receiver) = {
             let mut inner = self.lock();
@@ -614,19 +636,10 @@ impl ComputerUse {
             inner.catalog = None;
         }
         let binary = self.binary().ok_or("Cua Driver is not installed")?;
-        if !inner.started_daemon && self.shared.binary.is_none() {
-            inner.started_daemon = !daemon_listening();
-        }
-        let mut child = Command::new(&binary)
-            .arg("mcp")
-            .args(setup::socket_args())
+        let mut child = setup::quiet(Command::new(&binary).arg("mcp"))
+            .args(self.socket_args())
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
-            .stderr(Stdio::null())
-            // The driver must not see which Diri session asked: it would
-            // otherwise hand that identity to every app it launches.
-            .env_remove("DIRIJOR_SOCKET")
-            .env_remove("DIRIJOR_SESSION_ID")
             .spawn()
             .map_err(|error| format!("failed to start {}: {error}", binary.display()))?;
         inner.stdin = child.stdin.take();
@@ -702,6 +715,10 @@ impl Drop for Shared {
             if let Some(mut child) = inner.child.take() {
                 let _ = child.kill();
                 let _ = child.wait();
+            }
+            if let Some(mut daemon) = inner.daemon.take() {
+                let _ = daemon.kill();
+                let _ = daemon.wait();
             }
         }
     }
@@ -829,22 +846,14 @@ fn sweep_idle(shared: std::sync::Weak<Shared>) {
         let quiet = inner
             .last_activity
             .is_some_and(|at| at.elapsed() > IDLE_TIMEOUT);
-        if quiet && pending(&shared).is_empty() && (inner.child.is_some() || inner.started_daemon) {
+        if quiet && pending(&shared).is_empty() && (inner.child.is_some() || inner.daemon.is_some())
+        {
             terminate(&shared, &mut inner, "driver closed after idle timeout");
             inner.state = Sessions::default();
-            if std::mem::take(&mut inner.started_daemon)
-                && shared.binary.is_none()
-                && let Some(binary) = locate_driver()
-            {
-                // Off the lock; the daemon answers `stop` at once.
-                std::thread::spawn(move || {
-                    let _ = Command::new(binary)
-                        .arg("stop")
-                        .stdin(Stdio::null())
-                        .stdout(Stdio::null())
-                        .stderr(Stdio::null())
-                        .status();
-                });
+            inner.granted_at = None;
+            if inner.daemon.is_some() {
+                drop(inner);
+                ComputerUse { shared }.stop_daemon();
             }
         }
     }
@@ -1006,44 +1015,6 @@ fn truncate_label(text: &str, max: usize) -> String {
     out = out.trim_end().to_owned();
     out.push('…');
     out
-}
-
-/// Whether a CuaDriver daemon already serves this user (on macOS the MCP
-/// pipe proxies to it, launching it on demand).
-fn daemon_listening() -> bool {
-    #[cfg(target_os = "macos")]
-    {
-        setup::socket_override()
-            .or_else(|| {
-                diri_platform::home_dir()
-                    .map(|home| home.join("Library/Caches/cua-driver/cua-driver.sock"))
-            })
-            .is_some_and(|socket| std::os::unix::net::UnixStream::connect(socket).is_ok())
-    }
-    #[cfg(not(target_os = "macos"))]
-    {
-        // Elsewhere `cua-driver mcp` owns its runtime and exits with the pipe.
-        true
-    }
-}
-
-/// `DIRI_CUA_DRIVER`, then the installed app, then the CLI on PATH.
-fn locate_driver() -> Option<PathBuf> {
-    if let Some(configured) = std::env::var_os("DIRI_CUA_DRIVER") {
-        let path = PathBuf::from(configured);
-        return path.is_file().then_some(path);
-    }
-    let mut candidates = vec![PathBuf::from(
-        "/Applications/CuaDriver.app/Contents/MacOS/cua-driver",
-    )];
-    if let Some(home) = diri_platform::home_dir() {
-        candidates.push(home.join("Applications/CuaDriver.app/Contents/MacOS/cua-driver"));
-        candidates.push(home.join(".local/bin/cua-driver"));
-    }
-    if let Some(path) = std::env::var_os("PATH") {
-        candidates.extend(std::env::split_paths(&path).map(|dir| dir.join("cua-driver")));
-    }
-    candidates.into_iter().find(|path| is_executable(path))
 }
 
 fn is_executable(path: &Path) -> bool {

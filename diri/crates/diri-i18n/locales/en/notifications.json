@@ -95,7 +95,7 @@
   "toast.agent_ready_detail": "It asks you to sign in the first time.",
   "toast.computer_setup_action": "Set up",
   "toast.computer_setup_needed": "{agent} wants to use apps on this Mac",
-  "toast.computer_setup_needed_install": "Set up computer use once; it takes about a minute.",
+  "toast.computer_setup_needed_install": "Set up computer use once; it takes a few seconds.",
   "toast.computer_setup_needed_permissions": "Allow computer use in System Settings to continue.",
   "toast.connecting": "Connecting…",
   "toast.connecting_body": "Sessions stay visible meanwhile.",

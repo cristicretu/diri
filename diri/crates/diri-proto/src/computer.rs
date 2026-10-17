@@ -52,7 +52,8 @@ pub struct ComputerStatus {
     /// The installed driver's version, if one is installed.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub version: Option<String>,
-    /// The CuaDriver.app bundle: what the person drags into System Settings.
+    /// The app macOS charges the driver's grants to (the bundle the Engine
+    /// ships in): what the person drags into System Settings.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub app_path: Option<String>,
     /// Older than the release Diri was tested with.

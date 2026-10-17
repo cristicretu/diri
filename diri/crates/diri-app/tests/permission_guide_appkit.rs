@@ -3,7 +3,7 @@
 //! `DIRI_TEST_PERMISSION_GUIDE=accessibility cargo test -p diri-app --test permission_guide_appkit`
 //! (or `=screen-recording`); `DIRI_TEST_PERMISSION_GUIDE_SECONDS` keeps it up
 //! for that long (default 20), and `DIRI_TEST_PERMISSION_GUIDE_APP` picks the
-//! app to offer (default /Applications/CuaDriver.app). Opens System Settings.
+//! app to offer (default /Applications/Diri.app). Opens System Settings.
 //! `DIRI_TEST_PERMISSION_GUIDE=render:<dir>` instead draws the panel, light
 //! and dark, to `<dir>/guide-light.png` and `<dir>/guide-dark.png`.
 #[cfg(target_os = "macos")]
@@ -36,15 +36,15 @@ fn show(pane: &str) {
     // No Dock icon, and never the active app: Settings keeps focus.
     app.setActivationPolicy(NSApplicationActivationPolicy::Accessory);
     if let Some(dir) = pane.strip_prefix("render:") {
-        let bundle = PathBuf::from("/Applications/CuaDriver.app");
+        let bundle = PathBuf::from("/Applications/Diri.app");
         for (dark, file) in [(false, "guide-light.png"), (true, "guide-dark.png")] {
             let path = PathBuf::from(dir).join(file);
             assert!(
                 permission_guide::render_png(
                     mtm,
                     &bundle,
-                    "CuaDriver",
-                    "Drag CuaDriver to the list above to allow Accessibility",
+                    "Diri",
+                    "Drag Diri to the list above to allow Accessibility",
                     dark,
                     &path,
                 ),
@@ -61,7 +61,7 @@ fn show(pane: &str) {
     };
     let bundle = std::env::var_os("DIRI_TEST_PERMISSION_GUIDE_APP")
         .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from("/Applications/CuaDriver.app"));
+        .unwrap_or_else(|| PathBuf::from("/Applications/Diri.app"));
     let seconds: u64 = std::env::var("DIRI_TEST_PERMISSION_GUIDE_SECONDS")
         .ok()
         .and_then(|value| value.parse().ok())

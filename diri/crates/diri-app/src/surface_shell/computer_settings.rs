@@ -1,11 +1,12 @@
-//! Settings › Agents › Computer use: one place to install Cua Driver and
+//! Settings › Agents › Computer use: one place to set computer use up and
 //! allow it, for people who have never opened a terminal.
 //!
-//! Set up installs the driver in the background, then walks through the two
-//! macOS grants with a guide anchored to System Settings: drag CuaDriver
-//! into the list, and the next step follows on its own. Screen Recording
-//! applies to a process only from its launch, so while that step waits the
-//! driver is restarted every few seconds until it reports the grant.
+//! Set up downloads the driver in the background, then walks through the two
+//! macOS grants with a guide anchored to System Settings: drag Diri into the
+//! list (the driver runs as part of Diri, so the grants are Diri's), and the
+//! next step follows on its own. Screen Recording applies to a process only
+//! from its launch, so while that step waits the driver is restarted every
+//! few seconds until it reports the grant.
 use super::*;
 use std::time::Instant;
 
@@ -49,11 +50,12 @@ impl GrantStep {
             .find(|step| !step.granted(status))
     }
 
-    fn title(self) -> &'static str {
-        match self {
-            Self::Accessibility => t("settings.computer.guide_accessibility"),
-            Self::ScreenRecording => t("settings.computer.guide_screen_recording"),
-        }
+    fn title(self, app: &str) -> String {
+        let key = match self {
+            Self::Accessibility => "settings.computer.guide_accessibility",
+            Self::ScreenRecording => "settings.computer.guide_screen_recording",
+        };
+        tf(key, &[("app", &app)])
     }
 }
 
@@ -81,7 +83,10 @@ impl UtilitySurfaces {
             .read()
             .expect("session store lock poisoned")
             .computer_status()
-            .and_then(|status| status.app_path.clone());
+            .and_then(|status| status.app_path.clone())
+            .map(std::path::PathBuf::from)
+            // A loose Engine build: the driver still runs under this app.
+            .or_else(own_bundle);
         let Some(app) = app else {
             return;
         };
@@ -174,7 +179,7 @@ impl UtilitySurfaces {
         let mut status = diri_proto::ComputerStatus {
             supported: true,
             version: Some("0.36.0".into()),
-            app_path: Some("/Applications/CuaDriver.app".into()),
+            app_path: Some("/Applications/Diri.app".into()),
             tested_version: "0.36.0".into(),
             accessibility: Some(false),
             screen_recording: Some(false),
@@ -196,8 +201,9 @@ impl UtilitySurfaces {
                     "Couldn't reach the download. Check the connection and try again.".into(),
                 );
                 status.install_log = Some(
-                    "==> downloading https://cua.ai/driver/install.sh\ncurl: (6) Could not \
-                     resolve host: cua.ai\n"
+                    "==> downloading https://github.com/trycua/cua/releases/download/\
+                     cua-driver-rs-v0.36.0/cua-driver-rs-0.36.0-darwin-universal-binary.tar.gz\n\
+                     curl: (6) Could not resolve host: github.com\n"
                         .into(),
                 );
                 self.computer_guide.log_open = true;
@@ -428,8 +434,24 @@ fn status_label(text: &'static str, color: impl Into<gpui::Hsla>) -> impl IntoEl
         .child(text)
 }
 
+/// The `.app` this process runs from.
+fn own_bundle() -> Option<std::path::PathBuf> {
+    let exe = std::env::current_exe().ok()?;
+    exe.ancestors()
+        .skip(1)
+        .find(|dir| dir.extension().is_some_and(|ext| ext == "app"))
+        .map(std::path::Path::to_path_buf)
+}
+
+/// "Diri", or "Diri Dev": the name System Settings lists the bundle under.
+fn bundle_name(app: &std::path::Path) -> String {
+    app.file_stem()
+        .map(|stem| stem.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "Diri".to_owned())
+}
+
 #[cfg(target_os = "macos")]
-fn present_guide(step: GrantStep, app: &str) -> bool {
+fn present_guide(step: GrantStep, app: &std::path::Path) -> bool {
     let Some(mtm) = objc2::MainThreadMarker::new() else {
         return false;
     };
@@ -437,12 +459,13 @@ fn present_guide(step: GrantStep, app: &str) -> bool {
         GrantStep::Accessibility => crate::macos::permission_guide::Pane::Accessibility,
         GrantStep::ScreenRecording => crate::macos::permission_guide::Pane::ScreenRecording,
     };
+    let name = bundle_name(app);
     crate::macos::permission_guide::present(
         mtm,
         pane,
-        std::path::Path::new(app),
-        "CuaDriver",
-        step.title(),
+        app,
+        &name,
+        &step.title(&name),
         // The guide closes itself; the next tick notices.
         Box::new(|| {}),
     );
@@ -450,7 +473,7 @@ fn present_guide(step: GrantStep, app: &str) -> bool {
 }
 
 #[cfg(not(target_os = "macos"))]
-fn present_guide(_step: GrantStep, _app: &str) -> bool {
+fn present_guide(_step: GrantStep, _app: &std::path::Path) -> bool {
     false
 }
 
