@@ -62,7 +62,10 @@ use crate::commands::{
     ShowWhatsNew, ToggleAuxiliaryTerminal, ToggleCommandPalette, ToggleHistory, ToggleInspector,
     ToggleOverview, ToggleQuickOpen, ToggleSidebar, ToggleTabPeek,
 };
-use crate::commands::{TogglePerfOverlay, ToggleRenderCounters};
+use crate::commands::{
+    ReadAllExceptThisTab, ReadAllTabs, ReadOnlyThisTab, TogglePerfOverlay, ToggleReadAloud,
+    ToggleReadThisTab, ToggleRenderCounters,
+};
 use crate::external_drop::ExternalDropAction;
 use crate::haptics::{self, Haptic};
 use crate::i18n::{t, tf};
@@ -1103,6 +1106,10 @@ impl RootView {
             menu_bar.refresh();
         }
         crate::application_notifications::install(services.clone(), preview, preview_scenario, cx);
+        #[cfg(target_os = "macos")]
+        if !preview {
+            crate::voice::install(Arc::clone(&services.store), services.tokio.handle().clone());
+        }
         // Once, the first time a build that records runs: say so, and where
         // to turn it off. The standard toast, held a little longer.
         if !preview && crate::telemetry::take_first_run_notice() {
@@ -1848,6 +1855,16 @@ impl RootView {
                     });
                 }
             }
+            ToastCommand::OpenComputerSetup => {
+                self.toast.dismiss();
+                if let Some(surfaces) = &self.utility_surfaces {
+                    surfaces.update(cx, |surfaces, cx| {
+                        surfaces.open_settings(cx);
+                        surfaces.open_settings_tab(crate::settings::SettingsTab::Agents, cx);
+                        surfaces.focus_handle(cx).focus(window, cx);
+                    });
+                }
+            }
             ToastCommand::RetryConnection => {
                 self.window_store
                     .write()
@@ -1864,6 +1881,62 @@ impl RootView {
                 cx.write_to_clipboard(gpui::ClipboardItem::new_string(detail));
             }
         }
+        cx.notify();
+    }
+
+    /// ⌥⌘S: turns "Talk with your agent" on or off for every agent without
+    /// opening Settings. Turning it off stops a reading mid-sentence.
+    fn toggle_read_aloud(&mut self, cx: &mut Context<Self>) {
+        let mut enabled = false;
+        let result = self
+            .window_store
+            .write()
+            .expect("session store lock poisoned")
+            .update_preferences(|prefs| {
+                prefs.talk_with_agent = !prefs.talk_with_agent;
+                enabled = prefs.talk_with_agent;
+            });
+        match result {
+            Ok(()) => {
+                self.services.store.publish_local_change();
+                let message = if enabled {
+                    "toast.read_aloud_on"
+                } else {
+                    "toast.read_aloud_off"
+                };
+                self.show_feedback("voice", Toast::info(crate::i18n::t(message)), cx);
+            }
+            Err(error) => self.show_feedback(
+                "prefs",
+                Toast::error(crate::i18n::t("toast.read_aloud_failed")).detail(error.to_string()),
+                cx,
+            ),
+        }
+        cx.notify();
+    }
+
+    /// The palette's per-tab read-aloud commands, for the selected tab.
+    fn set_read_aloud(&mut self, choice: crate::store::ReadAloudChoice, cx: &mut Context<Self>) {
+        let message = {
+            let mut store = self
+                .window_store
+                .write()
+                .expect("session store lock poisoned");
+            let Some(id) = store.selected_session_id().cloned() else {
+                return;
+            };
+            store.set_read_aloud(id.clone(), choice);
+            let reading = store.tab_reads_aloud(&id);
+            match choice {
+                crate::store::ReadAloudChoice::Toggle if reading => "toast.read_aloud_tab_on",
+                crate::store::ReadAloudChoice::Toggle => "toast.read_aloud_tab_off",
+                crate::store::ReadAloudChoice::Only => "toast.read_aloud_only_tab",
+                crate::store::ReadAloudChoice::AllExcept => "toast.read_aloud_all_except_tab",
+                crate::store::ReadAloudChoice::All => "toast.read_aloud_all_tabs",
+            }
+        };
+        self.services.store.publish_local_change();
+        self.show_feedback("voice", Toast::info(crate::i18n::t(message)), cx);
         cx.notify();
     }
 
@@ -2737,6 +2810,15 @@ impl RootView {
             }
             CommandId::CheckForUpdates => self.services.updates.check(true),
             CommandId::ShowWhatsNew => self.open_whats_new_at(0, window, cx),
+            CommandId::ToggleReadAloud => self.toggle_read_aloud(cx),
+            CommandId::ToggleReadThisTab => {
+                self.set_read_aloud(crate::store::ReadAloudChoice::Toggle, cx)
+            }
+            CommandId::ReadOnlyThisTab => self.set_read_aloud(crate::store::ReadAloudChoice::Only, cx),
+            CommandId::ReadAllExceptThisTab => {
+                self.set_read_aloud(crate::store::ReadAloudChoice::AllExcept, cx)
+            }
+            CommandId::ReadAllTabs => self.set_read_aloud(crate::store::ReadAloudChoice::All, cx),
             CommandId::TogglePerfOverlay => self.toggle_perf_tool(true, cx),
             CommandId::ToggleRenderCounters => self.toggle_perf_tool(false, cx),
             CommandId::SelectPreviousSession if !self.arrow_surface_visible() => {
@@ -5754,6 +5836,21 @@ impl Render for RootView {
             }))
             .on_action(cx.listener(|this, _: &ShowWhatsNew, window, cx| {
                 this.run_command(CommandId::ShowWhatsNew, window, cx);
+            }))
+.on_action(cx.listener(|this, _: &ToggleReadThisTab, window, cx| {
+                this.run_command(CommandId::ToggleReadThisTab, window, cx);
+            }))
+            .on_action(cx.listener(|this, _: &ReadOnlyThisTab, window, cx| {
+                this.run_command(CommandId::ReadOnlyThisTab, window, cx);
+            }))
+            .on_action(cx.listener(|this, _: &ReadAllExceptThisTab, window, cx| {
+                this.run_command(CommandId::ReadAllExceptThisTab, window, cx);
+            }))
+            .on_action(cx.listener(|this, _: &ReadAllTabs, window, cx| {
+                this.run_command(CommandId::ReadAllTabs, window, cx);
+            }))
+            .on_action(cx.listener(|this, _: &ToggleReadAloud, window, cx| {
+                this.run_command(CommandId::ToggleReadAloud, window, cx);
             }))
             .on_action(cx.listener(|this, _: &TogglePerfOverlay, window, cx| {
                 this.run_command(CommandId::TogglePerfOverlay, window, cx);

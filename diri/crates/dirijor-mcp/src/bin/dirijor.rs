@@ -170,7 +170,7 @@ fn hook(event: Option<&str>) -> Result<(), CliError> {
     // Hooks are deliberately fail-open: an unavailable UI must never prevent
     // an agent from starting or completing its own action.
     if event == "SessionStart"
-        && let Ok(result) = result
+        && let Ok(result) = &result
         && let Some(title) = result.get("sessionTitle").and_then(Value::as_str)
     {
         println!(
@@ -179,6 +179,19 @@ fn hook(event: Option<&str>) -> Result<(), CliError> {
                 "hookSpecificOutput": {
                     "hookEventName": "SessionStart",
                     "sessionTitle": title,
+                }
+            })
+        );
+    } else if event == "UserPromptSubmit"
+        && let Ok(result) = &result
+        && let Some(context) = result.get("additionalContext").and_then(Value::as_str)
+    {
+        println!(
+            "{}",
+            json!({
+                "hookSpecificOutput": {
+                    "hookEventName": "UserPromptSubmit",
+                    "additionalContext": context,
                 }
             })
         );

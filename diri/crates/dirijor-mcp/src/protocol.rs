@@ -59,6 +59,16 @@ pub fn error(id: Value, code: i64, message: impl Into<String>) -> Value {
 }
 
 pub fn tool_content(result: Result<Value, String>) -> Value {
+    // Tools that relay another MCP server (computer use) hand over its
+    // result as is: images stay image blocks.
+    if let Ok(Value::Object(object)) = &result
+        && let Some(Value::Object(relayed)) = object.get("mcpToolResult")
+    {
+        let mut relayed = relayed.clone();
+        relayed.entry("content").or_insert_with(|| json!([]));
+        relayed.entry("isError").or_insert(Value::Bool(false));
+        return Value::Object(relayed);
+    }
     let (value, is_error) = match result {
         Ok(value) => {
             let is_error = value.get("ok") == Some(&Value::Bool(false));
@@ -267,6 +277,21 @@ mod tests {
     fn unknown_delivery_is_not_marked_as_a_successful_tool_call() {
         let result = tool_content(Ok(json!({"ok":false, "receipt":{"delivery":"unknown"}})));
         assert_eq!(result["isError"], true);
+    }
+
+    #[test]
+    fn relayed_results_keep_their_images() {
+        let result = tool_content(Ok(json!({"mcpToolResult": {
+            "content": [{"type":"text","text":"tree"},{"type":"image","data":"AAAA","mimeType":"image/png"}],
+            "structuredContent": {"snapshot_id": "s1"}
+        }})));
+        assert_eq!(result["content"][1]["type"], "image");
+        assert_eq!(result["structuredContent"]["snapshot_id"], "s1");
+        assert_eq!(result["isError"], false);
+        let failed = tool_content(Ok(
+            json!({"mcpToolResult": {"content": [], "isError": true}}),
+        ));
+        assert_eq!(failed["isError"], true);
     }
 
     #[test]

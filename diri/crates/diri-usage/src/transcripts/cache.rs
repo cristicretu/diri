@@ -107,7 +107,6 @@ pub(crate) fn save(path: &Path, cache: &UsageCacheFile) -> io::Result<()> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
     }
-    let data = serde_json::to_vec(cache).map_err(io::Error::other)?;
     let temporary = temporary_path(path);
     let mut options = fs::OpenOptions::new();
     options.write(true).create_new(true);
@@ -116,9 +115,12 @@ pub(crate) fn save(path: &Path, cache: &UsageCacheFile) -> io::Result<()> {
         use std::os::unix::fs::OpenOptionsExt;
         options.mode(0o600).custom_flags(libc::O_NOFOLLOW);
     }
-    let mut file = options.open(&temporary)?;
-    let result = file
-        .write_all(&data)
+    // Streamed: the cache runs to megabytes, and building it in memory first
+    // cost several large allocations on every save.
+    let mut file = io::BufWriter::new(options.open(&temporary)?);
+    let result = serde_json::to_writer(&mut file, cache)
+        .map_err(io::Error::other)
+        .and_then(|()| file.flush())
         .and_then(|()| fs::rename(&temporary, path));
     if result.is_err() {
         let _ = fs::remove_file(&temporary);

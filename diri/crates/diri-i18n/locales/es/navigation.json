@@ -535,6 +535,8 @@
   "terminal.path_copied": "Ruta copiada",
   "terminal.preparing": "Preparando terminal…",
   "terminal.prompt.none": "No hay prompt del shell en esa dirección (requiere marcas OSC 133)",
+  "terminal.read_aloud.start": "Leer esta pestaña en voz alta",
+  "terminal.read_aloud.stop": "Dejar de leer esta pestaña en voz alta",
   "terminal.reconnect.connecting": "Conectando…",
   "terminal.reconnect.input_dropped": "Se descartó la entrada en cola; puede que no haya llegado",
   "terminal.reconnect.lost_last": "Conexión perdida · Última pantalla recibida",

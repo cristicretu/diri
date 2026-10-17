@@ -628,7 +628,7 @@ async fn http_get(url: &str, headers: &[String]) -> Result<Value, &'static str> 
         .stderr(Stdio::null())
         .kill_on_drop(true)
         .spawn()
-        .map_err(|_| "Could not refresh limits")?;
+        .map_err(|_| "Could not refresh limits: curl isn’t installed")?;
     let mut stdin = child.stdin.take().ok_or("Could not refresh limits")?;
     stdin
         .write_all(config.as_bytes())

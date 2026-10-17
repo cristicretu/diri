@@ -4,10 +4,15 @@ pub mod accounts;
 pub mod agent_names;
 pub mod api_request;
 pub mod attention;
+pub mod computer;
 pub use accounts::*;
 pub use api_request::{
     ApiEnvironmentDraft, ApiHeaderDraft, ApiRequestDraft, ApiVariableDraft,
     SessionOpenApiRequestParams,
+};
+pub use computer::{
+    ComputerActParams, ComputerSetupAction, ComputerSetupNeededEvent, ComputerSetupParams,
+    ComputerStatus, ComputerStatusParams,
 };
 pub mod control;
 pub mod frames;
@@ -33,6 +38,7 @@ pub mod process_facts;
 pub mod tasks;
 pub mod terminal;
 pub mod terminal_input;
+pub mod voice;
 pub mod workspace;
 
 pub use control::{ControlError, ControlMessage, JsonValue, WIRE_VERSION};

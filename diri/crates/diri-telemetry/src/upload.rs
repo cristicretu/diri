@@ -460,18 +460,12 @@ fn save_offsets(dir: &Path, offsets: &BTreeMap<String, u64>) -> std::io::Result<
     crate::identity::write_private(&dir.join(OFFSETS_FILE), &serde_json::to_vec(offsets)?)
 }
 
-fn tool(name: &str) -> String {
-    let system = format!("/usr/bin/{name}");
-    if Path::new(&system).exists() {
-        system
-    } else {
-        name.to_owned()
-    }
-}
-
 /// Compresses through the system `gzip`.
 pub fn gzip(input: &[u8]) -> std::io::Result<Vec<u8>> {
-    pipe(Command::new(tool("gzip")).args(["-c", "-6"]), input)
+    pipe(
+        Command::new(diri_platform::gzip_executable()).args(["-c", "-6"]),
+        input,
+    )
 }
 
 fn pipe(command: &mut Command, input: &[u8]) -> std::io::Result<Vec<u8>> {
@@ -503,7 +497,7 @@ fn pipe(command: &mut Command, input: &[u8]) -> std::io::Result<Vec<u8>> {
 fn curl_transport(endpoint: &str, body: &[u8], install: &str) -> std::io::Result<u16> {
     let url = format!("{}/v1/ingest", endpoint.trim_end_matches('/'));
     let output = pipe(
-        Command::new(tool("curl")).args([
+        Command::new(diri_platform::curl_executable()).args([
             "-sS",
             "-m",
             "30",
@@ -537,7 +531,11 @@ mod tests {
     use std::sync::{Arc, Mutex};
 
     fn gunzip(input: &[u8]) -> Vec<u8> {
-        pipe(Command::new(tool("gzip")).args(["-d", "-c"]), input).unwrap()
+        pipe(
+            Command::new(diri_platform::gzip_executable()).args(["-d", "-c"]),
+            input,
+        )
+        .unwrap()
     }
 
     fn capture(status: u16) -> (Transport, Arc<Mutex<Vec<String>>>) {

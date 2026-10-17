@@ -1,5 +1,6 @@
 //! Headless application state and the thin asynchronous daemon adapter.
 
+mod computer;
 mod herdr;
 mod prefs;
 mod projection;
@@ -39,9 +40,9 @@ use crate::switcher::{
 };
 
 pub use prefs::{
-    FileEditor, InspectorTab, InterfaceStyle, NewAgentStart, PaneDensity, Prefs, SavedWindow,
-    SidebarGrouping, SidebarOrdering, TabOrientation, UiLanguage, WindowMaterial, WindowMode,
-    WindowPlacement,
+    DictationShortcut, FileEditor, InspectorTab, InterfaceStyle, NewAgentStart, PaneDensity, Prefs,
+    SavedWindow, SidebarGrouping, SidebarOrdering, TabOrientation, TalkAnswer, UiLanguage,
+    WindowMaterial, WindowMode, WindowPlacement,
 };
 pub use projection::{SidebarProject, SidebarProjection, SidebarRow};
 pub use residency::{ResidencyUpdate, TerminalResidency};
@@ -194,6 +195,10 @@ pub enum StoreEffect {
     ImportHerdr(Vec<herdr::ImportStep>),
     /// Resume every session a restart ended, a few at a time.
     ResumeAll(Vec<SessionId>),
+    /// Poll computer use setup while Settings or a permission guide shows it.
+    WatchComputer,
+    /// Install Cua Driver, or restart it.
+    ComputerSetup(diri_proto::ComputerSetupAction),
     /// Rescan this Mac until the Agent the user is installing appears.
     WatchAgentInstall {
         kind: AgentKind,
@@ -405,6 +410,20 @@ fn repo_target_key(host: Option<&str>) -> String {
     host.unwrap_or("local").to_owned()
 }
 
+/// How the palette and the title bar's speaker change which tabs are read
+/// aloud ([`SessionStore::set_read_aloud`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ReadAloudChoice {
+    /// This tab flips; the others keep their choice.
+    Toggle,
+    /// Read this tab and no other.
+    Only,
+    /// Read every tab but this one.
+    AllExcept,
+    /// Read every tab.
+    All,
+}
+
 /// Pure application model. Side effects are emitted onto a channel for the daemon adapter.
 pub struct SessionStore {
     workspaces: WorkspaceCatalog,
@@ -493,6 +512,7 @@ pub struct SessionStore {
     /// The Agent whose installer the user started from Diri. While set, the
     /// runtime rescans this Mac so setup surfaces flip to ready unprompted.
     agent_install: Option<AgentKind>,
+    computer: computer::ComputerSetupState,
     herdr: herdr::HerdrState,
     /// Attention states serving out their settle window, newest arming wins.
     /// Drained by the settle task in `StoreHandle`, which is what turns one of
@@ -504,6 +524,8 @@ pub struct SessionStore {
     /// Text terminal programs copied with OSC 52, for the application to put
     /// on the system clipboard.
     terminal_clipboard: broadcast::Sender<String>,
+    /// Turns that just finished, for reading the reply aloud (`voice`).
+    turn_completions: broadcast::Sender<crate::voice::TurnCompletion>,
     effects: mpsc::UnboundedSender<StoreEffect>,
 }
 
@@ -595,10 +617,12 @@ impl SessionStore {
                 agent_catalog_scans: HashMap::new(),
                 agent_catalog_errors: HashMap::new(),
                 agent_install: None,
+                computer: computer::ComputerSetupState::default(),
                 herdr: herdr::HerdrState::default(),
                 notification_feed,
                 attention_wake: Arc::new(Notify::new()),
                 terminal_clipboard: broadcast::channel(4).0,
+                turn_completions: broadcast::channel(8).0,
                 effects,
             },
             receiver,
@@ -611,6 +635,10 @@ impl SessionStore {
 
     pub fn terminal_clipboard_writes(&self) -> broadcast::Receiver<String> {
         self.terminal_clipboard.subscribe()
+    }
+
+    pub fn turn_completions(&self) -> broadcast::Receiver<crate::voice::TurnCompletion> {
+        self.turn_completions.subscribe()
     }
 
     /// Relays an OSC 52 copy while the user is in Diri. A write from a session
@@ -732,6 +760,43 @@ impl SessionStore {
                     .map(|entry| entry.id.clone())
                     .collect(),
             );
+        }
+        let _ = self.persist_preferences();
+        self.emit(StoreEffect::PublishSnapshot);
+    }
+
+    /// Whether "Talk with your agent" reads `session` aloud: the setting is
+    /// on, the tab's speaker is not off, and the chat is not muted (muting a
+    /// chat silences both its notifications and its readings).
+    pub fn reads_aloud(&self, session: &SessionId) -> bool {
+        self.prefs.talk_with_agent
+            && self.tab_reads_aloud(session)
+            && !self.prefs.muted_notification_sessions.contains(&session.0)
+    }
+
+    /// The tab's own read-aloud choice, whether or not the setting is on.
+    pub fn tab_reads_aloud(&self, session: &SessionId) -> bool {
+        self.prefs.talk_reads_by_default != self.prefs.talk_exceptions.contains(&session.0)
+    }
+
+    /// Which tabs "Talk with your agent" reads, without touching their
+    /// notifications. Choosing which tabs to read also turns the setting on.
+    pub fn set_read_aloud(&mut self, session: SessionId, choice: ReadAloudChoice) {
+        let prefs = &mut self.prefs;
+        match choice {
+            ReadAloudChoice::Toggle => {
+                if !prefs.talk_exceptions.remove(&session.0) {
+                    prefs.talk_exceptions.insert(session.0);
+                }
+            }
+            ReadAloudChoice::Only | ReadAloudChoice::AllExcept | ReadAloudChoice::All => {
+                prefs.talk_with_agent = true;
+                prefs.talk_reads_by_default = choice != ReadAloudChoice::Only;
+                prefs.talk_exceptions.clear();
+                if choice != ReadAloudChoice::All {
+                    prefs.talk_exceptions.insert(session.0);
+                }
+            }
         }
         let _ = self.persist_preferences();
         self.emit(StoreEffect::PublishSnapshot);
@@ -1853,6 +1918,14 @@ impl SessionStore {
                 }
                 return StoreEventChange::None;
             }
+            EventName::COMPUTER_SETUP_NEEDED => {
+                if let Ok(event) =
+                    serde_json::from_value::<diri_proto::ComputerSetupNeededEvent>(event.params)
+                {
+                    self.computer_setup_needed(event);
+                }
+                return StoreEventChange::None;
+            }
             EventName::SESSION_CLIPBOARD => {
                 if let Ok(event) =
                     serde_json::from_value::<diri_proto::SessionClipboardEvent>(event.params)
@@ -2046,6 +2119,15 @@ impl SessionStore {
         {
             self.notification_change(Vec::new());
             self.attention_wake.notify_one();
+        }
+        if self.prefs.talk_with_agent
+            && !self.closing.contains(&id)
+            && let Some(turn) = crate::voice::completed_turn(previous.as_deref(), current)
+        {
+            let _ = self.turn_completions.send(crate::voice::TurnCompletion {
+                session_id: id.clone(),
+                turn,
+            });
         }
         // Spawn selects the id before the authoritative record arrives, and
         // only focus_session grants terminal residency -- without this, a
@@ -4377,6 +4459,23 @@ async fn run_effects(
                 ));
                 Ok(())
             }
+            StoreEffect::WatchComputer => {
+                tokio::spawn(computer::watch(
+                    Arc::clone(&client),
+                    Arc::clone(&store),
+                    change_tx.clone(),
+                ));
+                Ok(())
+            }
+            StoreEffect::ComputerSetup(action) => {
+                tokio::spawn(computer::setup(
+                    action,
+                    Arc::clone(&client),
+                    Arc::clone(&store),
+                    change_tx.clone(),
+                ));
+                Ok(())
+            }
             StoreEffect::WatchAgentInstall { kind, display_name } => {
                 let client = Arc::clone(&client);
                 let store = Arc::clone(&store);
@@ -4557,6 +4656,8 @@ fn action_context(effect: &StoreEffect) -> Option<ActionContext> {
         | StoreEffect::RefreshAgents { .. }
         | StoreEffect::ConfigureAgent(_)
         | StoreEffect::WatchAgentInstall { .. } => return None,
+        // Setup outcomes render in place in Settings › Agents.
+        StoreEffect::WatchComputer | StoreEffect::ComputerSetup(_) => return None,
         // Import outcomes, failures included, arrive as one summary banner.
         StoreEffect::ScanHerdr { .. } | StoreEffect::ImportHerdr(_) => return None,
         // So does a "Resume all" batch.

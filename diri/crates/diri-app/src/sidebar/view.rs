@@ -6692,6 +6692,34 @@ impl Sidebar {
                     ))
                     .child(menu_divider(colors));
             }
+            // One switch per chat: muted, it neither notifies nor is read
+            // aloud ("Talk with your agent").
+            let muted = self
+                .store
+                .read()
+                .expect("session store lock poisoned")
+                .preferences()
+                .muted_notification_sessions
+                .contains(&id.0);
+            content = content.child(menu_row(
+                if muted {
+                    t("notify.unmute_chat")
+                } else {
+                    t("notify.mute_chat")
+                },
+                colors,
+                cx.listener({
+                    let id = id.clone();
+                    move |this, _, _, cx| {
+                        this.store
+                            .write()
+                            .expect("session store lock poisoned")
+                            .toggle_notification_mute(id.clone());
+                        this.ui.popover = None;
+                        cx.notify();
+                    }
+                }),
+            ));
             if session.kind == ProtoAgentKind::CLAUDE_CODE
                 || (session.kind == ProtoAgentKind::CODEX && session.host.is_none())
             {

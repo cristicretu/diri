@@ -617,12 +617,17 @@ fn exit_status_capture(shell: &str) -> Option<ExitStatusCapture> {
 /// Cursor, chalk, and Ink treat `FORCE_COLOR=0` as "no colour" even when
 /// `COLORTERM=truecolor` is set. A daemon launched from a Cursor session
 /// inherits that, so those overrides are dropped too.
+///
+/// The terminal Diri itself was started from must not be the child's either.
+/// Launched from Terminal.app (as `scripts/dev.sh` usually is), every agent
+/// inherited `TERM_PROGRAM=Apple_Terminal`, and Claude Code then asks
+/// Terminal.app for its theme over AppleScript, which launches Terminal.
 pub(crate) fn assert_color_environment(env: &mut Vec<(String, String)>) {
     env.retain(|(key, _)| {
         !matches!(
             key.as_str(),
             "NO_COLOR" | "FORCE_COLOR" | "CLICOLOR" | "CLICOLOR_FORCE" | "TERM" | "COLORTERM"
-        )
+        ) && !HOST_TERMINAL_IDENTITY.contains(&key.as_str())
     });
     env.push(("TERM".into(), "xterm-256color".into()));
     env.push(("COLORTERM".into(), "truecolor".into()));
@@ -635,6 +640,22 @@ pub(crate) fn assert_color_environment(env: &mut Vec<(String, String)>) {
 }
 
 const CARGO_PROGRESS_ENV: &str = "CARGO_TERM_PROGRESS_TERM_INTEGRATION";
+
+/// Variables by which programs recognise the terminal they run in. Inside
+/// Diri they would name whichever terminal launched Diri.
+const HOST_TERMINAL_IDENTITY: &[&str] = &[
+    "TERM_PROGRAM",
+    "TERM_PROGRAM_VERSION",
+    "TERM_SESSION_ID",
+    "LC_TERMINAL",
+    "LC_TERMINAL_VERSION",
+    "ITERM_SESSION_ID",
+    "ITERM_PROFILE",
+    "WT_SESSION",
+    "KITTY_WINDOW_ID",
+    "WEZTERM_PANE",
+    "__CFBundleIdentifier",
+];
 
 /// Terminal modes an agent may leave on, turned off after it exits and
 /// before the login shell takes the PTY, written for the shell's `printf`
@@ -1238,6 +1259,23 @@ mod tests {
         assert_eq!(get("COLORTERM"), Some("truecolor"));
         assert_eq!(get("NO_COLOR"), None);
         assert_eq!(get(super::CARGO_PROGRESS_ENV), Some("true"));
+
+        // Started from Terminal.app: the agent must not think it runs there.
+        let mut from_terminal = vec![
+            ("TERM_PROGRAM".to_owned(), "Apple_Terminal".to_owned()),
+            ("TERM_PROGRAM_VERSION".to_owned(), "470.2".to_owned()),
+            (
+                "__CFBundleIdentifier".to_owned(),
+                "com.apple.Terminal".to_owned(),
+            ),
+            ("HOME".to_owned(), "/Users/me".to_owned()),
+        ];
+        super::assert_color_environment(&mut from_terminal);
+        let keys: Vec<&str> = from_terminal.iter().map(|(key, _)| key.as_str()).collect();
+        assert!(!keys.contains(&"TERM_PROGRAM"), "{keys:?}");
+        assert!(!keys.contains(&"TERM_PROGRAM_VERSION"), "{keys:?}");
+        assert!(!keys.contains(&"__CFBundleIdentifier"), "{keys:?}");
+        assert!(keys.contains(&"HOME"), "{keys:?}");
 
         let mut chosen = vec![(super::CARGO_PROGRESS_ENV.to_owned(), "false".to_owned())];
         super::assert_color_environment(&mut chosen);

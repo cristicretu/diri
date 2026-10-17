@@ -1,0 +1,47 @@
+name: Nix hashes
+
+# flake.nix fetches a Git dependency in diri/Cargo.lock as just its pinned
+# commit when nix/cargo-git-hashes.json has that commit's hash; otherwise it
+# clones the dependency's whole repository with every branch, tag and pull
+# request (about 1.3 GB for Zed, against 89 MB for the commit). This fails a
+# pull request that changes Cargo.lock or the flake without regenerating the
+# file, so main never carries stale hashes. Not a required check: a stale file
+# makes the flake slower, never broken.
+
+on:
+  pull_request:
+    paths: &paths
+      - diri/Cargo.lock
+      - flake.lock
+      - flake.nix
+      - nix/**
+      - scripts/update-nix-hashes.sh
+      - .github/workflows/nix-hashes.yml
+  push:
+    branches: [main]
+    paths: *paths
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: nix-hashes-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  check:
+    name: Check Nix hashes
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: cachix/install-nix-action@448cde739abec1eaf0646249e3d25bb8d9bc7702 # v31.11.2
+      - name: Check nix/cargo-git-hashes.json
+        run: scripts/update-nix-hashes.sh --check
+      # Guards against a flake that no longer evaluates. It fetches no Git
+      # dependency.
+      - name: Evaluate the flake
+        run: nix eval --raw .#packages.x86_64-linux.diri.drvPath

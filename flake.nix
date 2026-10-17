@@ -89,6 +89,8 @@
           imagemagick,
           copyDesktopItems,
           makeDesktopItem,
+          curl,
+          gzip,
           fontconfig,
           freetype,
           libxkbcommon,
@@ -117,11 +119,28 @@
             cargo = toolchain;
             rustc = toolchain;
           };
-          # Git dependencies (GPUI, xcb, ...) are fetched from the revisions
-          # pinned in Cargo.lock, so dependency bumps need no hash updates here.
+          # Git dependencies (GPUI, xcb, ...) are fetched at the revisions pinned
+          # in Cargo.lock. Those with a hash in nix/cargo-git-hashes.json, keyed
+          # by Cargo.lock source, fetch only that commit. A revision without one
+          # (scripts/update-nix-hashes.sh regenerates the file; the Nix hashes
+          # check fails pull requests that forget) falls back to
+          # builtins.fetchGit, which clones the whole repository with every
+          # branch, tag and pull request: slow for Zed, but the build still works.
           # Vendored once and shared with the static Helper.
+          gitHashes = lib.importJSON ./nix/cargo-git-hashes.json;
+          # importCargoLock keys outputHashes by name-version and resolves each
+          # to the first Git package with that name-version, so a crate locked
+          # from two sources is keyed for the source importCargoLock picks.
+          gitSources = lib.listToAttrs (
+            map (p: lib.nameValuePair "${p.name}-${p.version}" p.source) (
+              lib.filter (p: lib.hasPrefix "git+" (p.source or "")) (lib.importTOML ./diri/Cargo.lock).package
+            )
+          );
           cargoDeps = rustPlatform.importCargoLock {
             lockFile = ./diri/Cargo.lock;
+            outputHashes = lib.filterAttrs (_: hash: hash != null) (
+              lib.mapAttrs (_: source: gitHashes.${source} or null) gitSources
+            );
             allowBuiltinFetchGit = true;
           };
 
@@ -159,6 +178,11 @@
         rustPlatform.buildRustPackage {
           pname = "diri";
           inherit version src cargoDeps;
+
+          # NixOS has no /usr/bin/curl or /usr/bin/gzip; diri-platform reads
+          # these at compile time so the package never depends on PATH.
+          env.DIRI_CURL = lib.getExe curl;
+          env.DIRI_GZIP = "${gzip}/bin/gzip";
 
           buildPhase = ''
             runHook preBuild

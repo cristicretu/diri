@@ -105,7 +105,12 @@ impl Bridge {
         kinds.sort();
         kinds.dedup();
         kinds.push("shell".into());
-        Ok(tool_definitions_for(&kinds))
+        let mut tools = tool_definitions_for(&kinds);
+        // Always listed: Agents read the tool list once, when they start, and
+        // "Talk with your agent" may be turned on later. Its description says
+        // to call it only when Diri's prompt context asks for a summary.
+        tools.push(crate::tools::speak_tool());
+        Ok(tools)
     }
 
     pub fn call(&self, tool: &str, arguments: &Value) -> Result<Value, String> {
@@ -142,6 +147,7 @@ impl Bridge {
             "release_agent" => self.release_agent(arguments),
             "test_run" => self.test_run(arguments),
             "browser" => self.browser(arguments),
+            "computer" => self.computer(arguments),
             "open_api_request" => self.open_api_request(arguments),
             "quick_open_include" => self.quick_open_include(arguments),
             "whoami" => self.whoami(),
@@ -160,6 +166,7 @@ impl Bridge {
             "create_note" => self.create_note(arguments),
             "start_from_note" => self.start_from_note(arguments),
             "note_history" => self.note_history(arguments),
+            diri_proto::voice::SPEAK_TOOL => self.speak(arguments),
             other => Err(format!("unknown tool: {other}")),
         }
     }
@@ -610,6 +617,30 @@ impl Bridge {
         )
     }
 
+    /// Relays one Cua Driver call; the Engine owns the driver, the caller's
+    /// cursor badge, and which session may act on which app.
+    fn computer(&self, arguments: &Value) -> Result<Value, String> {
+        let snapshot = self.snapshot()?;
+        McpPolicy::new(
+            &snapshot.sessions,
+            &snapshot.projects,
+            self.caller.as_deref(),
+        )?
+        .authorize(WriteAction::Computer)?;
+        let caller = self.caller.as_ref().expect("policy requires a caller");
+        let tool = required_string(arguments, "tool")?;
+        self.request(
+            Method::COMPUTER_ACT,
+            json!({
+                "sessionID": caller,
+                "tool": tool,
+                "args": arguments.get("args").cloned().unwrap_or_else(|| json!({})),
+            }),
+            // The Engine waits up to two minutes for a batched action.
+            Duration::from_secs(130),
+        )
+    }
+
     fn test_run(&self, arguments: &Value) -> Result<Value, String> {
         let snapshot = self.snapshot()?;
         McpPolicy::new(
@@ -1009,6 +1040,14 @@ impl Bridge {
             "receipt": receipt,
             "recorded_on_task": task,
         }))
+    }
+
+    fn speak(&self, arguments: &Value) -> Result<Value, String> {
+        self.request(
+            Method::VOICE_SPEAK,
+            json!({"sessionID": self.require_caller()?, "text": required_string(arguments, "text")?}),
+            DEFAULT_TIMEOUT,
+        )
     }
 
     fn require_caller(&self) -> Result<&str, String> {

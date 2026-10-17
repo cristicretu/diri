@@ -132,9 +132,10 @@ nix run --impure github:nix-community/nixGL -- nix run github:cristicretu/diri
 nixGL works by setting `LD_LIBRARY_PATH`, which the terminals Diri starts
 inherit.
 
-The first build clones Zed's full Git history (about 1.6 GB) for the pinned
-GPUI revision; later builds reuse Nix's Git cache. On NixOS, add the overlay and install
-`pkgs.diri`:
+The first build downloads only the pinned commit of GPUI and each other Git
+dependency. A dependency whose hash is missing from `nix/cargo-git-hashes.json`
+has its full Git history cloned instead (about 1.3 GB for Zed); after bumping a
+Git dependency, run `./scripts/update-nix-hashes.sh` and commit the result. On NixOS, add the overlay and install `pkgs.diri`:
 
 ```nix
 {

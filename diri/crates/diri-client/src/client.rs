@@ -135,8 +135,9 @@ impl ClientCore {
     /// IF YOU ADD AN EVENT KIND THAT DIRI NEEDS, ADD IT HERE TOO. Server-side
     /// filtering means an unlisted kind never reaches `route_message`, and the
     /// symptom is silence, not an error.
-    const EVENT_KINDS: [&'static str; 9] = [
+    const EVENT_KINDS: [&'static str; 10] = [
         EventName::SESSION_UPDATED,
+        EventName::COMPUTER_SETUP_NEEDED,
         EventName::SESSION_API_REQUEST,
         EventName::SESSION_NOTIFICATION,
         EventName::SESSION_CLIPBOARD,
@@ -1003,6 +1004,36 @@ impl DaemonClient {
         let timeout = agent_catalog_timeout(params.host.is_some());
         self.core
             .request_typed(Method::AGENT_READINESS, Some(&params), Some(timeout))
+            .await
+    }
+
+    /// `computer.status`: Cua Driver's install and grants. `probe` starts
+    /// its daemon to read the grants, which takes a few seconds cold.
+    pub async fn computer_status(
+        &self,
+        probe: bool,
+    ) -> Result<diri_proto::ComputerStatus, ClientError> {
+        self.core
+            .request_typed(
+                Method::COMPUTER_STATUS,
+                Some(&diri_proto::ComputerStatusParams { probe }),
+                Some(Duration::from_secs(20)),
+            )
+            .await
+    }
+
+    /// `computer.setup`: starts an install (answers at once) or restarts
+    /// the driver's daemon.
+    pub async fn computer_setup(
+        &self,
+        action: diri_proto::ComputerSetupAction,
+    ) -> Result<diri_proto::ComputerStatus, ClientError> {
+        self.core
+            .request_typed(
+                Method::COMPUTER_SETUP,
+                Some(&diri_proto::ComputerSetupParams { action }),
+                Some(Duration::from_secs(30)),
+            )
             .await
     }
 

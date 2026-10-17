@@ -174,6 +174,7 @@ pub struct ControlServer {
     cli_versions: crate::cli_version::CliVersions,
     governor: std::sync::Arc<Mutex<crate::governor::GovernorConfig>>,
     browser: std::sync::OnceLock<crate::browser::BrowserPool>,
+    computer: crate::computer::ComputerUse,
     active_connections: Arc<AtomicUsize>,
     background_requests: Arc<AtomicUsize>,
     worktree_scan: crate::worktree_scan::ScanStore,
@@ -186,6 +187,9 @@ pub struct ControlServer {
     session_operations: Mutex<std::collections::HashSet<String>>,
     agent_scans: Arc<Mutex<std::collections::HashMap<String, Arc<Mutex<()>>>>>,
     hook_reports: hook_queue::HookQueue,
+    /// Each session's spoken summary (Diri's `speak` tool) and the turn it
+    /// was given in, until the app's reader collects it.
+    spoken: Mutex<SpokenSummaries>,
     /// Where note Sessions keep their files; `None` resolves the standard
     /// notes directory (tests pin a temporary one).
     notes_dir: Option<PathBuf>,
@@ -305,6 +309,7 @@ impl ControlServer {
             cli_versions: Default::default(),
             governor: std::sync::Arc::new(Mutex::new(crate::governor::GovernorConfig::default())),
             browser: std::sync::OnceLock::new(),
+            computer: Default::default(),
             active_connections: Arc::new(AtomicUsize::new(0)),
             background_requests: Arc::new(AtomicUsize::new(0)),
             worktree_scan: Default::default(),
@@ -316,6 +321,7 @@ impl ControlServer {
             session_operations: Mutex::new(std::collections::HashSet::new()),
             agent_scans: Arc::new(Mutex::new(std::collections::HashMap::new())),
             hook_reports: hook_queue::HookQueue::new(),
+            spoken: Mutex::new(SpokenSummaries::default()),
             notes_dir: None,
             scheduler: Arc::new(schedules::Scheduler::default()),
         }
@@ -881,6 +887,8 @@ impl ControlServer {
                         | Method::WORKTREE_OVERVIEW
                         | Method::WORKTREE_CLEANUP
                         | Method::TELEMETRY_UPLOAD_NOW
+                        | Method::COMPUTER_STATUS
+                        | Method::COMPUTER_SETUP
                 ) || ((method == Method::AGENT_READINESS
                     || method == Method::AGENT_CONFIGURE)
                     && params
@@ -1201,6 +1209,18 @@ impl ControlServer {
             Method::WORKTREE_OVERVIEW => self.worktree_overview(),
             Method::TEST_RUN => self.browser_call("run", params),
             "browser.act" => self.browser_call("browser", params),
+            Method::COMPUTER_ACT => self.computer_act(params),
+            Method::COMPUTER_STATUS => {
+                let p: diri_proto::ComputerStatusParams = decode(params)?;
+                encode(&self.computer.status(p.probe))
+            }
+            Method::COMPUTER_SETUP => {
+                let p: diri_proto::ComputerSetupParams = decode(params)?;
+                self.computer
+                    .setup(p.action)
+                    .map_err(|error| ControlError::new(error.code, error.message))
+                    .and_then(|status| encode(&status))
+            }
             Method::EVENTS_WAIT => self.events_wait(params),
             Method::HOST_SYNC_PREFS => self.host_sync_prefs(params),
             Method::HOST_INITIALIZE => self.host_initialize(params),
@@ -1211,6 +1231,11 @@ impl ControlServer {
             Method::SESSION_REPARENT_WORKTREE => self.session_reparent_worktree(params),
             Method::HOST_LOCATE_REPO => self.host_locate_repo(params),
             Method::HOOK_REPORT => self.hook_report(params),
+            Method::VOICE_STATE => encode(&diri_proto::voice::VoiceStateResult {
+                talk_with_agent: talk_with_agent_enabled(),
+            }),
+            Method::VOICE_SPEAK => self.voice_speak(params),
+            Method::VOICE_SPOKEN => self.voice_spoken(params),
             Method::SESSION_RESUME => self.session_resume(params),
             Method::SESSION_PROCESS_INFO => self.session_process_info(params),
             Method::SESSION_RECONNECT => self.session_reconnect(params),
@@ -1447,6 +1472,7 @@ impl ControlServer {
                     self.mcp_http_url_for(&descriptor),
                 );
                 launch_args.extend(injected.argv);
+                launch_args.extend(spoken_summary_args(&descriptor.injection));
                 mcp_http_token = injected
                     .mcp_http
                     .then(|| self.mcp_http.get().map(|endpoint| endpoint.token(&id)))
@@ -2250,6 +2276,60 @@ impl ControlServer {
             code: "browser_pool".into(),
             message: error,
         })
+    }
+
+    /// `computer.act`: one Cua Driver call on behalf of a live session, under
+    /// that session's own cursor badge and app leases.
+    fn computer_act(&self, params: Option<JsonValue>) -> Result<JsonValue, ControlError> {
+        let p: diri_proto::ComputerActParams = decode(params)?;
+        let id = p.session_id.0.clone();
+        let (badge, live) = {
+            let registry = self.registry.lock().map_err(poisoned)?;
+            let record = registry
+                .record(&id)
+                .filter(|record| !record.is_archived())
+                .ok_or_else(|| ControlError::not_found(format!("no session {id}")))?;
+            let agent = registry
+                .engine()
+                .manifest(record.kind.id())
+                .and_then(|manifest| manifest.agent.as_ref())
+                .and_then(|agent| agent.display_name.clone())
+                .filter(|name| !name.is_empty())
+                .unwrap_or_else(|| record.kind.id().to_owned());
+            let badge = cursor_badge(&agent, &record.title);
+            let live: std::collections::HashSet<String> = registry
+                .records()
+                .into_iter()
+                .filter(|record| !record.is_archived() && registry.is_live(&record.id.0))
+                .map(|record| record.id.0)
+                .collect();
+            (badge, live)
+        };
+        let caller = crate::computer::Caller {
+            session_id: &id,
+            badge: &badge,
+        };
+        let result = self
+            .computer
+            .act(&caller, &p.tool, p.args, &|session| live.contains(session));
+        if let Err(error) = &result
+            && matches!(
+                error.code,
+                crate::computer::UNAVAILABLE | crate::computer::PERMISSIONS
+            )
+            && self.computer.should_nudge(&id)
+        {
+            // The app offers to finish setup; only the person can.
+            self.events.publish_encoded(
+                diri_proto::EventName::COMPUTER_SETUP_NEEDED,
+                &diri_proto::ComputerSetupNeededEvent {
+                    session_id: p.session_id.clone(),
+                    badge: badge.clone(),
+                },
+                Some(&id),
+            );
+        }
+        result.map_err(|error| ControlError::new(error.code, error.message))
     }
 
     /// The aggregated staleness view: every worktree of every project,
@@ -3464,6 +3544,7 @@ impl ControlServer {
             return Ok(json!({}));
         };
         let session_end = p.kind == "claude-hook" && p.event.as_deref() == Some("SessionEnd");
+        let prompt = p.kind == "claude-hook" && p.event.as_deref() == Some("UserPromptSubmit");
         // Never wait on the Registry here: the Agent is blocked on this reply.
         self.hook_reports
             .submit(
@@ -3477,7 +3558,57 @@ impl ControlServer {
                 },
             )
             .map_err(poisoned)?;
+        if prompt && talk_with_agent_enabled() {
+            return Ok(json!({ "additionalContext": diri_proto::voice::SPOKEN_INSTRUCTION }));
+        }
         Ok(json!({}))
+    }
+
+    /// Keeps an Agent's spoken summary for the turn it is in, for the app to
+    /// read aloud when that turn ends. Ignored while the setting is off.
+    fn voice_speak(&self, params: Option<JsonValue>) -> Result<JsonValue, ControlError> {
+        let p: diri_proto::voice::SpeakParams = decode(params)?;
+        if !talk_with_agent_enabled() {
+            return Ok(json!({
+                "spoken": false,
+                "note": "Talk with your agent is off; there is no need to call speak."
+            }));
+        }
+        let text: String = p
+            .text
+            .trim()
+            .chars()
+            .take(diri_proto::voice::MAX_SPOKEN_CHARS)
+            .collect();
+        if text.is_empty() {
+            return Err(ControlError::bad_request("speak needs some text"));
+        }
+        let turn = {
+            let registry = self.registry.lock().map_err(poisoned)?;
+            let record = registry
+                .record(&p.session_id)
+                .ok_or_else(|| ControlError::not_found(p.session_id.clone()))?;
+            record
+                .attention_state
+                .as_ref()
+                .map_or(0, |state| state.turn)
+        };
+        self.spoken
+            .lock()
+            .map_err(poisoned)?
+            .keep(p.session_id, turn, text);
+        Ok(json!({ "spoken": true }))
+    }
+
+    /// Hands the reader the summary given during `turn`, once.
+    fn voice_spoken(&self, params: Option<JsonValue>) -> Result<JsonValue, ControlError> {
+        let p: diri_proto::voice::SpokenParams = decode(params)?;
+        let text = self
+            .spoken
+            .lock()
+            .map_err(poisoned)?
+            .take(&p.session_id, p.turn);
+        encode(&diri_proto::voice::SpokenResult { text })
     }
 
     fn session_process_info(&self, params: Option<JsonValue>) -> Result<JsonValue, ControlError> {
@@ -4291,6 +4422,7 @@ impl ControlServer {
                 self.mcp_http_url_for(&descriptor),
             );
             launch_args.extend(injected.argv);
+            launch_args.extend(spoken_summary_args(&descriptor.injection));
             mcp_http_token = injected
                 .mcp_http
                 .then(|| self.mcp_http.get().map(|endpoint| endpoint.token(id)))
@@ -5428,6 +5560,26 @@ impl ActiveConnectionGuard {
 impl Drop for ActiveConnectionGuard {
     fn drop(&mut self) {
         self.connections.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
+/// The words under a session's agent cursor: the agent and the tab, without
+/// saying the agent twice when the tab already names it ("Codex · fix" not
+/// "Codex · Codex · fix"; "Claude · x" for Claude Code).
+fn cursor_badge(agent: &str, title: &str) -> String {
+    let title = title.trim();
+    let first_word = agent.split_whitespace().next().unwrap_or(agent);
+    let named = |word: &str| {
+        title
+            .get(..word.len())
+            .is_some_and(|prefix| prefix.eq_ignore_ascii_case(word))
+    };
+    if title.is_empty() {
+        agent.to_owned()
+    } else if named(agent) || named(first_word) {
+        title.to_owned()
+    } else {
+        format!("{agent} · {title}")
     }
 }
 
@@ -7019,6 +7171,64 @@ fn verification_probe(prompt: &str, before: &str) -> Option<String> {
 const MIN_PROBE_CHARS: usize = 4;
 const MAX_PROBE_CHARS: usize = 20;
 
+/// The latest spoken summary per session, with the turn it belongs to. A
+/// newer one replaces it; asking for another turn leaves it.
+#[derive(Default)]
+struct SpokenSummaries(std::collections::HashMap<String, (u64, String)>);
+
+impl SpokenSummaries {
+    fn keep(&mut self, session: String, turn: u64, text: String) {
+        self.0.insert(session, (turn, text));
+    }
+
+    fn take(&mut self, session: &str, turn: u64) -> Option<String> {
+        if self.0.get(session).is_some_and(|(kept, _)| *kept == turn) {
+            return self.0.remove(session).map(|(_, text)| text);
+        }
+        None
+    }
+}
+
+#[cfg(test)]
+mod spoken_summary_tests {
+    use super::SpokenSummaries;
+
+    #[test]
+    fn a_summary_is_read_once_and_only_for_its_turn() {
+        let mut spoken = SpokenSummaries::default();
+        spoken.keep("s_a".into(), 3, "Fixed it.".into());
+        assert_eq!(spoken.take("s_a", 2), None);
+        assert_eq!(spoken.take("s_b", 3), None);
+        assert_eq!(spoken.take("s_a", 3).as_deref(), Some("Fixed it."));
+        assert_eq!(spoken.take("s_a", 3), None);
+        spoken.keep("s_a".into(), 4, "First.".into());
+        spoken.keep("s_a".into(), 4, "Second.".into());
+        assert_eq!(spoken.take("s_a", 4).as_deref(), Some("Second."));
+    }
+}
+
+/// Codex has no prompt hook, so while "Talk with your agent" is on its
+/// launch carries the request for a closing `Spoken:` paragraph as
+/// developer instructions, which add to its own rather than replace them.
+/// It applies from the next launch; Claude Code is asked on every prompt.
+fn spoken_summary_args(injection: &crate::agent::InjectionSpec) -> Vec<String> {
+    if !injection.codex_notify || !talk_with_agent_enabled() {
+        return Vec::new();
+    }
+    vec![
+        "-c".into(),
+        crate::inject::codex_developer_instructions(diri_proto::voice::SPOKEN_INSTRUCTION),
+    ]
+}
+
+/// "Talk with your agent" is an app preference; the Engine reads it from the
+/// app's file on each prompt so turning it off takes effect on the next one.
+fn talk_with_agent_enabled() -> bool {
+    std::env::var_os("HOME")
+        .and_then(|home| std::fs::read(diri_proto::paths::DirijorPaths::prefs_file(home)).ok())
+        .is_some_and(|prefs| diri_proto::voice::talk_with_agent_enabled(&prefs))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -7031,6 +7241,21 @@ mod tests {
     mod reconnect_tests;
     #[cfg(unix)]
     mod send_key_tests;
+
+    #[test]
+    fn cursor_badges_name_the_agent_once() {
+        assert_eq!(cursor_badge("Codex", "fix login"), "Codex · fix login");
+        assert_eq!(
+            cursor_badge("Codex", "Codex · calculator"),
+            "Codex · calculator"
+        );
+        assert_eq!(
+            cursor_badge("Claude Code", "Claude · settings"),
+            "Claude · settings"
+        );
+        assert_eq!(cursor_badge("Claude Code", "claude code"), "claude code");
+        assert_eq!(cursor_badge("Gemini", "  "), "Gemini");
+    }
 
     #[test]
     fn an_over_budget_session_list_drops_only_pull_request_detail() {

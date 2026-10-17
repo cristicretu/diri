@@ -75,6 +75,11 @@ impl Method {
     /// (`SessionOpenApiRequestParams`); the Engine re-publishes it as the
     /// `session.api_request` event. Nothing is sent by the Engine.
     pub const SESSION_OPEN_API_REQUEST: &'static str = "session.open_api_request";
+    pub const COMPUTER_ACT: &'static str = "computer.act";
+    /// Whether Cua Driver is installed and allowed (`ComputerStatusParams`).
+    pub const COMPUTER_STATUS: &'static str = "computer.status";
+    /// Install it or restart it (`ComputerSetupParams`); answers a status.
+    pub const COMPUTER_SETUP: &'static str = "computer.setup";
     pub const SESSION_MIGRATE: &'static str = "session.migrate";
     pub const SESSION_REPARENT_WORKTREE: &'static str = "session.reparent_worktree";
     pub const HOST_SYNC_PREFS: &'static str = "host.sync_prefs";
@@ -114,6 +119,11 @@ impl Method {
     pub const EVENTS_SUBSCRIBE: &'static str = "events.subscribe";
     pub const EVENTS_WAIT: &'static str = "events.wait";
     pub const HOOK_REPORT: &'static str = "hook.report";
+    /// "Talk with your agent": whether it is on, an Agent's spoken summary
+    /// of its turn (Diri's `speak` tool), and the reader collecting it.
+    pub const VOICE_STATE: &'static str = "voice.state";
+    pub const VOICE_SPEAK: &'static str = "voice.speak";
+    pub const VOICE_SPOKEN: &'static str = "voice.spoken";
     pub const TEST_RUN: &'static str = "test.run";
     pub const STATE_SNAPSHOT: &'static str = "state.snapshot";
     pub const DAEMON_PREPARE_SHUTDOWN: &'static str = "daemon.prepare_shutdown";
@@ -147,6 +157,9 @@ impl EventName {
     /// (`SessionOpenApiRequestParams`). The app prefills the tab; it sends
     /// only a `GET` marked `autoSend`, anything else waits for Send.
     pub const SESSION_API_REQUEST: &'static str = "session.api_request";
+    /// An Agent called `computer` before setup was finished
+    /// (`ComputerSetupNeededEvent`). The app offers to finish it.
+    pub const COMPUTER_SETUP_NEEDED: &'static str = "computer.setup_needed";
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]

@@ -30,6 +30,8 @@ pub enum ToastTone {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ToastCommand {
     OpenPrivacySettings,
+    /// Settings › Agents, where computer use is set up.
+    OpenComputerSetup,
     RetryConnection,
     RetryAction,
     CopyDetails(String),

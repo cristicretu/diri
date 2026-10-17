@@ -1,6 +1,6 @@
 //! HTTPS via `curl`, plus the URL checks the feed's contents have to pass.
 //!
-//! Shelling out to `/usr/bin/curl` instead of linking an HTTP stack is a
+//! Shelling out to the system `curl` instead of linking an HTTP stack is a
 //! deliberate trade: it keeps a TLS + async-runtime dependency tree out of a
 //! GPUI app that already takes minutes to build, and macOS ships curl on every
 //! machine diri supports. Two requests per update cycle is not a workload that
@@ -15,19 +15,6 @@ use std::time::Duration;
 use crate::error::{NetworkFailure, Result, UpdateError};
 use sha2::{Digest, Sha256};
 
-fn curl_path() -> std::path::PathBuf {
-    #[cfg(windows)]
-    {
-        std::path::PathBuf::from(
-            std::env::var_os("SystemRoot").unwrap_or_else(|| "C:\\Windows".into()),
-        )
-        .join("System32/curl.exe")
-    }
-    #[cfg(not(windows))]
-    {
-        "/usr/bin/curl".into()
-    }
-}
 const FEED_TIMEOUT_SECONDS: u32 = 20;
 const DOWNLOAD_TIMEOUT_SECONDS: u32 = 900;
 /// Where GitHub is blocked the TCP handshake usually just hangs; ten seconds
@@ -219,7 +206,7 @@ impl Http {
     }
 
     fn curl(&self) -> Command {
-        let mut command = Command::new(curl_path());
+        let mut command = Command::new(diri_platform::curl_executable());
         // -K - keeps the URL and (more importantly) the credentials out of the
         // process arguments, where any user on the machine could read them.
         command.arg("-K").arg("-");

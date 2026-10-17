@@ -1,0 +1,8 @@
+{
+  "git+https://github.com/proptest-rs/proptest?rev=3dca198a8fef1b32e3a66f1e1897c955b4dc5b5b#3dca198a8fef1b32e3a66f1e1897c955b4dc5b5b": "sha256-p5NTcHhruI8QQvANACg8AMRVNmuvGxs2NLit+/8PaWo=",
+  "git+https://github.com/rust-x-bindings/rust-xcb.git?rev=ae3b2cd080e78173223038ccbebdc644eaf4a9ad#ae3b2cd080e78173223038ccbebdc644eaf4a9ad": "sha256-AbgVQoB2vf0La+cQcQa52N03xiIF9sGhyCvXNoml228=",
+  "git+https://github.com/zed-industries/font-kit?rev=94b0f28166665e8fd2f53ff6d268a14955c82269#94b0f28166665e8fd2f53ff6d268a14955c82269": "sha256-KXygi0olNQi5yM8eaJVykNDtbPMDjT+cWPBF8UrtXR4=",
+  "git+https://github.com/zed-industries/scap?rev=4afea48c3b002197176fb19cd0f9b180dd36eaac#4afea48c3b002197176fb19cd0f9b180dd36eaac": "sha256-BihiQHlal/eRsktyf0GI3aSWsUCW7WcICMsC2Xvb7kw=",
+  "git+https://github.com/zed-industries/xim-rs.git?rev=16f35a2c881b815a2b6cdfd6687988e84f8447d8#16f35a2c881b815a2b6cdfd6687988e84f8447d8": "sha256-pRT4Sz1JU9ros47/7pmIW9kosWOGMOItcnNd+VrvnpE=",
+  "git+https://github.com/zed-industries/zed.git?rev=dc2a339d5d043da448a3f7ddc7c0a85c63864aad#dc2a339d5d043da448a3f7ddc7c0a85c63864aad": "sha256-VVtji9JmITIvuq2S05VH3Nh4FrnVJ/t2+RPgVlhq9f4="
+}

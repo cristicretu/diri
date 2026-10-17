@@ -535,6 +535,8 @@
   "terminal.path_copied": "已拷贝路径",
   "terminal.preparing": "正在准备终端…",
   "terminal.prompt.none": "该方向没有 shell 提示符（需要 OSC 133 标记）",
+  "terminal.read_aloud.start": "朗读此标签页",
+  "terminal.read_aloud.stop": "停止朗读此标签页",
   "terminal.reconnect.connecting": "正在连接…",
   "terminal.reconnect.input_dropped": "排队的输入已被丢弃，可能没有送达",
   "terminal.reconnect.lost_last": "连接已断开 · 显示最后收到的画面",

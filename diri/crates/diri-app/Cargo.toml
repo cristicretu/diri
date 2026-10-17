@@ -1,6 +1,6 @@
 [package]
 name = "diri-app"
-version = "0.9.7"
+version = "0.10.0"
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
@@ -18,6 +18,11 @@ harness = false
 [[test]]
 name = "find_native_appkit"
 path = "tests/find_native_appkit.rs"
+harness = false
+
+[[test]]
+name = "permission_guide_appkit"
+path = "tests/permission_guide_appkit.rs"
 harness = false
 
 [features]
@@ -93,6 +98,9 @@ objc2-app-kit = { version = "=0.3.2", default-features = false, features = [
     "NSAppearance",
     "NSApplication",
     "NSDockTile",
+    "NSDragging",
+    "NSDraggingItem",
+    "NSDraggingSession",
     "NSAttributedString",
     "NSBezierPath",
     "NSBitmapImageRep",
@@ -118,6 +126,7 @@ objc2-app-kit = { version = "=0.3.2", default-features = false, features = [
     "NSMenu",
     "NSMenuItem",
     "NSPanel",
+    "NSPasteboard",
     "NSParagraphStyle",
     "NSResponder",
     "NSRunningApplication",

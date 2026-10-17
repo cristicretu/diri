@@ -106,3 +106,25 @@ Changes made: each Ghostty theme was reduced to diri's colors (background,
 foreground, cursor, selection, 16 ANSI colors), diri's selection and find
 overlays were derived from it, and ten themes whose default text is below
 3:1 contrast were left out.
+
+ONNX Runtime (https://github.com/microsoft/onnxruntime)
+-------------------------------------------------------
+Copyright (c) Microsoft Corporation. Licensed under the MIT License.
+Not bundled: when a Kokoro voice is chosen on Apple silicon, Diri downloads
+Microsoft's unmodified libonnxruntime.1.31.0.dylib, signed with Diri's
+Developer ID and pinned by SHA-256, to run the voice. Its license and
+third-party notices ship in Contents/Resources/licenses/ONNXRuntime-MIT.txt
+and ONNXRuntime-ThirdPartyNotices.txt.
+
+Kokoro-82M (https://huggingface.co/hexgrad/Kokoro-82M)
+------------------------------------------------------
+Model weights licensed under the Apache License, Version 2.0. Not bundled:
+Diri downloads the ONNX export (onnx-community/Kokoro-82M-v1.0-ONNX), pinned
+by revision and SHA-256, when a Kokoro voice is chosen.
+
+misaki (https://github.com/hexgrad/misaki)
+------------------------------------------
+Licensed under the Apache License, Version 2.0.
+diri/native/diri-voice/EnglishG2P.swift is ADAPTED from misaki's English G2P
+(misaki/en.py). Its pronunciation lexicons are not bundled: Diri downloads
+them, pinned by commit and SHA-256, with the Kokoro model.

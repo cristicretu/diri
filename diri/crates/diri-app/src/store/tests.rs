@@ -4309,3 +4309,43 @@ mod split_panes {
         assert_ne!(store.selected_session_id(), Some(&id("shown")));
     }
 }
+
+#[test]
+fn muting_a_chat_also_stops_it_being_read_aloud() {
+    let record = session("talky", "p", 1.0);
+    let prefs = Prefs {
+        talk_with_agent: true,
+        ..Prefs::default()
+    };
+    let (mut store, _effects) = hydrated(vec![record.clone()], vec![project("p", "P")], prefs);
+    assert!(store.reads_aloud(&record.id));
+    store.toggle_notification_mute(record.id.clone());
+    assert!(!store.reads_aloud(&record.id));
+    store.toggle_notification_mute(record.id.clone());
+    assert!(store.reads_aloud(&record.id));
+}
+
+#[test]
+fn read_aloud_can_pick_one_tab_or_all_but_one() {
+    use super::ReadAloudChoice;
+    let (a, b) = (session("talk-a", "p", 1.0), session("talk-b", "p", 2.0));
+    let (mut store, _effects) = hydrated(
+        vec![a.clone(), b.clone()],
+        vec![project("p", "P")],
+        Prefs::default(),
+    );
+    // Picking tabs turns the setting on.
+    store.set_read_aloud(a.id.clone(), ReadAloudChoice::Only);
+    assert!(store.reads_aloud(&a.id));
+    assert!(!store.reads_aloud(&b.id));
+    // A tab opened later follows the default: not read.
+    assert!(!store.tab_reads_aloud(&SessionId("later".into())));
+    store.set_read_aloud(b.id.clone(), ReadAloudChoice::Toggle);
+    assert!(store.reads_aloud(&b.id));
+    store.set_read_aloud(a.id.clone(), ReadAloudChoice::AllExcept);
+    assert!(!store.reads_aloud(&a.id));
+    assert!(store.reads_aloud(&b.id));
+    assert!(store.tab_reads_aloud(&SessionId("later".into())));
+    store.set_read_aloud(a.id.clone(), ReadAloudChoice::All);
+    assert!(store.reads_aloud(&a.id) && store.reads_aloud(&b.id));
+}
