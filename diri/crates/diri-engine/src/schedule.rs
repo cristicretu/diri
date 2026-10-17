@@ -297,12 +297,68 @@ mod local {
         (secs != -1).then_some(secs as i64)
     }
 
-    #[cfg(not(unix))]
+    /// The C runtime's `struct tm`, which is the same nine ints on Windows.
+    #[cfg(windows)]
+    #[repr(C)]
+    #[derive(Default)]
+    struct CrtTm {
+        tm_sec: i32,
+        tm_min: i32,
+        tm_hour: i32,
+        tm_mday: i32,
+        tm_mon: i32,
+        tm_year: i32,
+        tm_wday: i32,
+        tm_yday: i32,
+        tm_isdst: i32,
+    }
+
+    #[cfg(windows)]
+    unsafe extern "C" {
+        fn _localtime64_s(tm: *mut CrtTm, time: *const i64) -> i32;
+        fn _mktime64(tm: *mut CrtTm) -> i64;
+    }
+
+    #[cfg(windows)]
+    pub fn break_down(secs: i64) -> Option<Tm> {
+        let mut tm = CrtTm::default();
+        // SAFETY: both pointers are live for the call, which only writes `tm`.
+        if unsafe { _localtime64_s(&mut tm, &secs) } != 0 {
+            return None;
+        }
+        Some(Tm {
+            year: tm.tm_year + 1900,
+            month: (tm.tm_mon + 1) as u32,
+            mday: tm.tm_mday as u32,
+            wday: tm.tm_wday as u32,
+            hour: tm.tm_hour as u32,
+            minute: tm.tm_min as u32,
+        })
+    }
+
+    /// Local wall time to epoch seconds; out-of-range fields roll over.
+    #[cfg(windows)]
+    pub fn compose(year: i32, month: u32, mday: u32, hour: u32, minute: u32) -> Option<i64> {
+        let mut tm = CrtTm {
+            tm_year: year - 1900,
+            tm_mon: month as i32 - 1,
+            tm_mday: mday as i32,
+            tm_hour: hour as i32,
+            tm_min: minute as i32,
+            tm_isdst: -1,
+            ..CrtTm::default()
+        };
+        // SAFETY: `tm` is initialized; mktime only normalizes it in place.
+        let secs = unsafe { _mktime64(&mut tm) };
+        (secs != -1).then_some(secs)
+    }
+
+    #[cfg(not(any(unix, windows)))]
     pub fn break_down(_secs: i64) -> Option<Tm> {
         None
     }
 
-    #[cfg(not(unix))]
+    #[cfg(not(any(unix, windows)))]
     pub fn compose(_: i32, _: u32, _: u32, _: u32, _: u32) -> Option<i64> {
         None
     }
@@ -356,6 +412,7 @@ mod tests {
         assert!(Cron::parse("1/4294967295 * * * *").is_ok());
     }
 
+    #[cfg(unix)]
     #[test]
     fn dst_fold_and_gap_in_an_isolated_timezone() {
         if std::env::var_os("DIRI_CRON_DST_CHILD").is_none() {

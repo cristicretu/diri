@@ -377,6 +377,7 @@ mod tests {
         assert_eq!(read_frame(&mut reader).unwrap(), "{}\n");
     }
 
+    #[cfg(unix)]
     #[test]
     fn power_commands_can_be_replaced_without_global_environment() {
         let config = PowerConfig {
@@ -453,6 +454,7 @@ mod tests {
         assert_ne!(owner_tag(501), owner_tag(502));
     }
 
+    #[cfg(unix)]
     #[test]
     fn a_missing_helper_fails_fast_with_a_readable_error() {
         let error = call_at("/nonexistent/diri-wake.sock", &Request::Status).unwrap_err();

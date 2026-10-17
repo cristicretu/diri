@@ -785,9 +785,9 @@ mod tests {
             injected.argv,
             [
                 "-c".to_owned(),
-                format!("notify=[\"{cli_text}\", \"notify\"]"),
+                format!("notify=[{}, \"notify\"]", toml_string(&cli_text)),
                 "-c".to_owned(),
-                format!("mcp_servers.dirijor.command=\"{cli_text}\""),
+                format!("mcp_servers.dirijor.command={}", toml_string(&cli_text)),
                 "-c".to_owned(),
                 "mcp_servers.dirijor.args=[\"mcp-stdio\"]".to_owned(),
             ]

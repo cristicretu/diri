@@ -4464,7 +4464,11 @@ mod tests {
         registry.insert_record(stale);
         registry.persist_now().unwrap();
 
-        let sessions = temp.path().join(".codex/sessions/2026/10/07");
+        let sessions = temp.path().join(
+            [".codex", "sessions", "2026", "10", "07"]
+                .iter()
+                .collect::<std::path::PathBuf>(),
+        );
         std::fs::create_dir_all(&sessions).expect("mkdir");
         let rollout = sessions.join("rollout-now-thread-l.jsonl");
         std::fs::write(
@@ -4495,9 +4499,18 @@ mod tests {
     #[test]
     fn first_codex_notify_associates_the_matching_live_rollout() {
         let temp = tempfile::tempdir().expect("temp");
-        let transcript = temp
-            .path()
-            .join(".codex/sessions/2026/08/13/rollout-now-thread-9.jsonl");
+        let transcript = temp.path().join(
+            [
+                ".codex",
+                "sessions",
+                "2026",
+                "08",
+                "13",
+                "rollout-now-thread-9.jsonl",
+            ]
+            .iter()
+            .collect::<std::path::PathBuf>(),
+        );
         std::fs::create_dir_all(transcript.parent().expect("parent")).expect("mkdir");
         std::fs::write(
             &transcript,
@@ -4528,9 +4541,18 @@ mod tests {
     #[test]
     fn codex_native_titles_promote_and_follow_rename() {
         let temp = tempfile::tempdir().expect("temp");
-        let transcript = temp
-            .path()
-            .join(".codex/sessions/2026/08/13/rollout-now-thread-9.jsonl");
+        let transcript = temp.path().join(
+            [
+                ".codex",
+                "sessions",
+                "2026",
+                "08",
+                "13",
+                "rollout-now-thread-9.jsonl",
+            ]
+            .iter()
+            .collect::<std::path::PathBuf>(),
+        );
         std::fs::create_dir_all(transcript.parent().expect("parent")).expect("mkdir");
         std::fs::write(
             &transcript,
