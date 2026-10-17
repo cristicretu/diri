@@ -408,14 +408,22 @@ impl HolderChildRecord {
 
     /// Owner-only and atomic; a torn record must never be read as a run.
     pub fn write(&self, path: &std::path::Path) -> std::io::Result<()> {
-        use std::os::unix::fs::OpenOptionsExt as _;
         let temp = path.with_extension(format!("child.{}", std::process::id()));
-        let mut file = std::fs::OpenOptions::new()
-            .write(true)
-            .create(true)
-            .truncate(true)
-            .mode(0o600)
-            .open(&temp)?;
+        #[cfg(unix)]
+        let mut file = {
+            use std::os::unix::fs::OpenOptionsExt as _;
+            std::fs::OpenOptions::new()
+                .write(true)
+                .create(true)
+                .truncate(true)
+                .mode(0o600)
+                .open(&temp)?
+        };
+        #[cfg(not(unix))]
+        let mut file = {
+            let _ = std::fs::remove_file(&temp);
+            diri_platform::security::create_private(&temp)?
+        };
         let result = serde_json::to_writer(&mut file, self)
             .map_err(std::io::Error::other)
             .and_then(|()| file.sync_all())
@@ -428,17 +436,21 @@ impl HolderChildRecord {
 
     pub fn read(path: &std::path::Path) -> std::io::Result<Self> {
         use std::io::Read as _;
-        use std::os::unix::fs::{MetadataExt as _, OpenOptionsExt as _};
-        let file = std::fs::OpenOptions::new()
-            .read(true)
-            .custom_flags(libc::O_NOFOLLOW)
-            .open(path)?;
+        #[cfg(unix)]
+        let (file, owned) = {
+            use std::os::unix::fs::{MetadataExt as _, OpenOptionsExt as _};
+            let file = std::fs::OpenOptions::new()
+                .read(true)
+                .custom_flags(libc::O_NOFOLLOW)
+                .open(path)?;
+            // SAFETY: geteuid has no preconditions.
+            let owned = file.metadata()?.uid() == unsafe { libc::geteuid() };
+            (file, owned)
+        };
+        #[cfg(not(unix))]
+        let (file, owned) = (diri_platform::security::read_owned(path, false)?, true);
         let metadata = file.metadata()?;
-        // SAFETY: geteuid has no preconditions.
-        if !metadata.is_file()
-            || metadata.uid() != unsafe { libc::geteuid() }
-            || metadata.len() > Self::MAX_BYTES
-        {
+        if !metadata.is_file() || !owned || metadata.len() > Self::MAX_BYTES {
             return Err(std::io::Error::other(
                 "child record is not a private regular file",
             ));

@@ -1,5 +1,6 @@
 //! Headless application state and the thin asynchronous daemon adapter.
 
+mod computer;
 mod herdr;
 mod prefs;
 mod projection;
@@ -194,6 +195,10 @@ pub enum StoreEffect {
     ImportHerdr(Vec<herdr::ImportStep>),
     /// Resume every session a restart ended, a few at a time.
     ResumeAll(Vec<SessionId>),
+    /// Poll computer use setup while Settings or a permission guide shows it.
+    WatchComputer,
+    /// Install Cua Driver, or restart it.
+    ComputerSetup(diri_proto::ComputerSetupAction),
     /// Rescan this Mac until the Agent the user is installing appears.
     WatchAgentInstall {
         kind: AgentKind,
@@ -493,6 +498,7 @@ pub struct SessionStore {
     /// The Agent whose installer the user started from Diri. While set, the
     /// runtime rescans this Mac so setup surfaces flip to ready unprompted.
     agent_install: Option<AgentKind>,
+    computer: computer::ComputerSetupState,
     herdr: herdr::HerdrState,
     /// Attention states serving out their settle window, newest arming wins.
     /// Drained by the settle task in `StoreHandle`, which is what turns one of
@@ -597,6 +603,7 @@ impl SessionStore {
                 agent_catalog_scans: HashMap::new(),
                 agent_catalog_errors: HashMap::new(),
                 agent_install: None,
+                computer: computer::ComputerSetupState::default(),
                 herdr: herdr::HerdrState::default(),
                 notification_feed,
                 attention_wake: Arc::new(Notify::new()),
@@ -1864,6 +1871,14 @@ impl SessionStore {
                     serde_json::from_value::<diri_proto::SessionOpenApiRequestParams>(event.params)
                 {
                     self.accept_api_request(params);
+                }
+                return StoreEventChange::None;
+            }
+            EventName::COMPUTER_SETUP_NEEDED => {
+                if let Ok(event) =
+                    serde_json::from_value::<diri_proto::ComputerSetupNeededEvent>(event.params)
+                {
+                    self.computer_setup_needed(event);
                 }
                 return StoreEventChange::None;
             }
@@ -4400,6 +4415,23 @@ async fn run_effects(
                 ));
                 Ok(())
             }
+            StoreEffect::WatchComputer => {
+                tokio::spawn(computer::watch(
+                    Arc::clone(&client),
+                    Arc::clone(&store),
+                    change_tx.clone(),
+                ));
+                Ok(())
+            }
+            StoreEffect::ComputerSetup(action) => {
+                tokio::spawn(computer::setup(
+                    action,
+                    Arc::clone(&client),
+                    Arc::clone(&store),
+                    change_tx.clone(),
+                ));
+                Ok(())
+            }
             StoreEffect::WatchAgentInstall { kind, display_name } => {
                 let client = Arc::clone(&client);
                 let store = Arc::clone(&store);
@@ -4580,6 +4612,8 @@ fn action_context(effect: &StoreEffect) -> Option<ActionContext> {
         | StoreEffect::RefreshAgents { .. }
         | StoreEffect::ConfigureAgent(_)
         | StoreEffect::WatchAgentInstall { .. } => return None,
+        // Setup outcomes render in place in Settings › Agents.
+        StoreEffect::WatchComputer | StoreEffect::ComputerSetup(_) => return None,
         // Import outcomes, failures included, arrive as one summary banner.
         StoreEffect::ScanHerdr { .. } | StoreEffect::ImportHerdr(_) => return None,
         // So does a "Resume all" batch.

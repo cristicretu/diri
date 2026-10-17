@@ -105,7 +105,7 @@ fn run(spec: HolderLaunchSpec) -> io::Result<()> {
         .spawn(move || {
             for client in listener.incoming().flatten() {
                 if active_workers
-                    .fetch_update(Ordering::AcqRel, Ordering::Acquire, |n| {
+                    .try_update(Ordering::AcqRel, Ordering::Acquire, |n| {
                         (n < 32).then_some(n + 1)
                     })
                     .is_err()

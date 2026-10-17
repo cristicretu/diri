@@ -1071,6 +1071,7 @@ mod tests {
         }
     }
 
+    #[cfg(unix)]
     #[test]
     fn inline_image_reads_are_sent_only_after_the_holder_negotiated_them() {
         use crate::remote::{

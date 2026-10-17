@@ -364,6 +364,7 @@ mod tests {
         path.to_string_lossy().into_owned()
     }
 
+    #[cfg(unix)]
     fn descriptor(binary: Option<String>, injection: InjectionSpec) -> AgentDescriptor {
         AgentDescriptor {
             binary,

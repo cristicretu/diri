@@ -331,7 +331,7 @@ impl Player for PlatformPlayer {
         use windows::Win32::Media::Audio::{PlaySoundW, SND_MEMORY, SND_NODEFAULT, SND_SYNC};
         let mut wav = wav.to_vec();
         // Scale our own PCM instead of changing the user's system volume.
-        for sample in wav[44..].chunks_exact_mut(2) {
+        for sample in wav[44..].as_chunks_mut::<2>().0 {
             let value = (f32::from(i16::from_le_bytes([sample[0], sample[1]]))
                 * volume.clamp(0.0, 1.0)) as i16;
             sample.copy_from_slice(&value.to_le_bytes());

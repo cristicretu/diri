@@ -112,6 +112,52 @@ sudo apt install build-essential clang cmake libasound2-dev libfontconfig-dev \
 Creating distribution artifacts additionally needs Node.js 20 or newer and
 `cargo-packager` 0.11.8, then `diri/scripts/package-linux.sh`.
 
+## Nix
+
+The repository's flake builds Diri from source for x86_64 Linux. It is not
+part of the CI-tested matrix. Run it without installing:
+
+```sh
+nix run github:cristicretu/diri
+```
+
+The package's graphics libraries come from nixpkgs, so outside NixOS they
+cannot load the host's GPU drivers and the window fails to open. On other
+distributions, run it through [nixGL](https://github.com/nix-community/nixGL):
+
+```sh
+nix run --impure github:nix-community/nixGL -- nix run github:cristicretu/diri
+```
+
+nixGL works by setting `LD_LIBRARY_PATH`, which the terminals Diri starts
+inherit.
+
+The first build clones Zed's full Git history (about 1.6 GB) for the pinned
+GPUI revision; later builds reuse Nix's Git cache. On NixOS, add the overlay and install
+`pkgs.diri`:
+
+```nix
+{
+  inputs.diri.url = "github:cristicretu/diri";
+
+  outputs = { nixpkgs, diri, ... }: {
+    nixosConfigurations.my-host = nixpkgs.lib.nixosSystem {
+      system = "x86_64-linux";
+      modules = [
+        { nixpkgs.overlays = [ diri.overlays.default ]; }
+        ({ pkgs, ... }: { environment.systemPackages = [ pkgs.diri ]; })
+      ];
+    };
+  };
+}
+```
+
+The package contains the same commands as the Debian package, but not the
+browser sidecar, so the browser tool reports itself unavailable. For
+development, `nix develop` provides Rust, Clippy, rustfmt and the native
+libraries, with the Rust version pinned in `rust-toolchain.toml`; then run
+`cargo` from `diri/` as usual.
+
 ## User files
 
 Diri follows the XDG base-directory specification. The defaults are:

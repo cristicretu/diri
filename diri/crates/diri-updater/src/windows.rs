@@ -122,9 +122,18 @@ pub fn running_config(current: &str) -> Result<UpdaterConfig> {
     } else {
         "x64"
     };
+    let feed_url = std::env::var(crate::FEED_URL_ENV).unwrap_or_else(|_| format!("https://github.com/cristicretu/diri/releases/latest/download/appcast-windows-{architecture}.json"));
     Ok(UpdaterConfig {
-        feed_url: std::env::var(crate::FEED_URL_ENV).unwrap_or_else(|_| format!("https://github.com/cristicretu/diri/releases/latest/download/appcast-windows-{architecture}.json")),
-        current_version, bundle: executable, cache_dir: root.join("updates"), installed_signature: signature,
+        // No Windows nightly feed or mirror is published yet; the macOS ones
+        // name macOS archives, so both channels read the Windows feed.
+        nightly_feed_url: feed_url.clone(),
+        feed_url,
+        releases_host: crate::RELEASES_HOST.to_owned(),
+        mirror: None,
+        current_version,
+        bundle: executable,
+        cache_dir: root.join("updates"),
+        installed_signature: signature,
     })
 }
 fn install_root(executable: &Path) -> Result<PathBuf> {

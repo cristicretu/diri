@@ -517,6 +517,7 @@ struct ForegroundProgram {
 
 /// An Agent recognised in a shell's foreground.
 #[derive(Clone, Copy)]
+#[cfg_attr(not(unix), allow(dead_code))]
 enum ForegroundAgent {
     /// One with a launch manifest, by its index in `known_agents`.
     Manifest(usize),
@@ -525,6 +526,7 @@ enum ForegroundAgent {
 }
 
 /// How a shell's status is read while an Agent holds its foreground.
+#[cfg_attr(not(unix), allow(dead_code))]
 enum Lend<'a> {
     Screen(&'a KnownAgent),
     Activity(&'static str),
@@ -534,6 +536,7 @@ enum Lend<'a> {
 /// manifest's own binary first, then the recognition catalog, whose entries
 /// that share a manifest's id are read with that manifest. The npm package is
 /// read only for a short name that needs one.
+#[cfg(unix)]
 fn recognize_agent(known: &[KnownAgent], name: &str, group: i32) -> Option<ForegroundAgent> {
     if let Some(index) = known.iter().position(|agent| agent.binary == name) {
         return Some(ForegroundAgent::Manifest(index));
@@ -553,6 +556,7 @@ fn recognize_agent(known: &[KnownAgent], name: &str, group: i32) -> Option<Foreg
 
 /// An Agent a shell can recognise in its foreground.
 struct KnownAgent {
+    #[cfg(unix)]
     binary: String,
     manifest_id: String,
     manifest_version: String,
@@ -3580,7 +3584,10 @@ fn known_agents(engine: &ManifestEngine) -> Vec<KnownAgent> {
         .filter(|manifest| !matches!(manifest.id.as_str(), "shell" | "generic"))
         .filter_map(|manifest| {
             let binary = manifest.agent.as_ref()?.binary.clone()?;
+            #[cfg(not(unix))]
+            let _ = binary;
             Some(KnownAgent {
+                #[cfg(unix)]
                 binary,
                 manifest_id: manifest.id.clone(),
                 manifest_version: manifest.version.clone(),
@@ -6235,7 +6242,8 @@ fn interrupted_exit(shared: &Shared, exit: Option<Exit>) -> bool {
 }
 
 fn is_outside_kill(exit: Option<Exit>) -> bool {
-    const KILLS: [i32; 3] = [libc::SIGHUP, libc::SIGKILL, libc::SIGTERM];
+    use diri_platform::signals::{SIGHUP, SIGKILL, SIGTERM};
+    const KILLS: [i32; 3] = [SIGHUP, SIGKILL, SIGTERM];
     match exit {
         None => true,
         Some(Exit::Signal(signal)) => KILLS.contains(&signal),
@@ -6243,7 +6251,7 @@ fn is_outside_kill(exit: Option<Exit>) -> bool {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 mod outside_kill_tests {
     use super::{Exit, is_outside_kill};
 
@@ -8425,6 +8433,7 @@ mod foreground_program_tests {
         let _ = session.terminate(Duration::from_secs(2));
     }
 
+    #[cfg(unix)]
     /// An Agent with no launch manifest, typed at the prompt, is recognised
     /// by name from the catalog and its status follows its output.
     #[test]

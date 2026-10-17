@@ -11,9 +11,13 @@
 //! Wire: one JSON request line, one JSON response line, per connection.
 
 use serde::{Deserialize, Serialize};
+#[cfg(unix)]
 use std::io::{Read, Write};
+#[cfg(unix)]
 use std::os::fd::AsRawFd;
+#[cfg(unix)]
 use std::os::unix::net::UnixStream;
+#[cfg(unix)]
 use std::time::Duration;
 
 /// Per-Engine power endpoints. Tests use a private socket and a harmless
@@ -151,6 +155,7 @@ pub fn reconcile(existing: &[i64], desired: &[i64]) -> (Vec<i64>, Vec<i64>) {
 }
 
 /// A bounded newline frame with an absolute deadline, including slow senders.
+#[cfg(unix)]
 pub fn read_frame(stream: &mut UnixStream) -> Result<String, String> {
     let deadline = std::time::Instant::now() + Duration::from_secs(5);
     let mut bytes = Vec::new();
@@ -267,6 +272,12 @@ pub fn call(request: &Request) -> Result<Response, String> {
     call_at(SOCKET_PATH, request)
 }
 
+#[cfg(not(unix))]
+pub fn call_at(_path: impl AsRef<std::path::Path>, _request: &Request) -> Result<Response, String> {
+    Err("waking the computer for a scheduled run isn't supported on this platform".to_owned())
+}
+
+#[cfg(unix)]
 pub fn call_at(path: impl AsRef<std::path::Path>, request: &Request) -> Result<Response, String> {
     // A full launchd backlog must not hang the scheduler indefinitely.
     let connect = || -> std::io::Result<UnixStream> {
@@ -349,6 +360,7 @@ mod tests {
         assert!(validate_replacement(&[NOW - 10_000], &[NOW - 10_000], NOW).is_err());
     }
 
+    #[cfg(unix)]
     #[test]
     fn frame_requires_newline_and_rejects_oversized_input() {
         for bytes in [b"{}".to_vec(), vec![b'x'; MAX_REQUEST_BYTES + 1]] {
@@ -365,6 +377,7 @@ mod tests {
         assert_eq!(read_frame(&mut reader).unwrap(), "{}\n");
     }
 
+    #[cfg(unix)]
     #[test]
     fn power_commands_can_be_replaced_without_global_environment() {
         let config = PowerConfig {
@@ -441,6 +454,7 @@ mod tests {
         assert_ne!(owner_tag(501), owner_tag(502));
     }
 
+    #[cfg(unix)]
     #[test]
     fn a_missing_helper_fails_fast_with_a_readable_error() {
         let error = call_at("/nonexistent/diri-wake.sock", &Request::Status).unwrap_err();

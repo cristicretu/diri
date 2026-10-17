@@ -1852,6 +1852,16 @@ impl RootView {
                     });
                 }
             }
+            ToastCommand::OpenComputerSetup => {
+                self.toast.dismiss();
+                if let Some(surfaces) = &self.utility_surfaces {
+                    surfaces.update(cx, |surfaces, cx| {
+                        surfaces.open_settings(cx);
+                        surfaces.open_settings_tab(crate::settings::SettingsTab::Agents, cx);
+                        surfaces.focus_handle(cx).focus(window, cx);
+                    });
+                }
+            }
             ToastCommand::RetryConnection => {
                 self.window_store
                     .write()

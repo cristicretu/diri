@@ -1976,6 +1976,7 @@ mod tests {
             .collect()
     }
 
+    #[cfg(unix)]
     fn failing_ssh_manager(script: &str, askpass: bool) -> (tempfile::TempDir, RemoteManager) {
         let temporary = tempfile::tempdir().expect("temp");
         let fake_ssh = temporary.path().join("ssh");
@@ -2025,6 +2026,7 @@ mod tests {
         (temporary, manager)
     }
 
+    #[cfg(unix)]
     fn fixture_host() -> HostEntry {
         HostEntry {
             id: "hogwarts".into(),
@@ -2036,6 +2038,7 @@ mod tests {
         }
     }
 
+    #[cfg(unix)]
     #[test]
     fn openssh_setup_failures_surface_as_classified_errors() {
         use super::super::ssh_error::{SshFailure, SshFailureClass};
@@ -2073,6 +2076,7 @@ mod tests {
         }
     }
 
+    #[cfg(unix)]
     #[test]
     fn interactive_probe_uses_ssh_config_and_the_askpass_broker() {
         use super::super::ssh_error::{SshFailure, SshFailureClass};
@@ -2105,6 +2109,7 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
     #[test]
     fn an_exiting_control_master_is_retried_once_on_a_fresh_connection() {
         use super::super::ssh_error::{SshFailure, SshFailureClass};

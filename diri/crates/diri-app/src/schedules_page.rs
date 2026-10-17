@@ -809,7 +809,12 @@ mod local {
         // SAFETY: `localtime_r` writes only to the provided, zeroed `tm`.
         let tm = unsafe {
             let mut tm = std::mem::zeroed::<libc::tm>();
+            #[cfg(unix)]
             if libc::localtime_r(&time, &mut tm).is_null() {
+                return None;
+            }
+            #[cfg(windows)]
+            if libc::localtime_s(&mut tm, &time) != 0 {
                 return None;
             }
             tm
@@ -834,7 +839,16 @@ mod local {
             tm.tm_hour = hour;
             tm.tm_min = minute;
             tm.tm_isdst = -1;
-            libc::mktime(&mut tm)
+            #[cfg(unix)]
+            let secs = libc::mktime(&mut tm);
+            #[cfg(windows)]
+            let secs = {
+                unsafe extern "C" {
+                    fn _mktime64(tm: *mut libc::tm) -> i64;
+                }
+                _mktime64(&mut tm)
+            };
+            secs
         };
         (secs != -1).then_some(secs as f64 * 1000.0)
     }

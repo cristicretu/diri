@@ -354,6 +354,7 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
     #[test]
     fn launch_args_persist_per_target_and_reject_unsafe_values() {
         let temp = tempfile::tempdir().expect("temp");

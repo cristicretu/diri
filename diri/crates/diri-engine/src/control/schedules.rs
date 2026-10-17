@@ -1218,6 +1218,6 @@ mod tests {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 #[path = "schedules_wake_tests.rs"]
 mod wake_tests;

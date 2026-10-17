@@ -173,6 +173,10 @@ impl Pty {
     pub fn secret_input(&self) -> bool {
         false
     }
+    /// ConPTY has no pixel geometry, so only the cell size applies.
+    pub fn resize_with_pixels(&self, cols: u16, rows: u16, _pixels: (u16, u16)) -> io::Result<()> {
+        self.resize(cols, rows)
+    }
     pub fn resize(&self, cols: u16, rows: u16) -> io::Result<()> {
         hresult(unsafe {
             ResizePseudoConsole(
