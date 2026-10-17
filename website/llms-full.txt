@@ -1763,6 +1763,22 @@ Use this Mac's apps the way a person would, in the background: any native app (S
 | `tool` | string | **Required.** A computer tool, e.g. launch_app, list_windows, get_window_state, click, type_text, press_key, hotkey, scroll, run_steps; or "tools" for the list. |
 | `args` | object | That tool's arguments. Ask {"tool":"tools","args":{"name":"<tool>"}} for one tool's full arguments. |
 
+### `sidebar_browser`
+
+Test the web page the person opened in YOUR session's sidebar Browser in Diri (or open one there), straight through its web view: fast, exact, and visible to them as your labelled cursor on the page. Loop: state (or open {url}) -> snapshot returns an outline of the page with element refs (e1, e2, ...) -> act by ref: click {ref}, fill {ref, value}, press {key}, scroll {ref / dy} -> snapshot again to check the result before going on; refs from an older snapshot may be stale. console returns the page's console messages and uncaught errors; eval {script} runs JavaScript in the page; screenshot returns an image when the look matters; wait {text, ms} waits for text to appear. For other apps use computer.
+
+| Argument | Type | Notes |
+| --- | --- | --- |
+| `action` | `state`, `open`, `snapshot`, `click`, `fill`, `press`, `scroll`, `eval`, `console`, `screenshot`, `wait` | **Required.** |
+| `dy` | number | scroll: pixels down (negative scrolls up) when no ref is given. |
+| `key` | string | press: a key name (Enter, Tab, Escape, ArrowDown, a, ...). |
+| `ms` | number | wait: the most to wait, in milliseconds (default 5000). |
+| `ref` | string | An element ref from the latest snapshot, e.g. e12. |
+| `script` | string | eval: a JavaScript expression or function body; the result is returned as JSON. |
+| `text` | string | wait: until this text is on the page. |
+| `url` | string | open: http(s) URL; no scheme means http:// for localhost. |
+| `value` | string | fill: the text to put in the field. |
+
 ### `open_api_request`
 
 Open an HTTP request in the API tab of YOUR session's right panel in Diri, prefilled, so the person can inspect, edit and send it. Use it whenever you build, run or debug an HTTP API: after starting a dev server, open the endpoint you just added or changed (e.g. GET http://localhost:3000/api/health) instead of only pasting a curl command. Put {{name}} placeholders in url/headers/body and pass their values in variables (marking tokens in secrets so they are masked); they land in the project's environment (environment names it, default the active one or "Local"). json sets a JSON body and its Content-Type; body sends text as written. auto_send:true sends a GET immediately and shows the response; any other method is never sent until the person presses Send. The call returns once the tab is open, without the response.
