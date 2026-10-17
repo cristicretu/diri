@@ -74,6 +74,11 @@ struct LinkRow {
     site: String,
     section: Section,
     icon: IconName,
+    /// A PR's glyph wears its state's color, so open and merged differ at a
+    /// glance rather than only in the status word.
+    icon_tint: Option<gpui::Rgba>,
+    /// Merged or closed: listed after the open ones, in quieter ink.
+    settled: bool,
     status: Option<(String, gpui::Rgba)>,
     action: LinkAction,
     details: Option<String>,
@@ -86,21 +91,23 @@ fn pr_state(pr: &PullRequestStatus) -> &'static str {
         _ => "Open",
     }
 }
-fn pr_summary(pr: &PullRequestStatus) -> (String, gpui::Rgba) {
+/// GitHub's colors for a PR's state.
+fn pr_tone(pr: &PullRequestStatus) -> gpui::Rgba {
     match pr.state.as_str() {
-        "MERGED" => ("Merged".into(), rgba(0xaf7cf7ff)),
-        "CLOSED" => ("Closed".into(), Ink::DANGER),
-        _ => check_summary(pr).unwrap_or_else(|| {
-            (
-                pr_state(pr).into(),
-                if pr.is_draft {
-                    Ink::GENERIC_WORKING
-                } else {
-                    Ink::FRESH
-                },
-            )
-        }),
+        "MERGED" => rgba(0xaf7cf7ff),
+        "CLOSED" => Ink::DANGER,
+        _ if pr.is_draft => Ink::GENERIC_WORKING,
+        _ => Ink::FRESH,
     }
+}
+fn pr_settled(pr: &PullRequestStatus) -> bool {
+    matches!(pr.state.as_str(), "MERGED" | "CLOSED")
+}
+fn pr_summary(pr: &PullRequestStatus) -> (String, gpui::Rgba) {
+    if pr_settled(pr) {
+        return (pr_state(pr).into(), pr_tone(pr));
+    }
+    check_summary(pr).unwrap_or_else(|| (pr_state(pr).into(), pr_tone(pr)))
 }
 
 fn check_summary(pr: &PullRequestStatus) -> Option<(String, gpui::Rgba)> {
@@ -134,7 +141,7 @@ fn active_check_attention(session: &SessionRecord) -> Option<(gpui::Rgba, String
         .as_deref()
         .unwrap_or_default()
         .iter()
-        .filter(|pr| !matches!(pr.state.as_str(), "MERGED" | "CLOSED"))
+        .filter(|pr| !pr_settled(pr))
         .collect::<Vec<_>>();
     let failed = active
         .iter()
@@ -184,6 +191,8 @@ fn pr_row(pr: &PullRequestStatus) -> LinkRow {
         } else {
             IconName::PullRequest
         },
+        icon_tint: Some(pr_tone(pr)),
+        settled: pr_settled(pr),
         status: Some(pr_summary(pr)),
         action: LinkAction::Open(pr.url.clone()),
         details: Some(pr.url.clone()),
@@ -196,6 +205,8 @@ fn port_row(port: &diri_proto::PortInfo) -> LinkRow {
         site: port.process_name.clone(),
         section: Section::Running,
         icon: IconName::Monitor,
+        icon_tint: None,
+        settled: false,
         status: None,
         action: LinkAction::Open(format!("http://localhost:{}", port.port)),
         details: None,
@@ -244,6 +255,8 @@ fn artifact_row(artifact: &SessionArtifact) -> LinkRow {
         site: site_label(url),
         section: Section::Links,
         icon,
+        icon_tint: None,
+        settled: false,
         status: None,
         action: LinkAction::Open(artifact.url.clone()),
         details: None,
@@ -507,6 +520,9 @@ fn session_rows(session: &SessionRecord) -> Vec<LinkRow> {
             prs.push(pr_row(pr));
         }
     }
+    // Work still in flight first; merged and closed ones keep their order
+    // below it.
+    prs.sort_by_key(|row| row.settled);
     prs.into_iter().chain(running).chain(links).collect()
 }
 /// What the list shows: a section label or a row.
@@ -609,6 +625,8 @@ fn detail_rows(pr: &PullRequestStatus) -> Vec<LinkRow> {
             pr.changed_files
         ),
         icon: IconName::GitHub,
+        icon_tint: None,
+        settled: false,
         status: None,
         action: LinkAction::Open(pr.url.clone()),
         details: None,
@@ -626,6 +644,8 @@ fn detail_rows(pr: &PullRequestStatus) -> Vec<LinkRow> {
             title: check.name,
             subtitle: check.detail.filter(|s| !s.is_empty()).unwrap_or_default(),
             icon,
+            icon_tint: None,
+            settled: false,
             status: Some((label.into(), tone)),
             details: None,
             action: LinkAction::Open(
@@ -643,6 +663,8 @@ fn detail_rows(pr: &PullRequestStatus) -> Vec<LinkRow> {
             subtitle: check_summary(pr)
                 .map_or_else(|| "No checks reported".into(), |(label, _)| label),
             icon: IconName::CheckCircle,
+            icon_tint: None,
+            settled: false,
             status: None,
             details: None,
             action: LinkAction::Open(format!("{}/checks", pr.url.trim_end_matches('/'))),
@@ -655,6 +677,8 @@ fn detail_rows(pr: &PullRequestStatus) -> Vec<LinkRow> {
             title: "Discussion".into(),
             subtitle: comments_help(pr),
             icon: IconName::Comment,
+            icon_tint: None,
+            settled: false,
             status: None,
             details: None,
             action: LinkAction::Open(format!(
@@ -740,6 +764,22 @@ impl TerminalPane {
         self.session_links.close();
         self.focus.focus(window, cx);
         cx.notify();
+    }
+    /// Closes the popover of a pane that left the screen, leaving focus
+    /// where the pane that replaced it put it.
+    pub(crate) fn dismiss_session_links(&mut self, cx: &mut Context<Self>) {
+        if self.session_links.open {
+            self.session_links.close();
+            cx.notify();
+        }
+    }
+    #[cfg(test)]
+    pub(crate) fn session_links_open_for_test(&self) -> bool {
+        self.session_links.open
+    }
+    #[cfg(test)]
+    pub(crate) fn open_session_links_for_test(&mut self) {
+        self.session_links.open = true;
     }
     fn links_back(&mut self, cx: &mut Context<Self>) {
         self.session_links.pull_request = None;
@@ -964,14 +1004,24 @@ impl TerminalPane {
                     })
                     .cursor_pointer()
                     .text_size(px(13.0))
-                    .text_color(ink.primary)
+                    .text_color(if row.settled && !selected {
+                        ink.secondary
+                    } else {
+                        ink.primary
+                    })
                     .child(
                         div()
                             .w(px(16.0))
                             .flex_none()
                             .flex()
                             .justify_center()
-                            .child(Icon::new(row.icon, 14.0, ink.secondary)),
+                            .child(Icon::new(
+                                row.icon,
+                                14.0,
+                                row.icon_tint
+                                    .filter(|_| !selected)
+                                    .unwrap_or(ink.secondary),
+                            )),
                     )
                     .child(
                         div()
@@ -1647,6 +1697,33 @@ mod tests {
         session.pull_requests.as_mut().unwrap()[1].state = "MERGED".into();
         let rows = session_rows(&session);
         assert_eq!(rows[1].status.as_ref().unwrap().0, "Merged");
+    }
+
+    #[test]
+    fn open_pull_requests_come_first_and_glyphs_wear_their_state() {
+        let mut session = fixture();
+        // Merge whichever PR would otherwise be listed first.
+        let first = session_rows(&session)[0].title.clone();
+        let merged = session
+            .pull_requests
+            .as_mut()
+            .unwrap()
+            .iter_mut()
+            .find(|pr| pr.title.as_deref() == Some(first.as_str()))
+            .unwrap();
+        merged.state = "MERGED".into();
+        let rows = session_rows(&session);
+        let prs: Vec<_> = rows
+            .iter()
+            .filter(|row| row.section == Section::PullRequests)
+            .collect();
+        assert_eq!(prs.len(), 2);
+        assert_eq!(prs[1].title, first);
+        assert!(!prs[0].settled);
+        assert_eq!(prs[0].icon_tint, Some(Ink::FRESH));
+        assert!(prs[1].settled);
+        assert_eq!(prs[1].icon, IconName::Merge);
+        assert_eq!(prs[1].icon_tint, Some(rgba(0xaf7cf7ff)));
     }
 
     #[test]

@@ -313,6 +313,14 @@ impl WorkspaceWorkbench {
         };
         let mut required = Vec::new();
         leaves(&tab.layout, &mut required);
+        // A hidden pane stays warm, but its Links popover is a window of its
+        // own and would stay on screen over whatever replaced the pane.
+        for (id, pane) in &self.mounted {
+            if !required.iter().any(|required| required.pane == *id) {
+                pane.terminal
+                    .update(cx, |terminal, cx| terminal.dismiss_session_links(cx));
+            }
+        }
         {
             let store = self.runtime.store.read().expect("store");
             let revision = store
@@ -660,8 +668,10 @@ impl WorkspaceWorkbench {
         self.enabled = false;
         self.cancel_resize();
         for pane in self.mounted.values() {
-            pane.terminal
-                .update(cx, |terminal, _| terminal.release_layout_control());
+            pane.terminal.update(cx, |terminal, cx| {
+                terminal.release_layout_control();
+                terminal.dismiss_session_links(cx);
+            });
         }
     }
 
@@ -1795,6 +1805,61 @@ mod tests {
         cx.run_until_parked();
         assert_eq!(repaints.get(), 1, "switching back makes it live again");
 
+        handle
+            .update(cx, |_, window, _| window.remove_window())
+            .unwrap();
+        cx.run_until_parked();
+    }
+    #[gpui::test]
+    fn a_pane_leaving_the_screen_closes_its_links_popover(cx: &mut TestAppContext) {
+        let (runtime, tokio, _) = fixture(false);
+        let original =
+            runtime.store.read().unwrap().sessions()[&SessionId::new("preview-claude")].clone();
+        let mut tabs = Vec::new();
+        for index in 0..2 {
+            let mut session = (*original).clone();
+            session.id = SessionId::new(format!("session-{index}"));
+            runtime
+                .store
+                .write()
+                .unwrap()
+                .upsert_session(session.clone());
+            let pane = PaneId::new(format!("pane-{index}"));
+            tabs.push(WorkspaceTab {
+                id: TabId::new(format!("tab-{index}")),
+                title: None,
+                focused_pane: pane.clone(),
+                zoomed_pane: None,
+                layout: LayoutNode::Pane {
+                    id: pane,
+                    session_id: session.id,
+                },
+            });
+        }
+        seed(&runtime, tabs.clone(), 1);
+        let handle =
+            cx.add_window(|window, cx| WorkspaceWorkbench::new(runtime.clone(), tokio, window, cx));
+        let first = handle
+            .update(cx, |workbench, window, cx| {
+                workbench.set_tab(tabs[0].clone(), viewport(), window, cx);
+                let first = workbench.mounted[&PaneId::new("pane-0")].terminal.clone();
+                first.update(cx, |terminal, _| terminal.open_session_links_for_test());
+                workbench.set_tab(tabs[1].clone(), viewport(), window, cx);
+                first
+            })
+            .unwrap();
+        assert!(
+            !first.read_with(cx, |terminal, _| terminal.session_links_open_for_test()),
+            "a warm hidden pane's popover would float over the new session"
+        );
+        handle
+            .update(cx, |workbench, _, cx| {
+                let second = workbench.mounted[&PaneId::new("pane-1")].terminal.clone();
+                second.update(cx, |terminal, _| terminal.open_session_links_for_test());
+                workbench.deactivate(cx);
+                assert!(!second.read(cx).session_links_open_for_test());
+            })
+            .unwrap();
         handle
             .update(cx, |_, window, _| window.remove_window())
             .unwrap();
