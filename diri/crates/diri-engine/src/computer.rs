@@ -406,6 +406,14 @@ impl ComputerUse {
                 ),
             ));
         }
+        // Relaunch a pipe that died before reading its catalog or names: a
+        // name from the dead pipe is refused by the new one.
+        self.start_daemon();
+        {
+            let mut inner = self.lock();
+            self.ensure_running(&mut inner)
+                .map_err(ComputerError::driver)?;
+        }
         let catalog = self.catalog()?;
         if !catalog.iter().any(|entry| entry["name"] == tool) {
             return Err(ComputerError::new(
