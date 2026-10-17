@@ -591,6 +591,10 @@ fn setup_downloads_verifies_and_installs_in_the_background() {
             & 0o777,
         0o700
     );
+    assert_eq!(
+        std::fs::metadata(&root).unwrap().permissions().mode() & 0o777,
+        0o700
+    );
     assert!(!root.join("0.35.0").exists(), "the old driver is removed");
     // Only the driver is unpacked, and nothing is left half-done.
     let leftovers: Vec<_> = std::fs::read_dir(&root)

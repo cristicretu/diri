@@ -163,7 +163,8 @@ impl ComputerUse {
         let download = &self.shared.download;
         let staging = root.join(format!(".download-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&staging);
-        create_private_dir(&staging)
+        create_private_dir(root)
+            .and_then(|()| create_private_dir(&staging))
             .map_err(|error| format!("Diri couldn't write to {}: {error}", root.display()))?;
         let result = (|| {
             let archive = staging.join("driver.tar.gz");

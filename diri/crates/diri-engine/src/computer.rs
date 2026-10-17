@@ -36,6 +36,8 @@ const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(20);
 /// switching a grant off mid-session gets the driver's own errors meanwhile.
 const GRANTS_FRESH: Duration = Duration::from_secs(60);
 /// How often one session may ask the app to offer setup.
+/// A refused permission check restarts the daemon at most this often.
+const REASK_INTERVAL: Duration = Duration::from_secs(10);
 const NUDGE_INTERVAL: Duration = Duration::from_secs(600);
 const LEASE_IDLE: Duration = Duration::from_secs(90);
 /// Long edge of screenshots when the Agent does not ask for a size: what
@@ -179,6 +181,8 @@ struct Inner {
     daemon: Option<Child>,
     /// When the driver last confirmed both grants.
     granted_at: Option<Instant>,
+    /// When a refused check last restarted the daemon to re-ask macOS.
+    reasked_at: Option<Instant>,
     /// When each session last asked the app to offer setup.
     nudged: HashMap<String, Instant>,
     state: Sessions,
@@ -374,7 +378,27 @@ impl ComputerUse {
         let Some(binary) = self.binary() else {
             return true;
         };
-        let granted = self.grants(&binary).is_none_or(|(ax, screen)| ax && screen);
+        let mut granted = self.grants(&binary).is_none_or(|(ax, screen)| ax && screen);
+        // macOS answers from what was true when the daemon launched: one
+        // started before the person allowed Diri would refuse until idle.
+        // A fresh daemon asks again, at most every `REASK_INTERVAL`.
+        if !granted && !self.overridden() {
+            let due = {
+                let mut inner = self.lock();
+                let due = inner
+                    .reasked_at
+                    .is_none_or(|at| at.elapsed() >= REASK_INTERVAL);
+                if due {
+                    inner.reasked_at = Some(Instant::now());
+                }
+                due
+            };
+            if due {
+                self.stop_daemon();
+                self.start_daemon();
+                granted = self.grants(&binary).is_none_or(|(ax, screen)| ax && screen);
+            }
+        }
         self.lock().granted_at = granted.then(Instant::now);
         granted
     }

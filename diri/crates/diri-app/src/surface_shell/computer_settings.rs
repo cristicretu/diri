@@ -4,9 +4,9 @@
 //! Set up downloads the driver in the background, then walks through the two
 //! macOS grants with a guide anchored to System Settings: drag Diri into the
 //! list (the driver runs as part of Diri, so the grants are Diri's), and the
-//! next step follows on its own. Screen Recording applies to a process only
-//! from its launch, so while that step waits the driver is restarted every
-//! few seconds until it reports the grant.
+//! next step follows on its own. macOS answers a process's permission checks
+//! from what was true at its launch, so while a step waits the driver is
+//! restarted every few seconds until it reports the grant.
 use super::*;
 use std::time::Instant;
 
@@ -14,9 +14,9 @@ use std::time::Instant;
 const GUIDE_TICK: Duration = Duration::from_millis(400);
 /// How long each tick keeps the Engine polling.
 const GUIDE_WATCH: Duration = Duration::from_secs(3);
-/// While Screen Recording waits: how often the driver is relaunched so a
-/// grant made meanwhile takes effect.
-const SCREEN_RESTART_EVERY: Duration = Duration::from_secs(4);
+/// While a grant waits: how often the driver is relaunched so a grant made
+/// meanwhile takes effect.
+const RESTART_EVERY: Duration = Duration::from_secs(4);
 /// How long the section keeps polling after it was last painted.
 const SECTION_WATCH: Duration = Duration::from_secs(4);
 
@@ -151,12 +151,10 @@ impl UtilitySurfaces {
                 }
             }
         }
-        if step == GrantStep::ScreenRecording
-            && status.accessibility == Some(true)
-            && self
+        if self
                 .computer_guide
                 .last_restart
-                .is_none_or(|at| at.elapsed() >= SCREEN_RESTART_EVERY)
+                .is_none_or(|at| at.elapsed() >= RESTART_EVERY)
         {
             self.computer_guide.last_restart = Some(Instant::now());
             self.store
