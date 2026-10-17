@@ -10,7 +10,10 @@ pub use api_request::{
     ApiEnvironmentDraft, ApiHeaderDraft, ApiRequestDraft, ApiVariableDraft,
     SessionOpenApiRequestParams,
 };
-pub use computer::ComputerActParams;
+pub use computer::{
+    ComputerActParams, ComputerSetupAction, ComputerSetupNeededEvent, ComputerSetupParams,
+    ComputerStatus, ComputerStatusParams,
+};
 pub mod control;
 pub mod frames;
 pub mod grid;

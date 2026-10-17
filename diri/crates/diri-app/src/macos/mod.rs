@@ -7,6 +7,7 @@ pub(crate) mod global_shortcut;
 pub(crate) mod login_item;
 pub mod menu_bar;
 pub mod notifier;
+pub mod permission_guide;
 pub(crate) mod terminal_keys;
 
 use objc2_foundation::NSBundle;

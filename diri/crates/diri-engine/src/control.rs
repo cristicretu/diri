@@ -878,6 +878,8 @@ impl ControlServer {
                         | Method::WORKTREE_OVERVIEW
                         | Method::WORKTREE_CLEANUP
                         | Method::TELEMETRY_UPLOAD_NOW
+                        | Method::COMPUTER_STATUS
+                        | Method::COMPUTER_SETUP
                 ) || ((method == Method::AGENT_READINESS
                     || method == Method::AGENT_CONFIGURE)
                     && params
@@ -1183,6 +1185,17 @@ impl ControlServer {
             Method::TEST_RUN => self.browser_call("run", params),
             "browser.act" => self.browser_call("browser", params),
             Method::COMPUTER_ACT => self.computer_act(params),
+            Method::COMPUTER_STATUS => {
+                let p: diri_proto::ComputerStatusParams = decode(params)?;
+                encode(&self.computer.status(p.probe))
+            }
+            Method::COMPUTER_SETUP => {
+                let p: diri_proto::ComputerSetupParams = decode(params)?;
+                self.computer
+                    .setup(p.action)
+                    .map_err(|error| ControlError::new(error.code, error.message))
+                    .and_then(|status| encode(&status))
+            }
             Method::EVENTS_WAIT => self.events_wait(params),
             Method::HOST_SYNC_PREFS => self.host_sync_prefs(params),
             Method::HOST_INITIALIZE => self.host_initialize(params),
@@ -2250,9 +2263,27 @@ impl ControlServer {
             session_id: &id,
             badge: &badge,
         };
-        self.computer
-            .act(&caller, &p.tool, p.args, &|session| live.contains(session))
-            .map_err(|error| ControlError::new(error.code, error.message))
+        let result = self
+            .computer
+            .act(&caller, &p.tool, p.args, &|session| live.contains(session));
+        if let Err(error) = &result
+            && matches!(
+                error.code,
+                crate::computer::UNAVAILABLE | crate::computer::PERMISSIONS
+            )
+            && self.computer.should_nudge(&id)
+        {
+            // The app offers to finish setup; only the person can.
+            self.events.publish_encoded(
+                diri_proto::EventName::COMPUTER_SETUP_NEEDED,
+                &diri_proto::ComputerSetupNeededEvent {
+                    session_id: p.session_id.clone(),
+                    badge: badge.clone(),
+                },
+                Some(&id),
+            );
+        }
+        result.map_err(|error| ControlError::new(error.code, error.message))
     }
 
     /// The aggregated staleness view: every worktree of every project,

@@ -146,11 +146,26 @@ fn summaries_end_at_the_first_sentence() {
 /// A stand-in for `cua-driver mcp`: answers the handshake and a three-tool
 /// catalog, and echoes each call's request line back as structured content.
 const FAKE_DRIVER: &str = r#"#!/bin/sh
-[ "$1" = mcp ] || exit 2
+case "$1" in
+  --version) printf 'cua-driver %s\n' "$(cat "$0.version" 2>/dev/null || echo 0.36.0)"; exit 0 ;;
+  call)
+    [ "$2" = check_permissions ] || exit 2
+    cat "$0.grants" 2>/dev/null || printf '{"accessibility":true,"screen_recording":true}\n'
+    exit 0 ;;
+  mcp) ;;
+  *) exit 2 ;;
+esac
 while IFS= read -r line; do
   printf '%s\n' "$line" >> "$0.log"
   id=$(printf '%s' "$line" | sed -n 's/.*"id":\([0-9][0-9]*\).*/\1/p')
   [ -z "$id" ] && continue
+  if [ -e "$0.ungranted" ]; then
+    case "$line" in
+      *'"name":"click"'*)
+        printf '{"jsonrpc":"2.0","id":%s,"result":{"content":[{"type":"text","text":"permissions_pending: macOS Accessibility or Screen Recording permission is still pending"}],"isError":true}}\n' "$id"
+        continue ;;
+    esac
+  fi
   case "$line" in
     *'"method":"initialize"'*)
       printf '{"jsonrpc":"2.0","id":%s,"result":{"protocolVersion":"2025-06-18","capabilities":{"tools":{}}}}\n' "$id" ;;
@@ -386,5 +401,297 @@ fn a_missing_driver_is_reported_as_unavailable() {
         .act(&caller("s", "Agent"), "tools", json!({}), &|_: &str| true)
         .unwrap_err();
     assert_eq!(error.code, UNAVAILABLE);
-    assert!(error.message.contains("permissions grant"));
+    // Agents are pointed at Diri's setup, never at a terminal installer.
+    assert!(error.message.contains("Settings › Agents › Computer use"));
+    assert!(!error.message.contains("curl"));
+    let status = computer.status(true);
+    assert!(!status.installed());
+    assert!(!status.ready());
+}
+
+#[test]
+fn a_missing_grant_points_the_agent_at_setup_once_per_spell() {
+    let temp = tempfile::tempdir().unwrap();
+    let driver = fake_driver(temp.path());
+    std::fs::write(driver.with_extension("ungranted"), "").unwrap();
+    let computer = ComputerUse::with_binary(Some(driver));
+    let error = computer
+        .act(
+            &caller("s", "Agent"),
+            "click",
+            json!({"pid":1,"x":1,"y":1}),
+            &|_: &str| true,
+        )
+        .unwrap_err();
+    assert_eq!(error.code, PERMISSIONS);
+    assert!(error.message.contains("Settings › Agents › Computer use"));
+    // A refused call holds no app.
+    let other = computer
+        .act(
+            &caller("t", "Other"),
+            "click",
+            json!({"pid":1,"x":1,"y":1}),
+            &|_: &str| true,
+        )
+        .unwrap_err();
+    assert_eq!(other.code, PERMISSIONS);
+
+    assert!(computer.should_nudge("s"));
+    assert!(
+        !computer.should_nudge("s"),
+        "a retry is not a second prompt"
+    );
+    assert!(computer.should_nudge("t"));
+}
+
+#[test]
+fn a_driver_without_grants_is_not_asked_to_act() {
+    let temp = tempfile::tempdir().unwrap();
+    let driver = fake_driver(temp.path());
+    let grants = driver.with_extension("grants");
+    std::fs::write(
+        &grants,
+        r#"{"accessibility":true,"screen_recording":false}"#,
+    )
+    .unwrap();
+    let computer = ComputerUse::with_binary(Some(driver.clone()));
+    let live = |_: &str| true;
+    let error = computer
+        .act(
+            &caller("s", "Agent"),
+            "click",
+            json!({"pid":7,"x":1,"y":1}),
+            &live,
+        )
+        .unwrap_err();
+    assert_eq!(error.code, PERMISSIONS);
+    let log = std::fs::read_to_string(driver.with_extension("log")).unwrap_or_default();
+    assert!(
+        !log.contains(r#""name":"click""#),
+        "refused before the driver: {log}"
+    );
+
+    // Granted in System Settings: the very next call goes through.
+    std::fs::write(&grants, r#"{"accessibility":true,"screen_recording":true}"#).unwrap();
+    computer
+        .act(
+            &caller("s", "Agent"),
+            "click",
+            json!({"pid":7,"x":1,"y":1}),
+            &live,
+        )
+        .unwrap();
+}
+
+#[test]
+fn status_reads_version_bundle_and_grants() {
+    let temp = tempfile::tempdir().unwrap();
+    let macos = temp.path().join("CuaDriver.app/Contents/MacOS");
+    std::fs::create_dir_all(&macos).unwrap();
+    let driver = fake_driver(&macos);
+    let computer = ComputerUse::with_binary(Some(driver.clone()));
+    let grants = driver.with_extension("grants");
+    std::fs::write(
+        &grants,
+        r#"{"accessibility":false,"screen_recording":false}"#,
+    )
+    .unwrap();
+
+    let status = computer.status(false);
+    assert!(status.supported);
+    assert_eq!(status.version.as_deref(), Some("0.36.0"));
+    assert!(!status.outdated);
+    assert_eq!(
+        status.app_path.as_deref().map(Path::new),
+        Some(
+            std::fs::canonicalize(temp.path().join("CuaDriver.app"))
+                .unwrap()
+                .as_path()
+        )
+    );
+    assert_eq!(status.accessibility, Some(false));
+    assert_eq!(status.screen_recording, Some(false));
+    assert!(!status.ready());
+
+    std::fs::write(
+        driver.with_extension("grants"),
+        r#"{"accessibility":true,"screen_recording":true,"source":{"pid":1}}"#,
+    )
+    .unwrap();
+    assert!(computer.status(false).ready());
+
+    std::fs::write(driver.with_extension("version"), "0.35.2").unwrap();
+    let old = computer.status(false);
+    assert!(old.outdated);
+    assert!(!old.ready(), "an outdated driver is offered an update");
+}
+
+#[test]
+fn install_runs_in_the_background_and_reports_the_result() {
+    use std::os::unix::fs::PermissionsExt as _;
+    let temp = tempfile::tempdir().unwrap();
+    let driver = temp.path().join("bin/cua-driver");
+    // Stands in for cua.ai's script: checks Diri's pins, then "installs".
+    let installer = temp.path().join("install.sh");
+    std::fs::write(
+        &installer,
+        format!(
+            "echo \"==> installing $CUA_DRIVER_RS_VERSION telemetry=$CUA_DRIVER_RS_TELEMETRY_ENABLED args=$*\"\n\
+             [ \"$CUA_DRIVER_RS_NO_MODIFY_PATH\" = 1 ] || exit 3\n\
+             mkdir -p {bin}\n\
+             cat > {driver} <<'FAKE'\n{FAKE_DRIVER}FAKE\n\
+             chmod +x {driver}\n",
+            bin = temp.path().join("bin").display(),
+            driver = driver.display(),
+        ),
+    )
+    .unwrap();
+    let computer = ComputerUse::with_driver(Some(driver.clone()), Some(installer.clone()));
+    assert!(!computer.status(false).installed());
+
+    let started = computer
+        .setup(diri_proto::ComputerSetupAction::Install)
+        .unwrap();
+    let done = wait_for(|| {
+        let status = computer.status(false);
+        (!status.installing).then_some(status)
+    });
+    assert!(started.installing || done.installed());
+    assert_eq!(done.install_error, None, "{:?}", done.install_log);
+    assert_eq!(done.version.as_deref(), Some(TESTED_VERSION));
+    let log = done.install_log.unwrap();
+    assert!(
+        log.contains(&format!(
+            "installing {TESTED_VERSION} telemetry=0 args=--no-modify-path"
+        )),
+        "{log}"
+    );
+
+    // A failing installer leaves its words for the person, and the log.
+    std::fs::write(
+        &installer,
+        "echo 'error: /Applications is not writable. Re-run'; exit 1\n",
+    )
+    .unwrap();
+    std::fs::set_permissions(&installer, std::fs::Permissions::from_mode(0o644)).unwrap();
+    computer
+        .setup(diri_proto::ComputerSetupAction::Install)
+        .unwrap();
+    let failed = wait_for(|| {
+        let status = computer.status(false);
+        (!status.installing).then_some(status)
+    });
+    assert!(failed.install_error.unwrap().contains("administrator"));
+    assert!(failed.install_log.unwrap().contains("not writable"));
+}
+
+fn wait_for<T>(mut probe: impl FnMut() -> Option<T>) -> T {
+    let deadline = Instant::now() + Duration::from_secs(20);
+    loop {
+        if let Some(value) = probe() {
+            return value;
+        }
+        assert!(Instant::now() < deadline, "timed out");
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
+#[test]
+fn installer_failures_read_as_what_to_do() {
+    assert!(
+        setup::install_failure("curl: (6) Could not resolve host: github.com")
+            .contains("connection")
+    );
+    assert_eq!(
+        setup::install_failure(
+            "==> x\nerror: downloaded CuaDriver.app failed signature verification\n"
+        ),
+        "The installer stopped: downloaded CuaDriver.app failed signature verification"
+    );
+    assert!(setup::install_failure("").contains("Show the log"));
+}
+
+#[test]
+fn versions_compare_numerically() {
+    assert!(setup::older_than("0.9.0", "0.36.0"));
+    assert!(setup::older_than("0.35.9", "0.36.0"));
+    assert!(!setup::older_than("0.36.0", "0.36.0"));
+    assert!(!setup::older_than("0.36.1-nightly.2", "0.36.0"));
+    assert!(!setup::older_than("1.0.0", "0.36.0"));
+}
+
+#[test]
+fn grants_parse_from_either_shape() {
+    assert_eq!(
+        setup::parse_grants(br#"{"accessibility":true,"screen_recording":false}"#),
+        Some((true, false))
+    );
+    assert_eq!(
+        setup::parse_grants(
+            br#"{"structuredContent":{"accessibility":false,"screen_recording":true}}"#
+        ),
+        Some((false, true))
+    );
+    assert_eq!(setup::parse_grants(b"permissions_pending: retry"), None);
+}
+
+#[test]
+fn the_app_bundle_is_found_through_the_cli_symlink() {
+    let temp = tempfile::tempdir().unwrap();
+    let macos = temp.path().join("CuaDriver.app/Contents/MacOS");
+    std::fs::create_dir_all(&macos).unwrap();
+    let binary = fake_driver(&macos);
+    let link = temp.path().join("cua-driver");
+    std::os::unix::fs::symlink(&binary, &link).unwrap();
+    let app = std::fs::canonicalize(temp.path().join("CuaDriver.app")).unwrap();
+    assert_eq!(setup::app_bundle(&link), Some(app.clone()));
+    assert_eq!(setup::app_bundle(&binary), Some(app));
+    assert_eq!(
+        setup::app_bundle(&temp.path().join("cua-driver-elsewhere")),
+        None
+    );
+}
+
+/// Against the real Cua Driver on this Mac. With `DIRI_CUA_DRIVER_SOCKET`
+/// pointing at a daemon started without grants, expects them missing.
+/// `cargo test -p diri-engine --lib real_driver_status -- --ignored --nocapture`
+#[test]
+#[ignore = "needs Cua Driver installed"]
+fn real_driver_status() {
+    let computer = ComputerUse::new();
+    let status = computer.status(true);
+    eprintln!("{status:#?}");
+    assert!(status.installed());
+    assert!(
+        status
+            .app_path
+            .as_deref()
+            .is_some_and(|app| app.ends_with("CuaDriver.app"))
+    );
+    let expect_granted = setup::socket_override().is_none();
+    assert_eq!(status.accessibility, Some(expect_granted));
+    if !expect_granted {
+        let error = computer
+            .act(
+                &caller("real", "Diri test"),
+                "get_window_state",
+                json!({"pid": finder_pid(), "include_screenshot": false}),
+                &|_: &str| true,
+            )
+            .unwrap_err();
+        eprintln!("{error:?}");
+        assert_eq!(error.code, PERMISSIONS);
+    }
+    computer.shutdown();
+}
+
+fn finder_pid() -> i64 {
+    let output = std::process::Command::new("pgrep")
+        .args(["-x", "Finder"])
+        .output()
+        .unwrap();
+    String::from_utf8_lossy(&output.stdout)
+        .trim()
+        .parse()
+        .unwrap()
 }

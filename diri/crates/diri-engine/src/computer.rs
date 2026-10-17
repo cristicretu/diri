@@ -21,6 +21,9 @@ use std::time::{Duration, Instant};
 
 use serde_json::{Map, Value, json};
 
+mod setup;
+pub use setup::TESTED_VERSION;
+
 /// No calls for this long → close the driver pipe. Matches the daemon's own
 /// session expiry, so cursors and the pipe go away together.
 const IDLE_TIMEOUT: Duration = Duration::from_secs(300);
@@ -29,6 +32,11 @@ const REQUEST_TIMEOUT: Duration = Duration::from_secs(120);
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(20);
 /// A lease outlives its last use by this long, so an Agent that pauses to
 /// think keeps its app; then any other session may take it.
+/// How long a confirmed grant is trusted before it is read again. Someone
+/// switching a grant off mid-session gets the driver's own errors meanwhile.
+const GRANTS_FRESH: Duration = Duration::from_secs(60);
+/// How often one session may ask the app to offer setup.
+const NUDGE_INTERVAL: Duration = Duration::from_secs(600);
 const LEASE_IDLE: Duration = Duration::from_secs(90);
 /// Long edge of screenshots when the Agent does not ask for a size: what
 /// vision models read at full fidelity, and well inside a control frame.
@@ -117,6 +125,8 @@ impl ComputerError {
 
 /// The driver is not installed: a fact about this Mac, retrying cannot help.
 pub const UNAVAILABLE: &str = "computer_unavailable";
+/// Installed, but macOS has not allowed it yet. Only the person can fix it.
+pub const PERMISSIONS: &str = "computer_permissions";
 /// Another session is driving that app right now.
 pub const APP_BUSY: &str = "computer_app_busy";
 /// The tool is unknown or not offered to Agents.
@@ -145,6 +155,9 @@ struct Shared {
     /// The live launch, readable without `inner` (see `read_replies`).
     incarnation: AtomicU64,
     binary: Option<PathBuf>,
+    /// A local installer script in place of cua.ai's (tests).
+    installer: Option<PathBuf>,
+    setup: Mutex<setup::SetupState>,
 }
 
 type Waiter = mpsc::Sender<Result<Value, String>>;
@@ -162,6 +175,10 @@ struct Inner {
     /// The CuaDriver daemon was not running until Diri needed it, so an
     /// idle Diri stops it again rather than leave it resident.
     started_daemon: bool,
+    /// When the driver last confirmed both grants.
+    granted_at: Option<Instant>,
+    /// When each session last asked the app to offer setup.
+    nudged: HashMap<String, Instant>,
     state: Sessions,
 }
 
@@ -267,6 +284,12 @@ impl Sessions {
         }
     }
 
+    /// Gives back what a refused call took: it never acted on those apps.
+    fn release(&mut self, session_id: &str, pids: &[i64]) {
+        self.leases
+            .retain(|pid, lease| lease.session_id != session_id || !pids.contains(pid));
+    }
+
     fn forget_session(&mut self, session_id: &str) {
         self.labels.remove(session_id);
         self.driver_names.remove(session_id);
@@ -282,30 +305,55 @@ impl ComputerUse {
 
     /// Tests point this at a fake driver.
     pub fn with_binary(binary: Option<PathBuf>) -> Self {
+        Self::with_driver(binary, None)
+    }
+
+    /// Tests: a fake driver, and a local script standing in for the installer.
+    pub fn with_driver(binary: Option<PathBuf>, installer: Option<PathBuf>) -> Self {
         Self {
             shared: Arc::new(Shared {
                 inner: Mutex::new(Inner::default()),
                 pending: Mutex::new(HashMap::new()),
                 incarnation: AtomicU64::new(0),
                 binary,
+                installer,
+                setup: Mutex::new(setup::SetupState::default()),
             }),
         }
     }
 
     fn binary(&self) -> Option<PathBuf> {
-        match &self.shared.binary {
-            Some(path) => is_executable(path).then(|| path.clone()),
-            None => locate_driver(),
-        }
+        self.shared.locate()
     }
 
     pub fn unavailable_reason(&self) -> Option<String> {
         self.binary().is_none().then(|| {
-            "Computer use needs Cua Driver, which is not installed. Install it with \
-             /bin/bash -c \"$(curl -fsSL https://cua.ai/driver/install.sh)\", then run \
-             `cua-driver permissions grant` to allow Accessibility and Screen Recording."
+            "Computer use isn't set up on this Mac yet. Ask the user to open Diri Settings \
+             › Agents › Computer use and click Set up; it takes about a minute. Don't try \
+             to install anything yourself."
                 .to_owned()
         })
+    }
+
+    /// Whether macOS lets the driver see and control apps. A confirmed yes
+    /// is trusted for [`GRANTS_FRESH`]; a no is asked again every call, so
+    /// the first call after setup goes through. Unknown counts as yes: the
+    /// driver will say so itself.
+    fn permitted(&self) -> bool {
+        if self
+            .lock()
+            .granted_at
+            .is_some_and(|at| at.elapsed() < GRANTS_FRESH)
+        {
+            return true;
+        }
+        self.start_daemon();
+        let Some(binary) = self.binary() else {
+            return true;
+        };
+        let granted = self.grants(&binary).is_none_or(|(ax, screen)| ax && screen);
+        self.lock().granted_at = granted.then(Instant::now);
+        granted
     }
 
     /// One `computer` call from an Agent. `tool` names a driver tool, or
@@ -323,6 +371,11 @@ impl ComputerUse {
         }
         if tool == "tools" {
             return self.catalog_summary(args.get("name").and_then(Value::as_str));
+        }
+        // A driver without its grants doesn't refuse; it answers with empty
+        // trees and blank captures, which an Agent would misread.
+        if !self.permitted() {
+            return Err(ComputerError::new(PERMISSIONS, PERMISSIONS_MESSAGE));
         }
         if HIDDEN_TOOLS.contains(&tool) {
             return Err(ComputerError::new(
@@ -388,6 +441,10 @@ impl ComputerUse {
                 REQUEST_TIMEOUT,
             )
             .map_err(ComputerError::driver)?;
+        if needs_permission(&result) {
+            self.lock().state.release(caller.session_id, &pids);
+            return Err(ComputerError::new(PERMISSIONS, PERMISSIONS_MESSAGE));
+        }
 
         {
             let mut inner = self.lock();
@@ -439,6 +496,21 @@ impl ComputerUse {
             .driver_names
             .insert(session_id.to_owned(), name.clone());
         name
+    }
+
+    /// Whether to tell the app this session wants computer use set up: once
+    /// per session per [`NUDGE_INTERVAL`], so a retrying Agent is one prompt.
+    pub fn should_nudge(&self, session_id: &str) -> bool {
+        let mut inner = self.lock();
+        let now = Instant::now();
+        let due = inner
+            .nudged
+            .get(session_id)
+            .is_none_or(|at| now.duration_since(*at) >= NUDGE_INTERVAL);
+        if due {
+            inner.nudged.insert(session_id.to_owned(), now);
+        }
+        due
     }
 
     /// Lets go of a session's badge and leases (its tab closed).
@@ -512,6 +584,9 @@ impl ComputerUse {
     }
 
     fn request(&self, method: &str, params: Value, timeout: Duration) -> Result<Value, String> {
+        // Before the pipe: `cua-driver mcp` would otherwise launch the
+        // daemon with its permission gate, which opens System Settings.
+        self.start_daemon();
         let (id, receiver) = {
             let mut inner = self.lock();
             self.ensure_running(&mut inner)?;
@@ -536,6 +611,7 @@ impl ComputerUse {
         }
         let mut child = Command::new(&binary)
             .arg("mcp")
+            .args(setup::socket_args())
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::null())
@@ -590,6 +666,11 @@ impl ComputerUse {
             &json!({"jsonrpc": "2.0", "method": "notifications/initialized"}),
         )?;
 
+        self.ensure_sweeper(inner);
+        Ok(())
+    }
+
+    fn ensure_sweeper(&self, inner: &mut Inner) {
         if !inner.idle_sweeper_running {
             inner.idle_sweeper_running = true;
             let shared = Arc::downgrade(&self.shared);
@@ -597,7 +678,6 @@ impl ComputerUse {
                 .name("diri-computer-idle".into())
                 .spawn(move || sweep_idle(shared));
         }
-        Ok(())
     }
 }
 
@@ -741,10 +821,11 @@ fn sweep_idle(shared: std::sync::Weak<Shared>) {
         let quiet = inner
             .last_activity
             .is_some_and(|at| at.elapsed() > IDLE_TIMEOUT);
-        if quiet && pending(&shared).is_empty() && inner.child.is_some() {
+        if quiet && pending(&shared).is_empty() && (inner.child.is_some() || inner.started_daemon) {
             terminate(&shared, &mut inner, "driver closed after idle timeout");
             inner.state = Sessions::default();
             if std::mem::take(&mut inner.started_daemon)
+                && shared.binary.is_none()
                 && let Some(binary) = locate_driver()
             {
                 // Off the lock; the daemon answers `stop` at once.
@@ -781,6 +862,32 @@ fn terminate(shared: &Shared, inner: &mut Inner, reason: &str) {
     }
     let _ = child.kill();
     let _ = child.wait();
+}
+
+const PERMISSIONS_MESSAGE: &str = "Computer use is installed, but macOS hasn't allowed it to see \
+     and control apps yet. Ask the user to open Diri Settings › Agents › Computer use and \
+     finish setup (two switches in System Settings). Don't change System Settings yourself.";
+
+/// The driver refused because a macOS grant is missing.
+fn needs_permission(result: &Value) -> bool {
+    if result["isError"] != true {
+        return false;
+    }
+    let code = result["structuredContent"]["code"].as_str().unwrap_or("");
+    let text: String = result["content"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|block| block["text"].as_str())
+        .collect();
+    [
+        "permissions_pending",
+        "permission_denied",
+        "missing_accessibility",
+        "missing_screen_recording",
+    ]
+    .iter()
+    .any(|needle| code == *needle || text.contains(needle))
 }
 
 /// Every integer `pid` anywhere in the arguments: `run_steps` nests actions.
@@ -898,12 +1005,12 @@ fn truncate_label(text: &str, max: usize) -> String {
 fn daemon_listening() -> bool {
     #[cfg(target_os = "macos")]
     {
-        diri_platform::home_dir().is_some_and(|home| {
-            std::os::unix::net::UnixStream::connect(
-                home.join("Library/Caches/cua-driver/cua-driver.sock"),
-            )
-            .is_ok()
-        })
+        setup::socket_override()
+            .or_else(|| {
+                diri_platform::home_dir()
+                    .map(|home| home.join("Library/Caches/cua-driver/cua-driver.sock"))
+            })
+            .is_some_and(|socket| std::os::unix::net::UnixStream::connect(socket).is_ok())
     }
     #[cfg(not(target_os = "macos"))]
     {

@@ -76,6 +76,10 @@ impl Method {
     /// `session.api_request` event. Nothing is sent by the Engine.
     pub const SESSION_OPEN_API_REQUEST: &'static str = "session.open_api_request";
     pub const COMPUTER_ACT: &'static str = "computer.act";
+    /// Whether Cua Driver is installed and allowed (`ComputerStatusParams`).
+    pub const COMPUTER_STATUS: &'static str = "computer.status";
+    /// Install it or restart it (`ComputerSetupParams`); answers a status.
+    pub const COMPUTER_SETUP: &'static str = "computer.setup";
     pub const SESSION_MIGRATE: &'static str = "session.migrate";
     pub const SESSION_REPARENT_WORKTREE: &'static str = "session.reparent_worktree";
     pub const HOST_SYNC_PREFS: &'static str = "host.sync_prefs";
@@ -148,6 +152,9 @@ impl EventName {
     /// (`SessionOpenApiRequestParams`). The app prefills the tab; it sends
     /// only a `GET` marked `autoSend`, anything else waits for Send.
     pub const SESSION_API_REQUEST: &'static str = "session.api_request";
+    /// An Agent called `computer` before setup was finished
+    /// (`ComputerSetupNeededEvent`). The app offers to finish it.
+    pub const COMPUTER_SETUP_NEEDED: &'static str = "computer.setup_needed";
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]

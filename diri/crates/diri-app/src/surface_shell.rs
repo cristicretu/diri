@@ -27,6 +27,7 @@ use crate::settings::{
 };
 mod account_settings;
 mod import_settings;
+mod computer_settings;
 mod privacy_settings;
 use crate::sidebar::DraggedSidebarItem;
 use crate::store::{Prefs, SessionStore, StoreRuntime, WindowMaterial};
@@ -605,6 +606,7 @@ pub struct UtilitySurfaces {
     activity: String,
     diagnostics_report: Option<String>,
     privacy: privacy_settings::PrivacyState,
+    computer_guide: computer_settings::ComputerGuide,
     _update_changes: Task<()>,
     _store_changes: Task<()>,
 }
@@ -836,6 +838,7 @@ impl UtilitySurfaces {
             activity: "Connected client · shared daemon remains untouched".to_owned(),
             diagnostics_report,
             privacy: Default::default(),
+            computer_guide: Default::default(),
             _update_changes: update_changes,
             _store_changes: store_changes,
         };
@@ -4423,6 +4426,7 @@ impl UtilitySurfaces {
                 .flex()
                 .flex_col()
                 .gap(px(SETTINGS_SECTION_GAP))
+                .children(self.computer_settings(cx))
                 .child(setting_section(
                     t("settings.agents.execution_target"),
                     targets,
@@ -7114,6 +7118,7 @@ impl Focusable for UtilitySurfaces {
 impl Render for UtilitySurfaces {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         crate::perf_overlay::rendered("settings");
+        self.sync_computer_setup(cx);
         self.hosts = self
             .store
             .read()
@@ -9209,6 +9214,22 @@ mod tests {
                 });
             })
             .expect("switch language");
+            cx.run_until_parked();
+        }
+        // `DIRI_VISUAL_COMPUTER=missing|installing|failed|allow|waiting|ready`
+        // seeds Settings › Agents › Computer use with that setup state.
+        if let Ok(state) = std::env::var("DIRI_VISUAL_COMPUTER") {
+            cx.update_window(window.into(), |root, _, cx| {
+                let harness = root
+                    .downcast::<SettingsWorkbenchHarness>()
+                    .expect("harness");
+                let surfaces = harness.read(cx).surfaces.clone();
+                surfaces.update(cx, |surfaces, cx| {
+                    surfaces.seed_computer_preview(&state);
+                    cx.notify();
+                });
+            })
+            .expect("seed computer use");
             cx.run_until_parked();
         }
         // `DIRI_VISUAL_PRIVACY=on|off` seeds Settings > General > Privacy
