@@ -111,13 +111,12 @@ impl LauncherOverlay {
     }
 
     pub(super) fn show_account_picker(&self) -> bool {
-        matches!(self.selected_harness.id(), "codex" | "claude-code")
-            && (self.selected_account.is_some()
+        self.selected_account.is_some()
                 || self.accounts_error.is_some()
                 || self.accounts.profiles.iter().any(|profile| {
                     profile.agent == self.selected_harness.id()
                         && profile.host == self.selected_host
-                }))
+                })
     }
 
     pub(super) fn account_picker_button(

@@ -2059,6 +2059,10 @@ impl UtilitySurfaces {
         }
         if tab == SettingsTab::Accounts {
             self.refresh_accounts(cx);
+            self.store
+                .write()
+                .expect("session store lock poisoned")
+                .request_agent_catalog(None, false);
         }
         if tab == SettingsTab::General {
             self.store

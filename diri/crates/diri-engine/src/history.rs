@@ -2000,7 +2000,10 @@ mod tests {
             host: None,
             config_home: config.to_string_lossy().into_owned(),
             is_default: false,
+            unset_environment: Vec::new(),
             login_store: None,
+            environment: Default::default(),
+            launch_args: Vec::new(),
         };
         let transcript = config.join("sessions/2026/09/04/rollout-now-thread-9.jsonl");
         write(

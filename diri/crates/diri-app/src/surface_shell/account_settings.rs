@@ -1,7 +1,5 @@
-//! Settings › Accounts: every Claude Code and Codex account on this Mac, who
-//! it is (email, plan), how much of each plan window it has used and when
-//! that resets, and one click to switch, sign in, rename or remove it. Remote
-//! and separate-directory profiles keep the full profile editor below.
+//! Settings › Accounts: shared Claude Code/Codex logins and isolated launch
+//! profiles for any manifest-backed Agent, on this Mac or a saved remote host.
 use super::*;
 use crate::tooltip_warmth::WarmTooltip;
 use crate::usage::limits::AccountLimits;
@@ -30,7 +28,10 @@ struct ProfileEditor {
     profile: AgentAccountProfile,
     name: QueryEditor,
     path: QueryEditor,
-    path_active: bool,
+    environment: QueryEditor,
+    unset_environment: QueryEditor,
+    arguments: QueryEditor,
+    active: usize,
 }
 
 enum AccountAction {
@@ -43,15 +44,17 @@ enum AccountAction {
 
 /// What opens a sign-in tab: a saved profile, or a new account of an Agent.
 enum SignIn {
-    Profile(AgentAccountProfile),
+    Profile(Box<AgentAccountProfile>),
     New(&'static str),
 }
 
 fn agent_title(agent: &str) -> &'static str {
     if agent == AgentKind::CODEX_ID {
         "Codex"
-    } else {
+    } else if agent == AgentKind::CLAUDE_CODE_ID {
         "Claude Code"
+    } else {
+        "Agent"
     }
 }
 
@@ -209,7 +212,21 @@ fn plan_windows(usage: &AccountLimits, live: bool, now: i64, colors: SemanticCol
 /// A local profile that shares the provider's home and switches only its
 /// login: every open tab of that Agent follows it.
 fn shares_login(profile: &AgentAccountProfile) -> bool {
-    profile.host.is_none() && matches!(profile.agent.as_str(), "codex" | "claude-code")
+    if profile.host.is_some()
+        || !profile.environment.is_empty()
+        || !profile.unset_environment.is_empty()
+        || !profile.launch_args.is_empty()
+    {
+        return false;
+    }
+    let default = match profile.agent.as_str() {
+        "codex" => ".codex",
+        "claude-code" => ".claude",
+        _ => return false,
+    };
+    profile.config_home == format!("~/{default}")
+        || diri_platform::home_dir()
+            .is_some_and(|home| home.join(default) == std::path::Path::new(&profile.config_home))
 }
 
 impl UtilitySurfaces {
@@ -640,7 +657,10 @@ impl UtilitySurfaces {
             host: Some("devbox".into()),
             config_home: "~/.codex".into(),
             is_default: true,
+            unset_environment: Vec::new(),
             login_store: None,
+            environment: Default::default(),
+            launch_args: Vec::new(),
         };
         let mut overview = crate::usage::limits::preview_overview();
         overview.catalog.profiles.push(remote.clone());
@@ -654,8 +674,11 @@ impl UtilitySurfaces {
             self.accounts.editor = Some(ProfileEditor {
                 name: text_editor(&remote.label),
                 path: text_editor(&remote.config_home),
+                environment: text_editor(""),
+                unset_environment: text_editor(""),
+                arguments: text_editor(""),
                 profile: remote,
-                path_active: false,
+                active: 0,
             });
         }
     }
@@ -746,13 +769,17 @@ impl UtilitySurfaces {
             host: None,
             config_home: "~/.claude-work".into(),
             is_default: true,
+            unset_environment: Vec::new(),
             login_store: None,
+            environment: Default::default(),
+            launch_args: Vec::new(),
         };
         let personal = AgentAccountProfile {
             id: "personal".into(),
             label: "Personal".into(),
             config_home: "~/.claude-personal".into(),
             is_default: false,
+            unset_environment: Vec::new(),
             login_store: None,
             ..work.clone()
         };
@@ -917,20 +944,34 @@ impl UtilitySurfaces {
                     .as_nanos()
             );
             AgentAccountProfile {
-                config_home: "~/.codex".into(),
+                config_home: format!("~/.diri/profiles/{id}/codex"),
                 id,
                 label: String::new(),
                 agent: "codex".into(),
                 host: None,
                 is_default: false,
+                unset_environment: Vec::new(),
                 login_store: None,
+                environment: [("CODEX_HOME".into(), "{home}".into())].into(),
+                launch_args: Vec::new(),
             }
         });
+        let environment = profile
+            .environment
+            .iter()
+            .map(|(key, value)| format!("{key}={value}"))
+            .collect::<Vec<_>>();
+        let unset_environment = profile.unset_environment.join(" ");
         self.accounts.editor = Some(ProfileEditor {
             name: text_editor(&profile.label),
             path: text_editor(&profile.config_home),
+            environment: text_editor(&crate::agent_catalog::join_launch_args(&environment)),
+            unset_environment: text_editor(&unset_environment),
+            arguments: text_editor(&crate::agent_catalog::join_launch_args(
+                &profile.launch_args,
+            )),
             profile,
-            path_active: false,
+            active: 0,
         });
         self.accounts.error = None;
         self.settings_search_active = false;
@@ -949,11 +990,42 @@ impl UtilitySurfaces {
         if profile.label.is_empty() {
             self.accounts.error = Some(t("settings.accounts.name_required").into());
             if let Some(editor) = self.accounts.editor.as_mut() {
-                editor.path_active = false;
+                editor.active = 0;
             }
             cx.notify();
             return;
         }
+        let Some(assignments) = crate::agent_catalog::split_launch_args(editor.environment.text())
+        else {
+            self.accounts.error = Some(t("settings.accounts.environment_quotes").into());
+            cx.notify();
+            return;
+        };
+        let mut environment = std::collections::BTreeMap::new();
+        for assignment in assignments {
+            let Some((key, value)) = assignment.split_once('=') else {
+                self.accounts.error = Some(t("settings.accounts.environment_format").into());
+                cx.notify();
+                return;
+            };
+            environment.insert(key.to_owned(), value.to_owned());
+        }
+        let Some(arguments) = crate::agent_catalog::split_launch_args(editor.arguments.text())
+        else {
+            self.accounts.error = Some(t("settings.accounts.arguments_quotes").into());
+            cx.notify();
+            return;
+        };
+        let Some(unset_environment) =
+            crate::agent_catalog::split_launch_args(editor.unset_environment.text())
+        else {
+            self.accounts.error = Some(t("settings.accounts.unset_quotes").into());
+            cx.notify();
+            return;
+        };
+        profile.environment = environment;
+        profile.unset_environment = unset_environment;
+        profile.launch_args = arguments;
         if shares_login(&profile) {
             profile.is_default = self
                 .accounts
@@ -1055,7 +1127,7 @@ impl UtilitySurfaces {
             "escape" => self.accounts.editor = None,
             "tab" => {
                 let editor = self.accounts.editor.as_mut().unwrap();
-                editor.path_active = !editor.path_active;
+                editor.active = (editor.active + 1) % 5;
             }
             "enter" => {
                 self.save_account(cx);
@@ -1066,10 +1138,12 @@ impl UtilitySurfaces {
                     return false;
                 };
                 let editor = self.accounts.editor.as_mut().unwrap();
-                let input = if editor.path_active {
-                    &mut editor.path
-                } else {
-                    &mut editor.name
+                let input = match editor.active {
+                    1 => &mut editor.path,
+                    2 => &mut editor.environment,
+                    3 => &mut editor.unset_environment,
+                    4 => &mut editor.arguments,
+                    _ => &mut editor.name,
                 };
                 match edit {
                     Edit::Local(local) => {
@@ -1097,6 +1171,13 @@ impl UtilitySurfaces {
         }
         let colors = self.settings_colors();
         let now = crate::usage::Clock::read(&crate::usage::SystemClock).unix_seconds;
+        let agents = self
+            .store
+            .read()
+            .expect("session store lock poisoned")
+            .agent_catalog(None)
+            .map(|catalog| catalog.agents.clone())
+            .unwrap_or_default();
         let mut content = div().flex().flex_col().gap(px(16.0)).child(
             div()
                 .text_size(px(12.0))
@@ -1188,56 +1269,100 @@ impl UtilitySurfaces {
                         .font_weight(FontWeight::MEDIUM)
                         .child(t("settings.accounts.account_profile")),
                 );
-            form = form.child(
-                div()
-                    .flex()
-                    .gap(px(8.0))
-                    .child(self.account_button(
-                        "profile-codex",
-                        if editor.profile.agent == "codex" {
-                            "✓ Codex"
-                        } else {
-                            "Codex"
-                        },
-                        cx,
-                        |this, _, cx| {
-                            if let Some(editor) = &mut this.accounts.editor {
-                                editor.profile.agent = "codex".into();
-                                if editor.profile.host.is_none()
-                                    && matches!(editor.path.text(), "~/.claude" | "")
-                                {
-                                    editor.path = text_editor("~/.codex");
-                                }
+            let mut agent_choices = div().flex().flex_wrap().gap(px(8.0));
+            for item in agents.iter().filter(|item| {
+                item.descriptor.as_ref().is_some_and(|descriptor| {
+                    descriptor
+                        .extra
+                        .get("binary")
+                        .and_then(|value| value.as_str())
+                        .is_some()
+                })
+            }) {
+                let id = item.kind.id().to_owned();
+                let selected = editor.profile.agent == id;
+                let title = item
+                    .descriptor
+                    .as_ref()
+                    .map_or(id.clone(), |d| d.display_name.clone());
+                let defaults = item
+                    .descriptor
+                    .as_ref()
+                    .and_then(|d| d.extra.get("profile"))
+                    .and_then(|p| p.get("environment"))
+                    .and_then(|env| {
+                        serde_json::from_value::<std::collections::BTreeMap<String, String>>(
+                            env.clone(),
+                        )
+                        .ok()
+                    })
+                    .unwrap_or_default();
+                let unset_defaults = item
+                    .descriptor
+                    .as_ref()
+                    .and_then(|d| d.extra.get("profile"))
+                    .and_then(|p| p.get("unsetEnvironment"))
+                    .and_then(|env| serde_json::from_value::<Vec<String>>(env.clone()).ok())
+                    .unwrap_or_default();
+                agent_choices = agent_choices.child(self.account_button(
+                    format!("profile-{id}"),
+                    if selected {
+                        format!("✓ {title}")
+                    } else {
+                        title
+                    },
+                    cx,
+                    move |this, _, cx| {
+                        if let Some(editor) = &mut this.accounts.editor {
+                            let old_default = format!(
+                                "~/.diri/profiles/{}/{}",
+                                editor.profile.id, editor.profile.agent
+                            );
+                            if editor.profile.agent != id && editor.path.text() == old_default {
+                                editor.path = text_editor(&format!(
+                                    "~/.diri/profiles/{}/{id}",
+                                    editor.profile.id
+                                ));
                             }
-                            cx.notify();
-                        },
-                    ))
-                    .child(self.account_button(
-                        "profile-claude",
-                        if editor.profile.agent == "claude-code" {
-                            "✓ Claude Code"
-                        } else {
-                            "Claude Code"
-                        },
-                        cx,
-                        |this, _, cx| {
-                            if let Some(editor) = &mut this.accounts.editor {
-                                editor.profile.agent = "claude-code".into();
-                                if editor.profile.host.is_none()
-                                    && matches!(editor.path.text(), "~/.codex" | "")
-                                {
-                                    editor.path = text_editor("~/.claude");
-                                }
+                            if editor.profile.agent != id {
+                                editor.profile.agent = id.clone();
+                                editor.profile.environment = defaults.clone();
+                                editor.profile.unset_environment = unset_defaults.clone();
+                                let assignments = defaults
+                                    .iter()
+                                    .map(|(key, value)| format!("{key}={value}"))
+                                    .collect::<Vec<_>>();
+                                editor.environment = text_editor(
+                                    &crate::agent_catalog::join_launch_args(&assignments),
+                                );
+                                editor.unset_environment = text_editor(&unset_defaults.join(" "));
                             }
-                            cx.notify();
-                        },
-                    )),
-            );
-            for (path, label, input) in [
-                (false, t("settings.accounts.name"), &editor.name),
-                (true, t("settings.accounts.directory"), &editor.path),
+                        }
+                        cx.notify();
+                    },
+                ));
+            }
+            form = form.child(agent_choices);
+            if agents.is_empty() {
+                form = form.child(
+                    div()
+                        .text_size(px(11.0))
+                        .text_color(colors.secondary)
+                        .child(t("settings.accounts.agents_loading")),
+                );
+            }
+            for (field, label, input) in [
+                (0, t("settings.accounts.name"), &editor.name),
+                (1, t("settings.accounts.directory"), &editor.path),
+                (2, t("settings.accounts.environment"), &editor.environment),
+                (
+                    3,
+                    t("settings.accounts.unset_environment"),
+                    &editor.unset_environment,
+                ),
+                (4, t("settings.accounts.arguments"), &editor.arguments),
             ] {
-                let active = path == editor.path_active;
+                let active = field == editor.active;
                 form = form.child(
                     div()
                         .flex()
@@ -1251,7 +1376,13 @@ impl UtilitySurfaces {
                         )
                         .child(
                             div()
-                                .id(if path { "account-path" } else { "account-name" })
+                                .id(match field {
+                                    1 => "account-path",
+                                    2 => "account-environment",
+                                    3 => "account-unset-environment",
+                                    4 => "account-arguments",
+                                    _ => "account-name",
+                                })
                                 .role(Role::TextInput)
                                 .aria_label(label)
                                 .h(px(34.0))
@@ -1267,7 +1398,7 @@ impl UtilitySurfaces {
                                 .cursor(CursorStyle::IBeam)
                                 .on_click(cx.listener(move |this, _, window, cx| {
                                     if let Some(editor) = &mut this.accounts.editor {
-                                        editor.path_active = path;
+                                        editor.active = field;
                                     }
                                     this.focus.focus(window, cx);
                                     cx.notify();
@@ -1434,7 +1565,16 @@ impl UtilitySurfaces {
                         div()
                             .text_size(px(11.0))
                             .text_color(colors.secondary)
-                            .child(format!("{} · {}", agent_title(&profile.agent), host)),
+                            .child(format!(
+                                "{} · {}",
+                                agents
+                                    .iter()
+                                    .find(|item| item.kind.id() == profile.agent)
+                                    .and_then(|item| item.descriptor.as_ref())
+                                    .map_or(profile.agent.as_str(), |descriptor| &descriptor
+                                        .display_name),
+                                host
+                            )),
                     )
                     .child(
                         div()
@@ -1674,7 +1814,9 @@ impl UtilitySurfaces {
                     format!("sign-in-{id}"),
                     t("settings.accounts.sign_in"),
                     cx,
-                    move |this, _, cx| this.login_account(SignIn::Profile(sign_in.clone()), cx),
+                    move |this, _, cx| {
+                        this.login_account(SignIn::Profile(Box::new(sign_in.clone())), cx)
+                    },
                 ));
             } else if signed_in && !live {
                 let switch = profile.id.clone();
@@ -2159,7 +2301,7 @@ mod tests {
                 prefer_character_input: false,
             };
             assert!(surfaces.handle_account_key(&key("tab"), cx));
-            assert!(surfaces.accounts.editor.as_ref().unwrap().path_active);
+            assert_eq!(surfaces.accounts.editor.as_ref().unwrap().active, 1);
             surfaces
                 .accounts
                 .editor

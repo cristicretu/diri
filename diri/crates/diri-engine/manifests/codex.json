@@ -22,6 +22,7 @@
     },
     "statusAuthority": "screen",
     "binary": "codex",
+    "profile": {"environment": {"CODEX_HOME": "{home}"}},
     "returnToLoginShell": true,
     "relaunchNotice": "Please restart Codex.",
     "resume": {

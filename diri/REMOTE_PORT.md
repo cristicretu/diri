@@ -113,14 +113,18 @@ an observed default. See [terminal key input](docs/terminal-key-input.md).
 ## Account-profile enhancement
 
 The local Engine owns the account-profile catalog and durable per-session
-launch binding described in [ACCOUNTS.md](ACCOUNTS.md). A remote profile is scoped
-to one Agent and saved host. Its directory resolves against the remote login
-environment; credentials never move between machines. The Engine prepares a
-missing provider directory with its existing bounded, authenticated fixed-script
-SSH seam (the directory travels as stdin data), then sends the selected provider
-environment through the existing structured LaunchRequest. Resume and fork use
-the recorded binding, not the current catalog default. Cross-host migration of
-bound sessions fails until an explicit destination-account mapping exists.
+launch binding described in [ACCOUNTS.md](ACCOUNTS.md). Any manifest-backed Agent
+can have isolated profiles with environment path selectors, inherited variable
+scrubbing, and structured argv tokens; the GUI offers known selectors from
+Rust-owned manifest metadata. A
+remote profile is scoped to one Agent and saved host. Its directory resolves
+against the remote login environment; credentials never move between machines.
+The Engine prepares a missing provider directory with its existing bounded,
+authenticated fixed-script SSH seam (the directory travels as stdin data), then
+sends the selected provider environment and argv through the existing structured
+LaunchRequest. Resume and fork use the recorded binding, not the current catalog
+default. Cross-host migration of bound sessions fails until an explicit
+destination-account mapping exists.
 
 An explicit same-host Claude account continuation is also owned by the local
 Engine. It preflights the source and destination, stops the existing Holder's

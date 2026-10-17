@@ -209,6 +209,11 @@ enum ConversationAction {
     Fresh,
 }
 
+struct LocalConversationLaunch<'a> {
+    action: ConversationAction,
+    profile: Option<&'a diri_proto::AgentAccountProfile>,
+}
+
 /// Whether a local session's execution directory is inside `target`.
 ///
 /// Session cwd values intentionally preserve the spelling supplied at spawn,
@@ -1114,6 +1119,22 @@ impl ControlServer {
             }
             Method::ACCOUNT_PROFILES_SAVE => {
                 let profile: diri_proto::AgentAccountProfile = decode(params)?;
+                {
+                    let registry = self.registry.lock().map_err(poisoned)?;
+                    let engine = registry.engine();
+                    let manifest = engine.manifest(&profile.agent).ok_or_else(|| {
+                        ControlError::bad_request("Choose an Agent from Diri's catalog")
+                    })?;
+                    if manifest
+                        .agent
+                        .as_ref()
+                        .is_none_or(|agent| agent.binary.is_none())
+                    {
+                        return Err(ControlError::bad_request(
+                            "This Agent has no executable to bind to a profile",
+                        ));
+                    }
+                }
                 if let Some(host) = &profile.host {
                     self.resolve_host(host)?;
                 }
@@ -1407,6 +1428,13 @@ impl ControlServer {
         if descriptor.binary.is_some() {
             launch_args.extend(descriptor.spawn_args.iter().cloned());
             launch_args.extend(self.configured_launch_args(None, &kind)?);
+            if let Some(profile) = &account_profile {
+                let home = diri_platform::home_dir();
+                launch_args.extend(crate::accounts::launch_args(
+                    profile,
+                    home.as_deref().and_then(Path::to_str),
+                )?);
+            }
             if let Some(injection) = &self.injection {
                 let injected = crate::inject::injection_args_full(
                     &descriptor.injection,
@@ -2014,6 +2042,14 @@ impl ControlServer {
         if descriptor.binary.is_some() {
             launch_args.extend(descriptor.spawn_args.iter().cloned());
             launch_args.extend(self.configured_launch_args(Some(&host.id), &kind)?);
+            if let Some(profile) = &account_profile {
+                let home = inherited
+                    .iter()
+                    .rev()
+                    .find(|(key, _)| key == "HOME")
+                    .map(|(_, value)| value.as_str());
+                launch_args.extend(crate::accounts::launch_args(profile, home)?);
+            }
             let minted = descriptor
                 .mints_conversation_id()
                 .then(crate::inject::uuid_v4);
@@ -3773,7 +3809,10 @@ impl ControlServer {
                 kind.id(),
                 &source.cwd,
                 source.agent_session_id.as_deref(),
-                ConversationAction::Fork,
+                LocalConversationLaunch {
+                    action: ConversationAction::Fork,
+                    profile: source.account_profile.as_ref(),
+                },
             )?
         };
         let remote_persistence = spec.remote.as_ref().map(|remote| remote.launch.persistence);
@@ -3893,6 +3932,15 @@ impl ControlServer {
         }
         let mut launch_args = descriptor.spawn_args.clone();
         launch_args.extend(self.configured_launch_args(Some(&host.id), kind.id())?);
+        if let Some(profile) = &record.account_profile {
+            let home = captured
+                .environment
+                .iter()
+                .rev()
+                .find(|variable| variable.name == "HOME")
+                .map(|variable| variable.value.as_str());
+            launch_args.extend(crate::accounts::launch_args(profile, home)?);
+        }
         let provider_dir = captured
             .environment
             .iter()
@@ -4159,13 +4207,19 @@ impl ControlServer {
         cwd: &str,
         agent_session_id: Option<&str>,
     ) -> Result<crate::session::SessionSpec, ControlError> {
+        let profile = registry
+            .record(id)
+            .and_then(|record| record.account_profile);
         self.local_conversation_spec(
             registry,
             id,
             kind,
             cwd,
             agent_session_id,
-            ConversationAction::Resume,
+            LocalConversationLaunch {
+                action: ConversationAction::Resume,
+                profile: profile.as_ref(),
+            },
         )
     }
 
@@ -4178,13 +4232,19 @@ impl ControlServer {
         cwd: &str,
         agent_session_id: Option<&str>,
     ) -> Result<crate::session::SessionSpec, ControlError> {
+        let profile = registry
+            .record(id)
+            .and_then(|record| record.account_profile);
         self.local_conversation_spec(
             registry,
             id,
             kind,
             cwd,
             agent_session_id,
-            ConversationAction::Fresh,
+            LocalConversationLaunch {
+                action: ConversationAction::Fresh,
+                profile: profile.as_ref(),
+            },
         )
     }
 
@@ -4195,8 +4255,9 @@ impl ControlServer {
         kind: &str,
         cwd: &str,
         agent_session_id: Option<&str>,
-        action: ConversationAction,
+        launch: LocalConversationLaunch<'_>,
     ) -> Result<crate::session::SessionSpec, ControlError> {
+        let action = launch.action;
         let engine = registry.engine();
         let manifest = engine
             .manifest(kind)
@@ -4210,6 +4271,13 @@ impl ControlServer {
         descriptor.binary = Some(self.resolve_local_agent_executable(kind, &binary)?);
         let mut launch_args = descriptor.spawn_args.clone();
         launch_args.extend(self.configured_launch_args(None, kind)?);
+        if let Some(profile) = launch.profile {
+            let home = diri_platform::home_dir();
+            launch_args.extend(crate::accounts::launch_args(
+                profile,
+                home.as_deref().and_then(Path::to_str),
+            )?);
+        }
         let mut mcp_http_token = None;
         if let Some(injection) = &self.injection {
             let injected = crate::inject::injection_args_full(
@@ -8306,7 +8374,10 @@ mod tests {
                 "claude-code",
                 "/tmp",
                 Some("uuid-1"),
-                ConversationAction::Fork,
+                LocalConversationLaunch {
+                    action: ConversationAction::Fork,
+                    profile: None,
+                },
             )
             .expect("fork spec");
         let command = fork.pty.argv.last().expect("fork argv");
@@ -8395,7 +8466,10 @@ mod tests {
                 .to_string_lossy()
                 .into_owned(),
             is_default: true,
+            unset_environment: Vec::new(),
             login_store: None,
+            environment: Default::default(),
+            launch_args: Vec::new(),
         };
         server
             .accounts
@@ -8464,6 +8538,115 @@ mod tests {
             .unwrap();
         assert!(!temp.path().join("different-account").exists());
         assert!(server.session_spawn(Some(json!({"kind": diri_proto::AgentKind::CODEX, "cwd": temp.path(), "accountProfileId": "work"}))).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn generic_agent_profile_launches_with_its_own_home_and_argv() {
+        use std::os::unix::fs::PermissionsExt;
+        let temp = tempfile::tempdir().unwrap();
+        let server = server(temp.path());
+        let executable = temp.path().join("gemini");
+        std::fs::write(
+            &executable,
+            "#!/bin/sh\nprintf '%s\\n' \"$GEMINI_CLI_HOME\" \"$@\" > \"$GEMINI_CLI_HOME/launch\"\nexec /bin/sleep 30\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o700)).unwrap();
+        server
+            .agent_catalog
+            .lock()
+            .unwrap()
+            .configure(
+                None,
+                "gemini",
+                crate::agent_catalog::AgentPreference {
+                    executable_path: Some(executable.to_string_lossy().into_owned()),
+                    show_in_quick_create: Some(true),
+                    launch_args: Vec::new(),
+                },
+            )
+            .unwrap();
+        let directory = temp.path().join("personal-gemini");
+        let profile = diri_proto::AgentAccountProfile {
+            id: "personal".into(),
+            label: "Personal".into(),
+            agent: "gemini".into(),
+            host: None,
+            config_home: directory.to_string_lossy().into_owned(),
+            is_default: true,
+            unset_environment: Vec::new(),
+            login_store: None,
+            environment: [("GEMINI_CLI_HOME".into(), "{home}".into())].into(),
+            launch_args: vec!["--model".into(), "test-model".into()],
+        };
+        let mut work = profile.clone();
+        work.id = "work".into();
+        work.label = "Work".into();
+        work.config_home = temp
+            .path()
+            .join("work-gemini")
+            .to_string_lossy()
+            .into_owned();
+        work.is_default = false;
+        server.accounts.lock().unwrap().upsert(profile).unwrap();
+        server
+            .accounts
+            .lock()
+            .unwrap()
+            .upsert(work.clone())
+            .unwrap();
+        let spawned = server
+            .session_spawn(Some(
+                json!({"kind": diri_proto::AgentKind::GEMINI, "cwd": temp.path()}),
+            ))
+            .unwrap();
+        let record: diri_proto::SessionRecord = serde_json::from_value(spawned).unwrap();
+        let capture = directory.join("launch");
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while !capture.exists() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "fake Agent did not launch"
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        let output = std::fs::read_to_string(capture).unwrap();
+        assert!(output.starts_with(&format!("{}\n", directory.display())));
+        assert!(output.contains("--model\ntest-model\n"));
+        assert_eq!(
+            record.account_profile.unwrap().config_home,
+            directory.to_string_lossy()
+        );
+        server
+            .session_kill(Some(json!({"sessionID": record.id})))
+            .unwrap();
+        let spawned = server
+            .session_spawn(Some(json!({
+                "kind": diri_proto::AgentKind::GEMINI,
+                "cwd": temp.path(),
+                "accountProfileId": "work"
+            })))
+            .unwrap();
+        let record: diri_proto::SessionRecord = serde_json::from_value(spawned).unwrap();
+        let capture = std::path::Path::new(&work.config_home).join("launch");
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while !capture.exists() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "Work profile did not launch"
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert!(
+            std::fs::read_to_string(capture)
+                .unwrap()
+                .starts_with(&format!("{}\n", work.config_home))
+        );
+        assert_eq!(record.account_profile.unwrap().id, "work");
+        server
+            .session_kill(Some(json!({"sessionID": record.id})))
+            .unwrap();
     }
 
     #[cfg(unix)]
@@ -9318,7 +9501,10 @@ mod tests {
                 host: None,
                 config_home: config.to_string_lossy().into_owned(),
                 is_default: false,
+                unset_environment: Vec::new(),
                 login_store: None,
+                environment: Default::default(),
+                launch_args: Vec::new(),
             });
             registry
                 .spawn(

@@ -47,7 +47,7 @@ impl AccountStore {
         let file: File = serde_json::from_slice(&bytes).map_err(|_| {
             ControlError::bad_request("Account profiles are invalid; the file has been preserved")
         })?;
-        if file.version != 1 {
+        if !matches!(file.version, 1 | 2) {
             return Err(ControlError::bad_request(
                 "Unsupported account profile version",
             ));
@@ -110,7 +110,7 @@ impl AccountStore {
         if id == Some("") {
             return Ok(None);
         }
-        if id.is_none() && !matches!(agent, "codex" | "claude-code") {
+        if id.is_none() && matches!(agent, "shell" | "generic" | "note") {
             return Ok(None);
         }
         let catalog = self.catalog()?;
@@ -151,7 +151,7 @@ impl AccountStore {
             serde_json::to_writer_pretty(
                 &mut file,
                 &File {
-                    version: 1,
+                    version: 2,
                     profiles: catalog.profiles.clone(),
                 },
             )?;
@@ -168,6 +168,11 @@ impl AccountStore {
 }
 
 fn validate(profile: &AgentAccountProfile) -> Result<(), ControlError> {
+    if matches!(profile.agent.as_str(), "shell" | "generic" | "note") {
+        return Err(ControlError::bad_request(
+            "Choose a manifest-backed Agent for this profile",
+        ));
+    }
     if profile.id.is_empty()
         || profile.id.len() > 80
         || !profile
@@ -177,6 +182,15 @@ fn validate(profile: &AgentAccountProfile) -> Result<(), ControlError> {
     {
         return Err(ControlError::bad_request("Invalid account profile id"));
     }
+    if profile.agent.is_empty()
+        || profile.agent.len() > 128
+        || !profile
+            .agent
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.'))
+    {
+        return Err(ControlError::bad_request("Invalid Agent id"));
+    }
     if profile.label.trim().is_empty()
         || profile.label.len() > 120
         || profile.label.chars().any(char::is_control)
@@ -185,9 +199,55 @@ fn validate(profile: &AgentAccountProfile) -> Result<(), ControlError> {
             "Enter an account name of at most 120 bytes",
         ));
     }
-    if profile.environment_key().is_none() {
+    if profile.environment_key().is_none()
+        && profile.environment.is_empty()
+        && profile.launch_args.is_empty()
+    {
         return Err(ControlError::bad_request(
-            "Account profiles support Claude Code and Codex",
+            "This Agent profile needs a config environment variable or launch argument",
+        ));
+    }
+    if profile.environment.len() > 16
+        || profile.environment.iter().any(|(key, value)| {
+            key.is_empty()
+                || key.len() > 128
+                || !key.bytes().enumerate().all(|(i, b)| {
+                    b.is_ascii_uppercase() || b == b'_' || (i > 0 && b.is_ascii_digit())
+                })
+                || key.starts_with("DIRI_")
+                || key.starts_with("DIRIJOR_")
+                || matches!(key.as_str(), "HOME" | "PATH" | "SHELL" | "PWD")
+                || key.ends_with("_KEY")
+                || key.ends_with("_TOKEN")
+                || key.ends_with("_SECRET")
+                || key.ends_with("_PASSWORD")
+                || value.is_empty()
+                || value.len() > 4096
+                || value.chars().any(char::is_control)
+                || !value
+                    .strip_prefix("{home}")
+                    .is_some_and(|tail| tail.is_empty() || tail.starts_with('/'))
+                    && !Path::new(value).is_absolute()
+        })
+        || profile.unset_environment.len() > 32
+        || profile.unset_environment.iter().any(|key| {
+            key.is_empty()
+                || key.len() > 128
+                || !key.bytes().enumerate().all(|(i, b)| {
+                    b.is_ascii_uppercase() || b == b'_' || (i > 0 && b.is_ascii_digit())
+                })
+                || matches!(key.as_str(), "HOME" | "PATH" | "SHELL" | "PWD")
+                || key.starts_with("DIRI_")
+                || key.starts_with("DIRIJOR_")
+        })
+        || profile.launch_args.len() > 64
+        || profile
+            .launch_args
+            .iter()
+            .any(|arg| arg.is_empty() || arg.len() > 4096 || arg.chars().any(char::is_control))
+    {
+        return Err(ControlError::bad_request(
+            "Invalid profile environment or launch arguments",
         ));
     }
     if profile.host.as_ref().is_some_and(|host| {
@@ -196,9 +256,14 @@ fn validate(profile: &AgentAccountProfile) -> Result<(), ControlError> {
         return Err(ControlError::bad_request("Invalid execution host"));
     }
     if let Some(store) = &profile.login_store {
-        if profile.agent != "claude-code" || profile.host.is_some() {
+        if profile.agent != "claude-code"
+            || profile.host.is_some()
+            || !profile.environment.is_empty()
+            || !profile.unset_environment.is_empty()
+            || !profile.launch_args.is_empty()
+        {
             return Err(ControlError::bad_request(
-                "Login stores apply to local Claude Code profiles",
+                "Shared login stores apply only to local Claude Code accounts",
             ));
         }
         if store.len() > 4096
@@ -250,7 +315,11 @@ pub fn bind(
             .into_owned();
     }
     // Ambient provider credentials would silently override the chosen account.
-    env.retain(|(key, _)| !ACCOUNT_ENVIRONMENT.contains(&key.as_str()));
+    env.retain(|(key, _)| {
+        !ACCOUNT_ENVIRONMENT.contains(&key.as_str())
+            && !profile.unset_environment.contains(key)
+            && !profile.environment.contains_key(key)
+    });
     env.extend(launch_assignments(profile));
     Ok(())
 }
@@ -262,15 +331,47 @@ pub fn bind(
 /// every profile sees the same conversations, MCP servers and settings while
 /// signing in on its own. Everything else binds the whole config home.
 pub fn launch_assignments(profile: &AgentAccountProfile) -> Vec<(String, String)> {
+    if !profile.environment.is_empty() {
+        return profile
+            .environment
+            .iter()
+            .map(|(key, value)| (key.clone(), value.replace("{home}", &profile.config_home)))
+            .collect();
+    }
     match (&profile.login_store, profile.agent.as_str()) {
         (Some(store), "claude-code") => {
             vec![("CLAUDE_SECURESTORAGE_CONFIG_DIR".to_owned(), store.clone())]
         }
-        _ => vec![(
-            profile.environment_key().expect("validated").to_owned(),
-            profile.config_home.clone(),
-        )],
+        _ => profile
+            .environment_key()
+            .map(|key| vec![(key.to_owned(), profile.config_home.clone())])
+            .unwrap_or_default(),
     }
+}
+
+/// Expand structured profile arguments before the manifest's conversation
+/// grammar places resume/fork tokens. `home` belongs to the execution host.
+pub fn launch_args(
+    profile: &AgentAccountProfile,
+    home: Option<&str>,
+) -> Result<Vec<String>, ControlError> {
+    validate(profile)?;
+    let config_home = if let Some(relative) = profile.config_home.strip_prefix("~/") {
+        let home = home
+            .filter(|home| Path::new(home).is_absolute())
+            .ok_or_else(|| ControlError::bad_request("Execution host did not report HOME"))?;
+        Path::new(home)
+            .join(relative)
+            .to_string_lossy()
+            .into_owned()
+    } else {
+        profile.config_home.clone()
+    };
+    Ok(profile
+        .launch_args
+        .iter()
+        .map(|arg| arg.replace("{home}", &config_home))
+        .collect())
 }
 
 pub fn bind_pty(
@@ -294,6 +395,8 @@ pub fn bind_pty(
             .join(" ");
         let scrub = ACCOUNT_ENVIRONMENT
             .iter()
+            .copied()
+            .chain(profile.unset_environment.iter().map(String::as_str))
             .map(|key| format!("-u {key}"))
             .collect::<Vec<_>>()
             .join(" ");
@@ -373,7 +476,10 @@ mod tests {
             host: None,
             config_home: "~/codex-work".into(),
             is_default: true,
+            unset_environment: Vec::new(),
             login_store: None,
+            environment: Default::default(),
+            launch_args: Vec::new(),
         }
     }
     #[cfg(unix)]
@@ -417,6 +523,76 @@ mod tests {
         assert!(env.contains(&("CODEX_HOME".into(), p.config_home)));
     }
 
+    #[test]
+    fn manifest_agent_profile_binds_paths_and_arguments_without_credentials() {
+        let root = tempfile::tempdir().unwrap();
+        let store = AccountStore::new(root.path().join("accounts.json"));
+        let mut work = profile("work");
+        work.agent = "opencode".into();
+        work.config_home = "~/.diri/profiles/work/opencode".into();
+        work.environment = [
+            ("XDG_CONFIG_HOME".into(), "{home}/config".into()),
+            ("XDG_DATA_HOME".into(), "{home}/data".into()),
+        ]
+        .into();
+        work.unset_environment = vec!["OPENROUTER_API_KEY".into()];
+        work.launch_args = vec!["--config".into(), "{home}/config/opencode.json".into()];
+        store.upsert(work).unwrap();
+        let mut selected = store.resolve(None, "opencode", None).unwrap().unwrap();
+        let home = root.path().to_str().unwrap();
+        let args = launch_args(&selected, Some(home)).unwrap();
+        let mut env = vec![
+            ("HOME".into(), home.into()),
+            ("XDG_DATA_HOME".into(), "/wrong".into()),
+            ("OPENAI_API_KEY".into(), "ambient-secret".into()),
+            ("OPENROUTER_API_KEY".into(), "ambient-secret".into()),
+        ];
+        bind(&mut selected, &mut env).unwrap();
+        assert_eq!(
+            args[1],
+            format!("{}/config/opencode.json", selected.config_home)
+        );
+        assert!(env.contains(&(
+            "XDG_CONFIG_HOME".into(),
+            format!("{}/config", selected.config_home)
+        )));
+        assert!(env.contains(&(
+            "XDG_DATA_HOME".into(),
+            format!("{}/data", selected.config_home)
+        )));
+        assert!(!env.iter().any(|(key, _)| key == "OPENAI_API_KEY"));
+        assert!(!env.iter().any(|(key, _)| key == "OPENROUTER_API_KEY"));
+
+        selected
+            .environment
+            .insert("OPENAI_API_KEY".into(), "secret".into());
+        assert!(store.upsert(selected).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn version_one_catalog_is_read_and_saved_as_version_two() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("accounts.json");
+        std::fs::write(
+            &path,
+            serde_json::to_vec(&File {
+                version: 1,
+                profiles: vec![profile("work")],
+            })
+            .unwrap(),
+        )
+        .unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        let store = AccountStore::new(path.clone());
+        assert_eq!(store.catalog().unwrap().profiles[0].id, "work");
+        store.upsert(profile("personal")).unwrap();
+        let saved: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
+        assert_eq!(saved["version"], 2);
+        assert_eq!(saved["profiles"].as_array().unwrap().len(), 2);
+    }
+
     #[cfg(unix)]
     #[test]
     fn remote_configuration_arguments_are_never_rewritten_as_shell_commands() {
@@ -444,7 +620,7 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         let store = AccountStore::new(root.path().join("private/accounts.json"));
         store.upsert(profile("work")).unwrap();
-        for bytes in [b"broken".as_slice(), br#"{"version":2,"profiles":[]}"#] {
+        for bytes in [b"broken".as_slice(), br#"{"version":3,"profiles":[]}"#] {
             fs::write(&store.path, bytes).unwrap();
             assert!(store.upsert(profile("personal")).is_err());
             assert_eq!(fs::read(&store.path).unwrap(), bytes);

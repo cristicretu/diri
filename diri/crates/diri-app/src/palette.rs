@@ -1514,8 +1514,11 @@ mod tests {
             host: None,
             config_home: "~/.claude-work".into(),
             is_default: false,
+            unset_environment: Vec::new(),
             login_store: None,
-        });
+                    environment: Default::default(),
+            launch_args: Vec::new(),
+});
         for session_host in [None, Some("forge".to_owned())] {
             session.host = session_host;
             let result = actions_for_catalogs(
