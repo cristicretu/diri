@@ -8748,12 +8748,12 @@ fn talk_voice_option_label(voice: &crate::voice::VoiceOption) -> String {
         2 => Some(t("settings.general.talk_voice_enhanced")),
         _ => None,
     };
-    let mut label = match quality {
+    let label = match quality {
         Some(quality) => format!("{} · {} · {quality}", voice.name, voice.language_name),
         None => format!("{} · {}", voice.name, voice.language_name),
     };
     #[cfg(target_os = "macos")]
-    {
+    let label = {
         use crate::voice::KokoroState;
         let state = match crate::voice::kokoro_state(&voice.id) {
             Some(KokoroState::Missing) => {
@@ -8768,10 +8768,11 @@ fn talk_voice_option_label(voice: &crate::voice::VoiceOption) -> String {
             }
             Some(KokoroState::Ready) | None => None,
         };
-        if let Some(state) = state {
-            label = format!("{label} · {state}");
+        match state {
+            Some(state) => format!("{label} · {state}"),
+            None => label,
         }
-    }
+    };
     label
 }
 

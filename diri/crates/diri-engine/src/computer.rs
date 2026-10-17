@@ -1008,7 +1008,7 @@ fn tagged(label: &str, seed: u64) -> String {
 }
 
 /// What a person sees of a driver session name.
-#[cfg(test)]
+#[cfg(all(test, unix))]
 fn visible(name: &str) -> String {
     name.chars().filter(|c| !NAME_TAG.contains(c)).collect()
 }
