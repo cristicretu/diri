@@ -1,4 +1,5 @@
-//! `computer.act`: one Cua Driver call made for a Session.
+//! `computer.act`: one Cua Driver call made for a Session; `browser.pane`:
+//! one action on the page in that Session's sidebar Browser.
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -100,4 +101,42 @@ pub struct ComputerSetupNeededEvent {
     pub session_id: SessionId,
     /// "Claude · signup flow": who asked.
     pub badge: String,
+}
+/// `browser.pane`: what an Agent asks of its Session's sidebar Browser.
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+pub struct BrowserPaneParams {
+    #[serde(rename = "sessionID")]
+    pub session_id: SessionId,
+    /// `state`, `open`, `snapshot`, `click`, `fill`, `press`, `scroll`,
+    /// `eval`, `console`, `screenshot` or `wait`.
+    pub action: String,
+    #[serde(default)]
+    pub args: Value,
+}
+
+/// `session.browser_pane`: the Engine hands one action to the app.
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BrowserPaneRequest {
+    #[serde(rename = "sessionID")]
+    pub session_id: SessionId,
+    pub request_id: String,
+    pub action: String,
+    #[serde(default)]
+    pub args: Value,
+    /// Words for the in-page agent cursor, e.g. "Codex · checkout".
+    #[serde(default)]
+    pub badge: String,
+}
+
+/// `browser.pane_reply`: the app's answer. Exactly one of `result` and
+/// `error` is set.
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BrowserPaneReply {
+    pub request_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub result: Option<Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
 }

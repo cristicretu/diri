@@ -36,6 +36,7 @@ pub mod attach;
 pub mod attention;
 pub mod boot;
 pub mod browser;
+pub mod browser_pane;
 pub mod checkpoint;
 pub mod cli_version;
 pub mod completed_terminal;

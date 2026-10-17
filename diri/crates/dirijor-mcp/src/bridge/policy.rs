@@ -56,6 +56,8 @@ pub(super) enum WriteAction<'a> {
     /// Drive the Mac's apps through the shared Cua Driver, under the
     /// caller's own cursor and app leases.
     Computer,
+    /// Act on the page in the caller's own sidebar Browser.
+    SidebarBrowser,
     /// Open a request in the caller's own API tab (nothing is sent for it).
     ApiRequest,
     TestRun,
@@ -174,6 +176,7 @@ impl<'a> McpPolicy<'a> {
             WriteAction::QuickOpenInclude
             | WriteAction::Browser
             | WriteAction::Computer
+            | WriteAction::SidebarBrowser
             | WriteAction::ApiRequest
             | WriteAction::TestRun => Relation::Unrelated,
             WriteAction::Worktree { repo } => {
@@ -681,6 +684,7 @@ mod tests {
         assert!(policy.authorize(WriteAction::QuickOpenInclude).is_ok());
         assert!(policy.authorize(WriteAction::Browser).is_ok());
         assert!(policy.authorize(WriteAction::Computer).is_ok());
+        assert!(policy.authorize(WriteAction::SidebarBrowser).is_ok());
         assert!(policy.authorize(WriteAction::TestRun).is_ok());
         assert!(
             policy

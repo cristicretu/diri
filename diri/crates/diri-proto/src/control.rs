@@ -23,6 +23,10 @@ pub const TERMINAL_NOT_RETAINED: &str = "terminal_not_retained";
 /// browser sidecar or Node.js. A fact about the install: retrying cannot help.
 pub const BROWSER_UNAVAILABLE: &str = "browser_unavailable";
 
+/// Error code for `browser.pane` when no Diri window answered: the app is
+/// closed, or no window shows that Session.
+pub const BROWSER_PANE_UNAVAILABLE: &str = "browser_pane_unavailable";
+
 /// Error code for a local launch whose working directory no longer exists
 /// (a deleted project or worktree). Expected, and answered at once: nothing
 /// is spawned, and the Session record is left as it was.

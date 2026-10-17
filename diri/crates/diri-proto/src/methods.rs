@@ -80,6 +80,12 @@ impl Method {
     pub const COMPUTER_STATUS: &'static str = "computer.status";
     /// Install it or restart it (`ComputerSetupParams`); answers a status.
     pub const COMPUTER_SETUP: &'static str = "computer.setup";
+    /// An Agent acts on its Session's sidebar Browser page
+    /// (`BrowserPaneParams`); the Engine relays it to the app and waits.
+    pub const BROWSER_PANE: &'static str = "browser.pane";
+    /// The app's answer to one `session.browser_pane` event
+    /// (`BrowserPaneReply`).
+    pub const BROWSER_PANE_REPLY: &'static str = "browser.pane_reply";
     pub const SESSION_MIGRATE: &'static str = "session.migrate";
     pub const SESSION_REPARENT_WORKTREE: &'static str = "session.reparent_worktree";
     pub const HOST_SYNC_PREFS: &'static str = "host.sync_prefs";
@@ -155,6 +161,10 @@ impl EventName {
     /// An Agent called `computer` before setup was finished
     /// (`ComputerSetupNeededEvent`). The app offers to finish it.
     pub const COMPUTER_SETUP_NEEDED: &'static str = "computer.setup_needed";
+    /// An Agent's action on its Session's sidebar Browser page
+    /// (`BrowserPaneRequest`). The window holding that page runs it and
+    /// answers with `browser.pane_reply`.
+    pub const SESSION_BROWSER_PANE: &'static str = "session.browser_pane";
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]

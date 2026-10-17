@@ -3833,6 +3833,49 @@ fn an_agents_api_request_waits_for_the_window_to_open_it() {
 }
 
 #[test]
+fn sidebar_browser_actions_wait_for_the_window_and_overflow_is_answered() {
+    let agent = session("codex", "p", 1.0);
+    let (mut store, mut effects) = hydrated(
+        vec![agent.clone()],
+        vec![project("p", "P")],
+        Prefs::default(),
+    );
+    while effects.try_recv().is_ok() {}
+    let event = |session: &str, id: usize| EventEnvelope {
+        name: diri_proto::EventName::SESSION_BROWSER_PANE.into(),
+        params: serde_json::json!({
+            "sessionID": session, "requestId": format!("bp{id}"),
+            "action": "snapshot", "args": {}, "badge": "Codex · signup"
+        }),
+        seq: 2,
+    };
+    store.handle_event(event(&agent.id.0, 1));
+    store.handle_event(event("s_gone", 2));
+    assert!(store.has_pending_ui_request());
+    let requests = store.take_browser_pane_requests();
+    assert_eq!(requests.len(), 1, "unknown sessions never reach the UI");
+    assert_eq!(requests[0].request_id, "bp1");
+    assert_eq!(requests[0].badge, "Codex · signup");
+    assert!(!store.has_pending_ui_request());
+
+    // A runaway burst drops the oldest, and tells its Agent so.
+    while effects.try_recv().is_ok() {}
+    for id in 0..33 {
+        store.handle_event(event(&agent.id.0, 100 + id));
+    }
+    assert_eq!(store.take_browser_pane_requests().len(), 32);
+    let mut dropped = None;
+    while let Ok(effect) = effects.try_recv() {
+        if let StoreEffect::BrowserPaneReply(reply) = effect {
+            dropped = Some(reply);
+        }
+    }
+    let dropped = dropped.expect("the dropped action is answered");
+    assert_eq!(dropped.request_id, "bp100");
+    assert!(dropped.error.is_some());
+}
+
+#[test]
 fn opening_a_note_file_spawns_a_note_session_that_adopts_it() {
     let (mut store, mut effects) = SessionStore::headless(Prefs::default());
     store.open_note_file(

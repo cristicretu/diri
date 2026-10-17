@@ -1,5 +1,7 @@
 pub mod brand_raster;
 pub mod browser;
+#[cfg(debug_assertions)]
+pub mod browser_pane_fixture;
 pub(crate) mod floating_panel;
 pub(crate) mod global_shortcut;
 // Tests never touch the real login items; see `schedules_page::login`.

@@ -28,6 +28,15 @@ pub(crate) fn is_dev_bundle(bundle_id: &str) -> bool {
     bundle_id.starts_with(DEV_BUNDLE_PREFIX)
 }
 
+/// A development build an Agent launched to verify itself starts behind the
+/// person's work instead of taking focus: `DIRI_DEV=1 DIRI_DEV_BACKGROUND=1`.
+/// Debug builds only, so a shipped app never honours it.
+pub(crate) fn launches_in_background() -> bool {
+    cfg!(debug_assertions)
+        && std::env::var("DIRI_DEV").ok().as_deref() == Some("1")
+        && std::env::var_os("DIRI_DEV_BACKGROUND").is_some()
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct DevBuildIdentity {
     bundle_id: String,
