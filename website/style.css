@@ -950,7 +950,7 @@ html { overflow-x: clip; }
 .sidebar-rows > * { flex-shrink: 0; }
 .app-sidebar .sidebar-bottom { position: static; flex: none; background: none; }
 
-/* Features as a bento: eight cards that show a slice of the app, then a grid of short facts. */
+/* Features as a bento: cards that show a slice of the app. */
 .bento, .bento-small { display: grid; gap: 14px; margin: 8px 0 0; }
 .bento { grid-template-columns: repeat(6, minmax(0, 1fr)); }
 .bento-small { grid-template-columns: repeat(4, minmax(0, 1fr)); margin-top: 14px; }
@@ -993,6 +993,25 @@ html { overflow-x: clip; }
 .mini-pr { width: min(420px, 100%); display: flex; align-items: center; gap: 9px; padding: 11px 14px; }
 .mini-pr small { display: inline-flex; align-items: center; gap: 5px; margin-left: auto; color: #8fd3a3; font-size: 12px; }
 .mini-pr small .icon { width: 12px; height: 12px; color: #8fd3a3; }
+/* Headline features: alternating rows with a larger app slice, then the basics as cards, then a plain list. */
+.spotlights { display: flex; flex-direction: column; gap: 14px; margin-top: 8px; }
+.spot { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1.15fr); align-items: center; gap: 48px; padding: 48px 56px; border-radius: 24px; background: #ffffff06; border: 1px solid #ffffff0d; }
+.spot:nth-child(even) .spot-copy { order: 2; }
+.spot h3 { font-family: "Geist", -apple-system, BlinkMacSystemFont, sans-serif; font-size: 30px; line-height: 1.15; font-weight: 540; letter-spacing: -.025em; color: #f4f0fa; text-wrap: balance; }
+.spot p { margin-top: 14px; font-size: 16px; line-height: 1.6; color: #a9a2bc; text-wrap: pretty; }
+.spot .spot-ask { margin-top: 22px; padding-left: 14px; border-left: 2px solid #c4a7e7; font-size: 14.5px; color: #e9e4f2; }
+.spot-visual { display: flex; justify-content: center; }
+.spot-visual .mini { width: min(440px, 100%); zoom: 1.12; }
+.spotlights + .bento { grid-template-columns: repeat(3, minmax(0, 1fr)); margin-top: 14px; }
+.spotlights + .bento .bento-card { grid-column: auto; }
+.spotlights + .bento .bento-visual { height: 210px; }
+.also-title { margin: 64px 0 18px; font-family: "Geist", -apple-system, BlinkMacSystemFont, sans-serif; font-size: 18px; font-weight: 500; letter-spacing: -.02em; color: #f4f0fa; }
+.also { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 26px 32px; margin: 0; }
+.also dt { display: flex; align-items: center; gap: 9px; font-size: 14px; font-weight: 500; color: #e9e4f2; }
+.also dt .icon { width: 14px; height: 14px; color: #8f87a3; }
+.also dd { margin: 5px 0 0 23px; font-size: 13.5px; line-height: 1.5; color: #8f87a3; }
+@media (max-width: 1050px) { .spot { grid-template-columns: minmax(0, 1fr); gap: 28px; padding: 36px 32px; } .spot:nth-child(even) .spot-copy { order: 0; } .spotlights + .bento { grid-template-columns: minmax(0, 1fr); } .also { grid-template-columns: repeat(2, minmax(0, 1fr)); } }
+@media (max-width: 600px) { .spot { padding: 28px 22px; } .spot h3 { font-size: 24px; } .spot-visual .mini { zoom: 1; } .also { grid-template-columns: minmax(0, 1fr); } }
 /* Showcase slices: an MCP conversation, hosts, schedules, a background cursor and a spoken reply. */
 .mini-ask { margin: 2px 2px 10px; padding: 10px 12px; border-radius: 10px; background: #ffffff0a; color: #e9e4f2; line-height: 1.45; white-space: normal; }
 .mini-call { display: flex; align-items: center; gap: 9px; height: 32px; padding: 0 9px; white-space: nowrap; }
