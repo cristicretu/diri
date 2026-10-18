@@ -676,7 +676,7 @@ fn record_schedules(cx: &mut HeadlessAppContext, dir: PathBuf) {
     rec.finish();
 }
 
-/// Codex drives the Simulator through the computer tool while you work.
+/// Claude Code drives the Simulator through the computer tool while you work.
 fn record_computer(cx: &mut HeadlessAppContext, dir: PathBuf) {
     let clip = open(
         cx,
@@ -684,7 +684,7 @@ fn record_computer(cx: &mut HeadlessAppContext, dir: PathBuf) {
             vec![session_like(
                 t,
                 "clip-sim",
-                AgentKind::CODEX,
+                AgentKind::CLAUDE_CODE,
                 "Check the new onboarding",
                 SessionStatus::Working,
             )]
@@ -697,72 +697,76 @@ fn record_computer(cx: &mut HeadlessAppContext, dir: PathBuf) {
     use Hue::*;
     let call = |tool: &str, args: &str| {
         l(&[
-            ("• ", Dim),
-            ("Called ", Bold),
-            ("dirijor.computer", Purple),
-            (&format!("({{\"tool\":\"{tool}\",\"args\":{args}}})"), Dim),
+            ("● ", Green),
+            ("dirijor - computer", Bold),
+            (" (MCP)", Dim),
+            (&format!("(tool: \"{tool}\", args: {args})"), Plain),
         ])
     };
-    let mut lines = codex_banner("~/acme/ios");
+    let result = |text: &str| l(&[("  ⎿  ", Dim), (text, Plain)]);
+    let mut lines = claude_banner("~/acme/ios");
     lines.extend([
-        l(&[("› ", Bold), ("Build the onboarding, then sign in on the Simulator as the test user and check it.", Plain)]),
+        l(&[("> ", Dim), ("Build the onboarding, then sign in on the Simulator as the test user and check it.", Plain)]),
         p(""),
-        l(&[("• ", Dim), ("Edited ", Bold), ("ios/Onboarding/OnboardingView.swift ", Plain), ("(+184 ", Green), ("-0)", Red)]),
-        l(&[("• ", Dim), ("Ran ", Bold), ("xcodebuild -scheme Acme -destination 'name=iPhone 17 Pro' build", Plain)]),
-        l(&[("  └ ", Dim), ("** BUILD SUCCEEDED **", Green)]),
+        l(&[("● ", Green), ("Update", Bold), ("(ios/Onboarding/OnboardingView.swift)", Plain)]),
+        l(&[("  ⎿  ", Dim), ("Updated with ", Plain), ("184 additions", Green)]),
+        l(&[("● ", Green), ("Bash", Bold), ("(xcodebuild -scheme Acme -destination 'name=iPhone 17 Pro' build)", Plain)]),
+        l(&[("  ⎿  ", Dim), ("** BUILD SUCCEEDED **", Green)]),
         p(""),
     ]);
-    let blocks: Vec<(Vec<Line>, &str)> = vec![
-        (vec![
-            call("launch_app", "{\"name\":\"Simulator\"}"),
-            l(&[("  └ ", Dim), ("Simulator · iPhone 17 Pro · Acme (debug)", Plain)]),
-        ], "2m 14s"),
+    let blocks: Vec<(Vec<Line>, &str, &str)> = vec![
+        (vec![call("launch_app", "{\"name\":\"Simulator\"}"), result("Simulator · iPhone 17 Pro · Acme (debug)")], "Launching…", "2m 14s"),
         (vec![
             call("click", "{\"element_token\":\"s1:14\"}"),
-            l(&[("  └ ", Dim), ("Clicked text field “Email”", Plain)]),
+            result("Clicked text field “Email”"),
             call("type_text", "{\"text\":\"alex@acme.dev\"}"),
-        ], "2m 19s"),
-        (vec![
-            call("click", "{\"element_token\":\"s2:21\"}"),
-            l(&[("  └ ", Dim), ("Clicked button “Continue”", Plain)]),
-        ], "2m 22s"),
+        ], "Typing…", "2m 19s"),
+        (vec![call("click", "{\"element_token\":\"s2:21\"}"), result("Clicked button “Continue”")], "Clicking…", "2m 22s"),
         (vec![
             call("get_window_state", "{\"pid\":4211}"),
-            l(&[("  └ ", Dim), ("“Welcome, Alex” · page dots · Skip · screenshot attached", Plain)]),
+            result("“Welcome, Alex” · page dots · Skip · screenshot attached"),
             p(""),
-        ], "2m 25s"),
+        ], "Looking…", "2m 25s"),
         (vec![
-            l(&[("• ", Dim), ("The page dots overlap the Skip button on the smallest screen.", Plain)]),
-            l(&[("• ", Dim), ("Edited ", Bold), ("ios/Onboarding/PageDots.swift ", Plain), ("(+6 ", Green), ("-2)", Red)]),
-        ], "3m 02s"),
-        (vec![
-            l(&[("• ", Dim), ("Rebuilt and checked it again in the Simulator: no overlap.", Plain)]),
-        ], "3m 40s"),
+            l(&[("● ", Claude), ("The page dots overlap the Skip button on the smallest screen.", Plain)]),
+            l(&[("● ", Green), ("Update", Bold), ("(ios/Onboarding/PageDots.swift)", Plain)]),
+            l(&[("  ⎿  ", Dim), ("Updated with ", Plain), ("6 additions", Green), (" and ", Plain), ("2 removals", Red)]),
+        ], "Fixing…", "3m 02s"),
     ];
-    let worked = [p(""), l(&[("─ Worked for 3m 44s · your cursor and keyboard were never used ─", Dim)])];
-    // Codex keeps its composer on the pane's last rows while the transcript
-    // grows above it, so every frame is padded to the finished run's height.
+    let done = [
+        p(""),
+        l(&[("● ", Claude), ("Rebuilt and checked it again in the Simulator: no overlap. Your cursor and", Plain)]),
+        l(&[("  ", Plain), ("keyboard were never used.", Plain)]),
+    ];
+    // Claude Code keeps its prompt box on the pane's last rows while the
+    // transcript grows above it, so every frame is padded to the finished
+    // run's height.
     let rows = {
         let mut all = lines.clone();
-        all.extend(blocks.iter().flat_map(|(block, _)| block.clone()));
-        all.extend(worked.clone());
-        codex(&all, None).lines.len()
+        all.extend(blocks.iter().flat_map(|(block, ..)| block.clone()));
+        all.extend(done.clone());
+        claude(&all, "", FULL).lines.len()
     };
-    let pinned = |body: &[Line], working: Option<&str>| {
-        let mut screen = codex(body, working);
+    let pinned = |body: &[Line], working: Option<(&str, &str)>| {
+        let mut body = body.to_vec();
+        if let Some((verb, time)) = working {
+            body.extend([p(""), l(&[("✻ ", Claude), (verb, Claude), (&format!(" ({time} · esc to interrupt)"), Dim)])]);
+        }
+        let mut screen = claude(&body, "", FULL);
         let pad = rows.saturating_sub(screen.lines.len());
-        screen.lines.splice(body.len()..body.len(), (0..pad).map(|_| p("")));
+        let at = body.len() - working.map_or(0, |_| 2);
+        screen.lines.splice(at..at, (0..pad).map(|_| p("")));
         screen.cursor.0 += pad;
         screen
     };
-    show(&mut rec, &pinned(&lines, Some("2m 10s")));
+    show(&mut rec, &pinned(&lines, Some(("Building…", "2m 10s"))));
     rec.shot(1200);
-    for (block, time) in blocks {
+    for (block, verb, time) in blocks {
         lines.extend(block);
-        show(&mut rec, &pinned(&lines, Some(time)));
+        show(&mut rec, &pinned(&lines, Some((verb, time))));
         rec.shot(850);
     }
-    lines.extend(worked);
+    lines.extend(done);
     show(&mut rec, &pinned(&lines, None));
     update_session(&mut rec, "clip-sim", |s| {
         s.status = SessionStatus::Idle;
@@ -772,8 +776,8 @@ fn record_computer(cx: &mut HeadlessAppContext, dir: PathBuf) {
     rec.finish();
 }
 
-/// Claude Code finishes and hands diri a summary to read aloud; the spoken
-/// answer lands in its prompt the way dictation types it, then is sent.
+/// Claude Code finishes and hands diri a summary to read aloud; dictation
+/// hears the answer, pastes it into the prompt, and it is sent.
 fn record_voice(cx: &mut HeadlessAppContext, dir: PathBuf) {
     let clip = open(
         cx,
@@ -790,6 +794,7 @@ fn record_voice(cx: &mut HeadlessAppContext, dir: PathBuf) {
         None,
         WINDOW,
     );
+    let listen = dir.join("listen.txt");
     let mut rec = Recorder::new(cx, clip.window, dir);
     use Hue::*;
     let mut lines: Vec<Line> = vec![
@@ -824,15 +829,17 @@ fn record_voice(cx: &mut HeadlessAppContext, dir: PathBuf) {
         s.last_turn_completed_at = Some(DateMillis(3.0));
     });
     rec.shot(3000);
-    // Dictation types the answer; "send to agent" submits it.
-    let answer = "Yes, merge it, then start on the release notes. Send to agent.";
-    let mut typed = String::new();
-    for word in answer.split_inclusive(' ') {
-        typed.push_str(word);
-        show(&mut rec, &claude(&lines, &typed, FULL));
-        rec.shot(110);
+    // Dictation listens, then pastes the answer; "send to agent" submits it.
+    // The site draws the dictation pill over the frames listen.txt names.
+    let mut listening = String::new();
+    for frame in 2..24 {
+        listening.push_str(&format!("frame_{frame:04}.png\n"));
+        show(&mut rec, &claude(&lines, "", FULL));
+        rec.shot(100);
     }
-    rec.shot(700);
+    std::fs::write(listen, listening).unwrap();
+    show(&mut rec, &claude(&lines, "Yes, merge it, then start on the release notes.", FULL));
+    rec.shot(900);
     lines.extend([
         p(""),
         l(&[("> ", Dim), ("Yes, merge it, then start on the release notes.", Plain)]),

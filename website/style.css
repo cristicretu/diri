@@ -1011,8 +1011,9 @@ html { overflow-x: clip; }
 .feature-detail .feature-clip, .feature-side .feature-clip { background: #191724; }
 .feature-detail .feature-clip img { -webkit-mask-image: linear-gradient(90deg, #000 82%, transparent); mask-image: linear-gradient(90deg, #000 82%, transparent); }
 /* AppKit draws the traffic lights, so a headless recording has none; these sit where diri puts them (20, 17 pt, 14 pt wide, 8 pt apart). */
-.clip-lights { position: absolute; left: calc(20cqw / 15.2); top: calc(17cqw / 15.2); display: flex; gap: calc(8cqw / 15.2); }
-.clip-lights i { width: calc(14cqw / 15.2); aspect-ratio: 1; border-radius: 50%; background: #ff5f57; box-shadow: inset 0 0 0 .5px #0000002e; }
+/* One window point, in clip widths: the clip shows --clip-pt points across. */
+.clip-lights { --pt: calc(100cqw / var(--clip-pt, 1520)); position: absolute; z-index: 1; left: calc(20 * var(--pt)); top: calc(17 * var(--pt)); display: flex; gap: calc(8 * var(--pt)); }
+.clip-lights i { width: calc(14 * var(--pt)); aspect-ratio: 1; border-radius: 50%; background: #ff5f57; box-shadow: inset 0 0 0 .5px #0000002e; }
 .clip-lights i:nth-child(2) { background: #febc2e; } .clip-lights i:nth-child(3) { background: #28c840; }
 .also-title { margin: 96px 0 28px; }
 .also { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 26px 32px; margin: 0; }
