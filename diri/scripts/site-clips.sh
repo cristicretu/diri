@@ -7,14 +7,11 @@
 #
 # Recording is the ignored `render_site_clips` test (see
 # crates/diri-app/src/root/site_clips.rs); DIRI_CLIP=<name> limits it to one
-# clip. Needs img2webp (brew install webp) and macOS `sips`.
+# clip. Needs img2webp (brew install webp).
 set -euo pipefail
 
 cd "$(dirname "$0")/.."
 out=../website/assets/features
-# The page shows clips at up to 1200 CSS pixels; this is sharp at that size
-# on a 2x display without shipping the full 2400-pixel recording.
-width=1800
 
 frames=${1:-}
 if [[ -z $frames ]]; then
@@ -28,13 +25,12 @@ mkdir -p "$out"
 for dir in "$frames"/*/; do
   name=$(basename "$dir")
   [[ -f $dir/frames.txt ]] || continue
-  scaled=$(mktemp -d)
+  # Lossless at the recorded 2x size: terminal text smears under lossy
+  # compression and any resampling.
   args=(-loop 0 -min_size)
   while read -r frame hold; do
-    sips -s format png --resampleWidth "$width" "$dir/$frame" --out "$scaled/$frame" >/dev/null
-    args+=(-d "$hold" -lossy -q 88 -m 6 "$scaled/$frame")
+    args+=(-d "$hold" -lossless -m 6 "$dir/$frame")
   done <"$dir/frames.txt"
   img2webp "${args[@]}" -o "$out/$name.webp"
-  rm -rf "$scaled"
   printf '%-10s %s\n' "$name" "$(du -h "$out/$name.webp" | cut -f1)"
 done

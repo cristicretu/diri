@@ -998,9 +998,15 @@ html { overflow-x: clip; }
 .feature-copy { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); gap: 48px; align-items: start; margin-bottom: 36px; }
 .feature h3 { font-family: "Geist", -apple-system, BlinkMacSystemFont, sans-serif; font-size: 34px; line-height: 1.12; font-weight: 540; letter-spacing: -.03em; color: #f4f0fa; text-wrap: balance; }
 .feature p { max-width: 520px; padding-top: 4px; font-size: 16px; line-height: 1.6; color: #a9a2bc; text-wrap: pretty; }
-.feature-clip { margin: 0; border-radius: 14px; overflow: hidden; border: 1px solid #ffffff14; background: #1f1d2e; box-shadow: 0 1px 0 #ffffff0d inset, 0 40px 80px -40px #000; }
-/* The recording is 1200×750; its last rows are empty terminal, so show the top 560. */
-.feature-clip img { display: block; width: 100%; height: auto; aspect-ratio: 1200 / 560; object-fit: cover; object-position: top; }
+.feature-clip { position: relative; container-type: inline-size; max-width: 1200px; margin: 0 auto; border-radius: 12px; overflow: hidden; border: 1px solid #ffffff1a; background: #1f1d2e; box-shadow: 0 1px 0 #ffffff0d inset, 0 40px 80px -40px #000; }
+/* Recorded at 1200×620 points, 2x. Wide screens zoom the page, so the cap divides that zoom back out: never shown larger than recorded. */
+@media (min-width: 1280px) { .feature-clip { max-width: calc(1200px / 1.15); } }
+@media (min-width: 1600px) { .feature-clip { max-width: calc(1200px / 1.25); } }
+.feature-clip img { display: block; width: 100%; height: auto; }
+/* AppKit draws the traffic lights, so a headless recording has none; these sit where diri puts them (20, 17 pt, 14 pt wide, 8 pt apart). */
+.clip-lights { position: absolute; left: calc(20cqw / 12); top: calc(17cqw / 12); display: flex; gap: calc(8cqw / 12); }
+.clip-lights i { width: calc(14cqw / 12); aspect-ratio: 1; border-radius: 50%; background: #ff5f57; box-shadow: inset 0 0 0 .5px #0000002e; }
+.clip-lights i:nth-child(2) { background: #febc2e; } .clip-lights i:nth-child(3) { background: #28c840; }
 .also-title { margin: 140px 0 22px; font-family: "Geist", -apple-system, BlinkMacSystemFont, sans-serif; font-size: 18px; font-weight: 500; letter-spacing: -.02em; color: #f4f0fa; }
 .also { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 26px 32px; margin: 0; }
 .also dt { display: flex; align-items: center; gap: 9px; font-size: 14px; font-weight: 500; color: #e9e4f2; }

@@ -26,8 +26,9 @@ use super::whats_new_clips::Recorder;
 use super::*;
 use crate::SidebarPreviewFixture;
 
-/// 16:10, like the What's New clips; the site shows them up to 1200 wide.
-const WINDOW: (f32, f32) = (1200.0, 750.0);
+/// Short enough that no clip ends in empty terminal; the site shows them
+/// at exactly 1200 CSS pixels, 2x.
+const WINDOW: (f32, f32) = (1200.0, 620.0);
 const COLS: u16 = 120;
 
 #[derive(Clone, Copy)]
