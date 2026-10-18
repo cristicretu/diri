@@ -712,8 +712,6 @@ fn record_computer(cx: &mut HeadlessAppContext, dir: PathBuf) {
         l(&[("  └ ", Dim), ("** BUILD SUCCEEDED **", Green)]),
         p(""),
     ]);
-    show(&mut rec, &codex(&lines, Some("2m 10s")));
-    rec.shot(1200);
     let blocks: Vec<(Vec<Line>, &str)> = vec![
         (vec![
             call("launch_app", "{\"name\":\"Simulator\"}"),
@@ -741,13 +739,31 @@ fn record_computer(cx: &mut HeadlessAppContext, dir: PathBuf) {
             l(&[("• ", Dim), ("Rebuilt and checked it again in the Simulator: no overlap.", Plain)]),
         ], "3m 40s"),
     ];
+    let worked = [p(""), l(&[("─ Worked for 3m 44s · your cursor and keyboard were never used ─", Dim)])];
+    // Codex keeps its composer on the pane's last rows while the transcript
+    // grows above it, so every frame is padded to the finished run's height.
+    let rows = {
+        let mut all = lines.clone();
+        all.extend(blocks.iter().flat_map(|(block, _)| block.clone()));
+        all.extend(worked.clone());
+        codex(&all, None).lines.len()
+    };
+    let pinned = |body: &[Line], working: Option<&str>| {
+        let mut screen = codex(body, working);
+        let pad = rows.saturating_sub(screen.lines.len());
+        screen.lines.splice(body.len()..body.len(), (0..pad).map(|_| p("")));
+        screen.cursor.0 += pad;
+        screen
+    };
+    show(&mut rec, &pinned(&lines, Some("2m 10s")));
+    rec.shot(1200);
     for (block, time) in blocks {
         lines.extend(block);
-        show(&mut rec, &codex(&lines, Some(time)));
+        show(&mut rec, &pinned(&lines, Some(time)));
         rec.shot(850);
     }
-    lines.extend([p(""), l(&[("─ Worked for 3m 44s · your cursor and keyboard were never used ─", Dim)])]);
-    show(&mut rec, &codex(&lines, None));
+    lines.extend(worked);
+    show(&mut rec, &pinned(&lines, None));
     update_session(&mut rec, "clip-sim", |s| {
         s.status = SessionStatus::Idle;
         s.last_turn_completed_at = Some(DateMillis(5.0));

@@ -28,7 +28,7 @@ crop_for() {
   case $1 in
     schedules) echo "1280 900 0 0" ;;       # the clocked rows and the run
     voice) echo "1280 900 516 230" ;;       # the spoken summary and the answer
-    computer) echo "1764 1120 516 0" ;;     # the terminal, without the sidebar
+    computer) echo "1756 1098 510 14" ;;    # inside the terminal pane, down to its last row
   esac
 }
 
