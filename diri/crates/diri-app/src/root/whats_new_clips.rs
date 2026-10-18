@@ -28,15 +28,15 @@ use crate::notes::editor_view::NoteEditorView;
 /// The window every clip is recorded in, 16:10 like the sheet's clip frame.
 const WINDOW: (f32, f32) = (1040.0, 650.0);
 
-struct Recorder<'a> {
-    cx: &'a mut HeadlessAppContext,
-    window: AnyWindowHandle,
+pub(super) struct Recorder<'a> {
+    pub(super) cx: &'a mut HeadlessAppContext,
+    pub(super) window: AnyWindowHandle,
     dir: PathBuf,
     frames: Vec<(String, u32)>,
 }
 
 impl<'a> Recorder<'a> {
-    fn new(cx: &'a mut HeadlessAppContext, window: AnyWindowHandle, dir: PathBuf) -> Self {
+    pub(super) fn new(cx: &'a mut HeadlessAppContext, window: AnyWindowHandle, dir: PathBuf) -> Self {
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         Self {
@@ -47,7 +47,7 @@ impl<'a> Recorder<'a> {
         }
     }
 
-    fn settle(&mut self) {
+    pub(super) fn settle(&mut self) {
         for _ in 0..3 {
             self.cx
                 .update_window(self.window, |view, window, cx| {
@@ -66,7 +66,7 @@ impl<'a> Recorder<'a> {
     }
 
     /// Captures the window as it stands and holds it for `hold_ms`.
-    fn shot(&mut self, hold_ms: u32) {
+    pub(super) fn shot(&mut self, hold_ms: u32) {
         self.settle();
         let name = format!("frame_{:04}.png", self.frames.len());
         self.cx
@@ -77,7 +77,7 @@ impl<'a> Recorder<'a> {
         self.frames.push((name, hold_ms));
     }
 
-    fn finish(self) {
+    pub(super) fn finish(self) {
         let list: String = self
             .frames
             .iter()

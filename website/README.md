@@ -39,6 +39,10 @@ Each run also rewrites `llms.txt`, `llms-full.txt`, the generated sitemap entrie
 
 Pages use a small Markdown subset: `##`–`####` headings (ids are generated), paragraphs, single-level lists, GFM tables, fenced code with an optional title after the language (```` ```toml ~/.codex/config.toml ````), `> [!NOTE]` / `[!TIP]` / `[!WARNING]` callouts, images on their own line, and inline `<kbd>`. Frontmatter needs `title` and an 80–180 character `description`; `nav` and `lead` are optional.
 
+### Feature clips
+
+The four clips under the home page's headline features (`assets/features/*.webp`) are recorded from the real app window, not drawn. `diri/scripts/site-clips.sh` runs the ignored `render_site_clips` test (`diri/crates/diri-app/src/root/site_clips.rs`), which scripts each terminal's contents frame by frame, and encodes the frames with `img2webp`. Re-record after a visible change to the sidebar, panes or terminal.
+
 ### Share cards
 
 Every generated page and guide has its own 1200×630 card in `og/`. `npm run og` draws the ones whose text changed with headless Chrome and saves JPEGs with `sips`, so it runs on a Mac (set `CHROME` to use another Chrome). `og/rendered.json` records what each card was drawn from; `npm run verify` names any card that needs redrawing. Change the design in `scripts/og.mjs` and bump `CARD_DESIGN` in `scripts/site.mjs` to redraw them all.

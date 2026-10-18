@@ -638,6 +638,22 @@ impl WorkspaceWorkbench {
         }
     }
 
+    /// Seeds `session`'s pane with `grid`, for clips that script each pane.
+    #[cfg(all(test, target_os = "macos"))]
+    pub(crate) fn seed_session_grid_for_test(
+        &self,
+        session: &str,
+        grid: &diri_term::buffer::GridBuffer,
+        cx: &mut Context<Self>,
+    ) {
+        for pane in self.mounted.values().filter(|pane| pane.session.0 == session) {
+            pane.terminal.update(cx, |terminal, cx| {
+                terminal.seed_preview_grid_for_test(grid.clone(), cx);
+                cx.notify();
+            });
+        }
+    }
+
     /// Seeds each listed session's pane with its own lines of text.
     #[cfg(all(test, target_os = "macos"))]
     pub(crate) fn seed_pane_text_for_test(&self, texts: &[(&str, &str)], cx: &mut Context<Self>) {

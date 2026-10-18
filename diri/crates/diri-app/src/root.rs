@@ -22,6 +22,8 @@ mod theme_fade_frames;
 mod title_settle_frames;
 #[cfg(all(test, target_os = "macos"))]
 mod whats_new_clips;
+#[cfg(all(test, target_os = "macos"))]
+mod site_clips;
 #[cfg(test)]
 mod whats_new_tests;
 #[cfg(all(test, target_os = "macos"))]
