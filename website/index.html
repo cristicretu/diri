@@ -5,7 +5,7 @@
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <meta name="theme-color" content="#191724">
   <title>Diri — Run Claude Code, Codex and other coding agents in parallel</title>
-  <meta name="description" content="Free, open-source Mac app to run Claude Code, Codex, Cursor and Gemini side by side. Agents start other agents, and sessions keep running when you close it.">
+  <meta name="description" content="Free, open-source app to run Claude Code, Codex and 20 more side by side, on your Mac or over SSH. Agents drive it over MCP: spawn agents, schedule runs, use your apps.">
   <meta name="robots" content="index, follow, max-image-preview:large">
   <link rel="canonical" href="https://diri.sh/">
   <meta property="og:type" content="website">
@@ -13,7 +13,7 @@
   <meta property="og:locale" content="en_US">
   <meta property="og:url" content="https://diri.sh/">
   <meta property="og:title" content="Diri — The best way to work with coding agents">
-  <meta property="og:description" content="Free, open-source Mac app to run Claude Code, Codex, Cursor and Gemini side by side. Agents start other agents, and sessions keep running when you close it.">
+  <meta property="og:description" content="Free, open-source app to run Claude Code, Codex and 20 more side by side, on your Mac or over SSH. Agents drive it over MCP: spawn agents, schedule runs, use your apps.">
   <meta property="og:image" content="https://diri.sh/assets/social-card.jpg">
   <meta property="og:image:type" content="image/jpeg">
   <meta property="og:image:width" content="1200">
@@ -21,7 +21,7 @@
   <meta property="og:image:alt" content="Diri: the best way to work with coding agents. A Claude Code session starting three agents, shown in the app window.">
   <meta name="twitter:card" content="summary_large_image">
   <meta name="twitter:title" content="Diri — The best way to work with coding agents">
-  <meta name="twitter:description" content="Free, open-source Mac app to run Claude Code, Codex, Cursor and Gemini side by side. Agents start other agents, and sessions keep running when you close it.">
+  <meta name="twitter:description" content="Free, open-source app to run Claude Code, Codex and 20 more side by side, on your Mac or over SSH. Agents drive it over MCP: spawn agents, schedule runs, use your apps.">
   <meta name="twitter:image" content="https://diri.sh/assets/social-card.jpg">
   <meta name="twitter:image:alt" content="Diri: the best way to work with coding agents.">
   <link rel="icon" href="/favicon.svg" type="image/svg+xml" sizes="any">
@@ -44,7 +44,7 @@
       "@id": "https://diri.sh/#webpage",
       "url": "https://diri.sh/",
       "name": "Diri — Run Claude Code, Codex and other coding agents in parallel",
-      "description": "Free, open-source Mac app to run Claude Code, Codex, Cursor and Gemini side by side. Agents start other agents, and sessions keep running when you close it.",
+      "description": "Free, open-source app to run Claude Code, Codex and 20 more side by side, on your Mac or over SSH. Agents drive it over MCP: spawn agents, schedule runs, use your apps.",
       "isPartOf": {
         "@id": "https://diri.sh/#website"
       },
@@ -64,7 +64,7 @@
       "@id": "https://diri.sh/#app",
       "name": "Diri",
       "url": "https://diri.sh/",
-      "description": "Free, open-source Mac app to run Claude Code, Codex, Cursor and Gemini side by side. Agents start other agents, and sessions keep running when you close it.",
+      "description": "Free, open-source app to run Claude Code, Codex and 20 more side by side, on your Mac or over SSH. Agents drive it over MCP: spawn agents, schedule runs, use your apps.",
       "applicationCategory": "DeveloperApplication",
       "operatingSystem": [
         "macOS",
@@ -85,12 +85,16 @@
       },
       "featureList": [
         "Run many AI coding agents in parallel",
-        "Agents that start and coordinate other agents",
+        "Every tab, pane, worktree and schedule controllable over MCP",
+        "Agents that start and coordinate other agents, locally or on remote hosts",
+        "Remote sessions over SSH with nothing to install",
+        "Scheduled agent runs that wake a sleeping Mac",
+        "Computer use for every agent",
+        "Voice: hear finished turns and answer by voice",
         "Sessions that survive closing the app",
         "Isolated Git worktrees",
         "Code review and pull request status",
-        "Usage and account profiles",
-        "Remote sessions over SSH"
+        "Usage and account profiles"
       ],
       "softwareRequirements": "macOS 15 or later"
     },
@@ -135,7 +139,7 @@
           "name": "Can agents work together?",
           "acceptedAnswer": {
             "@type": "Answer",
-            "text": "Yes. Claude Code, Codex and Cursor sessions started in diri can start other agents, hand them tasks, and collect their results. Ask in plain English, starting with “Use diri to…”."
+            "text": "Yes. Agents started in diri can start other agents, on this Mac or on any of your SSH hosts, hand them tasks, wait for them, and merge their work. Ask in plain English, starting with “Use diri to…”."
           }
         },
         {
@@ -180,8 +184,8 @@
     <main id="main">
       <section class="intro" aria-labelledby="page-title">
         <div class="intro-heading">
-          <h1 id="page-title">Run coding agents side by side</h1>
-          <p><span class="sub-line">Claude Code, Codex, Cursor and 19 others, each in its own terminal.</span> <span class="sub-line">When one stops to ask you something, diri lets you know.</span></p>
+          <h1 id="page-title">The multiplexer your agents can drive</h1>
+          <p><span class="sub-line">Claude Code, Codex and 20 more, on your Mac or any SSH host.</span> <span class="sub-line">Agents spawn agents, schedule runs, use your apps, and tell you when they're done.</span></p>
         </div>
         <div class="intro-actions">
           <a id="download-primary" class="button primary" href="https://github.com/cristicretu/diri/releases/latest"><img class="button-mark" src="/assets/brand/apple.svg" width="15" height="15" alt=""><span class="button-label">Download for macOS</span></a>
@@ -289,24 +293,31 @@
       <section class="features" id="features" aria-labelledby="features-title">
         <div class="features-heading"><h2 id="features-title">Features</h2><a href="/docs/">Read the docs <span class="icon" data-icon="chevron-right" aria-hidden="true"></span></a></div>
         <dl class="bento">
-          <div class="bento-card "><div class="bento-visual" aria-hidden="true"><div class="mini"><div class="mini-title">New Agent</div><div class="mini-row selected"><i class="agent-logo claude" data-agent="claude"></i><span>Claude Code</span><small>Opus</small></div><div class="mini-row"><i class="agent-logo" data-agent="codex"></i><span>Codex</span><small>gpt-6</small></div><div class="mini-row"><i class="agent-logo" data-agent="cursor"></i><span>Cursor</span><small>Auto</small></div><div class="mini-row mini-skeleton"><i></i><b></b><em></em></div></div></div><dt>Every agent you already use</dt><dd>Claude Code, Codex, Cursor, Gemini and 18 more, in their own real terminals, with your existing logins.</dd></div>
+          <div class="bento-card wide"><div class="bento-visual" aria-hidden="true"><div class="mini mini-mcp"><div class="mini-ask">Use diri to start Codex on forge and fix the flaky reconnect test. Show it beside me.</div><div class="mini-call"><span class="icon" data-icon="check" aria-hidden="true"></span><code>spawn_agent</code><span>codex · host forge · split</span></div><div class="mini-call"><span class="icon" data-icon="check" aria-hidden="true"></span><code>wait_for_agent</code><span>done in 6m</span></div><div class="mini-call working"><span class="icon" data-icon="working-0" aria-hidden="true"></span><code>integrate</code><span>fix/reconnect-test</span></div></div></div><dt>Agents drive diri</dt><dd>Every tab, pane, worktree and schedule is an MCP tool. Any agent can start a Codex on your build server, put it beside you, wait for it and merge its branch.</dd></div>
+          <div class="bento-card wide"><div class="bento-visual" aria-hidden="true"><div class="mini mini-table mini-hosts"><div class="mini-tr head"><span>Host</span><span>Platform</span><span>Sessions</span></div><div class="mini-tr"><span><span class="icon" data-icon="monitor" aria-hidden="true"></span>This Mac</span><span>macOS arm64</span><span><i class="agent-logo claude" data-agent="claude"></i><i class="agent-logo" data-agent="cursor"></i> 4</span></div><div class="mini-tr"><span><span class="icon" data-icon="server" aria-hidden="true"></span>forge</span><span>Linux x86_64</span><span><i class="agent-logo" data-agent="codex"></i><i class="agent-logo claude" data-agent="claude"></i> 6</span></div><div class="mini-tr"><span><span class="icon" data-icon="server" aria-hidden="true"></span>gpu-box</span><span>Linux arm64</span><span><i class="agent-logo" data-agent="codex"></i> 2</span></div></div></div><dt>Any machine you can SSH into</dt><dd>diri brings a small helper over your existing SSH setup. No tmux, no relay, nothing to install by hand, and remote agents keep working when you disconnect.</dd></div>
+          <div class="bento-card "><div class="bento-visual" aria-hidden="true"><div class="mini"><div class="mini-title"><span class="icon" data-icon="clock" aria-hidden="true"></span>Schedules</div><div class="mini-row"><i class="agent-logo claude" data-agent="claude"></i><span>Triage new issues</span><small>Weekdays 7:00</small></div><div class="mini-row woke"><span class="icon" data-icon="moon" aria-hidden="true"></span><span>Woke the Mac</span><small>6:58</small></div><div class="mini-row"><i class="agent-logo" data-agent="codex"></i><span>Check prod errors</span><small>Hourly</small></div></div></div><dt>Scheduled runs that wake your Mac</dt><dd>Start an agent every weekday at 7, every hour, or once tomorrow. diri wakes a sleeping Mac for the run and catches up on anything missed.</dd></div>
+          <div class="bento-card "><div class="bento-visual" aria-hidden="true"><div class="mini mini-computer"><div class="mini-title"><span class="icon" data-icon="monitor" aria-hidden="true"></span>Simulator</div><div class="mini-screen"><b></b><b></b><b class="short"></b><span class="mini-button">Sign in</span><span class="mini-cursor"><i class="agent-logo" data-agent="codex"></i>Codex · login</span></div></div></div><dt>Computer use for every agent</dt><dd>Claude Code, Codex, Cursor and the rest can click through your Mac’s apps in the background. Your cursor and keyboard stay yours.</dd></div>
+          <div class="bento-card "><div class="bento-visual" aria-hidden="true"><div class="mini mini-voice"><div class="mini-wave"><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i></div><div class="mini-row"><i class="agent-logo" data-agent="codex"></i><span>“Tests pass. PR 812 is open.”</span></div><div class="mini-row reply"><span>“Merge it…”</span><small>send to agent</small></div></div></div><dt>Talk while you do something else</dt><dd>When an agent finishes, diri reads you what it did. Answer out loud and it goes straight back to that agent.</dd></div>
           <div class="bento-card "><div class="bento-visual" aria-hidden="true"><div class="mini"><div class="mini-row"><span class="icon" data-icon="check" aria-hidden="true"></span><span>Ship the 0.9 release</span><i class="agent-logo claude" data-agent="claude"></i></div><div class="mini-tree"><div class="mini-row"><span class="icon" data-icon="check" aria-hidden="true"></span><span>Write the release notes</span><small>2m</small></div><div class="mini-row"><span class="icon" data-icon="check" aria-hidden="true"></span><span>Verify the Linux build</span><small>7m</small></div><div class="mini-row working"><span class="icon" data-icon="working-0" aria-hidden="true"></span><span>Test the updater</span><small>9m</small></div></div></div></div><dt>Agents that run agents</dt><dd>One prompt starts a team. Agents hand out tasks, follow progress and bring back one result.</dd></div>
-          <div class="bento-card "><div class="bento-visual" aria-hidden="true"><div class="mini"><div class="mini-title"><span class="icon" data-icon="bell" aria-hidden="true"></span>Notifications</div><div class="mini-row note"><span class="icon" data-icon="warning" aria-hidden="true"></span><span>Weekly plan</span><small>Claude has a question</small></div><div class="mini-row done"><span class="icon" data-icon="check-circle" aria-hidden="true"></span><span>Diri website</span><small>Codex finished</small></div><div class="mini-row mini-skeleton"><i></i><b></b><em></em></div></div></div><dt>Know who needs you</dt><dd>One sidebar, not thirty terminals. Jump straight to the session that is waiting.</dd></div>
-          <div class="bento-card wide"><div class="bento-visual" aria-hidden="true"><div class="mini mini-table"><div class="mini-tr head"><span>Branch</span><span>Agent</span><span>Changes</span></div><div class="mini-tr"><span><span class="icon" data-icon="branch" aria-hidden="true"></span>fix/reconnect-test</span><span><i class="agent-logo" data-agent="codex"></i></span><span><b>+42</b> <s>−7</s></span></div><div class="mini-tr"><span><span class="icon" data-icon="branch" aria-hidden="true"></span>feat/passkeys</span><span><i class="agent-logo claude" data-agent="claude"></i></span><span><b>+318</b> <s>−40</s></span></div><div class="mini-tr"><span><span class="icon" data-icon="branch" aria-hidden="true"></span>perf/search-p95</span><span><i class="agent-logo" data-agent="cursor"></i></span><span><b>+27</b> <s>−12</s></span></div></div></div><dt>A workspace per agent</dt><dd>Each agent gets its own Git worktree and branch, so parallel work never collides.</dd></div>
-          <div class="bento-card wide"><div class="bento-visual" aria-hidden="true"><div class="mini mini-diff"><div class="mini-file"><span class="icon" data-icon="code" aria-hidden="true"></span>src/updater/linux.rs<small>+18 −6</small></div><code class="del">−    fs::rename(new, &amp;current)?;</code><code class="add">+    fs::rename(new, &amp;staged)?;</code><code class="add">+    verify_bundle(&amp;staged)?;</code></div><div class="mini mini-pr"><span class="icon" data-icon="pull-request" aria-hidden="true"></span><span>Swap the bundle atomically</span><small><span class="icon" data-icon="check" aria-hidden="true"></span>Checks passed</small></div></div><dt>Review and ship</dt><dd>Inspect diffs, commit, and follow the pull request from the session that did the work.</dd></div>
+          <div class="bento-card "><div class="bento-visual" aria-hidden="true"><div class="mini mini-table"><div class="mini-tr head"><span>Branch</span><span>Agent</span><span>Changes</span></div><div class="mini-tr"><span><span class="icon" data-icon="branch" aria-hidden="true"></span>fix/reconnect-test</span><span><i class="agent-logo" data-agent="codex"></i></span><span><b>+42</b> <s>−7</s></span></div><div class="mini-tr"><span><span class="icon" data-icon="branch" aria-hidden="true"></span>feat/passkeys</span><span><i class="agent-logo claude" data-agent="claude"></i></span><span><b>+318</b> <s>−40</s></span></div><div class="mini-tr"><span><span class="icon" data-icon="branch" aria-hidden="true"></span>perf/search-p95</span><span><i class="agent-logo" data-agent="cursor"></i></span><span><b>+27</b> <s>−12</s></span></div></div></div><dt>A workspace per agent</dt><dd>Each agent gets its own Git worktree and branch, so parallel work never collides.</dd></div>
+          <div class="bento-card "><div class="bento-visual" aria-hidden="true"><div class="mini mini-diff"><div class="mini-file"><span class="icon" data-icon="code" aria-hidden="true"></span>src/updater/linux.rs<small>+18 −6</small></div><code class="del">−    fs::rename(new, &amp;current)?;</code><code class="add">+    fs::rename(new, &amp;staged)?;</code><code class="add">+    verify_bundle(&amp;staged)?;</code></div><div class="mini mini-pr"><span class="icon" data-icon="pull-request" aria-hidden="true"></span><span>Swap the bundle atomically</span><small><span class="icon" data-icon="check" aria-hidden="true"></span>Checks passed</small></div></div><dt>Review and ship</dt><dd>Inspect diffs, commit, and follow the pull request from the session that did the work.</dd></div>
         </dl>
         <dl class="bento-small">
+          <div class="bento-card small"><span class="icon" data-icon="apps" aria-hidden="true"></span><dt>Every agent you already use</dt><dd>Claude Code, Codex, Cursor, Gemini and 18 more, with your existing logins.</dd></div>
+          <div class="bento-card small"><span class="icon" data-icon="split" aria-hidden="true"></span><dt>Panes and prefix keys</dt><dd>Splits, zoom and tmux-style keys, all scriptable from the CLI or MCP.</dd></div>
+          <div class="bento-card small"><span class="icon" data-icon="bell" aria-hidden="true"></span><dt>Know who needs you</dt><dd>One sidebar, not thirty terminals. Jump to the session that is waiting.</dd></div>
           <div class="bento-card small"><span class="icon" data-icon="moon" aria-hidden="true"></span><dt>Sessions that stay open</dt><dd>Close diri and agents keep working. Idle ones hibernate.</dd></div>
-          <div class="bento-card small"><span class="icon" data-icon="server" aria-hidden="true"></span><dt>Remote machines</dt><dd>Run sessions on your own SSH hosts, with no hosted relay.</dd></div>
+          <div class="bento-card small"><span class="icon" data-icon="external-link" aria-hidden="true"></span><dt>A browser per agent</dt><dd>Each session drives its own real browser to test what it built.</dd></div>
+          <div class="bento-card small"><span class="icon" data-icon="plug" aria-hidden="true"></span><dt>API tab</dt><dd>Agents open the endpoint they just built, ready for you to send.</dd></div>
+          <div class="bento-card small"><span class="icon" data-icon="terminal" aria-hidden="true"></span><dt>Quick terminal</dt><dd>A drop-down terminal on a global hotkey, over any app.</dd></div>
+          <div class="bento-card small"><span class="icon" data-icon="file" aria-hidden="true"></span><dt>Inline images</dt><dd>Kitty and iTerm2 images in the terminal, locally and over SSH.</dd></div>
           <div class="bento-card small"><span class="icon" data-icon="monitor" aria-hidden="true"></span><dt>iPhone companion</dt><dd>Answer questions and review changes from your phone. Beta.</dd></div>
           <div class="bento-card small"><span class="icon" data-icon="clock" aria-hidden="true"></span><dt>Conversation history</dt><dd>Find and resume past Claude and Codex chats, even ones started elsewhere.</dd></div>
           <div class="bento-card small"><span class="icon" data-icon="refresh" aria-hidden="true"></span><dt>Handoffs &amp; forks</dt><dd>Pass a task and its context to another agent, or fork the conversation.</dd></div>
-          <div class="bento-card small"><span class="icon" data-icon="local-agents" aria-hidden="true"></span><dt>Usage &amp; limits</dt><dd>Spend, tokens, context and plan limits beside your sessions.</dd></div>
-          <div class="bento-card small"><span class="icon" data-icon="user" aria-hidden="true"></span><dt>Work &amp; personal accounts</dt><dd>Choose a Claude or Codex account for each session.</dd></div>
+          <div class="bento-card small"><span class="icon" data-icon="user" aria-hidden="true"></span><dt>Switch accounts in one click</dt><dd>Move every Claude or Codex tab to the account with room left.</dd></div>
           <div class="bento-card small"><span class="icon" data-icon="note" aria-hidden="true"></span><dt>Notes &amp; to-dos</dt><dd>Plans next to your agents. Any to-do can start one.</dd></div>
           <div class="bento-card small"><span class="icon" data-icon="keyboard" aria-hidden="true"></span><dt>Command menu</dt><dd>Chats, projects and settings one ⌘K away. Rebind any shortcut.</dd></div>
-          <div class="bento-card small"><span class="icon" data-icon="code" aria-hidden="true"></span><dt>Files &amp; source</dt><dd>Open file references from output and search symbols in place.</dd></div>
-          <div class="bento-card small"><span class="icon" data-icon="file" aria-hidden="true"></span><dt>Skill library</dt><dd>Search, read and copy personal, project and plugin skills.</dd></div>
+          <div class="bento-card small"><span class="icon" data-icon="local-agents" aria-hidden="true"></span><dt>Usage &amp; limits</dt><dd>Spend, tokens, context and plan limits beside your sessions.</dd></div>
           <div class="bento-card small"><span class="icon" data-icon="shield" aria-hidden="true"></span><dt>Free &amp; open source</dt><dd>AGPL-3.0, native Rust, no Electron, no account.</dd></div>
         </dl>
         <section class="more-section" aria-labelledby="guides-title">
@@ -320,7 +331,7 @@
         </section>
         <section class="more-section" id="faq" aria-labelledby="faq-title">
           <div class="features-heading"><h2 id="faq-title">Questions</h2></div>
-          <dl class="faq-grid"><div><dt>Is diri free?</dt><dd>Yes. diri is free and open source under AGPL-3.0. You only pay for the agents you use, through your own Claude, ChatGPT or other accounts. If you distribute a modified copy, or let people use one over a network, you must offer them its source under the same license.</dd></div><div><dt>Which agents does it work with?</dt><dd>Claude Code, Codex, Cursor, Gemini, OpenCode, Pi, Copilot, Kimi and more: 22 agent definitions ship with the app, and any terminal agent can be added with a short JSON file.</dd></div><div><dt>Do I need to know how to code?</dt><dd>No. You describe tasks in plain English and the agents do the work. The guides are written for marketers and product managers as well as developers.</dd></div><div><dt>What happens when I close diri?</dt><dd>Your agents keep working. Reopen diri and every session is where you left it. Restarting your Mac stops them, but Claude Code, Codex and most others can resume the same conversation.</dd></div><div><dt>Can agents work together?</dt><dd>Yes. Claude Code, Codex and Cursor sessions started in diri can start other agents, hand them tasks, and collect their results. Ask in plain English, starting with “Use diri to…”.</dd></div><div><dt>Does diri see my code or prompts?</dt><dd>No. Agents run on your Mac or your own servers, with no diri account and no hosted relay. diri records crash and performance diagnostics, never terminal contents or prompts, and you can turn sharing off.</dd></div><div><dt>Which platforms are supported?</dt><dd>macOS 15 or newer on Apple silicon and Intel. Linux is in beta, and a Windows version is in progress.</dd></div></dl>
+          <dl class="faq-grid"><div><dt>Is diri free?</dt><dd>Yes. diri is free and open source under AGPL-3.0. You only pay for the agents you use, through your own Claude, ChatGPT or other accounts. If you distribute a modified copy, or let people use one over a network, you must offer them its source under the same license.</dd></div><div><dt>Which agents does it work with?</dt><dd>Claude Code, Codex, Cursor, Gemini, OpenCode, Pi, Copilot, Kimi and more: 22 agent definitions ship with the app, and any terminal agent can be added with a short JSON file.</dd></div><div><dt>Do I need to know how to code?</dt><dd>No. You describe tasks in plain English and the agents do the work. The guides are written for marketers and product managers as well as developers.</dd></div><div><dt>What happens when I close diri?</dt><dd>Your agents keep working. Reopen diri and every session is where you left it. Restarting your Mac stops them, but Claude Code, Codex and most others can resume the same conversation.</dd></div><div><dt>Can agents work together?</dt><dd>Yes. Agents started in diri can start other agents, on this Mac or on any of your SSH hosts, hand them tasks, wait for them, and merge their work. Ask in plain English, starting with “Use diri to…”.</dd></div><div><dt>Does diri see my code or prompts?</dt><dd>No. Agents run on your Mac or your own servers, with no diri account and no hosted relay. diri records crash and performance diagnostics, never terminal contents or prompts, and you can turn sharing off.</dd></div><div><dt>Which platforms are supported?</dt><dd>macOS 15 or newer on Apple silicon and Intel. Linux is in beta, and a Windows version is in progress.</dd></div></dl>
         </section>
       </section>
     </main>

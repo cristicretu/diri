@@ -950,7 +950,7 @@ html { overflow-x: clip; }
 .sidebar-rows > * { flex-shrink: 0; }
 .app-sidebar .sidebar-bottom { position: static; flex: none; background: none; }
 
-/* Features as a bento: five cards that show a slice of the app, then a grid of short facts. */
+/* Features as a bento: eight cards that show a slice of the app, then a grid of short facts. */
 .bento, .bento-small { display: grid; gap: 14px; margin: 8px 0 0; }
 .bento { grid-template-columns: repeat(6, minmax(0, 1fr)); }
 .bento-small { grid-template-columns: repeat(4, minmax(0, 1fr)); margin-top: 14px; }
@@ -993,8 +993,34 @@ html { overflow-x: clip; }
 .mini-pr { width: min(420px, 100%); display: flex; align-items: center; gap: 9px; padding: 11px 14px; }
 .mini-pr small { display: inline-flex; align-items: center; gap: 5px; margin-left: auto; color: #8fd3a3; font-size: 12px; }
 .mini-pr small .icon { width: 12px; height: 12px; color: #8fd3a3; }
-@media (max-width: 1050px) { .bento { grid-template-columns: repeat(2, minmax(0, 1fr)); } .bento-card, .bento-card.wide { grid-column: span 1; } .bento-card.wide:last-child { grid-column: span 2; } .bento-small { grid-template-columns: repeat(2, minmax(0, 1fr)); } }
-@media (max-width: 600px) { .bento, .bento-small { grid-template-columns: minmax(0, 1fr); } .bento-card, .bento-card.wide, .bento-card.wide:last-child { grid-column: auto; } .bento-visual { min-height: 0; } }
+/* Showcase slices: an MCP conversation, hosts, schedules, a background cursor and a spoken reply. */
+.mini-ask { margin: 2px 2px 10px; padding: 10px 12px; border-radius: 10px; background: #ffffff0a; color: #e9e4f2; line-height: 1.45; white-space: normal; }
+.mini-call { display: flex; align-items: center; gap: 9px; height: 32px; padding: 0 9px; white-space: nowrap; }
+.mini-call code { font: 12px Menlo, monospace; color: #c4a7e7; }
+.mini-call span:last-child { overflow: hidden; text-overflow: ellipsis; color: #8f87a3; font-size: 12px; }
+.mini-call > .icon[data-icon="check"] { color: #8fd3a3; }
+.mini-call.working > .icon { animation: spin 1.2s linear infinite; }
+.mini-mcp { width: min(420px, 100%); }
+.mini-hosts .mini-tr { grid-template-columns: 1fr 1fr .8fr; }
+.mini-hosts .mini-tr span:first-child { font-family: inherit; font-size: 13px; }
+.mini-hosts .mini-tr span:nth-child(2) { color: #a9a2bc; font-size: 12px; }
+.mini-hosts .mini-tr span:last-child { display: flex; align-items: center; gap: 5px; color: #a9a2bc; }
+.mini-hosts .agent-logo { width: 13px; height: 13px; }
+.mini-row.woke { color: #a9a2bc; } .mini-row.woke .icon { color: #9ccfd8; }
+.mini-screen { position: relative; display: flex; flex-direction: column; gap: 9px; height: 150px; padding: 18px 20px; border-radius: 9px; background: #191724; }
+.mini-screen b { width: 70%; height: 8px; border-radius: 4px; background: #ffffff12; } .mini-screen b.short { width: 40%; }
+.mini-button { align-self: flex-start; margin-top: 10px; padding: 6px 14px; border-radius: 7px; background: #ebbcba; color: #191724; font-size: 12px; font-weight: 500; }
+.mini-cursor { position: absolute; left: 92px; top: 104px; display: inline-flex; align-items: center; gap: 5px; padding: 3px 8px 3px 6px; border-radius: 999px; background: #c4a7e7; color: #191724; font-size: 11px; white-space: nowrap; }
+.mini-cursor::before { content: ""; position: absolute; left: -6px; top: -7px; border: 5px solid transparent; border-top-color: #c4a7e7; border-left-color: #c4a7e7; }
+.mini-cursor .agent-logo { width: 11px; height: 11px; color: #191724; }
+.mini-wave { display: flex; align-items: center; justify-content: center; gap: 4px; height: 52px; }
+.mini-wave i { width: 4px; height: 30%; border-radius: 2px; background: #c4a7e7; animation: wave 1.1s ease-in-out infinite alternate; }
+.mini-wave i:nth-child(3n) { animation-delay: -.3s; } .mini-wave i:nth-child(3n+1) { animation-delay: -.7s; } .mini-wave i:nth-child(4n) { animation-delay: -.5s; }
+@keyframes wave { to { height: 90%; } }
+.mini-row.reply { color: #a9a2bc; font-style: italic; } .mini-row.reply small { font-style: normal; }
+@media (prefers-reduced-motion: reduce) { .mini-wave i, .mini-call.working > .icon { animation: none; } }
+@media (max-width: 1050px) { .bento { grid-template-columns: repeat(2, minmax(0, 1fr)); } .bento-card, .bento-card.wide { grid-column: span 1; } .bento-small { grid-template-columns: repeat(2, minmax(0, 1fr)); } }
+@media (max-width: 600px) { .bento, .bento-small { grid-template-columns: minmax(0, 1fr); } .bento-card, .bento-card.wide { grid-column: auto; } .bento-visual { min-height: 0; } }
 @media (prefers-reduced-motion: reduce) { .mini-row.working .icon { animation: none; } }
 .bento-visual { height: 250px; min-height: 0; }
 .bento-card dt { margin-top: 0; }
