@@ -8482,7 +8482,6 @@ mod tests {
         for selector in [
             "session-links-trigger",
             "toggle-inspector",
-            "notification-inbox-button",
         ] {
             let control = cx
                 .debug_bounds(selector)
@@ -8531,8 +8530,8 @@ mod tests {
             cx.debug_bounds("show-sidebar").is_some(),
             "the pane title bar returns with its top-bar toggle"
         );
-        let bell = cx.debug_bounds("notification-inbox-button").unwrap();
-        assert!(bell.center().y < px(Metrics::TITLE_BAR));
+        let toggle = cx.debug_bounds("toggle-inspector").unwrap();
+        assert!(toggle.center().y < px(Metrics::TITLE_BAR));
         assert!(!root.read_with(cx, |root, cx| {
             root.terminal.as_ref().unwrap().read(cx).header_hidden()
         }));
@@ -12305,9 +12304,9 @@ mod tests {
         let toggle = cx
             .debug_bounds("toggle-inspector")
             .expect("a closed panel is toggled from the session title bar");
-        let bell = cx.debug_bounds("notification-inbox-button").unwrap();
+        let links = cx.debug_bounds("session-links-trigger").unwrap();
         assert!(
-            toggle.left() >= bell.right(),
+            toggle.left() >= links.right(),
             "the toggle ends the title bar"
         );
         assert!(toggle.center().y < px(Metrics::TITLE_BAR));
@@ -12420,40 +12419,6 @@ mod tests {
     }
 
     #[gpui::test]
-    fn notification_trigger_closes_an_open_panel_in_one_click(cx: &mut gpui::TestAppContext) {
-        let services = test_services();
-        let session = SidebarPreviewFixture::make(PreviewScenario::Typical)
-            .list
-            .sessions[0]
-            .clone();
-        {
-            let mut store = services.store.store.write().expect("store");
-            store.upsert_session(session.clone());
-            store.select(session.id);
-        }
-        let (root, cx) = cx.add_window_view(move |window, cx| {
-            RootView::new(services, true, PreviewScenario::Empty, window, cx)
-        });
-        cx.simulate_resize(size(px(1_000.0), px(700.0)));
-        cx.run_until_parked();
-        let trigger = cx
-            .debug_bounds("notification-inbox-button")
-            .expect("notification trigger");
-
-        root.update_in(cx, |root, window, cx| {
-            root.toggle_notifications(window, cx);
-            assert!(root.notification_panel_open);
-        });
-        cx.simulate_click(trigger.center(), Modifiers::default());
-        cx.run_until_parked();
-
-        assert!(
-            !root.read_with(cx, |root, _| root.notification_panel_open),
-            "clicking the notification trigger again must close the panel without reopening it"
-        );
-    }
-
-    #[gpui::test]
     fn the_hidden_sidebar_button_clears_the_traffic_lights_in_both_densities(
         cx: &mut gpui::TestAppContext,
     ) {
@@ -12519,7 +12484,6 @@ mod tests {
         for selector in [
             "show-sidebar",
             "session-links-trigger",
-            "notification-inbox-button",
         ] {
             let control = cx
                 .debug_bounds(selector)
@@ -12640,7 +12604,7 @@ mod tests {
 
         // Vertical tabs: the pane's title bar reaches the corner and keeps
         // its actions clear of the caption.
-        for selector in ["toggle-inspector", "notification-inbox-button"] {
+        for selector in ["toggle-inspector", "session-links-trigger"] {
             let control = cx.debug_bounds(selector).unwrap();
             assert!(
                 control.center().y < px(Metrics::TITLE_BAR)
@@ -12656,9 +12620,9 @@ mod tests {
             Some(WindowControlArea::Drag),
             "the sidebar's empty title row moves the window"
         );
-        let bell = cx.debug_bounds("notification-inbox-button").unwrap();
+        let links = cx.debug_bounds("session-links-trigger").unwrap();
         assert_eq!(
-            area_at(cx, point(bell.left() - px(80.0), px(20.0))),
+            area_at(cx, point(links.left() - px(80.0), px(20.0))),
             Some(WindowControlArea::Drag),
             "so does the pane's title bar"
         );
@@ -12960,25 +12924,15 @@ mod tests {
         cx.run_until_parked();
 
         let settings = cx.debug_bounds("settings-shell").expect("settings shell");
-        let trigger = cx
-            .debug_bounds("notification-inbox-button")
-            .expect("settings notification trigger");
         let panel = cx
             .debug_bounds("notification-panel")
             .expect("notification panel");
-        assert_eq!(trigger.top(), settings.top() + px(7.0));
         assert!(
             panel.top() <= settings.top() + px(14.0)
                 && panel.top() < settings.top() + px(Metrics::TITLE_BAR),
             "Settings has no workbench navbar, so the panel must enter from its canvas edge: {panel:?}"
         );
 
-        cx.simulate_click(trigger.center(), Modifiers::default());
-        cx.run_until_parked();
-        assert!(
-            !root.read_with(cx, |root, _| root.notification_panel_open),
-            "the Settings notification trigger must close its open panel in one click"
-        );
     }
 
     #[cfg(target_os = "macos")]

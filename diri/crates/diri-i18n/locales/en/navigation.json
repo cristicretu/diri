@@ -513,7 +513,6 @@
   "terminal.messages.none_on_screen": "Couldn’t find a message on screen",
   "terminal.messages.reconnecting": "Reconnecting to the session…",
   "terminal.moving_session": "Moving session…",
-  "terminal.notifications": "Notifications",
   "terminal.password_prompt": "Password prompt",
   "terminal.paste.cancel": "Cancel",
   "terminal.paste.changed": "Terminal changed. Paste again to review.",

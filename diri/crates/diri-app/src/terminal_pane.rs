@@ -4679,7 +4679,6 @@ impl TerminalPane {
                     .opacity(self.title_opacity)
                     .when(shell_controls, |trailing| {
                         trailing
-                            .child(self.render_notification_button(colors, self.held_hint))
                             .children(self.render_inspector_toggle(colors, self.held_hint))
                     }),
             )
@@ -4745,63 +4744,6 @@ impl TerminalPane {
         })
     }
 
-    fn render_notification_button(&self, colors: SemanticColors, held_hint: f32) -> AnyElement {
-        let unread = self
-            .runtime
-            .store
-            .read()
-            .expect("session store lock poisoned")
-            .notifications()
-            .unread_count();
-        let button = div()
-            .id("notification-inbox-button")
-            .debug_selector(|| "notification-inbox-button".into())
-            .role(gpui::Role::Button)
-            .aria_label(t("terminal.notifications"))
-            .relative()
-            .size(px(Metrics::TOOLBAR_CONTROL_SIZE))
-            .flex_none()
-            .flex()
-            .items_center()
-            .justify_center()
-            .rounded(px(Radius::BADGE))
-            .cursor_pointer()
-            .hover(move |button| button.bg(Fill::subtle(colors)))
-            .child(sf_symbol(
-                if unread > 0 { "bell.fill" } else { "bell" },
-                14.0,
-                if unread > 0 {
-                    Ink::FRESH
-                } else {
-                    colors.secondary
-                },
-            ))
-            .when(unread > 0, |button| {
-                button.child(
-                    div()
-                        .absolute()
-                        .top(px(2.0))
-                        .right(px(2.0))
-                        .size(px(5.0))
-                        .rounded_full()
-                        .bg(Ink::FRESH),
-                )
-            })
-            .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
-            .on_click(|_, window, cx| {
-                window.dispatch_action(Box::new(crate::commands::ToggleNotifications), cx);
-                cx.stop_propagation();
-            })
-            .into_any_element();
-        crate::held_hints::below(
-            button,
-            "notifications",
-            crate::held_hints::label(crate::commands::CommandId::ToggleNotifications),
-            held_hint,
-            colors,
-        )
-    }
-
     /// The title-bar actions for a workbench that paints them itself, in the
     /// horizontal tab strip beside the new-tab control. Only the pane that
     /// follows the selection owns shell-wide controls; a fixed pane hosts
@@ -4830,7 +4772,6 @@ impl TerminalPane {
                         .children(self.render_read_aloud_toggle(&session, colors, cx))
                         .child(self.render_session_links_trigger(&session, colors, cx))
                 })
-                .child(self.render_notification_button(colors, held_hint))
                 .children(self.render_inspector_toggle(colors, held_hint))
                 .into_any_element(),
         )

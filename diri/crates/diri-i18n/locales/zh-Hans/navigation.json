@@ -513,7 +513,6 @@
   "terminal.messages.none_on_screen": "屏幕上找不到消息",
   "terminal.messages.reconnecting": "正在重新连接会话…",
   "terminal.moving_session": "正在移动会话…",
-  "terminal.notifications": "通知",
   "terminal.password_prompt": "密码提示",
   "terminal.paste.cancel": "取消",
   "terminal.paste.changed": "终端已变化。请再次粘贴以重新确认。",

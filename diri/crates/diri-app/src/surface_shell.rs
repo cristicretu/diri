@@ -3143,12 +3143,6 @@ impl UtilitySurfaces {
          * layout immediately.
          * ───────────────────────────────────────────────────────── */
         let colors = self.settings_colors();
-        let unread = self
-            .store
-            .read()
-            .expect("session store lock poisoned")
-            .notifications()
-            .unread_count();
         let generation = self.settings_transition_generation;
         let pane = match self.settings_tab {
             SettingsTab::General => self.general_settings(cx).into_any_element(),
@@ -3254,7 +3248,6 @@ impl UtilitySurfaces {
                     .h(px(Metrics::TITLE_BAR))
                     .titlebar_drag_area(),
             )
-            .child(notification_titlebar_button(unread, colors))
             .when_some(self.nested_root.as_ref(), |shell, prompt| {
                 let parent = prompt.parent.clone();
                 let child = prompt.child.clone();
@@ -8412,48 +8405,6 @@ fn settings_tab_matches(tab: SettingsTab, query: &str) -> bool {
     query
         .split_whitespace()
         .all(|word| searchable.contains(word))
-}
-
-fn notification_titlebar_button(unread: usize, colors: SemanticColors) -> AnyElement {
-    div()
-        .id("notification-inbox-button")
-        .debug_selector(|| "notification-inbox-button".into())
-        .absolute()
-        .top(px(7.0))
-        .right(px(14.0 + crate::window_chrome::caption_lane()))
-        .size(px(Metrics::TOOLBAR_CONTROL_SIZE))
-        .flex()
-        .items_center()
-        .justify_center()
-        .rounded(px(Radius::BADGE))
-        .cursor_pointer()
-        .hover(move |button| button.bg(Fill::subtle(colors)))
-        .child(sf_symbol(
-            if unread > 0 { "bell.fill" } else { "bell" },
-            14.0,
-            if unread > 0 {
-                Ink::FRESH
-            } else {
-                colors.secondary
-            },
-        ))
-        .when(unread > 0, |button| {
-            button.child(
-                div()
-                    .absolute()
-                    .top(px(2.0))
-                    .right(px(2.0))
-                    .size(px(5.0))
-                    .rounded_full()
-                    .bg(Ink::FRESH),
-            )
-        })
-        .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
-        .on_click(|_, window, cx| {
-            window.dispatch_action(Box::new(crate::commands::ToggleNotifications), cx);
-            cx.stop_propagation();
-        })
-        .into_any_element()
 }
 
 fn spaced_shortcut_label(label: &str) -> String {

@@ -513,7 +513,6 @@
   "terminal.messages.none_on_screen": "No se encontró ningún mensaje en pantalla",
   "terminal.messages.reconnecting": "Reconectando con la sesión…",
   "terminal.moving_session": "Moviendo sesión…",
-  "terminal.notifications": "Notificaciones",
   "terminal.password_prompt": "Solicitud de contraseña",
   "terminal.paste.cancel": "Cancelar",
   "terminal.paste.changed": "El terminal cambió. Pega de nuevo para revisarlo.",
