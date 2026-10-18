@@ -26,10 +26,10 @@ use super::whats_new_clips::Recorder;
 use super::*;
 use crate::SidebarPreviewFixture;
 
-/// Short enough that no clip ends in empty terminal; the site shows them
-/// at exactly 1200 CSS pixels, 2x.
-const WINDOW: (f32, f32) = (1200.0, 620.0);
-const COLS: u16 = 120;
+/// As wide as the site's content column at its largest zoom (1208 CSS px at
+/// 1.25), so a 2x recording is only ever scaled down.
+const WINDOW: (f32, f32) = (1520.0, 720.0);
+const COLS: u16 = 170;
 
 #[derive(Clone, Copy)]
 enum Hue {
@@ -415,9 +415,9 @@ fn lead_pane() -> LayoutNode {
     }
 }
 
-/// Split panes are about 56 columns wide; a full pane about 116.
-const HALF: usize = 56;
-const FULL: usize = 116;
+/// Split panes are about 76 columns wide; a full pane about 156.
+const HALF: usize = 72;
+const FULL: usize = 150;
 
 /// Claude Code starts Codex on `forge` beside itself over MCP, waits, and
 /// reads its result.
