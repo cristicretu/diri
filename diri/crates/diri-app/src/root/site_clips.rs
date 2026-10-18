@@ -27,8 +27,9 @@ use super::*;
 use crate::SidebarPreviewFixture;
 
 /// As wide as the site's content column at its largest zoom (1208 CSS px at
-/// 1.25), so a 2x recording is only ever scaled down.
-const WINDOW: (f32, f32) = (1520.0, 720.0);
+/// 1.25), so a 2x recording is only ever scaled down; short, so the
+/// terminals are full and scroll rather than trail off into empty rows.
+const WINDOW: (f32, f32) = (1520.0, 560.0);
 const COLS: u16 = 170;
 
 #[derive(Clone, Copy)]

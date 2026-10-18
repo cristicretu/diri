@@ -993,27 +993,27 @@ html { overflow-x: clip; }
 .mini-pr { width: min(420px, 100%); display: flex; align-items: center; gap: 9px; padding: 11px 14px; }
 .mini-pr small { display: inline-flex; align-items: center; gap: 5px; margin-left: auto; color: #8fd3a3; font-size: 12px; }
 .mini-pr small .icon { width: 12px; height: 12px; color: #8fd3a3; }
-/* Features, Everything else and Questions share one grid: titles on the content's left edge, body text and
-   lists from its centre line, and every section title at one size, a clear step below the hero. */
-.feature-list { display: flex; flex-direction: column; gap: 136px; margin-top: 56px; }
-.feature-copy, #faq { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); column-gap: 48px; }
-.feature-copy { align-items: start; margin-bottom: 32px; }
+/* Features, Everything else and Questions hang off the content's left edge, and every section title is one
+   size, a clear step below the hero. A feature's line sits under its title, never floating mid-page. */
+.feature-list { display: flex; flex-direction: column; gap: 88px; margin-top: 40px; }
+#faq { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); column-gap: 48px; }
+.feature-copy { margin-bottom: 24px; }
 .feature h3, .faq-head h2 { margin: 0; }
 .feature h3, .also-title, .faq-head h2 { font-family: "Geist", -apple-system, BlinkMacSystemFont, sans-serif; font-size: 28px; line-height: 1.15; font-weight: 540; letter-spacing: -.025em; color: #f4f0fa; text-wrap: balance; }
-.feature p { max-width: 30rem; padding-top: 3px; font-size: 15.5px; line-height: 1.6; color: #a9a2bc; text-wrap: pretty; }
+.feature p { max-width: 36rem; margin-top: 12px; font-size: 16px; line-height: 1.6; color: #a9a2bc; text-wrap: pretty; }
 .feature-clip { position: relative; container-type: inline-size; margin: 0; border-radius: 12px; overflow: hidden; border: 1px solid #ffffff1a; background: #1f1d2e; box-shadow: 0 1px 0 #ffffff0d inset, 0 40px 80px -40px #000; }
-/* Recorded 1520×720 points at 2x: wider than the column at any zoom, so it is only ever scaled down. */
+/* Recorded 1520×560 points at 2x: wider than the column at any zoom, so it is only ever scaled down. */
 .feature-clip img { display: block; width: 100%; height: auto; }
 /* AppKit draws the traffic lights, so a headless recording has none; these sit where diri puts them (20, 17 pt, 14 pt wide, 8 pt apart). */
 .clip-lights { position: absolute; left: calc(20cqw / 15.2); top: calc(17cqw / 15.2); display: flex; gap: calc(8cqw / 15.2); }
 .clip-lights i { width: calc(14cqw / 15.2); aspect-ratio: 1; border-radius: 50%; background: #ff5f57; box-shadow: inset 0 0 0 .5px #0000002e; }
 .clip-lights i:nth-child(2) { background: #febc2e; } .clip-lights i:nth-child(3) { background: #28c840; }
-.also-title { margin: 136px 0 32px; }
+.also-title { margin: 96px 0 28px; }
 .also { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 26px 32px; margin: 0; }
 .also dt { display: flex; align-items: center; gap: 9px; font-size: 14px; font-weight: 500; color: #e9e4f2; }
 .also dt .icon { width: 14px; height: 14px; color: #8f87a3; }
 .also dd { margin: 5px 0 0 23px; font-size: 13.5px; line-height: 1.5; color: #8f87a3; }
-@media (max-width: 1050px) { .feature-copy { grid-template-columns: minmax(0, 1fr); row-gap: 12px; } .feature-list { gap: 96px; margin-top: 80px; } .also-title { margin-top: 96px; } .also { grid-template-columns: repeat(2, minmax(0, 1fr)); } }
+@media (max-width: 1050px) { .feature-list { gap: 96px; margin-top: 80px; } .also-title { margin-top: 96px; } .also { grid-template-columns: repeat(2, minmax(0, 1fr)); } }
 @media (max-width: 600px) { .feature h3, .also-title, .faq-head h2 { font-size: 24px; } .feature-clip { border-radius: 10px; } .also { grid-template-columns: minmax(0, 1fr); } }
 @media (max-width: 1050px) { .bento { grid-template-columns: repeat(2, minmax(0, 1fr)); } .bento-card, .bento-card.wide { grid-column: span 1; } .bento-small { grid-template-columns: repeat(2, minmax(0, 1fr)); } }
 @media (max-width: 600px) { .bento, .bento-small { grid-template-columns: minmax(0, 1fr); } .bento-card, .bento-card.wide { grid-column: auto; } .bento-visual { min-height: 0; } }
@@ -1094,7 +1094,7 @@ html { overflow-x: clip; }
 .guide-card:focus-within { outline: 2px solid var(--rp-rose); outline-offset: 2px; }
 .guide-card dt a:focus-visible { outline: none; }
 /* Questions: heading on the left, one column of answers that open on demand. */
-#faq { align-items: start; padding-top: 136px; }
+#faq { align-items: start; padding-top: 96px; }
 .faq-head p { margin-top: 8px; font-size: 14px; color: #8f87a3; }
 .faq-head a { color: #c9c2d8; text-decoration: underline; text-decoration-color: #ffffff30; text-underline-offset: 3px; }
 .faq-head a:hover { color: #f4f0fa; }
