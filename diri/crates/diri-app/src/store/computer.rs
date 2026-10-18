@@ -195,8 +195,8 @@ mod tests {
     fn status(installed: bool, grants: (bool, bool)) -> diri_proto::ComputerStatus {
         diri_proto::ComputerStatus {
             supported: true,
-            version: installed.then(|| "0.36.0".to_owned()),
-            tested_version: "0.36.0".to_owned(),
+            version: installed.then(|| "0.36.1".to_owned()),
+            tested_version: "0.36.1".to_owned(),
             accessibility: installed.then_some(grants.0),
             screen_recording: installed.then_some(grants.1),
             ..Default::default()
