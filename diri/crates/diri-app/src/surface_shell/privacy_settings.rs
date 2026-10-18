@@ -120,7 +120,7 @@ impl UtilitySurfaces {
         cx: &mut Context<Self>,
     ) -> bool {
         if self.surface != Surface::Settings
-            || self.settings_tab != SettingsTab::General
+            || self.settings_tab != SettingsTab::Privacy
             || !self.privacy.name_active
         {
             return false;
@@ -170,7 +170,7 @@ impl UtilitySurfaces {
             .clone()
             .unwrap_or_else(|| t("settings.privacy.unavailable").to_owned());
         setting_section(
-            t("settings.privacy.title"),
+            t("settings.privacy.diagnostics"),
             div()
                 .flex()
                 .flex_col()

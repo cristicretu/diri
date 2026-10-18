@@ -675,6 +675,7 @@ impl UtilitySurfaces {
             Some("appearance") => SettingsTab::Appearance,
             Some("terminal") => SettingsTab::Terminal,
             Some("voice") => SettingsTab::Voice,
+            Some("privacy") => SettingsTab::Privacy,
             Some("whats-new" | "what's-new") => SettingsTab::WhatsNew,
             Some("agents") => SettingsTab::Agents,
             Some("skills") => SettingsTab::Skills,
@@ -3160,6 +3161,7 @@ impl UtilitySurfaces {
             SettingsTab::Appearance => self.appearance_settings(cx).into_any_element(),
             SettingsTab::Terminal => self.terminal_settings(cx).into_any_element(),
             SettingsTab::Voice => self.voice_settings(cx).into_any_element(),
+            SettingsTab::Privacy => self.privacy_page(cx).into_any_element(),
             SettingsTab::Worktrees => self.worktree_settings(cx).into_any_element(),
             SettingsTab::Resources => self.resource_settings(cx).into_any_element(),
             SettingsTab::Remote => self.remote_settings(cx).into_any_element(),
@@ -4028,19 +4030,18 @@ impl UtilitySurfaces {
                 .flex()
                 .flex_col()
                 .gap(px(SETTINGS_SECTION_GAP))
-                .child(setting_section(
-                    t("settings.general.language"),
-                    setting_row(
-                        t("settings.general.interface_language"),
-                        t("settings.general.interface_language_detail"),
-                        self.language_dropdown(cx),
-                        colors,
-                    ),
-                    colors,
-                ))
-                .child(setting_section(
-                    t("settings.general.new_sessions"),
-                    setting_row(
+                .child(setting_card(
+                    div()
+                        .flex()
+                        .flex_col()
+                        .child(setting_row(
+                            t("settings.general.interface_language"),
+                            t("settings.general.interface_language_detail"),
+                            self.language_dropdown(cx),
+                            colors,
+                        ))
+                        .child(setting_divider(colors))
+                        .child(setting_row(
                         t("settings.general.default_agent"),
                         tf(
                             "settings.general.default_agent_detail",
@@ -4051,9 +4052,9 @@ impl UtilitySurfaces {
                                     .unwrap_or_default(),
                             )],
                         ),
-                        self.default_agent_dropdown(cx),
-                        colors,
-                    ),
+                            self.default_agent_dropdown(cx),
+                            colors,
+                        )),
                     colors,
                 ))
                 .child(setting_section(
@@ -4369,13 +4370,28 @@ impl UtilitySurfaces {
                         ),
                     colors,
                 ))
+                ,
+            colors,
+        )
+    }
+
+    /// Settings › Privacy: what diri records and shares, and the developer
+    /// switches that measure it.
+    fn privacy_page(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let colors = self.settings_colors();
+        settings_page(
+            t("settings.tab.privacy"),
+            div()
+                .flex()
+                .flex_col()
+                .gap(px(SETTINGS_SECTION_GAP))
                 .child(self.privacy_settings(cx))
                 .child(self.developer_settings(cx)),
             colors,
         )
     }
 
-    /// Settings › General › Developer: the performance overlay and render
+    /// Settings › Privacy › Developer: the performance overlay and render
     /// counters. Shows the live switches, which ⌥⌘P / ⌥⌘R may have flipped
     /// since this panel copied the preferences.
     fn developer_settings(&self, cx: &mut Context<Self>) -> impl IntoElement {
@@ -8376,6 +8392,7 @@ fn settings_tab_matches(tab: SettingsTab, query: &str) -> bool {
         SettingsTab::Appearance => "settings.keywords.appearance",
         SettingsTab::Terminal => "settings.keywords.terminal",
         SettingsTab::Voice => "settings.keywords.voice",
+        SettingsTab::Privacy => "settings.keywords.privacy",
         SettingsTab::Usage => "settings.keywords.usage",
         SettingsTab::Worktrees => "settings.keywords.worktrees",
         SettingsTab::Resources => "settings.keywords.resources",
@@ -9419,6 +9436,7 @@ mod tests {
             Ok("appearance") => SettingsTab::Appearance,
             Ok("terminal") => SettingsTab::Terminal,
             Ok("voice") => SettingsTab::Voice,
+            Ok("privacy") => SettingsTab::Privacy,
             Ok("worktrees") => SettingsTab::Worktrees,
             Ok("resources") => SettingsTab::Resources,
             Ok("usage") => SettingsTab::Usage,
@@ -9542,7 +9560,7 @@ mod tests {
             .expect("seed computer use");
             cx.run_until_parked();
         }
-        // `DIRI_VISUAL_PRIVACY=on|off` seeds Settings > General > Privacy
+        // `DIRI_VISUAL_PRIVACY=on|off` seeds Settings > Privacy
         // (a fixed Support ID and name, never the real files) and scrolls to
         // it at the bottom of the page.
         if let Ok(privacy) = std::env::var("DIRI_VISUAL_PRIVACY") {

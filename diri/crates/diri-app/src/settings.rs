@@ -49,6 +49,7 @@ pub enum SettingsTab {
     Terminal,
     Shortcuts,
     Voice,
+    Privacy,
     WhatsNew,
     Agents,
     Accounts,
@@ -63,12 +64,13 @@ pub enum SettingsTab {
 
 impl SettingsTab {
     /// Navigation order: grouped by [`SettingsSection`], most used first.
-    pub const ALL: [Self; 15] = [
+    pub const ALL: [Self; 16] = [
         Self::General,
         Self::Appearance,
         Self::Terminal,
         Self::Shortcuts,
         Self::Voice,
+        Self::Privacy,
         Self::WhatsNew,
         Self::Agents,
         Self::Accounts,
@@ -93,6 +95,7 @@ impl SettingsTab {
             Self::Terminal => "settings.tab.terminal",
             Self::Shortcuts => "settings.tab.shortcuts",
             Self::Voice => "settings.tab.voice",
+            Self::Privacy => "settings.tab.privacy",
             Self::WhatsNew => "settings.tab.whats_new",
             Self::Agents => "settings.tab.agents",
             Self::Accounts => "settings.tab.accounts",
@@ -113,6 +116,7 @@ impl SettingsTab {
             Self::Terminal => "settings.subtitle.terminal",
             Self::Shortcuts => "settings.subtitle.shortcuts",
             Self::Voice => "settings.subtitle.voice",
+            Self::Privacy => "settings.subtitle.privacy",
             Self::WhatsNew => "settings.subtitle.whats_new",
             Self::Agents => "settings.subtitle.agents",
             Self::Accounts => "settings.subtitle.accounts",
@@ -135,6 +139,7 @@ impl SettingsTab {
             | Self::Terminal
             | Self::Shortcuts
             | Self::Voice
+            | Self::Privacy
             | Self::WhatsNew => SettingsSection::App,
             Self::Agents | Self::Accounts | Self::Skills | Self::Schedules | Self::Usage => {
                 SettingsSection::Agents
@@ -152,6 +157,7 @@ impl SettingsTab {
             Self::Terminal => "terminal",
             Self::Shortcuts => "keyboard",
             Self::Voice => "speaker.wave.2",
+            Self::Privacy => "lock",
             Self::WhatsNew => "gift",
             Self::Agents => "sparkles",
             Self::Accounts => "account.circle",

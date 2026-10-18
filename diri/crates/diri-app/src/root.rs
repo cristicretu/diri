@@ -1850,7 +1850,7 @@ impl RootView {
                 if let Some(surfaces) = &self.utility_surfaces {
                     surfaces.update(cx, |surfaces, cx| {
                         surfaces.open_settings(cx);
-                        surfaces.open_settings_tab(crate::settings::SettingsTab::General, cx);
+                        surfaces.open_settings_tab(crate::settings::SettingsTab::Privacy, cx);
                         surfaces.focus_handle(cx).focus(window, cx);
                     });
                 }
