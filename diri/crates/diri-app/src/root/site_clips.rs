@@ -26,10 +26,12 @@ use super::whats_new_clips::Recorder;
 use super::*;
 use crate::SidebarPreviewFixture;
 
-/// A normal window's proportions. The site shows it beside the feature's
-/// text at up to about 1100 screen pixels wide, so 2x is never stretched.
+/// A normal window's proportions, shown beside or under its feature's text.
 const WINDOW: (f32, f32) = (1140.0, 700.0);
-const COLS: u16 = 120;
+/// The agents clip spans the site's whole content column (up to about 1510
+/// screen pixels), so it is the same shape, larger: 2x is never stretched.
+const WIDE_WINDOW: (f32, f32) = (1520.0, 930.0);
+const COLS: u16 = 170;
 
 #[derive(Clone, Copy)]
 enum Hue {
@@ -211,12 +213,14 @@ fn session_like(
 }
 
 /// The real window over the Typical sidebar with `sessions` on top and
-/// `selected` open. `workspace` puts the selected tab in a split layout.
+/// `selected` open in a `window_size` window. `workspace` puts the selected
+/// tab in a split layout.
 fn open(
     cx: &mut HeadlessAppContext,
     sessions: impl FnOnce(&SessionRecord) -> Vec<SessionRecord>,
     selected: &str,
     workspace: Option<WorkspaceSnapshot>,
+    window_size: (f32, f32),
 ) -> Clip {
     let services = test_services();
     let mut fixture = SidebarPreviewFixture::make(PreviewScenario::Typical);
@@ -253,7 +257,7 @@ fn open(
         }
     }
     let window = cx
-        .open_window(size(px(WINDOW.0), px(WINDOW.1)), move |window, cx| {
+        .open_window(size(px(window_size.0), px(window_size.1)), move |window, cx| {
             cx.new(|cx| {
                 let root = RootView::new(services, false, PreviewScenario::Empty, window, cx);
                 if let Some(snapshot) = &workspace {
@@ -415,9 +419,11 @@ fn lead_pane() -> LayoutNode {
     }
 }
 
-/// Split panes are about 54 columns wide; a full pane about 110.
-const HALF: usize = 52;
+/// A full pane is about 110 columns wide in WINDOW; in WIDE_WINDOW a full
+/// pane is about 156 and a split pane about 76.
 const FULL: usize = 108;
+const WIDE_FULL: usize = 154;
+const WIDE_HALF: usize = 74;
 
 /// Claude Code starts Codex on `forge` beside itself over MCP, waits, and
 /// reads its result.
@@ -435,6 +441,7 @@ fn record_agents(cx: &mut HeadlessAppContext, dir: PathBuf) {
         },
         "clip-lead",
         Some(workspace(1, lead_pane())),
+        WIDE_WINDOW,
     );
     let mut rec = Recorder::new(cx, clip.window, dir);
     use Hue::*;
@@ -451,13 +458,13 @@ fn record_agents(cx: &mut HeadlessAppContext, dir: PathBuf) {
     ];
     let ask = "Use diri to start Codex on forge and fix it there. Show it beside me.";
     let mut typed = String::new();
-    show_pane(&mut rec, "clip-lead", &claude(&lead, "", FULL));
+    show_pane(&mut rec, "clip-lead", &claude(&lead, "", WIDE_FULL));
     rec.shot(700);
     for word in ask.split_inclusive(' ') {
         typed.push_str(word);
         // The prompt box wraps at the pane's width.
-        let shown: String = typed.chars().rev().take(FULL - 4).collect::<Vec<_>>().into_iter().rev().collect();
-        show_pane(&mut rec, "clip-lead", &claude(&lead, &shown, FULL));
+        let shown: String = typed.chars().rev().take(WIDE_FULL - 4).collect::<Vec<_>>().into_iter().rev().collect();
+        show_pane(&mut rec, "clip-lead", &claude(&lead, &shown, WIDE_FULL));
         rec.shot(70);
     }
     rec.shot(400);
@@ -469,7 +476,7 @@ fn record_agents(cx: &mut HeadlessAppContext, dir: PathBuf) {
         l(&[("  ⎿ ", Dim), ("codex · host forge · split right", Dim)]),
     ]);
     update_session(&mut rec, "clip-lead", |s| s.status = SessionStatus::Working);
-    show_pane(&mut rec, "clip-lead", &claude(&lead, "", FULL));
+    show_pane(&mut rec, "clip-lead", &claude(&lead, "", WIDE_FULL));
     rec.shot(800);
     // The Engine opens the new session as a pane beside the caller.
     let template = rec
@@ -513,7 +520,7 @@ fn record_agents(cx: &mut HeadlessAppContext, dir: PathBuf) {
         l(&[("● ", Green), ("dirijor - wait_for_agent", Bold), (" (MCP)", Dim)]),
         l(&[("  ⎿ ", Dim), ("until done…", Dim)]),
     ]);
-    show_pane(&mut rec, "clip-lead", &claude(&lead, "", HALF));
+    show_pane(&mut rec, "clip-lead", &claude(&lead, "", WIDE_HALF));
     let mut work = codex_banner("~/diri on forge");
     work.extend([
         l(&[("› ", Bold), ("Fix the flaky reconnect test. It fails under", Plain)]),
@@ -561,14 +568,14 @@ fn record_agents(cx: &mut HeadlessAppContext, dir: PathBuf) {
         l(&[("● ", Green), ("dirijor - read_output", Bold), (" (MCP)", Dim)]),
         l(&[("  ⎿ ", Dim), ("last message from Codex", Dim)]),
     ]);
-    show_pane(&mut rec, "clip-lead", &claude(&lead, "", HALF));
+    show_pane(&mut rec, "clip-lead", &claude(&lead, "", WIDE_HALF));
     rec.shot(800);
     lead.extend([
         p(""),
         l(&[("● ", Claude), ("Codex fixed it on forge: the retry timer", Plain)]),
         l(&[("  ", Plain), ("raced the handshake. 20 of 20 runs pass.", Plain)]),
     ]);
-    show_pane(&mut rec, "clip-lead", &claude(&lead, "", HALF));
+    show_pane(&mut rec, "clip-lead", &claude(&lead, "", WIDE_HALF));
     update_session(&mut rec, "clip-lead", |s| {
         s.status = SessionStatus::Idle;
         s.last_turn_completed_at = Some(DateMillis(4.0));
@@ -610,6 +617,7 @@ fn record_schedules(cx: &mut HeadlessAppContext, dir: PathBuf) {
         },
         "clip-triage",
         None,
+        WINDOW,
     );
     let mut rec = Recorder::new(cx, clip.window, dir);
     use Hue::*;
@@ -683,6 +691,7 @@ fn record_computer(cx: &mut HeadlessAppContext, dir: PathBuf) {
         },
         "clip-sim",
         None,
+        WINDOW,
     );
     let mut rec = Recorder::new(cx, clip.window, dir);
     use Hue::*;
@@ -763,6 +772,7 @@ fn record_voice(cx: &mut HeadlessAppContext, dir: PathBuf) {
         },
         "clip-voice",
         None,
+        WINDOW,
     );
     let mut rec = Recorder::new(cx, clip.window, dir);
     use Hue::*;

@@ -41,7 +41,7 @@ Pages use a small Markdown subset: `##`–`####` headings (ids are generated), p
 
 ### Feature clips
 
-The four clips under the home page's headline features (`assets/features/*.webp`) are recorded from the real app window, not drawn. `diri/scripts/site-clips.sh` runs the ignored `render_site_clips` test (`diri/crates/diri-app/src/root/site_clips.rs`), which scripts each terminal's contents frame by frame, and encodes the frames with `img2webp`. Re-record after a visible change to the sidebar, panes or terminal.
+The four clips under the home page's headline features (`assets/features/*.webp`) are recorded from the real app window, not drawn. `diri/scripts/site-clips.sh` runs the ignored `render_site_clips` test (`diri/crates/diri-app/src/root/site_clips.rs`), which scripts each terminal's contents frame by frame, crops the ones the page zooms into (`crop_for` in the script), and encodes the frames with `img2webp`. Re-record after a visible change to the sidebar, panes or terminal.
 
 ### Share cards
 
