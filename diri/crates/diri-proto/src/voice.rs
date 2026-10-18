@@ -60,6 +60,33 @@ pub fn talk_with_agent_enabled(prefs: &[u8]) -> bool {
         .unwrap_or(false)
 }
 
+/// Whether the app reads `session_id`'s turns aloud, mirroring the app
+/// store's `reads_aloud`: the setting is on, the tab follows or is an
+/// exception to `talkReadsByDefault`, and its chat is not muted. Only such a
+/// session is asked to call the [`SPEAK_TOOL`]; "read only this tab" must
+/// not make every other Agent narrate its turns.
+pub fn reads_session_aloud(prefs: &[u8], session_id: &str) -> bool {
+    let Ok(prefs) = serde_json::from_slice::<serde_json::Value>(prefs) else {
+        return false;
+    };
+    let listed = |key: &str| {
+        prefs
+            .get(key)
+            .and_then(serde_json::Value::as_array)
+            .is_some_and(|ids| ids.iter().any(|id| id.as_str() == Some(session_id)))
+    };
+    let by_default = prefs
+        .get("talkReadsByDefault")
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(true);
+    prefs
+        .get("talkWithAgent")
+        .and_then(serde_json::Value::as_bool)
+        == Some(true)
+        && by_default != listed("talkExceptions")
+        && !listed("mutedNotificationSessions")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -70,5 +97,27 @@ mod tests {
         assert!(!talk_with_agent_enabled(br#"{"talkWithAgent":false}"#));
         assert!(!talk_with_agent_enabled(br#"{}"#));
         assert!(!talk_with_agent_enabled(b"not json"));
+    }
+
+    #[test]
+    fn only_tabs_the_app_reads_are_asked_to_speak() {
+        let all = br#"{"talkWithAgent":true,"talkReadsByDefault":true,"talkExceptions":["s_b"]}"#;
+        assert!(reads_session_aloud(all, "s_a"));
+        assert!(!reads_session_aloud(all, "s_b"));
+
+        let only = br#"{"talkWithAgent":true,"talkReadsByDefault":false,"talkExceptions":["s_a"]}"#;
+        assert!(reads_session_aloud(only, "s_a"));
+        assert!(!reads_session_aloud(only, "s_b"));
+
+        let none = br#"{"talkWithAgent":true,"talkReadsByDefault":false,"talkExceptions":[]}"#;
+        assert!(!reads_session_aloud(none, "s_a"));
+
+        let muted = br#"{"talkWithAgent":true,"mutedNotificationSessions":["s_a"]}"#;
+        assert!(!reads_session_aloud(muted, "s_a"));
+        assert!(reads_session_aloud(muted, "s_b"));
+
+        let off = br#"{"talkWithAgent":false,"talkReadsByDefault":true}"#;
+        assert!(!reads_session_aloud(off, "s_a"));
+        assert!(!reads_session_aloud(b"not json", "s_a"));
     }
 }

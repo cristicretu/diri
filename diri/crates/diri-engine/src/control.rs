@@ -1444,7 +1444,7 @@ impl ControlServer {
                     self.mcp_http_url_for(&descriptor),
                 );
                 launch_args.extend(injected.argv);
-                launch_args.extend(spoken_summary_args(&descriptor.injection));
+                launch_args.extend(spoken_summary_args(&descriptor.injection, &id));
                 mcp_http_token = injected
                     .mcp_http
                     .then(|| self.mcp_http.get().map(|endpoint| endpoint.token(&id)))
@@ -3509,6 +3509,7 @@ impl ControlServer {
         };
         let session_end = p.kind == "claude-hook" && p.event.as_deref() == Some("SessionEnd");
         let prompt = p.kind == "claude-hook" && p.event.as_deref() == Some("UserPromptSubmit");
+        let speak = prompt && reads_session_aloud(&session_id.0);
         // Never wait on the Registry here: the Agent is blocked on this reply.
         self.hook_reports
             .submit(
@@ -3522,20 +3523,21 @@ impl ControlServer {
                 },
             )
             .map_err(poisoned)?;
-        if prompt && talk_with_agent_enabled() {
+        if speak {
             return Ok(json!({ "additionalContext": diri_proto::voice::SPOKEN_INSTRUCTION }));
         }
         Ok(json!({}))
     }
 
     /// Keeps an Agent's spoken summary for the turn it is in, for the app to
-    /// read aloud when that turn ends. Ignored while the setting is off.
+    /// read aloud when that turn ends. Ignored unless the app reads this
+    /// session aloud.
     fn voice_speak(&self, params: Option<JsonValue>) -> Result<JsonValue, ControlError> {
         let p: diri_proto::voice::SpeakParams = decode(params)?;
-        if !talk_with_agent_enabled() {
+        if !reads_session_aloud(&p.session_id) {
             return Ok(json!({
                 "spoken": false,
-                "note": "Talk with your agent is off; there is no need to call speak."
+                "note": "Diri is not reading this session aloud; there is no need to call speak."
             }));
         }
         let text: String = p
@@ -4354,7 +4356,7 @@ impl ControlServer {
                 self.mcp_http_url_for(&descriptor),
             );
             launch_args.extend(injected.argv);
-            launch_args.extend(spoken_summary_args(&descriptor.injection));
+            launch_args.extend(spoken_summary_args(&descriptor.injection, id));
             mcp_http_token = injected
                 .mcp_http
                 .then(|| self.mcp_http.get().map(|endpoint| endpoint.token(id)))
@@ -7143,8 +7145,8 @@ mod spoken_summary_tests {
 /// launch carries the request for a closing `Spoken:` paragraph as
 /// developer instructions, which add to its own rather than replace them.
 /// It applies from the next launch; Claude Code is asked on every prompt.
-fn spoken_summary_args(injection: &crate::agent::InjectionSpec) -> Vec<String> {
-    if !injection.codex_notify || !talk_with_agent_enabled() {
+fn spoken_summary_args(injection: &crate::agent::InjectionSpec, session_id: &str) -> Vec<String> {
+    if !injection.codex_notify || !reads_session_aloud(session_id) {
         return Vec::new();
     }
     vec![
@@ -7156,9 +7158,18 @@ fn spoken_summary_args(injection: &crate::agent::InjectionSpec) -> Vec<String> {
 /// "Talk with your agent" is an app preference; the Engine reads it from the
 /// app's file on each prompt so turning it off takes effect on the next one.
 fn talk_with_agent_enabled() -> bool {
+    app_prefs().is_some_and(|prefs| diri_proto::voice::talk_with_agent_enabled(&prefs))
+}
+
+/// Whether the app reads this session's turns aloud (the setting, the tab's
+/// speaker and its mute), so only that session is asked for a summary.
+fn reads_session_aloud(session_id: &str) -> bool {
+    app_prefs().is_some_and(|prefs| diri_proto::voice::reads_session_aloud(&prefs, session_id))
+}
+
+fn app_prefs() -> Option<Vec<u8>> {
     std::env::var_os("HOME")
         .and_then(|home| std::fs::read(diri_proto::paths::DirijorPaths::prefs_file(home)).ok())
-        .is_some_and(|prefs| diri_proto::voice::talk_with_agent_enabled(&prefs))
 }
 
 #[cfg(test)]
