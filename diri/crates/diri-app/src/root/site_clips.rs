@@ -27,10 +27,12 @@ use super::*;
 use crate::SidebarPreviewFixture;
 
 /// A normal window's proportions, shown beside or under its feature's text.
-const WINDOW: (f32, f32) = (1140.0, 700.0);
+const WINDOW: ((f32, f32), f32) = ((1140.0, 700.0), 13.0);
 /// The agents clip spans the site's whole content column (up to about 1510
 /// screen pixels), so it is the same shape, larger: 2x is never stretched.
-const WIDE_WINDOW: (f32, f32) = (1520.0, 930.0);
+/// Its terminal font is larger by the same factor, so it reads at the size of
+/// the page's other clips.
+const WIDE_WINDOW: ((f32, f32), f32) = ((1520.0, 930.0), 17.0);
 const COLS: u16 = 170;
 
 #[derive(Clone, Copy)]
@@ -220,7 +222,7 @@ fn open(
     sessions: impl FnOnce(&SessionRecord) -> Vec<SessionRecord>,
     selected: &str,
     workspace: Option<WorkspaceSnapshot>,
-    window_size: (f32, f32),
+    (window_size, font_size): ((f32, f32), f32),
 ) -> Clip {
     let services = test_services();
     let mut fixture = SidebarPreviewFixture::make(PreviewScenario::Typical);
@@ -250,6 +252,7 @@ fn open(
                 prefs.sidebar_visible = true;
                 prefs.terminal_theme = "rose-pine".into();
                 prefs.window_material = crate::store::WindowMaterial::Opaque;
+                prefs.terminal_font_size = font_size;
             })
             .unwrap();
         if let Some(snapshot) = workspace.clone() {
@@ -420,10 +423,21 @@ fn lead_pane() -> LayoutNode {
 }
 
 /// A full pane is about 110 columns wide in WINDOW; in WIDE_WINDOW a full
-/// pane is about 156 and a split pane about 76.
+/// pane is 120 columns by 43 rows and a split pane about 59 columns.
 const FULL: usize = 108;
-const WIDE_FULL: usize = 154;
-const WIDE_HALF: usize = 74;
+const WIDE_FULL: usize = 118;
+const WIDE_HALF: usize = 57;
+const WIDE_ROWS: usize = 43;
+
+/// `screen` with blank rows inserted after its first `body` lines, so an
+/// agent's input stays on the pane's last rows the way a full-screen TUI
+/// keeps it while the transcript above is still short.
+fn pin(mut screen: Screen, body: usize, rows: usize) -> Screen {
+    let pad = rows.saturating_sub(screen.lines.len());
+    screen.lines.splice(body..body, (0..pad).map(|_| p("")));
+    screen.cursor.0 += pad;
+    screen
+}
 
 /// Claude Code starts Codex on `forge` beside itself over MCP, waits, and
 /// reads its result.
@@ -446,6 +460,14 @@ fn record_agents(cx: &mut HeadlessAppContext, dir: PathBuf) {
     let mut rec = Recorder::new(cx, clip.window, dir);
     use Hue::*;
     let mut lead: Vec<Line> = vec![
+        l(&[("> ", Dim), ("Bump tokio and check nothing else moved.", Plain)]),
+        p(""),
+        l(&[("● ", Green), ("Update", Bold), ("(Cargo.toml)", Plain)]),
+        l(&[("  ⎿ ", Dim), ("Updated with ", Plain), ("1 addition", Green), (" and ", Plain), ("1 removal", Red)]),
+        l(&[("● ", Green), ("Bash", Bold), ("(cargo test --workspace)", Plain)]),
+        l(&[("  ⎿ ", Dim), ("1,642 passed, 0 failed", Green)]),
+        l(&[("● ", Claude), ("tokio is on 1.48 and the workspace is green.", Plain)]),
+        p(""),
         l(&[("> ", Dim), ("The reconnect test failed on CI again.", Plain)]),
         p(""),
         l(&[("● ", Green), ("Bash", Bold), ("(gh run view 4412 --log-failed)", Plain)]),
@@ -458,13 +480,13 @@ fn record_agents(cx: &mut HeadlessAppContext, dir: PathBuf) {
     ];
     let ask = "Use diri to start Codex on forge and fix it there. Show it beside me.";
     let mut typed = String::new();
-    show_pane(&mut rec, "clip-lead", &claude(&lead, "", WIDE_FULL));
+    show_pane(&mut rec, "clip-lead", &pin(claude(&lead, "", WIDE_FULL), lead.len(), WIDE_ROWS));
     rec.shot(700);
     for word in ask.split_inclusive(' ') {
         typed.push_str(word);
         // The prompt box wraps at the pane's width.
         let shown: String = typed.chars().rev().take(WIDE_FULL - 4).collect::<Vec<_>>().into_iter().rev().collect();
-        show_pane(&mut rec, "clip-lead", &claude(&lead, &shown, WIDE_FULL));
+        show_pane(&mut rec, "clip-lead", &pin(claude(&lead, &shown, WIDE_FULL), lead.len(), WIDE_ROWS));
         rec.shot(70);
     }
     rec.shot(400);
@@ -476,7 +498,7 @@ fn record_agents(cx: &mut HeadlessAppContext, dir: PathBuf) {
         l(&[("  ⎿ ", Dim), ("codex · host forge · split right", Dim)]),
     ]);
     update_session(&mut rec, "clip-lead", |s| s.status = SessionStatus::Working);
-    show_pane(&mut rec, "clip-lead", &claude(&lead, "", WIDE_FULL));
+    show_pane(&mut rec, "clip-lead", &pin(claude(&lead, "", WIDE_FULL), lead.len(), WIDE_ROWS));
     rec.shot(800);
     // The Engine opens the new session as a pane beside the caller.
     let template = rec
@@ -520,7 +542,7 @@ fn record_agents(cx: &mut HeadlessAppContext, dir: PathBuf) {
         l(&[("● ", Green), ("dirijor - wait_for_agent", Bold), (" (MCP)", Dim)]),
         l(&[("  ⎿ ", Dim), ("until done…", Dim)]),
     ]);
-    show_pane(&mut rec, "clip-lead", &claude(&lead, "", WIDE_HALF));
+    show_pane(&mut rec, "clip-lead", &pin(claude(&lead, "", WIDE_HALF), lead.len(), WIDE_ROWS));
     let mut work = codex_banner("~/diri on forge");
     work.extend([
         l(&[("› ", Bold), ("Fix the flaky reconnect test. It fails under", Plain)]),
@@ -551,11 +573,11 @@ fn record_agents(cx: &mut HeadlessAppContext, dir: PathBuf) {
     ];
     for (i, (block, time)) in steps.into_iter().enumerate() {
         work.extend(block);
-        show_pane(&mut rec, "clip-codex", &codex(&work, Some(time)));
+        show_pane(&mut rec, "clip-codex", &pin(codex(&work, Some(time)), work.len(), WIDE_ROWS));
         rec.shot(if i == 0 { 900 } else { 650 });
     }
     work.extend([p(""), l(&[("─ Worked for 6m 12s ─", Dim)])]);
-    show_pane(&mut rec, "clip-codex", &codex(&work, None));
+    show_pane(&mut rec, "clip-codex", &pin(codex(&work, None), work.len(), WIDE_ROWS));
     update_session(&mut rec, "clip-codex", |s| {
         s.status = SessionStatus::Idle;
         s.last_turn_completed_at = Some(DateMillis(3.0));
@@ -568,14 +590,14 @@ fn record_agents(cx: &mut HeadlessAppContext, dir: PathBuf) {
         l(&[("● ", Green), ("dirijor - read_output", Bold), (" (MCP)", Dim)]),
         l(&[("  ⎿ ", Dim), ("last message from Codex", Dim)]),
     ]);
-    show_pane(&mut rec, "clip-lead", &claude(&lead, "", WIDE_HALF));
+    show_pane(&mut rec, "clip-lead", &pin(claude(&lead, "", WIDE_HALF), lead.len(), WIDE_ROWS));
     rec.shot(800);
     lead.extend([
         p(""),
         l(&[("● ", Claude), ("Codex fixed it on forge: the retry timer", Plain)]),
         l(&[("  ", Plain), ("raced the handshake. 20 of 20 runs pass.", Plain)]),
     ]);
-    show_pane(&mut rec, "clip-lead", &claude(&lead, "", WIDE_HALF));
+    show_pane(&mut rec, "clip-lead", &pin(claude(&lead, "", WIDE_HALF), lead.len(), WIDE_ROWS));
     update_session(&mut rec, "clip-lead", |s| {
         s.status = SessionStatus::Idle;
         s.last_turn_completed_at = Some(DateMillis(4.0));
@@ -799,12 +821,6 @@ fn record_voice(cx: &mut HeadlessAppContext, dir: PathBuf) {
     use Hue::*;
     let mut lines: Vec<Line> = vec![
         l(&[("> ", Dim), ("Find out why the reconnect test is flaky and fix it. I'll be away from the desk.", Plain)]),
-        p(""),
-        l(&[("● ", Green), ("Bash", Bold), ("(cargo test -p reconnect -- --test-threads 32 ×20)", Plain)]),
-        l(&[("  ⎿ ", Dim), ("3 of 20 runs failed: handshake_timeout", Red)]),
-        p(""),
-        l(&[("● ", Green), ("Read", Bold), ("(src/retry.rs)", Plain)]),
-        l(&[("  ⎿ ", Dim), ("Read 212 lines", Dim)]),
         p(""),
         l(&[("● ", Green), ("Update", Bold), ("(src/retry.rs)", Plain)]),
         l(&[("  ⎿ ", Dim), ("Updated with ", Plain), ("14 additions", Green), (" and ", Plain), ("3 removals", Red)]),

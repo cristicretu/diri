@@ -304,32 +304,40 @@
         <dl class="also">
           <div><dt><span class="icon" data-icon="server" aria-hidden="true"></span>Any machine over SSH</dt><dd>Nothing to install by hand, no tmux, no relay.</dd></div>
           <div><dt><span class="icon" data-icon="branch" aria-hidden="true"></span>A worktree per agent</dt><dd>Parallel work never collides.</dd></div>
-          <div><dt><span class="icon" data-icon="pull-request" aria-hidden="true"></span>Review and ship</dt><dd>Diffs, commits and PR checks beside the session.</dd></div>
-          <div><dt><span class="icon" data-icon="shield" aria-hidden="true"></span>Free and open source</dt><dd>AGPL-3.0, native Rust, no account.</dd></div>
-          <div><dt><span class="icon" data-icon="split" aria-hidden="true"></span>Panes and prefix keys</dt><dd>tmux-style splits and keys, scriptable from the CLI.</dd></div>
           <div><dt><span class="icon" data-icon="moon" aria-hidden="true"></span>Sessions that stay open</dt><dd>Close diri and agents keep working.</dd></div>
+          <div><dt><span class="icon" data-icon="pull-request" aria-hidden="true"></span>Review and ship</dt><dd>Diffs, commits and PR checks beside the session.</dd></div>
           <div><dt><span class="icon" data-icon="bell" aria-hidden="true"></span>Know who needs you</dt><dd>Jump straight to the session that is waiting.</dd></div>
           <div><dt><span class="icon" data-icon="external-link" aria-hidden="true"></span>A browser per agent</dt><dd>Each session tests what it built in its own browser.</dd></div>
-          <div><dt><span class="icon" data-icon="plug" aria-hidden="true"></span>API tab</dt><dd>Agents open the endpoint they built, ready to send.</dd></div>
-          <div><dt><span class="icon" data-icon="terminal" aria-hidden="true"></span>Quick terminal</dt><dd>A drop-down terminal on a global hotkey.</dd></div>
-          <div><dt><span class="icon" data-icon="file" aria-hidden="true"></span>Inline images</dt><dd>Kitty and iTerm2 images, locally and over SSH.</dd></div>
-          <div><dt><span class="icon" data-icon="monitor" aria-hidden="true"></span>iPhone companion</dt><dd>Answer questions from your phone. Beta.</dd></div>
-          <div><dt><span class="icon" data-icon="clock" aria-hidden="true"></span>Conversation history</dt><dd>Resume any past Claude or Codex chat.</dd></div>
           <div><dt><span class="icon" data-icon="user" aria-hidden="true"></span>One-click account switching</dt><dd>Move every tab to the account with room left.</dd></div>
+          <div><dt><span class="icon" data-icon="clock" aria-hidden="true"></span>Conversation history</dt><dd>Resume any past Claude or Codex chat.</dd></div>
+          <div><dt><span class="icon" data-icon="split" aria-hidden="true"></span>Panes and prefix keys</dt><dd>tmux-style splits and keys, scriptable from the CLI.</dd></div>
+          <div><dt><span class="icon" data-icon="plug" aria-hidden="true"></span>API tab</dt><dd>Agents open the endpoint they built, ready to send.</dd></div>
           <div><dt><span class="icon" data-icon="local-agents" aria-hidden="true"></span>Usage &amp; limits</dt><dd>Spend and plan limits beside your sessions.</dd></div>
+          <div><dt><span class="icon" data-icon="terminal" aria-hidden="true"></span>Quick terminal</dt><dd>A drop-down terminal on a global hotkey.</dd></div>
+          <div><dt><span class="icon" data-icon="monitor" aria-hidden="true"></span>iPhone companion</dt><dd>Answer questions from your phone. Beta.</dd></div>
+          <div><dt><span class="icon" data-icon="file" aria-hidden="true"></span>Inline images</dt><dd>Kitty and iTerm2 images, locally and over SSH.</dd></div>
           <div><dt><span class="icon" data-icon="note" aria-hidden="true"></span>Notes &amp; to-dos</dt><dd>Any to-do can start an agent.</dd></div>
+          <div><dt><span class="icon" data-icon="shield" aria-hidden="true"></span>Free and open source</dt><dd>AGPL-3.0, native Rust, no account.</dd></div>
         </dl>
         <section class="more-section" id="faq" aria-labelledby="faq-title">
           <div class="faq-head"><h2 id="faq-title">Questions</h2><p>More in the <a href="/docs/">docs</a> and <a href="/guides/">guides</a>.</p></div>
           <div class="faq-list"><details><summary>Is diri free?<span class="icon" data-icon="chevron-down" aria-hidden="true"></span></summary><p>Yes. diri is free and open source under AGPL-3.0. You only pay for the agents you use, through your own Claude, ChatGPT or other accounts. If you distribute a modified copy, or let people use one over a network, you must offer them its source under the same license.</p></details><details><summary>Which agents does it work with?<span class="icon" data-icon="chevron-down" aria-hidden="true"></span></summary><p>Claude Code, Codex, Cursor, Gemini, OpenCode, Pi, Copilot, Kimi and more: 22 agent definitions ship with the app, and any terminal agent can be added with a short JSON file.</p></details><details><summary>Do I need to know how to code?<span class="icon" data-icon="chevron-down" aria-hidden="true"></span></summary><p>No. You describe tasks in plain English and the agents do the work. The guides are written for marketers and product managers as well as developers.</p></details><details><summary>What happens when I close diri?<span class="icon" data-icon="chevron-down" aria-hidden="true"></span></summary><p>Your agents keep working. Reopen diri and every session is where you left it. Restarting your Mac stops them, but Claude Code, Codex and most others can resume the same conversation.</p></details><details><summary>Can agents work together?<span class="icon" data-icon="chevron-down" aria-hidden="true"></span></summary><p>Yes. Agents started in diri can start other agents, on this Mac or on any of your SSH hosts, hand them tasks, wait for them, and collect their results. Ask in plain English, starting with “Use diri to…”.</p></details><details><summary>Does diri see my code or prompts?<span class="icon" data-icon="chevron-down" aria-hidden="true"></span></summary><p>No. Agents run on your Mac or your own servers, with no diri account and no hosted relay. diri records crash and performance diagnostics, never terminal contents or prompts, and you can turn sharing off.</p></details><details><summary>Which platforms are supported?<span class="icon" data-icon="chevron-down" aria-hidden="true"></span></summary><p>macOS 15 or newer on Apple silicon and Intel. Linux is in beta, and a Windows version is in progress.</p></details></div>
         </section>
       </section>
+      <section class="closing" aria-labelledby="closing-title">
+        <h2 id="closing-title">Hand your agents the wheel</h2>
+        <p>Free and open source. macOS 15 or later, Linux in beta.</p>
+        <div class="intro-actions">
+          <a class="button primary" href="https://github.com/cristicretu/diri/releases/latest"><img class="button-mark" src="/assets/brand/apple.svg" width="15" height="15" alt=""><span class="button-label">Download for macOS</span></a>
+          <a class="button secondary text-link" href="https://github.com/cristicretu/diri">View on GitHub</a>
+        </div>
+      </section>
     </main>
     <footer class="site-footer">
       <div class="footer-main">
         <div class="footer-about">
           <a class="footer-brand" href="/" aria-label="Diri home"><img class="app-mark" src="/assets/brand/diri-icon.svg" width="26" height="26" alt="">diri</a>
-          <p>The best way to work with coding agents.</p>
+          <p>The multiplexer your agents can drive.</p>
         </div>
         <nav class="footer-columns" aria-label="Resources">
           <div><h3>Product</h3><a href="https://github.com/cristicretu/diri/releases/latest">Download</a><a href="/whats-new/">What's new</a><a href="https://github.com/cristicretu/diri/releases">Release notes</a><a href="/guides/">Guides</a><a href="/agents/">Agents</a><a href="/compare/">Compare</a></div>

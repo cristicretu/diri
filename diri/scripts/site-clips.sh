@@ -27,7 +27,7 @@ mkdir -p "$out"
 crop_for() {
   case $1 in
     schedules) echo "1280 900 0 0" ;;       # the clocked rows and the run
-    voice) echo "1280 900 516 230" ;;       # the spoken summary and the answer
+    voice) echo "1280 900 510 14" ;;        # the pane, from its title to the answer
     computer) echo "1756 1140 510 14" ;;    # inside the terminal pane, down to its last row
   esac
 }
@@ -36,7 +36,7 @@ crop_for() {
 # capsule at x y (recorded pixels, before the crop) with a moving waveform.
 pill_at() {
   case $1 in
-    voice) echo "941 960" ;;                # under the prompt, left of the fade
+    voice) echo "935 704" ;;                # under the prompt, left of the fade
   esac
 }
 pill=$(mktemp -d)/pill.png
