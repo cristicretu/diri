@@ -276,6 +276,19 @@ impl UtilitySurfaces {
                         },
                     ),
                     colors,
+                ))
+                .child(setting_divider(colors))
+                .child(setting_row(
+                    t("settings.general.copy_diagnostics"),
+                    t("settings.general.copy_diagnostics_detail"),
+                    surface_button(
+                        t("settings.general.preview"),
+                        "preview-diagnostics",
+                        colors,
+                        cx,
+                        |this, cx| this.open_diagnostics(cx),
+                    ),
+                    colors,
                 )),
             colors,
         )

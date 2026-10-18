@@ -1,5 +1,4 @@
 {
-  "settings.appearance.background": "Background",
   "settings.appearance.click_links": "Open links with a click",
   "settings.appearance.click_links_detail": "Click a link to open it. When off, use ⌘-click.",
   "settings.appearance.click_links_detail_ctrl": "Click a link to open it. When off, use Ctrl+click.",
@@ -11,10 +10,10 @@
   "settings.appearance.editor_automatic_default": "Automatic (default app)",
   "settings.appearance.editor_default_app": "Default app",
   "settings.appearance.file_links": "Open file links in",
+  "settings.appearance.font": "Font",
   "settings.appearance.font_default": "Default ({font})",
   "settings.appearance.font_not_installed": "{font} (not installed)",
   "settings.appearance.font_size": "Font size",
-  "settings.appearance.foreground": "Foreground",
   "settings.appearance.group_dark": "Dark",
   "settings.appearance.group_imported": "Imported",
   "settings.appearance.group_light": "Light",
@@ -54,6 +53,7 @@
   "settings.appearance.transparency_default": "Default",
   "settings.appearance.transparency_solid": "Solid",
   "settings.appearance.use_mode": "Use {mode} appearance",
+  "settings.appearance.window": "Window",
   "settings.phone.awake_failed": "Cannot keep this Mac awake: {error}",
   "settings.phone.check_again": "Check again",
   "settings.phone.check_mac": "Check this Mac",
@@ -64,8 +64,6 @@
   "settings.phone.get_tailscale": "Get Tailscale for Mac",
   "settings.phone.intro_awake": "Keep Diri running and your Mac plugged in with its lid open. The display can turn off; closing the lid or choosing Sleep disconnects your phone.",
   "settings.phone.intro_setup": "A one-time setup, with no commands, router settings or addresses to type.",
-  "settings.phone.intro_title": "Your Mac does the work. Your phone is the remote.",
-  "settings.phone.no_advanced": "No exit node, Tailscale SSH, port forwarding or other advanced settings are needed.",
   "settings.phone.on": "Phone access is on",
   "settings.phone.open_tailscale": "Open Tailscale",
   "settings.phone.scan_hint": "In Diri on your iPhone, tap Scan pairing code. We’ll check the connection before saving it.",
@@ -137,7 +135,6 @@
   "settings.remote.title": "Remote",
   "settings.remote.token_hint": "The token stays in that owner-only file. SSH remains available for install and recovery.",
   "settings.remote.transport_note": "Diri uses your SSH configuration without changing the host. Private-network and Tailscale names work transparently when OpenSSH can resolve them.",
-  "settings.remote.transport_note_title": "OpenSSH transport",
   "settings.remote.use_by_default": "Use by default",
   "settings.resources.frozen_note": "Frozen sessions are never killed. Opening one wakes it immediately, exactly where you left it.",
   "settings.resources.hibernate": "Hibernate idle sessions",
@@ -151,5 +148,8 @@
   "settings.resources.memory_limit": "Memory limit",
   "settings.resources.memory_limit_detail": "Freeze an idle session when its process tree reaches this size.",
   "settings.resources.session_limits": "Session limits",
-  "settings.resources.title": "Resources"
+  "settings.resources.title": "Resources",
+  "settings.terminal.file_links_detail": "The editor a clicked file path opens in.",
+  "settings.terminal.mouse": "Mouse and selection",
+  "settings.terminal.shell": "Shell"
 }

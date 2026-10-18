@@ -1,4 +1,4 @@
-//! Settings > General > Voice, the parts beyond the toggles: the speech
+//! Settings > Voice, the parts beyond the toggles: the speech
 //! command a "Custom command" voice pipes readings to, what takes the spoken
 //! answer (Diri, Wispr Flow, or any dictation app's shortcut), and that
 //! shortcut's recorder.
@@ -42,7 +42,7 @@ impl UtilitySurfaces {
         event: &KeyDownEvent,
         cx: &mut Context<Self>,
     ) -> bool {
-        if self.surface != Surface::Settings || self.settings_tab != SettingsTab::General {
+        if self.surface != Surface::Settings || self.settings_tab != SettingsTab::Voice {
             return false;
         }
         if self.voice_fields.recording_shortcut {

@@ -10550,7 +10550,7 @@ mod tests {
                     }
                 })
                 .unwrap();
-                // `DIRI_STYLE_SETTINGS=1`: Settings › Terminal (appearance)
+                // `DIRI_STYLE_SETTINGS=1`: Settings › Appearance
                 // open over the same window, where it stands in for the card.
                 if std::env::var_os("DIRI_STYLE_SETTINGS").is_some() {
                     cx.update_window(window.into(), |root, window, cx| {
@@ -10560,7 +10560,7 @@ mod tests {
                             let surfaces = root.utility_surfaces.clone().unwrap();
                             surfaces.update(cx, |surfaces, cx| {
                                 surfaces
-                                    .open_settings_tab(crate::settings::SettingsTab::Terminal, cx)
+                                    .open_settings_tab(crate::settings::SettingsTab::Appearance, cx)
                             });
                             cx.notify();
                         });

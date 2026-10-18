@@ -1,5 +1,4 @@
 {
-  "settings.appearance.background": "背景",
   "settings.appearance.click_links": "单击打开链接",
   "settings.appearance.click_links_detail": "单击链接即可打开。关闭后需按住 ⌘ 单击。",
   "settings.appearance.click_links_detail_ctrl": "单击链接即可打开。关闭后需按住 Ctrl 单击。",
@@ -11,10 +10,10 @@
   "settings.appearance.editor_automatic_default": "自动（默认 App）",
   "settings.appearance.editor_default_app": "默认 App",
   "settings.appearance.file_links": "文件链接打开方式",
+  "settings.appearance.font": "字体",
   "settings.appearance.font_default": "默认（{font}）",
   "settings.appearance.font_not_installed": "{font}（未安装）",
   "settings.appearance.font_size": "字号",
-  "settings.appearance.foreground": "前景",
   "settings.appearance.group_dark": "深色",
   "settings.appearance.group_imported": "已导入",
   "settings.appearance.group_light": "浅色",
@@ -54,6 +53,7 @@
   "settings.appearance.transparency_default": "默认",
   "settings.appearance.transparency_solid": "不透明",
   "settings.appearance.use_mode": "使用“{mode}”外观",
+  "settings.appearance.window": "窗口",
   "settings.phone.awake_failed": "无法让这台 Mac 保持唤醒：{error}",
   "settings.phone.check_again": "重新检查",
   "settings.phone.check_mac": "检查这台 Mac",
@@ -64,8 +64,6 @@
   "settings.phone.get_tailscale": "获取 Mac 版 Tailscale",
   "settings.phone.intro_awake": "请保持 Diri 运行，Mac 接通电源并打开屏幕盖。显示器可以关闭；合上屏幕盖或选择“睡眠”会断开手机连接。",
   "settings.phone.intro_setup": "只需设置一次，无需输入命令、路由器设置或地址。",
-  "settings.phone.intro_title": "Mac 负责干活，手机就是遥控器。",
-  "settings.phone.no_advanced": "无需出口节点、Tailscale SSH、端口转发或其他高级设置。",
   "settings.phone.on": "手机访问已开启",
   "settings.phone.open_tailscale": "打开 Tailscale",
   "settings.phone.scan_hint": "在 iPhone 上的 Diri 中轻点“Scan pairing code”。保存前我们会先检查连接。",
@@ -137,7 +135,6 @@
   "settings.remote.title": "远程",
   "settings.remote.token_hint": "令牌保存在该仅限所有者访问的文件中。SSH 仍可用于安装和恢复。",
   "settings.remote.transport_note": "Diri 使用你的 SSH 配置，不会更改主机。只要 OpenSSH 能解析，私有网络和 Tailscale 名称都可直接使用。",
-  "settings.remote.transport_note_title": "OpenSSH 传输",
   "settings.remote.use_by_default": "设为默认",
   "settings.resources.frozen_note": "冻结的会话绝不会被终止。打开时会立即唤醒，并停留在你离开时的位置。",
   "settings.resources.hibernate": "休眠闲置会话",
@@ -151,5 +148,8 @@
   "settings.resources.memory_limit": "内存上限",
   "settings.resources.memory_limit_detail": "闲置会话的进程树达到此大小时将其冻结。",
   "settings.resources.session_limits": "会话限制",
-  "settings.resources.title": "资源"
+  "settings.resources.title": "资源",
+  "settings.terminal.file_links_detail": "点击文件路径时用来打开的编辑器。",
+  "settings.terminal.mouse": "鼠标与选择",
+  "settings.terminal.shell": "Shell"
 }

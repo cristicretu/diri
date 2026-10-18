@@ -1,6 +1,6 @@
 //! State shared by the settings tabs.
 //!
-//! General, Terminal, and Resources mutate diri's preferences. Remote manages
+//! General, Appearance, Terminal, Voice, and Resources mutate diri's preferences. Remote manages
 //! the shared execution-host catalog used by the SSH Remote Holder transport.
 
 use diri_proto::{HostEntry, HostNodeConfig};
@@ -9,18 +9,20 @@ use diri_term::theme::TermTheme;
 use crate::query_editor::QueryEditor;
 use crate::store::Prefs;
 
-/// The two groups the navigation list is split into.
+/// The groups the navigation list is split into.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SettingsSection {
-    Personal,
-    System,
+    App,
+    Agents,
+    Machines,
 }
 
 impl SettingsSection {
     pub fn label(self) -> &'static str {
         crate::i18n::t(match self {
-            Self::Personal => "settings.section.personal",
-            Self::System => "settings.section.system",
+            Self::App => "settings.section.app",
+            Self::Agents => "settings.section.agents",
+            Self::Machines => "settings.section.machines",
         })
     }
 }
@@ -43,13 +45,15 @@ pub struct SettingsNav {
 pub enum SettingsTab {
     #[default]
     General,
+    Appearance,
+    Terminal,
+    Shortcuts,
+    Voice,
     WhatsNew,
     Agents,
+    Accounts,
     Skills,
     Schedules,
-    Accounts,
-    Shortcuts,
-    Terminal,
     Usage,
     Worktrees,
     Resources,
@@ -58,15 +62,18 @@ pub enum SettingsTab {
 }
 
 impl SettingsTab {
-    pub const ALL: [Self; 13] = [
+    /// Navigation order: grouped by [`SettingsSection`], most used first.
+    pub const ALL: [Self; 15] = [
         Self::General,
+        Self::Appearance,
+        Self::Terminal,
+        Self::Shortcuts,
+        Self::Voice,
         Self::WhatsNew,
         Self::Agents,
+        Self::Accounts,
         Self::Skills,
         Self::Schedules,
-        Self::Accounts,
-        Self::Shortcuts,
-        Self::Terminal,
         Self::Usage,
         Self::Worktrees,
         Self::Resources,
@@ -74,16 +81,23 @@ impl SettingsTab {
         Self::Phone,
     ];
 
+    /// Pages this build can show. Voice is macOS-only.
+    pub fn available(self) -> bool {
+        self != Self::Voice || cfg!(target_os = "macos")
+    }
+
     pub fn label(self) -> &'static str {
         crate::i18n::t(match self {
             Self::General => "settings.tab.general",
+            Self::Appearance => "settings.tab.appearance",
+            Self::Terminal => "settings.tab.terminal",
+            Self::Shortcuts => "settings.tab.shortcuts",
+            Self::Voice => "settings.tab.voice",
             Self::WhatsNew => "settings.tab.whats_new",
             Self::Agents => "settings.tab.agents",
+            Self::Accounts => "settings.tab.accounts",
             Self::Skills => "settings.tab.skills",
             Self::Schedules => "settings.tab.schedules",
-            Self::Accounts => "settings.tab.accounts",
-            Self::Shortcuts => "settings.tab.shortcuts",
-            Self::Terminal => "settings.tab.appearance",
             Self::Usage => "settings.tab.usage",
             Self::Worktrees => "settings.tab.worktrees",
             Self::Resources => "settings.tab.resources",
@@ -95,13 +109,15 @@ impl SettingsTab {
     pub fn subtitle(self) -> &'static str {
         crate::i18n::t(match self {
             Self::General => "settings.subtitle.general",
+            Self::Appearance => "settings.subtitle.appearance",
+            Self::Terminal => "settings.subtitle.terminal",
+            Self::Shortcuts => "settings.subtitle.shortcuts",
+            Self::Voice => "settings.subtitle.voice",
             Self::WhatsNew => "settings.subtitle.whats_new",
             Self::Agents => "settings.subtitle.agents",
+            Self::Accounts => "settings.subtitle.accounts",
             Self::Skills => "settings.subtitle.skills",
             Self::Schedules => "settings.subtitle.schedules",
-            Self::Accounts => "settings.subtitle.accounts",
-            Self::Shortcuts => "settings.subtitle.shortcuts",
-            Self::Terminal => "settings.subtitle.appearance",
             Self::Usage => "settings.subtitle.usage",
             Self::Worktrees => "settings.subtitle.worktrees",
             Self::Resources => "settings.subtitle.resources",
@@ -110,21 +126,21 @@ impl SettingsTab {
         })
     }
 
-    /// Personal pages change how diri behaves for this user; System pages
-    /// describe the machines and resources sessions run on.
+    /// App pages shape diri itself, Agents pages the agents and what they
+    /// cost, and Machines pages where sessions run.
     pub const fn section(self) -> SettingsSection {
         match self {
             Self::General
-            | Self::WhatsNew
-            | Self::Agents
-            | Self::Skills
-            | Self::Schedules
-            | Self::Accounts
-            | Self::Shortcuts
+            | Self::Appearance
             | Self::Terminal
-            | Self::Usage => SettingsSection::Personal,
+            | Self::Shortcuts
+            | Self::Voice
+            | Self::WhatsNew => SettingsSection::App,
+            Self::Agents | Self::Accounts | Self::Skills | Self::Schedules | Self::Usage => {
+                SettingsSection::Agents
+            }
             Self::Worktrees | Self::Resources | Self::Remote | Self::Phone => {
-                SettingsSection::System
+                SettingsSection::Machines
             }
         }
     }
@@ -132,13 +148,15 @@ impl SettingsTab {
     pub const fn icon(self) -> &'static str {
         match self {
             Self::General => "gearshape",
-            Self::WhatsNew => "sparkles",
+            Self::Appearance => "paintpalette",
+            Self::Terminal => "terminal",
+            Self::Shortcuts => "keyboard",
+            Self::Voice => "speaker.wave.2",
+            Self::WhatsNew => "gift",
             Self::Agents => "sparkles",
+            Self::Accounts => "account.circle",
             Self::Skills => "doc.text",
             Self::Schedules => "clock.fill",
-            Self::Accounts => "account.circle",
-            Self::Shortcuts => "keyboard",
-            Self::Terminal => "terminal",
             Self::Usage => "chart.bar.xaxis",
             Self::Worktrees => "arrow.branch",
             Self::Resources => "server.rack",
@@ -383,7 +401,8 @@ mod tests {
         assert_eq!(cycle_hibernate_minutes(60), 0);
         assert_eq!(cycle_memory_limit(2), 4);
         assert_eq!(cycle_memory_limit(8), 2);
-        assert_eq!(SettingsTab::Terminal.label(), "Appearance");
+        assert_eq!(SettingsTab::Appearance.label(), "Appearance");
+        assert_eq!(SettingsTab::Terminal.label(), "Terminal");
         assert!(
             SettingsTab::ALL
                 .into_iter()

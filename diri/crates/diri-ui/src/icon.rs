@@ -147,10 +147,13 @@ pub enum IconName {
     Globe,
     Speaker,
     SpeakerOff,
+    Smartphone,
+    Palette,
+    Gift,
 }
 
 impl IconName {
-    pub const ALL: [Self; 101] = [
+    pub const ALL: [Self; 104] = [
         Self::Account,
         Self::Activity,
         Self::Archive,
@@ -252,6 +255,9 @@ impl IconName {
         Self::Globe,
         Self::Speaker,
         Self::SpeakerOff,
+        Self::Smartphone,
+        Self::Palette,
+        Self::Gift,
     ];
 
     pub const fn asset_path(self) -> &'static str {
@@ -357,6 +363,9 @@ impl IconName {
             Self::Globe => "icons/globe.svg",
             Self::Speaker => "icons/speaker.svg",
             Self::SpeakerOff => "icons/speaker-off.svg",
+            Self::Smartphone => "icons/smartphone.svg",
+            Self::Palette => "icons/palette.svg",
+            Self::Gift => "icons/gift.svg",
         }
     }
 
@@ -364,18 +373,21 @@ impl IconName {
     /// All names currently used by diri resolve to the shared SVG vocabulary.
     pub fn from_system_name(name: &str) -> Option<Self> {
         Some(match name {
-            "waveform.circle" | "waveform.circle.fill" => Self::Activity,
+            "waveform.circle" | "waveform.circle.fill" | "stethoscope" => Self::Activity,
             "archivebox" | "archivebox.fill" => Self::Archive,
             "pin" | "pin.fill" => Self::Pin,
             "arrow.down" => Self::ArrowDown,
             "arrow.turn.down.right" => Self::ArrowTurnDownRight,
-            "arrow.turn.up.left" => Self::ArrowTurnUpLeft,
+            "arrow.turn.up.left" | "arrow.uturn.backward" => Self::ArrowTurnUpLeft,
             "arrow.up.arrow.down" => Self::ResizeHorizontal,
             "arrow.up" => Self::ArrowUp,
             "bell" | "bell.fill" => Self::Bell,
             "speaker.wave.2" => Self::Speaker,
             "speaker.slash" => Self::SpeakerOff,
-            "arrow.branch" => Self::Branch,
+            "iphone" => Self::Smartphone,
+            "paintpalette" => Self::Palette,
+            "gift" => Self::Gift,
+            "arrow.branch" | "arrow.triangle.branch" => Self::Branch,
             "chart.bar" | "chart.bar.xaxis" => Self::ChartBar,
             "checkmark" => Self::Check,
             "checkmark.circle" | "checkmark.circle.fill" => Self::CheckCircle,
@@ -393,8 +405,8 @@ impl IconName {
             "cube" => Self::Cube,
             "arrow.down.circle" => Self::Download,
             "link" => Self::ExternalLink,
-            "doc" | "doc.fill" | "doc.text" => Self::File,
-            "folder" | "folder.fill" => Self::Folder,
+            "doc" | "doc.fill" | "doc.text" | "doc.on.doc" => Self::File,
+            "folder" | "folder.fill" | "folder.badge.plus" => Self::Folder,
             "square.grid.2x2" | "terminal.grid" => Self::Grid,
             "keyboard" => Self::Keyboard,
             "lock" | "lock.fill" => Self::Lock,
@@ -433,7 +445,9 @@ impl IconName {
             "terminal" => Self::Terminal,
             "trash" => Self::Trash,
             "tray.and.arrow.up.fill" => Self::Unarchive,
-            "exclamationmark.triangle" => Self::Warning,
+            "exclamationmark.triangle"
+            | "exclamationmark.triangle.fill"
+            | "exclamationmark.circle.fill" => Self::Warning,
             "point.3.filled.connected.trianglepath.dotted" => Self::Worktree,
             "textformat" => Self::Text,
             "textformat.h1" => Self::Heading1,
@@ -623,6 +637,9 @@ fn embedded_svg(path: &str) -> Option<&'static [u8]> {
         "icons/stack.svg" => include_bytes!("../assets/icons/stack.svg"),
         "icons/projects.svg" => include_bytes!("../assets/icons/projects.svg"),
         "icons/terminal.svg" => include_bytes!("../assets/icons/terminal.svg"),
+        "icons/smartphone.svg" => include_bytes!("../assets/icons/smartphone.svg"),
+        "icons/palette.svg" => include_bytes!("../assets/icons/palette.svg"),
+        "icons/gift.svg" => include_bytes!("../assets/icons/gift.svg"),
         "icons/trash.svg" => include_bytes!("../assets/icons/trash.svg"),
         "icons/unarchive.svg" => include_bytes!("../assets/icons/unarchive.svg"),
         "icons/warning.svg" => include_bytes!("../assets/icons/warning.svg"),
@@ -732,6 +749,9 @@ mod tests {
             "sidebar.right",
             "sparkle",
             "sparkles",
+            "iphone",
+            "paintpalette",
+            "gift",
             "square.and.arrow.up",
             "square.and.pencil",
             "square.grid.2x2",

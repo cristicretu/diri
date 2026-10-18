@@ -672,7 +672,9 @@ impl UtilitySurfaces {
             .ok()
             .map(|value| value.to_ascii_lowercase());
         let settings_tab = match settings_preview.as_deref() {
-            Some("terminal" | "appearance") => SettingsTab::Terminal,
+            Some("appearance") => SettingsTab::Appearance,
+            Some("terminal") => SettingsTab::Terminal,
+            Some("voice") => SettingsTab::Voice,
             Some("whats-new" | "what's-new") => SettingsTab::WhatsNew,
             Some("agents") => SettingsTab::Agents,
             Some("skills") => SettingsTab::Skills,
@@ -1990,6 +1992,7 @@ impl UtilitySurfaces {
     fn visible_settings_tabs(&self) -> Vec<SettingsTab> {
         SettingsTab::ALL
             .into_iter()
+            .filter(|tab| tab.available())
             .filter(|tab| settings_tab_matches(*tab, self.settings_search.text()))
             .collect()
     }
@@ -3154,7 +3157,9 @@ impl UtilitySurfaces {
             SettingsTab::Schedules => self.schedules.clone().into_any_element(),
             SettingsTab::Accounts => self.accounts_settings(cx).into_any_element(),
             SettingsTab::Shortcuts => self.shortcuts_settings(cx).into_any_element(),
+            SettingsTab::Appearance => self.appearance_settings(cx).into_any_element(),
             SettingsTab::Terminal => self.terminal_settings(cx).into_any_element(),
+            SettingsTab::Voice => self.voice_settings(cx).into_any_element(),
             SettingsTab::Worktrees => self.worktree_settings(cx).into_any_element(),
             SettingsTab::Resources => self.resource_settings(cx).into_any_element(),
             SettingsTab::Remote => self.remote_settings(cx).into_any_element(),
@@ -3322,115 +3327,112 @@ impl UtilitySurfaces {
     fn phone_settings(&self, cx: &mut Context<Self>) -> impl IntoElement {
         use crate::phone_access::TailscaleSetup;
         let colors = self.settings_colors();
+        let ready = matches!(self.phone_setup, Some(TailscaleSetup::Ready(_)));
+        let mac_detail: SharedString = if self.phone_loading && self.phone_access.is_none() {
+            t("settings.phone.checking").into()
+        } else {
+            match self.phone_setup {
+                None => t("settings.phone.step_mac_detail").into(),
+                Some(setup @ TailscaleSetup::Ready(_)) => setup.message().into(),
+                Some(setup) => {
+                    format!("{} {}", setup.message(), t("settings.phone.tailscale_sign_in")).into()
+                }
+            }
+        };
+        let mac_controls = div()
+            .flex_none()
+            .flex()
+            .items_center()
+            .gap(px(6.0))
+            .when(self.phone_setup.is_some() && !ready, |row| {
+                row.child(if self.phone_setup == Some(TailscaleSetup::NotInstalled) {
+                    surface_button(
+                        t("settings.phone.get_tailscale"),
+                        "phone-install-tailscale",
+                        colors,
+                        cx,
+                        |_, cx| cx.open_url("https://tailscale.com/download/mac"),
+                    )
+                    .into_any_element()
+                } else {
+                    surface_button(
+                        t("settings.phone.open_tailscale"),
+                        "phone-open-tailscale",
+                        colors,
+                        cx,
+                        |_, cx| cx.open_url("file:///Applications/Tailscale.app"),
+                    )
+                    .into_any_element()
+                })
+            })
+            .when(!self.phone_loading, |row| {
+                row.child(surface_button(
+                    if self.phone_setup.is_none() {
+                        t("settings.phone.check_mac")
+                    } else {
+                        t("settings.phone.check_again")
+                    },
+                    "phone-check",
+                    colors,
+                    cx,
+                    |this, cx| {
+                        this.phone_loading = true;
+                        this.phone_error = None;
+                        let task = this.runtime.spawn(crate::phone_access::check_tailscale());
+                        cx.spawn(async move |this, cx| {
+                            let state = task.await.unwrap_or(TailscaleSetup::Unavailable);
+                            let _ = this.update(cx, |this, cx| {
+                                this.phone_loading = false;
+                                this.phone_setup = Some(state);
+                                cx.notify();
+                            });
+                        })
+                        .detach();
+                        cx.notify();
+                    },
+                ))
+            });
         let content = div()
             .flex()
             .flex_col()
-            .gap(px(20.0))
-            .child(setting_section(
-                t("settings.phone.intro_title"),
+            .gap(px(SETTINGS_SECTION_GAP))
+            .child(
                 div()
-                    .flex()
-                    .flex_col()
-                    .gap(px(10.0))
-                    .child(t("settings.phone.intro_setup"))
-                    .child(t("settings.phone.intro_awake")),
-                colors,
-            ))
+                    .text_size(px(12.0))
+                    .text_color(colors.secondary)
+                    .child(wrappable_setting_copy(
+                        format!(
+                            "{} {}",
+                            t("settings.phone.intro_setup"),
+                            t("settings.phone.intro_awake")
+                        )
+                        .into(),
+                    )),
+            )
+            .when_some(self.phone_error.clone(), |view, error| {
+                view.child(
+                    div()
+                        .text_size(px(12.0))
+                        .text_color(Ink::DANGER)
+                        .child(wrappable_setting_copy(error.into())),
+                )
+            })
             .when(self.phone_access.is_none(), |view| {
                 view.child(setting_section(
                     t("settings.phone.step_mac"),
-                    div()
-                        .flex()
-                        .flex_col()
-                        .gap(px(10.0))
-                        .child(
-                            self.phone_setup
-                                .map(TailscaleSetup::message)
-                                .unwrap_or_else(|| t("settings.phone.step_mac_detail")),
-                        )
-                        .when(
-                            self.phone_setup.is_some()
-                                && !matches!(self.phone_setup, Some(TailscaleSetup::Ready(_))),
-                            |view| {
-                                view.child(surface_button(
-                                    t("settings.phone.get_tailscale"),
-                                    "phone-install-tailscale",
-                                    colors,
-                                    cx,
-                                    |_, cx| {
-                                        cx.open_url("https://tailscale.com/download/mac");
-                                    },
-                                ))
-                                .when(
-                                    self.phone_setup != Some(TailscaleSetup::NotInstalled),
-                                    |view| {
-                                        view.child(surface_button(
-                                            t("settings.phone.open_tailscale"),
-                                            "phone-open-tailscale",
-                                            colors,
-                                            cx,
-                                            |_, cx| {
-                                                cx.open_url("file:///Applications/Tailscale.app");
-                                            },
-                                        ))
-                                    },
-                                )
-                                .child(t("settings.phone.tailscale_sign_in"))
-                            },
-                        )
-                        .when(!self.phone_loading, |view| {
-                            view.child(surface_button(
-                                if self.phone_setup.is_none() {
-                                    t("settings.phone.check_mac")
-                                } else {
-                                    t("settings.phone.check_again")
-                                },
-                                "phone-check",
-                                colors,
-                                cx,
-                                |this, cx| {
-                                    this.phone_loading = true;
-                                    this.phone_error = None;
-                                    let task =
-                                        this.runtime.spawn(crate::phone_access::check_tailscale());
-                                    cx.spawn(async move |this, cx| {
-                                        let state =
-                                            task.await.unwrap_or(TailscaleSetup::Unavailable);
-                                        let _ = this.update(cx, |this, cx| {
-                                            this.phone_loading = false;
-                                            this.phone_setup = Some(state);
-                                            cx.notify();
-                                        });
-                                    })
-                                    .detach();
-                                    cx.notify();
-                                },
-                            ))
-                        }),
+                    setting_row("Tailscale", mac_detail, mac_controls, colors),
                     colors,
                 ))
-            })
-            .when_some(self.phone_error.clone(), |view, error| view.child(error))
-            .when(self.phone_loading, |view| {
-                view.child(t("settings.phone.checking"))
-            })
-            .when(
-                !self.phone_loading
-                    && self.phone_access.is_none()
-                    && matches!(self.phone_setup, Some(TailscaleSetup::Ready(_))),
-                |view| {
+                .when(ready && !self.phone_loading, |view| {
                     view.child(setting_section(
                         t("settings.phone.step_iphone"),
-                        div()
-                            .flex()
-                            .flex_col()
-                            .gap(px(10.0))
-                            .child(tf(
+                        setting_row(
+                            t("settings.phone.title"),
+                            tf(
                                 "settings.phone.step_iphone_detail",
                                 &[("machine", &crate::platform::local_machine_label_lowercase())],
-                            ))
-                            .child(t("settings.phone.no_advanced"))
-                            .child(settings_primary_button(
+                            ),
+                            settings_primary_button(
                                 t("settings.phone.enable"),
                                 "phone-enable",
                                 Some("iphone"),
@@ -3459,11 +3461,13 @@ impl UtilitySurfaces {
                                     .detach();
                                     cx.notify();
                                 },
-                            )),
+                            ),
+                            colors,
+                        ),
                         colors,
                     ))
-                },
-            )
+                })
+            })
             .when_some(self.phone_access.as_ref(), |view, access| {
                 let size = access.qr.width();
                 let module = (240.0 / (size + 8) as f32).floor();
@@ -3471,6 +3475,7 @@ impl UtilitySurfaces {
                     .flex()
                     .flex_col()
                     .p(px(module * 4.0))
+                    .rounded(px(Radius::BADGE))
                     .bg(gpui::white())
                     .children((0..size).map(|y| {
                         div().flex().children((0..size).map(|x| {
@@ -3483,35 +3488,68 @@ impl UtilitySurfaces {
                             )
                         }))
                     }));
-                view.child(if access.is_running() {
-                    t("settings.phone.on")
-                } else {
-                    t("settings.phone.stopped")
-                })
-                .child(t("settings.phone.scan_hint"))
-                .child(div().flex().child(qr))
-                .child(t("settings.phone.code_warning"))
-                .child(surface_button(
-                    t("settings.phone.copy_link"),
-                    "phone-copy",
+                let copy = |text: &'static str| {
+                    div()
+                        .min_w(px(0.0))
+                        .w_full()
+                        .whitespace_normal()
+                        .text_size(px(Typo::META.size))
+                        .line_height(px(16.0))
+                        .text_color(colors.secondary)
+                        .child(wrappable_setting_copy(text.into()))
+                };
+                view.child(setting_section(
+                    if access.is_running() {
+                        t("settings.phone.on")
+                    } else {
+                        t("settings.phone.stopped")
+                    },
+                    div()
+                        .p(px(12.0))
+                        .flex()
+                        .items_start()
+                        .gap(px(16.0))
+                        .child(div().flex_none().child(qr))
+                        .child(
+                            div()
+                                .flex_1()
+                                .min_w(px(0.0))
+                                .flex()
+                                .flex_col()
+                                .gap(px(10.0))
+                                .child(copy(t("settings.phone.scan_hint")))
+                                .child(copy(t("settings.phone.code_warning")))
+                                .child(
+                                    div()
+                                        .flex()
+                                        .gap(px(6.0))
+                                        .child(surface_button(
+                                            t("settings.phone.copy_link"),
+                                            "phone-copy",
+                                            colors,
+                                            cx,
+                                            |this, cx| {
+                                                if let Some(access) = &this.phone_access {
+                                                    cx.write_to_clipboard(
+                                                        gpui::ClipboardItem::new_string(
+                                                            access.url.clone(),
+                                                        ),
+                                                    );
+                                                }
+                                            },
+                                        ))
+                                        .child(settings_danger_button(
+                                            t("settings.phone.turn_off"),
+                                            "phone-disable",
+                                            cx,
+                                            |this, cx| {
+                                                this.phone_access = None;
+                                                cx.notify();
+                                            },
+                                        )),
+                                ),
+                        ),
                     colors,
-                    cx,
-                    |this, cx| {
-                        if let Some(access) = &this.phone_access {
-                            cx.write_to_clipboard(gpui::ClipboardItem::new_string(
-                                access.url.clone(),
-                            ));
-                        }
-                    },
-                ))
-                .child(settings_danger_button(
-                    t("settings.phone.turn_off"),
-                    "phone-disable",
-                    cx,
-                    |this, cx| {
-                        this.phone_access = None;
-                        cx.notify();
-                    },
                 ))
             });
         settings_page(t("settings.phone.title"), content, colors)
@@ -3750,8 +3788,9 @@ impl UtilitySurfaces {
 
     fn voice_settings(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let colors = self.settings_colors();
-        setting_section(
-            t("settings.general.voice"),
+        settings_page(
+            t("settings.tab.voice"),
+            setting_card(
             div()
                 .flex()
                 .flex_col()
@@ -3842,6 +3881,8 @@ impl UtilitySurfaces {
                         ))
                     },
                 ),
+                colors,
+            ),
             colors,
         )
     }
@@ -4072,27 +4113,8 @@ impl UtilitySurfaces {
                         )),
                     colors,
                 ))
-                .when(cfg!(target_os = "macos"), |page| {
-                    page.child(self.voice_settings(cx))
-                })
-                .child(self.import_settings(cx))
+                .children(self.import_settings(cx))
                 .child(self.update_settings(cx))
-                .child(setting_section(
-                    t("settings.general.support"),
-                    setting_row(
-                        t("settings.general.copy_diagnostics"),
-                        t("settings.general.copy_diagnostics_detail"),
-                        surface_button(
-                            t("settings.general.preview"),
-                            "preview-diagnostics",
-                            colors,
-                            cx,
-                            |this, cx| this.open_diagnostics(cx),
-                        ),
-                        colors,
-                    ),
-                    colors,
-                ))
                 .child(setting_section(
                     t("settings.general.quick_open"),
                     div()
@@ -4674,11 +4696,14 @@ impl UtilitySurfaces {
                 .flex_col()
                 .gap(px(SETTINGS_SECTION_GAP))
                 .children(self.computer_settings(cx))
-                .child(setting_section(
-                    t("settings.agents.execution_target"),
-                    targets,
-                    colors,
-                ))
+                // With no remote hosts the only target is this machine.
+                .when(!hosts.is_empty(), |page| {
+                    page.child(setting_section(
+                        t("settings.agents.execution_target"),
+                        targets,
+                        colors,
+                    ))
+                })
                 .child(
                     div()
                         .flex()
@@ -5969,7 +5994,7 @@ impl UtilitySurfaces {
         list
     }
 
-    fn terminal_settings(&self, cx: &mut Context<Self>) -> impl IntoElement {
+    fn appearance_settings(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let colors = self.settings_colors();
         let selected = theme(&self.prefs.terminal_theme);
         let font_control = settings_stepper(
@@ -6008,132 +6033,111 @@ impl UtilitySurfaces {
                 appearance_mode_card(index, label, active, colors, cx).into_any_element()
             }),
         );
-        let hex = |color: gpui::Rgba| {
-            format!(
-                "#{:02X}{:02X}{:02X}",
-                (color.r * 255.0).round() as u8,
-                (color.g * 255.0).round() as u8,
-                (color.b * 255.0).round() as u8
-            )
+        let row = |label: &'static str, control: AnyElement| {
+            setting_row(label, SharedString::default(), control, colors).into_any_element()
         };
-        let swatch = |color: gpui::Rgba| {
-            let ink = if color.r * 0.2126 + color.g * 0.7152 + color.b * 0.0722 > 0.5 {
-                rgba(0x202020ff)
-            } else {
-                rgba(0xf5f5f5ff)
-            };
-            div()
-                .h(px(30.0))
-                .w(px(148.0))
-                .px(px(10.0))
-                .flex()
-                .items_center()
-                .gap(px(8.0))
-                .rounded(px(9.0))
-                .bg(color)
-                .border_1()
-                .border_color(colors.primary.alpha(0.12))
-                .child(
-                    div()
-                        .size(px(12.0))
-                        .rounded_full()
-                        .border_1()
-                        .border_color(ink.alpha(0.3)),
-                )
-                .child(div().text_size(px(12.0)).text_color(ink).child(hex(color)))
-        };
-        appearance_settings_page(
+        settings_page(
+            t("settings.appearance.title"),
             div()
                 .flex()
                 .flex_col()
-                .gap(px(18.0))
+                .gap(px(SETTINGS_SECTION_GAP))
                 .child(
                     div()
-                        .text_size(px(13.0))
-                        .text_color(colors.primary)
-                        .child(t("settings.appearance.theme")),
-                )
-                .child(choices)
-                .child(appearance_diff_preview(
-                    selected,
-                    crate::fonts::terminal_family(&self.prefs.terminal_font_family),
-                    self.prefs.terminal_font_size,
-                    self.prefs.terminal_line_height,
-                ))
-                .child(
-                    div()
-                        .rounded(px(16.0))
-                        .border_1()
-                        .border_color(colors.primary.alpha(0.08))
-                        .bg(colors.primary.alpha(0.035))
-                        .px(px(16.0))
                         .flex()
                         .flex_col()
-                        .child(appearance_setting_row(
+                        .gap(px(12.0))
+                        .child(choices)
+                        .child(appearance_diff_preview(
+                            selected,
+                            crate::fonts::terminal_family(&self.prefs.terminal_font_family),
+                            self.prefs.terminal_font_size,
+                            self.prefs.terminal_line_height,
+                        )),
+                )
+                .child(setting_section(
+                    t("settings.appearance.theme"),
+                    div()
+                        .flex()
+                        .flex_col()
+                        .child(row(
                             t("settings.appearance.color_theme"),
-                            self.terminal_theme_dropdown(cx),
-                            colors,
+                            self.terminal_theme_dropdown(cx).into_any_element(),
                         ))
-                        .child(appearance_divider(colors))
-                        .child(appearance_setting_row(
+                        .child(setting_divider(colors))
+                        .child(row(
                             t("settings.appearance.theme_files"),
-                            self.theme_files_control(cx),
-                            colors,
-                        ))
-                        .child(appearance_divider(colors))
-                        .child(appearance_setting_row(
+                            self.theme_files_control(cx).into_any_element(),
+                        )),
+                    colors,
+                ))
+                .child(setting_section(
+                    t("settings.appearance.window"),
+                    div()
+                        .flex()
+                        .flex_col()
+                        .child(row(
                             t("settings.appearance.interface_style"),
-                            self.interface_style_dropdown(cx),
-                            colors,
+                            self.interface_style_dropdown(cx).into_any_element(),
                         ))
-                        .child(appearance_divider(colors))
-                        .child(appearance_setting_row(
+                        .child(setting_divider(colors))
+                        .child(row(
                             t("settings.appearance.density"),
-                            self.pane_density_dropdown(cx),
-                            colors,
+                            self.pane_density_dropdown(cx).into_any_element(),
                         ))
-                        .child(appearance_divider(colors))
-                        .child(appearance_setting_row(
+                        .child(setting_divider(colors))
+                        .child(row(
                             t("settings.appearance.transparency"),
                             window_transparency_slider(
                                 self.prefs.window_transparency,
                                 self.prefs.window_material == WindowMaterial::Glass,
                                 colors,
                                 cx,
-                            ),
-                            colors,
-                        ))
-                        .child(appearance_divider(colors))
-                        .child(appearance_setting_row(
-                            t("settings.appearance.background"),
-                            swatch(selected.background),
-                            colors,
-                        ))
-                        .child(appearance_divider(colors))
-                        .child(appearance_setting_row(
-                            t("settings.appearance.foreground"),
-                            swatch(selected.foreground),
-                            colors,
-                        ))
-                        .child(appearance_divider(colors))
-                        .child(appearance_setting_row(
+                            )
+                            .into_any_element(),
+                        )),
+                    colors,
+                ))
+                .child(setting_section(
+                    t("settings.appearance.font"),
+                    div()
+                        .flex()
+                        .flex_col()
+                        .child(row(
                             t("settings.appearance.terminal_font"),
-                            self.terminal_font_dropdown(cx),
-                            colors,
+                            self.terminal_font_dropdown(cx).into_any_element(),
                         ))
-                        .child(appearance_divider(colors))
-                        .child(appearance_setting_row(
+                        .child(setting_divider(colors))
+                        .child(row(
                             t("settings.appearance.font_size"),
-                            font_control,
-                            colors,
+                            font_control.into_any_element(),
                         ))
-                        .child(appearance_divider(colors))
-                        .child(appearance_setting_row(
+                        .child(setting_divider(colors))
+                        .child(row(
                             t("settings.appearance.line_height"),
-                            line_height_control,
-                            colors,
-                        ))
-                        .child(appearance_divider(colors))
+                            line_height_control.into_any_element(),
+                        )),
+                    colors,
+                )),
+            colors,
+        )
+    }
+
+    /// Settings › Terminal: how the terminal behaves under the mouse and
+    /// in the shell. Appearance owns how it looks.
+    fn terminal_settings(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let colors = self.settings_colors();
+        settings_page(
+            t("settings.tab.terminal"),
+            div()
+                .flex()
+                .flex_col()
+                .gap(px(SETTINGS_SECTION_GAP))
+                .child(setting_section(
+                    t("settings.terminal.mouse"),
+                    div()
+                        .flex()
+                        .flex_col()
                         .child(toggle_row(
                             t("settings.appearance.copy_on_select"),
                             t("settings.appearance.copy_on_select_detail"),
@@ -6149,7 +6153,7 @@ impl UtilitySurfaces {
                                 cx.notify();
                             },
                         ))
-                        .child(appearance_divider(colors))
+                        .child(setting_divider(colors))
                         .child(toggle_row(
                             t("settings.appearance.click_links"),
                             if cfg!(target_os = "macos") {
@@ -6169,13 +6173,14 @@ impl UtilitySurfaces {
                                 cx.notify();
                             },
                         ))
-                        .child(appearance_divider(colors))
-                        .child(appearance_setting_row(
+                        .child(setting_divider(colors))
+                        .child(setting_row(
                             t("settings.appearance.file_links"),
+                            t("settings.terminal.file_links_detail"),
                             self.file_editor_dropdown(cx),
                             colors,
                         ))
-                        .child(appearance_divider(colors))
+                        .child(setting_divider(colors))
                         .child(toggle_row(
                             t("settings.appearance.hide_pointer"),
                             t("settings.appearance.hide_pointer_detail"),
@@ -6190,8 +6195,14 @@ impl UtilitySurfaces {
                                 });
                                 cx.notify();
                             },
-                        ))
-                        .child(appearance_divider(colors))
+                        )),
+                    colors,
+                ))
+                .child(setting_section(
+                    t("settings.terminal.shell"),
+                    div()
+                        .flex()
+                        .flex_col()
                         .child(toggle_row(
                             t("settings.appearance.paste_protection"),
                             t("settings.appearance.paste_protection_detail"),
@@ -6207,7 +6218,7 @@ impl UtilitySurfaces {
                                 cx.notify();
                             },
                         ))
-                        .child(appearance_divider(colors))
+                        .child(setting_divider(colors))
                         .child(toggle_row(
                             t("settings.appearance.shell_integration"),
                             t("settings.appearance.shell_integration_detail"),
@@ -6223,7 +6234,7 @@ impl UtilitySurfaces {
                                 cx.notify();
                             },
                         ))
-                        .child(appearance_divider(colors))
+                        .child(setting_divider(colors))
                         .child(toggle_row(
                             t("settings.appearance.last_folder"),
                             t("settings.appearance.last_folder_detail"),
@@ -6240,14 +6251,15 @@ impl UtilitySurfaces {
                             },
                         ))
                         .when(cfg!(target_os = "macos"), |rows| {
-                            rows.child(appearance_divider(colors))
+                            rows.child(setting_divider(colors))
                                 .child(default_terminal_row(
                                     self.default_terminal_state,
                                     colors,
                                     cx,
                                 ))
                         }),
-                ),
+                    colors,
+                )),
             colors,
         )
     }
@@ -6302,15 +6314,15 @@ impl UtilitySurfaces {
                 .flex_col()
                 .gap(px(SETTINGS_SECTION_GAP))
                 .child(self.remote_hosts_section(cx))
-                .child(settings_note(
-                    "lock.shield",
-                    Some(t("settings.remote.transport_note_title")),
-                    t("settings.remote.transport_note"),
-                    colors.secondary,
-                    colors.primary.alpha(0.08),
-                    colors.primary.alpha(0.035),
-                    colors,
-                )),
+                .child(
+                    div()
+                        .debug_selector(|| "SETTINGS_NOTE_COPY".into())
+                        .px(px(1.0))
+                        .text_size(px(Typo::META.size))
+                        .line_height(px(16.0))
+                        .text_color(colors.tertiary)
+                        .child(wrappable_setting_copy(t("settings.remote.transport_note").into())),
+                ),
             colors,
         )
     }
@@ -7952,15 +7964,19 @@ fn setting_section(
                 .text_color(colors.tertiary)
                 .child(title),
         )
-        .child(
-            div()
-                .rounded(px(Radius::ROW))
-                .border_1()
-                .border_color(colors.primary.alpha(0.065))
-                .bg(colors.primary.alpha(0.02))
-                .overflow_hidden()
-                .child(content),
-        )
+        .child(setting_card(content, colors))
+}
+
+/// The bordered group a [`setting_section`] draws, for a page whose title
+/// already names its only group.
+fn setting_card(content: impl IntoElement, colors: SemanticColors) -> impl IntoElement {
+    div()
+        .rounded(px(Radius::ROW))
+        .border_1()
+        .border_color(colors.primary.alpha(0.065))
+        .bg(colors.primary.alpha(0.02))
+        .overflow_hidden()
+        .child(content)
 }
 
 fn setting_row(
@@ -8254,7 +8270,8 @@ fn setting_text_stack(
                 .text_color(colors.primary)
                 .child(wrappable_setting_copy(label)),
         )
-        .child(
+        .when(!detail.is_empty(), |stack| {
+            stack.child(
             div()
                 .debug_selector(|| "settings-row-detail".into())
                 .min_w(px(0.0))
@@ -8264,7 +8281,8 @@ fn setting_text_stack(
                 .line_height(px(14.0))
                 .text_color(colors.tertiary)
                 .child(wrappable_setting_copy(detail)),
-        )
+            )
+        })
         .into_any_element()
 }
 
@@ -8355,7 +8373,9 @@ fn settings_tab_matches(tab: SettingsTab, query: &str) -> bool {
         SettingsTab::Schedules => "settings.keywords.schedules",
         SettingsTab::Accounts => "settings.keywords.accounts",
         SettingsTab::Shortcuts => "settings.keywords.shortcuts",
-        SettingsTab::Terminal => "settings.keywords.appearance",
+        SettingsTab::Appearance => "settings.keywords.appearance",
+        SettingsTab::Terminal => "settings.keywords.terminal",
+        SettingsTab::Voice => "settings.keywords.voice",
         SettingsTab::Usage => "settings.keywords.usage",
         SettingsTab::Worktrees => "settings.keywords.worktrees",
         SettingsTab::Resources => "settings.keywords.resources",
@@ -8495,46 +8515,6 @@ fn settings_page_with_trailing(
         .child(content)
 }
 
-fn appearance_settings_page(content: impl IntoElement, colors: SemanticColors) -> impl IntoElement {
-    div()
-        .w_full()
-        .px(px(24.0))
-        .pt(px(28.0))
-        .pb(px(36.0))
-        .flex()
-        .flex_col()
-        .gap(px(36.0))
-        .child(
-            div()
-                .text_size(px(24.0))
-                .font_weight(FontWeight::NORMAL)
-                .text_color(colors.primary)
-                .child(t("settings.appearance.title")),
-        )
-        .child(content)
-}
-
-fn appearance_setting_row(
-    label: &'static str,
-    control: impl IntoElement,
-    colors: SemanticColors,
-) -> impl IntoElement {
-    div()
-        .min_h(px(52.0))
-        .py(px(9.0))
-        .flex()
-        .items_center()
-        .justify_between()
-        .gap(px(16.0))
-        .child(
-            div()
-                .text_size(px(13.0))
-                .text_color(colors.primary)
-                .child(label),
-        )
-        .child(control)
-}
-
 /// Blur the desktop behind the window, or paint it solid. Solid is cheaper
 /// for the compositor, so the choice stays one click away from the theme.
 /// Drag toward "less" for a denser tint, toward "more" for clearer glass. The
@@ -8661,10 +8641,6 @@ fn window_transparency_slider(
                 .child(label),
         )
         .child(track)
-}
-
-fn appearance_divider(colors: SemanticColors) -> impl IntoElement {
-    div().h(px(1.0)).bg(colors.primary.alpha(0.055))
 }
 
 fn setting_divider(colors: SemanticColors) -> impl IntoElement {
@@ -9440,7 +9416,9 @@ mod tests {
             Ok("skills") => SettingsTab::Skills,
             Ok("schedules") => SettingsTab::Schedules,
             Ok("accounts") => SettingsTab::Accounts,
+            Ok("appearance") => SettingsTab::Appearance,
             Ok("terminal") => SettingsTab::Terminal,
+            Ok("voice") => SettingsTab::Voice,
             Ok("worktrees") => SettingsTab::Worktrees,
             Ok("resources") => SettingsTab::Resources,
             Ok("usage") => SettingsTab::Usage,
@@ -9783,7 +9761,7 @@ mod tests {
         let (harness, cx) = open_settings_workbench(cx);
         let surfaces = harness.read_with(cx, |harness, _| harness.surfaces.clone());
         surfaces.update(cx, |surfaces, cx| {
-            surfaces.settings_tab = SettingsTab::Terminal;
+            surfaces.settings_tab = SettingsTab::Appearance;
             // A Nerd Font collection: every row names its family in that
             // face, so building them all loaded every font at once.
             surfaces.terminal_font_families = (0..500)
@@ -10702,7 +10680,7 @@ mod tests {
         let window = cx
             .open_window(size(px(1200.0), px(height)), move |window, cx| {
                 let harness = cx
-                    .new(|cx| SettingsWorkbenchHarness::open_at(SettingsTab::Terminal, window, cx));
+                    .new(|cx| SettingsWorkbenchHarness::open_at(SettingsTab::Appearance, window, cx));
                 harness.update(cx, |harness, cx| {
                     harness
                         .sidebar
@@ -11980,8 +11958,11 @@ mod tests {
         assert!(settings_tab_matches(SettingsTab::General, "login"));
         assert!(settings_tab_matches(SettingsTab::General, "diri-include"));
         assert!(settings_tab_matches(SettingsTab::Shortcuts, "keyboard"));
-        assert!(settings_tab_matches(SettingsTab::Terminal, "appearance"));
-        assert!(!settings_tab_matches(SettingsTab::Terminal, "ssh"));
+        assert!(settings_tab_matches(SettingsTab::Appearance, "appearance"));
+        assert!(!settings_tab_matches(SettingsTab::Appearance, "ssh"));
+        assert!(settings_tab_matches(SettingsTab::Terminal, "paste"));
+        assert!(settings_tab_matches(SettingsTab::Voice, "dictation"));
+        assert!(!settings_tab_matches(SettingsTab::General, "dictation"));
     }
 
     #[gpui::test]
@@ -12116,7 +12097,7 @@ mod tests {
     #[gpui::test]
     fn appearance_modes_switch_the_palette_and_persist_system_following(cx: &mut TestAppContext) {
         let (harness, cx) = cx.add_window_view(|window, cx| {
-            SettingsWorkbenchHarness::open_at(SettingsTab::Terminal, window, cx)
+            SettingsWorkbenchHarness::open_at(SettingsTab::Appearance, window, cx)
         });
         cx.simulate_resize(size(px(1200.0), px(800.0)));
         cx.run_until_parked();
@@ -12151,7 +12132,7 @@ mod tests {
     #[gpui::test]
     fn appearance_theme_cards_fit_inside_a_narrow_settings_pane(cx: &mut TestAppContext) {
         let (_harness, cx) = cx.add_window_view(|window, cx| {
-            SettingsWorkbenchHarness::open_at(SettingsTab::Terminal, window, cx)
+            SettingsWorkbenchHarness::open_at(SettingsTab::Appearance, window, cx)
         });
         cx.simulate_resize(size(px(760.0), px(760.0)));
         cx.run_until_parked();

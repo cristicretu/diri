@@ -1,5 +1,4 @@
 {
-  "settings.appearance.background": "Fondo",
   "settings.appearance.click_links": "Abrir enlaces con un clic",
   "settings.appearance.click_links_detail": "Haz clic en un enlace para abrirlo. Si está desactivado, usa ⌘-clic.",
   "settings.appearance.click_links_detail_ctrl": "Haz clic en un enlace para abrirlo. Si está desactivado, usa Ctrl+clic.",
@@ -11,10 +10,10 @@
   "settings.appearance.editor_automatic_default": "Automático (app predeterminada)",
   "settings.appearance.editor_default_app": "App predeterminada",
   "settings.appearance.file_links": "Abrir enlaces de archivo en",
+  "settings.appearance.font": "Tipo de letra",
   "settings.appearance.font_default": "Predeterminado ({font})",
   "settings.appearance.font_not_installed": "{font} (no instalado)",
   "settings.appearance.font_size": "Tamaño de letra",
-  "settings.appearance.foreground": "Primer plano",
   "settings.appearance.group_dark": "Oscuro",
   "settings.appearance.group_imported": "Importados",
   "settings.appearance.group_light": "Claro",
@@ -54,6 +53,7 @@
   "settings.appearance.transparency_default": "Predeterminada",
   "settings.appearance.transparency_solid": "Opaca",
   "settings.appearance.use_mode": "Usar apariencia: {mode}",
+  "settings.appearance.window": "Ventana",
   "settings.phone.awake_failed": "No se puede mantener este Mac activo: {error}",
   "settings.phone.check_again": "Volver a comprobar",
   "settings.phone.check_mac": "Comprobar este Mac",
@@ -64,8 +64,6 @@
   "settings.phone.get_tailscale": "Obtener Tailscale para Mac",
   "settings.phone.intro_awake": "Mantén Diri abierto y tu Mac conectado a la corriente con la tapa abierta. La pantalla puede apagarse; cerrar la tapa o elegir Reposo desconecta tu teléfono.",
   "settings.phone.intro_setup": "Una configuración única, sin comandos, ajustes del router ni direcciones que escribir.",
-  "settings.phone.intro_title": "Tu Mac hace el trabajo. Tu teléfono es el mando.",
-  "settings.phone.no_advanced": "No hace falta nodo de salida, Tailscale SSH, redirección de puertos ni otros ajustes avanzados.",
   "settings.phone.on": "El acceso desde el teléfono está activado",
   "settings.phone.open_tailscale": "Abrir Tailscale",
   "settings.phone.scan_hint": "En Diri en tu iPhone, toca Escanear código de vinculación. Comprobaremos la conexión antes de guardarla.",
@@ -137,7 +135,6 @@
   "settings.remote.title": "Remoto",
   "settings.remote.token_hint": "El token se queda en ese archivo, accesible solo para su propietario. SSH sigue disponible para instalación y recuperación.",
   "settings.remote.transport_note": "Diri usa tu configuración de SSH sin modificar el host. Los nombres de redes privadas y de Tailscale funcionan sin más cuando OpenSSH puede resolverlos.",
-  "settings.remote.transport_note_title": "Transporte OpenSSH",
   "settings.remote.use_by_default": "Usar como predeterminado",
   "settings.resources.frozen_note": "Las sesiones congeladas nunca se terminan. Al abrir una, se reactiva al instante, justo donde la dejaste.",
   "settings.resources.hibernate": "Hibernar sesiones inactivas",
@@ -151,5 +148,8 @@
   "settings.resources.memory_limit": "Límite de memoria",
   "settings.resources.memory_limit_detail": "Congelar una sesión inactiva cuando su árbol de procesos alcance este tamaño.",
   "settings.resources.session_limits": "Límites de sesión",
-  "settings.resources.title": "Recursos"
+  "settings.resources.title": "Recursos",
+  "settings.terminal.file_links_detail": "El editor donde se abre una ruta de archivo al hacer clic.",
+  "settings.terminal.mouse": "Ratón y selección",
+  "settings.terminal.shell": "Shell"
 }
