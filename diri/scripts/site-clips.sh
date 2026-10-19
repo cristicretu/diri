@@ -29,7 +29,7 @@ crop_for() {
   case $1 in
     schedules) echo "1280 900 0 0" ;;       # the clocked rows and the run
     voice) echo "1280 900 510 14" ;;        # the pane, from its title to the answer
-    computer) echo "2474 1140 510 14" ;;    # inside the terminal pane, down to its last row
+    computer) echo "2280 1400 0 0" ;;       # the whole window: tabs, transcript, Simulators
   esac
 }
 
@@ -87,13 +87,14 @@ for dir in "$frames"/*/; do
       fi
     done <"$dir/frames.txt"
   fi
-  # The computer clip gets a Simulator window over the right of the pane,
-  # in frames of its own between the recorded ones.
+  # The computer clip gets a Simulator window per agent over the right of
+  # the pane, in frames of its own between the recorded ones.
   if [[ $name == computer ]]; then
     sim=$(mktemp -d)
     node scripts/site-clip-simulator.mjs "$dir" "$sim" $((w / 2)) $((h / 2))
+    i=0
     while read -r frame png hold; do
-      out_frame=$sim/$(basename "$png" .png)_on.png
+      out_frame=$sim/on_$((i++)).png
       ffmpeg -loglevel error -i "$src/$frame" -i "$png" -filter_complex overlay=0:0 "$out_frame"
       echo "$out_frame $hold"
     done <"$sim/overlay.txt" >"$sim/frames.txt"

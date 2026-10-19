@@ -25,6 +25,7 @@ use super::tests::test_services;
 use super::whats_new_clips::Recorder;
 use super::*;
 use crate::SidebarPreviewFixture;
+use crate::store::TabOrientation;
 
 /// A normal window's proportions, shown beside or under its feature's text.
 const WINDOW: ((f32, f32), f32) = ((1140.0, 700.0), 13.0);
@@ -33,11 +34,11 @@ const WINDOW: ((f32, f32), f32) = ((1140.0, 700.0), 13.0);
 /// Its terminal font is larger by the same factor, so it reads at the size of
 /// the page's other clips.
 const WIDE_WINDOW: ((f32, f32), f32) = ((1520.0, 930.0), 17.0);
-/// The computer-use clip: as tall as `WINDOW`, wide enough for the
-/// Simulator window the encoder draws to sit beside the transcript.
-const CINEMA_WINDOW: ((f32, f32), f32) = ((1500.0, 700.0), 13.0);
-const CINEMA_FULL: usize = 150;
 const COLS: u16 = 170;
+/// `WINDOW` under horizontal tabs: the pane's columns and rows, so the prompt
+/// box spans the pane and sits on its last rows.
+const SWARM_COLS: usize = 148;
+const SWARM_ROWS: usize = 42;
 
 #[derive(Clone, Copy)]
 enum Hue {
@@ -228,6 +229,7 @@ fn open(
     workspace: Option<WorkspaceSnapshot>,
     (window_size, font_size): ((f32, f32), f32),
     material: crate::store::WindowMaterial,
+    tabs: TabOrientation,
 ) -> Clip {
     let services = test_services();
     let mut fixture = SidebarPreviewFixture::make(PreviewScenario::Typical);
@@ -239,7 +241,12 @@ fn open(
         )
     });
     let template = fixture.list.sessions[0].clone();
-    for (i, s) in sessions(&template).into_iter().enumerate() {
+    let own = sessions(&template);
+    // Tabs show every session, so a horizontal-tabs clip shows only its own.
+    if tabs == TabOrientation::Horizontal {
+        fixture.list.sessions.clear();
+    }
+    for (i, s) in own.into_iter().enumerate() {
         fixture.list.sessions.insert(i, s);
     }
     {
@@ -254,7 +261,8 @@ fn open(
         store.select(SessionId::new(selected));
         store
             .update_preferences(|prefs| {
-                prefs.sidebar_visible = true;
+                prefs.sidebar_visible = tabs == TabOrientation::Vertical;
+                prefs.tab_orientation = tabs;
                 prefs.terminal_theme = "rose-pine".into();
                 prefs.window_material = material;
                 prefs.terminal_font_size = font_size;
@@ -469,6 +477,7 @@ fn record_agents(cx: &mut HeadlessAppContext, dir: PathBuf) {
         Some(workspace(1, lead_pane())),
         WIDE_WINDOW,
         crate::store::WindowMaterial::Glass,
+        TabOrientation::Vertical,
     );
     // The hero clip: its sidebar spinners turn, so motion stays on and the
     // clock steps with the frames.
@@ -658,6 +667,7 @@ fn record_schedules(cx: &mut HeadlessAppContext, dir: PathBuf) {
         None,
         WINDOW,
         crate::store::WindowMaterial::Opaque,
+        TabOrientation::Vertical,
     );
     let mut rec = Recorder::new(cx, clip.window, dir);
     use Hue::*;
@@ -716,107 +726,114 @@ fn record_schedules(cx: &mut HeadlessAppContext, dir: PathBuf) {
     rec.finish();
 }
 
-/// Claude Code drives the Simulator through the computer tool while you work.
+/// Three agents in horizontal tabs, each driving its own Simulator through
+/// the computer tool at once. The Simulator windows are drawn over the frames
+/// by the encoder (`scripts/site-clip-simulator.mjs`), timed by the marks.
 fn record_computer(cx: &mut HeadlessAppContext, dir: PathBuf) {
     let clip = open(
         cx,
         |t| {
-            vec![session_like(
-                t,
-                "clip-sim",
-                AgentKind::CLAUDE_CODE,
-                "Check the new onboarding",
-                SessionStatus::Working,
-            )]
+            let tab = |id, kind, title| session_like(t, id, kind, title, SessionStatus::Working);
+            vec![
+                tab("clip-sim", AgentKind::CLAUDE_CODE, "iPhone 17 Pro"),
+                tab("clip-sim-se", AgentKind::CODEX, "iPhone SE"),
+                tab("clip-sim-dark", AgentKind::CURSOR, "Dark mode"),
+            ]
         },
         "clip-sim",
         None,
-        CINEMA_WINDOW,
+        WINDOW,
         crate::store::WindowMaterial::Opaque,
+        TabOrientation::Horizontal,
     );
-    let mut rec = Recorder::new(cx, clip.window, dir);
+    // The tab spinners turn, so motion stays on and the clock steps with
+    // the frames.
+    cx.update(|cx| cx.set_reduce_motion(false));
+    let mut rec = Recorder::new(cx, clip.window, dir).animated(125);
     use Hue::*;
     let call = |tool: &str, args: &str| {
         l(&[
             ("● ", Green),
-            ("dirijor - computer", Bold),
+            ("dirijor - ", Bold),
+            (tool, Bold),
             (" (MCP)", Dim),
-            (&format!("(tool: \"{tool}\", args: {args})"), Plain),
+            (args, Plain),
         ])
     };
     let result = |text: &str| l(&[("  ⎿  ", Dim), (text, Plain)]);
     let mut lines = claude_banner("~/acme/ios");
     lines.extend([
-        l(&[("> ", Dim), ("Build the onboarding, then sign in on the Simulator and check it.", Plain)]),
-        p(""),
-        l(&[("● ", Green), ("Update", Bold), ("(ios/Onboarding/OnboardingView.swift)", Plain)]),
-        l(&[("  ⎿  ", Dim), ("Updated with ", Plain), ("184 additions", Green)]),
-        l(&[("● ", Green), ("Bash", Bold), ("(xcodebuild -scheme Acme -destination 'name=iPhone 17 Pro' build)", Plain)]),
-        l(&[("  ⎿  ", Dim), ("** BUILD SUCCEEDED **", Green)]),
+        l(&[("> ", Dim), ("Check the onboarding on three phones. Split it with Codex and Cursor.", Plain)]),
         p(""),
     ]);
-    // Each step holds long enough for the Simulator window the encoder draws
-    // over the right of the pane to show the cursor doing it.
-    let blocks: Vec<(Vec<Line>, &str, &str, u32)> = vec![
-        (vec![call("launch_app", "{\"name\":\"Simulator\"}"), result("Simulator · iPhone 17 Pro · Acme (debug)")], "Launching…", "2m 14s", 1100),
-        (vec![
-            call("click", "{\"element_token\":\"s1:14\"}"),
-            result("Clicked text field “Email”"),
-            call("type_text", "{\"text\":\"alex@acme.dev\"}"),
-        ], "Typing…", "2m 19s", 1700),
-        (vec![call("click", "{\"element_token\":\"s2:21\"}"), result("Clicked button “Continue”")], "Clicking…", "2m 22s", 1200),
-        (vec![
-            call("get_window_state", "{\"pid\":4211}"),
-            result("“Welcome, Alex” · page dots · Skip · screenshot attached"),
+    let steps: Vec<(&str, Vec<Line>, &str, &str, u32)> = vec![
+        ("spawn", vec![
+            call("spawn_agents", "(codex: iPhone SE, cursor: dark mode)"),
+            result("Started Codex and Cursor, each with its own Simulator"),
             p(""),
-        ], "Looking…", "2m 25s", 1300),
-        (vec![
-            l(&[("● ", Claude), ("The page dots overlap the Skip button on the smallest screen.", Plain)]),
+        ], "Launching…", "0m 12s", 1300),
+        ("type", vec![
+            call("computer", "(tool: \"type_text\", args: {\"text\":\"alex@acme.dev\"})"),
+            call("computer", "(tool: \"click\", args: {\"element_token\":\"s2:21\"})"),
+            result("Clicked button “Continue”"),
+            p(""),
+        ], "Checking…", "0m 31s", 2400),
+        ("wait", vec![
+            call("wait_for_children", ""),
+            result("Codex: the page dots overlap Skip on the SE"),
+            result("Cursor: dark mode reads fine"),
+            p(""),
+        ], "Fixing…", "1m 04s", 1700),
+        ("fix", vec![
             l(&[("● ", Green), ("Update", Bold), ("(ios/Onboarding/PageDots.swift)", Plain)]),
             l(&[("  ⎿  ", Dim), ("Updated with ", Plain), ("6 additions", Green), (" and ", Plain), ("2 removals", Red)]),
-        ], "Fixing…", "3m 02s", 1500),
+        ], "Rechecking…", "1m 40s", 1500),
     ];
     let done = [
         p(""),
-        l(&[("● ", Claude), ("Rebuilt and checked it again in the Simulator: no overlap. Your cursor and", Plain)]),
-        l(&[("  ", Plain), ("keyboard were never used.", Plain)]),
+        l(&[("● ", Claude), ("All three phones pass now. Your cursor and keyboard were never used.", Plain)]),
     ];
     // Claude Code keeps its prompt box on the pane's last rows while the
     // transcript grows above it, so every frame is padded to the finished
     // run's height.
     let rows = {
         let mut all = lines.clone();
-        all.extend(blocks.iter().flat_map(|(block, ..)| block.clone()));
+        all.extend(steps.iter().flat_map(|(_, block, ..)| block.clone()));
         all.extend(done.clone());
-        claude(&all, "", CINEMA_FULL).lines.len()
+        claude(&all, "", SWARM_COLS).lines.len().max(SWARM_ROWS)
     };
     let pinned = |body: &[Line], working: Option<(&str, &str)>| {
         let mut body = body.to_vec();
         if let Some((verb, time)) = working {
             body.extend([p(""), l(&[("✻ ", Claude), (verb, Claude), (&format!(" ({time} · esc to interrupt)"), Dim)])]);
         }
-        let mut screen = claude(&body, "", CINEMA_FULL);
+        let mut screen = claude(&body, "", SWARM_COLS);
         let pad = rows.saturating_sub(screen.lines.len());
         let at = body.len() - working.map_or(0, |_| 2);
         screen.lines.splice(at..at, (0..pad).map(|_| p("")));
         screen.cursor.0 += pad;
         screen
     };
-    show(&mut rec, &pinned(&lines, Some(("Building…", "2m 10s"))));
-    rec.shot(1200);
-    for (block, verb, time, hold) in blocks {
+    show(&mut rec, &pinned(&lines, Some(("Thinking…", "0m 04s"))));
+    rec.shot(900);
+    for (mark, block, verb, time, hold) in steps {
         lines.extend(block);
         show(&mut rec, &pinned(&lines, Some((verb, time))));
+        rec.mark(mark);
         rec.shot(hold);
     }
     lines.extend(done);
     show(&mut rec, &pinned(&lines, None));
-    update_session(&mut rec, "clip-sim", |s| {
-        s.status = SessionStatus::Idle;
-        s.last_turn_completed_at = Some(DateMillis(5.0));
-    });
+    for id in ["clip-sim", "clip-sim-se", "clip-sim-dark"] {
+        update_session(&mut rec, id, |s| {
+            s.status = SessionStatus::Idle;
+            s.last_turn_completed_at = Some(DateMillis(5.0));
+        });
+    }
+    rec.mark("done");
     rec.shot(3200);
     rec.finish();
+    cx.update(|cx| cx.set_reduce_motion(true));
 }
 
 /// Claude Code finishes and hands diri a summary to read aloud; dictation
@@ -837,6 +854,7 @@ fn record_voice(cx: &mut HeadlessAppContext, dir: PathBuf) {
         None,
         WINDOW,
         crate::store::WindowMaterial::Opaque,
+        TabOrientation::Vertical,
     );
     let listen = dir.join("listen.txt");
     let mut rec = Recorder::new(cx, clip.window, dir);

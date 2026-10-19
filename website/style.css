@@ -985,6 +985,9 @@ html { overflow-x: clip; }
 .feature-lead .feature-copy { max-width: 40rem; margin-bottom: 28px; }
 .feature-pair { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); gap: 32px; align-items: start; }
 .feature-detail .feature-copy { margin-top: 22px; padding-right: 24px; }
+/* The swarm clip is a whole window: kept narrower than the hero and
+   centred, its caption under it like the pair's. */
+.feature-wide { width: min(100%, 1040px); margin-inline: auto; }
 .feature-wide .feature-copy { margin-top: 24px; }
 .feature-wide .feature-clip { background: #191724; }
 #faq { display: grid; grid-template-columns: minmax(0, 1fr); row-gap: 28px; max-width: 760px; margin-inline: auto; }

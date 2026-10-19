@@ -34,6 +34,7 @@ pub(super) struct Recorder<'a> {
     dir: PathBuf,
     frames: Vec<(String, u32)>,
     step: Option<u32>,
+    marks: Vec<(String, u32)>,
 }
 
 impl<'a> Recorder<'a> {
@@ -46,6 +47,7 @@ impl<'a> Recorder<'a> {
             dir,
             frames: Vec::new(),
             step: None,
+            marks: Vec::new(),
         }
     }
 
@@ -73,6 +75,13 @@ impl<'a> Recorder<'a> {
                 .unwrap();
             self.cx.run_until_parked();
         }
+    }
+
+    /// Notes when `name` happens, in ms from the clip's start, for whatever
+    /// the encoder draws over the frames to keep time with (`marks.txt`).
+    pub(super) fn mark(&mut self, name: &str) {
+        let at = self.frames.iter().map(|(_, hold)| hold).sum();
+        self.marks.push((name.to_owned(), at));
     }
 
     /// Captures the window as it stands and holds it for `hold_ms`.
@@ -109,6 +118,14 @@ impl<'a> Recorder<'a> {
             .map(|(name, ms)| format!("{name} {ms}\n"))
             .collect();
         std::fs::write(self.dir.join("frames.txt"), list).unwrap();
+        if !self.marks.is_empty() {
+            let marks: String = self
+                .marks
+                .iter()
+                .map(|(name, at)| format!("{name} {at}\n"))
+                .collect();
+            std::fs::write(self.dir.join("marks.txt"), marks).unwrap();
+        }
         self.cx
             .update_window(self.window, |_, window, _| window.remove_window())
             .unwrap();
