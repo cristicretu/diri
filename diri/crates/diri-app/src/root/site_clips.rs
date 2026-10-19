@@ -257,6 +257,7 @@ fn open(
             "claude-code",
             "codex",
             "gemini",
+            "pi",
         ]));
         store.select(SessionId::new(selected));
         store
@@ -726,18 +727,61 @@ fn record_schedules(cx: &mut HeadlessAppContext, dir: PathBuf) {
     rec.finish();
 }
 
+/// Selects `id`'s tab the way a click or shortcut does.
+fn select(rec: &mut Recorder, id: &str) {
+    for index in 0..8 {
+        let selected = rec
+            .cx
+            .update_window(rec.window, |view, _, cx| {
+                let root = view.downcast::<RootView>().unwrap();
+                root.update(cx, |root, cx| root.select_session_shortcut(index, cx));
+                let root = root.read(cx);
+                let store = root.window_store.read().unwrap();
+                store.selected_session_id().is_some_and(|s| s.0 == id)
+            })
+            .unwrap();
+        rec.cx.run_until_parked();
+        if selected {
+            return;
+        }
+    }
+    panic!("no tab for {id}");
+}
+
+/// Pi: the transcript, then its editor between rules and the footer.
+fn pi(body: &[Line], working: bool, rows: usize) -> Screen {
+    let mut lines = body.to_vec();
+    lines.push(p(""));
+    if working {
+        lines.push(l(&[("⠹ ", Hue::Blue), ("Working…", Hue::Dim)]));
+    }
+    let pad = rows.saturating_sub(lines.len() + 4);
+    lines.extend((0..pad).map(|_| p("")));
+    lines.push(rule(SWARM_COLS));
+    let row = lines.len();
+    lines.push(p(""));
+    lines.push(rule(SWARM_COLS));
+    lines.push(l(&[("~/acme/ios (main)", Hue::Dim)]));
+    Screen {
+        lines,
+        cursor: (row, 0),
+    }
+}
+
 /// Three agents in horizontal tabs, each driving its own Simulator through
-/// the computer tool at once. The Simulator windows are drawn over the frames
-/// by the encoder (`scripts/site-clip-simulator.mjs`), timed by the marks.
+/// the computer tool. Claude Code starts Codex and Pi; the window follows each
+/// to its tab as its Simulator opens, then comes back to Claude's. The
+/// Simulator windows are drawn over the frames by the encoder
+/// (`scripts/site-clip-simulator.mjs`), timed by the marks.
 fn record_computer(cx: &mut HeadlessAppContext, dir: PathBuf) {
     let clip = open(
         cx,
         |t| {
             let tab = |id, kind, title| session_like(t, id, kind, title, SessionStatus::Working);
             vec![
-                tab("clip-sim", AgentKind::CLAUDE_CODE, "iPhone 17 Pro"),
+                tab("clip-sim", AgentKind::CLAUDE_CODE, "Notifications"),
                 tab("clip-sim-se", AgentKind::CODEX, "iPhone SE"),
-                tab("clip-sim-dark", AgentKind::CURSOR, "Dark mode"),
+                tab("clip-sim-tour", AgentKind::new("pi"), "Dark mode"),
             ]
         },
         "clip-sim",
@@ -761,70 +805,116 @@ fn record_computer(cx: &mut HeadlessAppContext, dir: PathBuf) {
         ])
     };
     let result = |text: &str| l(&[("  ⎿  ", Dim), (text, Plain)]);
-    let mut lines = claude_banner("~/acme/ios");
-    lines.extend([
-        l(&[("> ", Dim), ("Check the onboarding on three phones. Split it with Codex and Cursor.", Plain)]),
+    let mut lead = claude_banner("~/acme/ios");
+    lead.extend([
+        l(&[("> ", Dim), ("Check the onboarding on three phones. Split it with Codex and Pi.", Plain)]),
         p(""),
     ]);
-    let steps: Vec<(&str, Vec<Line>, &str, &str, u32)> = vec![
-        ("spawn", vec![
-            call("spawn_agents", "(codex: iPhone SE, cursor: dark mode)"),
-            result("Started Codex and Cursor, each with its own Simulator"),
-            p(""),
-        ], "Launching…", "0m 12s", 1300),
-        ("type", vec![
-            call("computer", "(tool: \"type_text\", args: {\"text\":\"alex@acme.dev\"})"),
-            call("computer", "(tool: \"click\", args: {\"element_token\":\"s2:21\"})"),
-            result("Clicked button “Continue”"),
-            p(""),
-        ], "Checking…", "0m 31s", 2400),
-        ("wait", vec![
-            call("wait_for_children", ""),
-            result("Codex: the page dots overlap Skip on the SE"),
-            result("Cursor: dark mode reads fine"),
-            p(""),
-        ], "Fixing…", "1m 04s", 1700),
-        ("fix", vec![
-            l(&[("● ", Green), ("Update", Bold), ("(ios/Onboarding/PageDots.swift)", Plain)]),
-            l(&[("  ⎿  ", Dim), ("Updated with ", Plain), ("6 additions", Green), (" and ", Plain), ("2 removals", Red)]),
-        ], "Rechecking…", "1m 40s", 1500),
-    ];
     let done = [
         p(""),
         l(&[("● ", Claude), ("All three phones pass now. Your cursor and keyboard were never used.", Plain)]),
     ];
-    // Claude Code keeps its prompt box on the pane's last rows while the
-    // transcript grows above it, so every frame is padded to the finished
-    // run's height.
-    let rows = {
-        let mut all = lines.clone();
-        all.extend(steps.iter().flat_map(|(_, block, ..)| block.clone()));
+    let claude_rows = {
+        let mut all = lead.clone();
+        all.extend([
+            call("spawn_agents", ""), result(""), result(""), p(""),
+            call("computer", ""), call("computer", ""), result(""), p(""),
+            call("wait_for_children", ""), result(""), result(""), p(""),
+            l(&[]), l(&[]),
+        ]);
         all.extend(done.clone());
         claude(&all, "", SWARM_COLS).lines.len().max(SWARM_ROWS)
     };
-    let pinned = |body: &[Line], working: Option<(&str, &str)>| {
+    let claude_at = |body: &[Line], working: Option<(&str, &str)>| {
         let mut body = body.to_vec();
         if let Some((verb, time)) = working {
             body.extend([p(""), l(&[("✻ ", Claude), (verb, Claude), (&format!(" ({time} · esc to interrupt)"), Dim)])]);
         }
         let mut screen = claude(&body, "", SWARM_COLS);
-        let pad = rows.saturating_sub(screen.lines.len());
+        let pad = claude_rows.saturating_sub(screen.lines.len());
         let at = body.len() - working.map_or(0, |_| 2);
         screen.lines.splice(at..at, (0..pad).map(|_| p("")));
         screen.cursor.0 += pad;
         screen
     };
-    show(&mut rec, &pinned(&lines, Some(("Thinking…", "0m 04s"))));
+
+    // Claude Code takes the task and hands two phones to Codex and Pi.
+    show(&mut rec, &claude_at(&lead, Some(("Thinking…", "0m 04s"))));
+    rec.shot(800);
+    lead.extend([
+        call("spawn_agents", "(codex: iPhone SE, pi: 17 Pro Max)"),
+        result("Codex signs in on the SE"),
+        result("Pi walks the tour in dark mode"),
+        p(""),
+    ]);
+    show(&mut rec, &claude_at(&lead, Some(("Delegating…", "0m 09s"))));
+    rec.mark("spawn");
     rec.shot(900);
-    for (mark, block, verb, time, hold) in steps {
-        lines.extend(block);
-        show(&mut rec, &pinned(&lines, Some((verb, time))));
-        rec.mark(mark);
-        rec.shot(hold);
-    }
-    lines.extend(done);
-    show(&mut rec, &pinned(&lines, None));
-    for id in ["clip-sim", "clip-sim-se", "clip-sim-dark"] {
+
+    // Codex opens the iPhone SE and signs in.
+    select(&mut rec, "clip-sim-se");
+    let mut work = codex_banner("~/acme/ios");
+    work.extend([
+        l(&[("› ", Bold), ("Sign in on the iPhone SE Simulator and check the welcome screen.", Plain)]),
+        p(""),
+        l(&[("• ", Green), ("Called ", Bold), ("dirijor.computer", Plain), ("({\"tool\":\"launch_app\",\"device\":\"iPhone SE\"})", Dim)]),
+    ]);
+    show(&mut rec, &pin(codex(&work, Some("0m 03s")), work.len(), SWARM_ROWS));
+    rec.mark("codex");
+    rec.shot(1100);
+    work.extend([
+        l(&[("• ", Green), ("Called ", Bold), ("dirijor.computer", Plain), ("({\"tool\":\"type_text\",\"text\":\"sam@acme.dev\"})", Dim)]),
+        l(&[("• ", Green), ("Called ", Bold), ("dirijor.computer", Plain), ("({\"tool\":\"click\",\"label\":\"Continue\"})", Dim)]),
+    ]);
+    show(&mut rec, &pin(codex(&work, Some("0m 07s")), work.len(), SWARM_ROWS));
+    rec.shot(1200);
+
+    // Pi opens the 17 Pro Max in dark mode and pages through the tour.
+    select(&mut rec, "clip-sim-tour");
+    let mut tour = vec![
+        l(&[("pi", Bold), (" v0.31 · ~/acme/ios", Dim)]),
+        p(""),
+        l(&[("Walk the onboarding tour on the iPhone 17 Pro Max in dark mode.", Bold)]),
+        p(""),
+        l(&[("computer ", Blue), ("launch_app iPhone 17 Pro Max · appearance dark", Plain)]),
+    ];
+    show(&mut rec, &pi(&tour, true, SWARM_ROWS));
+    rec.mark("pi");
+    rec.shot(1100);
+    tour.push(l(&[("computer ", Blue), ("click Next · click Next · click Get started", Plain)]));
+    show(&mut rec, &pi(&tour, true, SWARM_ROWS));
+    rec.shot(1300);
+
+    // Back to Claude Code, which turns on notifications on its own phone.
+    select(&mut rec, "clip-sim");
+    lead.extend([
+        call("computer", "(tool: \"launch_app\", args: {\"device\":\"iPhone 17 Pro\"})"),
+        call("computer", "(tool: \"click\", args: {\"label\":\"Allow\"})"),
+        result("Notifications on"),
+        p(""),
+    ]);
+    show(&mut rec, &claude_at(&lead, Some(("Checking…", "0m 31s"))));
+    rec.mark("claude");
+    rec.shot(2600);
+    lead.extend([
+        call("wait_for_children", ""),
+        result("Codex: the page dots overlap Skip on the SE"),
+        result("Pi: the tour reads fine in dark mode"),
+        p(""),
+    ]);
+    show(&mut rec, &claude_at(&lead, Some(("Fixing…", "1m 04s"))));
+    rec.mark("wait");
+    rec.shot(1700);
+    lead.extend([
+        l(&[("● ", Green), ("Update", Bold), ("(ios/Onboarding/PageDots.swift)", Plain)]),
+        l(&[("  ⎿  ", Dim), ("Updated with ", Plain), ("6 additions", Green), (" and ", Plain), ("2 removals", Red)]),
+    ]);
+    show(&mut rec, &claude_at(&lead, Some(("Rechecking…", "1m 40s"))));
+    rec.mark("fix");
+    rec.shot(1500);
+    lead.extend(done);
+    show(&mut rec, &claude_at(&lead, None));
+    for id in ["clip-sim", "clip-sim-se", "clip-sim-tour"] {
         update_session(&mut rec, id, |s| {
             s.status = SessionStatus::Idle;
             s.last_turn_completed_at = Some(DateMillis(5.0));

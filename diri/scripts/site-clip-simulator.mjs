@@ -19,48 +19,86 @@ const lines = file => readFileSync(join(clip, file), 'utf8').trim().split('\n').
 const frames = lines('frames.txt').map(([frame, hold]) => [frame, Number(hold)]);
 const mark = Object.fromEntries(lines('marks.txt').map(([name, at]) => [name, Number(at)]));
 
-// Each phone's story in ms. The Simulators open as spawn_agents returns; each
-// agent signs in on its own clock; the SE shows the overlap the transcript
-// reports, flagged when the children report back and fixed by the rebuild.
+// Each phone's story in ms. A phone opens just after its agent's tab is
+// selected (the codex, pi and claude marks), so the window shows who opened
+// it, and each tests something else: Codex signs in on the SE and finds the
+// overlap the transcript reports, flagged when the children report back and
+// fixed by the rebuild; Pi pages through the tour in dark mode; Claude Code
+// turns on notifications through the system alert.
 const devices = [
-  { title: 'iPhone SE', agent: 'Codex', tag: '#e8e6ee', ink: '#17151f', x: W - 490, y: 72,
-    open: mark.spawn + 200, start: mark.spawn + 700, email: 'sam@acme.dev', bug: true },
-  { title: 'iPhone 17 Pro Max', agent: 'Cursor', tag: '#7f8cff', ink: '#fff', x: W - 345, y: 100,
-    open: mark.spawn + 400, start: mark.spawn + 1100, email: 'kai@acme.dev', dark: true },
-  { title: 'iPhone 17 Pro', agent: 'Claude Code', tag: '#d97757', ink: '#fff', x: W - 200, y: 128,
-    open: mark.spawn, start: mark.type, email: 'alex@acme.dev' },
+  { kind: 'signin', title: 'iPhone SE', agent: 'Codex', tag: '#e8e6ee', ink: '#17151f', x: W - 490, y: 72,
+    open: mark.codex + 300, start: mark.codex + 700, email: 'sam@acme.dev', bug: true },
+  { kind: 'tour', title: 'iPhone 17 Pro Max', agent: 'Pi', tag: '#7f8cff', ink: '#fff', x: W - 345, y: 100,
+    open: mark.pi + 300, start: mark.pi + 700, dark: true },
+  { kind: 'notify', title: 'iPhone 17 Pro', agent: 'Claude Code', tag: '#d97757', ink: '#fff', x: W - 200, y: 128,
+    open: mark.claude + 300, start: mark.claude + 700 },
 ];
 const FIELD = [70, 223], BUTTON = [98, 263], REST = [150, 330], AWAY = [112, 292];
-const GLIDE = 380, PER_KEY = 45, PRESS = 140;
+const NEXT = [98, 325], NOTIFY = [98, 315], ALLOW = [138, 254], CLEAR = [60, 270];
+const GLIDE = 380, PER_KEY = 45, PRESS = 140, TOUR_STEP = 650;
 const ease = t => (t < 0.5 ? 2 * t * t : 1 - (-2 * t + 2) ** 2 / 2);
 const clamp = v => Math.max(0, Math.min(1, v));
 const lerp = (a, b, t) => [a[0] + (b[0] - a[0]) * t, a[1] + (b[1] - a[1]) * t];
+// Where a cursor is at `t` along `path`, a list of [ms, point] stops it
+// glides between.
+const along = (path, t) => {
+  let at = path[0][1];
+  for (let i = 1; i < path.length; i++) if (t >= path[i][0]) at = lerp(path[i - 1][1], path[i][1], ease(clamp((t - path[i][0]) / GLIDE)));
+  return at;
+};
+const ripple = (clicks, t) => clicks.map(at => (t - at) / 200).find(p => p >= 0 && p < 1) ?? null;
 
-function phone(d, t) {
+function signin(d, t) {
   const typedAt = d.start + GLIDE + PRESS;
-  const typedEnd = typedAt + d.email.length * PER_KEY;
-  const toButton = typedEnd + 120;
+  const toButton = typedAt + d.email.length * PER_KEY + 120;
   const pressAt = toButton + GLIDE;
   const welcomeAt = pressAt + PRESS;
-  const leaveAt = welcomeAt + 500;
-  let cursor = t >= d.open + 200 ? REST : null;
-  if (t >= d.start) cursor = lerp(REST, FIELD, ease(clamp((t - d.start) / GLIDE)));
-  if (t >= toButton) cursor = lerp(FIELD, BUTTON, ease(clamp((t - toButton) / GLIDE)));
-  if (t >= leaveAt) cursor = lerp(BUTTON, AWAY, ease(clamp((t - leaveAt) / GLIDE)));
-  const click = [d.start + GLIDE, pressAt].map(at => (t - at) / 200).find(p => p >= 0 && p < 1);
   const keys = t >= typedAt ? Math.floor((t - typedAt) / PER_KEY) + 1 : 0;
   return {
-    show: clamp((t - d.open) / 160),
-    cursor,
-    ripple: click ?? null,
+    cursor: along([[0, REST], [d.start, FIELD], [toButton, BUTTON], [welcomeAt + 500, AWAY]], t),
+    ripple: ripple([d.start + GLIDE, pressAt], t),
     focus: t >= d.start + GLIDE && t < welcomeAt,
     typed: d.email.slice(0, keys),
     pressed: t >= pressAt && t < welcomeAt,
     screen: t >= welcomeAt ? 'welcome' : 'signin',
-    fixed: !d.bug || t >= mark.done,
-    ring: d.bug && t >= mark.wait ? (t >= mark.done ? '#22c55e' : '#ef4444') : null,
-    ringOpacity: d.bug ? clamp((t - mark.wait) / 120) : 0,
+    fixed: t >= mark.done,
+    ring: t >= mark.wait ? (t >= mark.done ? '#22c55e' : '#ef4444') : null,
+    ringOpacity: clamp((t - mark.wait) / 120),
   };
+}
+
+function tour(d, t) {
+  const taps = [0, 1, 2].map(i => d.start + GLIDE + i * TOUR_STEP);
+  const page = taps.filter(at => t >= at + PRESS).length;
+  return {
+    cursor: along([[0, REST], [d.start, NEXT], [taps[2] + 600, CLEAR]], t),
+    ripple: ripple(taps, t),
+    pressed: taps.some(at => t >= at && t < at + PRESS),
+    screen: 'tour',
+    page: Math.min(page, 2),
+    started: page > 2,
+  };
+}
+
+function notify(d, t) {
+  const tapAt = d.start + GLIDE;
+  const alertAt = tapAt + PRESS;
+  const allowAt = alertAt + 500 + GLIDE;
+  return {
+    cursor: along([[0, REST], [d.start, NOTIFY], [alertAt + 500, ALLOW], [allowAt + 700, CLEAR]], t),
+    ripple: ripple([tapAt, allowAt], t),
+    pressed: t >= tapAt && t < alertAt,
+    screen: 'notify',
+    alert: t >= alertAt && t < allowAt + PRESS,
+    allowPressed: t >= allowAt && t < allowAt + PRESS,
+    on: t >= allowAt + PRESS,
+  };
+}
+
+const stories = { signin, tour, notify };
+function phone(d, t) {
+  const show = clamp((t - d.open) / 160);
+  return { show, ...stories[d.kind](d, t), ...(t < d.open + 200 ? { cursor: null, ripple: null } : {}) };
 }
 
 const page = `<!doctype html><meta charset="utf-8"><style>
@@ -89,9 +127,20 @@ h1 { font-size: 16px; font-weight: 650; letter-spacing: -.01em; }
 .next { position: absolute; top: 310px; left: 18px; width: 160px; height: 30px; border-radius: 9px; background: var(--next); color: var(--next-ink); font-size: 10.5px; font-weight: 600; display: flex; align-items: center; justify-content: center; }
 .dots { position: absolute; left: 0; right: 0; display: flex; justify-content: center; gap: 5px; }
 .dots i { width: 6px; height: 6px; border-radius: 50%; background: #c9c6d3; }
-.dots i:first-child { width: 14px; border-radius: 3px; background: #6d5dfc; }
 .skip { font-size: 10px; font-weight: 500; color: var(--sub); }
 .ring { position: absolute; left: 50px; width: 96px; border-radius: 10px; border: 2px solid; }
+.dots i { transition: none; } .dots i.on, .dots:not(:has(.on)) i:first-child { width: 14px; border-radius: 3px; background: #6d5dfc; }
+.next.pressed { transform: scale(.97); opacity: .85; }
+.next.on { background: #22c55e; color: #fff; }
+.bell { position: absolute; top: 96px; left: 62px; width: 72px; height: 72px; border-radius: 22px; display: grid; place-items: center; font-size: 34px; background: linear-gradient(135deg, #ffb36b, #d93a6a); }
+.dim { position: absolute; inset: 0; background: #0006; }
+.alert { position: absolute; top: 150px; left: 23px; width: 150px; border-radius: 13px; background: #f2f1f6f2; color: #15131c; text-align: center; overflow: hidden; box-shadow: 0 10px 30px #0005; }
+.alert b { display: block; padding: 12px 12px 3px; font-size: 9.5px; line-height: 1.3; }
+.alert p { padding: 0 12px 10px; font-size: 8.5px; color: #6e6a7a; }
+.alert .choices { display: grid; grid-template-columns: 1fr 1fr; border-top: 1px solid #d9d7e1; }
+.alert span { padding: 8px 0; font-size: 10px; color: #3478f6; }
+.alert span + span { border-left: 1px solid #d9d7e1; font-weight: 600; }
+.alert span.pressed { background: #0000000f; }
 .cursor { position: absolute; left: 0; top: 0; }
 .cursor b { position: absolute; left: 13px; top: 17px; padding: 2px 6px; border-radius: 6px; font-size: 9px; font-weight: 600; white-space: nowrap; box-shadow: 0 2px 6px #0006; }
 .ripple { position: absolute; width: 26px; height: 26px; margin: -13px 0 0 -13px; border-radius: 50%; border: 2px solid; }
@@ -110,6 +159,29 @@ const welcome = s => \`<div class="island"></div><div class="time">9:41</div><di
   <div class="dots" style="top:\${s.fixed ? 356 : 375}px"><i></i><i></i><i></i></div>
   <div class="abs skip" style="top:\${s.fixed ? 378 : 371}px">Skip</div>
   \${s.ring ? \`<div class="ring" style="top:\${s.fixed ? 348 : 363}px;height:\${s.fixed ? 50 : 26}px;border-color:\${s.ring};opacity:\${s.ringOpacity};box-shadow:0 0 0 4px \${s.ring}26"></div>\` : ''}\`;
+const pages = [
+  ['Welcome', 'Your workspace is ready.<br>Here’s a quick tour.', '#8b7dff, #f08bc8'],
+  ['Agents everywhere', 'Start one on this Mac<br>or on any server.', '#5ec8ff, #7f8cff'],
+  ['You’re all set', 'Notes, schedules and voice<br>are a tap away.', '#ffb36b, #d93a6a'],
+];
+const tour = s => {
+  const [title, body, art] = pages[s.page];
+  return \`<div class="island"></div><div class="time">9:41</div>
+  <div class="art" style="background:radial-gradient(circle at 35% 30%, #ffffffb3, #fff0 40%), linear-gradient(135deg, \${art})"></div>
+  <div class="abs" style="top:214px"><h1>\${title}</h1></div>
+  <div class="abs sub" style="top:240px;line-height:1.45">\${body}</div>
+  <div class="next \${s.pressed ? 'pressed' : ''}">\${s.page === 2 ? (s.started ? 'Let’s go ✓' : 'Get started') : 'Next'}</div>
+  <div class="dots" style="top:356px">\${[0, 1, 2].map(i => \`<i class="\${i === s.page ? 'on' : ''}"></i>\`).join('')}</div>
+  <div class="abs skip" style="top:378px">Skip</div>\`;
+};
+const notify = s => \`<div class="island"></div><div class="time">9:41</div>
+  <div class="bell">🔔</div>
+  <div class="abs" style="top:200px"><h1>Stay in the loop</h1></div>
+  <div class="abs sub" style="top:226px;line-height:1.45">Hear when an agent finishes<br>or needs you.</div>
+  <div class="next \${s.pressed ? 'pressed' : ''} \${s.on ? 'on' : ''}" style="top:300px">\${s.on ? 'Notifications on ✓' : 'Turn on notifications'}</div>
+  \${s.alert ? \`<div class="dim"></div><div class="alert"><b>“Acme” Would Like to Send You Notifications</b><p>Alerts, sounds and badges.</p>
+    <div class="choices"><span>Don’t Allow</span><span class="\${s.allowPressed ? 'pressed' : ''}">Allow</span></div></div>\` : ''}\`;
+const screens = { signin, welcome, tour, notify };
 window.draw = (devices, states) => {
   document.body.innerHTML = devices.map((d, i) => {
     const s = states[i];
@@ -122,7 +194,7 @@ window.draw = (devices, states) => {
     return \`<div class="stage" style="left:\${d.x}px;top:\${d.y}px">
       <div class="win" style="opacity:\${s.show};transform:translateY(\${(1 - s.show) * 8}px) scale(\${0.97 + s.show * 0.03})">
         <div class="bar"><i style="background:#ff5f57"></i><i style="background:#febc2e"></i><i style="background:#28c840"></i><span>\${d.title}</span></div>
-        <div class="phone"><div class="screen \${d.dark ? 'dark' : ''}">\${s.screen === 'signin' ? signin(s) : welcome(s)}</div></div>
+        <div class="phone"><div class="screen \${d.dark ? 'dark' : ''}">\${screens[s.screen](s)}</div></div>
       </div>\${cursor}</div>\`;
   }).join('');
 };
