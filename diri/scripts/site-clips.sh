@@ -29,7 +29,7 @@ crop_for() {
   case $1 in
     schedules) echo "1280 900 0 0" ;;       # the clocked rows and the run
     voice) echo "1280 900 510 14" ;;        # the pane, from its title to the answer
-    computer) echo "2280 1400 0 0" ;;       # the whole window: tabs, transcript, Simulators
+    computer) echo "3040 1044 0 0" ;;       # the whole window: tabs, transcript, Simulators
   esac
 }
 

@@ -34,11 +34,16 @@ const WINDOW: ((f32, f32), f32) = ((1140.0, 700.0), 13.0);
 /// Its terminal font is larger by the same factor, so it reads at the size of
 /// the page's other clips.
 const WIDE_WINDOW: ((f32, f32), f32) = ((1520.0, 930.0), 17.0);
-const COLS: u16 = 170;
-/// `WINDOW` under horizontal tabs: the pane's columns and rows, so the prompt
-/// box spans the pane and sits on its last rows.
-const SWARM_COLS: usize = 148;
-const SWARM_ROWS: usize = 42;
+const COLS: u16 = 180;
+/// The swarm clip spans both columns of the site's feature grid at the height
+/// of the clips beside each other above it, so the grid's rows match: as wide
+/// as `WIDE_WINDOW`, about a third as tall. Its font matches what the smaller
+/// clips show once the page scales them up.
+const SWARM_WINDOW: ((f32, f32), f32) = ((1520.0, 522.0), 15.0);
+/// `SWARM_WINDOW` under horizontal tabs: the pane's columns and rows, so the
+/// prompt box spans the pane and sits on its last rows.
+const SWARM_COLS: usize = 170;
+const SWARM_ROWS: usize = 26;
 
 #[derive(Clone, Copy)]
 enum Hue {
@@ -786,7 +791,7 @@ fn record_computer(cx: &mut HeadlessAppContext, dir: PathBuf) {
         },
         "clip-sim",
         None,
-        WINDOW,
+        SWARM_WINDOW,
         crate::store::WindowMaterial::Opaque,
         TabOrientation::Horizontal,
     );

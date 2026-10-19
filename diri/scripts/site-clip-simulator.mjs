@@ -26,11 +26,11 @@ const mark = Object.fromEntries(lines('marks.txt').map(([name, at]) => [name, Nu
 // fixed by the rebuild; Pi pages through the tour in dark mode; Claude Code
 // turns on notifications through the system alert.
 const devices = [
-  { kind: 'signin', title: 'iPhone SE', agent: 'Codex', tag: '#e8e6ee', ink: '#17151f', x: W - 490, y: 72,
+  { kind: 'signin', title: 'iPhone SE', agent: 'Codex', tag: '#e8e6ee', ink: '#17151f', x: W - 572, y: 52,
     open: mark.codex + 300, start: mark.codex + 700, email: 'sam@acme.dev', bug: true },
-  { kind: 'tour', title: 'iPhone 17 Pro Max', agent: 'Pi', tag: '#7f8cff', ink: '#fff', x: W - 345, y: 100,
+  { kind: 'tour', title: 'iPhone 17 Pro Max', agent: 'Pi', tag: '#7f8cff', ink: '#fff', x: W - 386, y: 52,
     open: mark.pi + 300, start: mark.pi + 700, dark: true },
-  { kind: 'notify', title: 'iPhone 17 Pro', agent: 'Claude Code', tag: '#d97757', ink: '#fff', x: W - 200, y: 128,
+  { kind: 'notify', title: 'iPhone 17 Pro', agent: 'Claude Code', tag: '#d97757', ink: '#fff', x: W - 200, y: 52,
     open: mark.claude + 300, start: mark.claude + 700 },
 ];
 const FIELD = [70, 223], BUTTON = [98, 263], REST = [150, 330], AWAY = [112, 292];
@@ -104,7 +104,7 @@ function phone(d, t) {
 const page = `<!doctype html><meta charset="utf-8"><style>
 * { box-sizing: border-box; margin: 0; }
 html, body { width: ${W}px; height: ${H}px; background: transparent; overflow: hidden; font-family: -apple-system, "SF Pro Text", sans-serif; -webkit-font-smoothing: antialiased; }
-.stage { position: absolute; scale: .82; transform-origin: 0 0; }
+.stage { position: absolute; scale: .78; transform-origin: 0 0; }
 .win { position: absolute; left: 0; top: 0; width: 220px; height: 468px; border-radius: 12px; background: #2a2838; border: 1px solid #ffffff1f; box-shadow: 0 18px 50px #00000099, 0 2px 8px #00000066; transform-origin: 50% 40%; }
 .bar { height: 26px; display: flex; align-items: center; gap: 6px; padding: 0 10px; }
 .bar i { width: 9px; height: 9px; border-radius: 50%; }
