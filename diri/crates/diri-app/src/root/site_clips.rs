@@ -728,7 +728,7 @@ fn record_computer(cx: &mut HeadlessAppContext, dir: PathBuf) {
     let result = |text: &str| l(&[("  ⎿  ", Dim), (text, Plain)]);
     let mut lines = claude_banner("~/acme/ios");
     lines.extend([
-        l(&[("> ", Dim), ("Build the onboarding, then sign in on the Simulator as the test user and check it.", Plain)]),
+        l(&[("> ", Dim), ("Build the onboarding, then sign in on the Simulator and check it.", Plain)]),
         p(""),
         l(&[("● ", Green), ("Update", Bold), ("(ios/Onboarding/OnboardingView.swift)", Plain)]),
         l(&[("  ⎿  ", Dim), ("Updated with ", Plain), ("184 additions", Green)]),
@@ -736,24 +736,26 @@ fn record_computer(cx: &mut HeadlessAppContext, dir: PathBuf) {
         l(&[("  ⎿  ", Dim), ("** BUILD SUCCEEDED **", Green)]),
         p(""),
     ]);
-    let blocks: Vec<(Vec<Line>, &str, &str)> = vec![
-        (vec![call("launch_app", "{\"name\":\"Simulator\"}"), result("Simulator · iPhone 17 Pro · Acme (debug)")], "Launching…", "2m 14s"),
+    // Each step holds long enough for the Simulator window the encoder draws
+    // over the right of the pane to show the cursor doing it.
+    let blocks: Vec<(Vec<Line>, &str, &str, u32)> = vec![
+        (vec![call("launch_app", "{\"name\":\"Simulator\"}"), result("Simulator · iPhone 17 Pro · Acme (debug)")], "Launching…", "2m 14s", 1100),
         (vec![
             call("click", "{\"element_token\":\"s1:14\"}"),
             result("Clicked text field “Email”"),
             call("type_text", "{\"text\":\"alex@acme.dev\"}"),
-        ], "Typing…", "2m 19s"),
-        (vec![call("click", "{\"element_token\":\"s2:21\"}"), result("Clicked button “Continue”")], "Clicking…", "2m 22s"),
+        ], "Typing…", "2m 19s", 1700),
+        (vec![call("click", "{\"element_token\":\"s2:21\"}"), result("Clicked button “Continue”")], "Clicking…", "2m 22s", 1200),
         (vec![
             call("get_window_state", "{\"pid\":4211}"),
             result("“Welcome, Alex” · page dots · Skip · screenshot attached"),
             p(""),
-        ], "Looking…", "2m 25s"),
+        ], "Looking…", "2m 25s", 1300),
         (vec![
             l(&[("● ", Claude), ("The page dots overlap the Skip button on the smallest screen.", Plain)]),
             l(&[("● ", Green), ("Update", Bold), ("(ios/Onboarding/PageDots.swift)", Plain)]),
             l(&[("  ⎿  ", Dim), ("Updated with ", Plain), ("6 additions", Green), (" and ", Plain), ("2 removals", Red)]),
-        ], "Fixing…", "3m 02s"),
+        ], "Fixing…", "3m 02s", 1500),
     ];
     let done = [
         p(""),
@@ -783,10 +785,10 @@ fn record_computer(cx: &mut HeadlessAppContext, dir: PathBuf) {
     };
     show(&mut rec, &pinned(&lines, Some(("Building…", "2m 10s"))));
     rec.shot(1200);
-    for (block, verb, time) in blocks {
+    for (block, verb, time, hold) in blocks {
         lines.extend(block);
         show(&mut rec, &pinned(&lines, Some((verb, time))));
-        rec.shot(850);
+        rec.shot(hold);
     }
     lines.extend(done);
     show(&mut rec, &pinned(&lines, None));

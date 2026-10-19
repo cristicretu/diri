@@ -7,7 +7,8 @@
 #
 # Recording is the ignored `render_site_clips` test (see
 # crates/diri-app/src/root/site_clips.rs); DIRI_CLIP=<name> limits it to one
-# clip. Needs img2webp (brew install webp) and ffmpeg.
+# clip. Needs img2webp (brew install webp), ffmpeg, and Node with Google
+# Chrome for the computer clip's Simulator window (site-clip-simulator.mjs).
 set -euo pipefail
 
 cd "$(dirname "$0")/.."
@@ -60,6 +61,7 @@ for dir in "$frames"/*/; do
   [[ -f $dir/frames.txt ]] || continue
   read -r w h x y <<<"$(crop_for "$name")" || true
   src=$dir
+  list=$dir/frames.txt
   if [[ -n ${w:-} ]]; then
     src=$(mktemp -d)
     # sips centres any crop whose offset is 0,0; ffmpeg crops exactly.
@@ -73,14 +75,28 @@ for dir in "$frames"/*/; do
       fi
     done <"$dir/frames.txt"
   fi
+  # The computer clip gets a Simulator window over the right of the pane,
+  # in frames of its own between the recorded ones.
+  if [[ $name == computer ]]; then
+    sim=$(mktemp -d)
+    node scripts/site-clip-simulator.mjs "$dir" "$sim"
+    while read -r frame png hold; do
+      out_frame=$sim/$(basename "$png" .png)_on.png
+      ffmpeg -loglevel error -i "$src/$frame" -i "$png" -filter_complex overlay=0:0 "$out_frame"
+      echo "$out_frame $hold"
+    done <"$sim/overlay.txt" >"$sim/frames.txt"
+    list=$sim/frames.txt
+  fi
   # Lossless at the recorded 2x size: terminal text smears under lossy
   # compression and any resampling.
   args=(-loop 0 -min_size)
   while read -r frame hold; do
-    args+=(-d "$hold" -lossless -m 6 "$src/$frame")
-  done <"$dir/frames.txt"
+    [[ $frame == /* ]] || frame=$src/$frame
+    args+=(-d "$hold" -lossless -m 6 "$frame")
+  done <"$list"
   img2webp "${args[@]}" -o "$out/$name.webp"
   [[ $src == "$dir" ]] || rm -rf "$src"
-  unset w h x y
+  [[ -z ${sim:-} ]] || rm -rf "$sim"
+  unset w h x y sim
   printf '%-10s %s\n' "$name" "$(du -h "$out/$name.webp" | cut -f1)"
 done
