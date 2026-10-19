@@ -985,12 +985,12 @@ html { overflow-x: clip; }
 .feature-lead .feature-copy { max-width: 40rem; margin-bottom: 28px; }
 .feature-pair { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); gap: 32px; align-items: start; }
 .feature-detail .feature-copy { margin-top: 22px; padding-right: 24px; }
-/* The swarm clip is a whole window: kept narrower than the hero and
-   centred, its caption under it like the pair's. */
-.feature-wide { width: min(100%, 1040px); margin-inline: auto; }
+/* The swarm clip is a whole window, kept narrower than the hero and on the
+   page's left edge, its caption one line beneath it. */
+.feature-wide { width: min(100%, 1040px); margin-inline: 0; }
 .feature-wide .feature-copy { margin-top: 24px; }
 .feature-wide .feature-clip { background: #191724; }
-#faq { display: grid; grid-template-columns: minmax(0, 1fr); row-gap: 28px; max-width: 760px; margin-inline: auto; }
+#faq { display: grid; grid-template-columns: minmax(0, 1fr); row-gap: 28px; max-width: 760px; }
 .feature h3, .faq-head h2 { margin: 0; }
 .feature h3, .also-title, .faq-head h2 { font-family: "Geist", -apple-system, BlinkMacSystemFont, sans-serif; font-size: 28px; line-height: 1.15; font-weight: 540; letter-spacing: -.025em; color: #f4f0fa; text-wrap: balance; }
 .feature p { margin-top: 14px; font-size: 15.5px; line-height: 1.6; color: #a9a2bc; text-wrap: pretty; }
@@ -1269,6 +1269,8 @@ html { overflow-x: clip; }
 .feature-lead .feature-copy { max-width: 38em; margin-bottom: 36px; }
 .feature-lead .feature-copy h3, .feature-lead .feature-copy p { font-size: 24px; line-height: 1.42; letter-spacing: -.018em; }
 .feature-detail .feature-copy { margin-top: 24px; padding-right: 0; }
+.feature-wide .feature-copy { max-width: none; }
+@media (min-width: 1100px) { .feature-wide .feature-copy { white-space: nowrap; } }
 
 /* The last ask is one quiet row: the line on the left, the download on the right. */
 .closing { display: flex; align-items: center; justify-content: space-between; gap: 24px; margin: 104px 0 0; padding: 40px 0; border-top: 1px solid #ffffff12; }
