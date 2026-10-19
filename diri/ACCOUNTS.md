@@ -53,6 +53,16 @@ Engine's state (owner-only; percentages and reset times only), dated in
 Settings. A login the provider rejects with a valid token (HTTP 401) reads
 **Sign in again** and is never suggested.
 
+A Claude login's account record is kept apart from its token, and the shared
+one in `~/.claude.json` is rewritten by every running Claude Code: after a
+switch, an old session can write its own account back beside another
+account's token. So with a valid token the app also asks
+`api.anthropic.com/api/oauth/profile` whose it is, as Claude Code does after a
+sign-in, and Settings names each login by that answer. The login in use that
+no profile holds is shown and remembered under the account its token names;
+an answer nobody could vouch for is shown but not remembered. (A Codex
+login's ID token sits beside its access token and names it.)
+
 A switch is never refused because of one tab. A Codex tab whose conversation
 Diri has not learned yet (it never finished a turn, or predates id binding) is
 identified from the rollout Codex wrote at launch, matched by directory and

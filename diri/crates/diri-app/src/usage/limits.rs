@@ -14,7 +14,7 @@ use std::{
     time::Duration,
 };
 
-use diri_proto::{AgentAccountOverview, AgentKind};
+use diri_proto::{AgentAccountIdentity, AgentAccountOverview, AgentKind};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use tokio::{io::AsyncWriteExt, process::Command};
@@ -43,6 +43,10 @@ pub struct AccountLimits {
     pub error: Option<&'static str>,
     /// Its sign-in tab is still open: never pointed out as the one to use.
     pub signing_in: bool,
+    /// Who the provider says the login's token belongs to, when it was asked.
+    /// Truer than the account record beside a Claude login, which a running
+    /// Claude Code can rewrite with another account after a switch.
+    pub identity: Option<AgentAccountIdentity>,
 }
 
 /// How many percentage points more room another account needs before it is
@@ -156,13 +160,34 @@ enum Credential {
 struct AccountSource {
     provider: &'static str,
     label: String,
-    /// Remembers this login's last answer: profile, then the account's email,
-    /// so a slot signed into another account never shows the old numbers.
-    memory_key: String,
+    /// The account the login's record names (the Engine's overview).
+    email: Option<String>,
+    /// Remembers this login's last answer: profile (or `unsaved:<agent>`),
+    /// then the account's email, so a slot signed into another account never
+    /// shows the old numbers.
+    memory_scope: String,
     profile_id: Option<String>,
     live: bool,
     signing_in: bool,
     credential: Credential,
+}
+
+impl AccountSource {
+    /// Where this login's answer is remembered, and whether it may be. The
+    /// login in use that no profile holds is named by the shared
+    /// `~/.claude.json`, which an old session can rewrite with another
+    /// account: its answer is filed under the account its token names, and
+    /// kept only once that is known.
+    fn memory_key(&self, token: Option<&AgentAccountIdentity>) -> (String, bool) {
+        let (email, vouched) = match token.and_then(|t| t.email.as_deref()) {
+            Some(email) if self.profile_id.is_none() => (Some(email), true),
+            _ => (self.email.as_deref(), self.profile_id.is_some()),
+        };
+        (
+            format!("{}:{}", self.memory_scope, account_tag(email)),
+            vouched,
+        )
+    }
 }
 
 /// The Keychain item Claude Code derives for a credential directory (the
@@ -230,11 +255,8 @@ fn sources(home: &Path, overview: &AgentAccountOverview) -> Vec<AccountSource> {
         out.push(AccountSource {
             provider: provider_of(&profile.agent),
             label: profile.label.clone(),
-            memory_key: format!(
-                "{}:{}",
-                profile.id,
-                account_tag(login.identity.email.as_deref())
-            ),
+            email: login.identity.email.clone(),
+            memory_scope: profile.id.clone(),
             profile_id: Some(profile.id.clone()),
             live: overview.is_live(profile),
             signing_in: login.signing_in,
@@ -261,11 +283,8 @@ fn sources(home: &Path, overview: &AgentAccountOverview) -> Vec<AccountSource> {
                 .email
                 .clone()
                 .unwrap_or_else(|| "CLI account".into()),
-            memory_key: format!(
-                "unsaved:{}:{}",
-                live.agent,
-                account_tag(live.identity.email.as_deref())
-            ),
+            email: live.identity.email.clone(),
+            memory_scope: format!("unsaved:{}", live.agent),
             profile_id: None,
             live: true,
             signing_in: false,
@@ -364,8 +383,8 @@ pub(crate) async fn refresh(
     let mut tasks = tokio::task::JoinSet::new();
     for (index, source) in sources(home, overview).into_iter().enumerate() {
         tasks.spawn(async move {
-            let (plan, answer) = fetch(&source, now).await;
-            (index, source, plan, answer)
+            let (plan, identity, answer) = fetch(&source, now).await;
+            (index, source, plan, identity, answer)
         });
     }
     let mut answered = Vec::new();
@@ -378,17 +397,26 @@ pub(crate) async fn refresh(
     answered.sort_by_key(|(index, ..)| *index);
     let result = answered
         .into_iter()
-        .map(|(_, source, plan, answer)| {
-            let remembered = memory.answers.get(&source.memory_key).cloned();
+        .map(|(_, mut source, plan, identity, answer)| {
+            let (key, vouched) = source.memory_key(identity.as_ref());
+            // Shown under the same account it is filed under.
+            if source.profile_id.is_none()
+                && let Some(email) = identity.as_ref().and_then(|i| i.email.clone())
+            {
+                source.label = email;
+            }
+            let remembered = memory.answers.get(&key).cloned();
             let (windows, checked_at, error) = match answer {
                 Answer::Windows(windows) => {
-                    memory.answers.insert(
-                        source.memory_key.clone(),
-                        Remembered {
-                            windows: windows.clone(),
-                            checked_at: now,
-                        },
-                    );
+                    if vouched {
+                        memory.answers.insert(
+                            key,
+                            Remembered {
+                                windows: windows.clone(),
+                                checked_at: now,
+                            },
+                        );
+                    }
                     (windows, now, None)
                 }
                 Answer::Idle => {
@@ -411,6 +439,7 @@ pub(crate) async fn refresh(
                 checked_at,
                 error,
                 signing_in: source.signing_in,
+                identity,
             }
         })
         .collect();
@@ -451,18 +480,27 @@ fn jwt_claims(token: &str) -> Option<Value> {
     serde_json::from_slice(&bytes).ok()
 }
 
-/// The login's plan, and what its provider reports, when its token is valid.
-async fn fetch(source: &AccountSource, now: i64) -> (Option<String>, Answer) {
-    let (url, mut headers, plan, expires_at) = match &source.credential {
+/// The login's plan, who its token says it belongs to, and what its provider
+/// reports, when its token is valid.
+async fn fetch(
+    source: &AccountSource,
+    now: i64,
+) -> (Option<String>, Option<AgentAccountIdentity>, Answer) {
+    let (url, mut headers, plan, identity, expires_at) = match &source.credential {
         Credential::Claude { .. } => {
             let Some(value) = claude_credentials(source).await else {
-                return (None, Answer::Failed("Sign in to Claude to see limits"));
+                return (
+                    None,
+                    None,
+                    Answer::Failed("Sign in to Claude to see limits"),
+                );
             };
             let oauth = value.get("claudeAiOauth").cloned().unwrap_or(Value::Null);
             let plan = claude_plan(&oauth);
             let Some(token) = oauth.get("accessToken").and_then(Value::as_str) else {
                 return (
                     plan,
+                    None,
                     Answer::Failed("Claude subscription sign-in unavailable"),
                 );
             };
@@ -478,22 +516,32 @@ async fn fetch(source: &AccountSource, now: i64) -> (Option<String>, Answer) {
                     "User-Agent: claude-code/2.1.0".into(),
                 ],
                 plan,
+                // Asked below, with the token.
+                None,
                 expires_at,
             )
         }
         Credential::Codex { file } => {
             let Some(value) = read_json(file).await else {
-                return (None, Answer::Failed("Sign in to Codex to see limits"));
+                return (None, None, Answer::Failed("Sign in to Codex to see limits"));
             };
-            let plan = value
+            let claims = value
                 .pointer("/tokens/id_token")
                 .and_then(Value::as_str)
-                .and_then(jwt_claims)
-                .and_then(|claims| {
-                    claims
-                        .pointer("/https:~1~1api.openai.com~1auth/chatgpt_plan_type")
-                        .and_then(Value::as_str)
-                        .map(capitalized)
+                .and_then(jwt_claims);
+            let plan = claims.as_ref().and_then(|claims| {
+                claims
+                    .pointer("/https:~1~1api.openai.com~1auth/chatgpt_plan_type")
+                    .and_then(Value::as_str)
+                    .map(capitalized)
+            });
+            // The ID token beside the access token names its account.
+            let identity = claims
+                .as_ref()
+                .and_then(|claims| claims.get("email")?.as_str())
+                .map(|email| AgentAccountIdentity {
+                    email: Some(email.to_owned()),
+                    ..Default::default()
                 });
             let Some(token) = value
                 .pointer("/tokens/access_token")
@@ -501,6 +549,7 @@ async fn fetch(source: &AccountSource, now: i64) -> (Option<String>, Answer) {
             else {
                 return (
                     plan,
+                    identity,
                     Answer::Failed("Codex subscription sign-in unavailable"),
                 );
             };
@@ -516,28 +565,62 @@ async fn fetch(source: &AccountSource, now: i64) -> (Option<String>, Answer) {
                 "https://chatgpt.com/backend-api/wham/usage",
                 headers,
                 plan,
+                identity,
                 expires_at,
             )
         }
     };
     if expires_at.is_some_and(|expiry| expiry <= now + 30) {
-        return (plan, Answer::Idle);
+        return (plan, identity, Answer::Idle);
     }
     headers.push("Accept: application/json".into());
-    let body = match http_get(url, &headers).await {
-        Ok(body) => body,
-        Err(error) => return (plan, Answer::Failed(error)),
+    let claude = matches!(source.credential, Credential::Claude { .. });
+    let (body, identity) = if claude {
+        // A Claude login's account record is kept apart from its tokens:
+        // ask whose the token is, as Claude Code does after a sign-in.
+        let (body, profile) = tokio::join!(
+            http_get(url, &headers),
+            http_get("https://api.anthropic.com/api/oauth/profile", &headers)
+        );
+        (body, profile.ok().as_ref().and_then(claude_account))
+    } else {
+        (http_get(url, &headers).await, identity)
     };
-    let windows = if matches!(source.credential, Credential::Claude { .. }) {
+    let body = match body {
+        Ok(body) => body,
+        Err(error) => return (plan, identity, Answer::Failed(error)),
+    };
+    let windows = if claude {
         parse_claude(&body)
     } else {
         parse_codex(&body)
     };
     if windows.is_empty() {
-        (plan, Answer::Failed("No subscription limits reported"))
+        (
+            plan,
+            identity,
+            Answer::Failed("No subscription limits reported"),
+        )
     } else {
-        (plan, Answer::Windows(windows))
+        (plan, identity, Answer::Windows(windows))
     }
+}
+
+/// Who a Claude token belongs to, from `/api/oauth/profile`: the account and
+/// organization Claude Code copies into the login's account record.
+fn claude_account(body: &Value) -> Option<AgentAccountIdentity> {
+    let text = |path: &str| {
+        body.pointer(path)
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|s| !s.is_empty() && !s.chars().any(char::is_control))
+            .map(str::to_owned)
+    };
+    Some(AgentAccountIdentity {
+        email: Some(text("/account/email")?),
+        organization: text("/organization/name"),
+        plan: None,
+    })
 }
 
 async fn read_json(path: &Path) -> Option<Value> {
@@ -876,6 +959,7 @@ pub(crate) fn preview() -> Vec<AccountLimits> {
                 checked_at: now,
                 error: None,
                 signing_in: false,
+                identity: None,
             }
         };
     vec![
@@ -971,6 +1055,7 @@ mod tests {
             checked_at: 0,
             error: None,
             signing_in: false,
+            identity: None,
         }
     }
 
@@ -1030,7 +1115,7 @@ mod tests {
         assert!(matches!(&found[1].credential,
             Credential::Codex { file } if file == Path::new("/state/codex-logins/main/auth.json")));
         assert!(found[2].live && found[2].profile_id.is_none());
-        assert_ne!(found[0].memory_key, found[2].memory_key);
+        assert_ne!(found[0].memory_scope, found[2].memory_scope);
     }
 
     #[test]
@@ -1208,6 +1293,67 @@ mod tests {
                 0o600
             );
         }
+    }
+
+    #[test]
+    fn a_claude_token_is_named_by_its_profile() {
+        let profile = json!({
+            "account": {"uuid": "u1", "email": "a@example.test", "display_name": "A"},
+            "organization": {"uuid": "o1", "name": "A's Organization"}
+        });
+        assert_eq!(
+            claude_account(&profile),
+            Some(AgentAccountIdentity {
+                email: Some("a@example.test".into()),
+                organization: Some("A's Organization".into()),
+                plan: None,
+            })
+        );
+        assert_eq!(claude_account(&json!({"account": {"uuid": "u1"}})), None);
+    }
+
+    #[test]
+    fn the_login_in_use_is_remembered_only_under_the_account_its_token_names() {
+        // The shared record names b; the token is a's (an old session of b
+        // rewrote `~/.claude.json` after a switch).
+        let overview = AgentAccountOverview {
+            catalog: AgentAccountCatalog {
+                profiles: vec![profile("work", "claude-code", None, Some("/slot"))],
+            },
+            logins: vec![login("work", None)],
+            live: vec![AgentLiveLogin {
+                agent: "claude-code".into(),
+                profile_id: None,
+                identity: AgentAccountIdentity {
+                    email: Some("b@example.test".into()),
+                    ..Default::default()
+                },
+            }],
+        };
+        let found = sources(Path::new("/home/me"), &overview);
+        let (saved, unsaved) = (&found[0], &found[1]);
+        let a = AgentAccountIdentity {
+            email: Some("a@example.test".into()),
+            ..Default::default()
+        };
+        let under = |email: &str| format!("unsaved:claude-code:{}", account_tag(Some(email)));
+        assert_eq!(
+            unsaved.memory_key(Some(&a)),
+            (under("a@example.test"), true)
+        );
+        assert_eq!(
+            unsaved.memory_key(None),
+            (under("b@example.test"), false),
+            "an answer nobody vouched for is not filed under the record's account"
+        );
+        // A profile's slot holds its own login: its numbers stay with it.
+        assert_eq!(
+            saved.memory_key(Some(&a)),
+            (
+                format!("work:{}", account_tag(Some("work@example.test"))),
+                true
+            )
+        );
     }
 
     #[test]
