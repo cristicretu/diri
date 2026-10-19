@@ -75,7 +75,7 @@ Click **Share** to make an image of your usage. You can pick cost or tokens, the
 
 diri asks the provider only while an account's short-lived access token is valid, and never refreshes a token itself. An account you have not used for a while shows its last known numbers, dated ("as of 4h ago"), or **Not checked** if diri has not been able to ask yet. diri keeps those numbers in `account-limits.json` next to its other files: percentages and reset times only.
 
-For a Claude account, diri also asks Anthropic whose the token is, and shows the numbers under that account. The account recorded beside a Claude login can be out of date after a switch, because any Claude Code session still running can write its own account back.
+For a Claude account, diri also asks Anthropic whose the token is. It shows the numbers under that account, and **Save** names the account after it. The account recorded beside a Claude login can be out of date after a switch, because any Claude Code session still running can write its own account back.
 
 These numbers come from the provider for each signed-in account. They are separate from the cost estimates above. **Sign in again** means the provider no longer accepts that account's saved login.
 

@@ -522,8 +522,7 @@ impl ControlServer {
     /// switching away, so switching back does not land a stale copy. Best
     /// effort: the default store itself is never changed.
     pub(super) fn save_default_store_login(&self, home: &Path, except_store: &str) {
-        let Some(live) = claude::read_global_config(home)
-            .and_then(|config| config.get("oauthAccount").cloned())
+        let Some(live) = claude::store_identity(Store::Default, home)
             .and_then(|account| claude_identity(&account))
         else {
             return;
@@ -692,9 +691,10 @@ impl ControlServer {
                 current.label
             )));
         }
-        let live = claude::read_global_config(home)
-            .and_then(|config| config.get("oauthAccount").cloned())
-            .and_then(|account| claude_identity(&account));
+        // Named after the account its token belongs to: the shared record can
+        // name another one (see `claude::store_identity`).
+        let record = claude::store_identity(Store::Default, home);
+        let live = record.as_ref().and_then(claude_identity);
         // Refresh a profile saved from the default store before. One signed in
         // through its own tab keeps its login: the default store's record may
         // be all that matches it.
@@ -733,7 +733,9 @@ impl ControlServer {
         let store = slot.to_string_lossy().into_owned();
         Self::forget_claude_identity(&slot);
         claude::copy_login(Store::Default, Store::Slot(&store), home)?;
-        claude::snapshot_identity(home, &store);
+        if let Some(record) = &record {
+            claude::keep_identity(&store, record);
+        }
         let id = profile.id.clone();
         self.adopt_claude_slot(profile, home, &slot)?;
         Ok(id)

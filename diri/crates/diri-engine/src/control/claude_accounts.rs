@@ -15,7 +15,7 @@ use std::{
     fs,
     io::{Read, Write},
     process::{Command, Stdio},
-    time::{Instant, SystemTime},
+    time::{Instant, SystemTime, UNIX_EPOCH},
 };
 
 const LIMIT: u64 = 1024 * 1024;
@@ -350,13 +350,171 @@ pub(super) fn snapshot_path(store: &str) -> PathBuf {
     Path::new(store).join("oauth-account.json")
 }
 
-pub(super) fn snapshot_identity(home: &Path, store: &str) {
-    if let Some(config) = read_global_config(home)
-        && let Some(account) = config.get("oauthAccount").filter(|v| v.is_object())
-        && let Ok(bytes) = serde_json::to_vec_pretty(account)
-    {
+/// Keep `account` as the record of the login `store` holds.
+pub(super) fn keep_identity(store: &str, account: &Value) {
+    if let Ok(bytes) = serde_json::to_vec_pretty(account) {
         let _ = write_private(&snapshot_path(store), &bytes);
     }
+}
+
+/// Keep the record of the account whose login `store` holds.
+pub(super) fn snapshot_identity(home: &Path, store: &str) {
+    if let Some(account) = store_identity(Store::Slot(store), home) {
+        keep_identity(store, &account);
+    }
+}
+
+/// The account record of the login `store` holds: the shared one in
+/// `~/.claude.json`, unless the store's own token belongs to another account.
+/// Every running Claude Code rewrites that file, so after a switch an old
+/// session can leave its own account there beside another account's login.
+pub(super) fn store_identity(store: Store<'_>, home: &Path) -> Option<Value> {
+    let shared = read_global_config(home)
+        .and_then(|config| config.get("oauthAccount").cloned())
+        .filter(Value::is_object);
+    let Some(asked) = token_identity(store, home) else {
+        return shared;
+    };
+    let same = |a: &Value| {
+        ["accountUuid", "organizationUuid"]
+            .iter()
+            .all(|key| a.get(key) == asked.get(key))
+    };
+    // The shared record is fuller when it names the same account.
+    Some(shared.filter(same).unwrap_or(asked))
+}
+
+/// The account a store's login belongs to, as Anthropic names it when asked
+/// with its access token, as Claude Code asks after a sign-in. Only while
+/// that token is valid: Diri never refreshes one. `None` when not asked.
+fn token_identity(store: Store<'_>, home: &Path) -> Option<Value> {
+    let login = read_login(store, home)?;
+    let oauth = login.get("claudeAiOauth")?;
+    let token = oauth.get("accessToken")?.as_str()?;
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .ok()?
+        .as_millis();
+    if oauth
+        .get("expiresAt")
+        .and_then(Value::as_u64)
+        .is_some_and(|expiry| u128::from(expiry) <= now + 30_000)
+    {
+        return None;
+    }
+    profile_record(&ask_profile(token)?)
+}
+
+/// A store's login as Claude Code reads it: on macOS the Keychain item, else
+/// (or failing that) the credentials file.
+fn read_login(store: Store<'_>, home: &Path) -> Option<Value> {
+    if cfg!(target_os = "macos")
+        && let Ok((0, secret)) = security(
+            &[
+                "find-generic-password",
+                "-a",
+                &keychain_account(),
+                "-s",
+                &store.service(),
+                "-w",
+            ],
+            None,
+        )
+        && let Ok(login) = serde_json::from_str(secret.trim_end())
+    {
+        return Some(login);
+    }
+    serde_json::from_slice(&read_private(&store.file(home)).ok()??).ok()
+}
+
+/// `/api/oauth/profile`'s answer as the `oauthAccount` record Claude Code
+/// makes of it.
+fn profile_record(profile: &Value) -> Option<Value> {
+    let text = |path: &str| {
+        profile
+            .pointer(path)
+            .and_then(Value::as_str)
+            .filter(|s| !s.is_empty() && !s.chars().any(char::is_control))
+    };
+    let mut record = serde_json::Map::new();
+    record.insert("accountUuid".into(), text("/account/uuid")?.into());
+    record.insert(
+        "organizationUuid".into(),
+        text("/organization/uuid")?.into(),
+    );
+    for (key, path) in [
+        ("emailAddress", "/account/email"),
+        ("organizationName", "/organization/name"),
+        ("displayName", "/account/display_name"),
+    ] {
+        if let Some(value) = text(path) {
+            record.insert(key.into(), value.into());
+        }
+    }
+    Some(Value::Object(record))
+}
+
+/// Ask Anthropic whose `token` is. The token travels on curl's stdin, never
+/// in arguments, logs or errors.
+#[cfg(not(test))]
+fn ask_profile(token: &str) -> Option<Value> {
+    if token
+        .chars()
+        .any(|c| c.is_control() || c == '"' || c == '\\')
+    {
+        return None;
+    }
+    let mut child = Command::new("/usr/bin/curl")
+        .args([
+            "-q",
+            "--silent",
+            "--proto",
+            "=https",
+            "--max-time",
+            "5",
+            "--max-filesize",
+            "1048576",
+            "--write-out",
+            "\n%{http_code}",
+            "--config",
+            "-",
+            "https://api.anthropic.com/api/oauth/profile",
+        ])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .ok()?;
+    let config = format!(
+        "header = \"Authorization: Bearer {token}\"\nheader = \"User-Agent: claude-code/2.1.0\"\nheader = \"Accept: application/json\"\n"
+    );
+    let written = child
+        .stdin
+        .take()
+        .is_some_and(|mut pipe| pipe.write_all(config.as_bytes()).is_ok());
+    if !written {
+        kill_and_reap(&mut child);
+        return None;
+    }
+    let deadline = Instant::now() + Duration::from_secs(7);
+    let status = wait_until(&mut child, deadline, Duration::from_millis(25)).ok()??;
+    let mut out = String::new();
+    child.stdout.take()?.read_to_string(&mut out).ok()?;
+    let (body, code) = out.rsplit_once('\n')?;
+    (status.success() && code == "200")
+        .then(|| serde_json::from_str(body).ok())
+        .flatten()
+}
+
+/// Tests answer from these profiles, keyed by fake token: no test asks Anthropic.
+#[cfg(test)]
+pub(super) static PROFILES: std::sync::LazyLock<
+    std::sync::Mutex<std::collections::HashMap<String, Value>>,
+> = std::sync::LazyLock::new(Default::default);
+
+#[cfg(test)]
+fn ask_profile(token: &str) -> Option<Value> {
+    PROFILES.lock().ok()?.get(token).cloned()
 }
 
 fn install_identity(home: &Path, account: Value) {
@@ -875,6 +1033,62 @@ mod tests {
             read_global_config(&home).unwrap()["oauthAccount"]["emailAddress"],
             "b@example.test"
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_login_is_recorded_as_the_account_its_token_names() {
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path().join(".claude");
+        directory(&home).unwrap();
+        // An old session of b wrote its account back into the shared record.
+        write_private(
+            &global_config_path(&home),
+            br#"{"oauthAccount":{"accountUuid":"b","organizationUuid":"ob","emailAddress":"b@example.test","billingType":"stripe"}}"#,
+        )
+        .unwrap();
+        let slot = tmp.path().join("slot");
+        directory(&slot).unwrap();
+        let store = slot.to_str().unwrap();
+        let token = format!("token-for-{store}");
+        let login = |expires: u64| {
+            let login =
+                serde_json::json!({"claudeAiOauth": {"accessToken": token, "expiresAt": expires}});
+            write_private(
+                &slot.join(".credentials.json"),
+                login.to_string().as_bytes(),
+            )
+            .unwrap();
+        };
+        let answer = |user: &str| {
+            PROFILES.lock().unwrap().insert(
+                token.clone(),
+                serde_json::json!({
+                    "account": {"uuid": user, "email": format!("{user}@example.test")},
+                    "organization": {"uuid": format!("o{user}"), "name": user.to_uppercase()}
+                }),
+            );
+        };
+        let saved = || -> Value {
+            snapshot_identity(&home, store);
+            serde_json::from_slice(&read_private(&snapshot_path(store)).unwrap().unwrap()).unwrap()
+        };
+
+        login(32_503_680_000_000);
+        answer("a");
+        let a = saved();
+        assert_eq!(
+            a["emailAddress"], "a@example.test",
+            "the token's account, not b"
+        );
+        assert_eq!(a["organizationName"], "A");
+        // When the token names the same account, the fuller shared record stays.
+        answer("b");
+        assert_eq!(saved()["billingType"], "stripe");
+        // An expired token is never used: the shared record stands.
+        answer("a");
+        login(1_000);
+        assert_eq!(saved()["emailAddress"], "b@example.test");
     }
 
     #[cfg(unix)]

@@ -60,7 +60,11 @@ account's token. So with a valid token the app also asks
 `api.anthropic.com/api/oauth/profile` whose it is, as Claude Code does after a
 sign-in, and Settings names each login by that answer. The login in use that
 no profile holds is shown and remembered under the account its token names;
-an answer nobody could vouch for is shown but not remembered. (A Codex
+an answer nobody could vouch for is shown but not remembered. The Engine asks
+the same way before it keeps a Claude record: **Save** names the new account
+after the account its token names, and saving a login or switching away from
+one keeps that account's record, not the shared one when it names someone
+else. With no valid token it keeps the shared record, as before. (A Codex
 login's ID token sits beside its access token and names it.)
 
 A switch is never refused because of one tab. A Codex tab whose conversation
