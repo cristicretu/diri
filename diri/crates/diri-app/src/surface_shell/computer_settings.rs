@@ -178,9 +178,9 @@ impl UtilitySurfaces {
     pub(super) fn seed_computer_preview(&mut self, state: &str) {
         let mut status = diri_proto::ComputerStatus {
             supported: true,
-            version: Some("0.36.0".into()),
+            version: Some("0.36.1".into()),
             app_path: Some("/Applications/Diri.app".into()),
-            tested_version: "0.36.0".into(),
+            tested_version: "0.36.1".into(),
             accessibility: Some(false),
             screen_recording: Some(false),
             ..Default::default()
@@ -201,8 +201,8 @@ impl UtilitySurfaces {
                     "Couldn't reach the download. Check the connection and try again.".into(),
                 );
                 status.install_log = Some(
-                    "==> downloading https://github.com/trycua/cua/releases/download/\
-                     cua-driver-rs-v0.36.0/cua-driver-rs-0.36.0-darwin-universal-binary.tar.gz\n\
+                    "==> downloading https://github.com/cristicretu/cua/releases/download/\
+                     cua-driver-rs-v0.36.1-diri/cua-driver-rs-0.36.1-diri-darwin-universal-binary.tar.gz\n\
                      curl: (6) Could not resolve host: github.com\n"
                         .into(),
                 );

@@ -1,5 +1,5 @@
 //! Setting computer use up from Diri, so nobody needs a terminal or a second
-//! app: download Cua's signed driver into Diri's own data, run it as part of
+//! app: download the signed Cua driver into Diri's own data, run it as part of
 //! Diri, and read back the two grants.
 //!
 //! The driver runs in Cua's embedded mode, spawned directly by the Engine,
@@ -10,7 +10,7 @@
 //! hand the Agents' shells these permissions.
 //!
 //! The release is pinned: its archive must match a SHA-256 baked in here and
-//! the binary must carry Cua's Developer ID signature before it is used.
+//! the binary must carry the pinned Developer ID signature before it is used.
 
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -20,14 +20,18 @@ use serde_json::Value;
 
 use super::{ComputerUse, Shared};
 
-/// The release Diri was tested with, and downloads.
-pub const TESTED_VERSION: &str = "0.36.0";
-const ARCHIVE_URL: &str = "https://github.com/trycua/cua/releases/download/\
-     cua-driver-rs-v0.36.0/cua-driver-rs-0.36.0-darwin-universal-binary.tar.gz";
+/// The release Diri was tested with, and downloads: Diri's own build of Cua
+/// Driver, the cua-driver-rs-v0.36.0 release plus the macOS 27
+/// background-click fix (trycua/cua#5425), until Cua ships that fix. Source:
+/// github.com/cristicretu/cua, tag cua-driver-rs-v0.36.1-diri.
+pub const TESTED_VERSION: &str = "0.36.1";
+const ARCHIVE_URL: &str = "https://github.com/cristicretu/cua/releases/download/\
+     cua-driver-rs-v0.36.1-diri/cua-driver-rs-0.36.1-diri-darwin-universal-binary.tar.gz";
 /// From the release's SHA256SUMS.
-const ARCHIVE_SHA256: &str = "584e44435a26f5aa90c2f0097242307efbd63e843fc3f61072147c1963b0e592";
-/// Cua's Developer ID team. A binary signed by anyone else is not used.
-const CUA_TEAM_ID: &str = "YCK386LBJ7";
+const ARCHIVE_SHA256: &str = "0bf1956f63299595656e20e19ae71ad9f83beeb78da784ad6b7d6c265c3dae9e";
+/// The Developer ID team that signs Diri's driver build. A binary signed by
+/// anyone else is not used.
+const DRIVER_TEAM_ID: &str = "A56RVNJ69X";
 const DOWNLOAD_TIMEOUT_SECS: &str = "300";
 const DAEMON_START_TIMEOUT: Duration = Duration::from_secs(8);
 /// The tail of the setup's output kept for "Show log".
@@ -48,7 +52,7 @@ impl Default for Download {
         Self {
             url: ARCHIVE_URL.to_owned(),
             sha256: ARCHIVE_SHA256.to_owned(),
-            team: Some(CUA_TEAM_ID.to_owned()),
+            team: Some(DRIVER_TEAM_ID.to_owned()),
         }
     }
 }
@@ -444,7 +448,10 @@ fn verify_signature(binary: &Path, team: &str) -> Result<(), String> {
     if valid && signed_by == Some(team) {
         Ok(())
     } else {
-        Err("The downloaded driver isn't signed by Cua, so Diri didn't use it.".into())
+        Err(
+            "The downloaded driver isn't signed by Diri's release key, so Diri didn't use it."
+                .into(),
+        )
     }
 }
 
@@ -486,7 +493,7 @@ fn set_mode(path: &Path, mode: u32) -> std::io::Result<()> {
     }
 }
 
-/// `cua-driver 0.36.0` → `0.36.0`.
+/// `cua-driver 0.36.1` → `0.36.1`.
 fn driver_version(binary: &Path) -> Option<String> {
     let output = quiet(Command::new(binary).arg("--version"))
         .stdout(Stdio::piped())

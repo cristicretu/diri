@@ -193,7 +193,6 @@ impl WindowStore {
             })
         })
     }
-    #[cfg(any(target_os = "macos", windows, test))]
     pub fn enqueue(&self, action: WindowAction) -> bool {
         let mut navigation = self.navigation.borrow_mut();
         if !navigation.live || navigation.actions.len() >= 16 {

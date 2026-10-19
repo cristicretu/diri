@@ -954,11 +954,17 @@ impl NavigationOverlay {
                     let mut store = self.store.write().expect("session store lock poisoned");
                     let exists = store.sessions().contains_key(&id);
                     if exists {
-                        store.select(id);
+                        store.select(id.clone());
                     }
                     exists
                 };
                 if selected {
+                    // `select` only records the id. The menu bar asks the
+                    // window to show it; without that, Enter closes the
+                    // palette and the terminal stays on the previous session.
+                    self.store
+                        .enqueue(crate::store::WindowAction::Select(id));
+                    self._runtime.publish_local_change();
                     self.close_overlay(window, cx);
                 } else {
                     // The row outlived its session. Dismissing would look like

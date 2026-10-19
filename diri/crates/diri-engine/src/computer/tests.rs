@@ -147,7 +147,7 @@ fn summaries_end_at_the_first_sentence() {
 /// catalog, and echoes each call's request line back as structured content.
 const FAKE_DRIVER: &str = r#"#!/bin/sh
 case "$1" in
-  --version) printf 'cua-driver %s\n' "$(cat "$0.version" 2>/dev/null || echo 0.36.0)"; exit 0 ;;
+  --version) printf 'cua-driver %s\n' "$(cat "$0.version" 2>/dev/null || echo 0.36.1)"; exit 0 ;;
   call)
     [ "$2" = check_permissions ] || exit 2
     cat "$0.grants" 2>/dev/null || printf '{"accessibility":true,"screen_recording":true}\n'
@@ -499,7 +499,7 @@ fn status_reads_version_and_grants() {
 
     let status = computer.status(false);
     assert!(status.supported);
-    assert_eq!(status.version.as_deref(), Some("0.36.0"));
+    assert_eq!(status.version.as_deref(), Some("0.36.1"));
     assert!(!status.outdated);
     assert_eq!(status.accessibility, Some(false));
     assert_eq!(status.screen_recording, Some(false));
@@ -664,7 +664,7 @@ fn an_unsigned_download_is_refused() {
         Download {
             url,
             sha256,
-            team: Some("YCK386LBJ7".into()),
+            team: Some("A56RVNJ69X".into()),
         },
     );
     computer
@@ -678,8 +678,8 @@ fn an_unsigned_download_is_refused() {
         failed
             .install_error
             .unwrap()
-            .contains("isn't signed by Cua"),
-        "a shell script is not Cua's signed binary"
+            .contains("isn't signed by Diri's release key"),
+        "a shell script is not the signed driver"
     );
 }
 

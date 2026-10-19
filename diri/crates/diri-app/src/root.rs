@@ -8992,6 +8992,64 @@ mod tests {
         });
     }
 
+    #[cfg(target_os = "macos")]
+    #[gpui::test]
+    fn command_palette_enter_shows_the_named_session(cx: &mut gpui::TestAppContext) {
+        cx.update(|cx| {
+            cx.set_reduce_motion(true);
+            commands::bind_keys(cx, &Default::default());
+        });
+        let services = test_services();
+        let fixture = SidebarPreviewFixture::make(PreviewScenario::Typical);
+        let current = fixture.selected_session_id.clone().unwrap();
+        let target = fixture
+            .list
+            .sessions
+            .iter()
+            .find(|session| session.title.contains("signed"))
+            .unwrap()
+            .id
+            .clone();
+        assert_ne!(current, target);
+        {
+            let mut store = services.store.store.write().unwrap();
+            store.hydrate(fixture.list);
+            store.select(current.clone());
+        }
+        let (root, cx) = cx.add_window_view(move |window, cx| {
+            RootView::new(services, false, PreviewScenario::Empty, window, cx)
+        });
+        cx.simulate_resize(size(px(1000.0), px(700.0)));
+        cx.run_until_parked();
+        cx.simulate_keystrokes(&commands::test_chords("cmd-k"));
+        cx.run_until_parked();
+        cx.simulate_keystrokes("s i g n e d");
+        cx.run_until_parked();
+        cx.simulate_keystrokes("enter");
+        cx.run_until_parked();
+        root.read_with(cx, |root, cx| {
+            assert!(
+                !root.navigation.as_ref().unwrap().read(cx).is_open(),
+                "enter dismisses the palette"
+            );
+            assert_eq!(
+                root.window_store.read().unwrap().selected_session_id(),
+                Some(&target),
+                "enter selects the named session"
+            );
+            assert_eq!(
+                root.terminal
+                    .as_ref()
+                    .unwrap()
+                    .read(cx)
+                    .observed_session_for_test()
+                    .as_ref(),
+                Some(&target),
+                "the terminal follows that session"
+            );
+        });
+    }
+
     #[gpui::test]
     fn palette_settings_clicks_reach_themes_and_full_settings(cx: &mut gpui::TestAppContext) {
         cx.update(|cx| {

@@ -2872,6 +2872,13 @@ impl TerminalPane {
         self.selected_id()
     }
 
+    /// The session the grid last followed. Store selection can move without
+    /// this until a change notification reconciles the pane.
+    #[cfg(all(test, target_os = "macos"))]
+    pub(crate) fn observed_session_for_test(&self) -> Option<SessionId> {
+        self.observed_selected_id.clone()
+    }
+
     /// The resting page reads this Mac's detection facts, never a remote
     /// target's: a newcomer's first session is local, and only a local
     /// installer can be run from here.
