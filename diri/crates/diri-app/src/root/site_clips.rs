@@ -812,7 +812,7 @@ fn record_computer(cx: &mut HeadlessAppContext, dir: PathBuf) {
     ]);
     let done = [
         p(""),
-        l(&[("● ", Claude), ("All three phones pass now. Your cursor and keyboard were never used.", Plain)]),
+        l(&[("● ", Claude), ("All three pass. Your cursor and keyboard were never used.", Plain)]),
     ];
     let claude_rows = {
         let mut all = lead.clone();
@@ -855,16 +855,16 @@ fn record_computer(cx: &mut HeadlessAppContext, dir: PathBuf) {
     select(&mut rec, "clip-sim-se");
     let mut work = codex_banner("~/acme/ios");
     work.extend([
-        l(&[("› ", Bold), ("Sign in on the iPhone SE Simulator and check the welcome screen.", Plain)]),
+        l(&[("› ", Bold), ("Sign in on the iPhone SE and check the welcome screen.", Plain)]),
         p(""),
-        l(&[("• ", Green), ("Called ", Bold), ("dirijor.computer", Plain), ("({\"tool\":\"launch_app\",\"device\":\"iPhone SE\"})", Dim)]),
+        l(&[("• ", Green), ("Called ", Bold), ("dirijor.computer", Plain), ("(launch_app: iPhone SE)", Dim)]),
     ]);
     show(&mut rec, &pin(codex(&work, Some("0m 03s")), work.len(), SWARM_ROWS));
     rec.mark("codex");
     rec.shot(1100);
     work.extend([
-        l(&[("• ", Green), ("Called ", Bold), ("dirijor.computer", Plain), ("({\"tool\":\"type_text\",\"text\":\"sam@acme.dev\"})", Dim)]),
-        l(&[("• ", Green), ("Called ", Bold), ("dirijor.computer", Plain), ("({\"tool\":\"click\",\"label\":\"Continue\"})", Dim)]),
+        l(&[("• ", Green), ("Called ", Bold), ("dirijor.computer", Plain), ("(type_text: sam@acme.dev)", Dim)]),
+        l(&[("• ", Green), ("Called ", Bold), ("dirijor.computer", Plain), ("(click: Continue)", Dim)]),
     ]);
     show(&mut rec, &pin(codex(&work, Some("0m 07s")), work.len(), SWARM_ROWS));
     rec.shot(1200);
@@ -888,8 +888,8 @@ fn record_computer(cx: &mut HeadlessAppContext, dir: PathBuf) {
     // Back to Claude Code, which turns on notifications on its own phone.
     select(&mut rec, "clip-sim");
     lead.extend([
-        call("computer", "(tool: \"launch_app\", args: {\"device\":\"iPhone 17 Pro\"})"),
-        call("computer", "(tool: \"click\", args: {\"label\":\"Allow\"})"),
+        call("computer", "(launch_app: iPhone 17 Pro)"),
+        call("computer", "(click: Allow)"),
         result("Notifications on"),
         p(""),
     ]);

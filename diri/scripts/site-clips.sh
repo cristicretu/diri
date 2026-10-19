@@ -8,7 +8,9 @@
 # Recording is the ignored `render_site_clips` test (see
 # crates/diri-app/src/root/site_clips.rs); DIRI_CLIP=<name> limits it to one
 # clip. Needs img2webp (brew install webp), ffmpeg, and Node with Google
-# Chrome for the computer clip's Simulator window (site-clip-simulator.mjs).
+# Chrome for the computer clip's Simulators (site-clip-simulator.mjs), and
+# Xcode with the iPhone SE, 17 Pro and 17 Pro Max Simulators for their
+# screens (site-clip-phones.sh).
 set -euo pipefail
 
 cd "$(dirname "$0")/.."
@@ -87,11 +89,13 @@ for dir in "$frames"/*/; do
       fi
     done <"$dir/frames.txt"
   fi
-  # The computer clip gets a Simulator window per agent over the right of
-  # the pane, in frames of its own between the recorded ones.
+  # The computer clip gets a Simulator per agent over the right of the pane,
+  # in frames of its own between the recorded ones. The phones' screens are
+  # screenshotted once per recording and kept beside its frames.
   if [[ $name == computer ]]; then
+    [[ -d $dir/phones ]] || scripts/site-clip-phones.sh "$dir/phones"
     sim=$(mktemp -d)
-    node scripts/site-clip-simulator.mjs "$dir" "$sim" $((w / 2)) $((h / 2))
+    node scripts/site-clip-simulator.mjs "$dir" "$dir/phones" "$sim" $((w / 2)) $((h / 2))
     i=0
     while read -r frame png hold; do
       out_frame=$sim/on_$((i++)).png
