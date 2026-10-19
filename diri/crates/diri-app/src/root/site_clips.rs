@@ -29,7 +29,7 @@ use crate::store::TabOrientation;
 
 /// A normal window's proportions, shown beside or under its feature's text.
 const WINDOW: ((f32, f32), f32) = ((1140.0, 700.0), 13.0);
-/// The agents clip spans the site's whole content column (up to about 1110
+/// The agents clip spans the site's whole content column (up to about 1510
 /// screen pixels), so it is the same shape, larger: 2x is never stretched.
 /// Its terminal font is larger by the same factor, so it reads at the size of
 /// the page's other clips.
