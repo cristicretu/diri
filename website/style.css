@@ -1006,7 +1006,6 @@ html { overflow-x: clip; }
 .also > div:nth-child(4) ~ div { padding-top: 6px; }
 /* The hero sky fades to the page before the first feature. */
 .features { position: relative; }
-.features::before { content: ''; position: absolute; z-index: -1; top: -240px; height: 1200px; left: 50%; width: 100vw; translate: -50% 0; background: linear-gradient(#19172400, #191724 240px); pointer-events: none; }
 .also { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 26px 32px; margin: 0; }
 .also dt { display: flex; align-items: center; gap: 9px; font-size: 14px; font-weight: 500; color: #e9e4f2; }
 .also dt .icon { width: 14px; height: 14px; color: #8f87a3; }
