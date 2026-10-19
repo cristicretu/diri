@@ -828,23 +828,8 @@ html { overflow-x: clip; }
 .compatible .agent-chip { font-size: 11px; }
 @media (min-width: 851px) { .compatible .agent-chip, .compatible .agent-more { font-size: 13px; } }
 
-/* Footer: brand and one line on the left, three short columns on the right. */
-.site-footer { display: block; padding: 40px 0 48px; }
-.site-footer::before { background: #ffffff12; }
-.footer-main { display: flex; justify-content: space-between; align-items: flex-start; gap: 48px; }
-.footer-about p { margin-top: 12px; color: #b6afc9; font-size: 14px; }
-.footer-brand { display: inline-flex; align-items: center; gap: 9px; font-size: 20px; font-weight: 600; letter-spacing: -.4px; color: var(--rp-text); }
-.footer-brand .app-mark { width: 26px; height: 26px; border-radius: 7px; }
-.footer-columns { display: grid; grid-template-columns: repeat(3, 140px); gap: 48px; }
-.footer-columns > div { display: flex; flex-direction: column; gap: 10px; }
-.footer-columns h3 { margin: 0 0 4px; font-size: 12.5px; font-weight: 500; color: var(--rp-subtle); }
-.footer-columns a { font-size: 14px; color: #cfc8de; transition: color 140ms ease; }
-@media (hover: hover) and (pointer: fine) { .footer-columns a:hover { color: var(--rp-text); } }
-@media (max-width: 850px) { .footer-columns { gap: 40px; } }
-@media (max-width: 600px) {
-  .footer-main { flex-direction: column; gap: 32px; }
-  .footer-columns { grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 20px; width: 100%; }
-}
+.site-footer { display: block; }
+.footer-brand { display: inline-flex; align-items: center; font-weight: 600; letter-spacing: -.3px; color: var(--rp-text); }
 .site-header .site-nav { gap: 2px; }
 @media (max-width: 600px) { .site-header .site-nav { display: none; } .site-header { width: auto; } }
 
@@ -1281,37 +1266,28 @@ html { overflow-x: clip; }
 .feature-lead .feature-copy h3, .feature-lead .feature-copy p { font-size: 24px; line-height: 1.42; letter-spacing: -.018em; }
 .feature-detail .feature-copy { margin-top: 24px; padding-right: 0; }
 
-/* The last ask sits on the page grid like everything above it: the same
-   two-tone sentence, the buttons, and one quiet line. */
-.closing { margin: 112px 0 0; padding: 0 0 104px; }
-.closing h2 { max-width: 16em; margin: 0; font-family: "Geist", -apple-system, BlinkMacSystemFont, sans-serif; font-size: 48px; line-height: 1.1; font-weight: 520; letter-spacing: -.032em; color: #f4f0fa; text-wrap: balance; }
+/* The last ask is one quiet row: the line on the left, the download on the right. */
+.closing { display: flex; align-items: center; justify-content: space-between; gap: 24px; margin: 104px 0 0; padding: 40px 0; border-top: 1px solid #ffffff12; }
+.closing h2 { margin: 0; font-family: "Geist", -apple-system, BlinkMacSystemFont, sans-serif; font-size: 22px; line-height: 1.3; font-weight: 520; letter-spacing: -.016em; color: #f4f0fa; }
 .closing h2 span { color: #868094; }
-.closing-actions { display: flex; flex-wrap: wrap; align-items: center; gap: 12px; margin-top: 36px; }
-.closing-actions .button { height: 42px; padding: 0 18px; gap: 9px; border-radius: 9px; font-size: 14px; font-weight: 500; }
-.closing-actions .button.primary { color: #17151f; background: #f4f0fa; border: 1px solid #f4f0fa; }
-.closing-actions .button.secondary { color: var(--rp-text); background: #ffffff0a; border: 1px solid #ffffff1f; }
-.closing-actions p { margin: 0 0 0 12px; font-size: 13.5px; color: #7d7690; }
-@media (hover: hover) and (pointer: fine) { .closing-actions .button.primary:hover { background: #fff; } .closing-actions .button.secondary:hover { background: #ffffff14; } }
+.closing-actions { display: flex; align-items: center; gap: 20px; flex: none; }
+.closing-actions .button { height: 36px; padding: 0 14px; gap: 8px; border-radius: 8px; font-size: 13px; font-weight: 500; color: #17151f; background: #f4f0fa; border: 1px solid #f4f0fa; }
+.closing-link { font-size: 13px; color: #a9a2bc; }
+@media (hover: hover) and (pointer: fine) { .closing-actions .button:hover { background: #fff; } .closing-link:hover { color: #f4f0fa; } }
 
-/* Footer on the same four columns as the feature list, small and quiet. */
-.site-footer { padding: 36px 0 56px; }
-.footer-main { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 32px; align-items: start; }
-.footer-columns { display: contents; }
-.footer-brand { font-size: 16px; gap: 8px; }
-.footer-brand .app-mark { width: 20px; height: 20px; border-radius: 5px; }
-.footer-about p { margin-top: 10px; font-size: 13px; color: #7d7690; }
-.footer-columns > div { gap: 8px; }
-.footer-columns h3 { margin: 0 0 6px; font-size: 12px; font-weight: 500; color: #6f6982; }
-.footer-columns a { font-size: 13.5px; color: #a9a2bc; }
-
-@media (max-width: 1050px) { .footer-main { grid-template-columns: repeat(3, minmax(0, 1fr)); } .footer-about { grid-column: 1 / -1; } }
+/* Footer: the mark and one line of links. */
+.site-footer { padding: 24px 0 48px; }
+.site-footer::before { background: #ffffff12; }
+.footer-main { display: flex; align-items: center; justify-content: space-between; gap: 24px; }
+.footer-brand { font-size: 15px; gap: 8px; }
+.footer-brand .app-mark { width: 18px; height: 18px; border-radius: 5px; }
+.footer-links { display: flex; flex-wrap: wrap; justify-content: flex-end; gap: 6px 20px; }
+.footer-links a { font-size: 13px; color: #868094; transition: color 140ms ease; }
+@media (hover: hover) and (pointer: fine) { .footer-links a:hover { color: #f4f0fa; } }
+@media (max-width: 850px) { .footer-main { flex-direction: column; align-items: flex-start; } .footer-links { justify-content: flex-start; } }
 @media (max-width: 600px) {
   .feature .feature-copy h3, .feature .feature-copy p { font-size: 18px; }
   .feature-lead .feature-copy h3, .feature-lead .feature-copy p { font-size: 20px; }
-  .closing { margin-top: 72px; padding-bottom: 72px; }
-  .closing-actions { gap: 8px; }
-  .closing-actions .button { padding: 0 14px; font-size: 13px; }
-  .closing h2 { font-size: 34px; }
-  .closing-actions p { flex-basis: 100%; margin: 6px 0 0; }
-  .footer-main { gap: 28px 16px; }
+  .closing { flex-direction: column; align-items: flex-start; margin-top: 72px; padding: 32px 0; }
+  .closing h2 { font-size: 20px; }
 }
