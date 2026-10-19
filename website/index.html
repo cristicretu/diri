@@ -107,7 +107,7 @@
           "name": "Is diri free?",
           "acceptedAnswer": {
             "@type": "Answer",
-            "text": "Yes. diri is free and open source under AGPL-3.0. You only pay for the agents you use, through your own Claude, ChatGPT or other accounts. If you distribute a modified copy, or let people use one over a network, you must offer them its source under the same license."
+            "text": "Yes. diri is free and open source under AGPL-3.0. You only pay for the agents you use, through your own Claude, ChatGPT or other accounts."
           }
         },
         {
@@ -116,14 +116,6 @@
           "acceptedAnswer": {
             "@type": "Answer",
             "text": "Claude Code, Codex, Cursor, Gemini, OpenCode, Pi, Copilot, Kimi and more: 22 agent definitions ship with the app, and any terminal agent can be added with a short JSON file."
-          }
-        },
-        {
-          "@type": "Question",
-          "name": "Do I need to know how to code?",
-          "acceptedAnswer": {
-            "@type": "Answer",
-            "text": "No. You describe tasks in plain English and the agents do the work. The guides are written for marketers and product managers as well as developers."
           }
         },
         {
@@ -185,7 +177,7 @@
       <section class="intro" aria-labelledby="page-title">
         <div class="intro-heading">
           <h1 id="page-title">The multiplexer your agents can drive</h1>
-          <p><span class="sub-line">Claude Code, Codex and 20 more, on your Mac or any SSH host.</span> <span class="sub-line">Agents spawn agents, schedule runs, use your apps, and tell you when they're done.</span></p>
+          <p><span class="sub-line">Claude Code, Codex and 20 more, on your Mac or any SSH host.</span> <span class="sub-line">Agents spawn agents, schedule runs, use your apps, and talk you through what they did.</span></p>
         </div>
         <div class="intro-actions">
           <a id="download-primary" class="button primary" href="https://github.com/cristicretu/diri/releases/latest"><img class="button-mark" src="/assets/brand/apple.svg" width="15" height="15" alt=""><span class="button-label">Download for macOS</span></a>
@@ -293,7 +285,7 @@
       <section class="features" id="features" aria-labelledby="features-title">
         <h2 id="features-title" class="sr-only">Features</h2>
         <div class="feature-list">
-          <section class="feature feature-lead" aria-labelledby="feature-agents"><div class="feature-copy"><h3 id="feature-agents">Agents drive diri</h3><p>Every tab, split, worktree and schedule is one of nearly 50 MCP tools. Ask Claude Code to start a Codex on your build server, put it beside you, wait for it and read back what it found.</p></div><figure class="feature-clip"><span class="clip-lights" aria-hidden="true"><i></i><i></i><i></i></span><img src="/assets/features/agents.webp" width="1520" height="930" loading="lazy" decoding="async" alt="Claude Code starts Codex on a remote host called forge in a split pane beside it, waits for it to fix a flaky test, and reads back its result."></figure></section>
+          <section class="feature feature-lead" aria-labelledby="feature-agents"><div class="feature-copy"><h3 id="feature-agents">One agent runs the rest</h3><p>Every tab, split, worktree and schedule is one of 50 MCP tools. Ask Claude Code to start a Codex on your build server, put it beside you, wait for it and read back what it found.</p></div><figure class="feature-clip"><span class="clip-lights" aria-hidden="true"><i></i><i></i><i></i></span><img src="/assets/features/agents.webp" width="1520" height="930" loading="lazy" decoding="async" alt="Claude Code starts Codex on a remote host called forge in a split pane beside it, waits for it to fix a flaky test, and reads back its result."></figure></section>
           <div class="feature-pair">
             <section class="feature feature-detail" aria-labelledby="feature-schedules"><figure class="feature-clip"><span class="clip-lights" style="--clip-pt: 640" aria-hidden="true"><i></i><i></i><i></i></span><img src="/assets/features/schedules.webp" width="640" height="450" loading="lazy" decoding="async" alt="A scheduled Claude Code session, marked with an indigo clock because diri woke the Mac for it, triages new GitHub issues and opens a pull request."></figure><div class="feature-copy"><h3 id="feature-schedules">Scheduled runs that wake your Mac</h3><p>Start an agent every weekday at 7, every hour, or once tomorrow. diri wakes a sleeping Mac for the run, and a run missed while it was off still happens.</p></div></section>
             <section class="feature feature-detail" aria-labelledby="feature-voice"><figure class="feature-clip"><img src="/assets/features/voice.webp" width="640" height="450" loading="lazy" decoding="async" alt="Claude Code finishes and hands diri a summary to read aloud; dictation listens to the spoken answer, pastes it into the prompt and sends it."></figure><div class="feature-copy"><h3 id="feature-voice">Talk while you do something else</h3><p>When an agent finishes, diri reads you its summary. Answer out loud, end with “send to agent”, and it goes straight back to that agent.</p></div></section>
@@ -306,22 +298,22 @@
           <div><dt><span class="icon" data-icon="branch" aria-hidden="true"></span>A worktree per agent</dt><dd>Parallel work never collides.</dd></div>
           <div><dt><span class="icon" data-icon="moon" aria-hidden="true"></span>Sessions that stay open</dt><dd>Close diri and agents keep working.</dd></div>
           <div><dt><span class="icon" data-icon="pull-request" aria-hidden="true"></span>Review and ship</dt><dd>Diffs, commits and PR checks beside the session.</dd></div>
-          <div><dt><span class="icon" data-icon="bell" aria-hidden="true"></span>Know who needs you</dt><dd>Jump straight to the session that is waiting.</dd></div>
+          <div><dt><span class="icon" data-icon="bell" aria-hidden="true"></span>Notifications</dt><dd>Jump straight to the session waiting on you.</dd></div>
           <div><dt><span class="icon" data-icon="external-link" aria-hidden="true"></span>A browser per agent</dt><dd>Each session tests what it built in its own browser.</dd></div>
           <div><dt><span class="icon" data-icon="user" aria-hidden="true"></span>One-click account switching</dt><dd>Move every tab to the account with room left.</dd></div>
           <div><dt><span class="icon" data-icon="clock" aria-hidden="true"></span>Conversation history</dt><dd>Resume any past Claude or Codex chat.</dd></div>
           <div><dt><span class="icon" data-icon="split" aria-hidden="true"></span>Panes and prefix keys</dt><dd>tmux-style splits and keys, scriptable from the CLI.</dd></div>
           <div><dt><span class="icon" data-icon="plug" aria-hidden="true"></span>API tab</dt><dd>Agents open the endpoint they built, ready to send.</dd></div>
-          <div><dt><span class="icon" data-icon="local-agents" aria-hidden="true"></span>Usage &amp; limits</dt><dd>Spend and plan limits beside your sessions.</dd></div>
+          <div><dt><span class="icon" data-icon="local-agents" aria-hidden="true"></span>Usage and limits</dt><dd>Spend and plan limits beside your sessions.</dd></div>
           <div><dt><span class="icon" data-icon="terminal" aria-hidden="true"></span>Quick terminal</dt><dd>A drop-down terminal on a global hotkey.</dd></div>
           <div><dt><span class="icon" data-icon="monitor" aria-hidden="true"></span>iPhone companion</dt><dd>Answer questions from your phone. Beta.</dd></div>
           <div><dt><span class="icon" data-icon="file" aria-hidden="true"></span>Inline images</dt><dd>Kitty and iTerm2 images, locally and over SSH.</dd></div>
-          <div><dt><span class="icon" data-icon="note" aria-hidden="true"></span>Notes &amp; to-dos</dt><dd>Any to-do can start an agent.</dd></div>
+          <div><dt><span class="icon" data-icon="note" aria-hidden="true"></span>Notes and to-dos</dt><dd>Any to-do can start an agent.</dd></div>
           <div><dt><span class="icon" data-icon="shield" aria-hidden="true"></span>Free and open source</dt><dd>AGPL-3.0, native Rust, no account.</dd></div>
         </dl>
         <section class="more-section" id="faq" aria-labelledby="faq-title">
           <div class="faq-head"><h2 id="faq-title">Questions</h2><p>More in the <a href="/docs/">docs</a> and <a href="/guides/">guides</a>.</p></div>
-          <div class="faq-list"><details><summary>Is diri free?<span class="icon" data-icon="chevron-down" aria-hidden="true"></span></summary><p>Yes. diri is free and open source under AGPL-3.0. You only pay for the agents you use, through your own Claude, ChatGPT or other accounts. If you distribute a modified copy, or let people use one over a network, you must offer them its source under the same license.</p></details><details><summary>Which agents does it work with?<span class="icon" data-icon="chevron-down" aria-hidden="true"></span></summary><p>Claude Code, Codex, Cursor, Gemini, OpenCode, Pi, Copilot, Kimi and more: 22 agent definitions ship with the app, and any terminal agent can be added with a short JSON file.</p></details><details><summary>Do I need to know how to code?<span class="icon" data-icon="chevron-down" aria-hidden="true"></span></summary><p>No. You describe tasks in plain English and the agents do the work. The guides are written for marketers and product managers as well as developers.</p></details><details><summary>What happens when I close diri?<span class="icon" data-icon="chevron-down" aria-hidden="true"></span></summary><p>Your agents keep working. Reopen diri and every session is where you left it. Restarting your Mac stops them, but Claude Code, Codex and most others can resume the same conversation.</p></details><details><summary>Can agents work together?<span class="icon" data-icon="chevron-down" aria-hidden="true"></span></summary><p>Yes. Agents started in diri can start other agents, on this Mac or on any of your SSH hosts, hand them tasks, wait for them, and collect their results. Ask in plain English, starting with “Use diri to…”.</p></details><details><summary>Does diri see my code or prompts?<span class="icon" data-icon="chevron-down" aria-hidden="true"></span></summary><p>No. Agents run on your Mac or your own servers, with no diri account and no hosted relay. diri records crash and performance diagnostics, never terminal contents or prompts, and you can turn sharing off.</p></details><details><summary>Which platforms are supported?<span class="icon" data-icon="chevron-down" aria-hidden="true"></span></summary><p>macOS 15 or newer on Apple silicon and Intel. Linux is in beta, and a Windows version is in progress.</p></details></div>
+          <div class="faq-list"><details><summary>Is diri free?<span class="icon" data-icon="chevron-down" aria-hidden="true"></span></summary><p>Yes. diri is free and open source under AGPL-3.0. You only pay for the agents you use, through your own Claude, ChatGPT or other accounts.</p></details><details><summary>Which agents does it work with?<span class="icon" data-icon="chevron-down" aria-hidden="true"></span></summary><p>Claude Code, Codex, Cursor, Gemini, OpenCode, Pi, Copilot, Kimi and more: 22 agent definitions ship with the app, and any terminal agent can be added with a short JSON file.</p></details><details><summary>What happens when I close diri?<span class="icon" data-icon="chevron-down" aria-hidden="true"></span></summary><p>Your agents keep working. Reopen diri and every session is where you left it. Restarting your Mac stops them, but Claude Code, Codex and most others can resume the same conversation.</p></details><details><summary>Can agents work together?<span class="icon" data-icon="chevron-down" aria-hidden="true"></span></summary><p>Yes. Agents started in diri can start other agents, on this Mac or on any of your SSH hosts, hand them tasks, wait for them, and collect their results. Ask in plain English, starting with “Use diri to…”.</p></details><details><summary>Does diri see my code or prompts?<span class="icon" data-icon="chevron-down" aria-hidden="true"></span></summary><p>No. Agents run on your Mac or your own servers, with no diri account and no hosted relay. diri records crash and performance diagnostics, never terminal contents or prompts, and you can turn sharing off.</p></details><details><summary>Which platforms are supported?<span class="icon" data-icon="chevron-down" aria-hidden="true"></span></summary><p>macOS 15 or newer on Apple silicon and Intel. Linux is in beta, and a Windows version is in progress.</p></details></div>
         </section>
       </section>
       <section class="closing" aria-labelledby="closing-title">
