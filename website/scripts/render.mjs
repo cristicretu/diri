@@ -170,9 +170,9 @@ export const footer = `<footer class="site-footer">
           <p>The multiplexer your agents can drive.</p>
         </div>
         <nav class="footer-columns" aria-label="Resources">
-          <div><h3>Product</h3><a href="${repo}/releases/latest">Download</a><a href="/whats-new/">What's new</a><a href="${repo}/releases">Release notes</a><a href="/guides/">Guides</a><a href="/agents/">Agents</a><a href="/compare/">Compare</a></div>
-          <div><h3>Project</h3><a href="${repo}">GitHub</a><a href="/docs/">Documentation</a><a href="${repo}/blob/main/ROADMAP.md">Roadmap</a></div>
-          <div><h3>Legal</h3><a href="${repo}/blob/main/LICENSE">AGPL-3.0</a><a href="${repo}/blob/main/PRIVACY.md">Privacy</a><a href="${repo}/blob/main/SECURITY.md">Security</a></div>
+          <div><h3>Product</h3><a href="${repo}/releases/latest">Download</a><a href="/whats-new/">What's new</a><a href="${repo}/releases">Release notes</a><a href="${repo}/blob/main/ROADMAP.md">Roadmap</a></div>
+          <div><h3>Learn</h3><a href="/docs/">Documentation</a><a href="/guides/">Guides</a><a href="/agents/">Agents</a><a href="/compare/">Compare</a></div>
+          <div><h3>Project</h3><a href="${repo}">GitHub</a><a href="${repo}/blob/main/LICENSE">AGPL-3.0</a><a href="${repo}/blob/main/PRIVACY.md">Privacy</a><a href="${repo}/blob/main/SECURITY.md">Security</a></div>
         </nav>
       </div>
     </footer>`;
