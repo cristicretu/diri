@@ -29,7 +29,7 @@ crop_for() {
   case $1 in
     schedules) echo "1280 900 0 0" ;;       # the clocked rows and the run
     voice) echo "1280 900 510 14" ;;        # the pane, from its title to the answer
-    computer) echo "1756 1140 510 14" ;;    # inside the terminal pane, down to its last row
+    computer) echo "2474 1140 510 14" ;;    # inside the terminal pane, down to its last row
   esac
 }
 
@@ -91,7 +91,7 @@ for dir in "$frames"/*/; do
   # in frames of its own between the recorded ones.
   if [[ $name == computer ]]; then
     sim=$(mktemp -d)
-    node scripts/site-clip-simulator.mjs "$dir" "$sim"
+    node scripts/site-clip-simulator.mjs "$dir" "$sim" $((w / 2)) $((h / 2))
     while read -r frame png hold; do
       out_frame=$sim/$(basename "$png" .png)_on.png
       ffmpeg -loglevel error -i "$src/$frame" -i "$png" -filter_complex overlay=0:0 "$out_frame"
@@ -101,7 +101,9 @@ for dir in "$frames"/*/; do
   fi
   # Lossless at the recorded 2x size: terminal text smears under lossy
   # compression and any resampling.
-  args=(-loop 0 -min_size)
+  # No forced key-frames: most frames change a few rows, and a periodic
+  # full lossless frame would cost more than all of them.
+  args=(-loop 0 -min_size -kmax 0)
   while read -r frame hold; do
     [[ $frame == /* ]] || frame=$src/$frame
     args+=(-d "$hold" -lossless -m 6 "$frame")

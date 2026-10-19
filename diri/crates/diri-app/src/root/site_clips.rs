@@ -33,6 +33,10 @@ const WINDOW: ((f32, f32), f32) = ((1140.0, 700.0), 13.0);
 /// Its terminal font is larger by the same factor, so it reads at the size of
 /// the page's other clips.
 const WIDE_WINDOW: ((f32, f32), f32) = ((1520.0, 930.0), 17.0);
+/// The computer-use clip: as tall as `WINDOW`, wide enough for the
+/// Simulator window the encoder draws to sit beside the transcript.
+const CINEMA_WINDOW: ((f32, f32), f32) = ((1500.0, 700.0), 13.0);
+const CINEMA_FULL: usize = 150;
 const COLS: u16 = 170;
 
 #[derive(Clone, Copy)]
@@ -466,7 +470,10 @@ fn record_agents(cx: &mut HeadlessAppContext, dir: PathBuf) {
         WIDE_WINDOW,
         crate::store::WindowMaterial::Glass,
     );
-    let mut rec = Recorder::new(cx, clip.window, dir);
+    // The hero clip: its sidebar spinners turn, so motion stays on and the
+    // clock steps with the frames.
+    cx.update(|cx| cx.set_reduce_motion(false));
+    let mut rec = Recorder::new(cx, clip.window, dir).animated(125);
     use Hue::*;
     let mut lead: Vec<Line> = vec![
         l(&[("> ", Dim), ("Bump tokio and check nothing else moved.", Plain)]),
@@ -613,6 +620,7 @@ fn record_agents(cx: &mut HeadlessAppContext, dir: PathBuf) {
     });
     rec.shot(3200);
     rec.finish();
+    cx.update(|cx| cx.set_reduce_motion(true));
 }
 
 /// A schedule woke the Mac at 6:58 and its Claude Code run triages issues.
@@ -723,7 +731,7 @@ fn record_computer(cx: &mut HeadlessAppContext, dir: PathBuf) {
         },
         "clip-sim",
         None,
-        WINDOW,
+        CINEMA_WINDOW,
         crate::store::WindowMaterial::Opaque,
     );
     let mut rec = Recorder::new(cx, clip.window, dir);
@@ -780,14 +788,14 @@ fn record_computer(cx: &mut HeadlessAppContext, dir: PathBuf) {
         let mut all = lines.clone();
         all.extend(blocks.iter().flat_map(|(block, ..)| block.clone()));
         all.extend(done.clone());
-        claude(&all, "", FULL).lines.len()
+        claude(&all, "", CINEMA_FULL).lines.len()
     };
     let pinned = |body: &[Line], working: Option<(&str, &str)>| {
         let mut body = body.to_vec();
         if let Some((verb, time)) = working {
             body.extend([p(""), l(&[("✻ ", Claude), (verb, Claude), (&format!(" ({time} · esc to interrupt)"), Dim)])]);
         }
-        let mut screen = claude(&body, "", FULL);
+        let mut screen = claude(&body, "", CINEMA_FULL);
         let pad = rows.saturating_sub(screen.lines.len());
         let at = body.len() - working.map_or(0, |_| 2);
         screen.lines.splice(at..at, (0..pad).map(|_| p("")));

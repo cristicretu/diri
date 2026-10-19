@@ -985,7 +985,8 @@ html { overflow-x: clip; }
 .feature-lead .feature-copy { max-width: 40rem; margin-bottom: 28px; }
 .feature-pair { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); gap: 32px; align-items: start; }
 .feature-detail .feature-copy { margin-top: 22px; padding-right: 24px; }
-.feature-side { display: grid; grid-template-columns: minmax(0, 1.55fr) minmax(0, 1fr); gap: 48px; align-items: center; }
+.feature-wide .feature-copy { margin-top: 24px; }
+.feature-wide .feature-clip { background: #191724; }
 #faq { display: grid; grid-template-columns: minmax(0, 1fr); row-gap: 28px; max-width: 760px; margin-inline: auto; }
 .feature h3, .faq-head h2 { margin: 0; }
 .feature h3, .also-title, .faq-head h2 { font-family: "Geist", -apple-system, BlinkMacSystemFont, sans-serif; font-size: 28px; line-height: 1.15; font-weight: 540; letter-spacing: -.025em; color: #f4f0fa; text-wrap: balance; }
@@ -993,7 +994,7 @@ html { overflow-x: clip; }
 .feature-clip { position: relative; container-type: inline-size; margin: 0; border-radius: 12px; overflow: hidden; border: 1px solid #ffffff1a; background: #1f1d2e; box-shadow: 0 1px 0 #ffffff0d inset, 0 40px 80px -40px #000; }
 /* Clips are recorded at 2x and sized so the page only ever scales them down. */
 .feature-clip img { display: block; width: 100%; height: auto; }
-.feature-detail .feature-clip, .feature-side .feature-clip { background: #191724; }
+.feature-detail .feature-clip { background: #191724; }
 .feature-detail .feature-clip img { -webkit-mask-image: linear-gradient(90deg, #000 82%, transparent); mask-image: linear-gradient(90deg, #000 82%, transparent); }
 /* AppKit draws the traffic lights, so a headless recording has none; these sit where diri puts them (20, 17 pt, 14 pt wide, 8 pt apart). */
 /* One window point, in clip widths: the clip shows --clip-pt points across. */
@@ -1012,7 +1013,7 @@ html { overflow-x: clip; }
 .also dt { display: flex; align-items: center; gap: 9px; font-size: 14px; font-weight: 500; color: #e9e4f2; }
 .also dt .icon { width: 14px; height: 14px; color: #8f87a3; }
 .also dd { margin: 5px 0 0 23px; font-size: 13.5px; line-height: 1.5; color: #8f87a3; }
-@media (max-width: 1050px) { .feature-pair, .feature-side { grid-template-columns: minmax(0, 1fr); gap: 56px; } .feature-side { gap: 22px; } .feature-side .feature-copy { order: -1; } .feature-list { gap: 72px; margin-top: 32px; } .also-title { margin-top: 96px; } .also { grid-template-columns: repeat(2, minmax(0, 1fr)); } }
+@media (max-width: 1050px) { .feature-pair { grid-template-columns: minmax(0, 1fr); gap: 56px; } .feature-list { gap: 72px; margin-top: 32px; } .also-title { margin-top: 96px; } .also { grid-template-columns: repeat(2, minmax(0, 1fr)); } }
 @media (max-width: 600px) { .feature h3, .also-title, .faq-head h2 { font-size: 24px; } .feature-clip { border-radius: 10px; } .also { grid-template-columns: minmax(0, 1fr); } }
 @media (max-width: 1050px) { .bento { grid-template-columns: repeat(2, minmax(0, 1fr)); } .bento-card, .bento-card.wide { grid-column: span 1; } .bento-small { grid-template-columns: repeat(2, minmax(0, 1fr)); } }
 @media (max-width: 600px) { .bento, .bento-small { grid-template-columns: minmax(0, 1fr); } .bento-card, .bento-card.wide { grid-column: auto; } .bento-visual { min-height: 0; } }

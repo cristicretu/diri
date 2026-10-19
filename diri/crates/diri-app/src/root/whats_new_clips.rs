@@ -33,6 +33,7 @@ pub(super) struct Recorder<'a> {
     pub(super) window: AnyWindowHandle,
     dir: PathBuf,
     frames: Vec<(String, u32)>,
+    step: Option<u32>,
 }
 
 impl<'a> Recorder<'a> {
@@ -44,7 +45,16 @@ impl<'a> Recorder<'a> {
             window,
             dir,
             frames: Vec::new(),
+            step: None,
         }
+    }
+
+    /// Splits every hold into frames `step_ms` apart and moves the app's
+    /// clock between them, so looping marks (the working spinner) turn
+    /// instead of freezing for the length of the hold.
+    pub(super) fn animated(mut self, step_ms: u32) -> Self {
+        self.step = Some(step_ms);
+        self
     }
 
     pub(super) fn settle(&mut self) {
@@ -67,6 +77,21 @@ impl<'a> Recorder<'a> {
 
     /// Captures the window as it stands and holds it for `hold_ms`.
     pub(super) fn shot(&mut self, hold_ms: u32) {
+        let Some(step) = self.step else {
+            self.capture(hold_ms);
+            return;
+        };
+        let mut left = hold_ms;
+        while left > 0 {
+            // The last frame takes the remainder rather than a sliver.
+            let hold = if left >= 2 * step { step } else { left };
+            self.capture(hold);
+            self.cx.advance_clock(Duration::from_millis(u64::from(hold)));
+            left -= hold;
+        }
+    }
+
+    fn capture(&mut self, hold_ms: u32) {
         self.settle();
         let name = format!("frame_{:04}.png", self.frames.len());
         self.cx

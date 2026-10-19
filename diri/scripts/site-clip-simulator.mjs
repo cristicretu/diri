@@ -2,7 +2,7 @@
 // the app Claude Code is testing, with its cursor moving, clicking and typing
 // in step with the tool calls in the pane.
 //
-//   node scripts/site-clip-simulator.mjs <recorded clip dir> <out dir>
+//   node scripts/site-clip-simulator.mjs <recorded clip dir> <out dir> <width> <height>
 //
 // Reads the clip's frames.txt (frame, hold) and writes <out>/overlay.txt with
 // one line per overlay frame: the recorded frame under it, a transparent PNG
@@ -13,14 +13,13 @@ import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
-const [clip, out] = process.argv.slice(2);
-// The cropped clip in CSS pixels; Chrome renders at 2x like the recording.
-const W = 878, H = 570;
+// The cropped clip's size in CSS pixels; Chrome renders at 2x like the recording.
+const [clip, out, W, H] = process.argv.slice(2).map((arg, i) => (i < 2 ? arg : Number(arg)));
 
 const page = `<!doctype html><meta charset="utf-8"><style>
 * { box-sizing: border-box; margin: 0; }
 html, body { width: ${W}px; height: ${H}px; background: transparent; overflow: hidden; font-family: -apple-system, "SF Pro Text", sans-serif; -webkit-font-smoothing: antialiased; }
-#stage { position: absolute; left: 660px; top: 30px; scale: .93; transform-origin: 0 0; }
+#stage { position: absolute; left: ${Math.round(W * .74 - 102)}px; top: 30px; scale: .93; transform-origin: 0 0; }
 #win { position: absolute; left: 0; top: 0; width: 220px; height: 468px; border-radius: 12px; background: #2a2838; border: 1px solid #ffffff1f; box-shadow: 0 18px 50px #00000099, 0 2px 8px #00000066; transform-origin: 50% 40%; }
 .bar { height: 26px; display: flex; align-items: center; gap: 6px; padding: 0 10px; }
 .bar i { width: 9px; height: 9px; border-radius: 50%; }
