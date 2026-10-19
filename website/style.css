@@ -1001,7 +1001,7 @@ html { overflow-x: clip; }
 .feature-pair { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); gap: 32px; align-items: start; }
 .feature-detail .feature-copy { margin-top: 22px; padding-right: 24px; }
 .feature-side { display: grid; grid-template-columns: minmax(0, 1.55fr) minmax(0, 1fr); gap: 48px; align-items: center; }
-#faq { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); column-gap: 48px; }
+#faq { display: grid; grid-template-columns: minmax(0, 1fr); row-gap: 28px; max-width: 760px; margin-inline: auto; }
 .feature h3, .faq-head h2 { margin: 0; }
 .feature h3, .also-title, .faq-head h2 { font-family: "Geist", -apple-system, BlinkMacSystemFont, sans-serif; font-size: 28px; line-height: 1.15; font-weight: 540; letter-spacing: -.025em; color: #f4f0fa; text-wrap: balance; }
 .feature p { margin-top: 14px; font-size: 15.5px; line-height: 1.6; color: #a9a2bc; text-wrap: pretty; }
@@ -1114,7 +1114,6 @@ html { overflow-x: clip; }
 .guide-card dt a:focus-visible { outline: none; }
 /* Questions: heading on the left, one column of answers that open on demand. */
 #faq { align-items: start; padding-top: 96px; }
-@media (min-width: 1051px) { .faq-head { position: sticky; top: 110px; } }
 .faq-head p { margin-top: 8px; font-size: 14px; color: #8f87a3; }
 .faq-head a { color: #c9c2d8; text-decoration: underline; text-decoration-color: #ffffff30; text-underline-offset: 3px; }
 .faq-head a:hover { color: #f4f0fa; }
@@ -1127,7 +1126,7 @@ html { overflow-x: clip; }
 .faq-list summary:hover, .faq-list summary:hover .icon { color: #f4f0fa; }
 .faq-list summary:focus-visible { outline: 2px solid var(--rp-rose); outline-offset: 2px; border-radius: 4px; }
 .faq-list p { max-width: 640px; padding: 0 0 20px; font-size: 14px; line-height: 1.6; color: #a9a2bc; text-wrap: pretty; }
-@media (max-width: 850px) { #faq { grid-template-columns: minmax(0, 1fr); row-gap: 20px; padding-top: 88px; } }
+@media (max-width: 850px) { #faq { row-gap: 20px; padding-top: 88px; } }
 @media (prefers-reduced-motion: reduce) { .faq-list summary .icon { transition: none; } }
 
 /* Two-tone hero: release pill, the claim in white and the detail in grey at one size, agents named with their marks. */
