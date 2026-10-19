@@ -47,6 +47,10 @@ g='if(gt(hypot(max(0,abs(X-100)-70),Y-30),28),61,9)':\
 b='if(gt(hypot(max(0,abs(X-100)-70),Y-30),28),80,15)':\
 a='clip(255*(30.5-hypot(max(0,abs(X-100)-70),Y-30)),0,255)'" "$pill"
 RANDOM=7
+# Straight alpha from premultiplied: each channel over alpha (ffmpeg's own
+# unpremultiply filter leaves packed RGBA as it is).
+straight() { echo "$1='if(alpha(X\,Y)\,min(255\,$1(X\,Y)*255/alpha(X\,Y))\,0)'"; }
+unpremultiply="geq=$(straight r):$(straight g):$(straight b):a='alpha(X\,Y)'"
 waveform() { # drawbox filters for 11 bars centred in the pill at $1 $2
   local x=$(($1 + 37)) cy=$(($2 + 30)) out="" i h
   for i in 0 1 2 3 4 5 6 7 8 9 10; do
@@ -62,6 +66,14 @@ for dir in "$frames"/*/; do
   read -r w h x y <<<"$(crop_for "$name")" || true
   src=$dir
   list=$dir/frames.txt
+  # A glass clip is captured with the translucent chrome's alpha, premultiplied
+  # as the GPU leaves it; the page lays it over a blurred backdrop.
+  if [[ $name == agents ]]; then
+    src=$(mktemp -d)
+    while read -r frame _; do
+      ffmpeg -loglevel error -i "$dir/$frame" -vf "format=rgba,$unpremultiply" "$src/$frame"
+    done <"$dir/frames.txt"
+  fi
   if [[ -n ${w:-} ]]; then
     src=$(mktemp -d)
     # sips centres any crop whose offset is 0,0; ffmpeg crops exactly.

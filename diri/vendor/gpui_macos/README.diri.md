@@ -72,3 +72,8 @@ lets the GPU generate the mip levels, copies every level linearly into one
 shared buffer, and waits for that one command buffer. Reading back is then a
 plain copy rather than a CPU detile of a managed texture. Nothing is cached
 between captures, so it adds no resident memory.
+
+`MetalHeadlessRenderer::transparent()` (test support only) builds the headless
+renderer cleared to transparent, as a transparent window's is, so a capture
+keeps the alpha of glass chrome. The site clip recorder uses it; GPUI's test
+window ignores `set_background_appearance`, so there is no other way to ask.

@@ -18,7 +18,7 @@ const data = JSON.parse(html.match(/<script type="application\/ld\+json">([\s\S]
 assert.equal(data['@context'], 'https://schema.org');
 assert.ok(data['@graph'].some(item => item['@type'] === 'WebSite' && item.url === 'https://diri.sh/'));
 assert.ok(data['@graph'].some(item => item['@type'] === 'SoftwareApplication' && item.name === 'Diri'));
-assert.ok((html.match(/<dt>|<h3 id="feature-/g) || []).length >= 20, 'Feature copy must be in the initial HTML');
+assert.ok((html.match(/<dt>|<h3 id="feature-/g) || []).length >= 18, 'Feature copy must be in the initial HTML');
 const robots = await read('robots.txt');
 assert.match(robots, /Allow: \//);
 assert.match(robots, /Sitemap: https:\/\/diri\.sh\/sitemap\.xml/);

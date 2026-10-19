@@ -2146,6 +2146,15 @@ impl MetalHeadlessRenderer {
         let renderer = MetalRenderer::new_headless(instance_buffer_pool);
         Self { renderer }
     }
+
+    /// DIRI PATCH (transparent capture): a headless renderer that clears to
+    /// transparent, as a transparent window does, so captured frames keep the
+    /// alpha of translucent chrome.
+    pub fn transparent() -> Self {
+        let mut this = Self::new();
+        this.renderer.update_transparency(true);
+        this
+    }
 }
 
 #[cfg(any(test, feature = "test-support"))]

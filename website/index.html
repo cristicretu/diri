@@ -158,7 +158,6 @@
   <link rel="preload" href="/assets/fonts/geist.woff2" as="font" type="font/woff2" crossorigin>
   <link rel="stylesheet" href="style.css">
   <link rel="stylesheet" href="guides.css">
-  <script src="agent-previews.js" defer></script>
   <script src="app.js" defer></script>
   <script type="module" src="downloads.js"></script>
   <script type="module" src="stats.js"></script>
@@ -195,86 +194,15 @@
       </section>
 
 
-      <section class="product" aria-label="Interactive Diri preview" data-nosnippet>
-        <div class="desktop-stage">
-        <div class="app-window" id="demo-window" role="region" aria-label="Diri workspace preview">
-          <aside class="app-sidebar" aria-label="Demo agents">
-            <div class="sidebar-top"><span class="traffic-lights" aria-hidden="true"><i></i><i></i><i></i></span><button class="icon-button" data-open="command" aria-label="Open commands"><span class="icon" data-icon="settings"></span></button><button class="icon-button" data-open="command" aria-label="Search conversations"><span class="icon" data-icon="search"></span></button><button class="icon-button" id="toggle-sidebar" aria-label="Collapse sidebar"><span class="icon" data-icon="sidebar"></span></button></div>
-            <div class="sidebar-rows">
-            <button class="new-chat" data-open="command"><span class="icon" data-icon="new-agent"></span>New Agent <span class="agent-logo new-chat-agent" data-agent="claude"></span></button>
-            <div class="sidebar-group"><span class="group-chevron"><span class="icon" data-icon="chevron-down"></span></span>diri</div>
-            <button class="chat-row selected" data-chat="release" aria-pressed="true"><span class="chat-state completed" aria-label="Completed"><span class="icon" data-icon="check"></span></span><span>Ship the 0.9 release</span><span class="agent-logo claude" data-agent="claude"></span></button>
-            <div class="chat-children" aria-label="Agents started by Ship the 0.9 release">
-              <div class="chat-row child" data-child-row><span class="chat-state completed" aria-label="Completed"><span class="icon" data-icon="check"></span></span><span>Write the release notes</span><span class="agent-logo" data-agent="codex"></span></div>
-              <div class="chat-row child" data-child-row><span class="chat-state completed" aria-label="Completed"><span class="icon" data-icon="check"></span></span><span>Verify the Linux build</span><span class="agent-logo claude" data-agent="claude"></span></div>
-              <div class="chat-row child" data-child-row><span class="chat-state completed" aria-label="Completed"><span class="icon" data-icon="check"></span></span><span>Test the updater</span><span class="agent-logo gemini" data-agent="gemini"></span></div>
-            </div>
-            <div class="chat-row static"><span class="chat-state working" aria-label="Working"><span class="icon" data-icon="working-0"></span></span><span>Fix the flaky reconnect test</span><span class="agent-logo" data-agent="codex"></span></div>
-            <div class="chat-row static"><span class="chat-state completed" aria-label="Completed"><span class="icon" data-icon="check"></span></span><span>Review PR #412: session restore</span><span class="agent-logo claude" data-agent="claude"></span></div>
-            <button class="chat-row" data-chat="website" aria-pressed="false"><span class="chat-state completed" aria-label="Completed"><span class="icon" data-icon="check"></span></span><span>Build the Diri website</span><span class="agent-logo" data-agent="codex"></span></button>
-            <button class="chat-row" data-chat="notes" aria-pressed="false"><span class="chat-state needs-input" aria-label="Needs input"><span class="icon" data-icon="warning"></span></span><span>Weekly plan</span><span class="agent-logo claude" data-agent="claude"></span></button>
-            <button class="chat-row" data-chat="details" aria-pressed="false"><span class="chat-state working" aria-label="Working"><span class="icon" data-icon="working-0"></span></span><span>Keyboard navigation</span><span class="agent-logo" data-agent="cursor"></span></button>
-            <div class="sidebar-group second"><span class="group-chevron"><span class="icon" data-icon="chevron-down"></span></span>api</div>
-            <div class="chat-row static"><span class="chat-state working" aria-label="Working"><span class="icon" data-icon="working-0"></span></span><span>Rate limit the public API</span><span class="agent-logo claude" data-agent="claude"></span></div>
-            <div class="chat-row static"><span class="chat-state needs-input" aria-label="Needs input"><span class="icon" data-icon="warning"></span></span><span>Migrate auth to passkeys</span><span class="agent-logo" data-agent="codex"></span></div>
-            <div class="chat-row static"><span class="chat-state completed" aria-label="Completed"><span class="icon" data-icon="check"></span></span><span>Upgrade to Postgres 18</span><span class="agent-logo" data-agent="opencode"></span></div>
-            <div class="chat-row static"><span class="chat-state working" aria-label="Working"><span class="icon" data-icon="working-0"></span></span><span>Cut p95 latency on /search</span><span class="agent-logo" data-agent="cursor"></span></div>
-            <div class="sidebar-group second"><span class="group-chevron"><span class="icon" data-icon="chevron-down"></span></span>Experiments</div>
-            <div class="chat-row static"><span class="chat-state idle" aria-label="Hibernated"><span class="icon" data-icon="moon"></span></span><span>Benchmark the terminal parser</span><span class="agent-logo" data-agent="opencode"></span></div>
-            <button class="chat-row" data-chat="weekend" aria-pressed="false"><span class="chat-state idle" aria-label="Hibernated"><span class="icon" data-icon="moon"></span></span><span>Travel map</span><span class="agent-logo gemini" data-agent="gemini"></span></button>
-            </div>
-            <div class="sidebar-bottom">
-              <div class="sidebar-filter"><span class="icon" data-icon="search"></span>Filter agents</div>
-              <div class="account-summary"><span class="account-avatar" aria-hidden="true">G</span><span class="account-name">giga</span><span class="account-cost" title="Estimated usage cost today" aria-label="Estimated usage cost today: 19 dollars and 41 cents">$19.41</span><span class="icon" data-icon="chevron-up-down"></span></div>
-            </div>
-          </aside>
-          <div class="app-main">
-            <div class="app-titlebar"><span class="traffic-lights mobile-traffic-lights" aria-hidden="true"><i></i><i></i><i></i></span>
-              <span class="current-agent"><span class="agent-logo" data-agent="codex"></span><span id="agent-name" class="sr-only">Codex</span></span><span class="session-name" id="session-name">Build the Diri website</span>
-              <div class="app-tools">
-                <button class="app-tool links-trigger" data-open="links" aria-expanded="false" aria-controls="links-panel"><span class="icon" data-icon="external-link"></span><span class="link-count">2</span></button>
-                <span class="pane-tool" aria-hidden="true"><span class="icon" data-icon="split"></span></span>
-                <span class="pane-tool" aria-hidden="true"><span class="icon" data-icon="expand"></span></span>
-                <button class="icon-button notification-trigger" data-open="notifications" aria-expanded="false" aria-controls="notifications-panel" aria-label="Open demo notifications"><span class="icon" data-icon="bell"></span></button>
-                <button class="icon-button" id="toggle-changes" aria-label="Toggle changes" aria-expanded="true"><span class="icon" data-icon="sidebar-right"></span></button>
-              </div>
-            </div>
-            <div class="terminal-body">
-            <div class="terminal" id="terminal-content" aria-live="polite"></div>
-            <div class="terminal-composer" aria-label="Example terminal prompt"><span>›</span><span>Ask a question or describe a task</span><span class="terminal-cursor" aria-hidden="true"></span></div>
-            <div class="terminal-footer"><span id="terminal-status">Completed</span><button data-open="command" aria-label="Explore the command menu"><span class="icon" data-icon="search"></span><kbd>⌘K</kbd></button></div>
-            </div>
-          </div>
-          <aside class="changes-panel" aria-label="Changes preview">
-            <div class="changes-header"><span class="icon" data-icon="code"></span><strong>Changes</strong><span class="diff-count"></span><button class="icon-button" id="close-changes" aria-label="Close changes"><span class="icon" data-icon="close"></span></button></div>
-            <div class="changes-content"></div>
-          </aside>
-          <div class="demo-shade" id="demo-shade" hidden></div>
-          <section class="palette floating-panel" id="palette" aria-label="Demo command menu" hidden>
-            <div class="palette-head"><button id="palette-back" class="icon-button" aria-label="Back to commands" hidden><span class="icon" data-icon="chevron-left"></span></button><span id="palette-search-icon" class="icon" data-icon="search"></span><input id="palette-input" aria-label="Search demo commands" placeholder="Search chats or run a command…" autocomplete="off" spellcheck="false" role="combobox" aria-expanded="true" aria-controls="palette-list" aria-autocomplete="list"><button class="escape-key" data-close aria-label="Close command menu">esc</button></div>
-            <div class="palette-list" id="palette-list" role="listbox" aria-label="Commands"></div>
-          </section>
-          <section class="links-panel floating-panel" id="links-panel" aria-label="Demo links" hidden>
-            <div class="floating-head"><span class="icon" data-icon="external-link"></span><span>Links</span><button class="escape-key" data-close aria-label="Close links">esc</button></div>
-            <a class="link-row" href="https://github.com/cristicretu/diri/pulls" target="_blank" rel="noopener noreferrer"><span class="icon pr-icon" data-icon="pull-request"></span><span><strong>Update website</strong><small>Pull request preview</small></span><span class="checks-label">Checks passed</span><span class="icon" data-icon="external-link"></span></a>
-            <button class="link-row" id="preview-website"><span class="icon" data-icon="monitor"></span><span><strong>Website</strong><small>Local preview</small></span><span class="icon" data-icon="external-link"></span></button>
-            <div class="link-context"><span class="icon" data-icon="branch"></span>Branch <span>design/website</span></div>
-          </section>
-          <section class="notifications-panel floating-panel" id="notifications-panel" aria-label="Demo notifications" hidden>
-            <div class="floating-head"><span class="icon" data-icon="bell"></span><span>Notifications</span><button class="escape-key" data-close aria-label="Close notifications">esc</button></div>
-            <button class="notification-row" data-chat="website"><span class="icon green-icon" data-icon="check-circle"></span><span><strong>Diri website</strong><small>Codex finished</small></span></button>
-            <button class="notification-row" data-chat="notes"><span class="icon orange-icon" data-icon="bell"></span><span><strong>Weekly plan</strong><small>Claude has a question</small></span></button>
-          </section>
-        </div>
-        </div>
+      <section class="product" aria-label="Diri preview" data-nosnippet>
+        <figure class="hero-clip"><span class="clip-lights" aria-hidden="true"><i></i><i></i><i></i></span><img src="/assets/features/agents.webp" width="1520" height="930" decoding="async" fetchpriority="high" alt="Claude Code starts Codex on a remote host called forge in a split pane beside it, waits for it to fix a flaky test, and reads back its result."></figure>
       </section>
 
-
-      <section class="compatible" aria-label="Preview each agent"><div>
-        <button class="agent-switch" data-chat="notes" aria-pressed="false"><i class="agent-logo claude" data-agent="claude"></i>Claude Code</button>
-        <button class="agent-switch" data-chat="website" aria-pressed="true"><i class="agent-logo" data-agent="codex"></i>Codex</button>
-        <button class="agent-switch" data-chat="details" aria-pressed="false"><i class="agent-logo" data-agent="cursor"></i>Cursor</button>
-        <button class="agent-switch" data-chat="weekend" aria-pressed="false"><i class="agent-logo gemini" data-agent="gemini"></i>Gemini</button>
+      <section class="compatible" aria-label="Agents diri works with"><div>
+        <span class="agent-chip"><i class="agent-logo claude" data-agent="claude"></i>Claude Code</span>
+        <span class="agent-chip"><i class="agent-logo" data-agent="codex"></i>Codex</span>
+        <span class="agent-chip"><i class="agent-logo" data-agent="cursor"></i>Cursor</span>
+        <span class="agent-chip"><i class="agent-logo gemini" data-agent="gemini"></i>Gemini</span>
         <span class="agent-chip"><i class="agent-logo" data-agent="pi"></i>Pi</span>
         <span class="agent-chip"><i class="agent-logo" data-agent="opencode"></i>OpenCode</span>
         <span class="agent-chip"><i class="agent-logo" data-agent="copilot"></i>Copilot</span>
@@ -285,7 +213,6 @@
       <section class="features" id="features" aria-labelledby="features-title">
         <h2 id="features-title" class="sr-only">Features</h2>
         <div class="feature-list">
-          <section class="feature feature-lead" aria-labelledby="feature-agents"><div class="feature-copy"><h3 id="feature-agents">One agent runs the rest.</h3><p>Claude Code starts a Codex on your build server, waits for it, and reads back what it found.</p></div><figure class="feature-clip"><span class="clip-lights" aria-hidden="true"><i></i><i></i><i></i></span><img src="/assets/features/agents.webp" width="1520" height="930" loading="lazy" decoding="async" alt="Claude Code starts Codex on a remote host called forge in a split pane beside it, waits for it to fix a flaky test, and reads back its result."></figure></section>
           <div class="feature-pair">
             <section class="feature feature-detail" aria-labelledby="feature-schedules"><figure class="feature-clip"><span class="clip-lights" style="--clip-pt: 640" aria-hidden="true"><i></i><i></i><i></i></span><img src="/assets/features/schedules.webp" width="640" height="450" loading="lazy" decoding="async" alt="A scheduled Claude Code session, marked with an indigo clock because diri woke the Mac for it, triages new GitHub issues and opens a pull request."></figure><div class="feature-copy"><h3 id="feature-schedules">Scheduled runs that wake your Mac.</h3><p>Every weekday at 7, or once tomorrow. diri wakes your Mac for the run.</p></div></section>
             <section class="feature feature-detail" aria-labelledby="feature-voice"><figure class="feature-clip"><img src="/assets/features/voice.webp" width="640" height="450" loading="lazy" decoding="async" alt="Claude Code finishes and hands diri a summary to read aloud; dictation listens to the spoken answer, pastes it into the prompt and sends it."></figure><div class="feature-copy"><h3 id="feature-voice">Talk while you do something else.</h3><p>diri reads you each summary. Answer out loud and it goes back to the agent.</p></div></section>

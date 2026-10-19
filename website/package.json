@@ -5,7 +5,7 @@
   "type": "module",
   "scripts": {
     "dev": "node server.mjs",
-    "check": "node --check app.js && node --check agent-previews.js && node --check downloads.js && node --check guides.js && node --check stats.js && node --check server.mjs && node --check scripts/build.mjs && node --check scripts/check-site.mjs && node --check docs.js && node --check docs-search.js && node --check functions/mcp.js && node --check scripts/docs.mjs && node --check scripts/render.mjs && node --check scripts/pages.mjs && node --check scripts/site.mjs && node --check scripts/og.mjs",
+    "check": "node --check app.js && node --check downloads.js && node --check guides.js && node --check stats.js && node --check server.mjs && node --check scripts/build.mjs && node --check scripts/check-site.mjs && node --check docs.js && node --check docs-search.js && node --check functions/mcp.js && node --check scripts/docs.mjs && node --check scripts/render.mjs && node --check scripts/pages.mjs && node --check scripts/site.mjs && node --check scripts/og.mjs",
     "test": "node --test scripts/downloads.test.mjs scripts/stats.test.mjs scripts/docs.test.mjs",
     "build": "node scripts/build.mjs",
     "preview": "node server.mjs --production",

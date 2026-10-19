@@ -9,7 +9,7 @@ await rm(output, { recursive: true, force: true });
 await mkdir(output, { recursive: true });
 const pages = new Map(await Promise.all(['index.html', '404.html', 'guides/index.html', 'guides/first-agent/index.html', 'guides/never-lose-work/index.html', 'guides/parallel-agents/index.html', 'guides/agent-teams/index.html', 'guides/review-changes/index.html', 'guides/scheduled-tasks/index.html', 'guides/remote-sessions/index.html', 'guides/shortcuts/index.html', 'whats-new/index.html', ...await sitePages()].map(async file => [file, await readFile(resolve(root, file), 'utf8')])));
 const hashed = [];
-for (const file of ['style.css', 'guides.css', 'app.js', 'agent-previews.js', 'downloads.js', 'guides.js', 'stats.js', 'docs.css', 'docs.js']) {
+for (const file of ['style.css', 'guides.css', 'app.js', 'downloads.js', 'guides.js', 'stats.js', 'docs.css', 'docs.js']) {
   const content = await readFile(resolve(root, file));
   const hash = createHash('sha256').update(content).digest('hex').slice(0, 12);
   const ext = extname(file);

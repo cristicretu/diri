@@ -223,6 +223,7 @@ fn open(
     selected: &str,
     workspace: Option<WorkspaceSnapshot>,
     (window_size, font_size): ((f32, f32), f32),
+    material: crate::store::WindowMaterial,
 ) -> Clip {
     let services = test_services();
     let mut fixture = SidebarPreviewFixture::make(PreviewScenario::Typical);
@@ -251,7 +252,7 @@ fn open(
             .update_preferences(|prefs| {
                 prefs.sidebar_visible = true;
                 prefs.terminal_theme = "rose-pine".into();
-                prefs.window_material = crate::store::WindowMaterial::Opaque;
+                prefs.window_material = material;
                 prefs.terminal_font_size = font_size;
             })
             .unwrap();
@@ -273,6 +274,13 @@ fn open(
         })
         .unwrap();
     cx.run_until_parked();
+    // A headless window opens opaque and the root only pushes a material when
+    // it changes, so glass is set here: the capture keeps the translucent
+    // chrome's alpha for the page to show its own backdrop through.
+    cx.update_window(window.into(), |_, window, _| {
+        window.set_background_appearance(window_background(material));
+    })
+    .unwrap();
     for _ in 0..3 {
         std::thread::sleep(Duration::from_millis(120));
         cx.update_window(window.into(), |_, window, _| window.refresh())
@@ -456,6 +464,7 @@ fn record_agents(cx: &mut HeadlessAppContext, dir: PathBuf) {
         "clip-lead",
         Some(workspace(1, lead_pane())),
         WIDE_WINDOW,
+        crate::store::WindowMaterial::Glass,
     );
     let mut rec = Recorder::new(cx, clip.window, dir);
     use Hue::*;
@@ -640,6 +649,7 @@ fn record_schedules(cx: &mut HeadlessAppContext, dir: PathBuf) {
         "clip-triage",
         None,
         WINDOW,
+        crate::store::WindowMaterial::Opaque,
     );
     let mut rec = Recorder::new(cx, clip.window, dir);
     use Hue::*;
@@ -714,6 +724,7 @@ fn record_computer(cx: &mut HeadlessAppContext, dir: PathBuf) {
         "clip-sim",
         None,
         WINDOW,
+        crate::store::WindowMaterial::Opaque,
     );
     let mut rec = Recorder::new(cx, clip.window, dir);
     use Hue::*;
@@ -817,6 +828,7 @@ fn record_voice(cx: &mut HeadlessAppContext, dir: PathBuf) {
         "clip-voice",
         None,
         WINDOW,
+        crate::store::WindowMaterial::Opaque,
     );
     let listen = dir.join("listen.txt");
     let mut rec = Recorder::new(cx, clip.window, dir);
@@ -882,7 +894,11 @@ fn render_site_clips() {
     let mut cx = HeadlessAppContext::with_platform(
         platform.text_system(),
         Arc::new(diri_ui::IconAssets),
-        gpui_platform::current_headless_renderer,
+        // Transparent, so a glass clip keeps its alpha; opaque clips paint
+        // every pixel anyway.
+        || -> Option<Box<dyn gpui::PlatformHeadlessRenderer>> {
+            Some(Box::new(gpui_macos::metal_renderer::MetalHeadlessRenderer::transparent()))
+        },
     );
     cx.update(|cx| {
         crate::fonts::init(cx);

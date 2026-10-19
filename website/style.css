@@ -1291,3 +1291,10 @@ html { overflow-x: clip; }
   .closing { flex-direction: column; align-items: flex-start; margin-top: 72px; padding: 32px 0; }
   .closing h2 { font-size: 20px; }
 }
+
+/* The hero is the real app, recorded with glass: the sidebar's pixels are
+   translucent, so the page's dusk shows through them, blurred as the desktop
+   is behind a real window. */
+.hero-clip { position: relative; container-type: inline-size; margin: 0; border-radius: 12px; overflow: hidden; border: 1px solid #e0def42b; background: #1917241f; -webkit-backdrop-filter: blur(40px) saturate(1.5); backdrop-filter: blur(40px) saturate(1.5); box-shadow: 0 1px 0 #ffffff14 inset, 0 50px 100px -30px #0000008c; }
+.hero-clip img { display: block; width: 100%; height: auto; }
+@media (max-width: 600px) { .hero-clip { border-radius: 9px; } }
