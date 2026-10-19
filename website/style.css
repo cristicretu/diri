@@ -640,13 +640,9 @@ body { isolation: isolate; position: relative; min-height: 100svh; }
 @media (max-width: 850px) { .page-sky { height: 1300px; } }
 @media (max-width: 600px) { .page-sky { height: 1080px; } .desktop-stage { padding: 0; } }
 
-/* Read like 115–125% browser zoom on wide screens. Tiers keep the zoomed layout above the 1050px breakpoint. */
-@media (min-width: 1280px) { html { zoom: 1.15; } }
-@media (min-width: 1600px) { html { zoom: 1.25; } }
-
 /* Larger reading scale on desktop: about 1.15–1.2x type, controls, and spacing. */
 @media (min-width: 851px) {
-  .site-wrap { max-width: 1280px; padding-inline: 36px; }
+  .site-wrap { max-width: 1184px; padding-inline: 36px; }
   .site-header { height: 78px; }
   .wordmark { font-size: 26px; gap: 8px; }
   .wordmark .brand-mark { width: 23px; height: 19px; }
