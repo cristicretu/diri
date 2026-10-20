@@ -56,15 +56,27 @@ Settings. A login the provider rejects with a valid token (HTTP 401) reads
 A Claude login's account record is kept apart from its token, and the shared
 one in `~/.claude.json` is rewritten by every running Claude Code: after a
 switch, an old session can write its own account back beside another
-account's token. So with a valid token the app also asks
-`api.anthropic.com/api/oauth/profile` whose it is, as Claude Code does after a
-sign-in, and Settings names each login by that answer. The login in use that
-no profile holds is shown and remembered under the account its token names;
-an answer nobody could vouch for is shown but not remembered. The Engine asks
-the same way before it keeps a Claude record: **Save** names the new account
-after the account its token names, and saving a login or switching away from
-one keeps that account's record, not the shared one when it names someone
-else. With no valid token it keeps the shared record, as before. (A Codex
+account's token. So the Engine asks `api.anthropic.com/api/oauth/profile`
+whose a token is, as Claude Code does after a sign-in, and only while that
+token is valid. The answer is kept in memory for the Engine run under the
+login's refresh token, which outlives its access tokens; a failed question is
+asked again after five minutes. It is used wherever the Engine names a Claude
+login:
+
+- `account.overview` names the login in use by its token, and matches it to
+  a profile by that, so Settings, the account menu and the limits filed under
+  it follow the token.
+- **Save** names the new profile after the token's account. Saving a login,
+  switching away from one, and handing the default store's latest login to its
+  profile keep the shared record when it names that account (an organization
+  is compared only when both records name one), else a record already kept
+  for it, else one made from the answer. The outgoing login is asked about
+  before its tabs stop, so a switch does not wait on the network.
+- Once per Engine run, a saved profile whose kept record names another
+  account than its token is repaired.
+
+With no answer (an expired token never asked this run, or no network) the
+shared record is used, as before. The app does not ask on its own. (A Codex
 login's ID token sits beside its access token and names it.)
 
 A switch is never refused because of one tab. A Codex tab whose conversation

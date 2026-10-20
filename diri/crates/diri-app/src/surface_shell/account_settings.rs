@@ -1556,11 +1556,7 @@ impl UtilitySurfaces {
             let usage = limits
                 .iter()
                 .find(|l| l.live && l.profile_id.is_none() && l.provider == provider(agent));
-            // Who its token belongs to, over the shared record that can be stale.
-            let identity = usage
-                .and_then(|u| u.identity.as_ref())
-                .unwrap_or(&live.identity);
-            let row = self.unsaved_account_row(agent, identity, usage, now, cx);
+            let row = self.unsaved_account_row(agent, &live.identity, usage, now, cx);
             rows = divided(rows, row);
         }
         let add =
@@ -1611,15 +1607,10 @@ impl UtilitySurfaces {
         let signed_in = login.is_some_and(|l| l.signed_in);
         let signing_in = login.is_some_and(|l| l.signing_in);
         let needs_sign_in = usage.is_some_and(AccountLimits::needs_sign_in);
-        // Who its token belongs to, over the record saved with it.
-        let identity = usage
-            .and_then(|u| u.identity.as_ref())
-            .or(login.map(|l| &l.identity));
-        let plan = usage.and_then(|u| u.plan.clone()).or_else(|| {
-            login
-                .and_then(|l| l.identity.plan.as_deref())
-                .map(plan_label)
-        });
+        let identity = login.map(|l| &l.identity);
+        let plan = usage
+            .and_then(|u| u.plan.clone())
+            .or_else(|| identity.and_then(|i| i.plan.as_deref()).map(plan_label));
         let detail = [
             identity.and_then(|i| i.email.clone()),
             identity.and_then(organization),

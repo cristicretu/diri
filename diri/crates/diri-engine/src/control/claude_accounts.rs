@@ -11,10 +11,13 @@
 use super::account_switch::PreparedTab;
 use super::*;
 use diri_proto::{AgentAccountProfile, AgentKind, SwitchAccountResult};
+use sha2::{Digest, Sha256};
 use std::{
+    collections::HashMap,
     fs,
     io::{Read, Write},
     process::{Command, Stdio},
+    sync::{LazyLock, Mutex},
     time::{Instant, SystemTime, UNIX_EPOCH},
 };
 
@@ -357,10 +360,29 @@ pub(super) fn keep_identity(store: &str, account: &Value) {
     }
 }
 
-/// Keep the record of the account whose login `store` holds.
+fn kept_identity(store: &str) -> Option<Value> {
+    read_private(&snapshot_path(store))
+        .ok()
+        .flatten()
+        .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok())
+        .filter(Value::is_object)
+}
+
+fn shared_identity(home: &Path) -> Option<Value> {
+    read_global_config(home)
+        .and_then(|config| config.get("oauthAccount").cloned())
+        .filter(Value::is_object)
+}
+
+/// Keep the record of the account whose login `store` holds, which was in use
+/// until now: the shared record, else the one already kept when it names the
+/// token's account, else the token's own.
 pub(super) fn snapshot_identity(home: &Path, store: &str) {
-    if let Some(account) = store_identity(Store::Slot(store), home) {
-        keep_identity(store, &account);
+    let kept = kept_identity(store);
+    let asked = read_login(Store::Slot(store), home).and_then(|login| login_owner(&login));
+    match choose_identity(asked, [shared_identity(home), kept.clone()]) {
+        Some(account) if Some(&account) != kept.as_ref() => keep_identity(store, &account),
+        _ => {}
     }
 }
 
@@ -369,28 +391,101 @@ pub(super) fn snapshot_identity(home: &Path, store: &str) {
 /// Every running Claude Code rewrites that file, so after a switch an old
 /// session can leave its own account there beside another account's login.
 pub(super) fn store_identity(store: Store<'_>, home: &Path) -> Option<Value> {
-    let shared = read_global_config(home)
-        .and_then(|config| config.get("oauthAccount").cloned())
-        .filter(Value::is_object);
-    let Some(asked) = token_identity(store, home) else {
-        return shared;
-    };
-    let same = |a: &Value| {
-        ["accountUuid", "organizationUuid"]
-            .iter()
-            .all(|key| a.get(key) == asked.get(key))
-    };
-    // The shared record is fuller when it names the same account.
-    Some(shared.filter(same).unwrap_or(asked))
+    login_identity(read_login(store, home).as_ref(), home)
 }
 
-/// The account a store's login belongs to, as Anthropic names it when asked
-/// with its access token, as Claude Code asks after a sign-in. Only while
-/// that token is valid: Diri never refreshes one. `None` when not asked.
-fn token_identity(store: Store<'_>, home: &Path) -> Option<Value> {
-    let login = read_login(store, home)?;
+/// [`store_identity`] for a login already read.
+pub(super) fn login_identity(login: Option<&Value>, home: &Path) -> Option<Value> {
+    choose_identity(login.and_then(login_owner), [shared_identity(home)])
+}
+
+/// Repair a saved slot's record when its token names another account, as an
+/// older Diri could have kept. Asked once per slot per Engine run (again
+/// after a while when the token could not be asked).
+pub(super) fn verify_identity(store: &str, home: &Path) {
+    static VERIFIED: LazyLock<Mutex<HashMap<String, Option<Instant>>>> =
+        LazyLock::new(Default::default);
+    {
+        let Ok(mut verified) = VERIFIED.lock() else {
+            return;
+        };
+        match verified.get(store) {
+            Some(None) => return,
+            Some(Some(at)) if at.elapsed() < ASK_AGAIN_AFTER => return,
+            _ => {}
+        }
+        verified.insert(store.to_owned(), Some(Instant::now()));
+    }
+    let Some(asked) = read_login(Store::Slot(store), home).and_then(|login| login_owner(&login))
+    else {
+        return;
+    };
+    if let Ok(mut verified) = VERIFIED.lock() {
+        verified.insert(store.to_owned(), None);
+    }
+    let kept = kept_identity(store);
+    let signed_in = super::account_overview::signed_in_account(store);
+    let recorded = kept.as_ref().or(signed_in.as_ref());
+    if recorded.is_some_and(|record| !same_account(record, &asked)) {
+        let chosen = signed_in
+            .filter(|s| same_account(s, &asked))
+            .unwrap_or(asked);
+        keep_identity(store, &chosen);
+    }
+}
+
+/// A token's answer is asked again after this long when it could not be had.
+const ASK_AGAIN_AFTER: Duration = Duration::from_secs(5 * 60);
+
+/// Whether two `oauthAccount` records name the same account. An organization
+/// is compared only when both name one: older records leave it out.
+fn same_account(a: &Value, b: &Value) -> bool {
+    let text = |v: &Value, key: &str| v.get(key).and_then(Value::as_str).map(str::to_owned);
+    text(a, "accountUuid").is_some()
+        && text(a, "accountUuid") == text(b, "accountUuid")
+        && match (text(a, "organizationUuid"), text(b, "organizationUuid")) {
+            (Some(x), Some(y)) => x == y,
+            _ => true,
+        }
+}
+
+/// The first record that names the account `asked` names (records are
+/// fuller than the token's answer), else that answer. Without an answer,
+/// the first record.
+fn choose_identity<const N: usize>(
+    asked: Option<Value>,
+    records: [Option<Value>; N],
+) -> Option<Value> {
+    let mut records = records.into_iter().flatten();
+    let Some(asked) = asked else {
+        return records.next();
+    };
+    Some(records.find(|r| same_account(r, &asked)).unwrap_or(asked))
+}
+
+/// Who a login belongs to, as Anthropic names it when asked with its access
+/// token, as Claude Code asks after a sign-in. Asked only while that token is
+/// valid: Diri never refreshes one. An answer is kept for the Engine run
+/// under the login's refresh token, which outlives its access tokens, so it
+/// still names the login once the access token expires.
+fn login_owner(login: &Value) -> Option<Value> {
+    /// Each refresh token's answer, and when it was had.
+    type Owners = HashMap<[u8; 32], (Instant, Option<Value>)>;
+    static OWNERS: LazyLock<Mutex<Owners>> = LazyLock::new(Default::default);
     let oauth = login.get("claudeAiOauth")?;
     let token = oauth.get("accessToken")?.as_str()?;
+    let key: [u8; 32] = Sha256::digest(
+        oauth
+            .get("refreshToken")
+            .and_then(Value::as_str)
+            .unwrap_or(token),
+    )
+    .into();
+    if let Some((at, owner)) = OWNERS.lock().ok()?.get(&key)
+        && (owner.is_some() || at.elapsed() < ASK_AGAIN_AFTER)
+    {
+        return owner.clone();
+    }
     let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .ok()?
@@ -402,13 +497,20 @@ fn token_identity(store: Store<'_>, home: &Path) -> Option<Value> {
     {
         return None;
     }
-    profile_record(&ask_profile(token)?)
+    let owner = ask_profile(token).as_ref().and_then(profile_record);
+    let mut owners = OWNERS.lock().ok()?;
+    if owners.len() >= 64 {
+        owners.clear();
+    }
+    owners.insert(key, (Instant::now(), owner.clone()));
+    owner
 }
 
 /// A store's login as Claude Code reads it: on macOS the Keychain item, else
-/// (or failing that) the credentials file.
-fn read_login(store: Store<'_>, home: &Path) -> Option<Value> {
-    if cfg!(target_os = "macos")
+/// (or failing that) the credentials file. Tests read only files: never a
+/// real login from the Keychain.
+pub(super) fn read_login(store: Store<'_>, home: &Path) -> Option<Value> {
+    if cfg!(all(target_os = "macos", not(test)))
         && let Ok((0, secret)) = security(
             &[
                 "find-generic-password",
@@ -464,7 +566,9 @@ fn ask_profile(token: &str) -> Option<Value> {
     {
         return None;
     }
-    let mut child = Command::new("/usr/bin/curl")
+    let mut command = Command::new(diri_platform::curl_executable());
+    diri_platform::hide_console_window(&mut command);
+    let mut child = command
         .args([
             "-q",
             "--silent",
@@ -733,6 +837,19 @@ exit $LASTEXITCODE
             ));
         }
         let previous = self.current_claude_store()?;
+        // Ask whose the outgoing login is now, while its tabs still run: the
+        // answer is kept, so recording it below asks nobody.
+        match &previous {
+            Some(previous) if previous != &store => {
+                read_login(Store::Slot(previous), &home).and_then(|login| login_owner(&login));
+            }
+            Some(_) => {}
+            None => {
+                if self.default_store_heirs(&store).next().is_some() {
+                    store_identity(Store::Default, &home);
+                }
+            }
+        }
         let records = self.open_local_tabs(&AgentKind::CLAUDE_CODE)?;
         let mut result = SwitchAccountResult::default();
         let mut prepared = Vec::new();
@@ -1041,26 +1158,25 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let home = tmp.path().join(".claude");
         directory(&home).unwrap();
-        // An old session of b wrote its account back into the shared record.
-        write_private(
-            &global_config_path(&home),
-            br#"{"oauthAccount":{"accountUuid":"b","organizationUuid":"ob","emailAddress":"b@example.test","billingType":"stripe"}}"#,
-        )
-        .unwrap();
-        let slot = tmp.path().join("slot");
-        directory(&slot).unwrap();
-        let store = slot.to_str().unwrap();
-        let token = format!("token-for-{store}");
-        let login = |expires: u64| {
-            let login =
-                serde_json::json!({"claudeAiOauth": {"accessToken": token, "expiresAt": expires}});
+        let shared = |record: &str| {
             write_private(
-                &slot.join(".credentials.json"),
-                login.to_string().as_bytes(),
+                &global_config_path(&home),
+                format!(r#"{{"oauthAccount":{record}}}"#).as_bytes(),
             )
             .unwrap();
         };
-        let answer = |user: &str| {
+        // An old session of b wrote its account back into the shared record.
+        shared(
+            r#"{"accountUuid":"b","organizationUuid":"ob","emailAddress":"b@example.test","billingType":"stripe"}"#,
+        );
+        let slot = tmp.path().join("slot");
+        directory(&slot).unwrap();
+        let store = slot.to_str().unwrap();
+        // Each step signs in afresh: a token's answer is kept for the run.
+        let step = std::cell::Cell::new(0);
+        let login = |user: &str, expires: u64| {
+            step.set(step.get() + 1);
+            let token = format!("token-{}-{store}", step.get());
             PROFILES.lock().unwrap().insert(
                 token.clone(),
                 serde_json::json!({
@@ -1068,27 +1184,94 @@ mod tests {
                     "organization": {"uuid": format!("o{user}"), "name": user.to_uppercase()}
                 }),
             );
+            let login = serde_json::json!({"claudeAiOauth": {
+                "accessToken": token, "refreshToken": format!("refresh-{token}"), "expiresAt": expires
+            }});
+            write_private(
+                &slot.join(".credentials.json"),
+                login.to_string().as_bytes(),
+            )
+            .unwrap();
+            login
         };
         let saved = || -> Value {
             snapshot_identity(&home, store);
-            serde_json::from_slice(&read_private(&snapshot_path(store)).unwrap().unwrap()).unwrap()
+            kept_identity(store).unwrap()
         };
+        const LATER: u64 = 32_503_680_000_000;
 
-        login(32_503_680_000_000);
-        answer("a");
+        login("a", LATER);
         let a = saved();
         assert_eq!(
             a["emailAddress"], "a@example.test",
             "the token's account, not b"
         );
         assert_eq!(a["organizationName"], "A");
-        // When the token names the same account, the fuller shared record stays.
-        answer("b");
+        // A fuller record already kept for a is not replaced by the answer.
+        keep_identity(
+            store,
+            &serde_json::json!({
+                "accountUuid": "a", "organizationUuid": "oa", "emailAddress": "a@example.test",
+                "billingType": "kept"
+            }),
+        );
+        login("a", LATER);
+        assert_eq!(saved()["billingType"], "kept");
+        // When the shared record names the token's account, it is kept, even
+        // without the organization an older Claude Code left out.
+        shared(r#"{"accountUuid":"b","emailAddress":"b@example.test","billingType":"stripe"}"#);
+        login("b", LATER);
         assert_eq!(saved()["billingType"], "stripe");
-        // An expired token is never used: the shared record stands.
-        answer("a");
-        login(1_000);
+        // An expired token is never asked: the shared record stands...
+        shared(r#"{"accountUuid":"b","organizationUuid":"ob","emailAddress":"b@example.test"}"#);
+        let expired = login("a", 1_000);
         assert_eq!(saved()["emailAddress"], "b@example.test");
+        // ...unless its login was asked while valid: the refresh token stays.
+        let mut valid = expired.clone();
+        valid["claudeAiOauth"]["expiresAt"] = LATER.into();
+        assert_eq!(login_owner(&valid).unwrap()["accountUuid"], "a");
+        assert_eq!(login_owner(&expired).unwrap()["accountUuid"], "a");
+        assert_eq!(saved()["emailAddress"], "a@example.test");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_slot_kept_under_another_account_is_repaired_once() {
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path().join(".claude");
+        directory(&home).unwrap();
+        let slot = tmp.path().join("slot");
+        directory(&slot).unwrap();
+        let store = slot.to_str().unwrap();
+        let token = format!("verify-{store}");
+        PROFILES.lock().unwrap().insert(
+            token.clone(),
+            serde_json::json!({
+                "account": {"uuid": "a", "email": "a@example.test"},
+                "organization": {"uuid": "oa", "name": "A"}
+            }),
+        );
+        let login = serde_json::json!({"claudeAiOauth": {"accessToken": token, "expiresAt": 32_503_680_000_000u64}});
+        write_private(
+            &slot.join(".credentials.json"),
+            login.to_string().as_bytes(),
+        )
+        .unwrap();
+        // An older Diri kept b's record for a's login.
+        let b = serde_json::json!({"accountUuid": "b", "organizationUuid": "ob", "emailAddress": "b@example.test"});
+        keep_identity(store, &b);
+        verify_identity(store, &home);
+        assert_eq!(
+            kept_identity(store).unwrap()["emailAddress"],
+            "a@example.test"
+        );
+        // Verified for this run: not asked again.
+        keep_identity(store, &b);
+        verify_identity(store, &home);
+        assert_eq!(
+            kept_identity(store).unwrap()["emailAddress"],
+            "b@example.test"
+        );
     }
 
     #[cfg(unix)]
