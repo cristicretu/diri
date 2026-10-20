@@ -3509,7 +3509,9 @@ impl ControlServer {
         };
         let session_end = p.kind == "claude-hook" && p.event.as_deref() == Some("SessionEnd");
         let prompt = p.kind == "claude-hook" && p.event.as_deref() == Some("UserPromptSubmit");
-        let speak = prompt && reads_session_aloud(&session_id.0);
+        let context = prompt
+            .then(|| prompt_hook_context(app_prefs().as_deref(), &session_id.0))
+            .flatten();
         // Never wait on the Registry here: the Agent is blocked on this reply.
         self.hook_reports
             .submit(
@@ -3523,8 +3525,8 @@ impl ControlServer {
                 },
             )
             .map_err(poisoned)?;
-        if speak {
-            return Ok(json!({ "additionalContext": diri_proto::voice::SPOKEN_INSTRUCTION }));
+        if let Some(context) = context {
+            return Ok(json!({ "additionalContext": context }));
         }
         Ok(json!({}))
     }
@@ -7125,7 +7127,25 @@ impl SpokenSummaries {
 
 #[cfg(test)]
 mod spoken_summary_tests {
-    use super::SpokenSummaries;
+    use super::{SpokenSummaries, prompt_hook_context};
+
+    #[test]
+    fn only_tabs_i_pick_adds_no_prompt_context_to_an_unpicked_tab() {
+        let only_picked = br#"{"talkWithAgent":true,"talkReadsByDefault":false,"talkExceptions":[],"talkDictation":true,"talkAnswer":"wisprFlow"}"#;
+        assert_eq!(prompt_hook_context(Some(only_picked), "s_a"), None);
+
+        let picked =
+            br#"{"talkWithAgent":true,"talkReadsByDefault":false,"talkExceptions":["s_a"]}"#;
+        assert_eq!(
+            prompt_hook_context(Some(picked), "s_a"),
+            Some(diri_proto::voice::SPOKEN_INSTRUCTION)
+        );
+        assert_eq!(prompt_hook_context(Some(picked), "s_b"), None);
+
+        let every_tab = br#"{"talkWithAgent":true,"talkReadsByDefault":true,"talkExceptions":[]}"#;
+        assert!(prompt_hook_context(Some(every_tab), "s_b").is_some());
+        assert_eq!(prompt_hook_context(None, "s_a"), None);
+    }
 
     #[test]
     fn a_summary_is_read_once_and_only_for_its_turn() {
@@ -7165,6 +7185,14 @@ fn talk_with_agent_enabled() -> bool {
 /// speaker and its mute), so only that session is asked for a summary.
 fn reads_session_aloud(session_id: &str) -> bool {
     app_prefs().is_some_and(|prefs| diri_proto::voice::reads_session_aloud(&prefs, session_id))
+}
+
+/// What Claude Code's prompt hook adds for this session: the speak request
+/// only when the app reads that tab aloud.
+fn prompt_hook_context(prefs: Option<&[u8]>, session_id: &str) -> Option<&'static str> {
+    prefs
+        .is_some_and(|prefs| diri_proto::voice::reads_session_aloud(prefs, session_id))
+        .then_some(diri_proto::voice::SPOKEN_INSTRUCTION)
 }
 
 fn app_prefs() -> Option<Vec<u8>> {
