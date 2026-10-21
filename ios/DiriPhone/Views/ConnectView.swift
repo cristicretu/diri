@@ -215,7 +215,9 @@ enum PairingHelp {
     case DiriClient.Failure.unauthorized:
       "This code is no longer valid. Scan the current code in Diri → Settings → Phone access on your Mac."
     case DiriClient.Failure.daemonUnreachable:
-      "Your Mac answered, but its session engine isn’t ready. Open Diri on the Mac and try again."
+      // A transport failure: the request never got an answer. Usually the
+      // tailnet's access policy (a custom ACL may allow nothing into the Mac).
+      "Your iPhone couldn’t reach Diri on your Mac. Keep Diri open with phone access on, and check that Tailscale lets your devices connect to this Mac (a custom access policy may block it). Then try again."
     case DiriClient.Failure.http(400, _):
       "Use the pairing code or link from Diri → Settings → Phone access on your Mac."
     case DiriClient.Failure.malformed:

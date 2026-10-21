@@ -31,8 +31,15 @@ final class VoiceController {
         didSet { if muted, phase == .speaking { synthesizer.stopSpeaking(at: .immediate); phase = .idle } }
     }
 
-    /// Silence after speech that ends an utterance.
-    static let silenceToSend: Duration = .milliseconds(1500)
+    /// Silence after speech that ends an utterance. The recogniser revises
+    /// its text in bursts and people pause mid-thought, so 1.5 s cut sentences.
+    static let silenceToSend: Duration = .milliseconds(2500)
+    /// Mic level (0…1, about −36 dBFS) that counts as still talking, even
+    /// while the recogniser has not caught up with new words.
+    static let speakingLevel: Float = 0.35
+    /// Loud audio may hold the send only this long past the last new words,
+    /// so a noisy gym cannot keep the microphone open forever.
+    static let loudHold: Duration = .seconds(3)
     /// Nothing heard at all for this long: stop listening rather than leave
     /// the microphone hot.
     static let nothingHeard: Duration = .seconds(10)
@@ -46,6 +53,7 @@ final class VoiceController {
     private var silenceTask: Task<Void, Never>?
     private var lastHandledTurn: Int?
     private var lastHeardChange = ContinuousClock.now
+    private var lastLoud = ContinuousClock.now
     private var previousReadAloud: Bool?
     private var autoListenAfterSpeech = false
     private var currentUtterance: ObjectIdentifier?
@@ -70,6 +78,7 @@ final class VoiceController {
                 // flickers with every buffer.
                 let next = Double(value)
                 self.level = next > self.level ? next : self.level * 0.8 + next * 0.2
+                if value >= Self.speakingLevel { self.lastLoud = .now }
             }
         }
     }
@@ -239,6 +248,8 @@ final class VoiceController {
         level = 0
         phase = .listening
         lastHeardChange = .now
+        lastLoud = .now
+        dictation.play(.listening)
         do {
             try await dictation.begin { [weak self] text in
                 guard let self, self.phase == .listening, text != self.heard else { return }
@@ -262,8 +273,9 @@ final class VoiceController {
             while !Task.isCancelled {
                 try? await Task.sleep(for: .milliseconds(200))
                 guard let self, self.phase == .listening else { return }
-                let quiet = ContinuousClock.now - self.lastHeardChange
-                if !self.heard.isEmpty, quiet >= Self.silenceToSend {
+                let now = ContinuousClock.now
+                if !self.heard.isEmpty,
+                   Self.utteranceEnded(sinceWords: now - self.lastHeardChange, sinceLoud: now - self.lastLoud) {
                     // Outside this task: finishing cancels the silence task,
                     // and the send must not inherit that cancellation.
                     Task { await self.finishListening() }
@@ -276,6 +288,13 @@ final class VoiceController {
                 }
             }
         }
+    }
+
+    /// Whether a pause ends the utterance: no new words for `silenceToSend`,
+    /// and no loud audio either, unless the words stopped `loudHold` ago.
+    nonisolated static func utteranceEnded(sinceWords: Duration, sinceLoud: Duration) -> Bool {
+        guard sinceWords >= silenceToSend else { return false }
+        return sinceLoud >= silenceToSend || sinceWords >= silenceToSend + loudHold
     }
 
     private func finishListening() async {
@@ -295,11 +314,15 @@ final class VoiceController {
             lastSent = text
             heard = ""
             phase = .waiting
+            dictation.play(.sent)
         } catch {
             // Never retried automatically: the send may have arrived even
             // though the response did not.
             self.error = "Not confirmed: \(error.localizedDescription) Check the session before saying it again."
             phase = .idle
+            dictation.play(.failed)
+            // With the phone in a pocket the tone alone is ambiguous.
+            if !muted { synthesizer.speak(AVSpeechUtterance(string: "Not sent. Check the session before saying it again.")) }
         }
     }
 }

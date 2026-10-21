@@ -52,6 +52,10 @@ final class Dictation {
 
     private let engine = AVAudioEngine()
     private let relay = TapRelay()
+    /// Plays the cues through the same running engine, so they reach the
+    /// headphones with the screen locked, where system sounds may not.
+    private let cuePlayer = AVAudioPlayerNode()
+    private let cueFormat = AVAudioFormat(standardFormatWithSampleRate: 44_100, channels: 1)!
     /// Loudness of each microphone buffer, 0…1, on the audio thread.
     var onLevel: (@Sendable (Float) -> Void)? {
         get { relay.onLevel }
@@ -79,9 +83,48 @@ final class Dictation {
         input.installTap(onBus: 0, bufferSize: 2048, format: format) { buffer, _ in
             relay.deliver(buffer)
         }
+        engine.attach(cuePlayer)
+        engine.connect(cuePlayer, to: engine.mainMixerNode, format: cueFormat)
         engine.prepare()
         try engine.start()
         engineRunning = true
+    }
+
+    /// Short tones that say what happened without a screen: listening began,
+    /// the message was sent, or it was not.
+    enum Cue { case listening, sent, failed }
+
+    func play(_ cue: Cue) {
+        guard engineRunning else { return }
+        let samples = Self.samples(for: cue, sampleRate: cueFormat.sampleRate)
+        guard let buffer = AVAudioPCMBuffer(pcmFormat: cueFormat, frameCapacity: AVAudioFrameCount(samples.count)),
+              let channel = buffer.floatChannelData?[0] else { return }
+        buffer.frameLength = AVAudioFrameCount(samples.count)
+        samples.withUnsafeBufferPointer { channel.update(from: $0.baseAddress!, count: samples.count) }
+        cuePlayer.scheduleBuffer(buffer, at: nil, options: .interrupts)
+        if !cuePlayer.isPlaying { cuePlayer.play() }
+    }
+
+    /// Rising for listening, a bright double ding for sent, falling and low
+    /// for failed. Each tone fades in and out over 5 ms so it never clicks.
+    nonisolated static func samples(for cue: Cue, sampleRate: Double) -> [Float] {
+        let tones: [(hertz: Double, seconds: Double)] = switch cue {
+        case .listening: [(660, 0.07), (880, 0.09)]
+        case .sent: [(880, 0.08), (0, 0.04), (1320, 0.12)]
+        case .failed: [(330, 0.18), (220, 0.22)]
+        }
+        var samples: [Float] = []
+        for tone in tones {
+            let count = Int(tone.seconds * sampleRate)
+            let fade = max(1, Int(0.005 * sampleRate))
+            for index in 0..<count {
+                guard tone.hertz > 0 else { samples.append(0); continue }
+                let envelope = Float(min(1, Double(min(index, count - 1 - index)) / Double(fade)))
+                let phase = 2 * Double.pi * tone.hertz * Double(index) / sampleRate
+                samples.append(0.25 * envelope * Float(sin(phase)))
+            }
+        }
+        return samples
     }
 
     func stopEngine() {
