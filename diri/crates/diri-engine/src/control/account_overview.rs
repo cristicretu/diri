@@ -3,7 +3,8 @@
 //! `account.overview` reads, for every local profile that shares its Agent's
 //! home, whose login it holds (email, organization, plan) and which login new
 //! tabs use now -- including one that no profile holds yet. Identities come
-//! from the logins themselves (Codex's ID token, Claude's account record).
+//! from the logins themselves (Codex's ID token; for Claude, the account its
+//! token names, else its account record).
 //! Nothing here returns or logs a credential.
 //!
 //! `account.adopt` saves the login in use now as a profile named after its
@@ -385,22 +386,26 @@ impl ControlServer {
                     .map(|k| k.identity.clone())
                     .unwrap_or_default(),
             });
-        } else if let Some(known) = claude::read_global_config(&homes.claude)
-            .and_then(|config| config.get("oauthAccount").cloned())
-            .and_then(|account| claude_identity(&account))
-            && claude::has_login(Store::Default, &homes.claude).unwrap_or(true)
-        {
-            let owner = catalog
-                .profiles
-                .iter()
-                .filter(|p| p.agent == AgentKind::CLAUDE_CODE_ID && shares_home(p))
-                .find(|p| known_of(&p.id).is_some_and(|k| k.same_account(&known)))
-                .map(|p| p.id.clone());
-            live.push(AgentLiveLogin {
-                agent: AgentKind::CLAUDE_CODE_ID.into(),
-                profile_id: owner,
-                identity: known.identity,
-            });
+        } else {
+            let login = claude::read_login(Store::Default, &homes.claude);
+            // Named by its token: the shared record can name another account.
+            if let Some(known) = claude::login_identity(login.as_ref(), &homes.claude)
+                .and_then(|account| claude_identity(&account))
+                && (login.is_some()
+                    || claude::has_login(Store::Default, &homes.claude).unwrap_or(true))
+            {
+                let owner = catalog
+                    .profiles
+                    .iter()
+                    .filter(|p| p.agent == AgentKind::CLAUDE_CODE_ID && shares_home(p))
+                    .find(|p| known_of(&p.id).is_some_and(|k| k.same_account(&known)))
+                    .map(|p| p.id.clone());
+                live.push(AgentLiveLogin {
+                    agent: AgentKind::CLAUDE_CODE_ID.into(),
+                    profile_id: owner,
+                    identity: known.identity,
+                });
+            }
         }
 
         Ok(AgentAccountOverview {
@@ -462,6 +467,9 @@ impl ControlServer {
             return (login, None);
         };
         login.signing_in = open.contains(store);
+        if !login.signing_in {
+            claude::verify_identity(store, &homes.claude);
+        }
         let mut known = claude_store_identity(store);
         login.signed_in = known.is_some()
             || claude::has_login(Store::Slot(store), &homes.claude).unwrap_or(false);
@@ -522,32 +530,42 @@ impl ControlServer {
     /// switching away, so switching back does not land a stale copy. Best
     /// effort: the default store itself is never changed.
     pub(super) fn save_default_store_login(&self, home: &Path, except_store: &str) {
-        let Some(live) = claude::read_global_config(home)
-            .and_then(|config| config.get("oauthAccount").cloned())
+        let heirs: Vec<(String, Known)> = self.default_store_heirs(except_store).collect();
+        if heirs.is_empty() {
+            return;
+        }
+        let Some(live) = claude::store_identity(Store::Default, home)
             .and_then(|account| claude_identity(&account))
         else {
             return;
         };
-        let Ok(catalog) = self
+        if let Some((store, _)) = heirs.iter().find(|(_, k)| k.same_account(&live)) {
+            let _ = claude::copy_login(Store::Default, Store::Slot(store), home);
+        }
+    }
+
+    /// Local Claude stores, other than `except_store`, holding a record Diri
+    /// saved from the default store: only those take its latest login. One
+    /// signed in through its own tab may hold a newer login of the same
+    /// account.
+    pub(super) fn default_store_heirs(
+        &self,
+        except_store: &str,
+    ) -> impl Iterator<Item = (String, Known)> {
+        let catalog = self
             .accounts
             .lock()
             .map_err(poisoned)
             .and_then(|a| a.catalog())
-        else {
-            return;
-        };
-        // Only a profile whose record came from the default store: one signed
-        // in through its own tab may hold a newer login of the same account.
-        if let Some(store) = catalog
+            .unwrap_or_default();
+        let except_store = except_store.to_owned();
+        catalog
             .profiles
-            .iter()
+            .into_iter()
             .filter(|p| p.agent == AgentKind::CLAUDE_CODE_ID && p.host.is_none())
-            .filter_map(|p| p.login_store.as_deref())
-            .filter(|store| *store != except_store)
-            .find(|store| saved_record(store).is_some_and(|k| k.same_account(&live)))
-        {
-            let _ = claude::copy_login(Store::Default, Store::Slot(store), home);
-        }
+            .filter_map(|p| p.login_store)
+            .filter(move |store| *store != except_store)
+            .filter_map(|store| saved_record(&store).map(|known| (store, known)))
     }
 
     /// A name the user chose is never replaced by the email's.
@@ -692,9 +710,10 @@ impl ControlServer {
                 current.label
             )));
         }
-        let live = claude::read_global_config(home)
-            .and_then(|config| config.get("oauthAccount").cloned())
-            .and_then(|account| claude_identity(&account));
+        // Named after the account its token belongs to: the shared record can
+        // name another one (see `claude::store_identity`).
+        let record = claude::store_identity(Store::Default, home);
+        let live = record.as_ref().and_then(claude_identity);
         // Refresh a profile saved from the default store before. One signed in
         // through its own tab keeps its login: the default store's record may
         // be all that matches it.
@@ -733,7 +752,9 @@ impl ControlServer {
         let store = slot.to_string_lossy().into_owned();
         Self::forget_claude_identity(&slot);
         claude::copy_login(Store::Default, Store::Slot(&store), home)?;
-        claude::snapshot_identity(home, &store);
+        if let Some(record) = &record {
+            claude::keep_identity(&store, record);
+        }
         let id = profile.id.clone();
         self.adopt_claude_slot(profile, home, &slot)?;
         Ok(id)
@@ -1142,6 +1163,60 @@ mod tests {
                 .as_deref(),
             Some("side@corp.test")
         );
+    }
+
+    #[test]
+    fn the_claude_login_in_use_is_named_by_its_token() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (server, homes) = sandbox(tmp.path());
+        // An old session of a wrote a's account beside b's login.
+        claude::write_private(
+            &homes.claude.parent().unwrap().join(".claude.json"),
+            br#"{"oauthAccount":{"accountUuid":"a1","organizationUuid":"o1","emailAddress":"me@example.test"}}"#,
+        )
+        .unwrap();
+        let token = format!("overview-{}", tmp.path().display());
+        claude::PROFILES.lock().unwrap().insert(
+            token.clone(),
+            serde_json::json!({
+                "account": {"uuid": "b1", "email": "b@example.test"},
+                "organization": {"uuid": "o2", "name": "B's"}
+            }),
+        );
+        claude::write_private(
+            &homes.claude.join(".credentials.json"),
+            serde_json::json!({"claudeAiOauth": {"accessToken": token, "expiresAt": 32_503_680_000_000u64}})
+                .to_string()
+                .as_bytes(),
+        )
+        .unwrap();
+        // a's saved profile is not the one in use.
+        let slot = tmp.path().join("claude-logins/mine");
+        fs::create_dir_all(slot.parent().unwrap()).unwrap();
+        claude::write_private(
+            &claude::snapshot_path(&slot.to_string_lossy()),
+            br#"{"accountUuid":"a1","organizationUuid":"o1","emailAddress":"me@example.test"}"#,
+        )
+        .unwrap();
+        server
+            .accounts
+            .lock()
+            .unwrap()
+            .upsert(AgentAccountProfile {
+                id: "mine".into(),
+                label: "Mine".into(),
+                agent: "claude-code".into(),
+                host: None,
+                config_home: homes.claude.to_string_lossy().into_owned(),
+                is_default: false,
+                login_store: Some(slot.to_string_lossy().into_owned()),
+            })
+            .unwrap();
+        let overview = server.overview_at(&homes).unwrap();
+        let live = overview.live(AgentKind::CLAUDE_CODE_ID).unwrap();
+        assert_eq!(live.identity.email.as_deref(), Some("b@example.test"));
+        assert_eq!(live.identity.organization.as_deref(), Some("B's"));
+        assert_eq!(live.profile_id, None, "a's profile is not in use");
     }
 
     #[test]
