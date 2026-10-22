@@ -68,6 +68,7 @@ Monograms (Inter Bold, OFL 1.1), and why there is no logo:
 | `crush` | Crush | C | PNG under FSL-1.1; mark is Charm's trademark |
 | `devin` | Devin | D | Brand kit grants no redistribution licence |
 | `droid` | Droid | Dr | Website favicon, no licence stated |
+| `fx` | fx | fx | No published mark |
 | `hermes` | Hermes | H | The logo is a detailed portrait that does not survive 14 px |
 | `maki` | Maki | M | No published mark |
 | `mcode` | MCode | Mc | No published mark |
