@@ -941,6 +941,7 @@ mod tests {
             host: None,
             config_home: home.to_string_lossy().into_owned(),
             is_default: id == "one",
+            unset_environment: Vec::new(),
             login_store: Some(
                 tmp.path()
                     .join("claude-logins")
@@ -948,6 +949,8 @@ mod tests {
                     .to_string_lossy()
                     .into_owned(),
             ),
+            environment: Default::default(),
+            launch_args: Vec::new(),
         });
         for (profile, slot) in profiles.iter().zip(&slots) {
             server

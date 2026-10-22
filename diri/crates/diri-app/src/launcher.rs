@@ -4788,7 +4788,10 @@ mod tests {
             host: host.map(str::to_owned),
             config_home: format!("~/.{agent}-{id}"),
             is_default: default,
+            unset_environment: Vec::new(),
             login_store: None,
+            environment: Default::default(),
+            launch_args: Vec::new(),
         }
     }
 
@@ -4808,6 +4811,8 @@ mod tests {
                 account_fixture("personal", "codex", None, false),
                 account_fixture("remote", "codex", Some("server"), true),
                 account_fixture("claude", "claude-code", None, true),
+                account_fixture("gemini-work", "gemini", None, true),
+                account_fixture("gemini-personal", "gemini", None, false),
             ];
             launcher.selected_harness = AgentKind::CODEX;
             launcher.selected_root = "/tmp".into();
@@ -4844,6 +4849,26 @@ mod tests {
             assert_eq!(launcher.account_choices().len(), 3);
             recipe.account_profile_id = Some(String::new());
             assert!(launcher.validate_recipe_account(&recipe).is_ok());
+            launcher.selected_host = None;
+            launcher.selected_harness = AgentKind::new("gemini");
+            assert!(launcher.show_account_picker());
+            assert_eq!(launcher.account_choices().len(), 4);
+            let mut gemini_recipe = LaunchRecipe::draft(
+                "Gemini Work",
+                AgentKind::new("gemini"),
+                RecipeProject::Path {
+                    path: "/tmp".into(),
+                },
+                None,
+                "Check this",
+            );
+            gemini_recipe.account_profile_id = Some("gemini-work".into());
+            assert!(launcher.validate_recipe_account(&gemini_recipe).is_ok());
+            gemini_recipe.account_profile_id = Some("work".into());
+            assert!(matches!(
+                launcher.validate_recipe_account(&gemini_recipe),
+                Err(RecipeIssue::AccountUnavailable)
+            ));
         });
     }
 

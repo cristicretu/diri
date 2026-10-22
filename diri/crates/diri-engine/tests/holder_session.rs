@@ -212,7 +212,10 @@ fn a_capsule_and_hook_seed_recover_a_holder_when_global_state_is_gone() {
         host: None,
         config_home: "/tmp/work-claude".into(),
         is_default: false,
+        unset_environment: Vec::new(),
         login_store: None,
+        environment: Default::default(),
+        launch_args: Vec::new(),
     };
     store
         .write_capsule(&diri_proto::recovery::SessionRecoveryCapsule {

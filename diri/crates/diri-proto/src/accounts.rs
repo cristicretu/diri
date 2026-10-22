@@ -19,6 +19,18 @@ pub struct AgentAccountProfile {
     /// isolated-home behaviour driven by `config_home`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub login_store: Option<String>,
+    /// Launch environment for this Agent profile. Values may contain the
+    /// `{home}` token, resolved against `config_home` on the execution host.
+    /// Empty keeps the original Codex/Claude profile behavior.
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub environment: std::collections::BTreeMap<String, String>,
+    /// Inherited environment names to remove before this Agent starts. This
+    /// keeps ambient credentials or routing from overriding the selected home.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub unset_environment: Vec<String>,
+    /// Each entry is one argv element, never a shell fragment.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub launch_args: Vec<String>,
 }
 
 impl AgentAccountProfile {

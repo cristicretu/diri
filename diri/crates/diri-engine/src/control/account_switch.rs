@@ -54,6 +54,11 @@ impl ControlServer {
                 "Remote profiles are chosen per conversation; the shared switch applies to this Mac.",
             ));
         }
+        if !super::account_overview::shares_home(&profile) {
+            return Err(ControlError::bad_request(
+                "Separate-home profiles are selected per launch; open tabs keep their profile",
+            ));
+        }
         let agent = profile.agent.clone();
         let result = match profile.agent.as_str() {
             AgentKind::CODEX_ID => self.switch_codex(profile),

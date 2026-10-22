@@ -797,8 +797,11 @@ pub(crate) fn preview_overview() -> AgentAccountOverview {
             host: None,
             config_home: String::new(),
             is_default: matches!(*id, "preview-0" | "preview-2"),
+            unset_environment: Vec::new(),
             login_store: None,
-        })
+                    environment: Default::default(),
+            launch_args: Vec::new(),
+})
         .collect();
     let logins = accounts
         .iter()
@@ -939,7 +942,10 @@ mod tests {
             host: host.map(str::to_owned),
             config_home: "/home/me/.claude".into(),
             is_default: false,
+            unset_environment: Vec::new(),
             login_store: store.map(str::to_owned),
+            environment: Default::default(),
+            launch_args: Vec::new(),
         }
     }
 
