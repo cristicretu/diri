@@ -115,6 +115,7 @@ async fn bench_history_page_and_diff_delivery() {
         client: Arc::clone(&client),
         auth: Auth::temporary().unwrap(),
         host_label: "bench".into(),
+        inputs: Default::default(),
     });
     let token = api.auth.token().to_owned();
 

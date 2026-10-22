@@ -19,6 +19,7 @@ use serde_json::{Value, json};
 
 use crate::auth::{self, Auth};
 use crate::http::{Request, Response};
+use crate::input_ledger::InputLedger;
 use crate::turns::TurnWatcher;
 
 /// Long enough for a cold `git diff` on a large repo, short enough that a
@@ -33,6 +34,7 @@ pub struct Api {
     pub client: Arc<DaemonClient>,
     pub auth: Auth,
     pub host_label: String,
+    pub inputs: InputLedger,
 }
 
 impl Api {
@@ -206,8 +208,35 @@ impl Api {
         let Ok(text) = String::from_utf8(bytes) else {
             return Response::error(400, "data must be UTF-8 terminal input");
         };
-        match self.client.send_text(&session_id(id), text, false).await {
-            Ok(()) => Response::json(&json!({ "ok": true })),
+        let session = session_id(id);
+        // `id` lets the phone resend a batch whose reply it lost; `once`
+        // tells it this gateway is safe to resend to.
+        let written = match body.get("id").and_then(Value::as_str) {
+            Some(batch) => {
+                // A timed-out write may still have landed, so its id counts
+                // as delivered: a resend is never written twice.
+                let mut timed_out = None;
+                let delivered = self
+                    .inputs
+                    .deliver(&format!("{id}/{batch}"), || async {
+                        match self.client.send_text(&session, text, false).await {
+                            Err(error @ ClientError::Timeout(_)) => {
+                                timed_out = Some(error);
+                                Ok(())
+                            }
+                            other => other,
+                        }
+                    })
+                    .await;
+                match timed_out {
+                    Some(error) => Err(error),
+                    None => delivered,
+                }
+            }
+            None => self.client.send_text(&session, text, false).await,
+        };
+        match written {
+            Ok(()) => Response::json(&json!({ "ok": true, "once": true })),
             Err(error) => daemon_error(&error),
         }
     }
@@ -577,6 +606,7 @@ mod tests {
             client,
             auth: Auth::temporary().unwrap(),
             host_label: "Mac".into(),
+            inputs: Default::default(),
         };
         for (path, method, body, expected) in [
             ("/api/hosts", "GET", "", Method::HOST_LIST),
@@ -684,6 +714,7 @@ mod tests {
             client: Arc::clone(&engine.client),
             auth: Auth::temporary().unwrap(),
             host_label: "Mac".into(),
+            inputs: Default::default(),
         };
 
         let (status, body) = call(&api, "GET", "/api/session/s_a/transcript", "").await;
@@ -796,6 +827,7 @@ mod tests {
             client: Arc::clone(&engine.client),
             auth: Auth::temporary().unwrap(),
             host_label: "Mac".into(),
+            inputs: Default::default(),
         };
         let text = |line: &Value| line["runs"][0]["t"].as_str().unwrap().to_owned();
 
@@ -878,6 +910,7 @@ mod tests {
             client: Arc::clone(&engine.client),
             auth: Auth::temporary().unwrap(),
             host_label: "Mac".into(),
+            inputs: Default::default(),
         };
         // Ctrl-C, Up, Escape and a paste: exactly these bytes, no Enter, no
         // bracketing.
@@ -904,6 +937,33 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn a_resent_input_batch_is_written_once() {
+        let mut engine = crate::testing::fake_engine(|_, _| json!({})).await;
+        let api = Api {
+            client: Arc::clone(&engine.client),
+            auth: Auth::temporary().unwrap(),
+            host_label: "Mac".into(),
+            inputs: Default::default(),
+        };
+        let batch = json!({ "data": base64_encode(b"deploy\r"), "id": "b1" }).to_string();
+        for _ in 0..2 {
+            let (status, body) = call(&api, "POST", "/api/session/s_a/input", &batch).await;
+            assert_eq!(status, 200);
+            assert_eq!(body["once"], true);
+        }
+        assert!(engine.calls.recv().await.is_some());
+        assert!(
+            engine.calls.try_recv().is_err(),
+            "the resend was not written"
+        );
+
+        // The same batch id on another session is a different batch.
+        let (status, _) = call(&api, "POST", "/api/session/s_b/input", &batch).await;
+        assert_eq!(status, 200);
+        assert!(engine.calls.recv().await.is_some());
+    }
+
     fn base64_encode(bytes: &[u8]) -> String {
         use base64::Engine as _;
         base64::engine::general_purpose::STANDARD.encode(bytes)
@@ -917,6 +977,7 @@ mod tests {
             client: Arc::clone(&engine.client),
             auth: Auth::temporary().unwrap(),
             host_label: "Mac".into(),
+            inputs: Default::default(),
         };
         for (method, path, body) in [
             ("GET", "/api/session/s_a/grid", ""),
@@ -950,6 +1011,7 @@ mod tests {
             client: Arc::clone(&engine.client),
             auth: Auth::temporary().unwrap(),
             host_label: "Mac".into(),
+            inputs: Default::default(),
         });
         let request = tokio::spawn({
             let api = Arc::clone(&api);

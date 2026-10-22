@@ -21,6 +21,7 @@ mod auth;
 #[cfg(test)]
 mod bench;
 mod http;
+mod input_ledger;
 mod terminal;
 #[cfg(test)]
 mod testing;
@@ -275,6 +276,7 @@ async fn serve(config: Config, auth: Auth, minted: bool) -> Result<(), String> {
         client: Arc::clone(&client),
         auth,
         host_label: config.host_label,
+        inputs: Default::default(),
     });
 
     serve_connections(listener, api).await
@@ -327,6 +329,7 @@ pub async fn start_phone_access(
         client,
         auth,
         host_label: label,
+        inputs: Default::default(),
     });
     Ok((url, tokio::spawn(serve_connections(listener, api))))
 }
@@ -617,6 +620,7 @@ mod tests {
             )),
             auth,
             host_label: "test".into(),
+            inputs: Default::default(),
         });
         let server = tokio::spawn(serve_connections(listener, api));
         let mut stream = TcpStream::connect(address).await.unwrap();
@@ -660,6 +664,7 @@ mod tests {
             client: Arc::clone(&engine.client),
             auth,
             host_label: "test".into(),
+            inputs: Default::default(),
         });
         let server = tokio::spawn(serve_connections(listener, api));
         let stream = TcpStream::connect(address).await.unwrap();
@@ -769,6 +774,7 @@ mod tests {
             client: Arc::clone(&engine.client),
             auth,
             host_label: "test".into(),
+            inputs: Default::default(),
         });
         (
             address,

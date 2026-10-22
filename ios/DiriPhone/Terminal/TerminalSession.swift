@@ -40,6 +40,8 @@ final class TerminalSession {
     @ObservationIgnored private var wanted: [Int] = []
     @ObservationIgnored private var outbox: [UInt8] = []
     @ObservationIgnored private var sending = false
+    /// Learned from the first answered batch; until then nothing is resent.
+    @ObservationIgnored private var gatewayDedupesInput = false
     @ObservationIgnored private var warmed = false
     @ObservationIgnored private var lastFocus = 0
 
@@ -237,15 +239,47 @@ final class TerminalSession {
         outbox = []
         let client = client
         let id = sessionID
+        let batchID = UUID().uuidString
+        let resendable = gatewayDedupesInput
         Task { [weak self] in
-            // Keystrokes are not idempotent, so a failed batch is reported,
-            // never resent: the screen shows whether it landed.
-            let failed: Bool
-            do { try await client.input(batch, to: id); failed = false } catch { failed = true }
+            // Keystrokes are not idempotent. A batch is resent only to a
+            // gateway that writes each batch id once; a lost reply to an
+            // older one is reported instead, and the screen shows whether it
+            // landed.
+            var attempt = 0
+            var failed = false
+            while true {
+                do {
+                    let once = try await client.input(batch, to: id, batchID: batchID)
+                    self?.gatewayDedupesInput = once
+                    break
+                } catch {
+                    guard resendable, attempt < Self.inputRetryDelays.count, Self.isTransient(error) else {
+                        failed = true
+                        break
+                    }
+                    try? await Task.sleep(for: Self.inputRetryDelays[attempt])
+                    attempt += 1
+                }
+            }
             guard let self else { return }
             if failed { self.inputFailed = true }
             self.sending = false
             self.flush()
+        }
+    }
+
+    /// Backoff for resending a batch whose reply was lost: covers a Wi-Fi to
+    /// cellular hop or a tailnet reconnect, not a Mac that is off.
+    static let inputRetryDelays: [Duration] = [.milliseconds(300), .seconds(1), .seconds(2), .seconds(4)]
+
+    /// A dropped connection or a gateway that could not reach the Engine. A
+    /// refusal (bad session, bad token) would fail the same way again.
+    static func isTransient(_ error: Error) -> Bool {
+        switch error {
+        case DiriClient.Failure.daemonUnreachable: true
+        case let DiriClient.Failure.http(code, _): code == 502 || code == 503 || code == 504
+        default: false
         }
     }
 

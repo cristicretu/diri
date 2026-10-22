@@ -18,10 +18,15 @@ extension DiriClient {
         return try decode(HistoryPage.self, from: try await send(try request(path)))
     }
 
-    /// Raw bytes to the PTY, exactly as typed.
-    func input(_ bytes: [UInt8], to sessionID: String) async throws {
+    /// Raw bytes to the PTY, exactly as typed. `batchID` names the batch so
+    /// a resend after a lost reply is written once; the result says whether
+    /// this gateway honours that, since an older one would write it twice.
+    @discardableResult
+    func input(_ bytes: [UInt8], to sessionID: String, batchID: String) async throws -> Bool {
         let path = "/api/session/\(escape(sessionID))/input"
-        _ = try await send(try request(path, method: "POST", body: ["data": Data(bytes).base64EncodedString()]))
+        let body: [String: Any] = ["data": Data(bytes).base64EncodedString(), "id": batchID]
+        let reply = try await send(try request(path, method: "POST", body: body))
+        return (try? JSONSerialization.jsonObject(with: reply) as? [String: Any])?["once"] as? Bool ?? false
     }
 
     func resize(sessionID: String, cols: Int, rows: Int) async throws {

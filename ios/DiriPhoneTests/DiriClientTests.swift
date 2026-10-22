@@ -33,6 +33,29 @@ final class DiriClientTests: XCTestCase {
         XCTAssertEqual(request.httpMethod, "GET")
     }
 
+    func testInputNamesTheBatchAndLearnsWhetherResendIsSafe() async throws {
+        StubProtocol.respond(json: #"{"ok":true,"once":true}"#)
+        let once = try await client.input(Array("hi\r".utf8), to: "s_a", batchID: "b1")
+        XCTAssertTrue(once)
+        XCTAssertEqual(StubProtocol.lastRequest?.url?.path, "/api/session/s_a/input")
+        let body = try XCTUnwrap(JSONSerialization.jsonObject(with: try XCTUnwrap(StubProtocol.lastBody)) as? [String: Any])
+        XCTAssertEqual(body["id"] as? String, "b1")
+        XCTAssertEqual(body["data"] as? String, Data("hi\r".utf8).base64EncodedString())
+
+        // An older gateway answers without `once`: never resend to it.
+        StubProtocol.respond(json: #"{"ok":true}"#)
+        let older = try await client.input([0x03], to: "s_a", batchID: "b2")
+        XCTAssertFalse(older)
+    }
+
+    @MainActor
+    func testOnlyDroppedLinksAreRetried() {
+        XCTAssertTrue(TerminalSession.isTransient(DiriClient.Failure.daemonUnreachable("lost")))
+        XCTAssertTrue(TerminalSession.isTransient(DiriClient.Failure.http(502, "engine timeout")))
+        XCTAssertFalse(TerminalSession.isTransient(DiriClient.Failure.http(400, "no such session")))
+        XCTAssertFalse(TerminalSession.isTransient(DiriClient.Failure.unauthorized))
+    }
+
     func testPairingRejectsUnsafeOrAmbiguousURLs() {
         for link in ["file:///tmp?token=t", "ftp://host?token=t", "http://user:pass@host?token=t",
                      "http://host?token=a&token=b", "http://host?token=t#secret", "http://host"] {
