@@ -52,7 +52,7 @@ impl NavigationOverlay {
                         );
                         drop(store);
                         let selected_id = this.highlighted_history().map(|entry| entry.id.clone());
-                        this.history_search.set_prompts(scanner.prompts());
+                        this.history_search.set_search_text(scanner.search_text());
                         this.history_scanner = Some(scanner);
                         if this.overlay.is_none() {
                             // Closed mid-scan: keep the warm scanner, not

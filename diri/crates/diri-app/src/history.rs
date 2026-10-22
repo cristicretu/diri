@@ -67,7 +67,23 @@ pub struct HistoryScanner {
     files: HashMap<PathBuf, CachedTranscript>,
     visited: HashSet<PathBuf>,
     logs: HashMap<PathBuf, PromptLog>,
-    prompts: Arc<HashMap<String, String>>,
+    search_text: Arc<HashMap<String, SearchText>>,
+}
+
+/// What a conversation can be found by besides its title and folder.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct SearchText {
+    /// Git branch and `pr #N owner/repo`, the labels Claude's picker matches.
+    pub labels: String,
+    /// Every prompt the user typed, newline separated.
+    pub prompts: String,
+}
+
+/// Transcript-derived search facts, cached with the entry they belong to.
+#[derive(Clone, Debug, Default)]
+struct TranscriptFacts {
+    first_prompt: Option<String>,
+    labels: String,
 }
 
 struct CachedTranscript {
@@ -75,7 +91,7 @@ struct CachedTranscript {
     len: u64,
     provider_title: Option<String>,
     entry: Option<HistoryEntry>,
-    first_prompt: Option<String>,
+    facts: TranscriptFacts,
 }
 
 /// One provider prompt log, reread only when it changes.
@@ -114,9 +130,9 @@ impl HistoryScanner {
         entries
     }
 
-    /// Prompt text per conversation id, for [`HistorySearch::set_prompts`].
-    pub fn prompts(&self) -> Arc<HashMap<String, String>> {
-        Arc::clone(&self.prompts)
+    /// Search text per conversation id, for [`HistorySearch::set_search_text`].
+    pub fn search_text(&self) -> Arc<HashMap<String, SearchText>> {
+        Arc::clone(&self.search_text)
     }
 
     fn index_prompts(&mut self, roots: &HistoryRoots) {
@@ -149,34 +165,38 @@ impl HistoryScanner {
             );
         }
 
-        let mut index = HashMap::<String, String>::new();
-        let mut append = |id: &str, prompt: &str| {
-            let text = index.entry(id.to_owned()).or_default();
+        let mut index = HashMap::<String, SearchText>::new();
+        let append = |index: &mut HashMap<String, SearchText>, id: &str, prompt: &str| {
+            let text = &mut index.entry(id.to_owned()).or_default().prompts;
             if text.len() + prompt.len() < PROMPT_INDEX_BYTES && !text.contains(prompt) {
                 text.push_str(prompt);
                 text.push('\n');
             }
         };
         for cached in self.files.values() {
-            if let (Some(entry), Some(prompt)) = (&cached.entry, &cached.first_prompt) {
-                append(&entry.id, prompt);
+            let Some(entry) = &cached.entry else {
+                continue;
+            };
+            index.entry(entry.id.clone()).or_default().labels = cached.facts.labels.clone();
+            if let Some(prompt) = &cached.facts.first_prompt {
+                append(&mut index, &entry.id, prompt);
             }
         }
         for log in self.logs.values() {
             for (id, prompts) in &log.prompts {
                 for prompt in prompts {
-                    append(id, prompt);
+                    append(&mut index, id, prompt);
                 }
             }
         }
-        self.prompts = Arc::new(index);
+        self.search_text = Arc::new(index);
     }
 
     fn read(
         &mut self,
         path: &Path,
         titles: Option<&HashMap<String, String>>,
-        read: impl FnOnce() -> Option<(HistoryEntry, Option<String>)>,
+        read: impl FnOnce() -> Option<(HistoryEntry, TranscriptFacts)>,
     ) -> Option<HistoryEntry> {
         let metadata = fs::symlink_metadata(path).ok()?;
         if !metadata.is_file() {
@@ -198,8 +218,7 @@ impl HistoryScanner {
             entry.cwd_exists = Path::new(&entry.cwd).is_dir();
             return Some(entry);
         }
-        let (entry, first_prompt) = read().unzip();
-        let first_prompt = first_prompt.flatten();
+        let (entry, facts) = read().unzip();
         let provider_title = entry
             .as_ref()
             .and_then(|entry| titles.and_then(|titles| titles.get(&entry.id)))
@@ -211,7 +230,7 @@ impl HistoryScanner {
                 len: metadata.len(),
                 provider_title,
                 entry: entry.clone(),
-                first_prompt,
+                facts: facts.unwrap_or_default(),
             },
         );
         entry
@@ -262,7 +281,7 @@ pub async fn resume(
 #[derive(Default)]
 pub struct HistorySearch {
     candidates: Vec<SearchCandidate>,
-    prompts: Arc<HashMap<String, String>>,
+    search_text: Arc<HashMap<String, SearchText>>,
     matcher: FuzzyMatcher,
 }
 
@@ -275,8 +294,8 @@ struct SearchCandidate {
 }
 
 impl HistorySearch {
-    pub fn set_prompts(&mut self, prompts: Arc<HashMap<String, String>>) {
-        self.prompts = prompts;
+    pub fn set_search_text(&mut self, search_text: Arc<HashMap<String, SearchText>>) {
+        self.search_text = search_text;
     }
 
     pub fn rebuild(&mut self, entries: &[HistoryEntry]) {
@@ -285,23 +304,23 @@ impl HistorySearch {
             .map(|entry| {
                 let title = entry.title.as_deref().unwrap_or_default();
                 let place = format!("{} {}", folder_name(&entry.cwd), entry.kind.id());
+                let text = self.search_text.get(&entry.id);
                 SearchCandidate {
                     label: PreparedText::new(&format!("{title} {place}")),
                     title: title.to_lowercase(),
-                    place: place.to_lowercase(),
-                    prompts: self
-                        .prompts
-                        .get(&entry.id)
-                        .map(|text| text.to_lowercase())
+                    place: format!("{place} {}", text.map_or("", |text| &text.labels))
+                        .to_lowercase(),
+                    prompts: text
+                        .map(|text| text.prompts.to_lowercase())
                         .unwrap_or_default(),
                 }
             })
             .collect();
     }
 
-    /// Every word must appear in the title, folder, agent, or a prompt the
-    /// user typed; `!word` excludes by title, folder, or agent. Title hits
-    /// outrank folder hits, which outrank prompt hits, and equal ranks keep
+    /// Every word must appear in the title, folder, agent, branch, PR, or a
+    /// prompt the user typed; `!word` excludes by any of those but prompts.
+    /// Title hits outrank folder/branch/PR hits, which outrank prompt hits, and equal ranks keep
     /// newest-first order. Only a query nothing contains falls back to fuzzy
     /// title matching, so typos still land without subsequence noise.
     pub fn rank(&mut self, query: &str) -> Vec<usize> {
@@ -426,7 +445,7 @@ pub(crate) fn conversation(
                                     |name| name.starts_with("rollout-") && name.ends_with(&suffix),
                                 );
                             if named
-                                && let Some(entry) = codex_entry(&path, &titles)
+                                && let Some((entry, _)) = codex_entry(&path, &titles)
                                 && entry.id == id
                             {
                                 return Some(entry);
@@ -460,7 +479,7 @@ fn scan_claude(root: &Path, scanner: &mut HistoryScanner) -> Vec<HistoryEntry> {
     result
 }
 
-fn claude_entry(path: &Path) -> Option<(HistoryEntry, Option<String>)> {
+fn claude_entry(path: &Path) -> Option<(HistoryEntry, TranscriptFacts)> {
     let id = path.file_stem()?.to_str()?.to_owned();
     if id.len() < 32 {
         return None;
@@ -468,7 +487,10 @@ fn claude_entry(path: &Path) -> Option<(HistoryEntry, Option<String>)> {
     let metadata = fs::metadata(path).ok()?;
     let mut cwd = None;
     let mut first_prompt = None;
-    let provider_title = latest_claude_ai_title(path);
+    let ClaudeTail {
+        title: provider_title,
+        labels,
+    } = claude_tail(path).unwrap_or_default();
     for line in capped_lines(path, CLAUDE_HEAD_CAP)
         .ok()?
         .map_while(Result::ok)
@@ -497,7 +519,13 @@ fn claude_entry(path: &Path) -> Option<(HistoryEntry, Option<String>)> {
         ))
     });
     let entry = history_entry(id, AgentKind::CLAUDE_CODE, cwd, title, path, &metadata);
-    Some((entry, first_prompt))
+    Some((
+        entry,
+        TranscriptFacts {
+            first_prompt,
+            labels,
+        },
+    ))
 }
 
 fn claude_user_text(object: &Value) -> Option<String> {
@@ -517,7 +545,15 @@ fn claude_user_text(object: &Value) -> Option<String> {
     })
 }
 
-fn latest_claude_ai_title(path: &Path) -> Option<String> {
+#[derive(Default)]
+struct ClaudeTail {
+    title: Option<String>,
+    labels: String,
+}
+
+/// The newest title, branch, and linked PR from the bounded transcript tail,
+/// which is where Claude's own picker reads them.
+fn claude_tail(path: &Path) -> Option<ClaudeTail> {
     let mut file = File::open(path).ok()?;
     let end = file.seek(SeekFrom::End(0)).ok()?;
     let start = end.saturating_sub(CLAUDE_TAIL_BYTES as u64);
@@ -527,9 +563,22 @@ fn latest_claude_ai_title(path: &Path) -> Option<String> {
         .read_to_end(&mut bytes)
         .ok()?;
 
+    let text = String::from_utf8_lossy(&bytes);
+    let mut labels = last_string_field(&text, "gitBranch").unwrap_or_default();
+    if let Some(number) = last_field(&text, "prNumber")
+        .map(str::trim_start)
+        .and_then(|value| value.split(|ch: char| !ch.is_ascii_digit()).next())
+        .filter(|number| !number.is_empty())
+    {
+        labels.push_str(&format!(" pr #{number}"));
+        if let Some(repository) = last_string_field(&text, "prRepository") {
+            labels.push(' ');
+            labels.push_str(&repository);
+        }
+    }
     let mut newest = None;
     let mut custom = None;
-    for line in String::from_utf8_lossy(&bytes).lines() {
+    for line in text.lines() {
         if !line.contains("\"ai-title\"") && !line.contains("\"custom-title\"") {
             continue;
         }
@@ -553,7 +602,26 @@ fn latest_claude_ai_title(path: &Path) -> Option<String> {
             newest = Some(title);
         }
     }
-    custom.or(newest)
+    Some(ClaudeTail {
+        title: custom.or(newest),
+        labels,
+    })
+}
+
+/// The text after the last `"field":` in `text`.
+fn last_field<'a>(text: &'a str, field: &str) -> Option<&'a str> {
+    let key = format!("\"{field}\":");
+    text.rfind(&key).map(|at| &text[at + key.len()..])
+}
+
+/// The last JSON string value of `field`, without parsing whole lines.
+fn last_string_field(text: &str, field: &str) -> Option<String> {
+    let value = last_field(text, field)?;
+    serde_json::Deserializer::from_str(value.trim_start())
+        .into_iter::<String>()
+        .next()?
+        .ok()
+        .filter(|value| !value.is_empty())
 }
 
 fn scan_codex(root: &Path, scanner: &mut HistoryScanner) -> Vec<HistoryEntry> {
@@ -576,7 +644,7 @@ fn scan_codex(root: &Path, scanner: &mut HistoryScanner) -> Vec<HistoryEntry> {
                     // Names can change without the transcript changing. The
                     // index revision participates in cache invalidation below.
                     if let Some(entry) = scanner.read(&path, Some(&titles), || {
-                        codex_entry(&path, &titles).map(|entry| (entry, None))
+                        codex_entry(&path, &titles)
                     }) {
                         result.push(entry);
                     }
@@ -587,7 +655,10 @@ fn scan_codex(root: &Path, scanner: &mut HistoryScanner) -> Vec<HistoryEntry> {
     result
 }
 
-fn codex_entry(path: &Path, titles: &HashMap<String, String>) -> Option<HistoryEntry> {
+fn codex_entry(
+    path: &Path,
+    titles: &HashMap<String, String>,
+) -> Option<(HistoryEntry, TranscriptFacts)> {
     let first = read_first_line(path, CODEX_FIRST_LINE_CAP).ok()??;
     let object: Value = serde_json::from_str(&first).ok()?;
     if object.get("type").and_then(Value::as_str) != Some("session_meta") {
@@ -617,13 +688,17 @@ fn codex_entry(path: &Path, titles: &HashMap<String, String>) -> Option<HistoryE
                 id.chars().take(8).collect::<String>()
             ))
         });
-    Some(history_entry(
-        id,
-        AgentKind::CODEX,
-        cwd,
-        title,
-        path,
-        &metadata,
+    let labels = payload
+        .pointer("/git/branch")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_owned();
+    Some((
+        history_entry(id, AgentKind::CODEX, cwd, title, path, &metadata),
+        TranscriptFacts {
+            first_prompt: None,
+            labels,
+        },
     ))
 }
 
@@ -1110,16 +1185,30 @@ mod tests {
             entry("e", "Old ssh bootstrap", "/w/app", 4.0),
         ];
         let mut search = HistorySearch::default();
-        search.set_prompts(Arc::new(HashMap::from([(
-            "a".to_owned(),
-            "why does SSH reconnect hang\n".to_owned(),
-        )])));
+        search.set_search_text(Arc::new(HashMap::from([
+            (
+                "a".to_owned(),
+                SearchText {
+                    labels: "polish/sidebar pr #812 cristicretu/diri".to_owned(),
+                    prompts: "why does SSH reconnect hang\n".to_owned(),
+                },
+            ),
+            (
+                "b".to_owned(),
+                SearchText {
+                    labels: "fix/askpass-prompt".to_owned(),
+                    prompts: String::new(),
+                },
+            ),
+        ])));
         search.rebuild(&entries);
         // "ssh" is a subsequence of "Session shell" but not a word in it.
         assert_eq!(search.rank("ssh"), [1, 4, 3, 0]);
         assert_eq!(search.rank("ssh reconnect"), [0]);
         assert_eq!(search.rank("ssh !askpass"), [4, 3, 0]);
         assert_eq!(search.rank("SIDEBAR"), [0]);
+        assert_eq!(search.rank("pr #812"), [0], "Claude's PR label");
+        assert_eq!(search.rank("fix/"), [1], "git branch");
         assert_eq!(search.rank("sbar"), [0], "abbreviations fall back to fuzzy");
         assert!(search.rank("ahsbr").is_empty(), "scattered letters do not");
     }
@@ -1134,9 +1223,10 @@ mod tests {
         fs::write(
             project.join(format!("{id}.jsonl")),
             format!(
-                "{}\n{}\n",
+                "{}\n{}\n{}\n",
                 serde_json::json!({"type":"user","cwd":"/tmp","message":{"content":"first ask"}}),
-                serde_json::json!({"type":"ai-title","aiTitle":"Generated"}),
+                serde_json::json!({"type":"ai-title","aiTitle":"Generated","gitBranch":"feat/history"}),
+                serde_json::json!({"type":"pr-link","prNumber":819,"prRepository":"cristicretu/diri"}),
             ),
         )
         .unwrap();
@@ -1152,11 +1242,12 @@ mod tests {
         let mut scanner = HistoryScanner::default();
         let entries = scanner.scan(&roots, &HashSet::new());
         assert_eq!(entries[0].title.as_deref(), Some("Generated"));
-        let prompts = scanner.prompts();
-        assert_eq!(prompts[id], "first ask\nlater follow-up\n");
-        assert_eq!(prompts["thread"], "codex prompt\n");
+        let prompts = scanner.search_text();
+        assert_eq!(prompts[id].prompts, "first ask\nlater follow-up\n");
+        assert_eq!(prompts[id].labels, "feat/history pr #819 cristicretu/diri");
+        assert_eq!(prompts["thread"].prompts, "codex prompt\n");
         let mut search = HistorySearch::default();
-        search.set_prompts(prompts);
+        search.set_search_text(prompts);
         search.rebuild(&entries);
         assert_eq!(search.rank("follow-up"), [0]);
         assert_eq!(search.rank("first ask"), [0]);
