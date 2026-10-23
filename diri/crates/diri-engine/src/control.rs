@@ -405,6 +405,49 @@ impl ControlServer {
 
     /// The endpoint URL a launch of `descriptor` may use: set only when the
     /// endpoint runs and the Agent's CLI is a release verified to speak it.
+    /// A local terminal's environment, from `inherited` (the Engine's own):
+    /// scrubbed by its manifest (an Engine started from inside a Claude
+    /// session must not hand its child-session marker to a `claude` typed in
+    /// the shell, which would then save no transcript), colour-capable (GUI
+    /// apps launched by launchd inherit no terminal environment), and naming
+    /// session `id` to `dirijor`, as manifest-backed panes do. A new terminal
+    /// and one restarted for an existing session start alike.
+    fn local_terminal_environment(
+        &self,
+        id: &str,
+        descriptor: &crate::agent::AgentDescriptor,
+        inherited: Vec<(String, String)>,
+    ) -> Vec<(String, String)> {
+        let mut env: Vec<(String, String)> = inherited
+            .into_iter()
+            .filter(|(key, _)| !descriptor.should_scrub(key))
+            .collect();
+        crate::agent::assert_color_environment(&mut env);
+        // No hooks or MCP config apply to a bare argv.
+        if let Some(injection) = &self.injection {
+            env.retain(|(key, _)| {
+                !matches!(
+                    key.as_str(),
+                    crate::inject::SESSION_ID_ENV
+                        | crate::inject::SOCKET_ENV
+                        | crate::inject::CLI_ENV
+                )
+            });
+            env.extend([
+                (crate::inject::SESSION_ID_ENV.into(), id.to_owned()),
+                (
+                    crate::inject::SOCKET_ENV.into(),
+                    self.socket_path.to_string_lossy().into_owned(),
+                ),
+                (
+                    crate::inject::CLI_ENV.into(),
+                    injection.cli_path.to_string_lossy().into_owned(),
+                ),
+            ]);
+        }
+        env
+    }
+
     fn mcp_http_url_for(&self, descriptor: &crate::agent::AgentDescriptor) -> Option<&str> {
         let endpoint = self.mcp_http.get()?;
         crate::mcp_http::http_allowed(descriptor, &self.cli_versions).then(|| endpoint.url())
@@ -1496,43 +1539,7 @@ impl ControlServer {
             // No binary in the manifest: the caller has to say what to run.
             None if !argv.is_empty() => {
                 let mut spec = crate::pty::PtySpec::new(argv.clone(), launch_path);
-                // A terminal is scrubbed by its manifest too: an Engine
-                // started from inside a Claude session must not hand its
-                // child-session marker to a `claude` typed in this shell,
-                // which would then save no transcript.
-                spec.env = inherited
-                    .into_iter()
-                    .filter(|(key, _)| !descriptor.should_scrub(key))
-                    .collect();
-                // GUI apps launched by launchd commonly inherit no terminal
-                // environment. A binary-free descriptor is still attached to
-                // Diri's colour-capable PTY, so assert the same capabilities
-                // as manifest-backed Agents instead of leaving tools such as
-                // `clear` unable to operate.
-                crate::agent::assert_color_environment(&mut spec.env);
-                // Every pane can name itself to `dirijor`, as manifest-backed
-                // ones do below; no hooks or MCP config apply to a bare argv.
-                if let Some(injection) = &self.injection {
-                    spec.env.retain(|(key, _)| {
-                        !matches!(
-                            key.as_str(),
-                            crate::inject::SESSION_ID_ENV
-                                | crate::inject::SOCKET_ENV
-                                | crate::inject::CLI_ENV
-                        )
-                    });
-                    spec.env.extend([
-                        (crate::inject::SESSION_ID_ENV.into(), id.clone()),
-                        (
-                            crate::inject::SOCKET_ENV.into(),
-                            self.socket_path.to_string_lossy().into_owned(),
-                        ),
-                        (
-                            crate::inject::CLI_ENV.into(),
-                            injection.cli_path.to_string_lossy().into_owned(),
-                        ),
-                    ]);
-                }
+                spec.env = self.local_terminal_environment(&id, &descriptor, inherited);
                 spec
             }
             None => {
@@ -4184,8 +4191,18 @@ impl ControlServer {
         let kind = diri_proto::AgentKind::SHELL_ID;
         let launch_path = directory.unwrap_or_else(|| Path::new(&record.cwd));
         let mut pty = crate::pty::PtySpec::new(login_shell_argv(), launch_path);
-        pty.env = std::env::vars().collect();
-        crate::agent::assert_color_environment(&mut pty.env);
+        // As a new terminal's: a shell restarted after a reboot or a crash
+        // must still know its session, or nothing run in it can reach Diri.
+        let descriptor = registry
+            .engine()
+            .manifest(kind)
+            .and_then(|manifest| manifest.agent.clone())
+            .unwrap_or_default();
+        pty.env = self.local_terminal_environment(
+            &record.id.0,
+            &descriptor,
+            diri_platform::launch::local_environment(),
+        );
         if let Some(integration) = self.terminal_shell_integration() {
             integration.apply(&mut pty);
         }
@@ -9268,6 +9285,65 @@ mod tests {
         assert_eq!(result["cwd"], project.to_string_lossy().as_ref());
         wait_for_live_directory(&registry, &project);
         stop_terminal(&registry);
+    }
+
+    /// A terminal restarted for its session (after a reboot or a crash took
+    /// its shell) gets the environment a new one does: it names its session
+    /// to `dirijor`, once, and leaves out what the shell manifest scrubs.
+    #[test]
+    fn a_restarted_terminal_names_its_session_as_a_new_one_does() {
+        let temp = tempfile::tempdir().expect("temp");
+        let registry = Registry::new(engine(), temp.path().join("state.json"));
+        let server = ControlServer::new(Arc::new(Mutex::new(registry)), temp.path().join("socket"))
+            .with_injection(InjectionConfig {
+                inject_dir: temp.path().join("inject"),
+                cli_path: temp.path().join("dirijor"),
+            });
+        let values = |env: &[(String, String)], key: &str| -> Vec<String> {
+            env.iter()
+                .filter(|(name, _)| name == key)
+                .map(|(_, value)| value.clone())
+                .collect()
+        };
+        let named = |env: &[(String, String)], id: &str| {
+            assert_eq!(values(env, crate::inject::SESSION_ID_ENV), [id]);
+            assert_eq!(
+                values(env, crate::inject::SOCKET_ENV),
+                [temp.path().join("socket").to_string_lossy()]
+            );
+            assert_eq!(
+                values(env, crate::inject::CLI_ENV),
+                [temp.path().join("dirijor").to_string_lossy()]
+            );
+        };
+
+        let spec = server
+            .shell_restart_spec(&test_record("s_term"), None)
+            .expect("restart spec");
+        named(&spec.pty.env, "s_term");
+
+        // An Engine started inside another Diri pane and a Claude session.
+        let descriptor = engine()
+            .manifest(diri_proto::AgentKind::SHELL_ID)
+            .and_then(|manifest| manifest.agent.clone())
+            .expect("shell manifest");
+        let inherited = vec![
+            ("PATH".to_owned(), "/usr/bin".to_owned()),
+            (
+                crate::inject::SESSION_ID_ENV.to_owned(),
+                "s_engine".to_owned(),
+            ),
+            ("CLAUDECODE".to_owned(), "1".to_owned()),
+            ("CLAUDE_CODE_CHILD_SESSION".to_owned(), "1".to_owned()),
+        ];
+        let env = server.local_terminal_environment("s_term", &descriptor, inherited);
+        named(&env, "s_term");
+        assert_eq!(values(&env, "PATH"), ["/usr/bin"]);
+        assert!(values(&env, "CLAUDECODE").is_empty(), "{env:?}");
+        assert!(
+            values(&env, "CLAUDE_CODE_CHILD_SESSION").is_empty(),
+            "{env:?}"
+        );
     }
 
     /// Only a local shell restarts in its last directory. Agents re-enter
