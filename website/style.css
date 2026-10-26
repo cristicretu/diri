@@ -1102,9 +1102,10 @@ cSystemFont, sans-serif; font-size: 20px; line-height: 1.5; font-weight: 500; le
 .intro { display: flex; flex-direction: column; align-items: center; text-align: center; padding: 72px 0 64px; }
 .intro-heading { max-width: 760px; }
 .intro-heading h1 { font-size: clamp(34px, 4vw, 48px); line-height: 1.08; font-weight: 600; letter-spacing: -.03em; color: #f4f0fa; text-wrap: balance; }
-.intro-heading p { max-width: 32em; margin: 16px auto 0; font-size: 16px; line-height: 1.6; color: #a9a2bc; text-wrap: balance; }
+.intro-heading p { max-width: 46em; margin: 16px auto 0; font-size: 16px; line-height: 1.6; color: #a9a2bc; }
+@media (min-width: 601px) { .intro-heading p { white-space: nowrap; } }
 .intro-actions { display: flex; flex-wrap: wrap; justify-content: center; align-items: center; gap: 10px; margin-top: 28px; }
-.intro-actions .button { width: 340px; height: 40px; padding: 0 18px; gap: 8px; justify-content: center; border-radius: 10px; font-size: 14px; font-weight: 500; }
+.intro-actions .button { min-width: 168px; height: 40px; padding: 0 20px; gap: 8px; justify-content: center; border-radius: 10px; font-size: 14px; font-weight: 500; }
 .intro-actions .button.primary { color: #17151f; background: #f4f0fa; border: 1px solid #f4f0fa; }
 .intro-actions .button.primary .button-mark { filter: brightness(0); }
 .intro-actions .button.primary:hover { background: #fff; border-color: #fff; }
@@ -1115,10 +1116,10 @@ cSystemFont, sans-serif; font-size: 20px; line-height: 1.5; font-weight: 500; le
 .download-options > summary:hover { color: var(--rp-text); }
 .brew-line { display: flex; justify-content: center; }
 .brew-line[hidden] { display: none; }
-.brew-pill { display: inline-flex; align-items: center; justify-content: space-between; gap: 12px; width: 340px; max-width: 100%; height: 40px; padding: 0 5px 0 16px; border: 1px solid #ffffff1f; border-radius: 10px; background: #ffffff0a; }
+.brew-pill { display: inline-flex; align-items: center; justify-content: space-between; gap: 12px; max-width: 100%; height: 40px; padding: 0 5px 0 16px; border: 1px solid #ffffff1f; border-radius: 10px; background: #ffffff0a; }
 .brew-line code { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 13px; font-variant-ligatures: none; color: var(--rp-text); white-space: nowrap; overflow-x: auto; }
 .brew-prompt { margin-right: 8px; color: var(--rp-muted); }
-.brew-copy { height: 30px; min-width: 96px; padding: 0 14px; border: 0; border-radius: 8px; background: #ffffff14; color: var(--rp-text); font: inherit; font-size: 12px; font-weight: 500; cursor: pointer; }
+.brew-copy { height: 30px; min-width: 92px; padding: 0 12px; border: 0; border-radius: 8px; background: #ffffff14; color: var(--rp-text); font: inherit; font-size: 12px; font-weight: 500; cursor: pointer; }
 .brew-copy:hover { background: #ffffff24; }
 @media (max-width: 600px) {
   .intro { padding: 48px 0 48px; }
