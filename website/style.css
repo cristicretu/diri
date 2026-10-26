@@ -737,10 +737,14 @@ body { isolation: isolate; position: relative; min-height: 100svh; }
 .os-marks img { filter: invert(92%) sepia(6%) saturate(400%) hue-rotate(210deg); }
 .os-marks img.upcoming { opacity: .4; }
 .download-options { position: relative; }
-.brew-line { margin: 18px auto 0; display: flex; align-items: center; gap: 4px; width: max-content; max-width: 100%; padding: 4px 4px 4px 16px; border: 1px solid #ffffff1f; border-radius: 999px; background: #ffffff0b; }
-.brew-line code { margin-right: 10px; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 13px; font-variant-ligatures: none; color: var(--rp-text); white-space: nowrap; overflow-x: auto; }
+.intro-actions { flex-wrap: wrap; }
+.intro-actions .brew-line { flex-basis: 100%; margin: 0; }
+.brew-line { margin: 18px 0 0; display: flex; justify-content: center; }
+.brew-line[hidden] { display: none; }
+.brew-pill { display: inline-flex; align-items: center; gap: 12px; max-width: 100%; padding: 4px 4px 4px 16px; border: 1px solid #ffffff1f; border-radius: 999px; background: #ffffff0b; }
+.brew-line code { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 13px; font-variant-ligatures: none; color: var(--rp-text); white-space: nowrap; overflow-x: auto; }
 .brew-prompt { color: var(--rp-muted); margin-right: 6px; }
-.brew-copy { height: 30px; padding: 0 14px; border: 0; border-radius: 999px; background: #ffffff14; color: var(--rp-text); font: inherit; font-size: 12px; font-weight: 500; cursor: pointer; }
+.brew-copy { height: 30px; min-width: 104px; padding: 0 14px; border: 0; border-radius: 999px; background: #ffffff14; color: var(--rp-text); font: inherit; font-size: 12px; font-weight: 500; cursor: pointer; }
 .brew-copy:focus-visible { outline: 2px solid var(--rp-rose); outline-offset: 2px; }
 @media (hover: hover) and (pointer: fine) { .brew-copy:hover { background: #ffffff24; } }
 .download-menu { position: absolute; z-index: 5; top: calc(100% + 8px); left: 50%; translate: -50% 0; min-width: 280px; display: flex; flex-direction: column; gap: 2px; padding: 6px; text-align: left; background: #26243af7; border: 1px solid #ffffff1f; border-radius: 12px; box-shadow: 0 20px 50px -12px #0009; font-size: 13px; animation: panel-in 160ms var(--ease) both; }
