@@ -343,6 +343,9 @@ struct ShortcutEditor {
     native_key_code: Option<u16>,
     #[cfg(target_os = "macos")]
     _global_recording: crate::macos::global_shortcut::Recording,
+    /// Bound combos dispatch their action before key listeners run, so the
+    /// recorder takes keys from an interceptor while it is open.
+    _keystrokes: gpui::Subscription,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -2130,6 +2133,21 @@ impl UtilitySurfaces {
     ) {
         self.settings_search_active = false;
         self.shortcut_search_active = false;
+        let entity = cx.entity();
+        let recording_window = window.window_handle();
+        let keystrokes = cx.intercept_keystrokes(move |event, window, cx| {
+            if window.window_handle() != recording_window
+                || entity.read(cx).shortcut_editor.is_none()
+            {
+                return;
+            }
+            let keystroke = event.keystroke.clone();
+            let handled =
+                entity.update(cx, |this, cx| this.handle_shortcut_editor_key(&keystroke, cx));
+            if handled {
+                cx.stop_propagation();
+            }
+        });
         self.shortcut_editor = Some(ShortcutEditor {
             command,
             error: None,
@@ -2137,6 +2155,7 @@ impl UtilitySurfaces {
             native_key_code: None,
             #[cfg(target_os = "macos")]
             _global_recording: crate::macos::global_shortcut::Recording::begin(),
+            _keystrokes: keystrokes,
         });
         self.focus.focus(window, cx);
         cx.notify();
@@ -2285,14 +2304,13 @@ impl UtilitySurfaces {
         cx.notify();
     }
 
-    fn handle_shortcut_editor_key(&mut self, event: &KeyDownEvent, cx: &mut Context<Self>) -> bool {
+    fn handle_shortcut_editor_key(&mut self, key: &gpui::Keystroke, cx: &mut Context<Self>) -> bool {
         if self.surface != Surface::Settings || self.settings_tab != SettingsTab::Shortcuts {
             return false;
         }
         let Some(command) = self.shortcut_editor.as_ref().map(|editor| editor.command) else {
             return false;
         };
-        let key = &event.keystroke;
         if key.key == "escape" {
             self.shortcut_editor = None;
             cx.notify();
@@ -2323,7 +2341,7 @@ impl UtilitySurfaces {
         #[cfg(target_os = "macos")]
         if let Some(editor) = &mut self.shortcut_editor {
             editor.error = None;
-            editor.native_key_code = gpui_macos::current_native_key_code(event);
+            editor.native_key_code = gpui_macos::current_physical_key().map(|(code, _)| code);
         }
         self.assign_shortcut(command, key.unparse(), cx);
         true
@@ -2658,7 +2676,8 @@ impl UtilitySurfaces {
         if self.surface == Surface::None {
             return;
         }
-        if self.handle_shortcut_editor_key(event, cx) || self.handle_shortcut_search_key(event, cx)
+        if self.handle_shortcut_editor_key(&event.keystroke, cx)
+            || self.handle_shortcut_search_key(event, cx)
         {
             cx.stop_propagation();
             return;
@@ -12056,6 +12075,49 @@ mod tests {
             "Ctrl\u{2009}+\u{2009}Shift\u{2009}+\u{2009}C"
         );
         assert_eq!(spaced_shortcut_label("Unassigned"), "Unassigned");
+    }
+
+    gpui::actions!(shortcut_recorder_test, [BoundElsewhere]);
+
+    #[gpui::test]
+    fn shortcut_recorder_takes_combos_already_bound_to_an_action(cx: &mut TestAppContext) {
+        let fired = Arc::new(AtomicUsize::new(0));
+        let (harness, cx) = open_settings_workbench(cx);
+        let assigned = crate::commands::test_chords("cmd-shift-y");
+        cx.update(|_, cx| {
+            cx.bind_keys([gpui::KeyBinding::new(&assigned, BoundElsewhere, None)]);
+            let fired = fired.clone();
+            cx.on_action(move |_: &BoundElsewhere, _| {
+                fired.fetch_add(1, Ordering::SeqCst);
+            });
+        });
+        let surfaces = harness.read_with(cx, |harness, _| harness.surfaces.clone());
+        surfaces.update(cx, |surfaces, cx| {
+            surfaces.open_settings_tab(SettingsTab::Shortcuts, cx);
+        });
+
+        let binding = cx
+            .debug_bounds("SHORTCUT_BINDING_open-launcher")
+            .expect("shortcut binding should render");
+        cx.simulate_click(binding.center(), Modifiers::default());
+        cx.simulate_keystrokes(&assigned);
+
+        assert_eq!(
+            fired.load(Ordering::SeqCst),
+            0,
+            "recording must not run the action bound to the combo"
+        );
+        surfaces.read_with(cx, |surfaces, _| {
+            assert_eq!(
+                surfaces
+                    .prefs
+                    .shortcut_overrides
+                    .get("open-launcher")
+                    .and_then(|binding| binding.as_deref()),
+                Some(assigned.as_str())
+            );
+            assert!(surfaces.shortcut_editor.is_none());
+        });
     }
 
     #[gpui::test]
