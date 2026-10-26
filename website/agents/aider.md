@@ -23,7 +23,7 @@ diri runs `aider` exactly as you would in a terminal, with your own install and 
 1. Install Aider with its official installer or pipx. See the [Aider install guide](https://aider.chat/docs/install.html).
 
 2. Configure an API key for your chosen model provider.
-3. Install diri with `brew install --cask cristicretu/diri/diri`, or [download it](https://github.com/cristicretu/diri/releases/latest).
+3. Install diri with `brew install --cask diri`, or [download it](https://github.com/cristicretu/diri/releases/latest).
 4. Open **New Agent** in the sidebar and choose **Aider**. If you installed Aider while diri was open, click **Refresh** in **Settings → Agents** first.
 
 The [quickstart](/docs/quickstart/) covers the rest: picking a folder, giving a task and answering questions.

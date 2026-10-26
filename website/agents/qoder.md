@@ -23,7 +23,7 @@ diri runs `qodercli` exactly as you would in a terminal, with your own install a
 1. Install Qoder CLI with its official installer or a supported package manager. See the [Qoder CLI install guide](https://docs.qoder.com/en/cli/quick-start).
 
 2. Run qodercli, then use /login.
-3. Install diri with `brew install --cask cristicretu/diri/diri`, or [download it](https://github.com/cristicretu/diri/releases/latest).
+3. Install diri with `brew install --cask diri`, or [download it](https://github.com/cristicretu/diri/releases/latest).
 4. Open **New Agent** in the sidebar and choose **Qoder CLI**. If you installed Qoder CLI while diri was open, click **Refresh** in **Settings → Agents** first.
 
 The [quickstart](/docs/quickstart/) covers the rest: picking a folder, giving a task and answering questions.

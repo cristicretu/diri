@@ -2,6 +2,11 @@
 const $ = (selector, root = document) => root.querySelector(selector);
 const $$ = (selector, root = document) => [...root.querySelectorAll(selector)];
 
+// Homebrew casks are macOS only, so install boxes show the brew line on Macs and leave it hidden elsewhere.
+// iPads can report a Mac platform in desktop mode, so touch screens are excluded.
+const onMac = /Mac/.test(navigator.userAgentData?.platform ?? navigator.platform ?? '') && navigator.maxTouchPoints < 2;
+document.documentElement.classList.toggle('is-mac', onMac);
+
 const masthead = $('.site-header');
 if (masthead) {
   const sync = () => masthead.classList.toggle('scrolled', scrollY > 8);

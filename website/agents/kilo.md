@@ -23,7 +23,7 @@ diri runs `kilo` exactly as you would in a terminal, with your own install and s
 1. Install Kilo Code CLI with npm. See the [Kilo Code install guide](https://kilo.ai/docs/code-with-ai/platforms/cli).
 
 2. Run kilo, then use /connect to configure credentials.
-3. Install diri with `brew install --cask cristicretu/diri/diri`, or [download it](https://github.com/cristicretu/diri/releases/latest).
+3. Install diri with `brew install --cask diri`, or [download it](https://github.com/cristicretu/diri/releases/latest).
 4. Open **New Agent** in the sidebar and choose **Kilo Code**. If you installed Kilo Code while diri was open, click **Refresh** in **Settings → Agents** first.
 
 The [quickstart](/docs/quickstart/) covers the rest: picking a folder, giving a task and answering questions.

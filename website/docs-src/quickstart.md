@@ -8,7 +8,7 @@ This page takes you from a fresh install to a working agent in a few minutes. If
 Install with Homebrew or the DMG. You need macOS 15 or newer. See [Install](/docs/install/) for Linux and details.
 
 ```sh
-brew install --cask cristicretu/diri/diri
+brew install --cask diri
 ```
 
 ## 2. Add an agent

@@ -19,7 +19,7 @@ with Linux in beta.
 ## Install
 
 ```sh
-brew install --cask cristicretu/diri/diri
+brew install --cask diri
 ```
 
 macOS 15 or newer. Apple silicon and Intel. Signed and notarized.

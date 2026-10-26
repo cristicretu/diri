@@ -23,7 +23,7 @@ diri runs `copilot` exactly as you would in a terminal, with your own install an
 1. Install Copilot CLI with GitHub's installer or a supported package manager. See the [Copilot CLI install guide](https://docs.github.com/en/copilot/how-tos/copilot-cli/set-up-copilot-cli/install-copilot-cli).
 
 2. Run copilot login and complete GitHub OAuth.
-3. Install diri with `brew install --cask cristicretu/diri/diri`, or [download it](https://github.com/cristicretu/diri/releases/latest).
+3. Install diri with `brew install --cask diri`, or [download it](https://github.com/cristicretu/diri/releases/latest).
 4. Open **New Agent** in the sidebar and choose **Copilot CLI**. If you installed Copilot CLI while diri was open, click **Refresh** in **Settings → Agents** first.
 
 The [quickstart](/docs/quickstart/) covers the rest: picking a folder, giving a task and answering questions.

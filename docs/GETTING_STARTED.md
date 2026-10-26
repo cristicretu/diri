@@ -5,7 +5,7 @@
 On macOS 15 or newer, install the signed and notarized universal build:
 
 ```sh
-brew install --cask cristicretu/diri/diri
+brew install --cask diri
 ```
 
 Alternatively, download the latest DMG from [GitHub Releases](https://github.com/cristicretu/diri/releases/latest),

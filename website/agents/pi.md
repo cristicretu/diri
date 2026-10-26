@@ -23,7 +23,7 @@ diri runs `pi` exactly as you would in a terminal, with your own install and sig
 1. Follow Pi's coding-agent installation guide. See the [Pi install guide](https://github.com/earendil-works/pi).
 
 2. Start `pi` once and sign in.
-3. Install diri with `brew install --cask cristicretu/diri/diri`, or [download it](https://github.com/cristicretu/diri/releases/latest).
+3. Install diri with `brew install --cask diri`, or [download it](https://github.com/cristicretu/diri/releases/latest).
 4. Open **New Agent** in the sidebar and choose **Pi**. If you installed Pi while diri was open, click **Refresh** in **Settings → Agents** first.
 
 The [quickstart](/docs/quickstart/) covers the rest: picking a folder, giving a task and answering questions.

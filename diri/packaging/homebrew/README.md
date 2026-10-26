@@ -1,13 +1,12 @@
 # diri in homebrew/cask
 
-Today diri installs from its own tap:
+diri is in Homebrew's official cask repository, so this is the install command:
 
 ```sh
-brew install --cask cristicretu/diri/diri
+brew install --cask diri
 ```
 
-This directory prepares the move to Homebrew's official cask repository, so
-that `brew install --cask diri` works with no tap:
+This directory keeps the candidate and the submission tooling:
 
 - `diri.rb` is the candidate cask. Version and checksum are rendered from the
   latest GitHub release at submission time, so the values committed here only
@@ -164,8 +163,8 @@ in `homebrew/cask`.
 
 ## Retiring the custom tap
 
-After the official cask is merged and https://formulae.brew.sh/cask/diri
-exists, make one commit in `cristicretu/homebrew-diri` that:
+The official cask is merged (Homebrew/homebrew-cask PR 296092), so the custom tap
+can be retired. Make one commit in `cristicretu/homebrew-diri` that:
 
 1. deletes `Casks/diri.rb`, and
 2. adds `tap_migrations.json` at the tap root:
@@ -188,6 +187,6 @@ Check this on a Mac that has the tap: `brew update`, then
 `brew info --cask cristicretu/diri/diri` should point at `homebrew/cask`.
 Users can then run `brew untap cristicretu/diri`.
 
-Also update the install instructions to `brew install --cask diri`:
-`README.md`, `diri/README.md` (which still says the project is below the
-notability threshold), the website, and the tap's own README.
+The install instructions already say `brew install --cask diri` in `README.md`,
+`diri/README.md`, `docs/GETTING_STARTED.md` and the website. The tap's own README
+still needs the same change in `cristicretu/homebrew-diri`.

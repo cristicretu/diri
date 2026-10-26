@@ -23,7 +23,7 @@ diri runs `devin` exactly as you would in a terminal, with your own install and 
 1. Install Devin CLI with Cognition's installer or Homebrew. See the [Devin install guide](https://docs.devin.ai/cli).
 
 2. Run devin auth login.
-3. Install diri with `brew install --cask cristicretu/diri/diri`, or [download it](https://github.com/cristicretu/diri/releases/latest).
+3. Install diri with `brew install --cask diri`, or [download it](https://github.com/cristicretu/diri/releases/latest).
 4. Open **New Agent** in the sidebar and choose **Devin**. If you installed Devin while diri was open, click **Refresh** in **Settings → Agents** first.
 
 The [quickstart](/docs/quickstart/) covers the rest: picking a folder, giving a task and answering questions.

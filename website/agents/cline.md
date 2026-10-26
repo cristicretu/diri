@@ -23,7 +23,7 @@ diri runs `cline` exactly as you would in a terminal, with your own install and 
 1. Install Cline CLI with npm install -g cline. See the [Cline CLI install guide](https://docs.cline.bot/getting-started/installing-cline).
 
 2. Run cline auth and choose a provider or API key.
-3. Install diri with `brew install --cask cristicretu/diri/diri`, or [download it](https://github.com/cristicretu/diri/releases/latest).
+3. Install diri with `brew install --cask diri`, or [download it](https://github.com/cristicretu/diri/releases/latest).
 4. Open **New Agent** in the sidebar and choose **Cline CLI**. If you installed Cline CLI while diri was open, click **Refresh** in **Settings → Agents** first.
 
 The [quickstart](/docs/quickstart/) covers the rest: picking a folder, giving a task and answering questions.

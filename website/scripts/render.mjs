@@ -178,7 +178,7 @@ export const ogPath = url => `/og/${ogKey(url)}.jpg`;
 // The install box at the end of agent, comparison and release pages.
 export const installBox = (heading = 'Try diri') => `<aside class="install-box">
           <div class="install-copy"><strong>${esc(heading)}</strong><span>Free and open source. macOS 15 or newer, Linux in beta. Bring the agent CLIs and accounts you already have.</span></div>
-          <div class="install-actions"><a class="button primary" href="${repo}/releases/latest"><span class="icon" data-icon="download" aria-hidden="true"></span>Download for macOS</a><div class="code-block install-brew" data-lang="sh"><button class="code-copy" type="button" aria-label="Copy code"><span class="icon" aria-hidden="true"></span></button><pre><code><span class="tk-cmd">brew</span> install <span class="tk-flag">--cask</span> cristicretu/diri/diri</code></pre></div></div>
+          <div class="install-actions"><a class="button primary" href="${repo}/releases/latest"><span class="icon" data-icon="download" aria-hidden="true"></span>Download for macOS</a><div class="code-block install-brew" data-lang="sh"><button class="code-copy" type="button" aria-label="Copy code"><span class="icon" aria-hidden="true"></span></button><pre><code><span class="tk-cmd">brew</span> install <span class="tk-flag">--cask</span> diri</code></pre></div></div>
         </aside>`;
 
 // A long-form page outside the docs: agents, comparisons, releases.

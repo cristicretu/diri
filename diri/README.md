@@ -59,20 +59,20 @@ worktree` commands instead.
 ## Install
 
 ```sh
-brew install --cask cristicretu/diri/diri
+brew install --cask diri
 ```
 
 Or download the DMG from [the latest release](https://github.com/cristicretu/diri/releases/latest).
 Either way you get the same universal build, signed and notarized, so it opens
 without a Gatekeeper prompt.
 
-The cask lives in [cristicretu/homebrew-diri](https://github.com/cristicretu/homebrew-diri)
-for now. A submission to the official `homebrew/cask` repository is prepared in
-[packaging/homebrew](packaging/homebrew/README.md). The cask declares
+The cask is in Homebrew's official [`homebrew/cask`](https://github.com/Homebrew/homebrew-cask)
+repository, so no tap is needed. The cask declares
 `auto_updates true`, so Homebrew installs diri
 once and then leaves it alone — diri updates itself after that, and
 `brew upgrade` will not clobber a build the app moved itself to. See
-[UPDATING.md](UPDATING.md) for how that works.
+[UPDATING.md](UPDATING.md) for how that works. The packaging steps are in
+[packaging/homebrew](packaging/homebrew/README.md).
 
 ## Toolchain and GPUI pin
 

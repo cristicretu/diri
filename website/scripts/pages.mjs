@@ -87,7 +87,7 @@ ${rows.map(([k, v]) => `| ${k} | ${v} |`).join('\n')}
 1. ${install.split('\n')[0]}
 ${install.includes('```') ? '\n' + install.split('\n').slice(2).join('\n') + '\n' : ''}
 2. ${agent.setup.signInHint || `Start \`${agent.binary}\` once and sign in.`}
-3. Install diri with \`brew install --cask cristicretu/diri/diri\`, or [download it](${repo}/releases/latest).
+3. Install diri with \`brew install --cask diri\`, or [download it](${repo}/releases/latest).
 4. Open **New Agent** in the sidebar and choose **${n}**. If you installed ${n} while diri was open, click **Refresh** in **Settings → Agents** first.
 
 The [quickstart](/docs/quickstart/) covers the rest: picking a folder, giving a task and answering questions.

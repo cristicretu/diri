@@ -23,7 +23,7 @@ diri runs `kimi` exactly as you would in a terminal, with your own install and s
 1. Install Kimi Code CLI with its official installer or npm. See the [Kimi install guide](https://moonshotai.github.io/kimi-code/en/guides/getting-started.html).
 
 2. Run kimi, then use /login.
-3. Install diri with `brew install --cask cristicretu/diri/diri`, or [download it](https://github.com/cristicretu/diri/releases/latest).
+3. Install diri with `brew install --cask diri`, or [download it](https://github.com/cristicretu/diri/releases/latest).
 4. Open **New Agent** in the sidebar and choose **Kimi**. If you installed Kimi while diri was open, click **Refresh** in **Settings → Agents** first.
 
 The [quickstart](/docs/quickstart/) covers the rest: picking a folder, giving a task and answering questions.

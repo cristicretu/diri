@@ -27,7 +27,7 @@ curl -fsSL https://raw.githubusercontent.com/context-labs/whip/main/install.sh |
 ```
 
 2. Run whipcode and pick a provider, or run whipcode auth.
-3. Install diri with `brew install --cask cristicretu/diri/diri`, or [download it](https://github.com/cristicretu/diri/releases/latest).
+3. Install diri with `brew install --cask diri`, or [download it](https://github.com/cristicretu/diri/releases/latest).
 4. Open **New Agent** in the sidebar and choose **WhipCode**. If you installed WhipCode while diri was open, click **Refresh** in **Settings → Agents** first.
 
 The [quickstart](/docs/quickstart/) covers the rest: picking a folder, giving a task and answering questions.

@@ -10,7 +10,7 @@ The macOS build is universal (Apple silicon and Intel), signed with a Developer 
 ### Homebrew
 
 ```sh
-brew install --cask cristicretu/diri/diri
+brew install --cask diri
 ```
 
 ### DMG

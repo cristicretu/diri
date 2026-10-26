@@ -27,7 +27,7 @@ curl -fsSL https://chatgpt.com/codex/install.sh | sh
 ```
 
 2. Run codex and choose Sign in with ChatGPT or another offered method.
-3. Install diri with `brew install --cask cristicretu/diri/diri`, or [download it](https://github.com/cristicretu/diri/releases/latest).
+3. Install diri with `brew install --cask diri`, or [download it](https://github.com/cristicretu/diri/releases/latest).
 4. Open **New Agent** in the sidebar and choose **Codex**. If you installed Codex while diri was open, click **Refresh** in **Settings → Agents** first.
 
 The [quickstart](/docs/quickstart/) covers the rest: picking a folder, giving a task and answering questions.

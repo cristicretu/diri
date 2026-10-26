@@ -216,7 +216,8 @@ body.searching { overflow: hidden; }
 .install-actions { min-width: 0; display: flex; flex-direction: column; align-items: stretch; gap: 8px; }
 .install-actions .button.primary { height: 38px; text-decoration: none; color: #241c26; }
 .install-actions .button .icon { width: 14px; height: 14px; }
-.install-brew { margin: 0; }
+.install-brew { margin: 0; display: none; }
+.is-mac .install-brew { display: block; }
 .install-brew pre { padding: 8px 40px 8px 12px; font-size: 12px; }
 .install-brew .code-copy { top: 5px; right: 5px; opacity: 1; }
 .release-page .release { max-width: none; padding-top: 0; }

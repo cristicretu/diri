@@ -23,7 +23,7 @@ diri runs `hermes` exactly as you would in a terminal, with your own install and
 1. Install Hermes with the official Nous Research installer. See the [Hermes install guide](https://github.com/NousResearch/hermes-agent/blob/main/website/docs/getting-started/quickstart.md).
 
 2. Run hermes setup --portal or hermes model to configure a provider.
-3. Install diri with `brew install --cask cristicretu/diri/diri`, or [download it](https://github.com/cristicretu/diri/releases/latest).
+3. Install diri with `brew install --cask diri`, or [download it](https://github.com/cristicretu/diri/releases/latest).
 4. Open **New Agent** in the sidebar and choose **Hermes**. If you installed Hermes while diri was open, click **Refresh** in **Settings → Agents** first.
 
 The [quickstart](/docs/quickstart/) covers the rest: picking a folder, giving a task and answering questions.

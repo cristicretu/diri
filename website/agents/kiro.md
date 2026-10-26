@@ -23,7 +23,7 @@ diri runs `kiro-cli` exactly as you would in a terminal, with your own install a
 1. Install Kiro CLI with its official platform installer. See the [Kiro install guide](https://kiro.dev/docs/cli/installation/).
 
 2. Run kiro-cli login.
-3. Install diri with `brew install --cask cristicretu/diri/diri`, or [download it](https://github.com/cristicretu/diri/releases/latest).
+3. Install diri with `brew install --cask diri`, or [download it](https://github.com/cristicretu/diri/releases/latest).
 4. Open **New Agent** in the sidebar and choose **Kiro**. If you installed Kiro while diri was open, click **Refresh** in **Settings → Agents** first.
 
 The [quickstart](/docs/quickstart/) covers the rest: picking a folder, giving a task and answering questions.

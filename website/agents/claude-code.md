@@ -27,7 +27,7 @@ curl -fsSL https://claude.ai/install.sh | bash
 ```
 
 2. Run claude and choose an Anthropic Console or Claude account.
-3. Install diri with `brew install --cask cristicretu/diri/diri`, or [download it](https://github.com/cristicretu/diri/releases/latest).
+3. Install diri with `brew install --cask diri`, or [download it](https://github.com/cristicretu/diri/releases/latest).
 4. Open **New Agent** in the sidebar and choose **Claude Code**. If you installed Claude Code while diri was open, click **Refresh** in **Settings → Agents** first.
 
 The [quickstart](/docs/quickstart/) covers the rest: picking a folder, giving a task and answering questions.

@@ -23,7 +23,7 @@ diri runs `droid` exactly as you would in a terminal, with your own install and 
 1. Install Droid with Factory's installer or a supported package manager. See the [Droid install guide](https://docs.factory.ai/cli/getting-started/quickstart).
 
 2. Run droid, then use /login if prompted.
-3. Install diri with `brew install --cask cristicretu/diri/diri`, or [download it](https://github.com/cristicretu/diri/releases/latest).
+3. Install diri with `brew install --cask diri`, or [download it](https://github.com/cristicretu/diri/releases/latest).
 4. Open **New Agent** in the sidebar and choose **Droid**. If you installed Droid while diri was open, click **Refresh** in **Settings → Agents** first.
 
 The [quickstart](/docs/quickstart/) covers the rest: picking a folder, giving a task and answering questions.

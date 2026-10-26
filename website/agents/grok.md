@@ -23,7 +23,7 @@ diri runs `grok` exactly as you would in a terminal, with your own install and s
 1. Install Grok with xAI's official installer. See the [Grok install guide](https://docs.x.ai/build/overview).
 
 2. Run grok login, or set XAI_API_KEY.
-3. Install diri with `brew install --cask cristicretu/diri/diri`, or [download it](https://github.com/cristicretu/diri/releases/latest).
+3. Install diri with `brew install --cask diri`, or [download it](https://github.com/cristicretu/diri/releases/latest).
 4. Open **New Agent** in the sidebar and choose **Grok**. If you installed Grok while diri was open, click **Refresh** in **Settings → Agents** first.
 
 The [quickstart](/docs/quickstart/) covers the rest: picking a folder, giving a task and answering questions.
