@@ -737,6 +737,8 @@ body { isolation: isolate; position: relative; min-height: 100svh; }
 .os-marks img { filter: invert(92%) sepia(6%) saturate(400%) hue-rotate(210deg); }
 .os-marks img.upcoming { opacity: .4; }
 .download-options { position: relative; }
+.brew-line { margin: 14px 0 0; font-size: 13px; color: var(--rp-subtle); text-align: center; }
+.brew-line code { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; color: var(--rp-text); }
 .download-menu { position: absolute; z-index: 5; top: calc(100% + 8px); left: 50%; translate: -50% 0; min-width: 280px; display: flex; flex-direction: column; gap: 2px; padding: 6px; text-align: left; background: #26243af7; border: 1px solid #ffffff1f; border-radius: 12px; box-shadow: 0 20px 50px -12px #0009; font-size: 13px; animation: panel-in 160ms var(--ease) both; }
 .download-menu a, .download-upcoming, .download-menu-head { display: flex; align-items: center; gap: 9px; min-height: 34px; padding: 0 10px; border-radius: 7px; color: var(--rp-text); }
 .download-menu-head { justify-content: space-between; color: var(--rp-subtle); border-bottom: 1px solid #ffffff12; border-radius: 0; margin-bottom: 4px; padding-bottom: 2px; }
