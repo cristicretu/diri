@@ -403,8 +403,6 @@ impl ControlServer {
         Ok(url)
     }
 
-    /// The endpoint URL a launch of `descriptor` may use: set only when the
-    /// endpoint runs and the Agent's CLI is a release verified to speak it.
     /// A local terminal's environment, from `inherited` (the Engine's own):
     /// scrubbed by its manifest (an Engine started from inside a Claude
     /// session must not hand its child-session marker to a `claude` typed in
@@ -424,30 +422,66 @@ impl ControlServer {
             .collect();
         crate::agent::assert_color_environment(&mut env);
         // No hooks or MCP config apply to a bare argv.
-        if let Some(injection) = &self.injection {
-            env.retain(|(key, _)| {
-                !matches!(
-                    key.as_str(),
-                    crate::inject::SESSION_ID_ENV
-                        | crate::inject::SOCKET_ENV
-                        | crate::inject::CLI_ENV
-                )
-            });
-            env.extend([
-                (crate::inject::SESSION_ID_ENV.into(), id.to_owned()),
-                (
-                    crate::inject::SOCKET_ENV.into(),
-                    self.socket_path.to_string_lossy().into_owned(),
-                ),
-                (
-                    crate::inject::CLI_ENV.into(),
-                    injection.cli_path.to_string_lossy().into_owned(),
-                ),
-            ]);
-        }
+        self.name_session(&mut env, id, None, None);
         env
     }
 
+    /// Names session `id` to what runs in it: `dirijor`'s socket and CLI, the
+    /// MCP `token` and `recovery_dir` when the launch has them, and the notes
+    /// directory. The Diri identity the Engine itself inherited (one started
+    /// from inside a Diri session) is dropped first, with or without
+    /// injection: it names that other session.
+    fn name_session(
+        &self,
+        env: &mut Vec<(String, String)>,
+        id: &str,
+        recovery_dir: Option<&Path>,
+        token: Option<String>,
+    ) {
+        env.retain(|(key, _)| {
+            !matches!(
+                key.as_str(),
+                crate::inject::SESSION_ID_ENV
+                    | crate::inject::SOCKET_ENV
+                    | crate::inject::CLI_ENV
+                    | crate::inject::MCP_TOKEN_ENV
+                    | diri_proto::paths::ENV_SESSION_RECOVERY_DIR
+                    | diri_proto::paths::ENV_NOTES_DIR
+            )
+        });
+        let Some(injection) = &self.injection else {
+            return;
+        };
+        env.extend([
+            (crate::inject::SESSION_ID_ENV.into(), id.to_owned()),
+            (
+                crate::inject::SOCKET_ENV.into(),
+                self.socket_path.to_string_lossy().into_owned(),
+            ),
+            (
+                crate::inject::CLI_ENV.into(),
+                injection.cli_path.to_string_lossy().into_owned(),
+            ),
+        ]);
+        if let Some(token) = token {
+            env.push((crate::inject::MCP_TOKEN_ENV.into(), token));
+        }
+        if let Some(dir) = recovery_dir {
+            env.push((
+                diri_proto::paths::ENV_SESSION_RECOVERY_DIR.into(),
+                dir.to_string_lossy().into_owned(),
+            ));
+        }
+        if let Some(dir) = self.resolved_notes_dir() {
+            env.push((
+                diri_proto::paths::ENV_NOTES_DIR.into(),
+                dir.to_string_lossy().into_owned(),
+            ));
+        }
+    }
+
+    /// The endpoint URL a launch of `descriptor` may use: set only when the
+    /// endpoint runs and the Agent's CLI is a release verified to speak it.
     fn mcp_http_url_for(&self, descriptor: &crate::agent::AgentDescriptor) -> Option<&str> {
         let endpoint = self.mcp_http.get()?;
         crate::mcp_http::http_allowed(descriptor, &self.cli_versions).then(|| endpoint.url())
@@ -1581,38 +1615,13 @@ impl ControlServer {
         // argv side was assembled before `spawn_spec` so its shell wrapper
         // contains the complete command.
         if descriptor.binary.is_some() {
-            if let Some(injection) = &self.injection {
-                pty.env
-                    .push((crate::inject::SESSION_ID_ENV.into(), id.clone()));
-                pty.env.push((
-                    crate::inject::SOCKET_ENV.into(),
-                    self.socket_path.to_string_lossy().into_owned(),
-                ));
-                pty.env.push((
-                    crate::inject::CLI_ENV.into(),
-                    injection.cli_path.to_string_lossy().into_owned(),
-                ));
-                // Never pass on a token the Engine itself inherited (an Engine
-                // started from inside a Diri session): it names that session.
-                pty.env
-                    .retain(|(key, _)| key != crate::inject::MCP_TOKEN_ENV);
-                if let Some(token) = mcp_http_token.take() {
-                    pty.env.push((crate::inject::MCP_TOKEN_ENV.into(), token));
-                }
-                pty.env.push((
-                    diri_proto::paths::ENV_SESSION_RECOVERY_DIR.into(),
-                    registry
-                        .recovery_directory(&id)
-                        .to_string_lossy()
-                        .into_owned(),
-                ));
-                if let Some(dir) = self.resolved_notes_dir() {
-                    pty.env.push((
-                        diri_proto::paths::ENV_NOTES_DIR.into(),
-                        dir.to_string_lossy().into_owned(),
-                    ));
-                }
-            }
+            let recovery_dir = registry.recovery_directory(&id);
+            self.name_session(
+                &mut pty.env,
+                &id,
+                Some(&recovery_dir),
+                mcp_http_token.take(),
+            );
             if let Some(uuid) = &agent_session_id {
                 record.agent_session_id = Some(uuid.clone());
                 if descriptor.injection.claude_hooks
@@ -4181,28 +4190,26 @@ impl ControlServer {
 
     /// A fresh login shell under an existing local terminal's id, started in
     /// `directory` when there is one and in the terminal's `cwd` otherwise.
-    /// It is launched exactly as `session.spawn` launches a new terminal.
+    /// Its environment is a new terminal's; the caller binds its account.
     fn shell_restart_spec(
         &self,
         record: &diri_proto::SessionRecord,
         directory: Option<&Path>,
     ) -> Result<crate::session::SessionSpec, ControlError> {
-        let registry = self.registry.lock().map_err(poisoned)?;
+        let inherited = diri_platform::launch::local_environment();
+        let engine = self.registry.lock().map_err(poisoned)?.engine();
         let kind = diri_proto::AgentKind::SHELL_ID;
+        // As for a new terminal, no shell manifest is an error: a default
+        // descriptor would scrub nothing.
+        let descriptor = engine
+            .manifest(kind)
+            .and_then(|manifest| manifest.agent.as_ref())
+            .ok_or_else(|| ControlError::not_found(format!("no manifest for agent {kind:?}")))?;
         let launch_path = directory.unwrap_or_else(|| Path::new(&record.cwd));
         let mut pty = crate::pty::PtySpec::new(login_shell_argv(), launch_path);
         // As a new terminal's: a shell restarted after a reboot or a crash
         // must still know its session, or nothing run in it can reach Diri.
-        let descriptor = registry
-            .engine()
-            .manifest(kind)
-            .and_then(|manifest| manifest.agent.clone())
-            .unwrap_or_default();
-        pty.env = self.local_terminal_environment(
-            &record.id.0,
-            &descriptor,
-            diri_platform::launch::local_environment(),
-        );
+        pty.env = self.local_terminal_environment(&record.id.0, descriptor, inherited);
         if let Some(integration) = self.terminal_shell_integration() {
             integration.apply(&mut pty);
         }
@@ -4210,7 +4217,7 @@ impl ControlServer {
             id: record.id.0.clone(),
             pty,
             manifest_id: kind.to_owned(),
-            authority: crate::session::authority_for(kind, &registry.engine()),
+            authority: crate::session::authority_for(kind, &engine),
             logs_dir: self.logs_dir.clone(),
             holder: self.holder.clone(),
             remote: None,
@@ -4467,36 +4474,8 @@ impl ControlServer {
         let mut pty = descriptor
             .spawn_spec(Path::new(cwd), inherited, &launch_args)
             .ok_or_else(|| ControlError::internal("resume spec without a binary"))?;
-        if let Some(injection) = &self.injection {
-            pty.env
-                .push((crate::inject::SESSION_ID_ENV.into(), id.to_string()));
-            pty.env.push((
-                crate::inject::SOCKET_ENV.into(),
-                self.socket_path.to_string_lossy().into_owned(),
-            ));
-            pty.env.push((
-                crate::inject::CLI_ENV.into(),
-                injection.cli_path.to_string_lossy().into_owned(),
-            ));
-            pty.env
-                .retain(|(key, _)| key != crate::inject::MCP_TOKEN_ENV);
-            if let Some(token) = mcp_http_token.take() {
-                pty.env.push((crate::inject::MCP_TOKEN_ENV.into(), token));
-            }
-            pty.env.push((
-                diri_proto::paths::ENV_SESSION_RECOVERY_DIR.into(),
-                registry
-                    .recovery_directory(id)
-                    .to_string_lossy()
-                    .into_owned(),
-            ));
-            if let Some(dir) = self.resolved_notes_dir() {
-                pty.env.push((
-                    diri_proto::paths::ENV_NOTES_DIR.into(),
-                    dir.to_string_lossy().into_owned(),
-                ));
-            }
-        }
+        let recovery_dir = registry.recovery_directory(id);
+        self.name_session(&mut pty.env, id, Some(&recovery_dir), mcp_http_token.take());
         Ok(crate::session::SessionSpec {
             id: id.to_string(),
             pty,
@@ -9333,16 +9312,58 @@ mod tests {
                 crate::inject::SESSION_ID_ENV.to_owned(),
                 "s_engine".to_owned(),
             ),
+            (
+                crate::inject::MCP_TOKEN_ENV.to_owned(),
+                "t_engine".to_owned(),
+            ),
+            (
+                diri_proto::paths::ENV_SESSION_RECOVERY_DIR.to_owned(),
+                "/recovery/s_engine".to_owned(),
+            ),
             ("CLAUDECODE".to_owned(), "1".to_owned()),
             ("CLAUDE_CODE_CHILD_SESSION".to_owned(), "1".to_owned()),
         ];
-        let env = server.local_terminal_environment("s_term", &descriptor, inherited);
+        let env = server.local_terminal_environment("s_term", &descriptor, inherited.clone());
         named(&env, "s_term");
         assert_eq!(values(&env, "PATH"), ["/usr/bin"]);
-        assert!(values(&env, "CLAUDECODE").is_empty(), "{env:?}");
+        for key in [
+            crate::inject::MCP_TOKEN_ENV,
+            diri_proto::paths::ENV_SESSION_RECOVERY_DIR,
+            "CLAUDECODE",
+            "CLAUDE_CODE_CHILD_SESSION",
+        ] {
+            assert!(values(&env, key).is_empty(), "{key}: {env:?}");
+        }
+
+        // Without injection the inherited identity is still not passed on.
+        let bare = ControlServer::new(
+            Arc::new(Mutex::new(Registry::new(
+                engine(),
+                temp.path().join("bare.json"),
+            ))),
+            temp.path().join("bare-socket"),
+        );
+        let env = bare.local_terminal_environment("s_term", &descriptor, inherited);
+        for key in [
+            crate::inject::SESSION_ID_ENV,
+            crate::inject::MCP_TOKEN_ENV,
+            diri_proto::paths::ENV_SESSION_RECOVERY_DIR,
+        ] {
+            assert!(values(&env, key).is_empty(), "{key}: {env:?}");
+        }
+
+        // No shell manifest: the restart fails instead of scrubbing nothing.
+        let empty = ControlServer::new(
+            Arc::new(Mutex::new(Registry::new(
+                Arc::new(ManifestEngine::new(Vec::new())),
+                temp.path().join("empty.json"),
+            ))),
+            temp.path().join("empty-socket"),
+        );
         assert!(
-            values(&env, "CLAUDE_CODE_CHILD_SESSION").is_empty(),
-            "{env:?}"
+            empty
+                .shell_restart_spec(&test_record("s_term"), None)
+                .is_err()
         );
     }
 
