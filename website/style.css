@@ -1131,3 +1131,9 @@ cSystemFont, sans-serif; font-size: 20px; line-height: 1.5; font-weight: 500; le
   .brew-line code { min-width: 0; overflow: hidden; text-overflow: ellipsis; }
   .brew-copy { flex: none; }
 }
+.hero-agents { display: flex; flex-direction: column; align-items: center; gap: 14px; margin-top: 44px; }
+.hero-agents p { margin: 0; font-size: 12px; letter-spacing: .02em; color: var(--rp-muted); }
+.hero-agents ul { display: flex; flex-wrap: wrap; justify-content: center; align-items: center; gap: 26px 30px; margin: 0; padding: 0; list-style: none; }
+.hero-agents i { display: block; width: 22px; height: 22px; background: #c9c2d8; opacity: .6; -webkit-mask: var(--icon) center / contain no-repeat; mask: var(--icon) center / contain no-repeat; transition: opacity 140ms ease; }
+@media (hover: hover) and (pointer: fine) { .hero-agents i:hover { opacity: 1; } }
+@media (max-width: 600px) { .hero-agents ul { gap: 22px 24px; } .hero-agents i { width: 20px; height: 20px; } }
