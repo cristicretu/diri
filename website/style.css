@@ -1099,32 +1099,32 @@ cSystemFont, sans-serif; font-size: 20px; line-height: 1.5; font-weight: 500; le
 @media (max-width: 600px) { .hero-clip { border-radius: 9px; } }
 
 /* Landing hero: a headline, one line of copy, one action row, and the other platforms menu below. */
-.intro { display: flex; flex-direction: column; align-items: center; text-align: center; padding: 88px 0 72px; }
-.intro-heading { max-width: 980px; }
-.intro-heading h1 { font-size: clamp(40px, 5.8vw, 68px); line-height: 1.02; font-weight: 600; letter-spacing: -.04em; color: #f4f0fa; text-wrap: balance; }
-.intro-heading p { max-width: 36em; margin: 22px auto 0; font-size: 18px; line-height: 1.55; color: #a9a2bc; text-wrap: balance; }
-.intro-actions { display: flex; flex-wrap: wrap; justify-content: center; align-items: center; gap: 12px; margin-top: 36px; }
-.intro-actions .button { height: 46px; padding: 0 22px; gap: 10px; border-radius: 12px; font-size: 15px; font-weight: 600; }
+.intro { display: flex; flex-direction: column; align-items: center; text-align: center; padding: 72px 0 64px; }
+.intro-heading { max-width: 760px; }
+.intro-heading h1 { font-size: clamp(34px, 4vw, 48px); line-height: 1.08; font-weight: 600; letter-spacing: -.03em; color: #f4f0fa; text-wrap: balance; }
+.intro-heading p { max-width: 30em; margin: 16px auto 0; font-size: 16px; line-height: 1.6; color: #a9a2bc; text-wrap: balance; }
+.intro-actions { display: flex; flex-wrap: wrap; justify-content: center; align-items: center; gap: 10px; margin-top: 28px; }
+.intro-actions .button { height: 40px; padding: 0 18px; gap: 8px; border-radius: 10px; font-size: 14px; font-weight: 500; }
 .intro-actions .button.primary { color: #17151f; background: #f4f0fa; border: 1px solid #f4f0fa; }
 .intro-actions .button.primary .button-mark { filter: brightness(0); }
 .intro-actions .button.primary:hover { background: #fff; border-color: #fff; }
 .intro-actions .button:focus-visible, .brew-copy:focus-visible, .download-options summary:focus-visible { outline: 2px solid var(--rp-rose); outline-offset: 3px; }
-.download-options { position: relative; width: 100%; margin-top: 18px; text-align: center; }
-.download-options > summary { display: inline-flex; align-items: center; gap: 6px; padding: 6px 4px; color: var(--rp-subtle); font-size: 14px; list-style: none; cursor: pointer; }
+.download-options { position: relative; width: 100%; margin-top: 12px; text-align: center; }
+.download-options > summary { display: inline-flex; align-items: center; gap: 6px; padding: 6px 4px; color: var(--rp-muted); font-size: 13px; list-style: none; cursor: pointer; }
 .download-options > summary::-webkit-details-marker { display: none; }
 .download-options > summary:hover { color: var(--rp-text); }
 .brew-line { display: flex; justify-content: center; }
 .brew-line[hidden] { display: none; }
-.brew-pill { display: inline-flex; align-items: center; gap: 14px; max-width: 100%; height: 46px; padding: 0 6px 0 18px; border: 1px solid #ffffff1f; border-radius: 12px; background: #ffffff0a; }
-.brew-line code { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 14px; font-variant-ligatures: none; color: var(--rp-text); white-space: nowrap; overflow-x: auto; }
+.brew-pill { display: inline-flex; align-items: center; gap: 12px; max-width: 100%; height: 40px; padding: 0 5px 0 16px; border: 1px solid #ffffff1f; border-radius: 10px; background: #ffffff0a; }
+.brew-line code { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 13px; font-variant-ligatures: none; color: var(--rp-text); white-space: nowrap; overflow-x: auto; }
 .brew-prompt { margin-right: 8px; color: var(--rp-muted); }
-.brew-copy { height: 34px; min-width: 104px; padding: 0 16px; border: 0; border-radius: 9px; background: #ffffff14; color: var(--rp-text); font: inherit; font-size: 13px; font-weight: 500; cursor: pointer; }
+.brew-copy { height: 30px; min-width: 96px; padding: 0 14px; border: 0; border-radius: 8px; background: #ffffff14; color: var(--rp-text); font: inherit; font-size: 12px; font-weight: 500; cursor: pointer; }
 .brew-copy:hover { background: #ffffff24; }
 @media (max-width: 600px) {
-  .intro { padding: 56px 0 56px; }
-  .intro-heading h1 { font-size: 38px; }
-  .intro-heading p { font-size: 16px; }
-  .intro-actions { flex-direction: column; width: 100%; margin-top: 28px; }
+  .intro { padding: 48px 0 48px; }
+  .intro-heading h1 { font-size: 32px; }
+  .intro-heading p { font-size: 15px; }
+  .intro-actions { flex-direction: column; width: 100%; margin-top: 24px; }
   .intro-actions .button { width: 100%; justify-content: center; }
   .brew-line { width: 100%; min-width: 0; }
   .brew-pill { width: 100%; min-width: 0; justify-content: space-between; gap: 10px; padding-left: 14px; }
