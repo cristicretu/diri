@@ -22,6 +22,9 @@ diri-terminal-state.workspace = true
 # message handling as the stdio frontend (see src/mcp_http.rs).
 dirijor-mcp = { path = "../dirijor-mcp" }
 getrandom.workspace = true
+# Already in the graph through diri-terminal-state and the vendored parser;
+# the Engine pump scans every output byte for the Holder exit marker with it.
+memchr = "2.8"
 plist.workspace = true
 regex.workspace = true
 rusqlite.workspace = true
