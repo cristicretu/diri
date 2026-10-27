@@ -2950,3 +2950,52 @@ DIRI_AGENT_LAUNCHER=$PWD/target/debug/diri \
   cargo test -p diri-engine --test detached_agent -- --ignored
 ```
 
+
+## Idle sessions hold no threads (2026-10-27)
+
+With #839 an idle session cost no wakeups, but it still kept threads blocked
+for its whole life: seven in the Holder manager (control socket, PTY reader,
+log writer, exit watch, input lane, and an output writer plus a hangup
+watcher per subscriber) and one Engine pump. At 100 idle shells that was 702
+manager threads and 102 Engine threads.
+
+**What changed.** Each process has one readiness thread (`holder/reactor.rs`:
+kqueue on macOS, epoll on Linux, one-shot registrations). A Holder lane keeps
+its thread while it has work and hands its descriptor to the reactor after
+2 s idle (500 ms for the control socket, whose requests are one-shot); the
+next event starts a thread again. The exit watch is a reactor registration
+from the start. An idle held Engine pump (the #839 park point) moves its loop
+state off the stack and hands its own kqueue to the reactor, with the 300 s
+backstop as a kqueue timer; a frame, a hangup, the doorbell or the timer
+resumes it on a new thread. At any moment exactly one party owns each lane's
+descriptor or a pump's state. The input lane keeps interactive QoS; other
+lanes run at the QoS sessions were started with, not the reactor's.
+
+**Numbers.** `idlebench <n> 0 30 40` (interactive `zsh -f`, real
+`diri-holder --manager`), base (#839) and branch alternated, two rounds, load
+2.6–8. Idle values after 35 s; latencies are p95 of both rounds.
+
+| | n=1 base → branch | n=10 | n=100 |
+|---|---|---|---|
+| Engine threads | 3 → 3 | 12 → 3 | 102 → 3 |
+| Manager threads | 9 → 3 | 72 → 3 | 702 → 3 |
+| Manager footprint | 1.6 → 1.4 MB | 4.3 → 2.3 MB | 28.2–28.4 → 6.8 MB |
+| Engine footprint | 5.3–5.8 → 5.6–5.9 MB | 7.7–8.8 → 7.8–8.0 MB | 32.2–32.5 → 32.7 MB |
+| Manager fds | 15 → 15 | 105 → 96 | 1005 → 906 |
+| Idle 30 s: syscalls Engine / manager | 13 / 0 → 13 / 0 | same | 13 / 0 → 13 / 0 |
+| Echo after 40 s idle | 0.05–0.40 → 0.39–0.49 ms | 0.33–1.25 → 0.36–0.52 ms | 0.46–0.47 → 0.52–0.57 ms |
+| Command output after idle | 0.33–0.40 → 0.42–0.48 ms | 0.52–1.02 → 0.45–0.66 ms | 0.54–0.64 → 0.79–0.84 ms |
+| Echo while typing (keys 50 ms apart) | 0.70–0.79 → 0.53–0.70 ms | 0.57–0.73 → 0.63–0.72 ms | 0.79 → 0.86 ms |
+
+The first keystroke after an idle period pays for thread starts in both
+processes: about +0.06–0.1 ms on echo p95 and +0.2 ms on the first command
+output at n=100. Active typing is within run-to-run noise. Engine memory does
+not move: its pump threads' stacks were mostly untouched pages. Parking is a
+one-time transition (about 5 syscalls per lane), not a tick.
+
+`fleetbench payload 32 MiB, 160×50`, three alternating rounds: 1 session
+84.0/94.3/90.4 → 94.0/92.6/95.1 MB/s, 4 sessions 137.2/142.4/140.5 →
+138.0/142.8/137.5 MB/s. Throughput is unchanged; streaming lanes never park.
+
+Not changed: remote and direct (non-held) Engine pumps, and the ~2 Engine
+threads per attached pane.
