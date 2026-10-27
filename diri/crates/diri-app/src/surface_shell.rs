@@ -4085,6 +4085,155 @@ impl UtilitySurfaces {
         options.into_any_element()
     }
 
+    /// Where blocked, failed and finished sessions are announced: one row
+    /// per state, one switch per channel. Working only ever marks its row,
+    /// so it has none. Notifications post only while Diri is in the
+    /// background.
+    fn alert_settings(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        use crate::store::{AttentionRoute, AttentionRoutes, DockBadge};
+        type Pick = fn(&mut AttentionRoutes) -> &mut AttentionRoute;
+        let colors = self.settings_colors();
+        let routes = self.prefs.attention_routes;
+        let states: [(&'static str, &'static str, &'static str, AttentionRoute, Pick); 3] = [
+            (
+                "blocked",
+                t("settings.general.alert_blocked"),
+                t("settings.general.alert_blocked_detail"),
+                routes.blocked,
+                |routes| &mut routes.blocked,
+            ),
+            (
+                "error",
+                t("settings.general.alert_error"),
+                t("settings.general.alert_error_detail"),
+                routes.error,
+                |routes| &mut routes.error,
+            ),
+            (
+                "done",
+                t("settings.general.alert_done"),
+                t("settings.general.alert_done_detail"),
+                routes.done,
+                |routes| &mut routes.done,
+            ),
+        ];
+        let column = |label: &'static str| {
+            div()
+                .w(px(ALERT_COLUMN_WIDTH))
+                .flex()
+                .justify_center()
+                .child(label)
+        };
+        let mut list = div().flex().flex_col().child(
+            div()
+                .h(px(30.0))
+                .px(px(12.0))
+                .flex()
+                .items_center()
+                .text_size(px(Typo::META.size))
+                .text_color(colors.tertiary)
+                .child(
+                    div()
+                        .flex_1()
+                        .min_w(px(0.0))
+                        .child(t("settings.general.alerts_detail")),
+                )
+                .child(column(t("settings.general.alert_notify")))
+                .child(column(t("settings.general.alert_sound")))
+                .child(column(t("settings.general.alert_badge"))),
+        );
+        for (key, label, detail, route, pick) in states {
+            type Channel = fn(&mut AttentionRoute) -> &mut bool;
+            let channels: [(&'static str, bool, Channel); 3] = [
+                ("notify", route.notify, |route| &mut route.notify),
+                ("sound", route.sound, |route| &mut route.sound),
+                ("badge", route.badge, |route| &mut route.badge),
+            ];
+            let row = div()
+                .min_h(px(SETTINGS_ROW_HEIGHT))
+                .px(px(12.0))
+                .flex()
+                .items_center()
+                .gap(px(12.0))
+                .child(
+                    div()
+                        .flex_1()
+                        .min_w(px(0.0))
+                        .child(setting_text_stack(label.into(), detail.into(), colors)),
+                );
+            let mut cells = div().flex().flex_none();
+            for (channel, on, field) in channels {
+                let id: SharedString = format!("alert-{key}-{channel}").into();
+                cells = cells.child(
+                    div()
+                        .w(px(ALERT_COLUMN_WIDTH))
+                        .flex()
+                        .justify_center()
+                        .child(alert_check(id, on, colors).on_click(cx.listener(
+                            move |this, _, _, cx| {
+                                this.update_prefs(|prefs| {
+                                    let value = field(pick(&mut prefs.attention_routes));
+                                    *value = !*value;
+                                });
+                                cx.notify();
+                            },
+                        ))),
+                );
+            }
+            list = list
+                .child(setting_divider(colors))
+                .child(row.child(cells));
+        }
+        let badge = self.prefs.dock_badge;
+        let segment = |id: &'static str, label: &'static str, value: DockBadge| {
+            let selected = badge == value;
+            div()
+                .id(id)
+                .debug_selector(move || id.into())
+                .h(px(24.0))
+                .px(px(9.0))
+                .rounded(px(Radius::CHIP))
+                .flex()
+                .items_center()
+                .text_size(px(Typo::META.size))
+                .text_color(if selected {
+                    colors.primary
+                } else {
+                    colors.secondary
+                })
+                .when(selected, |segment| segment.bg(colors.primary.alpha(0.10)))
+                .cursor_pointer()
+                .on_click(cx.listener(move |this, _, _, cx| {
+                    this.update_prefs(|prefs| prefs.dock_badge = value);
+                    cx.notify();
+                }))
+                .child(label)
+        };
+        list = list.child(setting_divider(colors)).child(setting_row(
+            t("settings.general.dock_badge"),
+            t("settings.general.dock_badge_detail"),
+            div()
+                .flex_none()
+                .p(px(2.0))
+                .rounded(px(Radius::BADGE))
+                .bg(colors.primary.alpha(0.05))
+                .flex()
+                .gap(px(2.0))
+                .child(segment(
+                    "dock-badge-sessions",
+                    t("settings.general.dock_badge_sessions"),
+                    DockBadge::Sessions,
+                ))
+                .child(segment(
+                    "dock-badge-notifications",
+                    t("settings.general.dock_badge_notifications"),
+                    DockBadge::Notifications,
+                )),
+            colors,
+        ));
+        setting_section(t("settings.general.alerts"), list, colors)
+    }
+
     fn general_settings(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let colors = self.settings_colors();
         settings_page(
@@ -4177,6 +4326,7 @@ impl UtilitySurfaces {
                         )),
                     colors,
                 ))
+                .child(self.alert_settings(cx))
                 .children(self.import_settings(cx))
                 .child(self.update_settings(cx))
                 .child(setting_section(
@@ -7886,6 +8036,43 @@ fn toggle_row(
                 .when(!enabled, |toggle| toggle.justify_start())
                 .child(div().size(px(14.0)).rounded(px(7.0)).bg(colors.primary)),
         )
+}
+
+/// One alert channel column in General > Alerts.
+const ALERT_COLUMN_WIDTH: f32 = 52.0;
+
+/// A channel's switch in the alerts grid: a small check box, so three fit
+/// on a row where three toggles would crowd it.
+fn alert_check(
+    id: SharedString,
+    on: bool,
+    colors: SemanticColors,
+) -> gpui::Stateful<gpui::Div> {
+    div()
+        .id(id.clone())
+        .debug_selector(move || id.to_string())
+        .role(gpui::Role::CheckBox)
+        .size(px(16.0))
+        .rounded(px(4.0))
+        .flex()
+        .items_center()
+        .justify_center()
+        .cursor_pointer()
+        .when(on, |check| check.bg(Ink::FRESH.alpha(0.72)))
+        .when(!on, |check| {
+            check
+                .border_1()
+                .border_color(colors.primary.alpha(0.22))
+                .hover(move |style| style.bg(colors.primary.alpha(0.06)))
+        })
+        .when(on, |check| {
+            check.child(sf_symbol_weighted(
+                "checkmark",
+                9.0,
+                SymbolWeight::Bold,
+                colors.primary,
+            ))
+        })
 }
 
 /// "Start diri at login". Unlike a plain preference toggle it shows what

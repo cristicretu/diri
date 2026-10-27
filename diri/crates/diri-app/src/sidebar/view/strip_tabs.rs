@@ -129,7 +129,9 @@ impl Sidebar {
         };
         StripTabProps {
             id: id.clone(),
-            title: display_title(session),
+            // A tab waiting on a named question shows the question.
+            title: crate::session_presentation::blocker_line(session)
+                .unwrap_or_else(|| display_title(session)),
             kind: session.effective_kind().clone(),
             active,
             rank,

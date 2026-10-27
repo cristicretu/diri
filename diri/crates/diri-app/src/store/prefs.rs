@@ -30,6 +30,52 @@ impl UiLanguage {
     }
 }
 
+/// Where one kind of session news is announced, besides the session's own
+/// row: a system notification (only while Diri is in the background), a
+/// sound, and the Dock badge.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default, rename_all = "camelCase")]
+pub struct AttentionRoute {
+    pub notify: bool,
+    pub sound: bool,
+    pub badge: bool,
+}
+
+impl Default for AttentionRoute {
+    fn default() -> Self {
+        Self {
+            notify: true,
+            sound: true,
+            badge: true,
+        }
+    }
+}
+
+/// Per-state routing. Working has no entry: it only ever marks the row.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default, rename_all = "camelCase")]
+pub struct AttentionRoutes {
+    /// A permission prompt or question is waiting.
+    pub blocked: AttentionRoute,
+    /// The program failed or exited with an error.
+    pub error: AttentionRoute,
+    /// A turn finished.
+    pub done: AttentionRoute,
+}
+
+/// What the Dock badge counts.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum DockBadge {
+    /// Sessions that are blocked, failed or finished and not looked at yet:
+    /// one per session however many notifications it posted.
+    #[default]
+    Sessions,
+    /// Every unread entry in the notification inbox (the behavior before
+    /// per-session counting).
+    Notifications,
+}
+
 /// Who listens for a spoken answer after a reading.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -449,6 +495,10 @@ pub struct Prefs {
     pub confirm_before_closing_session: bool,
     pub status_sounds: bool,
     pub status_notifications: bool,
+    /// Which channels blocked, failed and finished sessions reach.
+    pub attention_routes: AttentionRoutes,
+    /// What the Dock badge counts.
+    pub dock_badge: DockBadge,
     /// Read the relevant part of a finished turn's reply aloud (`crate::voice`).
     #[serde(default)]
     pub talk_with_agent: bool,
@@ -646,6 +696,8 @@ impl Default for Prefs {
             confirm_before_closing_session: true,
             status_sounds: true,
             status_notifications: true,
+            attention_routes: AttentionRoutes::default(),
+            dock_badge: DockBadge::default(),
             talk_with_agent: false,
             talk_dictation: false,
             talk_voice: String::new(),

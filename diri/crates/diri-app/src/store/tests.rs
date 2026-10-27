@@ -3332,6 +3332,8 @@ fn delivery_rechecks_read_focus_and_mute_after_the_event_was_queued() {
         vec![project("p", "P")],
         Prefs::default(),
     );
+    // Session news posts only while Diri is in the background.
+    store.set_active(false);
     store.select(id("visible"));
     drain(&mut effects);
     store.handle_event(custom_notification(&record, "queued"));
@@ -4348,4 +4350,146 @@ fn read_aloud_can_pick_one_tab_or_all_but_one() {
     assert!(store.tab_reads_aloud(&SessionId("later".into())));
     store.set_read_aloud(a.id.clone(), ReadAloudChoice::All);
     assert!(store.reads_aloud(&a.id) && store.reads_aloud(&b.id));
+}
+
+/// A session holding one unresolved attention event of `kind`.
+fn session_with_event(
+    value: &str,
+    kind: diri_proto::attention::AttentionKind,
+    sequence: u64,
+) -> SessionRecord {
+    use diri_proto::attention::{ATTENTION_VERSION, AttentionEvent, AttentionState};
+    let mut record = session(value, "p", 1.0);
+    record.attention_state = Some(AttentionState {
+        version: ATTENTION_VERSION,
+        epoch: record.id.0.clone(),
+        sequence,
+        turn: 1,
+        working: false,
+        last_native_completion: None,
+        observed_at: None,
+        active_tools: Default::default(),
+        events: (1..=sequence)
+            .map(|sequence| AttentionEvent {
+                sequence,
+                turn: sequence,
+                kind,
+                occurred_at: record.updated_at,
+                resolved: false,
+                blocking: true,
+                detail: None,
+            })
+            .collect(),
+        native_requests: Default::default(),
+        native_completions: Default::default(),
+    });
+    record
+}
+
+#[test]
+fn session_news_posts_only_in_the_background_but_still_chimes_in_front() {
+    use diri_proto::attention::AttentionKind;
+    let (mut store, mut effects) = hydrated(
+        vec![session("visible", "p", 2.0)],
+        vec![project("p", "P")],
+        Prefs::default(),
+    );
+    store.select(id("visible"));
+    drain(&mut effects);
+    store.upsert_session(session_with_event("done", AttentionKind::Completion, 1));
+    let due = store.next_attention_deadline().expect("a finished turn is armed");
+
+    // Diri in front: the row shows it and the chime plays; no banner.
+    let transitions = store.drain_settled_attention(due);
+    let transition = transitions.first().expect("the chime is still due");
+    assert_eq!(transition.sound, Some(NotificationSound::Done));
+    let request = transition.notification.as_ref().unwrap();
+    assert!(!store.should_deliver_notification(request));
+    assert!(store.should_play_sound(request));
+
+    // The same news while Diri is in the background posts.
+    store.set_active(false);
+    assert!(store.should_deliver_notification(request));
+    // Muting the chimes leaves the banner alone, and the reverse.
+    store
+        .update_preferences(|prefs| prefs.status_sounds = false)
+        .unwrap();
+    assert!(!store.should_play_sound(request));
+    assert!(store.should_deliver_notification(request));
+}
+
+#[test]
+fn each_state_routes_its_notification_sound_and_badge_on_its_own() {
+    use diri_proto::attention::AttentionKind;
+    let (mut store, mut effects) = hydrated(
+        vec![session("visible", "p", 2.0)],
+        vec![project("p", "P")],
+        Prefs::default(),
+    );
+    store.select(id("visible"));
+    store.set_active(false);
+    drain(&mut effects);
+    store
+        .update_preferences(|prefs| {
+            prefs.attention_routes.done.notify = false;
+            prefs.attention_routes.error.sound = false;
+            prefs.attention_routes.blocked.badge = false;
+        })
+        .unwrap();
+    store.upsert_session(session_with_event("done", AttentionKind::Completion, 1));
+    store.upsert_session(session_with_event("failed", AttentionKind::Failure, 1));
+    store.upsert_session(session_with_event("asks", AttentionKind::Request, 1));
+    let due = store.next_attention_deadline().unwrap() + Duration::from_secs(1);
+    let transitions = store.drain_settled_attention(due);
+    let by_session = |name: &str| {
+        transitions
+            .iter()
+            .find(|transition| {
+                transition.notification.as_ref().unwrap().thread_identifier.as_deref()
+                    == Some(name)
+            })
+            .unwrap_or_else(|| panic!("{name} announced"))
+    };
+    let done = by_session("done");
+    assert!(!store.should_deliver_notification(done.notification.as_ref().unwrap()));
+    assert_eq!(done.sound, Some(NotificationSound::Done));
+    let failed = by_session("failed");
+    assert!(store.should_deliver_notification(failed.notification.as_ref().unwrap()));
+    assert_eq!(failed.sound, None);
+    let asks = by_session("asks");
+    assert!(store.should_deliver_notification(asks.notification.as_ref().unwrap()));
+    // The waiting session does not badge; the other two do.
+    assert_eq!(store.dock_badge_count(), 2);
+}
+
+#[test]
+fn dock_badge_counts_unseen_sessions_once_until_each_is_viewed() {
+    use diri_proto::attention::AttentionKind;
+    let (mut store, mut effects) = hydrated(
+        vec![session("visible", "p", 2.0)],
+        vec![project("p", "P")],
+        Prefs::default(),
+    );
+    store.select(id("visible"));
+    drain(&mut effects);
+    // Three finished turns from one session, one failure from another.
+    store.upsert_session(session_with_event("busy", AttentionKind::Completion, 3));
+    store.upsert_session(session_with_event("failed", AttentionKind::Failure, 1));
+    assert_eq!(store.notifications().unread_count(), 4);
+    assert_eq!(store.dock_badge_count(), 2, "one per session");
+
+    // The former count stays one preference away.
+    store
+        .update_preferences(|prefs| prefs.dock_badge = crate::store::DockBadge::Notifications)
+        .unwrap();
+    assert_eq!(store.dock_badge_count(), 4);
+    store
+        .update_preferences(|prefs| prefs.dock_badge = crate::store::DockBadge::Sessions)
+        .unwrap();
+
+    // Looking at a session clears it; a muted one never counts.
+    store.select(id("busy"));
+    assert_eq!(store.dock_badge_count(), 1);
+    store.toggle_notification_mute(id("failed"));
+    assert_eq!(store.dock_badge_count(), 0);
 }

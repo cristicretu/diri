@@ -44,6 +44,7 @@ actions!(
         ToggleQuickOpen,
         ToggleHistory,
         ToggleNotifications,
+        ToggleActivity,
         ToggleOverview,
         ToggleTabPeek,
         ReviewLaunches,
@@ -165,6 +166,7 @@ pub enum CommandId {
     ToggleQuickOpen,
     ToggleHistory,
     ToggleNotifications,
+    ToggleActivity,
     ToggleOverview,
     ToggleTabPeek,
     ReviewLaunches,
@@ -938,6 +940,16 @@ pub const COMMANDS: &[CommandSpec] = &[
         "inbox unread alerts attention"
     ),
     spec!(
+        ToggleActivity,
+        "toggle-activity",
+        Some("cmd-."),
+        Some("⌘."),
+        Some(APP_CONTEXT),
+        "command.toggle_activity.palette_title",
+        "waveform.circle",
+        "activity working waiting blocked finished status filter"
+    ),
+    spec!(
         CheckForUpdates,
         "check-for-updates",
         None,
@@ -1426,6 +1438,7 @@ impl CommandSpec {
             CommandId::ToggleQuickOpen => KeyBinding::new(key, ToggleQuickOpen, context),
             CommandId::ToggleHistory => KeyBinding::new(key, ToggleHistory, context),
             CommandId::ToggleNotifications => KeyBinding::new(key, ToggleNotifications, context),
+            CommandId::ToggleActivity => KeyBinding::new(key, ToggleActivity, context),
             CommandId::ToggleOverview => KeyBinding::new(key, ToggleOverview, context),
             CommandId::ReviewLaunches => KeyBinding::new(key, ReviewLaunches, context),
             CommandId::ToggleTabPeek => KeyBinding::new(key, ToggleTabPeek, context),
@@ -1807,6 +1820,11 @@ impl CommandId {
             Self::ToggleNotifications => ShortcutMetadata {
                 title: t("command.toggle_notifications.title"),
                 description: t("command.toggle_notifications.description"),
+                category: Navigation,
+            },
+            Self::ToggleActivity => ShortcutMetadata {
+                title: t("command.toggle_activity.title"),
+                description: t("command.toggle_activity.description"),
                 category: Navigation,
             },
             Self::SelectNextAttentionSession => ShortcutMetadata {
@@ -2255,6 +2273,7 @@ impl CommandId {
             Self::ToggleQuickOpen => Box::new(ToggleQuickOpen),
             Self::ToggleHistory => Box::new(ToggleHistory),
             Self::ToggleNotifications => Box::new(ToggleNotifications),
+            Self::ToggleActivity => Box::new(ToggleActivity),
             Self::ToggleOverview => Box::new(ToggleOverview),
             Self::ToggleTabPeek => Box::new(ToggleTabPeek),
             Self::ReviewLaunches => Box::new(ReviewLaunches),

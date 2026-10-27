@@ -280,7 +280,7 @@ impl Sidebar {
     ) -> Vec<Arc<SessionRecord>> {
         if store.preferences().tab_orientation == TabOrientation::Horizontal {
             selected_project_tabs(store).sessions
-        } else if !self.filter_query.text().trim().is_empty() {
+        } else if self.filtering() {
             // Numeric shortcuts follow the displayed filtered rows, including
             // disclosed archives and the current project/recency grouping.
             self.focus_rows_for_store(store)
@@ -288,12 +288,7 @@ impl Sidebar {
                 .filter_map(|row| store.sessions().get(&row.id).cloned())
                 .collect()
         } else {
-            super::super::filter::filter_projection(
-                store.sidebar_projection(),
-                self.filter_query.text(),
-            )
-            .ordered_sessions
-            .clone()
+            store.sidebar_projection().ordered_sessions.clone()
         }
     }
 

@@ -2809,6 +2809,25 @@ impl RootView {
                 }
             }
             CommandId::ToggleNotifications => self.toggle_notifications(window, cx),
+            CommandId::ToggleActivity => {
+                if self.sidebar.read(cx).tab_orientation()
+                    == crate::store::TabOrientation::Horizontal
+                {
+                    // Activity narrows the vertical sidebar, which horizontal
+                    // tabs replace: the inbox answers "who needs me" there.
+                    self.toggle_notifications(window, cx);
+                } else {
+                    // Turning it on shows a hidden sidebar.
+                    let sidebar = self.sidebar.read(cx);
+                    let reveal = !sidebar.activity_filter() && !sidebar.is_visible();
+                    self.sidebar.update(cx, |sidebar, cx| {
+                        if reveal {
+                            sidebar.toggle(cx);
+                        }
+                        sidebar.toggle_activity_filter(cx);
+                    });
+                }
+            }
             CommandId::SelectNextAttentionSession => {
                 self.sidebar
                     .update(cx, |sidebar, cx| sidebar.select_next_needing_input(cx));
@@ -5883,6 +5902,9 @@ impl Render for RootView {
                     this.run_command(CommandId::SelectNextAttentionSession, window, cx);
                 }),
             )
+            .on_action(cx.listener(|this, _: &crate::commands::ToggleActivity, window, cx| {
+                this.run_command(CommandId::ToggleActivity, window, cx);
+            }))
             .on_action(cx.listener(|this, _: &CheckForUpdates, window, cx| {
                 this.run_command(CommandId::CheckForUpdates, window, cx);
             }))

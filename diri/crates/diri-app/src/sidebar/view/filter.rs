@@ -1,5 +1,8 @@
 use super::*;
 
+/// The Activity toggle's width plus its gap from the filter field.
+const ACTIVITY_TOGGLE_ROOM: f32 = 30.0;
+
 impl Sidebar {
     pub(super) fn handle_filter_key(
         &mut self,
@@ -62,8 +65,6 @@ impl Sidebar {
         let mut control = div()
             .id("sidebar-filter")
             .debug_selector(|| "sidebar-filter".into())
-            .mx(px(Space::INSET))
-            .mb(px(6.0))
             .h(px(30.0))
             .flex_none()
             .rounded(px(SIDEBAR_ROW_RADIUS))
@@ -142,7 +143,8 @@ impl Sidebar {
                 .aria_label(t("sidebar.filter.agents"))
                 .child(t("sidebar.filter.agents"));
         }
-        let expanded = (self.ui.width - Space::INSET * 2.0).max(0.0);
+        // The Activity toggle keeps its place at the row's end.
+        let expanded = (self.ui.width - Space::INSET * 2.0 - ACTIVITY_TOGGLE_ROOM).max(0.0);
         if self.filter_open && !cx.reduce_motion() {
             control
                 .with_animation(
