@@ -1741,6 +1741,7 @@ name = "diri-term"
 version = "0.1.0"
 dependencies = [
  "criterion",
+ "diri-engine",
  "diri-proto",
  "diri-telemetry",
  "diri-terminal-state",
@@ -1748,9 +1749,11 @@ dependencies = [
  "gpui_platform",
  "image",
  "miniz_oxide 0.9.1",
+ "objc",
  "plist",
  "serde",
  "serde_json",
+ "tokio",
  "unicode-width",
 ]
 

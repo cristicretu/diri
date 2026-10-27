@@ -70,9 +70,6 @@ struct ControlState {
     resize_storm: crate::telemetry::ResizeStorm,
     /// Last `pane.input_rejected` event, to keep one per burst.
     rejection_recorded: Option<Instant>,
-    /// When the owner last queued typed input whose echo has not yet been
-    /// seen; see [`AttachmentControl::take_echo`].
-    echo_due: Option<Instant>,
     /// The session's keystroke probe, shared with its transport task.
     echo: Arc<crate::telemetry::EchoProbe>,
     /// Typed input this attachment accepted that a disconnect could have
@@ -286,9 +283,7 @@ impl AttachmentControl {
             } => writer.scroll(direction, lines, col, row),
         };
         if typed && result.is_ok() {
-            let now = Instant::now();
-            state.echo_due = Some(now);
-            state.input_at_risk.sent(now);
+            state.input_at_risk.sent(Instant::now());
         }
         result.map_err(|error| match error {
             AttachmentClosed::Backpressure => InputRejection::Overloaded,
@@ -327,24 +322,6 @@ impl AttachmentControl {
     /// The session's grid was painted; closes a pending echo's timing.
     pub(super) fn echo_painted(&self, agent: &str) {
         self.echo.painted(agent);
-    }
-
-    /// Whether a screen change landing now answers input this attachment
-    /// queued within [`diri_term::cursor_motion::KEYSTROKE_WINDOW`] (long enough for a remote echo).
-    /// True at most once per input, so a keystroke buys one echo frame and
-    /// the output that follows it is paced like any other.
-    pub(super) fn take_echo(&self) -> bool {
-        self.state
-            .lock()
-            .unwrap()
-            .echo_due
-            .take()
-            .is_some_and(|sent| sent.elapsed() <= diri_term::cursor_motion::KEYSTROKE_WINDOW)
-    }
-
-    #[cfg(test)]
-    pub(super) fn note_echo_due_for_test(&self) {
-        self.state.lock().unwrap().echo_due = Some(Instant::now());
     }
 
     pub(super) fn resize(&self, cols: u16, rows: u16) {
@@ -463,7 +440,6 @@ impl ControllerLease {
                 retry: Arc::new(Notify::new()),
                 resize_storm: crate::telemetry::ResizeStorm::default(),
                 rejection_recorded: None,
-                echo_due: None,
                 echo: echo.clone(),
                 input_at_risk: InputAtRisk::default(),
                 #[cfg(test)]
@@ -1041,7 +1017,6 @@ mod tests {
                 retry: Arc::new(Notify::new()),
                 resize_storm: crate::telemetry::ResizeStorm::default(),
                 rejection_recorded: None,
-                echo_due: None,
                 echo: Arc::default(),
                 input_at_risk: InputAtRisk::default(),
                 #[cfg(test)]
@@ -1155,7 +1130,6 @@ mod tests {
             retry: Arc::new(Notify::new()),
             resize_storm: crate::telemetry::ResizeStorm::default(),
             rejection_recorded: None,
-            echo_due: None,
             echo: Arc::default(),
             input_at_risk: InputAtRisk::default(),
             resize_sends: 0,
@@ -1372,7 +1346,6 @@ mod tests {
                 retry: Arc::new(Notify::new()),
                 resize_storm: crate::telemetry::ResizeStorm::default(),
                 rejection_recorded: None,
-                echo_due: None,
                 echo: Arc::default(),
                 input_at_risk: InputAtRisk::default(),
                 #[cfg(test)]
@@ -1569,59 +1542,6 @@ mod tests {
             feedback(),
             1,
             "a click during a reconnect still explains itself"
-        );
-    }
-
-    #[gpui::test]
-    fn a_keystroke_buys_one_echo_frame(cx: &mut TestAppContext) {
-        let runtime = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .unwrap();
-        let engine = FakeEngine::start(&runtime);
-        let (events, _rx) = pane_event_channel();
-        let (_lease, control, _) = cx.update(|cx| {
-            ControllerLease::mount(
-                engine.path.clone(),
-                SessionId("shared-session".into()),
-                runtime.handle(),
-                events,
-                1,
-                None,
-                cx,
-            )
-        });
-        wait_for(cx, &runtime, || {
-            control.state.lock().unwrap().writer.is_some()
-        });
-        assert!(
-            !control.take_echo(),
-            "output nobody typed for is not an echo"
-        );
-        control.input(b"x".to_vec());
-        assert!(
-            !control.take_echo(),
-            "a passive view's rejected key has no echo"
-        );
-        control.claim();
-        control.mouse(b"\x1b[<0;1;1M".to_vec());
-        assert!(!control.take_echo(), "a click is not typing");
-        control.input(b"x".to_vec());
-        assert!(
-            control.take_echo(),
-            "the first change after a key is its echo"
-        );
-        assert!(
-            !control.take_echo(),
-            "the output after it is paced normally"
-        );
-        control.input(b"y".to_vec());
-        control.state.lock().unwrap().echo_due = Some(
-            Instant::now() - diri_term::cursor_motion::KEYSTROKE_WINDOW - Duration::from_millis(1),
-        );
-        assert!(
-            !control.take_echo(),
-            "a key too long ago is not being answered"
         );
     }
 

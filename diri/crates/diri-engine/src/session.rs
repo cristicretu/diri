@@ -158,6 +158,20 @@ const OUTPUT_SETTLE: Duration = Duration::from_millis(16);
 /// than the renderer's own frame cadence.
 const OUTPUT_BATCH_CEILING: Duration = Duration::from_millis(8);
 
+/// How long a held pump waits for more output before it publishes a batch
+/// that opened at least [`OUTPUT_BATCH_CEILING`] after the last publication.
+///
+/// The Holder's output stream cannot say a burst is over: a run read off it
+/// ends when the socket is momentarily empty, and the next PTY read may be
+/// microseconds behind. Waiting out the whole batch ceiling for the empty poll
+/// that proves it put ~9 ms between every lone piece of output (a background
+/// program's line, a spinner tick, a remote echo) and the screen. A short
+/// quiet window still folds in the rest of a write that spans several PTY
+/// reads, or several writes issued back to back, and anything that lost
+/// content waits for its redraw as before ([`RepaintHold`]). Continuous
+/// output stays capped at one publication per [`OUTPUT_BATCH_CEILING`].
+const OUTPUT_QUIET: Duration = Duration::from_millis(1);
+
 /// How long after a keystroke the output that follows it counts as its
 /// answer. A shell's echo lands well under a millisecond after the write and a
 /// Node TUI's repaint within a few; this is a ceiling on how stale an input may
@@ -5538,6 +5552,23 @@ fn evaluate_if_screen_changed(
 /// honoring only markers at or beyond `exit_marker_floor` (bytes below it
 /// belong to prior incarnations of the session id). A holder that dies
 /// *without* a marker is caught by a periodic liveness probe.
+/// How long a held pump's output stream may wait for more of a pending,
+/// non-destructive batch, given how long ago the batch opened and the last
+/// publication went out.
+///
+/// The batch never outlives [`OUTPUT_BATCH_CEILING`]. Within it, once a
+/// publication is due by the cadence, only [`OUTPUT_QUIET`] of silence is
+/// asked for before the batch is published; until then the wait runs to
+/// the moment the cadence allows the next one, so continuous output is still
+/// published at most once per ceiling.
+fn held_batch_wait(batch_age: Duration, since_published: Option<Duration>) -> Duration {
+    let ceiling = OUTPUT_BATCH_CEILING.saturating_sub(batch_age);
+    let cadence = since_published.map_or(Duration::ZERO, |since| {
+        OUTPUT_BATCH_CEILING.saturating_sub(since)
+    });
+    ceiling.min(cadence.max(OUTPUT_QUIET))
+}
+
 fn pump_held(
     shared: Arc<Shared>,
     engine: Arc<ManifestEngine>,
@@ -5652,6 +5683,9 @@ fn pump_held(
     let mut interactive_qos = false;
     // Set while a repaint is being assembled across more than one log read.
     let mut publish_pending: Option<Instant> = None;
+    // When output was last published, which paces the leading edge; see
+    // [`OUTPUT_QUIET`].
+    let mut last_published: Option<Instant> = None;
     // Filled cells when the pending batch opened, so an echo is judged
     // against the last published screen rather than the previous read.
     let mut batch_filled: Option<usize> = None;
@@ -5775,7 +5809,9 @@ fn pump_held(
                     (Some(RepaintHold::Redrawing(until)), _) => until
                         .saturating_duration_since(Instant::now())
                         .min(OUTPUT_BATCH_CEILING),
-                    (None, Some(started)) => OUTPUT_BATCH_CEILING.saturating_sub(started.elapsed()),
+                    (None, Some(started)) => {
+                        held_batch_wait(started.elapsed(), last_published.map(|at| at.elapsed()))
+                    }
                     (None, None) => shared.quiet_tick(),
                 };
                 match stream.next_run_into(timeout, LOG_READ_BUDGET, &mut live_run) {
@@ -5835,6 +5871,7 @@ fn pump_held(
             blank_since = None;
             shared.awaiting_redraw.store(false, Ordering::SeqCst);
             if publish_pending.take().is_some() {
+                last_published = Some(Instant::now());
                 shared.grid_wake.notify();
             }
         }
@@ -6127,6 +6164,7 @@ fn pump_held(
                 batch_filled = None;
                 repaint = None;
                 blank_since = None;
+                last_published = Some(Instant::now());
                 shared.awaiting_redraw.store(false, Ordering::SeqCst);
                 shared.grid_wake.notify();
             }
@@ -6870,6 +6908,45 @@ mod quiet_tick_tests {
         // Input or an attach makes it interactive again at once.
         shared.note_hot();
         assert_eq!(shared.quiet_tick(), TICK_INTERVAL);
+    }
+}
+
+#[cfg(test)]
+mod held_batch_wait_tests {
+    use super::*;
+
+    const MS: Duration = Duration::from_millis(1);
+
+    #[test]
+    fn output_after_quiet_waits_only_the_quiet_window() {
+        // Nothing published yet, or long enough ago: the batch publishes once
+        // the stream has been silent for OUTPUT_QUIET (was the whole ceiling).
+        assert_eq!(held_batch_wait(Duration::ZERO, None), OUTPUT_QUIET);
+        assert_eq!(
+            held_batch_wait(Duration::ZERO, Some(500 * MS)),
+            OUTPUT_QUIET
+        );
+        assert_eq!(
+            held_batch_wait(Duration::ZERO, Some(OUTPUT_BATCH_CEILING)),
+            OUTPUT_QUIET
+        );
+    }
+
+    #[test]
+    fn continuous_output_stays_paced_by_the_ceiling() {
+        // A batch that opened 1 ms after the last publication waits until the
+        // cadence allows the next one, never sooner.
+        assert_eq!(held_batch_wait(Duration::ZERO, Some(MS)), 7 * MS);
+        assert_eq!(held_batch_wait(3 * MS, Some(4 * MS)), 4 * MS);
+        // And never past its own ceiling.
+        assert_eq!(held_batch_wait(7 * MS, Some(7 * MS)), MS);
+        assert_eq!(held_batch_wait(OUTPUT_BATCH_CEILING, None), Duration::ZERO);
+        assert_eq!(held_batch_wait(20 * MS, Some(MS)), Duration::ZERO);
+    }
+
+    #[test]
+    fn the_quiet_window_is_shorter_than_a_display_frame() {
+        assert!(OUTPUT_QUIET * 4 <= OUTPUT_BATCH_CEILING);
     }
 }
 
