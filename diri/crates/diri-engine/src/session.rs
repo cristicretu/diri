@@ -2649,7 +2649,16 @@ impl Session {
                 alt_screen: modes.0,
                 mouse: modes.2,
             };
-            let grid = if current == *signature {
+            // Input modes alone (cleared on a transport drop, restored by the
+            // next seed) leave this consumer's grid as it is: the modes are
+            // published separately, and repainting every row would clear a
+            // selection over cells that did not change.
+            let content = GridSignature {
+                keyboard: signature.keyboard,
+                ..current
+            };
+            let grid = if content == *signature {
+                *signature = current;
                 None
             } else {
                 let reset_changed = signature.reset_generation != current.reset_generation;
@@ -4135,7 +4144,14 @@ fn pump_remote(
             .expect("remote grid")
             .as_ref()
             .and_then(|state| state.mirror.sequence());
-        let Ok((generation, mut output)) = client.connect(output_offset, grid_sequence) else {
+        let grid_resume = remote_grid_resume(&shared, &client);
+        let mut resume = RemoteResume {
+            offered: grid_resume.as_ref().map(|request| request.base_sequence),
+            accepted: None,
+        };
+        let Ok((generation, mut output)) =
+            client.connect(output_offset, grid_sequence, grid_resume)
+        else {
             set_remote_reconnecting(&shared);
             reconnects = reconnects.saturating_add(1);
             if reconnects.is_multiple_of(3) && remote_inspection_exited(&shared, &client) {
@@ -4153,6 +4169,7 @@ fn pump_remote(
             generation,
             &mut output,
             &manifest_id,
+            &mut resume,
         );
         client.disconnect(generation);
         if client.uncertain_effect()
@@ -4210,6 +4227,50 @@ fn settle_during_stop(
     }
 }
 
+/// What this Engine's mirror already shows, for a `grid-resume-v1` attach:
+/// the Holder then sends only rows that differ instead of a Full Snapshot.
+/// `None` (no seed yet, an older Holder, a grid too tall to describe) keeps
+/// today's snapshot reseed.
+fn remote_grid_resume(
+    shared: &Shared,
+    client: &RemoteSessionClient,
+) -> Option<diri_proto::remote_pty::GridResume> {
+    let epoch = client.last_controller_epoch();
+    if !client.supports_grid_resume() || epoch == 0 {
+        return None;
+    }
+    let key = RemoteSessionClient::grid_resume_key().ok()?;
+    let remote = shared.remote_grid.lock().expect("remote grid");
+    let remote = remote.as_ref()?;
+    let base = remote.mirror.sequence()?;
+    let (cols, rows) = remote.mirror.size();
+    if rows > diri_proto::remote_pty::MAX_GRID_RESUME_ROWS {
+        return None;
+    }
+    let digests = remote.mirror.row_digests(&key)?;
+    let reset_generation = remote
+        .reset_committed
+        .as_ref()
+        .map_or(0, |reset| reset.generation);
+    Some(diri_proto::remote_pty::GridResume::new(
+        epoch,
+        base,
+        reset_generation,
+        cols,
+        rows,
+        &key,
+        &digests,
+    ))
+}
+
+/// One attach's `grid-resume-v1` exchange: the base sequence offered in
+/// Hello, then the base the Holder accepted until its delta arrives.
+#[derive(Debug, Default)]
+struct RemoteResume {
+    offered: Option<u64>,
+    accepted: Option<u64>,
+}
+
 fn remote_inspection_exited(shared: &Shared, client: &RemoteSessionClient) -> bool {
     let Ok(inspection) = client.inspect() else {
         return false;
@@ -4237,6 +4298,7 @@ fn pump_remote_connection(
     generation: u64,
     output: &mut diri_platform::pipe::ChildStdout,
     manifest_id: &str,
+    resume: &mut RemoteResume,
 ) -> RemoteConnectionDisposition {
     let mut codec = RemoteCodec::new();
     let mut buffer = [0_u8; 64 << 10];
@@ -4360,6 +4422,7 @@ fn pump_remote_connection(
                         &mut last_eval_seq,
                         &mut replaying,
                         &mut hello_accepted,
+                        resume,
                         message,
                     );
                     if disposition != RemoteConnectionDisposition::Continue {
@@ -4383,6 +4446,7 @@ fn handle_remote_message(
     last_eval_seq: &mut u64,
     replaying: &mut bool,
     hello_accepted: &mut bool,
+    resume: &mut RemoteResume,
     message: RemoteMessage,
 ) -> RemoteConnectionDisposition {
     if !*hello_accepted && !matches!(message, RemoteMessage::HelloAck(_)) {
@@ -4412,6 +4476,21 @@ fn handle_remote_message(
                 return RemoteConnectionDisposition::Fatal;
             }
             client.observe_hello_capabilities(&acknowledgement);
+            let offered = resume.offered.take();
+            match acknowledgement.grid_resume {
+                Some(diri_proto::remote_pty::GridResumeOutcome::Accepted { base_sequence }) => {
+                    // A resume answers only the base this attach offered.
+                    if offered != Some(base_sequence) {
+                        return RemoteConnectionDisposition::Fatal;
+                    }
+                    diri_telemetry::count("remote.grid_resume.accepted", 1);
+                    resume.accepted = Some(base_sequence);
+                }
+                Some(diri_proto::remote_pty::GridResumeOutcome::Declined { .. }) => {
+                    diri_telemetry::count("remote.grid_resume.declined", 1);
+                }
+                None => {}
+            }
             if let RemoteProcessState::Exited { code, signal } = acknowledgement.process_state {
                 record_remote_exit(shared, ProcessExit { code, signal });
                 return RemoteConnectionDisposition::Exited;
@@ -4503,10 +4582,24 @@ fn handle_remote_message(
             RemoteConnectionDisposition::Continue
         }
         RemoteMessage::FullSnapshot(snapshot) => {
+            // A snapshot is authoritative on its own and supersedes a resume.
+            resume.accepted = None;
             if apply_remote_snapshot(shared, engine, client, manifest_id, last_eval_seq, snapshot)
                 .is_err()
             {
                 RemoteConnectionDisposition::Fatal
+            } else {
+                set_remote_connection(shared, diri_proto::RemoteConnectionState::Connected);
+                RemoteConnectionDisposition::Continue
+            }
+        }
+        RemoteMessage::GridDelta(delta) if resume.accepted.is_some() => {
+            let base = resume.accepted.take().expect("checked");
+            if apply_remote_resume(shared, engine, manifest_id, last_eval_seq, base, delta).is_err()
+            {
+                // The next Hello offers the mirror as it stands, or reseeds.
+                diri_telemetry::count("remote.delta_gaps", 1);
+                RemoteConnectionDisposition::Reconnect
             } else {
                 set_remote_connection(shared, diri_proto::RemoteConnectionState::Connected);
                 RemoteConnectionDisposition::Continue
@@ -4719,20 +4812,96 @@ fn apply_remote_snapshot(
         remote.pending = Some(snapshot.grid.clone());
     }
     shared.grid_wake.notify();
+    restore_remote_status_screen(
+        shared,
+        engine,
+        manifest_id,
+        last_eval_seq,
+        &snapshot.grid,
+        snapshot.alt_screen,
+        snapshot.bracketed_paste,
+        snapshot.mouse,
+    )
+}
+
+/// Applies the delta that answers an accepted `grid-resume-v1` attach. The
+/// display receives it as an ordinary delta: rows the client already shows
+/// are not repainted and a selection over them survives the reconnect.
+fn apply_remote_resume(
+    shared: &Shared,
+    engine: &ManifestEngine,
+    manifest_id: &str,
+    last_eval_seq: &mut u64,
+    base: u64,
+    delta: GridDelta,
+) -> std::io::Result<()> {
+    let full = {
+        let mut remote = shared.remote_grid.lock().expect("remote grid");
+        let remote = remote
+            .as_mut()
+            .ok_or_else(|| std::io::Error::other("remote grid state is unavailable"))?;
+        let keyboard = remote.keyboard.state_for(delta.sequence)?;
+        remote
+            .mirror
+            .apply_resumed_delta(
+                base,
+                delta.sequence,
+                &delta.grid,
+                delta.alt_screen,
+                delta.bracketed_paste,
+                delta.mouse,
+            )
+            .map_err(std::io::Error::other)?;
+        remote.keyboard.commit(keyboard);
+        remote.revision = remote.revision.saturating_add(1);
+        let full = remote
+            .mirror
+            .full_update()
+            .ok_or_else(|| std::io::Error::other("resumed remote grid is incomplete"))?;
+        remote.pending = if remote.pending.is_some() {
+            Some(full.clone())
+        } else {
+            Some(delta.grid)
+        };
+        full
+    };
+    shared.grid_wake.notify();
+    // Replayed output was logged, not parsed: seed the status screen from the
+    // resumed grid exactly as a snapshot would.
+    restore_remote_status_screen(
+        shared,
+        engine,
+        manifest_id,
+        last_eval_seq,
+        &full,
+        delta.alt_screen,
+        delta.bracketed_paste,
+        delta.mouse,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn restore_remote_status_screen(
+    shared: &Shared,
+    engine: &ManifestEngine,
+    manifest_id: &str,
+    last_eval_seq: &mut u64,
+    grid: &diri_proto::grid::GridUpdate,
+    alt_screen: bool,
+    bracketed_paste: bool,
+    mouse: diri_proto::terminal::MouseModes,
+) -> std::io::Result<()> {
     let observation = {
         let mut screen = shared.screen.lock().expect("screen");
-        screen.resize(
-            usize::from(snapshot.grid.cols),
-            usize::from(snapshot.grid.rows),
-        );
+        screen.resize(usize::from(grid.cols), usize::from(grid.rows));
         if !screen.restore(
-            // A remote Full Snapshot carries only the visible grid; scrollback
-            // is fetched on demand through `Scroll`, never replayed here.
+            // A remote seed carries only the visible grid; scrollback is
+            // fetched on demand through `Scroll`, never replayed here.
             &[],
-            &snapshot.grid,
-            snapshot.alt_screen,
-            snapshot.bracketed_paste,
-            snapshot.mouse,
+            grid,
+            alt_screen,
+            bracketed_paste,
+            mouse,
         ) {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidData,
@@ -7876,6 +8045,7 @@ mod remote_connection_tests {
                 output_offset: 0,
                 snapshot_sequence: 1,
                 foreground_pid: Some(pid as i32),
+                grid_resume: None,
                 child_identity: None,
             });
             let mut screen = crate::screen::HeadlessScreen::new(80, 24);
@@ -7943,6 +8113,7 @@ if mkdir first 2>/dev/null; then
   cat reset.bin snapshot.bin
   while [ ! -f disconnect ]; do sleep 0.01; done
 else
+  cat <&0 > second-stdin.bin &
   while [ ! -f reconnect ]; do sleep 0.01; done
   cat hello.bin modes.bin reset.bin snapshot.bin
   while [ ! -f finish ]; do sleep 0.01; done
@@ -8076,6 +8247,20 @@ fi
             wait_for("reconnected snapshot", || {
                 session.view().remote_connection.unwrap().state == State::Connected
             });
+            // The reconnect offered grid-resume-v1 for the grid it held. This
+            // Holder answered without it (as one predating the capability
+            // does), and the snapshot that followed seeded the session.
+            let Some(RemoteMessage::Hello(second)) = RemoteCodec::new()
+                .feed(&std::fs::read(temp.path().join("second-stdin.bin")).unwrap())
+                .unwrap()
+                .into_iter()
+                .next()
+            else {
+                panic!("reconnect Hello");
+            };
+            let offered = second.grid_resume.expect("resume offered");
+            assert_eq!((offered.controller_epoch, offered.base_sequence), (1, 1));
+            assert_eq!((offered.cols, offered.rows), (80, 24));
             assert_eq!(session.child_pid(), pid as i32);
             assert_eq!(session.preview_seed().grid, seed);
             assert_eq!(session.keyboard_state(), keyboard);

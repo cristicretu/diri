@@ -91,6 +91,28 @@ pub(crate) trait WarmTooltip: StatefulInteractiveElement {
                 cx.new(|cx| WarmTooltipView::new(content, cx)).into()
             })
     }
+
+    /// A chrome control's tooltip: `label`, then the shortcut `command` is
+    /// bound to when the tooltip opens, so a rebinding never leaves it stale.
+    fn shortcut_tooltip(
+        self,
+        label: impl Into<String>,
+        command: Option<crate::commands::CommandId>,
+        colors: diri_ui::SemanticColors,
+    ) -> Self
+    where
+        Self: Sized,
+    {
+        let label = label.into();
+        self.warm_tooltip(move |_, cx| {
+            let line = match command {
+                Some(command) => crate::commands::with_shortcut(&label, command),
+                None => label.clone(),
+            };
+            cx.new(|_| crate::palette_chrome::PaletteTooltip(line, colors))
+                .into()
+        })
+    }
 }
 
 impl<E: StatefulInteractiveElement> WarmTooltip for E {}

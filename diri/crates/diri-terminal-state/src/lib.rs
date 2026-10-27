@@ -119,6 +119,68 @@ impl GridMirror {
         Ok(())
     }
 
+    /// Applies a `grid-resume-v1` delta: the rows that differ between this
+    /// mirror at `base` and the Holder's grid at `sequence`. Unlike
+    /// [`Self::apply_delta`] the sequence may jump, because the delta is
+    /// computed against this mirror's exact rows rather than against the
+    /// publications it missed.
+    pub fn apply_resumed_delta(
+        &mut self,
+        base: u64,
+        sequence: u64,
+        grid: &GridUpdate,
+        alt_screen: bool,
+        bracketed_paste: bool,
+        mouse: MouseModes,
+    ) -> Result<(), MirrorError> {
+        let Some(previous) = self.sequence else {
+            return Err(MirrorError::SnapshotRequired);
+        };
+        if previous != base || sequence <= base {
+            return Err(MirrorError::SequenceGap {
+                expected: base.saturating_add(1),
+                actual: sequence,
+            });
+        }
+        if grid.is_full_snapshot || grid.cols != self.cols || grid.rows != self.rows {
+            return Err(MirrorError::SnapshotRequired);
+        }
+        validate_grid(grid)?;
+        grid.apply(&mut self.cells);
+        self.update_metadata(grid);
+        self.sequence = Some(sequence);
+        self.alt_screen = alt_screen;
+        self.bracketed_paste = bracketed_paste;
+        self.mouse = mouse;
+        Ok(())
+    }
+
+    /// One keyed digest per visible row, for a `grid-resume-v1` request.
+    #[must_use]
+    pub fn row_digests(
+        &self,
+        key: &[u8; diri_proto::remote_pty::GRID_RESUME_KEY_BYTES],
+    ) -> Option<Vec<u64>> {
+        self.sequence?;
+        let cols = usize::from(self.cols);
+        if self.cells.len() != cols.saturating_mul(usize::from(self.rows)) {
+            return None;
+        }
+        let blank = RowMetadata::default();
+        Some(
+            (0..usize::from(self.rows))
+                .map(|row| {
+                    diri_proto::remote_pty::grid_resume_row_digest(
+                        key,
+                        self.cols,
+                        &self.cells[row * cols..(row + 1) * cols],
+                        self.annotations.get(row).unwrap_or(&blank),
+                    )
+                })
+                .collect(),
+        )
+    }
+
     fn update_metadata(&mut self, grid: &GridUpdate) {
         if grid.is_full_snapshot {
             self.annotations.clear();
@@ -3475,6 +3537,58 @@ mod tests {
                 actual: 12
             })
         ));
+    }
+
+    #[test]
+    fn resumed_delta_applies_only_to_its_base_and_digests_track_rows() {
+        let key = [7_u8; diri_proto::remote_pty::GRID_RESUME_KEY_BYTES];
+        let mut holder = HeadlessScreen::new(8, 3);
+        holder.feed(b"one\r\ntwo");
+        let mut mirror = GridMirror::new();
+        assert_eq!(mirror.row_digests(&key), None, "nothing to describe yet");
+        mirror
+            .apply_snapshot(4, &holder.full_snapshot(), false, false, MouseModes::OFF)
+            .unwrap();
+        let before = mirror.row_digests(&key).unwrap();
+        // Holder-side digests of the same rows agree with the mirror's.
+        let snapshot = holder.full_snapshot();
+        for row in &snapshot.changed_rows {
+            assert_eq!(
+                diri_proto::remote_pty::grid_resume_row_digest(&key, 8, &row.cells, &row.metadata),
+                before[usize::from(row.y)]
+            );
+        }
+        // Another key gives unrelated digests.
+        assert_ne!(mirror.row_digests(&[8; 16]).unwrap(), before);
+
+        holder.feed(b" 2");
+        let mut delta = holder.full_snapshot();
+        delta.is_full_snapshot = false;
+        delta.changed_rows.retain(|row| row.y == 1);
+        for (base, sequence) in [(3, 9), (4, 4)] {
+            assert!(matches!(
+                mirror.clone().apply_resumed_delta(
+                    base,
+                    sequence,
+                    &delta,
+                    false,
+                    false,
+                    MouseModes::OFF
+                ),
+                Err(MirrorError::SequenceGap { .. })
+            ));
+        }
+        mirror
+            .apply_resumed_delta(4, 9, &delta, false, false, MouseModes::OFF)
+            .unwrap();
+        assert_eq!(mirror.sequence(), Some(9));
+        let after = mirror.row_digests(&key).unwrap();
+        assert_eq!((after[0], after[2]), (before[0], before[2]));
+        assert_ne!(after[1], before[1]);
+        assert_eq!(
+            mirror.full_update().unwrap().encode().unwrap(),
+            holder.full_snapshot().encode().unwrap()
+        );
     }
 
     #[test]

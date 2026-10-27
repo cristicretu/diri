@@ -669,7 +669,10 @@ PTY bytes -> shared terminal parser -> Grid + Cursor + Modes
 ```
 
 On attach, the Holder sends a `FullSnapshot`, followed by sequenced incremental
-updates. A snapshot contains only the visible grid, cursor, modes, dimensions,
+updates. A controller that negotiates `grid-resume-v1` (protocol minor 17) may
+instead receive only the rows its existing grid lacks; see
+[Grid resume](#grid-resume-protocol-minor-17).
+A snapshot contains only the visible grid, cursor, modes, dimensions,
 and sequence. Mouse state preserves the selected tracking regime (off, DECSET
 1000, 1002, or 1003) independently from legacy/SGR coordinate encoding. The
 wire mode byte retains its historical any-mouse bit and uses previously unused
@@ -2003,6 +2006,78 @@ codepoint widths until its session restarts; the Engine renders that Holder's
 grid as sent. Mode 2027 is parser state: it is not carried in snapshots or
 checkpoints, so after a Holder or Engine restart a program sees the default
 widths until it sets the mode again.
+## Grid resume (protocol minor 17)
+
+Protocol minor 17 adds optional `grid-resume-v1`, so a reconnect after a
+transport drop no longer re-sends the whole visible grid. Before this, every
+reattach carried a `FullSnapshot`: about 100 KB for a 160x48 screen of colored
+text, which took every row of the display through a full replacement (and
+cleared a selection over any of them) even when nothing had changed.
+
+The Engine's `Hello` may carry `gridResume`: the controller epoch it was last
+granted, the sequence, reset generation and dimensions of its mirror, a random
+16-byte key for this attach, and one keyed 64-bit digest per visible row (the
+first eight bytes of SHA-256 over a fixed tag, the key, the width, the row's
+RLE wire encoding padded to the width as the mirror stores it, and its
+annotations). It carries no cell content. A 48-row request adds about 0.9 KB to
+`Hello`. Requests over 1,024 rows are not made, which keeps them inside one
+control frame. The Engine sends the field only to Holders at minor 17 or newer
+and only after it holds a seeded mirror and a granted epoch. A malformed
+request fails `Hello` decoding.
+
+The Holder judges the request before the attach takes the lease. It accepts
+when the named epoch is the one it granted last (no other controller attached
+since), the reset generation is unchanged, and its grid has the same
+dimensions. It then answers `HelloAck.gridResume = accepted(baseSequence)` and,
+after the usual bounded raw-output replay, queues a `GridDelta` at a new
+sequence that carries exactly the rows whose digests differ, with the current
+cursor and modes, preceded by its `InputModes`. No `TerminalResetState`
+precedes it, because the generation is unchanged. Otherwise it answers
+`declined(reason)` (`stale-controller-epoch`, `reset-generation-changed` or
+`geometry-changed`) and sends today's boundary and `FullSnapshot`. Either way
+the attach increments the controller epoch and revokes any previous attach;
+a stale epoch still cannot send input, signals or other controller frames.
+
+Equal digests mean the controller already shows that row, so the resumed grid
+matches the Holder's exactly, however many publications were lost in flight.
+There is no time window and no buffer: the Holder retains nothing between
+attaches and does no work while detached. Its later diffs continue against
+its own last publication, as after a snapshot. The per-reconnect cost is one
+full-grid read and one SHA-256 pass over the visible rows on each side (about
+120 KB at 160x48).
+
+The Engine applies the accepted delta only to the mirror at the offered base
+sequence (`GridMirror::apply_resumed_delta`), commits the staged input modes,
+reseeds its status screen from the resulting grid as a snapshot would, and
+publishes the delta to attached displays as an ordinary diff. An acceptance
+for a base it did not offer is fatal for the connection. A delta that does not
+apply forces another reconnect. A `FullSnapshot` always supersedes a pending
+resume.
+
+An interrupted resume needs no recovery state. If the transport drops before
+the `HelloAck` arrives, the Engine still names the previous epoch, which the
+Holder now sees as stale, so the next attach reseeds from a snapshot. If it
+drops after the `HelloAck` but before the delta, the Engine has recorded the
+new epoch and its unchanged mirror, and the next attach resumes again.
+
+Old Helpers keep working unchanged. A Holder before minor 17 never receives
+the field. If it did, it would ignore the unknown JSON field and send a
+snapshot, and the Engine treats an absent answer exactly like a decline. A
+minor-17 Holder ignores the field from a controller below minor 17 and omits
+the capability from that controller's `HelloAck`. Live Holders keep their
+original Build IDs. Only Holders launched by a minor-17 Helper resume.
+
+Measurements (2026-10-27, Apple Silicon, release build, real Holder and PTY,
+160x48 screen of colored text). On reconnect after a forced transport drop, the
+downstream seed up to `ControlGranted` dropped from 102,550 to 921 bytes when
+the screen was idle, and from 102,845 to 3,397 bytes with a once-per-200 ms
+status ticker. Upstream `Hello` grew from 526 to 1,452 bytes. Holder
+`Hello`-to-`ControlGranted` over its socket: p50 0.97 ms with a snapshot,
+0.57 ms with a resume. Engine first-seed-byte-to-validated-seed: p50 6.1 to
+8.2 ms with a snapshot, 1.6 to 3.0 ms with a resume. The loopback reconnect
+wall time (about 20 to 60 ms) is dominated by process spawn either way. The
+harness is `diri-remote/tests/reconnect_resume.rs` (ignored measurement
+tests).
 
 ## Read-only output log ownership
 

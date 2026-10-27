@@ -20,6 +20,7 @@ use diri_proto::{
     },
 };
 use diri_ui::{Fill, Metrics, Radius};
+use crate::tooltip_warmth::WarmTooltip;
 use gpui::{
     Context, CursorStyle, DragMoveEvent, Entity, EventEmitter, MouseButton, Render, Role,
     SharedString, StyleRefinement, Subscription, Window, div, prelude::*, px,
@@ -1214,6 +1215,7 @@ impl Render for WorkspaceWorkbench {
                 .gap(px(4.0))
                 .when(close_shell, |controls| {
                     let session = pane.identity.session.clone();
+                    let pane_focused = geometry.focused.pane == pane.identity.pane;
                     controls.child(
                         div()
                             .id(SharedString::from(format!("close-pane-{}", pane_id.0)))
@@ -1232,6 +1234,12 @@ impl Render for WorkspaceWorkbench {
                             .cursor_pointer()
                             .child(sf_symbol("xmark", 12.0, colors.secondary))
                             .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                            // ⌘W closes the focused shell pane, so only its ✕ says so.
+                            .shortcut_tooltip(
+                                "Close pane",
+                                pane_focused.then_some(crate::commands::CommandId::CloseSession),
+                                colors,
+                            )
                             .on_click(cx.listener(move |this, _, window, cx| {
                                 this.focus_before_closing(&session, window, cx);
                                 // The Engine collapses the split once the
@@ -1255,17 +1263,15 @@ impl Render for WorkspaceWorkbench {
                 });
             let focused = geometry.panes.len() > 1 && geometry.focused.pane == pane.identity.pane;
             // Unfocused panes recede a little, the way a split terminal
-            // marks where typing goes without a heavy frame.
-            if geometry.panes.len() > 1 && !focused {
-                surface = surface.child(
-                    div()
-                        .debug_selector(|| "workspace-pane-dimmed".into())
-                        .absolute()
-                        .inset_0()
-                        .when(islands, |dim| dim.rounded(px(Radius::CARD)))
-                        .bg(colors.terminal_surface().alpha(0.28)),
-                );
-            }
+            // marks where typing goes without a heavy frame; in a window
+            // that is not key every pane recedes a step further.
+            surface = crate::pane_fade::faded(
+                surface,
+                colors,
+                window.is_window_active(),
+                geometry.panes.len() == 1 || focused,
+                islands.then_some(Radius::CARD),
+            );
             if focused || islands {
                 surface = surface.child(
                     div()

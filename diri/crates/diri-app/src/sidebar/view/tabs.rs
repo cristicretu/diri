@@ -751,6 +751,12 @@ impl Sidebar {
                         cx.stop_propagation();
                         cx.notify();
                     }))
+                    // ⌘W closes the selected session, so only its ✕ says so.
+                    .shortcut_tooltip(
+                        t("session.close_session"),
+                        active.then_some(crate::commands::CommandId::CloseSession),
+                        colors,
+                    )
                     .into_any_element(),
                 "close-tab",
                 // ⌘W closes the selected session, so only its ✕ says so.
@@ -1052,6 +1058,11 @@ impl Sidebar {
                     .on_click(|_, window, cx| {
                         window.dispatch_action(Box::new(crate::commands::ToggleTabPeek), cx)
                     })
+                    .shortcut_tooltip(
+                        t("sidebar.tabs.peek"),
+                        Some(crate::commands::CommandId::ToggleTabPeek),
+                        colors,
+                    )
                     .into_any_element(),
                 "peek-tabs",
                 crate::held_hints::label(crate::commands::CommandId::ToggleTabPeek),
@@ -1077,6 +1088,11 @@ impl Sidebar {
                     .on_click(|_, window, cx| {
                         window.dispatch_action(Box::new(crate::commands::NewDefaultSession), cx)
                     })
+                    .shortcut_tooltip(
+                        t("sidebar.tabs.new_session"),
+                        Some(crate::commands::CommandId::NewDefaultSession),
+                        colors,
+                    )
                     .into_any_element(),
                 "new-tab",
                 crate::held_hints::label(crate::commands::CommandId::NewDefaultSession),

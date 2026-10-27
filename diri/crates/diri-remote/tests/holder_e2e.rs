@@ -300,6 +300,7 @@ fn hello(launch: &LaunchResult, acknowledged: Option<u64>, nonce: &str) -> Hello
         ],
         last_acknowledged_output_offset: acknowledged,
         last_acknowledged_grid_sequence: None,
+        grid_resume: None,
     }
 }
 

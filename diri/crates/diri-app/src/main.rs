@@ -59,6 +59,7 @@ mod overview_zoom;
 pub mod palette;
 mod palette_chrome;
 mod palette_workspace;
+mod pane_fade;
 mod path_picker;
 mod peek_settle;
 mod perf_overlay;

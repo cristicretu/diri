@@ -12,8 +12,9 @@ use std::time::{Duration, Instant};
 use diri_proto::frames::{Frame, FrameType, MAX_FRAME_BYTES};
 use diri_proto::remote_pty::{
     ANNOTATED_HOLDER_CAPABILITIES, ControlGranted, ControlRevoked,
-    FOREGROUND_PROCESS_PROTOCOL_MINOR, ForegroundProcess, FullSnapshot, GridDelta, Hello, HelloAck,
-    ImageChunk, ImageResponse, LaunchRequest, LaunchResult, ProcessExit, RemoteCodec, RemoteError,
+    FOREGROUND_PROCESS_PROTOCOL_MINOR, ForegroundProcess, FullSnapshot, GRID_RESUME_PROTOCOL_MINOR,
+    GridDelta, GridResume, GridResumeDecline, GridResumeOutcome, Hello, HelloAck, ImageChunk,
+    ImageResponse, LaunchRequest, LaunchResult, ProcessExit, RemoteCodec, RemoteError,
     RemoteMessage, RemoteProcessState, ScrollbackResponse, validate_terminal_dimensions,
 };
 use diri_pty::{Exit, ExitWatcher, Pty, PtySpec, PtyStream};
@@ -1229,6 +1230,13 @@ impl Holder {
             hello.protocol.minor >= diri_proto::remote_pty::INLINE_IMAGES_PROTOCOL_MINOR;
         ensure_keyboard_controller(self.screen.input_keyboard_state(), enhanced_keyboard)?;
         connection.enhanced_keyboard = enhanced_keyboard;
+        // Judged against the lease as it stands before this attach claims it:
+        // the request must name the controller that held it last.
+        let grid_resume = hello
+            .grid_resume
+            .as_ref()
+            .filter(|_| hello.protocol.minor >= GRID_RESUME_PROTOCOL_MINOR)
+            .map(|request| (request.base_sequence, self.resume_grid(request)));
         self.state.controller_epoch = self.state.controller_epoch.saturating_add(1);
         let epoch = self.state.controller_epoch;
         connection.epoch = Some(epoch);
@@ -1250,14 +1258,75 @@ impl Holder {
             output_offset: self.state.output_offset,
             snapshot_sequence: self.state.snapshot_sequence,
             foreground_pid,
+            grid_resume: grid_resume
+                .as_ref()
+                .map(|(base_sequence, grid)| match grid {
+                    Ok(_) => GridResumeOutcome::Accepted {
+                        base_sequence: *base_sequence,
+                    },
+                    Err(reason) => GridResumeOutcome::Declined { reason: *reason },
+                }),
         }))?;
         self.queue_replay(connection, hello.last_acknowledged_output_offset)?;
         self.state.snapshot_sequence = self.state.snapshot_sequence.saturating_add(1);
-        self.queue_snapshot(connection)?;
+        if let Some((_, Ok(grid))) = grid_resume {
+            // Only the rows the controller does not already show. Its InputModes
+            // travel with this delta; no reset boundary precedes it, because
+            // an accepted resume means the generation is unchanged.
+            connection.queue(RemoteMessage::GridDelta(GridDelta {
+                sequence: self.state.snapshot_sequence,
+                alt_screen: self.screen.is_alt_screen(),
+                bracketed_paste: self.screen.bracketed_paste(),
+                mouse: self.screen.mouse_modes(),
+                grid,
+            }))?;
+        } else {
+            self.queue_snapshot(connection)?;
+        }
         connection.queue(RemoteMessage::ControlGranted(ControlGranted {
             controller_epoch: epoch,
         }))?;
         self.checkpoint.submit(self.state.clone())
+    }
+
+    /// The rows a resuming controller lacks, or why it must take a snapshot.
+    /// Equal keyed digests mean the controller already shows that exact row,
+    /// so the result reproduces the Holder's grid on the controller's side
+    /// however many publications it missed. Nothing is retained between
+    /// attaches: the request carries all the state the comparison needs.
+    fn resume_grid(
+        &self,
+        request: &GridResume,
+    ) -> Result<diri_proto::grid::GridUpdate, GridResumeDecline> {
+        if request.controller_epoch == 0 || request.controller_epoch != self.state.controller_epoch
+        {
+            return Err(GridResumeDecline::StaleControllerEpoch);
+        }
+        if request.reset_generation != self.reset_generation {
+            return Err(GridResumeDecline::ResetGenerationChanged);
+        }
+        let mut grid = self.screen.full_snapshot();
+        let (Some(key), Some(digests)) = (request.key(), request.digests()) else {
+            // Hello decoding already rejects malformed requests.
+            return Err(GridResumeDecline::GeometryChanged);
+        };
+        if grid.cols != request.cols || grid.rows != request.rows {
+            return Err(GridResumeDecline::GeometryChanged);
+        }
+        // Controllers at grid-resume-v1 negotiate annotations and inline
+        // images, so these rows need no per-connection projection.
+        let cols = grid.cols;
+        grid.changed_rows.retain(|row| {
+            digests.get(usize::from(row.y)).copied()
+                != Some(diri_proto::remote_pty::grid_resume_row_digest(
+                    &key,
+                    cols,
+                    &row.cells,
+                    &row.metadata,
+                ))
+        });
+        grid.is_full_snapshot = false;
+        Ok(grid)
     }
 
     fn queue_replay(
@@ -1758,6 +1827,13 @@ impl Connection {
                 }
                 _ => {}
             }
+        }
+        if self.protocol_minor < GRID_RESUME_PROTOCOL_MINOR
+            && let RemoteMessage::HelloAck(value) = &mut message
+        {
+            value.capabilities.retain(|capability| {
+                *capability != diri_proto::remote_pty::RemoteCapability::GridResume
+            });
         }
         if !self.terminal_reset
             && let RemoteMessage::HelloAck(value) = &mut message
@@ -2275,6 +2351,7 @@ mod tests {
             },
             last_acknowledged_output_offset: None,
             last_acknowledged_grid_sequence: None,
+            grid_resume: None,
         };
         let legacy = hello(false);
         let capable = hello(true);
@@ -2384,6 +2461,7 @@ mod tests {
             required_capabilities: capabilities,
             last_acknowledged_output_offset: None,
             last_acknowledged_grid_sequence: None,
+            grid_resume: None,
         };
         let (stream, _peer) = UnixStream::pair().unwrap();
         let mut connection = Connection::new(stream);
@@ -2677,6 +2755,7 @@ mod tests {
             required_capabilities: vec![],
             last_acknowledged_output_offset: None,
             last_acknowledged_grid_sequence: None,
+            grid_resume: None,
         }
     }
 

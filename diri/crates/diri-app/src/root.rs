@@ -4596,6 +4596,11 @@ impl RootView {
             let available_height = (card_height - 1.0).max(0.0);
             self.terminal_available_height = available_height;
             let heights = self.workbench_layout.pane_heights(available_height);
+            // Typing goes to the terminal below only while it holds focus.
+            let below_active = self
+                .auxiliary_terminal
+                .as_ref()
+                .is_some_and(|terminal| terminal.read(cx).is_focused(window));
             if let Some(primary) = &self.terminal {
                 primary.update(cx, |terminal, cx| {
                     terminal.set_shell_chrome(visible_sidebar, self.inspector_open, cx);
@@ -4613,12 +4618,23 @@ impl RootView {
                 });
                 body = body.child(
                     div()
+                        .relative()
                         .flex_none()
                         .w_full()
                         .h(px(heights.primary))
                         .min_h(px(0.0))
                         .overflow_hidden()
-                        .child(primary.clone()),
+                        .child(primary.clone())
+                        .children(
+                            crate::pane_fade::scrim(
+                                terminal,
+                                window.is_window_active(),
+                                !below_active,
+                            )
+                            .map(|scrim| {
+                                scrim.when(card_island, |scrim| scrim.rounded_t(px(Radius::CARD)))
+                            }),
+                        ),
                 );
             }
             body = body.child(self.terminal_resize_handle(cx));
@@ -4657,6 +4673,14 @@ impl RootView {
                         .text_color(terminal.secondary)
                         .child(t("window.opening_terminal")),
                 );
+            }
+            if let Some(scrim) = crate::pane_fade::scrim(
+                terminal,
+                window.is_window_active(),
+                below_active,
+            ) {
+                auxiliary =
+                    auxiliary.child(scrim.when(card_island, |scrim| scrim.rounded_b(px(Radius::CARD))));
             }
             if let Some(id) = self.auxiliary_id.clone() {
                 let store = Arc::clone(&self.services.store);
@@ -4708,6 +4732,12 @@ impl RootView {
                 );
             });
             body = body.child(primary.clone());
+            // One pane: it recedes only while the window is not key.
+            if let Some(scrim) =
+                crate::pane_fade::scrim(terminal, window.is_window_active(), true)
+            {
+                body = body.child(scrim.when(card_island, |scrim| scrim.rounded(px(Radius::CARD))));
+            }
         }
 
         if let Some(auxiliary) = &self.auxiliary_terminal {

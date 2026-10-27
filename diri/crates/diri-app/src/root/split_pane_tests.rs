@@ -291,3 +291,217 @@ fn command_j_hides_the_terminal_below_and_command_w_closes_only_a_shell_pane(
         assert!(store.is_open(&SessionId::new("pane-tests")));
     }
 }
+
+/// Which panes paint a fade, by selector, in paint order.
+fn fades(cx: &mut gpui::VisualTestContext) -> Vec<&'static str> {
+    [
+        "pane-fade:key-inactive",
+        "pane-fade:nonkey-active",
+        "pane-fade:nonkey-inactive",
+    ]
+    .into_iter()
+    .filter(|selector| cx.debug_bounds(selector).is_some())
+    .collect()
+}
+
+fn set_window_key(root: &Entity<RootView>, key: bool, cx: &mut gpui::VisualTestContext) {
+    if key {
+        root.update_in(cx, |_, window, _| window.activate_window());
+    } else {
+        cx.deactivate_window();
+    }
+    cx.run_until_parked();
+    root.update_in(cx, |_, window, _| assert_eq!(window.is_window_active(), key));
+}
+
+/// The key window marks only the panes typing does not reach; a window that
+/// is not key fades every pane, keeping the focused one ahead.
+#[gpui::test]
+fn panes_fade_by_window_key_status_and_pane_focus(cx: &mut gpui::TestAppContext) {
+    let (services, workspace) = stacked_tab("agent");
+    let (root, cx) = cx.add_window_view(move |window, cx| {
+        RootView::new(services, false, PreviewScenario::Empty, window, cx)
+    });
+    root.update_in(cx, |root, window, cx| {
+        root.activate_saved_workspace(Some(workspace), window, cx)
+    });
+    cx.simulate_resize(size(px(1100.0), px(800.0)));
+    set_window_key(&root, true, cx);
+    assert_eq!(fades(cx), ["pane-fade:key-inactive"]);
+    // The agent fills the top 60 %; the fade covers only the shell below.
+    let faded = cx.debug_bounds("pane-fade:key-inactive").unwrap();
+    assert!(
+        faded.origin.y > px(400.0),
+        "the focused pane stays at full strength: {faded:?}"
+    );
+
+    set_window_key(&root, false, cx);
+    assert_eq!(
+        fades(cx),
+        ["pane-fade:nonkey-active", "pane-fade:nonkey-inactive"]
+    );
+
+    set_window_key(&root, true, cx);
+    assert_eq!(fades(cx), ["pane-fade:key-inactive"]);
+}
+
+/// A tab with one pane has nothing to point at while its window is key, and
+/// fades with the window otherwise; the same for a session outside any
+/// workspace.
+#[gpui::test]
+fn a_lone_pane_fades_only_with_its_window(cx: &mut gpui::TestAppContext) {
+    for in_workspace in [true, false] {
+        let services = test_services();
+        let workspace = WorkspaceId::new("project-workspace");
+        {
+            let fixture = SidebarPreviewFixture::make(PreviewScenario::Typical);
+            let mut store = services.store.store.write().unwrap();
+            store.hydrate(fixture.list);
+            store.select(SessionId::new("preview-claude"));
+            store.seed_workspace_snapshot_for_test(WorkspaceSnapshot {
+                revision: 1,
+                workspaces: vec![WorkspaceRecord {
+                    project_id: None,
+                    id: workspace.clone(),
+                    name: "diri".into(),
+                    selected_tab: Some(TabId::new("release")),
+                    tabs: vec![WorkspaceTab {
+                        id: TabId::new("release"),
+                        title: None,
+                        focused_pane: PaneId::new("agent"),
+                        zoomed_pane: None,
+                        layout: pane("agent", "preview-claude"),
+                    }],
+                }],
+                ..Default::default()
+            });
+        }
+        let (root, cx) = cx.add_window_view(move |window, cx| {
+            RootView::new(services, false, PreviewScenario::Empty, window, cx)
+        });
+        if in_workspace {
+            root.update_in(cx, |root, window, cx| {
+                root.activate_saved_workspace(Some(workspace), window, cx)
+            });
+        }
+        cx.simulate_resize(size(px(1100.0), px(800.0)));
+        set_window_key(&root, true, cx);
+        assert_eq!(fades(cx), Vec::<&str>::new(), "workspace: {in_workspace}");
+        set_window_key(&root, false, cx);
+        assert_eq!(
+            fades(cx),
+            ["pane-fade:nonkey-active"],
+            "workspace: {in_workspace}"
+        );
+    }
+}
+
+#[test]
+#[ignore = "writes key and non-key window renders to DIRI_FADE_SCREENSHOTS (a directory)"]
+fn render_pane_fade_screenshots() {
+    use gpui::HeadlessAppContext;
+    let output = std::path::PathBuf::from(std::env::var("DIRI_FADE_SCREENSHOTS").unwrap());
+    std::fs::create_dir_all(&output).unwrap();
+    let themes = ["dirijor-dark", "dirijor-light"];
+    for theme in themes {
+        for density in crate::store::PaneDensity::ALL {
+            for key in [true, false] {
+                let platform = gpui_platform::current_platform(true);
+                let mut cx = HeadlessAppContext::with_platform(
+                    platform.text_system(),
+                    Arc::new(diri_ui::IconAssets),
+                    gpui_platform::current_headless_renderer,
+                );
+                cx.update(|cx| {
+                    crate::fonts::init(cx);
+                    cx.set_reduce_motion(true);
+                });
+                let services = test_services();
+                let mut fixture = SidebarPreviewFixture::make(PreviewScenario::Typical);
+                fixture
+                    .list
+                    .sessions
+                    .push(pane_shell("pane-tests", "cargo test", &fixture));
+                let workspace = WorkspaceId::new("project-workspace");
+                {
+                    let mut store = services.store.store.write().unwrap();
+                    store.hydrate(fixture.list);
+                    store
+                        .update_preferences(|prefs| {
+                            prefs.terminal_theme = theme.into();
+                            prefs.pane_density = density;
+                        })
+                        .unwrap();
+                    store.select(SessionId::new("preview-claude"));
+                    store.seed_workspace_snapshot_for_test(WorkspaceSnapshot {
+                        revision: 3,
+                        workspaces: vec![WorkspaceRecord {
+                            project_id: None,
+                            id: workspace.clone(),
+                            name: "diri".into(),
+                            selected_tab: Some(TabId::new("release")),
+                            tabs: vec![WorkspaceTab {
+                                id: TabId::new("release"),
+                                title: None,
+                                focused_pane: PaneId::new("agent"),
+                                zoomed_pane: None,
+                                layout: split(
+                                    "columns",
+                                    LayoutAxis::Horizontal,
+                                    0.5,
+                                    pane("agent", "preview-claude"),
+                                    pane("tests", "pane-tests"),
+                                ),
+                            }],
+                        }],
+                        ..Default::default()
+                    });
+                }
+                let window = cx
+                    .open_window(size(px(1280.0), px(640.0)), |window, cx| {
+                        cx.new(|cx| {
+                            let root =
+                                RootView::new(services, false, PreviewScenario::Empty, window, cx);
+                            root.sidebar.update(cx, |sidebar, cx| {
+                                sidebar.activate_workspace(Some(workspace), cx);
+                            });
+                            root
+                        })
+                    })
+                    .unwrap();
+                cx.run_until_parked();
+                if key {
+                    cx.update_window(window.into(), |_, window, _| window.activate_window())
+                        .unwrap();
+                    cx.run_until_parked();
+                }
+                cx.update_window(window.into(), |root, window, cx| {
+                    assert_eq!(window.is_window_active(), key);
+                    let root = root.downcast::<RootView>().unwrap();
+                    let workbench = root.read(cx).workspace_workbench.clone().unwrap();
+                    workbench.update(cx, |workbench, cx| {
+                        workbench.seed_pane_text_for_test(
+                            &[("preview-claude", CLAUDE), ("pane-tests", TESTS)],
+                            cx,
+                        )
+                    });
+                })
+                .unwrap();
+                cx.run_until_parked();
+                let image = cx.capture_screenshot(window.into()).unwrap();
+                let density = if density.islands() {
+                    "comfortable"
+                } else {
+                    "compact"
+                };
+                let key = if key { "key" } else { "nonkey" };
+                image
+                    .save(output.join(format!("{theme}-{density}-{key}.png")))
+                    .unwrap();
+                cx.update_window(window.into(), |_, window, _| window.remove_window())
+                    .unwrap();
+                cx.run_until_parked();
+            }
+        }
+    }
+}

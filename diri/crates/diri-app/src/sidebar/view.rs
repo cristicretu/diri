@@ -2124,6 +2124,7 @@ impl Sidebar {
             icon_button(
                 "close-settings",
                 t("sidebar.back_to_sessions"),
+                None,
                 "chevron.left",
                 primary_hover,
                 colors,
@@ -2141,6 +2142,7 @@ impl Sidebar {
                 icon_button(
                     "sidebar-search",
                     t("sidebar.search_sessions"),
+                    Some(CommandId::ToggleHistory),
                     "magnifyingglass",
                     primary_hover,
                     colors,
@@ -2176,6 +2178,7 @@ impl Sidebar {
                 bar.child(icon_button(
                     "sidebar-layout",
                     t("sidebar.group_and_order"),
+                    None,
                     "gearshape",
                     layout_hover,
                     colors,
@@ -2203,6 +2206,7 @@ impl Sidebar {
                     } else {
                         t("sidebar.hide")
                     },
+                    Some(CommandId::ToggleSidebar),
                     "sidebar.left",
                     toggle_hover,
                     colors,
@@ -8984,9 +8988,11 @@ fn disclosure_body(
         .into_any_element()
 }
 
+#[allow(clippy::too_many_arguments)]
 fn icon_button(
     id: &'static str,
     label: &'static str,
+    shortcut: Option<CommandId>,
     system_image: &'static str,
     hovering: bool,
     colors: SemanticColors,
@@ -9010,6 +9016,7 @@ fn icon_button(
         .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
         .on_click(on_click)
         .on_hover(on_hover)
+        .shortcut_tooltip(label, shortcut, colors)
         .child(sf_symbol(system_image, 15.0, colors.secondary))
         .into_any_element()
 }
