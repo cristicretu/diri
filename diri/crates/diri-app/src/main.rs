@@ -81,6 +81,7 @@ mod secure_input;
 mod session_presentation;
 mod session_surfaces;
 pub mod settings;
+mod shortcut_recorder;
 pub mod sidebar;
 mod skills_catalog;
 mod skills_page;

@@ -259,6 +259,8 @@
   "command.zoom_out.description": "Make terminal text smaller",
   "command.zoom_out.title": "Decrease text size",
   "settings.shortcuts.conflict": "Already used by {command}.",
+  "settings.shortcuts.conflict_replace": "Already used by {command}. Press ↩ to take it.",
+  "settings.shortcuts.conflict_swap": "Already used by {command}. Press ↩ to take it or ⇥ to swap the two.",
   "settings.shortcuts.empty_detail": "Try an action name, description, or key.",
   "settings.shortcuts.empty_title": "No shortcuts found",
   "settings.shortcuts.global_conflict": "This shortcut is already used by another app. Choose a different shortcut.",
