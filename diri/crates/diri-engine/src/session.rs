@@ -3322,10 +3322,14 @@ impl Session {
     }
 
     /// Answers color queries from `palette` from now on, and tells a program
-    /// that asked for color-scheme reports when light/dark changed. Remote
-    /// sessions are untouched: their Holder answers its own queries.
-    pub(crate) fn apply_terminal_palette(&self, palette: Option<diri_proto::TerminalPalette>) {
-        if matches!(self.transport, Transport::Remote(_)) {
+    /// that asked for color-scheme reports when light/dark changed. A remote
+    /// session's Holder answers its own queries; a `query-replies-v1` one is
+    /// sent the palette.
+    pub fn apply_terminal_palette(&self, palette: Option<diri_proto::TerminalPalette>) {
+        if let Transport::Remote(client) = &self.transport {
+            if let Some(palette) = palette {
+                let _ = client.send_palette(palette);
+            }
             return;
         }
         let reports = {
@@ -4588,6 +4592,11 @@ fn handle_remote_message(
             {
                 RemoteConnectionDisposition::Reconnect
             } else {
+                // Every attach tells a `query-replies-v1` Holder the colors
+                // it is painted with; it may have restarted or missed a change.
+                if let Some(palette) = terminal_palette() {
+                    let _ = client.send_palette(palette);
+                }
                 RemoteConnectionDisposition::Continue
             }
         }
@@ -4690,11 +4699,17 @@ fn apply_remote_output(
         if screen.has_notifications() {
             shared.bump_state_version();
         }
-        // The attached terminal answers the emulator's queries; this
-        // mirror's would otherwise pile up unread for the session's
-        // lifetime. The one it answers itself is the `OSC 7501` support
-        // query, for the Engine is what reads program status.
-        let queries = program_status_queries(&screen.take_replies());
+        // The Holder answers its program's queries from its own emulator;
+        // this mirror's would otherwise pile up unread for the session's
+        // lifetime. A Holder from before `query-replies-v1` leaves the
+        // `OSC 7501` support query to the Engine, which answers it here, a
+        // round trip late; a newer one answers it in stream order itself.
+        let replies = screen.take_replies();
+        let queries = if client.is_some_and(|client| client.holder_answers_queries()) {
+            0
+        } else {
+            program_status_queries(&replies)
+        };
         let observation =
             evaluate_if_screen_changed(shared, &mut screen, engine, manifest_id, last_eval_seq);
         (observation, queries)
@@ -7561,6 +7576,62 @@ mod progress_tests {
         shared.progress.lock().unwrap().reported_at = Instant::now().checked_sub(PROGRESS_STALE);
         expire_stale_progress(&shared);
         assert_eq!(published(&shared), None);
+    }
+
+    /// What the Engine sent the Holder, as raw Bridge bytes.
+    #[cfg(unix)]
+    fn sent(output: &mut std::os::unix::net::UnixStream) -> Vec<u8> {
+        use std::io::Read as _;
+        let mut bytes = Vec::new();
+        let mut buffer = [0_u8; 4096];
+        while let Ok(count) = output.read(&mut buffer) {
+            if count == 0 {
+                break;
+            }
+            bytes.extend_from_slice(&buffer[..count]);
+        }
+        bytes
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn program_status_queries_are_left_to_a_holder_that_answers_queries() {
+        use crate::remote::client::tests::{attached_fixture_client, fixture_ack};
+        use diri_proto::remote_pty::QUERY_REPLIES_PROTOCOL_MINOR;
+        let reply = diri_terminal_state::PROGRAM_STATUS_QUERY_REPLY;
+        let answered = |bytes: &[u8]| bytes.windows(reply.len()).any(|window| window == reply);
+        let probe = b"\x1b]7501;?\x1b\\\x1b[c";
+        for (minor, capable, engine_answers) in [
+            // Every Holder from before query-replies-v1 (forge runs several
+            // older builds) leaves the support query to the Engine.
+            (QUERY_REPLIES_PROTOCOL_MINOR - 1, false, true),
+            (QUERY_REPLIES_PROTOCOL_MINOR - 1, true, true),
+            (QUERY_REPLIES_PROTOCOL_MINOR, false, true),
+            // A Holder that answers it already did, in order; a second
+            // answer would reach the program as stray input.
+            (QUERY_REPLIES_PROTOCOL_MINOR, true, false),
+        ] {
+            let (temp, engine, shared) = remote_shell("status-query");
+            let (client, mut output) = attached_fixture_client(temp.path());
+            client.observe_hello_capabilities(&fixture_ack(minor, capable));
+            let mut seq = 0;
+            apply_remote_output(
+                &shared,
+                &engine,
+                "shell",
+                &mut seq,
+                0,
+                probe,
+                false,
+                Some(&client),
+            )
+            .unwrap();
+            assert_eq!(
+                answered(&sent(&mut output)),
+                engine_answers,
+                "minor {minor}, capability named: {capable}"
+            );
+        }
     }
 
     #[test]

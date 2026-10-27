@@ -497,6 +497,19 @@ impl HeadlessScreen {
         self
     }
 
+    /// Answer `OSC 7501` support queries among this terminal's replies, in
+    /// stream order with the emulator's own, and interpret no other product
+    /// OSC. For a remote Holder (`query-replies-v1`), which answers its
+    /// program's queries itself and does not interpret product alerts. A
+    /// screen [`Self::with_notifications`] already answers them.
+    #[must_use]
+    pub fn answering_program_status_queries(mut self) -> Self {
+        if self.notifications.is_none() {
+            self.notifications = Some(notifications::NotificationParser::queries_only());
+        }
+        self
+    }
+
     /// Opt in only where this screen is the terminal the program talks to
     /// and its replies reach the program: a local Engine session. The screen
     /// then reports `terminal_version` to XTVERSION, answers color queries
@@ -560,8 +573,8 @@ impl HeadlessScreen {
             self.geometry.rows,
             self.keyboard_enhancements_enabled(),
         );
-        if self.notifications.is_some() {
-            reset = reset.with_notifications();
+        if let Some(parser) = &self.notifications {
+            reset.notifications = Some(parser.reset_copy());
         }
         if let Some(images) = &self.images {
             let cell_pixels = images.cell_pixels;

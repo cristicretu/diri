@@ -31,7 +31,15 @@ pub(crate) struct NotificationParser {
     pub program: crate::program_status::ProgramStatusTable,
     /// Answers owed to the child, moved to the screen's replies after a feed.
     pub replies: Vec<u8>,
+    /// Answer `OSC 7501` support queries and interpret nothing else: no
+    /// alerts, clipboard writes, exit reports or status records. A remote
+    /// Holder's mode; see [`crate::HeadlessScreen::answering_program_status_queries`].
+    queries_only: bool,
 }
+
+/// Longest OSC payload a queries-only scanner keeps; anything longer cannot
+/// be the support query and is skipped without buffering.
+const QUERY_PAYLOAD_LIMIT: usize = 16;
 
 /// `OSC 6973;agent-exit;<status> BEL`: the status the login-shell wrapper's
 /// shell saw when the agent it launched returned (`$?`, or `$status` in
@@ -41,6 +49,21 @@ pub(crate) struct NotificationParser {
 pub const AGENT_EXIT_OSC: &str = "6973;agent-exit;";
 
 impl NotificationParser {
+    pub fn queries_only() -> Self {
+        Self {
+            queries_only: true,
+            ..Self::default()
+        }
+    }
+
+    /// A fresh parser in the same mode, for a terminal reset.
+    pub fn reset_copy(&self) -> Self {
+        Self {
+            queries_only: self.queries_only,
+            ..Self::default()
+        }
+    }
+
     pub fn reset_sequence(&mut self) {
         self.state = 0;
         self.payload.clear();
@@ -125,7 +148,9 @@ impl NotificationParser {
     }
 
     fn payload_limit(&self) -> usize {
-        if self.payload.starts_with(b"52;") {
+        if self.queries_only {
+            QUERY_PAYLOAD_LIMIT
+        } else if self.payload.starts_with(b"52;") {
             CLIPBOARD_PAYLOAD_LIMIT
         } else {
             OSC_PAYLOAD_LIMIT
@@ -133,6 +158,17 @@ impl NotificationParser {
     }
 
     fn finish(&mut self) {
+        if self.queries_only {
+            if self
+                .payload
+                .strip_prefix(crate::program_status::PREFIX.as_bytes())
+                .is_some_and(|report| report == crate::program_status::QUERY.as_bytes())
+            {
+                self.replies
+                    .extend_from_slice(crate::program_status::QUERY_REPLY);
+            }
+            return;
+        }
         let Ok(payload) = std::str::from_utf8(&self.payload) else {
             return;
         };
