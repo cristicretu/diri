@@ -151,6 +151,11 @@ impl Grid<crate::term::cell::Cell> {
         self.raw.release_read_cache();
     }
 
+    /// Release history caches and spare allocations once output is idle.
+    pub fn release_idle_history(&mut self) {
+        self.raw.release_idle();
+    }
+
     pub fn bound_history_storage(&mut self, budget: usize) {
         self.raw.bound_history_bytes(budget);
         self.display_offset = self.display_offset.min(self.history_size());

@@ -1897,3 +1897,18 @@ fn a_blocked_report_borrows_the_choices_on_screen() {
     // Once only.
     assert_eq!(reducer.reduce(dialog(3), now).needs_input, None);
 }
+
+#[test]
+fn only_a_session_with_something_on_the_clock_asks_for_ticks() {
+    // An idle session's pump sleeps without a deadline when no tick could
+    // change its status; a turn in progress keeps the clock running.
+    let mut reducer = StatusReducer::new(Authority::HooksPrimary, t0());
+    assert!(reducer.wants_tick(), "startup runs on the clock");
+    let now = settled(&mut reducer, t0());
+    reducer.reduce(hook(ClaudeHook::UserPromptSubmit), now);
+    assert!(reducer.wants_tick(), "a turn in progress ticks");
+    reducer.reduce(hook(ClaudeHook::Stop), now + Duration::from_millis(100));
+    reducer.reduce(StatusSignal::Tick, now + Duration::from_millis(200));
+    assert_eq!(*reducer.status(), SessionStatus::Idle);
+    assert!(!reducer.wants_tick(), "a finished turn needs no tick");
+}

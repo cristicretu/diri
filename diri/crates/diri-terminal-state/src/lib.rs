@@ -597,6 +597,21 @@ impl HeadlessScreen {
         self.settle();
     }
 
+    /// Gives back memory a burst of output left behind, once output has gone
+    /// quiet: history decode caches and spare rows, the synchronized-update
+    /// buffer's capacity and grown scratch buffers. Nothing observable
+    /// changes; every buffer regrows on demand.
+    pub fn compact_idle(&mut self) {
+        #[cfg(feature = "compact-history")]
+        self.term.release_idle_history();
+        self.parser.release_idle_buffers();
+        self.replies.shrink_to_fit();
+        self.progress_carry.shrink_to_fit();
+        self.moved_digests = Vec::new();
+        self.moved_filled_cells = Vec::new();
+        self.moved_stale = Vec::new();
+    }
+
     /// Synchronized updates (DECSET 2026) the child has closed with its ESU,
     /// so far. A feed that raises it, and leaves no update open, ended on a
     /// frame the child declared complete.
@@ -3073,6 +3088,39 @@ mod tests {
         assert_eq!(restored.history_metadata(), metadata);
         assert_eq!(restored.history_snapshot(), history);
         assert!(restored.term.grid().history_storage_bytes() <= HISTORY_STORAGE_BUDGET_BYTES);
+    }
+
+    #[cfg(feature = "compact-history")]
+    #[test]
+    fn idle_compaction_gives_back_caches_and_changes_nothing_observable() {
+        // Two screens fed the same bytes; one compacts every time output
+        // pauses. History beyond the row limit keeps an eviction index, and a
+        // read of recent history leaves decoded blocks behind.
+        let mut idle = HeadlessScreen::new(120, 40);
+        let mut busy = HeadlessScreen::new(120, 40);
+        for burst in 0..3 {
+            let mut bytes = Vec::new();
+            for line in 0..4_500 {
+                bytes.extend_from_slice(
+                    format!("{burst}:{line:05} \x1b[1mbold\x1b[0m\r\n").as_bytes(),
+                );
+            }
+            // A synchronized repaint grows the parser's holding buffer.
+            bytes.extend_from_slice(b"\x1b[?2026h");
+            bytes.extend_from_slice(&[b'x'; 64 << 10]);
+            bytes.extend_from_slice(b"\x1b[?2026l\r\n");
+            idle.feed(&bytes);
+            busy.feed(&bytes);
+            let _ = idle.link_source(400);
+            let _ = busy.link_source(400);
+            let before = idle.term.grid().history_storage_bytes();
+            idle.compact_idle();
+            assert!(idle.term.grid().history_storage_bytes() <= before);
+            assert_eq!(idle.scrollback(), busy.scrollback());
+            assert_eq!(idle.full_snapshot(), busy.full_snapshot());
+        }
+        assert_eq!(idle.history_snapshot(), busy.history_snapshot());
+        assert_eq!(idle.parser.sync_bytes_count(), 0);
     }
 
     #[test]
