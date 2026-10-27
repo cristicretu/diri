@@ -50,6 +50,9 @@ impl Method {
     /// Resets the emulator (screens, history, modes, title) without touching
     /// the PTY or process. Acceptance means queued to the terminal owner.
     pub const SESSION_RESET_TERMINAL: &'static str = "session.reset_terminal";
+    /// Sets the palette local terminals answer color queries from
+    /// ([`TerminalPalette`]). Engine-wide; the result is empty.
+    pub const TERMINAL_SET_PALETTE: &'static str = "terminal.set_palette";
     pub const SESSION_CAPTURE_FIND: &'static str = "session.capture_find";
     pub const SESSION_READ_SCROLLBACK: &'static str = "session.read_scrollback";
     pub const SESSION_READ_SCROLLBACK_CELLS: &'static str = "session.read_scrollback_cells";
@@ -567,6 +570,20 @@ pub struct SessionSpawnParams {
 pub enum TerminalAppearance {
     Light,
     Dark,
+}
+
+/// The colors local terminals are painted with. Programs that ask the
+/// terminal (OSC 10/11/12/4, `CSI ? 996 n`, DECSET 2031) are answered from
+/// this. The App sends it whenever its theme settles on a new palette.
+#[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct TerminalPalette {
+    pub appearance: TerminalAppearance,
+    pub foreground: [u8; 3],
+    pub background: [u8; 3],
+    pub cursor: [u8; 3],
+    /// ANSI colors 0–15. Colors 16–255 are the fixed xterm cube and ramp.
+    pub ansi: [[u8; 3]; 16],
 }
 
 pub type SessionSpawnResult = SessionRecord;
@@ -1326,6 +1343,11 @@ pub struct TerminalConfigureParams {
     /// Whether new zsh and bash terminals get Diri's OSC 133 prompt and
     /// command marks without any setup.
     pub shell_integration: bool,
+    /// The colors local terminals are painted with, so programs that ask
+    /// (OSC 4/10/11/12, `CSI ? 996 n`, DECSET 2031) are answered. Absent from
+    /// older Apps: queries stay unanswered, as before.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub palette: Option<TerminalPalette>,
 }
 
 pub type TerminalConfigureResult = EmptyResult;

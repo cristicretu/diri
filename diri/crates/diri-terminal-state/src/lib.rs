@@ -30,6 +30,7 @@ use alacritty_terminal::event::{Event, EventListener, WindowSize};
 use alacritty_terminal::grid::Dimensions;
 use alacritty_terminal::index::{Column, Line};
 use alacritty_terminal::term::cell::{Cell, Flags};
+use alacritty_terminal::term::color::Colors;
 use alacritty_terminal::term::{CONTENT_CHANGED, Config, Term, TermMode};
 use alacritty_terminal::vte::ansi::{Color, NamedColor, Processor, Rgb};
 use diri_proto::grid::{
@@ -39,6 +40,7 @@ use diri_proto::terminal::{
     MouseEncoding, MouseModes, MouseTrackingMode, TerminalMouseEvent, TerminalMouseModifiers,
     encode_mouse_event,
 };
+use diri_proto::{TerminalAppearance, TerminalPalette};
 
 /// Receiver-side authority for a remote terminal stream. A mirror accepts a
 /// full snapshot as a new baseline and then only contiguous sequenced diffs;
@@ -394,6 +396,15 @@ pub struct HeadlessScreen {
     /// Keep only the replies that report inline-image support; see
     /// [`HeadlessScreen::answering_image_queries_only`].
     image_replies_only: bool,
+    /// Whether this screen is the terminal a local program talks to, so it
+    /// answers color and size queries and shows palette changes; see
+    /// [`HeadlessScreen::with_host_replies`].
+    host_replies: bool,
+    /// The colors the App paints this terminal with, when it has said.
+    palette: Option<TerminalPalette>,
+    /// Reports the program asked to receive when something changes (DECSET
+    /// 2031 and 2048), rather than answers to a query it just made.
+    unsolicited: Vec<u8>,
     /// Whether the title moved since the last settle, tracked where it is
     /// assigned so no per-chunk clone is needed to notice.
     title_changed: bool,
@@ -467,6 +478,9 @@ impl HeadlessScreen {
             images: None,
             replies: Vec::new(),
             image_replies_only: false,
+            host_replies: false,
+            palette: None,
+            unsolicited: Vec::new(),
             title_changed: false,
             last_cells: Vec::new(),
             last_annotations: Vec::new(),
@@ -481,6 +495,53 @@ impl HeadlessScreen {
     pub fn with_notifications(mut self) -> Self {
         self.notifications = Some(Default::default());
         self
+    }
+
+    /// Opt in only where this screen is the terminal the program talks to
+    /// and its replies reach the program: a local Engine session. The screen
+    /// then reports `terminal_version` to XTVERSION, answers color queries
+    /// (OSC 4/10/11/12), the color-scheme query and in-band size reports, and
+    /// publishes colors a program set with OSC 4 as the colors it set.
+    pub fn with_host_replies(mut self, terminal_version: impl Into<String>) -> Self {
+        self.host_replies = true;
+        let config = Config {
+            terminal_version: Some(terminal_version.into()),
+            ..self.term.config().clone()
+        };
+        self.term.set_options(config);
+        // `set_options` re-announces the title; nothing changed.
+        self.drain_events();
+        self
+    }
+
+    /// Sets the colors color queries are answered from. A program that
+    /// enabled color-scheme reports (DECSET 2031) is told when the light or
+    /// dark appearance changes; take it with [`Self::take_unsolicited`].
+    pub fn set_palette(&mut self, palette: Option<TerminalPalette>) {
+        let before = self.palette.map(|palette| palette.appearance);
+        self.palette = palette;
+        let after = self.palette.map(|palette| palette.appearance);
+        if self.host_replies
+            && before != after
+            && let Some(appearance) = after
+            && self.term.mode().contains(TermMode::COLOR_SCHEME_UPDATES)
+        {
+            self.unsolicited
+                .extend_from_slice(color_scheme_report(appearance).as_bytes());
+        }
+    }
+
+    pub fn palette(&self) -> Option<TerminalPalette> {
+        self.palette
+    }
+
+    /// Reports owed to the program because something outside its output
+    /// changed (a resize, a theme change). [`Self::take_replies`] includes
+    /// them too; a caller that changes the size or theme outside the pump
+    /// takes them here and writes them at once.
+    #[must_use]
+    pub fn take_unsolicited(&mut self) -> Vec<u8> {
+        std::mem::take(&mut self.unsolicited)
     }
 
     /// Resets the emulator at its current dimensions without touching a PTY.
@@ -508,6 +569,16 @@ impl HeadlessScreen {
             reset.set_cell_pixels(cell_pixels.0, cell_pixels.1);
         }
         reset.image_replies_only = self.image_replies_only;
+        if self.host_replies {
+            let version = self
+                .term
+                .config()
+                .terminal_version
+                .clone()
+                .unwrap_or_default();
+            reset = reset.with_host_replies(version);
+        }
+        reset.palette = self.palette;
         reset.content_seq = self.content_seq.saturating_add(1);
         *self = reset;
     }
@@ -749,23 +820,40 @@ impl HeadlessScreen {
         // A narrower screen needs the larger row allowance before reflow to
         // retain wrapped history. When widening, reflow first: rows may merge,
         // and trimming beforehand would discard history that still fits.
+        // Only the history limit changes; keyboard negotiation and the
+        // reported identity are construction options and must survive.
+        let with_history = |term: &Term<Collector>| Config {
+            scrolling_history: new_limit,
+            ..term.config().clone()
+        };
         if new_limit > old_limit {
-            self.term.set_options(Config {
-                scrolling_history: new_limit,
-                ..Config::default()
-            });
+            self.term.set_options(with_history(&self.term));
         }
         self.geometry = geometry;
         self.term.resize(self.geometry);
         if new_limit < old_limit {
             // set_options updates the primary history even while the alternate
             // screen is active, and preserves the limit across terminal reset.
-            self.term.set_options(Config {
-                scrolling_history: new_limit,
-                ..Config::default()
-            });
+            self.term.set_options(with_history(&self.term));
+        }
+        if self.host_replies && self.term.mode().contains(TermMode::IN_BAND_RESIZE) {
+            // DECSET 2048: the program reads its new size from the stream
+            // rather than asking after SIGWINCH.
+            let report = self.in_band_size_report();
+            self.unsolicited.extend_from_slice(report.as_bytes());
         }
         self.settle();
+    }
+
+    /// `CSI 48 ; rows ; cols ; height ; width t`, pixels zero when unknown.
+    fn in_band_size_report(&self) -> String {
+        let (cell_width, cell_height) = self.cell_pixels().unwrap_or((0, 0));
+        let (cols, rows) = (self.geometry.cols, self.geometry.rows);
+        format!(
+            "\x1b[48;{rows};{cols};{};{}t",
+            rows * usize::from(cell_height),
+            cols * usize::from(cell_width),
+        )
     }
 
     pub fn content_seq(&self) -> u64 {
@@ -855,6 +943,19 @@ impl HeadlessScreen {
     }
 
     /// Restore checkpointed modes through the existing parser after grid restore.
+    /// A checkpoint from an Engine whose parser could not negotiate kitty
+    /// flags (written before keyboard snapshots existed) proves they were
+    /// zero; restoring it leaves them known rather than unknown. Returns
+    /// false, changing nothing, if this screen holds any flags.
+    pub fn mark_keyboard_never_negotiated(&mut self) -> bool {
+        let snapshot = self.term.keyboard_snapshot();
+        if snapshot != Self::new(1, 1).term.keyboard_snapshot() {
+            return false;
+        }
+        self.keyboard_enhancements_known = true;
+        true
+    }
+
     pub fn restore_keyboard_state(&mut self, state: diri_proto::terminal_input::KeyboardState) {
         // Current flags alone cannot reconstruct the saved inactive/pop state.
         // Only restore_keyboard_snapshot can establish enhanced state as known.
@@ -922,6 +1023,7 @@ impl HeadlessScreen {
             self.last_grid_rows = rows;
         }
 
+        let overrides = palette_overrides(self.host_replies, &self.term);
         let grid = self.term.grid();
         let candidate_count = if force_full {
             rows
@@ -942,10 +1044,21 @@ impl HeadlessScreen {
             let row = &mut self.last_cells[base..base + cols];
             let mut row_changed = force_full || self.last_annotations[y] != metadata;
             let source = &grid[line];
-            for (x, previous) in row.iter_mut().enumerate() {
-                let cell = wire_cell(&source[Column(x)]);
-                row_changed |= *previous != cell;
-                *previous = cell;
+            // Two loops rather than a branch per cell: this is the
+            // publication hot path, and the common case has no overrides.
+            if let Some(colors) = overrides {
+                for (x, previous) in row.iter_mut().enumerate() {
+                    let mut cell = wire_cell(&source[Column(x)]);
+                    apply_palette(&mut cell, colors);
+                    row_changed |= *previous != cell;
+                    *previous = cell;
+                }
+            } else {
+                for (x, previous) in row.iter_mut().enumerate() {
+                    let cell = wire_cell(&source[Column(x)]);
+                    row_changed |= *previous != cell;
+                    *previous = cell;
+                }
             }
             if !row_changed {
                 continue;
@@ -979,13 +1092,15 @@ impl HeadlessScreen {
         let cols = self.geometry.cols;
         let rows = self.geometry.rows;
         let grid = self.term.grid();
+        let overrides = palette_overrides(self.host_replies, &self.term);
         let mut all = Vec::with_capacity(rows);
         for y in 0..rows {
             let line = Line(y as i32);
             let mut row = Vec::with_capacity(cols);
             let source = &grid[line];
-            for x in 0..cols {
-                row.push(wire_cell(&source[Column(x)]));
+            row.extend((0..cols).map(|x| wire_cell(&source[Column(x)])));
+            if let Some(colors) = overrides {
+                row.iter_mut().for_each(|cell| apply_palette(cell, colors));
             }
             let mut changed = ChangedRow::new(y as u16, row);
             changed.metadata = self.row_metadata(line);
@@ -1335,12 +1450,17 @@ impl HeadlessScreen {
         let end = (start + max_rows.max(0) as usize).min(total);
         let mut rows = Vec::with_capacity(end.saturating_sub(start));
         let mut metadata = Vec::with_capacity(end.saturating_sub(start));
+        let overrides = palette_overrides(self.host_replies, &self.term).cloned();
         for index in start..end {
             let line = Line(index as i32 - history as i32);
             let mut row = Vec::with_capacity(cols);
             let source = &self.term.grid()[line];
             for x in 0..cols {
-                row.push(wire_cell(&source[Column(x)]));
+                let mut cell = wire_cell(&source[Column(x)]);
+                if let Some(colors) = &overrides {
+                    apply_palette(&mut cell, colors);
+                }
+                row.push(cell);
             }
             rows.push(row);
             metadata.push(self.row_metadata_with_budget(
@@ -1645,6 +1765,21 @@ impl HeadlessScreen {
                     };
                     self.replies.extend_from_slice(format(size).as_bytes());
                 }
+                Event::ColorRequest(index, format) if self.host_replies => {
+                    if let Some(color) = self.color_value(index) {
+                        self.replies.extend_from_slice(format(color).as_bytes());
+                    }
+                }
+                Event::ColorSchemeRequest if self.host_replies => {
+                    if let Some(palette) = self.palette {
+                        self.replies
+                            .extend_from_slice(color_scheme_report(palette.appearance).as_bytes());
+                    }
+                }
+                Event::InBandResize if self.host_replies => {
+                    let report = self.in_band_size_report();
+                    self.replies.extend_from_slice(report.as_bytes());
+                }
                 // Unanswered where the cell size is unknown, as before.
                 Event::CellSizeRequest(format) => {
                     if let Some((cell_width, cell_height)) = self.cell_pixels() {
@@ -1666,7 +1801,34 @@ impl HeadlessScreen {
     /// after feeding a chunk; nothing else may consume them.
     #[must_use]
     pub fn take_replies(&mut self) -> Vec<u8> {
-        std::mem::take(&mut self.replies)
+        let mut replies = std::mem::take(&mut self.replies);
+        replies.append(&mut self.unsolicited);
+        replies
+    }
+
+    /// The current value of color `index` (0–255, or a dynamic color) as a
+    /// program asking for it should see it: a color the program set itself,
+    /// else the App's palette. Unknown until the App has sent a palette,
+    /// except the fixed 16–255 cube and ramp.
+    fn color_value(&self, index: usize) -> Option<Rgb> {
+        if let Some(color) = self.term.colors()[index] {
+            return Some(color);
+        }
+        let rgb = |[r, g, b]: [u8; 3]| Rgb { r, g, b };
+        match index {
+            0..16 => self.palette.map(|palette| rgb(palette.ansi[index])),
+            16..256 => Some(xterm_extended(index as u8)),
+            _ if index == NamedColor::Foreground as usize => {
+                self.palette.map(|palette| rgb(palette.foreground))
+            }
+            _ if index == NamedColor::Background as usize => {
+                self.palette.map(|palette| rgb(palette.background))
+            }
+            _ if index == NamedColor::Cursor as usize => {
+                self.palette.map(|palette| rgb(palette.cursor))
+            }
+            _ => None,
+        }
     }
 
     // (cell mapping lives at module level; see `wire_cell`)
@@ -1862,6 +2024,54 @@ fn wire_cell(cell: &alacritty_terminal::term::cell::Cell) -> GridCell {
         wire_color(cell.bg),
         wire_style(cell.flags),
     )
+}
+
+/// Colors 0–255 a program redefined with OSC 4, when it has, so grids show
+/// them as the RGB the program chose. `None`, the usual case, costs one scan
+/// of 256 entries per publication and nothing per cell.
+fn palette_overrides(host_replies: bool, term: &Term<Collector>) -> Option<&Colors> {
+    let colors = term.colors();
+    (host_replies && (0..256).any(|index| colors[index].is_some())).then_some(colors)
+}
+
+fn apply_palette(cell: &mut GridCell, colors: &Colors) {
+    let resolve = |color: &mut TermColor| {
+        if let TermColor::Ansi(index) = *color
+            && let Some(rgb) = colors[usize::from(index)]
+        {
+            *color = TermColor::Rgb(rgb.r, rgb.g, rgb.b);
+        }
+    };
+    resolve(&mut cell.fg);
+    resolve(&mut cell.bg);
+}
+
+/// `CSI ? 997 ; 1 n` for dark, `2` for light (the color-scheme report).
+fn color_scheme_report(appearance: TerminalAppearance) -> &'static str {
+    match appearance {
+        TerminalAppearance::Dark => "\x1b[?997;1n",
+        TerminalAppearance::Light => "\x1b[?997;2n",
+    }
+}
+
+/// xterm's fixed colors 16–255: a 6×6×6 cube, then a 24-step gray ramp.
+fn xterm_extended(index: u8) -> Rgb {
+    if index < 232 {
+        const STEPS: [u8; 6] = [0, 95, 135, 175, 215, 255];
+        let cube = index - 16;
+        Rgb {
+            r: STEPS[usize::from(cube / 36)],
+            g: STEPS[usize::from((cube % 36) / 6)],
+            b: STEPS[usize::from(cube % 6)],
+        }
+    } else {
+        let value = 8 + (index - 232) * 10;
+        Rgb {
+            r: value,
+            g: value,
+            b: value,
+        }
+    }
 }
 
 fn wire_color(color: Color) -> TermColor {

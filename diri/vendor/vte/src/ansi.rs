@@ -258,7 +258,31 @@ struct ProcessorState<T: Timeout> {
 
     /// State for synchronized terminal updates.
     sync_state: SyncState<T>,
+
+    /// DIRI PATCH: the DCS request being collected, if it is one we answer.
+    dcs: Option<DcsRequest>,
 }
+
+/// DIRI PATCH: a DCS query whose payload is collected until its terminator.
+#[derive(Debug)]
+struct DcsRequest {
+    kind: DcsKind,
+    payload: Vec<u8>,
+    /// The payload outgrew [`DCS_REQUEST_MAX`]; the request is dropped.
+    overflowed: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DcsKind {
+    /// XTGETTCAP, `DCS + q`.
+    Termcap,
+    /// DECRQSS, `DCS $ q`.
+    Setting,
+}
+
+/// DIRI PATCH: queries are a few capability names; anything longer is not a
+/// request worth buffering.
+const DCS_REQUEST_MAX: usize = 1024;
 
 #[derive(Debug)]
 struct SyncState<T: Timeout> {
@@ -771,6 +795,27 @@ pub trait Handler {
 
     // Set SCP control.
     fn set_scp(&mut self, _char_path: ScpCharPath, _update_mode: ScpUpdateMode) {}
+
+    /// DIRI PATCH: report the terminal's name and version (XTVERSION,
+    /// `CSI > q`).
+    fn report_version(&mut self) {}
+
+    /// DIRI PATCH: soft terminal reset (DECSTR, `CSI ! p`).
+    fn soft_reset(&mut self) {}
+
+    /// DIRI PATCH: a DEC-private device status report (`CSI ? Ps n`).
+    fn private_device_status(&mut self, _arg: usize) {}
+
+    /// DIRI PATCH: report the screen size in characters (XTWINOPS 19).
+    fn screen_size_chars(&mut self) {}
+
+    /// DIRI PATCH: XTGETTCAP (`DCS + q Pt ST`). `names` is the raw request:
+    /// hex-encoded capability names separated by `;`.
+    fn request_termcap(&mut self, _names: &[u8]) {}
+
+    /// DIRI PATCH: DECRQSS (`DCS $ q Pt ST`). `setting` is the raw request,
+    /// for example `m`, `r` or ` q`.
+    fn request_setting(&mut self, _setting: &[u8]) {}
 }
 
 bitflags! {
@@ -956,6 +1001,12 @@ impl PrivateMode {
             1049 => Self::Named(NamedPrivateMode::SwapScreenAndSetRestoreCursor),
             2004 => Self::Named(NamedPrivateMode::BracketedPaste),
             2026 => Self::Named(NamedPrivateMode::SyncUpdate),
+            47 => Self::Named(NamedPrivateMode::LegacyAltScreen),
+            69 => Self::Named(NamedPrivateMode::LeftRightMargins),
+            1016 => Self::Named(NamedPrivateMode::SgrPixelMouse),
+            1047 => Self::Named(NamedPrivateMode::ClearingAltScreen),
+            2031 => Self::Named(NamedPrivateMode::ColorSchemeUpdates),
+            2048 => Self::Named(NamedPrivateMode::InBandResize),
             _ => Self::Unknown(mode),
         }
     }
@@ -1007,6 +1058,23 @@ pub enum NamedPrivateMode {
     BracketedPaste = 2004,
     /// The mode is handled automatically by [`Processor`].
     SyncUpdate = 2026,
+    /// DIRI PATCH: xterm's legacy alternate screen. The cursor is shared and
+    /// neither screen is cleared.
+    LegacyAltScreen = 47,
+    /// DIRI PATCH: left and right margins (DECLRMM). Recognized so DECRQM can
+    /// report it as permanently reset; margins are not implemented.
+    LeftRightMargins = 69,
+    /// DIRI PATCH: SGR mouse reports in pixels. Recognized so DECRQM can
+    /// report it as permanently reset; pixel reports are not implemented.
+    SgrPixelMouse = 1016,
+    /// DIRI PATCH: alternate screen that is cleared on exit; the cursor is
+    /// shared.
+    ClearingAltScreen = 1047,
+    /// DIRI PATCH: report color-scheme (light/dark) changes as
+    /// `CSI ? 997 ; Ps n`.
+    ColorSchemeUpdates = 2031,
+    /// DIRI PATCH: in-band window resize notifications (`CSI 48 ; … t`).
+    InBandResize = 2048,
 }
 
 /// Mode for clearing line.
@@ -1359,20 +1427,44 @@ where
 
     #[inline]
     fn hook(&mut self, params: &Params, intermediates: &[u8], ignore: bool, action: char) {
-        debug!(
-            "[unhandled hook] params={:?}, ints: {:?}, ignore: {:?}, action: {:?}",
-            params, intermediates, ignore, action
-        );
+        let kind = match (intermediates, action, ignore) {
+            ([b'+'], 'q', false) => Some(DcsKind::Termcap),
+            ([b'$'], 'q', false) => Some(DcsKind::Setting),
+            _ => None,
+        };
+        self.state.dcs =
+            kind.map(|kind| DcsRequest { kind, payload: Vec::new(), overflowed: false });
+        if self.state.dcs.is_none() {
+            debug!(
+                "[unhandled hook] params={:?}, ints: {:?}, ignore: {:?}, action: {:?}",
+                params, intermediates, ignore, action
+            );
+        }
     }
 
     #[inline]
     fn put(&mut self, byte: u8) {
-        debug!("[unhandled put] byte={:?}", byte);
+        if let Some(request) = &mut self.state.dcs {
+            if request.payload.len() < DCS_REQUEST_MAX {
+                request.payload.push(byte);
+            } else {
+                request.overflowed = true;
+            }
+        }
     }
 
     #[inline]
     fn unhook(&mut self) {
-        debug!("[unhandled unhook]");
+        let Some(request) = self.state.dcs.take() else {
+            return;
+        };
+        if request.overflowed {
+            return;
+        }
+        match request.kind {
+            DcsKind::Termcap => self.handler.request_termcap(&request.payload),
+            DcsKind::Setting => self.handler.request_setting(&request.payload),
+        }
     }
 
     #[inline]
@@ -1765,6 +1857,9 @@ where
                 }
             },
             ('n', []) => handler.device_status(next_param_or(0) as usize),
+            ('n', [b'?']) => handler.private_device_status(next_param_or(0) as usize),
+            ('p', [b'!']) => handler.soft_reset(),
+            ('q', [b'>']) if next_param_or(0) == 0 => handler.report_version(),
             ('P', []) => handler.delete_chars(next_param_or(1) as usize),
             ('p', [b'$']) => {
                 let mode = next_param_or(0);
@@ -1806,6 +1901,7 @@ where
                 14 => handler.text_area_size_pixels(),
                 16 => handler.cell_size_pixels(),
                 18 => handler.text_area_size_chars(),
+                19 => handler.screen_size_chars(),
                 22 => handler.push_title(),
                 23 => handler.pop_title(),
                 _ => unhandled!(),

@@ -856,7 +856,14 @@ impl AttachHub {
                 session.resize_pty(cols.max(2), rows.max(2))
             };
             if let Ok(Some(reflow)) = reflow {
-                reflow.apply();
+                // DECSET 2048 programs read their new size in-band.
+                let reports = reflow.apply();
+                if !reports.is_empty()
+                    && let Ok(guard) = registry.lock()
+                    && let Some(session) = guard.get(session_id)
+                {
+                    session.write_reports(&reports);
+                }
             }
             return true;
         }

@@ -1829,7 +1829,12 @@ account record, not environment variables. No command arguments are collected.
 `enhanced-keyboard-v1` is an optional, explicit controller capability. It does
 not enable parser negotiation: shipping `HeadlessScreen::new` remains disabled.
 Only an explicitly configured capable input owner may use the opt-in parser
-constructor. Five validated flag bits come from the shared parser; there is no
+constructor. The local Engine is such an owner for local sessions: it builds
+their screens with `new_with_keyboard_enhancements`, and the desktop App
+attaches with `enhancedKeyboard` and encodes the negotiated flags. The remote
+Holder and the Engine's mirror of a remote session keep the disabled parser,
+so remote sessions still never answer `CSI ? u`; enabling it there is a
+separate Holder change. Five validated flag bits come from the shared parser; there is no
 second escape parser. Direct set, query, push/pop and screen swaps share the
 same bounded stack state.
 
@@ -1936,6 +1941,16 @@ attributes (`?62;22c`, which kitten's probe waits on), and it sets the PTY's
 queries. Every other reply stays unanswered, as before, and the Holder keeps
 no queue of unanswered replies. A Holder from before minor 16 neither intercepts
 nor answers, so its programs see no support and keep working unchanged.
+
+Local sessions answer more than this: XTVERSION, XTGETTCAP, DECRQSS, the kitty
+keyboard query, OSC 4/10/11/12 color queries from the App's palette
+(`terminal.configure`), `CSI ? 996 n` and DECSET 2031/2048 reports. That is
+opt-in on the shared screen (`with_host_replies`) and the Holder does not opt
+in, so a remote program still gets none of these replies and no OSC 4 color
+rewrite on the wire. Answering them remotely needs its own revision of this
+section. The shared emulator's state fixes (DECSTR, erase-in-line at a pending
+wrap, RIS clearing the title, modes 47 and 1047) reach Holders as ordinary
+emulator behavior with no protocol change.
 
 Pixels are read on demand. `ImageRequest` (kind 50, JSON) names an anchor
 key and a byte offset. `ImageResponse` (kind 51) carries a length-prefixed JSON
