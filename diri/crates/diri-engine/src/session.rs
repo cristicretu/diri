@@ -497,6 +497,12 @@ struct Shared {
     relaunch_requested: AtomicBool,
     /// The latest keystroke whose echo the held pump has not published yet.
     echo_request: Mutex<Option<EchoRequest>>,
+    /// Rings the held pump out of an idle park; see [`PumpWake`].
+    pump_wake: PumpWake,
+    /// What the last foreground sample of a shell found: 0 unknown, 1 the
+    /// shell itself, 2 a job. Only a job can change without moving bytes,
+    /// so only then does an idle pump keep its slow sampling backstop.
+    foreground_job: std::sync::atomic::AtomicU8,
     /// What a local shell is running and where it is. Stays empty for Agent
     /// sessions and for remote shells, whose processes are not on this host.
     foreground: Mutex<ForegroundProgram>,
@@ -755,6 +761,8 @@ impl Shared {
         let now = unix_secs();
         self.last_hot.store(now, Ordering::Relaxed);
         self.last_interaction.store(now, Ordering::Relaxed);
+        // A touched session ticks fast again; a parked pump has to hear it.
+        self.pump_wake.ring();
     }
 
     /// Fast quiet-tick while the session is attached/touched or Working;
@@ -788,6 +796,58 @@ fn unix_secs() -> u64 {
         .duration_since(SystemTime::UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs()
+}
+
+/// How long an idle held pump sleeps when nothing at all is pending: a
+/// backstop, not a tick. Output, input, hooks, a stop or a hangup wake it at
+/// once; this only bounds how late a Holder that is up but lost its child
+/// without an exit marker is noticed.
+const IDLE_PARK: Duration = Duration::from_secs(300);
+
+/// The doorbell of a parked held pump: an `EVFILT_USER` event on the pump's
+/// own log-watch kqueue, so waking costs no descriptor. Whoever changes what
+/// the pump's idle decision depends on (a touch, an out-of-band status
+/// signal, a stop) rings it.
+#[derive(Default)]
+struct PumpWake {
+    /// The pump's kqueue while it runs; -1 otherwise. Cleared under the lock
+    /// before the kqueue closes, so a ring never reaches a reused descriptor.
+    kq: Mutex<i32>,
+}
+
+impl PumpWake {
+    fn set(&self, kq: i32) {
+        *self.kq.lock().expect("pump wake") = kq;
+    }
+
+    fn ring(&self) {
+        #[cfg(target_os = "macos")]
+        {
+            let kq = self.kq.lock().expect("pump wake");
+            if *kq >= 0 {
+                let event = libc::kevent {
+                    ident: log_watch::WAKE_IDENT,
+                    filter: libc::EVFILT_USER,
+                    flags: 0,
+                    fflags: libc::NOTE_TRIGGER,
+                    data: 0,
+                    udata: std::ptr::null_mut(),
+                };
+                // SAFETY: one initialized change on a live kqueue (held open
+                // by the pump until it clears this under the same lock).
+                unsafe { libc::kevent(*kq, &event, 1, std::ptr::null_mut(), 0, std::ptr::null()) };
+            }
+        }
+    }
+}
+
+/// Clears [`PumpWake`] when the pump ends, before its kqueue closes.
+struct PumpWakeRegistration<'a>(&'a PumpWake);
+
+impl Drop for PumpWakeRegistration<'_> {
+    fn drop(&mut self) {
+        self.0.set(-1);
+    }
 }
 
 /// What the grid pump compares between ticks to decide whether anything
@@ -3453,6 +3513,8 @@ impl Session {
             .expect("reducer")
             .reduce_identified(signal, identity, SystemTime::now());
         apply(&self.shared, &outcome);
+        // The signal may have started a turn whose timers need ticks.
+        self.shared.pump_wake.ring();
         outcome
     }
 
@@ -3516,6 +3578,7 @@ impl Session {
             Transport::Remote(client) => stop_remote(&self.shared, client, grace)?,
         };
         self.shared.stop.store(true, Ordering::SeqCst);
+        self.shared.pump_wake.ring();
         if let Transport::Remote(client) = &self.transport {
             client.close();
         }
@@ -3539,6 +3602,8 @@ impl Drop for Session {
     /// [`Session::adopt`].
     fn drop(&mut self) {
         self.shared.stop.store(true, Ordering::SeqCst);
+        // A parked held pump sees `stop` only once woken.
+        self.shared.pump_wake.ring();
         // An attach pump idles on this wake source; a replacement Session has
         // a new one, so tell the pump to go and look for it.
         self.shared.grid_wake.notify();
@@ -3694,6 +3759,8 @@ fn new_shared(
             .filter(|notice| !notice.is_empty()),
         relaunch_requested: AtomicBool::new(false),
         echo_request: Mutex::new(None),
+        pump_wake: PumpWake::default(),
+        foreground_job: std::sync::atomic::AtomicU8::new(0),
         foreground: Mutex::new(ForegroundProgram::default()),
         progress: Mutex::new(ProgressTrack::default()),
         program_status: Mutex::new(ProgramStatusTrack::default()),
@@ -3951,6 +4018,9 @@ fn apply_foreground_sample(
     shared
         .builtin_prompt
         .store(builtin_prompt, Ordering::SeqCst);
+    shared
+        .foreground_job
+        .store(if running { 2 } else { 1 }, Ordering::SeqCst);
     progress_follows_job(shared, foreground_pgid.filter(|_| running));
     let agent: Option<Lend<'_>> = match host {
         #[cfg(unix)]
@@ -4248,6 +4318,50 @@ fn held_foreground_sample_due(
 ) -> bool {
     since_activity.is_some_and(|since| since <= FOREGROUND_SETTLE)
         || since_sample.is_none_or(|since| since >= LIVENESS_INTERVAL)
+}
+
+/// Whether an idle pump still has something on the clock that only a tick
+/// would run: reducer timers, a slow foreground backstop while a job (which
+/// can change without output) holds the terminal, progress waiting to go
+/// stale, an artifact scan deferred by its rate limit, or an open
+/// synchronized update waiting to be released.
+fn idle_work_pending(
+    shared: &Shared,
+    manifest_id: &str,
+    last_scan_at: Option<Instant>,
+    last_scan_seq: u64,
+) -> bool {
+    if shared.wants_fast_tick() || shared.reducer.lock().expect("reducer").wants_tick() {
+        return true;
+    }
+    let sampling = if manifest_id == "shell" {
+        shared.foreground_job.load(Ordering::SeqCst) != 1
+    } else {
+        secret_input_plausible(shared)
+    };
+    if sampling {
+        return true;
+    }
+    {
+        let track = shared.progress.lock().expect("progress");
+        if track.published.is_some() && track.job.is_none() {
+            return true;
+        }
+    }
+    let screen = shared.screen.lock().expect("screen");
+    screen.in_synchronized_update()
+        || (last_scan_at.is_some() && screen.content_seq() != last_scan_seq)
+}
+
+/// The descriptor an idle held pump may park on (unix only).
+#[cfg(unix)]
+fn park_descriptor(stream: &crate::holder::HolderOutputStream) -> Option<i32> {
+    stream.wait_descriptor()
+}
+
+#[cfg(not(unix))]
+fn park_descriptor(_stream: &crate::holder::HolderOutputStream) -> Option<i32> {
+    None
 }
 
 /// Rows of scrollback each artifact scan covers besides the screen. Output
@@ -5989,6 +6103,15 @@ fn pump_held(
             }
         }
     };
+    // Declared after the watcher so it is dropped first: the doorbell is
+    // cleared before the kqueue it rings closes.
+    if let Some(watcher) = &watcher {
+        shared.pump_wake.set(watcher.wake_descriptor());
+    }
+    let _wake_registration = PumpWakeRegistration(&shared.pump_wake);
+    // Set at the end of a quiet pass that left nothing pending, so the next
+    // wait parks without a deadline instead of ticking.
+    let mut park_next = false;
     // Adoption can restore a checkpoint concurrently with a freshly attached
     // App. One event is cheap and guarantees a seed that raced the restore is
     // corrected without bringing back periodic grid polling.
@@ -6142,7 +6265,17 @@ fn pump_held(
                     (None, Some(started)) => {
                         held_batch_wait(started.elapsed(), last_published.map(|at| at.elapsed()))
                     }
-                    (None, None) => shared.quiet_tick(),
+                    (None, None) => match (park_next, watcher.as_mut(), park_descriptor(stream)) {
+                        // Nothing is pending: sleep until a frame, a hangup or
+                        // the doorbell, then take whatever is there at once.
+                        (true, Some(watcher), Some(descriptor)) => {
+                            if watcher.park(descriptor, IDLE_PARK) {
+                                shared.log.lock().expect("log").invalidate_read_handle();
+                            }
+                            Duration::ZERO
+                        }
+                        _ => shared.quiet_tick(),
+                    },
                 };
                 match stream.next_run_into(timeout, LOG_READ_BUDGET, &mut live_run) {
                     // Contiguous by construction, and checked anyway: a run
@@ -6330,8 +6463,34 @@ fn pump_held(
                     }
                 }
             }
+            // Park only on the subscription: its hangup is the liveness
+            // signal, and a log-only pump keeps probing on its tick.
+            let parking = streaming
+                && repaint.is_none()
+                && publish_pending.is_none()
+                && !eval_dirty
+                && !replaying
+                && checkpoint_dirty_at.is_none()
+                && last_activity.is_none_or(|at| at.elapsed() > FOREGROUND_SETTLE)
+                && !idle_work_pending(&shared, &manifest_id, last_scan_at, last_scan_seq);
+            if parking {
+                // Give back what output, a checkpoint or an artifact scan left
+                // decoded or allocated before sleeping. Cheap when there is
+                // nothing to give back, and parks are rare.
+                shared.screen.lock().expect("screen").compact_idle();
+                if !park_next {
+                    // Output just went quiet: its buffers are not needed
+                    // until the next burst, which reallocates them.
+                    live_run = Vec::new();
+                    if let Some(stream) = live.as_mut() {
+                        stream.release_idle_buffer();
+                    }
+                }
+            }
+            park_next = parking;
             continue;
         }
+        park_next = false;
 
         trace_hop!(OutputReceived);
         // A rotation can move the readable floor past us; resynchronize.
@@ -7033,6 +7192,9 @@ mod log_watch {
     use std::path::{Path, PathBuf};
     use std::time::Duration;
 
+    /// The `EVFILT_USER` identifier [`PumpWake`] triggers.
+    pub const WAKE_IDENT: usize = 0x6469_7269;
+
     pub struct LogWatcher {
         kq: i32,
         fd: i32,
@@ -7051,8 +7213,25 @@ mod log_watch {
                 fd: -1,
                 path: path.to_path_buf(),
             };
+            // The pump's doorbell: [`PumpWake`] triggers it, so a parked pump
+            // can be woken without a descriptor of its own.
+            let wake = libc::kevent {
+                ident: WAKE_IDENT,
+                filter: libc::EVFILT_USER,
+                flags: libc::EV_ADD | libc::EV_CLEAR,
+                fflags: 0,
+                data: 0,
+                udata: std::ptr::null_mut(),
+            };
+            // SAFETY: registering one initialized event; no output requested.
+            unsafe { libc::kevent(kq, &wake, 1, std::ptr::null_mut(), 0, std::ptr::null()) };
             watcher.arm();
             Some(watcher)
+        }
+
+        /// The kqueue a [`PumpWake`] rings.
+        pub fn wake_descriptor(&self) -> i32 {
+            self.kq
         }
 
         fn arm(&mut self) {
@@ -7106,14 +7285,47 @@ mod log_watch {
                     return false;
                 }
             }
+            self.wait_events(None, timeout)
+        }
+
+        /// [`Self::wait`], also returning once `stream` is readable (a frame
+        /// or its hangup) or the pump's [`PumpWake`] rings. This is how an
+        /// idle pump sleeps: no timer short of `timeout`, which callers make
+        /// a long backstop.
+        pub fn park(&mut self, stream: i32, timeout: Duration) -> bool {
+            if self.fd < 0 {
+                self.arm();
+            }
+            self.wait_events(Some(stream), timeout)
+        }
+
+        fn wait_events(&mut self, stream: Option<i32>, timeout: Duration) -> bool {
             let spec = libc::timespec {
                 tv_sec: timeout.as_secs() as libc::time_t,
                 tv_nsec: libc::c_long::from(timeout.subsec_nanos()),
             };
-            // SAFETY: zeroed kevent output slot, valid timeout.
+            // One-shot, so a later wait without the stream is never woken by
+            // it; closing the socket removes the registration too.
+            let readable = stream.map(|fd| libc::kevent {
+                ident: fd as usize,
+                filter: libc::EVFILT_READ,
+                flags: libc::EV_ADD | libc::EV_ONESHOT,
+                fflags: 0,
+                data: 0,
+                udata: std::ptr::null_mut(),
+            });
+            let (changes, count) = match &readable {
+                Some(event) => (event as *const libc::kevent, 1),
+                None => (std::ptr::null(), 0),
+            };
+            // SAFETY: zeroed kevent output slot, valid timeout, and at most
+            // one initialized change that outlives the call.
             let mut out = unsafe { std::mem::zeroed::<libc::kevent>() };
-            let woke = unsafe { libc::kevent(self.kq, std::ptr::null(), 0, &mut out, 1, &spec) };
-            if woke > 0 && out.fflags & (libc::NOTE_DELETE | libc::NOTE_RENAME) != 0 {
+            let woke = unsafe { libc::kevent(self.kq, changes, count, &mut out, 1, &spec) };
+            if woke > 0
+                && out.filter == libc::EVFILT_VNODE
+                && out.fflags & (libc::NOTE_DELETE | libc::NOTE_RENAME) != 0
+            {
                 // Rotation replaced the file: track the new incarnation.
                 self.arm();
                 return true;
@@ -7179,6 +7391,14 @@ mod log_watch {
         pub fn wait(&mut self, timeout: Duration) -> bool {
             std::thread::sleep(timeout);
             false
+        }
+
+        pub fn wake_descriptor(&self) -> i32 {
+            -1
+        }
+
+        pub fn park(&mut self, _stream: i32, timeout: Duration) -> bool {
+            self.wait(timeout)
         }
     }
 }

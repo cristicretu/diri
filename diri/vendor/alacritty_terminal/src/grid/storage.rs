@@ -121,6 +121,13 @@ impl<T> Storage<T> {
     }
 
     #[cfg(feature = "compact-history")]
+    pub fn release_idle(&mut self) {
+        if let Some(compact) = &mut self.compact {
+            compact.release_idle();
+        }
+    }
+
+    #[cfg(feature = "compact-history")]
     pub fn bound_history_bytes(&mut self, budget: usize) {
         if let Some(compact) = &mut self.compact {
             compact.bound_history_bytes(budget);

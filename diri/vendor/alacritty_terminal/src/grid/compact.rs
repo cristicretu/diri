@@ -1026,6 +1026,19 @@ impl<T> CompactRows<T> {
         }
     }
 
+    /// Give back what streaming output leaves behind once it stops: decode
+    /// caches, the oldest block's eviction index and spare row allocations,
+    /// and deque capacity beyond what the rows need. Stored history is
+    /// untouched; each cache is rebuilt on its next use.
+    pub fn release_idle(&mut self) {
+        self.release_read_cache();
+        self.evict_cache = None;
+        self.spare = Vec::new();
+        self.recent.shrink_to_fit();
+        self.oldest.shrink_to_fit();
+        self.blocks.shrink_to_fit();
+    }
+
     #[cfg(test)]
     fn payload_bytes(&self) -> usize {
         self.payload_bytes
