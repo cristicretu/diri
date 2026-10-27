@@ -236,11 +236,16 @@ pub(crate) fn caption_inset(top: f32, right_gap: f32) -> f32 {
 /// window's whole title bar ("all title bar elements should be
 /// semi-transparent when the window is inactive"); toolbar backgrounds keep
 /// their color, only what sits on them fades.
-pub(crate) fn title_row_opacity(window: &Window) -> f32 {
-    if draws_caption_buttons() && !window.is_window_active() {
+///
+/// Elsewhere the title row steps back by the interface style's own amount
+/// (`chrome_focus`), as a native macOS window greys its title and toolbar.
+pub(crate) fn title_row_opacity(window: &Window, look: crate::chrome_focus::ChromeLook) -> f32 {
+    if window.is_window_active() {
+        1.0
+    } else if draws_caption_buttons() {
         INACTIVE_TITLE_ROW_OPACITY
     } else {
-        1.0
+        look.title
     }
 }
 

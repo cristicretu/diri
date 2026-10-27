@@ -5620,24 +5620,26 @@ impl TerminalPane {
         if crate::alerts::enabled(cx) {
             self.sync_paste_prompt(window, cx);
         }
-        let (theme, colors, sidebar_colors, typeface) = {
+        let (theme, colors, sidebar_colors, typeface, chrome_look) = {
             let store = self
                 .runtime
                 .store
                 .read()
                 .expect("session store lock poisoned");
+            let colors = crate::app_theme::colors_in(&store);
             (
                 crate::app_theme::terminal_theme_in(&store),
-                crate::app_theme::colors_in(&store),
+                colors,
                 crate::app_theme::sidebar_colors_in(&store),
                 TerminalType::from_prefs(store.preferences()),
+                crate::chrome_focus::look_in(&store, colors.appearance, window),
             )
         };
         self.sync_status_glyphs(colors, window, cx);
         self.update_selected_geometry(window, cx);
         self.main_viewport = window.viewport_size();
         self.held_hint = crate::held_hints::opacity(window, cx);
-        self.title_opacity = crate::window_chrome::title_row_opacity(window);
+        self.title_opacity = crate::window_chrome::title_row_opacity(window, chrome_look);
 
         let selected = self.selected_session();
 

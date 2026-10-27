@@ -966,11 +966,13 @@ impl WorkspaceWorkbench {
 impl Render for WorkspaceWorkbench {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         crate::perf_overlay::rendered("workbench");
-        let (colors, islands) = {
+        let (colors, islands, chrome_look) = {
             let store = self.runtime.store.read().expect("store");
+            let colors = crate::app_theme::colors_in(&store);
             (
-                crate::app_theme::colors_in(&store),
+                colors,
                 store.preferences().pane_density.islands(),
+                crate::chrome_focus::look_in(&store, colors.appearance, window),
             )
         };
         if !cx.has_active_drag() {
@@ -1211,7 +1213,7 @@ impl Render for WorkspaceWorkbench {
                 } - Metrics::TOOLBAR_CONTROL_SIZE)
                     / 2.0))
                 .right(px(Metrics::TOOLBAR_EDGE_INSET + caption_inset))
-                .opacity(crate::window_chrome::title_row_opacity(window))
+                .opacity(crate::window_chrome::title_row_opacity(window, chrome_look))
                 .flex()
                 .gap(px(4.0))
                 .when(close_shell, |controls| {

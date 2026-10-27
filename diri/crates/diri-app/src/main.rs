@@ -4,6 +4,7 @@ mod alerts;
 mod api_client;
 mod app_theme;
 mod application_notifications;
+mod chrome_focus;
 mod clipboard_transfer;
 mod code_editor;
 mod code_intelligence;

@@ -1,4 +1,5 @@
 use super::*;
+use crate::chrome_focus::LookPill;
 use crate::store::TabOrientation;
 use crate::tab_navigation::selected_project_tabs;
 use diri_ui::title_fade;
@@ -510,7 +511,7 @@ impl Sidebar {
                     .rounded(px(SIDEBAR_ROW_RADIUS))
                     .border_1()
                     .border_color(colors.primary.alpha(0.0))
-                    .glass_pill(colors, true)
+                    .look_pill(colors, self.chrome_look, true)
                     // Frames only while the pill is travelling.
                     .when(frame.animating, |pill| {
                         pill.child(
@@ -571,6 +572,7 @@ impl Sidebar {
             held_hint,
             pill_drawn,
             hover_linger,
+            look,
             ..
         } = *props;
         let id = id.clone();
@@ -660,14 +662,15 @@ impl Sidebar {
             .border_color(colors.primary.alpha(0.0))
             // The shared pill layer draws the selection; a tab fills itself
             // only while that layer stands down.
-            .glass_pill(colors, active && !pill_drawn)
+            .look_pill(colors, look, active && !pill_drawn)
             // The tab the pointer just left keeps a fading fill; the
             // declarative hover below still lights the new tab at once.
-            .when(!active && hover_linger > 0.0, |row| {
+            // Neither lights a tab while the window is not key.
+            .when(!active && look.hover && hover_linger > 0.0, |row| {
                 row.bg(colors.primary.alpha(0.06 * hover_linger))
             })
             .hover(move |row| {
-                if active {
+                if active || !look.hover {
                     row
                 } else {
                     row.bg(colors.primary.alpha(0.06))
