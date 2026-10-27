@@ -1108,9 +1108,15 @@ impl HeadlessScreen {
                 }
             }
             for (x, text) in &metadata.graphemes {
+                let column = Column(usize::from(*x));
                 for ch in text.chars() {
-                    self.term.grid_mut()[line][Column(usize::from(*x))].push_zerowidth(ch);
+                    self.term.grid_mut()[line][column].push_zerowidth(ch);
                 }
+                let spacer_follows = column.0 + 1 < self.term.columns()
+                    && self.term.grid()[line][column + 1]
+                        .flags
+                        .contains(Flags::WIDE_CHAR_SPACER);
+                restore_wide_base(&mut self.term.grid_mut()[line][column], spacer_follows);
             }
             self.finish_history_read_batch(index + 1, index + 1 == count);
         }
@@ -1245,6 +1251,11 @@ impl HeadlessScreen {
                         target.push_zerowidth(ch);
                     }
                 }
+                let spacer_follows = row
+                    .cells
+                    .get(x + 1)
+                    .is_some_and(|next| next.style.contains(TermStyle::WIDE_SPACER));
+                restore_wide_base(target, spacer_follows);
             }
         }
         // Semantic flags and links were written after the parser settled;
@@ -2156,6 +2167,30 @@ fn restore_semantic_flags(target: &mut Cell, source: GridCell) {
     }
     if source.style.contains(TermStyle::WIDE_SPACER) {
         target.flags.insert(Flags::WIDE_CHAR_SPACER);
+    }
+}
+
+/// Marks a restored cluster wide when the wire put a spacer after it and the
+/// cluster is two columns. The replay already marks CJK and emoji wide, but a
+/// cluster widened by what follows its first codepoint (`❤` + VS16, a flag)
+/// was replayed by that codepoint alone. A spacer after a one-column cluster
+/// is the leading spacer of a wide character wrapped to the next row.
+fn restore_wide_base(target: &mut Cell, spacer_follows: bool) {
+    if !spacer_follows
+        || target.flags.intersects(
+            Flags::WIDE_CHAR | Flags::WIDE_CHAR_SPACER | Flags::LEADING_WIDE_CHAR_SPACER,
+        )
+    {
+        return;
+    }
+    let Some(zerowidth) = target.zerowidth().filter(|chars| !chars.is_empty()) else {
+        return;
+    };
+    let cluster: String = std::iter::once(target.c)
+        .chain(zerowidth.iter().copied())
+        .collect();
+    if alacritty_terminal::term::grapheme_width(&cluster) == 2 {
+        target.flags.insert(Flags::WIDE_CHAR);
     }
 }
 
@@ -3710,6 +3745,124 @@ mod qol_tests {
         let mut restored = HeadlessScreen::new(20, 3);
         assert!(restored.restore(&[], &screen.full_snapshot(), false, false, MouseModes::OFF));
         assert_eq!(restored.lines(), screen.lines());
+    }
+
+    /// Columns of each cluster as `Bun.stringWidth` in Bun 1.4.4 (the runtime
+    /// in Claude Code 2.1) measures them.
+    const BUN_CLUSTER_WIDTHS: &[(&str, u16)] = &[
+        ("❤️", 2),
+        ("✔️", 2),
+        ("⚠️", 2),
+        ("☀️", 2),
+        ("▶️", 2),
+        ("👨‍👩‍👧‍👦", 2),
+        ("🧑‍💻", 2),
+        ("🏳️‍🌈", 2),
+        ("❤️‍🔥", 2),
+        ("👍🏽", 2),
+        ("🧑🏽‍💻", 2),
+        ("🇷🇴", 2),
+        ("🇷", 1),
+        ("🇷🇴🇷", 3),
+        ("1️⃣", 2),
+        ("⌚︎", 2),
+        ("☺︎", 1),
+        ("e\u{FE0F}", 1),
+        ("x\u{200D}y", 2),
+        ("😀\u{200D}a", 3),
+        ("你", 2),
+        ("হিন্দী", 3),
+        ("রগুলো", 3),
+        ("a\u{AD}", 1),
+    ];
+
+    #[test]
+    fn grapheme_clusters_take_the_columns_claude_code_gives_them() {
+        // Claude Code moves its cursor relative to where Bun says text ends;
+        // a cluster one column off leaves fragments of earlier frames.
+        let mut screen = HeadlessScreen::new(40, 3);
+        for (text, width) in BUN_CLUSTER_WIDTHS {
+            screen.feed(format!("\x1b[H\x1b[2K{text}|").as_bytes());
+            assert_eq!(screen.cursor().0, width + 1, "{text:?}");
+            assert_eq!(screen.row_text(0), format!("{text}|"), "{text:?}");
+        }
+
+        // An Ink-style repaint: back to column 0, skip the emoji, overwrite.
+        screen.feed("\x1b[H\x1b[2K✔️ done ❤️ ok".as_bytes());
+        screen.feed(b"\r\x1b[3CDONE");
+        assert_eq!(screen.row_text(0), "✔️ DONE ❤️ ok");
+        screen.feed(b"\r\x1b[11CO");
+        assert_eq!(screen.row_text(0), "✔️ DONE ❤️ Ok");
+    }
+
+    #[test]
+    fn a_cluster_is_one_wide_cell_carrying_its_codepoints() {
+        let mut screen = HeadlessScreen::new(12, 2);
+        screen.feed("🇷🇴|❤️|👨‍👩‍👧‍👦|".as_bytes());
+        let snapshot = screen.full_snapshot();
+        let row = &snapshot.changed_rows[0];
+        let scalars: Vec<u32> = row.cells.iter().take(9).map(|cell| cell.scalar).collect();
+        assert_eq!(
+            scalars,
+            [
+                0x1F1F7, 0, '|' as u32, 0x2764, 0, '|' as u32, 0x1F468, 0, '|' as u32
+            ]
+        );
+        for spacer in [1, 4, 7] {
+            assert!(row.cells[spacer].style.contains(TermStyle::WIDE_SPACER));
+        }
+        assert_eq!(
+            row.metadata.graphemes,
+            vec![
+                (0, "🇴".to_string()),
+                (3, "\u{FE0F}".to_string()),
+                (6, "\u{200D}👩\u{200D}👧\u{200D}👦".to_string()),
+            ]
+        );
+
+        // The layout survives a checkpoint restore (Engine restart).
+        let mut restored = HeadlessScreen::new(12, 2);
+        assert!(restored.restore(&[], &snapshot, false, false, MouseModes::OFF));
+        assert_eq!(restored.full_snapshot().changed_rows, snapshot.changed_rows);
+        restored.feed(b"\r\x1b[3CX");
+        assert_eq!(restored.row_text(0), "🇷🇴|X |👨‍👩‍👧‍👦|");
+    }
+
+    #[test]
+    fn a_cluster_widened_at_the_last_column_wraps_like_a_wide_character() {
+        let mut screen = HeadlessScreen::new(5, 3);
+        screen.feed("abcd❤️|".as_bytes());
+        assert_eq!(screen.row_text(0).trim_end(), "abcd");
+        assert_eq!(screen.row_text(1), "❤️|");
+        assert_eq!(screen.cursor(), (3, 1, true));
+
+        // Without autowrap the cluster keeps its one column.
+        let mut screen = HeadlessScreen::new(5, 3);
+        screen.feed("\x1b[?7labcd❤️".as_bytes());
+        assert_eq!(screen.row_text(0), "abcd❤️");
+    }
+
+    #[test]
+    fn mode_2027_is_reported_and_switches_to_first_codepoint_widths() {
+        let mut screen = HeadlessScreen::new(20, 2);
+        screen.feed(b"\x1b[?2027$p");
+        assert_eq!(screen.take_replies(), b"\x1b[?2027;2$y");
+        screen.feed(b"\x1b[?2027h\x1b[?2027$p");
+        assert_eq!(screen.take_replies(), b"\x1b[?2027;1$y");
+
+        for (text, width) in [("❤️", 2), ("⌚︎", 1), ("👨‍👩‍👧‍👦", 2), ("हिन्दी", 2)]
+        {
+            screen.feed(format!("\x1b[H\x1b[2K{text}|").as_bytes());
+            assert_eq!(screen.cursor().0, width + 1, "{text:?}");
+            assert_eq!(screen.row_text(0), format!("{text}|"), "{text:?}");
+        }
+
+        screen.feed(b"\x1b[?2027l\x1b[?2027$p");
+        assert_eq!(screen.take_replies(), b"\x1b[?2027;2$y");
+        screen.feed("\x1b[H\x1b[2K⌚︎|".as_bytes());
+        assert_eq!(screen.cursor().0, 3);
+        screen.feed(b"\x1b[?2027h\x1bc\x1b[?2027$p");
+        assert_eq!(screen.take_replies(), b"\x1b[?2027;2$y", "RIS resets 2027");
     }
 
     #[test]
