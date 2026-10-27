@@ -1226,6 +1226,21 @@ impl Holder {
             ));
         }
         connection.terminal_reset = reset_requested;
+        // Styles are negotiated by name: only a controller that asks for
+        // terminal-styles-v1 (and speaks a minor that defines it) gets spans
+        // and cursor bits; every other controller gets the legacy grid.
+        let styles_requested = hello
+            .required_capabilities
+            .contains(&diri_proto::remote_pty::RemoteCapability::TerminalStyles);
+        if styles_requested
+            && hello.protocol.minor < diri_proto::remote_pty::TERMINAL_STYLES_PROTOCOL_MINOR
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "terminal-styles-v1 requires protocol minor 18",
+            ));
+        }
+        connection.terminal_styles = styles_requested;
         connection.inline_images =
             hello.protocol.minor >= diri_proto::remote_pty::INLINE_IMAGES_PROTOCOL_MINOR;
         ensure_keyboard_controller(self.screen.input_keyboard_state(), enhanced_keyboard)?;
@@ -1737,6 +1752,7 @@ fn strip_image_anchors(metadata: &mut diri_proto::grid::RowMetadata) {
 struct Connection {
     enhanced_keyboard: bool,
     terminal_reset: bool,
+    terminal_styles: bool,
     /// The controller speaks `inline-images-v1`: it may read images, and
     /// image anchors in the grid are meaningful to it.
     inline_images: bool,
@@ -1755,6 +1771,7 @@ impl Connection {
         Self {
             enhanced_keyboard: false,
             terminal_reset: false,
+            terminal_styles: false,
             inline_images: false,
             reset_state: None,
             protocol_minor: 0,
@@ -1784,6 +1801,23 @@ impl Connection {
                     }
                 }
                 RemoteMessage::ScrollbackResponse(value) => value.result.metadata.clear(),
+                _ => {}
+            }
+        }
+        if !self.terminal_styles {
+            // An older controller rejects unknown annotation fields; it gets
+            // the plain underline bit and the default cursor it always drew.
+            match &mut message {
+                RemoteMessage::HelloAck(value) => value.capabilities.retain(|capability| {
+                    *capability != diri_proto::remote_pty::RemoteCapability::TerminalStyles
+                }),
+                RemoteMessage::FullSnapshot(value) => value.grid.strip_styles(),
+                RemoteMessage::GridDelta(value) => value.grid.strip_styles(),
+                RemoteMessage::ScrollbackResponse(value) => value
+                    .result
+                    .metadata
+                    .iter_mut()
+                    .for_each(|metadata| metadata.styles.clear()),
                 _ => {}
             }
         }
@@ -2202,6 +2236,7 @@ mod tests {
                 cursor_visible: true,
                 is_full_snapshot: true,
                 changed_rows: Vec::new(),
+                cursor_style: Default::default(),
             };
             grid.is_full_snapshot = true;
             grid.changed_rows.push(row);
@@ -2228,6 +2263,67 @@ mod tests {
                 .unwrap(),
             "\"terminal-annotations-v1\""
         );
+    }
+
+    #[test]
+    fn styles_are_negotiated_without_breaking_old_controllers() {
+        use diri_proto::grid::{
+            ChangedRow, CursorShape, CursorStyle, GridCell, GridUpdate, StyleSpan, UnderlineKind,
+        };
+        // A current-minor controller that did not ask gets the legacy grid.
+        for (minor, requested) in [(16, false), (18, false), (18, true)] {
+            let (stream, _peer) = UnixStream::pair().unwrap();
+            let mut connection = Connection::new(stream);
+            connection.protocol_minor = minor;
+            connection.terminal_styles = requested;
+            let mut row = ChangedRow::new(0, vec![GridCell::default(); 4]);
+            row.metadata.styles.push(StyleSpan {
+                start: 0,
+                end: 4,
+                underline: UnderlineKind::Curly,
+                underline_color: None,
+                overline: false,
+            });
+            let grid = GridUpdate {
+                cols: 4,
+                rows: 1,
+                cursor_col: 0,
+                cursor_row: 0,
+                cursor_visible: true,
+                is_full_snapshot: true,
+                changed_rows: vec![row],
+                cursor_style: CursorStyle {
+                    shape: CursorShape::Bar,
+                    steady: true,
+                },
+            };
+            connection
+                .queue(RemoteMessage::FullSnapshot(FullSnapshot {
+                    sequence: 1,
+                    alt_screen: false,
+                    bracketed_paste: false,
+                    mouse: Default::default(),
+                    grid,
+                }))
+                .unwrap();
+            let messages = RemoteCodec::new().feed(&connection.outbound).unwrap();
+            // A controller with input modes gets its mode state first.
+            let Some(snapshot) = messages.iter().find_map(|message| match message {
+                RemoteMessage::FullSnapshot(snapshot) => Some(snapshot),
+                _ => None,
+            }) else {
+                panic!("snapshot");
+            };
+            let capable = requested;
+            assert_eq!(
+                snapshot.grid.changed_rows[0].metadata.styles.len(),
+                usize::from(capable)
+            );
+            assert_eq!(
+                snapshot.grid.cursor_style.shape == CursorShape::Bar,
+                capable
+            );
+        }
     }
 
     #[test]

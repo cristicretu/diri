@@ -363,6 +363,7 @@ mod tests {
                 cursor_visible: true,
                 is_full_snapshot: true,
                 changed_rows: vec![ChangedRow::new(0, cells.clone()), ChangedRow::new(1, cells)],
+                cursor_style: Default::default(),
             },
             marker_buffer: vec![0x1b, b']'],
             alt_screen: true,
@@ -384,7 +385,15 @@ mod tests {
                 uri: "https://example.com".into(),
             }],
             graphemes: vec![(0, "\u{301}".into())],
+            styles: vec![diri_proto::grid::StyleSpan {
+                start: 0,
+                end: 2,
+                underline: diri_proto::grid::UnderlineKind::Curly,
+                underline_color: Some(diri_proto::grid::TermColor::Ansi(1).packed()),
+                overline: true,
+            }],
         };
+        checkpoint.grid.cursor_style.shape = diri_proto::grid::CursorShape::Bar;
         checkpoint.history_metadata.push(metadata.clone());
         checkpoint.history[0][0].style |= TermStyle::PROMPT_START;
         checkpoint.grid.changed_rows[0].metadata = metadata.clone();
@@ -392,6 +401,10 @@ mod tests {
         let restored = ScreenCheckpoint::load(&path).unwrap();
         assert_eq!(restored.history_metadata, vec![metadata.clone()]);
         assert_eq!(restored.grid.changed_rows[0].metadata, metadata);
+        assert_eq!(
+            restored.grid.cursor_style.shape,
+            diri_proto::grid::CursorShape::Bar
+        );
         assert!(
             restored.history[0][0]
                 .style

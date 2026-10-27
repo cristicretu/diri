@@ -1008,6 +1008,7 @@ mod tests {
             cursor_row: 0,
             cursor_visible: true,
             is_full_snapshot: sequence == 1,
+            cursor_style: Default::default(),
             changed_rows: vec![ChangedRow::new(
                 0,
                 vec![

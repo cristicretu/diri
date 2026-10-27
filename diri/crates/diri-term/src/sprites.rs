@@ -246,6 +246,12 @@ pub(crate) enum AntialiasedShape {
         path: Path<Pixels>,
         color: Background,
     },
+    /// A curly underline (SGR `4:3`): GPUI's wavy underline primitive.
+    Wave {
+        origin: Point<Pixels>,
+        width: Pixels,
+        style: gpui::UnderlineStyle,
+    },
 }
 
 impl AntialiasedShape {
@@ -265,6 +271,7 @@ impl AntialiasedShape {
                     vertex.xy_position += delta;
                 }
             }
+            Self::Wave { origin, .. } => *origin += delta,
         }
     }
 
@@ -276,6 +283,11 @@ impl AntialiasedShape {
                 });
             }
             Self::Polygon { path, color } => window.paint_path(path.clone(), *color),
+            Self::Wave {
+                origin,
+                width,
+                style,
+            } => window.paint_underline(*origin, *width, style),
         }
     }
 }

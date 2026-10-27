@@ -33,12 +33,31 @@ use alacritty_terminal::term::cell::{Cell, Flags};
 use alacritty_terminal::term::{CONTENT_CHANGED, Config, Term, TermMode};
 use alacritty_terminal::vte::ansi::{Color, NamedColor, Processor, Rgb};
 use diri_proto::grid::{
-    ChangedRow, GridCell, GridRowCodec, GridUpdate, LinkSpan, RowMetadata, TermColor, TermStyle,
+    ChangedRow, CursorShape, CursorStyle, GridCell, GridRowCodec, GridUpdate, LinkSpan,
+    RowMetadata, StyleSpan, TermColor, TermStyle, UnderlineKind,
 };
 use diri_proto::terminal::{
     MouseEncoding, MouseModes, MouseTrackingMode, TerminalMouseEvent, TerminalMouseModifiers,
     encode_mouse_event,
 };
+
+/// Diri's own cursor: a block that blinks (the renderer's eased, finite
+/// blink). A program's DECSCUSR replaces it and `CSI 0 SP q` restores it. Mode
+/// 12 starts from it, so a DECRQM `?12` query reports the blink and never
+/// turns the cursor steady.
+const DEFAULT_CURSOR: alacritty_terminal::vte::ansi::CursorStyle =
+    alacritty_terminal::vte::ansi::CursorStyle {
+        shape: alacritty_terminal::vte::ansi::CursorShape::Block,
+        blinking: true,
+    };
+
+/// Cell flags whose drawing needs a [`StyleSpan`]: every underline kind but
+/// the plain one, and overline. A plain underline needs one only for a color.
+const SPAN_FLAGS: Flags = Flags::DOUBLE_UNDERLINE
+    .union(Flags::UNDERCURL)
+    .union(Flags::DOTTED_UNDERLINE)
+    .union(Flags::DASHED_UNDERLINE)
+    .union(Flags::OVERLINE);
 
 /// Receiver-side authority for a remote terminal stream. A mirror accepts a
 /// full snapshot as a new baseline and then only contiguous sequenced diffs;
@@ -52,6 +71,7 @@ pub struct GridMirror {
     cursor_col: u16,
     cursor_row: u16,
     cursor_visible: bool,
+    cursor_style: CursorStyle,
     sequence: Option<u64>,
     annotations: Vec<RowMetadata>,
     alt_screen: bool,
@@ -197,6 +217,7 @@ impl GridMirror {
         self.cursor_col = grid.cursor_col;
         self.cursor_row = grid.cursor_row;
         self.cursor_visible = grid.cursor_visible;
+        self.cursor_style = grid.cursor_style;
     }
 
     #[must_use]
@@ -250,6 +271,7 @@ impl GridMirror {
             cursor_visible: self.cursor_visible,
             is_full_snapshot: true,
             changed_rows,
+            cursor_style: self.cursor_style,
         })
     }
 }
@@ -459,6 +481,10 @@ pub struct HeadlessScreen {
     /// Whether the title moved since the last settle, tracked where it is
     /// assigned so no per-chunk clone is needed to notice.
     title_changed: bool,
+    /// The DECSCUSR cursor at the last settle. A program that only changes
+    /// its cursor (neovim entering insert mode) must still advance
+    /// `content_seq`, or the attach pump withholds the frame.
+    cursor_style: CursorStyle,
 
     /// Diff baseline for [`grid_update`]: the cells last handed out, so the
     /// next call sends only changed rows.
@@ -490,6 +516,7 @@ impl HeadlessScreen {
         let config = Config {
             kitty_keyboard,
             scrolling_history: history_line_limit(geometry.cols),
+            default_cursor_style: DEFAULT_CURSOR,
             ..Config::default()
         };
         let term = Term::new(config, &geometry, Collector(sender));
@@ -530,6 +557,7 @@ impl HeadlessScreen {
             replies: Vec::new(),
             image_replies_only: false,
             title_changed: false,
+            cursor_style: CursorStyle::default(),
             last_cells: Vec::new(),
             last_annotations: Vec::new(),
             last_grid_cols: 0,
@@ -727,6 +755,11 @@ impl HeadlessScreen {
         // The title is compared where it is assigned, so settling costs no
         // clone of it per chunk of output.
         let mut content_changed = std::mem::take(&mut self.title_changed);
+        let cursor_style = self.wire_cursor_style();
+        if cursor_style != self.cursor_style {
+            self.cursor_style = cursor_style;
+            content_changed = true;
+        }
         if self.row_digests.len() != rows || self.row_filled_cells.len() != rows {
             self.rebuild_content_cache();
             content_changed = true;
@@ -814,6 +847,7 @@ impl HeadlessScreen {
         if new_limit > old_limit {
             self.term.set_options(Config {
                 scrolling_history: new_limit,
+                default_cursor_style: DEFAULT_CURSOR,
                 ..Config::default()
             });
         }
@@ -824,6 +858,7 @@ impl HeadlessScreen {
             // screen is active, and preserves the limit across terminal reset.
             self.term.set_options(Config {
                 scrolling_history: new_limit,
+                default_cursor_style: DEFAULT_CURSOR,
                 ..Config::default()
             });
         }
@@ -958,6 +993,26 @@ impl HeadlessScreen {
         self.mouse_modes().is_reporting()
     }
 
+    /// The cursor shape and blink the program asked for (DECSCUSR, mode
+    /// 12). A program that never asked gets the default: a blinking block.
+    #[must_use]
+    pub fn cursor_style(&self) -> CursorStyle {
+        self.wire_cursor_style()
+    }
+
+    fn wire_cursor_style(&self) -> CursorStyle {
+        use alacritty_terminal::vte::ansi::CursorShape as Shape;
+        let style = self.term.cursor_style();
+        CursorStyle {
+            shape: match style.shape {
+                Shape::Underline => CursorShape::Underline,
+                Shape::Beam => CursorShape::Bar,
+                Shape::Block | Shape::HollowBlock | Shape::Hidden => CursorShape::Block,
+            },
+            steady: !style.blinking,
+        }
+    }
+
     /// Cursor (col, row, visible) without touching cell data.
     pub fn cursor(&self) -> (u16, u16, bool) {
         let point = self.term.grid().cursor.point;
@@ -1000,21 +1055,33 @@ impl HeadlessScreen {
             }
             let line = Line(y as i32);
             let base = y * cols;
-            let metadata = self.row_metadata(line);
             let row = &mut self.last_cells[base..base + cols];
-            let mut row_changed = force_full || self.last_annotations[y] != metadata;
+            let mut row_changed = force_full;
+            // Links, combining marks, underline colors and decoration flags
+            // are the only sources of row metadata. Noting them in the one
+            // pass over the cells spares a plain row a second pass.
+            let mut annotated = false;
             let source = &grid[line];
             for (x, previous) in row.iter_mut().enumerate() {
-                let cell = wire_cell(&source[Column(x)]);
+                let source = &source[Column(x)];
+                annotated |= source.extra.is_some() | source.flags.intersects(SPAN_FLAGS);
+                let cell = wire_cell(source);
                 row_changed |= *previous != cell;
                 *previous = cell;
             }
+            let metadata = if annotated {
+                self.row_metadata(line)
+            } else {
+                RowMetadata::default()
+            };
+            row_changed |= self.last_annotations[y] != metadata;
             if !row_changed {
                 continue;
             }
             if changed.is_empty() {
                 changed.reserve_exact(candidate_count);
             }
+            let row = &self.last_cells[base..base + cols];
             let mut changed_row = ChangedRow::new(y as u16, row.to_vec());
             self.last_annotations[y].clone_from(&metadata);
             changed_row.metadata = metadata;
@@ -1031,6 +1098,7 @@ impl HeadlessScreen {
             cursor_visible: self.term.mode().contains(TermMode::SHOW_CURSOR),
             is_full_snapshot: force_full,
             changed_rows: changed,
+            cursor_style: self.wire_cursor_style(),
         }
     }
 
@@ -1046,11 +1114,16 @@ impl HeadlessScreen {
             let line = Line(y as i32);
             let mut row = Vec::with_capacity(cols);
             let source = &grid[line];
+            let mut annotated = false;
             for x in 0..cols {
-                row.push(wire_cell(&source[Column(x)]));
+                let source = &source[Column(x)];
+                annotated |= source.extra.is_some() | source.flags.intersects(SPAN_FLAGS);
+                row.push(wire_cell(source));
             }
             let mut changed = ChangedRow::new(y as u16, row);
-            changed.metadata = self.row_metadata(line);
+            if annotated {
+                changed.metadata = self.row_metadata(line);
+            }
             all.push(changed);
         }
         let cursor = grid.cursor.point;
@@ -1062,6 +1135,7 @@ impl HeadlessScreen {
             cursor_visible: self.term.mode().contains(TermMode::SHOW_CURSOR),
             is_full_snapshot: true,
             changed_rows: all,
+            cursor_style: self.wire_cursor_style(),
         }
     }
 
@@ -1200,7 +1274,7 @@ impl HeadlessScreen {
             if row.y as usize >= rows || row.cells.len() != cols {
                 return false;
             }
-            let mut previous: Option<&GridCell> = None;
+            let mut previous: Option<(&GridCell, Option<&StyleSpan>)> = None;
             for (x, cell) in row.cells.iter().enumerate() {
                 // The initial clear already produced true blank cells;
                 // leaving them untouched keeps sparse checkpoints cheap.
@@ -1208,10 +1282,14 @@ impl HeadlessScreen {
                     continue;
                 }
                 bytes.extend_from_slice(format!("\x1b[{};{}H", row.y + 1, x + 1).as_bytes());
-                if previous.is_none_or(|prev| {
-                    prev.fg != cell.fg || prev.bg != cell.bg || prev.style != cell.style
+                let decoration = row.metadata.style_at(x);
+                if previous.is_none_or(|(prev, prev_decoration)| {
+                    prev.fg != cell.fg
+                        || prev.bg != cell.bg
+                        || prev.style != cell.style
+                        || prev_decoration != decoration
                 }) {
-                    bytes.extend_from_slice(sgr(cell).as_bytes());
+                    bytes.extend_from_slice(sgr(cell, decoration).as_bytes());
                 }
                 match char::from_u32(cell.scalar) {
                     Some(glyph) if cell.scalar != 0 => {
@@ -1220,11 +1298,20 @@ impl HeadlessScreen {
                     }
                     _ => bytes.push(b' '),
                 }
-                previous = Some(cell);
+                previous = Some((cell, decoration));
             }
         }
 
         bytes.extend_from_slice(b"\x1b[0m");
+        if update.cursor_style != CursorStyle::default() {
+            let shape = match update.cursor_style.shape {
+                CursorShape::Block => 1,
+                CursorShape::Underline => 3,
+                CursorShape::Bar => 5,
+            };
+            let code = shape + u8::from(update.cursor_style.steady);
+            bytes.extend_from_slice(format!("\x1b[{code} q").as_bytes());
+        }
         if bracketed_paste {
             bytes.extend_from_slice(b"\x1b[?2004h");
         }
@@ -1499,9 +1586,27 @@ impl HeadlessScreen {
         // Account for framing as well as text before allocating. Retained Find
         // uses complete mode; existing live/page exports keep their old limits.
         let mut used = 0;
+        // Decoration spans have a budget of their own (the same size), so
+        // they never crowd out a link. Past it a span is dropped and its
+        // cells keep the plain underline bit.
+        let mut style_used = 0;
         let source = &grid[line];
         for x in 0..self.geometry.cols {
             let cell = &source[Column(x)];
+            // Links, combining marks and underline colors all live in the
+            // cell's extra storage: a plain cell needs no further look.
+            let extra = cell.extra.is_some();
+            if !extra && !cell.flags.intersects(SPAN_FLAGS) {
+                continue;
+            }
+            if cell.flags.intersects(SPAN_FLAGS)
+                || (extra && cell.flags.intersects(Flags::ALL_UNDERLINES))
+            {
+                push_style_span(&mut result.styles, cell, x as u16, &mut style_used, budget);
+            }
+            if !extra {
+                continue;
+            }
             if let Some(link) = cell.hyperlink() {
                 let uri = link.uri();
                 if let Some(last) = result.links.last_mut()
@@ -1948,6 +2053,69 @@ fn wire_color(color: Color) -> TermColor {
     }
 }
 
+/// The decoration of `cell` beyond the style bits, if it needs a span.
+fn cell_decoration(cell: &Cell) -> Option<StyleSpan> {
+    let flags = cell.flags;
+    let underline = if flags.contains(Flags::UNDERCURL) {
+        UnderlineKind::Curly
+    } else if flags.contains(Flags::DOUBLE_UNDERLINE) {
+        UnderlineKind::Double
+    } else if flags.contains(Flags::DOTTED_UNDERLINE) {
+        UnderlineKind::Dotted
+    } else if flags.contains(Flags::DASHED_UNDERLINE) {
+        UnderlineKind::Dashed
+    } else if flags.contains(Flags::UNDERLINE) {
+        UnderlineKind::Single
+    } else {
+        UnderlineKind::None
+    };
+    // SGR 58 alone draws nothing; `Default` is the foreground anyway.
+    let underline_color = cell
+        .underline_color()
+        .map(|color| wire_color(color).packed())
+        .filter(|packed| *packed != TermColor::Default.packed() && !underline.is_none());
+    let overline = flags.contains(Flags::OVERLINE);
+    let plain = matches!(underline, UnderlineKind::None | UnderlineKind::Single)
+        && underline_color.is_none()
+        && !overline;
+    (!plain).then_some(StyleSpan {
+        start: 0,
+        end: 0,
+        underline,
+        underline_color,
+        overline,
+    })
+}
+
+/// Extends the last span or starts one for the cell at `x`.
+fn push_style_span(
+    spans: &mut Vec<StyleSpan>,
+    cell: &Cell,
+    x: u16,
+    used: &mut usize,
+    budget: usize,
+) {
+    let Some(mut span) = cell_decoration(cell) else {
+        return;
+    };
+    if let Some(last) = spans.last_mut()
+        && last.end == x
+        && last.same_decoration(&span)
+    {
+        last.end += 1;
+        return;
+    }
+    // A span serializes to at most ~90 bytes of JSON.
+    const SPAN_BYTES: usize = 96;
+    if *used + SPAN_BYTES > budget || spans.len() >= diri_proto::grid::MAX_STYLE_SPANS_PER_ROW {
+        return;
+    }
+    *used += SPAN_BYTES;
+    span.start = x;
+    span.end = x + 1;
+    spans.push(span);
+}
+
 /// Folded 64×64→128-bit multiply: one step of a fast non-cryptographic hash.
 #[inline]
 fn fold_mix(state: u64, word: u64) -> u64 {
@@ -2016,6 +2184,13 @@ impl RowHashState {
                 self.marks = fold_mix(self.marks, u64::from(*ch) | (column as u64) << 32);
             }
         }
+        // SGR 58: an undercurl that only changes color is a visible change.
+        if let Some(color) = cell.underline_color() {
+            self.marks = fold_mix(
+                self.marks,
+                u64::from(wire_color(color).packed()) | (column as u64) << 32 | 1 << 62,
+            );
+        }
     }
 }
 
@@ -2039,9 +2214,12 @@ fn raw_style_key(cell: &Cell) -> u128 {
 #[inline]
 fn style_word(flags: Flags, fg: Color, bg: Color) -> u64 {
     let colors = u64::from(wire_color(fg).packed()) | u64::from(wire_color(bg).packed()) << 32;
+    // The wire collapses underline kinds into one style bit and carries the
+    // kind and overline in a span: hash the raw flags that reach the screen.
+    let decoration = (flags & (Flags::ALL_UNDERLINES | Flags::OVERLINE)).bits();
     fold_mix(
         fold_mix(0x243f_6a88_85a3_08d3, colors),
-        u64::from(wire_style(flags).bits()),
+        u64::from(wire_style(flags).bits()) | u64::from(decoration) << 32,
     )
 }
 
@@ -2095,6 +2273,9 @@ fn wire_style(flags: Flags) -> TermStyle {
     if flags.contains(Flags::INVERSE) {
         style |= TermStyle::INVERSE;
     }
+    if flags.contains(Flags::BLINK) {
+        style |= TermStyle::BLINK;
+    }
     if flags.contains(Flags::HIDDEN) {
         style |= TermStyle::INVISIBLE;
     }
@@ -2111,7 +2292,7 @@ fn wire_style(flags: Flags) -> TermStyle {
 }
 
 /// The SGR sequence that reproduces a cell's attributes.
-fn sgr(cell: &GridCell) -> String {
+fn sgr(cell: &GridCell, decoration: Option<&StyleSpan>) -> String {
     let mut codes: Vec<String> = vec!["0".into()];
     if cell.style.contains(TermStyle::BOLD) {
         codes.push("1".into());
@@ -2122,8 +2303,13 @@ fn sgr(cell: &GridCell) -> String {
     if cell.style.contains(TermStyle::ITALIC) {
         codes.push("3".into());
     }
-    if cell.style.contains(TermStyle::UNDERLINE) {
-        codes.push("4".into());
+    match decoration.map(|span| span.underline) {
+        Some(UnderlineKind::Double) => codes.push("4:2".into()),
+        Some(UnderlineKind::Curly) => codes.push("4:3".into()),
+        Some(UnderlineKind::Dotted) => codes.push("4:4".into()),
+        Some(UnderlineKind::Dashed) => codes.push("4:5".into()),
+        _ if cell.style.contains(TermStyle::UNDERLINE) => codes.push("4".into()),
+        _ => {}
     }
     if cell.style.contains(TermStyle::BLINK) {
         codes.push("5".into());
@@ -2137,8 +2323,18 @@ fn sgr(cell: &GridCell) -> String {
     if cell.style.contains(TermStyle::CROSSED_OUT) {
         codes.push("9".into());
     }
+    if decoration.is_some_and(|span| span.overline) {
+        codes.push("53".into());
+    }
     append_color(cell.fg, true, &mut codes);
     append_color(cell.bg, false, &mut codes);
+    if let Some(color) = decoration.and_then(|span| span.underline_color) {
+        match TermColor::unpack(color) {
+            TermColor::Ansi(index) => codes.push(format!("58:5:{index}")),
+            TermColor::Rgb(red, green, blue) => codes.push(format!("58:2::{red}:{green}:{blue}")),
+            TermColor::Default | TermColor::DefaultInverted => {}
+        }
+    }
     format!("\x1b[{}m", codes.join(";"))
 }
 
@@ -3621,5 +3817,165 @@ mod find_capture_tests {
                 );
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod style_tests {
+    use super::*;
+
+    fn screen(bytes: &[u8]) -> HeadlessScreen {
+        let mut screen = HeadlessScreen::new(20, 3);
+        screen.feed(bytes);
+        screen
+    }
+
+    fn row0(screen: &HeadlessScreen) -> ChangedRow {
+        screen.full_snapshot().changed_rows.remove(0)
+    }
+
+    #[test]
+    fn underline_kinds_colors_and_overline_reach_the_wire() {
+        let screen = screen(
+            b"a\x1b[4:3;58:2::255:0:0mbc\x1b[4:2;59md\x1b[4:4me\x1b[4:5mf\x1b[24;53mg\x1b[55;4mh\x1b[0m",
+        );
+        let row = row0(&screen);
+        let spans = &row.metadata.styles;
+        let kinds: Vec<_> = spans
+            .iter()
+            .map(|span| {
+                (
+                    span.start,
+                    span.end,
+                    span.underline,
+                    span.underline_color,
+                    span.overline,
+                )
+            })
+            .collect();
+        assert_eq!(
+            kinds,
+            vec![
+                (
+                    1,
+                    3,
+                    UnderlineKind::Curly,
+                    Some(TermColor::Rgb(255, 0, 0).packed()),
+                    false
+                ),
+                (3, 4, UnderlineKind::Double, None, false),
+                (4, 5, UnderlineKind::Dotted, None, false),
+                (5, 6, UnderlineKind::Dashed, None, false),
+                (6, 7, UnderlineKind::None, None, true),
+            ]
+        );
+        // Every underlined cell keeps the bit an older renderer draws.
+        for x in 1..6 {
+            assert!(row.cells[x].style.contains(TermStyle::UNDERLINE), "col {x}");
+        }
+        // A plain underline needs no span.
+        assert!(row.metadata.style_at(7).is_none());
+        assert!(row.cells[7].style.contains(TermStyle::UNDERLINE));
+    }
+
+    #[test]
+    fn indexed_underline_color_and_blink() {
+        let row = row0(&screen(b"\x1b[4;58;5;3;5mx\x1b[25my"));
+        assert_eq!(
+            row.metadata.styles[0].underline_color,
+            Some(TermColor::Ansi(3).packed())
+        );
+        assert!(row.cells[0].style.contains(TermStyle::BLINK));
+        assert!(!row.cells[1].style.contains(TermStyle::BLINK));
+    }
+
+    #[test]
+    fn decscusr_reaches_the_wire_and_advances_content_seq() {
+        let mut screen = screen(b"hello");
+        assert_eq!(screen.full_snapshot().cursor_style, CursorStyle::default());
+        let _ = screen.grid_update(true);
+        let before = screen.content_seq();
+        // neovim entering insert mode: only the cursor changes.
+        screen.feed(b"\x1b[6 q");
+        assert!(
+            screen.content_seq() > before,
+            "a cursor-only change was withheld"
+        );
+        let update = screen.grid_update(false);
+        assert_eq!(
+            update.cursor_style,
+            CursorStyle {
+                shape: CursorShape::Bar,
+                steady: true
+            }
+        );
+        assert!(update.changed_rows.is_empty());
+        for (code, shape, steady) in [
+            (b"\x1b[1 q", CursorShape::Block, false),
+            (b"\x1b[2 q", CursorShape::Block, true),
+            (b"\x1b[3 q", CursorShape::Underline, false),
+            (b"\x1b[4 q", CursorShape::Underline, true),
+            (b"\x1b[5 q", CursorShape::Bar, false),
+            (b"\x1b[0 q", CursorShape::Block, false),
+        ] {
+            screen.feed(code);
+            assert_eq!(screen.cursor_style(), CursorStyle { shape, steady });
+        }
+        // A DECRQM ?12 query must not turn Diri's blinking cursor steady.
+        screen.feed(b"\x1b[?12$p");
+        assert!(!screen.cursor_style().steady);
+        // A resize keeps the program's cursor and Diri's default.
+        screen.feed(b"\x1b[3 q");
+        screen.resize(40, 10);
+        assert_eq!(screen.cursor_style().shape, CursorShape::Underline);
+    }
+
+    #[test]
+    fn a_decoration_only_repaint_advances_content_seq() {
+        // Same glyphs, same colors, same style bits on the wire: only the
+        // underline kind, its color or overline changes.
+        for (first, second) in [
+            (&b"\x1b[H\x1b[4:1mword"[..], &b"\x1b[H\x1b[4:3mword"[..]),
+            (b"\x1b[H\x1b[4:3;58;5;1mword", b"\x1b[H\x1b[4:3;58;5;2mword"),
+            (b"\x1b[H\x1b[0mword", b"\x1b[H\x1b[53mword"),
+        ] {
+            let mut screen = screen(first);
+            let before = screen.content_seq();
+            screen.feed(second);
+            assert!(screen.content_seq() > before, "{second:?}");
+        }
+    }
+
+    #[test]
+    fn restore_reproduces_styles_and_cursor() {
+        let source = screen(b"a\x1b[4:3;58:2::1:2:3mbc\x1b[0;53;4:4;58;5;9md\x1b[0m\x1b[5 q");
+        let snapshot = source.full_snapshot();
+        let mut restored = HeadlessScreen::new(20, 3);
+        assert!(restored.restore(&[], &snapshot, false, false, MouseModes::default()));
+        let again = restored.full_snapshot();
+        assert_eq!(
+            again.changed_rows[0].metadata.styles,
+            snapshot.changed_rows[0].metadata.styles
+        );
+        assert_eq!(again.cursor_style, snapshot.cursor_style);
+    }
+
+    #[test]
+    fn mirror_keeps_the_cursor_style() {
+        let mut source = screen(b"\x1b[4 qx");
+        let mut mirror = GridMirror::new();
+        mirror
+            .apply_snapshot(
+                1,
+                &source.grid_update(true),
+                false,
+                false,
+                MouseModes::default(),
+            )
+            .unwrap();
+        assert_eq!(
+            mirror.full_update().unwrap().cursor_style.shape,
+            CursorShape::Underline
+        );
     }
 }

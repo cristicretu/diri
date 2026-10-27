@@ -2046,6 +2046,53 @@ wall time (about 20 to 60 ms) is dominated by process spawn either way. The
 harness is `diri-remote/tests/reconnect_resume.rs` (ignored measurement
 tests).
 
+## Terminal styles (protocol minor 18)
+
+Protocol minor 18 adds optional `terminal-styles-v1`: the grid now carries
+the cursor shape and blink a program asks for (DECSCUSR, mode 12) and the
+underline kind (`4:2` double, `4:3` curly, `4:4` dotted, `4:5` dashed),
+underline color (SGR 58/59) and overline (SGR 53) that the shared parser
+already kept. The RLE rows, the u16 cell style and the annotation extension
+are unchanged:
+
+- The cursor rides grid flag bits 3-4 (block, underline, bar) and bit 5
+  (steady). All zero is a blinking block, the cursor Diri always drew, so
+  every older encoder already means the default.
+- Decorations are a sorted, non-overlapping `styles` span list in the
+  existing row annotations (`start`, `end`, `underline`, packed
+  `underlineColor`, `overline`). A span exists only where a cell needs one:
+  a plain underline stays the `UNDERLINE` style bit alone, and every
+  underlined cell keeps that bit, so a renderer without spans draws a single
+  underline. Spans have their own per-response budget the size of the link
+  budget; past it a span is dropped and its cells keep the bit. A row holds
+  at most 512 spans. Invalid, overlapping or empty spans fail decoding.
+- SGR 5/6 now reach the existing `BLINK` style bit. The vendored VTE parses
+  SGR 53/55, and the vendored alacritty_terminal gains `BLINK` and
+  `OVERLINE` cell flags (the cell stays 24 bytes; the compact history stores
+  flags as a varint).
+
+Older peers keep working. Negotiation is by capability name, not by minor
+order (minor 17 is `grid-resume-v1`): the Engine lists `terminal-styles-v1`
+in `Hello.requiredCapabilities` only for a Helper at minor 18 or above,
+because an older Holder rejects a capability it does not know. A Holder
+rejects the request below minor 18, and otherwise strips spans and cursor
+bits from snapshots, deltas and scrollback for every controller that did not
+ask, naming the capability in `HelloAck` only to one that did. Annotation
+JSON rejects unknown fields, so this keeps older Engines reading. A new Engine attaching to an older live Holder
+receives neither and shows the default cursor and single underlines, never
+fabricated styles. Locally, `AttachRequest.terminalStyles` and the
+`session.read_scrollback_cells` `styles` parameter opt in the same way; the
+Engine sends a client that omits them the exact pre-styles bytes, encoding a
+second time only for a publication that carries styles while such a sink is
+attached. Previews always receive the legacy form.
+
+A cursor-only change (neovim entering insert mode) advances `content_seq`,
+and the row fingerprint hashes underline kind, overline and underline color,
+so a decoration-only repaint is never withheld by the attach pump. Mode 12
+starts from the blinking default, so a DECRQM `?12` query reports the blink
+and never turns the cursor steady. Checkpoint restore replays spans and the
+cursor style. No Holder task, timer or queue is added.
+
 ## Read-only output log ownership
 
 Opening a raw output log as a reader never creates directories, creates a missing

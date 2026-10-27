@@ -1765,6 +1765,7 @@ impl TerminalPane {
             cursor_visible: true,
             is_full_snapshot: false,
             changed_rows: vec![diri_proto::grid::ChangedRow::new(row, cells)],
+            cursor_style: Default::default(),
         };
         self.apply_grid_updates(id, [update], window, cx);
     }
@@ -1804,6 +1805,7 @@ impl TerminalPane {
                     diri_proto::grid::ChangedRow::new(row, cells)
                 })
                 .collect(),
+            cursor_style: Default::default(),
         };
         self.apply_grid_updates(id, [update], window, cx);
     }
@@ -6494,6 +6496,7 @@ mod tests {
             cursor_visible: true,
             is_full_snapshot: true,
             changed_rows: vec![ChangedRow::new(0, first_cells)],
+            cursor_style: Default::default(),
         };
         let mut final_cells = vec![GridCell::BLANK; 2];
         final_cells[1].scalar = u32::from('b');
@@ -6505,6 +6508,7 @@ mod tests {
             cursor_visible: false,
             is_full_snapshot: false,
             changed_rows: vec![ChangedRow::new(0, final_cells.clone())],
+            cursor_style: Default::default(),
         };
 
         assert!(
@@ -6868,6 +6872,7 @@ mod tests {
             cursor_visible: true,
             is_full_snapshot: true,
             changed_rows: vec![diri_proto::grid::ChangedRow::new(0, cells)],
+            cursor_style: Default::default(),
         });
         let option = Modifiers {
             alt: true,
@@ -7075,6 +7080,7 @@ mod tests {
             cursor_visible: true,
             is_full_snapshot: full,
             changed_rows: Vec::new(),
+            cursor_style: Default::default(),
         }
     }
 
@@ -7093,6 +7099,7 @@ mod tests {
             changed_rows: (0..ROWS)
                 .map(|row| ChangedRow::new(row, vec![cell; usize::from(COLS)]))
                 .collect(),
+            cursor_style: Default::default(),
         }
     }
 

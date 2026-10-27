@@ -265,6 +265,9 @@ pub struct CursorMotion {
     /// False until the cursor has been painted, and again after it stops
     /// being painted (blur, hidden, scrollback), so its return starts solid.
     drawn: bool,
+    /// The program asked for a cursor that does not blink (DECSCUSR 2, 4
+    /// or 6, or mode 12 reset). Glides still run; the blink never starts.
+    steady: bool,
 }
 
 impl CursorMotion {
@@ -318,11 +321,25 @@ impl CursorMotion {
         };
     }
 
+    /// Follows the program's DECSCUSR blink request.
+    pub fn set_steady(&mut self, steady: bool) {
+        self.steady = steady;
+    }
+
     /// Decides a wake against the opacity the last frame painted.
     #[must_use]
     pub fn wake(&self, painted_opacity: f32, now: Instant) -> Wake {
         if !self.drawn {
             return Wake::Stop;
+        }
+        if self.steady {
+            // A blink in flight when the program asked for a steady cursor
+            // ends with one solid frame.
+            return if painted_opacity < 1.0 {
+                Wake::Paint
+            } else {
+                Wake::Stop
+            };
         }
         let idle = self.last_activity.map_or(Duration::MAX, |activity| {
             now.saturating_duration_since(activity)
@@ -367,6 +384,9 @@ impl CursorMotion {
                 }
                 None => self.glide = None,
             }
+        }
+        if self.steady {
+            return CursorFrame::REST;
         }
         let idle = self.last_activity.map_or(Duration::MAX, |activity| {
             now.saturating_duration_since(activity)
@@ -1002,5 +1022,25 @@ mod tests {
             let frame = motion.sample(target, start + ms(offset), true);
             assert_eq!(frame, CursorFrame::REST);
         }
+    }
+
+    #[test]
+    fn a_steady_cursor_never_blinks_but_still_glides() {
+        let start = Instant::now();
+        let mut motion = CursorMotion::default();
+        motion.set_steady(true);
+        motion.sample(cell(4, 0), start, false);
+        for offset in [700, 900, 5_000] {
+            let frame = motion.sample(cell(4, 0), start + ms(offset), false);
+            assert_eq!(frame, CursorFrame::REST, "{offset} ms");
+            assert_eq!(motion.wake(1.0, start + ms(offset)), Wake::Stop);
+        }
+        // A blink caught mid-fade ends with one solid frame.
+        assert_eq!(motion.wake(0.5, start + ms(900)), Wake::Paint);
+        let target = type_one_cell(&mut motion, cell(4, 0), start + ms(6_000));
+        assert!(motion.sample(target, start + ms(6_010), false).is_gliding());
+        // The same idle cursor blinks once the program lets it.
+        motion.set_steady(false);
+        assert!(motion.sample(target, start + ms(9_000), false).opacity < 1.0);
     }
 }

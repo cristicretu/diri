@@ -1220,6 +1220,10 @@ pub enum Attr {
     CancelHidden,
     /// Cancel strikeout.
     CancelStrike,
+    /// Line above the text.
+    Overline,
+    /// Cancel overline.
+    CancelOverline,
     /// Set indexed foreground color.
     Foreground(Color),
     /// Set indexed background color.
@@ -1921,6 +1925,8 @@ fn attrs_from_sgr_parameters<H: Handler>(handler: &mut H, params: &mut ParamsIte
             [27] => Some(Attr::CancelReverse),
             [28] => Some(Attr::CancelHidden),
             [29] => Some(Attr::CancelStrike),
+            [53] => Some(Attr::Overline),
+            [55] => Some(Attr::CancelOverline),
             [30] => Some(Attr::Foreground(Color::Named(NamedColor::Black))),
             [31] => Some(Attr::Foreground(Color::Named(NamedColor::Red))),
             [32] => Some(Attr::Foreground(Color::Named(NamedColor::Green))),

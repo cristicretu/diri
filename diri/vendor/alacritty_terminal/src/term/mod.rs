@@ -2302,9 +2302,10 @@ impl<T: EventListener> Handler for Term<T> {
             Attr::CancelHidden => cursor.template.flags.remove(Flags::HIDDEN),
             Attr::Strike => cursor.template.flags.insert(Flags::STRIKEOUT),
             Attr::CancelStrike => cursor.template.flags.remove(Flags::STRIKEOUT),
-            _ => {
-                debug!("Term got unhandled attr: {attr:?}");
-            }
+            Attr::BlinkSlow | Attr::BlinkFast => cursor.template.flags.insert(Flags::BLINK),
+            Attr::CancelBlink => cursor.template.flags.remove(Flags::BLINK),
+            Attr::Overline => cursor.template.flags.insert(Flags::OVERLINE),
+            Attr::CancelOverline => cursor.template.flags.remove(Flags::OVERLINE),
         }
     }
 

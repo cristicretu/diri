@@ -669,6 +669,7 @@ impl WorkspaceWorkbench {
                 col: lines.last().map_or(0, |line| line.chars().count()) as u16,
                 row: lines.len().saturating_sub(1) as u16,
                 visible: true,
+                ..diri_term::buffer::CursorState::default()
             };
             for (y, line) in lines.iter().enumerate() {
                 for (x, ch) in line.chars().take(100).enumerate() {

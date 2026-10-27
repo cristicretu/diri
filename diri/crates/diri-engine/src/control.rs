@@ -884,10 +884,13 @@ impl ControlServer {
                     // Bytes the line reader buffered past the attach line are
                     // already binary frames; hand them over.
                     let buffered = reader.buffer().to_vec();
-                    self.attach.serve_with_keyboard(
+                    self.attach.serve_with_capabilities(
                         &self.registry,
                         &attach.attach.0,
-                        attach.enhanced_keyboard,
+                        crate::attach::AttachCapabilities {
+                            enhanced_keyboard: attach.enhanced_keyboard,
+                            terminal_styles: attach.terminal_styles,
+                        },
                         reader.into_inner(),
                         buffered,
                         writer,
@@ -3281,13 +3284,23 @@ impl ControlServer {
         // A remote history page takes a network round trip (up to the request
         // timeout). Attach input and grid publication also need the Registry;
         // neither may wait for this reply.
+        // An older client rejects decoration spans it does not know.
+        let styled = |mut result: diri_proto::ReadScrollbackCellsResult| {
+            if !p.styles {
+                result
+                    .metadata
+                    .iter_mut()
+                    .for_each(|metadata| metadata.styles.clear());
+            }
+            result
+        };
         if let Some(reader) = reader {
-            return encode(&reader.read(p.first_row, p.max_rows));
+            return encode(&styled(reader.read(p.first_row, p.max_rows)));
         }
         let (mut screen, _) = self
             .completed_terminal(&p.session_id.0)?
             .ok_or_else(|| self.no_retained_terminal(&p.session_id.0))?;
-        encode(&screen.scrollback_cells(p.first_row, p.max_rows))
+        encode(&styled(screen.scrollback_cells(p.first_row, p.max_rows)))
     }
 
     fn spawn_session_unlocked(
@@ -9019,6 +9032,7 @@ mod tests {
                     diri_proto::grid::ChangedRow::new(0, row.clone()),
                     diri_proto::grid::ChangedRow::new(1, row),
                 ],
+                cursor_style: Default::default(),
             },
             marker_buffer: Vec::new(),
             alt_screen: false,

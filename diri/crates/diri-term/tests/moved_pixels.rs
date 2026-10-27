@@ -86,6 +86,7 @@ fn snapshot() -> GridUpdate {
                 ChangedRow::new(row as u16, cells)
             })
             .collect(),
+        cursor_style: Default::default(),
     }
 }
 

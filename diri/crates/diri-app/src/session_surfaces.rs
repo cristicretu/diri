@@ -1704,6 +1704,7 @@ impl SessionSurfaces {
                                     diri_proto::grid::ChangedRow::new(row as u16, cells)
                                 })
                                 .collect(),
+                            cursor_style: Default::default(),
                         });
                         Some(element)
                     });
@@ -2395,6 +2396,7 @@ mod tests {
                         cursor_visible: false,
                         is_full_snapshot: true,
                         changed_rows: vec![],
+                        cursor_style: Default::default(),
                     };
                     stream
                         .get_mut()

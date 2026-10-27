@@ -151,6 +151,7 @@ fn synthetic_grid(text: &str) -> GridUpdate {
         cursor_visible: true,
         is_full_snapshot: true,
         changed_rows: rows,
+        cursor_style: Default::default(),
     }
 }
 

@@ -1,4 +1,4 @@
-use diri_proto::grid::{GridCell, GridUpdate, RowMetadata, TermStyle};
+use diri_proto::grid::{CursorStyle, GridCell, GridUpdate, RowMetadata, StyleSpan, TermStyle};
 use unicode_width::UnicodeWidthChar;
 
 /// Cursor state carried by every daemon grid update.
@@ -7,6 +7,8 @@ pub struct CursorState {
     pub col: u16,
     pub row: u16,
     pub visible: bool,
+    /// DECSCUSR shape and blink.
+    pub style: CursorStyle,
 }
 
 /// A compact summary of damage caused by applying a grid update.
@@ -25,6 +27,8 @@ pub struct ChangedRenderRow {
     pub generation: u64,
     pub cells: Vec<GridCell>,
     pub graphemes: Vec<(u16, String)>,
+    /// Decoration spans clipped to the visible columns.
+    pub styles: Vec<StyleSpan>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -33,6 +37,19 @@ pub struct RenderDamageSnapshot {
     pub rows: u16,
     pub cursor: CursorState,
     pub changed_rows: Vec<ChangedRenderRow>,
+}
+
+/// `spans` limited to the first `cols` columns.
+#[must_use]
+pub fn clip_styles(spans: &[StyleSpan], cols: usize) -> Vec<StyleSpan> {
+    spans
+        .iter()
+        .filter(|span| usize::from(span.start) < cols)
+        .map(|span| StyleSpan {
+            end: span.end.min(u16::try_from(cols).unwrap_or(u16::MAX)),
+            ..span.clone()
+        })
+        .collect()
 }
 
 /// Row-major terminal cells plus damage and cursor bookkeeping.
@@ -253,6 +270,9 @@ impl GridBuffer {
                             .cloned()
                             .collect()
                     }),
+                    styles: self.annotations.get(row).map_or_else(Vec::new, |metadata| {
+                        clip_styles(&metadata.styles, col_count)
+                    }),
                 });
                 *known = generation;
             }
@@ -353,6 +373,7 @@ impl GridBuffer {
             col: update.cursor_col,
             row: update.cursor_row,
             visible: update.cursor_visible,
+            style: update.cursor_style,
         };
         let cursor_changed = self.cursor != new_cursor;
         if cursor_changed {
@@ -490,6 +511,7 @@ mod tests {
             cursor_visible: true,
             is_full_snapshot: full,
             changed_rows,
+            cursor_style: Default::default(),
         }
     }
 

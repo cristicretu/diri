@@ -971,6 +971,10 @@ pub struct ReadScrollbackCellsParams {
     pub session_id: SessionId,
     pub first_row: i64,
     pub max_rows: i64,
+    /// The caller decodes `terminal-styles-v1` decoration spans in row
+    /// metadata; an older caller rejects them and omits this.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub styles: bool,
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
@@ -1341,6 +1345,10 @@ pub type DaemonShutdownResult = EmptyResult;
 pub struct AttachRequest {
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub enhanced_keyboard: bool,
+    /// The client decodes `terminal-styles-v1` grids (cursor shape bits and
+    /// decoration spans). An older client omits it and gets the legacy form.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub terminal_styles: bool,
     pub attach: SessionId,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub from_offset: Option<u64>,
