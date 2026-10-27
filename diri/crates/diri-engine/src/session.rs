@@ -3527,8 +3527,11 @@ fn new_shared(
         prompt_input: Mutex::new(PromptInputState::default()),
         log: Mutex::new(log),
         screen: Mutex::new({
+            // The pump feeds every Holder frame (about a kilobyte while output
+            // streams) and releases streaming memory once it settles.
             let screen = HeadlessScreen::new(spec.pty.cols as usize, spec.pty.rows as usize)
-                .with_notifications();
+                .with_notifications()
+                .keeping_spare_rows_until_idle();
             // Only a local session's own emulator feeds the client grid; a
             // remote session's grid, image anchors and pixels come from its
             // Holder (`inline-images-v1`), so storing images here too would
@@ -6040,6 +6043,7 @@ fn pump_held(
                 replaying = false;
                 // The replay tail is drained: checkpoint immediately, as the
                 // Swift daemon does right after `replayExistingLog`.
+                shared.screen.lock().expect("screen").release_idle_memory();
                 if checkpoint_dirty_at.take().is_some() {
                     persist_checkpoint(
                         &shared,
@@ -6053,6 +6057,9 @@ fn pump_held(
                 last.elapsed() >= CHECKPOINT_SETTLE || first.elapsed() >= CHECKPOINT_MAX_STALENESS
             }) {
                 checkpoint_dirty_at = None;
+                // Output has been quiet for a second (or keeps streaming past
+                // the staleness bound, when the rows are reused at once).
+                shared.screen.lock().expect("screen").release_idle_memory();
                 persist_checkpoint(
                     &shared,
                     &checkpoint_path,

@@ -151,6 +151,18 @@ impl Grid<crate::term::cell::Cell> {
         self.raw.release_read_cache();
     }
 
+    /// Keep the rows recycled for new lines across history bounds until
+    /// `release_history_spare_rows`, for an owner that bounds history after
+    /// every read but can tell when output has gone quiet.
+    pub fn keep_history_spare_rows(&mut self, keep: bool) {
+        self.raw.keep_spare_rows(keep);
+    }
+
+    /// Drop the rows kept for recycling; an idle terminal needs none.
+    pub fn release_history_spare_rows(&mut self) {
+        self.raw.release_spare_rows();
+    }
+
     /// Discard the oldest history beyond `budget` stored bytes.
     ///
     /// The row limit follows the byte bound, with `ceiling` as its maximum.

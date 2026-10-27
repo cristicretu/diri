@@ -517,6 +517,20 @@ impl<T> Term<T> {
             .bound_history_storage(budget, ceiling);
     }
 
+    /// Keep the primary history's recycled rows across history bounds until
+    /// [`Term::release_primary_history_spare_rows`]: see
+    /// [`Grid::keep_history_spare_rows`].
+    #[cfg(feature = "compact-history")]
+    pub fn keep_primary_history_spare_rows(&mut self, keep: bool) {
+        self.primary_grid_mut().keep_history_spare_rows(keep);
+    }
+
+    /// Drop the primary history's recycled rows.
+    #[cfg(feature = "compact-history")]
+    pub fn release_primary_history_spare_rows(&mut self) {
+        self.primary_grid_mut().release_history_spare_rows();
+    }
+
     #[cfg(feature = "compact-history")]
     fn primary_grid_mut(&mut self) -> &mut Grid<Cell> {
         if self.mode.contains(TermMode::ALT_SCREEN) {
@@ -3236,6 +3250,44 @@ mod tests {
         assert_eq!(replies.lock().unwrap().last().unwrap(), "\x1b[?5u");
         parser.advance(&mut term, b"\x1bc\x1b[?u");
         assert_eq!(replies.lock().unwrap().last().unwrap(), "\x1b[?0u");
+    }
+
+    #[test]
+    fn a_coloured_line_widened_and_then_recycled_clears_its_old_columns() {
+        // A line scrolled in under a red background is red blanks above an
+        // occupancy of zero. Widening appends default cells; recycling the
+        // row for a new line must still clear the red ones, or they show up
+        // on an unrelated line.
+        for compact in [false, true] {
+            let mut term = Term::new(
+                Config {
+                    scrolling_history: 4,
+                    ..Config::default()
+                },
+                &TermSize::new(10, 2),
+                VoidListener,
+            );
+            #[cfg(feature = "compact-history")]
+            if compact {
+                term.grid_mut().enable_compact_history();
+            }
+            let mut parser: crate::vte::ansi::Processor = crate::vte::ansi::Processor::new();
+            parser.advance(&mut term, b"\x1b[41m\r\n\r\n\x1b[0m");
+            term.resize(TermSize::new(20, 2));
+            parser.advance(&mut term, b"\r\n\r\n\r\n\r\n\r\n\r\n\r\n\r\nx");
+            let grid = term.grid();
+            for line in -(grid.history_size() as i32)..2 {
+                for cell in &grid[Line(line)][..] {
+                    assert_eq!(
+                        cell.bg,
+                        Color::Named(NamedColor::Background),
+                        "compact {compact} line {line}"
+                    );
+                }
+            }
+            #[cfg(not(feature = "compact-history"))]
+            let _ = compact;
+        }
     }
 
     #[test]

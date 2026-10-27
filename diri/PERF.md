@@ -1,5 +1,78 @@
 # diri performance record
 
+## History encoding and per-read costs: Engine parse +25% (2026-10-27)
+
+The Engine session thread is the limit when output floods a held session: on
+the `catbench` 100 MB mixed log (plain, SGR/truecolor and CJK lines, 160×50)
+it was busy for the whole run, about half of it encoding scrollback history.
+
+**What changed.**
+
+- History encoding (`vendor/alacritty_terminal/src/grid/compact.rs`; see
+  DIRI-PATCH "Cheaper history encoding"): wide characters and their spacers
+  are encoded as pairs, so a CJK line is a few runs instead of one per cell;
+  the search for a row's last non-default cell starts at its occupancy, so
+  a short line in a wide row is not scanned to its end (`Row::grow` now keeps
+  that rule true, which also fixes coloured blanks surviving a recycled line);
+  style lookups hit a 32-slot cache; runs, text and styles are written without
+  intermediate copies.
+- Per-read costs (`diri-terminal-state`): the Engine keeps the rows history
+  recycles across reads and drops them when the checkpoint timer fires after
+  output goes quiet (they used to be dropped after every read, so most lines
+  allocated a fresh row); row fingerprints stop at a row's last non-default
+  cell and cache the two styles a wide-character run alternates between; the
+  notification scanner skips CSI introducers and DCS/APC bodies with `memchr`
+  instead of a state step per byte (a string that never ends no longer makes
+  it scan every later byte).
+
+**Same-machine feed, 100 MiB files, `feedbench … 64k`**, median of 3
+interleaved runs, CPU time (instructions):
+
+| Log | main (before #840) | #830 + #840 + #845 | branch |
+| --- | ---: | ---: | ---: |
+| mixed (`big.log`) | 871 ms (19.8 G) | 871 ms (19.8 G) | **692 ms (15.6 G)** |
+| emoji-dense | 1239 ms (28.2 G) | 1592 ms (32.9 G) | **1065 ms (24.9 G)** |
+| Indic | 1279 ms (29.0 G) | 1509 ms (31.8 G) | **959 ms (26.2 G)** |
+
+**End to end, `catbench`** (held session, Holder, Engine, attached client
+until its grid shows the last line), 6 interleaved rounds at load 3–5, next
+to a reference terminal multiplexer on an isolated server with one attached
+stream (its column is the last raw byte reaching that client, unparsed). The
+instrumented builds also count the bytes the Engine parsed:
+
+| Path | PTY drain, median (min) | Last line at client, median (min) | Engine parsed | Engine thread CPU | Parse rate |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| Reference | 0.662 s (0.655) | 0.661 s (0.654) | all, in its server | server 0.75 s | — |
+| main (before #840) | 0.487 s (0.483) | 0.696 s (0.689) | 80.6 of 105.8 MB, every run | 0.66 s | 122 MB/s |
+| #830 + #840 + #845 | 0.504 s (0.474) | 0.693 s (0.679) | 80.6 MB, every run | 0.65 s | 123 MB/s |
+| branch, all parsed (3 runs) | 0.508 s | 0.722 s (0.717) | 105.8 MB | 0.69 s | 153 MB/s |
+| branch, as main (3 runs) | 0.476 s | 0.542 s (0.538) | 80.6 MB | 0.52 s | 154 MB/s |
+
+When the Engine falls further behind than the session log keeps, it resumes
+at the oldest byte kept and skips the rest (25.2 MB here); main does that in
+every run. The branch parses 25% more per second, so in half the runs it keeps up and
+parses everything. **Parsing everything, it still trails the reference by
+about 9% (0.72 against 0.66 s)**; skipping the same bytes as main, it finishes
+first (0.54 s). The reference spends 0.75 s of server CPU on the same log.
+
+Footprint: no thread, timer or idle work. While output streams, the Engine
+keeps at most one block of recycled rows (128 KiB of cells) between reads;
+they are dropped a second after output stops. The Remote Holder keeps the
+old behaviour. History stays bounded at 4 MiB; rows retained under it
+(`history_depth`): agent transcript 80 cols 127,548 → 124,799, 200 cols
+70,543 → 72,479, cargo 200 cols 117,487 → 117,583, others unchanged. Feed rate
+in the same bench: cargo 121 → 141 MB/s, `seq` 51 → 95 MB/s at 80 columns.
+
+`scripts/terminal-perf-gate.sh` passes; held input-to-grid median 385–414 µs
+on both the base and the branch (3 runs each), Holder input stream p50 14 µs /
+p95 15 µs.
+
+Measured and not done: moving block encoding to another thread (a fifth of the
+session thread) would break the one-owner rule for terminal state, hold raw
+rows across threads and add a thread per streaming session; a smaller LZ hash
+table for small blocks, a single-pass field-compare run scan, and a scalar ESC
+search before `memchr` changed no cycle counts.
+
 ## History depth bounded by stored bytes (2026-10-27)
 
 History used to stop at 10,000 rows even though compressed rows used under
