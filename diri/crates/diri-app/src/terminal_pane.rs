@@ -4398,6 +4398,14 @@ impl TerminalPane {
             let previous = resident.last_size;
             let first_measure = previous == (0, 0);
             resident.last_size = size;
+            // Only the main pane's real viewport, never the full-window launch
+            // guess or a split's share of it, sizes the window's next tab.
+            if matches!(self.session_source, SessionSource::FollowSelection)
+                && self.viewport.is_some()
+                && let Some(window_store) = &self.window_store
+            {
+                window_store.note_terminal_grid(size);
+            }
             let now = Instant::now();
             let since_sent = self.last_resize_sent.map(|at| now.duration_since(at));
             let delay = match plan_resize(first_measure, since_sent, self.resize_flush_armed) {

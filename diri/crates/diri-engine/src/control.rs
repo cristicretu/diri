@@ -1606,9 +1606,20 @@ impl ControlServer {
         record.worktree_path = worktree_path;
         record.git_branch = git_branch.or_else(|| crate::git::branch(&cwd_path));
         record.parent = p.parent.clone();
-        if let (Some(cols), Some(rows)) = (p.initial_cols, p.initial_rows) {
-            pty.cols = cols.clamp(2, u16::MAX as i64) as u16;
-            pty.rows = rows.clamp(2, u16::MAX as i64) as u16;
+        // A size the caller named (the App measures the pane a new tab opens
+        // in), else the size a client last gave any session: launch at it now
+        // instead of waiting out the pane's first report. Only a spawn with
+        // neither waits, up to the launch fallback, for its pane.
+        let launch_size = match (p.initial_cols, p.initial_rows) {
+            (Some(cols), Some(rows)) => Some((
+                cols.clamp(2, u16::MAX as i64) as u16,
+                rows.clamp(2, u16::MAX as i64) as u16,
+            )),
+            _ => registry.last_client_size(),
+        };
+        if let Some((cols, rows)) = launch_size {
+            pty.cols = cols;
+            pty.rows = rows;
         }
 
         // Injection environment and the caller-minted conversation UUID. The
@@ -1674,6 +1685,11 @@ impl ControlServer {
         registry
             .spawn(spec, record)
             .map_err(|error| ControlError::internal(error.to_string()))?;
+        if let Some((cols, rows)) = launch_size
+            && let Some(session) = registry.get(&id)
+        {
+            session.launch_at(cols, rows);
+        }
         if let Some(record) = registry.record(&id) {
             crate::telemetry::record_session_spawn(
                 &record,
@@ -4315,12 +4331,24 @@ impl ControlServer {
             record.title = title.clone();
             record.title_source = diri_proto::TitleSource::FirstPrompt;
         }
-        let spec = self.resume_spec(&registry, &id, &kind, &p.entry.cwd, Some(&p.entry.id))?;
+        let mut spec = self.resume_spec(&registry, &id, &kind, &p.entry.cwd, Some(&p.entry.id))?;
+        // A new tab: launch at the size a client last gave any session, as a
+        // fresh spawn with no caller size does.
+        let launch_size = registry.last_client_size();
+        if let Some((cols, rows)) = launch_size {
+            spec.pty.cols = cols;
+            spec.pty.rows = rows;
+        }
         self.ensure_published_project(&mut registry, &p.entry.cwd, None);
         let spawn_started = Instant::now();
         registry
             .spawn(spec, record)
             .map_err(|error| ControlError::internal(error.to_string()))?;
+        if let Some((cols, rows)) = launch_size
+            && let Some(session) = registry.get(&id)
+        {
+            session.launch_at(cols, rows);
+        }
         if let Some(record) = registry.record(&id) {
             crate::telemetry::record_session_spawn(
                 &record,

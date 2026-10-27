@@ -135,6 +135,11 @@ pub struct Registry {
     /// Session installed under that id closes it and the client reattaches
     /// to the live run instead of typing into the dead one.
     completed_views: HashMap<String, Vec<(u64, diri_platform::ipc::UnixStream)>>,
+    /// The grid size a client last gave any session. A new session whose
+    /// caller named no size is launched at this one rather than waiting for
+    /// its own pane to report: a window's panes share its geometry, and a
+    /// size that turns out wrong reaches the child as an ordinary resize.
+    last_client_size: Option<(u16, u16)>,
 }
 
 /// Immutable input for a Cursor provider-store scan. The events watcher builds
@@ -246,7 +251,20 @@ impl Registry {
             completed_views: HashMap::new(),
             cursor_title_refresh_at: None,
             native_title_refresh_at: None,
+            last_client_size: None,
         }
+    }
+
+    /// Records a grid size a client asked a session's PTY to take.
+    pub fn note_client_size(&mut self, cols: u16, rows: u16) {
+        if cols >= 2 && rows >= 2 {
+            self.last_client_size = Some((cols, rows));
+        }
+    }
+
+    /// The grid size a client last asked any session to take, if one has.
+    pub fn last_client_size(&self) -> Option<(u16, u16)> {
+        self.last_client_size
     }
 
     /// Loads a persisted state file.

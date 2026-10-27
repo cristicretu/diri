@@ -847,9 +847,10 @@ impl AttachHub {
             // milliseconds over long history, and every session's input
             // and publication needs that lock.
             let reflow = {
-                let Ok(guard) = registry.lock() else {
+                let Ok(mut guard) = registry.lock() else {
                     return false;
                 };
+                guard.note_client_size(cols.max(2), rows.max(2));
                 let Some(session) = guard.get(session_id) else {
                     return true;
                 };

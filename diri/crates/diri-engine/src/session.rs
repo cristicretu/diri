@@ -96,14 +96,10 @@ const CHECKPOINT_MAX_STALENESS: Duration = Duration::from_secs(5);
 
 /// How long a deferred spawn waits for the first client size before
 /// launching at the estimated size anyway — an MCP-spawned agent may never
-/// get a view. The Swift daemon's 400ms fallback window.
+/// get a view. The Swift daemon's 400ms fallback window. Only a spawn with
+/// no known size waits here: a caller-named size, or the size a client last
+/// gave any session, launches at once.
 const LAUNCH_FALLBACK: Duration = Duration::from_millis(400);
-
-/// While unlaunched, each client resize pushes the exec back this far, so
-/// the agent starts at the SETTLED viewport rather than a transient
-/// first-layout size — otherwise its one-shot banner bakes at the wrong
-/// width. The Swift daemon's `scheduleDebouncedLaunch` delay.
-const LAUNCH_DEBOUNCE: Duration = Duration::from_millis(120);
 
 /// Outlasts the Holder's 10 s wait for a launchd job to call back
 /// (`diri_pty::detached`), after which it starts the Agent directly.
@@ -1514,10 +1510,10 @@ fn accept_remote_stop_result(
     }
 }
 
-/// Deferred-launch state: the agent is not exec'd until the attaching client
-/// reports its real terminal size, so a TUI's one-shot banner renders at the
-/// exact width (no post-spawn reflow). Ported from the Swift daemon's
-/// `scheduleDebouncedLaunch`.
+/// Deferred-launch state: the agent is not exec'd until its size is known
+/// (named by the caller, or reported by the attaching client), so a TUI's
+/// one-shot banner renders at the exact width (no post-spawn reflow). Ported
+/// from the Swift daemon's `scheduleDebouncedLaunch`, without its debounce.
 struct DeferredLaunch {
     state: Mutex<DeferredState>,
     cond: std::sync::Condvar,
@@ -1555,15 +1551,21 @@ impl DeferredLaunch {
         }
     }
 
-    /// Records a client size while unlaunched, pushing the exec back so the
-    /// viewport can settle. False once launched: resize the PTY instead.
+    /// Records a client size while unlaunched and launches at it now. A
+    /// size that arrives while the exec is in flight is handed back by
+    /// [`Self::finish_launch`] and applied as an ordinary resize, which the
+    /// child sees long before an agent paints its first frame (Claude Code
+    /// boots for ~300 ms). The Swift daemon debounced 120 ms per proposal
+    /// because AppKit's first layout was transient; the GPUI pane measures
+    /// its laid-out viewport, so that wait only delayed every tab.
+    /// False once launched: resize the PTY instead.
     fn propose_size(&self, cols: u16, rows: u16) -> bool {
         let mut state = self.state.lock().expect("deferred");
         if state.launched {
             return false;
         }
         state.pending = Some((cols, rows));
-        state.deadline = Instant::now() + LAUNCH_DEBOUNCE;
+        state.deadline = Instant::now();
         self.cond.notify_all();
         true
     }
@@ -1690,8 +1692,9 @@ pub struct SessionSpec {
     /// Present for a remote Holder-backed session. It is mutually exclusive
     /// with the local `holder` transport.
     pub remote: Option<RemoteSessionSpec>,
-    /// Defer the exec until the first client size settles (holder spawns
-    /// only), so the agent's banner renders at the real viewport width.
+    /// Defer the exec until a size is known (holder spawns only): the first
+    /// client size or [`Session::launch_at`], so the agent's banner renders
+    /// at the real viewport width.
     pub defer_launch: bool,
 }
 
@@ -2065,11 +2068,12 @@ impl Session {
         Self::attach(spec, client, floor, engine, true, stat.as_ref())
     }
 
-    /// Spawns through a holder, but not yet: the exec waits for the first
-    /// client size to settle ([`LAUNCH_DEBOUNCE`] after each proposal, at
-    /// most [`LAUNCH_FALLBACK`] total without one), so the agent's one-shot
-    /// banner renders at the real viewport width. Until then input queues
-    /// and the session presents an empty screen at the estimated size.
+    /// Spawns through a holder, but not yet: the exec waits for a client
+    /// size (the first proposal, or [`Session::launch_at`] when the size is
+    /// already known; at most [`LAUNCH_FALLBACK`] without one), so the
+    /// agent's one-shot banner renders at the real viewport width. Until
+    /// then input queues and the session presents an empty screen at the
+    /// estimated size.
     fn spawn_held_deferred(
         spec: SessionSpec,
         holder: &HolderConfig,
@@ -2192,6 +2196,12 @@ impl Session {
                         // A size proposed while the exec was in flight: apply
                         // as an ordinary resize now that the PTY exists.
                         let (cols, rows) = (cols.max(2), rows.max(2));
+                        diri_telemetry::debug_event!(
+                            "session.exec_resized",
+                            session = diri_telemetry::id(&id),
+                            cols = cols,
+                            rows = rows,
+                        );
                         let _ = client.resize_with_pixels(
                             cols,
                             rows,
@@ -3276,6 +3286,17 @@ impl Session {
             }
             _ => None,
         }
+    }
+
+    /// Launches a deferred spawn now at `cols`×`rows`, a size its caller
+    /// already knows (the pane it opens in, or the size a client last gave
+    /// any session), instead of waiting for its pane to report one. A pane
+    /// that then reports a different size resizes the child like any other
+    /// resize. False when the session was not waiting to launch.
+    pub fn launch_at(&self, cols: u16, rows: u16) -> bool {
+        self.deferred
+            .as_ref()
+            .is_some_and(|deferred| deferred.propose_size(cols.max(2), rows.max(2)))
     }
 
     pub fn resize(&self, cols: u16, rows: u16) -> std::io::Result<()> {
@@ -7773,6 +7794,36 @@ mod preview_tests {
         );
         assert!(!session.accepts_keyboard_input(false));
         assert!(session.accepts_keyboard_input(true));
+    }
+
+    #[test]
+    fn a_client_size_ends_the_launch_wait_at_once() {
+        // The Swift-era debounce held the exec 120 ms after every proposal.
+        // A size now launches at once: the waiting launcher wakes with it.
+        let deferred = Arc::new(DeferredLaunch::new());
+        let waiter = {
+            let deferred = Arc::clone(&deferred);
+            std::thread::spawn(move || {
+                let size = deferred.wait_for_launch_size((80, 24));
+                (size, Instant::now())
+            })
+        };
+        std::thread::sleep(Duration::from_millis(20));
+        let proposed = Instant::now();
+        assert!(deferred.propose_size(132, 41));
+        let (size, woke) = waiter.join().unwrap();
+        assert_eq!(size, Some((132, 41)));
+        assert!(
+            woke.duration_since(proposed) < Duration::from_millis(100),
+            "the launch waited {:?} after the size arrived",
+            woke.duration_since(proposed)
+        );
+        // A size arriving while the exec is in flight is handed back to be
+        // applied as an ordinary resize.
+        assert!(deferred.propose_size(90, 28));
+        let handoff = deferred.finish_launch((132, 41)).unwrap();
+        assert_eq!(handoff.late_size, Some((90, 28)));
+        assert!(!deferred.propose_size(100, 30), "launched: resize instead");
     }
 
     #[test]
