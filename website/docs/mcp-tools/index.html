@@ -61,7 +61,7 @@
 <p>Park or revive an authorized session without losing it: hibernate freezes its whole process tree (no CPU) while keeping the conversation and terminal, wake resumes it, and resume restarts an exited Agent in its saved conversation. Same authorization as release_agent.</p>
 <div class="table-wrap"><table><thead><tr><th>Argument</th><th>Type</th><th>Notes</th></tr></thead><tbody><tr><td><code>action</code></td><td><code>hibernate</code>, <code>wake</code>, <code>resume</code></td><td><strong>Required.</strong></td></tr><tr><td><code>session_id</code></td><td>string</td><td><strong>Required.</strong></td></tr></tbody></table></div>
 <h3 id="release-agent"><a class="anchor" href="#release-agent" aria-hidden="true" tabindex="-1">#</a><code>release_agent</code></h3>
-<p>Terminate an authorized agent session. Delegated agents may release direct children; root agents may release sessions in their project. The caller and its ancestors are protected.</p>
+<p>Terminate an authorized agent session. Delegated agents may release direct children; root agents may release sessions in their project and their direct children anywhere. The caller and its ancestors are protected.</p>
 <div class="table-wrap"><table><thead><tr><th>Argument</th><th>Type</th><th>Notes</th></tr></thead><tbody><tr><td><code>session_id</code></td><td>string</td><td><strong>Required.</strong></td></tr></tbody></table></div>
 <h3 id="list-agents"><a class="anchor" href="#list-agents" aria-hidden="true" tabindex="-1">#</a><code>list_agents</code></h3>
 <p>List every agent session with its id, kind, title, status, parent, host, and working directory.</p>

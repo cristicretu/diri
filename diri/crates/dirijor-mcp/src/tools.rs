@@ -295,7 +295,7 @@ pub fn tool_definitions_for(kinds: &[String]) -> Vec<ToolDefinition> {
         ),
         ToolDefinition::new(
             "release_agent",
-            "Terminate an authorized agent session. Delegated agents may release direct children; root agents may release sessions in their project. The caller and its ancestors are protected.",
+            "Terminate an authorized agent session. Delegated agents may release direct children; root agents may release sessions in their project and their direct children anywhere. The caller and its ancestors are protected.",
             session_id_schema(),
         ),
         ToolDefinition::new(

@@ -12,7 +12,7 @@ use diri_proto::{Project, SessionRecord, SessionStatus};
 
 use super::{Lineage, Relation};
 
-pub(super) const WRITE_POLICY: &str = "Reads are open across all sessions. Root agents may write within their project and message direct children on any host; delegated agents may write only to their parent and direct children. Every write requires a live Diri session identity. Cross-lineage messages are attributed. Agents cannot target themselves. Root agents may release, hibernate, wake, resume, fork, or integrate only sessions in their project; delegated agents only their direct children. Split-pane layout follows the same reach, plus the caller's own pane and splitting beside its parent. Delegation depth and live children per session are capped (DIRIJOR_MAX_SPAWN_DEPTH, default 3; DIRIJOR_MAX_LIVE_CHILDREN, default 16).";
+pub(super) const WRITE_POLICY: &str = "Reads are open across all sessions. Root agents may write within their project and message direct children on any host; delegated agents may write only to their parent and direct children. Every write requires a live Diri session identity. Cross-lineage messages are attributed. Agents cannot target themselves. Root agents may release, hibernate, wake, resume, fork, or integrate sessions in their project and their direct children on any project or host; delegated agents only their direct children. Split-pane layout follows the same reach, plus the caller's own pane and splitting beside its parent. Delegation depth and live children per session are capped (DIRIJOR_MAX_SPAWN_DEPTH, default 3; DIRIJOR_MAX_LIVE_CHILDREN, default 16).";
 
 const DEFAULT_MAX_SPAWN_DEPTH: usize = 3;
 const DEFAULT_MAX_LIVE_CHILDREN: usize = 16;
@@ -147,7 +147,7 @@ impl<'a> McpPolicy<'a> {
                 }
                 if !self.can_release(target_record, relation) {
                     return Err(format!(
-                        "manage denied: {target} is {}; root agents may manage sessions in their project, delegated agents only direct children",
+                        "manage denied: {target} is {}; root agents may manage sessions in their project and their direct children, delegated agents only direct children",
                         relation.as_str()
                     ));
                 }
@@ -225,6 +225,8 @@ impl<'a> McpPolicy<'a> {
                 if !self.can_release(target_record, relation) {
                     let reason = if matches!(relation, Relation::Parent | Relation::Ancestor) {
                         "the session waiting on this result"
+                    } else if self.is_root() {
+                        "a session outside its project and direct children"
                     } else {
                         "a session outside its direct children"
                     };
@@ -380,9 +382,13 @@ impl<'a> McpPolicy<'a> {
         }
     }
 
+    /// A root agent reaches its project plus its own direct children, which
+    /// may run in another project or on another host (a child spawned with a
+    /// different `cwd`). Every delegated agent already controls its direct
+    /// children wherever they run; a root must not have less reach.
     fn can_release(&self, target: &SessionRecord, relation: Relation) -> bool {
         if self.is_root() {
-            self.same_project(target)
+            relation == Relation::Child || self.same_project(target)
         } else {
             relation == Relation::Child
         }
@@ -553,10 +559,17 @@ mod tests {
             .authorize(WriteAction::SendPrompt { target: "child" })
             .expect("direct child is writable across projects");
         assert_eq!(message.frame("follow up"), "follow up");
+        // A root releases and manages its own children wherever they run,
+        // as a delegated agent already can.
         assert!(
             policy
                 .authorize(WriteAction::Release { target: "child" })
-                .is_err()
+                .is_ok()
+        );
+        assert!(
+            policy
+                .authorize(WriteAction::Manage { target: "child" })
+                .is_ok()
         );
         for target in ["root", "foreign", "grandchild"] {
             assert!(

@@ -967,3 +967,68 @@ fn agents_split_panes_by_session_id_without_touching_processes() {
             .unwrap();
     }
 }
+
+/// A root agent's child spawned with a `cwd` outside the root's project is
+/// still its direct child: `release_agent` from that root must close it, as a
+/// delegated agent can and as `dirijor session release` already did.
+#[test]
+fn root_releases_its_child_spawned_in_another_project() {
+    let temp = tempfile::tempdir().unwrap();
+    let repo = temp.path().join("repo");
+    let elsewhere = temp.path().join("elsewhere");
+    std::fs::create_dir_all(&repo).unwrap();
+    std::fs::create_dir_all(&elsewhere).unwrap();
+    let fixture = temp.path().join("prompt-fixture");
+    std::fs::write(&fixture, "#!/bin/sh\nexec cat\n").unwrap();
+    std::fs::set_permissions(&fixture, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let server = start_server(temp.path(), &fixture, &repo);
+    let parent = Bridge::new(server.socket_path().into(), Some("s_parent".into()));
+    let spawned = parent
+        .call(
+            "spawn_agent",
+            &json!({"kind":"prompt-fixture", "cwd":elsewhere}),
+        )
+        .unwrap();
+    let id = spawned["id"].as_str().expect("child id").to_owned();
+    let sessions = parent
+        .request(Method::SESSION_LIST, json!({}), Duration::from_secs(3))
+        .unwrap();
+    let record = |id: &str| {
+        sessions["sessions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|record| record["id"] == id)
+            .cloned()
+            .unwrap()
+    };
+    let child = record(&id);
+    assert_eq!(child["parent"], "s_parent", "{child}");
+    assert_ne!(
+        child["projectID"],
+        record("s_parent")["projectID"],
+        "the fixture must put the child in another project"
+    );
+
+    let released = parent.call("release_agent", &json!({"session_id":id}));
+    if released.is_err() {
+        // Never leak the fixture process when the assertion below fails.
+        let _ = parent.request(
+            Method::SESSION_KILL,
+            json!({"sessionID": id}),
+            Duration::from_secs(3),
+        );
+    }
+    released.expect("a root releases its own direct child in another project");
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        let status = parent
+            .call("get_status", &json!({"session_id":id}))
+            .map(|status| status["status"].clone());
+        if matches!(&status, Ok(status) if status == "exited") || status.is_err() {
+            break;
+        }
+        assert!(Instant::now() < deadline, "child still running: {status:?}");
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
