@@ -1623,6 +1623,25 @@ fn platform_shortcut_label(label: &str) -> String {
 }
 
 /// How a native menu prints a keymap source such as `"cmd-alt-1"`: `⌥⌘1`.
+/// A chrome control's tooltip line: its name, then the shortcut `id` is
+/// bound to right now, or the name alone when it has none.
+pub(crate) fn with_shortcut(label: &str, id: CommandId) -> String {
+    joined_with_shortcut(label, command(id).shortcut_label())
+}
+
+/// [`with_shortcut`] against an explicit keymap.
+#[cfg(test)]
+pub(crate) fn with_shortcut_for(label: &str, id: CommandId, overrides: &ShortcutOverrides) -> String {
+    joined_with_shortcut(label, command(id).shortcut_label_for(overrides))
+}
+
+fn joined_with_shortcut(label: &str, shortcut: Option<String>) -> String {
+    match shortcut {
+        Some(shortcut) => format!("{label}  {shortcut}"),
+        None => label.to_owned(),
+    }
+}
+
 pub(crate) fn keystroke_label(source: &str) -> String {
     Keystroke::parse(source)
         .map_or_else(|_| source.to_owned(), |k| shortcut_label_for_keystroke(&k))
@@ -2509,6 +2528,34 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn tooltips_follow_the_keymap() {
+        let mut overrides = ShortcutOverrides::new();
+        let default = with_shortcut_for("Hide sidebar", CommandId::ToggleSidebar, &overrides);
+        let bound = command(CommandId::ToggleSidebar)
+            .shortcut_label_for(&overrides)
+            .unwrap();
+        assert_eq!(default, format!("Hide sidebar  {bound}"));
+
+        overrides.insert(
+            command(CommandId::ToggleSidebar).stable_id.to_owned(),
+            Some("cmd-alt-b".to_owned()),
+        );
+        let rebound = with_shortcut_for("Hide sidebar", CommandId::ToggleSidebar, &overrides);
+        #[cfg(target_os = "macos")]
+        assert_eq!(rebound, "Hide sidebar  ⌥⌘B");
+        assert_ne!(rebound, default);
+
+        overrides.insert(
+            command(CommandId::ToggleSidebar).stable_id.to_owned(),
+            None,
+        );
+        assert_eq!(
+            with_shortcut_for("Hide sidebar", CommandId::ToggleSidebar, &overrides),
+            "Hide sidebar"
+        );
     }
 
     #[test]

@@ -5,6 +5,7 @@
 
 mod autoscroll;
 mod controller;
+use crate::tooltip_warmth::WarmTooltip;
 use controller::{AttachmentControl, ControllerLease};
 mod find_input;
 mod find_overlay;
@@ -4597,6 +4598,15 @@ impl TerminalPane {
                         window.dispatch_action(Box::new(ToggleSidebar), cx);
                         cx.stop_propagation();
                     }))
+                    .shortcut_tooltip(
+                        if horizontal {
+                            t("terminal.toggle_top_bar")
+                        } else {
+                            t("terminal.show_sidebar")
+                        },
+                        Some(crate::commands::CommandId::ToggleSidebar),
+                        colors,
+                    )
                     .into_any_element(),
                 "show-sidebar",
                 crate::held_hints::label(crate::commands::CommandId::ToggleSidebar),
