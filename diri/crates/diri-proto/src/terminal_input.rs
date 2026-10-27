@@ -273,6 +273,39 @@ pub fn encode_action(
     keyboard: Option<KeyboardState>,
     action: KeyAction,
 ) -> Result<Vec<u8>, KeyEncodingError> {
+    // A program that negotiated kitty keyboard flags reads its keys in that
+    // protocol. Command chords stay the App's, as before: only
+    // Command-Backspace reaches the terminal, as the legacy kill-line.
+    // Flags that change no key's bytes (alternate keys or associated text
+    // alone) keep the legacy rules below.
+    const ACTIVE: u8 = enhanced::KeyboardEnhancements::DISAMBIGUATE
+        | enhanced::KeyboardEnhancements::EVENT_TYPES
+        | enhanced::KeyboardEnhancements::ALL_KEYS;
+    if let Some(state) = keyboard
+        && let Some(flags) = state
+            .enhancements
+            .filter(|flags| flags.bits() & ACTIVE != 0)
+        && !modifiers.cmd
+    {
+        let enhanced_event = enhanced::EnhancedKeyEvent::from(normalized_logical_key(event));
+        let enhanced_modifiers = enhanced::EnhancedModifiers {
+            ordinary: modifiers,
+            ..Default::default()
+        };
+        return match enhanced::encode(
+            &enhanced_event,
+            enhanced_modifiers,
+            state.encoding_modes(false),
+            flags,
+            action,
+        ) {
+            Ok(bytes) => Ok(bytes),
+            // A logical key the protocol has no code for (a multi-scalar
+            // layout name) still types its text.
+            Err(_) if action == KeyAction::Release => Ok(Vec::new()),
+            Err(_) => Ok(encode_key(event, modifiers, state.encoding_modes(false))),
+        };
+    }
     if action == KeyAction::Release {
         return Err(KeyEncodingError::UnsupportedRelease);
     }
@@ -292,6 +325,18 @@ pub fn encode_action(
         return Err(KeyEncodingError::UnsupportedKeypadModifiers);
     }
     Ok(encode_key(event, modifiers, modes))
+}
+
+/// Platform adapters name a few printable keys rather than spelling them
+/// (`space`); the kitty protocol identifies a key by its Unicode scalar.
+fn normalized_logical_key(event: &KeyEvent) -> KeyEvent {
+    match &event.key {
+        Key::Character(name) if name == "space" => KeyEvent {
+            key: Key::Character(" ".to_owned()),
+            text: event.text.clone(),
+        },
+        _ => event.clone(),
+    }
 }
 
 /// Encodes one key event as bytes to write to the PTY.
@@ -525,6 +570,178 @@ fn csi_tilde(number: u8, modifier: u8) -> Vec<u8> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn flags(bits: u8) -> Option<KeyboardState> {
+        Some(KeyboardState {
+            enhancements: Some(bits.try_into().unwrap()),
+            ..Default::default()
+        })
+    }
+
+    fn shift() -> Modifiers {
+        Modifiers {
+            shift: true,
+            ..Default::default()
+        }
+    }
+
+    fn ctrl() -> Modifiers {
+        Modifiers {
+            ctrl: true,
+            ..Default::default()
+        }
+    }
+
+    fn alt() -> Modifiers {
+        Modifiers {
+            alt: true,
+            ..Default::default()
+        }
+    }
+
+    /// The keys the desktop sends, as its key adapter builds them.
+    fn fixtures() -> Vec<(&'static str, KeyEvent, Modifiers)> {
+        vec![
+            ("a", KeyEvent::character("a"), Modifiers::default()),
+            ("shift-a", KeyEvent::composed("a", "A"), shift()),
+            ("ctrl-c", KeyEvent::character("c"), ctrl()),
+            ("alt-b", KeyEvent::character("b"), alt()),
+            (
+                "space",
+                KeyEvent::composed("space", " "),
+                Modifiers::default(),
+            ),
+            ("ctrl-space", KeyEvent::composed("space", " "), ctrl()),
+            (
+                "enter",
+                KeyEvent::named(NamedKey::Enter),
+                Modifiers::default(),
+            ),
+            ("shift-enter", KeyEvent::named(NamedKey::Enter), shift()),
+            (
+                "escape",
+                KeyEvent::named(NamedKey::Escape),
+                Modifiers::default(),
+            ),
+            ("tab", KeyEvent::named(NamedKey::Tab), Modifiers::default()),
+            ("shift-tab", KeyEvent::named(NamedKey::Tab), shift()),
+            (
+                "backspace",
+                KeyEvent::named(NamedKey::Backspace),
+                Modifiers::default(),
+            ),
+            (
+                "up",
+                KeyEvent::named(NamedKey::ArrowUp),
+                Modifiers::default(),
+            ),
+            ("ctrl-up", KeyEvent::named(NamedKey::ArrowUp), ctrl()),
+            ("f5", KeyEvent::named(NamedKey::F5), Modifiers::default()),
+            (
+                "kp1",
+                KeyEvent::keypad(KeypadKey::One),
+                Modifiers::default(),
+            ),
+        ]
+    }
+
+    /// Every flag combination a program can negotiate, every fixture key,
+    /// pressed, repeated and released: bytes come from the kitty encoder
+    /// whenever a flag changes key bytes, and from the legacy encoder (with
+    /// its errors) otherwise. Command chords always stay legacy.
+    #[test]
+    fn negotiated_flags_select_the_kitty_encoder_for_every_combination() {
+        for bits in 0..=31u8 {
+            let keyboard = flags(bits);
+            let active = bits & 0b1011 != 0;
+            for (name, event, modifiers) in fixtures() {
+                for action in [KeyAction::Press, KeyAction::Repeat, KeyAction::Release] {
+                    let actual = encode_action(&event, modifiers, keyboard, action);
+                    let expected = if active {
+                        let mut logical = event.clone();
+                        if logical.key == Key::Character("space".into()) {
+                            logical.key = Key::Character(" ".into());
+                        }
+                        Ok(enhanced::encode(
+                            &logical.into(),
+                            enhanced::EnhancedModifiers {
+                                ordinary: modifiers,
+                                ..Default::default()
+                            },
+                            TermInputModes::default(),
+                            bits.try_into().unwrap(),
+                            action,
+                        )
+                        .unwrap())
+                    } else {
+                        encode_action(&event, modifiers, Some(KeyboardState::default()), action)
+                    };
+                    assert_eq!(actual, expected, "flags {bits} {name} {action:?}");
+                }
+            }
+            let cmd = Modifiers {
+                cmd: true,
+                ..Default::default()
+            };
+            assert_eq!(
+                encode_action(
+                    &KeyEvent::named(NamedKey::Backspace),
+                    cmd,
+                    keyboard,
+                    KeyAction::Press
+                ),
+                Ok(vec![0x15]),
+                "flags {bits}: Command-Backspace stays kill-line"
+            );
+        }
+    }
+
+    /// Concrete bytes for the flag sets agents negotiate: Claude Code and
+    /// Neovim push 1, fish pushes 1|4, Codex (crossterm) pushes 1|2|4.
+    #[test]
+    fn kitty_bytes_for_the_flag_sets_programs_negotiate() {
+        let cases: &[(u8, &str, KeyAction, &[u8])] = &[
+            (1, "a", KeyAction::Press, b"a"),
+            (1, "shift-a", KeyAction::Press, b"A"),
+            (1, "ctrl-c", KeyAction::Press, b"\x1b[99;5u"),
+            (1, "alt-b", KeyAction::Press, b"\x1b[98;3u"),
+            (1, "space", KeyAction::Press, b" "),
+            (1, "ctrl-space", KeyAction::Press, b"\x1b[32;5u"),
+            (1, "enter", KeyAction::Press, b"\r"),
+            (1, "shift-enter", KeyAction::Press, b"\x1b[13;2u"),
+            (1, "escape", KeyAction::Press, b"\x1b[27u"),
+            (1, "tab", KeyAction::Press, b"\t"),
+            (1, "shift-tab", KeyAction::Press, b"\x1b[9;2u"),
+            (1, "backspace", KeyAction::Press, b"\x7f"),
+            (1, "up", KeyAction::Press, b"\x1b[A"),
+            (1, "ctrl-up", KeyAction::Press, b"\x1b[1;5A"),
+            (1, "f5", KeyAction::Press, b"\x1b[15~"),
+            (1, "kp1", KeyAction::Press, b"\x1b[57400u"),
+            (1, "a", KeyAction::Release, b""),
+            (1, "escape", KeyAction::Release, b""),
+            (5, "shift-enter", KeyAction::Press, b"\x1b[13;2u"),
+            (7, "escape", KeyAction::Press, b"\x1b[27u"),
+            (7, "escape", KeyAction::Repeat, b"\x1b[27;1:2u"),
+            (7, "escape", KeyAction::Release, b"\x1b[27;1:3u"),
+            (7, "ctrl-c", KeyAction::Release, b"\x1b[99;5:3u"),
+            (7, "up", KeyAction::Release, b"\x1b[1;1:3A"),
+            (7, "a", KeyAction::Press, b"a"),
+            (7, "enter", KeyAction::Release, b""),
+            (8, "a", KeyAction::Press, b"\x1b[97u"),
+            (8, "enter", KeyAction::Press, b"\x1b[13u"),
+            (10, "a", KeyAction::Release, b"\x1b[97;1:3u"),
+            (24, "a", KeyAction::Press, b"\x1b[97;1;97u"),
+        ];
+        let keys = fixtures();
+        for (bits, name, action, expected) in cases {
+            let (_, event, modifiers) = keys.iter().find(|(key, ..)| key == name).unwrap();
+            assert_eq!(
+                encode_action(event, *modifiers, flags(*bits), *action).unwrap(),
+                expected.to_vec(),
+                "flags {bits} {name} {action:?}"
+            );
+        }
+    }
 
     #[test]
     fn keyboard_enhancement_json_distinguishes_unknown_zero_and_legacy_projection() {

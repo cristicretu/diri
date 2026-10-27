@@ -4187,6 +4187,54 @@ impl TerminalPane {
         {
             cx.notify();
         }
+        self.send_key_release(event, cx);
+    }
+
+    /// A program that asked for key event types (kitty flag 2) is told when
+    /// a key it saw pressed is released. Nothing is sent otherwise.
+    fn send_key_release(&mut self, event: &KeyUpEvent, cx: &mut Context<Self>) {
+        if self
+            .navigation
+            .as_ref()
+            .is_some_and(|navigation| navigation.read(cx).is_open())
+            || self
+                .utility_surfaces
+                .as_ref()
+                .is_some_and(|surfaces| surfaces.read(cx).is_open())
+            || event.keystroke.modifiers.platform
+        {
+            return;
+        }
+        let Some(id) = self.selected_id() else {
+            return;
+        };
+        let Some(resident) = self.residents.get_mut(&id) else {
+            return;
+        };
+        let reports_releases = resident
+            .keyboard
+            .and_then(|keyboard| keyboard.enhancements)
+            .is_some_and(|flags| {
+                flags.contains(diri_proto::terminal_input::enhanced::KeyboardEnhancements::EVENT_TYPES)
+            });
+        if !reports_releases || resident.find.is_some() {
+            return;
+        }
+        let option = OptionKey::for_layout(cx.keyboard_layout().id());
+        let Some((term_event, modifiers)) = terminal_keystroke_event(&event.keystroke, option)
+        else {
+            return;
+        };
+        if let Ok(bytes) = diri_term::keys::encode_interactive_action(
+            &term_event,
+            modifiers,
+            resident.keyboard,
+            diri_term::keys::KeyAction::Release,
+        ) && !bytes.is_empty()
+            && resident.send_user_input(bytes)
+        {
+            cx.notify();
+        }
     }
 
     fn handle_modifiers_changed(
@@ -6094,18 +6142,34 @@ fn terminal_key_event(
     event: &KeyDownEvent,
     option: OptionKey,
 ) -> Option<(TermKeyEvent, TermModifiers)> {
-    let keystroke = &event.keystroke;
+    #[cfg(target_os = "macos")]
+    if let Some(keypad) = crate::macos::terminal_keys::keypad_event(event) {
+        let modifiers = &event.keystroke.modifiers;
+        return Some((
+            keypad,
+            TermModifiers {
+                shift: modifiers.shift,
+                ctrl: modifiers.control,
+                alt: modifiers.alt,
+                cmd: modifiers.platform,
+            },
+        ));
+    }
+    terminal_keystroke_event(&event.keystroke, option)
+}
+
+/// The terminal key a keystroke names, for presses and releases alike.
+fn terminal_keystroke_event(
+    keystroke: &gpui::Keystroke,
+    option: OptionKey,
+) -> Option<(TermKeyEvent, TermModifiers)> {
     let mut modifiers = TermModifiers {
         shift: keystroke.modifiers.shift,
         ctrl: keystroke.modifiers.control,
         alt: keystroke.modifiers.alt,
         cmd: keystroke.modifiers.platform,
     };
-    #[cfg(target_os = "macos")]
-    if let Some(keypad) = crate::macos::terminal_keys::keypad_event(event) {
-        return Some((keypad, modifiers));
-    }
-    let named = match event.keystroke.key.as_str() {
+    let named = match keystroke.key.as_str() {
         "up" => Some(NamedKey::ArrowUp),
         "down" => Some(NamedKey::ArrowDown),
         "right" => Some(NamedKey::ArrowRight),
