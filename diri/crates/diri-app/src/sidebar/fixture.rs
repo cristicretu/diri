@@ -594,7 +594,7 @@ fn session(
     } else {
         Resumability::NotResumable
     };
-    SessionBuilder(SessionRecord {
+    SessionBuilder(SessionRecord { command_run: None,
         attention_state: None,
         id: SessionId::new(id),
         kind,

@@ -263,6 +263,7 @@ impl Bridge {
         // Resolved before launching, so a bad split request starts nothing.
         let placement = self.spawn_placement(arguments, tracked)?;
         let params = SessionSpawnParams {
+            keep_open: None,
             appearance: None,
             kind,
             cwd: required_string(arguments, "cwd")?,
@@ -1441,6 +1442,7 @@ mod tests {
 
     pub(super) fn record(id: &str, parent: Option<&str>) -> SessionRecord {
         SessionRecord {
+            command_run: None,
             attention_state: None,
             id: SessionId::new(id),
             kind: AgentKind::CODEX,

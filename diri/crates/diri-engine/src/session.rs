@@ -330,6 +330,8 @@ pub struct SessionView {
     pub terminal_progress: Option<diri_proto::TerminalProgress>,
     pub tail_offset: u64,
     pub exited: bool,
+    /// How long the child ran, once this Engine saw a child it exec'd exit.
+    pub ran: Option<Duration>,
 }
 
 /// Small input-side composer mirror used only until the first real prompt is
@@ -461,6 +463,12 @@ struct Shared {
     /// When this Engine launched the child; `None` for an adopted one, whose
     /// start this process never saw.
     launched_at: Option<Instant>,
+    /// When the child was exec'd: `launched_at`, or later for a launch that
+    /// waited for the client's size. `None` for an adopted child.
+    exec_at: Mutex<Option<Instant>>,
+    /// How long the child ran, from `exec_at` to the moment its exit was
+    /// applied. Set once; a command session's tab policy reads it.
+    ran: Mutex<Option<Duration>>,
     /// Set before an explicit stop, so its exit is not read as a crash.
     terminate_requested: AtomicBool,
     /// A remote stop is in flight. Its Helper `kill` takes the controller
@@ -2157,6 +2165,7 @@ impl Session {
                         disk_capacity: crate::holder::protocol::DEFAULT_DISK_CAPACITY,
                     };
                     let exec_started = Instant::now();
+                    *shared.exec_at.lock().expect("exec at") = Some(exec_started);
                     if let Err(error) = HolderLauncher::launch(&holder.executable, &paths, &launch)
                     {
                         mark_launch_failed(&shared, "holder_launch", &error);
@@ -2438,6 +2447,7 @@ impl Session {
             title_source,
             tail_offset: self.shared.log.lock().expect("log").tail_offset(),
             exited: self.shared.exited.load(Ordering::SeqCst),
+            ran: *self.shared.ran.lock().expect("ran"),
         }
     }
 
@@ -3552,6 +3562,7 @@ fn new_shared(
                 .find(|event| event.kind == diri_proto::attention::AttentionKind::Completion)
         })
         .map(|event| event.occurred_at);
+    let launched_at = fresh.then(Instant::now);
     Arc::new(Shared {
         holder_identity: std::sync::OnceLock::new(),
         reset_requested: AtomicBool::new(false),
@@ -3620,7 +3631,9 @@ fn new_shared(
         awaiting_redraw: AtomicBool::new(false),
         grid_wake: GridWake::for_agent(&spec.manifest_id),
         agent: spec.manifest_id.clone(),
-        launched_at: fresh.then(Instant::now),
+        launched_at,
+        exec_at: Mutex::new(launched_at),
+        ran: Mutex::new(None),
         terminate_requested: AtomicBool::new(false),
         remote_stopping: AtomicBool::new(false),
         exit_recorded: AtomicBool::new(false),
@@ -3797,6 +3810,18 @@ mod paste_text_sanitize_tests {
 fn apply(shared: &Shared, outcome: &ReducerOutcome) {
     let mut changed = outcome.attention_changed;
     if let Some(status) = &outcome.status_change {
+        // Before the status: a view that reads the exit also reads how long
+        // the child ran, so a command's tab policy never sees one alone.
+        if matches!(status, SessionStatus::Exited(_)) {
+            let mut ran = shared.ran.lock().expect("ran");
+            if ran.is_none() {
+                *ran = shared
+                    .exec_at
+                    .lock()
+                    .expect("exec at")
+                    .map(|exec| exec.elapsed());
+            }
+        }
         {
             let mut current = shared.status.lock().expect("status");
             if *current != *status {

@@ -517,6 +517,18 @@ The local Engine sends a structured launch request containing:
 The PTY child executes `argv` directly. Agent launches are never assembled by
 concatenating shell text.
 
+A program that cannot be executed is reported the way a shell reports it
+(October 2026, shared `diri-pty` exec path for the local Holder, its launchd
+helper, and the remote Helper): the child writes `diri: <argv[0]>: command not
+found` (or the `execve` error) to the PTY and exits 127, or 126 when the file
+exists but cannot be run. The search uses the launch's own `PATH`. The launch
+itself succeeds, so the output log, exit marker and exit facts carry the
+failure like any other exit. This is not a protocol change: before, the child
+aborted (SIGABRT) because the descriptors it closes include the Rust runtime's
+exec-error pipe. The Engine-side tab policy for one-off commands
+(`SessionRecord.commandRun`, `keepOpen`) is local-only and never crosses the
+Helper protocol.
+
 Local credentials, local Unix sockets, authentication responses, and local
 process environment are not copied wholesale. Sensitive or irrelevant local
 variables, including local-only `DIRI_` and `SSH_` state, are removed. The

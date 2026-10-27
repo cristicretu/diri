@@ -852,7 +852,7 @@ mod tests {
         store.spawn_kind(resolved.kind, resolved.options);
         assert_eq!(
             effects.try_recv().expect("canonical spawn effect"),
-            StoreEffect::Spawn(SessionSpawnParams {
+            StoreEffect::Spawn(SessionSpawnParams { keep_open: None,
                 appearance: Some(diri_proto::TerminalAppearance::Dark),
                 kind: AgentKind::CODEX,
                 cwd: root,

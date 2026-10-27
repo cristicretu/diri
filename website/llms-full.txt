@@ -1894,7 +1894,7 @@ dirijor run --wait --rm -- cargo test --workspace && echo green
 | `session key ID KEY` | `--ctrl`, `--alt`, `--shift`, `--cmd`, `--repeat`, `--json` | Press one key. `send` takes any target and several keys. |
 | `session wait TARGET` | `--until STATUS` (repeatable), `--timeout SECONDS`, `--json` | Block until the session reaches a status. Default `--until done`, default timeout 600 seconds. |
 | `session spawn KIND` | `--cwd PATH`, `--worktree`, `--branch NAME`, `--prompt TEXT`, `--title TEXT`, `--host ID`, `--json` | Start an agent, for example `claude` or `codex`. The folder defaults to the current one. |
-| `session run -- PROGRAM [ARG...]` | `--cwd PATH`, `--host ID`, `--title TEXT`, `--json` | Run a command in a new terminal session. A remote run needs `--cwd` with an absolute path on that host. |
+| `session run -- PROGRAM [ARG...]` | `--cwd PATH`, `--host ID`, `--title TEXT`, `--keep-open`, `--json` | Run a command in a new terminal session. A remote run needs `--cwd` with an absolute path on that host. The tab closes when the command succeeds and stays open when it fails or is killed within 250 ms, so you can read the error. `--keep-open` keeps it open after any exit. |
 | `session fork TARGET` | `--json` | Fork the conversation into a new session (agents that support fork). |
 | `session release TARGET` | `--remove`, `--json` | Stop the session. `--remove` also deletes its record. |
 | `session archive TARGET` | `--undo`, `--json` | Archive the session, or unarchive it with `--undo`. |

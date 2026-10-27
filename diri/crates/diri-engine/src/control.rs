@@ -1439,6 +1439,7 @@ impl ControlServer {
         // never silently drop arguments or fall back to a login shell.
         let argv = decode_launch_argv(&raw)?;
         let mut p: diri_proto::SessionSpawnParams = decode(Some(raw))?;
+        let command_run = command_run_for(&p, &argv)?;
         if let Some((host, cwd)) =
             crate::wsl::route_unc(&p.cwd, &crate::wsl::catalog(self.hosts_file()))
                 .map_err(io_control_error)?
@@ -1461,7 +1462,14 @@ impl ControlServer {
             p.host.as_deref(),
         )?;
         if p.host.is_some() {
-            return self.session_spawn_remote(p, argv, account_profile, reserved_id, scheduled);
+            return self.session_spawn_remote(
+                p,
+                argv,
+                command_run,
+                account_profile,
+                reserved_id,
+                scheduled,
+            );
         }
         if let Some(profile) = &account_profile
             && profile.agent == "codex"
@@ -1615,6 +1623,7 @@ impl ControlServer {
         }
         let mut record = new_record(&id, &kind, &cwd);
         record.scheduled_run = scheduled;
+        record.command_run = command_run;
         record.terminal_cwd = start_directory.map(|path| path.to_string_lossy().into_owned());
         record.account_profile = account_profile;
         record.kind = p.kind.clone();
@@ -1993,6 +2002,7 @@ impl ControlServer {
         &self,
         p: diri_proto::SessionSpawnParams,
         caller_argv: Vec<String>,
+        command_run: Option<diri_proto::CommandRun>,
         mut account_profile: Option<diri_proto::AgentAccountProfile>,
         reserved_id: Option<String>,
         scheduled: Option<diri_proto::schedules::ScheduledRunInfo>,
@@ -2180,6 +2190,7 @@ impl ControlServer {
 
         let mut record = new_record(&id, &kind, &captured.cwd);
         record.scheduled_run = scheduled;
+        record.command_run = command_run;
         record.account_profile = account_profile;
         record.kind = p.kind.clone();
         record.originating_prompt = p.initial_prompt.clone();
@@ -3950,6 +3961,15 @@ impl ControlServer {
         registry
             .respawn(spec)
             .map_err(|error| ControlError::internal(error.to_string()))?;
+        registry.update_record(&p.session_id.0, |record| {
+            if local_shell {
+                // Restarted as a login shell, no longer the command.
+                record.command_run = None;
+            } else if let Some(run) = record.command_run.as_mut() {
+                // The previous run's duration says nothing about this one.
+                run.ran_ms = None;
+            }
+        });
         if local_shell {
             // Report where the new shell actually starts before its first
             // sample: the restored directory, or none when that directory is
@@ -5359,6 +5379,31 @@ fn live_pane_shells(
         .collect()
 }
 
+/// A spawn that runs one command rather than an Agent or a login shell: an
+/// explicit `argv`, or a `generic` kind's command line, on a terminal kind.
+/// `keepOpen` is accepted only there: an Agent's or a login shell's tab
+/// already outlives its program, and that policy is not this flag's to change.
+fn command_run_for(
+    p: &diri_proto::SessionSpawnParams,
+    argv: &[String],
+) -> Result<Option<diri_proto::CommandRun>, ControlError> {
+    let command = p.kind.is_terminal()
+        && (!argv.is_empty()
+            || p.kind
+                .command()
+                .is_some_and(|command| !command.trim().is_empty()));
+    let keep_open = p.keep_open.unwrap_or(false);
+    if keep_open && !command {
+        return Err(ControlError::bad_request(
+            "keepOpen applies only to a command: an argv, or a generic kind's command line",
+        ));
+    }
+    Ok(command.then_some(diri_proto::CommandRun {
+        keep_open,
+        ran_ms: None,
+    }))
+}
+
 fn decode_launch_argv(params: &JsonValue) -> Result<Vec<String>, ControlError> {
     let Some(value) = params.get("argv") else {
         return Ok(Vec::new());
@@ -5492,6 +5537,7 @@ pub(crate) fn new_record(id: &str, kind: &str, cwd: &str) -> diri_proto::Session
     use diri_proto::{AgentKind, DateMillis, Resumability, SessionId, TitleSource};
     let now: DateMillis = std::time::SystemTime::now().into();
     diri_proto::SessionRecord {
+        command_run: None,
         attention_state: None,
         id: SessionId(id.to_string()),
         kind: AgentKind::new(kind),
@@ -7728,6 +7774,7 @@ mod tests {
     pub(super) fn test_record(id: &str) -> diri_proto::SessionRecord {
         use diri_proto::*;
         SessionRecord {
+            command_run: None,
             attention_state: None,
             id: SessionId(id.into()),
             kind: AgentKind::SHELL,

@@ -749,6 +749,7 @@ mod tests {
 
     fn record(id: &str, exit: Option<ExitInfo>) -> SessionRecord {
         SessionRecord {
+            command_run: None,
             attention_state: None,
             id: SessionId(id.into()),
             kind: AgentKind::SHELL,

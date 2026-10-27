@@ -6373,6 +6373,20 @@ fn exit_description(session: &SessionRecord) -> String {
     let SessionStatus::Exited(info) = &session.status else {
         return t("terminal.exit.session_ended").to_owned();
     };
+    if session.command_run.is_some() {
+        // A command's own status, as a shell would show it: a kill is not
+        // an Agent being interrupted, and the signal is the reason.
+        match (info.reason, info.code, info.signal) {
+            (ExitReason::Exited, Some(0), _) => return t("terminal.exit.command_exited").to_owned(),
+            (ExitReason::Exited, Some(code), _) => {
+                return tf("terminal.exit.command_exited_code", &[("code", &code)]);
+            }
+            (ExitReason::Signaled, _, Some(signal)) => {
+                return tf("terminal.exit.command_killed", &[("signal", &signal)]);
+            }
+            _ => {}
+        }
+    }
     if info.interrupted {
         // Killed from outside (a force-quit, memory pressure), not finished:
         // the session comes back on its own, so don't blame the Agent.
@@ -11143,6 +11157,34 @@ mod tests {
             "Ended when your computer restarted"
         };
         assert_eq!(exit_description(&session), expected);
+    }
+
+    /// A kept command tab says how the command ended in its own terms: its
+    /// code, or the signal that killed it, never "Agent was interrupted".
+    #[test]
+    fn a_command_exit_names_its_code_or_signal() {
+        let mut session = fixture_session();
+        session.command_run = Some(diri_proto::CommandRun::default());
+        let exit = |reason, code, signal, interrupted| {
+            SessionStatus::Exited(ExitInfo {
+                reason,
+                code,
+                signal,
+                system_restart: false,
+                interrupted,
+            })
+        };
+        session.status = exit(ExitReason::Exited, Some(127), None, false);
+        assert_eq!(exit_description(&session), "Command exited (code 127)");
+        session.status = exit(ExitReason::Signaled, None, Some(9), true);
+        assert_eq!(
+            exit_description(&session),
+            "Command was killed (signal 9)"
+        );
+        session.status = exit(ExitReason::Exited, Some(0), None, false);
+        assert_eq!(exit_description(&session), "Command exited");
+        session.command_run = None;
+        assert_eq!(exit_description(&session), "Agent exited");
     }
 
     #[test]

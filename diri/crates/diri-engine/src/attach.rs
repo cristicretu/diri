@@ -1618,6 +1618,7 @@ mod tests {
             interrupted: false,
         };
         let record = diri_proto::SessionRecord {
+            command_run: None,
             attention_state: None,
             id: diri_proto::SessionId("finished".into()),
             kind: diri_proto::AgentKind::SHELL,

@@ -980,7 +980,7 @@ fn session_spawn(arguments: &[String]) -> Result<(), CliError> {
 
 /// Everything after `--` is an argv element, never a shell command string.
 fn session_run_params(arguments: &[String]) -> Result<(Value, bool), CliError> {
-    let usage = "session run [--cwd PATH] [--host ID] [--title TEXT] [--json] -- PROGRAM [ARG ...]";
+    let usage = "session run [--cwd PATH] [--host ID] [--title TEXT] [--keep-open] [--json] -- PROGRAM [ARG ...]";
     let Some(separator) = arguments.iter().position(|argument| argument == "--") else {
         return Err(CliError::failure(usage));
     };
@@ -998,6 +998,10 @@ fn session_run_params(arguments: &[String]) -> Result<(Value, bool), CliError> {
         let field = match option.as_str() {
             "--json" => {
                 json_output = true;
+                continue;
+            }
+            "--keep-open" => {
+                params["keepOpen"] = json!(true);
                 continue;
             }
             "--cwd" => "cwd",
@@ -1047,7 +1051,7 @@ fn session_run_params(arguments: &[String]) -> Result<(Value, bool), CliError> {
 fn session_run(arguments: &[String]) -> Result<(), CliError> {
     if matches!(arguments, [help] if matches!(help.as_str(), "--help" | "-h")) {
         println!(
-            "Usage: dirijor session run [--cwd PATH] [--host ID] [--title TEXT] [--json] -- PROGRAM [ARG ...]\n\nArguments after -- are passed literally. Completed commands retain their terminal output.\nWait for completion: dirijor session wait ID --until exited --json\nClose retained work: dirijor session release ID --remove"
+            "Usage: dirijor session run [--cwd PATH] [--host ID] [--title TEXT] [--keep-open] [--json] -- PROGRAM [ARG ...]\n\nArguments after -- are passed literally. Completed commands retain their terminal output.\nIn the app the tab closes after a success and stays when the command fails or is killed within 250 ms; --keep-open keeps it after any exit.\nWait for completion: dirijor session wait ID --until exited --json\nClose retained work: dirijor session release ID --remove"
         );
         return Ok(());
     }
@@ -1909,6 +1913,7 @@ mod tests {
 
     fn record(id: &str, title: &str) -> SessionRecord {
         SessionRecord {
+            command_run: None,
             attention_state: None,
             id: SessionId::new(id),
             kind: AgentKind::CODEX,

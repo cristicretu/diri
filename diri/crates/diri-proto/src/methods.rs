@@ -562,6 +562,13 @@ pub struct SessionSpawnParams {
     /// Absent keeps the manifest's launch.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub argv: Option<Vec<String>>,
+    /// For a command (an `argv`, or a `generic` kind's command line): keep its
+    /// tab after any exit, a clean one included. Without it a command's tab
+    /// closes on success and stays when it failed or was killed within
+    /// [`crate::QUICK_EXIT_MILLIS`]. Rejected for Agents and login shells,
+    /// whose tabs already outlive their programs.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub keep_open: Option<bool>,
 }
 
 /// The light or dark family of the terminal theme a Session is shown in.

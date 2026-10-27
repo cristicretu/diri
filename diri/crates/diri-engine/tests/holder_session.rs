@@ -297,6 +297,7 @@ fn a_held_child_exit_is_observed_from_the_marker() {
 fn record(id: &str) -> diri_proto::SessionRecord {
     use diri_proto::*;
     SessionRecord {
+        command_run: None,
         attention_state: None,
         id: SessionId(id.into()),
         kind: AgentKind::SHELL,

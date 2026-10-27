@@ -961,6 +961,51 @@ pub struct SessionRecord {
     /// Present when a Diri schedule opened this session.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub scheduled_run: Option<crate::schedules::ScheduledRunInfo>,
+    /// Present when the session runs one command (a spawn `argv`, or a
+    /// `generic` kind's command line) rather than a login shell or an Agent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub command_run: Option<CommandRun>,
+}
+
+/// A failure or kill this soon after the exec is a command that never got
+/// going: its tab stays so the error can be read.
+pub const QUICK_EXIT_MILLIS: u64 = 250;
+
+/// How a command session's tab treats the command's exit.
+#[derive(Clone, Debug, Default, Deserialize, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CommandRun {
+    /// The spawn asked to keep the tab after any exit (`--keep-open`).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub keep_open: bool,
+    /// Milliseconds from the exec to the exit, once the Engine that launched
+    /// it saw it end. Absent while running, and for a run an Engine restart
+    /// adopted (its start is not known).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ran_ms: Option<u64>,
+}
+
+impl SessionRecord {
+    /// A command session whose tab stays after its exit: one that asked to
+    /// (`keepOpen`), or one that failed or was killed within
+    /// [`QUICK_EXIT_MILLIS`] of starting, so its error is still on screen.
+    /// A quick success, a slower failure, Agents and login shells: `false`,
+    /// so their existing exit handling applies unchanged.
+    #[must_use]
+    pub fn command_keeps_tab(&self) -> bool {
+        let (Some(run), SessionStatus::Exited(exit)) = (&self.command_run, &self.status) else {
+            return false;
+        };
+        let finished = matches!(exit.reason, ExitReason::Exited | ExitReason::Signaled);
+        if !finished {
+            return false;
+        }
+        if run.keep_open {
+            return true;
+        }
+        let failed = exit.reason == ExitReason::Signaled || exit.code != Some(0);
+        failed && run.ran_ms.is_some_and(|ms| ms < QUICK_EXIT_MILLIS)
+    }
 }
 
 impl SessionRecord {

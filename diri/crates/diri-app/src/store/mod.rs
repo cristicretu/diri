@@ -2096,6 +2096,9 @@ impl SessionStore {
             && !self.migrating.contains(&id)
             && !self.auto_resuming.contains(&id)
             && clean_exit
+            // A command spawned to keep its tab (`--keep-open`) stays even
+            // after a success.
+            && !session.command_keeps_tab()
             && (disposable || quit_after_running)
             // Closing the tab closes its ⌘J terminals too, and an exit is no
             // confirmation that a dev server running in one may go.
@@ -3042,7 +3045,7 @@ impl SessionStore {
         self.last_action_failure = None;
         self.emit(StoreEffect::SpawnPane {
             pane,
-            params: SessionSpawnParams {
+            params: SessionSpawnParams { keep_open: None,
                 appearance: None,
                 kind: AgentKind::SHELL,
                 cwd: session.cwd.clone(),
@@ -3089,7 +3092,7 @@ impl SessionStore {
         self.last_action_failure = None;
         self.emit(StoreEffect::SpawnAuxiliary {
             slot,
-            params: SessionSpawnParams {
+            params: SessionSpawnParams { keep_open: None,
                 appearance: None,
                 kind: AgentKind::SHELL,
                 cwd: session.cwd.clone(),
@@ -3203,7 +3206,7 @@ impl SessionStore {
             .map_or((None, None, None), |worktree| {
                 (Some(worktree.create), worktree.branch, worktree.base)
             });
-        SessionSpawnParams {
+        SessionSpawnParams { keep_open: None,
             appearance: Some(crate::app_theme::spawn_appearance(self.theme_id())),
             kind,
             cwd,
