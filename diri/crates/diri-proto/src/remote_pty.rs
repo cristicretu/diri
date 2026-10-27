@@ -516,6 +516,7 @@ impl DirectoryListRequest {
 
 #[derive(Clone, Copy, Debug, Default, Deserialize, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "kebab-case")]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub enum DirectoryListMode {
     #[default]
     Directories,

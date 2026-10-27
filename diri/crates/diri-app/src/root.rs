@@ -28,6 +28,7 @@ mod site_clips;
 mod whats_new_tests;
 #[cfg(all(test, target_os = "macos"))]
 mod window_navigation_tests;
+mod app_actions;
 mod workspace_launches;
 #[cfg(all(test, target_os = "macos"))]
 mod workspace_palette_tests;
@@ -1301,6 +1302,9 @@ impl RootView {
                             if let Some(id) = launched {
                                 this.open_workspace_launch_session(id, window, cx);
                             }
+                            // Before the window's own requests: they may bring
+                            // the window forward, and an Agent's must not.
+                            this.perform_app_actions(window, cx);
                             let actions = this
                                 .window_store
                                 .write()

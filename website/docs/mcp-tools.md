@@ -553,6 +553,23 @@ Open an HTTP request in the API tab of YOUR session's right panel in Diri, prefi
 | `secrets` | string array | Names in variables to mask as secrets. |
 | `variables` | object | Variable name to value for {{name}} placeholders. |
 
+### `list_actions`
+
+List the Diri app's window actions: what its menus, keys and command palette do (split, focus, zoom or equalize panes, select tabs, toggle the sidebar, find, font size, theme). query filters by name or title. Run one with perform_action.
+
+| Argument | Type | Notes |
+| --- | --- | --- |
+| `query` | string |  |
+
+### `perform_action`
+
+Run one Diri app action from list_actions in the person's window; args must match its schema. The window names you while it changes, so change it only when the user asked. Destructive actions need args.session_id of a session you may manage, or are the person's to run.
+
+| Argument | Type | Notes |
+| --- | --- | --- |
+| `action` | string | **Required.** |
+| `args` | object |  |
+
 ### `note_links`
 
 How one Diri note connects to the others. links: the notes it links to. backlinks: every note linking to it, with the words around each link (backlinks_total counts them). unlinked_mentions: notes that write its title without linking it (unlinked:false skips them). depth (1-3) adds graph: the notes within that many links, either direction, and the links between them. Check backlinks before changing a note others depend on, and to find the plans, briefs and findings a note belongs to. note is an id, a title, part of a title, a note Session id, or "origin".

@@ -12,6 +12,7 @@ const ESC: u8 = 0x1b;
 /// A keyboard event's logical key.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "kebab-case")]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub enum Key {
     /// Characters with layout modifiers removed (AppKit's
     /// `charactersIgnoringModifiers`).
@@ -23,6 +24,7 @@ pub enum Key {
 /// Non-text keys understood by the terminal encoder.
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "kebab-case")]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub enum NamedKey {
     ArrowUp,
     ArrowDown,
@@ -55,6 +57,7 @@ pub enum NamedKey {
 /// Numeric keypad identity remains distinct from ordinary text and Enter.
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "kebab-case")]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub enum KeypadKey {
     Zero,
     One,
@@ -166,6 +169,7 @@ impl KeyEvent {
 /// Keyboard modifiers relevant to terminal input.
 #[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(default, deny_unknown_fields)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct Modifiers {
     pub shift: bool,
     pub ctrl: bool,
@@ -238,6 +242,7 @@ impl KeyboardState {
 /// Key release has no byte representation in the legacy terminal protocol.
 #[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "kebab-case")]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub enum KeyAction {
     #[default]
     Press,

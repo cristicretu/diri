@@ -1,4 +1,5 @@
 {
+  "agent_notice.app_action": "运行应用操作",
   "agent_notice.change_workspaces": "编辑工作区",
   "agent_notice.close_pane": "关闭窗格",
   "agent_notice.close_tab": "关闭标签页",

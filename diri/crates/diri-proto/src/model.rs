@@ -7,6 +7,7 @@ use std::collections::BTreeMap;
 /// A Foundation `Date` encoded by Dirijor as milliseconds since 1970.
 #[derive(Clone, Copy, Debug, Deserialize, PartialEq, PartialOrd, Serialize)]
 #[serde(transparent)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct DateMillis(pub f64);
 
 impl From<std::time::SystemTime> for DateMillis {
@@ -191,6 +192,22 @@ impl Serialize for AgentKind {
     }
 }
 
+/// Requests may name a kind by its manifest id (`"codex"`); records carry the
+/// keyed form (`{"agent":{"id":"opencode"}}`), which Deserialize also takes.
+#[cfg(feature = "schema")]
+impl schemars::JsonSchema for AgentKind {
+    fn schema_name() -> std::borrow::Cow<'static, str> {
+        "AgentKind".into()
+    }
+
+    fn json_schema(_: &mut schemars::SchemaGenerator) -> schemars::Schema {
+        schemars::json_schema!({
+            "description": "An Agent's manifest id (\"claude-code\", \"codex\", \"shell\", ...), or the keyed form a session record carries.",
+            "anyOf": [{"type": "string", "minLength": 1}, {"type": "object"}]
+        })
+    }
+}
+
 impl<'de> Deserialize<'de> for AgentKind {
     fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
     where
@@ -267,6 +284,7 @@ impl<'de> Deserialize<'de> for AttentionLevel {
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq, Hash, Serialize)]
 #[serde(transparent)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct SessionId(pub String);
 
 /// Swift spelling retained for protocol-oriented callers.

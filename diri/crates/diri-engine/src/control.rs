@@ -29,6 +29,7 @@ mod account_overview;
 mod account_switch;
 mod agent_relaunch;
 mod agent_sign_in;
+mod app_actions;
 mod claude_accounts;
 mod codex_accounts;
 mod hook_queue;
@@ -198,6 +199,8 @@ pub struct ControlServer {
     /// notes directory (tests pin a temporary one).
     notes_dir: Option<PathBuf>,
     scheduler: Arc<schedules::Scheduler>,
+    /// The connected app's exported actions and the requests waiting on it.
+    app_actions: Arc<app_actions::AppActionHub>,
 }
 
 /// Where injection files live and which CLI they point at. Present, spawns
@@ -324,6 +327,7 @@ impl ControlServer {
             phone_reads_aloud: std::sync::atomic::AtomicBool::new(false),
             notes_dir: None,
             scheduler: Arc::new(schedules::Scheduler::default()),
+            app_actions: Arc::default(),
         }
     }
 
@@ -798,6 +802,9 @@ impl ControlServer {
         diri_telemetry::count("engine.connections", 1);
         let mut reader = BufReader::new(stream.try_clone()?);
         let writer = Arc::new(Mutex::new(stream));
+        // Whatever ends this connection, an app that published actions on it
+        // stops being the performer.
+        let _performer = self.app_actions.guard(&writer);
         let mut subscription: Option<SubscriptionHandle> = None;
 
         let mut first = true;
@@ -932,6 +939,18 @@ impl ControlServer {
                 })
             }
             ControlMessage::Request { id, method, params }
+                if method == Method::APP_ACTIONS_PUBLISH || method == Method::APP_REPLY =>
+            {
+                // Both are about this connection: it becomes the performer,
+                // and only the performer may answer.
+                let result = if method == Method::APP_ACTIONS_PUBLISH {
+                    self.app_actions.publish(params, writer)
+                } else {
+                    self.app_actions.reply(params, writer)
+                };
+                Some(ControlMessage::Response { id, result })
+            }
+            ControlMessage::Request { id, method, params }
                 if matches!(
                     method.as_str(),
                     Method::SESSION_SPAWN
@@ -966,6 +985,7 @@ impl ControlServer {
                         | Method::TELEMETRY_UPLOAD_NOW
                         | Method::COMPUTER_STATUS
                         | Method::COMPUTER_SETUP
+                        | Method::APP_PERFORM
                 ) || ((method == Method::AGENT_READINESS
                     || method == Method::AGENT_CONFIGURE)
                     && params
@@ -1291,7 +1311,7 @@ impl ControlServer {
             Method::WORKTREE_SCAN => encode(&self.worktree_scan_page(decode(params)?)?),
             Method::WORKTREE_OVERVIEW => self.worktree_overview(),
             Method::TEST_RUN => self.browser_call("run", params),
-            "browser.act" => self.browser_call("browser", params),
+            Method::BROWSER_ACT => self.browser_call("browser", params),
             Method::COMPUTER_ACT => self.computer_act(params),
             Method::COMPUTER_STATUS => {
                 let p: diri_proto::ComputerStatusParams = decode(params)?;
@@ -1345,6 +1365,16 @@ impl ControlServer {
             Method::GOVERNOR_CONFIGURE => self.governor_configure(params),
             Method::TERMINAL_CONFIGURE => self.terminal_configure(params),
             Method::CLIENT_SET_ACTIVE => self.client_set_active(params),
+            Method::APP_ACTIONS_LIST => encode(&self.app_actions.list()),
+            Method::APP_PERFORM => self.app_actions.perform(params),
+            Method::API_LIST => encode(&self.app_actions.api_list()),
+            Method::API_DESCRIBE => self.app_actions.api_describe(params),
+            Method::API_LLMS => encode(&self.app_actions.api_llms()),
+            Method::APP_ACTIONS_PUBLISH | Method::APP_REPLY | Method::EVENTS_SUBSCRIBE => {
+                Err(ControlError::bad_request(format!(
+                    "{method} is answered per connection, not dispatched"
+                )))
+            }
             other => Err(ControlError::not_found(format!(
                 "method {other:?} is not implemented by this engine yet"
             ))),

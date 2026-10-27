@@ -3,6 +3,7 @@ use serde::{Deserialize, Serialize};
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub enum TaskStatus {
     AwaitingAcknowledgement,
     Acknowledged,
@@ -55,6 +56,7 @@ pub struct TaskRecord {
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct TaskSubmitParams {
     pub caller_id: String,
     pub request_id: String,
@@ -65,6 +67,7 @@ pub struct TaskSubmitParams {
 }
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct TaskGetParams {
     pub caller_id: String,
     pub task_id: Option<String>,
@@ -72,6 +75,7 @@ pub struct TaskGetParams {
 }
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct TaskReportParams {
     pub caller_id: String,
     pub task_id: String,
@@ -81,6 +85,7 @@ pub struct TaskReportParams {
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct TaskAnswerParams {
     pub caller_id: String,
     pub task_id: String,
@@ -88,6 +93,7 @@ pub struct TaskAnswerParams {
 }
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct TaskCancelParams {
     pub caller_id: String,
     pub task_id: String,
@@ -96,6 +102,7 @@ pub struct TaskCancelParams {
 }
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct TaskListParams {
     pub caller_id: String,
     /// `sent`, `assigned`, or omitted for both.

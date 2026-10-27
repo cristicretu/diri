@@ -131,11 +131,141 @@ impl Method {
     /// In memory only; older Engines lack it.
     pub const VOICE_PHONE_READER: &'static str = "voice.phone_reader";
     pub const TEST_RUN: &'static str = "test.run";
+    /// One step of the shared browser (`browser` MCP tool).
+    pub const BROWSER_ACT: &'static str = "browser.act";
     pub const STATE_SNAPSHOT: &'static str = "state.snapshot";
     pub const DAEMON_PREPARE_SHUTDOWN: &'static str = "daemon.prepare_shutdown";
     pub const DAEMON_SHUTDOWN_IF_IDLE: &'static str = "daemon.shutdown_if_idle";
     pub const DAEMON_SHUTDOWN: &'static str = "daemon.shutdown";
     pub const TELEMETRY_UPLOAD_NOW: &'static str = "telemetry.upload_now";
+    /// The app's exported actions (`app_actions::AppActionsPublishParams`);
+    /// makes the publishing connection the one that performs them.
+    pub const APP_ACTIONS_PUBLISH: &'static str = "app.actions.publish";
+    /// The connected app's actions (`app_actions::AppActionsListResult`).
+    pub const APP_ACTIONS_LIST: &'static str = "app.actions.list";
+    /// Run one app action (`app_actions::AppPerformParams`) and wait for the
+    /// app's answer.
+    pub const APP_PERFORM: &'static str = "app.perform";
+    /// The app's answer to `app.perform_requested` (`app_actions::AppReplyParams`).
+    pub const APP_REPLY: &'static str = "app.reply";
+    /// Every Engine method and app action, one line each (`api::ApiListResult`).
+    pub const API_LIST: &'static str = "api.list";
+    /// One method's or action's JSON Schema and example (`api::ApiDescribeParams`).
+    pub const API_DESCRIBE: &'static str = "api.describe";
+    /// The whole API as compact text for an Agent to read (`api::ApiTextResult`).
+    pub const API_LLMS: &'static str = "api.llms";
+
+    /// Every method above. `api.list` describes each one, and a test keeps
+    /// this list, the constants and the catalog in step.
+    pub const ALL: &'static [&'static str] = &[
+        Self::WORKSPACE_SNAPSHOT,
+        Self::WORKSPACE_MUTATE,
+        Self::HELLO,
+        Self::SESSION_SPAWN_TRACKED,
+        Self::TASK_SUBMIT,
+        Self::TASK_GET,
+        Self::TASK_REPORT,
+        Self::TASK_ANSWER,
+        Self::TASK_CANCEL,
+        Self::TASK_LIST,
+        Self::SCHEDULE_CREATE,
+        Self::SCHEDULE_UPDATE,
+        Self::SCHEDULE_DELETE,
+        Self::SCHEDULE_LIST,
+        Self::SCHEDULE_RUN_NOW,
+        Self::SESSION_SPAWN,
+        Self::SESSION_LIST,
+        Self::SESSION_KILL,
+        Self::SESSION_REMOVE,
+        Self::SESSION_RENAME,
+        Self::SESSION_PROCESS_INFO,
+        Self::SESSION_RECONNECT,
+        Self::SESSION_RESUME,
+        Self::SESSION_FORK,
+        Self::SESSION_DELIVER_MESSAGE,
+        Self::SESSION_SEND_KEY,
+        Self::SESSION_SEND_TEXT,
+        Self::SESSION_RESIZE,
+        Self::SESSION_READ_SCREEN,
+        Self::SESSION_TERMINAL_TITLE,
+        Self::SESSION_RESET_TERMINAL,
+        Self::SESSION_CAPTURE_FIND,
+        Self::SESSION_READ_SCROLLBACK,
+        Self::SESSION_READ_SCROLLBACK_CELLS,
+        Self::SESSION_READ_DIFF,
+        Self::SESSION_READ_IMAGE,
+        Self::SESSION_READ_TRANSCRIPT,
+        Self::SESSION_MARK_SEEN,
+        Self::SESSION_MARK_UNREAD,
+        Self::SESSION_HIBERNATE,
+        Self::SESSION_WAKE,
+        Self::SESSION_ARCHIVE,
+        Self::SESSION_UNARCHIVE,
+        Self::SESSION_REOPEN_LAST,
+        Self::SESSION_REVEAL,
+        Self::SESSION_OPEN_API_REQUEST,
+        Self::COMPUTER_ACT,
+        Self::COMPUTER_STATUS,
+        Self::COMPUTER_SETUP,
+        Self::SESSION_MIGRATE,
+        Self::SESSION_REPARENT_WORKTREE,
+        Self::HOST_SYNC_PREFS,
+        Self::HOST_LOCATE_REPO,
+        Self::HOST_INITIALIZE,
+        Self::HOST_USAGE,
+        Self::HOST_LIST_DIRECTORIES,
+        Self::HOST_LIST,
+        Self::SESSION_HISTORY,
+        Self::ACTIVITY_LIST,
+        Self::SESSION_RESUME_FROM_HISTORY,
+        Self::WORKTREE_CREATE,
+        Self::WORKTREE_LIST,
+        Self::WORKTREE_CLEANUP,
+        Self::WORKTREE_REMOVE,
+        Self::WORKTREE_SCAN,
+        Self::WORKTREE_OVERVIEW,
+        Self::WORKTREE_INTEGRATE,
+        Self::PROJECT_ADD,
+        Self::CLIENT_SET_ACTIVE,
+        Self::GOVERNOR_CONFIGURE,
+        Self::TERMINAL_CONFIGURE,
+        Self::AGENT_READINESS,
+        Self::AGENT_CONFIGURE,
+        Self::ACCOUNT_PROFILES_LIST,
+        Self::ACCOUNT_PROFILES_SAVE,
+        Self::ACCOUNT_PROFILES_REMOVE,
+        Self::ACCOUNT_CODEX_LOGIN,
+        Self::ACCOUNT_CODEX_CAPTURE,
+        Self::ACCOUNT_CLAUDE_LOGIN,
+        Self::ACCOUNT_CLAUDE_CAPTURE,
+        Self::ACCOUNT_SWITCH_ALL,
+        Self::ACCOUNT_OVERVIEW,
+        Self::ACCOUNT_ADOPT,
+        Self::ACCOUNT_ADD,
+        Self::SESSION_CONTINUE_ACCOUNT,
+        Self::EVENTS_SUBSCRIBE,
+        Self::EVENTS_WAIT,
+        Self::HOOK_REPORT,
+        Self::VOICE_STATE,
+        Self::VOICE_SPEAK,
+        Self::VOICE_SPOKEN,
+        Self::VOICE_LATEST_SPOKEN,
+        Self::VOICE_PHONE_READER,
+        Self::TEST_RUN,
+        Self::BROWSER_ACT,
+        Self::STATE_SNAPSHOT,
+        Self::DAEMON_PREPARE_SHUTDOWN,
+        Self::DAEMON_SHUTDOWN_IF_IDLE,
+        Self::DAEMON_SHUTDOWN,
+        Self::TELEMETRY_UPLOAD_NOW,
+        Self::APP_ACTIONS_PUBLISH,
+        Self::APP_ACTIONS_LIST,
+        Self::APP_PERFORM,
+        Self::APP_REPLY,
+        Self::API_LIST,
+        Self::API_DESCRIBE,
+        Self::API_LLMS,
+    ];
 }
 
 /// Event names pushed on subscribed control channels.
@@ -169,6 +299,10 @@ impl EventName {
     /// An Agent changed what the window shows
     /// (`agent_action::AgentActionEvent`). The app names it in a notice.
     pub const AGENT_ACTION: &'static str = "agent.action";
+    /// The Engine asks the connected app to run an action
+    /// (`app_actions::AppPerformRequest`). Written only to the connection
+    /// that published the catalog, never to the replayable event log.
+    pub const APP_PERFORM_REQUESTED: &'static str = "app.perform_requested";
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
@@ -184,6 +318,7 @@ pub struct SessionResourcesEvent {
 }
 
 #[derive(Clone, Debug, Default, Deserialize, PartialEq, Eq, Serialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct EmptyParams {}
 
 pub type EmptyResult = EmptyParams;
@@ -191,6 +326,7 @@ pub type EmptyResult = EmptyParams;
 /// orchestrator passes itself so the fork joins its own lineage.
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct SessionForkParams {
     #[serde(rename = "sessionID")]
     pub session_id: SessionId,
@@ -201,6 +337,7 @@ pub type SessionForkResult = SessionRecord;
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct ContinueAccountParams {
     #[serde(rename = "sessionID")]
     pub session_id: SessionId,
@@ -209,6 +346,7 @@ pub struct ContinueAccountParams {
 
 #[derive(Clone, Debug, Default, Deserialize, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct ActivityListParams {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub limit: Option<u16>,
@@ -245,6 +383,7 @@ pub struct TelemetryUploadNowResult {
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct HelloParams {
     pub proto: u32,
     pub build: String,
@@ -280,12 +419,14 @@ pub struct HelloResult {
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq, Serialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct ClientActiveParams {
     pub active: bool,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct GovernorSettingsParams {
     pub idle_threshold_seconds: f64,
     pub hard_memory_bytes: u64,
@@ -475,6 +616,7 @@ impl AgentReadinessResult {
 
 #[derive(Clone, Debug, Default, Deserialize, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct AgentReadinessParams {
     /// `HostEntry.id`; absent means this Mac.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -488,6 +630,7 @@ pub struct AgentReadinessParams {
 /// executable resolves.
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct AgentConfigureParams {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub host: Option<String>,
@@ -507,6 +650,7 @@ pub type AgentConfigureResult = AgentReadinessResult;
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct SessionSpawnParams {
     /// None uses the target's configured default; an empty id uses the CLI environment.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -567,6 +711,7 @@ pub struct SessionSpawnParams {
 /// The light or dark family of the terminal theme a Session is shown in.
 #[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub enum TerminalAppearance {
     Light,
     Dark,
@@ -586,6 +731,7 @@ pub type StateSnapshotParams = EmptyParams;
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct SessionIdParams {
     #[serde(rename = "sessionID")]
     pub session_id: SessionId,
@@ -629,6 +775,7 @@ pub type SessionArchiveResult = EmptyResult;
 pub type SessionUnarchiveResult = EmptyResult;
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct SessionReparentWorktreeParams {
     #[serde(rename = "sessionID")]
     pub session_id: SessionId,
@@ -642,6 +789,7 @@ pub type SessionReadScrollbackResult = ReadScrollbackResult;
 pub type SessionReadScrollbackCellsResult = ReadScrollbackCellsResult;
 #[derive(Clone, Copy, Debug, Default, Deserialize, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub enum SessionDiffBase {
     #[default]
     DefaultBranch,
@@ -650,6 +798,7 @@ pub enum SessionDiffBase {
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct SessionReadDiffParams {
     #[serde(rename = "sessionID")]
     pub session_id: SessionId,
@@ -661,6 +810,7 @@ pub struct SessionReadDiffParams {
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct HistoryEntry {
     pub id: String,
     pub kind: AgentKind,
@@ -683,6 +833,7 @@ pub type SessionHistoryParams = EmptyParams;
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct ResumeFromHistoryParams {
     pub entry: HistoryEntry,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -693,6 +844,7 @@ pub type ResumeFromHistoryResult = SessionRecord;
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct SessionRenameParams {
     #[serde(rename = "sessionID")]
     pub session_id: SessionId,
@@ -703,6 +855,7 @@ pub type SessionRenameResult = EmptyResult;
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct SendTextParams {
     #[serde(rename = "sessionID")]
     pub session_id: SessionId,
@@ -713,6 +866,7 @@ pub struct SendTextParams {
 /// One key event; ordinary Enter is a carriage return, never pasted text.
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct SendKeyParams {
     #[serde(rename = "sessionID")]
     pub session_id: SessionId,
@@ -761,6 +915,7 @@ pub struct SendKeyResult {
 /// session and retained across Engine restarts. Raw interactive input uses SendText.
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct DeliverMessageParams {
     #[serde(rename = "sessionID")]
     pub session_id: SessionId,
@@ -776,6 +931,7 @@ pub type SendTextResult = EmptyResult;
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct ResizeParams {
     #[serde(rename = "sessionID")]
     pub session_id: SessionId,
@@ -855,6 +1011,7 @@ pub struct SessionReadDiffResult {
 /// tool payloads. `available` is false for kinds or hosts without one.
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct ReadTranscriptParams {
     #[serde(rename = "sessionID")]
     pub session_id: SessionId,
@@ -885,6 +1042,7 @@ pub struct ReadTranscriptResult {
 
 #[derive(Clone, Copy, Debug, Default, Deserialize, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub enum IntegrateStrategy {
     #[default]
     Merge,
@@ -896,6 +1054,7 @@ pub enum IntegrateStrategy {
 /// checkout. The target must be clean; conflicts abort and are reported.
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct WorktreeIntegrateParams {
     #[serde(rename = "sourceSessionID")]
     pub source_session_id: SessionId,
@@ -969,6 +1128,7 @@ mod scrollback_text_tests {
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct ReadScrollbackCellsParams {
     #[serde(rename = "sessionID")]
     pub session_id: SessionId,
@@ -1020,6 +1180,7 @@ pub type SessionReopenLastResult = SessionRecord;
 /// session round-trips losslessly and origin only ever sees real commits.
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct SessionMigrateParams {
     #[serde(rename = "sessionID")]
     pub session_id: SessionId,
@@ -1044,6 +1205,7 @@ pub struct SessionMigrateResult {
 /// `host.sync_prefs`: push the local user's agent preferences to a host. The
 /// include list is FIXED daemon-side and never contains credentials.
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct HostSyncPrefsParams {
     /// `HostEntry.id` from `hosts.json`.
     pub host: String,
@@ -1074,6 +1236,7 @@ pub struct HostSyncPrefsResult {
 /// diagnostics because both can contain secrets.
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct HostInitializeParams {
     /// `HostEntry.id` from `hosts.json`.
     pub host: String,
@@ -1104,6 +1267,7 @@ pub struct HostInitializeResult {
 /// the New Agent folder picker, not a general remote filesystem protocol.
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct HostListDirectoriesParams {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub host: Option<String>,
@@ -1119,6 +1283,7 @@ pub type HostListDirectoriesResult = crate::remote_pty::DirectoryListResult;
 /// from that session's checkout (cwd + host) — one round trip for pickers.
 #[derive(Clone, Debug, Default, Deserialize, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct HostLocateRepoParams {
     /// Target host id; absent ⇒ search the daemon's local project roots.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -1142,6 +1307,7 @@ pub struct HostLocateRepoResult {
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct WorktreeCreateParams {
     pub repo_path: String,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -1154,6 +1320,7 @@ pub type WorktreeCreateResult = WorktreeInfo;
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct WorktreeListParams {
     pub repo_path: String,
 }
@@ -1162,6 +1329,7 @@ pub type WorktreeListResult = Vec<WorktreeInfo>;
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct WorktreeRemoveParams {
     pub repo_path: String,
     pub worktree_path: String,
@@ -1173,6 +1341,7 @@ pub type WorktreeRemoveResult = EmptyResult;
 /// Confirmed Settings cleanup. An older engine rejects the unknown method.
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct WorktreeCleanupParams {
     pub repo_path: String,
     pub worktree_path: String,
@@ -1194,6 +1363,7 @@ pub struct WorktreeHealth {
 /// Incremental, shared on-demand scan. Cursors belong to one generation.
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct WorktreeScanParams {
     #[serde(default)]
     pub refresh: bool,
@@ -1244,6 +1414,7 @@ pub struct WorktreeOverviewResult {
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct ProjectAddParams {
     pub root: String,
 }
@@ -1270,6 +1441,7 @@ pub type TestRunResult = JsonValue;
 
 #[derive(Clone, Debug, Default, Deserialize, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct EventsSubscribeParams {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub since_seq: Option<u64>,
@@ -1291,6 +1463,7 @@ pub struct EventsSubscribeResult {
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct EventsWaitParams {
     #[serde(rename = "sessionID")]
     pub session_id: SessionId,
@@ -1307,6 +1480,7 @@ pub struct EventsWaitResult {
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct HookReportParams {
     pub kind: String,
     #[serde(rename = "dirijorSessionID", skip_serializing_if = "Option::is_none")]
@@ -1325,6 +1499,7 @@ pub type GovernorConfigureResult = EmptyResult;
 /// it too.
 #[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct TerminalConfigureParams {
     /// Whether new zsh and bash terminals get Diri's OSC 133 prompt and
     /// command marks without any setup.
@@ -1363,6 +1538,7 @@ pub struct ForwardRequest {
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct SessionReadImageParams {
     #[serde(rename = "sessionID")]
     pub session_id: SessionId,
@@ -1507,6 +1683,7 @@ pub struct SessionClipboardEvent {
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct HostUsageParams {
     pub host: String,
 }
