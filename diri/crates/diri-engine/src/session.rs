@@ -487,6 +487,9 @@ struct Shared {
     /// What the program says it is doing with `OSC 7501`. See
     /// [`observe_program_status`].
     program_status: Mutex<ProgramStatusTrack>,
+    /// The shell has no job and is asking for a line itself, as of the last
+    /// local foreground sample. See [`shell_prompts_in_command`].
+    builtin_prompt: AtomicBool,
     /// Agents a shell recognises in its foreground, by the program name a
     /// user types to start them. Empty for every session but a shell.
     known_agents: Vec<KnownAgent>,
@@ -614,6 +617,8 @@ struct ProgressTrack {
 struct ProgramStatusTrack {
     generation_seen: u64,
     published: Option<diri_terminal_state::ProgramRecord>,
+    /// Why nothing reports any more, while `published` is `None`.
+    removal: Option<diri_terminal_state::ProgramRemoval>,
     unreduced: bool,
 }
 
@@ -3120,6 +3125,13 @@ impl Session {
             bytes,
             b"\r" | b"\n" | b"\r\n" | b"\x03" | b"\x1b" | b"y" | b"n"
         );
+        if self.manifest_id == "shell" && bytes.iter().any(|byte| matches!(byte, b'\r' | b'\n')) {
+            self.shared
+                .screen
+                .lock()
+                .expect("screen")
+                .shell_line_submitted();
+        }
         self.feed_signal(if submits {
             StatusSignal::UserSubmission
         } else {
@@ -3473,6 +3485,7 @@ fn new_shared(
         .map(|manifest| manifest.version.clone());
     let reducer = StatusReducer::new(spec.authority, SystemTime::now())
         .with_manifest(spec.manifest_id.clone(), manifest_version)
+        .with_program_reporters(engine.program_reporters())
         .with_attention_storage(
             &spec.logs_dir.join(format!("{}.attention.sqlite", spec.id)),
             fresh,
@@ -3568,6 +3581,7 @@ fn new_shared(
         foreground: Mutex::new(ForegroundProgram::default()),
         progress: Mutex::new(ProgressTrack::default()),
         program_status: Mutex::new(ProgramStatusTrack::default()),
+        builtin_prompt: AtomicBool::new(false),
         known_agents: if spec.manifest_id == "shell" {
             known_agents(engine)
         } else {
@@ -3801,6 +3815,14 @@ fn apply_foreground_sample(
     let Some(running) = crate::status::foreground_job_running(child_pid, foreground_pgid) else {
         return;
     };
+    // No job, yet the shell is asking for a line on behalf of the command it
+    // runs: fish's `read` builtin. To the status it is a job waiting on its
+    // line, which the line probe then reports. Only the shell's own marks
+    // say so, and only a local shell's foreground is known to be the shell.
+    let builtin_prompt = !running && host == SampleHost::Local && shell_prompts_in_command(shared);
+    shared
+        .builtin_prompt
+        .store(builtin_prompt, Ordering::SeqCst);
     progress_follows_job(shared, foreground_pgid.filter(|_| running));
     let agent: Option<Lend<'_>> = match host {
         #[cfg(unix)]
@@ -3821,8 +3843,15 @@ fn apply_foreground_sample(
                 reducer.lend_to_agent(&agent.manifest_id, Some(&agent.manifest_version), now)
             }
             Some(Lend::Activity(id)) => reducer.lend_to_activity(id, now),
-            None if reducer.foreground_agent().is_some() => reducer.return_from_agent(running, now),
-            None => reducer.reduce(StatusSignal::ForegroundJob { running }, now),
+            None if reducer.foreground_agent().is_some() => {
+                reducer.return_from_agent(running || builtin_prompt, now)
+            }
+            None => reducer.reduce(
+                StatusSignal::ForegroundJob {
+                    running: running || builtin_prompt,
+                },
+                now,
+            ),
         };
         let read_as = reducer.foreground_agent().map(str::to_owned);
         shared.foreground.lock().expect("foreground").read_as = read_as;
@@ -4004,9 +4033,20 @@ fn probe_direct_line_wait(_shared: &Shared, _pty: &Mutex<Pty>) {
     // Unknown on ConPTY; do not fabricate a negative observation.
 }
 
+/// Whether the shell drew a prompt inside the command line it runs, per its
+/// `OSC 133` marks. See [`diri_terminal_state::ShellPhase::PromptInCommand`].
+fn shell_prompts_in_command(shared: &Shared) -> bool {
+    shared.screen.lock().expect("screen").shell_phase()
+        == diri_terminal_state::ShellPhase::PromptInCommand
+}
+
 /// Folds a line-wait sample into the shell's status, with the question as
 /// the screen shows it. Nothing is read from the screen while echo is off.
+///
+/// The shell's own prompt inside a command (fish's `read`) is a line wait
+/// too; the PTY owner, which looks for a job, never reports it.
 fn apply_line_wait(shared: &Shared, awaiting: bool) {
+    let awaiting = awaiting || shared.builtin_prompt.load(Ordering::SeqCst);
     let prompt = awaiting.then(|| {
         let secret = shared.secret_input.load(Ordering::SeqCst);
         let line = (!secret).then(|| {
@@ -5409,6 +5449,7 @@ fn observe_program_status(shared: &Shared, screen: &HeadlessScreen) {
         return;
     }
     let progress = track.progress();
+    track.removal = screen.program_status_removal();
     track.published = next;
     track.unreduced = true;
     let progress_changed = track.progress() != progress;
@@ -5422,23 +5463,33 @@ fn observe_program_status(shared: &Shared, screen: &HeadlessScreen) {
 /// the reducer already locked, ahead of the screen observation from the same
 /// output, so a program that just reported work silences the screen rules.
 fn reduce_program_status(shared: &Shared, reducer: &mut StatusReducer, now: SystemTime) {
-    let report = {
+    let signal = {
         let mut track = shared.program_status.lock().expect("program status");
         if !std::mem::take(&mut track.unreduced) {
             return;
         }
-        track.published.clone()
+        match (&track.published, track.removal) {
+            (None, Some(reason)) => StatusSignal::ProgramStatusRemoved(reason),
+            (report, _) => StatusSignal::ProgramStatus(report.clone()),
+        }
     };
-    let outcome = reducer.reduce(StatusSignal::ProgramStatus(report), now);
+    if let StatusSignal::ProgramStatusRemoved(reason) = &signal {
+        diri_telemetry::debug_event!(
+            "session.program_status_removed",
+            session = diri_telemetry::id(&shared.id),
+            reason = reason.as_str(),
+        );
+    }
+    let outcome = reducer.reduce(signal, now);
     apply(shared, &outcome);
 }
 
 /// The program a session's `OSC 7501` records described has ended: the
 /// wrapped agent returned to its shell, or a shell's job left the foreground.
-fn end_program_status(shared: &Shared) {
+fn end_program_status(shared: &Shared, reason: diri_terminal_state::ProgramRemoval) {
     {
         let mut screen = shared.screen.lock().expect("screen");
-        if !screen.end_program_status() {
+        if !screen.end_program_status(reason) {
             return;
         }
         observe_program_status(shared, &screen);
@@ -5462,7 +5513,7 @@ fn progress_follows_job(shared: &Shared, job: Option<i32>) {
         shared.bump_state_version();
     }
     if ended {
-        end_program_status(shared);
+        end_program_status(shared, diri_terminal_state::ProgramRemoval::Foreground);
     }
 }
 
@@ -6398,7 +6449,7 @@ fn split_shell_status(status: i32) -> (Option<i32>, Option<i32>) {
 /// that change with the rest of this output.
 fn note_agent_exit(shared: &Shared, status: i32, screen: &mut HeadlessScreen) {
     *shared.agent_exit.lock().expect("agent exit") = Some(status);
-    if screen.end_program_status() {
+    if screen.end_program_status(diri_terminal_state::ProgramRemoval::ChildExited) {
         observe_program_status(shared, screen);
     }
     if status == 0

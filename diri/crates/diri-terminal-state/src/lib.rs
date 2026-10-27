@@ -19,9 +19,10 @@ mod program_status;
 pub use inline_images::{
     DEFAULT_CELL_PIXELS, STORE_BUDGET_BYTES as INLINE_IMAGE_BUDGET_BYTES, StoredImage,
 };
-pub use notifications::{AGENT_EXIT_OSC, TerminalNotification};
+pub use notifications::{AGENT_EXIT_OSC, ShellPhase, TerminalNotification};
 pub use program_status::{
-    BlockedKind, ProgramRecord, ProgramState, QUERY_REPLY as PROGRAM_STATUS_QUERY_REPLY,
+    BlockedKind, ProgramRecord, ProgramRemoval, ProgramState,
+    QUERY_REPLY as PROGRAM_STATUS_QUERY_REPLY,
 };
 
 use std::sync::mpsc::{self, Receiver, SyncSender};
@@ -550,12 +551,37 @@ impl HeadlessScreen {
         self.notifications.as_ref()?.program.summary()
     }
 
-    /// Drops the `OSC 7501` records of a program that has ended. Returns
-    /// whether there were any.
-    pub fn end_program_status(&mut self) -> bool {
+    /// Drops the `OSC 7501` records of a program that has ended, for
+    /// `reason`. Returns whether there were any.
+    pub fn end_program_status(&mut self, reason: ProgramRemoval) -> bool {
         self.notifications
             .as_mut()
-            .is_some_and(|parser| parser.program.end_program())
+            .is_some_and(|parser| parser.program.end_program(reason))
+    }
+
+    /// Where the shell is between its `OSC 133` marks, read from live output
+    /// only. [`ShellPhase::Unknown`] without notifications.
+    pub fn shell_phase(&self) -> ShellPhase {
+        self.notifications
+            .as_ref()
+            .map_or(ShellPhase::Unknown, |parser| parser.shell)
+    }
+
+    /// The user submitted a line. A question the shell's own line reader
+    /// was asking ([`ShellPhase::PromptInCommand`]) is answered: the command
+    /// line runs on until the shell draws another prompt or ends it.
+    pub fn shell_line_submitted(&mut self) {
+        if let Some(parser) = self.notifications.as_mut()
+            && parser.shell == ShellPhase::PromptInCommand
+        {
+            parser.shell = ShellPhase::Running;
+        }
+    }
+
+    /// Why the `OSC 7501` records went away, while none are left: the
+    /// program cleared them, the terminal was reset, or the program ended.
+    pub fn program_status_removal(&self) -> Option<ProgramRemoval> {
+        self.notifications.as_ref()?.program.removal()
     }
 
     pub fn take_notifications(&mut self) -> Vec<TerminalNotification> {

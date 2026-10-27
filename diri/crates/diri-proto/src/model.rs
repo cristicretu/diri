@@ -304,9 +304,13 @@ impl std::fmt::Display for ProjectId {
 }
 
 string_enum! {
+    /// `Auth` is a program waiting for the user to sign in (`OSC 7501`
+    /// `kind=auth`): neither a permission to grant nor a question a typed
+    /// reply answers.
     pub enum NeedsInputKind {
         Permission => "permission",
         Question => "question",
+        Auth => "auth",
     }
 }
 
