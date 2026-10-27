@@ -942,49 +942,88 @@ fn session_wait(arguments: &[String]) -> Result<(), CliError> {
     Ok(())
 }
 
-fn session_spawn(arguments: &[String]) -> Result<(), CliError> {
-    if matches!(arguments, [help] if matches!(help.as_str(), "--help" | "-h")) {
-        println!(
-            "Usage: dirijor session spawn KIND [OPTIONS]\n\n\
-             Arguments:\n  KIND             Agent kind to launch (for example, codex)\n\n\
-             Options:\n  --cwd PATH       Working directory (defaults to the current directory)\n  \
-             --worktree       Create a Git worktree for the session\n  \
-             --branch NAME    Branch for the worktree\n  \
-             --prompt TEXT    Initial prompt for the agent\n  \
-             --title TEXT     Session title (--name is an alias)\n  \
-             --host ID        Host on which to launch the agent\n  \
-             --json           Print the result as JSON\n  \
-             -h, --help       Show this help\n\n\
-             Example (local):\n  dirijor session spawn codex --cwd /path/to/repo --prompt \"Explain this project\""
-        );
-        return Ok(());
+const SESSION_SPAWN_HELP: &str = "Usage: dirijor session spawn KIND [OPTIONS]\n\n\
+     Arguments:\n  KIND             Agent kind to launch (for example, codex)\n\n\
+     Options:\n  --cwd PATH       Working directory (defaults to the current directory)\n  \
+     --worktree       Create a Git worktree for the session\n  \
+     --branch NAME    Branch for the worktree\n  \
+     --prompt TEXT    Initial prompt for the agent\n  \
+     --title TEXT     Session title (--name is an alias)\n  \
+     --host ID        Host on which to launch the agent\n  \
+     --json           Print the result as JSON\n  \
+     -h, --help       Show this help\n\n\
+     Example (local):\n  dirijor session spawn codex --cwd /path/to/repo --prompt \"Explain this project\"";
+
+/// `None` means help was requested: it wins wherever it appears, so asking
+/// for help never starts a session or creates a worktree.
+fn session_spawn_params(arguments: &[String]) -> Result<Option<(Value, bool)>, CliError> {
+    let usage = "usage: dirijor session spawn KIND [OPTIONS]; see dirijor session spawn --help";
+    let mut params = json!({});
+    let mut kind = None;
+    let mut json_output = false;
+    let mut arguments = arguments.iter();
+    while let Some(argument) = arguments.next() {
+        let field = match argument.as_str() {
+            "--help" | "-h" => return Ok(None),
+            "--json" => {
+                json_output = true;
+                continue;
+            }
+            "--worktree" => {
+                params["worktree"] = json!(true);
+                continue;
+            }
+            "--cwd" => "cwd",
+            "--branch" => "branch",
+            "--prompt" => "prompt",
+            "--title" | "--name" => "name",
+            "--host" => "host",
+            option if option.starts_with('-') => {
+                return Err(CliError::failure(format!(
+                    "unknown session spawn option {option:?}; {usage}"
+                )));
+            }
+            positional => {
+                if kind.replace(positional).is_some() {
+                    return Err(CliError::failure(format!(
+                        "unexpected argument {positional:?}; {usage}"
+                    )));
+                }
+                continue;
+            }
+        };
+        let value = arguments
+            .next()
+            .ok_or_else(|| CliError::failure(format!("{argument} requires a value")))?;
+        if params.get(field).is_some() {
+            return Err(CliError::failure(format!(
+                "{argument} was supplied more than once"
+            )));
+        }
+        params[field] = json!(value);
     }
-    let kind = positional(arguments, 0)
-        .ok_or_else(|| CliError::failure("session spawn requires an agent kind"))?;
-    let cwd = option_value(arguments, "--cwd")
-        .or_else(|| {
-            std::env::current_dir()
-                .ok()
-                .map(|path| path.to_string_lossy().into_owned())
-        })
-        .ok_or_else(|| CliError::failure("could not determine the working directory"))?;
-    let mut params = json!({
-        "kind": kind,
-        "cwd": cwd,
-        "worktree": has_flag(arguments, "--worktree"),
-        "branch": option_value(arguments, "--branch"),
-        "prompt": option_value(arguments, "--prompt"),
-        "name": option_value(arguments, "--title").or_else(|| option_value(arguments, "--name")),
-        "host": option_value(arguments, "--host"),
-    });
-    params
-        .as_object_mut()
-        .expect("spawn object")
-        .retain(|_, value| !value.is_null());
+    let kind = kind.ok_or_else(|| CliError::failure("session spawn requires an agent kind"))?;
+    params["kind"] = json!(kind);
+    if params.get("worktree").is_none() {
+        params["worktree"] = json!(false);
+    }
+    if params.get("cwd").is_none() {
+        let cwd = std::env::current_dir()
+            .map_err(|_| CliError::failure("could not determine the working directory"))?;
+        params["cwd"] = json!(cwd.to_string_lossy());
+    }
+    Ok(Some((params, json_output)))
+}
+
+fn session_spawn(arguments: &[String]) -> Result<(), CliError> {
+    let Some((params, json_output)) = session_spawn_params(arguments)? else {
+        println!("{SESSION_SPAWN_HELP}");
+        return Ok(());
+    };
     let result = bridge()
         .spawn_user_session(&params)
         .map_err(map_bridge_error)?;
-    if has_flag(arguments, "--json") {
+    if json_output {
         print_json(&result);
     } else if let Some(id) = result.get("id").and_then(Value::as_str) {
         println!("spawned {id}");

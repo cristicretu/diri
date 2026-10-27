@@ -51,10 +51,18 @@ fn spawn_help_never_connects_to_an_engine() {
     let socket = temp.path().join("engine.sock");
     let listener = UnixListener::bind(&socket).unwrap();
     listener.set_nonblocking(true).unwrap();
-    for flag in ["--help", "-h"] {
+    let invocations: [&[&str]; 5] = [
+        &["--help"],
+        &["-h"],
+        &["codex", "--help"],
+        &["--cwd", "/tmp", "codex", "-h"],
+        &["claude", "--worktree", "--branch", "foo", "-h"],
+    ];
+    for arguments in invocations {
         assert_help(
             Command::new(env!("CARGO_BIN_EXE_dirijor"))
-                .args(["session", "spawn", flag])
+                .args(["session", "spawn"])
+                .args(arguments)
                 .env("DIRIJOR_SOCKET", &socket)
                 .current_dir(temp.path())
                 .output()
@@ -81,4 +89,43 @@ fn spawn_missing_kind_keeps_its_error_without_contacting_engine() {
         b"dirijor: session spawn requires an agent kind\n"
     );
     assert_eq!(std::fs::read_dir(temp.path()).unwrap().count(), 0);
+}
+
+#[test]
+fn spawn_rejects_bad_arguments_without_contacting_engine() {
+    let temp = tempfile::tempdir().unwrap();
+    let socket = temp.path().join("engine.sock");
+    let listener = UnixListener::bind(&socket).unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let cases: [(&[&str], &str); 4] = [
+        (
+            &["codex", "--promt", "fix it"],
+            "dirijor: unknown session spawn option \"--promt\"; usage: dirijor session spawn KIND [OPTIONS]; see dirijor session spawn --help\n",
+        ),
+        (
+            &["codex", "claude"],
+            "dirijor: unexpected argument \"claude\"; usage: dirijor session spawn KIND [OPTIONS]; see dirijor session spawn --help\n",
+        ),
+        (
+            &["codex", "--prompt"],
+            "dirijor: --prompt requires a value\n",
+        ),
+        (
+            &["codex", "--title", "a", "--name", "b"],
+            "dirijor: --name was supplied more than once\n",
+        ),
+    ];
+    for (arguments, stderr) in cases {
+        let output = Command::new(env!("CARGO_BIN_EXE_dirijor"))
+            .args(["session", "spawn"])
+            .args(arguments)
+            .env("DIRIJOR_SOCKET", &socket)
+            .current_dir(temp.path())
+            .output()
+            .unwrap();
+        assert_eq!(output.status.code(), Some(1), "{arguments:?}");
+        assert_eq!(output.stdout, b"");
+        assert_eq!(String::from_utf8(output.stderr).unwrap(), stderr);
+        assert_eq!(listener.accept().unwrap_err().kind(), ErrorKind::WouldBlock);
+    }
 }

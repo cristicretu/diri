@@ -107,8 +107,9 @@ dirijor run --wait --rm -- cargo test --workspace && echo green
 `--name` is accepted as an alias for `--title`. `--host` takes a host id from your [remote hosts](/docs/remote-hosts/).
 
 For spawn usage, all supported options, and a local example, run
-`dirijor session spawn --help` (or `-h`). Help works without a running Engine
-and does not start a session or create a worktree.
+`dirijor session spawn --help` (or `-h`). `--help` anywhere in a spawn command
+prints help instead, so it never starts a session or creates a worktree, and
+works without a running Engine. Unknown options are rejected rather than ignored.
 
 ### Wait statuses
 
