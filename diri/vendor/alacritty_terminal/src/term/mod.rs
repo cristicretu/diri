@@ -498,15 +498,22 @@ pub enum Osc52 {
 }
 
 impl<T> Term<T> {
+    /// Bound primary history to `budget` stored bytes. The configured
+    /// `scrolling_history` is only a ceiling: see
+    /// [`Grid::bound_history_storage`].
     #[cfg(feature = "compact-history")]
     pub fn bound_primary_history_storage(&mut self, budget: usize) {
+        let ceiling = self.config.scrolling_history;
+        self.primary_grid_mut()
+            .bound_history_storage(budget, ceiling);
+    }
+
+    #[cfg(feature = "compact-history")]
+    fn primary_grid_mut(&mut self) -> &mut Grid<Cell> {
         if self.mode.contains(TermMode::ALT_SCREEN) {
-            self.inactive_grid
-                .as_mut()
-                .expect("primary grid")
-                .bound_history_storage(budget);
+            self.inactive_grid.as_mut().expect("primary grid")
         } else {
-            self.grid.bound_history_storage(budget);
+            &mut self.grid
         }
     }
 
@@ -847,6 +854,13 @@ impl<T> Term<T> {
         self.vi_mode_cursor.point.line += delta;
 
         let is_alt = self.mode.contains(TermMode::ALT_SCREEN);
+        // Reflow may change the physical row count; only the configured
+        // ceiling limits it by rows. The caller's byte bound trims afterwards.
+        #[cfg(feature = "compact-history")]
+        {
+            let ceiling = self.config.scrolling_history;
+            self.primary_grid_mut().restore_history_limit(ceiling);
+        }
         self.grid.resize(!is_alt, num_lines, num_cols);
         if let Some(inactive_grid) = self.inactive_grid.as_mut() {
             inactive_grid.resize(is_alt, num_lines, num_cols);

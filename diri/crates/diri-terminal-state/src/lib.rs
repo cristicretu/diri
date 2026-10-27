@@ -275,17 +275,30 @@ impl ScreenSnapshot {
     }
 }
 
-/// Retain up to 10,000 physical history rows within 4 MiB of stored row
-/// representation. Cold rows are losslessly compressed; visible cells and
-/// temporary caller-owned responses are separate. Dense differential builds
-/// translate this allowance into a width-dependent row count.
+/// History depth is bounded by 4 MiB of stored row representation, not by a
+/// row count. Cold rows are losslessly compressed, so typical agent and build
+/// output keeps 100,000+ rows at 80 columns while high-entropy output keeps
+/// fewer; visible cells and temporary caller-owned responses are separate.
+/// Dense differential builds translate this allowance into a width-dependent
+/// row count.
 const HISTORY_STORAGE_BUDGET_BYTES: usize = 4 << 20;
+
+/// The most physical history rows kept however well they compress, so the
+/// work that scales with rows (a column change's first history scan, reading
+/// reflowed history) stays bounded for near-empty output. Typical output
+/// reaches the byte budget first.
+pub const HISTORY_ROW_CEILING: usize = 150_000;
+
+/// Newest history rows a checkpoint or a whole-history text read carries.
+/// Both run under the screen lock; deeper history stays readable page by
+/// page through `scrollback_cells`.
+pub const HISTORY_EXPORT_ROWS: usize = 10_000;
 
 fn history_line_limit(cols: usize) -> usize {
     #[cfg(feature = "compact-history")]
     {
         let _ = cols;
-        10_000
+        HISTORY_ROW_CEILING
     }
     #[cfg(not(feature = "compact-history"))]
     {
@@ -768,6 +781,22 @@ impl HeadlessScreen {
         self.settle();
     }
 
+    /// Retained history rows above the active screen's visible grid.
+    pub fn history_rows(&self) -> usize {
+        self.term.grid().history_size()
+    }
+
+    /// Stored bytes of the active screen's history, the quantity the history
+    /// budget bounds. Zero without compact history.
+    pub fn history_storage_bytes(&self) -> usize {
+        #[cfg(feature = "compact-history")]
+        {
+            self.term.grid().history_storage_bytes()
+        }
+        #[cfg(not(feature = "compact-history"))]
+        0
+    }
+
     pub fn content_seq(&self) -> u64 {
         self.content_seq
     }
@@ -1011,25 +1040,30 @@ impl HeadlessScreen {
     /// Styled rows above the visible grid, oldest first. Checkpoints persist
     /// these alongside the visible snapshot so adoption does not collapse a
     /// long session to a single scrollback row.
+    ///
+    /// Only the newest [`HISTORY_EXPORT_ROWS`] rows: a checkpoint is taken
+    /// under the screen lock while output streams.
     pub fn history_snapshot(&mut self) -> Vec<Vec<GridCell>> {
         let history = self.term.grid().history_size();
+        let exported = history.min(HISTORY_EXPORT_ROWS);
         let cols = self.geometry.cols;
-        let mut rows = Vec::with_capacity(history);
-        for index in 0..history {
-            let line = Line(index as i32 - history as i32);
+        let mut rows = Vec::with_capacity(exported);
+        for index in 0..exported {
+            let line = Line(index as i32 - exported as i32);
             let mut row = Vec::with_capacity(cols);
             let source = &self.term.grid()[line];
             for x in 0..cols {
                 row.push(wire_cell(&source[Column(x)]));
             }
             rows.push(row);
-            self.finish_history_read_batch(index + 1, index + 1 == history);
+            self.finish_history_read_batch(index + 1, index + 1 == exported);
         }
         rows
     }
 
+    /// Annotations of the rows [`Self::history_snapshot`] exports.
     pub fn history_metadata(&mut self) -> Vec<RowMetadata> {
-        let count = self.term.grid().history_size();
+        let count = self.term.grid().history_size().min(HISTORY_EXPORT_ROWS);
         let mut rows = Vec::with_capacity(count);
         for index in 0..count {
             rows.push(self.row_metadata(Line(index as i32 - count as i32)));
@@ -1260,15 +1294,19 @@ impl HeadlessScreen {
     /// retains. They slide once the history budget evicts, so a client caching
     /// deep scrollback across heavy output may refetch; the visible region and
     /// recent history are exact.
+    ///
+    /// Carries only the newest [`HISTORY_EXPORT_ROWS`] history rows, from
+    /// `first_row`: the whole text is built under the screen lock.
     pub fn scrollback(&mut self) -> diri_proto::ReadScrollbackResult {
         let history = self.term.grid().history_size();
+        let first = history - history.min(HISTORY_EXPORT_ROWS);
         let rows = self.geometry.rows;
         let cols = self.geometry.cols;
         let total = history + rows;
-        let mut lines = Vec::with_capacity(total);
+        let mut lines = Vec::with_capacity(total - first);
         let mut text_cells = std::collections::BTreeMap::new();
         let mut ranges = Vec::with_capacity(cols);
-        for index in 0..total {
+        for index in first..total {
             let line = Line(index as i32 - history as i32);
             let mut text = String::with_capacity(cols);
             ranges.clear();
@@ -1304,15 +1342,15 @@ impl HeadlessScreen {
                 .enumerate()
                 .any(|(i, range)| usize::from(range[0]) != i || usize::from(range[1]) != i + 1)
             {
-                text_cells.insert(index, ranges.clone());
+                text_cells.insert(index - first, ranges.clone());
             }
             lines.push(text);
-            self.finish_history_read_batch(index + 1, index + 1 == total);
+            self.finish_history_read_batch(index - first + 1, index + 1 == total);
         }
         diri_proto::ReadScrollbackResult {
             lines,
             text_cells,
-            first_row: 0,
+            first_row: first as i64,
             visible_start_row: history as i64,
             cols: cols as i64,
             rows: rows as i64,
@@ -3053,6 +3091,276 @@ mod tests {
             "restorable"
         );
         assert_eq!(restored.scrollback(), original.scrollback());
+    }
+
+    /// Text of history rows `first..first + count`, by absolute row.
+    #[cfg(feature = "compact-history")]
+    fn history_text(screen: &mut HeadlessScreen, first: i64, count: i64) -> Vec<String> {
+        let page = screen.scrollback_cells(first, count);
+        diri_proto::grid::GridRowCodec::decode_rows(&page.payload, page.row_count as usize)
+            .unwrap()
+            .iter()
+            .map(|row| {
+                row.iter()
+                    .map(|cell| char::from_u32(cell.scalar).unwrap_or(' '))
+                    .collect::<String>()
+                    .trim_end()
+                    .to_owned()
+            })
+            .collect()
+    }
+
+    /// A build-log line numbered `n`, styled like compiler output.
+    #[cfg(feature = "compact-history")]
+    fn build_line(n: usize) -> String {
+        format!(
+            "\x1b[1;32m   Compiling\x1b[0m crate-{} v0.{}.{} line {n:07}\r\n",
+            n % 97,
+            n % 13,
+            n % 7
+        )
+    }
+
+    #[cfg(feature = "compact-history")]
+    fn line_number(text: &str) -> Option<usize> {
+        text.rsplit_once("line ")?.1.get(..7)?.parse().ok()
+    }
+
+    #[cfg(feature = "compact-history")]
+    #[test]
+    fn history_depth_is_bounded_by_stored_bytes_not_rows() {
+        let mut screen = HeadlessScreen::new(80, 24);
+        let lines = 60_000;
+        let log: String = (0..lines).map(build_line).collect();
+        for chunk in log.as_bytes().chunks(64 * 1024) {
+            screen.feed(chunk);
+        }
+        // Far past the former 10,000-row cap: nothing was evicted.
+        assert_eq!(screen.history_rows(), lines + 1 - 24);
+        assert!(screen.history_storage_bytes() <= HISTORY_STORAGE_BUDGET_BYTES);
+        // The oldest line is still readable, at depth.
+        assert_eq!(
+            history_text(&mut screen, 0, 1)[0],
+            "   Compiling crate-0 v0.0.0 line 0000000"
+        );
+    }
+
+    #[cfg(feature = "compact-history")]
+    #[test]
+    fn near_empty_output_stops_at_the_row_ceiling() {
+        let mut screen = HeadlessScreen::new(80, 24);
+        let blank = b"\r\n".repeat(64 * 1024);
+        for _ in 0..(HISTORY_ROW_CEILING / blank.len() * 2 + 2) {
+            screen.feed(&blank);
+        }
+        assert_eq!(screen.history_rows(), HISTORY_ROW_CEILING);
+        assert!(screen.history_storage_bytes() <= HISTORY_STORAGE_BUDGET_BYTES);
+    }
+
+    /// One numbered row of random truecolor cells: incompressible styles.
+    #[cfg(feature = "compact-history")]
+    fn noisy_line(n: usize, cols: usize, seed: &mut u64) -> String {
+        let mut line = String::new();
+        for _ in 0..cols - 13 {
+            *seed ^= *seed << 13;
+            *seed ^= *seed >> 7;
+            *seed ^= *seed << 17;
+            let [r, g, b, br, bg, bb, ch, _] = seed.to_le_bytes();
+            let ch = char::from(b'!' + ch % 94);
+            line.push_str(&format!("\x1b[38;2;{r};{g};{b};48;2;{br};{bg};{bb}m{ch}"));
+        }
+        line.push_str(&format!("\x1b[0m line {n:07}\r\n"));
+        line
+    }
+
+    #[cfg(feature = "compact-history")]
+    #[test]
+    fn worst_case_output_stays_within_the_byte_budget_and_evicts_oldest_first() {
+        let cols = 80;
+        let mut screen = HeadlessScreen::new(cols, 24);
+        let mut seed = 0x9e37_79b9_7f4a_7c15;
+        let mut fed = 0;
+        let mut at_capacity = None;
+        while fed < 12_000 {
+            let chunk: String = (fed..fed + 500)
+                .map(|n| noisy_line(n, cols, &mut seed))
+                .collect();
+            screen.feed(chunk.as_bytes());
+            fed += 500;
+            // The bound holds after every feed, not only at the end.
+            assert!(screen.history_storage_bytes() <= HISTORY_STORAGE_BUDGET_BYTES);
+            if at_capacity.is_none() && screen.history_rows() < fed + 1 - 24 {
+                at_capacity = Some(screen.history_rows());
+            }
+        }
+        let capacity = at_capacity.expect("incompressible output reaches the budget");
+        assert!(
+            capacity < 10_000,
+            "{capacity} rows of incompressible output"
+        );
+        // At capacity, every retained row is present, in order, with only the
+        // oldest evicted: the newest history row is the line above the screen.
+        let rows = screen.history_rows();
+        assert!(
+            rows >= capacity * 9 / 10,
+            "{rows} rows after eviction ({capacity})"
+        );
+        let numbers: Vec<_> = history_text(&mut screen, 0, rows as i64)
+            .iter()
+            .map(|text| line_number(text).expect("numbered row"))
+            .collect();
+        assert_eq!(numbers.len(), rows);
+        assert_eq!(*numbers.last().unwrap(), fed - 24);
+        assert!(numbers.windows(2).all(|pair| pair[1] == pair[0] + 1));
+    }
+
+    #[cfg(feature = "compact-history")]
+    #[test]
+    fn history_regrows_after_incompressible_output_gives_way() {
+        let cols = 80;
+        let mut screen = HeadlessScreen::new(cols, 24);
+        let mut seed = 7;
+        let noisy: String = (0..6_000).map(|n| noisy_line(n, cols, &mut seed)).collect();
+        screen.feed(noisy.as_bytes());
+        let capacity = screen.history_rows();
+        assert!(capacity < 6_000 - 23, "the budget evicted noisy rows");
+        // Compressible output recycles noisy rows, frees bytes, and history
+        // grows past the noisy capacity again.
+        let log: String = (0..40_000).map(build_line).collect();
+        for chunk in log.as_bytes().chunks(64 * 1024) {
+            screen.feed(chunk);
+            assert!(screen.history_storage_bytes() <= HISTORY_STORAGE_BUDGET_BYTES);
+        }
+        // Every build line is retained, beneath what is left of the noise.
+        let rows = screen.history_rows();
+        assert!(
+            rows > 40_000 && rows > capacity,
+            "{rows} rows ({capacity} noisy)"
+        );
+        let first_build = (rows + 24 - 1 - 40_000) as i64;
+        assert_eq!(
+            line_number(&history_text(&mut screen, first_build, 1)[0]),
+            Some(0)
+        );
+    }
+
+    #[cfg(feature = "compact-history")]
+    #[test]
+    fn a_column_change_at_capacity_keeps_hard_line_history() {
+        let mut screen = HeadlessScreen::new(80, 24);
+        // Past the row ceiling, history recycles its oldest row per line and
+        // leaves the oldest block partial. Every line is a hard line that
+        // fits each width used below, so a column change keeps the stored
+        // rows instead of indexing every line (which would evict history).
+        let lines = HISTORY_ROW_CEILING + 1_000;
+        let log: String = (0..lines).map(build_line).collect();
+        for chunk in log.as_bytes().chunks(64 * 1024) {
+            screen.feed(chunk);
+        }
+        let rows = screen.history_rows();
+        assert_eq!(rows, HISTORY_ROW_CEILING);
+        let oldest = history_text(&mut screen, 0, 1);
+        for cols in [72, 80, 100, 80] {
+            screen.resize(cols, 24);
+            assert_eq!(screen.history_rows(), rows, "rows at {cols} columns");
+            assert_eq!(history_text(&mut screen, 0, 1), oldest);
+            assert!(screen.history_storage_bytes() <= HISTORY_STORAGE_BUDGET_BYTES);
+        }
+    }
+
+    #[cfg(feature = "compact-history")]
+    #[test]
+    fn find_and_fetch_work_at_depth() {
+        let mut screen = HeadlessScreen::new(80, 24);
+        let lines = 100_000;
+        let mut log: String = (0..lines).map(build_line).collect();
+        log.push_str("needle at the end\r\n");
+        for chunk in log.as_bytes().chunks(64 * 1024) {
+            screen.feed(chunk);
+        }
+        let history = screen.history_rows();
+        assert!(history >= lines - 24, "{history} rows retained");
+        // Fetch at depth: the oldest rows, and a page in the middle.
+        assert_eq!(line_number(&history_text(&mut screen, 0, 1)[0]), Some(0));
+        let middle = history_text(&mut screen, 50_000, 3);
+        assert_eq!(
+            middle.iter().map(|t| line_number(t)).collect::<Vec<_>>(),
+            [Some(50_000), Some(50_001), Some(50_002)]
+        );
+        // The Find capture stays bounded however deep history is, and its
+        // absolute rows agree with scrollback fetches.
+        let capture = screen.find_capture_cells().unwrap();
+        let total = (history + 24) as i64;
+        assert_eq!(capture.total_rows, total);
+        assert_eq!(capture.live_start_row, history as i64);
+        assert!(
+            capture.row_count as usize
+                <= (diri_proto::FIND_CAPTURE_MAX_CELLS / 80).min(diri_proto::FIND_CAPTURE_MAX_ROWS)
+        );
+        let rows = diri_proto::grid::GridRowCodec::decode_rows(
+            &capture.payload,
+            capture.row_count as usize,
+        )
+        .unwrap();
+        let needle = rows
+            .iter()
+            .position(|row| {
+                row.iter()
+                    .map(|cell| char::from_u32(cell.scalar).unwrap_or(' '))
+                    .collect::<String>()
+                    .starts_with("needle")
+            })
+            .expect("needle in capture") as i64
+            + capture.first_row;
+        assert_eq!(history_text(&mut screen, needle, 1), ["needle at the end"]);
+        let first = history_text(&mut screen, capture.first_row, 1);
+        assert_eq!(
+            line_number(&first[0]),
+            Some(capture.first_row as usize),
+            "capture rows are absolute history rows"
+        );
+    }
+
+    #[cfg(feature = "compact-history")]
+    #[test]
+    fn exports_under_the_screen_lock_carry_only_recent_history() {
+        let mut screen = HeadlessScreen::new(80, 24);
+        let lines = 30_000;
+        let log: String = (0..lines).map(build_line).collect();
+        screen.feed(log.as_bytes());
+        let history = screen.history_rows();
+        assert!(history > HISTORY_EXPORT_ROWS);
+
+        let snapshot = screen.history_snapshot();
+        assert_eq!(snapshot.len(), HISTORY_EXPORT_ROWS);
+        assert_eq!(screen.history_metadata().len(), HISTORY_EXPORT_ROWS);
+        let newest: String = snapshot
+            .last()
+            .unwrap()
+            .iter()
+            .map(|cell| char::from_u32(cell.scalar).unwrap_or(' '))
+            .collect();
+        assert_eq!(line_number(&newest), Some(lines - 24));
+
+        let text = screen.scrollback();
+        assert_eq!(text.first_row as usize, history - HISTORY_EXPORT_ROWS);
+        assert_eq!(text.visible_start_row as usize, history);
+        assert_eq!(text.lines.len(), HISTORY_EXPORT_ROWS + 24);
+        assert_eq!(
+            line_number(&text.lines[0]),
+            Some(history - HISTORY_EXPORT_ROWS)
+        );
+
+        // A checkpoint of deep history restores its newest rows.
+        let mut restored = HeadlessScreen::new(80, 24);
+        assert!(restored.restore(
+            &snapshot,
+            &screen.full_snapshot(),
+            false,
+            false,
+            MouseModes::OFF
+        ));
+        assert_eq!(restored.history_rows(), HISTORY_EXPORT_ROWS);
     }
 
     #[cfg(feature = "compact-history")]

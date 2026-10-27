@@ -839,13 +839,26 @@ uses typed Cell style palettes, UTF-8 scalars and style runs followed by DEFLATE
 Row occupancy, flags, colors, links and combining marks survive exact round trips.
 There is one parser and no background compression task or terminal lock.
 
-Retain up to 10,000 physical history rows under a 4 MiB stored-history allowance:
-compressed payload, allocated block/row indexes, and editable history cells.
-Discard only oldest history when either limit is reached. Visible cells,
-cell-extra heap allocations, temporary codec/read/reflow work and caller-owned
-response buffers are separate from this allowance. Reflow can alter physical row
-count and therefore evict oldest rows at the same cap. History capacity no longer
-shrinks merely because the terminal becomes wider.
+History depth is bounded by a 4 MiB stored-history allowance, not a row count:
+compressed payload, allocated block/row indexes, the line index of history whose
+column change is deferred, and editable history cells. A ceiling of 150,000
+physical rows bounds row-proportional work for near-empty output; typical agent
+and build output reaches the byte allowance first (about 120,000-185,000 rows at
+80 columns, 70,000-115,000 at 200; incompressible truecolor output about 3,800
+at 80). Discard only oldest history when either limit is reached. Once the byte
+allowance evicts, each new line recycles the oldest row, as at the row ceiling;
+when stored history falls 1/16 below the allowance, history grows again.
+Visible cells, cell-extra heap allocations, temporary codec/read/reflow work and
+caller-owned response buffers are separate from this allowance. Reflow can alter
+physical row count and the deferred line index, and therefore evict oldest rows
+under the same allowance. History capacity no longer shrinks merely because the
+terminal becomes wider. The Remote Helper uses the same core, so its scrollback
+stays bounded by the same 4 MiB.
+
+Exports taken under the screen lock carry only the newest 10,000 history rows:
+the Engine checkpoint (so adoption after an Engine restart restores those rows)
+and the whole-text `session.read_scrollback` (its `firstRow` marks the start).
+Deeper rows remain readable through paged scrollback reads.
 
 History reads decode bounded row blocks and release caches at exclusive borrow
 boundaries. Resizing untouched hard lines retains compressed payloads and pads

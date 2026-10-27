@@ -1,5 +1,47 @@
 # diri performance record
 
+## History depth bounded by stored bytes (2026-10-27)
+
+History used to stop at 10,000 rows even though compressed rows used under
+10% of the 4 MiB budget. Depth is now bounded by that 4 MiB of stored
+(compressed) history, with a 150,000-row ceiling for near-empty output.
+`cargo bench -p diri-terminal-state --bench history_depth` feeds 300,000 lines
+(150,000 for the worst case) into one `HeadlessScreen`; base = origin/main.
+
+| content | cols | rows base → branch | stored bytes/row | RSS growth |
+|---|---|---|---|---|
+| agent transcript (truecolor, box drawing, diffs, CJK) | 80 | 10,000 → 127,548 | 32.2 | 6.2 MiB |
+| agent transcript | 200 | 10,000 → 70,543 | 59.0 | 7.2 MiB |
+| `cargo build` log | 80 | 10,000 → 150,000 (ceiling) | 23.0 | 5.1 MiB |
+| `cargo build` log | 200 | 10,000 → 117,487 | 35.7 | 6.5 MiB |
+| `seq` | 80 | 10,000 → 150,000 (ceiling) | 8.1 | 2.5 MiB |
+| random truecolor per cell | 80 | 3,839 → 3,812 | 1,096 | 12.8 MiB |
+
+Reference multiplexer, isolated server, 80×24: `cat` of 150,000 numbered lines
+kept 96,219 (oldest `053782`), and server RSS grew 42 → 130 MB.
+
+Unchanged under the lock: the Engine checkpoint and `session.read_scrollback` now
+export only the newest 10,000 history rows (12–35 ms; at 127k rows they took
+160–370 ms). Find capture is bounded by `FIND_CAPTURE_MAX_CELLS` and costs the
+same (1–2 ms). Feed throughput, oldest-page fetch (50–150 µs at any depth),
+attach seed and the wheel are within noise of base.
+
+Costs that scale with depth (`terminal_interactions`, 100,000 lines, 160×50):
+the first column change after a burst scans the new history once, 7 → 61 ms
+(ASCII) and 18 → 74 ms (CJK); later drag steps go from p50 55 to 184 µs because
+deferred lines are re-counted per width. The first deep read after a column
+change reflows deferred history once: 91 ms at 127k agent-transcript rows. Every
+gated p95 stays under 8.3 ms. History grows by recycling the cells of the
+newest sealed block, so the growth phase does not allocate a row per line.
+
+A column change now keeps stored rows when only the oldest block is partial.
+Before this, a terminal at capacity indexed every line, and that index could
+evict half of its history. Deferring wrapped lines still costs about 8 bytes
+per line within the budget: narrowing and widening an 80-column agent
+transcript at capacity kept 96,015 of 127,548 rows (base kept 6,429 of 10,000).
+Hard-line output loses nothing. Measured while other agents loaded the machine
+(load average 18–30); timings are single runs, alternated base/branch.
+
 ## Resource growth over a long session: explained, not leaked (2026-09-30)
 
 Local telemetry from one 0.8.10 install (4.7 h, one `health` sample a
