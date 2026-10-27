@@ -1,4 +1,5 @@
 mod agent_catalog;
+mod agent_notice;
 mod agent_setup;
 mod alerts;
 mod api_client;

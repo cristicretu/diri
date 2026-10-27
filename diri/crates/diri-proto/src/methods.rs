@@ -166,6 +166,9 @@ impl EventName {
     /// An Agent called `computer` before setup was finished
     /// (`ComputerSetupNeededEvent`). The app offers to finish it.
     pub const COMPUTER_SETUP_NEEDED: &'static str = "computer.setup_needed";
+    /// An Agent changed what the window shows
+    /// (`agent_action::AgentActionEvent`). The app names it in a notice.
+    pub const AGENT_ACTION: &'static str = "agent.action";
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]

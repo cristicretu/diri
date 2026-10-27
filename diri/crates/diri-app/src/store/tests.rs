@@ -3800,6 +3800,49 @@ fn a_reveal_request_selects_the_session() {
 }
 
 #[test]
+fn an_agents_window_change_names_it_once_and_unknown_actors_stay_silent() {
+    let mut agent = session("fix-auth", "p", 1.0);
+    agent.title_source = TitleSource::UserRename;
+    let mut gone = session("old", "p", 2.0);
+    gone.archived_at = Some(DateMillis(3.0));
+    let mut note = session("plan", "p", 3.0);
+    note.kind = AgentKind::NOTE;
+    let (mut store, mut effects) = hydrated(
+        vec![agent.clone(), gone.clone(), note.clone()],
+        vec![project("p", "P")],
+        Prefs::default(),
+    );
+    drain(&mut effects);
+    let acted = |actor: &str, action: &str, seq: u64| EventEnvelope {
+        name: diri_proto::EventName::AGENT_ACTION.into(),
+        params: serde_json::json!({ "sessionID": actor, "action": action }),
+        seq,
+    };
+    let banners = |effects: &mut mpsc::UnboundedReceiver<StoreEffect>| -> Vec<crate::toast::Toast> {
+        drain(effects)
+            .into_iter()
+            .filter_map(|effect| match effect {
+                StoreEffect::StatusTransition(transition) => transition.in_app_banner,
+                _ => None,
+            })
+            .collect()
+    };
+    // Nothing a user sees as store state changes: no sidebar rebuild.
+    assert!(!store.handle_event(acted(&agent.id.0, "zoom_pane", 2)));
+    let shown = banners(&mut effects);
+    assert_eq!(shown.len(), 1);
+    assert!(shown[0].ambient, "the Agent notice, not a feedback toast");
+    assert_eq!(shown[0].message, "fix-auth: Zoom pane");
+    // Unknown, archived, and future actions are dropped, never shown as ids.
+    store.handle_event(acted("s_gone", "zoom_pane", 3));
+    store.handle_event(acted(&gone.id.0, "split_pane", 4));
+    store.handle_event(acted(&agent.id.0, "teleport_pane", 5));
+    // Work started from a note is the person's own action.
+    store.handle_event(acted(&note.id.0, "new_tab", 6));
+    assert!(banners(&mut effects).is_empty());
+}
+
+#[test]
 fn an_agents_api_request_waits_for_the_window_to_open_it() {
     let agent = session("codex", "p", 1.0);
     let (mut store, _effects) = hydrated(

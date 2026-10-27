@@ -1124,6 +1124,28 @@ impl ControlServer {
     }
 
     fn dispatch(&self, method: &str, params: Option<JsonValue>) -> Result<JsonValue, ControlError> {
+        // An Agent's window change is announced only once it committed, so a
+        // rejected or conflicting request never shows a notice.
+        let announcement = diri_proto::agent_action::announcement(method, params.as_ref());
+        let result = self.dispatch_recorded(method, params);
+        if result.is_ok()
+            && let Some(announcement) = announcement
+        {
+            let actor = announcement.session_id.0.clone();
+            self.events.publish_encoded(
+                diri_proto::EventName::AGENT_ACTION,
+                &announcement,
+                Some(&actor),
+            );
+        }
+        result
+    }
+
+    fn dispatch_recorded(
+        &self,
+        method: &str,
+        params: Option<JsonValue>,
+    ) -> Result<JsonValue, ControlError> {
         if !diri_telemetry::is_enabled() {
             return self.dispatch_method(method, params);
         }
