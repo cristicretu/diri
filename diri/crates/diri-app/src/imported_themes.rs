@@ -25,7 +25,23 @@ pub(crate) fn dir_for(prefs_path: &Path) -> PathBuf {
 }
 
 pub(crate) fn default_dir() -> PathBuf {
+    #[cfg(test)]
+    if let Some(dir) = TEST_DIR.with(|dir| dir.borrow().clone()) {
+        return dir;
+    }
     dir_for(&Prefs::path())
+}
+
+#[cfg(test)]
+thread_local! {
+    static TEST_DIR: std::cell::RefCell<Option<PathBuf>> = const { std::cell::RefCell::new(None) };
+}
+
+/// Points [`default_dir`] at `dir` on this thread, so UI tests never write
+/// into the person's real themes folder.
+#[cfg(test)]
+pub(crate) fn set_test_dir(dir: Option<PathBuf>) {
+    TEST_DIR.with(|slot| *slot.borrow_mut() = dir);
 }
 
 /// Reads every theme in `dir`. Files that no longer parse are skipped; they

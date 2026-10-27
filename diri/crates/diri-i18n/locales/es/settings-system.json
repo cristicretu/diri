@@ -32,6 +32,7 @@
   "settings.appearance.shell_integration_detail": "Marcar los prompts de zsh y bash y el resultado de cada comando en los terminales nuevos. Se aplica a los terminales abiertos después del cambio.",
   "settings.appearance.terminal_font": "Tipo de letra del terminal",
   "settings.appearance.theme": "Tema",
+  "settings.appearance.theme_drop_hint": "O suelta aquí un tema de Ghostty o un archivo .itermcolors",
   "settings.appearance.theme_error_format": "no es un tema de iTerm2, Ghostty ni diri",
   "settings.appearance.theme_error_missing": "faltan colores obligatorios",
   "settings.appearance.theme_error_newer": "creado con una versión más nueva de diri",
