@@ -1970,6 +1970,27 @@ Unicode placeholders and animation (as for local sessions); a per-client cell
 size for remote `ws_xpixel` (the Holder uses the default cell size); and image
 survival across Holder restarts.
 
+## Grapheme cluster widths (October 2026)
+
+The shared parser in `diri-terminal-state` measures grapheme clusters, not
+codepoints, so the Holder and the local Engine lay out `❤️` (VS16), ZWJ
+sequences, skin tones, keycaps and flag pairs as one cell of two columns. The
+default widths are those of `Bun.stringWidth` in the Bun release embedded in
+Claude Code, from Bun's own generated table
+(`vendor/alacritty_terminal/src/term/grapheme_table.rs`); a program that sets
+DECSET 2027 gets first-codepoint cluster widths instead, and DECRQM 2027
+reports the mode. A cluster's extra codepoints ride the existing grapheme
+metadata and the widened base is followed by the existing wide-spacer cell,
+so Snapshot, Diff, the grid codec and the protocol minor are unchanged.
+
+This is a Helper build change, not a protocol change. The parser source is
+part of the Build ID, so a new Engine uploads a new Helper and new Holders use
+the new widths. A live Holder keeps the binary that launched it and its old
+codepoint widths until its session restarts; the Engine renders that Holder's
+grid as sent. Mode 2027 is parser state: it is not carried in snapshots or
+checkpoints, so after a Holder or Engine restart a program sees the default
+widths until it sets the mode again.
+
 ## Read-only output log ownership
 
 Opening a raw output log as a reader never creates directories, creates a missing

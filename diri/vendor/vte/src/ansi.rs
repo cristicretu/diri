@@ -956,6 +956,7 @@ impl PrivateMode {
             1049 => Self::Named(NamedPrivateMode::SwapScreenAndSetRestoreCursor),
             2004 => Self::Named(NamedPrivateMode::BracketedPaste),
             2026 => Self::Named(NamedPrivateMode::SyncUpdate),
+            2027 => Self::Named(NamedPrivateMode::GraphemeClustering),
             _ => Self::Unknown(mode),
         }
     }
@@ -1007,6 +1008,9 @@ pub enum NamedPrivateMode {
     BracketedPaste = 2004,
     /// The mode is handled automatically by [`Processor`].
     SyncUpdate = 2026,
+    /// Grapheme cluster widths by the first codepoint and variation
+    /// selectors, instead of the default `stringWidth`-compatible rule.
+    GraphemeClustering = 2027,
 }
 
 /// Mode for clearing line.

@@ -28,9 +28,16 @@ use crate::vte::ansi::{
 
 pub mod cell;
 pub mod color;
+mod grapheme;
+mod grapheme_table;
 pub mod keyboard;
 pub mod search;
-mod spacing_marks;
+
+/// Columns `text` takes as this terminal lays it out by default: the grapheme
+/// cluster widths of Bun's `stringWidth`, which Claude Code assumes.
+pub fn grapheme_width(text: &str) -> usize {
+    grapheme::str_width(text, false)
+}
 
 /// Minimum number of columns.
 ///
@@ -79,6 +86,8 @@ bitflags! {
         const REPORT_ALTERNATE_KEYS   = 1 << 20;
         const REPORT_ALL_KEYS_AS_ESC  = 1 << 21;
         const REPORT_ASSOCIATED_TEXT  = 1 << 22;
+        /// DECSET 2027: grapheme cluster widths by the clustering rule.
+        const GRAPHEME_CLUSTERING     = 1 << 23;
         const MOUSE_MODE              = Self::MOUSE_REPORT_CLICK.bits() | Self::MOUSE_MOTION.bits() | Self::MOUSE_DRAG.bits();
         const KITTY_KEYBOARD_PROTOCOL = Self::DISAMBIGUATE_ESC_CODES.bits()
                                       | Self::REPORT_EVENT_TYPES.bits()
@@ -1242,6 +1251,238 @@ impl<T> Term<T> {
         cursor_cell.extra = extra;
     }
 
+    /// Adds `c` to the grapheme cluster in the cell before the cursor when no
+    /// cluster boundary separates them, resizing that cell when the cluster's
+    /// width changes (`❤` + VS16 becomes two columns, a second regional
+    /// indicator makes a two-column flag). Returns false when `c` starts a
+    /// new cluster or takes columns of its own.
+    ///
+    /// The cluster is read back from the cell, so no state outlives a cursor
+    /// move: a cell holds one cluster's codepoints in order.
+    fn continue_cluster(&mut self, c: char, info: grapheme::Info) -> bool
+    where
+        T: EventListener,
+    {
+        // Real clusters hold a handful of codepoints; past this a run of
+        // joiners stops growing one cell without bound.
+        const MAX_CLUSTER_CHARS: usize = 32;
+
+        let point = self.grid.cursor.point;
+        let mut column = point.column;
+        if !self.grid.cursor.input_needs_wrap {
+            if column.0 == 0 {
+                return false;
+            }
+            column -= 1;
+        }
+        let line = point.line;
+        if self.grid[line][column]
+            .flags
+            .contains(Flags::WIDE_CHAR_SPACER)
+        {
+            if column.0 == 0 {
+                return false;
+            }
+            column -= 1;
+        }
+        let cell = &self.grid[line][column];
+        if cell
+            .flags
+            .intersects(Flags::WIDE_CHAR_SPACER | Flags::LEADING_WIDE_CHAR_SPACER)
+        {
+            return false;
+        }
+        let zerowidth = cell.zerowidth().unwrap_or(&[]);
+        if zerowidth.len() >= MAX_CLUSTER_CHARS {
+            return false;
+        }
+        // Cheap rejections before replaying the cell, for runs of marks and
+        // emoji. A codepoint rejected here lands exactly as it would after a
+        // cluster boundary: a zero-width mark on this cell, anything else in
+        // cells of its own.
+        let clustering = self.mode.contains(TermMode::GRAPHEME_CLUSTERING);
+        let first = grapheme::Info::of(cell.c);
+        let base = first.class();
+        if !grapheme::is_presentation_mark(c) {
+            let alone_presents = grapheme::Cluster::new(cell.c, first).presentation();
+            if info.width() == 0 {
+                // A mark changes no width, except that a second codepoint
+                // makes a lone regional indicator a two-column cluster.
+                if !(zerowidth.is_empty() && alone_presents) {
+                    return false;
+                }
+            } else if !clustering
+                && !matches!(
+                    info.class(),
+                    grapheme::Class::RegionalIndicator
+                        | grapheme::Class::EmojiModifier
+                        | grapheme::Class::ExtendedPictographic
+                        | grapheme::Class::EmojiModifierBase
+                )
+                && !alone_presents
+                && !zerowidth.iter().any(|&z| grapheme::sets_presentation(z))
+            {
+                // By default a codepoint with columns keeps them unless an
+                // emoji rule decides the cluster's width.
+                return false;
+            }
+        }
+        match info.class() {
+            grapheme::Class::ExtendedPictographic
+            | grapheme::Class::EmojiModifierBase
+            | grapheme::Class::IndicConsonant
+                if zerowidth.is_empty() =>
+            {
+                return false;
+            }
+            grapheme::Class::RegionalIndicator
+                if !zerowidth.is_empty() || base != grapheme::Class::RegionalIndicator =>
+            {
+                return false;
+            }
+            _ => (),
+        }
+
+        // Replay the cell's cluster to recover the break state.
+        let mut cluster = grapheme::Cluster::new(cell.c, first);
+        let mut previous = base;
+        let mut state = grapheme::BreakState::Default;
+        for &z in zerowidth {
+            let z_info = grapheme::Info::of(z);
+            if grapheme::breaks(previous, z_info.class(), &mut state) {
+                // The cell holds a zero-width cluster after its own (a stray
+                // mark); leave it alone.
+                return false;
+            }
+            cluster.add(z, z_info);
+            previous = z_info.class();
+        }
+        if grapheme::breaks(previous, info.class(), &mut state) {
+            return false;
+        }
+
+        let before = cluster.width(clustering);
+        cluster.add(c, info);
+        let after = cluster.width(clustering);
+        // By default a joined codepoint with columns of its own (a spacing
+        // mark, a second Hangul lead) keeps its own cells: the cluster is as
+        // wide as the sum of its codepoints, which per-cell layout gives.
+        if !clustering && info.width() > 0 && !cluster.presentation() {
+            return false;
+        }
+
+        let cell_width = if cell.flags.contains(Flags::WIDE_CHAR) {
+            2
+        } else {
+            1
+        };
+        self.grid[line][column].push_zerowidth(c);
+        if after != before && before == cell_width {
+            match after {
+                2 => self.widen_cluster(line, column),
+                1 => self.narrow_cluster(line, column),
+                _ => (),
+            }
+        }
+        true
+    }
+
+    /// Turns the one-column cluster at `column`, just before the cursor (or
+    /// under a cursor waiting to wrap), into a two-column one.
+    fn widen_cluster(&mut self, line: Line, column: Column)
+    where
+        T: EventListener,
+    {
+        let columns = self.columns();
+        if columns < 2 {
+            return;
+        }
+        if column.0 + 1 >= columns {
+            // No room on this row: the cluster moves to the next one, as a
+            // wide character that does not fit would have.
+            if !self.mode.contains(TermMode::LINE_WRAP) {
+                return;
+            }
+            let cluster = self.grid[line][column].clone();
+            self.grid.cursor.input_needs_wrap = false;
+            self.grid.cursor.point.column = column;
+            self.grid
+                .cursor
+                .template
+                .flags
+                .insert(Flags::LEADING_WIDE_CHAR_SPACER);
+            self.write_at_cursor(' ');
+            self.grid
+                .cursor
+                .template
+                .flags
+                .remove(Flags::LEADING_WIDE_CHAR_SPACER);
+            self.damage.content_changed(line);
+            self.wrapline();
+            self.grid.cursor.template.flags.insert(Flags::WIDE_CHAR);
+            self.write_at_cursor(cluster.c);
+            self.grid.cursor.template.flags.remove(Flags::WIDE_CHAR);
+            let shell_marks = self.grid.cursor_cell().flags & Flags::SHELL_MARKS;
+            let target = self.grid.cursor_cell();
+            *target = cluster;
+            target.flags.remove(Flags::SHELL_MARKS | Flags::WRAPLINE);
+            target.flags.insert(Flags::WIDE_CHAR | shell_marks);
+        } else {
+            self.grid[line][column].flags.insert(Flags::WIDE_CHAR);
+            self.grid.cursor.input_needs_wrap = false;
+            self.grid.cursor.point.column = column;
+        }
+
+        // The spacer takes the next column, shifting the row in insert mode.
+        self.grid.cursor.point.column += 1;
+        let spacer = self.grid.cursor.point.column;
+        if self.mode.contains(TermMode::INSERT) && spacer.0 + 1 < columns {
+            let cursor_line = self.grid.cursor.point.line;
+            let row = &mut self.grid[cursor_line][..];
+            for col in (spacer.0..columns - 1).rev() {
+                row.swap(col + 1, col);
+            }
+        }
+        self.grid
+            .cursor
+            .template
+            .flags
+            .insert(Flags::WIDE_CHAR_SPACER);
+        self.write_at_cursor(' ');
+        self.grid
+            .cursor
+            .template
+            .flags
+            .remove(Flags::WIDE_CHAR_SPACER);
+        if self.grid.cursor.point.column + 1 < columns {
+            self.grid.cursor.point.column += 1;
+        } else {
+            self.grid.cursor.input_needs_wrap = true;
+        }
+    }
+
+    /// Turns the two-column cluster at `column` into a one-column one (text
+    /// presentation under mode 2027), freeing its spacer.
+    fn narrow_cluster(&mut self, line: Line, column: Column) {
+        let spacer_column = column + 1;
+        if spacer_column.0 >= self.columns()
+            || !self.grid[line][spacer_column]
+                .flags
+                .contains(Flags::WIDE_CHAR_SPACER)
+        {
+            return;
+        }
+        self.grid[line][column].flags.remove(Flags::WIDE_CHAR);
+        let spacer = &mut self.grid[line][spacer_column];
+        spacer.flags.remove(Flags::WIDE_CHAR_SPACER);
+        spacer.c = ' ';
+        if self.grid.cursor.input_needs_wrap && self.grid.cursor.point.column == spacer_column {
+            self.grid.cursor.input_needs_wrap = false;
+        } else {
+            self.grid.cursor.point.column = spacer_column;
+        }
+    }
+
     #[inline]
     fn damage_cursor(&mut self) {
         // The normal cursor coordinates are always in viewport.
@@ -1342,13 +1583,17 @@ impl<T: EventListener> Handler for Term<T> {
     /// A character to be displayed.
     #[inline(never)]
     fn input(&mut self, c: char) {
-        // Number of cells the char will occupy. Spacing marks join the
-        // previous cell, the way Claude Code measures them.
-        let width = match c.width() {
-            Some(1) if spacing_marks::is_spacing_mark(c) => 0,
-            Some(width) => width,
-            None => return,
-        };
+        // Controls never reach the grid.
+        if c < ' ' || ('\u{7F}'..'\u{A0}').contains(&c) {
+            return;
+        }
+        // Number of cells the char will occupy, as Claude Code (Bun's
+        // `stringWidth`) measures it; see `grapheme`.
+        let info = grapheme::Info::of(c);
+        if grapheme::may_join(c, info) && self.continue_cluster(c, info) {
+            return;
+        }
+        let width = info.width();
 
         // Handle zero-width characters.
         if width == 0 {
@@ -2370,6 +2615,7 @@ impl<T: EventListener> Handler for Term<T> {
                 self.event_proxy.send_event(Event::CursorBlinkingChange);
             }
             NamedPrivateMode::SyncUpdate => (),
+            NamedPrivateMode::GraphemeClustering => self.mode.insert(TermMode::GRAPHEME_CLUSTERING),
         }
     }
 
@@ -2421,6 +2667,7 @@ impl<T: EventListener> Handler for Term<T> {
                 self.event_proxy.send_event(Event::CursorBlinkingChange);
             }
             NamedPrivateMode::SyncUpdate => (),
+            NamedPrivateMode::GraphemeClustering => self.mode.remove(TermMode::GRAPHEME_CLUSTERING),
         }
     }
 
@@ -2466,6 +2713,9 @@ impl<T: EventListener> Handler for Term<T> {
                     self.mode.contains(TermMode::BRACKETED_PASTE).into()
                 }
                 NamedPrivateMode::SyncUpdate => ModeState::Reset,
+                NamedPrivateMode::GraphemeClustering => {
+                    self.mode.contains(TermMode::GRAPHEME_CLUSTERING).into()
+                }
                 NamedPrivateMode::ColumnMode => ModeState::NotSupported,
             },
             PrivateMode::Unknown(_) => ModeState::NotSupported,
