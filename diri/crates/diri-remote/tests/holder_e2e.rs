@@ -324,6 +324,7 @@ fn detach_reconnect_preserves_pid_snapshot_and_input() {
         cols: 80,
         rows: 24,
         persistence: PersistenceCapability::NonPersistent,
+        keyboard_enhancements: false,
     };
     let launch: LaunchResult = run_json("launch", &state_dir, Some(&request));
     assert_ne!(launch.holder_pid, launch.process_pid);
@@ -538,6 +539,7 @@ fn detached_foreground_job_does_not_spin_the_holder() {
         cols: 80,
         rows: 24,
         persistence: PersistenceCapability::NonPersistent,
+        keyboard_enhancements: false,
     };
     let launch: LaunchResult = run_json("launch", &state_dir, Some(&request));
     struct Cleanup<'a>(&'a std::path::Path, SessionSelector);
@@ -616,6 +618,7 @@ fn holder_agent_has_a_real_editable_resizable_terminal() {
         cols: 80,
         rows: 24,
         persistence: PersistenceCapability::NonPersistent,
+        keyboard_enhancements: false,
     };
     let launch: LaunchResult = run_json("launch", &state_dir, Some(&request));
     let mut attach = Attach::open(&state_dir, hello(&launch, Some(0), "terminal-capabilities"));
@@ -670,6 +673,7 @@ fn list_kill_and_gc_complete_the_session_lifecycle() {
         cols: 80,
         rows: 24,
         persistence: PersistenceCapability::NonPersistent,
+        keyboard_enhancements: false,
     };
     let launched: LaunchResult = run_json("launch", &state_dir, Some(&request));
     let session_root = state_dir.join("sessions").join(&request.session_id);
@@ -742,6 +746,7 @@ fn killed_session_id_can_launch_a_new_authenticated_incarnation() {
         cols: 80,
         rows: 24,
         persistence: PersistenceCapability::NonPersistent,
+        keyboard_enhancements: false,
     };
     let first: LaunchResult = run_json("launch", &state_dir, Some(&first_request));
     let _: SessionInspection = run_json(
@@ -803,6 +808,7 @@ fn incompatible_protocol_and_wrong_incarnation_fail_with_structured_errors() {
         cols: 80,
         rows: 24,
         persistence: PersistenceCapability::NonPersistent,
+        keyboard_enhancements: false,
     };
     let launch: LaunchResult = run_json("launch", &state_dir, Some(&request));
 
@@ -867,6 +873,7 @@ fn explicit_stop_records_real_term_trap_and_forced_exit_facts() {
             cols: 80,
             rows: 24,
             persistence: PersistenceCapability::NonPersistent,
+            keyboard_enhancements: false,
         };
         let launch: LaunchResult = run_json("launch", &state_dir, Some(&request));
         let selector = SessionSelector {
@@ -929,6 +936,7 @@ fn concurrent_explicit_stops_complete_one_owned_lifecycle() {
         cols: 80,
         rows: 24,
         persistence: PersistenceCapability::NonPersistent,
+        keyboard_enhancements: false,
     };
     let launch: LaunchResult = run_json("launch", &state_dir, Some(&request));
     let selector = SessionSelector {
@@ -985,6 +993,7 @@ fn signal_exit_and_holder_failure_are_reported_without_orphaning_the_agent() {
         cols: 80,
         rows: 24,
         persistence: PersistenceCapability::NonPersistent,
+        keyboard_enhancements: false,
     };
     let launch: LaunchResult = run_json("launch", &state_dir, Some(&request));
     let mut attach = Attach::open(&state_dir, hello(&launch, None, "signal-client"));
@@ -1337,6 +1346,7 @@ fn existing_user_supervisor_can_own_one_holder_without_persistent_configuration(
         cols: 80,
         rows: 24,
         persistence: PersistenceCapability::UserSupervisor,
+        keyboard_enhancements: false,
     };
     let launch: LaunchResult = run_json("launch", &state_dir, Some(&request));
     assert_eq!(launch.persistence, PersistenceCapability::UserSupervisor);
@@ -1383,6 +1393,7 @@ fn performance_gate_meets_remote_holder_latency_budget() {
         cols: 100,
         rows: 32,
         persistence: PersistenceCapability::NonPersistent,
+        keyboard_enhancements: false,
     };
     let launch: LaunchResult = run_json("launch", &state_dir, Some(&request));
 
@@ -1509,6 +1520,7 @@ fn slow_attach_never_blocks_pty_and_reconnects_from_full_snapshot() {
         cols: 100,
         rows: 32,
         persistence: PersistenceCapability::NonPersistent,
+        keyboard_enhancements: false,
     };
     let launch: LaunchResult = run_json("launch", &state_dir, Some(&request));
 
@@ -1608,6 +1620,7 @@ fn bounded_drain_preserves_output_and_grid_before_process_exit() {
         argv: vec!["/bin/sh".into(), "-c".into(), "stty -echo; printf 'ready\\n'; read start; head -c 2097152 /dev/zero | tr '\\000' x; printf 'tail-complete'".into()],
         cwd: "/".into(), environment: vec![], cols: 80, rows: 24,
         persistence: PersistenceCapability::NonPersistent,
+        keyboard_enhancements: false,
     }));
     let mut attach = Attach::open(&state_dir, hello(&launch, Some(0), "exit-tail-client"));
     // A controller lease can arrive before the shell disables echo. Wait for
@@ -1666,6 +1679,7 @@ fn continuous_output_keeps_controller_responsive() {
         argv: vec!["/bin/sh".into(), "-c".into(), "stty -echo; printf 'ready\\n'; read start; yes noisy-output & producer=$!; read line; kill $producer; wait $producer 2>/dev/null; printf 'ack:%s\\n' \"$line\"; read end".into()],
         cwd: "/".into(), environment: vec![], cols: 80, rows: 24,
         persistence: PersistenceCapability::NonPersistent,
+        keyboard_enhancements: false,
     }));
     let mut attach = Attach::open(&state_dir, hello(&launch, Some(0), "loaded-client"));
     attach.receive_until(Duration::from_secs(5), |message| {
@@ -1719,6 +1733,7 @@ fn stopping_during_output_checkpoints_leaves_no_temporary_state() {
                 cols: 80,
                 rows: 24,
                 persistence: PersistenceCapability::NonPersistent,
+                keyboard_enhancements: false,
             }),
         );
         let session_root = state_dir.join("sessions").join(&launch.session_id);
@@ -1812,6 +1827,7 @@ fn impaired_tcp_preserves_input_history_and_reconnect() {
                 "i=0; while [ $i -lt 8192 ]; do printf '%080d\\n' $i; i=$((i+1)); done; printf 'ready>'; while IFS= read -r line; do printf 'ack:%s\\n' \"$line\"; done".into()],
             cwd: "/".into(), environment: vec![], cols: 100, rows: 24,
             persistence: PersistenceCapability::NonPersistent,
+            keyboard_enhancements: false,
         }));
         // Always reap the fixture's Agent tree even if a protocol assertion fails.
         struct Cleanup(std::path::PathBuf, SessionSelector);
