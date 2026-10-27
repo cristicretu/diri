@@ -15,6 +15,7 @@ pub use computer::{
     ComputerStatus, ComputerStatusParams,
 };
 pub mod control;
+pub mod find;
 pub mod frames;
 pub mod grid;
 pub mod hosts;

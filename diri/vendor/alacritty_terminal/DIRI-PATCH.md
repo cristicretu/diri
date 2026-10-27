@@ -274,3 +274,13 @@ cells of the newest sealed block (`RowCodec::clear_row`). Column changes keep
 stored rows when only the oldest block is partial, and the deferred line index
 reserves exact capacity and tracks its extras' heap incrementally (the history
 bound measures storage after every eviction).
+
+## Stable history rows
+
+`Grid` counts the rows that leave history from its oldest end (`history_origin`):
+rows a full scroll region recycles at the row limit, rows `update_history`
+trims, `bound_history_storage` evictions and `clear_history`. `history_origin +
+index` therefore names a history row stably while output evicts older rows.
+Diri's whole-history Find pages and jumps by these rows. One `u64` per grid, no
+per-row cost; not serialized. Resizes that reflow history renumber rows as
+before; Find stops paging at a width change and starts over with its next capture.

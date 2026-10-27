@@ -963,6 +963,20 @@ retained on the remote host. A Helper that cannot serve the rows makes the
 capture fail, and the client falls back to searching the mirrored screen, which
 is what every remote session did before.
 
+Find over a local session's whole history (October 2026) adds the local control
+method `session.find_history`: one bounded page of matches per request, walking
+from a stable row toward older output, with the Engine holding the screen lock
+for one run of 128 rows at a time and keeping no search state between pages.
+Stable rows count from a per-grid `history_origin` (rows that have left history
+from its oldest end) added to the vendored parser; local `session.capture_find`
+replies carry it as an optional `historyOrigin`. Remote sessions deliberately
+stay on the capture path above: the Helper gets no search request or
+capability, and remote captures omit `historyOrigin`, so the client never asks
+for older pages. A remote search would either page every history row over SSH
+to the Engine or add a Helper search protocol; neither is part of this baseline.
+The parser change alters the Helper Build ID only; live Holders keep their
+binary and no frame or on-disk format changes.
+
 The shared terminal parser additionally retains OSC 8 targets, soft-wrap facts,
 wide-cell continuation facts, combining characters, and OSC 133 A prompt-start
 marks. These are terminal screen facts; the Holder does not infer commands,

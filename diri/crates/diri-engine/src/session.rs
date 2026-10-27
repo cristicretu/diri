@@ -1068,6 +1068,7 @@ impl ScrollbackReader {
             })
             .map_err(|error| diri_proto::ControlError::new("find_capture_unavailable", error))?;
             return Ok(diri_proto::CaptureFindResult {
+                history_origin: None,
                 owner: self.shared.find_owner.clone(),
                 capture_revision: self
                     .shared
@@ -1093,7 +1094,9 @@ impl ScrollbackReader {
             .find_capture_cells()
             .map_err(|error| diri_proto::ControlError::new("find_capture_too_large", error))?;
         let first = cells.first_row;
+        let history_origin = Some(screen.history_origin());
         Ok(diri_proto::CaptureFindResult {
+            history_origin,
             owner: self.shared.find_owner.clone(),
             capture_revision: self
                 .shared
@@ -1104,6 +1107,25 @@ impl ScrollbackReader {
             visible_rows,
             partial: first > 0,
             cells,
+        })
+    }
+
+    /// One page of Find over this terminal's whole history. Remote sessions
+    /// keep searching the capture their Holder serves (`capture_find`): the
+    /// Helper has no history search, and paging every row over SSH would
+    /// cost more than the search.
+    pub(crate) fn find_history(
+        self,
+        params: &diri_proto::find::FindHistoryParams,
+    ) -> Result<diri_proto::find::FindHistoryResult, diri_proto::ControlError> {
+        if self.remote.is_some() {
+            return Err(diri_proto::ControlError::new(
+                "find_history_unsupported",
+                "History search runs on the remote host's capture",
+            ));
+        }
+        crate::find_history::find_history_page(params, || {
+            self.shared.screen.lock().expect("screen")
         })
     }
 
