@@ -4775,6 +4775,23 @@ impl UtilitySurfaces {
                 .flex_col()
                 .gap(px(SETTINGS_SECTION_GAP))
                 .children(self.computer_settings(cx))
+                .child(setting_section(
+                    t("settings.agents.session_names"),
+                    toggle_row(
+                        t("settings.agents.name_sessions"),
+                        t("settings.agents.name_sessions_detail"),
+                        self.prefs.agents_name_sessions,
+                        "toggle-agents-name-sessions",
+                        colors,
+                        cx,
+                        |this, cx| {
+                            let enabled = !this.prefs.agents_name_sessions;
+                            this.update_prefs(move |prefs| prefs.agents_name_sessions = enabled);
+                            cx.notify();
+                        },
+                    ),
+                    colors,
+                ))
                 // With no remote hosts the only target is this machine.
                 .when(!hosts.is_empty(), |page| {
                     page.child(setting_section(

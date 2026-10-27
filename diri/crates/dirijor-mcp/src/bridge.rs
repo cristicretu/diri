@@ -151,6 +151,7 @@ impl Bridge {
             "open_api_request" => self.open_api_request(arguments),
             "quick_open_include" => self.quick_open_include(arguments),
             "whoami" => self.whoami(),
+            crate::tools::NAME_SESSION_TOOL => self.name_session(arguments),
             "get_layout" => self.get_layout(arguments),
             "manage_layout" => self.manage_layout(arguments),
             "list_children" => self.list_children(arguments),
@@ -732,6 +733,10 @@ impl Bridge {
             ("hosted".into(), json!(true)),
             ("session".into(), detailed(record, Relation::Caller)),
             (
+                "name_set_by".into(),
+                json!(name_set_by(record.title_source)),
+            ),
+            (
                 "children".into(),
                 Value::Array(
                     lineage
@@ -1050,6 +1055,41 @@ impl Bridge {
         )
     }
 
+    /// The caller naming its own session. The Engine decides: it keeps a
+    /// name the user or Diri gave and names nothing while the setting is off,
+    /// unless the user asked for this name.
+    fn name_session(&self, arguments: &Value) -> Result<Value, String> {
+        let caller = self.require_caller()?;
+        let by = if optional_bool(arguments, "user_requested").unwrap_or(false) {
+            diri_proto::RenameAuthor::AgentForUser
+        } else {
+            diri_proto::RenameAuthor::Agent
+        };
+        let mut result = self.request(
+            Method::SESSION_RENAME,
+            serde_json::to_value(diri_proto::SessionRenameParams {
+                session_id: SessionId(caller.to_owned()),
+                title: required_string(arguments, "name")?,
+                by: Some(by),
+            })
+            .map_err(|error| error.to_string())?,
+            DEFAULT_TIMEOUT,
+        )?;
+        if let Some(object) = result.as_object_mut()
+            && let Some(reason) = object.get("reason").and_then(Value::as_str)
+        {
+            let note = match reason {
+                "userNamed" => "The user or Diri named this session; keep their name.",
+                "namingOff" => {
+                    "The user turned off agent session names; only names they ask for are used."
+                }
+                _ => "The session already has this name.",
+            };
+            object.insert("note".into(), json!(note));
+        }
+        Ok(result)
+    }
+
     fn require_caller(&self) -> Result<&str, String> {
         self.caller.as_deref().ok_or_else(|| {
             "this tool requires DIRIJOR_SESSION_ID and must run inside a Diri session".into()
@@ -1208,6 +1248,23 @@ fn compact(record: &SessionRecord) -> Value {
         object.insert("host".into(), json!(host));
     }
     Value::Object(object)
+}
+
+/// Who chose a session's current name, so an Agent knows whether it may
+/// replace it: `user` and `diri` names are kept, an `agent` name may be
+/// refined, an `automatic` one (prompt, terminal, provider summary) replaced.
+fn name_set_by(source: diri_proto::TitleSource) -> &'static str {
+    use diri_proto::TitleSource;
+    match source {
+        TitleSource::UserRename => "user",
+        TitleSource::DirijorAssigned => "diri",
+        TitleSource::AgentNamed => "agent",
+        TitleSource::Placeholder
+        | TitleSource::FirstPrompt
+        | TitleSource::AgentProvided
+        | TitleSource::TerminalTitle
+        | TitleSource::Unknown => "automatic",
+    }
 }
 
 fn detailed(record: &SessionRecord, relation: Relation) -> Value {

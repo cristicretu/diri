@@ -452,6 +452,10 @@ pub struct Prefs {
     /// Read the relevant part of a finished turn's reply aloud (`crate::voice`).
     #[serde(default)]
     pub talk_with_agent: bool,
+    /// Agents name their session after the task (`name_session`). The Engine
+    /// and the MCP server read it as an Agent starts, under
+    /// [`diri_proto::session_naming::PREF_KEY`], so it reaches new sessions.
+    pub agents_name_sessions: bool,
     /// After a reading, start Wispr Flow's hands-free dictation for the
     /// session in front of the user.
     #[serde(default)]
@@ -647,6 +651,7 @@ impl Default for Prefs {
             status_sounds: true,
             status_notifications: true,
             talk_with_agent: false,
+            agents_name_sessions: true,
             talk_dictation: false,
             talk_voice: String::new(),
             talk_voice_command: String::new(),
@@ -901,6 +906,18 @@ impl Prefs {
 mod tests {
     use super::*;
     use crate::launch_recipe::{LaunchRecipe, RecipeProject};
+
+    #[test]
+    fn agent_session_names_default_on_and_are_read_where_the_engine_looks() {
+        let older: Prefs = serde_json::from_str("{}").unwrap();
+        assert!(older.agents_name_sessions);
+        let mut prefs = Prefs::default();
+        let written = serde_json::to_vec(&prefs).unwrap();
+        assert!(diri_proto::session_naming::enabled(&written));
+        prefs.agents_name_sessions = false;
+        let written = serde_json::to_vec(&prefs).unwrap();
+        assert!(!diri_proto::session_naming::enabled(&written));
+    }
 
     #[test]
     fn files_from_before_interface_styles_keep_their_material() {

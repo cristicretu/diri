@@ -644,6 +644,7 @@ impl DaemonClient {
             &SessionRenameParams {
                 session_id: session_id.clone(),
                 title,
+                by: None,
             },
         )
         .await

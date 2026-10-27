@@ -545,6 +545,9 @@ pub enum TitleSource {
     UserRename,
     /// A provisional title extracted from terminal output, below native names.
     TerminalTitle,
+    /// The Agent named its own session after its task (`name_session`).
+    /// Above every automatic title, below the user's and Diri's.
+    AgentNamed,
     Unknown,
 }
 
@@ -560,6 +563,7 @@ impl Serialize for TitleSource {
             Self::DirijorAssigned => 3,
             Self::UserRename => 4,
             Self::TerminalTitle => 5,
+            Self::AgentNamed => 6,
             Self::Unknown => -1,
         })
     }
@@ -577,6 +581,7 @@ impl<'de> Deserialize<'de> for TitleSource {
             3 => Self::DirijorAssigned,
             4 => Self::UserRename,
             5 => Self::TerminalTitle,
+            6 => Self::AgentNamed,
             _ => Self::Unknown,
         })
     }
