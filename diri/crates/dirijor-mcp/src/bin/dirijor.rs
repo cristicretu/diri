@@ -943,6 +943,22 @@ fn session_wait(arguments: &[String]) -> Result<(), CliError> {
 }
 
 fn session_spawn(arguments: &[String]) -> Result<(), CliError> {
+    if matches!(arguments, [help] if matches!(help.as_str(), "--help" | "-h")) {
+        println!(
+            "Usage: dirijor session spawn KIND [OPTIONS]\n\n\
+             Arguments:\n  KIND             Agent kind to launch (for example, codex)\n\n\
+             Options:\n  --cwd PATH       Working directory (defaults to the current directory)\n  \
+             --worktree       Create a Git worktree for the session\n  \
+             --branch NAME    Branch for the worktree\n  \
+             --prompt TEXT    Initial prompt for the agent\n  \
+             --title TEXT     Session title (--name is an alias)\n  \
+             --host ID        Host on which to launch the agent\n  \
+             --json           Print the result as JSON\n  \
+             -h, --help       Show this help\n\n\
+             Example (local):\n  dirijor session spawn codex --cwd /path/to/repo --prompt \"Explain this project\""
+        );
+        return Ok(());
+    }
     let kind = positional(arguments, 0)
         .ok_or_else(|| CliError::failure("session spawn requires an agent kind"))?;
     let cwd = option_value(arguments, "--cwd")

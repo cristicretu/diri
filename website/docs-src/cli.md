@@ -106,6 +106,10 @@ dirijor run --wait --rm -- cargo test --workspace && echo green
 
 `--name` is accepted as an alias for `--title`. `--host` takes a host id from your [remote hosts](/docs/remote-hosts/).
 
+For spawn usage, all supported options, and a local example, run
+`dirijor session spawn --help` (or `-h`). Help works without a running Engine
+and does not start a session or create a worktree.
+
 ### Wait statuses
 
 | `--until` value | Matches |
