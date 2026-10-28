@@ -18,10 +18,13 @@ use crate::grid::{GridCodecError, GridUpdate};
 use crate::terminal::MouseModes;
 
 pub const PROTOCOL_MAJOR: u16 = 1;
-pub const PROTOCOL_MINOR: u16 = 19;
+pub const PROTOCOL_MINOR: u16 = 20;
 pub const GRID_RESUME_PROTOCOL_MINOR: u16 = 17;
 /// Minor 17 belongs to `grid-resume-v1`; styles are negotiated by name.
 pub const TERMINAL_STYLES_PROTOCOL_MINOR: u16 = 18;
+/// The launching Engine may ask a Holder to negotiate kitty keyboard flags
+/// with its program (`LaunchRequest.keyboardEnhancements`).
+pub const KITTY_KEYBOARD_PROTOCOL_MINOR: u16 = 20;
 pub const QUERY_REPLIES_PROTOCOL_MINOR: u16 = 19;
 pub const INLINE_IMAGES_PROTOCOL_MINOR: u16 = 16;
 pub const TERMINAL_RESET_PROTOCOL_MINOR: u16 = 15;
@@ -134,6 +137,13 @@ pub enum RemoteCapability {
     /// Engine then answers none of them.
     #[serde(rename = "query-replies-v1")]
     QueryReplies,
+    /// The Holder's emulator negotiates kitty keyboard flags with its
+    /// program (answers `CSI ? u`, honors push/pop/set) because its launching
+    /// Engine asked for it. Named only to an `enhanced-keyboard-v1`
+    /// controller at minor 20 or above; the flags themselves travel in
+    /// `InputModes` as before.
+    #[serde(rename = "kitty-keyboard-v1")]
+    KittyKeyboard,
     IncrementalGrid,
     ProcessExit,
     Signal,
@@ -181,6 +191,7 @@ impl RemoteCapability {
             Self::GridResume => "grid-resume-v1",
             Self::TerminalStyles => "terminal-styles-v1",
             Self::QueryReplies => "query-replies-v1",
+            Self::KittyKeyboard => "kitty-keyboard-v1",
             Self::FullSnapshot => "full-snapshot",
             Self::IncrementalGrid => "incremental-grid",
             Self::ProcessExit => "process-exit",
@@ -875,6 +886,12 @@ pub struct LaunchRequest {
     pub cols: u16,
     pub rows: u16,
     pub persistence: PersistenceCapability,
+    /// The launching Engine encodes keys with negotiated kitty keyboard
+    /// flags, so the Holder's emulator may negotiate them with the program.
+    /// Sent only to Helpers at [`KITTY_KEYBOARD_PROTOCOL_MINOR`] or above;
+    /// omitted when false, so a launch without it is the exact prior JSON.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub keyboard_enhancements: bool,
 }
 
 impl LaunchRequest {
@@ -2348,6 +2365,7 @@ mod tests {
             cols: 80,
             rows: 24,
             persistence: PersistenceCapability::NonPersistent,
+            keyboard_enhancements: false,
         };
         request.validate().expect("structured values are valid");
         request.cwd = "relative".into();
@@ -2355,6 +2373,44 @@ mod tests {
             request.validate(),
             Err(RemoteCodecError::InvalidLaunch(_))
         ));
+    }
+
+    /// A launch without kitty keyboard negotiation is the exact prior JSON,
+    /// so an older Helper reads it unchanged; an older launch parses as
+    /// `false`; and an older Engine reads the new capability as unknown.
+    #[test]
+    fn kitty_keyboard_launch_field_and_capability_are_additive() {
+        let mut request = LaunchRequest {
+            session_id: "session-1".into(),
+            session_token: SessionToken::new("0123456789abcdef").expect("token"),
+            argv: vec!["/bin/sh".into()],
+            cwd: "/".into(),
+            environment: vec![],
+            cols: 80,
+            rows: 24,
+            persistence: PersistenceCapability::NonPersistent,
+            keyboard_enhancements: false,
+        };
+        let legacy = serde_json::to_value(&request).unwrap();
+        assert!(legacy.get("keyboardEnhancements").is_none());
+        let parsed: LaunchRequest = serde_json::from_value(legacy).unwrap();
+        assert!(!parsed.keyboard_enhancements);
+        request.keyboard_enhancements = true;
+        let asked = serde_json::to_value(&request).unwrap();
+        assert_eq!(asked["keyboardEnhancements"], true);
+        assert_eq!(
+            serde_json::from_value::<LaunchRequest>(asked).unwrap(),
+            request
+        );
+        assert_eq!(
+            serde_json::to_value(RemoteCapability::KittyKeyboard).unwrap(),
+            "kitty-keyboard-v1"
+        );
+        assert_eq!(
+            RemoteCapability::KittyKeyboard.wire_name(),
+            "kitty-keyboard-v1"
+        );
+        assert!(!ANNOTATED_HOLDER_CAPABILITIES.contains(&RemoteCapability::KittyKeyboard));
     }
 
     #[test]
@@ -2579,7 +2635,7 @@ mod tests {
         // answers a query, so an older peer never sees anything new.
         const {
             assert!(QUERY_REPLIES_PROTOCOL_MINOR == 19);
-            assert!(QUERY_REPLIES_PROTOCOL_MINOR == PROTOCOL_MINOR);
+            assert!(QUERY_REPLIES_PROTOCOL_MINOR < PROTOCOL_MINOR);
             assert!(QUERY_REPLIES_PROTOCOL_MINOR > TERMINAL_STYLES_PROTOCOL_MINOR);
             assert!(QUERY_REPLIES_PROTOCOL_MINOR > INLINE_IMAGES_PROTOCOL_MINOR);
         }
