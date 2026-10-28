@@ -574,12 +574,6 @@ impl NavigationOverlay {
             .map(PathBuf::from)
             .unwrap_or_else(|| PathBuf::from("/nonexistent"));
         let projects = self.project_roots();
-        let mut fallback = vec![PathBuf::from("~")];
-        fallback.extend(
-            projects
-                .iter()
-                .filter_map(|(root, _)| root.parent().map(Path::to_path_buf)),
-        );
         let quick_open_roots = self
             .store
             .read()
@@ -587,7 +581,7 @@ impl NavigationOverlay {
             .preferences()
             .quick_open_roots
             .clone();
-        let roots = quick_open::resolve_roots(&quick_open_roots, &fallback, &home);
+        let roots = navigation_index_roots(&quick_open_roots, &projects, &home);
         let cache = quick_open::cache_file(&home);
         let include = quick_open::include_file(&home);
         (roots, vec![home], cache, include)
@@ -962,8 +956,7 @@ impl NavigationOverlay {
                     // `select` only records the id. The menu bar asks the
                     // window to show it; without that, Enter closes the
                     // palette and the terminal stays on the previous session.
-                    self.store
-                        .enqueue(crate::store::WindowAction::Select(id));
+                    self.store.enqueue(crate::store::WindowAction::Select(id));
                     self._runtime.publish_local_change();
                     self.close_overlay(window, cx);
                 } else {
@@ -2723,6 +2716,24 @@ fn relative_parent(path: &Path) -> String {
         .map_or(parent.clone(), |suffix| format!("~/{suffix}"))
 }
 
+/// Navigation's recursive roots, kept separate from the generic root parser.
+fn navigation_index_roots(
+    setting: &str,
+    projects: &[(PathBuf, String)],
+    home: &Path,
+) -> Vec<PathBuf> {
+    let parents: Vec<_> = projects
+        .iter()
+        .filter_map(|(root, _)| root.parent().map(Path::to_path_buf))
+        .collect();
+    let normalized_home = quick_open::resolve_roots("~", &[], home);
+    let mut fallback = quick_open::resolve_roots("", &parents, home);
+    // A project directly under home must not implicitly opt into scanning
+    // private sibling folders. Explicit roots still use the generic parser.
+    fallback.retain(|parent| !normalized_home.contains(parent));
+    quick_open::resolve_roots(setting, &fallback, home)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2738,6 +2749,97 @@ mod tests {
     #[cfg(target_os = "macos")]
     use gpui::HeadlessAppContext;
     use gpui::{Entity, ScrollDelta, ScrollWheelEvent, TestAppContext, point, size};
+
+    fn quick_open_fixture() -> tempfile::TempDir {
+        let target = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../target");
+        let target = quick_open::resolve_roots("", &[target], Path::new("/nonexistent"));
+        tempfile::tempdir_in(&target[0]).unwrap()
+    }
+
+    #[test]
+    fn quick_open_defaults_do_not_discover_private_folders() {
+        let fixture = quick_open_fixture();
+        let home = fixture.path().join("home");
+        for folder in [
+            "Documents",
+            "Downloads",
+            "Desktop",
+            "Pictures",
+            "Movies",
+            "Music",
+        ] {
+            std::fs::create_dir_all(home.join(folder).join("private-marker")).unwrap();
+        }
+        let repo = home.join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        for projects in [vec![], vec![(repo.clone(), "repo".into())]] {
+            let roots = navigation_index_roots("", &projects, &home);
+            assert!(roots.is_empty(), "unexpected recursive roots: {roots:?}");
+            let entries = quick_open::scan(&roots, std::slice::from_ref(&home));
+            assert_eq!(entries.len(), 1);
+            assert_eq!(entries[0].path, home);
+            let snapshot = quick_open::build_snapshot(&entries, &projects, &[]);
+            if !projects.is_empty() {
+                assert!(snapshot.pool.iter().any(|candidate| candidate.path == repo));
+                assert!(snapshot.recent.iter().any(|item| item.path == repo));
+            }
+        }
+    }
+
+    #[test]
+    fn quick_open_defaults_keep_only_normalized_non_home_parents() {
+        let fixture = quick_open_fixture();
+        let home = fixture.path().join("home");
+        let src = home.join("src");
+        let repo = src.join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        let projects = vec![
+            (home.join("src/../repo"), "direct".into()),
+            (home.join("./repo/"), "direct".into()),
+            (repo.clone(), "nested".into()),
+        ];
+        let roots = navigation_index_roots("", &projects, &home.join("./"));
+        assert_eq!(roots, vec![src]);
+        let entries = quick_open::scan(&roots, &[]);
+        assert!(entries.iter().any(|entry| entry.path == repo));
+    }
+
+    #[test]
+    fn quick_open_explicit_home_and_protected_roots_still_discover_folders() {
+        let fixture = quick_open_fixture();
+        let home = fixture.path().join("home");
+        let documents = home.join("Documents");
+        let marker = documents.join("private-marker");
+        std::fs::create_dir_all(&marker).unwrap();
+        for setting in ["~".to_owned(), documents.display().to_string()] {
+            let roots = navigation_index_roots(&setting, &[], &home);
+            let entries = quick_open::scan(&roots, &[]);
+            assert!(entries.iter().any(|entry| entry.path == marker));
+            let cache = fixture.path().join("explicit-index.json");
+            quick_open::store_cache(&cache, &roots, "", &entries);
+            assert_eq!(quick_open::load_cache(&cache, &roots, ""), Some(entries));
+        }
+    }
+
+    #[test]
+    fn quick_open_old_implicit_home_cache_is_rejected_by_defaults() {
+        let fixture = quick_open_fixture();
+        let home = fixture.path().join("home");
+        let marker = home.join("Pictures/private-marker");
+        std::fs::create_dir_all(&marker).unwrap();
+        let old_roots = vec![home.clone()];
+        let old_entries = quick_open::scan(&old_roots, &[]);
+        assert!(old_entries.iter().any(|entry| entry.path == marker));
+        let cache = fixture.path().join("old-index.json");
+        quick_open::store_cache(&cache, &old_roots, "", &old_entries);
+        assert_eq!(
+            quick_open::load_cache(&cache, &old_roots, ""),
+            Some(old_entries)
+        );
+        let defaults = navigation_index_roots("", &[], &home);
+        assert_eq!(quick_open::load_cache(&cache, &defaults, ""), None);
+        assert!(quick_open::scan(&defaults, &[]).is_empty());
+    }
 
     struct OverlayFocusHarness {
         previous_focus: FocusHandle,
