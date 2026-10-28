@@ -124,3 +124,17 @@ soups of printable runs, controls, DEL, C1 in both encodings, valid,
 truncated and invalid UTF-8 and escapes of every kind, fed whole and in
 pieces of 1 to 40 bytes. `printable_runs_end_at_the_first_byte_outside_space_to_tilde`
 checks the word test for every byte value at every offset.
+
+## Test-only OSC observation
+
+Feature `observe` (off by default; no product crate enables it) adds
+`vte::observe`: per-thread totals of `osc_dispatch` calls, their parameters
+and parameter bytes, and, when turned on with `observe::reset(true)`, an
+order-sensitive FNV-1a checksum of every parameter byte. `vt_workloads`
+compares these with a reference parse, because an OSC nothing reads (the
+long-escapes workload is OSC 6) leaves no terminal state that would expose a
+parser skipping its body. Without the feature the dispatch path is unchanged.
+
+Test: `diri-terminal-state`'s `tests/osc_observe.rs`
+(`cargo test -p diri-terminal-state --features bench-verify --test osc_observe`).
+

@@ -39,6 +39,8 @@ mod params;
 
 #[cfg(feature = "ansi")]
 pub mod ansi;
+#[cfg(feature = "observe")]
+pub mod observe;
 pub use params::{Params, ParamsIter};
 
 const MAX_INTERMEDIATES: usize = 2;
@@ -660,6 +662,8 @@ impl<const OSC_RAW_BUF_SIZE: usize> Parser<OSC_RAW_BUF_SIZE> {
         unsafe {
             let num_params = self.osc_num_params;
             let params = &slices[..num_params] as *const [MaybeUninit<&[u8]>] as *const [&[u8]];
+            #[cfg(feature = "observe")]
+            observe::record(&*params, byte == 0x07);
             performer.osc_dispatch(&*params, byte == 0x07);
         }
     }

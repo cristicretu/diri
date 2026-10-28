@@ -392,3 +392,9 @@ OSC 4/10/11 changes no cell, so without it the host's change detection saw no
 change and never republished the screen. `reset_state` (RIS, `ESC c`) also
 clears every color a program set, as xterm and libghostty do; upstream kept
 them across `reset`. No wire, checkpoint or protocol change.
+
+## Test-only `observe` feature
+
+`observe = ["vte/observe"]` only forwards the vendored VTE's test-only OSC
+totals (see its DIRI-PATCH.md) so `diri-terminal-state`'s `bench-verify`
+feature can reach them. No source change.

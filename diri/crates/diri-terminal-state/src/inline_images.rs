@@ -181,6 +181,17 @@ impl HeadlessScreen {
             .map_or(0, |images| images.stored_bytes())
     }
 
+    /// Every image stored since the last call, oldest first, with its Kitty
+    /// id. Benchmark verification only (feature `bench-verify`): a stored
+    /// image can be deleted before the run ends, so the final store alone
+    /// cannot show that its pixels were decoded right.
+    #[cfg(feature = "bench-verify")]
+    pub fn take_stored_image_log(&mut self) -> Vec<(Option<u32>, StoredImage)> {
+        self.images
+            .as_mut()
+            .map_or_else(Vec::new, |images| std::mem::take(&mut images.store.log))
+    }
+
     /// The device-pixel size of one cell as the client draws it. Images given
     /// no size in cells are sized from it, and pixel-size queries report it.
     pub fn set_cell_pixels(&mut self, width: u16, height: u16) {
@@ -838,6 +849,9 @@ struct ImageStore {
     /// Kitty image number (`I`) → the id assigned to it.
     kitty_numbers: HashMap<u32, u32>,
     next_kitty_id: u32,
+    /// Every image stored, in order (benchmark verification only).
+    #[cfg(feature = "bench-verify")]
+    log: Vec<(Option<u32>, StoredImage)>,
 }
 
 impl ImageStore {
@@ -862,6 +876,8 @@ impl ImageStore {
             // Ids the terminal assigns for image numbers stay clear of the
             // small ids programs pick themselves.
             next_kitty_id: 0x7f00_0000,
+            #[cfg(feature = "bench-verify")]
+            log: Vec::new(),
         }
     }
 
@@ -908,6 +924,8 @@ impl ImageStore {
             };
             self.remove(oldest);
         }
+        #[cfg(feature = "bench-verify")]
+        self.log.push((kitty_id, image.clone()));
         let internal = self.next_id;
         self.next_id = self.next_id.wrapping_add(1).max(1);
         self.bytes += size;
