@@ -8,34 +8,55 @@
 //! is counted in [`Core::unsupported`], so a payload that needs it fails
 //! the check instead of reporting a number.
 
+use alacritty_terminal::term::TermMode;
 use alacritty_terminal::term::cell::Flags;
 use alacritty_terminal::term::grapheme::{self, BreakState, Class, Cluster, Info};
 use alacritty_terminal::vte::ansi::{
-    Attr, ClearMode, Handler, LineClearMode, Mode, NamedMode, NamedPrivateMode, PrivateMode,
+    Attr, CharsetIndex, ClearMode, Handler, Hyperlink, LineClearMode, Mode, PrivateMode,
+    ShellCommandMark, StandardCharset, TabulationClearMode,
 };
 
 use super::cell::{
     CLUSTER, Cell, GRAPHEME, LEADING, MARKS, SPACER, STYLE_SHIFT, Style, WIDE, fill_bytes,
     fill_cells,
 };
-use super::page::{Clusters, Pages, RowMeta, TextLog, push_mark};
+use super::ops::{Inactive, Saved};
+use super::page::{Clusters, Link, Pages, RowMeta, TextLog, push_mark};
 use super::text::{Tables, tables};
 
 pub struct Core {
     pub pages: Pages,
-    lines: usize,
-    cols: usize,
+    pub(super) lines: usize,
+    pub(super) cols: usize,
     pub line: usize,
     pub col: usize,
     pub wrap_pending: bool,
-    pen: Style,
+    pub(super) pen: Style,
     /// (page serial, interned id) of `pen`.
-    pen_cache: (u64, u16),
-    tabs: Vec<bool>,
-    clustering: bool,
-    insert: bool,
-    line_wrap: bool,
+    pub(super) pen_cache: (u64, u16),
+    pub(super) tabs: Vec<bool>,
+    pub(super) clustering: bool,
+    pub(super) insert: bool,
+    pub(super) line_wrap: bool,
     tables: &'static Tables,
+    /// Every mode, as the current core keeps them; `clustering`, `insert`
+    /// and `line_wrap` mirror their bits for the print path.
+    pub mode: TermMode,
+    /// Scroll region: first line and one past the last.
+    pub(super) region: (usize, usize),
+    /// The pen's hyperlink (OSC 8), part of the cursor like its style.
+    pub(super) link: Option<Link>,
+    /// Character sets G0..G3, part of the cursor; and the active one.
+    pub(super) charsets: [StandardCharset; 4],
+    pub(super) active_charset: usize,
+    /// Text must take the general path: a hyperlink or a character set
+    /// that maps ASCII is active.
+    pub(super) slow_text: bool,
+    /// DECSC state of this screen.
+    pub(super) saved: Saved,
+    /// The other screen (alternate while on the primary, and the reverse),
+    /// created on first use.
+    pub(super) other: Option<Box<Inactive>>,
     /// Sequences the prototype does not implement.
     pub unsupported: u64,
     /// Decode ground-state text from raw bytes (`Handler::input_bytes`)
@@ -83,6 +104,14 @@ impl Core {
             insert: false,
             line_wrap: true,
             tables: tables(),
+            mode: TermMode::default(),
+            region: (0, lines),
+            link: None,
+            charsets: [StandardCharset::Ascii; 4],
+            active_charset: 0,
+            slow_text: false,
+            saved: Saved::default(),
+            other: None,
             unsupported: 0,
             raw_text: true,
         }
@@ -102,12 +131,12 @@ impl Core {
 
     /// Live bytes of history (packed pages plus dense pages holding history).
     pub fn history_bytes(&self) -> usize {
-        self.pages.history_bytes()
+        self.primary_pages().history_bytes()
     }
 
-    /// Heap bytes held by pages.
+    /// Heap bytes held by pages, both screens.
     pub fn heap_bytes(&self) -> usize {
-        self.pages.heap_bytes()
+        self.pages.heap_bytes() + self.other.as_ref().map_or(0, |o| o.pages_heap_bytes())
     }
 
     /// The pen's style id in page `page`.
@@ -184,7 +213,7 @@ impl Core {
     }
 
     /// Writes one cell on screen line `line` (the general path).
-    fn set(&mut self, line: usize, col: usize, f: impl FnOnce(Cell) -> Cell) {
+    pub(super) fn set(&mut self, line: usize, col: usize, f: impl FnOnce(Cell) -> Cell) {
         let (p, r) = self.pages.locate(line);
         self.set_at(p, r, col, f);
     }
@@ -235,18 +264,46 @@ impl Core {
             return;
         }
         let (p, r) = self.pages.locate(self.line);
-        self.pages.page_mut(p).meta[r].wrapped = true;
-        self.linefeed_inner();
+        if self.col + 1 == self.cols {
+            self.pages.page_mut(p).meta[r].wrapped = true;
+        } else {
+            // A restored cursor can wait to wrap before the last column;
+            // the mark goes on the cursor cell, as in the current core.
+            let (line, col) = (self.line, self.col);
+            self.set(line, col, |cell| Cell(cell.0 | super::cell::WRAP));
+        }
+        if self.line + 1 >= self.region.1 {
+            self.linefeed_inner();
+        } else {
+            self.line += 1;
+        }
         self.col = 0;
         self.wrap_pending = false;
     }
 
     /// `Term::write_at_cursor`: `extra` is WIDE, SPACER or LEADING.
     fn write_at_cursor(&mut self, c: char, extra: u64) {
+        let c = self.charsets[self.active_charset].map(c);
         let (line, col) = (self.line, self.col);
         let (p, r) = self.pages.locate(line);
         let id = self.pen_id(p);
         let style = (id as u64) << STYLE_SHIFT;
+        self.write_at_cursor_inner(c, extra, p, r, id, style);
+        if self.link.is_some() {
+            self.link_cell(p, r, col);
+        }
+    }
+
+    fn write_at_cursor_inner(
+        &mut self,
+        c: char,
+        extra: u64,
+        p: usize,
+        r: usize,
+        id: u16,
+        style: u64,
+    ) {
+        let (line, col) = (self.line, self.col);
         let old = self.get(line, col);
         if old.has(WIDE | SPACER) {
             if old.has(WIDE) && col + 1 < self.cols {
@@ -280,7 +337,11 @@ impl Core {
             meta.dirty = true;
             if page.text.on {
                 let fill = meta.fill;
-                let fresh = col >= occ && id == fill && page.text.begin(r, occ, col);
+                let fresh = col >= occ
+                    && id == fill
+                    && self.link.is_none()
+                    && (c < '\u{80}' || extra != 0 || Info::of(c).width() != 2)
+                    && page.text.begin(r, occ, col);
                 let logged = fresh
                     && match extra {
                         0 if c >= '\u{A0}' => {
@@ -382,7 +443,7 @@ impl Core {
         }
         let cols = self.cols;
         if self.insert && self.col + width < cols {
-            self.unsupported += 1;
+            self.shift_right(self.line, self.col, width);
         }
         if width == 1 {
             self.write_at_cursor(c, 0);
@@ -530,7 +591,17 @@ impl Core {
             let style =
                 (self.pages.page_mut(p).styles.intern(&cluster_style) as u64) << STYLE_SHIFT;
             let keep = cluster.0 & (super::cell::CP | super::cell::HYPERLINK);
+            let link = cluster
+                .has(super::cell::HYPERLINK)
+                .then(|| self.link_at(line as i32, col))
+                .flatten();
             self.set(l, c, |_| Cell(keep | style | WIDE | marks));
+            if let Some(link) = link {
+                let (p, r) = self.pages.locate(l);
+                let page = self.pages.page_mut(p);
+                let id = page.link_id(&link);
+                page.set_link(r * cols + c, id);
+            }
             for z in zerowidth {
                 self.push_zerowidth(l, c, z);
             }
@@ -541,7 +612,7 @@ impl Core {
         }
         self.col += 1;
         if self.insert && self.col + 1 < cols {
-            self.unsupported += 1;
+            self.shift_right(self.line, self.col, 1);
         }
         self.write_at_cursor(' ', SPACER);
         if self.col + 1 < cols {
@@ -793,12 +864,12 @@ impl Core {
     fn ascii_run(&mut self, bytes: &[u8]) {
         let mut i = 0;
         while i < bytes.len() {
-            if self.wrap_pending && !self.insert && self.line_wrap {
+            if self.wrap_pending && !self.insert && !self.slow_text && self.line_wrap {
                 // What `input_general` does first for a character that
                 // starts its own cluster, as printable ASCII always does.
                 self.wrapline();
             }
-            if self.wrap_pending || self.insert {
+            if self.wrap_pending || self.insert || self.slow_text {
                 self.input_general(bytes[i] as char);
                 i += 1;
                 continue;
@@ -826,16 +897,25 @@ impl Core {
 
     fn linefeed_inner(&mut self) {
         let next = self.line + 1;
-        if next == self.lines {
-            let fill = self.pen.erased();
-            self.pages.push_row(&fill);
+        if next == self.region.1 {
+            if self.region == (0, self.lines) {
+                let fill = self.pen.erased();
+                self.pages.push_row(&fill);
+            } else {
+                self.scroll_up_from(self.region.0, 1);
+            }
         } else if next < self.lines {
             self.line = next;
         }
     }
 
-    fn goto_inner(&mut self, line: i32, col: usize) {
-        self.line = line.clamp(0, self.lines as i32 - 1) as usize;
+    pub(super) fn goto_inner(&mut self, line: i32, col: usize) {
+        let (offset, max) = if self.mode.contains(TermMode::ORIGIN) {
+            (self.region.0 as i32, self.region.1 as i32 - 1)
+        } else {
+            (0, self.lines as i32 - 1)
+        };
+        self.line = (line + offset).min(max).max(0) as usize;
         self.col = col.min(self.cols - 1);
         self.wrap_pending = false;
     }
@@ -844,7 +924,7 @@ impl Core {
 impl Handler for Core {
     /// REP of printable ASCII: row segments of the repeated byte.
     fn input_repeat(&mut self, c: char, count: usize) {
-        if !(' '..'\x7f').contains(&c) {
+        if self.slow_text || !(' '..'\x7f').contains(&c) {
             for _ in 0..count {
                 self.input(c);
             }
@@ -863,6 +943,10 @@ impl Handler for Core {
     /// it starts its own cluster, else the general path.
     #[inline]
     fn input(&mut self, c: char) {
+        if self.slow_text {
+            self.input_general(c);
+            return;
+        }
         if (' '..'\x7f').contains(&c) {
             self.ascii_run(&[c as u8]);
             return;
@@ -888,7 +972,7 @@ impl Handler for Core {
         let bytes = text.as_bytes();
         let mut i = 0;
         while i < bytes.len() {
-            if !self.wrap_pending && !self.insert {
+            if !self.wrap_pending && !self.insert && !self.slow_text {
                 let (used, columns) = self.write_text_segment(&bytes[i..]);
                 if used > 0 {
                     i += used;
@@ -907,7 +991,7 @@ impl Handler for Core {
     /// is interleaved with. Stops where the parser must take over.
     #[inline(never)]
     fn input_bytes(&mut self, bytes: &[u8]) -> (usize, Option<char>) {
-        if !self.raw_text {
+        if !self.raw_text || self.slow_text {
             return (0, None);
         }
         let mut i = 0;
@@ -1042,6 +1126,9 @@ impl Handler for Core {
 
     fn newline(&mut self) {
         self.linefeed_inner();
+        if self.mode.contains(TermMode::LINE_FEED_NEW_LINE) {
+            self.carriage_return();
+        }
     }
 
     fn goto(&mut self, line: i32, col: usize) {
@@ -1179,92 +1266,169 @@ impl Handler for Core {
     }
 
     fn set_mode(&mut self, mode: Mode) {
-        match mode {
-            Mode::Named(NamedMode::Insert) => self.insert = true,
-            Mode::Named(NamedMode::LineFeedNewLine) => self.unsupported += 1,
-            _ => {}
-        }
+        self.set_mode_inner(mode, true);
     }
 
     fn unset_mode(&mut self, mode: Mode) {
-        if let Mode::Named(NamedMode::Insert) = mode {
-            self.insert = false;
-        }
+        self.set_mode_inner(mode, false);
     }
 
     fn set_private_mode(&mut self, mode: PrivateMode) {
-        match mode {
-            PrivateMode::Named(NamedPrivateMode::LineWrap) => self.line_wrap = true,
-            PrivateMode::Named(NamedPrivateMode::CursorKeys) => {}
-            PrivateMode::Named(NamedPrivateMode::GraphemeClustering) => self.clustering = true,
-            _ => self.unsupported += 1,
-        }
+        self.set_private_mode_inner(mode, true);
     }
 
     fn unset_private_mode(&mut self, mode: PrivateMode) {
-        match mode {
-            PrivateMode::Named(NamedPrivateMode::LineWrap) => self.line_wrap = false,
-            PrivateMode::Named(NamedPrivateMode::CursorKeys) => {}
-            PrivateMode::Named(NamedPrivateMode::GraphemeClustering) => self.clustering = false,
-            _ => self.unsupported += 1,
+        self.set_private_mode_inner(mode, false);
+    }
+
+    fn set_keypad_application_mode(&mut self) {
+        self.mode.insert(TermMode::APP_KEYPAD);
+    }
+
+    fn unset_keypad_application_mode(&mut self) {
+        self.mode.remove(TermMode::APP_KEYPAD);
+    }
+
+    fn clear_screen(&mut self, mode: ClearMode) {
+        self.clear_screen_inner(mode);
+    }
+
+    fn set_scrolling_region(&mut self, top: usize, bottom: Option<usize>) {
+        self.set_scrolling_region_inner(top, bottom);
+    }
+
+    fn scroll_up(&mut self, lines: usize) {
+        self.scroll_up_from(self.region.0, lines);
+    }
+
+    fn scroll_down(&mut self, lines: usize) {
+        self.scroll_down_from(self.region.0, lines);
+    }
+
+    fn insert_blank_lines(&mut self, lines: usize) {
+        let origin = self.line;
+        if (self.region.0..self.region.1).contains(&origin) {
+            self.scroll_down_from(origin, lines);
         }
     }
 
-    // Not in the prototype: counted so the check fails loudly.
-    fn clear_screen(&mut self, _: ClearMode) {
-        self.unsupported += 1;
+    fn delete_lines(&mut self, lines: usize) {
+        let origin = self.line;
+        let lines = lines.min(self.lines - origin);
+        if lines > 0 && (self.region.0..self.region.1).contains(&origin) {
+            self.scroll_up_from(origin, lines);
+        }
     }
-    fn set_scrolling_region(&mut self, _: usize, _: Option<usize>) {
-        self.unsupported += 1;
+
+    fn erase_chars(&mut self, count: usize) {
+        let end = (self.col + count).min(self.cols);
+        self.erase_cells(self.line, self.col, end);
     }
-    fn scroll_up(&mut self, _: usize) {
-        self.unsupported += 1;
+
+    fn delete_chars(&mut self, count: usize) {
+        self.delete_chars_inner(count);
     }
-    fn scroll_down(&mut self, _: usize) {
-        self.unsupported += 1;
+
+    fn insert_blank(&mut self, count: usize) {
+        self.insert_blank_cells(count);
     }
-    fn insert_blank_lines(&mut self, _: usize) {
-        self.unsupported += 1;
-    }
-    fn delete_lines(&mut self, _: usize) {
-        self.unsupported += 1;
-    }
-    fn erase_chars(&mut self, _: usize) {
-        self.unsupported += 1;
-    }
-    fn delete_chars(&mut self, _: usize) {
-        self.unsupported += 1;
-    }
-    fn insert_blank(&mut self, _: usize) {
-        self.unsupported += 1;
-    }
+
     fn reverse_index(&mut self) {
-        self.unsupported += 1;
+        if self.line == self.region.0 {
+            self.scroll_down_from(self.region.0, 1);
+        } else {
+            self.line = self.line.saturating_sub(1);
+        }
     }
+
+    fn set_horizontal_tabstop(&mut self) {
+        self.tabs[self.col] = true;
+    }
+
+    fn clear_tabs(&mut self, mode: TabulationClearMode) {
+        match mode {
+            TabulationClearMode::Current => self.tabs[self.col] = false,
+            TabulationClearMode::All => self.tabs.fill(false),
+        }
+    }
+
+    fn move_forward_tabs(&mut self, count: u16) {
+        for _ in 0..count {
+            let mut col = self.col;
+            if col == self.cols - 1 {
+                break;
+            }
+            for i in col + 1..self.cols {
+                col = i;
+                if self.tabs[col] {
+                    break;
+                }
+            }
+            self.col = col;
+        }
+    }
+
+    fn move_backward_tabs(&mut self, count: u16) {
+        for _ in 0..count {
+            let mut col = self.col;
+            if col == 0 {
+                break;
+            }
+            for i in (0..col).rev() {
+                if self.tabs[i] {
+                    col = i;
+                    break;
+                }
+            }
+            self.col = col;
+        }
+    }
+
     fn save_cursor_position(&mut self) {
-        self.unsupported += 1;
+        self.saved = self.cursor_state();
     }
+
     fn restore_cursor_position(&mut self) {
-        self.unsupported += 1;
+        let saved = self.saved.clone();
+        self.set_cursor_state(saved);
     }
+
     fn reset_state(&mut self) {
-        self.unsupported += 1;
+        self.reset_state_inner();
     }
+
+    fn soft_reset(&mut self) {
+        self.soft_reset_inner();
+    }
+
     fn decaln(&mut self) {
-        self.unsupported += 1;
+        self.decaln_inner();
     }
-    fn configure_charset(
-        &mut self,
-        _: alacritty_terminal::vte::ansi::CharsetIndex,
-        _: alacritty_terminal::vte::ansi::StandardCharset,
-    ) {
-        self.unsupported += 1;
+
+    fn configure_charset(&mut self, index: CharsetIndex, charset: StandardCharset) {
+        self.charsets[index as usize] = charset;
+        self.update_slow_text();
     }
-    fn set_hyperlink(&mut self, _: Option<alacritty_terminal::vte::ansi::Hyperlink>) {
-        self.unsupported += 1;
+
+    fn set_active_charset(&mut self, index: CharsetIndex) {
+        self.active_charset = index as usize;
+        self.update_slow_text();
     }
+
+    fn set_hyperlink(&mut self, link: Option<Hyperlink>) {
+        self.link = link.map(|link| Link {
+            id: link.id,
+            uri: link.uri,
+        });
+        self.update_slow_text();
+    }
+
     fn mark_prompt(&mut self) {
-        self.unsupported += 1;
+        self.mark_prompt_inner();
+    }
+
+    fn mark_shell_command(&mut self, mark: ShellCommandMark) {
+        self.mark_command(mark);
     }
 }
 

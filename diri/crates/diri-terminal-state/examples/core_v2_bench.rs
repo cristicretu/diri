@@ -364,13 +364,13 @@ fn main() {
             stored = core.history_bytes();
             if let Some(want) = &want {
                 let checked: usize = want["history_rows_checked"].parse().expect("rows");
-                for (key, value) in golden_digest(&core, fed, checked) {
-                    if want[&key] != value {
-                        failure = Some(format!(
-                            "golden {key}: got {value}, reference {}",
-                            want[&key]
-                        ));
-                    }
+                let bad: Vec<String> = golden_digest(&core, fed, checked)
+                    .into_iter()
+                    .filter(|(key, value)| want[key] != *value)
+                    .map(|(key, value)| format!("{key}: got {value}, reference {}", want[&key]))
+                    .collect();
+                if !bad.is_empty() {
+                    failure = Some(format!("golden {}", bad.join("; ")));
                 }
                 if failure.is_some() {
                     break;
