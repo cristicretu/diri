@@ -11,7 +11,7 @@
 //!
 //! One gap is filled by hand: OSC 9;4 (progress) is a ConEmu extension that the
 //! emulator does not model, so it is scanned out of the byte stream directly —
-//! see [`scan_progress`].
+//! see [`Progress::scan`].
 
 #[cfg(feature = "core-v2")]
 pub mod core_v2;
@@ -496,9 +496,7 @@ pub struct HeadlessScreen {
     geometry: Geometry,
 
     title: Option<String>,
-    progress_state: Option<i64>,
-    progress_value: Option<i64>,
-    progress_reports: u64,
+    progress: Progress,
 
     content_seq: u64,
     filled_cells: usize,
@@ -535,7 +533,6 @@ pub struct HeadlessScreen {
     pending_damage_rows: Vec<bool>,
     /// Trailing bytes of the previous chunk, so an OSC split across a read
     /// boundary is still recognized.
-    progress_carry: Vec<u8>,
     /// Where the current read's C0 bytes are, when it has string sequences:
     /// one scan that the progress, notification and image scanners and the
     /// parser all find their string terminators in. Emptied when idle.
@@ -624,9 +621,7 @@ impl HeadlessScreen {
             drained_events: Vec::new(),
             geometry,
             title: None,
-            progress_state: None,
-            progress_value: None,
-            progress_reports: 0,
+            progress: Progress::default(),
             content_seq: 0,
             filled_cells: 0,
             row_digests: Vec::new(),
@@ -643,7 +638,6 @@ impl HeadlessScreen {
             reuse_moved_fingerprints: true,
             current_damage_rows: vec![false; geometry.rows],
             pending_damage_rows: vec![true; geometry.rows],
-            progress_carry: Vec::new(),
             c0_index: Vec::new(),
             notifications: None,
             images: None,
@@ -941,8 +935,8 @@ impl HeadlessScreen {
         let mut c0_index = std::mem::take(&mut self.c0_index);
         let indexed = !csi_only && c0_positions(bytes, &mut c0_index, C0_INDEX_CAP);
         let index = indexed.then(|| C0Index::new(&c0_index));
-        if !(csi_only && self.progress_carry.is_empty()) {
-            self.scan_progress(bytes, index);
+        if !(csi_only && self.progress.carry.is_empty()) {
+            self.progress.scan(bytes, index);
         }
         if let Some(parser) = &mut self.notifications {
             if historical_bytes != 0 {
@@ -979,7 +973,7 @@ impl HeadlessScreen {
         self.term.release_idle_history();
         self.parser.release_idle_buffers();
         self.replies.shrink_to_fit();
-        self.progress_carry.shrink_to_fit();
+        self.progress.carry.shrink_to_fit();
         self.c0_index = Vec::new();
         self.moved_digests = Vec::new();
         self.moved_filled_cells = Vec::new();
@@ -1334,17 +1328,7 @@ impl HeadlessScreen {
 
     /// Keyboard modes from the same parser that owns the visible terminal.
     pub fn keyboard_state(&self) -> diri_proto::terminal_input::KeyboardState {
-        let mode = self.term.mode();
-        diri_proto::terminal_input::KeyboardState {
-            enhancements: self.keyboard_enhancements_known.then(|| {
-                diri_proto::terminal_input::enhanced::KeyboardEnhancements::try_from(
-                    alacritty_terminal::vte::ansi::KeyboardModes::from(*mode).bits(),
-                )
-                .expect("parser keyboard flags are bounded")
-            }),
-            application_cursor_keys: mode.contains(TermMode::APP_CURSOR),
-            application_keypad: mode.contains(TermMode::APP_KEYPAD),
-        }
+        keyboard_state_of(*self.term.mode(), self.keyboard_enhancements_known)
     }
 
     /// A bounded projection of both keyboard stacks; unknown historical state
@@ -1398,24 +1382,7 @@ impl HeadlessScreen {
 
     /// The independent tracking and encoding modes requested by the child.
     pub fn mouse_modes(&self) -> MouseModes {
-        let mode = self.term.mode();
-        let tracking = if mode.contains(TermMode::MOUSE_MOTION) {
-            MouseTrackingMode::AnyMotion
-        } else if mode.contains(TermMode::MOUSE_DRAG) {
-            MouseTrackingMode::ButtonMotion
-        } else if mode.contains(TermMode::MOUSE_REPORT_CLICK) {
-            MouseTrackingMode::ButtonEvents
-        } else {
-            MouseTrackingMode::Off
-        };
-        let encoding = if mode.contains(TermMode::SGR_PIXEL_MOUSE) {
-            MouseEncoding::SgrPixels
-        } else if mode.contains(TermMode::SGR_MOUSE) {
-            MouseEncoding::Sgr
-        } else {
-            MouseEncoding::Legacy
-        };
-        MouseModes::new(tracking, encoding)
+        mouse_modes_of(*self.term.mode())
     }
 
     /// Whether any tracking mode is active.
@@ -1431,16 +1398,7 @@ impl HeadlessScreen {
     }
 
     fn wire_cursor_style(&self) -> CursorStyle {
-        use alacritty_terminal::vte::ansi::CursorShape as Shape;
-        let style = self.term.cursor_style();
-        CursorStyle {
-            shape: match style.shape {
-                Shape::Underline => CursorShape::Underline,
-                Shape::Beam => CursorShape::Bar,
-                Shape::Block | Shape::HollowBlock | Shape::Hidden => CursorShape::Block,
-            },
-            steady: !style.blinking,
-        }
+        wire_cursor_style_of(self.term.cursor_style())
     }
 
     /// Cursor (col, row, visible) without touching cell data.
@@ -2300,20 +2258,20 @@ impl HeadlessScreen {
         ScreenSnapshot {
             lines: self.lines(),
             osc_title: self.title.clone(),
-            osc_progress_state: self.progress_state,
+            osc_progress_state: self.progress.state,
             content_seq: self.content_seq,
         }
     }
 
     pub fn progress(&self) -> Option<(i64, i64)> {
-        Some((self.progress_state?, self.progress_value.unwrap_or(0)))
+        self.progress.progress()
     }
 
     /// Counts valid `OSC 9;4` reports, including repeats of the same value,
     /// so a consumer can tell a program still reporting from one that went
     /// quiet without clearing its progress. Wraps.
     pub fn progress_reports(&self) -> u64 {
-        self.progress_reports
+        self.progress.reports
     }
 
     fn drain_events(&mut self) {
@@ -2507,150 +2465,6 @@ impl HeadlessScreen {
             total_filled += filled;
         }
         self.filled_cells = total_filled;
-    }
-
-    /// Extracts `ESC ] 9 ; 4 ; state ; value` progress reports.
-    ///
-    /// Agents use this to say "I am working, 40% through"; the emulator has no
-    /// concept of it and would silently drop the sequence.
-    fn scan_progress(&mut self, bytes: &[u8], index: Option<C0Index<'_>>) {
-        if self.progress_carry.is_empty() {
-            if let Some(index) = index {
-                if let Some(start) = self.scan_progress_indexed(bytes, index) {
-                    self.progress_carry.extend_from_slice(&bytes[start..]);
-                }
-                return;
-            }
-            if memchr::memchr(0x1b, bytes).is_none() {
-                return;
-            }
-            // Scan the chunk where it lies. Joining it to an empty carry would
-            // copy every byte of every read, and reads that leave a carry
-            // behind are the rare case — the common one is output that merely
-            // contains color escapes.
-            if let Some(start) = self.scan_progress_within(bytes) {
-                self.progress_carry.extend_from_slice(&bytes[start..]);
-            }
-            return;
-        }
-        let mut haystack = std::mem::take(&mut self.progress_carry);
-        haystack.extend_from_slice(bytes);
-        if let Some(start) = self.scan_progress_within(&haystack) {
-            haystack.drain(..start);
-            self.progress_carry = haystack;
-        }
-    }
-
-    /// Applies one `state;percent` payload. A state outside ConEmu's 0–4 or a
-    /// payload that is not two small numbers is ignored whole, so junk cannot
-    /// clear or invent progress. The percent is clamped to 0–100; an error or
-    /// pause without one keeps the percent it interrupts.
-    fn take_progress_report(&mut self, payload: &[u8]) {
-        let Ok(payload) = std::str::from_utf8(payload) else {
-            return;
-        };
-        let mut parts = payload.split(';');
-        let Some(Ok(state)) = parts.next().map(|value| value.trim().parse::<u8>()) else {
-            return;
-        };
-        if state > 4 {
-            return;
-        }
-        let value = match parts.next().map(str::trim) {
-            None | Some("") => None,
-            Some(value) => match value.parse::<u32>() {
-                Ok(value) => Some(i64::from(value.min(100))),
-                Err(_) => return,
-            },
-        };
-        if parts.next().is_some() {
-            return;
-        }
-        self.progress_value = match state {
-            1 => Some(value.unwrap_or(0)),
-            2 | 4 => value.or(self
-                .progress_value
-                .filter(|_| self.progress_state.is_some())),
-            _ => None,
-        };
-        self.progress_state = Some(i64::from(state));
-        self.progress_reports = self.progress_reports.wrapping_add(1);
-    }
-
-    /// Scans one buffer for progress reports, returning where a carry for the
-    /// next chunk should begin if the buffer ends mid-sequence.
-    fn scan_progress_within(&mut self, haystack: &[u8]) -> Option<usize> {
-        self.scan_progress_with(
-            haystack,
-            |haystack, from| find(&haystack[from..], PROGRESS_PREFIX).map(|found| from + found),
-            |haystack, from| {
-                haystack[from..]
-                    .iter()
-                    .position(|&b| b == 0x07 || b == 0x1b)
-                    .map(|offset| from + offset)
-            },
-        )
-    }
-
-    /// [`Self::scan_progress_within`] for one read, finding escapes and
-    /// terminators in its C0 index instead of scanning it.
-    fn scan_progress_indexed(&mut self, bytes: &[u8], index: C0Index<'_>) -> Option<usize> {
-        self.scan_progress_with(
-            bytes,
-            |bytes, mut from| loop {
-                // Every report starts with ESC: try each escape in turn.
-                let at = index.next(bytes, from, &[0x1b]);
-                if at == bytes.len() {
-                    return None;
-                }
-                if bytes[at..].starts_with(PROGRESS_PREFIX) {
-                    return Some(at);
-                }
-                from = at + 1;
-            },
-            |bytes, from| {
-                let at = index.next(bytes, from, &[0x07, 0x1b]);
-                (at < bytes.len()).then_some(at)
-            },
-        )
-    }
-
-    /// The progress scan, given how to find the next report from an offset
-    /// and the next BEL or ESC from an offset.
-    fn scan_progress_with(
-        &mut self,
-        haystack: &[u8],
-        next_report: impl Fn(&[u8], usize) -> Option<usize>,
-        next_end: impl Fn(&[u8], usize) -> Option<usize>,
-    ) -> Option<usize> {
-        const PREFIX: &[u8] = PROGRESS_PREFIX;
-        const MAX_INCOMPLETE_BYTES: usize = 64;
-        let mut search_from = 0;
-        let mut incomplete = None;
-        while let Some(prefix_start) = next_report(haystack, search_from) {
-            let start = prefix_start + PREFIX.len();
-            // Terminated by BEL or ST (ESC \).
-            let Some(end) = next_end(haystack, start) else {
-                // Truncated: keep it for the next chunk.
-                incomplete = Some(prefix_start);
-                break;
-            };
-            self.take_progress_report(&haystack[start..end]);
-            search_from = end;
-        }
-
-        if let Some(start) = incomplete
-            && haystack.len() - start <= MAX_INCOMPLETE_BYTES
-        {
-            return Some(start);
-        }
-        // A malformed unterminated OSC must not turn the scanner into an
-        // unbounded copy of the PTY stream. Fall through and retain only a
-        // possible prefix suffix.
-        (1..PREFIX.len())
-            .rev()
-            .find(|length| haystack.ends_with(&PREFIX[..*length]))
-            .map(|length| haystack.len() - length)
     }
 }
 
@@ -3092,12 +2906,226 @@ fn append_color(color: TermColor, foreground: bool, codes: &mut Vec<String>) {
     }
 }
 
+/// The wire mouse modes of an emulator's mode bits.
+pub(crate) fn mouse_modes_of(mode: TermMode) -> MouseModes {
+    let tracking = if mode.contains(TermMode::MOUSE_MOTION) {
+        MouseTrackingMode::AnyMotion
+    } else if mode.contains(TermMode::MOUSE_DRAG) {
+        MouseTrackingMode::ButtonMotion
+    } else if mode.contains(TermMode::MOUSE_REPORT_CLICK) {
+        MouseTrackingMode::ButtonEvents
+    } else {
+        MouseTrackingMode::Off
+    };
+    let encoding = if mode.contains(TermMode::SGR_PIXEL_MOUSE) {
+        MouseEncoding::SgrPixels
+    } else if mode.contains(TermMode::SGR_MOUSE) {
+        MouseEncoding::Sgr
+    } else {
+        MouseEncoding::Legacy
+    };
+    MouseModes::new(tracking, encoding)
+}
+
+/// The wire cursor style of an emulator's cursor style.
+pub(crate) fn wire_cursor_style_of(
+    style: alacritty_terminal::vte::ansi::CursorStyle,
+) -> CursorStyle {
+    use alacritty_terminal::vte::ansi::CursorShape as Shape;
+    CursorStyle {
+        shape: match style.shape {
+            Shape::Underline => CursorShape::Underline,
+            Shape::Beam => CursorShape::Bar,
+            Shape::Block | Shape::HollowBlock | Shape::Hidden => CursorShape::Block,
+        },
+        steady: !style.blinking,
+    }
+}
+
+/// The keyboard state of an emulator's mode bits; `enhancements_known` as
+/// [`HeadlessScreen::keyboard_state`] tracks it.
+pub(crate) fn keyboard_state_of(
+    mode: TermMode,
+    enhancements_known: bool,
+) -> diri_proto::terminal_input::KeyboardState {
+    diri_proto::terminal_input::KeyboardState {
+        enhancements: enhancements_known.then(|| {
+            diri_proto::terminal_input::enhanced::KeyboardEnhancements::try_from(
+                alacritty_terminal::vte::ansi::KeyboardModes::from(mode).bits(),
+            )
+            .expect("parser keyboard flags are bounded")
+        }),
+        application_cursor_keys: mode.contains(TermMode::APP_CURSOR),
+        application_keypad: mode.contains(TermMode::APP_KEYPAD),
+    }
+}
+
+/// `OSC 9;4` progress reports, scanned out of the byte stream (the emulator
+/// has no concept of them). Shared by [`HeadlessScreen`] and core v2's
+/// screen.
+#[derive(Default)]
+pub(crate) struct Progress {
+    pub(crate) state: Option<i64>,
+    pub(crate) value: Option<i64>,
+    pub(crate) reports: u64,
+    /// The end of the previous read, when it may begin a report.
+    pub(crate) carry: Vec<u8>,
+}
+
+impl Progress {
+    pub(crate) fn progress(&self) -> Option<(i64, i64)> {
+        Some((self.state?, self.value.unwrap_or(0)))
+    }
+
+    /// Extracts `ESC ] 9 ; 4 ; state ; value` progress reports.
+    ///
+    /// Agents use this to say "I am working, 40% through"; the emulator has no
+    /// concept of it and would silently drop the sequence.
+    pub(crate) fn scan(&mut self, bytes: &[u8], index: Option<C0Index<'_>>) {
+        if self.carry.is_empty() {
+            if let Some(index) = index {
+                if let Some(start) = self.scan_indexed(bytes, index) {
+                    self.carry.extend_from_slice(&bytes[start..]);
+                }
+                return;
+            }
+            if memchr::memchr(0x1b, bytes).is_none() {
+                return;
+            }
+            // Scan the chunk where it lies. Joining it to an empty carry would
+            // copy every byte of every read, and reads that leave a carry
+            // behind are the rare case — the common one is output that merely
+            // contains color escapes.
+            if let Some(start) = self.scan_within(bytes) {
+                self.carry.extend_from_slice(&bytes[start..]);
+            }
+            return;
+        }
+        let mut haystack = std::mem::take(&mut self.carry);
+        haystack.extend_from_slice(bytes);
+        if let Some(start) = self.scan_within(&haystack) {
+            haystack.drain(..start);
+            self.carry = haystack;
+        }
+    }
+
+    /// Applies one `state;percent` payload. A state outside ConEmu's 0–4 or a
+    /// payload that is not two small numbers is ignored whole, so junk cannot
+    /// clear or invent progress. The percent is clamped to 0–100; an error or
+    /// pause without one keeps the percent it interrupts.
+    fn take_report(&mut self, payload: &[u8]) {
+        let Ok(payload) = std::str::from_utf8(payload) else {
+            return;
+        };
+        let mut parts = payload.split(';');
+        let Some(Ok(state)) = parts.next().map(|value| value.trim().parse::<u8>()) else {
+            return;
+        };
+        if state > 4 {
+            return;
+        }
+        let value = match parts.next().map(str::trim) {
+            None | Some("") => None,
+            Some(value) => match value.parse::<u32>() {
+                Ok(value) => Some(i64::from(value.min(100))),
+                Err(_) => return,
+            },
+        };
+        if parts.next().is_some() {
+            return;
+        }
+        self.value = match state {
+            1 => Some(value.unwrap_or(0)),
+            2 | 4 => value.or(self.value.filter(|_| self.state.is_some())),
+            _ => None,
+        };
+        self.state = Some(i64::from(state));
+        self.reports = self.reports.wrapping_add(1);
+    }
+
+    /// Scans one buffer for progress reports, returning where a carry for the
+    /// next chunk should begin if the buffer ends mid-sequence.
+    fn scan_within(&mut self, haystack: &[u8]) -> Option<usize> {
+        self.scan_with(
+            haystack,
+            |haystack, from| find(&haystack[from..], PROGRESS_PREFIX).map(|found| from + found),
+            |haystack, from| {
+                haystack[from..]
+                    .iter()
+                    .position(|&b| b == 0x07 || b == 0x1b)
+                    .map(|offset| from + offset)
+            },
+        )
+    }
+
+    /// [`Self::scan_within`] for one read, finding escapes and
+    /// terminators in its C0 index instead of scanning it.
+    fn scan_indexed(&mut self, bytes: &[u8], index: C0Index<'_>) -> Option<usize> {
+        self.scan_with(
+            bytes,
+            |bytes, mut from| loop {
+                // Every report starts with ESC: try each escape in turn.
+                let at = index.next(bytes, from, &[0x1b]);
+                if at == bytes.len() {
+                    return None;
+                }
+                if bytes[at..].starts_with(PROGRESS_PREFIX) {
+                    return Some(at);
+                }
+                from = at + 1;
+            },
+            |bytes, from| {
+                let at = index.next(bytes, from, &[0x07, 0x1b]);
+                (at < bytes.len()).then_some(at)
+            },
+        )
+    }
+
+    /// The progress scan, given how to find the next report from an offset
+    /// and the next BEL or ESC from an offset.
+    fn scan_with(
+        &mut self,
+        haystack: &[u8],
+        next_report: impl Fn(&[u8], usize) -> Option<usize>,
+        next_end: impl Fn(&[u8], usize) -> Option<usize>,
+    ) -> Option<usize> {
+        const PREFIX: &[u8] = PROGRESS_PREFIX;
+        const MAX_INCOMPLETE_BYTES: usize = 64;
+        let mut search_from = 0;
+        let mut incomplete = None;
+        while let Some(prefix_start) = next_report(haystack, search_from) {
+            let start = prefix_start + PREFIX.len();
+            // Terminated by BEL or ST (ESC \).
+            let Some(end) = next_end(haystack, start) else {
+                // Truncated: keep it for the next chunk.
+                incomplete = Some(prefix_start);
+                break;
+            };
+            self.take_report(&haystack[start..end]);
+            search_from = end;
+        }
+
+        if let Some(start) = incomplete
+            && haystack.len() - start <= MAX_INCOMPLETE_BYTES
+        {
+            return Some(start);
+        }
+        // A malformed unterminated OSC must not turn the scanner into an
+        // unbounded copy of the PTY stream. Fall through and retain only a
+        // possible prefix suffix.
+        (1..PREFIX.len())
+            .rev()
+            .find(|length| haystack.ends_with(&PREFIX[..*length]))
+            .map(|length| haystack.len() - length)
+    }
+}
+
 /// Whether every ESC in `bytes` introduces a CSI (`ESC [`), and the last
 /// byte is not an ESC whose next byte is still to come.
 ///
 /// Eight bytes are tested at a time, each against its successor: a byte is
 /// an ESC not followed by `[` exactly where the masks below disagree.
-fn only_csi_escapes(bytes: &[u8]) -> bool {
+pub(crate) fn only_csi_escapes(bytes: &[u8]) -> bool {
     const ONES: u64 = 0x0101_0101_0101_0101;
     const LOW: u64 = 0x7f7f_7f7f_7f7f_7f7f;
     // The high bit of each byte of `word` that equals `byte`.
@@ -3128,7 +3156,7 @@ const PROGRESS_PREFIX: &[u8] = b"\x1b]9;4;";
 /// Most C0 bytes one read is indexed with; denser output (short lines,
 /// bursts of escapes) is scanned as before. At most 16 KiB, released when the
 /// terminal goes idle.
-const C0_INDEX_CAP: usize = 4096;
+pub(crate) const C0_INDEX_CAP: usize = 4096;
 
 fn find(haystack: &[u8], needle: &[u8]) -> Option<usize> {
     if needle.is_empty() {
@@ -3737,7 +3765,7 @@ mod tests {
         let mut input = b"\x1b]9;4;1;".to_vec();
         input.extend(std::iter::repeat_n(b'9', 16 << 10));
         screen.feed(&input);
-        assert!(screen.progress_carry.len() < 8);
+        assert!(screen.progress.carry.len() < 8);
     }
 
     #[test]
@@ -4025,7 +4053,7 @@ mod tests {
             None,
             "the split progress prefix was dropped"
         );
-        assert!(screen.progress_carry.is_empty());
+        assert!(screen.progress.carry.is_empty());
     }
 
     #[test]
