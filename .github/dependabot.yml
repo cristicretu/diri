@@ -8,6 +8,11 @@ updates:
     groups:
       rust-dependencies:
         patterns: ["*"]
+    ignore:
+      # gpui's `bench` macro expands against gpui's own criterion (0.5);
+      # diri-term must use that same version or its benches stop compiling.
+      - dependency-name: criterion
+        update-types: ["version-update:semver-major", "version-update:semver-minor"]
     open-pull-requests-limit: 5
 
   - package-ecosystem: npm

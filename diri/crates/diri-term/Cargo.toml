@@ -26,6 +26,7 @@ diri-terminal-state.workspace = true
 # in-process Engine with a real Holder behind the real renderer.
 diri-engine.workspace = true
 tokio.workspace = true
+# Must match the criterion gpui's `bench` macro expands against.
 criterion = "0.5.1"
 gpui = { workspace = true, features = ["bench"] }
 gpui_platform = { workspace = true, features = ["test-support"] }

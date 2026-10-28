@@ -123,14 +123,8 @@ impl ZoomPresentation {
 impl SessionSurfaces {
     /// The user's terminal font, as the panes paint it.
     pub(super) fn terminal_font(&self) -> gpui::Font {
-        crate::fonts::terminal_font(
-            &self
-                .store
-                .read()
-                .expect("session store lock poisoned")
-                .preferences()
-                .terminal_font_family,
-        )
+        let store = self.store.read().expect("session store lock poisoned");
+        crate::fonts::terminal_font_from(store.preferences())
     }
 
     pub(crate) fn set_page_region(&mut self, viewport: TerminalViewport, header: f32) {

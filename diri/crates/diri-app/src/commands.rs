@@ -44,6 +44,7 @@ actions!(
         ToggleQuickOpen,
         ToggleHistory,
         ToggleNotifications,
+        ToggleActivity,
         ToggleOverview,
         ToggleTabPeek,
         ReviewLaunches,
@@ -107,6 +108,7 @@ actions!(
         SelectNextAttentionSession,
         CheckForUpdates,
         ShowWhatsNew,
+        ImportTerminalSetup,
         ToggleReadAloud,
         ToggleReadThisTab,
         ReadOnlyThisTab,
@@ -153,6 +155,8 @@ actions!(
         PreviousPrompt,
         NextPrompt,
         CopyLastCommandOutput,
+        ClearScrollback,
+        ResetTerminal,
     ]
 );
 
@@ -173,6 +177,7 @@ pub enum CommandId {
     ToggleQuickOpen,
     ToggleHistory,
     ToggleNotifications,
+    ToggleActivity,
     ToggleOverview,
     ToggleTabPeek,
     ReviewLaunches,
@@ -231,6 +236,7 @@ pub enum CommandId {
     SelectNextAttentionSession,
     CheckForUpdates,
     ShowWhatsNew,
+    ImportTerminalSetup,
     ToggleReadAloud,
     ToggleReadThisTab,
     ReadOnlyThisTab,
@@ -266,6 +272,8 @@ pub enum CommandId {
     PreviousPrompt,
     NextPrompt,
     CopyLastCommandOutput,
+    ClearScrollback,
+    ResetTerminal,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1034,6 +1042,16 @@ pub const COMMANDS: &[CommandSpec] = &[
         "inbox unread alerts attention"
     ),
     spec!(
+        ToggleActivity,
+        "toggle-activity",
+        Some("cmd-."),
+        Some("⌘."),
+        Some(APP_CONTEXT),
+        "command.toggle_activity.palette_title",
+        "waveform.circle",
+        "activity working waiting blocked finished status filter"
+    ),
+    spec!(
         CheckForUpdates,
         "check-for-updates",
         None,
@@ -1052,6 +1070,16 @@ pub const COMMANDS: &[CommandSpec] = &[
         "command.show_whats_new.palette_title",
         "sparkles",
         "whats new release highlights features changelog demo video tour"
+    ),
+    spec!(
+        ImportTerminalSetup,
+        "import-terminal-setup",
+        None,
+        None,
+        Some(APP_CONTEXT),
+        "command.import_terminal_setup.palette_title",
+        "arrow.down",
+        "import ghostty iterm iterm2 wezterm kitty alacritty terminal font theme cursor setup migrate"
     ),
     spec!(
         ToggleReadAloud,
@@ -1343,6 +1371,27 @@ pub const COMMANDS: &[CommandSpec] = &[
         "doc.on.doc",
         "terminal shell command output copy last osc 133"
     ),
+    // ⌘K is the palette here, so Clear takes the shifted chord.
+    spec!(
+        ClearScrollback,
+        "terminal-clear-scrollback",
+        Some("cmd-shift-k"),
+        Some("⇧⌘K"),
+        Some(TERMINAL_CONTEXT),
+        "command.clear_scrollback.palette_title",
+        "trash",
+        "terminal clear screen scrollback history wipe clean cls"
+    ),
+    spec!(
+        ResetTerminal,
+        "terminal-reset",
+        None,
+        None,
+        Some(TERMINAL_CONTEXT),
+        "command.reset_terminal.palette_title",
+        "arrow.counterclockwise",
+        "terminal reset garbled broken modes emulator stty sane"
+    ),
 ];
 
 pub fn command(id: CommandId) -> &'static CommandSpec {
@@ -1522,6 +1571,7 @@ impl CommandSpec {
             CommandId::ToggleQuickOpen => KeyBinding::new(key, ToggleQuickOpen, context),
             CommandId::ToggleHistory => KeyBinding::new(key, ToggleHistory, context),
             CommandId::ToggleNotifications => KeyBinding::new(key, ToggleNotifications, context),
+            CommandId::ToggleActivity => KeyBinding::new(key, ToggleActivity, context),
             CommandId::ToggleOverview => KeyBinding::new(key, ToggleOverview, context),
             CommandId::ReviewLaunches => KeyBinding::new(key, ReviewLaunches, context),
             CommandId::ToggleTabPeek => KeyBinding::new(key, ToggleTabPeek, context),
@@ -1593,6 +1643,7 @@ impl CommandSpec {
             }
             CommandId::CheckForUpdates => KeyBinding::new(key, CheckForUpdates, context),
             CommandId::ShowWhatsNew => KeyBinding::new(key, ShowWhatsNew, context),
+            CommandId::ImportTerminalSetup => KeyBinding::new(key, ImportTerminalSetup, context),
             CommandId::ToggleReadAloud => KeyBinding::new(key, ToggleReadAloud, context),
             CommandId::ToggleReadThisTab => KeyBinding::new(key, ToggleReadThisTab, context),
             CommandId::ReadOnlyThisTab => KeyBinding::new(key, ReadOnlyThisTab, context),
@@ -1636,6 +1687,8 @@ impl CommandSpec {
             CommandId::CopyLastCommandOutput => {
                 KeyBinding::new(key, CopyLastCommandOutput, context)
             }
+            CommandId::ClearScrollback => KeyBinding::new(key, ClearScrollback, context),
+            CommandId::ResetTerminal => KeyBinding::new(key, ResetTerminal, context),
         }
     }
 }
@@ -1911,6 +1964,11 @@ impl CommandId {
             Self::ToggleNotifications => ShortcutMetadata {
                 title: t("command.toggle_notifications.title"),
                 description: t("command.toggle_notifications.description"),
+                category: Navigation,
+            },
+            Self::ToggleActivity => ShortcutMetadata {
+                title: t("command.toggle_activity.title"),
+                description: t("command.toggle_activity.description"),
                 category: Navigation,
             },
             Self::SelectNextAttentionSession => ShortcutMetadata {
@@ -2301,6 +2359,16 @@ impl CommandId {
                 description: t("command.copy_last_command_output.description"),
                 category: ShortcutCategory::Terminal,
             },
+            Self::ClearScrollback => ShortcutMetadata {
+                title: t("command.clear_scrollback.title"),
+                description: t("command.clear_scrollback.description"),
+                category: ShortcutCategory::Terminal,
+            },
+            Self::ResetTerminal => ShortcutMetadata {
+                title: t("command.reset_terminal.title"),
+                description: t("command.reset_terminal.description"),
+                category: ShortcutCategory::Terminal,
+            },
             Self::CopySelection => ShortcutMetadata {
                 title: t("command.copy_selection.title"),
                 description: t("command.copy_selection.description"),
@@ -2319,6 +2387,11 @@ impl CommandId {
             Self::ShowWhatsNew => ShortcutMetadata {
                 title: t("command.show_whats_new.title"),
                 description: t("command.show_whats_new.description"),
+                category: Application,
+            },
+            Self::ImportTerminalSetup => ShortcutMetadata {
+                title: t("command.import_terminal_setup.title"),
+                description: t("command.import_terminal_setup.description"),
                 category: Application,
             },
             Self::ToggleReadThisTab
@@ -2399,6 +2472,7 @@ impl CommandId {
             Self::ToggleQuickOpen => Box::new(ToggleQuickOpen),
             Self::ToggleHistory => Box::new(ToggleHistory),
             Self::ToggleNotifications => Box::new(ToggleNotifications),
+            Self::ToggleActivity => Box::new(ToggleActivity),
             Self::ToggleOverview => Box::new(ToggleOverview),
             Self::ToggleTabPeek => Box::new(ToggleTabPeek),
             Self::ReviewLaunches => Box::new(ReviewLaunches),
@@ -2458,6 +2532,7 @@ impl CommandId {
             Self::SelectNextAttentionSession => Box::new(SelectNextAttentionSession),
             Self::CheckForUpdates => Box::new(CheckForUpdates),
             Self::ShowWhatsNew => Box::new(ShowWhatsNew),
+            Self::ImportTerminalSetup => Box::new(ImportTerminalSetup),
             Self::ToggleReadAloud => Box::new(ToggleReadAloud),
             Self::ToggleReadThisTab => Box::new(ToggleReadThisTab),
             Self::ReadOnlyThisTab => Box::new(ReadOnlyThisTab),
@@ -2493,6 +2568,8 @@ impl CommandId {
             Self::PreviousPrompt => Box::new(PreviousPrompt),
             Self::NextPrompt => Box::new(NextPrompt),
             Self::CopyLastCommandOutput => Box::new(CopyLastCommandOutput),
+            Self::ClearScrollback => Box::new(ClearScrollback),
+            Self::ResetTerminal => Box::new(ResetTerminal),
         }
     }
 }
@@ -2766,6 +2843,19 @@ mod tests {
             command(CommandId::SelectNextSession).keystroke,
             Some("cmd-}")
         );
+    }
+
+    #[test]
+    fn clear_and_reset_are_terminal_commands_in_the_palette() {
+        let clear = command(CommandId::ClearScrollback);
+        // ⌘K stays the palette; Clear takes the shifted chord, terminal only.
+        assert_eq!(command(CommandId::ToggleCommandPalette).keystroke, Some("cmd-k"));
+        assert_eq!(clear.keystroke, Some("cmd-shift-k"));
+        assert_eq!(clear.context, Some(TERMINAL_CONTEXT));
+        let reset = command(CommandId::ResetTerminal);
+        assert_eq!(reset.keystroke, None, "reset is palette and menu only");
+        assert_eq!(reset.context, Some(TERMINAL_CONTEXT));
+        assert!(clear.palette.is_some() && reset.palette.is_some());
     }
 
     #[test]
