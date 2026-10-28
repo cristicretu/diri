@@ -1129,13 +1129,24 @@ impl Sidebar {
         {
             cx.emit(SidebarEvent::RefreshUsageLimits);
         }
-        // Most refreshes only advance `updated_at`, which the sidebar does not
-        // show; redrawing for them costs a frame every few seconds.
+        // Timestamp-only ticks normally need no frame, except when the visible
+        // quota crosses freshness/reset expiry. Reuse incoming ticks, not a timer
+        // or another credential fetch, to invalidate that percentage.
+        let show_quota = self
+            .store
+            .read()
+            .expect("session store lock poisoned")
+            .preferences()
+            .sidebar_usage_indicator
+            == crate::store::SidebarUsageIndicator::RemainingQuota;
         let changed = self.usage.as_ref().is_none_or(|usage| {
-            UsageSnapshot {
-                updated_at: snapshot.updated_at,
-                ..usage.clone()
-            } != snapshot
+            (show_quota
+                && crate::usage::limits::footer_quota(&usage.limits, usage.updated_at)
+                    != crate::usage::limits::footer_quota(&snapshot.limits, snapshot.updated_at))
+                || UsageSnapshot {
+                    updated_at: snapshot.updated_at,
+                    ..usage.clone()
+                } != snapshot
         });
         self.usage = Some(snapshot);
         if changed {
@@ -4928,7 +4939,15 @@ impl Sidebar {
     fn account_footer(&self, colors: SemanticColors, cx: &mut Context<Self>) -> AnyElement {
         let hovered = self.ui.hovered_control == Some("account");
         let account_label = local_account_label(self.preview);
-        let cost = if self.preview {
+        let indicator = self
+            .store
+            .read()
+            .expect("session store lock poisoned")
+            .preferences()
+            .sidebar_usage_indicator;
+        let cost = if indicator != crate::store::SidebarUsageIndicator::EstimatedCost {
+            None
+        } else if self.preview {
             Some(PREVIEW_USAGE)
         } else {
             self.usage
@@ -4936,6 +4955,32 @@ impl Sidebar {
                 .map(|snapshot| snapshot.today().cost)
                 .filter(|cost| *cost > 0.0)
         };
+        let quota = (indicator == crate::store::SidebarUsageIndicator::RemainingQuota).then(|| {
+            let preview;
+            let limits = if self.preview {
+                preview = crate::usage::limits::preview();
+                preview.as_slice()
+            } else {
+                self.usage
+                    .as_ref()
+                    .map_or(&[][..], |usage| usage.limits.as_slice())
+            };
+            let now = crate::usage::Clock::read(&crate::usage::SystemClock).unix_seconds;
+            match crate::usage::limits::footer_quota(limits, now) {
+                Some(quota) => (
+                    format!("{:.0}%", quota.remaining_percent.floor()),
+                    tf(
+                        "sidebar.usage.quota_tooltip",
+                        &[
+                            ("agent", &quota.provider),
+                            ("account", &quota.account),
+                            ("window", &quota.window),
+                        ],
+                    ),
+                ),
+                None => ("—".to_owned(), t("sidebar.usage.unavailable").to_owned()),
+            }
+        });
         div()
             .flex_none()
             .px(px(Space::INSET))
@@ -4990,15 +5035,39 @@ impl Sidebar {
                             .child(account_label),
                     )
                     .when_some(cost, |row, cost| {
-                        row.child(self.number_flows.show_font(
-                            "sidebar-today",
-                            cost,
-                            UsageFormat::money(cost),
-                            Typo::META_MONO.size,
-                            colors.tertiary,
-                            FontWeight::NORMAL,
-                            Some(SharedString::from(crate::fonts::mono_family())),
+                        row.child(div().debug_selector(|| "sidebar-cost".into()).child(
+                            self.number_flows.show_font(
+                                "sidebar-today",
+                                cost,
+                                UsageFormat::money(cost),
+                                Typo::META_MONO.size,
+                                colors.tertiary,
+                                FontWeight::NORMAL,
+                                Some(SharedString::from(crate::fonts::mono_family())),
+                            ),
                         ))
+                    })
+                    .when_some(quota, |row, (label, tooltip)| {
+                        row.child(
+                            div()
+                                .id("sidebar-quota")
+                                .debug_selector(|| "sidebar-quota".into())
+                                .flex_none()
+                                .font_family(crate::fonts::mono_family())
+                                .text_size(px(Typo::META_MONO.size))
+                                .text_color(colors.tertiary)
+                                .aria_label(tooltip.clone())
+                                .child(label)
+                                .warm_tooltip(move |_, cx| {
+                                    cx.new(|_| {
+                                        crate::palette_chrome::PaletteTooltip(
+                                            tooltip.clone(),
+                                            colors,
+                                        )
+                                    })
+                                    .into()
+                                }),
+                        )
                     })
                     .child(
                         div()
@@ -13886,6 +13955,132 @@ mod tests {
                 }
             }
         });
+    }
+
+    #[gpui::test]
+    fn footer_modes_preserve_account_menu_and_refresh(cx: &mut TestAppContext) {
+        let (sidebar, _, cx) = drag_harness(cx);
+        cx.run_until_parked();
+        assert!(
+            cx.debug_bounds("sidebar-cost").is_some(),
+            "default retains estimated cost"
+        );
+        assert!(cx.debug_bounds("sidebar-quota").is_none());
+        let refreshes = Rc::new(std::cell::Cell::new(0));
+        let observed = Rc::clone(&refreshes);
+        let _subscription = cx.update(|_, cx| {
+            cx.subscribe(&sidebar, move |_, event, _| {
+                if matches!(event, SidebarEvent::RefreshUsageLimits) {
+                    observed.set(observed.get() + 1);
+                }
+            })
+        });
+        for choice in crate::store::SidebarUsageIndicator::ALL {
+            sidebar.update(cx, |sidebar, cx| {
+                sidebar
+                    .store
+                    .write()
+                    .unwrap()
+                    .update_preferences(|prefs| {
+                        prefs.sidebar_usage_indicator = choice;
+                    })
+                    .unwrap();
+                cx.notify();
+            });
+            cx.run_until_parked();
+            assert_eq!(
+                cx.debug_bounds("sidebar-cost").is_some(),
+                choice == crate::store::SidebarUsageIndicator::EstimatedCost
+            );
+            assert_eq!(
+                cx.debug_bounds("sidebar-quota").is_some(),
+                choice == crate::store::SidebarUsageIndicator::RemainingQuota
+            );
+            assert_eq!(
+                refreshes.get(),
+                0,
+                "changing a preference never fetches credentials"
+            );
+            // Leaving preview after construction exercises the production click
+            // handler over an isolated preview store, never the real preferences.
+            sidebar.update(cx, |sidebar, _| sidebar.preview = false);
+            let account = cx
+                .debug_bounds("account")
+                .expect("account row survives every mode");
+            cx.simulate_click(account.center(), Modifiers::default());
+            cx.run_until_parked();
+            assert!(sidebar.read_with(cx, |sidebar, _| sidebar.ui.popover
+                == Some(Popover::Account)));
+            assert_eq!(
+                refreshes.get(),
+                1,
+                "opening the menu keeps its existing refresh"
+            );
+            cx.simulate_click(account.center(), Modifiers::default());
+            cx.run_until_parked();
+            assert_eq!(refreshes.get(), 1, "closing the menu does not refresh");
+            sidebar.update(cx, |sidebar, _| sidebar.preview = true);
+            refreshes.set(0);
+        }
+    }
+
+    #[gpui::test]
+    fn footer_quota_timestamp_ticks_invalidate_only_on_expiry(cx: &mut TestAppContext) {
+        let (sidebar, _, cx) = drag_harness(cx);
+        cx.run_until_parked();
+        let notifications = Rc::new(std::cell::Cell::new(0));
+        let observed = Rc::clone(&notifications);
+        let _subscription =
+            cx.update(|_, cx| cx.observe(&sidebar, move |_, _| observed.set(observed.get() + 1)));
+        for reset in [None, Some(1_010)] {
+            let mut snapshot = UsageSnapshot {
+                updated_at: 1_000,
+                limits: vec![crate::usage::limits::AccountLimits {
+                    provider: "Claude",
+                    profile_id: None,
+                    plan: None,
+                    account: "Fixture".into(),
+                    live: true,
+                    windows: vec![crate::usage::limits::LimitWindow {
+                        label: "Weekly".into(),
+                        used_percent: 25.0,
+                        resets_at: reset,
+                    }],
+                    checked_at: 1_000,
+                    error: None,
+                    signing_in: false,
+                }],
+                ..UsageSnapshot::default()
+            };
+            sidebar.update(cx, |sidebar, cx| {
+                sidebar
+                    .store
+                    .write()
+                    .unwrap()
+                    .update_preferences(|prefs| {
+                        prefs.sidebar_usage_indicator =
+                            crate::store::SidebarUsageIndicator::RemainingQuota;
+                    })
+                    .unwrap();
+                sidebar.set_usage(snapshot.clone(), cx);
+            });
+            cx.run_until_parked();
+            notifications.set(0);
+            snapshot.updated_at = if reset.is_some() { 1_009 } else { 1_360 };
+            sidebar.update(cx, |sidebar, cx| sidebar.set_usage(snapshot.clone(), cx));
+            cx.run_until_parked();
+            assert_eq!(notifications.get(), 0, "a fresh timestamp needs no frame");
+            snapshot.updated_at += 1;
+            sidebar.update(cx, |sidebar, cx| sidebar.set_usage(snapshot.clone(), cx));
+            cx.run_until_parked();
+            assert!(
+                notifications.get() > 0,
+                "expiry must invalidate the displayed percentage"
+            );
+            assert!(
+                crate::usage::limits::footer_quota(&snapshot.limits, snapshot.updated_at).is_none()
+            );
+        }
     }
 
     #[gpui::test]
