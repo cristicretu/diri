@@ -1594,7 +1594,13 @@ impl HeadlessScreen {
         self.prepare_history_read();
         let history = self.term.grid().history_size().min(HISTORY_EXPORT_ROWS);
         let cols = self.geometry.cols;
-        let mut payload = Vec::new();
+        // Reserved at the bound so the payload never grows. Growing a
+        // multi-megabyte buffer by reallocation left every intermediate
+        // buffer resident in the macOS allocator after the read (~8 MB per
+        // 10k-row checkpoint, per session, for good), while pages of the
+        // reservation that the encoding never reaches are never touched.
+        let mut payload =
+            Vec::with_capacity(history * diri_proto::grid::GridRowCodec::max_row_len(cols));
         let mut row = Vec::with_capacity(cols);
         for index in 0..history {
             let line = Line(index as i32 - history as i32);

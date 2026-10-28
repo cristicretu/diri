@@ -7598,7 +7598,7 @@ fn persist_checkpoint(
     }
     let (rows, payload) = history.unwrap_or_default();
     // A failed write must not stop the session; the checkpoint is a cache.
-    if checkpoint.write_with_history(path, rows, &payload).is_ok() {
+    if checkpoint.write_with_history(path, rows, payload).is_ok() {
         *last_key = Some(key);
     }
 }

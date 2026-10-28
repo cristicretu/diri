@@ -6,6 +6,11 @@ struct CountingAllocator;
 pub static LIVE: AtomicUsize = AtomicUsize::new(0);
 pub static ALLOCS: AtomicUsize = AtomicUsize::new(0);
 pub static PEAK: AtomicUsize = AtomicUsize::new(0);
+/// Allocations and reallocations of at least [`LARGE`] bytes.
+#[allow(dead_code)]
+pub static LARGE_ALLOCS: AtomicUsize = AtomicUsize::new(0);
+/// What the macOS allocator serves from its large-allocation cache.
+pub const LARGE: usize = 1 << 20;
 
 // SAFETY: every operation delegates to System with the original layout. The
 // counters allocate nothing and never affect the returned pointer or layout.
@@ -16,6 +21,9 @@ unsafe impl GlobalAlloc for CountingAllocator {
             let live = LIVE.fetch_add(layout.size(), Relaxed) + layout.size();
             PEAK.fetch_max(live, Relaxed);
             ALLOCS.fetch_add(1, Relaxed);
+            if layout.size() >= LARGE {
+                LARGE_ALLOCS.fetch_add(1, Relaxed);
+            }
         }
         pointer
     }
@@ -37,6 +45,9 @@ unsafe impl GlobalAlloc for CountingAllocator {
             };
             PEAK.fetch_max(live, Relaxed);
             ALLOCS.fetch_add(1, Relaxed);
+            if size >= LARGE {
+                LARGE_ALLOCS.fetch_add(1, Relaxed);
+            }
         }
         next
     }
