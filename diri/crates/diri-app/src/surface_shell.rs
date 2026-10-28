@@ -326,6 +326,12 @@ struct AgentPathEditor {
     error: Option<String>,
 }
 
+/// The new-terminal command field and why it cannot be saved, if it cannot.
+struct ShellCommandEditor {
+    text: QueryEditor,
+    error: Option<String>,
+}
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum AgentEditorField {
     Path,
@@ -632,6 +638,8 @@ pub struct UtilitySurfaces {
     settings_menu: Option<SettingsMenu>,
     agents_host: Option<String>,
     agent_path_editor: Option<AgentPathEditor>,
+    /// Settings › Terminal: the new-terminal command being edited.
+    shell_command_editor: Option<ShellCommandEditor>,
     hosts_path: PathBuf,
     hosts: Vec<HostEntry>,
     host_editor: Option<HostEditor>,
@@ -876,6 +884,7 @@ impl UtilitySurfaces {
             settings_menu: None,
             agents_host,
             agent_path_editor: None,
+            shell_command_editor: None,
             hosts_path,
             hosts,
             host_editor: None,
@@ -1853,6 +1862,141 @@ impl UtilitySurfaces {
         true
     }
 
+    fn handle_shell_command_key(&mut self, event: &KeyDownEvent, cx: &mut Context<Self>) -> bool {
+        if self.surface != Surface::Settings
+            || self.settings_tab != SettingsTab::Terminal
+            || self.shell_command_editor.is_none()
+        {
+            return false;
+        }
+        let key = &event.keystroke;
+        match key.key.as_str() {
+            "escape" => self.shell_command_editor = None,
+            "enter" => self.save_shell_command(),
+            _ => {
+                let Some(edit) = query_editor::edit_for(key) else {
+                    return false;
+                };
+                let Some(editor) = &mut self.shell_command_editor else {
+                    return false;
+                };
+                match edit {
+                    Edit::Local(local) => {
+                        editor.text.apply(local);
+                    }
+                    Edit::Clipboard(ClipboardEdit::Copy) => {
+                        query_editor::copy_selection(&editor.text, cx);
+                    }
+                    Edit::Clipboard(ClipboardEdit::Cut) => {
+                        query_editor::cut_selection(&mut editor.text, cx);
+                    }
+                    Edit::Clipboard(ClipboardEdit::Paste) => {
+                        if let Some(text) = cx.read_from_clipboard().and_then(|item| item.text()) {
+                            editor.text.insert(&text);
+                        }
+                    }
+                }
+                editor.error = None;
+            }
+        }
+        cx.notify();
+        true
+    }
+
+    fn open_shell_command_editor(&mut self) {
+        let mut text = QueryEditor::default();
+        text.insert(&self.prefs.terminal_shell_command);
+        self.shell_command_editor = Some(ShellCommandEditor { text, error: None });
+    }
+
+    /// Saves the new-terminal command, or keeps the editor open saying why
+    /// it cannot be read as words. Empty is the login shell.
+    fn save_shell_command(&mut self) {
+        let Some(editor) = &mut self.shell_command_editor else {
+            return;
+        };
+        let text = editor.text.text().trim().to_owned();
+        if crate::agent_catalog::split_launch_args(&text).is_none() {
+            editor.error = Some(t("settings.agents.args_unbalanced").into());
+            return;
+        }
+        self.shell_command_editor = None;
+        self.update_prefs(move |prefs| prefs.terminal_shell_command = text);
+    }
+
+    fn shell_command_editor_row(
+        &self,
+        editor: &ShellCommandEditor,
+        colors: SemanticColors,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let mut row = div()
+            .px(px(12.0))
+            .py(px(10.0))
+            .flex()
+            .flex_col()
+            .gap(px(7.0))
+            .child(
+                div()
+                    .debug_selector(|| "shell-command-field".into())
+                    .h(px(30.0))
+                    .px(px(8.0))
+                    .rounded(px(Radius::CHIP))
+                    .border_1()
+                    .border_color(colors.primary.alpha(0.14))
+                    .flex()
+                    .items_center()
+                    .text_size(px(11.0))
+                    .text_color(colors.primary)
+                    .font_family(crate::fonts::terminal_family(
+                        &self.prefs.terminal_font_family,
+                    ))
+                    .child(if editor.text.is_empty() {
+                        div()
+                            .text_color(colors.tertiary)
+                            .child(t("settings.terminal.shell_command_placeholder"))
+                            .into_any_element()
+                    } else {
+                        query_label(&editor.text)
+                    }),
+            );
+        if let Some(error) = &editor.error {
+            row = row.child(
+                div()
+                    .text_size(px(10.0))
+                    .text_color(Ink::DANGER)
+                    .child(error.clone()),
+            );
+        }
+        row.child(
+            div()
+                .flex()
+                .justify_end()
+                .gap(px(7.0))
+                .child(surface_button(
+                    t("settings.agents.cancel"),
+                    "cancel-shell-command",
+                    colors,
+                    cx,
+                    |this, cx| {
+                        this.shell_command_editor = None;
+                        cx.notify();
+                    },
+                ))
+                .child(surface_button(
+                    t("settings.terminal.shell_command_save"),
+                    "save-shell-command",
+                    colors,
+                    cx,
+                    |this, cx| {
+                        this.save_shell_command();
+                        cx.notify();
+                    },
+                )),
+        )
+        .into_any_element()
+    }
+
     fn handle_include_key(&mut self, event: &KeyDownEvent, cx: &mut Context<Self>) -> bool {
         if self.surface != Surface::Settings
             || self.settings_tab != SettingsTab::General
@@ -2796,6 +2940,7 @@ impl UtilitySurfaces {
             || self.handle_include_key(event, cx)
             || self.handle_roots_key(event, cx)
             || self.handle_agent_path_key(event, cx)
+            || self.handle_shell_command_key(event, cx)
             || self.handle_host_editor_key(event, cx)
         {
             return;
@@ -6886,6 +7031,51 @@ impl UtilitySurfaces {
                     div()
                         .flex()
                         .flex_col()
+                        .child(setting_row(
+                            t("settings.terminal.shell_command"),
+                            if self.prefs.terminal_shell_command.trim().is_empty() {
+                                SharedString::from(t("settings.terminal.shell_command_login"))
+                            } else {
+                                tf(
+                                    "settings.terminal.shell_command_custom",
+                                    &[("command", &self.prefs.terminal_shell_command.trim())],
+                                )
+                                .into()
+                            },
+                            div()
+                                .flex()
+                                .gap(px(7.0))
+                                .when(!self.prefs.terminal_shell_command.trim().is_empty(), |row| {
+                                    row.child(surface_button(
+                                        t("settings.terminal.shell_command_reset"),
+                                        "reset-shell-command",
+                                        colors,
+                                        cx,
+                                        |this, cx| {
+                                            this.shell_command_editor = None;
+                                            this.update_prefs(|prefs| {
+                                                prefs.terminal_shell_command.clear()
+                                            });
+                                            cx.notify();
+                                        },
+                                    ))
+                                })
+                                .child(surface_button(
+                                    t("settings.terminal.shell_command_edit"),
+                                    "edit-shell-command",
+                                    colors,
+                                    cx,
+                                    |this, cx| {
+                                        this.open_shell_command_editor();
+                                        cx.notify();
+                                    },
+                                )),
+                            colors,
+                        ))
+                        .children(self.shell_command_editor.as_ref().map(|editor| {
+                            self.shell_command_editor_row(editor, colors, cx)
+                        }))
+                        .child(setting_divider(colors))
                         .child(toggle_row(
                             t("settings.appearance.paste_protection"),
                             t("settings.appearance.paste_protection_detail"),
@@ -10340,6 +10530,17 @@ mod tests {
                     harness
                         .sidebar
                         .update(cx, |sidebar, cx| sidebar.set_width(320.0, cx));
+                    // `DIRI_VISUAL_SHELL_COMMAND=<text>`: a saved new-terminal
+                    // command; `DIRI_VISUAL_SHELL_EDITOR` opens its editor.
+                    if let Ok(command) = std::env::var("DIRI_VISUAL_SHELL_COMMAND") {
+                        harness.surfaces.update(cx, |surfaces, cx| {
+                            surfaces.prefs.terminal_shell_command = command;
+                            if std::env::var_os("DIRI_VISUAL_SHELL_EDITOR").is_some() {
+                                surfaces.open_shell_command_editor();
+                            }
+                            cx.notify();
+                        });
+                    }
                     // `DIRI_VISUAL_TRUSTED_LINKS=ssh,vscode` lists trusted
                     // app-link schemes in Settings › Terminal.
                     if let Ok(schemes) = std::env::var("DIRI_VISUAL_TRUSTED_LINKS") {
@@ -13075,6 +13276,44 @@ mod tests {
                     .prefs
                     .shortcut_overrides
                     .contains_key("open-launcher")
+            );
+        });
+    }
+
+    #[gpui::test]
+    fn terminal_settings_edit_the_new_terminal_command(cx: &mut TestAppContext) {
+        let (harness, cx) = cx.add_window_view(|window, cx| {
+            SettingsWorkbenchHarness::open_at(SettingsTab::Terminal, window, cx)
+        });
+        cx.simulate_resize(size(px(1200.0), px(800.0)));
+        cx.run_until_parked();
+        let surfaces = harness.read_with(cx, |harness, _| harness.surfaces.clone());
+        assert!(cx.debug_bounds("shell-command-field").is_none());
+
+        surfaces.update(cx, |surfaces, cx| {
+            surfaces.open_shell_command_editor();
+            cx.notify();
+        });
+        cx.run_until_parked();
+        assert!(cx.debug_bounds("shell-command-field").is_some());
+        // An unbalanced quote stays open with the reason.
+        surfaces.update(cx, |surfaces, _| {
+            let editor = surfaces.shell_command_editor.as_mut().unwrap();
+            editor.text.insert("zsh -c 'oops");
+            surfaces.save_shell_command();
+            assert!(surfaces.shell_command_editor.as_ref().unwrap().error.is_some());
+            assert!(surfaces.prefs.terminal_shell_command.is_empty());
+            let editor = surfaces.shell_command_editor.as_mut().unwrap();
+            editor.text = QueryEditor::default();
+            editor.text.insert("  nix develop  ");
+            surfaces.save_shell_command();
+            assert!(surfaces.shell_command_editor.is_none());
+            assert_eq!(surfaces.prefs.terminal_shell_command, "nix develop");
+            let store = surfaces.store.read().unwrap();
+            assert_eq!(
+                store.terminal_settings().shell_command,
+                Some(vec!["nix".to_owned(), "develop".to_owned()]),
+                "the Engine is sent argv"
             );
         });
     }

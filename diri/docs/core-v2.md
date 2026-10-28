@@ -231,13 +231,30 @@ Each PR lands on its own, behind the single `core-v2` cargo feature of `diri-ter
 1. **This PR (design + prototype).**
    - What lands: the vendored `vte` hooks (`ground_bytes`/`input_bytes`, `input_repeat`; defaults keep today's behavior), the public grapheme module, the `core_v2` prototype, its differential tests, the `HeadlessScreen::from_core_v2` bridge, the bench with the golden check (v2 and, switch off, the Engine on all six workloads), and CI running the switch both ways (arm64 NEON and x86_64 scalar).
 2. **Complete grid semantics.**
-   - Implement every `Handler` method with the current semantics: scroll regions, `IL`/`DL`/`ICH`/`DCH`/`ECH`, `ED` variants (including Diri's "bare `ED 2` scrolls into history"), save/restore, charsets, origin mode, insert mode, alternate screen, tabs, resets, OSC 8 links and OSC 133 marks.
-   - The `unsupported` counter must reach zero on the whole terminal-state test corpus. Each sequence family gets a differential test against the current core.
+   - Status: done on `core/v2-step2`.
+   - Every `Handler` method that changes the grid or its cursor now has the current core's semantics, ported method by method into `core_v2/ops.rs`:
+     - scroll regions, `IL`/`DL`/`SU`/`SD`/`RI`;
+     - `ICH`/`DCH`/`ECH`, and the `ED` variants, including "bare `ED 2` scrolls into history";
+     - the three alternate-screen modes, DECSC/DECRC, charsets;
+     - origin, insert, wrap and newline modes, tab stops, RIS, DECSTR, DECALN, DECCOLM;
+     - OSC 8 links (a per-page link table) and OSC 133 marks.
+   - The `unsupported` counter never counts any more.
+   - Not in this step: handler effects that are events rather than grid state (titles, colors, clipboard, replies, keyboard protocol, cursor style). They reach `HeadlessScreen` through its event collector and come with the adapter in step 4.
+   - Gates:
+     - per-family differential tests against the current core, at every split and under four history budgets;
+     - a random mix of 90 sequence families, run 3,000 times in local runs and 24 times in CI;
+     - the adversarial corpus of #927 when present, fed the same reads to both cores.
 3. **Link table and the Unicode gap.** The grapheme arena has landed in the prototype. Add the link table, and close the Unicode gap: history-on Unicode is 0.46× the reference.
-4. **Boundary adapter.**
-   - Implement `HeadlessScreen` over v2 (`core-v2` feature).
-   - Run the whole `diri-terminal-state` test suite and benches on both cores in CI.
-   - Snapshot/diff/scrollback wire output must be byte-identical on the vt workloads and the parity bench.
+4. **Boundary adapter.** Split into three PRs.
+   - **4a, the event layer.** Status: done on `core/v2-step4`.
+     - Ported: titles and the title stack, OSC 4/10/11/12 colors and their resets, OSC 52 store and load, every reply (DA1, DA2, DSR, DECRQM, XTWINOPS, XTVERSION, XTGETTCAP, DECRQSS), the kitty keyboard stack (swapped with the screens), the cursor style, the bell, and the events modes send.
+     - They reach the same `EventListener` as the current core.
+     - A differential test compares the event sequence, after applying reply closures to fixed inputs, plus colors, the cursor style and every mode bit, in one read, byte by byte and in 7-byte reads.
+   - **4b, a pure refactor.** `HeadlessScreen` reads its emulator through one internal interface (cells, cursor, modes, damage, history management, checkpoint writes) implemented by the current core. No behavior change, and every existing test is the gate.
+   - **4c, the second implementation.** The `core-v2` switch implements that interface with v2. That needs damage tracking (rows written or scrolled since the last frame, and the content sources `grid_update` reuses) and checkpoint writes.
+     - The whole `diri-terminal-state` suite runs both ways in CI.
+     - The wire output must be byte-identical on the vt workloads and the golden digests, and the diri-term screenshots must be pixel-identical.
+     - Resize is the one gap until step 5: with the switch on it must refuse rather than guess.
 5. **Reflow.** Page rewrap plus deferred cold reflow. Run the resize tests, and the #921 narrowing test on both cores.
 6. **Cold-page packing and the budget.** Prototyped here: it measures 4.7× and 3.7× the Engine (ASCII and Unicode) at budget, and is deterministic under the split tests.
    - Remaining: close the 1.5% gap in rows kept against today's Engine.
