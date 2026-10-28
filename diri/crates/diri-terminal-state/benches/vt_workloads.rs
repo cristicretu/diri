@@ -268,15 +268,10 @@ fn without_store_nonce(text: String) -> String {
     out
 }
 
-/// History rows compared: all but the oldest 1/64 of what the reference
-/// kept. On this base the 4 MiB history bound runs once per read and its
-/// row limit follows what it kept then, so how deep history reaches depends
-/// on where reads end (kitten ASCII: 63,583 rows a byte at a time, 63,647 in
-/// 64 KiB reads). Only the oldest rows differ; every newer row, and the
-/// screen, must match exactly. Make this the whole history once retention
-/// no longer depends on reads.
+/// History rows compared: all the reference kept. Retention depends only
+/// on the output, not on where reads end, so every row must match.
 fn history_checked(kept: usize) -> usize {
-    kept - kept / 64
+    kept
 }
 
 /// Digest key of the per-byte OSC checksum, which timed runs leave off.
@@ -287,8 +282,8 @@ const REFERENCE_ONLY: &str = "history_rows_reference";
 /// Everything observable at the end of a run, hashed where large. Keys are
 /// stable; values are compared as text.
 ///
-/// History is compared over its newest `checked_rows` rows. `None` is the
-/// reference: it checks the newest [`history_checked`] of the rows it kept.
+/// History is compared over its newest `checked_rows` rows (all of it; see
+/// [`history_checked`]). `None` is the reference, which records what it kept.
 fn digest(
     name: &str,
     data: &[u8],
