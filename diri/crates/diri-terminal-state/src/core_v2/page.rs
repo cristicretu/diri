@@ -246,12 +246,6 @@ impl TextLog {
         at as usize == self.bytes.len()
     }
 
-    /// The arena, leaving an empty one of the same capacity.
-    fn take_bytes(&mut self) -> Vec<u8> {
-        let capacity = self.bytes.capacity();
-        std::mem::replace(&mut self.bytes, Vec::with_capacity(capacity))
-    }
-
     #[inline(always)]
     pub fn invalidate(&mut self, row: usize) {
         self.spans[row].0 = INVALID;
@@ -342,6 +336,8 @@ pub struct Page {
     pub len: usize,
     /// Empty once the page is packed.
     pub cells: Box<[Cell]>,
+    /// Empty once the page is packed: the packed bytes start with each
+    /// row's metadata (see [`Page::pack`]); read it with [`Pages::meta`].
     pub meta: Box<[RowMeta]>,
     pub styles: StyleTable,
     pub clusters: Clusters,
@@ -736,17 +732,75 @@ impl Writer {
     }
 }
 
+#[inline]
+fn push_varint(out: &mut Vec<u8>, mut value: usize) {
+    while value >= 0x80 {
+        out.push(value as u8 | 0x80);
+        value >>= 7;
+    }
+    out.push(value as u8);
+}
+
+#[inline]
+fn read_varint(data: &[u8], at: &mut usize) -> usize {
+    let mut value = 0;
+    let mut shift = 0;
+    loop {
+        let byte = data[*at];
+        *at += 1;
+        value |= ((byte & 0x7F) as usize) << shift;
+        if byte < 0x80 {
+            return value;
+        }
+        shift += 7;
+    }
+}
+
+/// The metadata a packed row keeps, as two varints: `occ`, then
+/// `fill << 1 | wrapped` (usually two bytes, against a ten-byte
+/// [`RowMeta`]). `lead` is in a text row's header; `dirty` and `simple`
+/// mean nothing once a row is packed.
+fn pack_meta(meta: &[RowMeta], out: &mut Vec<u8>) {
+    for meta in meta {
+        push_varint(out, meta.occ as usize);
+        push_varint(out, (meta.fill as usize) << 1 | meta.wrapped as usize);
+    }
+}
+
+/// Decodes `metas.len()` rows of [`pack_meta`] output; returns where the
+/// row tokens start.
+fn unpack_meta(data: &[u8], metas: &mut [RowMeta]) -> usize {
+    let mut at = 0;
+    for meta in metas {
+        let occ = read_varint(data, &mut at) as u16;
+        let fill = read_varint(data, &mut at);
+        *meta = RowMeta {
+            occ,
+            fill: (fill >> 1) as u16,
+            lead: 0,
+            wrapped: fill & 1 != 0,
+            dirty: false,
+            simple: false,
+        };
+    }
+    at
+}
+
+/// Dense buffers a packed page leaves behind, reused by the next tail page.
+type DenseBuffers = (Box<[Cell]>, Box<[RowMeta]>, TextLog);
+
 impl Page {
     fn new(
         rows: usize,
         cols: usize,
         serial: u64,
-        dense: Option<(Box<[Cell]>, TextLog)>,
+        dense: Option<DenseBuffers>,
         logging: bool,
     ) -> Page {
-        let (cells, text) = dense.unwrap_or_else(|| {
+        let (cells, meta, text) = dense.unwrap_or_else(|| {
             (
                 vec![Cell::default(); rows * cols].into_boxed_slice(),
+                vec![RowMeta::default(); rows].into_boxed_slice(),
                 TextLog::new(rows, logging),
             )
         });
@@ -754,7 +808,7 @@ impl Page {
             serial,
             len: 0,
             cells,
-            meta: vec![RowMeta::default(); rows].into_boxed_slice(),
+            meta,
             styles: StyleTable::default(),
             clusters: Clusters::default(),
             text,
@@ -801,9 +855,10 @@ impl Page {
         }
     }
 
-    /// Packs the page; returns its dense cell buffer for reuse.
+    /// Packs the page; returns its dense buffers for reuse.
     ///
-    /// Per row, the cells below `occ` as tokens, with a current style:
+    /// The packed bytes are every row's metadata (see [`pack_meta`]), then
+    /// per row, the cells below `occ` as tokens, with a current style:
     /// `0x02 id(u16)` sets the style; `0x03 n chars` makes the next cell a
     /// cluster with those extra codepoints; `0x04 n` is n blanks; `0x01` and
     /// eight bytes is a literal cell; `0x05` is a leading spacer; a blank,
@@ -812,32 +867,14 @@ impl Page {
     /// two columns (with its spacer) when its width is two. Everything else about a cell (marks,
     /// spacers that do not follow their character, leading spacers) is a
     /// literal, so packing is lossless.
-    fn pack(&mut self, cols: usize, out: &mut Vec<u8>) -> (Box<[Cell]>, TextLog) {
+    fn pack(&mut self, cols: usize, out: &mut Vec<u8>) -> DenseBuffers {
         out.clear();
+        pack_meta(&self.meta[..self.len], out);
         // Every written row logged, in order, with nothing between them:
-        // the log is the packed page.
+        // the log is the row tokens.
         if self.text.on && self.text.contiguous(&self.meta[..self.len]) {
-            let bytes = self.text.take_bytes();
-            self.packed = Some(bytes.into_boxed_slice());
-            self.clusters.release();
-            self.styles.freeze();
-            let text = std::mem::replace(&mut self.text, TextLog::new(0, false));
-            let cells = std::mem::take(&mut self.cells);
-            #[cfg(debug_assertions)]
-            {
-                let mut check = vec![Cell::default(); self.len * cols];
-                let mut clusters = Clusters::default();
-                self.unpack(cols, &mut check, &mut clusters);
-                for row in 0..self.len {
-                    let occ = self.meta[row].occ as usize;
-                    assert_eq!(
-                        check[row * cols..row * cols + occ],
-                        cells[row * cols..row * cols + occ],
-                        "zero-copy packed row {row}"
-                    );
-                }
-            }
-            return (cells, text);
+            out.extend_from_slice(&self.text.bytes);
+            return self.finish_pack(cols, out);
         }
         let mut current = 0u64;
         for row in 0..self.len {
@@ -976,23 +1013,60 @@ impl Page {
             }
             flush_blanks(out, &mut blanks);
         }
-        self.packed = Some(Box::from(out.as_slice()));
+        self.finish_pack(cols, out)
+    }
+
+    /// Keeps `packed` as the page and hands back its dense buffers.
+    fn finish_pack(&mut self, cols: usize, packed: &[u8]) -> DenseBuffers {
+        self.packed = Some(Box::from(packed));
+        // Debug builds decode the page and compare it with the cells.
+        #[cfg(debug_assertions)]
+        {
+            let mut check = vec![Cell::default(); self.len * cols];
+            let mut metas = vec![RowMeta::default(); self.len];
+            let mut clusters = Clusters::default();
+            self.unpack(cols, &mut metas, &mut check, &mut clusters);
+            for row in 0..self.len {
+                let (got, want) = (metas[row], self.meta[row]);
+                assert_eq!(
+                    (got.occ, got.fill, got.wrapped),
+                    (want.occ, want.fill, want.wrapped),
+                    "packed metadata of row {row}"
+                );
+                for x in row * cols..row * cols + want.occ as usize {
+                    let (a, b) = (check[x], self.cells[x]);
+                    assert_eq!(a.0 & !CLUSTER, b.0 & !CLUSTER, "packed row {row}");
+                    assert_eq!(clusters.of(a), self.clusters.of(b), "cluster in row {row}");
+                }
+            }
+        }
+        #[cfg(not(debug_assertions))]
+        let _ = cols;
         self.clusters.release();
         self.styles.freeze();
         let text = std::mem::replace(&mut self.text, TextLog::new(0, false));
-        (std::mem::take(&mut self.cells), text)
+        let cells = std::mem::take(&mut self.cells);
+        let meta = std::mem::take(&mut self.meta);
+        (cells, meta, text)
     }
 
-    /// Decodes a packed page into `cells` (rows * cols) and `clusters`.
-    fn unpack(&self, cols: usize, cells: &mut [Cell], clusters: &mut Clusters) {
+    /// Decodes a packed page into `metas` (its rows), `cells` (rows *
+    /// cols) and `clusters`.
+    fn unpack(
+        &self,
+        cols: usize,
+        metas: &mut [RowMeta],
+        cells: &mut [Cell],
+        clusters: &mut Clusters,
+    ) {
         let data = self.packed.as_deref().expect("packed");
         clusters.clear();
-        let mut at = 0;
+        let mut at = unpack_meta(data, &mut metas[..self.len]);
         let mut current = 0u64;
         let mut pending: Option<u64> = None;
         let mut chars = Vec::new();
         for row in 0..self.len {
-            let occ = self.meta[row].occ as usize;
+            let occ = metas[row].occ as usize;
             let cells = &mut cells[row * cols..row * cols + occ];
             if occ > 0 && data[at] == T_TEXT_ROW {
                 let mut lead = data[at + 1] as usize;
@@ -1001,7 +1075,8 @@ impl Page {
                     lead = u16::from_le_bytes([data[at], data[at + 1]]) as usize;
                     at += 2;
                 }
-                let row_cells = decode_text_row(data, &mut at, self.meta[row].fill, lead, occ);
+                metas[row].lead = lead as u16;
+                let row_cells = decode_text_row(data, &mut at, metas[row].fill, lead, occ);
                 cells.copy_from_slice(&row_cells);
                 continue;
             }
@@ -1088,6 +1163,7 @@ impl Page {
 /// The most recently unpacked page, for reads of packed history.
 struct Unpacked {
     serial: u64,
+    meta: Box<[RowMeta]>,
     cells: Box<[Cell]>,
     clusters: Clusters,
 }
@@ -1108,7 +1184,7 @@ pub struct Pages {
     sealed: usize,
     packed_bytes: usize,
     spare: Option<Page>,
-    spare_dense: Vec<(Box<[Cell]>, TextLog)>,
+    spare_dense: Vec<DenseBuffers>,
     /// Reused output buffer of `Page::pack`.
     scratch: Vec<u8>,
     next_serial: u64,
@@ -1207,24 +1283,40 @@ impl Pages {
 
     /// Runs `f` over page `p`'s cells and clusters, unpacking it first
     /// (into a one-page cache) when it is packed.
-    pub fn read<R>(&self, p: usize, f: impl FnOnce(&[Cell], &Clusters) -> R) -> R {
+    pub fn read<R>(&self, p: usize, f: impl FnOnce(&[RowMeta], &[Cell], &Clusters) -> R) -> R {
         let page = &self.pages[p];
         if !page.is_packed() {
-            return f(&page.cells, &page.clusters);
+            return f(&page.meta, &page.cells, &page.clusters);
         }
         let mut cache = self.cache.borrow_mut();
         if cache.as_ref().is_none_or(|c| c.serial != page.serial) {
             let mut unpacked = cache.take().unwrap_or_else(|| Unpacked {
                 serial: 0,
+                meta: vec![RowMeta::default(); self.rows_per_page()].into_boxed_slice(),
                 cells: vec![Cell::default(); self.rows_per_page() * self.cols].into_boxed_slice(),
                 clusters: Clusters::default(),
             });
-            page.unpack(self.cols, &mut unpacked.cells, &mut unpacked.clusters);
+            page.unpack(
+                self.cols,
+                &mut unpacked.meta,
+                &mut unpacked.cells,
+                &mut unpacked.clusters,
+            );
             unpacked.serial = page.serial;
             *cache = Some(unpacked);
         }
         let unpacked = cache.as_ref().expect("filled");
-        f(&unpacked.cells, &unpacked.clusters)
+        f(&unpacked.meta, &unpacked.cells, &unpacked.clusters)
+    }
+
+    /// The metadata of row `r` of page `p`, packed or not.
+    #[inline]
+    pub fn meta(&self, p: usize, r: usize) -> RowMeta {
+        let page = &self.pages[p];
+        if !page.is_packed() {
+            return page.meta[r];
+        }
+        self.read(p, |meta, _, _| meta[r])
     }
 
     /// Drops the read cache (readers call this after a batch).
@@ -1303,11 +1395,11 @@ impl Pages {
             }
             let cols = self.cols;
             let page = &mut self.pages[self.sealed];
-            let (cells, mut text) = page.pack(cols, &mut self.scratch);
+            let (cells, meta, mut text) = page.pack(cols, &mut self.scratch);
             self.packed_bytes += page.stored_bytes();
             if self.spare_dense.len() < 2 {
                 text.clear();
-                self.spare_dense.push((cells, text));
+                self.spare_dense.push((cells, meta, text));
             }
             self.sealed += 1;
         }

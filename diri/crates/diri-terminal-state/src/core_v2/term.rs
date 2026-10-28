@@ -121,15 +121,15 @@ impl Core {
     /// past the row's occupancy. Packed history is unpacked to read it.
     pub fn cell(&self, line: i32, col: usize) -> Cell {
         let (p, r) = self.pages.locate_line(line);
-        let page = self.pages.page(p);
-        let meta = page.meta[r];
-        if col >= meta.occ as usize {
-            Cell::blank(meta.fill)
-        } else if !page.is_packed() {
-            page.cells[r * self.cols + col]
-        } else {
-            self.pages.read(p, |cells, _| cells[r * self.cols + col])
-        }
+        let cols = self.cols;
+        self.pages.read(p, |meta, cells, _| {
+            let meta = meta[r];
+            if col >= meta.occ as usize {
+                Cell::blank(meta.fill)
+            } else {
+                cells[r * cols + col]
+            }
+        })
     }
 
     pub fn style_of(&self, line: i32, cell: Cell) -> Style {
@@ -139,17 +139,17 @@ impl Core {
 
     pub fn wrapped(&self, line: i32) -> bool {
         let (p, r) = self.pages.locate_line(line);
-        self.pages.page(p).meta[r].wrapped
+        self.pages.meta(p, r).wrapped
     }
 
     /// The extra codepoints of the cluster at `line`, `col`.
     pub fn zerowidth(&self, line: i32, col: usize) -> Vec<char> {
         let (p, r) = self.pages.locate_line(line);
-        if col >= self.pages.page(p).meta[r].occ as usize {
-            return Vec::new();
-        }
         let cols = self.cols;
-        self.pages.read(p, |cells, clusters| {
+        self.pages.read(p, |meta, cells, clusters| {
+            if col >= meta[r].occ as usize {
+                return Vec::new();
+            }
             clusters.of(cells[r * cols + col]).to_vec()
         })
     }
