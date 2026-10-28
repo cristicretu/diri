@@ -8,6 +8,8 @@
 
 use std::time::{Duration, Instant};
 
+use diri_proto::grid::{CursorShape, CursorStyle};
+
 use crate::cursor_focus::{CursorFocus, FocusFrame};
 
 /// The cursor holds solid for this long after the last keystroke, cursor move
@@ -30,6 +32,77 @@ pub const BLINK_CYCLES: u32 = 10;
 /// Shortest wake a hold arms. A timer that fires a hair before the fade it
 /// was aimed at re-arms for this long instead of spinning on a zero delay.
 const MIN_WAKE: Duration = Duration::from_millis(1);
+/// [`BlinkRate::stretch`] of the shipped blink.
+pub const NORMAL_STRETCH: u32 = 1_000;
+
+/// How fast an idle cursor blinks. `Off` holds it steady.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum BlinkRate {
+    Off,
+    Slow,
+    #[default]
+    Normal,
+    Fast,
+}
+
+impl BlinkRate {
+    /// One cycle's length in thousandths of [`BLINK_CYCLE`]; `None` when
+    /// the cursor does not blink. Integer so a stretched hold is exact.
+    #[must_use]
+    pub const fn stretch(self) -> Option<u32> {
+        match self {
+            Self::Off => None,
+            Self::Slow => Some(1_500),
+            Self::Normal => Some(NORMAL_STRETCH),
+            Self::Fast => Some(600),
+        }
+    }
+}
+
+/// The user's cursor: what an untouched terminal draws, and whether a
+/// program may override the shape.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct CursorPreferences {
+    pub shape: CursorShape,
+    pub blink: BlinkRate,
+    /// Honour a program's DECSCUSR shape and steady request (vim's bar in
+    /// insert mode). Off, every terminal draws [`Self::shape`].
+    pub follow_program: bool,
+}
+
+impl Default for CursorPreferences {
+    fn default() -> Self {
+        Self {
+            shape: CursorShape::Block,
+            blink: BlinkRate::Normal,
+            follow_program: true,
+        }
+    }
+}
+
+impl CursorPreferences {
+    /// The cursor to draw for what the program asked for. A program that
+    /// never sent DECSCUSR, or reset it with `CSI 0 SP q`, reads as the
+    /// default style and gets the user's; so does a blinking block (`CSI 1
+    /// SP q`), which is indistinguishable on the wire. A blink set to Off
+    /// is never overridden into blinking, and a program asking for steady
+    /// is always steady.
+    #[must_use]
+    pub fn resolve(self, program: CursorStyle) -> CursorStyle {
+        let own = self.blink == BlinkRate::Off;
+        if self.follow_program && program != CursorStyle::default() {
+            CursorStyle {
+                shape: program.shape,
+                steady: program.steady || own,
+            }
+        } else {
+            CursorStyle {
+                shape: self.shape,
+                steady: own,
+            }
+        }
+    }
+}
 
 pub const GLIDE_DURATION: Duration = Duration::from_millis(80);
 /// Horizontal reach of a glide, in cells. Word motions and short edits stay
@@ -95,9 +168,18 @@ pub fn glide_decision(cursor_move: CursorMove) -> MoveKind {
 /// Opacity of the cursor `idle` after the last activity.
 #[must_use]
 pub fn blink_opacity(idle: Duration) -> f32 {
+    blink_opacity_at(idle, NORMAL_STRETCH)
+}
+
+/// [`blink_opacity`] for a cycle `stretch` thousandths of [`BLINK_CYCLE`].
+/// The idle delay before the first fade does not stretch: it is about the
+/// user stopping, not about the blink.
+#[must_use]
+pub fn blink_opacity_at(idle: Duration, stretch: u32) -> f32 {
     let Some(blinking) = idle.checked_sub(BLINK_IDLE_DELAY) else {
         return 1.0;
     };
+    let blinking = unstretch(blinking, stretch);
     if blinking >= BLINK_CYCLE * BLINK_CYCLES {
         return 1.0;
     }
@@ -121,9 +203,31 @@ pub fn blink_opacity(idle: Duration) -> f32 {
 /// the cursor has come to rest nothing is scheduled.
 #[must_use]
 pub fn blink_schedule(idle: Duration) -> CursorSchedule {
+    blink_schedule_at(idle, NORMAL_STRETCH)
+}
+
+/// [`blink_schedule`] for a cycle `stretch` thousandths of [`BLINK_CYCLE`].
+#[must_use]
+pub fn blink_schedule_at(idle: Duration, stretch: u32) -> CursorSchedule {
     let Some(blinking) = idle.checked_sub(BLINK_IDLE_DELAY) else {
         return hold_for(BLINK_IDLE_DELAY - idle);
     };
+    match normal_blink_schedule(unstretch(blinking, stretch)) {
+        CursorSchedule::After(delay) => hold_for(delay * stretch / NORMAL_STRETCH),
+        schedule => schedule,
+    }
+}
+
+/// Time into a stretched blink as time into a normal one. Anything past the
+/// last cycle stays past it; the clamp keeps `Duration::MAX` (never active)
+/// from overflowing the float conversion.
+fn unstretch(blinking: Duration, stretch: u32) -> Duration {
+    let past_end = BLINK_CYCLE * (BLINK_CYCLES * 4);
+    blinking.min(past_end) * NORMAL_STRETCH / stretch.max(1)
+}
+
+/// The schedule `blinking` into a cycle of the normal length.
+fn normal_blink_schedule(blinking: Duration) -> CursorSchedule {
     // The last cycle ends on its high hold, which already looks like rest.
     let end = BLINK_CYCLE * BLINK_CYCLES - BLINK_HIGH_HOLD;
     if blinking >= end {
@@ -266,8 +370,11 @@ pub struct CursorMotion {
     /// being painted (blur, hidden, scrollback), so its return starts solid.
     drawn: bool,
     /// The program asked for a cursor that does not blink (DECSCUSR 2, 4
-    /// or 6, or mode 12 reset). Glides still run; the blink never starts.
+    /// or 6, or mode 12 reset), or the user turned blinking off. Glides
+    /// still run; the blink never starts.
     steady: bool,
+    /// The user's blink speed. Off is carried by `steady`.
+    blink: BlinkRate,
 }
 
 impl CursorMotion {
@@ -326,6 +433,18 @@ impl CursorMotion {
         self.steady = steady;
     }
 
+    /// Follows the user's blink speed. `Off` also holds the cursor steady.
+    pub fn set_blink(&mut self, blink: BlinkRate) {
+        self.blink = blink;
+        if blink == BlinkRate::Off {
+            self.steady = true;
+        }
+    }
+
+    fn stretch(&self) -> u32 {
+        self.blink.stretch().unwrap_or(NORMAL_STRETCH)
+    }
+
     /// Decides a wake against the opacity the last frame painted.
     #[must_use]
     pub fn wake(&self, painted_opacity: f32, now: Instant) -> Wake {
@@ -344,10 +463,11 @@ impl CursorMotion {
         let idle = self.last_activity.map_or(Duration::MAX, |activity| {
             now.saturating_duration_since(activity)
         });
-        if blink_opacity(idle) != painted_opacity {
+        let stretch = self.stretch();
+        if blink_opacity_at(idle, stretch) != painted_opacity {
             return Wake::Paint;
         }
-        match blink_schedule(idle) {
+        match blink_schedule_at(idle, stretch) {
             // A fade is starting: paint, and the frame hands the rest of it
             // to the display link.
             CursorSchedule::NextFrame => Wake::Paint,
@@ -391,11 +511,12 @@ impl CursorMotion {
         let idle = self.last_activity.map_or(Duration::MAX, |activity| {
             now.saturating_duration_since(activity)
         });
+        let stretch = self.stretch();
         CursorFrame {
-            opacity: blink_opacity(idle),
+            opacity: blink_opacity_at(idle, stretch),
             offset_cols: 0.0,
             offset_rows: 0.0,
-            schedule: blink_schedule(idle),
+            schedule: blink_schedule_at(idle, stretch),
         }
     }
 }
@@ -1042,5 +1163,112 @@ mod tests {
         // The same idle cursor blinks once the program lets it.
         motion.set_steady(false);
         assert!(motion.sample(target, start + ms(9_000), false).opacity < 1.0);
+    }
+
+    #[test]
+    fn blink_speed_stretches_the_cycle_but_not_the_idle_delay() {
+        // All three hold solid through the idle delay.
+        for stretch in [600, 1_000, 1_500] {
+            assert_eq!(blink_opacity_at(ms(499), stretch), 1.0);
+        }
+        // The normal low hold sits 200-500 ms into the cycle. Slow reaches it
+        // 1.5 times later, fast at 0.6 times.
+        let low = BLINK_IDLE_DELAY + ms(350);
+        assert_eq!(blink_opacity_at(low, 1_000), BLINK_FLOOR);
+        assert_eq!(
+            blink_opacity_at(BLINK_IDLE_DELAY + ms(525), 1_500),
+            BLINK_FLOOR
+        );
+        assert_eq!(
+            blink_opacity_at(BLINK_IDLE_DELAY + ms(210), 600),
+            BLINK_FLOOR
+        );
+        // Slow is still fading at the point where normal is already low.
+        assert!(blink_opacity_at(BLINK_IDLE_DELAY + ms(250), 1_500) > BLINK_FLOOR);
+        // A hold's wake is stretched with it.
+        assert_eq!(
+            blink_schedule_at(BLINK_IDLE_DELAY + ms(250), 1_000),
+            CursorSchedule::After(ms(250))
+        );
+        assert_eq!(
+            blink_schedule_at(BLINK_IDLE_DELAY + ms(375), 1_500),
+            CursorSchedule::After(ms(375))
+        );
+        // Every speed comes to rest after the same number of cycles, and the
+        // never-active cursor does not overflow.
+        assert_eq!(
+            blink_schedule_at(BLINK_IDLE_DELAY + BLINK_CYCLE * 3 / 2 * BLINK_CYCLES, 1_500),
+            CursorSchedule::Rest
+        );
+        for stretch in [600, 1_000, 1_500] {
+            assert_eq!(blink_opacity_at(Duration::MAX, stretch), 1.0);
+            assert_eq!(
+                blink_schedule_at(Duration::MAX, stretch),
+                CursorSchedule::Rest
+            );
+        }
+    }
+
+    #[test]
+    fn blink_off_holds_the_cursor_steady() {
+        let start = Instant::now();
+        let mut motion = CursorMotion::default();
+        motion.set_blink(BlinkRate::Off);
+        motion.sample(cell(4, 0), start, false);
+        for offset in [700, 900, 5_000] {
+            assert_eq!(
+                motion.sample(cell(4, 0), start + ms(offset), false),
+                CursorFrame::REST
+            );
+            assert_eq!(motion.wake(1.0, start + ms(offset)), Wake::Stop);
+        }
+    }
+
+    #[test]
+    fn preferences_draw_untouched_terminals_and_yield_to_programs() {
+        let program_bar = CursorStyle {
+            shape: CursorShape::Bar,
+            steady: false,
+        };
+        let prefs = CursorPreferences {
+            shape: CursorShape::Underline,
+            blink: BlinkRate::Normal,
+            follow_program: true,
+        };
+        // No DECSCUSR (or CSI 0 SP q): the user's shape.
+        assert_eq!(
+            prefs.resolve(CursorStyle::default()),
+            CursorStyle {
+                shape: CursorShape::Underline,
+                steady: false
+            }
+        );
+        // Vim's insert-mode bar wins while programs may change it.
+        assert_eq!(prefs.resolve(program_bar), program_bar);
+        // A program asking for steady stays steady.
+        let steady_bar = CursorStyle {
+            shape: CursorShape::Bar,
+            steady: true,
+        };
+        assert_eq!(prefs.resolve(steady_bar), steady_bar);
+        // Ignoring programs keeps the user's shape everywhere.
+        let ignore = CursorPreferences {
+            follow_program: false,
+            ..prefs
+        };
+        assert_eq!(ignore.resolve(steady_bar).shape, CursorShape::Underline);
+        assert!(!ignore.resolve(steady_bar).steady);
+        // Blink off is never overridden into blinking.
+        let off = CursorPreferences {
+            blink: BlinkRate::Off,
+            ..prefs
+        };
+        assert!(off.resolve(program_bar).steady);
+        assert!(off.resolve(CursorStyle::default()).steady);
+        // The shipped default changes nothing.
+        let shipped = CursorPreferences::default();
+        for style in [CursorStyle::default(), program_bar, steady_bar] {
+            assert_eq!(shipped.resolve(style), style);
+        }
     }
 }
