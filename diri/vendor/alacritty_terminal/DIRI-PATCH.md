@@ -492,3 +492,9 @@ are not implemented.
 answer table, the DA2 version and the OSC 52 base64 handling, so the core v2
 prototype in `diri-terminal-state` answers exactly as `Term` does instead of
 keeping a second copy. `Term`'s own code paths are unchanged.
+
+## Test-only `observe` feature
+
+`observe = ["vte/observe"]` only forwards the vendored VTE's test-only OSC
+totals (see its DIRI-PATCH.md) so `diri-terminal-state`'s `bench-verify`
+feature can reach them. No source change.
