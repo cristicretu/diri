@@ -3353,6 +3353,46 @@ impl<T: EventListener> Handler for Term<T> {
     }
 }
 
+/// DIRI PATCH (core v2): the XTGETTCAP reply for one hex-encoded name, as
+/// `request_termcap` writes it, so the core v2 prototype answers alike.
+#[doc(hidden)]
+pub fn xtgettcap_reply(hex: &[u8]) -> String {
+    let name = decode_hex(hex);
+    match name.as_deref().and_then(termcap) {
+        Some(Some(value)) => format!(
+            "\x1bP1+r{}={}\x1b\\",
+            hex_name(hex),
+            encode_hex(value.as_bytes())
+        ),
+        Some(None) => format!("\x1bP1+r{}\x1b\\", hex_name(hex)),
+        None => format!("\x1bP0+r{}\x1b\\", hex_name(hex)),
+    }
+}
+
+/// DIRI PATCH (core v2): the text of an OSC 52 store, as `clipboard_store`
+/// decodes it.
+#[doc(hidden)]
+pub fn osc52_store_text(base64: &[u8]) -> Option<String> {
+    String::from_utf8(Base64.decode(base64).ok()?).ok()
+}
+
+/// DIRI PATCH (core v2): the OSC 52 load reply `clipboard_load` builds.
+#[doc(hidden)]
+pub fn osc52_load_reply(clipboard: u8, text: &str, terminator: &str) -> String {
+    format!(
+        "\x1b]52;{};{}{}",
+        clipboard as char,
+        Base64.encode(text),
+        terminator
+    )
+}
+
+/// DIRI PATCH (core v2): the version DA2 (`CSI > c`) reports.
+#[doc(hidden)]
+pub fn da2_version() -> usize {
+    version_number(env!("CARGO_PKG_VERSION"))
+}
+
 /// DIRI PATCH: XTGETTCAP answers. `Some(None)` is a boolean capability; the
 /// values are terminfo strings, escapes spelled the way terminfo spells them.
 fn termcap(name: &[u8]) -> Option<Option<&'static str>> {
