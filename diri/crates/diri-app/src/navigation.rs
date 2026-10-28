@@ -2728,9 +2728,9 @@ fn navigation_index_roots(
         .collect();
     let normalized_home = quick_open::resolve_roots("~", &[], home);
     let mut fallback = quick_open::resolve_roots("", &parents, home);
-    // A project directly under home must not implicitly opt into scanning
-    // private sibling folders. Explicit roots still use the generic parser.
-    fallback.retain(|parent| !normalized_home.contains(parent));
+    // Implicit roots must not scan home or an ancestor that can re-enter it,
+    // even when home itself becomes a project. Explicit roots remain opt-in.
+    fallback.retain(|parent| !normalized_home.iter().any(|home| home.starts_with(parent)));
     quick_open::resolve_roots(setting, &fallback, home)
 }
 
@@ -2784,6 +2784,36 @@ mod tests {
                 assert!(snapshot.recent.iter().any(|item| item.path == repo));
             }
         }
+    }
+
+    #[test]
+    fn quick_open_selected_home_does_not_implicitly_scan_its_ancestor() {
+        let fixture = quick_open_fixture();
+        let home = fixture.path().join("home");
+        let marker = home.join("Documents/private-marker");
+        std::fs::create_dir_all(&marker).unwrap();
+        let projects = vec![(home.clone(), "home".into())];
+
+        // An explicitly configured ancestor remains an intentional scan root.
+        let explicit =
+            navigation_index_roots(&fixture.path().display().to_string(), &projects, &home);
+        assert_eq!(explicit, vec![fixture.path().to_path_buf()]);
+        assert!(
+            quick_open::scan(&explicit, &[])
+                .iter()
+                .any(|entry| entry.path == marker)
+        );
+
+        let roots = navigation_index_roots("", &projects, &home);
+        let entries = quick_open::scan(&roots, std::slice::from_ref(&home));
+        let snapshot = quick_open::build_snapshot(&entries, &projects, &[]);
+        assert!(snapshot.pool.iter().any(|candidate| candidate.path == home));
+        assert!(snapshot.recent.iter().any(|item| item.path == home));
+        assert!(entries.iter().all(|entry| entry.path != marker));
+        assert!(roots.iter().all(|root| !home.starts_with(root)));
+        assert!(roots.is_empty(), "unexpected recursive roots: {roots:?}");
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].path, home);
     }
 
     #[test]

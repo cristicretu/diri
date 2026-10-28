@@ -32,7 +32,7 @@
   "settings.general.quick_open": "Quick Open",
   "settings.general.render_counters": "Render counters",
   "settings.general.render_counters_detail": "Badge the main views with how often they render, and list them in the overlay.",
-  "settings.general.roots_empty_hint": "Empty uses known project parent folders, excluding your home folder. Add root opens the system picker.",
+  "settings.general.roots_empty_hint": "Empty uses known project parent folders, excluding your home folder and its ancestors. Add root opens the system picker.",
   "settings.general.roots_hint": "One folder per line, scanned four levels deep. Add root adds another.",
   "settings.general.save": "Save",
   "settings.general.save_failed": "Could not save settings: {error}",

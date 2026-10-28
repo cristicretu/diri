@@ -32,7 +32,7 @@
   "settings.general.quick_open": "Apertura rápida",
   "settings.general.render_counters": "Contadores de renderizado",
   "settings.general.render_counters_detail": "Mostrar en las vistas principales cuántas veces se renderizan y listarlas en la superposición.",
-  "settings.general.roots_empty_hint": "Si está vacío, se usan las carpetas que contienen proyectos conocidos, excepto tu carpeta de inicio. Añadir raíz abre el selector del sistema.",
+  "settings.general.roots_empty_hint": "Si está vacío, se usan las carpetas que contienen proyectos conocidos, excepto tu carpeta de inicio y sus carpetas superiores. Añadir raíz abre el selector del sistema.",
   "settings.general.roots_hint": "Una carpeta por línea; se exploran cuatro niveles. Añadir raíz agrega otra.",
   "settings.general.save": "Guardar",
   "settings.general.save_failed": "No se pudieron guardar los ajustes: {error}",
