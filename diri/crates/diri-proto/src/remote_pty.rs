@@ -18,9 +18,9 @@ use crate::grid::{GridCodecError, GridUpdate};
 use crate::terminal::MouseModes;
 
 pub const PROTOCOL_MAJOR: u16 = 1;
-pub const PROTOCOL_MINOR: u16 = 19;
+pub const PROTOCOL_MINOR: u16 = 23;
 /// `grid-history-v1`: grids carry the primary screen's history position.
-pub const GRID_HISTORY_PROTOCOL_MINOR: u16 = 19;
+pub const GRID_HISTORY_PROTOCOL_MINOR: u16 = 23;
 pub const GRID_RESUME_PROTOCOL_MINOR: u16 = 17;
 /// Minor 17 belongs to `grid-resume-v1`; styles are negotiated by name.
 pub const TERMINAL_STYLES_PROTOCOL_MINOR: u16 = 18;
@@ -2748,7 +2748,7 @@ mod usage_tests {
     }
 
     #[test]
-    fn grid_history_is_an_optional_minor_19_capability() {
+    fn grid_history_is_an_optional_minor_23_capability() {
         const {
             assert!(GRID_HISTORY_PROTOCOL_MINOR == PROTOCOL_MINOR);
             assert!(GRID_HISTORY_PROTOCOL_MINOR > TERMINAL_STYLES_PROTOCOL_MINOR);

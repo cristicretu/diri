@@ -2129,9 +2129,9 @@ starts from the blinking default, so a DECRQM `?12` query reports the blink
 and never turns the cursor steady. Checkpoint restore replays spans and the
 cursor style. No Holder task, timer or queue is added.
 
-## Grid history positions (protocol minor 19)
+## Grid history positions (protocol minor 23)
 
-Protocol minor 19 adds optional `grid-history-v1`. Every primary-screen grid
+Protocol minor 23 adds optional `grid-history-v1`. Every primary-screen grid
 (snapshot or delta) may carry a `GridHistory { origin, rows }`: `rows` is the
 history length (the `liveStartRow` a `session.read_scrollback_cells` reply
 made at that moment reports) and `origin` the rows that have left history
@@ -2151,10 +2151,11 @@ per grid for a fresh terminal, 3 at 10,000 rows of history, 5-6 once eviction
 has run for a while. A decoder that predates it cannot skip the bytes when
 annotations follow, so it is negotiated like `terminal-styles-v1` and only on
 top of it: the Engine lists `grid-history-v1` in `Hello.requiredCapabilities`
-for a Helper at minor 19 or above; a Holder rejects it below minor 19 or
+for a Helper at minor 23 or above; a Holder rejects it below minor 23 or
 without `terminal-styles-v1`, and strips positions from snapshots and deltas
 for every controller that did not ask, naming the capability in `HelloAck`
-only to one that did. The Engine's mirror republishes the latest position with
+only to one that did. Minors 19-22 belong to other optional capabilities;
+this one is negotiated by name and assumes none of them. The Engine's mirror republishes the latest position with
 a full update. Locally `AttachRequest.gridHistory` opts in; the Engine sends a
 client without it the exact styled bytes from before, encoding a third form
 only for a publication with a position while such a sink is attached.

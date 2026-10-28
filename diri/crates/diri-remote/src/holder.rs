@@ -1275,7 +1275,7 @@ impl Holder {
         {
             return Err(io::Error::new(
                 io::ErrorKind::Unsupported,
-                "grid-history-v1 requires protocol minor 19 and terminal-styles-v1",
+                "grid-history-v1 requires protocol minor 23 and terminal-styles-v1",
             ));
         }
         connection.grid_history = history_requested;
@@ -2486,7 +2486,7 @@ mod tests {
         assert!(snapshot.history.is_some());
         screen.feed(b"\r\nfour");
         let delta = screen.grid_update(false);
-        for (minor, styles, history) in [(18, true, false), (19, true, false), (19, true, true)] {
+        for (minor, styles, history) in [(18, true, false), (23, true, false), (23, true, true)] {
             let (stream, _peer) = UnixStream::pair().unwrap();
             let mut connection = Connection::new(stream);
             connection.protocol_minor = minor;
