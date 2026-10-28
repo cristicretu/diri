@@ -282,6 +282,92 @@ mod tests {
         engine
     }
 
+    /// Synthetic examples based on aider.json, not captured user sessions.
+    #[test]
+    fn aider_unanswered_and_wrapped_confirmations_match_permission() {
+        let engine = engine();
+        for lines in [
+            vec!["Create new file? (Y)es/(N)o [Yes]:"],
+            vec![
+                "░█ Waiting for openai/model",
+                "Add files? (Y)es/(N)o/(A)ll/(S)kip-all",
+                "[Yes]:",
+            ],
+        ] {
+            let snapshot = ScreenSnapshot::from_lines(lines.clone());
+            let observation = engine
+                .evaluate(&snapshot, "aider")
+                .expect("synthetic pending Aider confirmation should match");
+            assert_eq!(
+                (observation.state, observation.matched_rule_id.as_str()),
+                (ManifestState::BlockedPermission, "confirm-prompt"),
+                "{lines:#?}"
+            );
+            assert_eq!(observation.prompt_excerpt, Some(lines.join("\n")));
+        }
+    }
+
+    /// Synthetic examples based on aider.json, not captured user sessions.
+    #[test]
+    fn aider_answered_confirmation_yields_to_working_spinner() {
+        let engine = engine();
+        for spinner in [
+            "░█ Waiting for openai/model",
+            "  █░ Generating commit message with model",
+        ] {
+            for lines in [
+                vec![spinner],
+                vec!["Create new file? (Y)es/(N)o [Yes]: y", spinner],
+            ] {
+                let observation = engine
+                    .evaluate(&ScreenSnapshot::from_lines(lines.clone()), "aider")
+                    .expect("synthetic Aider spinner should match");
+                assert_eq!(
+                    (observation.state, observation.matched_rule_id.as_str()),
+                    (ManifestState::Working, "working-spinner"),
+                    "{lines:#?}"
+                );
+                assert_eq!(observation.prompt_excerpt, None);
+            }
+        }
+    }
+
+    /// Synthetic examples based on aider.json, not captured user sessions.
+    #[test]
+    fn aider_bottom_row_prompts_match_idle() {
+        let engine = engine();
+        for prompt in [">", "ask>  "] {
+            let observation = engine
+                .evaluate(
+                    &ScreenSnapshot::from_lines(["Response complete.", prompt]),
+                    "aider",
+                )
+                .expect("synthetic Aider bottom-row prompt should match");
+            assert_eq!(
+                (observation.state, observation.matched_rule_id.as_str()),
+                (ManifestState::Idle, "idle-prompt"),
+                "{prompt:?}"
+            );
+        }
+    }
+
+    /// Synthetic examples based on aider.json, not captured user sessions.
+    #[test]
+    fn aider_arrows_and_quoted_prompt_above_last_row_do_not_match_idle() {
+        let engine = engine();
+        for lines in [
+            vec!["->"],
+            vec!["-->"],
+            vec![">", "Response continues here."],
+        ] {
+            assert_eq!(
+                engine.evaluate(&ScreenSnapshot::from_lines(lines.clone()), "aider"),
+                None,
+                "synthetic non-prompt screen must not match: {lines:#?}"
+            );
+        }
+    }
+
     #[test]
     fn claude_live_work_outranks_its_visible_input_box() {
         let engine = engine();
