@@ -925,6 +925,8 @@ pub struct TerminalViewport {
 pub struct TerminalPane {
     #[cfg(test)]
     pub(crate) render_count: usize,
+    /// How the last key press read Option, for its release.
+    last_option_key: OptionKey,
     /// Hosts the note when this pane's session is a note Session: a note has
     /// no PTY, so the pane shows the editor and never attaches.
     note: Option<Entity<crate::notes::NotePane>>,
@@ -1243,6 +1245,7 @@ impl TerminalPane {
         let mut pane = Self {
             #[cfg(test)]
             render_count: 0,
+            last_option_key: OptionKey::Meta,
             note: None,
             pending_note_block: None,
             window_store,
@@ -1400,8 +1403,7 @@ impl TerminalPane {
                     .store
                     .read()
                     .expect("session store lock poisoned");
-                let prefs = store.preferences();
-                crate::fonts::terminal_font(&prefs.terminal_font_family, prefs.terminal_ligatures)
+                crate::fonts::terminal_font_from(store.preferences())
             };
             let generation = self.next_attachment_generation;
             self.next_attachment_generation = self.next_attachment_generation.wrapping_add(1);
@@ -2487,24 +2489,29 @@ impl TerminalPane {
                 self.paste_into_session(&id, &text);
             }
             Some(TerminalDropAction::Upload(files)) => {
-                let Some((target, ssh)) = destination else {
-                    return;
-                };
-                let pane_tx = self.pane_tx.clone();
-                self.tokio.spawn(async move {
-                    let result = tokio::task::spawn_blocking(move || {
-                        files
-                            .iter()
-                            .map(|file| upload_dropped_file(file, &ssh))
-                            .collect::<Result<Vec<_>, _>>()
-                    })
-                    .await
-                    .unwrap_or_else(|error| Err(format!("upload task failed: {error}")));
-                    let _ = pane_tx.send(PaneEvent::DroppedFilesUploaded(target, result));
-                });
+                if let Some(destination) = destination {
+                    self.upload_files(destination, files);
+                }
             }
         }
         cx.notify();
+    }
+
+    /// Copies local files to a remote session's host; the remote paths are
+    /// pasted when the upload finishes (`PaneEvent::DroppedFilesUploaded`).
+    fn upload_files(&self, (target, ssh): (UploadTarget, String), files: Vec<std::path::PathBuf>) {
+        let pane_tx = self.pane_tx.clone();
+        self.tokio.spawn(async move {
+            let result = tokio::task::spawn_blocking(move || {
+                files
+                    .iter()
+                    .map(|file| upload_dropped_file(file, &ssh))
+                    .collect::<Result<Vec<_>, _>>()
+            })
+            .await
+            .unwrap_or_else(|error| Err(format!("upload task failed: {error}")));
+            let _ = pane_tx.send(PaneEvent::DroppedFilesUploaded(target, result));
+        });
     }
 
     /// One tick as dragged files arrive over this pane, if releasing them
@@ -2950,6 +2957,11 @@ impl TerminalPane {
                     .filter(|plan| !plan.is_empty())
                     .map(|plan| plan.headline().into()),
                 importing_herdr: store.herdr().importing,
+                terminal_setup: store
+                    .terminal_setup()
+                    .plans()
+                    .first()
+                    .map(|plan| plan.source.name()),
             }
         };
         let canonical = Arc::clone(&self.runtime.store);
@@ -3450,6 +3462,33 @@ impl TerminalPane {
         })
     }
 
+    /// Whether a window point lies in the strip left of the grid where shell
+    /// command marks are drawn.
+    fn in_command_gutter(&self, position: gpui::Point<gpui::Pixels>) -> bool {
+        let viewport = self.viewport.unwrap_or_default();
+        let grid_x = viewport.x + GRID_HORIZONTAL_PADDING / 2.0;
+        let x = f32::from(position.x);
+        x < grid_x && x >= viewport.x
+    }
+
+    /// Selects the output of the finished command whose mark is on a window
+    /// row, as clicking that mark does. False when no finished command with
+    /// output starts there.
+    fn select_marked_command_output(&mut self, id: &SessionId, row: usize) -> bool {
+        let Some(resident) = self.residents.get(id) else {
+            return false;
+        };
+        let Some(output) = resident.element.command_output_marked_at(row) else {
+            return false;
+        };
+        resident.element.select_range(output.start, output.end);
+        resident.element.complete_selection();
+        if let Some(resident) = self.residents.get_mut(id) {
+            resident.pointer_owner = None;
+        }
+        true
+    }
+
     fn handle_pointer_down(
         &mut self,
         event: &gpui::MouseDownEvent,
@@ -3501,6 +3540,19 @@ impl TerminalPane {
         resident.pointer_owner = Some((event.button, owner));
         resident.mouse_motion.reset();
 
+        if owner == PointerOwner::LocalSelection
+            && event.button == MouseButton::Left
+            && event.click_count == 1
+            && is_plain_click(&event.modifiers)
+            && self.in_command_gutter(event.position)
+            && self.select_marked_command_output(&id, row)
+        {
+            cx.notify();
+            return;
+        }
+        let Some(resident) = self.residents.get_mut(&id) else {
+            return;
+        };
         match owner {
             PointerOwner::LocalSelection => {
                 // A plain press on a link arms it like a Command-press; the
@@ -3686,8 +3738,22 @@ impl TerminalPane {
                 self.qol.hover = next;
                 cx.notify();
             }
+            let mark = self
+                .in_command_gutter(event.position)
+                .then(|| {
+                    self.residents
+                        .get(&id)
+                        .and_then(|resident| resident.element.command_output_marked_at(row))
+                })
+                .flatten()
+                .map(|_| row);
+            if self.qol.gutter_mark != mark {
+                self.qol.gutter_mark = mark;
+                cx.notify();
+            }
         } else {
             self.qol.hover = None;
+            self.qol.gutter_mark = None;
         }
         let selecting = self.residents.get(&id).is_some_and(|r| {
             r.pointer_owner == Some((MouseButton::Left, PointerOwner::LocalSelection))
@@ -3948,7 +4014,41 @@ impl TerminalPane {
             return;
         }
 
-        let Some(text) = item.text() else {
+        // Files copied in Finder paste the way they drop: escaped paths a
+        // shell or an agent can use, uploaded first for a remote session.
+        // Finder's plain-text flavour is only the file's name. In Find the
+        // paths are just text for the query.
+        let copied_files = clipboard_paths(&item).filter(|_| {
+            self.residents
+                .get(&id)
+                .is_some_and(|resident| resident.find.is_none())
+        });
+        let text = if let Some(paths) = copied_files {
+            let destination = self.upload_destination(&id);
+            let plan = plan_terminal_drop(paths, destination.is_some());
+            if let Some(message) = plan.feedback() {
+                cx.emit(TerminalPaneEvent::ExternalDropFeedback { message });
+            }
+            match plan.action {
+                None => {
+                    record("files_refused", "files", 0, false);
+                    cx.stop_propagation();
+                    return;
+                }
+                Some(TerminalDropAction::Upload(files)) => {
+                    record("files_upload", "files", 0, false);
+                    if let Some(destination) = destination {
+                        self.upload_files(destination, files);
+                    }
+                    cx.stop_propagation();
+                    cx.notify();
+                    return;
+                }
+                Some(TerminalDropAction::Paste(text)) => text,
+            }
+        } else if let Some(text) = item.text() {
+            text
+        } else {
             record("no_text", "other", 0, false);
             return;
         };
@@ -4188,7 +4288,20 @@ impl TerminalPane {
             cx.propagate();
             return;
         }
-        let option = OptionKey::for_layout(cx.keyboard_layout().id());
+        let option_choice = self
+            .runtime
+            .store
+            .read()
+            .expect("session store lock poisoned")
+            .preferences()
+            .terminal_option_as_meta;
+        let option = OptionKey::resolve(
+            option_choice,
+            cx.keyboard_layout().id(),
+            physical_modifier_flags(),
+        );
+        // A release reuses its press's reading: a key-up carries no flags.
+        self.last_option_key = option;
         let Some(mapped) = terminal_key_event(event, option) else {
             cx.propagate();
             return;
@@ -4281,7 +4394,7 @@ impl TerminalPane {
         if !reports_key_releases(resident.keyboard) || resident.find.is_some() {
             return;
         }
-        let option = OptionKey::for_layout(cx.keyboard_layout().id());
+        let option = self.last_option_key;
         let Some((mut term_event, mut modifiers)) =
             terminal_keystroke_event(&event.keystroke, option)
         else {
@@ -5067,6 +5180,13 @@ impl TerminalPane {
             }
             return centered_message(t("terminal.preparing"), "", colors).into_any_element();
         };
+        #[cfg(target_os = "macos")]
+        crate::macos::sync_terminal_accessibility(
+            window,
+            &resident.element,
+            self.focus.is_focused(window),
+            crate::switcher::display_title_str(session),
+        );
         let element = resident
             .element
             .clone()
@@ -5080,6 +5200,9 @@ impl TerminalPane {
             .font(typeface.font.clone())
             .font_size(px(typeface.size))
             .line_height_scale(typeface.line_height)
+            .cell_width_scale(typeface.cell_width)
+            .faces(typeface.faces)
+            .glyph_raster(typeface.raster)
             .focus_handle(self.focus.clone())
             .reduce_motion(cx.reduce_motion())
             .cursor_preferences(cursor_preferences)
@@ -5117,7 +5240,7 @@ impl TerminalPane {
             .pt(px(2.0))
             .pb(px(10.0))
             .px(px(12.0))
-            .cursor(if self.qol.hit.is_some() {
+            .cursor(if self.qol.hit.is_some() || self.qol.gutter_mark.is_some() {
                 gpui::CursorStyle::PointingHand
             } else {
                 gpui::CursorStyle::IBeam
@@ -5126,6 +5249,7 @@ impl TerminalPane {
                 if !hovered {
                     this.qol.hover = None;
                     this.qol.hit = None;
+                    this.qol.gutter_mark = None;
                     this.qol.hover_key_clear();
                     cx.notify();
                 }
@@ -5972,6 +6096,18 @@ impl TerminalPane {
                 },
             ))
             .on_action(
+                cx.listener(|this, _: &crate::commands::ClearScrollback, window, cx| {
+                    this.clear_scrollback(window, cx);
+                    cx.stop_propagation();
+                }),
+            )
+            .on_action(
+                cx.listener(|this, _: &crate::commands::ResetTerminal, window, cx| {
+                    this.reset_terminal(window, cx);
+                    cx.stop_propagation();
+                }),
+            )
+            .on_action(
                 cx.listener(|this, _: &crate::commands::NextPrompt, window, cx| {
                     this.read_terminal_history(Some(true), window, cx);
                     cx.stop_propagation();
@@ -6306,7 +6442,41 @@ enum OptionKey {
     Compose,
 }
 
+/// macOS's device-dependent modifier bits telling which Option is held
+/// (`NX_DEVICELALTKEYMASK`, `NX_DEVICERALTKEYMASK`).
+const LEFT_OPTION_FLAG: u64 = 0x20;
+const RIGHT_OPTION_FLAG: u64 = 0x40;
+
 impl OptionKey {
+    /// The Settings choice for this keystroke. `physical` is the raw
+    /// modifier flags of the key event being dispatched, which carry the
+    /// left/right Option bits GPUI's modifiers fold together; without them
+    /// (a replayed event) a one-sided choice falls back to the layout rule.
+    fn resolve(
+        choice: crate::store::OptionAsMeta,
+        layout_id: &str,
+        physical: Option<u64>,
+    ) -> Self {
+        use crate::store::OptionAsMeta;
+        let side = match choice {
+            OptionAsMeta::Automatic => return Self::for_layout(layout_id),
+            OptionAsMeta::Both => return Self::Meta,
+            OptionAsMeta::Off => return Self::Compose,
+            OptionAsMeta::Left => LEFT_OPTION_FLAG,
+            OptionAsMeta::Right => RIGHT_OPTION_FLAG,
+        };
+        match physical {
+            Some(flags) if flags & (LEFT_OPTION_FLAG | RIGHT_OPTION_FLAG) != 0 => {
+                if flags & side != 0 {
+                    Self::Meta
+                } else {
+                    Self::Compose
+                }
+            }
+            _ => Self::for_layout(layout_id),
+        }
+    }
+
     fn for_layout(layout_id: &str) -> Self {
         // Off macOS, Alt is a real Alt key; AltGr composition arrives without
         // the alt modifier.
@@ -6338,6 +6508,18 @@ fn option_meta_text(keystroke: &gpui::Keystroke) -> String {
         return key.to_ascii_uppercase();
     }
     key.to_owned()
+}
+
+/// Raw modifier flags of the key event dispatching right now, if any.
+fn physical_modifier_flags() -> Option<u64> {
+    #[cfg(target_os = "macos")]
+    {
+        gpui_macos::current_physical_key().map(|(_, flags)| flags)
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        None
+    }
 }
 
 fn terminal_key_event(
@@ -6661,6 +6843,14 @@ fn estimated_grid_size(
     )
 }
 
+/// The files a Finder copy put on the pasteboard, if any.
+fn clipboard_paths(item: &ClipboardItem) -> Option<&[std::path::PathBuf]> {
+    item.entries().iter().find_map(|entry| match entry {
+        ClipboardEntry::ExternalPaths(paths) if !paths.paths().is_empty() => Some(paths.paths()),
+        _ => None,
+    })
+}
+
 fn clipboard_image(item: &ClipboardItem) -> Option<(&[u8], &'static str)> {
     item.entries().iter().find_map(|entry| match entry {
         ClipboardEntry::Image(image) => Some((image.bytes.as_slice(), image.format.extension())),
@@ -6724,23 +6914,27 @@ struct TerminalType {
     font: gpui::Font,
     size: f32,
     line_height: f32,
+    cell_width: f32,
+    faces: diri_term::glyphs::TerminalFaces,
+    raster: gpui::GlyphRasterStyle,
 }
 
 impl TerminalType {
     fn from_prefs(prefs: &crate::store::Prefs) -> Self {
         Self {
-            font: crate::fonts::terminal_font(
-                &prefs.terminal_font_family,
-                prefs.terminal_ligatures,
-            ),
+            font: crate::fonts::terminal_font_from(prefs),
             size: prefs.terminal_font_size,
             line_height: prefs.terminal_line_height,
+            cell_width: f32::from(prefs.terminal_cell_width) / 100.0,
+            faces: crate::fonts::terminal_faces(prefs),
+            raster: crate::fonts::glyph_raster(prefs),
         }
     }
 
     fn metrics(&self, window: &Window) -> CellMetrics {
         CellMetrics::measure(window.text_system(), &self.font, px(self.size))
             .with_line_height_scale(self.line_height)
+            .with_cell_width_scale(self.cell_width)
     }
 }
 
@@ -8412,6 +8606,21 @@ mod tests {
                             let output = resident.element.command_output_at(10, 4).unwrap();
                             resident.element.select_range(output.start, output.end);
                         }
+                        "commands-gutter" => {
+                            // A click on the failed `git push`'s red mark.
+                            let row = (0..16)
+                                .find(|&row| {
+                                    pane.residents[&id]
+                                        .element
+                                        .command_output_marked_at(row)
+                                        .is_some_and(|output| {
+                                            output.status == diri_proto::grid::CommandEnd::Failed
+                                        })
+                                })
+                                .unwrap();
+                            assert!(pane.select_marked_command_output(&id, row));
+                            pane.qol.gutter_mark = Some(row);
+                        }
                         "commands-menu" => pane.open_terminal_menu(
                             gpui::point(px(220.0), px(110.0)),
                             10,
@@ -9687,6 +9896,178 @@ mod tests {
         // The channel is live: a real keystroke still arrives.
         cx.simulate_keystrokes("a");
         assert_eq!(input.try_recv().unwrap(), (id.clone(), b"a".to_vec()));
+    }
+
+    /// History rows for a shell with prompts at rows 3 and 12, where the
+    /// command at row 3 printed rows 4 and 5 and failed.
+    fn prompted_history(rows: usize) -> Vec<Vec<GridCell>> {
+        (0..rows)
+            .map(|absolute| {
+                let mut cells = vec![GridCell::BLANK; 8];
+                let text = match absolute {
+                    3 | 12 => "$ make",
+                    4 => "error",
+                    5 => "stop",
+                    6 => "$",
+                    _ => "text",
+                };
+                for (cell, ch) in cells.iter_mut().zip(text.chars()) {
+                    cell.scalar = u32::from(ch);
+                }
+                match absolute {
+                    3 | 12 => cells[0].style |= TermStyle::PROMPT_START,
+                    4 => cells[0].style |= TermStyle::OUTPUT_START,
+                    6 => cells[0].style |= TermStyle::COMMAND_FAILED | TermStyle::PROMPT_START,
+                    _ => {}
+                }
+                cells
+            })
+            .collect()
+    }
+
+    #[gpui::test]
+    fn prompt_jumps_through_held_history_need_no_engine_read(cx: &mut TestAppContext) {
+        const ROWS: usize = 4;
+        const HISTORY: i64 = 20;
+        let runtime = Arc::new(StoreRuntime::inert());
+        let tokio = Arc::new(
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap(),
+        );
+        let session = fixture_session();
+        let id = session.id.clone();
+        {
+            let mut store = runtime.store.write().unwrap();
+            store.upsert_session(session);
+            store.select(id.clone());
+        }
+        let (pane, cx) =
+            cx.add_window_view(move |window, cx| TerminalPane::new(runtime, tokio, window, cx));
+        pane.update_in(cx, |pane, window, cx| {
+            pane.reconcile_store_change(window, cx);
+            let element = pane.residents[&id].element.clone();
+            element.apply_damage(filled_grid('o'));
+            let history = prompted_history(HISTORY as usize);
+            element.set_view_offset(4, ROWS);
+            element
+                .complete_scrollback_fetch(
+                    diri_proto::methods::ReadScrollbackCellsResult {
+                        metadata: Vec::new(),
+                        payload: diri_proto::grid::GridRowCodec::encode_rows(&history).unwrap(),
+                        first_row: 0,
+                        row_count: HISTORY,
+                        total_rows: HISTORY + ROWS as i64,
+                        live_start_row: HISTORY,
+                        cols: 8,
+                        content_seq: 1,
+                    },
+                    ROWS,
+                )
+                .unwrap();
+            element.set_view_offset(4, ROWS);
+            let top = |element: &diri_term::element::TerminalElement| {
+                HISTORY - element.view_offset()
+            };
+            assert_eq!(top(&element), 16);
+
+            // The inert runtime has no Engine: every answer below came from
+            // the rows the view holds, at once.
+            pane.read_history(Some(false), qol::PromptMiss::NeedsMarks, window, cx);
+            assert!(!pane.qol.busy, "a held prompt waited on an Engine read");
+            assert_eq!(top(&element), 12);
+            pane.read_history(Some(false), qol::PromptMiss::NeedsMarks, window, cx);
+            assert_eq!(top(&element), 6, "the failed command's end starts a prompt");
+            pane.read_history(Some(true), qol::PromptMiss::NeedsMarks, window, cx);
+            assert_eq!(top(&element), 12);
+            pane.read_history(Some(false), qol::PromptMiss::NeedsMarks, window, cx);
+            pane.read_history(Some(false), qol::PromptMiss::NeedsMarks, window, cx);
+            assert_eq!(top(&element), 3);
+            pane.read_history(Some(false), qol::PromptMiss::NeedsMarks, window, cx);
+            assert_eq!(top(&element), 3, "nothing above the first prompt");
+            assert_eq!(pane.qol.feedback.as_deref(), Some(t("terminal.prompt.none")));
+            assert!(!pane.qol.busy);
+
+            // Its mark in the gutter selects that command's output.
+            assert!(pane.select_marked_command_output(&id, 0));
+            assert_eq!(element.selected_text(), "error\nstop\n");
+            assert!(
+                !pane.select_marked_command_output(&id, 1),
+                "an output row carries no mark"
+            );
+        });
+    }
+
+    #[gpui::test]
+    fn pasting_files_copied_in_finder_types_their_escaped_paths(cx: &mut TestAppContext) {
+        let runtime = Arc::new(StoreRuntime::inert());
+        let tokio = Arc::new(
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap(),
+        );
+        let session = fixture_session();
+        let id = session.id.clone();
+        {
+            let mut store = runtime.store.write().unwrap();
+            store.upsert_session(session);
+            store.select(id.clone());
+        }
+        let folder = tempfile::tempdir().unwrap();
+        let shot = folder.path().join("Screen Shot (1).png");
+        let notes = folder.path().join("notes.md");
+        std::fs::write(&shot, b"png").unwrap();
+        std::fs::write(&notes, b"# notes").unwrap();
+        let (pane, cx) =
+            cx.add_window_view(move |window, cx| TerminalPane::new(runtime, tokio, window, cx));
+        pane.update_in(cx, |pane, window, cx| {
+            pane.reconcile_store_change(window, cx);
+            let (tx, mut input) = mpsc::unbounded_channel();
+            let resident = pane.residents.get_mut(&id).unwrap();
+            resident.attachment.claim();
+            resident.attachment.input_observer = Some((id.clone(), tx));
+
+            // What AppKit hands over for a Finder ⌘C of two files: the file
+            // URLs, and as plain text only their names.
+            cx.write_to_clipboard(ClipboardItem {
+                entries: vec![
+                    ClipboardEntry::ExternalPaths(ExternalPaths(smallvec::smallvec![
+                        shot.clone(),
+                        notes.clone(),
+                    ])),
+                    ClipboardEntry::String(gpui::ClipboardString::new(
+                        "Screen Shot (1).png\rnotes.md".to_owned(),
+                    )),
+                ],
+            });
+            pane.paste(&Paste, window, cx);
+            let expected = terminal_drop_text([
+                shot.to_str().unwrap(),
+                notes.to_str().unwrap(),
+            ]);
+            assert!(expected.contains("Screen\\ Shot\\ \\(1\\).png "), "{expected}");
+            assert_eq!(
+                input.try_recv().unwrap(),
+                (id.clone(), expected.into_bytes()),
+                "pasted like a drop, not as the file names"
+            );
+
+            // A copied file that no longer exists pastes nothing.
+            cx.write_to_clipboard(ClipboardItem {
+                entries: vec![ClipboardEntry::ExternalPaths(ExternalPaths(
+                    smallvec::smallvec![folder.path().join("gone.png")],
+                ))],
+            });
+            pane.paste(&Paste, window, cx);
+            assert!(input.try_recv().is_err(), "a missing file was pasted");
+
+            // Ordinary text is untouched.
+            cx.write_to_clipboard(ClipboardItem::new_string("echo hi".to_owned()));
+            pane.paste(&Paste, window, cx);
+            assert_eq!(input.try_recv().unwrap(), (id.clone(), b"echo hi".to_vec()));
+        });
     }
 
     #[gpui::test]
@@ -11953,6 +12334,46 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// Settings › Terminal › Option key: one side, both, none, or the layout
+    /// rule. Left and right are told apart by the event's device flags.
+    #[test]
+    fn option_as_meta_setting_picks_meta_per_side() {
+        use crate::store::OptionAsMeta;
+        let german = "com.apple.keylayout.German";
+        let us = "com.apple.keylayout.US";
+        // Raw flags as AppKit reports ⌥ held: the device-independent Option
+        // bit plus the side's device bit.
+        let left = Some(0x8_0000 | LEFT_OPTION_FLAG);
+        let right = Some(0x8_0000 | RIGHT_OPTION_FLAG);
+        let resolve = OptionKey::resolve;
+        assert_eq!(resolve(OptionAsMeta::Both, german, left), OptionKey::Meta);
+        assert_eq!(resolve(OptionAsMeta::Off, us, left), OptionKey::Compose);
+        assert_eq!(resolve(OptionAsMeta::Left, german, left), OptionKey::Meta);
+        assert_eq!(resolve(OptionAsMeta::Left, us, right), OptionKey::Compose);
+        assert_eq!(resolve(OptionAsMeta::Right, us, left), OptionKey::Compose);
+        assert_eq!(resolve(OptionAsMeta::Right, german, right), OptionKey::Meta);
+        // Without device flags a one-sided choice falls back to the layout.
+        for side in [OptionAsMeta::Left, OptionAsMeta::Right] {
+            assert_eq!(resolve(side, us, None), OptionKey::for_layout(us));
+            assert_eq!(resolve(side, german, Some(0x8_0000)), OptionKey::for_layout(german));
+        }
+        assert_eq!(
+            resolve(OptionAsMeta::Automatic, german, left),
+            OptionKey::for_layout(german)
+        );
+
+        // End to end: left ⌥B as Meta is readline's backward-word, right ⌥L
+        // types the layout's `@`.
+        assert_eq!(
+            option_bytes(&option_key("alt-b", Some("∫")), resolve(OptionAsMeta::Left, german, left)),
+            b"\x1bb"
+        );
+        assert_eq!(
+            option_bytes(&option_key("alt-l", Some("@")), resolve(OptionAsMeta::Left, german, right)),
+            b"@"
+        );
     }
 
     /// US layouts keep Option as Meta, and Meta now means the key itself:

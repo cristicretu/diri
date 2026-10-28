@@ -362,6 +362,7 @@ fn append_management_actions(
                             | CommandId::OpenSettings
                             | CommandId::ToggleHistory
                             | CommandId::ToggleNotifications
+                            | CommandId::ToggleActivity
                             | CommandId::ToggleReadAloud
                             | CommandId::ToggleReadThisTab
                             | CommandId::ReadOnlyThisTab
@@ -369,8 +370,11 @@ fn append_management_actions(
                             | CommandId::ReadAllTabs
                             | CommandId::CheckForUpdates
                             | CommandId::ShowWhatsNew
+                            | CommandId::ImportTerminalSetup
                             | CommandId::TogglePerfOverlay
                             | CommandId::ToggleRenderCounters
+                            | CommandId::ClearScrollback
+                            | CommandId::ResetTerminal
                     )
             )
         }),
@@ -600,6 +604,14 @@ pub fn actions_for_default_host(
         result.push(registered_action(CommandId::NoteGraph));
     }
 
+    // Terminal housekeeping for the selected session's terminal.
+    if let Some(session) = selected
+        && !session.is_note()
+    {
+        result.push(registered_action(CommandId::ClearScrollback));
+        result.push(registered_action(CommandId::ResetTerminal));
+    }
+
     // Session handoff: move the SELECTED Claude session across hosts (v1 is
     // Claude-only — other kinds have no reliable resume, so no entries).
     if let Some(session) = selected
@@ -668,6 +680,7 @@ pub fn actions_for_default_host(
         registered_action(CommandId::OpenSettings),
         registered_action(CommandId::ToggleHistory),
         registered_action(CommandId::ToggleNotifications),
+        registered_action(CommandId::ToggleActivity),
         registered_action(CommandId::ToggleReadAloud),
     ]);
     // Per-tab reading needs a tab to act on.
@@ -708,6 +721,7 @@ pub fn actions_for_default_host(
         registered_action(CommandId::CompactDensity),
         registered_action(CommandId::CheckForUpdates),
         registered_action(CommandId::ShowWhatsNew),
+        registered_action(CommandId::ImportTerminalSetup),
         registered_action(CommandId::TogglePerfOverlay),
         registered_action(CommandId::ToggleRenderCounters),
     ]);
@@ -1352,6 +1366,7 @@ mod tests {
                 "settings",
                 "history",
                 "toggle-notifications",
+                "toggle-activity",
                 "toggle-read-aloud",
                 "color-theme",
                 "interface-style",
@@ -1359,6 +1374,7 @@ mod tests {
                 "compact-density",
                 "check-for-updates",
                 "whats-new",
+                "import-terminal-setup",
                 "toggle-perf-overlay",
                 "toggle-render-counters",
             ]
@@ -1564,6 +1580,37 @@ mod tests {
                     .any(|row| matches!(row.command, PaletteCommand::SyncPrefs { .. }))
             );
         }
+    }
+
+    #[test]
+    fn terminal_housekeeping_follows_a_selected_terminal_not_a_note() {
+        let offered = |selected: Option<&SessionRecord>| {
+            actions_for_catalogs(
+                AgentKind::CLAUDE_CODE,
+                &[],
+                &[],
+                selected,
+                None,
+                &HashMap::new(),
+            )
+            .iter()
+            .filter_map(|row| match row.command {
+                PaletteCommand::Action(
+                    id @ (CommandId::ClearScrollback | CommandId::ResetTerminal),
+                ) => Some(id),
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+        };
+        let session = claude_session(None);
+        assert_eq!(
+            offered(Some(&session)),
+            [CommandId::ClearScrollback, CommandId::ResetTerminal]
+        );
+        assert!(offered(None).is_empty());
+        let mut note = claude_session(None);
+        note.kind = AgentKind::NOTE;
+        assert!(offered(Some(&note)).is_empty());
     }
 
     #[test]

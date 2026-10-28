@@ -25,6 +25,8 @@ mod whats_new_clips;
 #[cfg(all(test, target_os = "macos"))]
 mod site_clips;
 #[cfg(test)]
+mod terminal_import_tests;
+#[cfg(test)]
 mod whats_new_tests;
 #[cfg(all(test, target_os = "macos"))]
 mod window_navigation_tests;
@@ -368,6 +370,9 @@ pub struct RootView {
     window_bounds_save: Option<Task<()>>,
     /// The one transient toast; connection recovery renders beside it.
     toast: ToastSlot,
+    /// "fix-auth: Zoom pane": an Agent changed the window. Its own slot, so
+    /// it never displaces feedback about the person's own action.
+    agent_notice: ToastSlot,
     toast_style: ToastStyle,
     /// Records this window's open and close for the flight recorder.
     _telemetry_window: crate::telemetry::WindowGuard,
@@ -377,6 +382,7 @@ pub struct RootView {
     close_prompt: Option<Task<()>>,
     /// The What's New sheet, while open.
     whats_new: Option<Entity<crate::whats_new::WhatsNewSheet>>,
+    terminal_import: Option<Entity<crate::terminal_import::sheet::TerminalImportSheet>>,
     /// The main window's viewport, for content that sizes to it while a
     /// panel paints it elsewhere.
     main_viewport: gpui::Size<gpui::Pixels>,
@@ -920,6 +926,12 @@ impl RootView {
                         UtilitySurfacesEvent::ShowWhatsNew(page) => {
                             this.open_whats_new_at(*page, window, cx);
                         }
+                        UtilitySurfacesEvent::ShowTerminalImport => {
+                            this.open_terminal_import(window, cx);
+                        }
+                        UtilitySurfacesEvent::UndoTerminalImport => {
+                            this.undo_terminal_import(cx);
+                        }
                         UtilitySurfacesEvent::RefreshUsageLimits => {
                             let _ = this.services.usage_limits_refresh.try_send(());
                         }
@@ -1200,7 +1212,11 @@ impl RootView {
                         };
                         let _ = this.update(cx, |this, cx| {
                             if let Some(toast) = status.in_app_banner {
-                                this.show_toast(toast, cx);
+                                if toast.ambient {
+                                    this.show_agent_notice(toast, cx);
+                                } else {
+                                    this.show_toast(toast, cx);
+                                }
                             }
                         });
                     }
@@ -1567,12 +1583,14 @@ impl RootView {
             window_bounds_save: None,
             perf_idle_repaint: None,
             toast: ToastSlot::default(),
+            agent_notice: ToastSlot::default(),
             toast_style: ToastStyle::from_env(),
             _telemetry_window: crate::telemetry::WindowGuard::new("main", window),
             quote_target_picker: None,
             notification_panel_open: false,
             close_prompt: None,
             whats_new: None,
+            terminal_import: None,
             main_viewport: gpui::Size::default(),
             notification_filter_unread: true,
             notification_selected: 0,
@@ -1829,6 +1847,24 @@ impl RootView {
         cx.notify();
     }
 
+    /// Shows or rewrites the Agent notice. One timer per notice, and none
+    /// while nothing is shown.
+    fn show_agent_notice(&mut self, toast: Toast, cx: &mut Context<Self>) {
+        let Some(timer) = self.agent_notice.show(toast) else {
+            return;
+        };
+        cx.spawn(async move |this, cx| {
+            cx.background_executor().timer(timer.after).await;
+            let _ = this.update(cx, |this, cx| {
+                if this.agent_notice.expire(timer.token) {
+                    cx.notify();
+                }
+            });
+        })
+        .detach();
+        cx.notify();
+    }
+
     fn arm_toast_timer(&mut self, timer: Option<crate::toast::ToastTimer>, cx: &mut Context<Self>) {
         let Some(timer) = timer else {
             return;
@@ -1885,6 +1921,10 @@ impl RootView {
             }
             ToastCommand::CopyDetails(detail) => {
                 cx.write_to_clipboard(gpui::ClipboardItem::new_string(detail));
+            }
+            ToastCommand::UndoTerminalImport => {
+                self.toast.dismiss();
+                self.undo_terminal_import(cx);
             }
         }
         cx.notify();
@@ -2823,12 +2863,32 @@ impl RootView {
                 }
             }
             CommandId::ToggleNotifications => self.toggle_notifications(window, cx),
+            CommandId::ToggleActivity => {
+                if self.sidebar.read(cx).tab_orientation()
+                    == crate::store::TabOrientation::Horizontal
+                {
+                    // Activity narrows the vertical sidebar, which horizontal
+                    // tabs replace: the inbox answers "who needs me" there.
+                    self.toggle_notifications(window, cx);
+                } else {
+                    // Turning it on shows a hidden sidebar.
+                    let sidebar = self.sidebar.read(cx);
+                    let reveal = !sidebar.activity_filter() && !sidebar.is_visible();
+                    self.sidebar.update(cx, |sidebar, cx| {
+                        if reveal {
+                            sidebar.toggle(cx);
+                        }
+                        sidebar.toggle_activity_filter(cx);
+                    });
+                }
+            }
             CommandId::SelectNextAttentionSession => {
                 self.sidebar
                     .update(cx, |sidebar, cx| sidebar.select_next_needing_input(cx));
             }
             CommandId::CheckForUpdates => self.services.updates.check(true),
             CommandId::ShowWhatsNew => self.open_whats_new_at(0, window, cx),
+            CommandId::ImportTerminalSetup => self.open_terminal_import(window, cx),
             CommandId::ToggleReadAloud => self.toggle_read_aloud(cx),
             CommandId::ToggleReadThisTab => {
                 self.set_read_aloud(crate::store::ReadAloudChoice::Toggle, cx)
@@ -3052,6 +3112,121 @@ impl RootView {
         self.whats_new = Some(sheet);
         self.sidebar.update(cx, |_, cx| cx.notify());
         cx.notify();
+    }
+
+    /// Opens "Bring your setup from …?" on the best plan the last scan made.
+    /// With nothing to bring over it says why instead of opening empty.
+    pub(crate) fn open_terminal_import(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        use crate::terminal_import::sheet::{TerminalImportEvent, TerminalImportSheet};
+        if self.terminal_import.is_some() {
+            return;
+        }
+        let runtime = Arc::clone(&self.services.store);
+        let (plans, scanned, found) = {
+            let mut store = runtime.store.write().expect("session store lock poisoned");
+            store.replan_terminal_setup();
+            let setup = store.terminal_setup();
+            let state = (setup.plans().to_vec(), setup.scanned(), setup.found());
+            if !setup.scanned() {
+                store.request_terminal_setup_scan();
+            }
+            state
+        };
+        if plans.is_empty() {
+            let message = match found {
+                _ if !scanned => t("terminal_import.settings.looking").to_owned(),
+                Some(source) => tf(
+                    "terminal_import.settings.matches",
+                    &[("terminal", &source.name())],
+                ),
+                None => tf(
+                    "terminal_import.settings.none_found",
+                    &[("machine", &crate::platform::local_machine_label_lowercase())],
+                ),
+            };
+            self.show_toast(Toast::info(message), cx);
+            return;
+        }
+        let sheet = cx.new(|cx| TerminalImportSheet::new(plans, runtime, cx));
+        cx.subscribe_in(
+            &sheet,
+            window,
+            |this, _, event: &TerminalImportEvent, window, cx| {
+                let apply = match event {
+                    TerminalImportEvent::Close => None,
+                    TerminalImportEvent::Apply(source) => Some(*source),
+                };
+                this.close_terminal_import(window, cx);
+                if let Some(source) = apply {
+                    this.apply_terminal_import(source, cx);
+                }
+            },
+        )
+        .detach();
+        sheet.read(cx).focus_handle(cx).focus(window, cx);
+        self.terminal_import = Some(sheet);
+        cx.notify();
+    }
+
+    fn close_terminal_import(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.terminal_import.take().is_some() {
+            self.focus_active_terminal(window, cx);
+            cx.notify();
+        }
+    }
+
+    fn apply_terminal_import(
+        &mut self,
+        source: crate::terminal_import::Source,
+        cx: &mut Context<Self>,
+    ) {
+        let result = self
+            .services
+            .store
+            .store
+            .write()
+            .expect("session store lock poisoned")
+            .apply_terminal_setup(source);
+        let toast = match result {
+            Ok(()) => Toast::success(tf(
+                "terminal_import.toast.applied",
+                &[("terminal", &source.name())],
+            ))
+            .action(
+                t("terminal_import.toast.undo"),
+                ToastCommand::UndoTerminalImport,
+            ),
+            Err(_) => Toast::error(tf(
+                "terminal_import.toast.failed",
+                &[("terminal", &source.name())],
+            )),
+        };
+        self.after_terminal_import_change(cx);
+        self.show_toast(toast, cx);
+    }
+
+    fn undo_terminal_import(&mut self, cx: &mut Context<Self>) {
+        let undone = self
+            .services
+            .store
+            .store
+            .write()
+            .expect("session store lock poisoned")
+            .undo_terminal_setup();
+        if undone {
+            self.after_terminal_import_change(cx);
+            self.show_toast(Toast::info(t("terminal_import.toast.undone")), cx);
+        }
+    }
+
+    /// Settings keeps its own copy of the preferences; an import from the
+    /// sheet must show there too.
+    fn after_terminal_import_change(&mut self, cx: &mut Context<Self>) {
+        self.services.store.publish_local_change();
+        if let Some(surfaces) = &self.utility_surfaces {
+            surfaces.update(cx, |surfaces, cx| surfaces.reload_preferences(cx));
+        }
+        cx.refresh_windows();
     }
 
     fn close_whats_new(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -5259,7 +5434,8 @@ impl RootView {
         cx: &mut Context<Self>,
     ) -> Option<AnyElement> {
         let transient = self.toast.current();
-        if recovery.is_none() && transient.is_none() {
+        let agent_notice = self.agent_notice.current();
+        if recovery.is_none() && transient.is_none() && agent_notice.is_none() {
             return None;
         }
         let style = self.toast_style;
@@ -5325,6 +5501,38 @@ impl RootView {
             ));
         }
         let (left, right) = insets;
+        // The Agent notice sits bottom-centre of the work surface whatever
+        // the toast style; with the capsule style it shares that stack.
+        let mut notice_layer = None;
+        if let Some(notice) = agent_notice {
+            let element = crate::toast::toast_element(
+                notice,
+                ToastStyle::Capsule,
+                colors,
+                "agent-notice",
+                self.agent_notice.generation(),
+                reduce_motion,
+                ToastHandlers {
+                    on_action: Box::new(|_, _, _| {}),
+                    on_dismiss: Box::new(|_, _| {}),
+                    on_hover: Box::new(|_, _, _| {}),
+                },
+            );
+            if style.anchor() == crate::toast::ToastAnchor::BottomCenter {
+                items.insert(0, element);
+            } else {
+                notice_layer = Some(
+                    div()
+                        .absolute()
+                        .left(px(left + 16.0))
+                        .right(px(right + 16.0))
+                        .bottom(px(18.0))
+                        .flex()
+                        .justify_center()
+                        .child(element),
+                );
+            }
+        }
         let mut stack = div()
             .absolute()
             .left(px(left + 16.0))
@@ -5342,11 +5550,17 @@ impl RootView {
                 stack.top(px(Metrics::TITLE_BAR + 8.0)).items_end()
             }
         };
-        Some(
-            deferred(stack.children(items))
-                .with_priority(1)
+        let stack = stack.children(items);
+        let layer = match notice_layer {
+            Some(notice) => div()
+                .absolute()
+                .inset_0()
+                .child(stack)
+                .child(notice)
                 .into_any_element(),
-        )
+            None => stack.into_any_element(),
+        };
+        Some(deferred(layer).with_priority(1).into_any_element())
     }
 }
 
@@ -5935,8 +6149,14 @@ impl Render for RootView {
                     this.run_command(CommandId::SelectNextAttentionSession, window, cx);
                 }),
             )
+            .on_action(cx.listener(|this, _: &crate::commands::ToggleActivity, window, cx| {
+                this.run_command(CommandId::ToggleActivity, window, cx);
+            }))
             .on_action(cx.listener(|this, _: &CheckForUpdates, window, cx| {
                 this.run_command(CommandId::CheckForUpdates, window, cx);
+            }))
+            .on_action(cx.listener(|this, _: &crate::commands::ImportTerminalSetup, window, cx| {
+                this.run_command(CommandId::ImportTerminalSetup, window, cx);
             }))
             .on_action(cx.listener(|this, _: &ShowWhatsNew, window, cx| {
                 this.run_command(CommandId::ShowWhatsNew, window, cx);
@@ -6230,6 +6450,9 @@ impl Render for RootView {
         }
         // Above Settings too: Settings › What's New opens it.
         if let Some(sheet) = &self.whats_new {
+            root = root.child(div().absolute().inset_0().child(sheet.clone()));
+        }
+        if let Some(sheet) = &self.terminal_import {
             root = root.child(div().absolute().inset_0().child(sheet.clone()));
         }
         if let Some(picker) = self.quote_target_picker(colors, sidebar_width, cx) {
@@ -9480,6 +9703,60 @@ mod tests {
         assert!(cx.debug_bounds("recovery-action-0").is_none());
     }
 
+    #[cfg(target_os = "macos")]
+    #[gpui::test]
+    fn agent_notice_sits_bottom_centre_updates_in_place_and_leaves_no_timer(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        use diri_proto::agent_action::AgentAction;
+        let services = test_services();
+        let (root, cx) = cx.add_window_view(move |window, cx| {
+            let mut root = RootView::new(services, true, PreviewScenario::Typical, window, cx);
+            root.preview = true;
+            root
+        });
+        cx.update(|_, cx| cx.set_reduce_motion(true));
+        cx.simulate_resize(size(px(1000.0), px(700.0)));
+        let actor = {
+            let fixture = SidebarPreviewFixture::make(PreviewScenario::Typical);
+            let mut record = fixture.list.sessions[0].clone();
+            record.title = "fix-auth".into();
+            record.title_source = diri_proto::TitleSource::UserRename;
+            record
+        };
+        root.update(cx, |root, cx| {
+            root.show_agent_notice(crate::agent_notice::notice(&actor, AgentAction::SplitPane), cx);
+        });
+        cx.run_until_parked();
+        let first = cx.debug_bounds("agent-notice").expect("notice shown");
+        let (seam, generation) =
+            root.read_with(cx, |root, _| (root.sidebar_seam, root.agent_notice.generation()));
+        assert!(first.bottom() >= px(700.0 - 30.0) && first.bottom() <= px(700.0));
+        let centre = (seam + 1000.0) / 2.0;
+        assert!((f32::from(first.center().x) - centre).abs() < 24.0);
+        // A burst rewrites the same capsule: no second notice, no re-entry.
+        cx.executor().advance_clock(Duration::from_millis(1_500));
+        root.update(cx, |root, cx| {
+            root.show_agent_notice(crate::agent_notice::notice(&actor, AgentAction::ZoomPane), cx);
+        });
+        cx.run_until_parked();
+        root.read_with(cx, |root, _| {
+            assert_eq!(root.agent_notice.generation(), generation);
+            assert_eq!(root.agent_notice.current().unwrap().message, "fix-auth: Zoom pane");
+            assert!(root.toast.current().is_none(), "the feedback slot is untouched");
+        });
+        // The first notice's timer is stale; the burst's last one closes it.
+        cx.executor().advance_clock(Duration::from_millis(1_500));
+        cx.run_until_parked();
+        assert!(cx.debug_bounds("agent-notice").is_some());
+        cx.executor().advance_clock(crate::toast::AMBIENT_HOLD);
+        cx.run_until_parked();
+        assert!(root.read_with(cx, |root, _| root.agent_notice.current().is_none()));
+        root.update(cx, |_, cx| cx.notify());
+        cx.run_until_parked();
+        assert!(cx.debug_bounds("agent-notice").is_none());
+    }
+
     #[gpui::test]
     fn launch_review_keyboard_opens_exact_session_retries_only_placement_and_dismisses(
         cx: &mut gpui::TestAppContext,
@@ -11192,6 +11469,112 @@ mod tests {
         }
     }
 
+    /// An Agent changing the window, as the person sees it: nothing
+    /// (`none`, today's behaviour), the notice in each theme, a burst whose
+    /// text updates in place (`burst-1..3`), and the notice beside a
+    /// feedback toast (`with-toast`). `DIRI_AGENT_NOTICE_SCREENSHOTS=<dir>`.
+    #[cfg(target_os = "macos")]
+    #[test]
+    #[ignore = "writes Agent notice previews to DIRI_AGENT_NOTICE_SCREENSHOTS"]
+    fn render_agent_notice_screenshots() {
+        use diri_proto::agent_action::AgentAction;
+        use gpui::HeadlessAppContext;
+        let dir = std::path::PathBuf::from(
+            std::env::var("DIRI_AGENT_NOTICE_SCREENSHOTS").expect("output dir"),
+        );
+        std::fs::create_dir_all(&dir).unwrap();
+        let states: [(&str, &str, &[AgentAction]); 7] = [
+            ("none", "dark", &[]),
+            ("zoom", "dark", &[AgentAction::ZoomPane]),
+            ("zoom", "light", &[AgentAction::ZoomPane]),
+            ("burst-1", "dark", &[AgentAction::SplitPane]),
+            ("burst-2", "dark", &[AgentAction::SplitPane, AgentAction::FocusPane]),
+            (
+                "burst-3",
+                "dark",
+                &[
+                    AgentAction::SplitPane,
+                    AgentAction::FocusPane,
+                    AgentAction::EqualizePanes,
+                ],
+            ),
+            ("with-toast", "dark", &[AgentAction::NewTab]),
+        ];
+        for (state, theme, actions) in states {
+            let platform = gpui_platform::current_platform(true);
+            let mut cx = HeadlessAppContext::with_platform(
+                platform.text_system(),
+                Arc::new(diri_ui::IconAssets),
+                gpui_platform::current_headless_renderer,
+            );
+            cx.update(|cx| {
+                crate::fonts::init(cx);
+                cx.set_reduce_motion(true);
+            });
+            let services = test_services();
+            let mut fixture = SidebarPreviewFixture::make(PreviewScenario::Typical);
+            let selected = fixture.selected_session_id.clone().unwrap();
+            let session = fixture
+                .list
+                .sessions
+                .iter_mut()
+                .find(|s| s.id == selected)
+                .unwrap();
+            session.kind = diri_proto::AgentKind::CODEX;
+            session.host = None;
+            session.title = "Image drop regression".into();
+            let actor = session.clone();
+            {
+                let mut store = services.store.store.write().unwrap();
+                store.hydrate(fixture.list);
+                store.select(selected);
+                store
+                    .update_preferences(|p| {
+                        p.terminal_theme = format!("dirijor-{theme}");
+                        p.sidebar_visible = true;
+                    })
+                    .unwrap();
+            }
+            let window = cx
+                .open_window(size(px(1000.0), px(650.0)), |window, cx| {
+                    cx.new(|cx| {
+                        let mut root =
+                            RootView::new(services.clone(), false, PreviewScenario::Empty, window, cx);
+                        root.preview = true;
+                        let mut grid = diri_term::buffer::GridBuffer::new(100, 36);
+                        let sample = "  OpenAI Codex\n\n  /Users/you/work/diri\n\n  Ready to work on your project.\n\n› Ask Codex to do anything";
+                        for (y, line) in sample.lines().enumerate() {
+                            for (x, ch) in line.chars().enumerate() {
+                                grid.cells[y * 100 + x].scalar = ch as u32;
+                            }
+                        }
+                        root.terminal.as_ref().unwrap().update(cx, |terminal, cx| {
+                            terminal.seed_preview_grid_for_test(grid, cx);
+                        });
+                        if state == "with-toast" {
+                            root.show_toast(Toast::success("Copied"), cx);
+                        }
+                        for action in actions {
+                            root.show_agent_notice(
+                                crate::agent_notice::notice(&actor, *action),
+                                cx,
+                            );
+                        }
+                        root
+                    })
+                })
+                .unwrap();
+            cx.run_until_parked();
+            cx.capture_screenshot(window.into())
+                .unwrap()
+                .save(dir.join(format!("{state}-{theme}.png")))
+                .unwrap();
+            cx.update_window(window.into(), |_, window, _| window.remove_window())
+                .unwrap();
+            cx.run_until_parked();
+        }
+    }
+
     #[cfg(target_os = "macos")]
     #[test]
     #[ignore = "writes a visual preview to DIRI_RECOVERY_SCREENSHOT"]
@@ -12269,6 +12652,10 @@ mod tests {
                     }
                 }
                 store.set_agent_catalog(catalog);
+                // `DIRI_VISUAL_TERMINAL_SETUP=ghostty` adds the import line.
+                if let Ok(fixture) = std::env::var("DIRI_VISUAL_TERMINAL_SETUP") {
+                    store.set_terminal_setup_scan(crate::terminal_import::fixture_scan(&fixture));
+                }
                 store
                     .update_preferences(|prefs| {
                         prefs.sidebar_visible = true;

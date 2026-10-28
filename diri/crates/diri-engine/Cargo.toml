@@ -22,6 +22,9 @@ diri-terminal-state.workspace = true
 # message handling as the stdio frontend (see src/mcp_http.rs).
 dirijor-mcp = { path = "../dirijor-mcp" }
 getrandom.workspace = true
+# Already in the graph through diri-terminal-state and the vendored parser;
+# the Engine pump scans every output byte for the Holder exit marker with it.
+memchr = "2.8"
 plist.workspace = true
 regex.workspace = true
 rusqlite.workspace = true
@@ -35,7 +38,7 @@ libc = "0.2"
 socket2 = "0.6"
 
 [target.'cfg(target_os = "macos")'.dependencies]
-objc2 = "=0.6.4"
+objc2 = "=0.6.5"
 objc2-app-kit = { version = "=0.3.2", default-features = false, features = [
     "NSAlert",
     "NSApplication",

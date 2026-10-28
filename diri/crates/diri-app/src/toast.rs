@@ -35,6 +35,8 @@ pub enum ToastCommand {
     RetryConnection,
     RetryAction,
     CopyDetails(String),
+    /// Put back the terminal settings an import replaced.
+    UndoTerminalImport,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -56,7 +58,14 @@ pub struct Toast {
     pub dismissible: bool,
     /// Overrides the tone's default lifetime.
     pub hold: Option<Duration>,
+    /// An ambient notice (an Agent changed the window): it never takes the
+    /// pointer, offers no ✕, and a newer ambient notice rewrites its text in
+    /// place instead of entering again.
+    pub ambient: bool,
 }
+
+/// How long an ambient notice stays: long enough to read a few words.
+pub const AMBIENT_HOLD: Duration = Duration::from_millis(2_500);
 
 impl Toast {
     pub fn new(tone: ToastTone, message: impl Into<String>) -> Self {
@@ -67,6 +76,17 @@ impl Toast {
             actions: Vec::new(),
             dismissible: true,
             hold: None,
+            ambient: false,
+        }
+    }
+
+    /// An ambient notice: who changed the window, and how.
+    pub fn ambient(message: impl Into<String>) -> Self {
+        Self {
+            dismissible: false,
+            hold: Some(AMBIENT_HOLD),
+            ambient: true,
+            ..Self::new(ToastTone::Info, message)
         }
     }
 
@@ -190,9 +210,12 @@ impl ToastSlot {
     }
 
     /// Show `toast`, replacing any current one. Repeating the visible toast
-    /// only restarts its timer: no second entrance, no flicker.
+    /// only restarts its timer: no second entrance, no flicker. An ambient
+    /// notice replacing an ambient notice keeps the capsule and swaps its
+    /// text, so a burst reads as one notice that updates.
     pub fn show(&mut self, toast: Toast) -> Option<ToastTimer> {
-        if self.toast.as_ref() != Some(&toast) {
+        let in_place = toast.ambient && self.toast.as_ref().is_some_and(|current| current.ambient);
+        if !in_place && self.toast.as_ref() != Some(&toast) {
             self.generation = self.generation.wrapping_add(1);
             self.hovered = false;
         }
@@ -340,6 +363,9 @@ pub fn toast_element(
         id: SharedString::from(format!("{name}-{generation}")),
     };
     let handlers = std::rc::Rc::new(handlers);
+    if toast.ambient {
+        return ambient(toast, colors, &key, reduce_motion);
+    }
     let body = match style {
         ToastStyle::Capsule => capsule(toast, colors, &key, &handlers),
         ToastStyle::Card => card(toast, colors, &key, &handlers),
@@ -536,6 +562,54 @@ fn capsule(
                 .animate_entry(false),
         )
         .children(corner)
+        .into_any_element()
+}
+
+/// An ambient notice: the capsule's shape and type, nothing to hit. The
+/// terminal under it keeps every click, hover and scroll.
+fn ambient(toast: &Toast, colors: SemanticColors, key: &Key, reduce_motion: bool) -> AnyElement {
+    let name = key.name;
+    let row = div()
+        .max_w(px(480.0))
+        .h(px(30.0))
+        .px(px(14.0))
+        .flex()
+        .items_center()
+        .child(
+            div()
+                .min_w(px(0.0))
+                .truncate()
+                .text_size(px(Typo::ROW.size))
+                .line_height(px(18.0))
+                .text_color(colors.primary)
+                .child(toast.message.clone()),
+        );
+    let body = div()
+        .debug_selector(move || name.to_owned())
+        .max_w_full()
+        .child(
+            FloatingSurface::new(colors, row)
+                .radius(15.0)
+                .animate_entry(false),
+        );
+    if reduce_motion {
+        return body.into_any_element();
+    }
+    // The same rise as the capsule; an in-place text swap keeps the key, so
+    // only the first notice of a burst animates.
+    div()
+        .relative()
+        .max_w_full()
+        .child(body)
+        .with_animation(
+            SharedString::from(format!("{}-entry", key.id)),
+            Animation::new(Duration::from_millis(180)).with_easing(ease_out_quint()),
+            move |element, delta| {
+                element
+                    .top(px(8.0 * (1.0 - delta)))
+                    .opacity(delta.clamp(0.0, 1.0))
+            },
+        )
         .into_any_element()
 }
 
@@ -809,6 +883,39 @@ mod tests {
         slot.set_hovered(true);
         assert_eq!(slot.set_hovered(false), None);
         assert!(slot.expire(timer.token));
+    }
+
+    #[test]
+    fn a_burst_of_ambient_notices_updates_one_capsule_in_place() {
+        let mut slot = ToastSlot::default();
+        let first = slot.show(Toast::ambient("fix-auth: Split pane")).unwrap();
+        let generation = slot.generation();
+        let second = slot.show(Toast::ambient("fix-auth: Focus pane")).unwrap();
+        let third = slot.show(Toast::ambient("docs: Zoom pane")).unwrap();
+        assert_eq!(slot.generation(), generation, "no second entrance");
+        assert_eq!(slot.current().unwrap().message, "docs: Zoom pane");
+        assert_eq!(third.after, AMBIENT_HOLD);
+        assert!(!slot.expire(first.token), "the burst keeps it up");
+        assert!(!slot.expire(second.token));
+        assert!(slot.expire(third.token));
+        assert!(slot.current().is_none());
+        // After it closed, the next notice enters again.
+        slot.show(Toast::ambient("docs: New tab"));
+        assert_ne!(slot.generation(), generation);
+    }
+
+    #[test]
+    fn an_ambient_notice_is_quiet_and_short() {
+        let notice = Toast::ambient("fix-auth: Zoom pane");
+        assert!(notice.ambient && !notice.dismissible && notice.actions.is_empty());
+        assert_eq!(notice.visible_for(), Some(AMBIENT_HOLD));
+        assert!(!Toast::info("Copied").ambient);
+        // A regular toast replacing it still enters as itself.
+        let mut slot = ToastSlot::default();
+        slot.show(notice);
+        let generation = slot.generation();
+        slot.show(Toast::info("Copied"));
+        assert_ne!(slot.generation(), generation);
     }
 
     #[test]

@@ -200,16 +200,20 @@ impl HeadlessScreen {
 
     /// Parses `bytes`, cutting image sequences out of the stream. Replies to
     /// sequences that end inside the first `historical_bytes` are dropped.
-    pub(crate) fn advance_with_images(&mut self, bytes: &[u8], historical_bytes: usize) {
+    /// `csi_only`: every escape in `bytes` is a CSI (see `only_csi_escapes`),
+    /// so none can open an image sequence.
+    pub(crate) fn advance_with_images(
+        &mut self,
+        bytes: &[u8],
+        historical_bytes: usize,
+        csi_only: bool,
+    ) {
         let Some(images) = self.images.as_mut() else {
             self.parser.advance(&mut self.term, bytes);
             return;
         };
         // Fast path: nothing pending and nothing that could start a sequence.
-        if images.held.is_empty()
-            && images.collecting.is_none()
-            && memchr::memchr(0x1b, bytes).is_none()
-        {
+        if images.held.is_empty() && images.collecting.is_none() && csi_only {
             self.parser.advance(&mut self.term, bytes);
             return;
         }

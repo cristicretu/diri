@@ -1,0 +1,16 @@
+# Ghostty config, as a person writes it.
+font-family = JetBrains Mono
+font-family = Symbols Nerd Font
+font-size = 14
+adjust-cell-height = 20%
+theme = light:Paper,dark:Night Owl Custom
+cursor-style = bar
+cursor-style-blink = false
+copy-on-select = clipboard
+macos-option-as-alt = left
+window-padding-x = 8
+scrollback-limit = 100000000
+keybind = cmd+t=new_tab
+term = xterm-256color
+config-file = ?extra.conf
+config-file = ?missing.conf

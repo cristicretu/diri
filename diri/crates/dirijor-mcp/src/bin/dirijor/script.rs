@@ -31,7 +31,7 @@ pub(super) fn list(arguments: &[String]) -> Result<(), CliError> {
 
 pub(super) fn new(arguments: &[String]) -> Result<(), CliError> {
     let kind = option_value(arguments, "--kind").unwrap_or_else(|| "shell".into());
-    let cwd = match option_value(arguments, "--cwd") {
+    let cwd = match option_value(arguments, "--cwd").or_else(|| option_value(arguments, "-c")) {
         Some(cwd) => cwd,
         None => std::env::current_dir()
             .map_err(|error| {
@@ -46,7 +46,9 @@ pub(super) fn new(arguments: &[String]) -> Result<(), CliError> {
         "kind": kind,
         "cwd": cwd,
         "prompt": option_value(arguments, "--prompt"),
-        "name": option_value(arguments, "--name").or_else(|| option_value(arguments, "--title")),
+        "name": option_value(arguments, "--name")
+            .or_else(|| option_value(arguments, "--title"))
+            .or_else(|| option_value(arguments, "--label")),
         "host": option_value(arguments, "--host"),
     });
     params
@@ -320,12 +322,7 @@ pub(super) fn run(arguments: &[String]) -> Result<(), CliError> {
     let wait = has_flag(options, "--wait");
     let remove = has_flag(options, "--rm");
     let timeout = match option_value(options, "--timeout") {
-        Some(raw) => Some(
-            raw.parse::<f64>()
-                .ok()
-                .filter(|seconds| seconds.is_finite() && *seconds >= 0.0)
-                .ok_or_else(|| CliError::failure("--timeout expects seconds"))?,
-        ),
+        Some(raw) => Some(super::verbs::parse_duration(&raw)?.as_secs_f64()),
         None => None,
     };
     if !wait && (remove || timeout.is_some()) {
@@ -344,12 +341,19 @@ pub(super) fn run(arguments: &[String]) -> Result<(), CliError> {
             _ => forwarded.push(option.clone()),
         }
     }
+    // `--split`, `--beside`, `--ratio` and `--focus` place the new session;
+    // everything else is `session run`'s.
+    let placement = super::verbs::Placement::take(&mut forwarded)?;
     if let Some(separator) = separator {
         forwarded.extend_from_slice(&arguments[separator..]);
     }
     if !wait {
-        let (params, json_output) = session_run_params(&forwarded)?;
-        let result = request(Method::SESSION_SPAWN, params, Duration::from_secs(120))?;
+        let (mut params, json_output) = session_run_params(&forwarded)?;
+        let anchor = placement.apply(&mut params)?;
+        let mut result = request(Method::SESSION_SPAWN, params, Duration::from_secs(120))?;
+        if let Some(id) = result["id"].as_str().map(str::to_owned) {
+            result["layout"] = placement.finish(&id, anchor.as_ref())?;
+        }
         if json_output {
             print_json(&result);
         } else {
@@ -367,9 +371,13 @@ pub(super) fn run(arguments: &[String]) -> Result<(), CliError> {
         },
         message: error.message,
     };
-    let (params, json_output) = session_run_params(&forwarded).map_err(reserve)?;
+    let (mut params, json_output) = session_run_params(&forwarded).map_err(reserve)?;
+    let anchor = placement.apply(&mut params).map_err(reserve)?;
     let spawned =
         request(Method::SESSION_SPAWN, params, Duration::from_secs(120)).map_err(reserve)?;
+    if let Some(id) = spawned["id"].as_str() {
+        placement.finish(id, anchor.as_ref()).map_err(reserve)?;
+    }
     let id = spawned["id"]
         .as_str()
         .ok_or_else(|| CliError {
