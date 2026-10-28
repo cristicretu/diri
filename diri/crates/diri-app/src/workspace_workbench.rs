@@ -1094,13 +1094,13 @@ impl WorkspaceWorkbench {
         })
     }
 
-    #[cfg(test)]
+    #[cfg(all(test, target_os = "macos"))]
     pub(crate) fn morphing_for_test(&self) -> bool {
         self.morph.is_some()
     }
 
     /// Where `pane` sits in the window once settled.
-    #[cfg(test)]
+    #[cfg(all(test, target_os = "macos"))]
     pub(crate) fn pane_window_rect_for_test(&self, pane: &PaneId) -> Option<Rect> {
         let placement = self
             .geometry()?

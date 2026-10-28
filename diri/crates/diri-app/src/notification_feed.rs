@@ -419,6 +419,34 @@ impl NotificationFeed {
     pub fn unread_count(&self) -> usize {
         self.entries.iter().filter(|entry| !entry.read).count()
     }
+    pub fn entry(&self, id: &str) -> Option<&NotificationEntry> {
+        self.entries.iter().find(|entry| entry.id == id)
+    }
+    /// How many sessions hold news nobody has looked at that still stands:
+    /// a wait, a failure or a finished turn, unread and not superseded. One
+    /// per session, however many entries it posted; `counts` picks which
+    /// entries qualify.
+    pub fn unseen_sessions(&self, counts: impl Fn(&NotificationEntry) -> bool) -> usize {
+        let mut sessions = std::collections::HashSet::new();
+        for entry in &self.entries {
+            if !entry.read
+                && !entry.resolved
+                && entry.kind != NotificationKind::Custom
+                && counts(entry)
+            {
+                sessions.insert(&entry.session_id);
+            }
+        }
+        sessions.len()
+    }
+    /// The newest unread entry of a session: what its unseen mark stands
+    /// for, and since when.
+    pub fn latest_unread(&self, id: &SessionId) -> Option<&NotificationEntry> {
+        self.entries
+            .iter()
+            .filter(|entry| &entry.session_id == id && !entry.read)
+            .max_by_key(|entry| entry.created_at_ms)
+    }
     pub fn session_unread(&self, id: &SessionId) -> bool {
         self.entries
             .iter()
@@ -587,6 +615,41 @@ mod tests {
             native_completions: Default::default(),
         });
         session
+    }
+
+    #[test]
+    fn unseen_sessions_count_each_session_once_and_skip_settled_news() {
+        let mut feed = NotificationFeed::default();
+        let entry = |id: &str, session: &str, kind, read, resolved| NotificationEntry {
+            id: id.into(),
+            session_id: SessionId::new(session),
+            incarnation: 0,
+            kind,
+            title: String::new(),
+            body: String::new(),
+            created_at_ms: id.len() as u64,
+            read,
+            resolved,
+            blocker: String::new(),
+        };
+        feed.entries = vec![
+            entry("a1", "a", NotificationKind::Done, false, false),
+            entry("a22", "a", NotificationKind::Done, false, false),
+            entry("b1", "b", NotificationKind::Failed, false, false),
+            entry("c1", "c", NotificationKind::Done, true, false),
+            entry("d1", "d", NotificationKind::Done, false, true),
+            entry("e1", "e", NotificationKind::Custom, false, false),
+        ];
+        assert_eq!(feed.unread_count(), 5);
+        assert_eq!(feed.unseen_sessions(|_| true), 2);
+        assert_eq!(
+            feed.unseen_sessions(|entry| entry.kind == NotificationKind::Failed),
+            1
+        );
+        assert_eq!(
+            feed.latest_unread(&SessionId::new("a")).map(|entry| entry.id.as_str()),
+            Some("a22")
+        );
     }
 
     #[test]
