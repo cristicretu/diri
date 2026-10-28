@@ -741,7 +741,7 @@ mod tests {
     };
 
     fn session(kind: AgentKind, status: SessionStatus) -> SessionRecord {
-        SessionRecord {
+        SessionRecord { command_run: None,
             attention_state: None,
             id: SessionId::new("session-1"),
             kind,

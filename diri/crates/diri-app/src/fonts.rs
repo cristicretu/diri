@@ -12,7 +12,7 @@ use std::cell::RefCell;
 use std::collections::HashSet;
 use std::sync::{Mutex, OnceLock};
 
-use gpui::{App, Font, FontFallbacks, font};
+use gpui::{App, Font, FontFallbacks};
 
 static UI_FAMILY: OnceLock<&'static str> = OnceLock::new();
 static MONO_FAMILY: OnceLock<&'static str> = OnceLock::new();
@@ -26,6 +26,9 @@ pub fn init(cx: &App) {
     let _ = UI_FAMILY.set(select_ui(&names));
     let _ = MONO_FAMILY.set(select_mono(&names));
     *installed() = Some(names);
+    if let Err(error) = diri_term::glyphs::register_bundled_fonts(cx) {
+        eprintln!("diri: bundled symbol font unavailable: {error}");
+    }
 }
 
 fn installed() -> std::sync::MutexGuard<'static, Option<HashSet<String>>> {
@@ -52,27 +55,30 @@ pub fn terminal_family(configured: &str) -> &str {
     if usable { configured } else { mono_family() }
 }
 
-/// The terminal font for a stored family preference (empty = default).
-/// Called on every terminal frame, so the last answer is reused.
-pub fn terminal_font(configured: &str) -> Font {
+/// The terminal font for a stored family preference (empty = default) and
+/// the ligature preference. Called on every terminal frame, so the last
+/// answer is reused.
+pub fn terminal_font(configured: &str, ligatures: bool) -> Font {
     thread_local! {
-        static LAST: RefCell<Option<(String, Font)>> = const { RefCell::new(None) };
+        static LAST: RefCell<Option<(String, bool, Font)>> = const { RefCell::new(None) };
     }
     let family = terminal_family(configured);
     LAST.with_borrow_mut(|last| {
-        if let Some((key, font)) = last.as_ref()
+        if let Some((key, key_ligatures, font)) = last.as_ref()
             && key == family
+            && *key_ligatures == ligatures
         {
             return font.clone();
         }
-        let mut mono = font(family.to_owned());
-        let mut fallbacks = terminal_fallbacks();
-        // A custom family may lack glyphs the default covers.
+        let mut mono = diri_term::glyphs::terminal_font(family, ligatures);
+        let mut fallbacks = diri_term::glyphs::fallback_families();
+        // A custom family may lack glyphs the default covers. The bundled
+        // symbol font stays first: it only maps the Private Use Area.
         if mono.family.as_ref() != mono_family() {
-            fallbacks.insert(0, mono_family().to_owned());
+            fallbacks.insert(1, mono_family().to_owned());
         }
         mono.fallbacks = Some(FontFallbacks::from_fonts(fallbacks));
-        *last = Some((family.to_owned(), mono.clone()));
+        *last = Some((family.to_owned(), ligatures, mono.clone()));
         mono
     })
 }
@@ -244,33 +250,7 @@ fn select_mono(names: &HashSet<String>) -> &'static str {
     .unwrap_or(default_mono())
 }
 
-#[cfg(target_os = "macos")]
-fn terminal_fallbacks() -> Vec<String> {
-    [
-        ".SF NS Mono",
-        "Menlo",
-        "Apple Symbols",
-        "STIX Two Math",
-        "Apple Color Emoji",
-    ]
-    .into_iter()
-    .map(str::to_owned)
-    .collect()
-}
 
-#[cfg(all(unix, not(target_os = "macos")))]
-fn terminal_fallbacks() -> Vec<String> {
-    [
-        "Noto Sans Mono",
-        "DejaVu Sans Mono",
-        "Noto Sans Symbols 2",
-        "STIX Two Math",
-        "Noto Color Emoji",
-    ]
-    .into_iter()
-    .map(str::to_owned)
-    .collect()
-}
 
 #[cfg(windows)]
 fn default_ui() -> &'static str {
@@ -294,18 +274,6 @@ fn select_mono(names: &HashSet<String>) -> &'static str {
         .find(|name| names.contains(*name))
         .unwrap_or(default_mono())
 }
-#[cfg(windows)]
-fn terminal_fallbacks() -> Vec<String> {
-    [
-        "Cascadia Mono",
-        "Consolas",
-        "Segoe UI Symbol",
-        "Segoe UI Emoji",
-    ]
-    .into_iter()
-    .map(str::to_owned)
-    .collect()
-}
 
 #[cfg(test)]
 mod tests {
@@ -324,16 +292,17 @@ mod tests {
         assert_eq!(terminal_family("Diri Test Mono"), "Diri Test Mono");
         assert_eq!(terminal_family("Uninstalled Mono"), mono_family());
 
-        let custom = terminal_font("Diri Test Mono");
+        let custom = terminal_font("Diri Test Mono", true);
         assert_eq!(custom.family.as_ref(), "Diri Test Mono");
-        assert_eq!(
-            custom
-                .fallbacks
-                .as_ref()
-                .map(|f| f.fallback_list()[0].as_str()),
-            Some(mono_family())
-        );
-        assert_eq!(terminal_font("").family.as_ref(), mono_family());
+        let chain = custom.fallbacks.as_ref().unwrap().fallback_list();
+        assert_eq!(chain[0], diri_term::glyphs::SYMBOLS_FAMILY);
+        assert_eq!(chain[1], mono_family());
+        assert_eq!(terminal_font("", true).family.as_ref(), mono_family());
+        // The ligature preference is part of the font, and the reused
+        // answer follows it.
+        assert!(terminal_font("", true).features.tag_value_list().is_empty());
+        assert!(!terminal_font("", false).features.tag_value_list().is_empty());
+        assert!(terminal_font("", true).features.tag_value_list().is_empty());
     }
 
     #[test]

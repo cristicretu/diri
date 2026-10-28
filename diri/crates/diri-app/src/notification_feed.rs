@@ -115,7 +115,7 @@ impl NotificationFeed {
     pub fn load(path: &Path) -> io::Result<Self> {
         let database = path.with_extension("sqlite");
         if let Some(parent) = database.parent() {
-            std::fs::create_dir_all(parent)?;
+            diri_platform::private::create_dir_all(parent)?;
         }
         // Create with private permissions before SQLite can write sensitive text.
         let mut options = std::fs::OpenOptions::new();

@@ -644,6 +644,7 @@ impl DaemonClient {
             &SessionRenameParams {
                 session_id: session_id.clone(),
                 title,
+                by: None,
             },
         )
         .await
@@ -1952,6 +1953,7 @@ mod tests {
 
             let spawned_id = client
                 .spawn(SessionSpawnParams {
+                    keep_open: None,
                     appearance: None,
                     kind: AgentKind::SHELL,
                     cwd: scratch.to_string_lossy().into_owned(),

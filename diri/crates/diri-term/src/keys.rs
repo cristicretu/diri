@@ -8,7 +8,8 @@ pub use diri_proto::terminal_input::*;
 /// arrows and Home/End retain the desktop's historical normal-cursor (CSI)
 /// encoding. This is a compatibility policy, not an observed terminal mode:
 /// do not persist it or use it for the strict automation key API. Keypad keys
-/// still require authoritative state, and known application modes always win.
+/// type their characters in every legacy mode, and known application modes
+/// always win.
 /// The Engine continues to enforce controller and enhanced-keyboard admission.
 pub fn encode_interactive_action(
     event: &KeyEvent,
@@ -104,6 +105,8 @@ mod tests {
             encode_interactive_action(&up, Modifiers::default(), None, KeyAction::Release),
             Err(KeyEncodingError::UnsupportedRelease)
         );
+        // The keypad types its character whatever the modes, so it needs
+        // none observed.
         assert_eq!(
             encode_interactive_action(
                 &KeyEvent::keypad(KeypadKey::One),
@@ -111,7 +114,7 @@ mod tests {
                 None,
                 KeyAction::Press
             ),
-            Err(KeyEncodingError::UnknownModes)
+            Ok(b"1".to_vec())
         );
         assert!(
             encode_interactive_action(

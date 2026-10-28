@@ -75,12 +75,40 @@ pub struct ProgramRecord {
     pub msg: Option<String>,
 }
 
+/// Why the last records went away, so a reader can tell a program that
+/// cleared its own status from one that ended or was reset.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ProgramRemoval {
+    /// The program sent `state=clear` for them.
+    Clear,
+    /// A full terminal reset (RIS, `ESC c`).
+    Reset,
+    /// The shell job that reported them left the foreground.
+    Foreground,
+    /// The agent that reported them exited back to its login shell.
+    ChildExited,
+}
+
+impl ProgramRemoval {
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Clear => "clear",
+            Self::Reset => "reset",
+            Self::Foreground => "foreground",
+            Self::ChildExited => "child_exited",
+        }
+    }
+}
+
 #[derive(Clone, Debug, Default)]
 pub(crate) struct ProgramStatusTable {
     /// Keyed by id; the root record's id is empty.
     records: BTreeMap<String, (ProgramRecord, u64)>,
     clock: u64,
     generation: u64,
+    /// Why the table last went from some records to none.
+    removal: Option<ProgramRemoval>,
 }
 
 impl ProgramStatusTable {
@@ -103,6 +131,9 @@ impl ProgramStatusTable {
                     .retain(|id, _| !is_self_or_descendant(id, &report.id));
                 if self.records.len() != before {
                     self.generation += 1;
+                    if self.records.is_empty() {
+                        self.removal = Some(ProgramRemoval::Clear);
+                    }
                 }
             }
             Some(record) => {
@@ -119,26 +150,33 @@ impl ProgramStatusTable {
                 }
                 self.records.insert(report.id, (record, self.clock));
                 self.generation += 1;
+                self.removal = None;
             }
         }
         true
     }
 
-    /// Drops every record: the program that reported them has ended.
-    /// Returns whether there were any.
+    /// Drops every record: the program that reported them has ended, for
+    /// `reason`. Returns whether there were any.
     ///
     /// The specification keeps `done`, `error` and `idle` past the program's
     /// exit so a terminal can keep showing the result. Diri reads the records
     /// as the program's status instead, and delivers a result as the turn it
     /// completed when it arrives; kept, they would describe a program that is
     /// gone and hide the status of whatever runs next.
-    pub fn end_program(&mut self) -> bool {
+    pub fn end_program(&mut self, reason: ProgramRemoval) -> bool {
         if self.records.is_empty() {
             return false;
         }
         self.records.clear();
         self.generation += 1;
+        self.removal = Some(reason);
         true
+    }
+
+    /// Why the records went away, while none are left.
+    pub fn removal(&self) -> Option<ProgramRemoval> {
+        self.removal.filter(|_| self.records.is_empty())
     }
 
     /// The record that best describes the whole program: one waiting on the
@@ -422,9 +460,22 @@ mod tests {
     #[test]
     fn ending_the_program_drops_every_record() {
         let mut table = table(&["state=working:id=a", "state=error:id=b"]);
-        assert!(table.end_program());
+        assert!(table.end_program(ProgramRemoval::Foreground));
         assert_eq!(table.summary(), None);
-        assert!(!table.end_program());
+        assert_eq!(table.removal(), Some(ProgramRemoval::Foreground));
+        assert!(!table.end_program(ProgramRemoval::Reset));
+        assert_eq!(table.removal(), Some(ProgramRemoval::Foreground));
+    }
+
+    #[test]
+    fn a_program_clearing_its_last_record_says_so() {
+        let mut table = table(&["state=working:id=a", "state=idle"]);
+        assert!(table.apply("state=clear:id=a"));
+        assert_eq!(table.removal(), None, "the root record is still there");
+        assert!(table.apply("state=clear"));
+        assert_eq!(table.removal(), Some(ProgramRemoval::Clear));
+        assert!(table.apply("state=working"));
+        assert_eq!(table.removal(), None);
     }
 
     #[test]

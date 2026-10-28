@@ -200,3 +200,69 @@ fn resuming_a_session_whose_folder_is_gone_is_refused_at_once() {
         .expect_err("nothing spawns in a missing folder");
     assert_eq!(error.code, diri_proto::control::CWD_MISSING, "{error:?}");
 }
+
+/// A command whose program does not exist used to abort inside the spawn
+/// (SIGABRT, `fatal runtime error` on screen). Through a Holder it now ends
+/// the way a shell reports it: `command not found` on the terminal, exit 127,
+/// and how long it ran, so the app keeps that tab open on the error.
+#[test]
+fn a_missing_program_explains_itself_and_exits_127() {
+    let temp = tempfile::tempdir().unwrap();
+    let (registry, mut control) = start(temp.path());
+    for (program, explanation) in [
+        (
+            "diri-no-such-tool-xyz",
+            "diri: diri-no-such-tool-xyz: command not found",
+        ),
+        (
+            "/nonexistent/diri-tool",
+            "diri: /nonexistent/diri-tool: No such file or directory",
+        ),
+    ] {
+        let spawned = control.request(
+            "session.spawn",
+            json!({ "kind": { "shell": {} }, "cwd": "/tmp", "argv": [program], "keepOpen": true }),
+        );
+        let id = spawned["id"].as_str().unwrap().to_owned();
+        assert_eq!(spawned["commandRun"], json!({ "keepOpen": true }));
+        let record = || registry.lock().unwrap().record(&id).unwrap();
+        wait_until("the run exits", Duration::from_secs(10), || {
+            matches!(record().status, diri_proto::SessionStatus::Exited(_))
+        });
+        let record = record();
+        let diri_proto::SessionStatus::Exited(exit) = &record.status else {
+            unreachable!()
+        };
+        assert_eq!(
+            (exit.reason, exit.code, exit.signal),
+            (diri_proto::ExitReason::Exited, Some(127), None),
+            "{program}"
+        );
+        let run = record.command_run.clone().expect("a command run");
+        assert!(run.keep_open);
+        let ran = run.ran_ms.expect("the Engine timed the run");
+        assert!(ran < 5_000, "{program} ran {ran} ms");
+        assert!(record.command_keeps_tab());
+        let screen = registry.lock().unwrap().get(&id).unwrap().screen_lines();
+        assert!(
+            screen.iter().any(|line| line.contains(explanation)),
+            "{program}: {screen:?}"
+        );
+    }
+}
+
+/// `keepOpen` belongs to commands. An Agent's or a login shell's tab already
+/// outlives its program; the flag is refused there before anything starts.
+#[test]
+fn keep_open_is_refused_for_a_login_shell() {
+    let temp = tempfile::tempdir().unwrap();
+    let (registry, mut control) = start(temp.path());
+    let error = control
+        .call(
+            "session.spawn",
+            json!({ "kind": { "shell": {} }, "cwd": "/tmp", "keepOpen": true }),
+        )
+        .expect_err("a login shell has no command to keep open");
+    assert_eq!(error.code, "bad_request", "{error:?}");
+    assert!(registry.lock().unwrap().records().is_empty());
+}

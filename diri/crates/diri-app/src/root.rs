@@ -38,6 +38,10 @@ mod gesture_acceptance_tests;
 mod gesture_schedule_profile;
 #[cfg(all(test, target_os = "macos"))]
 mod split_pane_tests;
+#[cfg(all(test, target_os = "macos"))]
+mod pane_drag_tests;
+#[cfg(all(test, target_os = "macos"))]
+mod pane_drag_frames;
 
 use std::collections::HashSet;
 use std::sync::Arc;
@@ -2353,6 +2357,16 @@ impl RootView {
     }
 
     fn on_key_down(&mut self, event: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
+        // Escape drops a dragged pane where it came from. GPUI keeps the
+        // drag until the button comes up; every target goes quiet instead.
+        if event.keystroke.key == "escape" && crate::pane_drag::cancel(cx) {
+            if let Some(workbench) = &self.workspace_workbench {
+                workbench.update(cx, |_, cx| cx.notify());
+            }
+            self.sidebar.update(cx, |_, cx| cx.notify());
+            cx.stop_propagation();
+            return;
+        }
         if let Some(surfaces) = &self.session_surfaces
             && surfaces.read(cx).tab_peek_visible()
         {
@@ -2848,6 +2862,29 @@ impl RootView {
             CommandId::SelectPreviousSession if !self.arrow_surface_visible() => {
                 self.sidebar
                     .update(cx, |sidebar, cx| sidebar.select_relative(-1, cx));
+            }
+            CommandId::MovePaneToNextTab | CommandId::MovePaneToPreviousTab => {
+                let source = self
+                    .workspace_workbench
+                    .as_ref()
+                    .filter(|_| self.active_workspace.is_some())
+                    .and_then(|workbench| workbench.read(cx).focused_drag_source());
+                let moved = source.is_some_and(|source| {
+                    self.sidebar.update(cx, |sidebar, cx| {
+                        sidebar.move_pane_to_adjacent_tab(
+                            source,
+                            command == CommandId::MovePaneToNextTab,
+                            cx,
+                        )
+                    })
+                });
+                if !moved {
+                    self.show_feedback(
+                        "workspace",
+                        Toast::info(crate::i18n::t("toast.pane_has_nowhere_to_go")),
+                        cx,
+                    );
+                }
             }
             CommandId::SelectNextSession if !self.arrow_surface_visible() => {
                 self.sidebar
@@ -4538,7 +4575,7 @@ impl RootView {
             let strip_height = self.sidebar.read(cx).tab_strip_height();
             let strip = self.sidebar.update(cx, |sidebar, cx| {
                 sidebar.strip_held_hint = held_hint;
-                sidebar.title_opacity = crate::window_chrome::title_row_opacity(window);
+                sidebar.sync_chrome_look(sidebar_colors, window);
                 sidebar.strip_caption_inset = crate::window_chrome::caption_inset(
                     0.0,
                     f32::from(viewport_size.width) - (origin_x + card_width),
@@ -5799,6 +5836,21 @@ impl Render for RootView {
             .on_action(
                 cx.listener(|this, _: &crate::commands::MovePaneDown, window, cx| {
                     this.run_command(CommandId::MovePaneDown, window, cx);
+                }),
+            )
+            .on_action(
+                cx.listener(|this, _: &crate::commands::MovePaneToNewTab, window, cx| {
+                    this.run_command(CommandId::MovePaneToNewTab, window, cx);
+                }),
+            )
+            .on_action(
+                cx.listener(|this, _: &crate::commands::MovePaneToNextTab, window, cx| {
+                    this.run_command(CommandId::MovePaneToNextTab, window, cx);
+                }),
+            )
+            .on_action(
+                cx.listener(|this, _: &crate::commands::MovePaneToPreviousTab, window, cx| {
+                    this.run_command(CommandId::MovePaneToPreviousTab, window, cx);
                 }),
             )
             .on_action(
@@ -12649,6 +12701,9 @@ mod tests {
         });
     }
 
+    // Traffic lights exist only on macOS; elsewhere the leading lane is the
+    // platform's own (none on Linux, the window icon on Windows).
+    #[cfg(target_os = "macos")]
     #[gpui::test]
     fn the_hidden_sidebar_button_clears_the_traffic_lights_in_both_densities(
         cx: &mut gpui::TestAppContext,

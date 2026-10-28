@@ -59,6 +59,8 @@ pub(in crate::sidebar) struct StripTabProps {
     /// The fraction of the hover fill a tab the pointer just left still
     /// wears; it changes each frame of the fade (see `hover_linger`).
     pub(super) hover_linger: f32,
+    /// The selection and hover look for the window's key status.
+    pub(super) look: crate::chrome_focus::ChromeLook,
 }
 
 impl StripTabProps {
@@ -156,6 +158,7 @@ impl Sidebar {
             } else {
                 self.tab_hover_linger(id)
             },
+            look: self.chrome_look,
         }
     }
 

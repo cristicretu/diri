@@ -121,6 +121,7 @@
   "toast.non_persistent": "SSH 断开时 {host} 会结束会话",
   "toast.non_persistent_detail": "请保持连接，否则智能体可能会退出。",
   "toast.notification_session_gone": "该会话已关闭或归档",
+  "toast.pane_has_nowhere_to_go": "没有其他标签页可以接收这个窗格",
   "toast.prefs_sync_failed": "无法将偏好设置同步到 {host}",
   "toast.privacy_reports": "diri 会发送崩溃和错误报告",
   "toast.privacy_reports_detail": "终端内容绝不会离开你的电脑。",
