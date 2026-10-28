@@ -95,7 +95,12 @@ pub fn tool_content(result: Result<Value, String>) -> Value {
 #[cfg(test)]
 const INSTRUCTIONS_LIMIT: usize = 2048;
 
-fn instructions(browser: &str) -> String {
+fn instructions(browser: &str, names_sessions: bool) -> String {
+    let naming = if names_sessions {
+        format!("\n\n{}", diri_proto::session_naming::INSTRUCTION)
+    } else {
+        String::new()
+    };
     format!(
         "This session runs INSIDE Diri, a desktop orchestrator for coding agents; these \
          tools control it. Use them proactively, without asking, when the user wants to \
@@ -120,7 +125,7 @@ fn instructions(browser: &str) -> String {
          A Diri task you receive: report_task acknowledged first, then completed/failed for \
          that task_id after verifying (JSON matching result_schema if given), or blocked \
          with your question. Delivery is at most once: reuse message_id/operation_id/\
-         request_id on retries, never resend under a new identity.{browser}"
+         request_id on retries, never resend under a new identity.{browser}{naming}"
     )
 }
 
@@ -139,7 +144,12 @@ pub fn initialize(params: &Value) -> Value {
         "protocolVersion": version,
         "capabilities": {"tools":{}},
         "serverInfo": {"name":"dirijor","version":"0.1.0"},
-        "instructions": instructions(browser),
+        // "Let agents name sessions", read as the Agent starts: changing it
+        // reaches the next Agent session, never one already running.
+        "instructions": instructions(
+            browser,
+            diri_proto::session_naming::enabled_for_current_user(),
+        ),
     })
 }
 
@@ -238,9 +248,20 @@ mod tests {
     use super::*;
 
     #[test]
+    fn session_naming_is_told_only_while_the_setting_is_on() {
+        let on = instructions("", true);
+        assert!(on.contains("name_session"));
+        assert!(on.ends_with(diri_proto::session_naming::INSTRUCTION));
+        let off = instructions("", false);
+        assert!(!off.contains("name_session"));
+        assert!(!off.contains("Name this session"));
+    }
+
+    #[test]
     fn instructions_fit_the_client_cap_and_route_to_every_skill() {
         let longest = instructions(
             " To test a web feature, use test_run with a preview URL from get_artifacts.",
+            true,
         );
         assert!(
             longest.chars().count() <= INSTRUCTIONS_LIMIT,

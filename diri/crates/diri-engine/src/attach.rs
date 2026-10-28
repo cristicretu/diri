@@ -49,6 +49,14 @@ impl From<Arc<Mutex<SinkOutput>>> for PublicationOutput {
     }
 }
 impl PublicationOutput {
+    /// Whether this sink decodes `terminal-styles-v1`. Preview muxes never do.
+    fn terminal_styles(&self) -> bool {
+        match self {
+            Self::Socket(output) => output.lock().is_ok_and(|output| output.terminal_styles),
+            Self::Mux(_) => false,
+        }
+    }
+
     fn close(&self) {
         match self {
             Self::Socket(output) => {
@@ -82,8 +90,33 @@ const LAGGING_SINK_LIMIT: Duration = Duration::from_secs(30);
 /// between the client reading again and its fresh screen.
 const LAGGING_RECHECK: Duration = Duration::from_millis(100);
 
+/// One frame, encoded once and shared by every sink it is queued on.
+type EncodedFrame = Arc<[u8]>;
+
+/// What the attaching client declared it decodes.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct AttachCapabilities {
+    pub enhanced_keyboard: bool,
+    /// `terminal-styles-v1`: cursor shape bits and decoration spans. A sink
+    /// without it gets the exact pre-styles grid bytes.
+    pub terminal_styles: bool,
+}
+
+/// A grid frame for a sink that does or does not decode `terminal-styles-v1`.
+fn grid_frame(
+    update: &diri_proto::grid::GridUpdate,
+    styles: bool,
+) -> Result<Frame, diri_proto::grid::GridCodecError> {
+    if styles {
+        Frame::grid(update)
+    } else {
+        Frame::grid_without_styles(update)
+    }
+}
+
 struct SinkOutput {
     enhanced_keyboard: bool,
+    terminal_styles: bool,
     preview: bool,
     stream: UnixStream,
     frames: VecDeque<Arc<[u8]>>,
@@ -108,6 +141,7 @@ impl SinkOutput {
         stream.set_nonblocking(true)?;
         Ok(Self {
             enhanced_keyboard: false,
+            terminal_styles: false,
             preview: false,
             stream,
             frames: VecDeque::new(),
@@ -383,7 +417,8 @@ impl AttachHub {
             return Admission::Limit;
         }
         let seed = session.preview_seed();
-        let Ok(grid) = Frame::grid(&seed.grid)
+        // Thumbnails draw no cursor and no undercurl: always the legacy form.
+        let Ok(grid) = Frame::grid_without_styles(&seed.grid)
             .map_err(std::io::Error::other)
             .and_then(|frame| encoded(&frame))
         else {
@@ -449,13 +484,35 @@ impl AttachHub {
         buffered: Vec<u8>,
         writer: Arc<Mutex<UnixStream>>,
     ) {
+        self.serve_with_capabilities(
+            registry,
+            session_id,
+            AttachCapabilities {
+                enhanced_keyboard,
+                terminal_styles: false,
+            },
+            reader,
+            buffered,
+            writer,
+        );
+    }
+
+    pub fn serve_with_capabilities(
+        &self,
+        registry: &Arc<Mutex<Registry>>,
+        session_id: &str,
+        capabilities: AttachCapabilities,
+        reader: UnixStream,
+        buffered: Vec<u8>,
+        writer: Arc<Mutex<UnixStream>>,
+    ) {
         self.serve_kind(
             registry,
             session_id,
             reader,
             buffered,
             writer,
-            (false, enhanced_keyboard),
+            (false, capabilities),
         );
     }
 
@@ -473,7 +530,7 @@ impl AttachHub {
             reader,
             buffered,
             writer,
-            (true, false),
+            (true, AttachCapabilities::default()),
         );
     }
 
@@ -484,8 +541,9 @@ impl AttachHub {
         mut reader: UnixStream,
         buffered: Vec<u8>,
         writer: Arc<Mutex<UnixStream>>,
-        (preview, enhanced_keyboard): (bool, bool),
+        (preview, capabilities): (bool, AttachCapabilities),
     ) {
+        let enhanced_keyboard = capabilities.enhanced_keyboard;
         // Selecting a hibernated session revives it: the seed below paints
         // instantly from the emulator, and the live program resumes
         // underneath — the Swift attach() behavior.
@@ -516,6 +574,7 @@ impl AttachHub {
             output
         };
         output.enhanced_keyboard = enhanced_keyboard;
+        output.terminal_styles = capabilities.terminal_styles && !preview;
         output.preview = preview;
         // A completed local session whose Engine has since been replaced has
         // no live Session to attach to, but its final terminal may have been
@@ -598,7 +657,7 @@ impl AttachHub {
             if let Some(hook) = self.registration_hook.lock().unwrap().clone() {
                 hook();
             }
-            let Some(grid) = Frame::grid(&seed.grid)
+            let Some(grid) = grid_frame(&seed.grid, output.terminal_styles)
                 .ok()
                 .and_then(|frame| FrameCodec::encode(&frame).ok())
             else {
@@ -743,7 +802,7 @@ impl AttachHub {
         let Some(mut screen) = terminal.screen() else {
             return false;
         };
-        let Ok(grid) = Frame::grid(&screen.grid_update(true))
+        let Ok(grid) = grid_frame(&screen.grid_update(true), output.terminal_styles)
             .ok()
             .and_then(|frame| FrameCodec::encode(&frame).ok())
             .ok_or(())
@@ -847,16 +906,24 @@ impl AttachHub {
             // milliseconds over long history, and every session's input
             // and publication needs that lock.
             let reflow = {
-                let Ok(guard) = registry.lock() else {
+                let Ok(mut guard) = registry.lock() else {
                     return false;
                 };
+                guard.note_client_size(cols.max(2), rows.max(2));
                 let Some(session) = guard.get(session_id) else {
                     return true;
                 };
                 session.resize_pty(cols.max(2), rows.max(2))
             };
             if let Ok(Some(reflow)) = reflow {
-                reflow.apply();
+                // DECSET 2048 programs read their new size in-band.
+                let reports = reflow.apply();
+                if !reports.is_empty()
+                    && let Ok(guard) = registry.lock()
+                    && let Some(session) = guard.get(session_id)
+                {
+                    session.write_reports(&reports);
+                }
             }
             return true;
         }
@@ -1003,6 +1070,7 @@ impl AttachHub {
         self.enqueue_with_keyboard(session_id, sinks, frames, None, false);
     }
 
+    #[cfg(all(test, unix))]
     fn enqueue_with_keyboard(
         &self,
         session_id: &str,
@@ -1011,6 +1079,26 @@ impl AttachHub {
         enhanced_modes: Option<&Arc<[u8]>>,
         requires_enhanced: bool,
     ) {
+        self.enqueue_publication_frames(
+            session_id,
+            sinks,
+            frames,
+            (enhanced_modes, None),
+            requires_enhanced,
+        );
+    }
+
+    /// `legacy_grid`, when present, replaces the first frame (the grid) for
+    /// every sink that did not negotiate `terminal-styles-v1`.
+    fn enqueue_publication_frames(
+        &self,
+        session_id: &str,
+        sinks: Vec<(u64, PublicationOutput)>,
+        frames: &[Arc<[u8]>],
+        (enhanced_modes, legacy_grid): (Option<&EncodedFrame>, Option<&EncodedFrame>),
+        requires_enhanced: bool,
+    ) {
+        let mut legacy_frames = None;
         for (sink_id, output) in sinks {
             let accepted = match output {
                 PublicationOutput::Socket(output) => output.lock().is_ok_and(|mut output| {
@@ -1019,16 +1107,26 @@ impl AttachHub {
                         return false;
                     }
                     let enhanced = output.enhanced_keyboard;
+                    let styles = output.terminal_styles;
                     frames.iter().enumerate().all(|(index, frame)| {
                         let frame = if enhanced && index + 1 == frames.len() {
                             enhanced_modes.unwrap_or(frame)
+                        } else if index == 0 && !styles {
+                            legacy_grid.unwrap_or(frame)
                         } else {
                             frame
                         };
                         output.enqueue(Arc::clone(frame))
                     })
                 }),
-                PublicationOutput::Mux(output) => output.publish(frames),
+                PublicationOutput::Mux(output) => match legacy_grid {
+                    Some(legacy) => output.publish(legacy_frames.get_or_insert_with(|| {
+                        let mut copy = frames.to_vec();
+                        copy[0] = Arc::clone(legacy);
+                        copy
+                    })),
+                    None => output.publish(frames),
+                },
             };
             if !accepted {
                 self.deregister(session_id, sink_id);
@@ -1099,9 +1197,25 @@ impl AttachHub {
         else {
             return;
         };
+        // Encoded only when some sink cannot read the styled form.
+        let mut legacy_grid: Option<Arc<[u8]>> = None;
         for output in sinks {
             let Ok(mut output) = output.lock() else {
                 continue;
+            };
+            let grid = if output.terminal_styles || !seed.grid.has_style_extensions() {
+                Arc::clone(&grid)
+            } else if let Some(legacy) = &legacy_grid {
+                Arc::clone(legacy)
+            } else {
+                let Ok(legacy) = Frame::grid_without_styles(&seed.grid)
+                    .map_err(std::io::Error::other)
+                    .and_then(|frame| encoded(&frame))
+                else {
+                    continue;
+                };
+                legacy_grid = Some(Arc::clone(&legacy));
+                legacy
             };
             let Ok(modes) = encoded(
                 &Frame::modes_with_keyboard_capability(
@@ -1270,6 +1384,9 @@ impl AttachHub {
 
             let mut frames: Vec<Frame> = Vec::with_capacity(2);
             let mut enhanced_modes = None;
+            // The pre-styles form of `frames[0]`, for sinks that cannot read
+            // the styled one. Built only when the grid carries styles.
+            let mut legacy_grid = None;
             let mut requires_enhanced = false;
             let mut eligible_sinks = Vec::new();
             if let Some((publication, sinks, requires_capability)) = observed {
@@ -1284,6 +1401,15 @@ impl AttachHub {
                     && let Ok(frame) = Frame::grid(&update)
                 {
                     frames.push(frame);
+                    if update.has_style_extensions()
+                        && eligible_sinks
+                            .iter()
+                            .any(|(_, output)| !output.terminal_styles())
+                    {
+                        legacy_grid = Frame::grid_without_styles(&update)
+                            .ok()
+                            .and_then(|frame| encoded(&frame).ok());
+                    }
                 }
                 // Fresh sinks get their initial modes at seed time; the pump
                 // only broadcasts changes.
@@ -1327,11 +1453,11 @@ impl AttachHub {
                     }
                     return;
                 };
-                self.enqueue_with_keyboard(
+                self.enqueue_publication_frames(
                     session_id,
                     eligible_sinks,
                     &encoded_frames,
-                    enhanced_modes.as_ref(),
+                    (enhanced_modes.as_ref(), legacy_grid.as_ref()),
                     requires_enhanced,
                 );
                 trace_hop!(FrameEnqueued);
@@ -1493,6 +1619,7 @@ mod tests {
             interrupted: false,
         };
         let record = diri_proto::SessionRecord {
+            command_run: None,
             attention_state: None,
             id: diri_proto::SessionId("finished".into()),
             kind: diri_proto::AgentKind::SHELL,
@@ -1768,6 +1895,50 @@ mod tests {
             Some(AttachRejection::SessionNotFound)
         );
         serve.join().unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn styled_grids_reach_only_sinks_that_negotiated_them() {
+        let hub = AttachHub::new();
+        let (legacy, _legacy_reader) = constrained_output();
+        let (mut capable, _capable_reader) = constrained_output();
+        capable.terminal_styles = true;
+        let legacy = Arc::new(Mutex::new(legacy));
+        let capable = Arc::new(Mutex::new(capable));
+        let mut screen = diri_terminal_state::HeadlessScreen::new(8, 2);
+        screen.feed(b"\x1b[6 q\x1b[4:3mcurl");
+        let update = screen.full_snapshot();
+        assert!(update.has_style_extensions());
+        let styled = encoded(&Frame::grid(&update).unwrap()).unwrap();
+        let plain = encoded(&Frame::grid_without_styles(&update).unwrap()).unwrap();
+        let sinks: Vec<(u64, PublicationOutput)> = vec![
+            (1, Arc::clone(&legacy).into()),
+            (2, Arc::clone(&capable).into()),
+        ];
+        assert!(!sinks[0].1.terminal_styles());
+        assert!(sinks[1].1.terminal_styles());
+        hub.enqueue_publication_frames(
+            "fixture",
+            sinks,
+            std::slice::from_ref(&styled),
+            (None, Some(&plain)),
+            false,
+        );
+        assert!(Arc::ptr_eq(
+            legacy.lock().unwrap().frames.front().unwrap(),
+            &plain
+        ));
+        assert!(Arc::ptr_eq(
+            capable.lock().unwrap().frames.front().unwrap(),
+            &styled
+        ));
+        // The legacy bytes decode to the default cursor and no spans.
+        let decoded = FrameCodec::new().feed(&plain).unwrap()[0]
+            .grid_payload()
+            .unwrap()
+            .unwrap();
+        assert!(!decoded.has_style_extensions());
     }
 
     #[cfg(unix)]

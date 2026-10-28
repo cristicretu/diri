@@ -175,14 +175,12 @@ pub fn store_cache(path: &Path, roots: &[PathBuf], includes: &str, entries: &[Di
         return;
     };
     if let Some(parent) = path.parent() {
-        let _ = fs::create_dir_all(parent);
+        let _ = diri_platform::private::create_dir_all(parent);
     }
     // Write-then-rename: a half-written index would be parsed as no index at
-    // all on the next launch, silently costing a cold scan.
-    let temporary = path.with_extension("json.tmp");
-    if fs::write(&temporary, bytes).is_ok() && fs::rename(&temporary, path).is_err() {
-        let _ = fs::remove_file(&temporary);
-    }
+    // all on the next launch, silently costing a cold scan. Owner-only: it
+    // lists the user's file paths.
+    let _ = diri_platform::private::replace_via(&path.with_extension("json.tmp"), path, bytes);
 }
 
 /// Parse newline/comma-separated roots, expand `~`, standardize, and dedupe in
@@ -1026,6 +1024,13 @@ mod tests {
 
         store_cache(&path, &roots, "", &entries);
         assert_eq!(load_cache(&path, &roots, ""), Some(entries.clone()));
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = |path: &Path| fs::metadata(path).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode(&path), 0o600, "the index lists the user's paths");
+            assert_eq!(mode(path.parent().unwrap()), 0o700);
+        }
 
         // A different roots setting indexed a different world.
         assert!(load_cache(&path, &[PathBuf::from("/elsewhere")], "").is_none());

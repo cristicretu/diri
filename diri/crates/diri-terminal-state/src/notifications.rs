@@ -31,6 +31,49 @@ pub(crate) struct NotificationParser {
     pub program: crate::program_status::ProgramStatusTable,
     /// Answers owed to the child, moved to the screen's replies after a feed.
     pub replies: Vec<u8>,
+    /// Where the shell is between its `OSC 133` marks.
+    pub shell: ShellPhase,
+}
+
+/// Where an interactive shell is, from its `OSC 133` semantic prompt marks.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum ShellPhase {
+    /// No marks seen, or a full reset since.
+    #[default]
+    Unknown,
+    /// At its prompt: a prompt was drawn, or the last command ended (`D`).
+    Prompt,
+    /// Running a command line (`C`), with no `D` yet.
+    Running,
+    /// A prompt drawn (`A`) while a command line still runs: the shell's own
+    /// line reader asking for input on that command's behalf. fish marks its
+    /// `read` builtin's prompt this way; with no foreground job, nothing else
+    /// tells that question from an idle prompt.
+    PromptInCommand,
+}
+
+impl ShellPhase {
+    fn mark(self, mark: &str) -> Self {
+        match mark.as_bytes().first() {
+            Some(b'A') => match self {
+                Self::Running | Self::PromptInCommand => Self::PromptInCommand,
+                _ => Self::Prompt,
+            },
+            Some(b'C') => Self::Running,
+            Some(b'D') => Self::Prompt,
+            // `B` (input start) and unknown marks change nothing.
+            _ => self,
+        }
+    }
+
+    /// A shell reporting its directory (`OSC 7`) is at its own prompt: a
+    /// `C` that came before belonged to whatever replaced it (`exec fish`).
+    fn directory_reported(self) -> Self {
+        match self {
+            Self::Running => Self::Prompt,
+            other => other,
+        }
+    }
 }
 
 /// `OSC 6973;agent-exit;<status> BEL`: the status the login-shell wrapper's
@@ -68,9 +111,11 @@ impl NotificationParser {
                 }
                 1 => {
                     if byte == b'c' {
+                        self.shell = ShellPhase::Unknown;
                         // RIS ends every program-status record; a soft reset
                         // (DECSTR) and screen switches keep them.
-                        self.program.end_program();
+                        self.program
+                            .end_program(crate::program_status::ProgramRemoval::Reset);
                     }
                     self.state = match byte {
                         b']' => 2,
@@ -142,6 +187,14 @@ impl NotificationParser {
             {
                 self.agent_exit = Some(status);
             }
+            return;
+        }
+        if let Some(mark) = payload.strip_prefix("133;") {
+            self.shell = self.shell.mark(mark);
+            return;
+        }
+        if payload.starts_with("7;") {
+            self.shell = self.shell.directory_reported();
             return;
         }
         if let Some(report) = payload.strip_prefix(crate::program_status::PREFIX) {
@@ -385,8 +438,12 @@ mod tests {
         let generation = screen.program_status_generation();
         screen.feed(b"plain output");
         assert_eq!(screen.program_status_generation(), generation);
-        assert!(screen.end_program_status());
+        assert!(screen.end_program_status(crate::ProgramRemoval::Foreground));
         assert_eq!(screen.program_status(), None);
+        assert_eq!(
+            screen.program_status_removal(),
+            Some(crate::ProgramRemoval::Foreground)
+        );
     }
 
     #[test]
@@ -396,6 +453,10 @@ mod tests {
         assert!(screen.program_status().is_some(), "DECSTR and 1049 keep it");
         screen.feed(b"\x1bc");
         assert_eq!(screen.program_status(), None);
+        assert_eq!(
+            screen.program_status_removal(),
+            Some(crate::ProgramRemoval::Reset)
+        );
     }
 
     #[test]
@@ -404,5 +465,45 @@ mod tests {
         screen.feed(b"\x1b]7501;state=working\x07\x1b]7501;?\x07");
         assert_eq!(screen.program_status(), None);
         assert!(screen.take_replies().is_empty());
+    }
+
+    /// fish 4.0.2's own marks, as it sent them on 2026-10-27: its `read`
+    /// prompt is an `A` inside the command line's `C`…`D`.
+    #[test]
+    fn a_prompt_inside_a_running_command_is_the_shells_own_question() {
+        use super::ShellPhase;
+        let mut screen = crate::HeadlessScreen::new(80, 24).with_notifications();
+        assert_eq!(screen.shell_phase(), ShellPhase::Unknown);
+        let prompt = b"\x1b]7;file://host/private/tmp/statlab\x07\x1b]0;/p/t/statlab\x07\
+            \x1b]133;A;special_key=1\x07giga@host /p/t/statlab> ";
+        screen.feed(prompt);
+        assert_eq!(screen.shell_phase(), ShellPhase::Prompt);
+        screen.feed(
+            b"read -P \"Proceed? [y/N] \" ans\r\n\
+              \x1b]133;C;cmdline_url=read%20-P%20%22Proceed%3F%20%5By/N%5D%20%22%20ans\x07",
+        );
+        assert_eq!(screen.shell_phase(), ShellPhase::Running);
+        screen.feed(b"\x1b]0;read /p/t/statlab\x07\r\x1b]133;A;special_key=1\x07Proceed? [y/N] ");
+        assert_eq!(screen.shell_phase(), ShellPhase::PromptInCommand);
+        // A second `read` in the same command line.
+        screen.feed(b"y\r\n\x1b]133;A;special_key=1\x07Again? ");
+        assert_eq!(screen.shell_phase(), ShellPhase::PromptInCommand);
+        // Answered (or ^C, which ends it with `D;1`): the shell's prompt.
+        screen.feed(b"y\r\n\x1b]133;D;0\x07\x1b]133;A;special_key=1\x07giga@host> ");
+        assert_eq!(screen.shell_phase(), ShellPhase::Prompt);
+
+        // `exec fish` from a shell that marked the command: the new shell
+        // reports its directory before its first prompt.
+        screen.feed(b"\x1b]133;C\x07\x1b]7;file://host/tmp\x07\x1b]133;A;special_key=1\x07> ");
+        assert_eq!(screen.shell_phase(), ShellPhase::Prompt);
+
+        // zsh and bash marks: `A`/`B` around the prompt, `C`, `D`.
+        screen.feed(b"\x1b]133;A\x07$ \x1b]133;B\x07sleep 1\r\n\x1b]133;C\x07");
+        assert_eq!(screen.shell_phase(), ShellPhase::Running);
+        screen.feed(b"\x1b]133;D;0\x07\x1b]133;A\x07$ \x1b]133;B\x07");
+        assert_eq!(screen.shell_phase(), ShellPhase::Prompt);
+
+        screen.feed(b"\x1b]133;C\x07\x1bc");
+        assert_eq!(screen.shell_phase(), ShellPhase::Unknown);
     }
 }

@@ -51,6 +51,30 @@ fn phone_palette(theme: &TermTheme) -> diri_web::TerminalPalette {
     }
 }
 
+/// The palette the Engine answers local terminals' color queries from: the
+/// saved theme under the saved interface style, never a preview or a fade
+/// frame, so programs see what the terminal settles on.
+pub(crate) fn engine_palette(
+    theme_id: &str,
+    style: InterfaceStyle,
+) -> diri_proto::TerminalPalette {
+    fn rgb(color: Rgba) -> [u8; 3] {
+        let channel = |value: f32| (value.clamp(0.0, 1.0) * 255.0).round() as u8;
+        [channel(color.r), channel(color.g), channel(color.b)]
+    }
+    let theme = styled_terminal(catalog_theme(theme_id), style);
+    diri_proto::TerminalPalette {
+        appearance: match theme.appearance {
+            ThemeAppearance::Light => diri_proto::TerminalAppearance::Light,
+            ThemeAppearance::Dark => diri_proto::TerminalAppearance::Dark,
+        },
+        foreground: rgb(theme.foreground),
+        background: rgb(theme.background),
+        cursor: rgb(theme.cursor),
+        ansi: theme.ansi.map(rgb),
+    }
+}
+
 /// The terminal theme a store is showing: the previewed one, if any.
 pub(crate) fn terminal_theme_in(store: &SessionStore) -> TermTheme {
     let theme = catalog_theme(store.theme_id());

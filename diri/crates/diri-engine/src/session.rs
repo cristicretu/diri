@@ -80,6 +80,18 @@ fn replay_budget() -> usize {
         })
 }
 
+/// The session log size a Holder is launched with. `DIRIJOR_HOLDER_LOG_BYTES`
+/// overrides it, no lower than a megabyte; tests use it to reach the log's
+/// bound without printing tens of megabytes.
+fn holder_log_capacity() -> i64 {
+    std::env::var("DIRIJOR_HOLDER_LOG_BYTES")
+        .ok()
+        .and_then(|value| value.parse::<i64>().ok())
+        .map_or(crate::holder::protocol::DEFAULT_DISK_CAPACITY, |value| {
+            value.max(1 << 20)
+        })
+}
+
 /// Quiet time after the last output before a screen checkpoint is written,
 /// the Swift daemon's `checkpointSettleDelay`. Bursts coalesce into one
 /// write; an idle screen is checkpointed within about a second.
@@ -96,14 +108,10 @@ const CHECKPOINT_MAX_STALENESS: Duration = Duration::from_secs(5);
 
 /// How long a deferred spawn waits for the first client size before
 /// launching at the estimated size anyway — an MCP-spawned agent may never
-/// get a view. The Swift daemon's 400ms fallback window.
+/// get a view. The Swift daemon's 400ms fallback window. Only a spawn with
+/// no known size waits here: a caller-named size, or the size a client last
+/// gave any session, launches at once.
 const LAUNCH_FALLBACK: Duration = Duration::from_millis(400);
-
-/// While unlaunched, each client resize pushes the exec back this far, so
-/// the agent starts at the SETTLED viewport rather than a transient
-/// first-layout size — otherwise its one-shot banner bakes at the wrong
-/// width. The Swift daemon's `scheduleDebouncedLaunch` delay.
-const LAUNCH_DEBOUNCE: Duration = Duration::from_millis(120);
 
 /// Outlasts the Holder's 10 s wait for a launchd job to call back
 /// (`diri_pty::detached`), after which it starts the Agent directly.
@@ -157,6 +165,20 @@ const OUTPUT_SETTLE: Duration = Duration::from_millis(16);
 /// One 120 Hz display interval, so continuous streaming cannot be held longer
 /// than the renderer's own frame cadence.
 const OUTPUT_BATCH_CEILING: Duration = Duration::from_millis(8);
+
+/// How long a held pump waits for more output before it publishes a batch
+/// that opened at least [`OUTPUT_BATCH_CEILING`] after the last publication.
+///
+/// The Holder's output stream cannot say a burst is over: a run read off it
+/// ends when the socket is momentarily empty, and the next PTY read may be
+/// microseconds behind. Waiting out the whole batch ceiling for the empty poll
+/// that proves it put ~9 ms between every lone piece of output (a background
+/// program's line, a spinner tick, a remote echo) and the screen. A short
+/// quiet window still folds in the rest of a write that spans several PTY
+/// reads, or several writes issued back to back, and anything that lost
+/// content waits for its redraw as before ([`RepaintHold`]). Continuous
+/// output stays capped at one publication per [`OUTPUT_BATCH_CEILING`].
+const OUTPUT_QUIET: Duration = Duration::from_millis(1);
 
 /// How long after a keystroke the output that follows it counts as its
 /// answer. A shell's echo lands well under a millisecond after the write and a
@@ -222,8 +244,11 @@ impl EchoRequest {
     /// Whether output that took the screen from `filled_before` to
     /// `filled_after` filled cells is this input's complete answer. An
     /// editing key may clear up to one row, the most a line editor erases
-    /// for one keypress; anything else that lost cells is mid-repaint,
-    /// unless it ended on a closed synchronized update (`complete`).
+    /// for one keypress. Any key may lose cells on the cursor's row alone
+    /// (`line_edit`): a history entry shorter than the line it replaces, an
+    /// autosuggestion the next letter no longer matches, a deleted
+    /// character. Anything else that lost cells is mid-repaint, unless it
+    /// ended on a closed synchronized update (`complete`).
     fn answered_by(
         &self,
         now: Instant,
@@ -231,9 +256,10 @@ impl EchoRequest {
         filled_after: usize,
         cols: usize,
         complete: bool,
+        line_edit: bool,
     ) -> bool {
         let allowance = if self.erases { cols } else { 0 };
-        !self.expired(now) && (complete || filled_after + allowance >= filled_before)
+        !self.expired(now) && (complete || line_edit || filled_after + allowance >= filled_before)
     }
 }
 
@@ -303,6 +329,17 @@ const EVAL_INTERVAL: Duration = Duration::from_millis(16);
 /// moment rather than churning subscriptions that cannot be read yet.
 const LIVE_HANDOVER_GAP: u64 = 256 << 10;
 
+/// Bytes held-session pumps in this process skipped because the log had
+/// already rotated past them. Every one is output the screen never saw, so
+/// anything but zero is a bug; benches and tests read it to prove that.
+static HELD_OUTPUT_SKIPPED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// See [`HELD_OUTPUT_SKIPPED`].
+#[doc(hidden)]
+pub fn held_output_skipped_bytes() -> u64 {
+    HELD_OUTPUT_SKIPPED.load(Ordering::Relaxed)
+}
+
 /// What a session looks like from the outside.
 #[derive(Clone, Debug)]
 pub struct SessionView {
@@ -330,6 +367,8 @@ pub struct SessionView {
     pub terminal_progress: Option<diri_proto::TerminalProgress>,
     pub tail_offset: u64,
     pub exited: bool,
+    /// How long the child ran, once this Engine saw a child it exec'd exit.
+    pub ran: Option<Duration>,
 }
 
 /// Small input-side composer mirror used only until the first real prompt is
@@ -461,6 +500,12 @@ struct Shared {
     /// When this Engine launched the child; `None` for an adopted one, whose
     /// start this process never saw.
     launched_at: Option<Instant>,
+    /// When the child was exec'd: `launched_at`, or later for a launch that
+    /// waited for the client's size. `None` for an adopted child.
+    exec_at: Mutex<Option<Instant>>,
+    /// How long the child ran, from `exec_at` to the moment its exit was
+    /// applied. Set once; a command session's tab policy reads it.
+    ran: Mutex<Option<Duration>>,
     /// Set before an explicit stop, so its exit is not read as a crash.
     terminate_requested: AtomicBool,
     /// A remote stop is in flight. Its Helper `kill` takes the controller
@@ -479,6 +524,12 @@ struct Shared {
     relaunch_requested: AtomicBool,
     /// The latest keystroke whose echo the held pump has not published yet.
     echo_request: Mutex<Option<EchoRequest>>,
+    /// Rings the held pump out of an idle park; see [`PumpWake`].
+    pump_wake: PumpWake,
+    /// What the last foreground sample of a shell found: 0 unknown, 1 the
+    /// shell itself, 2 a job. Only a job can change without moving bytes,
+    /// so only then does an idle pump keep its slow sampling backstop.
+    foreground_job: std::sync::atomic::AtomicU8,
     /// What a local shell is running and where it is. Stays empty for Agent
     /// sessions and for remote shells, whose processes are not on this host.
     foreground: Mutex<ForegroundProgram>,
@@ -487,6 +538,9 @@ struct Shared {
     /// What the program says it is doing with `OSC 7501`. See
     /// [`observe_program_status`].
     program_status: Mutex<ProgramStatusTrack>,
+    /// The shell has no job and is asking for a line itself, as of the last
+    /// local foreground sample. See [`shell_prompts_in_command`].
+    builtin_prompt: AtomicBool,
     /// Agents a shell recognises in its foreground, by the program name a
     /// user types to start them. Empty for every session but a shell.
     known_agents: Vec<KnownAgent>,
@@ -614,6 +668,8 @@ struct ProgressTrack {
 struct ProgramStatusTrack {
     generation_seen: u64,
     published: Option<diri_terminal_state::ProgramRecord>,
+    /// Why nothing reports any more, while `published` is `None`.
+    removal: Option<diri_terminal_state::ProgramRemoval>,
     unreduced: bool,
 }
 
@@ -732,6 +788,8 @@ impl Shared {
         let now = unix_secs();
         self.last_hot.store(now, Ordering::Relaxed);
         self.last_interaction.store(now, Ordering::Relaxed);
+        // A touched session ticks fast again; a parked pump has to hear it.
+        self.pump_wake.ring();
     }
 
     /// Fast quiet-tick while the session is attached/touched or Working;
@@ -765,6 +823,58 @@ fn unix_secs() -> u64 {
         .duration_since(SystemTime::UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs()
+}
+
+/// How long an idle held pump sleeps when nothing at all is pending: a
+/// backstop, not a tick. Output, input, hooks, a stop or a hangup wake it at
+/// once; this only bounds how late a Holder that is up but lost its child
+/// without an exit marker is noticed.
+const IDLE_PARK: Duration = Duration::from_secs(300);
+
+/// The doorbell of a parked held pump: an `EVFILT_USER` event on the pump's
+/// own log-watch kqueue, so waking costs no descriptor. Whoever changes what
+/// the pump's idle decision depends on (a touch, an out-of-band status
+/// signal, a stop) rings it.
+#[derive(Default)]
+struct PumpWake {
+    /// The pump's kqueue while it runs; -1 otherwise. Cleared under the lock
+    /// before the kqueue closes, so a ring never reaches a reused descriptor.
+    kq: Mutex<i32>,
+}
+
+impl PumpWake {
+    fn set(&self, kq: i32) {
+        *self.kq.lock().expect("pump wake") = kq;
+    }
+
+    fn ring(&self) {
+        #[cfg(target_os = "macos")]
+        {
+            let kq = self.kq.lock().expect("pump wake");
+            if *kq >= 0 {
+                let event = libc::kevent {
+                    ident: log_watch::WAKE_IDENT,
+                    filter: libc::EVFILT_USER,
+                    flags: 0,
+                    fflags: libc::NOTE_TRIGGER,
+                    data: 0,
+                    udata: std::ptr::null_mut(),
+                };
+                // SAFETY: one initialized change on a live kqueue (held open
+                // by the pump until it clears this under the same lock).
+                unsafe { libc::kevent(*kq, &event, 1, std::ptr::null_mut(), 0, std::ptr::null()) };
+            }
+        }
+    }
+}
+
+/// Clears [`PumpWake`] when the pump ends, before its kqueue closes.
+struct PumpWakeRegistration<'a>(&'a PumpWake);
+
+impl Drop for PumpWakeRegistration<'_> {
+    fn drop(&mut self) {
+        self.0.set(-1);
+    }
 }
 
 /// What the grid pump compares between ticks to decide whether anything
@@ -1026,8 +1136,32 @@ pub(crate) struct MirrorResize {
     shared: Arc<Shared>,
 }
 
+/// What XTVERSION reports for a local terminal.
+const TERMINAL_VERSION: &str = concat!("diri ", env!("DIRI_APP_VERSION"));
+
+/// The palette the App paints local terminals with, from the last
+/// `terminal.configure`. One per Engine: every local terminal shares the
+/// App's theme.
+static TERMINAL_PALETTE: std::sync::RwLock<Option<diri_proto::TerminalPalette>> =
+    std::sync::RwLock::new(None);
+
+pub(crate) fn terminal_palette() -> Option<diri_proto::TerminalPalette> {
+    *TERMINAL_PALETTE
+        .read()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+pub(crate) fn set_terminal_palette(palette: Option<diri_proto::TerminalPalette>) {
+    *TERMINAL_PALETTE
+        .write()
+        .unwrap_or_else(|poisoned| poisoned.into_inner()) = palette;
+}
+
 impl MirrorResize {
-    pub(crate) fn apply(self) {
+    /// Reflows the emulator and returns the in-band size report a program
+    /// asked for with DECSET 2048, which the caller writes to the PTY.
+    #[must_use]
+    pub(crate) fn apply(self) -> Vec<u8> {
         let mut screen = self.shared.screen.lock().expect("screen");
         let Some((cols, rows)) = self
             .shared
@@ -1036,15 +1170,17 @@ impl MirrorResize {
             .expect("requested size")
             .take()
         else {
-            return;
+            return Vec::new();
         };
         screen.resize(cols as usize, rows as usize);
+        let reports = screen.take_unsolicited();
         drop(screen);
         // A TUI answers the resize by clearing and redrawing. If the clear is
         // already parsed, the held pump publishes once the redraw lands.
         if !self.shared.awaiting_redraw.load(Ordering::SeqCst) {
             self.shared.grid_wake.notify();
         }
+        reports
     }
 }
 
@@ -1514,10 +1650,10 @@ fn accept_remote_stop_result(
     }
 }
 
-/// Deferred-launch state: the agent is not exec'd until the attaching client
-/// reports its real terminal size, so a TUI's one-shot banner renders at the
-/// exact width (no post-spawn reflow). Ported from the Swift daemon's
-/// `scheduleDebouncedLaunch`.
+/// Deferred-launch state: the agent is not exec'd until its size is known
+/// (named by the caller, or reported by the attaching client), so a TUI's
+/// one-shot banner renders at the exact width (no post-spawn reflow). Ported
+/// from the Swift daemon's `scheduleDebouncedLaunch`, without its debounce.
 struct DeferredLaunch {
     state: Mutex<DeferredState>,
     cond: std::sync::Condvar,
@@ -1555,15 +1691,21 @@ impl DeferredLaunch {
         }
     }
 
-    /// Records a client size while unlaunched, pushing the exec back so the
-    /// viewport can settle. False once launched: resize the PTY instead.
+    /// Records a client size while unlaunched and launches at it now. A
+    /// size that arrives while the exec is in flight is handed back by
+    /// [`Self::finish_launch`] and applied as an ordinary resize, which the
+    /// child sees long before an agent paints its first frame (Claude Code
+    /// boots for ~300 ms). The Swift daemon debounced 120 ms per proposal
+    /// because AppKit's first layout was transient; the GPUI pane measures
+    /// its laid-out viewport, so that wait only delayed every tab.
+    /// False once launched: resize the PTY instead.
     fn propose_size(&self, cols: u16, rows: u16) -> bool {
         let mut state = self.state.lock().expect("deferred");
         if state.launched {
             return false;
         }
         state.pending = Some((cols, rows));
-        state.deadline = Instant::now() + LAUNCH_DEBOUNCE;
+        state.deadline = Instant::now();
         self.cond.notify_all();
         true
     }
@@ -1690,8 +1832,9 @@ pub struct SessionSpec {
     /// Present for a remote Holder-backed session. It is mutually exclusive
     /// with the local `holder` transport.
     pub remote: Option<RemoteSessionSpec>,
-    /// Defer the exec until the first client size settles (holder spawns
-    /// only), so the agent's banner renders at the real viewport width.
+    /// Defer the exec until a size is known (holder spawns only): the first
+    /// client size or [`Session::launch_at`], so the agent's banner renders
+    /// at the real viewport width.
     pub defer_launch: bool,
 }
 
@@ -2050,7 +2193,7 @@ impl Session {
             environment: spec.pty.env.iter().cloned().collect(),
             cols: spec.pty.cols.max(2),
             rows: spec.pty.rows.max(2),
-            disk_capacity: crate::holder::protocol::DEFAULT_DISK_CAPACITY,
+            disk_capacity: holder_log_capacity(),
         };
         HolderLauncher::launch(&holder.executable, &paths, &launch).map_err(holder_io_error)?;
 
@@ -2065,11 +2208,12 @@ impl Session {
         Self::attach(spec, client, floor, engine, true, stat.as_ref())
     }
 
-    /// Spawns through a holder, but not yet: the exec waits for the first
-    /// client size to settle ([`LAUNCH_DEBOUNCE`] after each proposal, at
-    /// most [`LAUNCH_FALLBACK`] total without one), so the agent's one-shot
-    /// banner renders at the real viewport width. Until then input queues
-    /// and the session presents an empty screen at the estimated size.
+    /// Spawns through a holder, but not yet: the exec waits for a client
+    /// size (the first proposal, or [`Session::launch_at`] when the size is
+    /// already known; at most [`LAUNCH_FALLBACK`] without one), so the
+    /// agent's one-shot banner renders at the real viewport width. Until
+    /// then input queues and the session presents an empty screen at the
+    /// estimated size.
     fn spawn_held_deferred(
         spec: SessionSpec,
         holder: &HolderConfig,
@@ -2128,9 +2272,10 @@ impl Session {
                         environment: pty.env.iter().cloned().collect(),
                         cols: pty.cols,
                         rows: pty.rows,
-                        disk_capacity: crate::holder::protocol::DEFAULT_DISK_CAPACITY,
+                        disk_capacity: holder_log_capacity(),
                     };
                     let exec_started = Instant::now();
+                    *shared.exec_at.lock().expect("exec at") = Some(exec_started);
                     if let Err(error) = HolderLauncher::launch(&holder.executable, &paths, &launch)
                     {
                         mark_launch_failed(&shared, "holder_launch", &error);
@@ -2192,6 +2337,12 @@ impl Session {
                         // A size proposed while the exec was in flight: apply
                         // as an ordinary resize now that the PTY exists.
                         let (cols, rows) = (cols.max(2), rows.max(2));
+                        diri_telemetry::debug_event!(
+                            "session.exec_resized",
+                            session = diri_telemetry::id(&id),
+                            cols = cols,
+                            rows = rows,
+                        );
                         let _ = client.resize_with_pixels(
                             cols,
                             rows,
@@ -2412,6 +2563,7 @@ impl Session {
             title_source,
             tail_offset: self.shared.log.lock().expect("log").tail_offset(),
             exited: self.shared.exited.load(Ordering::SeqCst),
+            ran: *self.shared.ran.lock().expect("ran"),
         }
     }
 
@@ -2649,7 +2801,16 @@ impl Session {
                 alt_screen: modes.0,
                 mouse: modes.2,
             };
-            let grid = if current == *signature {
+            // Input modes alone (cleared on a transport drop, restored by the
+            // next seed) leave this consumer's grid as it is: the modes are
+            // published separately, and repainting every row would clear a
+            // selection over cells that did not change.
+            let content = GridSignature {
+                keyboard: signature.keyboard,
+                ..current
+            };
+            let grid = if content == *signature {
+                *signature = current;
                 None
             } else {
                 let reset_changed = signature.reset_generation != current.reset_generation;
@@ -3120,6 +3281,13 @@ impl Session {
             bytes,
             b"\r" | b"\n" | b"\r\n" | b"\x03" | b"\x1b" | b"y" | b"n"
         );
+        if self.manifest_id == "shell" && bytes.iter().any(|byte| matches!(byte, b'\r' | b'\n')) {
+            self.shared
+                .screen
+                .lock()
+                .expect("screen")
+                .shell_line_submitted();
+        }
         self.feed_signal(if submits {
             StatusSignal::UserSubmission
         } else {
@@ -3278,11 +3446,47 @@ impl Session {
         }
     }
 
+    /// Launches a deferred spawn now at `cols`×`rows`, a size its caller
+    /// already knows (the pane it opens in, or the size a client last gave
+    /// any session), instead of waiting for its pane to report one. A pane
+    /// that then reports a different size resizes the child like any other
+    /// resize. False when the session was not waiting to launch.
+    pub fn launch_at(&self, cols: u16, rows: u16) -> bool {
+        self.deferred
+            .as_ref()
+            .is_some_and(|deferred| deferred.propose_size(cols.max(2), rows.max(2)))
+    }
+
     pub fn resize(&self, cols: u16, rows: u16) -> std::io::Result<()> {
         if let Some(reflow) = self.resize_pty(cols, rows)? {
-            reflow.apply();
+            self.write_reports(&reflow.apply());
         }
         Ok(())
+    }
+
+    /// Writes reports a program asked to receive (DECSET 2031 and 2048) when
+    /// something outside its output changed. They are not typed input: no
+    /// keyboard admission, no echo or prompt tracking. A failed write is
+    /// dropped like any reply to a program that has gone.
+    pub(crate) fn write_reports(&self, reports: &[u8]) {
+        if !reports.is_empty() && !matches!(self.transport, Transport::Remote(_)) {
+            let _ = self.write_raw(reports);
+        }
+    }
+
+    /// Answers color queries from `palette` from now on, and tells a program
+    /// that asked for color-scheme reports when light/dark changed. Remote
+    /// sessions are untouched: their Holder answers its own queries.
+    pub(crate) fn apply_terminal_palette(&self, palette: Option<diri_proto::TerminalPalette>) {
+        if matches!(self.transport, Transport::Remote(_)) {
+            return;
+        }
+        let reports = {
+            let mut screen = self.shared.screen.lock().expect("screen");
+            screen.set_palette(palette);
+            screen.take_unsolicited()
+        };
+        self.write_reports(&reports);
     }
 
     /// Resizes the PTY now and returns the emulator reflow still owed, for
@@ -3336,6 +3540,8 @@ impl Session {
             .expect("reducer")
             .reduce_identified(signal, identity, SystemTime::now());
         apply(&self.shared, &outcome);
+        // The signal may have started a turn whose timers need ticks.
+        self.shared.pump_wake.ring();
         outcome
     }
 
@@ -3399,6 +3605,7 @@ impl Session {
             Transport::Remote(client) => stop_remote(&self.shared, client, grace)?,
         };
         self.shared.stop.store(true, Ordering::SeqCst);
+        self.shared.pump_wake.ring();
         if let Transport::Remote(client) = &self.transport {
             client.close();
         }
@@ -3422,6 +3629,8 @@ impl Drop for Session {
     /// [`Session::adopt`].
     fn drop(&mut self) {
         self.shared.stop.store(true, Ordering::SeqCst);
+        // A parked held pump sees `stop` only once woken.
+        self.shared.pump_wake.ring();
         // An attach pump idles on this wake source; a replacement Session has
         // a new one, so tell the pump to go and look for it.
         self.shared.grid_wake.notify();
@@ -3473,6 +3682,7 @@ fn new_shared(
         .map(|manifest| manifest.version.clone());
     let reducer = StatusReducer::new(spec.authority, SystemTime::now())
         .with_manifest(spec.manifest_id.clone(), manifest_version)
+        .with_program_reporters(engine.program_reporters())
         .with_attention_storage(
             &spec.logs_dir.join(format!("{}.attention.sqlite", spec.id)),
             fresh,
@@ -3492,6 +3702,7 @@ fn new_shared(
                 .find(|event| event.kind == diri_proto::attention::AttentionKind::Completion)
         })
         .map(|event| event.occurred_at);
+    let launched_at = fresh.then(Instant::now);
     Arc::new(Shared {
         holder_identity: std::sync::OnceLock::new(),
         reset_requested: AtomicBool::new(false),
@@ -3518,16 +3729,24 @@ fn new_shared(
         prompt_input: Mutex::new(PromptInputState::default()),
         log: Mutex::new(log),
         screen: Mutex::new({
-            let screen = HeadlessScreen::new(spec.pty.cols as usize, spec.pty.rows as usize)
-                .with_notifications();
+            let (cols, rows) = (spec.pty.cols as usize, spec.pty.rows as usize);
             // Only a local session's own emulator feeds the client grid; a
             // remote session's grid, image anchors and pixels come from its
             // Holder (`inline-images-v1`), so storing images here too would
-            // cost memory for pixels nobody reads.
+            // cost memory for pixels nobody reads. A remote mirror's replies
+            // never reach the program, so it answers nothing new either.
             if spec.remote.is_none() {
-                screen.with_inline_images()
-            } else {
+                // The local Engine is the input owner and the App encodes the
+                // negotiated flags, so programs may enable kitty keyboard
+                // reporting here.
+                let mut screen = HeadlessScreen::new_with_keyboard_enhancements(cols, rows)
+                    .with_notifications()
+                    .with_inline_images()
+                    .with_host_replies(TERMINAL_VERSION);
+                screen.set_palette(terminal_palette());
                 screen
+            } else {
+                HeadlessScreen::new(cols, rows).with_notifications()
             }
         }),
         cell_pixels: spec
@@ -3552,7 +3771,9 @@ fn new_shared(
         awaiting_redraw: AtomicBool::new(false),
         grid_wake: GridWake::for_agent(&spec.manifest_id),
         agent: spec.manifest_id.clone(),
-        launched_at: fresh.then(Instant::now),
+        launched_at,
+        exec_at: Mutex::new(launched_at),
+        ran: Mutex::new(None),
         terminate_requested: AtomicBool::new(false),
         remote_stopping: AtomicBool::new(false),
         exit_recorded: AtomicBool::new(false),
@@ -3565,9 +3786,12 @@ fn new_shared(
             .filter(|notice| !notice.is_empty()),
         relaunch_requested: AtomicBool::new(false),
         echo_request: Mutex::new(None),
+        pump_wake: PumpWake::default(),
+        foreground_job: std::sync::atomic::AtomicU8::new(0),
         foreground: Mutex::new(ForegroundProgram::default()),
         progress: Mutex::new(ProgressTrack::default()),
         program_status: Mutex::new(ProgramStatusTrack::default()),
+        builtin_prompt: AtomicBool::new(false),
         known_agents: if spec.manifest_id == "shell" {
             known_agents(engine)
         } else {
@@ -3729,6 +3953,18 @@ mod paste_text_sanitize_tests {
 fn apply(shared: &Shared, outcome: &ReducerOutcome) {
     let mut changed = outcome.attention_changed;
     if let Some(status) = &outcome.status_change {
+        // Before the status: a view that reads the exit also reads how long
+        // the child ran, so a command's tab policy never sees one alone.
+        if matches!(status, SessionStatus::Exited(_)) {
+            let mut ran = shared.ran.lock().expect("ran");
+            if ran.is_none() {
+                *ran = shared
+                    .exec_at
+                    .lock()
+                    .expect("exec at")
+                    .map(|exec| exec.elapsed());
+            }
+        }
         {
             let mut current = shared.status.lock().expect("status");
             if *current != *status {
@@ -3801,6 +4037,17 @@ fn apply_foreground_sample(
     let Some(running) = crate::status::foreground_job_running(child_pid, foreground_pgid) else {
         return;
     };
+    // No job, yet the shell is asking for a line on behalf of the command it
+    // runs: fish's `read` builtin. To the status it is a job waiting on its
+    // line, which the line probe then reports. Only the shell's own marks
+    // say so, and only a local shell's foreground is known to be the shell.
+    let builtin_prompt = !running && host == SampleHost::Local && shell_prompts_in_command(shared);
+    shared
+        .builtin_prompt
+        .store(builtin_prompt, Ordering::SeqCst);
+    shared
+        .foreground_job
+        .store(if running { 2 } else { 1 }, Ordering::SeqCst);
     progress_follows_job(shared, foreground_pgid.filter(|_| running));
     let agent: Option<Lend<'_>> = match host {
         #[cfg(unix)]
@@ -3821,8 +4068,15 @@ fn apply_foreground_sample(
                 reducer.lend_to_agent(&agent.manifest_id, Some(&agent.manifest_version), now)
             }
             Some(Lend::Activity(id)) => reducer.lend_to_activity(id, now),
-            None if reducer.foreground_agent().is_some() => reducer.return_from_agent(running, now),
-            None => reducer.reduce(StatusSignal::ForegroundJob { running }, now),
+            None if reducer.foreground_agent().is_some() => {
+                reducer.return_from_agent(running || builtin_prompt, now)
+            }
+            None => reducer.reduce(
+                StatusSignal::ForegroundJob {
+                    running: running || builtin_prompt,
+                },
+                now,
+            ),
         };
         let read_as = reducer.foreground_agent().map(str::to_owned);
         shared.foreground.lock().expect("foreground").read_as = read_as;
@@ -4004,9 +4258,20 @@ fn probe_direct_line_wait(_shared: &Shared, _pty: &Mutex<Pty>) {
     // Unknown on ConPTY; do not fabricate a negative observation.
 }
 
+/// Whether the shell drew a prompt inside the command line it runs, per its
+/// `OSC 133` marks. See [`diri_terminal_state::ShellPhase::PromptInCommand`].
+fn shell_prompts_in_command(shared: &Shared) -> bool {
+    shared.screen.lock().expect("screen").shell_phase()
+        == diri_terminal_state::ShellPhase::PromptInCommand
+}
+
 /// Folds a line-wait sample into the shell's status, with the question as
 /// the screen shows it. Nothing is read from the screen while echo is off.
+///
+/// The shell's own prompt inside a command (fish's `read`) is a line wait
+/// too; the PTY owner, which looks for a job, never reports it.
 fn apply_line_wait(shared: &Shared, awaiting: bool) {
+    let awaiting = awaiting || shared.builtin_prompt.load(Ordering::SeqCst);
     let prompt = awaiting.then(|| {
         let secret = shared.secret_input.load(Ordering::SeqCst);
         let line = (!secret).then(|| {
@@ -4082,6 +4347,50 @@ fn held_foreground_sample_due(
         || since_sample.is_none_or(|since| since >= LIVENESS_INTERVAL)
 }
 
+/// Whether an idle pump still has something on the clock that only a tick
+/// would run: reducer timers, a slow foreground backstop while a job (which
+/// can change without output) holds the terminal, progress waiting to go
+/// stale, an artifact scan deferred by its rate limit, or an open
+/// synchronized update waiting to be released.
+fn idle_work_pending(
+    shared: &Shared,
+    manifest_id: &str,
+    last_scan_at: Option<Instant>,
+    last_scan_seq: u64,
+) -> bool {
+    if shared.wants_fast_tick() || shared.reducer.lock().expect("reducer").wants_tick() {
+        return true;
+    }
+    let sampling = if manifest_id == "shell" {
+        shared.foreground_job.load(Ordering::SeqCst) != 1
+    } else {
+        secret_input_plausible(shared)
+    };
+    if sampling {
+        return true;
+    }
+    {
+        let track = shared.progress.lock().expect("progress");
+        if track.published.is_some() && track.job.is_none() {
+            return true;
+        }
+    }
+    let screen = shared.screen.lock().expect("screen");
+    screen.in_synchronized_update()
+        || (last_scan_at.is_some() && screen.content_seq() != last_scan_seq)
+}
+
+/// The descriptor an idle held pump may park on (unix only).
+#[cfg(unix)]
+fn park_descriptor(stream: &crate::holder::HolderOutputStream) -> Option<i32> {
+    stream.wait_descriptor()
+}
+
+#[cfg(not(unix))]
+fn park_descriptor(_stream: &crate::holder::HolderOutputStream) -> Option<i32> {
+    None
+}
+
 /// Rows of scrollback each artifact scan covers besides the screen. Output
 /// that scrolls off between two scans is still read, so a PR link printed
 /// just before a long diff is not lost; the bound keeps a scan cheap.
@@ -4100,7 +4409,7 @@ fn scan_artifacts_if_due(
     }
     *last_scan_at = Some(std::time::Instant::now());
     let (seq, source) = {
-        let screen = shared.screen.lock().expect("screen");
+        let mut screen = shared.screen.lock().expect("screen");
         let seq = screen.content_seq();
         if seq == *last_scan_seq {
             return;
@@ -4135,7 +4444,14 @@ fn pump_remote(
             .expect("remote grid")
             .as_ref()
             .and_then(|state| state.mirror.sequence());
-        let Ok((generation, mut output)) = client.connect(output_offset, grid_sequence) else {
+        let grid_resume = remote_grid_resume(&shared, &client);
+        let mut resume = RemoteResume {
+            offered: grid_resume.as_ref().map(|request| request.base_sequence),
+            accepted: None,
+        };
+        let Ok((generation, mut output)) =
+            client.connect(output_offset, grid_sequence, grid_resume)
+        else {
             set_remote_reconnecting(&shared);
             reconnects = reconnects.saturating_add(1);
             if reconnects.is_multiple_of(3) && remote_inspection_exited(&shared, &client) {
@@ -4153,6 +4469,7 @@ fn pump_remote(
             generation,
             &mut output,
             &manifest_id,
+            &mut resume,
         );
         client.disconnect(generation);
         if client.uncertain_effect()
@@ -4210,6 +4527,50 @@ fn settle_during_stop(
     }
 }
 
+/// What this Engine's mirror already shows, for a `grid-resume-v1` attach:
+/// the Holder then sends only rows that differ instead of a Full Snapshot.
+/// `None` (no seed yet, an older Holder, a grid too tall to describe) keeps
+/// today's snapshot reseed.
+fn remote_grid_resume(
+    shared: &Shared,
+    client: &RemoteSessionClient,
+) -> Option<diri_proto::remote_pty::GridResume> {
+    let epoch = client.last_controller_epoch();
+    if !client.supports_grid_resume() || epoch == 0 {
+        return None;
+    }
+    let key = RemoteSessionClient::grid_resume_key().ok()?;
+    let remote = shared.remote_grid.lock().expect("remote grid");
+    let remote = remote.as_ref()?;
+    let base = remote.mirror.sequence()?;
+    let (cols, rows) = remote.mirror.size();
+    if rows > diri_proto::remote_pty::MAX_GRID_RESUME_ROWS {
+        return None;
+    }
+    let digests = remote.mirror.row_digests(&key)?;
+    let reset_generation = remote
+        .reset_committed
+        .as_ref()
+        .map_or(0, |reset| reset.generation);
+    Some(diri_proto::remote_pty::GridResume::new(
+        epoch,
+        base,
+        reset_generation,
+        cols,
+        rows,
+        &key,
+        &digests,
+    ))
+}
+
+/// One attach's `grid-resume-v1` exchange: the base sequence offered in
+/// Hello, then the base the Holder accepted until its delta arrives.
+#[derive(Debug, Default)]
+struct RemoteResume {
+    offered: Option<u64>,
+    accepted: Option<u64>,
+}
+
 fn remote_inspection_exited(shared: &Shared, client: &RemoteSessionClient) -> bool {
     let Ok(inspection) = client.inspect() else {
         return false;
@@ -4237,6 +4598,7 @@ fn pump_remote_connection(
     generation: u64,
     output: &mut diri_platform::pipe::ChildStdout,
     manifest_id: &str,
+    resume: &mut RemoteResume,
 ) -> RemoteConnectionDisposition {
     let mut codec = RemoteCodec::new();
     let mut buffer = [0_u8; 64 << 10];
@@ -4360,6 +4722,7 @@ fn pump_remote_connection(
                         &mut last_eval_seq,
                         &mut replaying,
                         &mut hello_accepted,
+                        resume,
                         message,
                     );
                     if disposition != RemoteConnectionDisposition::Continue {
@@ -4383,6 +4746,7 @@ fn handle_remote_message(
     last_eval_seq: &mut u64,
     replaying: &mut bool,
     hello_accepted: &mut bool,
+    resume: &mut RemoteResume,
     message: RemoteMessage,
 ) -> RemoteConnectionDisposition {
     if !*hello_accepted && !matches!(message, RemoteMessage::HelloAck(_)) {
@@ -4412,6 +4776,21 @@ fn handle_remote_message(
                 return RemoteConnectionDisposition::Fatal;
             }
             client.observe_hello_capabilities(&acknowledgement);
+            let offered = resume.offered.take();
+            match acknowledgement.grid_resume {
+                Some(diri_proto::remote_pty::GridResumeOutcome::Accepted { base_sequence }) => {
+                    // A resume answers only the base this attach offered.
+                    if offered != Some(base_sequence) {
+                        return RemoteConnectionDisposition::Fatal;
+                    }
+                    diri_telemetry::count("remote.grid_resume.accepted", 1);
+                    resume.accepted = Some(base_sequence);
+                }
+                Some(diri_proto::remote_pty::GridResumeOutcome::Declined { .. }) => {
+                    diri_telemetry::count("remote.grid_resume.declined", 1);
+                }
+                None => {}
+            }
             if let RemoteProcessState::Exited { code, signal } = acknowledgement.process_state {
                 record_remote_exit(shared, ProcessExit { code, signal });
                 return RemoteConnectionDisposition::Exited;
@@ -4503,10 +4882,24 @@ fn handle_remote_message(
             RemoteConnectionDisposition::Continue
         }
         RemoteMessage::FullSnapshot(snapshot) => {
+            // A snapshot is authoritative on its own and supersedes a resume.
+            resume.accepted = None;
             if apply_remote_snapshot(shared, engine, client, manifest_id, last_eval_seq, snapshot)
                 .is_err()
             {
                 RemoteConnectionDisposition::Fatal
+            } else {
+                set_remote_connection(shared, diri_proto::RemoteConnectionState::Connected);
+                RemoteConnectionDisposition::Continue
+            }
+        }
+        RemoteMessage::GridDelta(delta) if resume.accepted.is_some() => {
+            let base = resume.accepted.take().expect("checked");
+            if apply_remote_resume(shared, engine, manifest_id, last_eval_seq, base, delta).is_err()
+            {
+                // The next Hello offers the mirror as it stands, or reseeds.
+                diri_telemetry::count("remote.delta_gaps", 1);
+                RemoteConnectionDisposition::Reconnect
             } else {
                 set_remote_connection(shared, diri_proto::RemoteConnectionState::Connected);
                 RemoteConnectionDisposition::Continue
@@ -4719,20 +5112,96 @@ fn apply_remote_snapshot(
         remote.pending = Some(snapshot.grid.clone());
     }
     shared.grid_wake.notify();
+    restore_remote_status_screen(
+        shared,
+        engine,
+        manifest_id,
+        last_eval_seq,
+        &snapshot.grid,
+        snapshot.alt_screen,
+        snapshot.bracketed_paste,
+        snapshot.mouse,
+    )
+}
+
+/// Applies the delta that answers an accepted `grid-resume-v1` attach. The
+/// display receives it as an ordinary delta: rows the client already shows
+/// are not repainted and a selection over them survives the reconnect.
+fn apply_remote_resume(
+    shared: &Shared,
+    engine: &ManifestEngine,
+    manifest_id: &str,
+    last_eval_seq: &mut u64,
+    base: u64,
+    delta: GridDelta,
+) -> std::io::Result<()> {
+    let full = {
+        let mut remote = shared.remote_grid.lock().expect("remote grid");
+        let remote = remote
+            .as_mut()
+            .ok_or_else(|| std::io::Error::other("remote grid state is unavailable"))?;
+        let keyboard = remote.keyboard.state_for(delta.sequence)?;
+        remote
+            .mirror
+            .apply_resumed_delta(
+                base,
+                delta.sequence,
+                &delta.grid,
+                delta.alt_screen,
+                delta.bracketed_paste,
+                delta.mouse,
+            )
+            .map_err(std::io::Error::other)?;
+        remote.keyboard.commit(keyboard);
+        remote.revision = remote.revision.saturating_add(1);
+        let full = remote
+            .mirror
+            .full_update()
+            .ok_or_else(|| std::io::Error::other("resumed remote grid is incomplete"))?;
+        remote.pending = if remote.pending.is_some() {
+            Some(full.clone())
+        } else {
+            Some(delta.grid)
+        };
+        full
+    };
+    shared.grid_wake.notify();
+    // Replayed output was logged, not parsed: seed the status screen from the
+    // resumed grid exactly as a snapshot would.
+    restore_remote_status_screen(
+        shared,
+        engine,
+        manifest_id,
+        last_eval_seq,
+        &full,
+        delta.alt_screen,
+        delta.bracketed_paste,
+        delta.mouse,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn restore_remote_status_screen(
+    shared: &Shared,
+    engine: &ManifestEngine,
+    manifest_id: &str,
+    last_eval_seq: &mut u64,
+    grid: &diri_proto::grid::GridUpdate,
+    alt_screen: bool,
+    bracketed_paste: bool,
+    mouse: diri_proto::terminal::MouseModes,
+) -> std::io::Result<()> {
     let observation = {
         let mut screen = shared.screen.lock().expect("screen");
-        screen.resize(
-            usize::from(snapshot.grid.cols),
-            usize::from(snapshot.grid.rows),
-        );
+        screen.resize(usize::from(grid.cols), usize::from(grid.rows));
         if !screen.restore(
-            // A remote Full Snapshot carries only the visible grid; scrollback
-            // is fetched on demand through `Scroll`, never replayed here.
+            // A remote seed carries only the visible grid; scrollback is
+            // fetched on demand through `Scroll`, never replayed here.
             &[],
-            &snapshot.grid,
-            snapshot.alt_screen,
-            snapshot.bracketed_paste,
-            snapshot.mouse,
+            grid,
+            alt_screen,
+            bracketed_paste,
+            mouse,
         ) {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidData,
@@ -5185,16 +5654,21 @@ impl RepaintHold {
 /// A blank screen gets [`blank_repaint_ceiling`] from when it first went
 /// blank, and so does the rewrite that follows it; a screen that only lost
 /// some content gets [`OUTPUT_REPAINT_CEILING`] from when the batch opened.
-/// A closed synchronized update is a whole frame by its own declaration.
+/// A closed synchronized update is a whole frame by its own declaration, and
+/// a line edit (`line_edit`: only the visible cursor's row lost cells, see
+/// [`HeadlessScreen::lost_cells_only_on_cursor_row`]) has no redraw to wait
+/// for: a backspace or a progress line rewritten shorter is batched like
+/// output that adds.
 fn repaint_hold(
     blank_since: &mut Option<Instant>,
     batch_started: Instant,
     filled_before: usize,
     filled_after: usize,
     complete: bool,
+    line_edit: bool,
     now: Instant,
 ) -> Option<RepaintHold> {
-    if complete {
+    if complete || line_edit {
         *blank_since = None;
         return None;
     }
@@ -5252,7 +5726,10 @@ fn feed_output_batch(
         }
         let (mid_repaint, blank_repaint) = {
             let mut screen = shared.screen.lock().expect("screen");
-            let before = *filled_before.get_or_insert_with(|| screen.filled_cells());
+            let before = *filled_before.get_or_insert_with(|| {
+                screen.mark_row_baseline();
+                screen.filled_cells()
+            });
             let synchronized = screen.synchronized_updates_completed();
             screen.feed(&buffer[..count]);
             if screen.has_notifications() {
@@ -5263,15 +5740,16 @@ fn feed_output_batch(
             }
             let after = screen.filled_cells();
             // A closed synchronized update is a whole frame, however much
-            // it erased: nothing is left to wait for.
-            let complete = screen.synchronized_updates_completed() != synchronized
-                && !screen.in_synchronized_update();
+            // it erased, and so is a line edit: nothing is left to wait for.
+            let whole = (screen.synchronized_updates_completed() != synchronized
+                && !screen.in_synchronized_update())
+                || (after < before && screen.lost_cells_only_on_cursor_row());
             shared
                 .awaiting_redraw
-                .store(!complete && after < before, Ordering::SeqCst);
+                .store(!whole && after < before, Ordering::SeqCst);
             (
-                !complete && after < before,
-                !complete && after == 0 && before != 0,
+                !whole && after < before,
+                !whole && after == 0 && before != 0,
             )
         };
         total += count;
@@ -5409,6 +5887,7 @@ fn observe_program_status(shared: &Shared, screen: &HeadlessScreen) {
         return;
     }
     let progress = track.progress();
+    track.removal = screen.program_status_removal();
     track.published = next;
     track.unreduced = true;
     let progress_changed = track.progress() != progress;
@@ -5422,23 +5901,33 @@ fn observe_program_status(shared: &Shared, screen: &HeadlessScreen) {
 /// the reducer already locked, ahead of the screen observation from the same
 /// output, so a program that just reported work silences the screen rules.
 fn reduce_program_status(shared: &Shared, reducer: &mut StatusReducer, now: SystemTime) {
-    let report = {
+    let signal = {
         let mut track = shared.program_status.lock().expect("program status");
         if !std::mem::take(&mut track.unreduced) {
             return;
         }
-        track.published.clone()
+        match (&track.published, track.removal) {
+            (None, Some(reason)) => StatusSignal::ProgramStatusRemoved(reason),
+            (report, _) => StatusSignal::ProgramStatus(report.clone()),
+        }
     };
-    let outcome = reducer.reduce(StatusSignal::ProgramStatus(report), now);
+    if let StatusSignal::ProgramStatusRemoved(reason) = &signal {
+        diri_telemetry::debug_event!(
+            "session.program_status_removed",
+            session = diri_telemetry::id(&shared.id),
+            reason = reason.as_str(),
+        );
+    }
+    let outcome = reducer.reduce(signal, now);
     apply(shared, &outcome);
 }
 
 /// The program a session's `OSC 7501` records described has ended: the
 /// wrapped agent returned to its shell, or a shell's job left the foreground.
-fn end_program_status(shared: &Shared) {
+fn end_program_status(shared: &Shared, reason: diri_terminal_state::ProgramRemoval) {
     {
         let mut screen = shared.screen.lock().expect("screen");
-        if !screen.end_program_status() {
+        if !screen.end_program_status(reason) {
             return;
         }
         observe_program_status(shared, &screen);
@@ -5462,7 +5951,7 @@ fn progress_follows_job(shared: &Shared, job: Option<i32>) {
         shared.bump_state_version();
     }
     if ended {
-        end_program_status(shared);
+        end_program_status(shared, diri_terminal_state::ProgramRemoval::Foreground);
     }
 }
 
@@ -5538,6 +6027,23 @@ fn evaluate_if_screen_changed(
 /// honoring only markers at or beyond `exit_marker_floor` (bytes below it
 /// belong to prior incarnations of the session id). A holder that dies
 /// *without* a marker is caught by a periodic liveness probe.
+/// How long a held pump's output stream may wait for more of a pending,
+/// non-destructive batch, given how long ago the batch opened and the last
+/// publication went out.
+///
+/// The batch never outlives [`OUTPUT_BATCH_CEILING`]. Within it, once a
+/// publication is due by the cadence, only [`OUTPUT_QUIET`] of silence is
+/// asked for before the batch is published; until then the wait runs to
+/// the moment the cadence allows the next one, so continuous output is still
+/// published at most once per ceiling.
+fn held_batch_wait(batch_age: Duration, since_published: Option<Duration>) -> Duration {
+    let ceiling = OUTPUT_BATCH_CEILING.saturating_sub(batch_age);
+    let cadence = since_published.map_or(Duration::ZERO, |since| {
+        OUTPUT_BATCH_CEILING.saturating_sub(since)
+    });
+    ceiling.min(cadence.max(OUTPUT_QUIET))
+}
+
 fn pump_held(
     shared: Arc<Shared>,
     engine: Arc<ManifestEngine>,
@@ -5594,6 +6100,11 @@ fn pump_held(
                         .store(checkpoint.keyboard.is_some(), Ordering::SeqCst);
                     if let Some(keyboard) = checkpoint.keyboard {
                         screen.restore_keyboard_state(keyboard);
+                        // Written before keyboard snapshots, by an Engine
+                        // whose parser never negotiated kitty flags: zero.
+                        if checkpoint.keyboard_snapshot.is_none() {
+                            screen.mark_keyboard_never_negotiated();
+                        }
                     }
                     if let Some(snapshot) = &checkpoint.keyboard_snapshot {
                         let restored_keyboard = screen.restore_keyboard_snapshot(snapshot);
@@ -5612,7 +6123,15 @@ fn pump_held(
             ),
             None => {
                 let floor = exit_marker_floor.min(tail);
-                let start = log.preferred_replay_start(replay_budget).max(floor);
+                // A child this Engine just launched has printed only what it
+                // printed while the pump was starting, and all of it belongs
+                // on its screen. The replay budget bounds the work of adopting
+                // a session with a long past, which a fresh one does not have.
+                let start = if fresh {
+                    floor
+                } else {
+                    log.preferred_replay_start(replay_budget).max(floor)
+                };
                 // Replaying from this child's first byte sees every keyboard
                 // mode it set, just as replaying a whole log from zero does.
                 let whole_child = start == 0 || start == floor;
@@ -5628,6 +6147,15 @@ fn pump_held(
             }
         }
     };
+    // Declared after the watcher so it is dropped first: the doorbell is
+    // cleared before the kqueue it rings closes.
+    if let Some(watcher) = &watcher {
+        shared.pump_wake.set(watcher.wake_descriptor());
+    }
+    let _wake_registration = PumpWakeRegistration(&shared.pump_wake);
+    // Set at the end of a quiet pass that left nothing pending, so the next
+    // wait parks without a deadline instead of ticking.
+    let mut park_next = false;
     // Adoption can restore a checkpoint concurrently with a freshly attached
     // App. One event is cheap and guarantees a seed that raced the restore is
     // corrected without bringing back periodic grid polling.
@@ -5652,6 +6180,9 @@ fn pump_held(
     let mut interactive_qos = false;
     // Set while a repaint is being assembled across more than one log read.
     let mut publish_pending: Option<Instant> = None;
+    // When output was last published, which paces the leading edge; see
+    // [`OUTPUT_QUIET`].
+    let mut last_published: Option<Instant> = None;
     // Filled cells when the pending batch opened, so an echo is judged
     // against the last published screen rather than the previous read.
     let mut batch_filled: Option<usize> = None;
@@ -5702,8 +6233,14 @@ fn pump_held(
     // followed up to this point before a frame can be consumed.
     let mut live_from: u64 = 0;
     // Set once the log has been read to its end, which is the only safe moment
-    // to subscribe.
+    // to subscribe to a Holder that cannot resume.
     let mut drained = false;
+    // Whether to subscribe without waiting for a drained log. A Holder that
+    // resumes from our offset sends what we have not read yet itself, and
+    // holds its PTY at our pace while we read it, so subscribing at once is
+    // what keeps a flood from outrunning this pump. Cleared for a Holder that
+    // cannot resume, and after a failed attempt, until the log next drains.
+    let mut subscribe_eagerly = true;
 
     while !shared.stop.load(Ordering::SeqCst) && exit_status.is_none() {
         if shared.reset_requested.swap(false, Ordering::SeqCst) {
@@ -5730,15 +6267,28 @@ fn pump_held(
             shared.grid_wake.notify();
         }
         scan_artifacts_if_due(&shared, &mut last_scan_at, &mut last_scan_seq);
-        // Subscribe only from a standing start, with the log drained.
+        // Subscribe from where this pump stands. A Holder that resumes sends
+        // the bytes we have not read itself, so this works at any distance
+        // behind it, and it is what bounds that distance: while we are
+        // subscribed the Holder reads its PTY no faster than we take output,
+        // so a flood cannot outrun us past what its log keeps.
         //
-        // A subscription taken while still catching up is worse than none: the
-        // holder begins filling a queue this loop is not yet reading, and once
-        // that queue is full the pump waits on it for every chunk. Waiting for
-        // a drained log keeps the handover to a few frames.
-        if output_stream_supported && live.is_none() && drained {
-            match client.open_output_stream() {
+        // An older Holder only streams from its live offset. Subscribing to
+        // one while still catching up is worse than none: it begins filling a
+        // queue this loop is not yet reading, and once that queue is full it
+        // waits on it for every chunk. For those, wait for a drained log,
+        // which keeps the handover to a few frames.
+        if output_stream_supported && live.is_none() && (drained || subscribe_eagerly) {
+            match client.open_output_stream_from(offset) {
+                // Starts at `offset`, or later only if the log has already
+                // rotated past it, which the log read below records.
+                Ok(Some(stream)) if stream.resumed() => {
+                    live_from = stream.start_offset();
+                    live = Some(stream);
+                    subscribe_eagerly = true;
+                }
                 Ok(Some(stream)) => {
+                    subscribe_eagerly = false;
                     // A drained log does not mean the holder is where the log
                     // ends: writes are queued, so it can be megabytes further on.
                     // Subscribing across that distance is the worst case — the
@@ -5753,7 +6303,7 @@ fn pump_held(
                     }
                 }
                 Ok(None) => output_stream_supported = false,
-                Err(_) => {}
+                Err(_) => subscribe_eagerly = false,
             }
             drained = false;
         }
@@ -5775,8 +6325,20 @@ fn pump_held(
                     (Some(RepaintHold::Redrawing(until)), _) => until
                         .saturating_duration_since(Instant::now())
                         .min(OUTPUT_BATCH_CEILING),
-                    (None, Some(started)) => OUTPUT_BATCH_CEILING.saturating_sub(started.elapsed()),
-                    (None, None) => shared.quiet_tick(),
+                    (None, Some(started)) => {
+                        held_batch_wait(started.elapsed(), last_published.map(|at| at.elapsed()))
+                    }
+                    (None, None) => match (park_next, watcher.as_mut(), park_descriptor(stream)) {
+                        // Nothing is pending: sleep until a frame, a hangup or
+                        // the doorbell, then take whatever is there at once.
+                        (true, Some(watcher), Some(descriptor)) => {
+                            if watcher.park(descriptor, IDLE_PARK) {
+                                shared.log.lock().expect("log").invalidate_read_handle();
+                            }
+                            Duration::ZERO
+                        }
+                        _ => shared.quiet_tick(),
+                    },
                 };
                 match stream.next_run_into(timeout, LOG_READ_BUDGET, &mut live_run) {
                     // Contiguous by construction, and checked anyway: a run
@@ -5835,6 +6397,7 @@ fn pump_held(
             blank_since = None;
             shared.awaiting_redraw.store(false, Ordering::SeqCst);
             if publish_pending.take().is_some() {
+                last_published = Some(Instant::now());
                 shared.grid_wake.notify();
             }
         }
@@ -5963,12 +6526,44 @@ fn pump_held(
                     }
                 }
             }
+            // Park only on the subscription: its hangup is the liveness
+            // signal, and a log-only pump keeps probing on its tick.
+            let parking = streaming
+                && repaint.is_none()
+                && publish_pending.is_none()
+                && !eval_dirty
+                && !replaying
+                && checkpoint_dirty_at.is_none()
+                && last_activity.is_none_or(|at| at.elapsed() > FOREGROUND_SETTLE)
+                && !idle_work_pending(&shared, &manifest_id, last_scan_at, last_scan_seq);
+            if parking {
+                // Give back what output, a checkpoint or an artifact scan left
+                // decoded or allocated before sleeping. Cheap when there is
+                // nothing to give back, and parks are rare.
+                shared.screen.lock().expect("screen").compact_idle();
+                if !park_next {
+                    // Output just went quiet: its buffers are not needed
+                    // until the next burst, which reallocates them.
+                    live_run = Vec::new();
+                    if let Some(stream) = live.as_mut() {
+                        stream.release_idle_buffer();
+                    }
+                }
+            }
+            park_next = parking;
             continue;
         }
+        park_next = false;
 
         trace_hop!(OutputReceived);
         // A rotation can move the readable floor past us; resynchronize.
-        if start > offset && !marker_buffer.is_empty() {
+        if start > offset {
+            HELD_OUTPUT_SKIPPED.fetch_add(start - offset, Ordering::Relaxed);
+            diri_telemetry::warn_event!(
+                "session.held_output_skipped",
+                session = diri_telemetry::id(&shared.id),
+                bytes = start - offset,
+            );
             marker_buffer.clear();
         }
         offset = start + chunk.len() as u64;
@@ -6025,22 +6620,29 @@ fn pump_held(
             // catches up it runs again, so a settled screen is never stale.
             let evaluate_now = last_eval_at.is_none_or(|at: Instant| at.elapsed() >= EVAL_INTERVAL);
             eval_dirty = !evaluate_now;
-            let (observation, replies, filled_after, cols, complete) = {
+            let (observation, replies, filled_after, cols, complete, line_edit) = {
                 let mut screen = shared.screen.lock().expect("screen");
                 let historical_bytes =
                     replay_until.saturating_sub(start).min(output.len() as u64) as usize;
-                batch_filled.get_or_insert(screen.filled_cells());
+                if batch_filled.is_none() {
+                    batch_filled = Some(screen.filled_cells());
+                    screen.mark_row_baseline();
+                }
                 let synchronized = screen.synchronized_updates_completed();
                 screen.feed_with_history(output, historical_bytes);
                 let complete = screen.synchronized_updates_completed() != synchronized
                     && !screen.in_synchronized_update();
+                let lost = batch_filled.is_some_and(|before| screen.filled_cells() < before);
+                // Only asked once cells are gone, so output that adds pays
+                // nothing for it.
+                let line_edit = lost && screen.lost_cells_only_on_cursor_row();
                 // Raised before the lock drops, so no publisher reads the
                 // erase in between; see `repaint_hold` for when it lowers.
                 if !replaying
                     && offset > replay_until
                     && !complete
-                    && (blank_since.is_some()
-                        || batch_filled.is_some_and(|before| screen.filled_cells() < before))
+                    && !line_edit
+                    && (blank_since.is_some() || lost)
                 {
                     shared.awaiting_redraw.store(true, Ordering::SeqCst);
                 }
@@ -6069,6 +6671,7 @@ fn pump_held(
                     screen.filled_cells(),
                     screen.size().0,
                     complete,
+                    line_edit,
                 )
             };
             // The child is blocked reading the answer to its query, so send it
@@ -6100,6 +6703,7 @@ fn pump_held(
                         filled_before,
                         filled_after,
                         complete,
+                        line_edit,
                         Instant::now(),
                     )
                 });
@@ -6111,7 +6715,14 @@ fn pump_held(
                 && batch_filled.is_some_and(|filled_before| {
                     let now = Instant::now();
                     shared.take_echo_if(|request| {
-                        request.answered_by(now, filled_before, filled_after, cols, complete)
+                        request.answered_by(
+                            now,
+                            filled_before,
+                            filled_after,
+                            cols,
+                            complete,
+                            line_edit,
+                        )
                     })
                 });
             shared
@@ -6127,6 +6738,7 @@ fn pump_held(
                 batch_filled = None;
                 repaint = None;
                 blank_since = None;
+                last_published = Some(Instant::now());
                 shared.awaiting_redraw.store(false, Ordering::SeqCst);
                 shared.grid_wake.notify();
             }
@@ -6398,7 +7010,7 @@ fn split_shell_status(status: i32) -> (Option<i32>, Option<i32>) {
 /// that change with the rest of this output.
 fn note_agent_exit(shared: &Shared, status: i32, screen: &mut HeadlessScreen) {
     *shared.agent_exit.lock().expect("agent exit") = Some(status);
-    if screen.end_program_status() {
+    if screen.end_program_status(diri_terminal_state::ProgramRemoval::ChildExited) {
         observe_program_status(shared, screen);
     }
     if status == 0
@@ -6583,12 +7195,13 @@ fn persist_checkpoint(
     marker_buffer: &[u8],
     last_key: &mut Option<CheckpointKey>,
 ) {
-    let (key, checkpoint) = capture_checkpoint(shared, offset, marker_buffer);
+    let (key, checkpoint, history) = capture_checkpoint_with(shared, offset, marker_buffer, true);
     if last_key.as_ref() == Some(&key) {
         return;
     }
+    let (rows, payload) = history.unwrap_or_default();
     // A failed write must not stop the session; the checkpoint is a cache.
-    if checkpoint.write_atomically(path).is_ok() {
+    if checkpoint.write_with_history(path, rows, &payload).is_ok() {
         *last_key = Some(key);
     }
 }
@@ -6599,8 +7212,25 @@ fn capture_checkpoint(
     offset: u64,
     marker_buffer: &[u8],
 ) -> (CheckpointKey, crate::checkpoint::ScreenCheckpoint) {
+    let (key, checkpoint, _) = capture_checkpoint_with(shared, offset, marker_buffer, false);
+    (key, checkpoint)
+}
+
+/// With `encode_history`, history is returned encoded (row count, payload)
+/// and the checkpoint's `history` is empty: rows are encoded as they are
+/// read, so a full-history checkpoint never holds a cell copy of every row.
+fn capture_checkpoint_with(
+    shared: &Shared,
+    offset: u64,
+    marker_buffer: &[u8],
+    encode_history: bool,
+) -> (
+    CheckpointKey,
+    crate::checkpoint::ScreenCheckpoint,
+    Option<(usize, Vec<u8>)>,
+) {
     let (
-        history,
+        (history, encoded),
         history_metadata,
         grid,
         alt_screen,
@@ -6611,8 +7241,13 @@ fn capture_checkpoint(
         keyboard_snapshot,
     ) = {
         let mut screen = shared.screen.lock().expect("screen");
+        let (history, encoded) = if encode_history {
+            (Vec::new(), Some(screen.history_payload()))
+        } else {
+            (screen.history_snapshot(), None)
+        };
         (
-            screen.history_snapshot(),
+            (history, encoded),
             screen.history_metadata(),
             screen.full_snapshot(),
             screen.is_alt_screen(),
@@ -6653,7 +7288,7 @@ fn capture_checkpoint(
         bracketed_paste,
         mouse,
     };
-    (key, checkpoint)
+    (key, checkpoint, encoded)
 }
 
 /// Wakes the held pump the moment the holder appends to the log, instead of
@@ -6664,6 +7299,9 @@ fn capture_checkpoint(
 mod log_watch {
     use std::path::{Path, PathBuf};
     use std::time::Duration;
+
+    /// The `EVFILT_USER` identifier [`PumpWake`] triggers.
+    pub const WAKE_IDENT: usize = 0x6469_7269;
 
     pub struct LogWatcher {
         kq: i32,
@@ -6683,8 +7321,25 @@ mod log_watch {
                 fd: -1,
                 path: path.to_path_buf(),
             };
+            // The pump's doorbell: [`PumpWake`] triggers it, so a parked pump
+            // can be woken without a descriptor of its own.
+            let wake = libc::kevent {
+                ident: WAKE_IDENT,
+                filter: libc::EVFILT_USER,
+                flags: libc::EV_ADD | libc::EV_CLEAR,
+                fflags: 0,
+                data: 0,
+                udata: std::ptr::null_mut(),
+            };
+            // SAFETY: registering one initialized event; no output requested.
+            unsafe { libc::kevent(kq, &wake, 1, std::ptr::null_mut(), 0, std::ptr::null()) };
             watcher.arm();
             Some(watcher)
+        }
+
+        /// The kqueue a [`PumpWake`] rings.
+        pub fn wake_descriptor(&self) -> i32 {
+            self.kq
         }
 
         fn arm(&mut self) {
@@ -6738,14 +7393,47 @@ mod log_watch {
                     return false;
                 }
             }
+            self.wait_events(None, timeout)
+        }
+
+        /// [`Self::wait`], also returning once `stream` is readable (a frame
+        /// or its hangup) or the pump's [`PumpWake`] rings. This is how an
+        /// idle pump sleeps: no timer short of `timeout`, which callers make
+        /// a long backstop.
+        pub fn park(&mut self, stream: i32, timeout: Duration) -> bool {
+            if self.fd < 0 {
+                self.arm();
+            }
+            self.wait_events(Some(stream), timeout)
+        }
+
+        fn wait_events(&mut self, stream: Option<i32>, timeout: Duration) -> bool {
             let spec = libc::timespec {
                 tv_sec: timeout.as_secs() as libc::time_t,
                 tv_nsec: libc::c_long::from(timeout.subsec_nanos()),
             };
-            // SAFETY: zeroed kevent output slot, valid timeout.
+            // One-shot, so a later wait without the stream is never woken by
+            // it; closing the socket removes the registration too.
+            let readable = stream.map(|fd| libc::kevent {
+                ident: fd as usize,
+                filter: libc::EVFILT_READ,
+                flags: libc::EV_ADD | libc::EV_ONESHOT,
+                fflags: 0,
+                data: 0,
+                udata: std::ptr::null_mut(),
+            });
+            let (changes, count) = match &readable {
+                Some(event) => (event as *const libc::kevent, 1),
+                None => (std::ptr::null(), 0),
+            };
+            // SAFETY: zeroed kevent output slot, valid timeout, and at most
+            // one initialized change that outlives the call.
             let mut out = unsafe { std::mem::zeroed::<libc::kevent>() };
-            let woke = unsafe { libc::kevent(self.kq, std::ptr::null(), 0, &mut out, 1, &spec) };
-            if woke > 0 && out.fflags & (libc::NOTE_DELETE | libc::NOTE_RENAME) != 0 {
+            let woke = unsafe { libc::kevent(self.kq, changes, count, &mut out, 1, &spec) };
+            if woke > 0
+                && out.filter == libc::EVFILT_VNODE
+                && out.fflags & (libc::NOTE_DELETE | libc::NOTE_RENAME) != 0
+            {
                 // Rotation replaced the file: track the new incarnation.
                 self.arm();
                 return true;
@@ -6812,6 +7500,14 @@ mod log_watch {
             std::thread::sleep(timeout);
             false
         }
+
+        pub fn wake_descriptor(&self) -> i32 {
+            -1
+        }
+
+        pub fn park(&mut self, _stream: i32, timeout: Duration) -> bool {
+            self.wait(timeout)
+        }
     }
 }
 
@@ -6870,6 +7566,45 @@ mod quiet_tick_tests {
         // Input or an attach makes it interactive again at once.
         shared.note_hot();
         assert_eq!(shared.quiet_tick(), TICK_INTERVAL);
+    }
+}
+
+#[cfg(test)]
+mod held_batch_wait_tests {
+    use super::*;
+
+    const MS: Duration = Duration::from_millis(1);
+
+    #[test]
+    fn output_after_quiet_waits_only_the_quiet_window() {
+        // Nothing published yet, or long enough ago: the batch publishes once
+        // the stream has been silent for OUTPUT_QUIET (was the whole ceiling).
+        assert_eq!(held_batch_wait(Duration::ZERO, None), OUTPUT_QUIET);
+        assert_eq!(
+            held_batch_wait(Duration::ZERO, Some(500 * MS)),
+            OUTPUT_QUIET
+        );
+        assert_eq!(
+            held_batch_wait(Duration::ZERO, Some(OUTPUT_BATCH_CEILING)),
+            OUTPUT_QUIET
+        );
+    }
+
+    #[test]
+    fn continuous_output_stays_paced_by_the_ceiling() {
+        // A batch that opened 1 ms after the last publication waits until the
+        // cadence allows the next one, never sooner.
+        assert_eq!(held_batch_wait(Duration::ZERO, Some(MS)), 7 * MS);
+        assert_eq!(held_batch_wait(3 * MS, Some(4 * MS)), 4 * MS);
+        // And never past its own ceiling.
+        assert_eq!(held_batch_wait(7 * MS, Some(7 * MS)), MS);
+        assert_eq!(held_batch_wait(OUTPUT_BATCH_CEILING, None), Duration::ZERO);
+        assert_eq!(held_batch_wait(20 * MS, Some(MS)), Duration::ZERO);
+    }
+
+    #[test]
+    fn the_quiet_window_is_shorter_than_a_display_frame() {
+        assert!(OUTPUT_QUIET * 4 <= OUTPUT_BATCH_CEILING);
     }
 }
 
@@ -6997,14 +7732,69 @@ mod resize_tests {
         let second = session.resize_pty(120, 40).unwrap().expect("owed");
         // The older reflow wins the lock race but must not leave the
         // emulator at a size the PTY no longer has.
-        first.apply();
+        let _ = first.apply();
         assert_eq!(session.screen_size(), (120, 40));
         // The newer one finds nothing left to do.
         session.shared.screen.lock().unwrap().resize(90, 20);
-        second.apply();
+        let _ = second.apply();
         assert_eq!(session.screen_size(), (90, 20), "a spent reflow is a no-op");
         session.resize(132, 42).unwrap();
         assert_eq!(session.screen_size(), (132, 42));
+        let _ = session.terminate(Duration::from_secs(2));
+    }
+
+    /// End to end through a real PTY: a local program's queries are answered
+    /// by the Engine pump, in order, from the palette the App sent, and the
+    /// kitty keyboard query is answered because local sessions negotiate it.
+    #[cfg(unix)]
+    #[test]
+    fn a_local_program_gets_its_query_replies_in_order() {
+        let temp = tempfile::tempdir().unwrap();
+        let out = temp.path().join("replies");
+        let done = temp.path().join("done");
+        let script = format!(
+            "sleep 0.5; stty raw -echo min 0 time 15; \
+             printf '\\033]11;?\\033\\\\\\033[>0q\\033[?u\\033[?996n\\033[c'; \
+             cat > '{}'; : > '{}'; exec sleep 30",
+            out.display(),
+            done.display()
+        );
+        let (engine, _) = ManifestEngine::load_dir(&crate::detect::bundled_manifest_dir()).unwrap();
+        let spec = SessionSpec {
+            id: "queries".into(),
+            pty: PtySpec::new(vec!["/bin/sh".into(), "-c".into(), script], "/tmp")
+                .env("PATH", "/usr/bin:/bin")
+                .size(80, 24),
+            manifest_id: "shell".into(),
+            authority: Authority::ProcessOnly,
+            logs_dir: temp.path().to_path_buf(),
+            holder: None,
+            remote: None,
+            defer_launch: false,
+        };
+        let mut session = Session::spawn(spec, Arc::new(engine)).expect("spawn");
+        session.apply_terminal_palette(Some(diri_proto::TerminalPalette {
+            appearance: diri_proto::TerminalAppearance::Light,
+            foreground: [0x20, 0x20, 0x20],
+            background: [0xfa, 0xfb, 0xfc],
+            cursor: [0x20, 0x20, 0x20],
+            ansi: [[0; 3]; 16],
+        }));
+        let deadline = Instant::now() + Duration::from_secs(20);
+        while !done.exists() {
+            assert!(
+                Instant::now() < deadline,
+                "the program never finished reading"
+            );
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        let replies = String::from_utf8(std::fs::read(&out).unwrap()).unwrap();
+        assert_eq!(
+            replies,
+            format!(
+                "\x1b]11;rgb:fafa/fbfb/fcfc\x1b\\\x1bP>|{TERMINAL_VERSION}\x1b\\\x1b[?0u\x1b[?997;2n\x1b[?62;22c"
+            )
+        );
         let _ = session.terminate(Duration::from_secs(2));
     }
 }
@@ -7702,6 +8492,9 @@ mod preview_tests {
             manifest_id: spec.manifest_id.clone(),
             deferred: Some(Arc::new(DeferredLaunch::new())),
         };
+        // Local sessions now negotiate kitty flags; the legacy half of this
+        // contract is a parser that cannot (a remote session's mirror).
+        *session.shared.screen.lock().unwrap() = HeadlessScreen::new(80, 24);
         session.shared.keyboard_known.store(false, Ordering::SeqCst);
         assert_eq!(session.keyboard_state(), None);
         assert!(session.allows_keyboard_controller(false));
@@ -7773,6 +8566,36 @@ mod preview_tests {
         );
         assert!(!session.accepts_keyboard_input(false));
         assert!(session.accepts_keyboard_input(true));
+    }
+
+    #[test]
+    fn a_client_size_ends_the_launch_wait_at_once() {
+        // The Swift-era debounce held the exec 120 ms after every proposal.
+        // A size now launches at once: the waiting launcher wakes with it.
+        let deferred = Arc::new(DeferredLaunch::new());
+        let waiter = {
+            let deferred = Arc::clone(&deferred);
+            std::thread::spawn(move || {
+                let size = deferred.wait_for_launch_size((80, 24));
+                (size, Instant::now())
+            })
+        };
+        std::thread::sleep(Duration::from_millis(20));
+        let proposed = Instant::now();
+        assert!(deferred.propose_size(132, 41));
+        let (size, woke) = waiter.join().unwrap();
+        assert_eq!(size, Some((132, 41)));
+        assert!(
+            woke.duration_since(proposed) < Duration::from_millis(100),
+            "the launch waited {:?} after the size arrived",
+            woke.duration_since(proposed)
+        );
+        // A size arriving while the exec is in flight is handed back to be
+        // applied as an ordinary resize.
+        assert!(deferred.propose_size(90, 28));
+        let handoff = deferred.finish_launch((132, 41)).unwrap();
+        assert_eq!(handoff.late_size, Some((90, 28)));
+        assert!(!deferred.propose_size(100, 30), "launched: resize instead");
     }
 
     #[test]
@@ -7876,6 +8699,7 @@ mod remote_connection_tests {
                 output_offset: 0,
                 snapshot_sequence: 1,
                 foreground_pid: Some(pid as i32),
+                grid_resume: None,
                 child_identity: None,
             });
             let mut screen = crate::screen::HeadlessScreen::new(80, 24);
@@ -7943,6 +8767,10 @@ if mkdir first 2>/dev/null; then
   cat reset.bin snapshot.bin
   while [ ! -f disconnect ]; do sleep 0.01; done
 else
+  # dash (Linux /bin/sh) points an async list's stdin at /dev/null even
+  # with an explicit `<&0`, so hand the bridge's stdin over on fd 3.
+  exec 3<&0
+  cat <&3 > second-stdin.bin &
   while [ ! -f reconnect ]; do sleep 0.01; done
   cat hello.bin modes.bin reset.bin snapshot.bin
   while [ ! -f finish ]; do sleep 0.01; done
@@ -8076,6 +8904,25 @@ fi
             wait_for("reconnected snapshot", || {
                 session.view().remote_connection.unwrap().state == State::Connected
             });
+            // The reconnect offered grid-resume-v1 for the grid it held. This
+            // Holder answered without it (as one predating the capability
+            // does), and the snapshot that followed seeded the session.
+            // The fixture's background `cat` copies stdin to the file on its
+            // own schedule, so wait for the whole Hello frame to land.
+            let reconnect_hello = || {
+                RemoteCodec::new()
+                    .feed(&std::fs::read(temp.path().join("second-stdin.bin")).ok()?)
+                    .ok()?
+                    .into_iter()
+                    .next()
+            };
+            wait_for("reconnect Hello recorded", || reconnect_hello().is_some());
+            let Some(RemoteMessage::Hello(second)) = reconnect_hello() else {
+                panic!("reconnect Hello");
+            };
+            let offered = second.grid_resume.expect("resume offered");
+            assert_eq!((offered.controller_epoch, offered.base_sequence), (1, 1));
+            assert_eq!((offered.cols, offered.rows), (80, 24));
             assert_eq!(session.child_pid(), pid as i32);
             assert_eq!(session.preview_seed().grid, seed);
             assert_eq!(session.keyboard_state(), keyboard);
@@ -8127,7 +8974,7 @@ mod repaint_hold_tests {
     fn a_clear_waits_for_its_redraw_and_the_rewrite_publishes_when_quiet() {
         let opened = Instant::now();
         let mut blank_since = None;
-        let erased = repaint_hold(&mut blank_since, opened, 600, 0, false, opened);
+        let erased = repaint_hold(&mut blank_since, opened, 600, 0, false, false, opened);
         let Some(RepaintHold::Erased(until)) = erased else {
             panic!("a blank screen must wait for its redraw: {erased:?}");
         };
@@ -8136,7 +8983,7 @@ mod repaint_hold_tests {
         // More blank writes do not stretch the grace.
         let later = opened + Duration::from_millis(30);
         assert_eq!(
-            repaint_hold(&mut blank_since, opened, 600, 0, false, later),
+            repaint_hold(&mut blank_since, opened, 600, 0, false, false, later),
             Some(RepaintHold::Erased(until))
         );
 
@@ -8144,7 +8991,7 @@ mod repaint_hold_tests {
         // holding more than before or less, is not a frame on its own.
         for filled in [900, 200] {
             assert_eq!(
-                repaint_hold(&mut blank_since, opened, 600, filled, false, later),
+                repaint_hold(&mut blank_since, opened, 600, filled, false, false, later),
                 Some(RepaintHold::Redrawing(until))
             );
         }
@@ -8155,18 +9002,29 @@ mod repaint_hold_tests {
         let opened = Instant::now();
         let mut blank_since = None;
         assert_eq!(
-            repaint_hold(&mut blank_since, opened, 600, 400, false, opened),
+            repaint_hold(&mut blank_since, opened, 600, 400, false, false, opened),
             Some(RepaintHold::Erased(opened + OUTPUT_REPAINT_CEILING))
         );
         assert_eq!(
-            repaint_hold(&mut blank_since, opened, 600, 650, false, opened),
+            repaint_hold(&mut blank_since, opened, 600, 650, false, false, opened),
             None
         );
         // An empty screen staying empty is not an erase.
         assert_eq!(
-            repaint_hold(&mut blank_since, opened, 0, 0, false, opened),
+            repaint_hold(&mut blank_since, opened, 0, 0, false, false, opened),
             None
         );
+    }
+
+    #[test]
+    fn a_line_edit_has_no_redraw_to_wait_for() {
+        let opened = Instant::now();
+        let mut blank_since = Some(opened);
+        assert_eq!(
+            repaint_hold(&mut blank_since, opened, 600, 400, false, true, opened),
+            None
+        );
+        assert_eq!(blank_since, None);
     }
 
     #[test]
@@ -8174,7 +9032,7 @@ mod repaint_hold_tests {
         let opened = Instant::now();
         let mut blank_since = Some(opened);
         assert_eq!(
-            repaint_hold(&mut blank_since, opened, 600, 0, true, opened),
+            repaint_hold(&mut blank_since, opened, 600, 0, true, false, opened),
             None
         );
         assert_eq!(blank_since, None);
@@ -8190,9 +9048,9 @@ mod echo_request_tests {
         let at = Instant::now();
         let request = EchoRequest::for_input(b"a", at);
         assert!(!request.erases);
-        assert!(request.answered_by(at, 10, 11, 80, false));
+        assert!(request.answered_by(at, 10, 11, 80, false, false));
         assert!(
-            request.answered_by(at, 10, 10, 80, false),
+            request.answered_by(at, 10, 10, 80, false, false),
             "a cursor move alone"
         );
     }
@@ -8201,8 +9059,8 @@ mod echo_request_tests {
     fn output_that_loses_cells_after_a_typed_key_is_a_repaint_in_progress() {
         let at = Instant::now();
         let request = EchoRequest::for_input(b"a", at);
-        assert!(!request.answered_by(at, 400, 399, 80, false));
-        assert!(!request.answered_by(at, 400, 0, 80, false));
+        assert!(!request.answered_by(at, 400, 399, 80, false, false));
+        assert!(!request.answered_by(at, 400, 0, 80, false, false));
     }
 
     #[test]
@@ -8211,10 +9069,16 @@ mod echo_request_tests {
         for key in [&b"\x7f"[..], b"\x08", b"\x17", b"\x15"] {
             let request = EchoRequest::for_input(key, at);
             assert!(request.erases, "{key:?}");
-            assert!(request.answered_by(at, 100, 99, 80, false), "{key:?}");
-            assert!(request.answered_by(at, 100, 20, 80, false), "{key:?}");
             assert!(
-                !request.answered_by(at, 100, 19, 80, false),
+                request.answered_by(at, 100, 99, 80, false, false),
+                "{key:?}"
+            );
+            assert!(
+                request.answered_by(at, 100, 20, 80, false, false),
+                "{key:?}"
+            );
+            assert!(
+                !request.answered_by(at, 100, 19, 80, false, false),
                 "{key:?}: more than a row is a repaint"
             );
         }
@@ -8226,8 +9090,8 @@ mod echo_request_tests {
         let request = EchoRequest::for_input(b"a", at);
         let late = at + ECHO_WINDOW + Duration::from_millis(1);
         assert!(request.expired(late));
-        assert!(!request.answered_by(late, 10, 11, 80, false));
-        assert!(request.answered_by(at + ECHO_WINDOW, 10, 11, 80, false));
+        assert!(!request.answered_by(late, 10, 11, 80, false, false));
+        assert!(request.answered_by(at + ECHO_WINDOW, 10, 11, 80, false, false));
     }
 
     #[test]
@@ -8242,13 +9106,29 @@ mod echo_request_tests {
     }
 
     #[test]
+    fn any_key_is_answered_by_a_line_edit_that_removed_cells() {
+        let at = Instant::now();
+        // Up onto a shorter history entry; a letter that ends an
+        // autosuggestion; vim's `x`.
+        for key in [&b"\x1b[A"[..], b"Q", b"x"] {
+            let request = EchoRequest::for_input(key, at);
+            assert!(
+                request.answered_by(at, 400, 340, 80, false, true),
+                "{key:?}"
+            );
+        }
+        let late = at + ECHO_WINDOW + Duration::from_millis(1);
+        assert!(!EchoRequest::for_input(b"x", at).answered_by(late, 400, 340, 80, false, true));
+    }
+
+    #[test]
     fn a_closed_synchronized_update_answers_even_when_it_removed_cells() {
         let at = Instant::now();
         let request = EchoRequest::for_input(b"a", at);
-        assert!(request.answered_by(at, 400, 120, 80, true));
-        assert!(request.answered_by(at, 400, 0, 80, true));
+        assert!(request.answered_by(at, 400, 120, 80, true, false));
+        assert!(request.answered_by(at, 400, 0, 80, true, false));
         let late = at + ECHO_WINDOW + Duration::from_millis(1);
-        assert!(!request.answered_by(late, 400, 120, 80, true));
+        assert!(!request.answered_by(late, 400, 120, 80, true, false));
     }
 }
 

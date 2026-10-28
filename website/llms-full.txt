@@ -1782,6 +1782,15 @@ Open an HTTP request in the API tab of YOUR session's right panel in Diri, prefi
 | `secrets` | string array | Names in variables to mask as secrets. |
 | `variables` | object | Variable name to value for {{name}} placeholders. |
 
+### `name_session`
+
+Name your own Diri session (its tab and sidebar row) after the task: 2-4 lowercase words joined by hyphens naming the task or project, e.g. fix-login-redirect or checkout-flaky-tests, never generic ones like claude or session. Call it unasked while handling the first request that identifies the work (a greeting is not enough), keep a current name that still describes the work (whoami shows it and who set it), and call it again when the task changes. A name the user or Diri gave always wins: the call leaves it and answers applied:false, reason userNamed. When the user asks for a specific name, pass it with user_requested:true; it is kept as written and later agent names never replace it. Mention a rename briefly, if at all. If it fails, carry on with the task.
+
+| Argument | Type | Notes |
+| --- | --- | --- |
+| `name` | string | **Required.** |
+| `user_requested` | boolean |  |
+
 ### `note_links`
 
 How one Diri note connects to the others. links: the notes it links to. backlinks: every note linking to it, with the words around each link (backlinks_total counts them). unlinked_mentions: notes that write its title without linking it (unlinked:false skips them). depth (1-3) adds graph: the notes within that many links, either direction, and the links between them. Check backlinks before changing a note others depend on, and to find the plans, briefs and findings a note belongs to. note is an id, a title, part of a title, a note Session id, or "origin".
@@ -1894,7 +1903,7 @@ dirijor run --wait --rm -- cargo test --workspace && echo green
 | `session key ID KEY` | `--ctrl`, `--alt`, `--shift`, `--cmd`, `--repeat`, `--json` | Press one key. `send` takes any target and several keys. |
 | `session wait TARGET` | `--until STATUS` (repeatable), `--timeout SECONDS`, `--json` | Block until the session reaches a status. Default `--until done`, default timeout 600 seconds. |
 | `session spawn KIND` | `--cwd PATH`, `--worktree`, `--branch NAME`, `--prompt TEXT`, `--title TEXT`, `--host ID`, `--json` | Start an agent, for example `claude` or `codex`. The folder defaults to the current one. |
-| `session run -- PROGRAM [ARG...]` | `--cwd PATH`, `--host ID`, `--title TEXT`, `--json` | Run a command in a new terminal session. A remote run needs `--cwd` with an absolute path on that host. |
+| `session run -- PROGRAM [ARG...]` | `--cwd PATH`, `--host ID`, `--title TEXT`, `--keep-open`, `--json` | Run a command in a new terminal session. A remote run needs `--cwd` with an absolute path on that host. The tab closes when the command succeeds and stays open when it fails or is killed within 250 ms, so you can read the error. `--keep-open` keeps it open after any exit. |
 | `session fork TARGET` | `--json` | Fork the conversation into a new session (agents that support fork). |
 | `session release TARGET` | `--remove`, `--json` | Stop the session. `--remove` also deletes its record. |
 | `session archive TARGET` | `--undo`, `--json` | Archive the session, or unarchive it with `--undo`. |
@@ -1904,6 +1913,11 @@ dirijor run --wait --rm -- cargo test --workspace && echo green
 | `session reset-terminal ID` | | Clear the screen, history, modes and title. The process is not touched. |
 
 `--name` is accepted as an alias for `--title`. `--host` takes a host id from your [remote hosts](/docs/remote-hosts/).
+
+For spawn usage, all supported options, and a local example, run
+`dirijor session spawn --help` (or `-h`). `--help` anywhere in a spawn command
+prints help instead, so it never starts a session or creates a worktree, and
+works without a running Engine. Unknown options are rejected rather than ignored.
 
 ### Wait statuses
 

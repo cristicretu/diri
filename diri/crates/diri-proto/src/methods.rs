@@ -50,6 +50,9 @@ impl Method {
     /// Resets the emulator (screens, history, modes, title) without touching
     /// the PTY or process. Acceptance means queued to the terminal owner.
     pub const SESSION_RESET_TERMINAL: &'static str = "session.reset_terminal";
+    /// Sets the palette local terminals answer color queries from
+    /// ([`TerminalPalette`]). Engine-wide; the result is empty.
+    pub const TERMINAL_SET_PALETTE: &'static str = "terminal.set_palette";
     pub const SESSION_CAPTURE_FIND: &'static str = "session.capture_find";
     pub const SESSION_READ_SCROLLBACK: &'static str = "session.read_scrollback";
     pub const SESSION_READ_SCROLLBACK_CELLS: &'static str = "session.read_scrollback_cells";
@@ -559,6 +562,13 @@ pub struct SessionSpawnParams {
     /// Absent keeps the manifest's launch.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub argv: Option<Vec<String>>,
+    /// For a command (an `argv`, or a `generic` kind's command line): keep its
+    /// tab after any exit, a clean one included. Without it a command's tab
+    /// closes on success and stays when it failed or was killed within
+    /// [`crate::QUICK_EXIT_MILLIS`]. Rejected for Agents and login shells,
+    /// whose tabs already outlive their programs.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub keep_open: Option<bool>,
 }
 
 /// The light or dark family of the terminal theme a Session is shown in.
@@ -567,6 +577,20 @@ pub struct SessionSpawnParams {
 pub enum TerminalAppearance {
     Light,
     Dark,
+}
+
+/// The colors local terminals are painted with. Programs that ask the
+/// terminal (OSC 10/11/12/4, `CSI ? 996 n`, DECSET 2031) are answered from
+/// this. The App sends it whenever its theme settles on a new palette.
+#[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct TerminalPalette {
+    pub appearance: TerminalAppearance,
+    pub foreground: [u8; 3],
+    pub background: [u8; 3],
+    pub cursor: [u8; 3],
+    /// ANSI colors 0–15. Colors 16–255 are the fixed xterm cube and ramp.
+    pub ansi: [[u8; 3]; 16],
 }
 
 pub type SessionSpawnResult = SessionRecord;
@@ -694,9 +718,37 @@ pub struct SessionRenameParams {
     #[serde(rename = "sessionID")]
     pub session_id: SessionId,
     pub title: String,
+    /// Who is naming the session. Absent is the user (every older client),
+    /// whose name always lands and is never replaced by an Agent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub by: Option<RenameAuthor>,
 }
 
+/// Who asked for a [`SessionRenameParams`] rename besides the user.
+#[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub enum RenameAuthor {
+    /// The session's own Agent naming it after its task. Refused over a
+    /// name the user or Diri gave, and while the setting is off.
+    Agent,
+    /// The Agent passing on a name the user asked it for: lands like an
+    /// explicit name, so later Agent names never replace it.
+    AgentForUser,
+}
+
+/// The user's rename answers `{}`; an Agent's says what happened.
 pub type SessionRenameResult = EmptyResult;
+
+/// What an Agent's rename did. `applied` false leaves the title as it was;
+/// `reason` says why: `userNamed`, `namingOff`, `invalid`, or `unchanged`.
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AgentRenameResult {
+    pub applied: bool,
+    pub title: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+}
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -971,6 +1023,10 @@ pub struct ReadScrollbackCellsParams {
     pub session_id: SessionId,
     pub first_row: i64,
     pub max_rows: i64,
+    /// The caller decodes `terminal-styles-v1` decoration spans in row
+    /// metadata; an older caller rejects them and omits this.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub styles: bool,
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
@@ -1326,6 +1382,11 @@ pub struct TerminalConfigureParams {
     /// Whether new zsh and bash terminals get Diri's OSC 133 prompt and
     /// command marks without any setup.
     pub shell_integration: bool,
+    /// The colors local terminals are painted with, so programs that ask
+    /// (OSC 4/10/11/12, `CSI ? 996 n`, DECSET 2031) are answered. Absent from
+    /// older Apps: queries stay unanswered, as before.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub palette: Option<TerminalPalette>,
 }
 
 pub type TerminalConfigureResult = EmptyResult;
@@ -1341,6 +1402,10 @@ pub type DaemonShutdownResult = EmptyResult;
 pub struct AttachRequest {
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub enhanced_keyboard: bool,
+    /// The client decodes `terminal-styles-v1` grids (cursor shape bits and
+    /// decoration spans). An older client omits it and gets the legacy form.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub terminal_styles: bool,
     pub attach: SessionId,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub from_offset: Option<u64>,

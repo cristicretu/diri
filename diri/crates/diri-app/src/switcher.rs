@@ -597,7 +597,7 @@ mod tests {
     }
 
     fn session(value: &str, status: SessionStatus) -> SessionRecord {
-        SessionRecord {
+        SessionRecord { command_run: None,
             attention_state: None,
             id: id(value),
             kind: AgentKind::CLAUDE_CODE,
