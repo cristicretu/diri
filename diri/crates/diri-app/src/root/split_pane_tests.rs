@@ -505,3 +505,148 @@ fn render_pane_fade_screenshots() {
         }
     }
 }
+
+/// Renders the window key and not key under every interface style and
+/// density, for the themes in `DIRI_CHROME_THEMES` (comma-separated, default
+/// the two Diri themes), into `DIRI_CHROME_SCREENSHOTS`.
+/// `DIRI_CHROME_HORIZONTAL=1` uses the horizontal tab strip.
+#[cfg(target_os = "macos")]
+#[test]
+#[ignore = "writes PNGs; run with DIRI_CHROME_SCREENSHOTS=<dir>"]
+fn render_inactive_chrome_screenshots() {
+    use crate::store::{InterfaceStyle, PaneDensity, TabOrientation};
+    use gpui::HeadlessAppContext;
+    let output = std::path::PathBuf::from(std::env::var("DIRI_CHROME_SCREENSHOTS").unwrap());
+    std::fs::create_dir_all(&output).unwrap();
+    let themes = std::env::var("DIRI_CHROME_THEMES")
+        .unwrap_or_else(|_| "dirijor-dark,dirijor-light".into());
+    let horizontal = std::env::var("DIRI_CHROME_HORIZONTAL").is_ok_and(|value| value == "1");
+    let styles: Vec<InterfaceStyle> = match std::env::var("DIRI_CHROME_STYLES") {
+        Ok(list) => InterfaceStyle::ALL
+            .into_iter()
+            .filter(|style| list.split(',').any(|name| name.eq_ignore_ascii_case(&format!("{style:?}"))))
+            .collect(),
+        Err(_) => InterfaceStyle::ALL.to_vec(),
+    };
+    for theme in themes.split(',') {
+        for &style in &styles {
+            for density in PaneDensity::ALL {
+                for key in [true, false] {
+                    let platform = gpui_platform::current_platform(true);
+                    let mut cx = HeadlessAppContext::with_platform(
+                        platform.text_system(),
+                        Arc::new(diri_ui::IconAssets),
+                        gpui_platform::current_headless_renderer,
+                    );
+                    cx.update(|cx| {
+                        crate::fonts::init(cx);
+                        cx.set_reduce_motion(true);
+                    });
+                    let services = test_services();
+                    let mut fixture = SidebarPreviewFixture::make(PreviewScenario::Typical);
+                    fixture
+                        .list
+                        .sessions
+                        .push(pane_shell("pane-tests", "cargo test", &fixture));
+                    let workspace = WorkspaceId::new("project-workspace");
+                    {
+                        let mut store = services.store.store.write().unwrap();
+                        store.hydrate(fixture.list);
+                        store
+                            .update_preferences(|prefs| {
+                                prefs.terminal_theme = theme.into();
+                                prefs.pane_density = density;
+                                prefs.interface_style = Some(style);
+                                prefs.window_material = style.material();
+                                if horizontal {
+                                    prefs.tab_orientation = TabOrientation::Horizontal;
+                                    prefs.sidebar_visible = false;
+                                } else {
+                                    prefs.tab_orientation = TabOrientation::Vertical;
+                                    prefs.sidebar_visible = true;
+                                }
+                            })
+                            .unwrap();
+                        store.select(SessionId::new("preview-claude"));
+                        store.seed_workspace_snapshot_for_test(WorkspaceSnapshot {
+                            revision: 3,
+                            workspaces: vec![WorkspaceRecord {
+                                project_id: None,
+                                id: workspace.clone(),
+                                name: "diri".into(),
+                                selected_tab: Some(TabId::new("release")),
+                                tabs: vec![WorkspaceTab {
+                                    id: TabId::new("release"),
+                                    title: None,
+                                    focused_pane: PaneId::new("agent"),
+                                    zoomed_pane: None,
+                                    layout: split(
+                                        "columns",
+                                        LayoutAxis::Horizontal,
+                                        0.5,
+                                        pane("agent", "preview-claude"),
+                                        pane("tests", "pane-tests"),
+                                    ),
+                                }],
+                            }],
+                            ..Default::default()
+                        });
+                    }
+                    let window = cx
+                        .open_window(size(px(1280.0), px(640.0)), |window, cx| {
+                            cx.new(|cx| {
+                                let root = RootView::new(
+                                    services,
+                                    false,
+                                    PreviewScenario::Empty,
+                                    window,
+                                    cx,
+                                );
+                                root.sidebar.update(cx, |sidebar, cx| {
+                                    sidebar.activate_workspace(Some(workspace), cx);
+                                });
+                                root
+                            })
+                        })
+                        .unwrap();
+                    cx.run_until_parked();
+                    if key {
+                        cx.update_window(window.into(), |_, window, _| window.activate_window())
+                            .unwrap();
+                        cx.run_until_parked();
+                    }
+                    cx.update_window(window.into(), |root, window, cx| {
+                        assert_eq!(window.is_window_active(), key);
+                        let root = root.downcast::<RootView>().unwrap();
+                        let workbench = root.read(cx).workspace_workbench.clone().unwrap();
+                        workbench.update(cx, |workbench, cx| {
+                            workbench.seed_pane_text_for_test(
+                                &[("preview-claude", CLAUDE), ("pane-tests", TESTS)],
+                                cx,
+                            )
+                        });
+                    })
+                    .unwrap();
+                    cx.run_until_parked();
+                    let image = cx.capture_screenshot(window.into()).unwrap();
+                    let density = if density.islands() {
+                        "comfortable"
+                    } else {
+                        "compact"
+                    };
+                    let key = if key { "key" } else { "nonkey" };
+                    let style = format!("{style:?}").to_lowercase();
+                    let orientation = if horizontal { "-strip" } else { "" };
+                    image
+                        .save(output.join(format!(
+                            "{theme}-{style}-{density}{orientation}-{key}.png"
+                        )))
+                        .unwrap();
+                    cx.update_window(window.into(), |_, window, _| window.remove_window())
+                        .unwrap();
+                    cx.run_until_parked();
+                }
+            }
+        }
+    }
+}

@@ -722,10 +722,7 @@ fn spawn_detached(daemon: &Path, boot_log: Option<&Path>) -> io::Result<()> {
 
     match boot_log {
         Some(log_path) => {
-            let out = std::fs::OpenOptions::new()
-                .create(true)
-                .append(true)
-                .open(log_path)?;
+            let out = diri_platform::private::append(log_path)?;
             let err = out.try_clone()?;
             command.stdout(Stdio::from(out)).stderr(Stdio::from(err));
         }
@@ -759,7 +756,7 @@ fn spawn_detached(daemon: &Path, boot_log: Option<&Path>) -> io::Result<()> {
 fn boot_log_path() -> Option<PathBuf> {
     let home = diri_platform::home_dir().map(|p| p.into_os_string())?;
     let logs = DirijorPaths::logs_dir(PathBuf::from(home));
-    std::fs::create_dir_all(&logs).ok()?;
+    diri_platform::private::create_dir_all(&logs).ok()?;
     Some(logs.join(BOOT_LOG_FILE_NAME))
 }
 
@@ -774,6 +771,20 @@ mod tests {
     use std::os::unix::fs::PermissionsExt;
     use std::sync::atomic::AtomicUsize;
     use std::sync::{Arc, Mutex, mpsc};
+
+    #[test]
+    fn the_engine_boot_log_is_owner_only() {
+        let temp = tempfile::tempdir().unwrap();
+        let mode = |path: &Path| std::fs::metadata(path).unwrap().permissions().mode() & 0o777;
+        let log = temp.path().join(BOOT_LOG_FILE_NAME);
+        spawn_detached(Path::new("/usr/bin/true"), Some(&log)).unwrap();
+        assert_eq!(mode(&log), 0o600);
+
+        // A log an older build left world-readable is tightened on next use.
+        std::fs::set_permissions(&log, std::fs::Permissions::from_mode(0o644)).unwrap();
+        spawn_detached(Path::new("/usr/bin/true"), Some(&log)).unwrap();
+        assert_eq!(mode(&log), 0o600);
+    }
 
     fn touch_executable(path: &Path) {
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();

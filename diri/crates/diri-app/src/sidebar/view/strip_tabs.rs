@@ -35,6 +35,8 @@ pub(in crate::sidebar) struct StripTabProps {
     pub(super) id: SessionId,
     pub(super) title: String,
     pub(super) kind: ProtoAgentKind,
+    /// A terminal's program glyph; see `session_presentation::program_glyph`.
+    pub(super) glyph: Option<diri_ui::IconName>,
     pub(super) active: bool,
     /// ⌘1–⌘8, then ⌘9 for the last tab.
     pub(super) rank: Option<usize>,
@@ -59,6 +61,8 @@ pub(in crate::sidebar) struct StripTabProps {
     /// The fraction of the hover fill a tab the pointer just left still
     /// wears; it changes each frame of the fade (see `hover_linger`).
     pub(super) hover_linger: f32,
+    /// The selection and hover look for the window's key status.
+    pub(super) look: crate::chrome_focus::ChromeLook,
 }
 
 impl StripTabProps {
@@ -131,6 +135,7 @@ impl Sidebar {
             id: id.clone(),
             title: display_title(session),
             kind: session.effective_kind().clone(),
+            glyph: crate::session_presentation::program_glyph(session),
             active,
             rank,
             state,
@@ -154,6 +159,7 @@ impl Sidebar {
             } else {
                 self.tab_hover_linger(id)
             },
+            look: self.chrome_look,
         }
     }
 

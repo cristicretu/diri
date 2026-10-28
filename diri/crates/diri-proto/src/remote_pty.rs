@@ -18,8 +18,10 @@ use crate::grid::{GridCodecError, GridUpdate};
 use crate::terminal::MouseModes;
 
 pub const PROTOCOL_MAJOR: u16 = 1;
-pub const PROTOCOL_MINOR: u16 = 17;
+pub const PROTOCOL_MINOR: u16 = 18;
 pub const GRID_RESUME_PROTOCOL_MINOR: u16 = 17;
+/// Minor 17 belongs to `grid-resume-v1`; styles are negotiated by name.
+pub const TERMINAL_STYLES_PROTOCOL_MINOR: u16 = 18;
 pub const INLINE_IMAGES_PROTOCOL_MINOR: u16 = 16;
 pub const TERMINAL_RESET_PROTOCOL_MINOR: u16 = 15;
 pub const ENHANCED_KEYBOARD_PROTOCOL_MINOR: u16 = 14;
@@ -119,6 +121,10 @@ pub enum RemoteCapability {
     /// Holder answers with only the rows that differ instead of a snapshot.
     #[serde(rename = "grid-resume-v1")]
     GridResume,
+    /// Cursor shape and blink in grid flag bits 3-5, and underline kind,
+    /// underline color and overline spans in row annotations.
+    #[serde(rename = "terminal-styles-v1")]
+    TerminalStyles,
     IncrementalGrid,
     ProcessExit,
     Signal,
@@ -164,6 +170,7 @@ impl RemoteCapability {
             Self::TerminalReset => "terminal-reset-v1",
             Self::InlineImages => "inline-images-v1",
             Self::GridResume => "grid-resume-v1",
+            Self::TerminalStyles => "terminal-styles-v1",
             Self::FullSnapshot => "full-snapshot",
             Self::IncrementalGrid => "incremental-grid",
             Self::ProcessExit => "process-exit",
@@ -233,6 +240,7 @@ pub const ANNOTATED_HOLDER_CAPABILITIES: &[RemoteCapability] = &[
     RemoteCapability::TerminalReset,
     RemoteCapability::InlineImages,
     RemoteCapability::GridResume,
+    RemoteCapability::TerminalStyles,
 ];
 pub const ANNOTATED_HELPER_CAPABILITIES: &[RemoteCapability] = &[
     RemoteCapability::ProcessFacts,
@@ -257,6 +265,7 @@ pub const ANNOTATED_HELPER_CAPABILITIES: &[RemoteCapability] = &[
     RemoteCapability::TerminalReset,
     RemoteCapability::InlineImages,
     RemoteCapability::GridResume,
+    RemoteCapability::TerminalStyles,
 ];
 
 /// Authentication bearer shared only by the local Engine and one Holder.
@@ -1970,6 +1979,7 @@ mod tests {
                 uri: "https://example.com".into(),
             }],
             graphemes: Vec::new(),
+            styles: Vec::new(),
         };
         assert_ne!(grid_resume_row_digest(&key, 4, &cells, &linked), digest);
         assert_ne!(grid_resume_row_digest(&[2; 16], 4, &cells, &plain), digest);
@@ -2083,6 +2093,7 @@ mod tests {
                 cursor_visible: true,
                 is_full_snapshot: true,
                 changed_rows: vec![ChangedRow::new(0, vec![GridCell::BLANK; 2])],
+                cursor_style: Default::default(),
             },
         }
     }
@@ -2723,5 +2734,23 @@ mod usage_tests {
             }],
         };
         assert!(request.validate().is_ok());
+    }
+
+    #[test]
+    fn terminal_styles_is_an_optional_minor_18_capability() {
+        const {
+            assert!(TERMINAL_STYLES_PROTOCOL_MINOR == PROTOCOL_MINOR);
+            assert!(TERMINAL_STYLES_PROTOCOL_MINOR > INLINE_IMAGES_PROTOCOL_MINOR);
+        }
+        assert_eq!(
+            serde_json::to_string(&RemoteCapability::TerminalStyles).unwrap(),
+            "\"terminal-styles-v1\""
+        );
+        assert_eq!(
+            RemoteCapability::TerminalStyles.wire_name(),
+            "terminal-styles-v1"
+        );
+        assert!(!PHASE_ONE_HOLDER_CAPABILITIES.contains(&RemoteCapability::TerminalStyles));
+        assert!(ANNOTATED_HOLDER_CAPABILITIES.contains(&RemoteCapability::TerminalStyles));
     }
 }

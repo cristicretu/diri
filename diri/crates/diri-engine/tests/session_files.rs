@@ -37,6 +37,7 @@ fn short_root(tag: &str) -> PathBuf {
 fn record(id: &str) -> diri_proto::SessionRecord {
     use diri_proto::*;
     SessionRecord {
+        command_run: None,
         attention_state: None,
         id: SessionId(id.into()),
         kind: AgentKind::SHELL,
@@ -71,6 +72,7 @@ fn record(id: &str) -> diri_proto::SessionRecord {
         pull_requests: None,
         listening_ports: None,
         foreground_agent: None,
+        foreground_program: None,
         terminal_cwd: None,
         agent_workspace: None,
         note_id: None,

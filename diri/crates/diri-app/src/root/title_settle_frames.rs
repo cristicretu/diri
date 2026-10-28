@@ -10,6 +10,9 @@
 //! `DIRI_TITLES_HORIZONTAL=1` renders the tab strip instead of the sidebar,
 //! `DIRI_TITLES_INSTANT=1` files every rename as the user's own, which
 //! commits at once: what a build without the settle paints.
+//! `DIRI_TITLES_AGENT_NAMED=1` plays agents naming their own sessions
+//! (`name_session`): lowercase hyphenated task names replacing the first
+//! prompt or the provider's summary, then a rename when the task changes.
 //! `DIRI_TITLES_TERMINALS=1` plays a terminal's Engine names instead: its
 //! folder, `npm`, the port it serves, the folder again, and a `vim` opened
 //! and quit inside one settle.
@@ -32,6 +35,14 @@ const SCRIPT: [(u64, &str, &str); 4] = [
     (1960, "preview-spawned-review", "Audit the fixtures"),
 ];
 
+/// Agents naming their sessions after the task, then one moving on to the
+/// next task.
+const AGENT_NAMED_SCRIPT: [(u64, &str, &str); 3] = [
+    (300, "preview-spawned-deep", "check-rail-geometry"),
+    (1100, "preview-cursor", "fix-tab-focus"),
+    (1900, "preview-cursor", "audit-close-shortcuts"),
+];
+
 /// A terminal running a dev server, then a quick look in an editor.
 const TERMINAL_SCRIPT: [(u64, &str, &str); 6] = [
     (300, "preview-shell", "npm"),
@@ -50,7 +61,14 @@ fn render_title_settle_frames() {
     let horizontal = std::env::var_os("DIRI_TITLES_HORIZONTAL").is_some();
     let instant = std::env::var_os("DIRI_TITLES_INSTANT").is_some();
     let terminals = std::env::var_os("DIRI_TITLES_TERMINALS").is_some();
-    let script: &[(u64, &str, &str)] = if terminals { &TERMINAL_SCRIPT } else { &SCRIPT };
+    let agent_named = std::env::var_os("DIRI_TITLES_AGENT_NAMED").is_some();
+    let script: &[(u64, &str, &str)] = if terminals {
+        &TERMINAL_SCRIPT
+    } else if agent_named {
+        &AGENT_NAMED_SCRIPT
+    } else {
+        &SCRIPT
+    };
     let frame = Duration::from_micros(1_000_000 / 60);
     std::fs::create_dir_all(&output).unwrap();
 
@@ -154,6 +172,8 @@ fn render_title_settle_frames() {
                 TitleSource::UserRename
             } else if terminals {
                 TitleSource::TerminalTitle
+            } else if agent_named {
+                TitleSource::AgentNamed
             } else {
                 TitleSource::AgentProvided
             };

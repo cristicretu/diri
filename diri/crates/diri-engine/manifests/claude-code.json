@@ -1,7 +1,7 @@
 {
   "schemaVersion": 2,
   "id": "claude-code",
-  "version": "2026.09.07.1",
+  "version": "2026.10.27.1",
   "statusModel": "full",
   "agent": {
     "id": "claude-code",
@@ -15,6 +15,10 @@
     ],
     "firstClass": true,
     "catalogOrder": 10,
+    "programStatus": {
+      "app": "claude-code",
+      "_notice": "Claude Code reports done at the end of a turn and idle when the user cancels or denies, as OSC 7501 specifies."
+    },
     "setup": {
       "url": "https://docs.anthropic.com/en/docs/claude-code/getting-started",
       "installHint": "Follow Anthropic's Claude Code installation guide.",

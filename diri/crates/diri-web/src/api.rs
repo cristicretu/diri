@@ -444,6 +444,7 @@ impl Api {
             .map(str::to_string);
 
         let params = SessionSpawnParams {
+            keep_open: None,
             appearance: None,
             kind: AgentKind::new(kind),
             cwd: cwd.to_string(),
@@ -1037,6 +1038,7 @@ mod tests {
                     3
                 ],
             )],
+            cursor_style: Default::default(),
         };
         use diri_proto::frames::{Frame, FrameCodec};
         preview

@@ -435,7 +435,7 @@ pub fn now_ms() -> u64 {
 }
 
 fn create_private_dir(dir: &Path) -> io::Result<()> {
-    fs::create_dir_all(dir)?;
+    diri_platform::private::create_dir_all(dir)?;
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
@@ -447,15 +447,10 @@ fn create_private_dir(dir: &Path) -> io::Result<()> {
 fn write_private(path: &Path, contents: &str) -> io::Result<()> {
     let tmp = path.with_extension("tmp");
     let result = (|| {
-        let mut file = fs::OpenOptions::new()
+        let mut file = diri_platform::private::options()
             .write(true)
             .create_new(true)
             .open(&tmp)?;
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            file.set_permissions(fs::Permissions::from_mode(0o600))?;
-        }
         file.write_all(contents.as_bytes())?;
         file.sync_data()?;
         fs::rename(&tmp, path)

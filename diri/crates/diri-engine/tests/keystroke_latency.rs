@@ -304,3 +304,189 @@ fn keystroke_to_grid_latency_by_hop() {
     std::thread::sleep(Duration::from_millis(300));
     let _ = std::fs::remove_dir_all(&root);
 }
+
+/// Output nobody typed for: one byte written to the session's TTY from
+/// outside, the way a background program prints, timed to the grid diff that
+/// shows it. No input frame is involved, so nothing on the keystroke fast
+/// path applies; this is the leading edge of ordinary output.
+///
+/// ```sh
+/// cargo test -p diri-engine --release --features latency-trace \
+///     --test keystroke_latency output_to_grid -- --ignored --nocapture
+/// ```
+///
+/// `DIRI_OUTPUT_LATENCY_SAMPLES` sets the sample count (default 200). Writes
+/// are 30–60 ms apart, so each one starts after quiet. Cleanup as above.
+#[test]
+#[ignore = "measurement: run with --features latency-trace -- --ignored --nocapture"]
+fn output_to_grid_latency_by_hop() {
+    let samples: usize = std::env::var("DIRI_OUTPUT_LATENCY_SAMPLES")
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(200);
+    let root = PathBuf::from(format!("/tmp/diri-outlat-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&root);
+    std::fs::create_dir_all(&root).expect("root");
+    let tty_file = root.join("tty");
+    let argv = vec![
+        "/bin/sh".to_string(),
+        "-c".into(),
+        format!(
+            "tty > '{}'; stty -echo; printf 'ready\\n'; exec cat",
+            tty_file.display()
+        ),
+    ];
+    let registry = Arc::new(Mutex::new(Registry::new(engine(), root.join("state.json"))));
+    let server = Arc::new(
+        ControlServer::new(Arc::clone(&registry), root.join("daemon.sock"))
+            .with_logs_dir(root.join("logs"))
+            .with_holder(HolderConfig {
+                holders_dir: root.join("holders"),
+                executable: PathBuf::from(env!("CARGO_BIN_EXE_diri-holder")),
+            }),
+    );
+    let listener = server.bind().expect("bind");
+    {
+        let server = Arc::clone(&server);
+        std::thread::spawn(move || {
+            while let Ok((stream, _)) = listener.accept() {
+                let server = Arc::clone(&server);
+                std::thread::spawn(move || {
+                    let _ = server.serve(stream);
+                });
+            }
+        });
+    }
+    let control = UnixStream::connect(server.socket_path()).expect("connect control");
+    let send = |message: &ControlMessage| {
+        let mut bytes = serde_json::to_vec(message).expect("encode");
+        bytes.push(b'\n');
+        (&control).write_all(&bytes).expect("write");
+    };
+    send(&ControlMessage::Request {
+        id: 1,
+        method: "session.spawn".into(),
+        params: Some(json!({ "kind": { "shell": {} }, "cwd": "/tmp", "argv": argv })),
+    });
+    let mut replies = std::io::BufReader::new(control.try_clone().expect("clone"));
+    let id = loop {
+        let mut line = String::new();
+        replies.read_line(&mut line).expect("spawn reply");
+        if let Ok(ControlMessage::Response { result, .. }) = serde_json::from_str(&line) {
+            match result {
+                Ok(result) => break result["id"].as_str().expect("id").to_string(),
+                Err(error) => panic!("spawn failed: {error:?}"),
+            }
+        }
+    };
+    let mut data = UnixStream::connect(server.socket_path()).expect("connect data");
+    let mut attach = serde_json::to_vec(&json!({ "attach": id })).expect("encode");
+    attach.push(b'\n');
+    data.write_all(&attach).expect("attach");
+    let mut grids = GridReader {
+        stream: data.try_clone().expect("clone"),
+        codec: FrameCodec::new(),
+        queue: Default::default(),
+    };
+    let (seed, _) = grids
+        .next_grid(Instant::now() + Duration::from_secs(10))
+        .expect("seed");
+    let mut cursor = (seed.cursor_col, seed.cursor_row);
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let tty = loop {
+        if let Ok(path) = std::fs::read_to_string(&tty_file)
+            && path.trim().starts_with("/dev/")
+        {
+            break path.trim().to_string();
+        }
+        assert!(Instant::now() < deadline, "child never reported its tty");
+        std::thread::sleep(Duration::from_millis(20));
+    };
+    std::thread::sleep(Duration::from_millis(800));
+    while let Some((update, _)) = grids.next_grid(Instant::now() + Duration::from_millis(100)) {
+        cursor = (update.cursor_col, update.cursor_row);
+    }
+    let mut terminal = std::fs::OpenOptions::new()
+        .write(true)
+        .open(&tty)
+        .expect("open tty");
+    let mut write_byte = |bytes: &[u8]| {
+        let sent = Instant::now();
+        terminal.write_all(bytes).expect("tty write");
+        sent
+    };
+    let await_change = |grids: &mut GridReader, from: (u16, u16)| {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while let Some((update, at)) = grids.next_grid(deadline) {
+            let now = (update.cursor_col, update.cursor_row);
+            if now != from {
+                return Some((now, at));
+            }
+        }
+        None
+    };
+    for _ in 0..10 {
+        write_byte(b"w");
+        cursor = await_change(&mut grids, cursor).expect("warm-up").0;
+        std::thread::sleep(Duration::from_millis(40));
+    }
+    latency_trace::drain();
+
+    let mut end_to_end = Vec::new();
+    let mut hops: Vec<(&str, Vec<f64>)> = vec![
+        ("tty write -> output received", Vec::new()),
+        ("received -> grid published", Vec::new()),
+        ("published -> frame enqueued", Vec::new()),
+        ("enqueued -> client decoded", Vec::new()),
+    ];
+    for index in 0..samples {
+        if index % 60 == 59 {
+            write_byte(b"\r\n");
+            std::thread::sleep(Duration::from_millis(60));
+            while let Some((update, _)) =
+                grids.next_grid(Instant::now() + Duration::from_millis(50))
+            {
+                cursor = (update.cursor_col, update.cursor_row);
+            }
+            latency_trace::drain();
+        }
+        let pause = 30 + (index * 7919 % 31) as u64;
+        std::thread::sleep(Duration::from_millis(pause));
+        let sent = write_byte(b"x");
+        let Some((now, received)) = await_change(&mut grids, cursor) else {
+            panic!("no grid for sample {index}");
+        };
+        cursor = now;
+        end_to_end.push(ms(sent, received));
+        std::thread::sleep(Duration::from_millis(20));
+        let events = latency_trace::drain();
+        let output = first_after(&events, Hop::OutputReceived, sent);
+        let published = output.and_then(|at| first_after(&events, Hop::GridPublished, at));
+        let enqueued = published.and_then(|at| first_after(&events, Hop::FrameEnqueued, at));
+        let pairs = [
+            (Some(sent), output),
+            (output, published),
+            (published, enqueued),
+            (enqueued, Some(received)),
+        ];
+        for (slot, pair) in pairs.iter().enumerate() {
+            if let (Some(from), Some(to)) = pair {
+                hops[slot].1.push(ms(*from, *to));
+            }
+        }
+    }
+
+    println!("\nlocal output latency (tty write -> grid at client), holder-backed");
+    for (label, samples) in hops {
+        report(label, samples);
+    }
+    report("END TO END tty write -> grid", end_to_end);
+
+    send(&ControlMessage::Request {
+        id: 2,
+        method: "session.kill".into(),
+        params: Some(json!({ "sessionID": id })),
+    });
+    std::thread::sleep(Duration::from_millis(300));
+    let _ = std::fs::remove_dir_all(&root);
+}

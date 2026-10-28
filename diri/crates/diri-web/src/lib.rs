@@ -756,6 +756,7 @@ mod tests {
                     ChangedRow::new(*y, cells)
                 })
                 .collect(),
+            cursor_style: Default::default(),
         }
     }
 

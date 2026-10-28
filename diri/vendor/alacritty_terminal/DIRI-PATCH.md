@@ -199,7 +199,11 @@ editable rows (the screen, the newest history and any line ending there) to
   without reflow reflow everything eagerly, as before.
 - Reading deferred history builds every row at the current width once, and the
   next read-cache release stores them as blocks: a history that is read is
-  reflowed once, not per read. Editing a deferred row does the same. Dropping
+  reflowed once, not per read. Editing a deferred row does the same. A caller
+  about to read every history row in order (`Grid::prepare_history_read`: a
+  screen checkpoint, a link scan) has the deferred history reflowed straight
+  into blocks one block at a time instead, so the read never holds every row
+  decoded at once (58 MB → 1 MB at 10,000 rows of 97 columns). Dropping
   the oldest rows (history limit, byte budget) skips content cells without
   decoding. Recycling a greedy line's oldest row at full history needs no
   payload either: it resets to template cells, as a row with recipe bits does.
@@ -274,6 +278,18 @@ checkpoint or protocol change; the parser source is part of the Remote Helper
 Build ID. Tests: `grapheme::tests`, and in `diri-terminal-state`
 `grapheme_clusters_take_the_columns_claude_code_gives_them` and its neighbours.
 
+## History limit without side effects
+
+`Term::set_scrolling_history` changes only the primary screen's history row
+limit, which `set_options` also does, but without its full damage and title
+event, and `Term::primary_history_size` reads the primary history while the
+alternate screen is shown. `diri-terminal-state` uses both around every resize
+so that re-wrapping retained history into more rows never evicts it: the
+reflow runs under a larger allowance and the limit then holds the rows it
+produced. Both are O(1) unless the limit drops below the rows held. No wire,
+checkpoint or protocol change; the parser source is part of the Remote Helper
+Build ID. Test: `a_resize_at_capacity_keeps_every_retained_line`.
+
 ## Byte-bounded history depth
 
 With compact history the configured `scrolling_history` is only a ceiling.
@@ -287,6 +303,15 @@ stored rows when only the oldest block is partial, and the deferred line index
 reserves exact capacity and tracks its extras' heap incrementally (the history
 bound measures storage after every eviction).
 
+## Program colors: a generation, and RIS resets them
+
+`Term` keeps `colors_generation`, advanced whenever `set_color` or
+`reset_color` changes a color cells are painted with (0–255 and the dynamic
+foreground and background; not the cursor). A program that recolors with
+OSC 4/10/11 changes no cell, so without it the host's change detection saw no
+change and never republished the screen. `reset_state` (RIS, `ESC c`) also
+clears every color a program set, as xterm and libghostty do; upstream kept
+them across `reset`. No wire, checkpoint or protocol change.
 ## Cheaper history encoding
 
 History encoding was half of the session thread while output streamed. Four

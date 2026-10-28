@@ -5,7 +5,6 @@
 //! a daemon racing a manager's idle exit) safe: whoever holds it either finds
 //! a live manager or starts exactly one.
 
-use std::fs::OpenOptions;
 use std::os::fd::AsRawFd;
 use std::path::{Path, PathBuf};
 
@@ -44,7 +43,7 @@ impl HolderLauncher {
         paths: &HolderPaths,
         spec: &HolderLaunchSpec,
     ) -> HolderResult<i32> {
-        std::fs::create_dir_all(&paths.directory)
+        diri_platform::private::create_dir_all(&paths.directory)
             .map_err(|error| HolderError::io("create holders directory", error))?;
 
         // A concurrent revive or pre-manager holder may already own this
@@ -121,18 +120,14 @@ pub(crate) struct LaunchLock {
 
 impl LaunchLock {
     pub(crate) fn acquire(path: &Path) -> HolderResult<Self> {
-        let file = OpenOptions::new()
+        let file = diri_platform::private::options()
             .create(true)
             .read(true)
             .write(true)
             .truncate(false)
             .open(path)
             .map_err(|error| HolderError::Launch(format!("open {}: {error}", path.display())))?;
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600));
-        }
+        let _ = diri_platform::private::restrict(&file);
         // SAFETY: flock on an owned fd; blocks until the lock is granted.
         if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) } != 0 {
             return Err(HolderError::Launch(format!(
@@ -200,20 +195,12 @@ pub(crate) fn launchd_unavailable(directory: &Path, executable: &Path) -> bool {
 /// [`LAUNCHD_UNAVAILABLE_MARKER`]).
 #[cfg(target_os = "macos")]
 pub(crate) fn mark_launchd_unavailable(directory: &Path, executable: &Path) {
-    use std::io::Write;
-    use std::os::unix::fs::OpenOptionsExt;
     LAUNCHD_MANAGER_FAILED.store(true, std::sync::atomic::Ordering::Relaxed);
     let Some(key) = launchd_marker_key(executable) else {
         return;
     };
     let path = directory.join(LAUNCHD_UNAVAILABLE_MARKER);
-    let written = OpenOptions::new()
-        .create(true)
-        .write(true)
-        .truncate(true)
-        .mode(0o600)
-        .open(&path)
-        .and_then(|mut file| file.write_all(key.as_bytes()));
+    let written = diri_platform::private::write(&path, key.as_bytes());
     if let Err(error) = written {
         eprintln!("diri: record {}: {error}", path.display());
     }

@@ -500,6 +500,7 @@ async fn read_cells(
         session_id: session.clone(),
         first_row,
         max_rows,
+        styles: false,
     };
     let value = client
         .request(
@@ -816,6 +817,7 @@ mod tests {
                 .iter()
                 .map(|(y, text)| ChangedRow::new(*y, row(text, 10)))
                 .collect(),
+            cursor_style: Default::default(),
         }
     }
 

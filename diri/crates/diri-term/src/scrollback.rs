@@ -178,6 +178,88 @@ pub struct ScrollbackViewport {
     held_live_start: Option<i64>,
     in_flight: Option<Range<i64>>,
     queued: Option<Range<i64>>,
+    /// Set while a column change re-wraps the history under a reader; see
+    /// [`Relocation`].
+    relocation: Option<Relocation>,
+}
+
+/// Characters of a hard line kept to recognize it after a re-wrap.
+const RELOCATION_KEY_CHARS: usize = 256;
+/// Most rows fetched around the estimated position to look for that line.
+const RELOCATION_WINDOW_ROWS: i64 = 1024;
+
+/// A reader's place carried across a column change.
+///
+/// Rows are numbered by position, and a reflow renumbers every one of them:
+/// narrowing doubles the rows of wrapped prose, so the row the window was
+/// anchored to now holds older text, and the rows already fetched are at the
+/// old width. Reflow never moves text across a hard line break, so the place
+/// is kept as the hard line at the top of the window (its leading text) and
+/// how far into it the top row starts. Once history is re-wrapped the
+/// viewport learns the new geometry, fetches the rows around where history
+/// scaled the place to, and anchors to the matching line nearest to that
+/// estimate. Until then it keeps painting the rows it has.
+#[derive(Clone, Debug)]
+struct Relocation {
+    /// Leading text of the top row's hard line, and whether that is all of
+    /// it. `None` when the line's start was not fetched.
+    line: Option<(String, bool)>,
+    /// Characters from the line start to the top row's first character.
+    chars_before_top: usize,
+    /// Blank rows between the top and `line`, when the top row is blank.
+    blank_rows_above: i64,
+    /// How far above the live edge the top row sat, and the history then.
+    rows_above_live: i64,
+    history_rows: i64,
+    /// The offset when this began, so scrolling meanwhile carries over.
+    captured_offset: i64,
+    /// Width the history was re-wrapped to.
+    cols: u16,
+    /// The window to search and the estimated top row, once geometry is
+    /// known.
+    window: Option<(Range<i64>, i64)>,
+    request_in_flight: bool,
+}
+
+fn soft_wraps(row: &[GridCell]) -> bool {
+    row.last()
+        .is_some_and(|cell| cell.style.contains(diri_proto::grid::TermStyle::SOFT_WRAP))
+}
+
+/// Characters a row holds, wide-character spacers excluded.
+fn row_chars(row: &[GridCell]) -> impl Iterator<Item = char> + '_ {
+    row.iter()
+        .filter(|cell| {
+            !cell
+                .style
+                .contains(diri_proto::grid::TermStyle::WIDE_SPACER)
+        })
+        .map(|cell| {
+            char::from_u32(cell.scalar)
+                .filter(|c| *c != '\0')
+                .unwrap_or(' ')
+        })
+}
+
+/// Leading text of the hard line starting at `rows[0]`, and whether it ended
+/// within the key (trailing blanks of its last row dropped).
+fn line_key<'a>(rows: impl IntoIterator<Item = &'a [GridCell]>) -> (String, bool) {
+    let mut text = String::new();
+    let mut count = 0;
+    for row in rows {
+        for c in row_chars(row) {
+            if count == RELOCATION_KEY_CHARS {
+                return (text, false);
+            }
+            text.push(c);
+            count += 1;
+        }
+        if !soft_wraps(row) {
+            text.truncate(text.trim_end().len());
+            return (text, true);
+        }
+    }
+    (text, false)
 }
 
 impl ScrollbackViewport {
@@ -469,6 +551,16 @@ impl ScrollbackViewport {
             .map_or(&[], |metadata| metadata.graphemes.as_slice())
     }
 
+    /// The row's decoration spans (undercurl, colored underline, overline).
+    pub fn row_styles<'a>(
+        &'a self,
+        buffer: &'a GridBuffer,
+        row: i64,
+    ) -> &'a [diri_proto::grid::StyleSpan] {
+        self.row_metadata_ref(buffer, row)
+            .map_or(&[], |metadata| metadata.styles.as_slice())
+    }
+
     fn row_metadata_ref<'a>(&'a self, buffer: &'a GridBuffer, row: i64) -> Option<&'a RowMetadata> {
         if let Some(source) = &self.find_source {
             return source.metadata(row);
@@ -586,9 +678,111 @@ impl ScrollbackViewport {
         self.geometry_known = false;
     }
 
+    /// The terminal is about to show `cols` columns instead of the ones
+    /// `buffer` holds: the daemon has re-wrapped history, so every fetched
+    /// row is at the old width and the anchor names a renumbered row. A
+    /// reader's place is captured once and found again by the next fetches
+    /// (see [`Relocation`]); a view resting on the live edge just drops the
+    /// old-width screen it held.
+    pub fn note_width_change(&mut self, buffer: &GridBuffer, cols: u16) {
+        if self.find_source.is_some() || !self.is_reading() {
+            return;
+        }
+        if let Some(relocation) = &mut self.relocation {
+            // A drag: the place captured before the first change still
+            // describes the rows on screen.
+            relocation.cols = cols;
+            relocation.window = None;
+            return;
+        }
+        if self.view_offset <= 0 || !self.geometry_known {
+            self.held_live = None;
+            self.held_live_start = None;
+            self.cache.clear();
+            self.annotations.clear();
+            self.queued = None;
+            return;
+        }
+        let top = self.live_start_row.saturating_sub(self.view_offset);
+        let mut start = top;
+        while start > 0 && {
+            let above = self.row_source(buffer, start - 1);
+            !above.is_empty() && soft_wraps(above)
+        } {
+            start -= 1;
+        }
+        let line_cached = start == 0 || !self.row_source(buffer, start - 1).is_empty();
+        let key_at = |row: i64| {
+            line_key(
+                (row..)
+                    .map(|row| self.row_source(buffer, row))
+                    .take_while(|row| !row.is_empty()),
+            )
+        };
+        let mut chars_before_top = (start..top)
+            .map(|row| row_chars(self.row_source(buffer, row)).count())
+            .sum();
+        let mut blank_rows_above = 0;
+        let mut line =
+            (line_cached && !self.row_source(buffer, start).is_empty()).then(|| key_at(start));
+        if line
+            .as_ref()
+            .is_some_and(|(text, whole)| *whole && text.is_empty())
+        {
+            // A blank line matches every other one. Blank lines are one row
+            // at any width, so the first line with text below them keeps the
+            // same distance from the top.
+            let window = i64::from(buffer.rows);
+            line = (top + 1..top + window)
+                .take_while(|row| !self.row_source(buffer, *row).is_empty())
+                .find(|row| !key_at(*row).0.is_empty())
+                .map(|row| {
+                    blank_rows_above = row - top;
+                    key_at(row)
+                });
+            chars_before_top = 0;
+        }
+        self.relocation = Some(Relocation {
+            line,
+            chars_before_top,
+            blank_rows_above,
+            rows_above_live: self.view_offset,
+            history_rows: self.live_start_row,
+            captured_offset: self.view_offset,
+            cols,
+            window: None,
+            request_in_flight: false,
+        });
+        self.queued = None;
+    }
+
+    /// True while a reading view waits to find its place after a column
+    /// change; the host keeps fetching until it clears.
+    #[must_use]
+    pub fn relocating(&self) -> bool {
+        self.relocation.is_some()
+    }
+
     /// Returns the next coalesced request and marks it in flight. Until it is
     /// completed, further viewport movement is merged into one queued range.
     pub fn begin_fetch(&mut self, visible_rows: usize) -> Option<ScrollbackRequest> {
+        if let Some(relocation) = &mut self.relocation {
+            if self.in_flight.is_some() || relocation.request_in_flight {
+                return None;
+            }
+            // One row learns the re-wrapped geometry, then the window around
+            // the estimate is searched.
+            let range = relocation
+                .window
+                .as_ref()
+                .map_or(0..1, |(window, _)| window.clone());
+            relocation.request_in_flight = true;
+            self.in_flight = Some(range.clone());
+            return Some(ScrollbackRequest {
+                first_row: range.start,
+                max_rows: range.end - range.start,
+            });
+        }
         self.queue_missing_window(visible_rows);
         if self.in_flight.is_some() {
             return None;
@@ -615,6 +809,16 @@ impl ScrollbackViewport {
         if self.find_source.is_some() {
             return Ok(());
         }
+        let relocation_reply = match &mut self.relocation {
+            // Asked before the column change: rows at a width and numbering
+            // that no longer exist.
+            Some(relocation) if !relocation.request_in_flight => return Ok(()),
+            Some(relocation) => {
+                relocation.request_in_flight = false;
+                true
+            }
+            None => false,
+        };
         let row_count = usize::try_from(result.row_count)
             .map_err(|_| ScrollbackApplyError::NegativeRowCount(result.row_count))?;
         let decoded = GridRowCodec::decode_rows(&result.payload, row_count)?;
@@ -623,6 +827,10 @@ impl ScrollbackViewport {
                 declared: row_count,
                 decoded: decoded.len(),
             });
+        }
+        if relocation_reply {
+            self.continue_relocation(decoded, result, visible_rows);
+            return Ok(());
         }
         if (!result.metadata.is_empty() && result.metadata.len() != row_count)
             || result
@@ -653,9 +861,156 @@ impl ScrollbackViewport {
     }
 
     pub fn fail_fetch(&mut self) {
+        if let Some(relocation) = &mut self.relocation {
+            relocation.request_in_flight = false;
+            self.in_flight = None;
+            return;
+        }
         if let Some(range) = self.in_flight.take() {
             merge_range(&mut self.queued, range);
         }
+    }
+
+    /// Takes one relocation reply: the geometry probe, or the window to find
+    /// the reader's line in.
+    fn continue_relocation(
+        &mut self,
+        rows: Vec<Vec<GridCell>>,
+        result: ReadScrollbackCellsResult,
+        visible_rows: usize,
+    ) {
+        let Some(relocation) = self.relocation.as_mut() else {
+            return;
+        };
+        let history = result.live_start_row.max(0);
+        if result.cols != i64::from(relocation.cols) {
+            // Another column change is still on its way.
+            relocation.window = None;
+            return;
+        }
+        let Some((window, estimate)) = relocation.window.clone() else {
+            let above = if relocation.history_rows > 0 {
+                i64::try_from(
+                    i128::from(relocation.rows_above_live) * i128::from(history)
+                        / i128::from(relocation.history_rows),
+                )
+                .unwrap_or(history)
+            } else {
+                relocation.rows_above_live
+            };
+            let estimate = history.saturating_sub(above).max(0);
+            let visible = i64::try_from(visible_rows).unwrap_or(i64::MAX);
+            let least = visible.saturating_mul(4);
+            let reach = (above / 8).clamp(least, RELOCATION_WINDOW_ROWS.max(least));
+            let start = estimate.saturating_sub(reach).max(0);
+            // Through the live rows too: a line the reflow brought onto the
+            // screen is found there, and the view returns to live.
+            let end = estimate
+                .saturating_add(reach)
+                .saturating_add(visible)
+                .min(result.total_rows.max(history));
+            if start < end {
+                relocation.window = Some((start..end, estimate));
+                return;
+            }
+            let scrolled = self.view_offset - relocation.captured_offset;
+            self.finish_relocation(Vec::new(), Vec::new(), &result);
+            self.set_view_offset_after_relocation(
+                history.saturating_sub(estimate).saturating_add(scrolled),
+                visible_rows,
+            );
+            return;
+        };
+        if result.first_row != window.start {
+            relocation.window = None;
+            return;
+        }
+        let first = result.first_row;
+        let chars_before_top = relocation.chars_before_top;
+        let blank_rows_above = relocation.blank_rows_above;
+        let top = relocation
+            .line
+            .as_ref()
+            .and_then(|key| {
+                (0..rows.len())
+                    .filter(|&i| {
+                        if i == 0 {
+                            first == 0
+                        } else {
+                            !soft_wraps(&rows[i - 1])
+                        }
+                    })
+                    .filter(|&i| line_key(rows[i..].iter().map(Vec::as_slice)) == *key)
+                    .map(|start| {
+                        // The row holding the character the old top row began
+                        // with.
+                        let mut before = chars_before_top;
+                        let mut row = start;
+                        while row + 1 < rows.len() && soft_wraps(&rows[row]) {
+                            let chars = row_chars(&rows[row]).count();
+                            if before < chars {
+                                break;
+                            }
+                            before -= chars;
+                            row += 1;
+                        }
+                        first
+                            .saturating_add(i64::try_from(row).unwrap_or(i64::MAX))
+                            .saturating_sub(blank_rows_above)
+                    })
+                    .min_by_key(|row| (row - estimate).abs())
+            })
+            .unwrap_or(estimate);
+        let scrolled = self.view_offset - relocation.captured_offset;
+        let metadata = result.metadata.clone();
+        self.finish_relocation(rows, metadata, &result);
+        self.set_view_offset_after_relocation(
+            history.saturating_sub(top).saturating_add(scrolled),
+            visible_rows,
+        );
+    }
+
+    /// Replaces the old-width rows with the re-wrapped ones just fetched and
+    /// adopts the geometry they came with.
+    fn finish_relocation(
+        &mut self,
+        rows: Vec<Vec<GridCell>>,
+        metadata: Vec<RowMetadata>,
+        result: &ReadScrollbackCellsResult,
+    ) {
+        self.relocation = None;
+        self.held_live = None;
+        self.held_live_start = None;
+        self.cache.clear();
+        self.annotations.clear();
+        for (index, row) in rows.into_iter().enumerate() {
+            self.cache
+                .insert(result.first_row.saturating_add(index as i64), row);
+        }
+        for (index, meta) in metadata.into_iter().enumerate() {
+            self.annotations
+                .insert(result.first_row.saturating_add(index as i64), meta);
+        }
+        self.cache_seq = Some(result.content_seq);
+        self.live_start_row = result.live_start_row.max(0);
+        self.total_rows = result.total_rows.max(0);
+        self.geometry_known = true;
+        self.history_rows = Some(self.live_start_row);
+        self.queued = None;
+    }
+
+    fn set_view_offset_after_relocation(&mut self, offset: i64, visible_rows: usize) {
+        let clamped = offset.clamp(0, self.live_start_row.max(0));
+        self.view_offset = clamped;
+        if clamped == 0 {
+            self.sub_row = 0.0;
+            if !self.keyboard_pinned && !self.frame_held {
+                self.release_reading_view();
+            }
+        }
+        self.sync_anchor();
+        self.cap_cache_near_viewport();
+        self.queue_missing_window(visible_rows);
     }
 
     pub fn apply_rows(
@@ -900,6 +1255,53 @@ impl ScrollRouter {
     }
 }
 
+/// Sideways wheel travel bound for a mouse-reporting program, which xterm
+/// reports as buttons 6 and 7 (codes 66 and 67). Diri has no horizontal
+/// scrollback, so this only ever feeds a program.
+///
+/// Trackpads drift sideways during a vertical swipe, so an event counts only
+/// when its horizontal part dominates; a vertical one forgets partial travel.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct HorizontalWheel {
+    accumulated_points: f32,
+}
+
+impl HorizontalWheel {
+    /// Signed whole steps for one event: positive scrolls left (content
+    /// moves right, as AppKit's positive `deltaX`), negative right.
+    pub fn steps(&mut self, x: WheelDelta, y: f32, cell_width: f32) -> Option<i32> {
+        let delta = match x {
+            WheelDelta::PrecisePoints(delta) | WheelDelta::Lines(delta) => delta,
+        };
+        if delta == 0.0 || delta.abs() <= y.abs() {
+            self.accumulated_points = 0.0;
+            return None;
+        }
+        match x {
+            WheelDelta::Lines(lines) => {
+                self.accumulated_points = 0.0;
+                let magnitude = (lines.abs().trunc() as i32).clamp(1, 10);
+                Some(if lines > 0.0 { magnitude } else { -magnitude })
+            }
+            WheelDelta::PrecisePoints(points) => {
+                if self.accumulated_points != 0.0
+                    && points.is_sign_positive() != self.accumulated_points.is_sign_positive()
+                {
+                    self.accumulated_points = 0.0;
+                }
+                self.accumulated_points += points;
+                let per_step = cell_width.max(4.0);
+                let steps = (self.accumulated_points / per_step).trunc() as i32;
+                if steps == 0 {
+                    return None;
+                }
+                self.accumulated_points -= steps as f32 * per_step;
+                Some(steps)
+            }
+        }
+    }
+}
+
 fn classic_steps(delta: f32, visible_rows: u16) -> Option<i32> {
     if delta == 0.0 {
         return None;
@@ -948,6 +1350,32 @@ mod tests {
     use diri_proto::grid::{GridRowCodec, TermColor, TermStyle};
 
     use super::*;
+
+    #[test]
+    fn horizontal_wheel_needs_a_dominant_sideways_axis() {
+        let mut wheel = HorizontalWheel::default();
+        assert_eq!(wheel.steps(WheelDelta::Lines(1.0), 0.0, 8.0), Some(1));
+        assert_eq!(wheel.steps(WheelDelta::Lines(-1.0), 0.0, 8.0), Some(-1));
+        assert_eq!(
+            wheel.steps(WheelDelta::Lines(1.0), 2.0, 8.0),
+            None,
+            "a vertical notch"
+        );
+        // A trackpad's sideways drift during a vertical swipe sends nothing.
+        for _ in 0..20 {
+            assert_eq!(wheel.steps(WheelDelta::PrecisePoints(3.0), 12.0, 8.0), None);
+        }
+        assert_eq!(wheel.steps(WheelDelta::PrecisePoints(5.0), 0.0, 8.0), None);
+        assert_eq!(
+            wheel.steps(WheelDelta::PrecisePoints(5.0), 0.0, 8.0),
+            Some(1)
+        );
+        assert_eq!(
+            wheel.steps(WheelDelta::PrecisePoints(-17.0), 1.0, 8.0),
+            Some(-2)
+        );
+        assert_eq!(wheel.steps(WheelDelta::PrecisePoints(0.0), 0.0, 8.0), None);
+    }
 
     fn cell(ch: char) -> GridCell {
         GridCell::new(
@@ -1521,6 +1949,301 @@ mod tests {
                 col: 3,
                 row: 4,
             })
+        );
+    }
+
+    /// Text of one painted row.
+    fn painted_text(cells: &[GridCell]) -> String {
+        row_chars(cells).collect::<String>().trim_end().to_string()
+    }
+
+    /// The pane's fetch loop against a real terminal.
+    fn settle_against(
+        viewport: &mut ScrollbackViewport,
+        screen: &mut diri_terminal_state::HeadlessScreen,
+        rows: usize,
+    ) {
+        for _ in 0..16 {
+            let Some(request) = viewport.begin_fetch(rows) else {
+                return;
+            };
+            let result = screen.scrollback_cells(request.first_row, request.max_rows);
+            viewport.complete_fetch(result, rows).unwrap();
+        }
+        panic!("fetches never settled");
+    }
+
+    /// What a pane does when its width changes: the daemon re-wraps, then the
+    /// new grid arrives (prepare sees the old buffer), then rows are fetched.
+    fn resize_under_reader(
+        viewport: &mut ScrollbackViewport,
+        buffer: &mut GridBuffer,
+        screen: &mut diri_terminal_state::HeadlessScreen,
+        cols: usize,
+        rows: usize,
+    ) {
+        screen.resize(cols, rows);
+        let update = screen.grid_update(true);
+        viewport.hold_reading_view(buffer);
+        viewport.note_width_change(buffer, update.cols);
+        buffer.apply(update);
+    }
+
+    fn painted(viewport: &ScrollbackViewport, buffer: &GridBuffer, rows: usize) -> Vec<String> {
+        viewport
+            .compose(buffer, rows)
+            .iter()
+            .map(|row| painted_text(row))
+            .collect()
+    }
+
+    fn numbered_history(
+        cols: usize,
+        rows: usize,
+    ) -> (diri_terminal_state::HeadlessScreen, GridBuffer) {
+        let mut screen = diri_terminal_state::HeadlessScreen::new(cols, rows);
+        for i in 0..300 {
+            // 105 characters: two rows at 80 columns, three at 40.
+            screen.feed(format!("L{i:03} {}\r\n", "abcdefghij".repeat(10)).as_bytes());
+        }
+        let mut buffer = GridBuffer::new(cols as u16, rows as u16);
+        buffer.apply(screen.grid_update(true));
+        (screen, buffer)
+    }
+
+    /// A reader `rows_back` rows above the live edge, its rows fetched.
+    fn scrolled_back(
+        screen: &mut diri_terminal_state::HeadlessScreen,
+        buffer: &GridBuffer,
+        rows: usize,
+        rows_back: i64,
+    ) -> ScrollbackViewport {
+        let mut viewport = ScrollbackViewport::default();
+        // The first scroll goes at most a screen: geometry is not known yet.
+        viewport.scroll_by(1, rows);
+        viewport.hold_reading_view(buffer);
+        settle_against(&mut viewport, screen, rows);
+        viewport.scroll_by(rows_back - 1, rows);
+        settle_against(&mut viewport, screen, rows);
+        assert_eq!(viewport.view_offset(), rows_back);
+        viewport
+    }
+
+    fn line_text(id: usize) -> String {
+        format!("L{id:03} {}", "abcdefghij".repeat(10))
+    }
+
+    /// Narrowing a pane while reading history used to keep painting the
+    /// rows fetched at the old width, cut at the new right edge, and the
+    /// anchor pointed at renumbered rows, so the next scroll showed other
+    /// text. The reader keeps the same line at the top, re-wrapped.
+    #[test]
+    fn a_reader_keeps_its_line_through_a_column_change() {
+        let rows = 10;
+        for (from, to) in [(80, 40), (40, 120), (80, 33)] {
+            let (mut screen, mut buffer) = numbered_history(from, rows);
+            let mut viewport = scrolled_back(&mut screen, &buffer, rows, 150);
+            let before = painted(&viewport, &buffer, rows);
+            let top_line = before
+                .iter()
+                .find_map(|row| row.get(..4).filter(|id| id.starts_with('L')))
+                .expect("a line start on screen")
+                .to_string();
+            // Put that line's first row at the top.
+            let at = before
+                .iter()
+                .position(|row| row.starts_with(&top_line))
+                .unwrap();
+            viewport.scroll_by(-(at as i64), rows);
+            settle_against(&mut viewport, &mut screen, rows);
+            assert!(painted(&viewport, &buffer, rows)[0].starts_with(&top_line));
+
+            resize_under_reader(&mut viewport, &mut buffer, &mut screen, to, rows);
+            assert!(viewport.relocating());
+            settle_against(&mut viewport, &mut screen, rows);
+            assert!(!viewport.relocating());
+            let after = painted(&viewport, &buffer, rows);
+            let id: usize = top_line[1..].parse().unwrap();
+            // Rows re-wrap per line, so compare line by line.
+            let mut want = Vec::new();
+            for line in (id..id + rows).map(line_text) {
+                let chars: Vec<char> = line.chars().collect();
+                want.extend(
+                    chars
+                        .chunks(to)
+                        .map(|chunk| chunk.iter().collect::<String>()),
+                );
+            }
+            assert_eq!(after, want[..rows], "{from} -> {to}");
+
+            // Scrolling on continues through the re-wrapped rows, nothing
+            // repeated or skipped.
+            viewport.scroll_by(5, rows);
+            settle_against(&mut viewport, &mut screen, rows);
+            let mut want = Vec::new();
+            for line in (id - 10..id + rows).map(line_text) {
+                let chars: Vec<char> = line.chars().collect();
+                want.extend(
+                    chars
+                        .chunks(to)
+                        .map(|chunk| chunk.iter().collect::<String>()),
+                );
+            }
+            let start = want
+                .iter()
+                .position(|row| row.starts_with(&top_line))
+                .unwrap()
+                - 5;
+            assert_eq!(
+                painted(&viewport, &buffer, rows),
+                want[start..start + rows],
+                "{from} -> {to} after scrolling"
+            );
+        }
+    }
+
+    /// A window that starts partway into a wrapped line keeps the same
+    /// character at its top.
+    #[test]
+    fn a_reader_partway_into_a_line_keeps_its_character_at_the_top() {
+        let rows = 10;
+        let (mut screen, mut buffer) = numbered_history(80, rows);
+        let mut viewport = scrolled_back(&mut screen, &buffer, rows, 151);
+        if painted(&viewport, &buffer, rows)[0].starts_with('L') {
+            viewport.scroll_by(1, rows);
+            settle_against(&mut viewport, &mut screen, rows);
+        }
+        let before = painted(&viewport, &buffer, rows);
+        let top = &before[0];
+        assert!(!top.starts_with('L'), "the top row continues a line: {top}");
+        let id: usize = before[1][1..4].parse::<usize>().unwrap() - 1;
+
+        resize_under_reader(&mut viewport, &mut buffer, &mut screen, 40, rows);
+        settle_against(&mut viewport, &mut screen, rows);
+        // Character 80 of that line now starts its third 40-column row, and
+        // the rest of the window follows it at 40 columns.
+        let mut want: Vec<String> = Vec::new();
+        for line in (id..id + rows).map(line_text) {
+            let chars: Vec<char> = line.chars().collect();
+            want.extend(
+                chars
+                    .chunks(40)
+                    .map(|chunk| chunk.iter().collect::<String>()),
+            );
+        }
+        assert_eq!(painted(&viewport, &buffer, rows), want[2..2 + rows]);
+    }
+
+    /// A drag sends many column changes before any fetch answers; the place
+    /// captured before the first one is the one found.
+    #[test]
+    fn a_drag_of_column_changes_finds_the_place_from_before_it() {
+        let rows = 10;
+        let (mut screen, mut buffer) = numbered_history(80, rows);
+        let mut viewport = scrolled_back(&mut screen, &buffer, rows, 150);
+        let first = painted(&viewport, &buffer, rows)
+            .into_iter()
+            .find(|row| row.starts_with('L'))
+            .unwrap();
+        let at = painted(&viewport, &buffer, rows)
+            .iter()
+            .position(|row| *row == first)
+            .unwrap();
+        viewport.scroll_by(-(at as i64), rows);
+        settle_against(&mut viewport, &mut screen, rows);
+
+        for cols in [76, 70, 64, 58, 52, 46] {
+            resize_under_reader(&mut viewport, &mut buffer, &mut screen, cols, rows);
+            // Half of them answer a stale probe before the next change.
+            if cols % 4 == 0
+                && let Some(request) = viewport.begin_fetch(rows)
+            {
+                let mut stale = screen.scrollback_cells(request.first_row, request.max_rows);
+                stale.cols = 80;
+                viewport.complete_fetch(stale, rows).unwrap();
+            }
+        }
+        settle_against(&mut viewport, &mut screen, rows);
+        let id: usize = first[1..4].parse().unwrap();
+        let mut want: Vec<String> = Vec::new();
+        for line in (id..id + rows).map(line_text) {
+            let chars: Vec<char> = line.chars().collect();
+            want.extend(
+                chars
+                    .chunks(46)
+                    .map(|chunk| chunk.iter().collect::<String>()),
+            );
+        }
+        assert_eq!(painted(&viewport, &buffer, rows), want[..rows]);
+    }
+
+    /// A blank line at the top matches every blank line; the first line with
+    /// text below it places the window instead.
+    #[test]
+    fn a_blank_top_row_is_placed_by_the_text_below_it() {
+        let rows = 10;
+        let mut screen = diri_terminal_state::HeadlessScreen::new(80, rows);
+        for i in 0..200 {
+            screen.feed(format!("L{i:03} {}\r\n\r\n", "abcdefghij".repeat(10)).as_bytes());
+        }
+        let mut buffer = GridBuffer::new(80, rows as u16);
+        buffer.apply(screen.grid_update(true));
+        let mut viewport = scrolled_back(&mut screen, &buffer, rows, 150);
+        if !painted(&viewport, &buffer, rows)[0].is_empty() {
+            let blank = painted(&viewport, &buffer, rows)
+                .iter()
+                .position(String::is_empty)
+                .unwrap();
+            viewport.scroll_by(-(blank as i64), rows);
+            settle_against(&mut viewport, &mut screen, rows);
+        }
+        let before = painted(&viewport, &buffer, rows);
+        assert!(before[0].is_empty());
+        let id: usize = before[1][1..4].parse().unwrap();
+
+        resize_under_reader(&mut viewport, &mut buffer, &mut screen, 40, rows);
+        settle_against(&mut viewport, &mut screen, rows);
+        let mut want = vec![String::new()];
+        for line in (id..id + rows).map(line_text) {
+            let chars: Vec<char> = line.chars().collect();
+            want.extend(
+                chars
+                    .chunks(40)
+                    .map(|chunk| chunk.iter().collect::<String>()),
+            );
+            want.push(String::new());
+        }
+        assert_eq!(painted(&viewport, &buffer, rows), want[..rows]);
+    }
+
+    /// Without a line to recognize the view still drops the old-width rows,
+    /// landing where history scaled its place to.
+    #[test]
+    fn identical_lines_relocate_by_proportion() {
+        let rows = 10;
+        let mut screen = diri_terminal_state::HeadlessScreen::new(80, rows);
+        for _ in 0..300 {
+            screen.feed(format!("{}\r\n", "z".repeat(100)).as_bytes());
+        }
+        let mut buffer = GridBuffer::new(80, rows as u16);
+        buffer.apply(screen.grid_update(true));
+        let mut viewport = scrolled_back(&mut screen, &buffer, rows, 200);
+        let old_history = viewport.live_start_row();
+        resize_under_reader(&mut viewport, &mut buffer, &mut screen, 40, rows);
+        settle_against(&mut viewport, &mut screen, rows);
+        assert!(!viewport.relocating());
+        let history = screen.scrollback_cells(0, 0).live_start_row;
+        assert_eq!(viewport.live_start_row(), history);
+        let estimate = 200 * history / old_history;
+        assert!(
+            (viewport.view_offset() - estimate).abs() <= 3,
+            "offset {} for an estimate of {estimate} in {history} rows",
+            viewport.view_offset()
+        );
+        assert!(
+            painted(&viewport, &buffer, rows)
+                .iter()
+                .all(|row| row.chars().count() <= 40)
         );
     }
 }

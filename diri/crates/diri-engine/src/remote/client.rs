@@ -220,6 +220,13 @@ impl RemoteSessionClient {
             if self.helper.protocol.minor >= diri_proto::remote_pty::TERMINAL_RESET_PROTOCOL_MINOR {
                 required_capabilities.push(diri_proto::remote_pty::RemoteCapability::TerminalReset);
             }
+            // An older Holder rejects a capability it does not know, so it is
+            // asked for only from a Helper whose minor defines it.
+            if self.helper.protocol.minor >= diri_proto::remote_pty::TERMINAL_STYLES_PROTOCOL_MINOR
+            {
+                required_capabilities
+                    .push(diri_proto::remote_pty::RemoteCapability::TerminalStyles);
+            }
             let hello = RemoteMessage::Hello(Hello {
                 protocol: ProtocolVersion::CURRENT,
                 local_build_id: format!("engine-{}", env!("CARGO_PKG_VERSION")),

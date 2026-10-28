@@ -115,7 +115,30 @@ pub(crate) struct WorkspaceWorkbench {
     /// What the drag in flight last snapped to: the pane a moved pane would
     /// land on, or the end of a divider's travel.
     drag_haptic: haptics::Crossing,
+    /// Where the dragged pane would land, sliding between targets.
+    drop_preview: Option<crate::pane_drag::Glide>,
+    /// Panes travelling from where they were to where a move put them.
+    morph: Option<Morph>,
+    /// Where each pane of the tab on screen was drawn last frame.
+    last_rects: HashMap<PaneId, Rect>,
     _activation: Subscription,
+}
+
+/// A layout change in motion: each pane slides and resizes from its old
+/// rectangle to its new one. The terminal inside keeps its final size
+/// (one resize for its program) and is clipped while its frame catches up.
+struct Morph {
+    from: HashMap<PaneId, Rect>,
+    /// The pane that was moved: it travels above the others.
+    moved: PaneId,
+    start: std::time::Instant,
+}
+impl Morph {
+    fn progress(&self, now: std::time::Instant) -> f32 {
+        (now.saturating_duration_since(self.start).as_secs_f32()
+            / crate::pane_drag::MORPH.as_secs_f32())
+        .min(1.0)
+    }
 }
 impl EventEmitter<WorkspaceWorkbenchEvent> for WorkspaceWorkbench {}
 
@@ -182,6 +205,9 @@ impl WorkspaceWorkbench {
             closing: HashSet::new(),
             resize: None,
             drag_haptic: haptics::Crossing::default(),
+            drop_preview: None,
+            morph: None,
+            last_rects: HashMap::new(),
             _activation: activation,
         }
     }
@@ -286,6 +312,11 @@ impl WorkspaceWorkbench {
                 .retain(|session| commands::pane_for_session(&tab.layout, session).is_some());
         }
         let changed = previous_tab != self.tab || viewport_changed;
+        if previous_tab.as_ref().map(|tab| (&tab.id, &tab.layout))
+            != self.tab.as_ref().map(|tab| (&tab.id, &tab.layout))
+        {
+            self.arm_morph(cx);
+        }
         self.reconcile(window, cx);
         self.flush_focus();
         self.assign_visible_owners(window, cx);
@@ -669,6 +700,7 @@ impl WorkspaceWorkbench {
                 col: lines.last().map_or(0, |line| line.chars().count()) as u16,
                 row: lines.len().saturating_sub(1) as u16,
                 visible: true,
+                ..diri_term::buffer::CursorState::default()
             };
             for (y, line) in lines.iter().enumerate() {
                 for (x, ch) in line.chars().take(100).enumerate() {
@@ -907,6 +939,181 @@ impl WorkspaceWorkbench {
         }
     }
 
+    /// A pane just dropped or moved by a command: the layout that brings
+    /// it animates from where every pane was last drawn. Anything else
+    /// (a divider, a split, another window's edit) lands at once.
+    fn arm_morph(&mut self, cx: &mut Context<Self>) {
+        let Some(landing) = cx
+            .try_global::<crate::pane_drag::PaneDragState>()
+            .and_then(|state| state.landing.clone())
+        else {
+            return;
+        };
+        let Some(tab) = &self.tab else {
+            return;
+        };
+        if !commands::contains_pane(&tab.layout, &landing.pane) {
+            return;
+        }
+        cx.global_mut::<crate::pane_drag::PaneDragState>().landing = None;
+        if crate::pane_drag::now().saturating_duration_since(landing.at)
+            > crate::pane_drag::MORPH_ARM
+            || cx.reduce_motion()
+        {
+            return;
+        }
+        let mut from = self.last_rects.clone();
+        if let Some(rect) = landing.from {
+            from.insert(landing.pane.clone(), rect);
+        }
+        if !from.is_empty() {
+            self.morph = Some(Morph {
+                from,
+                moved: landing.pane,
+                start: crate::pane_drag::now(),
+            });
+        }
+    }
+
+    /// The pointer moved while a pane is dragged: which pane and zone of
+    /// this tab it points at, if a drop there would do something.
+    fn pane_drag_move(&mut self, x: f32, y: f32, cx: &mut Context<Self>) {
+        let target = {
+            let Some(state) = cx.try_global::<crate::pane_drag::PaneDragState>() else {
+                return;
+            };
+            let Some(source) = state.source.clone().filter(|_| state.active()) else {
+                return;
+            };
+            let (local_x, local_y) = (x - self.viewport.x, y - self.viewport.y);
+            let store = self.runtime.store.read().expect("store");
+            // Nothing lights up while another layout edit (the tab a rest
+            // just opened) is still on its way: a drop then would be lost.
+            let editable = store.workspace_catalog().can_edit();
+            self.geometry().filter(|_| editable).and_then(|geometry| {
+                let pane = geometry.panes.iter().find(|pane| {
+                    crate::pane_drag::zone(pane.bounds, local_x, local_y).is_some()
+                })?;
+                let zone = crate::pane_drag::zone(pane.bounds, local_x, local_y)?;
+                let target = crate::pane_drag::DropTarget::Pane {
+                    tab: geometry.tab.clone(),
+                    pane: pane.identity.pane.clone(),
+                    zone,
+                };
+                crate::pane_drag::drop_mutation(
+                    &source,
+                    &target,
+                    store.workspace_catalog().snapshot()?,
+                )?;
+                Some((
+                    target,
+                    crate::pane_drag::zone_preview(pane.bounds, zone),
+                ))
+            })
+        };
+        let reduce = cx.reduce_motion();
+        let state = cx.global_mut::<crate::pane_drag::PaneDragState>();
+        let next = target.as_ref().map(|(target, _)| target.clone());
+        if state.pane_target == next {
+            return;
+        }
+        state.pane_target = next.clone();
+        let now = crate::pane_drag::now();
+        self.drop_preview = target.map(|(_, rect)| match self.drop_preview {
+            Some(mut glide) => {
+                glide.retarget(rect, now, !reduce);
+                glide
+            }
+            None => crate::pane_drag::Glide::still(rect, now),
+        });
+        if let Some(crate::pane_drag::DropTarget::Pane { pane, zone, .. }) = &next {
+            haptics::perform(
+                Haptic::Snap,
+                haptics::key("pane-drop", (&pane.0, format!("{zone:?}"))),
+            );
+        }
+        cx.notify();
+    }
+
+    /// A pane was released over this workbench.
+    fn pane_drop(&mut self, cx: &mut Context<Self>) {
+        let from_elsewhere = cx
+            .try_global::<crate::pane_drag::PaneDragState>()
+            .and_then(|state| state.source.as_ref())
+            .zip(self.tab.as_ref())
+            .is_some_and(|(source, tab)| source.tab != tab.id);
+        // A pane from a tab not on screen grows out of the preview.
+        let from = self
+            .drop_preview
+            .filter(|_| from_elsewhere)
+            .map(|glide| glide.at(crate::pane_drag::now()));
+        let mutation = {
+            let store = self.runtime.store.read().expect("store");
+            crate::pane_drag::take_drop(store.workspace_catalog().snapshot(), from, cx)
+        };
+        self.drop_preview = None;
+        if let Some(mutation) = mutation {
+            self.runtime
+                .store
+                .write()
+                .expect("store")
+                .edit_workspace(mutation);
+        }
+        cx.notify();
+    }
+
+    /// The payload a pane's title starts dragging, or None where moving it
+    /// makes no sense (a tab of one pane, a layout that cannot be edited).
+    fn drag_source(
+        &self,
+        tab: &WorkspaceTab,
+        pane: &PaneIdentity,
+        colors: diri_ui::SemanticColors,
+    ) -> Option<crate::pane_drag::DraggedPane> {
+        if !matches!(tab.layout, LayoutNode::Split { .. }) || self.resize.is_some() {
+            return None;
+        }
+        let store = self.runtime.store.read().expect("store");
+        if !store.workspace_catalog().can_edit() {
+            return None;
+        }
+        let has_row = |session: &SessionId| {
+            store
+                .sessions()
+                .get(session)
+                .is_some_and(|record| !crate::store::is_auxiliary_terminal(record))
+        };
+        Some(crate::pane_drag::DraggedPane {
+            tab: tab.id.clone(),
+            pane: pane.pane.clone(),
+            session: pane.session.clone(),
+            title: SharedString::default(),
+            colors,
+            can_leave: crate::pane_drag::can_leave(tab, &pane.pane, has_row),
+            can_break: has_row(&pane.session),
+        })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn morphing_for_test(&self) -> bool {
+        self.morph.is_some()
+    }
+
+    /// Where `pane` sits in the window once settled.
+    #[cfg(test)]
+    pub(crate) fn pane_window_rect_for_test(&self, pane: &PaneId) -> Option<Rect> {
+        let placement = self
+            .geometry()?
+            .panes
+            .into_iter()
+            .find(|placement| &placement.identity.pane == pane)?;
+        Some(Rect {
+            x: placement.bounds.x + self.viewport.x,
+            y: placement.bounds.y + self.viewport.y,
+            ..placement.bounds
+        })
+    }
+
     fn geometry(&self) -> Option<WorkspaceGeometry> {
         let mut tab = self.tab.clone()?;
         if let Some(focused) = self.focused_id() {
@@ -965,16 +1172,20 @@ impl WorkspaceWorkbench {
 impl Render for WorkspaceWorkbench {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         crate::perf_overlay::rendered("workbench");
-        let (colors, islands) = {
+        let (colors, islands, chrome_look) = {
             let store = self.runtime.store.read().expect("store");
+            let colors = crate::app_theme::colors_in(&store);
             (
-                crate::app_theme::colors_in(&store),
+                colors,
                 store.preferences().pane_density.islands(),
+                crate::chrome_focus::look_in(&store, colors.appearance, window),
             )
         };
         if !cx.has_active_drag() {
             self.drag_haptic.reset();
+            self.drop_preview = None;
         }
+        crate::pane_drag::end_if_released(cx);
         crate::terminal_pane::SeamDrag::publish(
             window.window_handle().window_id(),
             "workspace",
@@ -1001,6 +1212,18 @@ impl Render for WorkspaceWorkbench {
                     );
                 },
             ))
+            .on_drag_move(cx.listener(
+                |this, event: &DragMoveEvent<crate::pane_drag::DraggedPane>, _, cx| {
+                    this.pane_drag_move(
+                        f32::from(event.event.position.x),
+                        f32::from(event.event.position.y),
+                        cx,
+                    );
+                },
+            ))
+            .on_drop(cx.listener(
+                |this, _: &crate::pane_drag::DraggedPane, _, cx| this.pane_drop(cx),
+            ))
             .on_key_down(cx.listener(|this, event: &gpui::KeyDownEvent, _, cx| {
                 if event.keystroke.key == "escape" && this.resize.is_some() {
                     this.cancel_resize();
@@ -1012,10 +1235,26 @@ impl Render for WorkspaceWorkbench {
             return root.child("Choose a tab to continue");
         };
         self.assign_visible_owners(window, cx);
+        let now = crate::pane_drag::now();
+        let morph_t = self.morph.as_ref().map(|morph| morph.progress(now));
+        if morph_t.is_some_and(|t| t >= 1.0) {
+            self.morph = None;
+        }
+        let morphing = self.morph.is_some();
+        if morphing || self.drop_preview.is_some_and(|glide| glide.moving(now)) {
+            window.request_animation_frame();
+        }
+        let (drag_source, drag_target) = cx
+            .try_global::<crate::pane_drag::PaneDragState>()
+            .filter(|state| state.active())
+            .map(|state| (Some(state.source.clone()), state.pane_target.clone()))
+            .unwrap_or_default();
+        let drag_source = drag_source.flatten();
         // Painted after the panes so a compact seam's grab area, which
-        // overlaps the panes either side, wins hit tests over them.
+        // overlaps the panes either side, wins hit tests over them. While
+        // panes travel, the dividers wait at their new places unseen.
         let mut seams = Vec::with_capacity(geometry.dividers.len());
-        for divider in &geometry.dividers {
+        for divider in geometry.dividers.iter().filter(|_| !morphing) {
             let divider = divider.clone();
             let horizontal = divider.axis == LayoutAxis::Horizontal;
             // Compact panes meet at a 1 pt seam; reach past it on both sides
@@ -1127,8 +1366,24 @@ impl Render for WorkspaceWorkbench {
                 .cloned()
                 .collect()
         };
+        let tab = self.tab.clone();
+        let mut drawn = HashMap::with_capacity(geometry.panes.len());
+        let mut on_top = None;
         for pane in &geometry.panes {
             let bounds = pane.bounds;
+            let shown = match (&self.morph, morph_t) {
+                (Some(morph), Some(t)) => morph.from.get(&pane.identity.pane).map_or(bounds, |from| {
+                    crate::pane_drag::lerp_rect(*from, bounds, crate::pane_drag::ease_out(t))
+                }),
+                _ => bounds,
+            };
+            drawn.insert(pane.identity.pane.clone(), shown);
+            let pane_drag = tab
+                .as_ref()
+                .and_then(|tab| self.drag_source(tab, &pane.identity, colors));
+            let lifted = drag_source
+                .as_ref()
+                .is_some_and(|source| source.pane == pane.identity.pane);
             // The pane whose title bar ends at the window's trailing edge.
             let inspector_toggle = self.inspector_toggle
                 && bounds.y <= 0.5
@@ -1139,11 +1394,21 @@ impl Render for WorkspaceWorkbench {
                     pane.identity.pane.0
                 )))
                 .absolute()
-                .left(px(bounds.x))
-                .top(px(bounds.y))
-                .w(px(bounds.width))
-                .h(px(bounds.height))
+                .left(px(shown.x))
+                .top(px(shown.y))
+                .w(px(shown.width))
+                .h(px(shown.height))
                 .when(islands, |surface| surface.rounded(px(Radius::CARD)))
+                // The pane being carried stays in place, faded, until it lands.
+                .when(lifted, |surface| surface.opacity(0.45))
+                // The moved pane travels over the others; see-through, the
+                // panes it crosses would show through its text.
+                .when(
+                    self.morph
+                        .as_ref()
+                        .is_some_and(|morph| morph.moved == pane.identity.pane),
+                    |surface| surface.bg(colors.background.alpha(1.0)),
+                )
                 .overflow_hidden();
             let close_shell = multiple_panes && shells.contains(&pane.identity.session);
             if let Some(mounted) = self.mounted.get(&pane.identity.pane) {
@@ -1158,6 +1423,7 @@ impl Render for WorkspaceWorkbench {
                         f32::from(count) * (Metrics::TOOLBAR_CONTROL_SIZE + 4.0) - 11.0
                     };
                     terminal.set_header_trailing_inset(inset, cx);
+                    terminal.set_pane_drag(pane_drag, cx);
                     terminal.set_island_corners(islands, cx);
                     terminal.set_viewport(
                         TerminalViewport {
@@ -1172,11 +1438,21 @@ impl Render for WorkspaceWorkbench {
                 // A sidebar tick or another pane's output must not repaint
                 // this terminal. Its own notifications and bounds changes
                 // invalidate the cached render, including input and resize.
+                // At its final size whatever the frame around it does, so a
+                // move resizes the program once.
                 surface = surface.child(
-                    mounted
-                        .terminal
-                        .clone()
-                        .cached(StyleRefinement::default().size_full()),
+                    div()
+                        .absolute()
+                        .top_0()
+                        .left_0()
+                        .w(px(bounds.width))
+                        .h(px(bounds.height))
+                        .child(
+                            mounted
+                                .terminal
+                                .clone()
+                                .cached(StyleRefinement::default().size_full()),
+                        ),
                 );
             } else if self.closing.contains(&pane.identity.session) {
                 surface = surface.bg(colors.terminal_surface());
@@ -1210,7 +1486,7 @@ impl Render for WorkspaceWorkbench {
                 } - Metrics::TOOLBAR_CONTROL_SIZE)
                     / 2.0))
                 .right(px(Metrics::TOOLBAR_EDGE_INSET + caption_inset))
-                .opacity(crate::window_chrome::title_row_opacity(window))
+                .opacity(crate::window_chrome::title_row_opacity(window, chrome_look))
                 .flex()
                 .gap(px(4.0))
                 .when(close_shell, |controls| {
@@ -1286,7 +1562,36 @@ impl Render for WorkspaceWorkbench {
                 );
             }
             surface = surface.child(controls);
-            root = root.child(surface);
+            if self
+                .morph
+                .as_ref()
+                .is_some_and(|morph| morph.moved == pane.identity.pane)
+            {
+                on_top = Some(surface);
+            } else {
+                root = root.child(surface);
+            }
+        }
+        root = root.children(on_top);
+        self.last_rects = drawn;
+        if let (Some(glide), Some(crate::pane_drag::DropTarget::Pane { .. })) =
+            (self.drop_preview, drag_target)
+        {
+            let rect = glide.at(now);
+            const INSET: f32 = 4.0;
+            root = root.child(
+                div()
+                    .debug_selector(|| "pane-drop-preview".into())
+                    .absolute()
+                    .left(px(rect.x + INSET))
+                    .top(px(rect.y + INSET))
+                    .w(px((rect.width - 2.0 * INSET).max(0.0)))
+                    .h(px((rect.height - 2.0 * INSET).max(0.0)))
+                    .rounded(px(if islands { Radius::CARD - 2.0 } else { 6.0 }))
+                    .bg(diri_ui::Palette::CLAY.alpha(0.14))
+                    .border_2()
+                    .border_color(diri_ui::Palette::CLAY.alpha(0.62)),
+            );
         }
         root.children(seams)
     }

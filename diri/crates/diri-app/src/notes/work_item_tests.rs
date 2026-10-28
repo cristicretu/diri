@@ -59,7 +59,7 @@ const NOTE_SESSION: &str = "s_note_launch";
 const AGENT: &str = "s_posts";
 
 pub(crate) fn record(id: &str, kind: AgentKind) -> SessionRecord {
-    SessionRecord {
+    SessionRecord { command_run: None,
         attention_state: None,
         id: SessionId::new(id),
         kind,
@@ -94,6 +94,7 @@ pub(crate) fn record(id: &str, kind: AgentKind) -> SessionRecord {
         pull_requests: None,
         listening_ports: None,
         foreground_agent: None,
+        foreground_program: None,
         terminal_cwd: None,
         agent_workspace: None,
         note_id: None,
