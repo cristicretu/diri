@@ -261,3 +261,15 @@ absolutely after multi-column clusters, so it is unaffected. Lookup is a binary
 search over 152 ranges, only for width-1 non-ASCII characters. No wire,
 checkpoint or protocol change; the parser source is part of the Remote Helper
 Build ID. Test: `spacing_vowel_signs_share_their_base_cell_like_claude_code`.
+
+## History limit without side effects
+
+`Term::set_scrolling_history` changes only the primary screen's history row
+limit, which `set_options` also does, but without its full damage and title
+event, and `Term::primary_history_size` reads the primary history while the
+alternate screen is shown. `diri-terminal-state` uses both around every resize
+so that re-wrapping retained history into more rows never evicts it: the
+reflow runs under a larger allowance and the limit then holds the rows it
+produced. Both are O(1) unless the limit drops below the rows held. No wire,
+checkpoint or protocol change; the parser source is part of the Remote Helper
+Build ID. Test: `a_resize_at_capacity_keeps_every_retained_line`.

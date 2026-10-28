@@ -381,6 +381,19 @@ fn history_line_limit(cols: usize) -> usize {
     }
 }
 
+/// Newest history rows a checkpoint carries. Above [`history_line_limit`]
+/// only after a resize re-wrapped full history into more rows; restore and
+/// completed-terminal retention admit no more than this.
+pub const HISTORY_EXPORT_ROWS: usize = 10_000;
+
+/// Most history rows a resize may re-wrap retained history into, as a
+/// multiple of the row limit. A column change re-wraps what is already
+/// retained rather than evicting it: narrowing a full 80-column terminal to
+/// 20 columns keeps every line. Bytes stay bounded by the storage budget;
+/// this bounds only the row-proportional work (reads, Find, the next reflow).
+#[cfg(feature = "compact-history")]
+const RESIZE_ROW_ALLOWANCE: usize = 4;
+
 /// Fixed screen geometry handed to the emulator.
 #[derive(Clone, Copy, Debug)]
 struct Geometry {
@@ -826,8 +839,21 @@ impl HeadlessScreen {
     /// a one-line echo never scans the rest of the viewport.
     fn settle(&mut self) {
         #[cfg(feature = "compact-history")]
-        self.term
-            .bound_primary_history_storage(HISTORY_STORAGE_BUDGET_BYTES);
+        {
+            self.term
+                .bound_primary_history_storage(HISTORY_STORAGE_BUDGET_BYTES);
+            // A limit a resize raised follows history back down (widening,
+            // a clear, budget eviction), so it never lets a later burst grow
+            // past the rows the re-wrap needed.
+            let limit = self.term.config().scrolling_history;
+            let base = history_line_limit(self.geometry.cols);
+            if limit > base {
+                let history = self.term.primary_history_size();
+                if history < limit {
+                    self.term.set_scrolling_history(history.max(base));
+                }
+            }
+        }
         self.drain_events();
         let rows = self.geometry.rows;
         self.current_damage_rows.resize(rows, false);
@@ -936,6 +962,37 @@ impl HeadlessScreen {
         if self.geometry.cols == geometry.cols && self.geometry.rows == geometry.rows {
             return;
         }
+        #[cfg(feature = "compact-history")]
+        {
+            // Only output evicts history. Narrowing re-wraps retained lines
+            // into more rows (and fewer rows push screen lines into history),
+            // so the reflow runs under the larger allowance and the limit then
+            // holds exactly what it produced: the next line recycles the
+            // oldest row, as at capacity, and `settle` lowers the limit back
+            // as widening or clearing leaves fewer rows. Stored bytes stay
+            // under the history budget throughout.
+            let base = history_line_limit(geometry.cols);
+            let allowance = base.saturating_mul(RESIZE_ROW_ALLOWANCE);
+            self.term.set_scrolling_history(allowance);
+            self.geometry = geometry;
+            self.term.resize(self.geometry);
+            let kept = self.term.primary_history_size().clamp(base, allowance);
+            self.term.set_scrolling_history(kept);
+        }
+        #[cfg(not(feature = "compact-history"))]
+        self.resize_dense(geometry);
+        if self.host_replies && self.term.mode().contains(TermMode::IN_BAND_RESIZE) {
+            // DECSET 2048: the program reads its new size from the stream
+            // rather than asking after SIGWINCH.
+            let report = self.in_band_size_report();
+            self.unsolicited.extend_from_slice(report.as_bytes());
+        }
+        self.settle();
+    }
+
+    /// Dense differential builds keep a width-dependent row allowance.
+    #[cfg(not(feature = "compact-history"))]
+    fn resize_dense(&mut self, geometry: Geometry) {
         let old_limit = history_line_limit(self.geometry.cols);
         let new_limit = history_line_limit(geometry.cols);
         // A narrower screen needs the larger row allowance before reflow to
@@ -957,13 +1014,6 @@ impl HeadlessScreen {
             // screen is active, and preserves the limit across terminal reset.
             self.term.set_options(with_history(&self.term));
         }
-        if self.host_replies && self.term.mode().contains(TermMode::IN_BAND_RESIZE) {
-            // DECSET 2048: the program reads its new size from the stream
-            // rather than asking after SIGWINCH.
-            let report = self.in_band_size_report();
-            self.unsolicited.extend_from_slice(report.as_bytes());
-        }
-        self.settle();
     }
 
     /// `CSI 48 ; rows ; cols ; height ; width t`, pixels zero when unknown.
@@ -1290,8 +1340,10 @@ impl HeadlessScreen {
     /// Styled rows above the visible grid, oldest first. Checkpoints persist
     /// these alongside the visible snapshot so adoption does not collapse a
     /// long session to a single scrollback row.
+    ///
+    /// At most the newest [`HISTORY_EXPORT_ROWS`]: restore admits no more.
     pub fn history_snapshot(&mut self) -> Vec<Vec<GridCell>> {
-        let history = self.term.grid().history_size();
+        let history = self.term.grid().history_size().min(HISTORY_EXPORT_ROWS);
         let cols = self.geometry.cols;
         let mut rows = Vec::with_capacity(history);
         for index in 0..history {
@@ -1307,8 +1359,9 @@ impl HeadlessScreen {
         rows
     }
 
+    /// Annotations of the rows [`Self::history_snapshot`] exports.
     pub fn history_metadata(&mut self) -> Vec<RowMetadata> {
-        let count = self.term.grid().history_size();
+        let count = self.term.grid().history_size().min(HISTORY_EXPORT_ROWS);
         let mut rows = Vec::with_capacity(count);
         for index in 0..count {
             rows.push(self.row_metadata(Line(index as i32 - count as i32)));
@@ -3359,6 +3412,118 @@ mod tests {
         screen.feed(b"hello\r\n");
         screen.resize(40, 10);
         assert_eq!(screen.lines(), vec!["hello"]);
+    }
+
+    /// Numbered lines `first..first + count`, each `width` columns wide.
+    #[cfg(feature = "compact-history")]
+    fn numbered_lines(first: usize, count: usize, width: usize) -> Vec<u8> {
+        let mut out = String::new();
+        for id in first..first + count {
+            let line = format!("L{id:06} {}", "abcdefghij".repeat(30));
+            out.push_str(&line[..width]);
+            out.push_str("\r\n");
+        }
+        out.into_bytes()
+    }
+
+    /// Line numbers still held anywhere in history or on the screen.
+    #[cfg(feature = "compact-history")]
+    fn retained_ids(screen: &HeadlessScreen) -> Vec<usize> {
+        screen
+            .link_source(usize::MAX)
+            .text
+            .lines()
+            .filter_map(|line| line.strip_prefix('L')?.get(..6)?.parse().ok())
+            .collect()
+    }
+
+    /// Splitting a pane, toggling the sidebar or dragging a window narrower
+    /// used to evict the oldest half of a full history: the re-wrapped rows
+    /// went past the row limit and the reflow cut them, so widening again
+    /// could not bring them back. A reference multiplexer keeps every line.
+    #[cfg(feature = "compact-history")]
+    #[test]
+    fn a_resize_at_capacity_keeps_every_retained_line() {
+        for (width, label) in [(70, "unwrapped"), (120, "wrapped")] {
+            let mut screen = HeadlessScreen::new(80, 24);
+            screen.feed(&numbered_lines(0, 30_000, width));
+            let full = retained_ids(&screen);
+            assert_eq!(screen.term.grid().history_size(), 10_000, "{label}");
+            let expected: Vec<usize> = (full[0]..30_000).collect();
+            assert_eq!(full, expected, "{label}: the starting point is contiguous");
+
+            for (cols, rows) in [(40, 24), (120, 24), (80, 12), (24, 30), (80, 24)] {
+                screen.resize(cols, rows);
+                assert_eq!(
+                    retained_ids(&screen),
+                    expected,
+                    "{label}: {cols}x{rows} lost history"
+                );
+            }
+            assert_eq!(screen.term.grid().history_size(), 10_000, "{label}");
+        }
+    }
+
+    /// The allowance a narrowing needed is held, not reused for growth: new
+    /// output recycles the oldest row at the re-wrapped count, and a clear or
+    /// widening returns the limit to its base.
+    #[cfg(feature = "compact-history")]
+    #[test]
+    fn a_raised_history_limit_follows_history_back_down() {
+        let mut screen = HeadlessScreen::new(80, 24);
+        screen.feed(&numbered_lines(0, 20_000, 120));
+        screen.resize(40, 24);
+        let narrowed = screen.term.grid().history_size();
+        assert!(narrowed > 10_000, "{narrowed} rows after narrowing");
+
+        // At the narrow width the same rows stay retained as output arrives.
+        screen.feed(&numbered_lines(20_000, 1_000, 120));
+        assert_eq!(screen.term.grid().history_size(), narrowed);
+        let ids = retained_ids(&screen);
+        assert_eq!(ids, (ids[0]..21_000).collect::<Vec<_>>());
+
+        // Clearing scrollback ends the allowance: the next burst stops at
+        // the base limit, as it would have without the resize.
+        screen.feed(b"\x1b[3J");
+        screen.feed(&numbered_lines(21_000, 20_000, 120));
+        assert_eq!(screen.term.grid().history_size(), 10_000);
+
+        // So does widening that merges rows back.
+        screen.resize(80, 24);
+        screen.resize(40, 24);
+        screen.resize(80, 24);
+        screen.feed(&numbered_lines(41_000, 20_000, 120));
+        assert_eq!(screen.term.grid().history_size(), 10_000);
+    }
+
+    /// A re-wrapped history can hold more rows than restore admits, so a
+    /// checkpoint carries the newest of them and still restores.
+    #[cfg(feature = "compact-history")]
+    #[test]
+    fn a_checkpoint_of_re_wrapped_history_stays_restorable() {
+        let mut screen = HeadlessScreen::new(80, 24);
+        screen.feed(&numbered_lines(0, 20_000, 120));
+        screen.resize(40, 24);
+        assert!(screen.term.grid().history_size() > HISTORY_EXPORT_ROWS);
+        let history = screen.history_snapshot();
+        let metadata = screen.history_metadata();
+        assert_eq!(history.len(), HISTORY_EXPORT_ROWS);
+        assert_eq!(metadata.len(), HISTORY_EXPORT_ROWS);
+
+        let mut restored = HeadlessScreen::new(40, 24);
+        assert!(restored.restore(
+            &history,
+            &screen.full_snapshot(),
+            false,
+            false,
+            MouseModes::OFF
+        ));
+        restored.restore_history_metadata(&metadata);
+        let newest = screen.scrollback().lines;
+        assert_eq!(
+            restored.scrollback().lines,
+            newest[newest.len() - HISTORY_EXPORT_ROWS - 24..]
+        );
     }
 
     #[test]

@@ -867,9 +867,13 @@ Retain up to 10,000 physical history rows under a 4 MiB stored-history allowance
 compressed payload, allocated block/row indexes, and editable history cells.
 Discard only oldest history when either limit is reached. Visible cells,
 cell-extra heap allocations, temporary codec/read/reflow work and caller-owned
-response buffers are separate from this allowance. Reflow can alter physical row
-count and therefore evict oldest rows at the same cap. History capacity no longer
-shrinks merely because the terminal becomes wider.
+response buffers are separate from this allowance. A resize does not evict: when
+re-wrapping needs more physical rows (a narrower screen, or fewer screen rows),
+the row limit rises to the rows the reflow produced, up to four times the cap,
+and returns toward the cap as widening, a clear or the byte allowance leaves
+fewer rows. New output then recycles the oldest row at that limit. Checkpoints
+carry only the newest 10,000 rows, within read admission. History capacity no
+longer shrinks merely because the terminal becomes wider.
 
 History reads decode bounded row blocks and release caches at exclusive borrow
 boundaries. Resizing untouched hard lines retains compressed payloads and pads
