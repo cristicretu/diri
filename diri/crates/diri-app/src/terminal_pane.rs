@@ -987,6 +987,8 @@ pub struct TerminalPane {
     /// Space in the title bar reserved for workbench-owned controls painted
     /// above this pane, such as the auxiliary terminal's close button.
     header_trailing_inset: f32,
+    /// Set by the split workbench: the title drags this pane elsewhere.
+    pane_drag: Option<crate::pane_drag::DraggedPane>,
     /// The pane is a comfortable-density island: its fills round their outer
     /// corners, because GPUI clips children to rectangles, not to the
     /// island's rounded edge.
@@ -1263,6 +1265,7 @@ impl TerminalPane {
             sidebar_visible: true,
             inspector_open: false,
             header_trailing_inset: 0.0,
+            pane_drag: None,
             island_corners: false,
             held_hint: 0.0,
             title_opacity: 1.0,
@@ -1842,6 +1845,19 @@ impl TerminalPane {
         self.sidebar_visible = sidebar_visible;
         self.inspector_open = inspector_open;
         cx.notify();
+    }
+
+    /// Makes the title a drag handle that moves this pane (a split tab's
+    /// pane), or plain text again (None).
+    pub(crate) fn set_pane_drag(
+        &mut self,
+        source: Option<crate::pane_drag::DraggedPane>,
+        cx: &mut Context<Self>,
+    ) {
+        if self.pane_drag != source {
+            self.pane_drag = source;
+            cx.notify();
+        }
     }
 
     pub fn set_header_trailing_inset(&mut self, inset: f32, cx: &mut Context<Self>) {
@@ -4725,16 +4741,7 @@ impl TerminalPane {
                             .then(|| self.render_origin_note(session, colors))
                             .flatten(),
                     )
-                    .child(
-                        div()
-                            .min_w(px(0.0))
-                            .flex_1()
-                            .text_ellipsis()
-                            .text_size(px(Typo::TITLE.size))
-                            .font_weight(Typo::TITLE.weight)
-                            .text_color(colors.primary)
-                            .child(session.title.clone()),
-                    )
+                    .child(self.render_header_title(session, colors, cx))
                     .children(self.render_read_aloud_toggle(session, colors, cx))
                     .child(self.render_session_links_trigger(session, colors, cx)),
             )
@@ -4753,6 +4760,67 @@ impl TerminalPane {
                     .when(shell_controls, |trailing| {
                         trailing
                             .children(self.render_inspector_toggle(colors, self.held_hint))
+                    }),
+            )
+            .into_any_element()
+    }
+
+    /// The pane's title. In a split tab the text itself is the handle that
+    /// drags the pane to another place, tab or a tab of its own; the rest
+    /// of the title bar still moves the window.
+    fn render_header_title(
+        &self,
+        session: &SessionRecord,
+        colors: SemanticColors,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let text = div()
+            .min_w(px(0.0))
+            .overflow_hidden()
+            .text_ellipsis()
+            .text_size(px(Typo::TITLE.size))
+            .font_weight(Typo::TITLE.weight)
+            .text_color(colors.primary)
+            .child(session.title.clone());
+        let Some(source) = self.pane_drag.clone() else {
+            return div()
+                .min_w(px(0.0))
+                .flex_1()
+                .child(text)
+                .into_any_element();
+        };
+        let payload = crate::pane_drag::DraggedPane {
+            title: session.title.clone().into(),
+            ..source
+        };
+        let selector = format!("pane-drag-handle-{}", payload.pane.0);
+        div()
+            .min_w(px(0.0))
+            .flex_1()
+            .flex()
+            .items_center()
+            .child(
+                text.id("pane-drag-handle")
+                    .debug_selector(move || selector.clone())
+                    .flex_shrink(1.0)
+                    // The title belongs to the pane, not the window: a drag
+                    // that starts here moves the pane, never the window.
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(|this, _, window, cx| {
+                            cx.stop_propagation();
+                            this.focus(window, cx);
+                        }),
+                    )
+                    .on_drag(payload, |dragged, _, _, cx| {
+                        cx.set_global(crate::pane_drag::PaneDragState {
+                            source: Some(dragged.clone()),
+                            landing: cx
+                                .try_global::<crate::pane_drag::PaneDragState>()
+                                .and_then(|state| state.landing.clone()),
+                            ..Default::default()
+                        });
+                        cx.new(|_| dragged.clone())
                     }),
             )
             .into_any_element()

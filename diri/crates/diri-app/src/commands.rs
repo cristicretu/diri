@@ -70,6 +70,9 @@ actions!(
         MovePaneRight,
         MovePaneUp,
         MovePaneDown,
+        MovePaneToNewTab,
+        MovePaneToNextTab,
+        MovePaneToPreviousTab,
         OpenWorktrees,
         NewNote,
         ShowTodos,
@@ -191,6 +194,9 @@ pub enum CommandId {
     MovePaneRight,
     MovePaneUp,
     MovePaneDown,
+    MovePaneToNewTab,
+    MovePaneToNextTab,
+    MovePaneToPreviousTab,
     OpenWorktrees,
     NewNote,
     ShowTodos,
@@ -721,6 +727,36 @@ pub const COMMANDS: &[CommandSpec] = &[
         "command.move_pane_down.palette_title",
         "rectangle.split.2x1",
         "workspace move pane down dock"
+    ),
+    spec!(
+        MovePaneToNewTab,
+        "move-pane-to-new-tab",
+        None,
+        None,
+        Some(APP_CONTEXT),
+        "command.move_pane_to_new_tab.palette_title",
+        "rectangle.split.2x1",
+        "workspace move pane new tab break detach"
+    ),
+    spec!(
+        MovePaneToNextTab,
+        "move-pane-to-next-tab",
+        None,
+        None,
+        Some(APP_CONTEXT),
+        "command.move_pane_to_next_tab.palette_title",
+        "rectangle.split.2x1",
+        "workspace move pane next tab join"
+    ),
+    spec!(
+        MovePaneToPreviousTab,
+        "move-pane-to-previous-tab",
+        None,
+        None,
+        Some(APP_CONTEXT),
+        "command.move_pane_to_previous_tab.palette_title",
+        "rectangle.split.2x1",
+        "workspace move pane previous tab join"
     ),
     spec!(
         NewNote,
@@ -1452,6 +1488,9 @@ impl CommandSpec {
             CommandId::MovePaneRight => KeyBinding::new(key, MovePaneRight, context),
             CommandId::MovePaneUp => KeyBinding::new(key, MovePaneUp, context),
             CommandId::MovePaneDown => KeyBinding::new(key, MovePaneDown, context),
+            CommandId::MovePaneToNewTab => KeyBinding::new(key, MovePaneToNewTab, context),
+            CommandId::MovePaneToNextTab => KeyBinding::new(key, MovePaneToNextTab, context),
+            CommandId::MovePaneToPreviousTab => KeyBinding::new(key, MovePaneToPreviousTab, context),
 
             CommandId::OpenWorktrees => KeyBinding::new(key, OpenWorktrees, context),
             CommandId::NewNote => KeyBinding::new(key, NewNote, context),
@@ -1954,6 +1993,21 @@ impl CommandId {
                 description: t("command.move_pane_down.description"),
                 category: Workspace,
             },
+            Self::MovePaneToNewTab => ShortcutMetadata {
+                title: t("command.move_pane_to_new_tab.title"),
+                description: t("command.move_pane_to_new_tab.description"),
+                category: Workspace,
+            },
+            Self::MovePaneToNextTab => ShortcutMetadata {
+                title: t("command.move_pane_to_next_tab.title"),
+                description: t("command.move_pane_to_next_tab.description"),
+                category: Workspace,
+            },
+            Self::MovePaneToPreviousTab => ShortcutMetadata {
+                title: t("command.move_pane_to_previous_tab.title"),
+                description: t("command.move_pane_to_previous_tab.description"),
+                category: Workspace,
+            },
             Self::ToggleTabPeek => ShortcutMetadata {
                 title: t("command.toggle_tab_peek.title"),
                 description: t("command.toggle_tab_peek.description"),
@@ -2281,6 +2335,9 @@ impl CommandId {
             Self::MovePaneRight => Box::new(MovePaneRight),
             Self::MovePaneUp => Box::new(MovePaneUp),
             Self::MovePaneDown => Box::new(MovePaneDown),
+            Self::MovePaneToNewTab => Box::new(MovePaneToNewTab),
+            Self::MovePaneToNextTab => Box::new(MovePaneToNextTab),
+            Self::MovePaneToPreviousTab => Box::new(MovePaneToPreviousTab),
 
             Self::OpenWorktrees => Box::new(OpenWorktrees),
             Self::NewNote => Box::new(NewNote),
