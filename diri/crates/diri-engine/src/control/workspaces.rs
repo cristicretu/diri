@@ -179,4 +179,47 @@ mod tests {
         assert!(events.recv(Duration::ZERO).is_none());
         assert_eq!(server.registry.lock().unwrap().record_count(), 0);
     }
+
+    #[test]
+    fn an_agents_committed_change_is_announced_and_the_persons_own_is_not() {
+        let temp = tempfile::tempdir().unwrap();
+        let server = crate::control::tests::server(temp.path());
+        let events = server.events().subscribe(
+            None,
+            crate::events::Filter::new(
+                None,
+                Some(vec![diri_proto::EventName::AGENT_ACTION.into()]),
+            ),
+        );
+        // The app's own edit carries no actor: silent.
+        server
+            .dispatch(
+                Method::WORKSPACE_MUTATE,
+                Some(json!({"expectedRevision": 0, "mutation": {"type": "createWorkspace", "name": "Mine"}})),
+            )
+            .unwrap();
+        assert!(events.recv(Duration::ZERO).is_none());
+        // An Agent's edit names it once committed.
+        server
+            .dispatch(
+                Method::WORKSPACE_MUTATE,
+                Some(json!({"expectedRevision": 1, "actor": "agent-1", "mutation": {"type": "createWorkspace", "name": "Theirs"}})),
+            )
+            .unwrap();
+        let event = events.recv(Duration::from_millis(10)).unwrap();
+        assert_eq!(
+            event.params(),
+            json!({"sessionID": "agent-1", "action": "change_workspaces"})
+        );
+        // A rejected request (stale revision) announces nothing.
+        assert!(
+            server
+                .dispatch(
+                    Method::WORKSPACE_MUTATE,
+                    Some(json!({"expectedRevision": 0, "actor": "agent-1", "mutation": {"type": "createWorkspace", "name": "Stale"}})),
+                )
+                .is_err()
+        );
+        assert!(events.recv(Duration::ZERO).is_none());
+    }
 }

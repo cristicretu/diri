@@ -84,7 +84,8 @@ impl KeyFixture {
 
 #[test]
 fn key_rpc_uses_current_modes_and_keeps_enter_separate_from_bracketed_paste() {
-    let expected = b"\x1bOA\x1bOH\x1bOq\r\x03\x1b[15;4~A";
+    // The keypad types its digit even under DECKPAM (Num Lock semantics).
+    let expected = b"\x1bOA\x1bOH1\r\x03\x1b[15;4~A";
     let fixture = KeyFixture::new(expected.len());
     assert_eq!(
         err_of(fixture.key(
@@ -107,7 +108,7 @@ fn key_rpc_uses_current_modes_and_keeps_enter_separate_from_bracketed_paste() {
     let cases = [
         (Key::Named(NamedKey::ArrowUp), Modifiers::default(), 3),
         (Key::Named(NamedKey::Home), Modifiers::default(), 3),
-        (Key::Keypad(KeypadKey::One), Modifiers::default(), 3),
+        (Key::Keypad(KeypadKey::One), Modifiers::default(), 1),
         (Key::Named(NamedKey::Enter), Modifiers::default(), 1),
         (
             Key::Character("c".into()),

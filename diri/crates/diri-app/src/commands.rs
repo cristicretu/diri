@@ -70,6 +70,9 @@ actions!(
         MovePaneRight,
         MovePaneUp,
         MovePaneDown,
+        MovePaneToNewTab,
+        MovePaneToNextTab,
+        MovePaneToPreviousTab,
         OpenWorktrees,
         NewNote,
         ShowTodos,
@@ -145,6 +148,8 @@ actions!(
         PreviousPrompt,
         NextPrompt,
         CopyLastCommandOutput,
+        ClearScrollback,
+        ResetTerminal,
     ]
 );
 
@@ -191,6 +196,9 @@ pub enum CommandId {
     MovePaneRight,
     MovePaneUp,
     MovePaneDown,
+    MovePaneToNewTab,
+    MovePaneToNextTab,
+    MovePaneToPreviousTab,
     OpenWorktrees,
     NewNote,
     ShowTodos,
@@ -250,6 +258,8 @@ pub enum CommandId {
     PreviousPrompt,
     NextPrompt,
     CopyLastCommandOutput,
+    ClearScrollback,
+    ResetTerminal,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -721,6 +731,36 @@ pub const COMMANDS: &[CommandSpec] = &[
         "command.move_pane_down.palette_title",
         "rectangle.split.2x1",
         "workspace move pane down dock"
+    ),
+    spec!(
+        MovePaneToNewTab,
+        "move-pane-to-new-tab",
+        None,
+        None,
+        Some(APP_CONTEXT),
+        "command.move_pane_to_new_tab.palette_title",
+        "rectangle.split.2x1",
+        "workspace move pane new tab break detach"
+    ),
+    spec!(
+        MovePaneToNextTab,
+        "move-pane-to-next-tab",
+        None,
+        None,
+        Some(APP_CONTEXT),
+        "command.move_pane_to_next_tab.palette_title",
+        "rectangle.split.2x1",
+        "workspace move pane next tab join"
+    ),
+    spec!(
+        MovePaneToPreviousTab,
+        "move-pane-to-previous-tab",
+        None,
+        None,
+        Some(APP_CONTEXT),
+        "command.move_pane_to_previous_tab.palette_title",
+        "rectangle.split.2x1",
+        "workspace move pane previous tab join"
     ),
     spec!(
         NewNote,
@@ -1247,6 +1287,27 @@ pub const COMMANDS: &[CommandSpec] = &[
         "doc.on.doc",
         "terminal shell command output copy last osc 133"
     ),
+    // ⌘K is the palette here, so Clear takes the shifted chord.
+    spec!(
+        ClearScrollback,
+        "terminal-clear-scrollback",
+        Some("cmd-shift-k"),
+        Some("⇧⌘K"),
+        Some(TERMINAL_CONTEXT),
+        "command.clear_scrollback.palette_title",
+        "trash",
+        "terminal clear screen scrollback history wipe clean cls"
+    ),
+    spec!(
+        ResetTerminal,
+        "terminal-reset",
+        None,
+        None,
+        Some(TERMINAL_CONTEXT),
+        "command.reset_terminal.palette_title",
+        "arrow.counterclockwise",
+        "terminal reset garbled broken modes emulator stty sane"
+    ),
 ];
 
 pub fn command(id: CommandId) -> &'static CommandSpec {
@@ -1452,6 +1513,9 @@ impl CommandSpec {
             CommandId::MovePaneRight => KeyBinding::new(key, MovePaneRight, context),
             CommandId::MovePaneUp => KeyBinding::new(key, MovePaneUp, context),
             CommandId::MovePaneDown => KeyBinding::new(key, MovePaneDown, context),
+            CommandId::MovePaneToNewTab => KeyBinding::new(key, MovePaneToNewTab, context),
+            CommandId::MovePaneToNextTab => KeyBinding::new(key, MovePaneToNextTab, context),
+            CommandId::MovePaneToPreviousTab => KeyBinding::new(key, MovePaneToPreviousTab, context),
 
             CommandId::OpenWorktrees => KeyBinding::new(key, OpenWorktrees, context),
             CommandId::NewNote => KeyBinding::new(key, NewNote, context),
@@ -1532,6 +1596,8 @@ impl CommandSpec {
             CommandId::CopyLastCommandOutput => {
                 KeyBinding::new(key, CopyLastCommandOutput, context)
             }
+            CommandId::ClearScrollback => KeyBinding::new(key, ClearScrollback, context),
+            CommandId::ResetTerminal => KeyBinding::new(key, ResetTerminal, context),
         }
     }
 }
@@ -1954,6 +2020,21 @@ impl CommandId {
                 description: t("command.move_pane_down.description"),
                 category: Workspace,
             },
+            Self::MovePaneToNewTab => ShortcutMetadata {
+                title: t("command.move_pane_to_new_tab.title"),
+                description: t("command.move_pane_to_new_tab.description"),
+                category: Workspace,
+            },
+            Self::MovePaneToNextTab => ShortcutMetadata {
+                title: t("command.move_pane_to_next_tab.title"),
+                description: t("command.move_pane_to_next_tab.description"),
+                category: Workspace,
+            },
+            Self::MovePaneToPreviousTab => ShortcutMetadata {
+                title: t("command.move_pane_to_previous_tab.title"),
+                description: t("command.move_pane_to_previous_tab.description"),
+                category: Workspace,
+            },
             Self::ToggleTabPeek => ShortcutMetadata {
                 title: t("command.toggle_tab_peek.title"),
                 description: t("command.toggle_tab_peek.description"),
@@ -2157,6 +2238,16 @@ impl CommandId {
                 description: t("command.copy_last_command_output.description"),
                 category: ShortcutCategory::Terminal,
             },
+            Self::ClearScrollback => ShortcutMetadata {
+                title: t("command.clear_scrollback.title"),
+                description: t("command.clear_scrollback.description"),
+                category: ShortcutCategory::Terminal,
+            },
+            Self::ResetTerminal => ShortcutMetadata {
+                title: t("command.reset_terminal.title"),
+                description: t("command.reset_terminal.description"),
+                category: ShortcutCategory::Terminal,
+            },
             Self::CopySelection => ShortcutMetadata {
                 title: t("command.copy_selection.title"),
                 description: t("command.copy_selection.description"),
@@ -2281,6 +2372,9 @@ impl CommandId {
             Self::MovePaneRight => Box::new(MovePaneRight),
             Self::MovePaneUp => Box::new(MovePaneUp),
             Self::MovePaneDown => Box::new(MovePaneDown),
+            Self::MovePaneToNewTab => Box::new(MovePaneToNewTab),
+            Self::MovePaneToNextTab => Box::new(MovePaneToNextTab),
+            Self::MovePaneToPreviousTab => Box::new(MovePaneToPreviousTab),
 
             Self::OpenWorktrees => Box::new(OpenWorktrees),
             Self::NewNote => Box::new(NewNote),
@@ -2341,6 +2435,8 @@ impl CommandId {
             Self::PreviousPrompt => Box::new(PreviousPrompt),
             Self::NextPrompt => Box::new(NextPrompt),
             Self::CopyLastCommandOutput => Box::new(CopyLastCommandOutput),
+            Self::ClearScrollback => Box::new(ClearScrollback),
+            Self::ResetTerminal => Box::new(ResetTerminal),
         }
     }
 }
@@ -2614,6 +2710,19 @@ mod tests {
             command(CommandId::SelectNextSession).keystroke,
             Some("cmd-}")
         );
+    }
+
+    #[test]
+    fn clear_and_reset_are_terminal_commands_in_the_palette() {
+        let clear = command(CommandId::ClearScrollback);
+        // ⌘K stays the palette; Clear takes the shifted chord, terminal only.
+        assert_eq!(command(CommandId::ToggleCommandPalette).keystroke, Some("cmd-k"));
+        assert_eq!(clear.keystroke, Some("cmd-shift-k"));
+        assert_eq!(clear.context, Some(TERMINAL_CONTEXT));
+        let reset = command(CommandId::ResetTerminal);
+        assert_eq!(reset.keystroke, None, "reset is palette and menu only");
+        assert_eq!(reset.context, Some(TERMINAL_CONTEXT));
+        assert!(clear.palette.is_some() && reset.palette.is_some());
     }
 
     #[test]

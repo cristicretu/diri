@@ -45,6 +45,15 @@ fn terminal_framed_tui_scroll(cx: &mut BenchAppContext) {
     scroll(cx, framed_row);
 }
 
+/// A prompt and file listing rather than prose: Nerd Font icons from the
+/// Private Use Area, powerline caps and wedges, and sextant and octant graphs.
+#[gpui::bench(fps = 120)]
+fn terminal_icon_listing_scroll(cx: &mut BenchAppContext) {
+    cx.update(|cx| diri_term::glyphs::register_bundled_fonts(cx))
+        .expect("bundled fonts");
+    scroll(cx, icon_row);
+}
+
 /// A reader scrolled 30 rows into history while output keeps arriving under
 /// the held view: every frame recomposes the same 50 rows.
 #[gpui::bench(fps = 120)]
@@ -466,6 +475,48 @@ fn framed_row(line_id: usize) -> Vec<GridCell> {
     }
 }
 
+fn icon_row(line_id: usize) -> Vec<GridCell> {
+    const ICONS: [char; 8] = [
+        '\u{f024b}',
+        '\u{e7a8}',
+        '\u{f023}',
+        '\u{f48a}',
+        '\u{e60b}',
+        '\u{e606}',
+        '\u{f0219}',
+        '\u{ea60}',
+    ];
+    let id = format!("{line_id:05}");
+    let icon = ICONS[line_id % ICONS.len()];
+    match line_id % 3 {
+        0 => cells("\u{e0b6}", TermColor::Ansi(5))
+            .chain(cells(
+                &format!(" \u{f179} giga \u{e0b0} \u{f07c} ~/fun/{id} "),
+                TermColor::Default,
+            ))
+            .chain(cells(
+                "\u{e0b4}\u{e0bc}\u{e0be} \u{e0a0} main \u{f044}",
+                TermColor::Ansi(2),
+            ))
+            .collect(),
+        1 => cells(
+            &format!(".rw-r--r-- 2.1k giga 27 Oct 22:41 {icon} file_{id}.rs"),
+            TermColor::Default,
+        )
+        .collect(),
+        _ => {
+            let graph: String = (0..96)
+                .map(|col| {
+                    let pick = (line_id * 7 + col * 13) % 290;
+                    char::from_u32(if pick < 60 { 0x1fb00 } else { 0x1cd00 - 60 } + pick as u32)
+                        .unwrap()
+                })
+                .collect();
+            cells(&graph, TermColor::Ansi(6)).collect()
+        }
+    }
+}
+
 fn build_frame(
     offset: usize,
     is_full_snapshot: bool,
@@ -495,6 +546,7 @@ gpui::bench_group!(
     terminal_build_log_scroll,
     terminal_styled_tui_scroll,
     terminal_framed_tui_scroll,
+    terminal_icon_listing_scroll,
     terminal_diagnostics_scroll,
     terminal_diagnostics_legacy_scroll,
     terminal_reading_view_redraw,
