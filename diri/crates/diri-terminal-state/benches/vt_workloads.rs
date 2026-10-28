@@ -201,21 +201,10 @@ fn reference(data: &[u8], reps: usize) -> Feeder {
     feeder
 }
 
-/// Requires `actual` to end where `expected` did. Past the history storage
-/// budget, how many of the oldest rows are still held depends on where reads
-/// ended; the rows both hold are compared, and they must be nearly all.
+/// Requires `actual` to end where `expected` did, every retained history
+/// row included.
 fn assert_same_state(expected: &mut Feeder, actual: &mut Feeder, how: &str) {
-    let (held, reference_held) = (actual.screen.history_rows(), expected.screen.history_rows());
-    let keep = held.min(reference_held);
-    assert!(
-        held.abs_diff(reference_held) <= 1 + reference_held / 100,
-        "{how}: holds {held} history rows, the reference {reference_held}"
-    );
-    assert_same(
-        &expected.observe_newest(Some(keep)),
-        &actual.observe_newest(Some(keep)),
-        how,
-    );
+    assert_same(&expected.snapshot(), &actual.snapshot(), how);
 }
 
 /// `data` without Kitty delete commands (`a=d`), so the images it transmits

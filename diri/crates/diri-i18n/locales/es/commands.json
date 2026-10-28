@@ -277,6 +277,8 @@
   "command.zoom_out.description": "Reduce el texto del terminal",
   "command.zoom_out.title": "Reducir texto",
   "settings.shortcuts.conflict": "Ya lo usa {command}.",
+  "settings.shortcuts.conflict_replace": "Ya lo usa {command}. Pulsa ↩ para quitárselo.",
+  "settings.shortcuts.conflict_swap": "Ya lo usa {command}. Pulsa ↩ para quitárselo o ⇥ para intercambiarlos.",
   "settings.shortcuts.empty_detail": "Prueba con el nombre, la descripción o la tecla de una acción.",
   "settings.shortcuts.empty_title": "No se encontraron atajos",
   "settings.shortcuts.global_conflict": "Otra app ya utiliza este atajo. Elige otro.",

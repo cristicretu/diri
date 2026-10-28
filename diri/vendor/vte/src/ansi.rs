@@ -570,6 +570,17 @@ pub trait Handler {
         }
     }
 
+    /// DIRI PATCH: a run of characters beyond ASCII, none a C1 control, to
+    /// be displayed.
+    ///
+    /// Must be equivalent to calling [`Handler::input`] for each character in
+    /// order, which the default implementation does.
+    fn input_text(&mut self, text: &str) {
+        for c in text.chars() {
+            self.input(c);
+        }
+    }
+
     /// Set cursor to position.
     fn goto(&mut self, _line: i32, _col: usize) {}
 
@@ -1422,6 +1433,14 @@ where
     #[inline]
     fn print_ascii(&mut self, text: &str) {
         self.handler.input_ascii(text);
+        if let Some(c) = text.chars().next_back() {
+            self.state.preceding_char = Some(c);
+        }
+    }
+
+    #[inline]
+    fn print_text(&mut self, text: &str) {
+        self.handler.input_text(text);
         if let Some(c) = text.chars().next_back() {
             self.state.preceding_char = Some(c);
         }

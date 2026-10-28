@@ -4427,17 +4427,22 @@ impl TerminalPane {
         }
     }
 
-    /// Starts the next queued scrollback fetch for `id`, if the viewport wants
-    /// one and none is in flight. Called from wheel events AND from fetch
+    /// Starts the queued scrollback fetches for `id` the viewport wants, up to
+    /// its in-flight limit. Called from wheel events AND from fetch
     /// completion: a fast wheel burst queues the next window while a fetch is
     /// in flight, and nothing else would ever start it — the stranded queue
     /// painted as a transient blank region in deep scrollback.
     fn pump_scrollback_fetch(&mut self, id: &SessionId, visible_rows: usize) {
+        // Up to `MAX_FETCHES_IN_FLIGHT` windows go out at once.
+        while self.start_scrollback_fetch(id, visible_rows) {}
+    }
+
+    fn start_scrollback_fetch(&mut self, id: &SessionId, visible_rows: usize) -> bool {
         let Some(resident) = self.residents.get_mut(id) else {
-            return;
+            return false;
         };
         let Some(request) = resident.element.begin_scrollback_fetch(visible_rows) else {
-            return;
+            return false;
         };
         let generation = resident.attachment_generation;
         let client = Arc::clone(self.runtime.client());
@@ -4461,6 +4466,7 @@ impl TerminalPane {
                 }
             }
         });
+        true
     }
 
     /// Learns how much history sits above a live view whose scroller knob is

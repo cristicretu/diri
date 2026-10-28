@@ -366,6 +366,8 @@ enum ThemeFileStatus {
 struct ShortcutEditor {
     command: CommandId,
     error: Option<String>,
+    /// The key just recorded belongs to another command: ↩ replaces, ⇥ swaps.
+    clash: Option<crate::commands::ShortcutClash>,
     #[cfg(target_os = "macos")]
     native_key_code: Option<u16>,
     #[cfg(target_os = "macos")]
@@ -2194,6 +2196,7 @@ impl UtilitySurfaces {
         self.shortcut_editor = Some(ShortcutEditor {
             command,
             error: None,
+            clash: None,
             #[cfg(target_os = "macos")]
             native_key_code: None,
             #[cfg(target_os = "macos")]
@@ -2217,13 +2220,25 @@ impl UtilitySurfaces {
         self.focus_shortcut_search(window, cx);
     }
 
+    /// The user keymap layer as saved, read fresh: the palette can rebind
+    /// while this page is open.
+    fn live_shortcut_overrides(&self) -> crate::commands::ShortcutOverrides {
+        self.store
+            .read()
+            .expect("session store lock poisoned")
+            .preferences()
+            .shortcut_overrides
+            .clone()
+    }
+
     fn save_shortcut_override(
         &mut self,
         command: CommandId,
-        value: Option<Option<String>>,
+        next_overrides: crate::commands::ShortcutOverrides,
         cx: &mut Context<Self>,
     ) -> bool {
-        let stable_id = crate::commands::command(command).stable_id.to_owned();
+        #[cfg(target_os = "macos")]
+        let stable_id = crate::commands::command(command).stable_id;
         #[cfg(target_os = "macos")]
         let previous = self
             .store
@@ -2233,11 +2248,14 @@ impl UtilitySurfaces {
             .clone();
         #[cfg(target_os = "macos")]
         let native_key_code = if command == CommandId::ShowApp {
-            value.as_ref().and_then(Option::as_ref).and_then(|_| {
-                self.shortcut_editor
-                    .as_ref()
-                    .and_then(|editor| editor.native_key_code)
-            })
+            next_overrides
+                .get(stable_id)
+                .and_then(Option::as_ref)
+                .and_then(|_| {
+                    self.shortcut_editor
+                        .as_ref()
+                        .and_then(|editor| editor.native_key_code)
+                })
         } else {
             previous.global_shortcut_key_code
         };
@@ -2245,15 +2263,7 @@ impl UtilitySurfaces {
         if command == CommandId::ShowApp {
             let mut next = previous.clone();
             next.global_shortcut_key_code = native_key_code;
-            match &value {
-                Some(value) => {
-                    next.shortcut_overrides
-                        .insert(stable_id.clone(), value.clone());
-                }
-                None => {
-                    next.shortcut_overrides.remove(&stable_id);
-                }
-            }
+            next.shortcut_overrides = next_overrides.clone();
             if let Err(error) = crate::macos::global_shortcut::configure(&next) {
                 if let Some(editor) = &mut self.shortcut_editor {
                     editor.error = Some(t(error).to_owned());
@@ -2262,19 +2272,13 @@ impl UtilitySurfaces {
                 return false;
             }
         }
+        let saved = next_overrides.clone();
         if !self.update_prefs(move |prefs| {
             #[cfg(target_os = "macos")]
             if command == CommandId::ShowApp {
                 prefs.global_shortcut_key_code = native_key_code;
             }
-            match value {
-                Some(value) => {
-                    prefs.shortcut_overrides.insert(stable_id, value);
-                }
-                None => {
-                    prefs.shortcut_overrides.remove(&stable_id);
-                }
-            }
+            prefs.shortcut_overrides = saved;
         }) {
             #[cfg(target_os = "macos")]
             if command == CommandId::ShowApp {
@@ -2292,20 +2296,26 @@ impl UtilitySurfaces {
         true
     }
 
-    fn assign_shortcut(&mut self, command: CommandId, binding: String, cx: &mut Context<Self>) {
-        if let Some(conflict) =
-            crate::commands::shortcut_conflict(command, &binding, &self.prefs.shortcut_overrides)
-        {
-            if let Some(editor) = &mut self.shortcut_editor {
-                editor.error = Some(tf(
-                    "settings.shortcuts.conflict",
-                    &[("command", &conflict.id.shortcut_metadata().title)],
-                ));
+    fn assign_shortcut(
+        &mut self,
+        command: CommandId,
+        binding: String,
+        resolution: Option<crate::commands::ShortcutResolution>,
+        cx: &mut Context<Self>,
+    ) {
+        let current = self.live_shortcut_overrides();
+        let next = match crate::commands::assign_shortcut(&current, command, &binding, resolution) {
+            Ok(next) => next,
+            Err(clash) => {
+                if let Some(editor) = &mut self.shortcut_editor {
+                    editor.error = Some(clash_message(&clash));
+                    editor.clash = Some(clash);
+                }
+                cx.notify();
+                return;
             }
-            cx.notify();
-            return;
-        }
-        if self.save_shortcut_override(command, Some(Some(binding)), cx) {
+        };
+        if self.save_shortcut_override(command, next, cx) {
             self.shortcut_editor = None;
         } else if let Some(editor) = &mut self.shortcut_editor
             && editor.error.is_none()
@@ -2316,21 +2326,23 @@ impl UtilitySurfaces {
     }
 
     fn unassign_shortcut(&mut self, command: CommandId, cx: &mut Context<Self>) {
-        if self.save_shortcut_override(command, Some(None), cx) {
+        let next = crate::commands::unassign_shortcut(&self.live_shortcut_overrides(), command);
+        if self.save_shortcut_override(command, next, cx) {
             self.shortcut_editor = None;
         }
         cx.notify();
     }
 
     fn restore_shortcut(&mut self, command: CommandId, cx: &mut Context<Self>) {
-        if self.save_shortcut_override(command, None, cx) {
+        let next = crate::commands::reset_shortcut(&self.live_shortcut_overrides(), command);
+        if self.save_shortcut_override(command, next, cx) {
             self.shortcut_editor = None;
         }
         cx.notify();
     }
 
     fn restore_all_shortcuts(&mut self, cx: &mut Context<Self>) {
-        if self.prefs.shortcut_overrides.is_empty() {
+        if self.live_shortcut_overrides().is_empty() {
             return;
         }
         if self.update_prefs(|prefs| {
@@ -2354,39 +2366,44 @@ impl UtilitySurfaces {
         let Some(command) = self.shortcut_editor.as_ref().map(|editor| editor.command) else {
             return false;
         };
-        if key.key == "escape" {
-            self.shortcut_editor = None;
-            cx.notify();
-            return true;
-        }
-        if matches!(key.key.as_str(), "backspace" | "delete") && !key.modifiers.modified() {
-            self.unassign_shortcut(command, cx);
-            return true;
-        }
-        if matches!(
-            key.key.as_str(),
-            "shift" | "control" | "ctrl" | "alt" | "platform" | "function" | "fn"
-        ) {
-            return true;
-        }
-        let function_key = key
-            .key
-            .strip_prefix('f')
-            .and_then(|number| number.parse::<u8>().ok())
-            .is_some_and(|number| (1..=35).contains(&number));
-        if !key.modifiers.modified() && !function_key {
-            if let Some(editor) = &mut self.shortcut_editor {
-                editor.error = Some(t("settings.shortcuts.needs_modifier").into());
+        use crate::shortcut_recorder::{RecorderKey, classify};
+        let clash = self
+            .shortcut_editor
+            .as_ref()
+            .and_then(|editor| editor.clash.clone());
+        match classify(key, clash.as_ref()) {
+            RecorderKey::Cancel => {
+                self.shortcut_editor = None;
+                cx.notify();
             }
-            cx.notify();
-            return true;
+            RecorderKey::Remove => self.unassign_shortcut(command, cx),
+            RecorderKey::Reset => self.restore_shortcut(command, cx),
+            RecorderKey::Resolve(resolution) => {
+                if let Some(clash) = clash {
+                    self.assign_shortcut(command, clash.binding, Some(resolution), cx);
+                }
+            }
+            RecorderKey::Ignore => {}
+            RecorderKey::NeedsModifier => {
+                if let Some(editor) = &mut self.shortcut_editor {
+                    editor.error = Some(t("settings.shortcuts.needs_modifier").into());
+                    editor.clash = None;
+                }
+                cx.notify();
+            }
+            RecorderKey::Record(binding) => {
+                if let Some(editor) = &mut self.shortcut_editor {
+                    editor.error = None;
+                    editor.clash = None;
+                    #[cfg(target_os = "macos")]
+                    {
+                        editor.native_key_code =
+                            gpui_macos::current_physical_key().map(|(code, _)| code);
+                    }
+                }
+                self.assign_shortcut(command, binding, None, cx);
+            }
         }
-        #[cfg(target_os = "macos")]
-        if let Some(editor) = &mut self.shortcut_editor {
-            editor.error = None;
-            editor.native_key_code = gpui_macos::current_physical_key().map(|(code, _)| code);
-        }
-        self.assign_shortcut(command, key.unparse(), cx);
         true
     }
 
@@ -4794,13 +4811,14 @@ impl UtilitySurfaces {
             .flex()
             .flex_col()
             .gap(px(SETTINGS_SECTION_GAP));
+        let overrides = self.live_shortcut_overrides();
         let mut found = false;
         for category in ShortcutCategory::ALL {
             let commands = COMMANDS
                 .iter()
                 .filter(|command| {
                     command.id.shortcut_metadata().category == category
-                        && shortcut_matches(command, query, &self.prefs.shortcut_overrides)
+                        && shortcut_matches(command, query, &overrides)
                 })
                 .collect::<Vec<_>>();
             if commands.is_empty() {
@@ -4815,7 +4833,7 @@ impl UtilitySurfaces {
                 rows = rows.child(shortcut_row(
                     command,
                     self.shortcut_editor.as_ref(),
-                    &self.prefs.shortcut_overrides,
+                    &overrides,
                     colors,
                     cx,
                 ));
@@ -4854,7 +4872,7 @@ impl UtilitySurfaces {
                 .into_any_element()
         };
 
-        let modified_count = self.prefs.shortcut_overrides.len();
+        let modified_count = overrides.len();
         settings_page(
             t("settings.shortcuts.title"),
             div()
@@ -8772,6 +8790,20 @@ fn setting_row(
         .gap(px(12.0))
         .child(setting_text_stack(label, detail, colors))
         .child(control)
+}
+
+/// What a recorder says when its key belongs to another command, naming the
+/// ways out it actually has.
+pub(crate) fn clash_message(clash: &crate::commands::ShortcutClash) -> String {
+    let holder = clash.holder.shortcut_metadata().title;
+    let key = if clash.can_swap {
+        "settings.shortcuts.conflict_swap"
+    } else if clash.can_replace {
+        "settings.shortcuts.conflict_replace"
+    } else {
+        "settings.shortcuts.conflict"
+    };
+    tf(key, &[("command", &holder)])
 }
 
 fn shortcut_matches(

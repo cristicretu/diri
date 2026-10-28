@@ -20,7 +20,7 @@ use std::os::fd::{AsRawFd, OwnedFd};
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, Weak};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use base64::Engine as _;
 
@@ -1200,6 +1200,11 @@ fn write_log_backlog(
     true
 }
 
+/// How close together two frames must be for the second to count as
+/// streaming output, and how long a streaming frame waits for the next one
+/// before it is flushed alone (see [`write_output`]).
+const STREAMING_FLUSH_GAP: Duration = Duration::from_micros(100);
+
 /// Writes frames to one subscriber until it goes, the queue closes, or it has
 /// had nothing to send for [`reactor::LANE_IDLE`] (the next frame then starts
 /// a new writer). The buffer is always flushed before the writer waits, so
@@ -1214,6 +1219,7 @@ fn write_output(
     let idle = reactor::lane_idle();
     let mut stream = std::io::BufWriter::with_capacity(OUTPUT_WRITE_BUFFER, &link.stream);
     let mut queued: Option<super::fanout::Frame> = None;
+    let mut last_write: Option<Instant> = None;
     let replayed = backlog.is_empty() || write_log_backlog(&mut stream, holder, frames, backlog);
     if replayed {
         loop {
@@ -1247,7 +1253,26 @@ fn write_output(
             // Flushed only once nothing else is waiting, so a burst coalesces into
             // few writes while a lone chunk still leaves immediately. The frame
             // taken here is carried to the next turn, never dropped.
-            match frames.try_pop() {
+            //
+            // While output streams, though, the next frame is a PTY read away,
+            // and flushing each kilobyte cost a write system call per read: a
+            // third of the Holder's time in a flood. A frame written within
+            // [`STREAMING_FLUSH_GAP`] of the one before waits that long for its
+            // successor before flushing alone. Typing and prompts, whose frames
+            // are further apart, still leave at once.
+            let streaming =
+                last_write.is_some_and(|at: Instant| at.elapsed() < STREAMING_FLUSH_GAP);
+            let next = frames.try_pop().or_else(|| {
+                if !streaming {
+                    return None;
+                }
+                match frames.pop_within(STREAMING_FLUSH_GAP) {
+                    Popped::Frame(frame) => Some(frame),
+                    Popped::Closed | Popped::Idle => None,
+                }
+            });
+            last_write = Some(Instant::now());
+            match next {
                 Some(next) => queued = Some(next),
                 None => {
                     if stream.flush().is_err() {

@@ -113,6 +113,12 @@ fn may_matter(payload: &[u8]) -> bool {
 }
 
 impl NotificationParser {
+    /// Between sequences: output whose escapes are all CSIs leaves the
+    /// parser exactly as it is.
+    pub fn is_idle(&self) -> bool {
+        self.state == 0
+    }
+
     pub fn reset_sequence(&mut self) {
         self.state = 0;
         self.payload.clear();
@@ -786,5 +792,107 @@ mod tests {
 
         screen.feed(b"\x1b]133;C\x07\x1bc");
         assert_eq!(screen.shell_phase(), ShellPhase::Unknown);
+    }
+
+    /// The scanner as it was before it skipped CSI introducers and string
+    /// bodies: one state transition per byte. Returns the completed OSC
+    /// payloads.
+    fn bytewise_payloads(bytes: &[u8]) -> Vec<Vec<u8>> {
+        let (mut state, mut payload, mut done) = (0u8, Vec::new(), Vec::new());
+        for &byte in bytes {
+            match state {
+                0 => {
+                    if byte == 0x1b {
+                        state = 1;
+                    }
+                }
+                1 => {
+                    state = match byte {
+                        b']' => 2,
+                        b'P' | b'_' | b'^' | b'X' => 4,
+                        0x1b => 1,
+                        _ => 0,
+                    };
+                    payload.clear();
+                }
+                2 => match byte {
+                    7 => {
+                        done.push(std::mem::take(&mut payload));
+                        state = 0;
+                    }
+                    0x1b => state = 3,
+                    0x18 | 0x1a => {
+                        payload.clear();
+                        state = 0;
+                    }
+                    _ if payload.len() < OSC_PAYLOAD_LIMIT => payload.push(byte),
+                    _ => {
+                        payload.clear();
+                        state = 4;
+                    }
+                },
+                3 => {
+                    if byte == b'\\' {
+                        done.push(std::mem::take(&mut payload));
+                        state = 0;
+                    } else {
+                        payload.clear();
+                        state = if byte == 0x1b { 1 } else { 0 };
+                    }
+                }
+                4 => match byte {
+                    7 | 0x18 | 0x1a => state = 0,
+                    0x1b => state = 5,
+                    _ => {}
+                },
+                _ => {
+                    state = if byte == b'\\' {
+                        0
+                    } else if byte == 0x1b {
+                        5
+                    } else {
+                        4
+                    }
+                }
+            }
+        }
+        done
+    }
+
+    #[test]
+    fn skipping_csi_and_string_bodies_finds_the_same_notifications() {
+        // Escapes, string introducers and terminators in random order, fed
+        // in random pieces, so every state meets every byte at a boundary.
+        const ALPHABET: &[u8] = b"\x1b\x1b\x1b[[]]]PX_^\\\\\x07\x18\x1a9;;am ";
+        let mut seed = 0x2545_f491_4f6c_dd1du64;
+        let mut next = move || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed
+        };
+        for _ in 0..2_000 {
+            let len = (next() % 200) as usize;
+            let bytes: Vec<u8> = (0..len)
+                .map(|_| ALPHABET[(next() % ALPHABET.len() as u64) as usize])
+                .collect();
+            let expected: Vec<String> = bytewise_payloads(&bytes)
+                .into_iter()
+                .filter_map(|payload| {
+                    let payload = String::from_utf8(payload).ok()?;
+                    let body = payload.strip_prefix("9;")?;
+                    (!body.starts_with("4;")).then(|| clean(body, 1000))
+                })
+                .collect();
+            let mut parser = NotificationParser::default();
+            let mut rest = &bytes[..];
+            while !rest.is_empty() {
+                let take = 1 + (next() as usize % rest.len().min(16));
+                parser.feed(&rest[..take]);
+                rest = &rest[take..];
+            }
+            let found: Vec<String> = parser.ready.iter().map(|n| n.body.clone()).collect();
+            assert_eq!(found, expected, "{:?}", String::from_utf8_lossy(&bytes));
+        }
     }
 }

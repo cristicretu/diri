@@ -75,44 +75,23 @@ impl Feeder {
     }
 
     pub fn observe(mut self) -> Observed {
-        self.observe_newest(None)
+        self.snapshot()
     }
 
-    /// Observes the state, with `Some(rows)` comparing only the newest
-    /// `rows` history rows. How much history a terminal past its storage
-    /// budget still holds depends on where reads ended (the budget is
-    /// enforced once per read), so two parses that both kept more than
-    /// `rows` compare on the rows both kept; `visible_start_row` then reports
-    /// `rows`.
-    pub fn observe_newest(&mut self, history: Option<usize>) -> Observed {
+    /// [`Self::observe`] without consuming the feeder, so one reference can
+    /// be compared with many parses.
+    pub fn snapshot(&mut self) -> Observed {
         let screen = &mut self.screen;
-        let retained = screen.history_rows();
-        let keep = history.unwrap_or(retained).min(retained);
         let scrollback = screen.scrollback();
-        // `scrollback` ends with the visible rows; cut its front.
-        let window = (keep.min(diri_terminal_state::HISTORY_EXPORT_ROWS) + screen.size().1)
-            .min(scrollback.lines.len());
-        let cut = scrollback.lines.len() - window;
-        let scrollback_lines = scrollback.lines[cut..].to_vec();
-        let text_cells: std::collections::BTreeMap<_, _> = scrollback
-            .text_cells
-            .into_iter()
-            .filter(|(row, _)| *row >= cut)
-            .map(|(row, ranges)| (row - cut, ranges))
-            .collect();
-        let cells = screen.scrollback_cells((retained - keep) as i64, i64::MAX);
-        let links = screen.link_source(keep);
+        let cells = screen.scrollback_cells(0, i64::MAX);
+        let links = screen.link_source(usize::MAX);
         Observed {
             replies: self.replies.clone(),
             notifications: self.notifications.clone(),
             clipboard: self.clipboard.clone(),
-            scrollback_lines,
-            scrollback_text_cells: format!("{text_cells:?}"),
-            visible_start_row: if history.is_some() {
-                keep as i64
-            } else {
-                scrollback.visible_start_row
-            },
+            scrollback_lines: scrollback.lines,
+            scrollback_text_cells: format!("{:?}", scrollback.text_cells),
+            visible_start_row: scrollback.visible_start_row,
             cells_payload: cells.payload,
             cells_metadata: without_store_nonce(format!("{:?}", cells.metadata)),
             full_snapshot: without_store_nonce(format!("{:?}", screen.full_snapshot())),

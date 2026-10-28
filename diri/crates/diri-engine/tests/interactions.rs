@@ -621,6 +621,132 @@ fn prompt_rows_in(
     )
 }
 
+/// Which rows of a page hold an output start (C) and a command end (D).
+fn command_marks_in(
+    harness: &mut Harness,
+    id: &str,
+    first: i64,
+    max: i64,
+) -> (Vec<i64>, Vec<i64>, i64, i64) {
+    use base64::Engine as _;
+    use diri_proto::grid::TermStyle;
+    let page = harness.request(
+        "session.read_scrollback_cells",
+        json!({ "sessionID": id, "firstRow": first, "maxRows": max, "styles": true }),
+    );
+    let count = page["rowCount"].as_i64().expect("rows");
+    let payload = base64::engine::general_purpose::STANDARD
+        .decode(page["payload"].as_str().expect("payload"))
+        .expect("base64");
+    let rows = diri_proto::grid::GridRowCodec::decode_rows(&payload, count as usize).expect("rows");
+    let marked = |style: TermStyle| {
+        rows.iter()
+            .enumerate()
+            .filter(|(_, row)| row.iter().any(|cell| cell.style.bits() & style.bits() != 0))
+            .map(|(index, _)| first + index as i64)
+            .collect::<Vec<_>>()
+    };
+    (
+        marked(TermStyle::OUTPUT_START),
+        marked(TermStyle::COMMAND_END),
+        count,
+        page["totalRows"].as_i64().expect("total"),
+    )
+}
+
+/// Time to find the newest finished command's output (Copy Last Command
+/// Output) over 10,000 rows of history: reading every retained row from the
+/// oldest, against reading backward from the live end in widening pages until
+/// a page holds that command's output start.
+#[test]
+#[ignore = "measurement; run explicitly"]
+fn last_command_output_measurement() {
+    let mut harness = Harness::new("last-output");
+    for (label, commands, output) in [("short", 400, 24), ("long", 2, 5_000)] {
+        let history = prompted_history(&harness.root, commands, output);
+        let id = harness.spawn(&format!("cat '{}'; exec cat", history.display()));
+        let last = format!("[{:05}:{:03}]", commands - 1, output - 1);
+        let deadline = Instant::now() + Duration::from_secs(60);
+        loop {
+            std::thread::sleep(Duration::from_millis(300));
+            let screen = harness.request("session.read_screen", json!({ "sessionID": id }));
+            if screen["text"]
+                .as_str()
+                .is_some_and(|text| text.contains(&last))
+            {
+                break;
+            }
+            assert!(Instant::now() < deadline, "history never finished");
+        }
+        let cols = 160_i64;
+        let limit = (diri_proto::FIND_CAPTURE_MAX_CELLS as i64 / cols).clamp(1, 1024);
+        let mut full = Vec::new();
+        let mut backward = Vec::new();
+        let mut found = (None, None);
+        let mut rows_read = (0, 0);
+        for _ in 0..20 {
+            let started = Instant::now();
+            let (mut starts, mut ends, mut first, total) =
+                command_marks_in(&mut harness, &id, 0, 1);
+            let mut read = first;
+            while first < total {
+                let (s, e, count, _) = command_marks_in(&mut harness, &id, first, limit);
+                starts.extend(s);
+                ends.extend(e);
+                if count == 0 {
+                    break;
+                }
+                first += count;
+                read += count;
+            }
+            let end = ends.last().copied();
+            let start = end.and_then(|end| starts.iter().rev().find(|row| **row < end).copied());
+            full.push(started.elapsed());
+            rows_read.0 = read;
+
+            let started = Instant::now();
+            let (_, _, mut read, total) = command_marks_in(&mut harness, &id, 0, 1);
+            let mut end = total;
+            let mut page = 64;
+            let (mut starts, mut ends) = (Vec::new(), Vec::new());
+            let mut near = None;
+            while end > 0 && near.is_none() {
+                let first = (end - page).max(0);
+                let (s, e, count, _) = command_marks_in(&mut harness, &id, first, end - first);
+                read += count;
+                starts.splice(0..0, s);
+                ends.splice(0..0, e);
+                near = ends.last().and_then(|end| {
+                    starts
+                        .iter()
+                        .rev()
+                        .find(|row| **row < *end)
+                        .map(|start| (*start, *end))
+                });
+                end = first;
+                page = (page * 4).min(limit);
+            }
+            backward.push(started.elapsed());
+            rows_read.1 = read;
+            found = (start, near.map(|(start, _)| start));
+        }
+        assert_eq!(found.0, found.1, "both reads must find the same output");
+        harness.request("session.kill", json!({ "sessionID": id }));
+        for (pattern, samples, read) in [
+            ("read all", &mut full, rows_read.0),
+            ("backward", &mut backward, rows_read.1),
+        ] {
+            eprintln!(
+                "{label} output at {:?}: {pattern} rows {read} p50 {:?} p95 {:?} (n={})",
+                found.0,
+                percentile(samples, 0.5),
+                percentile(samples, 0.95),
+                samples.len()
+            );
+        }
+    }
+}
+
 /// Time to find the previous shell prompt from the live screen over 10,000
 /// rows of history, by the two read patterns the desktop has used: reading
 /// every retained row from the oldest (the export path), and reading outward
