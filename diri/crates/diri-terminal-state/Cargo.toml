@@ -31,8 +31,8 @@ diri-pty.workspace = true
 diri-platform.workspace = true
 serde.workspace = true
 serde_json.workspace = true
-# SHA-256 of payloads, images and state in the benchmark's golden check and
-# the core v2 bench's golden digests.
+# SHA-256 of payloads, images and state in the benchmark golden checks
+# (vt_workloads and the core v2 bench).
 sha2.workspace = true
 
 [[bench]]
