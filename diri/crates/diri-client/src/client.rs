@@ -980,6 +980,26 @@ impl DaemonClient {
             .await
     }
 
+    /// Publishes this app's window actions; this connection then performs
+    /// them (`app.perform_requested` arrives as an event). Republished on
+    /// every reconnect, since the Engine forgets a closed connection's.
+    pub async fn publish_app_actions(
+        &self,
+        params: &diri_proto::app_actions::AppActionsPublishParams,
+    ) -> Result<(), ClientError> {
+        self.request(Method::APP_ACTIONS_PUBLISH, Some(params), None)
+            .await
+            .map(|_| ())
+    }
+
+    /// The answer to one `app.perform_requested`.
+    pub async fn reply_app_action(
+        &self,
+        params: &diri_proto::app_actions::AppReplyParams,
+    ) -> Result<(), ClientError> {
+        self.empty(Method::APP_REPLY, params).await
+    }
+
     pub async fn configure_governor(
         &self,
         params: GovernorConfigureParams,

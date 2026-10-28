@@ -206,6 +206,65 @@ impl WindowStore {
             .emit(StoreEffect::UiChanged);
         true
     }
+    /// The app actions routed to this window: those whose acting Agent's tab
+    /// this window shows, else those for the most recently focused window.
+    /// Every window's sync loop calls this, so each request runs exactly once.
+    pub fn take_app_performs(&self) -> Vec<diri_proto::app_actions::AppPerformRequest> {
+        if self
+            .canonical
+            .read()
+            .expect("store")
+            .pending_app_performs
+            .is_empty()
+        {
+            return Vec::new();
+        }
+        let windows = self.live_windows();
+        let mut mine = Vec::new();
+        let mut store = self.canonical.write().expect("store");
+        store.pending_app_performs.retain(|request| {
+            let target = request
+                .actor
+                .as_ref()
+                .and_then(|actor| {
+                    windows
+                        .iter()
+                        .find(|(_, selected)| selected.as_ref() == Some(actor))
+                })
+                .or_else(|| windows.first())
+                .map(|(owner, _)| *owner);
+            if target == Some(self.owner) {
+                mine.push(request.clone());
+                false
+            } else {
+                true
+            }
+        });
+        mine
+    }
+
+    /// Live windows on this store with their selected tab, most recently
+    /// focused first.
+    fn live_windows(&self) -> Vec<(SpawnOwner, Option<SessionId>)> {
+        WINDOWS.with(|windows| {
+            windows
+                .borrow()
+                .iter()
+                .rev()
+                .filter_map(|entry| {
+                    #[cfg(any(target_os = "macos", windows, test))]
+                    if !std::ptr::eq(entry.canonical.as_ptr(), Arc::as_ptr(&self.canonical)) {
+                        return None;
+                    }
+                    let navigation = entry.navigation.upgrade()?;
+                    let navigation = navigation.try_borrow().ok()?;
+                    navigation
+                        .live
+                        .then(|| (entry.owner, navigation.selected_session_id.clone()))
+                })
+                .collect()
+        })
+    }
     pub fn close_context(&self) {
         self.navigation.borrow_mut().live = false;
         let mut store = self.canonical.write().expect("store");
@@ -538,6 +597,7 @@ impl WindowWrite<'_> {
     pub fn take_window_actions(&mut self) -> Vec<WindowAction> {
         self.navigation.actions.drain(..).collect()
     }
+
 
     pub fn reconcile(&mut self) {
         if !self.session_list_hydrated || self.navigation.reconciled_revision == Some(self.revision)

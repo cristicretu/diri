@@ -10,6 +10,12 @@ diri-platform.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 zeroize.workspace = true
+# Generates the Engine's method schemas (`api.describe`). Off by default so
+# the remote Helper never builds it; already in the lockfile through gpui.
+schemars = { workspace = true, optional = true }
+
+[features]
+schema = ["dep:schemars"]
 
 [dev-dependencies]
 tempfile.workspace = true
