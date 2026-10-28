@@ -437,3 +437,13 @@ about 47 to about 10 MB/s with "Cheaper history encoding".
 Tests: `styles_with_extra_storage_are_told_apart_on_a_hash_collision`,
 `blocks_of_unique_combining_marks_round_trip_one_after_another`, and the
 existing randomized codec tests.
+
+## SGR-Pixels mouse (DECSET 1016)
+
+`TermMode::SGR_PIXEL_MOUSE` (bit 26) records DECSET 1016. It is one of the
+mutually exclusive mouse encodings, as in xterm: setting 1005, 1006 or 1016
+clears the other two, and resetting 1016 leaves the legacy X10 encoding.
+DECRQM answers `1`/`2` for it (it was recognized only to answer `4`). The
+mode is state only; the host encodes the reports. RIS clears it with the rest
+of the mode bits. Mode 69 (DECLRMM) still answers `4`: left and right margins
+are not implemented.

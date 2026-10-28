@@ -51,7 +51,14 @@ impl MouseTrackingMode {
     }
 }
 
-/// Coordinate/button encoding selected independently with DECSET 1006.
+/// The pixel size of one cell in the coordinates a program is told about:
+/// the PTY's `ws_xpixel`/`ws_ypixel`, the `CSI 14 t`/`16 t` replies and
+/// SGR-Pixels mouse reports (DECSET 1016) all use it, so a program that
+/// divides one by another lands on the cell the pointer is over whatever
+/// the renderer's real font size is.
+pub const NOMINAL_CELL_PIXELS: (u16, u16) = (16, 34);
+
+/// Coordinate/button encoding selected with DECSET 1005/1006/1016.
 #[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "kebab-case")]
 #[repr(u8)]
@@ -61,6 +68,10 @@ pub enum MouseEncoding {
     Sgr = 1,
     /// A pre-1.4 peer did not expose whether DECSET 1006 was active.
     Unknown = 2,
+    /// DECSET 1016: SGR reports whose coordinates are zero-based pixels in
+    /// [`NOMINAL_CELL_PIXELS`] cells. On wires that predate it, it travels
+    /// as [`Self::Sgr`] plus a separate flag that older peers ignore.
+    SgrPixels = 3,
 }
 
 impl MouseEncoding {
@@ -69,6 +80,7 @@ impl MouseEncoding {
         match value {
             0 => Some(Self::Legacy),
             1 => Some(Self::Sgr),
+            3 => Some(Self::SgrPixels),
             _ => None,
         }
     }
@@ -118,8 +130,33 @@ impl MouseModes {
     pub const fn detail_bits(self) -> u8 {
         match (self.tracking, self.encoding) {
             (MouseTrackingMode::Unknown, _) | (_, MouseEncoding::Unknown) => 0,
-            _ => (self.tracking as u8) | ((self.encoding as u8) << 2),
+            // SGR-Pixels shares the SGR bit: a peer that predates it then
+            // still sends SGR reports, as it did before DECSET 1016 was
+            // recognized. [`Self::pixel_reports`] carries the difference.
+            _ => {
+                (self.tracking as u8)
+                    | ((matches!(self.encoding, MouseEncoding::Sgr | MouseEncoding::SgrPixels)
+                        as u8)
+                        << 2)
+            }
         }
+    }
+
+    /// Whether reports carry pixel coordinates (DECSET 1016). Wires carry
+    /// this beside [`Self::detail_bits`] in a bit older peers ignore.
+    #[must_use]
+    pub const fn pixel_reports(self) -> bool {
+        matches!(self.encoding, MouseEncoding::SgrPixels)
+    }
+
+    /// Applies the separately carried [`Self::pixel_reports`] flag to modes
+    /// decoded from [`Self::detail_bits`]. Only an SGR encoding can be one.
+    #[must_use]
+    pub const fn with_pixel_reports(mut self, pixels: bool) -> Self {
+        if pixels && matches!(self.encoding, MouseEncoding::Sgr) {
+            self.encoding = MouseEncoding::SgrPixels;
+        }
+        self
     }
 
     /// Decodes additive wire details. An enabled-only legacy value remains
@@ -208,6 +245,8 @@ impl TerminalMouseEvent {
 /// The caller clamps coordinates to its authoritative grid. Legacy X10
 /// coordinates have no representation beyond the 223rd row/column, so those
 /// reports are omitted instead of lying about which cell was targeted.
+/// SGR-Pixels reports give the cell's top-left pixel; a caller that knows
+/// where in the cell the pointer is uses [`encode_mouse_event_at`].
 #[must_use]
 pub fn encode_mouse_event(
     modes: MouseModes,
@@ -215,6 +254,54 @@ pub fn encode_mouse_event(
     modifiers: TerminalMouseModifiers,
     col: u16,
     row: u16,
+) -> Option<Vec<u8>> {
+    encode_mouse_event_at(
+        modes,
+        event,
+        modifiers,
+        col,
+        row,
+        cell_origin_pixels(col, row),
+    )
+}
+
+/// The zero-based pixel of a cell's top-left corner in
+/// [`NOMINAL_CELL_PIXELS`] cells.
+#[must_use]
+pub const fn cell_origin_pixels(col: u16, row: u16) -> (u32, u32) {
+    (
+        col as u32 * NOMINAL_CELL_PIXELS.0 as u32,
+        row as u32 * NOMINAL_CELL_PIXELS.1 as u32,
+    )
+}
+
+/// The zero-based pixel under a pointer at fractional grid position
+/// (`x` columns, `y` rows from the grid's top-left), clamped into a
+/// `cols`×`rows` grid, in [`NOMINAL_CELL_PIXELS`] cells.
+#[must_use]
+pub fn grid_position_pixels(x: f32, y: f32, cols: u16, rows: u16) -> (u32, u32) {
+    let axis = |position: f32, cells: u16, cell: u16| {
+        let limit = u32::from(cells.max(1)) * u32::from(cell) - 1;
+        let pixel = (position.max(0.0) * f32::from(cell)).floor();
+        // `as` saturates a float beyond u32; the clamp keeps it in the grid.
+        (pixel as u32).min(limit)
+    };
+    (
+        axis(x, cols, NOMINAL_CELL_PIXELS.0),
+        axis(y, rows, NOMINAL_CELL_PIXELS.1),
+    )
+}
+
+/// [`encode_mouse_event`] with the pointer's pixel inside the grid, which an
+/// SGR-Pixels report (DECSET 1016) carries instead of the cell.
+#[must_use]
+pub fn encode_mouse_event_at(
+    modes: MouseModes,
+    event: TerminalMouseEvent,
+    modifiers: TerminalMouseModifiers,
+    col: u16,
+    row: u16,
+    pixel: (u32, u32),
 ) -> Option<Vec<u8>> {
     match (modes.tracking, event) {
         (MouseTrackingMode::Off, _) => return None,
@@ -234,6 +321,18 @@ pub fn encode_mouse_event(
                     event.button_code() + modifiers,
                     u32::from(col) + 1,
                     u32::from(row) + 1,
+                )
+                .into_bytes(),
+            )
+        }
+        MouseEncoding::SgrPixels => {
+            let final_byte = if event.is_release() { 'm' } else { 'M' };
+            Some(
+                format!(
+                    "\x1b[<{};{};{}{final_byte}",
+                    event.button_code() + modifiers,
+                    pixel.0,
+                    pixel.1,
                 )
                 .into_bytes(),
             )
@@ -272,7 +371,29 @@ pub fn encode_mouse_wheel(
     row: u16,
     count: usize,
 ) -> Vec<u8> {
-    let Some(report) = encode_mouse_event(modes, event, modifiers, col, row) else {
+    encode_mouse_wheel_at(
+        modes,
+        event,
+        modifiers,
+        col,
+        row,
+        cell_origin_pixels(col, row),
+        count,
+    )
+}
+
+/// [`encode_mouse_wheel`] with the pointer's pixel for SGR-Pixels reports.
+#[must_use]
+pub fn encode_mouse_wheel_at(
+    modes: MouseModes,
+    event: TerminalMouseEvent,
+    modifiers: TerminalMouseModifiers,
+    col: u16,
+    row: u16,
+    pixel: (u32, u32),
+    count: usize,
+) -> Vec<u8> {
+    let Some(report) = encode_mouse_event_at(modes, event, modifiers, col, row, pixel) else {
         return Vec::new();
     };
     report.repeat(count)
@@ -519,5 +640,86 @@ mod tests {
             "unknown legacy modes must not be guessed for app-generated input"
         );
         assert_eq!(MouseModes::from_detail_bits(0, false), MouseModes::OFF);
+    }
+
+    #[test]
+    fn sgr_pixels_reports_the_pointer_pixel_and_release_final() {
+        let pixels = MouseModes::new(MouseTrackingMode::AnyMotion, MouseEncoding::SgrPixels);
+        let modifiers = TerminalMouseModifiers {
+            shift: true,
+            ..Default::default()
+        };
+        let left = TerminalMouseButton::Left;
+        assert_eq!(
+            encode_mouse_event_at(
+                pixels,
+                TerminalMouseEvent::Press(left),
+                modifiers,
+                2,
+                1,
+                (41, 50)
+            ),
+            Some(b"\x1b[<4;41;50M".to_vec())
+        );
+        assert_eq!(
+            encode_mouse_event_at(
+                pixels,
+                TerminalMouseEvent::Release(left),
+                TerminalMouseModifiers::default(),
+                2,
+                1,
+                (41, 50)
+            ),
+            Some(b"\x1b[<0;41;50m".to_vec())
+        );
+        // Without a pointer pixel, a report names the cell's top-left pixel.
+        assert_eq!(
+            encode_mouse_event(
+                pixels,
+                TerminalMouseEvent::WheelUp,
+                TerminalMouseModifiers::default(),
+                3,
+                2
+            ),
+            Some(b"\x1b[<64;48;68M".to_vec())
+        );
+        // A cell report ignores the pixel.
+        let sgr = MouseModes::new(MouseTrackingMode::AnyMotion, MouseEncoding::Sgr);
+        assert_eq!(
+            encode_mouse_event_at(
+                sgr,
+                TerminalMouseEvent::Press(left),
+                TerminalMouseModifiers::default(),
+                2,
+                1,
+                (41, 50)
+            ),
+            Some(b"\x1b[<0;3;2M".to_vec())
+        );
+    }
+
+    #[test]
+    fn grid_positions_become_nominal_pixels_clamped_into_the_grid() {
+        assert_eq!(grid_position_pixels(0.0, 0.0, 80, 24), (0, 0));
+        assert_eq!(grid_position_pixels(2.5, 1.5, 80, 24), (40, 51));
+        assert_eq!(grid_position_pixels(-3.0, -1.0, 80, 24), (0, 0));
+        assert_eq!(
+            grid_position_pixels(500.0, 99.0, 80, 24),
+            (80 * 16 - 1, 24 * 34 - 1)
+        );
+    }
+
+    #[test]
+    fn sgr_pixels_travels_as_sgr_plus_a_flag_older_peers_ignore() {
+        let pixels = MouseModes::new(MouseTrackingMode::ButtonMotion, MouseEncoding::SgrPixels);
+        let sgr = MouseModes::new(MouseTrackingMode::ButtonMotion, MouseEncoding::Sgr);
+        assert_eq!(pixels.detail_bits(), sgr.detail_bits());
+        assert!(pixels.pixel_reports());
+        assert!(!sgr.pixel_reports());
+        let decoded = MouseModes::from_detail_bits(pixels.detail_bits(), true);
+        assert_eq!(decoded, sgr);
+        assert_eq!(decoded.with_pixel_reports(true), pixels);
+        let legacy = MouseModes::new(MouseTrackingMode::ButtonMotion, MouseEncoding::Legacy);
+        assert_eq!(legacy.with_pixel_reports(true), legacy);
     }
 }

@@ -699,7 +699,12 @@ DECSET 1007, cursor-key mode honoured) in Helper builds that include it; an
 older live Holder keeps ignoring that wheel. No frame or capability changes.
 A controller encodes wheel reports for a program whose mouse details it
 knows, with modifiers and the sideways axis, and sends them as mouse input
-like its clicks. Scrollback is bounded to 4 MiB and served on demand
+like its clicks. SGR-Pixels reports (DECSET 1016) ride mode-byte bit 6 beside
+the SGR bit, in `FullSnapshot` and `GridDelta` alike: a peer that predates
+the bit reads plain SGR and keeps sending cell reports, which is what every
+build did before 1016 was recognized, so no capability or minor is needed.
+Pixel coordinates are zero-based in 16×34 nominal cells, the same cell the
+Helper already reports in `ws_xpixel`/`ws_ypixel`. Scrollback is bounded to 4 MiB and served on demand
 through `Scroll`. Raw output is bounded to 32 MiB.
 
 On-demand history reads use the Engine's bounded background-request pool. The

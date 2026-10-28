@@ -32,8 +32,8 @@ use std::time::{Duration, Instant};
 use diri_client::attachment::{SessionAttachment, TerminalChunk};
 use diri_proto::grid::GridUpdate;
 use diri_proto::terminal::{
-    MouseModes, TerminalMouseButton, TerminalMouseEvent, TerminalMouseModifiers, encode_mouse_event,
-    encode_mouse_wheel,
+    MouseModes, TerminalMouseButton, TerminalMouseEvent, TerminalMouseModifiers,
+    encode_mouse_event_at, encode_mouse_wheel_at, grid_position_pixels,
 };
 use diri_proto::{
     AgentKind as ProtoAgentKind, ExitReason, Resumability, RiskHint, SessionId, SessionRecord,
@@ -3388,17 +3388,6 @@ impl TerminalPane {
         }
     }
 
-    /// Grid cell under a window-space pointer position, using the same
-    /// geometry as `handle_scroll`.
-    fn grid_cell_at(
-        &self,
-        position: gpui::Point<gpui::Pixels>,
-        window: &mut Window,
-    ) -> Option<(usize, usize)> {
-        self.grid_point_at(position, window)
-            .map(|point| (point.col, point.row))
-    }
-
     /// The cell under `position` and the column boundary nearest it.
     fn grid_point_at(
         &self,
@@ -3439,13 +3428,18 @@ impl TerminalPane {
                 .element
                 .scroll_shift(metrics.line_height, window.scale_factor()),
         );
-        let row = ((f32::from(position.y) - grid_y + shift) / f32::from(metrics.line_height))
-            .floor()
-            .max(0.0) as usize;
+        let rows_down = (f32::from(position.y) - grid_y + shift) / f32::from(metrics.line_height);
+        let row = rows_down.floor().max(0.0) as usize;
         // The extra row is addressable for selection and links. A program
         // reading the mouse is only ever told about rows of its own screen.
         let extra_row = shift > 0.0 && !resident.element.mouse_modes().is_reporting();
         let cols = resident.element.grid_cols();
+        let pixel = grid_position_pixels(
+            (f32::from(position.x) - grid_x) / f32::from(metrics.cell_width),
+            rows_down,
+            cols,
+            resident.element.grid_rows(),
+        );
         clamp_grid_cell(
             col,
             row,
@@ -3459,6 +3453,7 @@ impl TerminalPane {
             col: usize::from(col),
             row: usize::from(row),
             edge: edge.min(usize::from(cols)),
+            pixel,
         })
     }
 
@@ -3498,7 +3493,13 @@ impl TerminalPane {
         let Some(id) = self.selected_id() else {
             return;
         };
-        let Some(GridPoint { col, row, edge }) = self.grid_point_at(event.position, window) else {
+        let Some(GridPoint {
+            col,
+            row,
+            edge,
+            pixel,
+        }) = self.grid_point_at(event.position, window)
+        else {
             return;
         };
         self.reset_qol_session(&id);
@@ -3587,14 +3588,18 @@ impl TerminalPane {
                     return;
                 };
                 resident.element.note_pointer_input();
-                if let Some(bytes) = encode_mouse_event(
-                    resident.element.mouse_modes(),
+                let mouse = resident.element.mouse_modes();
+                if let Some(bytes) = encode_mouse_event_at(
+                    mouse,
                     TerminalMouseEvent::Press(button),
                     terminal_mouse_modifiers(&event.modifiers),
                     col as u16,
                     row as u16,
+                    pixel,
                 ) {
-                    resident.mouse_motion.pressed_at((col as u16, row as u16));
+                    resident
+                        .mouse_motion
+                        .pressed_at(motion_key(mouse, (col, row), pixel));
                     resident.attachment.mouse(bytes);
                 }
                 cx.stop_propagation();
@@ -3618,7 +3623,8 @@ impl TerminalPane {
         // ordinary release outside the pane still reaches this path and clamps.
         self.qol.drag = None;
         self.qol.autoscroll = None;
-        let cell = self.grid_cell_at(event.position, window);
+        let point = self.grid_point_at(event.position, window);
+        let cell = point.map(|point| (point.col, point.row));
         let copy_on_select = self
             .runtime
             .store
@@ -3699,12 +3705,13 @@ impl TerminalPane {
         let Some(button) = terminal_mouse_button(event.button) else {
             return;
         };
-        if let Some(bytes) = encode_mouse_event(
+        if let Some(bytes) = encode_mouse_event_at(
             resident.element.mouse_modes(),
             TerminalMouseEvent::Release(button),
             terminal_mouse_modifiers(&event.modifiers),
             col as u16,
             row as u16,
+            point.map_or((0, 0), |point| point.pixel),
         ) {
             resident.attachment.mouse(bytes);
         }
@@ -3720,7 +3727,13 @@ impl TerminalPane {
         let Some(id) = self.selected_id() else {
             return;
         };
-        let Some(GridPoint { col, row, edge }) = self.grid_point_at(event.position, window) else {
+        let Some(GridPoint {
+            col,
+            row,
+            edge,
+            pixel,
+        }) = self.grid_point_at(event.position, window)
+        else {
             return;
         };
         self.reset_qol_session(&id);
@@ -3786,19 +3799,23 @@ impl TerminalPane {
             let Some(button) = button else {
                 return;
             };
-            let Some(bytes) = encode_mouse_event(
-                resident.element.mouse_modes(),
+            let mouse = resident.element.mouse_modes();
+            let Some(bytes) = encode_mouse_event_at(
+                mouse,
                 TerminalMouseEvent::Motion(button),
                 terminal_mouse_modifiers(&event.modifiers),
                 col as u16,
                 row as u16,
+                pixel,
             ) else {
                 return;
             };
             (
-                resident
-                    .mouse_motion
-                    .push(Instant::now(), (col as u16, row as u16), bytes),
+                resident.mouse_motion.push(
+                    Instant::now(),
+                    motion_key(mouse, (col, row), pixel),
+                    bytes,
+                ),
                 resident.attachment.clone(),
             )
         };
@@ -4531,9 +4548,9 @@ impl TerminalPane {
         let metrics = typeface.metrics(window);
         // The same cell a click there would report (bottom-anchored grids and
         // a reading view between rows included), clamped to the grid.
-        let (col, row) = self
-            .grid_cell_at(event.position, window)
-            .map_or((0, 0), |(col, row)| (col as u16, row as u16));
+        let point = self.grid_point_at(event.position, window);
+        let (col, row) = point.map_or((0, 0), |point| (point.col as u16, point.row as u16));
+        let pixel = point.map_or((0, 0), |point| point.pixel);
         let (sideways, delta) = match event.delta {
             ScrollDelta::Pixels(point) => (
                 WheelDelta::PrecisePoints(f32::from(point.x)),
@@ -4569,7 +4586,9 @@ impl TerminalPane {
             let count = steps.unsigned_abs() as usize;
             resident
                 .attachment
-                .mouse(encode_mouse_wheel(mouse, wheel, modifiers, col, row, count));
+                .mouse(encode_mouse_wheel_at(
+                    mouse, wheel, modifiers, col, row, pixel, count,
+                ));
             sent = true;
         }
         let visible_rows = resident.last_size.1.max(1);
@@ -4592,12 +4611,15 @@ impl TerminalPane {
                 } else {
                     TerminalMouseEvent::WheelDown
                 };
-                resident.attachment.mouse(encode_mouse_wheel(
+                // The route's cell is the pointer's own (clamped the same
+                // way), so its pixel is the pointer's too.
+                resident.attachment.mouse(encode_mouse_wheel_at(
                     mouse,
                     wheel,
                     modifiers,
                     col,
                     row,
+                    pixel,
                     usize::from(lines),
                 ));
             }
@@ -5291,7 +5313,7 @@ impl TerminalPane {
             .on_mouse_up(MouseButton::Middle, cx.listener(Self::handle_pointer_up))
             .on_mouse_up(MouseButton::Right, cx.listener(Self::handle_pointer_up))
             // A release outside the pane still belongs to the child that saw
-            // the press. `grid_cell_at` clamps it to the nearest grid cell.
+            // the press. `grid_point_at` clamps it to the nearest grid cell.
             .on_mouse_up_out(MouseButton::Left, cx.listener(Self::handle_pointer_up))
             .on_mouse_up_out(MouseButton::Middle, cx.listener(Self::handle_pointer_up))
             .on_mouse_up_out(MouseButton::Right, cx.listener(Self::handle_pointer_up))
@@ -6138,6 +6160,22 @@ struct GridPoint {
     col: usize,
     row: usize,
     edge: usize,
+    /// The pointer's pixel in the grid, in the nominal cells programs are
+    /// told about, for SGR-Pixels mouse reports (DECSET 1016).
+    pixel: (u32, u32),
+}
+
+/// What makes one motion report different from the last: the cell, or for
+/// SGR-Pixels reports (DECSET 1016) the pixel, which moves within a cell.
+fn motion_key(mouse: MouseModes, cell: (usize, usize), pixel: (u32, u32)) -> (u16, u16) {
+    if mouse.pixel_reports() {
+        (
+            u16::try_from(pixel.0).unwrap_or(u16::MAX),
+            u16::try_from(pixel.1).unwrap_or(u16::MAX),
+        )
+    } else {
+        (cell.0 as u16, cell.1 as u16)
+    }
 }
 
 /// The cell under a pointer `x` pixels into the grid, and the column
@@ -7533,6 +7571,38 @@ mod tests {
             MotionDispatch::SendNow(b"drag".to_vec()),
             "the first real move is not held back by the cadence"
         );
+    }
+
+    /// A program reading SGR-Pixels reports (DECSET 1016) hears about motion
+    /// inside a cell; a cell-report program still hears only about new cells.
+    #[test]
+    fn pixel_reports_see_motion_inside_a_cell() {
+        use diri_proto::terminal::{MouseEncoding, MouseTrackingMode};
+        let pixels = MouseModes::new(MouseTrackingMode::AnyMotion, MouseEncoding::SgrPixels);
+        let cells = MouseModes::new(MouseTrackingMode::AnyMotion, MouseEncoding::Sgr);
+        let started = Instant::now();
+        for (mouse, second) in [
+            (pixels, MotionDispatch::SendNow(b"b".to_vec())),
+            (cells, MotionDispatch::None),
+        ] {
+            let mut limiter = MouseMotionLimiter::default();
+            limiter.pressed_at(motion_key(mouse, (2, 1), (32, 34)));
+            let later = started + MOUSE_MOTION_CADENCE * 2;
+            assert_eq!(
+                limiter.push(later, motion_key(mouse, (2, 1), (40, 50)), b"b".to_vec()),
+                second,
+                "{mouse:?}"
+            );
+        }
+        let point = encode_mouse_event_at(
+            pixels,
+            TerminalMouseEvent::Press(TerminalMouseButton::Left),
+            TerminalMouseModifiers::default(),
+            2,
+            1,
+            grid_position_pixels(2.5, 1.5, 80, 24),
+        );
+        assert_eq!(point, Some(b"\x1b[<0;40;51M".to_vec()));
     }
 
     #[test]
