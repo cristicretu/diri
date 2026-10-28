@@ -88,6 +88,11 @@ the ASCII byte was never parsed: the letter vanished, and only when that read
 boundary fell there. It now consumes only the first character's bytes.
 Test: `partial_utf8_then_ascii_then_partial_utf8`.
 
+## Mode 1016
+
+`NamedPrivateMode::SgrPixelMouse` names DECSET 1016 (SGR mouse reports in
+pixels); `alacritty_terminal` sets, resets and reports it.
+
 ## Mode 2027
 
 `NamedPrivateMode::GraphemeClustering` names DECSET 2027 so `Term` can set,

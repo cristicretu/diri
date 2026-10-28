@@ -1106,8 +1106,8 @@ pub enum NamedPrivateMode {
     /// DIRI PATCH: left and right margins (DECLRMM). Recognized so DECRQM can
     /// report it as permanently reset; margins are not implemented.
     LeftRightMargins = 69,
-    /// DIRI PATCH: SGR mouse reports in pixels. Recognized so DECRQM can
-    /// report it as permanently reset; pixel reports are not implemented.
+    /// DIRI PATCH: SGR mouse reports with pixel coordinates (xterm
+    /// SGR-Pixels), exclusive with the other mouse encodings.
     SgrPixelMouse = 1016,
     /// DIRI PATCH: alternate screen that is cleared on exit; the cursor is
     /// shared.
