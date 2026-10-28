@@ -712,7 +712,14 @@ interval, so a background program's lone line leaves the Holder about 1.4 ms
 after it is written rather than 8 ms. Output that never pauses for 1 ms is
 still published at most once per 8 ms, and a batch that leaves fewer filled
 cells than the last publication (an erase whose redraw may follow) keeps the
-whole 8 ms interval. This is a Holder-only timing rule with no protocol change
+whole 8 ms interval. The exception is a line edit: when the only row holding
+fewer cells than at the last publication is the row of the visible cursor (a
+backspace-erase, a kill to end of line, a progress line rewritten shorter),
+no redraw is coming, so the diff goes out on the leading edge like output
+that adds. Hidden cursors (full-screen programs mid-draw), scrolls that shorten
+other rows and resizes keep the hold. The local Engine pump applies the same
+predicate (`HeadlessScreen::lost_cells_only_on_cursor_row`, shared through
+`diri-terminal-state`). This is a Holder-only timing rule with no protocol change
 or capability; Holders launched by older Helper builds keep the 8 ms trailing
 wait until their session is relaunched with a new Helper. If a destructive repaint
 temporarily removes screen content, the Holder instead gives its redraw bytes up

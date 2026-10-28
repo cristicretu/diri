@@ -452,6 +452,8 @@ pub struct HeadlessScreen {
     moved_digests: Vec<u64>,
     moved_filled_cells: Vec<usize>,
     moved_stale: Vec<bool>,
+    /// Each row's filled cells when [`Self::mark_row_baseline`] last ran.
+    row_baseline: Vec<usize>,
     /// False after cells changed outside the parser (restore), until full
     /// damage re-fingerprints every row. Moved fingerprints are only reused
     /// while this holds.
@@ -556,6 +558,7 @@ impl HeadlessScreen {
             moved_digests: Vec::new(),
             moved_filled_cells: Vec::new(),
             moved_stale: Vec::new(),
+            row_baseline: Vec::new(),
             fingerprints_track_cells: true,
             #[cfg(test)]
             fingerprinted_rows: Default::default(),
@@ -926,6 +929,46 @@ impl HeadlessScreen {
     #[must_use]
     pub fn filled_cells(&self) -> usize {
         self.filled_cells
+    }
+
+    /// Remembers how many cells each row holds, the baseline
+    /// [`Self::lost_cells_only_on_cursor_row`] judges against. Called when a
+    /// batch of output opens; reuses its buffer, so it allocates once.
+    pub fn mark_row_baseline(&mut self) {
+        self.row_baseline.clone_from(&self.row_filled_cells);
+    }
+
+    /// Whether everything removed since [`Self::mark_row_baseline`] was
+    /// removed from the row the visible cursor is on, and that row still
+    /// holds something: a line editor's in-place edit (backspace, kill to end
+    /// of line, a history entry or a progress line rewritten shorter), not a
+    /// repaint caught between its erase and its redraw.
+    ///
+    /// A repaint's erased region is somewhere the cursor has already left or
+    /// has not reached yet, and full-screen programs hide the cursor while
+    /// they draw, so neither passes. A cursor row cleared to nothing is the
+    /// start of a redraw (`less` clears its `:` prompt before drawing the
+    /// next page; a progress line is cleared and then written), so it does
+    /// not pass either: a line editor always leaves its prompt. Rows that
+    /// only gained or kept content do not count. Scrolling moves rows, so a scroll that shortened any other
+    /// row fails, as does a resize since the mark. O(rows), and only worth
+    /// asking once the screen has lost cells.
+    #[must_use]
+    pub fn lost_cells_only_on_cursor_row(&self) -> bool {
+        let (_, cursor_row, visible) = self.cursor();
+        let cursor_row = usize::from(cursor_row);
+        visible
+            && self.row_baseline.len() == self.row_filled_cells.len()
+            && self
+                .row_filled_cells
+                .get(cursor_row)
+                .is_some_and(|&now| now > 0)
+            && self
+                .row_baseline
+                .iter()
+                .zip(&self.row_filled_cells)
+                .enumerate()
+                .all(|(row, (before, now))| row == cursor_row || now >= before)
     }
 
     pub fn resize(&mut self, cols: usize, rows: usize) {
@@ -2691,6 +2734,55 @@ mod tests {
                 ..Default::default()
             }
         );
+    }
+
+    #[test]
+    fn a_line_edit_loses_cells_only_on_the_cursor_row() {
+        let mut screen = super::HeadlessScreen::new(40, 6);
+        screen.feed(b"first line of output\r\nsecond line\r\n$ echo hello world");
+        for edit in [
+            &b"\x08 \x08"[..], // backspace erase
+            b"\x1b[5D\x1b[K",  // kill to end of line
+            b"\r\x1b[K$ true", // history entry rewritten shorter
+        ] {
+            screen.mark_row_baseline();
+            let before = screen.filled_cells();
+            screen.feed(edit);
+            assert!(screen.filled_cells() < before, "{edit:?} removes cells");
+            assert!(screen.lost_cells_only_on_cursor_row(), "{edit:?}");
+            screen.feed(b"\r$ echo hello world");
+        }
+    }
+
+    #[test]
+    fn a_repaint_between_erase_and_redraw_is_not_a_line_edit() {
+        let mut screen = super::HeadlessScreen::new(40, 6);
+        let page = b"\x1b[Hrow one\r\nrow two\r\nrow three\r\n$ prompt";
+        screen.feed(page);
+        for erase in [
+            // Clear, cursor home: the erased rows are below the cursor.
+            &b"\x1b[H\x1b[2J"[..],
+            // An Ink-style redraw cut short: the last row is still blank,
+            // but the program hid the cursor while drawing.
+            b"\x1b[?25l\x1b[H\x1b[2Jrow one\r\nrow two\r\nrow three\r\n",
+            // Erased above the cursor, which then moved on.
+            b"\x1b[1;1H\x1b[2K\x1b[4;1H",
+            // The cursor's row cleared to nothing (`less` before its next
+            // page, a progress line before its text): the rewrite is next.
+            b"\r\x1b[2K",
+        ] {
+            screen.feed(b"\x1b[?25h");
+            screen.feed(page);
+            screen.mark_row_baseline();
+            screen.feed(erase);
+            assert!(!screen.lost_cells_only_on_cursor_row(), "{erase:?}");
+        }
+        // A resize since the mark is not judged at all.
+        screen.feed(b"\x1b[?25h");
+        screen.feed(page);
+        screen.mark_row_baseline();
+        screen.resize(40, 5);
+        assert!(!screen.lost_cells_only_on_cursor_row());
     }
 
     use super::*;

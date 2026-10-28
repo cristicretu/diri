@@ -232,8 +232,11 @@ impl EchoRequest {
     /// Whether output that took the screen from `filled_before` to
     /// `filled_after` filled cells is this input's complete answer. An
     /// editing key may clear up to one row, the most a line editor erases
-    /// for one keypress; anything else that lost cells is mid-repaint,
-    /// unless it ended on a closed synchronized update (`complete`).
+    /// for one keypress. Any key may lose cells on the cursor's row alone
+    /// (`line_edit`): a history entry shorter than the line it replaces, an
+    /// autosuggestion the next letter no longer matches, a deleted
+    /// character. Anything else that lost cells is mid-repaint, unless it
+    /// ended on a closed synchronized update (`complete`).
     fn answered_by(
         &self,
         now: Instant,
@@ -241,9 +244,10 @@ impl EchoRequest {
         filled_after: usize,
         cols: usize,
         complete: bool,
+        line_edit: bool,
     ) -> bool {
         let allowance = if self.erases { cols } else { 0 };
-        !self.expired(now) && (complete || filled_after + allowance >= filled_before)
+        !self.expired(now) && (complete || line_edit || filled_after + allowance >= filled_before)
     }
 }
 
@@ -5513,16 +5517,21 @@ impl RepaintHold {
 /// A blank screen gets [`blank_repaint_ceiling`] from when it first went
 /// blank, and so does the rewrite that follows it; a screen that only lost
 /// some content gets [`OUTPUT_REPAINT_CEILING`] from when the batch opened.
-/// A closed synchronized update is a whole frame by its own declaration.
+/// A closed synchronized update is a whole frame by its own declaration, and
+/// a line edit (`line_edit`: only the visible cursor's row lost cells, see
+/// [`HeadlessScreen::lost_cells_only_on_cursor_row`]) has no redraw to wait
+/// for: a backspace or a progress line rewritten shorter is batched like
+/// output that adds.
 fn repaint_hold(
     blank_since: &mut Option<Instant>,
     batch_started: Instant,
     filled_before: usize,
     filled_after: usize,
     complete: bool,
+    line_edit: bool,
     now: Instant,
 ) -> Option<RepaintHold> {
-    if complete {
+    if complete || line_edit {
         *blank_since = None;
         return None;
     }
@@ -5580,7 +5589,10 @@ fn feed_output_batch(
         }
         let (mid_repaint, blank_repaint) = {
             let mut screen = shared.screen.lock().expect("screen");
-            let before = *filled_before.get_or_insert_with(|| screen.filled_cells());
+            let before = *filled_before.get_or_insert_with(|| {
+                screen.mark_row_baseline();
+                screen.filled_cells()
+            });
             let synchronized = screen.synchronized_updates_completed();
             screen.feed(&buffer[..count]);
             if screen.has_notifications() {
@@ -5591,15 +5603,16 @@ fn feed_output_batch(
             }
             let after = screen.filled_cells();
             // A closed synchronized update is a whole frame, however much
-            // it erased: nothing is left to wait for.
-            let complete = screen.synchronized_updates_completed() != synchronized
-                && !screen.in_synchronized_update();
+            // it erased, and so is a line edit: nothing is left to wait for.
+            let whole = (screen.synchronized_updates_completed() != synchronized
+                && !screen.in_synchronized_update())
+                || (after < before && screen.lost_cells_only_on_cursor_row());
             shared
                 .awaiting_redraw
-                .store(!complete && after < before, Ordering::SeqCst);
+                .store(!whole && after < before, Ordering::SeqCst);
             (
-                !complete && after < before,
-                !complete && after == 0 && before != 0,
+                !whole && after < before,
+                !whole && after == 0 && before != 0,
             )
         };
         total += count;
@@ -6392,22 +6405,29 @@ fn pump_held(
             // catches up it runs again, so a settled screen is never stale.
             let evaluate_now = last_eval_at.is_none_or(|at: Instant| at.elapsed() >= EVAL_INTERVAL);
             eval_dirty = !evaluate_now;
-            let (observation, replies, filled_after, cols, complete) = {
+            let (observation, replies, filled_after, cols, complete, line_edit) = {
                 let mut screen = shared.screen.lock().expect("screen");
                 let historical_bytes =
                     replay_until.saturating_sub(start).min(output.len() as u64) as usize;
-                batch_filled.get_or_insert(screen.filled_cells());
+                if batch_filled.is_none() {
+                    batch_filled = Some(screen.filled_cells());
+                    screen.mark_row_baseline();
+                }
                 let synchronized = screen.synchronized_updates_completed();
                 screen.feed_with_history(output, historical_bytes);
                 let complete = screen.synchronized_updates_completed() != synchronized
                     && !screen.in_synchronized_update();
+                let lost = batch_filled.is_some_and(|before| screen.filled_cells() < before);
+                // Only asked once cells are gone, so output that adds pays
+                // nothing for it.
+                let line_edit = lost && screen.lost_cells_only_on_cursor_row();
                 // Raised before the lock drops, so no publisher reads the
                 // erase in between; see `repaint_hold` for when it lowers.
                 if !replaying
                     && offset > replay_until
                     && !complete
-                    && (blank_since.is_some()
-                        || batch_filled.is_some_and(|before| screen.filled_cells() < before))
+                    && !line_edit
+                    && (blank_since.is_some() || lost)
                 {
                     shared.awaiting_redraw.store(true, Ordering::SeqCst);
                 }
@@ -6436,6 +6456,7 @@ fn pump_held(
                     screen.filled_cells(),
                     screen.size().0,
                     complete,
+                    line_edit,
                 )
             };
             // The child is blocked reading the answer to its query, so send it
@@ -6467,6 +6488,7 @@ fn pump_held(
                         filled_before,
                         filled_after,
                         complete,
+                        line_edit,
                         Instant::now(),
                     )
                 });
@@ -6478,7 +6500,14 @@ fn pump_held(
                 && batch_filled.is_some_and(|filled_before| {
                     let now = Instant::now();
                     shared.take_echo_if(|request| {
-                        request.answered_by(now, filled_before, filled_after, cols, complete)
+                        request.answered_by(
+                            now,
+                            filled_before,
+                            filled_after,
+                            cols,
+                            complete,
+                            line_edit,
+                        )
                     })
                 });
             shared
@@ -8638,7 +8667,7 @@ mod repaint_hold_tests {
     fn a_clear_waits_for_its_redraw_and_the_rewrite_publishes_when_quiet() {
         let opened = Instant::now();
         let mut blank_since = None;
-        let erased = repaint_hold(&mut blank_since, opened, 600, 0, false, opened);
+        let erased = repaint_hold(&mut blank_since, opened, 600, 0, false, false, opened);
         let Some(RepaintHold::Erased(until)) = erased else {
             panic!("a blank screen must wait for its redraw: {erased:?}");
         };
@@ -8647,7 +8676,7 @@ mod repaint_hold_tests {
         // More blank writes do not stretch the grace.
         let later = opened + Duration::from_millis(30);
         assert_eq!(
-            repaint_hold(&mut blank_since, opened, 600, 0, false, later),
+            repaint_hold(&mut blank_since, opened, 600, 0, false, false, later),
             Some(RepaintHold::Erased(until))
         );
 
@@ -8655,7 +8684,7 @@ mod repaint_hold_tests {
         // holding more than before or less, is not a frame on its own.
         for filled in [900, 200] {
             assert_eq!(
-                repaint_hold(&mut blank_since, opened, 600, filled, false, later),
+                repaint_hold(&mut blank_since, opened, 600, filled, false, false, later),
                 Some(RepaintHold::Redrawing(until))
             );
         }
@@ -8666,18 +8695,29 @@ mod repaint_hold_tests {
         let opened = Instant::now();
         let mut blank_since = None;
         assert_eq!(
-            repaint_hold(&mut blank_since, opened, 600, 400, false, opened),
+            repaint_hold(&mut blank_since, opened, 600, 400, false, false, opened),
             Some(RepaintHold::Erased(opened + OUTPUT_REPAINT_CEILING))
         );
         assert_eq!(
-            repaint_hold(&mut blank_since, opened, 600, 650, false, opened),
+            repaint_hold(&mut blank_since, opened, 600, 650, false, false, opened),
             None
         );
         // An empty screen staying empty is not an erase.
         assert_eq!(
-            repaint_hold(&mut blank_since, opened, 0, 0, false, opened),
+            repaint_hold(&mut blank_since, opened, 0, 0, false, false, opened),
             None
         );
+    }
+
+    #[test]
+    fn a_line_edit_has_no_redraw_to_wait_for() {
+        let opened = Instant::now();
+        let mut blank_since = Some(opened);
+        assert_eq!(
+            repaint_hold(&mut blank_since, opened, 600, 400, false, true, opened),
+            None
+        );
+        assert_eq!(blank_since, None);
     }
 
     #[test]
@@ -8685,7 +8725,7 @@ mod repaint_hold_tests {
         let opened = Instant::now();
         let mut blank_since = Some(opened);
         assert_eq!(
-            repaint_hold(&mut blank_since, opened, 600, 0, true, opened),
+            repaint_hold(&mut blank_since, opened, 600, 0, true, false, opened),
             None
         );
         assert_eq!(blank_since, None);
@@ -8701,9 +8741,9 @@ mod echo_request_tests {
         let at = Instant::now();
         let request = EchoRequest::for_input(b"a", at);
         assert!(!request.erases);
-        assert!(request.answered_by(at, 10, 11, 80, false));
+        assert!(request.answered_by(at, 10, 11, 80, false, false));
         assert!(
-            request.answered_by(at, 10, 10, 80, false),
+            request.answered_by(at, 10, 10, 80, false, false),
             "a cursor move alone"
         );
     }
@@ -8712,8 +8752,8 @@ mod echo_request_tests {
     fn output_that_loses_cells_after_a_typed_key_is_a_repaint_in_progress() {
         let at = Instant::now();
         let request = EchoRequest::for_input(b"a", at);
-        assert!(!request.answered_by(at, 400, 399, 80, false));
-        assert!(!request.answered_by(at, 400, 0, 80, false));
+        assert!(!request.answered_by(at, 400, 399, 80, false, false));
+        assert!(!request.answered_by(at, 400, 0, 80, false, false));
     }
 
     #[test]
@@ -8722,10 +8762,16 @@ mod echo_request_tests {
         for key in [&b"\x7f"[..], b"\x08", b"\x17", b"\x15"] {
             let request = EchoRequest::for_input(key, at);
             assert!(request.erases, "{key:?}");
-            assert!(request.answered_by(at, 100, 99, 80, false), "{key:?}");
-            assert!(request.answered_by(at, 100, 20, 80, false), "{key:?}");
             assert!(
-                !request.answered_by(at, 100, 19, 80, false),
+                request.answered_by(at, 100, 99, 80, false, false),
+                "{key:?}"
+            );
+            assert!(
+                request.answered_by(at, 100, 20, 80, false, false),
+                "{key:?}"
+            );
+            assert!(
+                !request.answered_by(at, 100, 19, 80, false, false),
                 "{key:?}: more than a row is a repaint"
             );
         }
@@ -8737,8 +8783,8 @@ mod echo_request_tests {
         let request = EchoRequest::for_input(b"a", at);
         let late = at + ECHO_WINDOW + Duration::from_millis(1);
         assert!(request.expired(late));
-        assert!(!request.answered_by(late, 10, 11, 80, false));
-        assert!(request.answered_by(at + ECHO_WINDOW, 10, 11, 80, false));
+        assert!(!request.answered_by(late, 10, 11, 80, false, false));
+        assert!(request.answered_by(at + ECHO_WINDOW, 10, 11, 80, false, false));
     }
 
     #[test]
@@ -8753,13 +8799,29 @@ mod echo_request_tests {
     }
 
     #[test]
+    fn any_key_is_answered_by_a_line_edit_that_removed_cells() {
+        let at = Instant::now();
+        // Up onto a shorter history entry; a letter that ends an
+        // autosuggestion; vim's `x`.
+        for key in [&b"\x1b[A"[..], b"Q", b"x"] {
+            let request = EchoRequest::for_input(key, at);
+            assert!(
+                request.answered_by(at, 400, 340, 80, false, true),
+                "{key:?}"
+            );
+        }
+        let late = at + ECHO_WINDOW + Duration::from_millis(1);
+        assert!(!EchoRequest::for_input(b"x", at).answered_by(late, 400, 340, 80, false, true));
+    }
+
+    #[test]
     fn a_closed_synchronized_update_answers_even_when_it_removed_cells() {
         let at = Instant::now();
         let request = EchoRequest::for_input(b"a", at);
-        assert!(request.answered_by(at, 400, 120, 80, true));
-        assert!(request.answered_by(at, 400, 0, 80, true));
+        assert!(request.answered_by(at, 400, 120, 80, true, false));
+        assert!(request.answered_by(at, 400, 0, 80, true, false));
         let late = at + ECHO_WINDOW + Duration::from_millis(1);
-        assert!(!request.answered_by(late, 400, 120, 80, true));
+        assert!(!request.answered_by(late, 400, 120, 80, true, false));
     }
 }
 
