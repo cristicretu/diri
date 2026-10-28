@@ -152,6 +152,14 @@
   "settings.resources.session_limits": "会话限制",
   "settings.resources.title": "资源",
   "settings.terminal.file_links_detail": "点击文件路径时用来打开的编辑器。",
+  "settings.terminal.keyboard": "键盘",
   "settings.terminal.mouse": "鼠标与选择",
+  "settings.terminal.option_automatic": "自动",
+  "settings.terminal.option_both": "两侧",
+  "settings.terminal.option_key": "将 Option 键用作 Meta",
+  "settings.terminal.option_key_detail": "发送 Esc + 按键，⌥B 即后退一个单词。“自动”仅在美式布局上如此。",
+  "settings.terminal.option_left": "左 Option",
+  "settings.terminal.option_off": "关闭",
+  "settings.terminal.option_right": "右 Option",
   "settings.terminal.shell": "Shell"
 }

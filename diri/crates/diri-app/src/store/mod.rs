@@ -40,7 +40,7 @@ use crate::switcher::{
 };
 
 pub use prefs::{
-    DictationShortcut, FileEditor, InspectorTab, InterfaceStyle, NewAgentStart, PaneDensity, Prefs,
+    DictationShortcut, FileEditor, InspectorTab, OptionAsMeta, InterfaceStyle, NewAgentStart, PaneDensity, Prefs,
     SavedWindow, SidebarGrouping, SidebarOrdering, TabOrientation, TalkAnswer, UiLanguage,
     WindowMaterial, WindowMode, WindowPlacement,
 };
