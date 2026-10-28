@@ -73,7 +73,7 @@ pub(super) fn read(roots: &Roots) -> Option<Setup> {
         .and_then(Value::as_boolean)
         .unwrap_or(false)
     {
-        setup.skip(t("terminal_import.setting.option_as_alt"), SkipReason::OptionKey);
+        setup.option_as_meta = Some(crate::store::OptionAsMeta::Both);
     }
     if profile.contains_key("ScrollbackLines") || profile.contains_key("ShouldLimitScrollback") {
         setup.skip(t("terminal_import.setting.scrollback"), SkipReason::Scrollback);

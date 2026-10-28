@@ -31,7 +31,7 @@
   "terminal_import.skip.font_missing": "字体 {font}：此 Mac 未安装",
   "terminal_import.skip.key_bindings": "{setting}：Diri 的快捷键在“设置 › 快捷键”中",
   "terminal_import.skip.legacy_format": "{setting}：旧格式，请先运行 alacritty migrate",
-  "terminal_import.skip.option_key": "{setting}：Diri 按键盘布局决定",
+  "terminal_import.skip.option_key": "{setting}：此系统上 Alt 始终是 Meta",
   "terminal_import.skip.other": "其他 {count} 项设置：{names}",
   "terminal_import.skip.padding": "{setting}：Diri 的边距固定",
   "terminal_import.skip.scrollback": "{setting}：Diri 自行管理历史大小",

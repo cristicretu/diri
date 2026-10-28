@@ -31,7 +31,7 @@
   "terminal_import.skip.font_missing": "Font {font}: not installed on this Mac",
   "terminal_import.skip.key_bindings": "{setting}: Diri's shortcuts are in Settings › Shortcuts",
   "terminal_import.skip.legacy_format": "{setting}: old format; run alacritty migrate first",
-  "terminal_import.skip.option_key": "{setting}: Diri follows your keyboard layout",
+  "terminal_import.skip.option_key": "{setting}: Alt is always Meta on this system",
   "terminal_import.skip.other": "{count} other settings: {names}",
   "terminal_import.skip.padding": "{setting}: Diri's padding is fixed",
   "terminal_import.skip.scrollback": "{setting}: Diri sizes history itself",

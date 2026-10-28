@@ -8,7 +8,7 @@ use super::{
     parse_color, read_text, resolve_path,
 };
 use crate::i18n::t;
-use crate::store::CursorShapePref;
+use crate::store::{CursorShapePref, OptionAsMeta};
 
 pub(super) fn config_files(roots: &Roots) -> Vec<PathBuf> {
     let xdg = roots.xdg_config.join("ghostty");
@@ -182,7 +182,14 @@ fn apply(key: &str, value: &str, state: &mut State) {
             };
         }
         "macos-option-as-alt" => {
-            setup.skip(t("terminal_import.setting.option_as_alt"), SkipReason::OptionKey);
+            setup.option_as_meta = match value.trim() {
+                "left" => Some(OptionAsMeta::Left),
+                "right" => Some(OptionAsMeta::Right),
+                other => parse_bool(other).map(|meta| super::option_from_sides(meta, meta)),
+            };
+            if setup.option_as_meta.is_none() {
+                setup.skip(t("terminal_import.setting.option_as_alt"), SkipReason::Unreadable);
+            }
         }
         "window-padding-x" | "window-padding-y" | "window-padding-balance" => {
             setup.skip(t("terminal_import.setting.padding"), SkipReason::Padding);

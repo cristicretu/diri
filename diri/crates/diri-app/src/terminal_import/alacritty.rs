@@ -11,7 +11,7 @@ use super::{
 };
 use crate::i18n::t;
 use super::blink_from_cycle;
-use crate::store::{CursorBlinkPref, CursorShapePref};
+use crate::store::{CursorBlinkPref, CursorShapePref, OptionAsMeta};
 
 const ANSI_NAMES: [&str; 8] = [
     "black", "red", "green", "yellow", "blue", "magenta", "cyan", "white",
@@ -107,15 +107,26 @@ fn read_file(path: &Path, roots: &Roots, setup: &mut Setup, colors: &mut Colors,
             "colors" => read_colors(item, colors, setup),
             "cursor" => read_cursor(item, setup),
             "window" => {
-                for (sub, _) in item.as_table_like().into_iter().flat_map(|t| t.iter()) {
+                for (sub, value) in item.as_table_like().into_iter().flat_map(|t| t.iter()) {
                     match sub {
                         "padding" | "dynamic_padding" => {
                             setup.skip(t("terminal_import.setting.padding"), SkipReason::Padding);
                         }
-                        "option_as_alt" => setup.skip(
-                            t("terminal_import.setting.option_as_alt"),
-                            SkipReason::OptionKey,
-                        ),
+                        "option_as_alt" => {
+                            setup.option_as_meta = match value.as_str() {
+                                Some("OnlyLeft") => Some(OptionAsMeta::Left),
+                                Some("OnlyRight") => Some(OptionAsMeta::Right),
+                                Some("Both") => Some(OptionAsMeta::Both),
+                                Some("None") => Some(OptionAsMeta::Off),
+                                _ => None,
+                            };
+                            if setup.option_as_meta.is_none() {
+                                setup.skip(
+                                    t("terminal_import.setting.option_as_alt"),
+                                    SkipReason::Unreadable,
+                                );
+                            }
+                        }
                         other => setup.unknown(&format!("window.{other}")),
                     }
                 }

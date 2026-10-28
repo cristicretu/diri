@@ -8,7 +8,7 @@ use super::{
     parse_color, read_text, resolve_path,
 };
 use crate::i18n::t;
-use crate::store::CursorShapePref;
+use crate::store::{CursorShapePref, OptionAsMeta};
 
 pub(super) fn config_file(roots: &Roots) -> Option<PathBuf> {
     roots
@@ -157,7 +157,16 @@ fn apply(key: &str, value: &str, state: &mut State) {
             };
         }
         "macos_option_as_alt" => {
-            setup.skip(t("terminal_import.setting.option_as_alt"), SkipReason::OptionKey);
+            setup.option_as_meta = match value.trim() {
+                "left" => Some(OptionAsMeta::Left),
+                "right" => Some(OptionAsMeta::Right),
+                "both" | "yes" => Some(OptionAsMeta::Both),
+                "no" => Some(OptionAsMeta::Off),
+                _ => None,
+            };
+            if setup.option_as_meta.is_none() {
+                setup.skip(t("terminal_import.setting.option_as_alt"), SkipReason::Unreadable);
+            }
         }
         "window_padding_width" | "window_margin_width" | "single_window_padding_width" => {
             setup.skip(t("terminal_import.setting.padding"), SkipReason::Padding);

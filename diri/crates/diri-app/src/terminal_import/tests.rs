@@ -64,6 +64,7 @@ fn ghostty_reads_includes_named_themes_and_only_what_was_set() {
     assert_eq!(setup.cursor_shape, Some(CursorShapePref::Bar));
     assert_eq!(setup.cursor_blink, Some(CursorBlinkPref::Off));
     assert_eq!(setup.copy_on_select, Some(true));
+    assert_eq!(setup.option_as_meta, Some(OptionAsMeta::Left));
     let theme = setup.theme.as_ref().unwrap();
     // `light:A,dark:B` takes the dark theme; inline colors beat the theme's.
     assert_eq!(theme.name, "Night Owl Custom");
@@ -75,7 +76,6 @@ fn ghostty_reads_includes_named_themes_and_only_what_was_set() {
     assert_eq!(
         skipped(&setup),
         [
-            SkipReason::OptionKey,
             SkipReason::Padding,
             SkipReason::Scrollback,
             SkipReason::KeyBindings,
@@ -99,6 +99,8 @@ fn kitty_reads_includes_and_kitten_theme_names() {
     assert_eq!(setup.cursor_blink, Some(CursorBlinkPref::Off));
     assert_eq!(setup.copy_on_select, Some(true));
     assert_eq!(setup.theme.as_ref().unwrap().name, "Tokyo Night Test");
+    // `yes` is both sides.
+    assert_eq!(setup.option_as_meta, Some(OptionAsMeta::Both));
     let spec = spec(&setup);
     assert_eq!(hex(Some(spec.background)).as_deref(), Some("#1a1b26"));
     assert_eq!(hex(spec.cursor_text).as_deref(), Some("#1a1b26"));
@@ -106,7 +108,6 @@ fn kitty_reads_includes_and_kitten_theme_names() {
     assert_eq!(
         skipped(&setup),
         [
-            SkipReason::OptionKey,
             SkipReason::Padding,
             SkipReason::Scrollback,
             SkipReason::KeyBindings,
@@ -136,14 +137,8 @@ fn alacritty_reads_imports_first_and_the_main_file_wins() {
     assert_eq!(hex(Some(spec.ansi[9])).as_deref(), Some("#d54e53"));
     // `CellForeground` is a mode, not a color, and not an error.
     assert_eq!(spec.cursor, None);
-    assert_eq!(
-        skipped(&setup),
-        [
-            SkipReason::Padding,
-            SkipReason::OptionKey,
-            SkipReason::Scrollback,
-        ]
-    );
+    assert_eq!(setup.option_as_meta, Some(OptionAsMeta::Both));
+    assert_eq!(skipped(&setup), [SkipReason::Padding, SkipReason::Scrollback]);
     assert!(setup.unknown.contains(&"window.opacity".to_owned()));
     assert!(setup.unknown.contains(&"env".to_owned()));
     assert_eq!(setup.files.len(), 2);
@@ -176,8 +171,9 @@ fn wezterm_reads_literals_and_never_guesses_at_code() {
     assert_eq!(hex(Some(spec(&setup).background)).as_deref(), Some("#1f1f28"));
     assert_eq!(hex(Some(spec(&setup).ansi[9])).as_deref(), Some("#e82424"));
     let reasons = skipped(&setup);
+    // Only the left side was set: left stops composing, right still does.
+    assert_eq!(setup.option_as_meta, Some(OptionAsMeta::Left));
     for reason in [
-        SkipReason::OptionKey,
         SkipReason::Scrollback,
         SkipReason::Padding,
         SkipReason::KeyBindings,
@@ -218,10 +214,11 @@ fn iterm_reads_the_default_profile_not_the_first() {
     assert_eq!(setup.theme.as_ref().unwrap().name, "iTerm2 Work");
     let spec = spec(&setup);
     assert_eq!(hex(Some(spec.background)), hex(parse_color("#0d0f12")));
+    // Left Option sends Esc+, right types characters.
+    assert_eq!(setup.option_as_meta, Some(OptionAsMeta::Left));
     assert_eq!(
         skipped(&setup),
         [
-            SkipReason::OptionKey,
             SkipReason::Padding,
             SkipReason::Scrollback,
             SkipReason::KeyBindings,
@@ -245,7 +242,8 @@ fn terminal_decodes_archived_fonts_and_colors() {
     assert_eq!(hex(Some(spec.background)).as_deref(), Some("#000000"));
     assert_eq!(hex(Some(spec.foreground)).as_deref(), Some("#f2f2f2"));
     assert_eq!(setup.theme.as_ref().unwrap().name, "Terminal Pro");
-    assert_eq!(skipped(&setup), [SkipReason::OptionKey]);
+    assert_eq!(setup.option_as_meta, Some(OptionAsMeta::Both));
+    assert!(skipped(&setup).is_empty());
 }
 
 #[test]
@@ -279,6 +277,89 @@ fn scan_finds_each_fixture_terminal() {
 }
 
 #[test]
+fn option_as_meta_values_map_per_terminal_and_undo_restores_them() {
+    let ghostty = |value: &str| {
+        let temp = tempfile::tempdir().unwrap();
+        let dir = temp.path().join(".config/ghostty");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("config"), format!("macos-option-as-alt = {value}\n")).unwrap();
+        ghostty::read(&Roots::in_home(temp.path())).unwrap()
+    };
+    for (value, expected) in [
+        ("true", Some(OptionAsMeta::Both)),
+        ("false", Some(OptionAsMeta::Off)),
+        ("left", Some(OptionAsMeta::Left)),
+        ("right", Some(OptionAsMeta::Right)),
+        ("sideways", None),
+    ] {
+        let setup = ghostty(value);
+        assert_eq!(setup.option_as_meta, expected, "{value}");
+        assert_eq!(
+            skipped(&setup).contains(&SkipReason::Unreadable),
+            expected.is_none(),
+            "{value}"
+        );
+    }
+    let kitty = |value: &str| {
+        let temp = tempfile::tempdir().unwrap();
+        let dir = temp.path().join(".config/kitty");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("kitty.conf"), format!("macos_option_as_alt {value}\n")).unwrap();
+        kitty::read(&Roots::in_home(temp.path())).unwrap().option_as_meta
+    };
+    assert_eq!(kitty("no"), Some(OptionAsMeta::Off));
+    assert_eq!(kitty("right"), Some(OptionAsMeta::Right));
+    assert_eq!(kitty("both"), Some(OptionAsMeta::Both));
+    let alacritty = |value: &str| {
+        let temp = tempfile::tempdir().unwrap();
+        let dir = temp.path().join(".config/alacritty");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("alacritty.toml"),
+            format!("[window]\noption_as_alt = \"{value}\"\n"),
+        )
+        .unwrap();
+        alacritty::read(&Roots::in_home(temp.path())).unwrap().option_as_meta
+    };
+    assert_eq!(alacritty("OnlyRight"), Some(OptionAsMeta::Right));
+    assert_eq!(alacritty("None"), Some(OptionAsMeta::Off));
+    // WezTerm sets each side on its own; not composing is Meta.
+    assert_eq!(
+        option_with_side(Some(OptionAsMeta::Left), false, true),
+        OptionAsMeta::Both
+    );
+    assert_eq!(
+        option_with_side(Some(OptionAsMeta::Both), true, false),
+        OptionAsMeta::Right
+    );
+    assert_eq!(option_with_side(None, false, false), OptionAsMeta::Off);
+
+    // Applying writes the choice; Undo puts the old one back.
+    let setup = ghostty("right");
+    let current = Prefs::default();
+    let plan = plan(Source::Ghostty, &setup, &current, &env());
+    let mut prefs = current.clone();
+    let temp = tempfile::tempdir().unwrap();
+    let undo_record = apply(&plan, temp.path(), &current, |edit| {
+        edit(&mut prefs);
+        Ok(())
+    })
+    .unwrap();
+    if cfg!(target_os = "macos") {
+        assert_eq!(prefs.terminal_option_as_meta, OptionAsMeta::Right);
+    } else {
+        assert_eq!(prefs.terminal_option_as_meta, OptionAsMeta::Automatic);
+        assert!(!plan.not_imported.is_empty(), "reported, not stored");
+    }
+    undo(&undo_record, |edit| {
+        edit(&mut prefs);
+        Ok(())
+    })
+    .unwrap();
+    assert_eq!(prefs.terminal_option_as_meta, OptionAsMeta::Automatic);
+}
+
+#[test]
 fn postscript_and_nerd_font_names_find_installed_families() {
     let installed = ["JetBrains Mono", "SF Mono", "Hack Nerd Font Mono", "Menlo"];
     let find = |name| match_font_family(name, installed.iter().copied());
@@ -304,8 +385,17 @@ fn the_plan_lists_exactly_what_changes() {
             t("terminal_import.setting.theme"),
             t("terminal_import.setting.cursor"),
             t("terminal_import.setting.copy_on_select"),
+            #[cfg(target_os = "macos")]
+            t("settings.terminal.option_key"),
         ]
     );
+    #[cfg(target_os = "macos")]
+    {
+        let option = plan.changes.last().unwrap();
+        assert_eq!(option.from, t("settings.terminal.option_automatic"));
+        assert_eq!(option.to, t("settings.terminal.option_left"));
+        assert_eq!(plan.apply.option_as_meta, Some(OptionAsMeta::Left));
+    }
     assert_eq!(plan.apply.font_family.as_deref(), Some("JetBrains Mono"));
     assert_eq!(plan.apply.font_size, Some(15.0));
     assert_eq!(plan.apply.line_height, Some(1.2));
@@ -313,8 +403,14 @@ fn the_plan_lists_exactly_what_changes() {
     let theme = &plan.changes[3];
     assert_eq!(theme.to, "Night Owl Custom");
     assert!(theme.swatch.is_some());
-    // Four named reasons plus one line for the unknown keys.
-    assert_eq!(plan.not_imported.len(), 5, "{:?}", plan.not_imported);
+    // Three named reasons plus one line for the unknown keys (Option as
+    // Meta is imported on macOS and reported elsewhere).
+    assert_eq!(
+        plan.not_imported.len(),
+        if cfg!(target_os = "macos") { 4 } else { 5 },
+        "{:?}",
+        plan.not_imported
+    );
 
     // Applied, the same plan has nothing left to change but the theme,
     // whose file only exists once applied for real.
@@ -328,7 +424,10 @@ fn the_plan_lists_exactly_what_changes() {
     let again = super::plan(Source::Ghostty, &setup, &after, &env());
     let left: Vec<&str> = again.changes.iter().map(|change| change.setting).collect();
     assert_eq!(left, [t("terminal_import.setting.theme")]);
-    assert_eq!(again.unchanged.len(), 5);
+    assert_eq!(
+        again.unchanged.len(),
+        if cfg!(target_os = "macos") { 6 } else { 5 }
+    );
 }
 
 #[test]

@@ -220,10 +220,23 @@ fn apply(key: &str, value: Option<Literal>, setup: &mut Setup, roots: &Roots, fi
             }
         }
         (
-            "send_composed_key_when_left_alt_is_pressed"
-            | "send_composed_key_when_right_alt_is_pressed",
-            _,
-        ) => setup.skip(t("terminal_import.setting.option_as_alt"), SkipReason::OptionKey),
+            side @ ("send_composed_key_when_left_alt_is_pressed"
+            | "send_composed_key_when_right_alt_is_pressed"),
+            value,
+        ) => match value {
+            // Not composing is Meta.
+            Some(Literal::Bool(composes)) => {
+                setup.option_as_meta = Some(super::option_with_side(
+                    setup.option_as_meta,
+                    side.contains("left"),
+                    !composes,
+                ));
+            }
+            _ => {
+                setup.option_as_meta = None;
+                setup.skip(t("terminal_import.setting.option_as_alt"), SkipReason::Unreadable);
+            }
+        },
         ("window_padding", _) => {
             setup.skip(t("terminal_import.setting.padding"), SkipReason::Padding);
         }

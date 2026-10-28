@@ -1,5 +1,6 @@
-//! Bring a terminal setup over: font, size, line height, colors, cursor and
-//! copy-on-select from the terminal someone used before Diri.
+//! Bring a terminal setup over: font, size, line height, colors, cursor,
+//! copy-on-select and Option-as-Meta from the terminal someone used before
+//! Diri.
 //!
 //! Each supported terminal has a reader that turns its configuration into a
 //! [`Setup`]: only what the person set, never the source's own defaults.
@@ -22,7 +23,7 @@ use diri_term::themes;
 use gpui::Rgba;
 
 use crate::i18n::{t, tf};
-use crate::store::{CursorBlinkPref, CursorShapePref, Prefs};
+use crate::store::{CursorBlinkPref, CursorShapePref, OptionAsMeta, Prefs};
 
 mod alacritty;
 mod ghostty;
@@ -150,6 +151,7 @@ pub(crate) struct Setup {
     pub cursor_shape: Option<CursorShapePref>,
     pub cursor_blink: Option<CursorBlinkPref>,
     pub copy_on_select: Option<bool>,
+    pub option_as_meta: Option<OptionAsMeta>,
     /// Read, but Diri has no matching setting: (setting, why).
     pub skipped: Vec<Skipped>,
     /// Names of keys the reader does not know. Names only, never values.
@@ -160,8 +162,6 @@ pub(crate) struct Setup {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum SkipReason {
-    /// Diri chooses Option's meaning from the keyboard layout.
-    OptionKey,
     /// Diri's padding is fixed.
     Padding,
     /// Diri bounds history by size itself.
@@ -210,6 +210,7 @@ impl Setup {
             || self.cursor_shape.is_some()
             || self.cursor_blink.is_some()
             || self.copy_on_select.is_some()
+            || self.option_as_meta.is_some()
             || !self.skipped.is_empty()
             || !self.unknown.is_empty()
     }
@@ -352,6 +353,37 @@ pub(super) fn parse_color(value: &str) -> Option<Rgba> {
     theme_file::parse_color(value)
 }
 
+/// Option as Meta from which sides are Meta.
+pub(super) const fn option_from_sides(left: bool, right: bool) -> OptionAsMeta {
+    match (left, right) {
+        (true, true) => OptionAsMeta::Both,
+        (true, false) => OptionAsMeta::Left,
+        (false, true) => OptionAsMeta::Right,
+        (false, false) => OptionAsMeta::Off,
+    }
+}
+
+/// `current` with one side's Option made Meta (`meta`) or not; a side not
+/// set yet types characters, as it does by default in every terminal here.
+pub(super) fn option_with_side(
+    current: Option<OptionAsMeta>,
+    left: bool,
+    meta: bool,
+) -> OptionAsMeta {
+    let (mut left_meta, mut right_meta) = match current {
+        Some(OptionAsMeta::Both) => (true, true),
+        Some(OptionAsMeta::Left) => (true, false),
+        Some(OptionAsMeta::Right) => (false, true),
+        _ => (false, false),
+    };
+    if left {
+        left_meta = meta;
+    } else {
+        right_meta = meta;
+    }
+    option_from_sides(left_meta, right_meta)
+}
+
 /// A blinking cursor on or off, at Diri's normal speed when on.
 pub(super) fn blink_from_bool(blinks: bool) -> CursorBlinkPref {
     if blinks {
@@ -419,6 +451,7 @@ pub(crate) struct Apply {
     pub cursor_shape: Option<CursorShapePref>,
     pub cursor_blink: Option<CursorBlinkPref>,
     pub copy_on_select: Option<bool>,
+    pub option_as_meta: Option<OptionAsMeta>,
 }
 
 impl Apply {
@@ -445,6 +478,9 @@ impl Apply {
         }
         if let Some(copy) = self.copy_on_select {
             prefs.terminal_copy_on_select = copy;
+        }
+        if let Some(option) = self.option_as_meta {
+            prefs.terminal_option_as_meta = option;
         }
     }
 }
@@ -523,6 +559,16 @@ pub(crate) fn plan(source: Source, setup: &Setup, current: &Prefs, env: &Environ
     apply.cursor_shape = setup.cursor_shape;
     apply.cursor_blink = setup.cursor_blink;
     apply.copy_on_select = setup.copy_on_select;
+    // Option is a Mac key; elsewhere Alt is always Meta and the setting has
+    // no row, so it stays reported rather than silently stored.
+    if cfg!(target_os = "macos") {
+        apply.option_as_meta = setup.option_as_meta;
+    } else if setup.option_as_meta.is_some() {
+        not_imported.push(tf(
+            "terminal_import.skip.option_key",
+            &[("setting", &t("terminal_import.setting.option_as_alt"))],
+        ));
+    }
 
     let mut theme_id: Option<&'static str> = None;
     let mut new_theme: Option<ThemeSpec> = None;
@@ -671,8 +717,14 @@ pub(crate) fn plan(source: Source, setup: &Setup, current: &Prefs, env: &Environ
         on_off(next.terminal_copy_on_select),
         apply.copy_on_select.is_some(),
     );
+    compare(
+        &mut changes,
+        t("settings.terminal.option_key"),
+        crate::surface_shell::option_as_meta_label(current.terminal_option_as_meta).to_owned(),
+        crate::surface_shell::option_as_meta_label(next.terminal_option_as_meta).to_owned(),
+        apply.option_as_meta.is_some(),
+    );
 
-    drop(compare);
     // Keep only what actually changes, so applying writes nothing else.
     let changed = |setting: &str| changes.iter().any(|change| change.setting == setting);
     if !changed(t("terminal_import.setting.font")) {
@@ -694,13 +746,15 @@ pub(crate) fn plan(source: Source, setup: &Setup, current: &Prefs, env: &Environ
     if !changed(t("terminal_import.setting.copy_on_select")) {
         apply.copy_on_select = None;
     }
+    if !changed(t("settings.terminal.option_key")) {
+        apply.option_as_meta = None;
+    }
     // Store the normalized values, so the write is exactly what was shown.
     apply.font_size = apply.font_size.map(|_| next.terminal_font_size);
     apply.line_height = apply.line_height.map(|_| next.terminal_line_height);
 
     for skip in &setup.skipped {
         let key = match skip.reason {
-            SkipReason::OptionKey => "terminal_import.skip.option_key",
             SkipReason::Padding => "terminal_import.skip.padding",
             SkipReason::Scrollback => "terminal_import.skip.scrollback",
             SkipReason::KeyBindings => "terminal_import.skip.key_bindings",
@@ -902,6 +956,7 @@ pub(crate) struct PreviousPrefs {
     pub cursor_shape: CursorShapePref,
     pub cursor_blink: CursorBlinkPref,
     pub copy_on_select: bool,
+    pub option_as_meta: OptionAsMeta,
 }
 
 impl PreviousPrefs {
@@ -915,6 +970,7 @@ impl PreviousPrefs {
             cursor_shape: prefs.terminal_cursor_shape,
             cursor_blink: prefs.terminal_cursor_blink,
             copy_on_select: prefs.terminal_copy_on_select,
+            option_as_meta: prefs.terminal_option_as_meta,
         }
     }
 
@@ -927,6 +983,7 @@ impl PreviousPrefs {
         prefs.terminal_cursor_shape = self.cursor_shape;
         prefs.terminal_cursor_blink = self.cursor_blink;
         prefs.terminal_copy_on_select = self.copy_on_select;
+        prefs.terminal_option_as_meta = self.option_as_meta;
     }
 }
 

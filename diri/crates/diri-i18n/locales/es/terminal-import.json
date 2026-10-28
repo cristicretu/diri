@@ -31,7 +31,7 @@
   "terminal_import.skip.font_missing": "Fuente {font}: no está instalada en este Mac",
   "terminal_import.skip.key_bindings": "{setting}: los atajos de Diri están en Ajustes › Atajos",
   "terminal_import.skip.legacy_format": "{setting}: formato antiguo; ejecuta alacritty migrate primero",
-  "terminal_import.skip.option_key": "{setting}: Diri sigue tu distribución de teclado",
+  "terminal_import.skip.option_key": "{setting}: Alt siempre es Meta en este sistema",
   "terminal_import.skip.other": "{count} ajustes más: {names}",
   "terminal_import.skip.padding": "{setting}: los márgenes de Diri son fijos",
   "terminal_import.skip.scrollback": "{setting}: Diri ajusta el historial por sí mismo",

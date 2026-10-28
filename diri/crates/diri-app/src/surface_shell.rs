@@ -176,7 +176,7 @@ const OPTION_AS_META_OPTIONS: [crate::store::OptionAsMeta; 5] = [
     crate::store::OptionAsMeta::Off,
 ];
 
-fn option_as_meta_label(choice: crate::store::OptionAsMeta) -> &'static str {
+pub(crate) fn option_as_meta_label(choice: crate::store::OptionAsMeta) -> &'static str {
     use crate::store::OptionAsMeta;
     crate::i18n::t(match choice {
         OptionAsMeta::Automatic => "settings.terminal.option_automatic",

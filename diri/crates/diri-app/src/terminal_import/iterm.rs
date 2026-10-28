@@ -90,9 +90,13 @@ fn read_profile(profile: &Dictionary, setup: &mut Setup) {
         .get("Blinking Cursor")
         .and_then(Value::as_boolean)
         .map(super::blink_from_bool);
+    // 0 is Normal (types characters); 1 Meta and 2 Esc+ both make it Meta.
+    // Every profile stores these keys, so all-Normal is iTerm2's default,
+    // not a choice, and is left alone.
     let sends = |key: &str| profile.get(key).and_then(integer).unwrap_or(0);
-    if sends("Option Key Sends") != 0 || sends("Right Option Key Sends") != 0 {
-        setup.skip(t("terminal_import.setting.option_as_alt"), SkipReason::OptionKey);
+    let (left, right) = (sends("Option Key Sends") != 0, sends("Right Option Key Sends") != 0);
+    if left || right {
+        setup.option_as_meta = Some(super::option_from_sides(left, right));
     }
     if profile.contains_key("Side Margins") || profile.contains_key("Top/Bottom Margins") {
         setup.skip(t("terminal_import.setting.padding"), SkipReason::Padding);
