@@ -5,6 +5,7 @@ mod hover_linger;
 #[cfg(test)]
 mod hue_tests;
 mod lineage;
+mod pane_drop;
 mod project_picker;
 mod rename_input;
 mod rows;
@@ -31,7 +32,7 @@ use diri_proto::{
     SessionRecord,
 };
 use diri_ui::{
-    AgentLogo, AlertChip, Fill, FloatingSurface, Glass, GlassMenuRow, GlassPill, HairlineDivider,
+    AgentLogo, AlertChip, Fill, FloatingSurface, Glass, GlassMenuRow, HairlineDivider,
     HoverMarquee, Ink, LoadingIndicator, Metrics, Motion, Palette, Radius, RowFill, SemanticColors,
     Space, StateChip, StatusGlyph, StatusState, Typo,
 };
@@ -630,6 +631,10 @@ pub struct Sidebar {
     /// Window-space row bounds from the latest prepaint. Keyboard navigation
     /// uses these to reveal only rows that actually crossed the viewport edge.
     row_bounds: Rc<RefCell<HashMap<SessionId, Bounds<Pixels>>>>,
+    /// Which surface the dragged pane is over (true: the tab strip), and
+    /// that surface's window bounds.
+    pane_drop_area: Option<bool>,
+    pane_drop_bounds: Option<Bounds<Pixels>>,
     /// The gap the insertion marker was last drawn in during a session drag.
     insertion_haptic: RefCell<haptics::Crossing>,
     insertion_line: Cell<Option<f32>>,
@@ -710,6 +715,9 @@ pub struct Sidebar {
     /// The title row's opacity this frame (`window_chrome::title_row_opacity`),
     /// set by whoever renders the sidebar's title-row chrome.
     pub(crate) title_opacity: f32,
+    /// How the chrome reads for the main window's key status this frame
+    /// (`chrome_focus`), set by whoever renders the sidebar or the strip.
+    pub(crate) chrome_look: crate::chrome_focus::ChromeLook,
     preview: bool,
     /// Which face the New Agent menu shows. The remote directory listing
     /// itself lives in the Store so the daemon adapter can complete it
@@ -878,6 +886,8 @@ impl Sidebar {
             filter_focus: cx.focus_handle(),
             filter_generation: 0,
             row_bounds: Rc::new(RefCell::new(HashMap::new())),
+            pane_drop_area: None,
+            pane_drop_bounds: None,
             insertion_haptic: RefCell::new(haptics::Crossing::default()),
             insertion_line: Cell::new(None),
             fade_bounds: Rc::new(RefCell::new(HashMap::new())),
@@ -911,6 +921,7 @@ impl Sidebar {
             strip_held_hint: 0.0,
             strip_caption_inset: 0.0,
             title_opacity: 1.0,
+            chrome_look: crate::chrome_focus::ChromeLook::KEY,
             lineage_roles: HashMap::new(),
             focus_handle: cx.focus_handle(),
             hover_task: None,
@@ -1464,6 +1475,15 @@ impl Sidebar {
     fn colors(&self) -> SemanticColors {
         let store = self.store.read().expect("session store lock poisoned");
         crate::app_theme::sidebar_colors_in(&store)
+    }
+
+    /// Reads the main window's key status into [`Self::chrome_look`] and the
+    /// title row's opacity. `window` must be the window the sidebar or its
+    /// strip is drawn in, never a floating panel's.
+    pub(crate) fn sync_chrome_look(&mut self, colors: SemanticColors, window: &Window) {
+        let store = self.store.read().expect("session store lock poisoned");
+        self.chrome_look = crate::chrome_focus::look_in(&store, colors.appearance, window);
+        self.title_opacity = crate::window_chrome::title_row_opacity(window, self.chrome_look);
     }
 
     fn begin_rename(
@@ -2124,6 +2144,7 @@ impl Sidebar {
             icon_button(
                 "close-settings",
                 t("sidebar.back_to_sessions"),
+                None,
                 "chevron.left",
                 primary_hover,
                 colors,
@@ -2141,6 +2162,7 @@ impl Sidebar {
                 icon_button(
                     "sidebar-search",
                     t("sidebar.search_sessions"),
+                    Some(CommandId::ToggleHistory),
                     "magnifyingglass",
                     primary_hover,
                     colors,
@@ -2176,6 +2198,7 @@ impl Sidebar {
                 bar.child(icon_button(
                     "sidebar-layout",
                     t("sidebar.group_and_order"),
+                    None,
                     "gearshape",
                     layout_hover,
                     colors,
@@ -2203,6 +2226,7 @@ impl Sidebar {
                     } else {
                         t("sidebar.hide")
                     },
+                    Some(CommandId::ToggleSidebar),
                     "sidebar.left",
                     toggle_hover,
                     colors,
@@ -2322,6 +2346,8 @@ impl Sidebar {
         colors: SemanticColors,
         cx: &mut Context<Self>,
     ) -> gpui::Stateful<gpui::Div> {
+        use crate::chrome_focus::LookPill;
+        let look = self.chrome_look;
         div()
             .id(SharedString::from(format!("settings-{}", tab.label())))
             .debug_selector(move || format!("SETTINGS_TAB_{}", tab.label()))
@@ -2334,7 +2360,7 @@ impl Sidebar {
             .gap(px(8.0))
             .border_1()
             .border_color(colors.primary.alpha(0.0))
-            .glass_pill(colors, selected)
+            .look_pill(colors, look, selected)
             .text_color(if selected {
                 colors.primary
             } else {
@@ -2345,7 +2371,7 @@ impl Sidebar {
                 if selected {
                     style
                 } else {
-                    style.bg(Fill::hover(colors, true))
+                    style.bg(look.hover(Fill::hover(colors, true)))
                 }
             })
             .on_click(cx.listener(move |_, _, _, cx| {
@@ -3762,6 +3788,7 @@ impl Sidebar {
             renaming,
             held_hint,
             hover_linger,
+            look,
             ..
         } = *props;
         let drop = drop.clone();
@@ -3812,19 +3839,24 @@ impl Sidebar {
         } else {
             colors.primary.alpha(0.90)
         };
+        // Keyboard focus still lights its row in a window that is not key;
+        // only pointer hover stands down there (`chrome_focus`).
         let fill = if selected {
             RowFill::Selected
         } else if multi {
             RowFill::MultiSelected
-        } else if hovered || focused {
+        } else if focused || (hovered && look.hover) {
             RowFill::Hover
         } else {
             RowFill::Clear
         };
-        let mut fill_color = fill.color(colors);
+        let mut fill_color = match fill {
+            RowFill::Selected => look.pill_fill(colors),
+            fill => fill.color(colors),
+        };
         if fill == RowFill::Clear {
             // The row the pointer just left keeps a fading hover fill.
-            fill_color.a = RowFill::Hover.color(colors).a * hover_linger;
+            fill_color.a = look.hover(RowFill::Hover.color(colors)).a * hover_linger;
         }
 
         if renaming {
@@ -3940,11 +3972,12 @@ impl Sidebar {
             .gap(px(8.0))
             .rounded(px(SIDEBAR_ROW_RADIUS))
             .bg(fill_color)
+            .when_some(self.pane_drop_fill(&id, cx), |row, fill| row.bg(fill))
             .border_1()
             .border_color(if marked {
                 Palette::CLAY.alpha(0.78)
             } else if selected {
-                Glass::stroke(colors)
+                look.pill_stroke(colors)
             } else {
                 colors.primary.alpha(0.0)
             })
@@ -4483,12 +4516,13 @@ impl Sidebar {
             .expect("session store lock poisoned")
             .selected_session_id()
             == Some(&id);
+        let look = self.chrome_look;
         let fill_color = if selected {
-            RowFill::Selected.color(colors)
-        } else if hovered || focused {
+            look.pill_fill(colors)
+        } else if focused || (hovered && look.hover) {
             RowFill::Hover.color(colors)
         } else {
-            let mut trail = RowFill::Hover.color(colors);
+            let mut trail = look.hover(RowFill::Hover.color(colors));
             trail.a *= self.session_hover_linger(&id);
             trail
         };
@@ -8517,6 +8551,9 @@ pub(crate) mod render_probe {
 impl Render for Sidebar {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         crate::perf_overlay::rendered("sidebar");
+        if crate::pane_drag::end_if_released(cx) {
+            self.pane_drop_area = None;
+        }
         self.discard_rename_preedit(window, cx);
         #[cfg(test)]
         let render_started = std::time::Instant::now();
@@ -8560,6 +8597,7 @@ impl Sidebar {
             self.dismiss_hover_card(cx);
         }
         let colors = self.colors();
+        self.sync_chrome_look(colors, window);
         let (
             projection,
             mut expanded_archives,
@@ -8788,6 +8826,14 @@ impl Sidebar {
                     this.track_lift_pointer(event.event.position, cx);
                 },
             ))
+            .on_drag_move::<crate::pane_drag::DraggedPane>(cx.listener(
+                |this, event: &gpui::DragMoveEvent<crate::pane_drag::DraggedPane>, _, cx| {
+                    this.pane_drag_move(event.event.position, event.bounds, false, cx);
+                },
+            ))
+            .on_drop(cx.listener(|this, _: &crate::pane_drag::DraggedPane, _, cx| {
+                this.pane_drop(cx);
+            }))
             .on_hover(cx.listener(|this, hovered: &bool, window, cx| {
                 if !this.surface_in_parent {
                     this.hover_peek(*hovered, window, cx);
@@ -8812,7 +8858,6 @@ impl Sidebar {
                 }
             }))
             .child({
-                self.title_opacity = crate::window_chrome::title_row_opacity(window);
                 self.top_bar(crate::held_hints::opacity(window, cx), colors, cx)
             });
         if let Some(nav) = self.settings_nav.clone() {
@@ -8930,6 +8975,8 @@ impl Sidebar {
         if self.hover_task.is_some() || self.ui.hover_card.is_some() {
             root = root.child(self.hover_card_input(cx));
         }
+        root = root.children(self.pane_new_tab_slot(false, cx));
+        self.animate_pane_drop(window, cx);
         if let Some(proposal) = self.ui.pending_sibling.clone() {
             root = root.child(self.sibling_confirmation(proposal, colors, cx));
         } else if let Some(notice) = self.ui.delegation_notice.clone() {
@@ -8984,9 +9031,11 @@ fn disclosure_body(
         .into_any_element()
 }
 
+#[allow(clippy::too_many_arguments)]
 fn icon_button(
     id: &'static str,
     label: &'static str,
+    shortcut: Option<CommandId>,
     system_image: &'static str,
     hovering: bool,
     colors: SemanticColors,
@@ -9010,6 +9059,7 @@ fn icon_button(
         .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
         .on_click(on_click)
         .on_hover(on_hover)
+        .shortcut_tooltip(label, shortcut, colors)
         .child(sf_symbol(system_image, 15.0, colors.secondary))
         .into_any_element()
 }
@@ -10639,6 +10689,92 @@ mod tests {
         cx.run_until_parked();
         let (rows, _, _) = render_probe::take();
         assert_eq!(rows, listed);
+    }
+
+    /// Rows built and sidebar renders for one key-status change, after the
+    /// window has settled. GPUI refreshes the whole window on activation, so
+    /// this is the cost a key change already paid before the inactive look.
+    fn key_change_cost(cx: &mut VisualTestContext, key: bool) -> (usize, usize) {
+        render_probe::take();
+        if key {
+            cx.update(|window, _| window.activate_window());
+        } else {
+            cx.deactivate_window();
+        }
+        cx.run_until_parked();
+        let (rows, renders, _) = render_probe::take();
+        (rows, renders)
+    }
+
+    #[gpui::test]
+    fn key_status_costs_only_the_refresh_activation_already_draws(cx: &mut TestAppContext) {
+        let (sidebar, _, cx) = drag_harness(cx);
+        cx.update(|window, _| window.activate_window());
+        cx.run_until_parked();
+        let listed = sidebar.read_with(cx, |sidebar, _| sidebar.session_row_views.len());
+        assert!(listed > 3);
+        // Holding key status draws nothing.
+        render_probe::take();
+        cx.run_until_parked();
+        assert_eq!(render_probe::take().0, 0);
+        let mut costs = Vec::new();
+        for key in [false, true, false, true] {
+            costs.push(key_change_cost(cx, key));
+            render_probe::take();
+            cx.run_until_parked();
+            assert_eq!(render_probe::take().0, 0, "settled after key={key}");
+        }
+        eprintln!("key change cost (rows built, sidebar renders) with {listed} rows: {costs:?}");
+        for (rows, renders) in costs {
+            assert!(rows <= listed, "each row at most once per change: {rows}");
+            assert!(renders <= 2, "{renders}");
+        }
+    }
+
+    #[gpui::test]
+    fn selection_and_hover_step_back_while_the_window_is_not_key(cx: &mut TestAppContext) {
+        let (sidebar, _, cx) = drag_harness(cx);
+        sidebar.update(cx, |sidebar, cx| {
+            sidebar
+                .store
+                .write()
+                .unwrap()
+                .select(SessionId::new("preview-codex"));
+            sidebar.store_changed(cx);
+        });
+        cx.update(|window, _| window.activate_window());
+        cx.run_until_parked();
+        let looks = |sidebar: &Entity<Sidebar>, cx: &VisualTestContext| {
+            sidebar.read_with(cx, |sidebar, cx| {
+                sidebar
+                    .session_row_views
+                    .iter()
+                    .map(|(id, view)| {
+                        let view = view.read(cx);
+                        (id.0.clone(), view.selected_for_test(), view.look_for_test())
+                    })
+                    .collect::<Vec<_>>()
+            })
+        };
+        let key = looks(&sidebar, cx);
+        assert!(key.iter().any(|(id, selected, _)| *selected && id == "preview-codex"));
+        assert!(key.iter().all(|(_, _, look)| *look == crate::chrome_focus::ChromeLook::KEY));
+
+        cx.deactivate_window();
+        cx.run_until_parked();
+        let colors = sidebar.read_with(cx, |sidebar, _| sidebar.colors());
+        for (id, _, look) in looks(&sidebar, cx) {
+            assert!(!look.key, "{id} still wears the key look");
+            assert!(!look.hover, "{id} lights on hover");
+            assert!(look.pill_fill(colors).a < diri_ui::Glass::fill(colors).a, "{id}");
+        }
+        let title = sidebar.read_with(cx, |sidebar, _| sidebar.title_opacity);
+        assert!(title < 1.0, "title row stays at full strength: {title}");
+
+        cx.update(|window, _| window.activate_window());
+        cx.run_until_parked();
+        assert_eq!(looks(&sidebar, cx), key);
+        assert_eq!(sidebar.read_with(cx, |sidebar, _| sidebar.title_opacity), 1.0);
     }
 
     #[gpui::test]

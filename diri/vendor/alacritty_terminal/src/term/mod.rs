@@ -507,6 +507,46 @@ pub enum Osc52 {
 }
 
 impl<T> Term<T> {
+    /// Release the primary grid's history caches once output is idle.
+    #[cfg(feature = "compact-history")]
+    pub fn release_idle_history(&mut self) {
+        if self.mode.contains(TermMode::ALT_SCREEN) {
+            self.inactive_grid
+                .as_mut()
+                .expect("primary grid")
+                .release_idle_history();
+        } else {
+            self.grid.release_idle_history();
+        }
+    }
+
+    /// DIRI PATCH: history rows of the primary screen, also while the
+    /// alternate screen is shown.
+    pub fn primary_history_size(&self) -> usize {
+        match (
+            &self.inactive_grid,
+            self.mode.contains(TermMode::ALT_SCREEN),
+        ) {
+            (Some(primary), true) => primary.history_size(),
+            _ => self.grid.history_size(),
+        }
+    }
+
+    /// DIRI PATCH: changes only the history row limit, as `set_options` does
+    /// for `scrolling_history`, without its damage and title side effects. A
+    /// lower limit drops the oldest rows; the limit survives a reset.
+    pub fn set_scrolling_history(&mut self, limit: usize) {
+        self.config.scrolling_history = limit;
+        if self.mode.contains(TermMode::ALT_SCREEN) {
+            self.inactive_grid
+                .as_mut()
+                .expect("alternate screen retains the primary grid")
+                .update_history(limit);
+        } else {
+            self.grid.update_history(limit);
+        }
+    }
+
     #[cfg(feature = "compact-history")]
     pub fn bound_primary_history_storage(&mut self, budget: usize) {
         if self.mode.contains(TermMode::ALT_SCREEN) {
@@ -2389,9 +2429,10 @@ impl<T: EventListener> Handler for Term<T> {
             Attr::CancelHidden => cursor.template.flags.remove(Flags::HIDDEN),
             Attr::Strike => cursor.template.flags.insert(Flags::STRIKEOUT),
             Attr::CancelStrike => cursor.template.flags.remove(Flags::STRIKEOUT),
-            _ => {
-                debug!("Term got unhandled attr: {attr:?}");
-            }
+            Attr::BlinkSlow | Attr::BlinkFast => cursor.template.flags.insert(Flags::BLINK),
+            Attr::CancelBlink => cursor.template.flags.remove(Flags::BLINK),
+            Attr::Overline => cursor.template.flags.insert(Flags::OVERLINE),
+            Attr::CancelOverline => cursor.template.flags.remove(Flags::OVERLINE),
         }
     }
 

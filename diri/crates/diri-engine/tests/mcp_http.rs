@@ -33,6 +33,7 @@ fn start() -> Engine {
         ControlServer::new(Arc::clone(&registry), temp.path().join("daemon.sock"))
             .with_config_dir(temp.path().join("config"))
             .with_notes_dir(temp.path().join("notes"))
+            .with_agent_naming_setting(|| true)
             .with_injection(InjectionConfig {
                 inject_dir: temp.path().join("inject"),
                 cli_path: temp.path().join("bin/dirijor"),
@@ -132,6 +133,76 @@ fn call(url: &str, token: &str, id: u64, tool: &str, arguments: Value) -> Value 
     );
     assert_eq!(reply.status, 200, "{}", reply.head);
     reply.message()
+}
+
+#[test]
+fn an_agent_names_its_own_session_over_http() {
+    let engine = start();
+    let cwd = tempfile::tempdir().unwrap();
+    let session = spawn_session(&engine, cwd.path());
+    let token = engine.server.mcp_http_token(&session).unwrap();
+    let title = || {
+        let registry = engine.registry.lock().unwrap();
+        let record = registry.record(&session).unwrap();
+        (record.title.clone(), record.title_source)
+    };
+
+    let named = call(
+        &engine.url,
+        &token,
+        1,
+        "name_session",
+        json!({"name": "Fix Login Redirect"}),
+    );
+    let named = &named["result"]["structuredContent"];
+    assert_eq!(named["applied"], true, "{named}");
+    assert_eq!(named["title"], "fix-login-redirect");
+    assert_eq!(
+        title(),
+        (
+            "fix-login-redirect".into(),
+            diri_proto::TitleSource::AgentNamed
+        )
+    );
+    let whoami = call(&engine.url, &token, 2, "whoami", json!({}));
+    assert_eq!(
+        whoami["result"]["structuredContent"]["name_set_by"],
+        "agent"
+    );
+
+    // The user renames the tab: the Agent's next name is refused, politely.
+    dirijor_mcp::Bridge::new(engine.server.socket_path().to_owned(), None)
+        .request(
+            "session.rename",
+            json!({"sessionID": session, "title": "Login work"}),
+            Duration::from_secs(5),
+        )
+        .unwrap();
+    let kept = call(
+        &engine.url,
+        &token,
+        3,
+        "name_session",
+        json!({"name": "other-task"}),
+    );
+    let kept = &kept["result"]["structuredContent"];
+    assert_eq!(kept["applied"], false, "{kept}");
+    assert_eq!(kept["reason"], "userNamed");
+    assert!(kept["note"].as_str().unwrap().contains("keep their name"));
+    assert_eq!(title().0, "Login work");
+    let whoami = call(&engine.url, &token, 4, "whoami", json!({}));
+    assert_eq!(whoami["result"]["structuredContent"]["name_set_by"], "user");
+
+    // A name the user asked for lands as written.
+    let asked = call(
+        &engine.url,
+        &token,
+        5,
+        "name_session",
+        json!({"name": "Release prep", "user_requested": true}),
+    );
+    assert_eq!(asked["result"]["structuredContent"]["applied"], true);
+    assert_eq!(title().0, "Release prep");
 }
 
 #[test]

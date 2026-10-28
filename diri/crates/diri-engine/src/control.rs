@@ -181,6 +181,10 @@ pub struct ControlServer {
     /// The Engine-served MCP endpoint, once [`ControlServer::start_mcp_http`]
     /// bound it. Unset means every Agent keeps the stdio `dirijor-mcp`.
     mcp_http: std::sync::OnceLock<crate::mcp_http::McpHttpEndpoint>,
+    /// Whether "Let agents name sessions" is on: read from the app's
+    /// preferences when an Agent starts or names its session. A field so
+    /// tests do not depend on the developer's own preferences.
+    agent_naming_enabled: fn() -> bool,
     /// Agent CLI versions, so only releases verified to speak HTTP MCP are
     /// pointed at the endpoint.
     cli_versions: crate::cli_version::CliVersions,
@@ -318,6 +322,7 @@ impl ControlServer {
             injection: None,
             shell_integration: None,
             mcp_http: std::sync::OnceLock::new(),
+            agent_naming_enabled: diri_proto::session_naming::enabled_for_current_user,
             cli_versions: Default::default(),
             governor: std::sync::Arc::new(Mutex::new(crate::governor::GovernorConfig::default())),
             browser: std::sync::OnceLock::new(),
@@ -561,6 +566,13 @@ impl ControlServer {
     /// to the socket's directory, which is right on macOS (one App Support
     /// root) and wrong on Linux, where the socket sits in the runtime tmpfs
     /// and the app writes `hosts.json` to the XDG config directory.
+    /// Where "Let agents name sessions" is read from. The default reads the
+    /// app's preferences; tests pin it so the developer's own do not leak in.
+    pub fn with_agent_naming_setting(mut self, enabled: fn() -> bool) -> Self {
+        self.agent_naming_enabled = enabled;
+        self
+    }
+
     pub fn with_config_dir(mut self, dir: impl Into<PathBuf>) -> Self {
         self.config_dir = dir.into();
         load_terminal_palette(&self.config_dir, &self.registry);
@@ -792,7 +804,7 @@ impl ControlServer {
             std::fs::remove_file(&self.socket_path)?;
         }
         if let Some(parent) = self.socket_path.parent() {
-            std::fs::create_dir_all(parent)?;
+            diri_platform::private::create_dir_all(parent)?;
         }
         let listener = UnixListener::bind(&self.socket_path)?;
         #[cfg(unix)]
@@ -905,10 +917,13 @@ impl ControlServer {
                     // Bytes the line reader buffered past the attach line are
                     // already binary frames; hand them over.
                     let buffered = reader.buffer().to_vec();
-                    self.attach.serve_with_keyboard(
+                    self.attach.serve_with_capabilities(
                         &self.registry,
                         &attach.attach.0,
-                        attach.enhanced_keyboard,
+                        crate::attach::AttachCapabilities {
+                            enhanced_keyboard: attach.enhanced_keyboard,
+                            terminal_styles: attach.terminal_styles,
+                        },
                         reader.into_inner(),
                         buffered,
                         writer,
@@ -1436,6 +1451,7 @@ impl ControlServer {
         // never silently drop arguments or fall back to a login shell.
         let argv = decode_launch_argv(&raw)?;
         let mut p: diri_proto::SessionSpawnParams = decode(Some(raw))?;
+        let command_run = command_run_for(&p, &argv)?;
         if let Some((host, cwd)) =
             crate::wsl::route_unc(&p.cwd, &crate::wsl::catalog(self.hosts_file()))
                 .map_err(io_control_error)?
@@ -1458,7 +1474,14 @@ impl ControlServer {
             p.host.as_deref(),
         )?;
         if p.host.is_some() {
-            return self.session_spawn_remote(p, argv, account_profile, reserved_id, scheduled);
+            return self.session_spawn_remote(
+                p,
+                argv,
+                command_run,
+                account_profile,
+                reserved_id,
+                scheduled,
+            );
         }
         if let Some(profile) = &account_profile
             && profile.agent == "codex"
@@ -1549,9 +1572,10 @@ impl ControlServer {
                     self.mcp_http_url_for(&descriptor),
                 );
                 launch_args.extend(injected.argv);
-                launch_args.extend(spoken_summary_args(
+                launch_args.extend(codex_developer_args(
                     &descriptor.injection,
                     self.reads_session_aloud(&id),
+                    (self.agent_naming_enabled)(),
                 ));
                 mcp_http_token = injected
                     .mcp_http
@@ -1612,6 +1636,7 @@ impl ControlServer {
         }
         let mut record = new_record(&id, &kind, &cwd);
         record.scheduled_run = scheduled;
+        record.command_run = command_run;
         record.terminal_cwd = start_directory.map(|path| path.to_string_lossy().into_owned());
         record.account_profile = account_profile;
         record.kind = p.kind.clone();
@@ -1627,9 +1652,20 @@ impl ControlServer {
         record.worktree_path = worktree_path;
         record.git_branch = git_branch.or_else(|| crate::git::branch(&cwd_path));
         record.parent = p.parent.clone();
-        if let (Some(cols), Some(rows)) = (p.initial_cols, p.initial_rows) {
-            pty.cols = cols.clamp(2, u16::MAX as i64) as u16;
-            pty.rows = rows.clamp(2, u16::MAX as i64) as u16;
+        // A size the caller named (the App measures the pane a new tab opens
+        // in), else the size a client last gave any session: launch at it now
+        // instead of waiting out the pane's first report. Only a spawn with
+        // neither waits, up to the launch fallback, for its pane.
+        let launch_size = match (p.initial_cols, p.initial_rows) {
+            (Some(cols), Some(rows)) => Some((
+                cols.clamp(2, u16::MAX as i64) as u16,
+                rows.clamp(2, u16::MAX as i64) as u16,
+            )),
+            _ => registry.last_client_size(),
+        };
+        if let Some((cols, rows)) = launch_size {
+            pty.cols = cols;
+            pty.rows = rows;
         }
 
         // Injection environment and the caller-minted conversation UUID. The
@@ -1695,6 +1731,11 @@ impl ControlServer {
         registry
             .spawn(spec, record)
             .map_err(|error| ControlError::internal(error.to_string()))?;
+        if let Some((cols, rows)) = launch_size
+            && let Some(session) = registry.get(&id)
+        {
+            session.launch_at(cols, rows);
+        }
         if let Some(record) = registry.record(&id) {
             crate::telemetry::record_session_spawn(
                 &record,
@@ -1990,6 +2031,7 @@ impl ControlServer {
         &self,
         p: diri_proto::SessionSpawnParams,
         caller_argv: Vec<String>,
+        command_run: Option<diri_proto::CommandRun>,
         mut account_profile: Option<diri_proto::AgentAccountProfile>,
         reserved_id: Option<String>,
         scheduled: Option<diri_proto::schedules::ScheduledRunInfo>,
@@ -2177,6 +2219,7 @@ impl ControlServer {
 
         let mut record = new_record(&id, &kind, &captured.cwd);
         record.scheduled_run = scheduled;
+        record.command_run = command_run;
         record.account_profile = account_profile;
         record.kind = p.kind.clone();
         record.originating_prompt = p.initial_prompt.clone();
@@ -3307,13 +3350,23 @@ impl ControlServer {
         // A remote history page takes a network round trip (up to the request
         // timeout). Attach input and grid publication also need the Registry;
         // neither may wait for this reply.
+        // An older client rejects decoration spans it does not know.
+        let styled = |mut result: diri_proto::ReadScrollbackCellsResult| {
+            if !p.styles {
+                result
+                    .metadata
+                    .iter_mut()
+                    .for_each(|metadata| metadata.styles.clear());
+            }
+            result
+        };
         if let Some(reader) = reader {
-            return encode(&reader.read(p.first_row, p.max_rows));
+            return encode(&styled(reader.read(p.first_row, p.max_rows)));
         }
         let (mut screen, _) = self
             .completed_terminal(&p.session_id.0)?
             .ok_or_else(|| self.no_retained_terminal(&p.session_id.0))?;
-        encode(&screen.scrollback_cells(p.first_row, p.max_rows))
+        encode(&styled(screen.scrollback_cells(p.first_row, p.max_rows)))
     }
 
     fn spawn_session_unlocked(
@@ -3429,6 +3482,10 @@ impl ControlServer {
         registry
             .remove(&p.session_id.0, &self.logs_dir)
             .map_err(io_control_error)?;
+        if let Some(holder) = &self.holder {
+            let _ =
+                crate::session_files::remove_holder_record(&holder.holders_dir, &p.session_id.0);
+        }
         if let Some(store) = &self.remote_bindings {
             let _ = store.remove(&p.session_id.0);
         }
@@ -3463,6 +3520,9 @@ impl ControlServer {
 
     fn session_rename(&self, params: Option<JsonValue>) -> Result<JsonValue, ControlError> {
         let p: diri_proto::SessionRenameParams = decode(params)?;
+        if let Some(by) = p.by {
+            return self.session_name_by_agent(&p.session_id.0, &p.title, by);
+        }
         let mut registry = self.registry.lock().map_err(poisoned)?;
         registry
             .rename(&p.session_id.0, &p.title)
@@ -3470,6 +3530,54 @@ impl ControlServer {
         let _ = registry.persist();
         self.publish_updated(&registry, &p.session_id.0);
         Ok(json!({}))
+    }
+
+    /// An Agent naming its own session (`name_session`). Never replaces the
+    /// user's or Diri's name, and names nothing while the setting is off
+    /// unless the user asked the Agent for this name.
+    fn session_name_by_agent(
+        &self,
+        id: &str,
+        name: &str,
+        by: diri_proto::RenameAuthor,
+    ) -> Result<JsonValue, ControlError> {
+        use crate::registry::AgentNaming;
+        let for_user = by == diri_proto::RenameAuthor::AgentForUser;
+        let mut registry = self.registry.lock().map_err(poisoned)?;
+        let current = registry
+            .record(id)
+            .map(|record| record.title.clone())
+            .ok_or_else(|| ControlError::not_found(format!("no session {id}")))?;
+        let refused = |reason: &str, title: String| {
+            serde_json::to_value(diri_proto::AgentRenameResult {
+                applied: false,
+                title,
+                reason: Some(reason.to_owned()),
+            })
+            .map_err(|error| ControlError::internal(error.to_string()))
+        };
+        if !for_user && !(self.agent_naming_enabled)() {
+            return refused("namingOff", current);
+        }
+        let outcome = registry
+            .name_by_agent(id, name, for_user)
+            .map_err(io_control_error)?;
+        let title = match outcome {
+            AgentNaming::Named(title) => title,
+            AgentNaming::Unchanged(title) => return refused("unchanged", title),
+            AgentNaming::Explicit(title) => return refused("userNamed", title),
+            AgentNaming::Invalid(invalid) => {
+                return Err(ControlError::bad_request(invalid.message()));
+            }
+        };
+        let _ = registry.persist();
+        self.publish_updated(&registry, id);
+        serde_json::to_value(diri_proto::AgentRenameResult {
+            applied: true,
+            title,
+            reason: None,
+        })
+        .map_err(|error| ControlError::internal(error.to_string()))
     }
 
     fn session_mark_seen(&self, params: Option<JsonValue>) -> Result<JsonValue, ControlError> {
@@ -3937,6 +4045,15 @@ impl ControlServer {
         registry
             .respawn(spec)
             .map_err(|error| ControlError::internal(error.to_string()))?;
+        registry.update_record(&p.session_id.0, |record| {
+            if local_shell {
+                // Restarted as a login shell, no longer the command.
+                record.command_run = None;
+            } else if let Some(run) = record.command_run.as_mut() {
+                // The previous run's duration says nothing about this one.
+                run.ran_ms = None;
+            }
+        });
         if local_shell {
             // Report where the new shell actually starts before its first
             // sample: the restored directory, or none when that directory is
@@ -4341,12 +4458,24 @@ impl ControlServer {
             record.title = title.clone();
             record.title_source = diri_proto::TitleSource::FirstPrompt;
         }
-        let spec = self.resume_spec(&registry, &id, &kind, &p.entry.cwd, Some(&p.entry.id))?;
+        let mut spec = self.resume_spec(&registry, &id, &kind, &p.entry.cwd, Some(&p.entry.id))?;
+        // A new tab: launch at the size a client last gave any session, as a
+        // fresh spawn with no caller size does.
+        let launch_size = registry.last_client_size();
+        if let Some((cols, rows)) = launch_size {
+            spec.pty.cols = cols;
+            spec.pty.rows = rows;
+        }
         self.ensure_published_project(&mut registry, &p.entry.cwd, None);
         let spawn_started = Instant::now();
         registry
             .spawn(spec, record)
             .map_err(|error| ControlError::internal(error.to_string()))?;
+        if let Some((cols, rows)) = launch_size
+            && let Some(session) = registry.get(&id)
+        {
+            session.launch_at(cols, rows);
+        }
         if let Some(record) = registry.record(&id) {
             crate::telemetry::record_session_spawn(
                 &record,
@@ -4458,9 +4587,10 @@ impl ControlServer {
                 self.mcp_http_url_for(&descriptor),
             );
             launch_args.extend(injected.argv);
-            launch_args.extend(spoken_summary_args(
+            launch_args.extend(codex_developer_args(
                 &descriptor.injection,
                 self.reads_session_aloud(id),
+                (self.agent_naming_enabled)(),
             ));
             mcp_http_token = injected
                 .mcp_http
@@ -5346,6 +5476,31 @@ fn live_pane_shells(
         .collect()
 }
 
+/// A spawn that runs one command rather than an Agent or a login shell: an
+/// explicit `argv`, or a `generic` kind's command line, on a terminal kind.
+/// `keepOpen` is accepted only there: an Agent's or a login shell's tab
+/// already outlives its program, and that policy is not this flag's to change.
+fn command_run_for(
+    p: &diri_proto::SessionSpawnParams,
+    argv: &[String],
+) -> Result<Option<diri_proto::CommandRun>, ControlError> {
+    let command = p.kind.is_terminal()
+        && (!argv.is_empty()
+            || p.kind
+                .command()
+                .is_some_and(|command| !command.trim().is_empty()));
+    let keep_open = p.keep_open.unwrap_or(false);
+    if keep_open && !command {
+        return Err(ControlError::bad_request(
+            "keepOpen applies only to a command: an argv, or a generic kind's command line",
+        ));
+    }
+    Ok(command.then_some(diri_proto::CommandRun {
+        keep_open,
+        ran_ms: None,
+    }))
+}
+
 fn decode_launch_argv(params: &JsonValue) -> Result<Vec<String>, ControlError> {
     let Some(value) = params.get("argv") else {
         return Ok(Vec::new());
@@ -5479,6 +5634,7 @@ pub(crate) fn new_record(id: &str, kind: &str, cwd: &str) -> diri_proto::Session
     use diri_proto::{AgentKind, DateMillis, Resumability, SessionId, TitleSource};
     let now: DateMillis = std::time::SystemTime::now().into();
     diri_proto::SessionRecord {
+        command_run: None,
         attention_state: None,
         id: SessionId(id.to_string()),
         kind: AgentKind::new(kind),
@@ -7276,17 +7432,31 @@ mod spoken_summary_tests {
     }
 }
 
-/// Codex has no prompt hook, so while "Talk with your agent" is on its
-/// launch carries the request for a closing `Spoken:` paragraph as
-/// developer instructions, which add to its own rather than replace them.
-/// It applies from the next launch; Claude Code is asked on every prompt.
-fn spoken_summary_args(injection: &crate::agent::InjectionSpec, reads_aloud: bool) -> Vec<String> {
-    if !injection.codex_notify || !reads_aloud {
+/// Codex has no prompt hook, so what it is asked for at startup travels as
+/// developer instructions, which add to its own rather than replace them:
+/// while "Talk with your agent" is on, a closing `Spoken:` paragraph (Claude
+/// Code is asked on every prompt instead), and while "Let agents name
+/// sessions" is on, naming its session (Codex does not show MCP server
+/// instructions to its model). Both apply from the next launch. Codex keeps
+/// only the last `developer_instructions` override, so they share one.
+fn codex_developer_args(
+    injection: &crate::agent::InjectionSpec,
+    reads_aloud: bool,
+    names_sessions: bool,
+) -> Vec<String> {
+    let mut parts = Vec::new();
+    if injection.codex_notify && reads_aloud {
+        parts.push(diri_proto::voice::SPOKEN_INSTRUCTION);
+    }
+    if injection.codex_mcp && names_sessions {
+        parts.push(diri_proto::session_naming::INSTRUCTION);
+    }
+    if parts.is_empty() {
         return Vec::new();
     }
     vec![
         "-c".into(),
-        crate::inject::codex_developer_instructions(diri_proto::voice::SPOKEN_INSTRUCTION),
+        crate::inject::codex_developer_instructions(&parts.join("\n\n")),
     ]
 }
 
@@ -7582,6 +7752,110 @@ mod tests {
     }
 
     #[test]
+    fn an_agent_names_its_own_session_and_the_users_name_wins() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut registry = Registry::new(engine(), temp.path().join("state.json"));
+        registry.insert_record(new_record("s_named", "claude", "/tmp"));
+        let mut server =
+            ControlServer::new(Arc::new(Mutex::new(registry)), temp.path().join("socket"));
+        server.agent_naming_enabled = || true;
+        let name = |server: &ControlServer, title: &str, by: &str| {
+            server.dispatch(
+                Method::SESSION_RENAME,
+                Some(json!({"sessionID": "s_named", "title": title, "by": by})),
+            )
+        };
+        let title = |server: &ControlServer| {
+            let registry = server.registry.lock().unwrap();
+            let record = registry.record("s_named").unwrap();
+            (record.title.clone(), record.title_source)
+        };
+
+        let named = name(&server, "Fix login redirect", "agent").unwrap();
+        assert_eq!(
+            named,
+            json!({"applied": true, "title": "fix-login-redirect"})
+        );
+        assert_eq!(
+            title(&server),
+            (
+                "fix-login-redirect".into(),
+                diri_proto::TitleSource::AgentNamed
+            )
+        );
+        assert!(name(&server, "session", "agent").is_err(), "generic");
+
+        // The user's rename answers `{}` as it always has, and then wins.
+        assert_eq!(
+            server
+                .dispatch(
+                    Method::SESSION_RENAME,
+                    Some(json!({"sessionID": "s_named", "title": "Login work"})),
+                )
+                .unwrap(),
+            json!({})
+        );
+        let kept = name(&server, "other-task", "agent").unwrap();
+        assert_eq!(
+            kept,
+            json!({"applied": false, "title": "Login work", "reason": "userNamed"})
+        );
+        // A name the user asked the Agent for lands as written.
+        let asked = name(&server, "Release prep", "agentForUser").unwrap();
+        assert_eq!(asked["applied"], true);
+        assert_eq!(
+            title(&server),
+            (
+                "Release prep".into(),
+                diri_proto::TitleSource::DirijorAssigned
+            )
+        );
+
+        // Switched off: Agents name nothing on their own, but a name the
+        // user asks for still lands.
+        server.agent_naming_enabled = || false;
+        server
+            .dispatch(
+                Method::SESSION_RENAME,
+                Some(json!({"sessionID": "s_named", "title": "x"})),
+            )
+            .unwrap();
+        let off = name(&server, "new-task", "agent").unwrap();
+        assert_eq!(off["applied"], false);
+        assert_eq!(off["reason"], "namingOff");
+        assert_eq!(title(&server).0, "x");
+        assert_eq!(
+            name(&server, "Asked for", "agentForUser").unwrap()["applied"],
+            true
+        );
+    }
+
+    #[test]
+    fn codex_is_told_to_name_its_session_in_one_developer_instructions_override() {
+        let codex = crate::agent::InjectionSpec {
+            codex_notify: true,
+            codex_mcp: true,
+            ..Default::default()
+        };
+        assert!(codex_developer_args(&codex, false, false).is_empty());
+        let naming = codex_developer_args(&codex, false, true);
+        assert_eq!(naming.len(), 2);
+        assert!(naming[1].contains("name_session"));
+        // Both requests share one override: Codex keeps only the last one.
+        let both = codex_developer_args(&codex, true, true);
+        assert_eq!(both.len(), 2);
+        assert!(both[1].contains("name_session"));
+        assert!(both[1].contains("speak tool"));
+        // No MCP, no tool to name it with.
+        let claude = crate::agent::InjectionSpec {
+            claude_hooks: true,
+            claude_mcp: true,
+            ..Default::default()
+        };
+        assert!(codex_developer_args(&claude, true, true).is_empty());
+    }
+
+    #[test]
     fn terminal_configure_switches_shell_integration_and_survives_a_restart() {
         let temp = tempfile::tempdir().unwrap();
         let start = || {
@@ -7715,6 +7989,7 @@ mod tests {
     pub(super) fn test_record(id: &str) -> diri_proto::SessionRecord {
         use diri_proto::*;
         SessionRecord {
+            command_run: None,
             attention_state: None,
             id: SessionId(id.into()),
             kind: AgentKind::SHELL,
@@ -7827,7 +8102,10 @@ mod tests {
         };
         let line = serde_json::to_vec(&request).expect("encode");
         let (writer, peer) = UnixStream::pair().expect("socketpair");
-        peer.set_read_timeout(Some(Duration::from_secs(10)))
+        // A bound on a hung test, not a latency budget: a background RPC
+        // that runs git (worktree cleanup) has outlasted 10 s on a loaded
+        // Windows runner.
+        peer.set_read_timeout(Some(Duration::from_secs(60)))
             .unwrap();
         if let Some(response) = server.handle_line(&line, &Arc::new(Mutex::new(writer)), &mut None)
         {
@@ -9045,6 +9323,7 @@ mod tests {
                     diri_proto::grid::ChangedRow::new(0, row.clone()),
                     diri_proto::grid::ChangedRow::new(1, row),
                 ],
+                cursor_style: Default::default(),
             },
             marker_buffer: Vec::new(),
             alt_screen: false,

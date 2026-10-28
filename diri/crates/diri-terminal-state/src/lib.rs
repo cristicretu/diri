@@ -19,9 +19,10 @@ mod program_status;
 pub use inline_images::{
     DEFAULT_CELL_PIXELS, STORE_BUDGET_BYTES as INLINE_IMAGE_BUDGET_BYTES, StoredImage,
 };
-pub use notifications::{AGENT_EXIT_OSC, TerminalNotification};
+pub use notifications::{AGENT_EXIT_OSC, ShellPhase, TerminalNotification};
 pub use program_status::{
-    BlockedKind, ProgramRecord, ProgramState, QUERY_REPLY as PROGRAM_STATUS_QUERY_REPLY,
+    BlockedKind, ProgramRecord, ProgramRemoval, ProgramState,
+    QUERY_REPLY as PROGRAM_STATUS_QUERY_REPLY,
 };
 
 use std::sync::mpsc::{self, Receiver, SyncSender};
@@ -34,13 +35,32 @@ use alacritty_terminal::term::color::Colors;
 use alacritty_terminal::term::{CONTENT_CHANGED, Config, Term, TermMode};
 use alacritty_terminal::vte::ansi::{Color, NamedColor, Processor, Rgb};
 use diri_proto::grid::{
-    ChangedRow, GridCell, GridRowCodec, GridUpdate, LinkSpan, RowMetadata, TermColor, TermStyle,
+    ChangedRow, CursorShape, CursorStyle, GridCell, GridRowCodec, GridUpdate, LinkSpan,
+    RowMetadata, StyleSpan, TermColor, TermStyle, UnderlineKind,
 };
 use diri_proto::terminal::{
     MouseEncoding, MouseModes, MouseTrackingMode, TerminalMouseEvent, TerminalMouseModifiers,
-    encode_mouse_event,
+    encode_mouse_wheel,
 };
 use diri_proto::{TerminalAppearance, TerminalPalette};
+
+/// Diri's own cursor: a block that blinks (the renderer's eased, finite
+/// blink). A program's DECSCUSR replaces it and `CSI 0 SP q` restores it. Mode
+/// 12 starts from it, so a DECRQM `?12` query reports the blink and never
+/// turns the cursor steady.
+const DEFAULT_CURSOR: alacritty_terminal::vte::ansi::CursorStyle =
+    alacritty_terminal::vte::ansi::CursorStyle {
+        shape: alacritty_terminal::vte::ansi::CursorShape::Block,
+        blinking: true,
+    };
+
+/// Cell flags whose drawing needs a [`StyleSpan`]: every underline kind but
+/// the plain one, and overline. A plain underline needs one only for a color.
+const SPAN_FLAGS: Flags = Flags::DOUBLE_UNDERLINE
+    .union(Flags::UNDERCURL)
+    .union(Flags::DOTTED_UNDERLINE)
+    .union(Flags::DASHED_UNDERLINE)
+    .union(Flags::OVERLINE);
 
 /// Receiver-side authority for a remote terminal stream. A mirror accepts a
 /// full snapshot as a new baseline and then only contiguous sequenced diffs;
@@ -54,6 +74,7 @@ pub struct GridMirror {
     cursor_col: u16,
     cursor_row: u16,
     cursor_visible: bool,
+    cursor_style: CursorStyle,
     sequence: Option<u64>,
     annotations: Vec<RowMetadata>,
     alt_screen: bool,
@@ -121,6 +142,68 @@ impl GridMirror {
         Ok(())
     }
 
+    /// Applies a `grid-resume-v1` delta: the rows that differ between this
+    /// mirror at `base` and the Holder's grid at `sequence`. Unlike
+    /// [`Self::apply_delta`] the sequence may jump, because the delta is
+    /// computed against this mirror's exact rows rather than against the
+    /// publications it missed.
+    pub fn apply_resumed_delta(
+        &mut self,
+        base: u64,
+        sequence: u64,
+        grid: &GridUpdate,
+        alt_screen: bool,
+        bracketed_paste: bool,
+        mouse: MouseModes,
+    ) -> Result<(), MirrorError> {
+        let Some(previous) = self.sequence else {
+            return Err(MirrorError::SnapshotRequired);
+        };
+        if previous != base || sequence <= base {
+            return Err(MirrorError::SequenceGap {
+                expected: base.saturating_add(1),
+                actual: sequence,
+            });
+        }
+        if grid.is_full_snapshot || grid.cols != self.cols || grid.rows != self.rows {
+            return Err(MirrorError::SnapshotRequired);
+        }
+        validate_grid(grid)?;
+        grid.apply(&mut self.cells);
+        self.update_metadata(grid);
+        self.sequence = Some(sequence);
+        self.alt_screen = alt_screen;
+        self.bracketed_paste = bracketed_paste;
+        self.mouse = mouse;
+        Ok(())
+    }
+
+    /// One keyed digest per visible row, for a `grid-resume-v1` request.
+    #[must_use]
+    pub fn row_digests(
+        &self,
+        key: &[u8; diri_proto::remote_pty::GRID_RESUME_KEY_BYTES],
+    ) -> Option<Vec<u64>> {
+        self.sequence?;
+        let cols = usize::from(self.cols);
+        if self.cells.len() != cols.saturating_mul(usize::from(self.rows)) {
+            return None;
+        }
+        let blank = RowMetadata::default();
+        Some(
+            (0..usize::from(self.rows))
+                .map(|row| {
+                    diri_proto::remote_pty::grid_resume_row_digest(
+                        key,
+                        self.cols,
+                        &self.cells[row * cols..(row + 1) * cols],
+                        self.annotations.get(row).unwrap_or(&blank),
+                    )
+                })
+                .collect(),
+        )
+    }
+
     fn update_metadata(&mut self, grid: &GridUpdate) {
         if grid.is_full_snapshot {
             self.annotations.clear();
@@ -137,6 +220,7 @@ impl GridMirror {
         self.cursor_col = grid.cursor_col;
         self.cursor_row = grid.cursor_row;
         self.cursor_visible = grid.cursor_visible;
+        self.cursor_style = grid.cursor_style;
     }
 
     #[must_use]
@@ -190,6 +274,7 @@ impl GridMirror {
             cursor_visible: self.cursor_visible,
             is_full_snapshot: true,
             changed_rows,
+            cursor_style: self.cursor_style,
         })
     }
 }
@@ -296,6 +381,19 @@ fn history_line_limit(cols: usize) -> usize {
     }
 }
 
+/// Newest history rows a checkpoint carries. Above [`history_line_limit`]
+/// only after a resize re-wrapped full history into more rows; restore and
+/// completed-terminal retention admit no more than this.
+pub const HISTORY_EXPORT_ROWS: usize = 10_000;
+
+/// Most history rows a resize may re-wrap retained history into, as a
+/// multiple of the row limit. A column change re-wraps what is already
+/// retained rather than evicting it: narrowing a full 80-column terminal to
+/// 20 columns keeps every line. Bytes stay bounded by the storage budget;
+/// this bounds only the row-proportional work (reads, Find, the next reflow).
+#[cfg(feature = "compact-history")]
+const RESIZE_ROW_ALLOWANCE: usize = 4;
+
 /// Fixed screen geometry handed to the emulator.
 #[derive(Clone, Copy, Debug)]
 struct Geometry {
@@ -367,6 +465,8 @@ pub struct HeadlessScreen {
     moved_digests: Vec<u64>,
     moved_filled_cells: Vec<usize>,
     moved_stale: Vec<bool>,
+    /// Each row's filled cells when [`Self::mark_row_baseline`] last ran.
+    row_baseline: Vec<usize>,
     /// False after cells changed outside the parser (restore), until full
     /// damage re-fingerprints every row. Moved fingerprints are only reused
     /// while this holds.
@@ -408,6 +508,10 @@ pub struct HeadlessScreen {
     /// Whether the title moved since the last settle, tracked where it is
     /// assigned so no per-chunk clone is needed to notice.
     title_changed: bool,
+    /// The DECSCUSR cursor at the last settle. A program that only changes
+    /// its cursor (neovim entering insert mode) must still advance
+    /// `content_seq`, or the attach pump withholds the frame.
+    cursor_style: CursorStyle,
 
     /// Diff baseline for [`grid_update`]: the cells last handed out, so the
     /// next call sends only changed rows.
@@ -439,6 +543,7 @@ impl HeadlessScreen {
         let config = Config {
             kitty_keyboard,
             scrolling_history: history_line_limit(geometry.cols),
+            default_cursor_style: DEFAULT_CURSOR,
             ..Config::default()
         };
         let term = Term::new(config, &geometry, Collector(sender));
@@ -466,6 +571,7 @@ impl HeadlessScreen {
             moved_digests: Vec::new(),
             moved_filled_cells: Vec::new(),
             moved_stale: Vec::new(),
+            row_baseline: Vec::new(),
             fingerprints_track_cells: true,
             #[cfg(test)]
             fingerprinted_rows: Default::default(),
@@ -482,6 +588,7 @@ impl HeadlessScreen {
             palette: None,
             unsolicited: Vec::new(),
             title_changed: false,
+            cursor_style: CursorStyle::default(),
             last_cells: Vec::new(),
             last_annotations: Vec::new(),
             last_grid_cols: 0,
@@ -634,12 +741,37 @@ impl HeadlessScreen {
         self.notifications.as_ref()?.program.summary()
     }
 
-    /// Drops the `OSC 7501` records of a program that has ended. Returns
-    /// whether there were any.
-    pub fn end_program_status(&mut self) -> bool {
+    /// Drops the `OSC 7501` records of a program that has ended, for
+    /// `reason`. Returns whether there were any.
+    pub fn end_program_status(&mut self, reason: ProgramRemoval) -> bool {
         self.notifications
             .as_mut()
-            .is_some_and(|parser| parser.program.end_program())
+            .is_some_and(|parser| parser.program.end_program(reason))
+    }
+
+    /// Where the shell is between its `OSC 133` marks, read from live output
+    /// only. [`ShellPhase::Unknown`] without notifications.
+    pub fn shell_phase(&self) -> ShellPhase {
+        self.notifications
+            .as_ref()
+            .map_or(ShellPhase::Unknown, |parser| parser.shell)
+    }
+
+    /// The user submitted a line. A question the shell's own line reader
+    /// was asking ([`ShellPhase::PromptInCommand`]) is answered: the command
+    /// line runs on until the shell draws another prompt or ends it.
+    pub fn shell_line_submitted(&mut self) {
+        if let Some(parser) = self.notifications.as_mut()
+            && parser.shell == ShellPhase::PromptInCommand
+        {
+            parser.shell = ShellPhase::Running;
+        }
+    }
+
+    /// Why the `OSC 7501` records went away, while none are left: the
+    /// program cleared them, the terminal was reset, or the program ended.
+    pub fn program_status_removal(&self) -> Option<ProgramRemoval> {
+        self.notifications.as_ref()?.program.removal()
     }
 
     pub fn take_notifications(&mut self) -> Vec<TerminalNotification> {
@@ -679,6 +811,21 @@ impl HeadlessScreen {
         }
         self.advance_with_images(bytes, historical_bytes);
         self.settle();
+    }
+
+    /// Gives back memory a burst of output left behind, once output has gone
+    /// quiet: history decode caches and spare rows, the synchronized-update
+    /// buffer's capacity and grown scratch buffers. Nothing observable
+    /// changes; every buffer regrows on demand.
+    pub fn compact_idle(&mut self) {
+        #[cfg(feature = "compact-history")]
+        self.term.release_idle_history();
+        self.parser.release_idle_buffers();
+        self.replies.shrink_to_fit();
+        self.progress_carry.shrink_to_fit();
+        self.moved_digests = Vec::new();
+        self.moved_filled_cells = Vec::new();
+        self.moved_stale = Vec::new();
     }
 
     /// Synchronized updates (DECSET 2026) the child has closed with its ESU,
@@ -723,8 +870,21 @@ impl HeadlessScreen {
     /// a one-line echo never scans the rest of the viewport.
     fn settle(&mut self) {
         #[cfg(feature = "compact-history")]
-        self.term
-            .bound_primary_history_storage(HISTORY_STORAGE_BUDGET_BYTES);
+        {
+            self.term
+                .bound_primary_history_storage(HISTORY_STORAGE_BUDGET_BYTES);
+            // A limit a resize raised follows history back down (widening,
+            // a clear, budget eviction), so it never lets a later burst grow
+            // past the rows the re-wrap needed.
+            let limit = self.term.config().scrolling_history;
+            let base = history_line_limit(self.geometry.cols);
+            if limit > base {
+                let history = self.term.primary_history_size();
+                if history < limit {
+                    self.term.set_scrolling_history(history.max(base));
+                }
+            }
+        }
         self.drain_events();
         let rows = self.geometry.rows;
         self.current_damage_rows.resize(rows, false);
@@ -749,6 +909,11 @@ impl HeadlessScreen {
         // The title is compared where it is assigned, so settling costs no
         // clone of it per chunk of output.
         let mut content_changed = std::mem::take(&mut self.title_changed);
+        let cursor_style = self.wire_cursor_style();
+        if cursor_style != self.cursor_style {
+            self.cursor_style = cursor_style;
+            content_changed = true;
+        }
         if self.row_digests.len() != rows || self.row_filled_cells.len() != rows {
             self.rebuild_content_cache();
             content_changed = true;
@@ -820,6 +985,46 @@ impl HeadlessScreen {
         self.filled_cells
     }
 
+    /// Remembers how many cells each row holds, the baseline
+    /// [`Self::lost_cells_only_on_cursor_row`] judges against. Called when a
+    /// batch of output opens; reuses its buffer, so it allocates once.
+    pub fn mark_row_baseline(&mut self) {
+        self.row_baseline.clone_from(&self.row_filled_cells);
+    }
+
+    /// Whether everything removed since [`Self::mark_row_baseline`] was
+    /// removed from the row the visible cursor is on, and that row still
+    /// holds something: a line editor's in-place edit (backspace, kill to end
+    /// of line, a history entry or a progress line rewritten shorter), not a
+    /// repaint caught between its erase and its redraw.
+    ///
+    /// A repaint's erased region is somewhere the cursor has already left or
+    /// has not reached yet, and full-screen programs hide the cursor while
+    /// they draw, so neither passes. A cursor row cleared to nothing is the
+    /// start of a redraw (`less` clears its `:` prompt before drawing the
+    /// next page; a progress line is cleared and then written), so it does
+    /// not pass either: a line editor always leaves its prompt. Rows that
+    /// only gained or kept content do not count. Scrolling moves rows, so a scroll that shortened any other
+    /// row fails, as does a resize since the mark. O(rows), and only worth
+    /// asking once the screen has lost cells.
+    #[must_use]
+    pub fn lost_cells_only_on_cursor_row(&self) -> bool {
+        let (_, cursor_row, visible) = self.cursor();
+        let cursor_row = usize::from(cursor_row);
+        visible
+            && self.row_baseline.len() == self.row_filled_cells.len()
+            && self
+                .row_filled_cells
+                .get(cursor_row)
+                .is_some_and(|&now| now > 0)
+            && self
+                .row_baseline
+                .iter()
+                .zip(&self.row_filled_cells)
+                .enumerate()
+                .all(|(row, (before, now))| row == cursor_row || now >= before)
+    }
+
     pub fn resize(&mut self, cols: usize, rows: usize) {
         let geometry = Geometry {
             cols: cols.max(1),
@@ -828,6 +1033,37 @@ impl HeadlessScreen {
         if self.geometry.cols == geometry.cols && self.geometry.rows == geometry.rows {
             return;
         }
+        #[cfg(feature = "compact-history")]
+        {
+            // Only output evicts history. Narrowing re-wraps retained lines
+            // into more rows (and fewer rows push screen lines into history),
+            // so the reflow runs under the larger allowance and the limit then
+            // holds exactly what it produced: the next line recycles the
+            // oldest row, as at capacity, and `settle` lowers the limit back
+            // as widening or clearing leaves fewer rows. Stored bytes stay
+            // under the history budget throughout.
+            let base = history_line_limit(geometry.cols);
+            let allowance = base.saturating_mul(RESIZE_ROW_ALLOWANCE);
+            self.term.set_scrolling_history(allowance);
+            self.geometry = geometry;
+            self.term.resize(self.geometry);
+            let kept = self.term.primary_history_size().clamp(base, allowance);
+            self.term.set_scrolling_history(kept);
+        }
+        #[cfg(not(feature = "compact-history"))]
+        self.resize_dense(geometry);
+        if self.host_replies && self.term.mode().contains(TermMode::IN_BAND_RESIZE) {
+            // DECSET 2048: the program reads its new size from the stream
+            // rather than asking after SIGWINCH.
+            let report = self.in_band_size_report();
+            self.unsolicited.extend_from_slice(report.as_bytes());
+        }
+        self.settle();
+    }
+
+    /// Dense differential builds keep a width-dependent row allowance.
+    #[cfg(not(feature = "compact-history"))]
+    fn resize_dense(&mut self, geometry: Geometry) {
         let old_limit = history_line_limit(self.geometry.cols);
         let new_limit = history_line_limit(geometry.cols);
         // A narrower screen needs the larger row allowance before reflow to
@@ -849,13 +1085,6 @@ impl HeadlessScreen {
             // screen is active, and preserves the limit across terminal reset.
             self.term.set_options(with_history(&self.term));
         }
-        if self.host_replies && self.term.mode().contains(TermMode::IN_BAND_RESIZE) {
-            // DECSET 2048: the program reads its new size from the stream
-            // rather than asking after SIGWINCH.
-            let report = self.in_band_size_report();
-            self.unsolicited.extend_from_slice(report.as_bytes());
-        }
-        self.settle();
     }
 
     /// `CSI 48 ; rows ; cols ; height ; width t`, pixels zero when unknown.
@@ -904,6 +1133,11 @@ impl HeadlessScreen {
 
     pub fn size(&self) -> (usize, usize) {
         (self.geometry.cols, self.geometry.rows)
+    }
+
+    /// Rows above the visible grid.
+    pub fn history_rows(&self) -> usize {
+        self.term.grid().history_size()
     }
 
     pub fn invalidate_keyboard_enhancements(&mut self) {
@@ -1010,6 +1244,26 @@ impl HeadlessScreen {
         self.mouse_modes().is_reporting()
     }
 
+    /// The cursor shape and blink the program asked for (DECSCUSR, mode
+    /// 12). A program that never asked gets the default: a blinking block.
+    #[must_use]
+    pub fn cursor_style(&self) -> CursorStyle {
+        self.wire_cursor_style()
+    }
+
+    fn wire_cursor_style(&self) -> CursorStyle {
+        use alacritty_terminal::vte::ansi::CursorShape as Shape;
+        let style = self.term.cursor_style();
+        CursorStyle {
+            shape: match style.shape {
+                Shape::Underline => CursorShape::Underline,
+                Shape::Beam => CursorShape::Bar,
+                Shape::Block | Shape::HollowBlock | Shape::Hidden => CursorShape::Block,
+            },
+            steady: !style.blinking,
+        }
+    }
+
     /// Cursor (col, row, visible) without touching cell data.
     pub fn cursor(&self) -> (u16, u16, bool) {
         let point = self.term.grid().cursor.point;
@@ -1053,32 +1307,46 @@ impl HeadlessScreen {
             }
             let line = Line(y as i32);
             let base = y * cols;
-            let metadata = self.row_metadata(line);
             let row = &mut self.last_cells[base..base + cols];
-            let mut row_changed = force_full || self.last_annotations[y] != metadata;
+            let mut row_changed = force_full;
+            // Links, combining marks, underline colors and decoration flags
+            // are the only sources of row metadata. Noting them in the one
+            // pass over the cells spares a plain row a second pass.
+            let mut annotated = false;
             let source = &grid[line];
             // Two loops rather than a branch per cell: this is the
             // publication hot path, and the common case has no overrides.
             if let Some(colors) = overrides {
                 for (x, previous) in row.iter_mut().enumerate() {
-                    let mut cell = wire_cell(&source[Column(x)]);
+                    let source = &source[Column(x)];
+                    annotated |= source.extra.is_some() | source.flags.intersects(SPAN_FLAGS);
+                    let mut cell = wire_cell(source);
                     apply_palette(&mut cell, colors);
                     row_changed |= *previous != cell;
                     *previous = cell;
                 }
             } else {
                 for (x, previous) in row.iter_mut().enumerate() {
-                    let cell = wire_cell(&source[Column(x)]);
+                    let source = &source[Column(x)];
+                    annotated |= source.extra.is_some() | source.flags.intersects(SPAN_FLAGS);
+                    let cell = wire_cell(source);
                     row_changed |= *previous != cell;
                     *previous = cell;
                 }
             }
+            let metadata = if annotated {
+                self.row_metadata(line)
+            } else {
+                RowMetadata::default()
+            };
+            row_changed |= self.last_annotations[y] != metadata;
             if !row_changed {
                 continue;
             }
             if changed.is_empty() {
                 changed.reserve_exact(candidate_count);
             }
+            let row = &self.last_cells[base..base + cols];
             let mut changed_row = ChangedRow::new(y as u16, row.to_vec());
             self.last_annotations[y].clone_from(&metadata);
             changed_row.metadata = metadata;
@@ -1095,6 +1363,7 @@ impl HeadlessScreen {
             cursor_visible: self.term.mode().contains(TermMode::SHOW_CURSOR),
             is_full_snapshot: force_full,
             changed_rows: changed,
+            cursor_style: self.wire_cursor_style(),
         }
     }
 
@@ -1111,12 +1380,19 @@ impl HeadlessScreen {
             let line = Line(y as i32);
             let mut row = Vec::with_capacity(cols);
             let source = &grid[line];
-            row.extend((0..cols).map(|x| wire_cell(&source[Column(x)])));
+            let mut annotated = false;
+            for x in 0..cols {
+                let source = &source[Column(x)];
+                annotated |= source.extra.is_some() | source.flags.intersects(SPAN_FLAGS);
+                row.push(wire_cell(source));
+            }
             if let Some(colors) = overrides {
                 row.iter_mut().for_each(|cell| apply_palette(cell, colors));
             }
             let mut changed = ChangedRow::new(y as u16, row);
-            changed.metadata = self.row_metadata(line);
+            if annotated {
+                changed.metadata = self.row_metadata(line);
+            }
             all.push(changed);
         }
         let cursor = grid.cursor.point;
@@ -1128,6 +1404,7 @@ impl HeadlessScreen {
             cursor_visible: self.term.mode().contains(TermMode::SHOW_CURSOR),
             is_full_snapshot: true,
             changed_rows: all,
+            cursor_style: self.wire_cursor_style(),
         }
     }
 
@@ -1139,8 +1416,11 @@ impl HeadlessScreen {
     /// Styled rows above the visible grid, oldest first. Checkpoints persist
     /// these alongside the visible snapshot so adoption does not collapse a
     /// long session to a single scrollback row.
+    ///
+    /// At most the newest [`HISTORY_EXPORT_ROWS`]: restore admits no more.
     pub fn history_snapshot(&mut self) -> Vec<Vec<GridCell>> {
-        let history = self.term.grid().history_size();
+        self.prepare_history_read();
+        let history = self.term.grid().history_size().min(HISTORY_EXPORT_ROWS);
         let cols = self.geometry.cols;
         let mut rows = Vec::with_capacity(history);
         for index in 0..history {
@@ -1156,14 +1436,48 @@ impl HeadlessScreen {
         rows
     }
 
+    /// [`Self::history_snapshot`] already encoded with
+    /// [`diri_proto::grid::GridRowCodec::append_row`], oldest row first, and
+    /// its row count. One row is decoded at a time, so the transient is one
+    /// row of cells plus the compact payload instead of a cell copy of every
+    /// row.
+    pub fn history_payload(&mut self) -> (usize, Vec<u8>) {
+        self.prepare_history_read();
+        let history = self.term.grid().history_size().min(HISTORY_EXPORT_ROWS);
+        let cols = self.geometry.cols;
+        let mut payload = Vec::new();
+        let mut row = Vec::with_capacity(cols);
+        for index in 0..history {
+            let line = Line(index as i32 - history as i32);
+            row.clear();
+            let source = &self.term.grid()[line];
+            row.extend((0..cols).map(|x| wire_cell(&source[Column(x)])));
+            // A row is at most the terminal width, far below the codec's
+            // u16 cell limit, so encoding cannot fail.
+            let _ = diri_proto::grid::GridRowCodec::append_row(&row, &mut payload);
+            self.finish_history_read_batch(index + 1, index + 1 == history);
+        }
+        (history, payload)
+    }
+
+    /// Annotations of the rows [`Self::history_snapshot`] exports.
     pub fn history_metadata(&mut self) -> Vec<RowMetadata> {
-        let count = self.term.grid().history_size();
+        self.prepare_history_read();
+        let count = self.term.grid().history_size().min(HISTORY_EXPORT_ROWS);
         let mut rows = Vec::with_capacity(count);
         for index in 0..count {
             rows.push(self.row_metadata(Line(index as i32 - count as i32)));
             self.finish_history_read_batch(index + 1, index + 1 == count);
         }
         rows
+    }
+
+    /// Before reading history rows: a reflow the compact store deferred is
+    /// stored a block at a time now, rather than rebuilt whole (every row at
+    /// the new width, tens of MB) by the first read.
+    fn prepare_history_read(&mut self) {
+        #[cfg(feature = "compact-history")]
+        self.term.grid_mut().prepare_history_read();
     }
 
     fn finish_history_read_batch(&mut self, completed: usize, finished: bool) {
@@ -1266,7 +1580,7 @@ impl HeadlessScreen {
             if row.y as usize >= rows || row.cells.len() != cols {
                 return false;
             }
-            let mut previous: Option<&GridCell> = None;
+            let mut previous: Option<(&GridCell, Option<&StyleSpan>)> = None;
             for (x, cell) in row.cells.iter().enumerate() {
                 // The initial clear already produced true blank cells;
                 // leaving them untouched keeps sparse checkpoints cheap.
@@ -1274,10 +1588,14 @@ impl HeadlessScreen {
                     continue;
                 }
                 bytes.extend_from_slice(format!("\x1b[{};{}H", row.y + 1, x + 1).as_bytes());
-                if previous.is_none_or(|prev| {
-                    prev.fg != cell.fg || prev.bg != cell.bg || prev.style != cell.style
+                let decoration = row.metadata.style_at(x);
+                if previous.is_none_or(|(prev, prev_decoration)| {
+                    prev.fg != cell.fg
+                        || prev.bg != cell.bg
+                        || prev.style != cell.style
+                        || prev_decoration != decoration
                 }) {
-                    bytes.extend_from_slice(sgr(cell).as_bytes());
+                    bytes.extend_from_slice(sgr(cell, decoration).as_bytes());
                 }
                 match char::from_u32(cell.scalar) {
                     Some(glyph) if cell.scalar != 0 => {
@@ -1286,11 +1604,20 @@ impl HeadlessScreen {
                     }
                     _ => bytes.push(b' '),
                 }
-                previous = Some(cell);
+                previous = Some((cell, decoration));
             }
         }
 
         bytes.extend_from_slice(b"\x1b[0m");
+        if update.cursor_style != CursorStyle::default() {
+            let shape = match update.cursor_style.shape {
+                CursorShape::Block => 1,
+                CursorShape::Underline => 3,
+                CursorShape::Bar => 5,
+            };
+            let code = shape + u8::from(update.cursor_style.steady);
+            bytes.extend_from_slice(format!("\x1b[{code} q").as_bytes());
+        }
         if bracketed_paste {
             bytes.extend_from_slice(b"\x1b[?2004h");
         }
@@ -1352,34 +1679,49 @@ impl HeadlessScreen {
         true
     }
 
-    /// Encodes a wheel event for the child, when it asked for mouse
-    /// reporting. Returns the bytes to write to the PTY — empty means the
-    /// child doesn't care and the client should scroll its own scrollback.
+    /// Encodes a wheel event for the child. Returns the bytes to write to the
+    /// PTY — empty means the child doesn't care and the client should scroll
+    /// its own scrollback.
+    ///
+    /// A program reporting the mouse gets one wheel report per line. A
+    /// program on the alternate screen that does not read the mouse gets
+    /// arrow keys instead while alternate scroll (DECSET 1007, on by default)
+    /// is set, as xterm does: pagers such as `less` and `man`, and editors,
+    /// have no scrollback for the terminal to move. The arrows follow the
+    /// cursor-key mode (`CSI A` or `SS3 A`).
     pub fn mouse_wheel(&self, up: bool, lines: usize, col: usize, row: usize) -> Vec<u8> {
-        if !self.mouse_reporting() || lines == 0 {
+        if lines == 0 {
             return Vec::new();
+        }
+        let modes = self.mouse_modes();
+        if !modes.is_reporting() {
+            let mode = self.term.mode();
+            if !mode.contains(TermMode::ALT_SCREEN) || !mode.contains(TermMode::ALTERNATE_SCROLL) {
+                return Vec::new();
+            }
+            let arrow: &[u8] = match (mode.contains(TermMode::APP_CURSOR), up) {
+                (true, true) => b"\x1bOA",
+                (true, false) => b"\x1bOB",
+                (false, true) => b"\x1b[A",
+                (false, false) => b"\x1b[B",
+            };
+            return arrow.repeat(lines);
         }
         let x = col.min(self.geometry.cols.saturating_sub(1));
         let y = row.min(self.geometry.rows.saturating_sub(1));
-        let mut out = Vec::new();
-        for _ in 0..lines {
-            let event = if up {
-                TerminalMouseEvent::WheelUp
-            } else {
-                TerminalMouseEvent::WheelDown
-            };
-            let Some(report) = encode_mouse_event(
-                self.mouse_modes(),
-                event,
-                TerminalMouseModifiers::default(),
-                x as u16,
-                y as u16,
-            ) else {
-                break;
-            };
-            out.extend_from_slice(&report);
-        }
-        out
+        let event = if up {
+            TerminalMouseEvent::WheelUp
+        } else {
+            TerminalMouseEvent::WheelDown
+        };
+        encode_mouse_wheel(
+            modes,
+            event,
+            TerminalMouseModifiers::default(),
+            x as u16,
+            y as u16,
+            lines,
+        )
     }
 
     /// Scrollback plus the visible screen as plain text, for search.
@@ -1389,6 +1731,7 @@ impl HeadlessScreen {
     /// deep scrollback across heavy output may refetch; the visible region and
     /// recent history are exact.
     pub fn scrollback(&mut self) -> diri_proto::ReadScrollbackResult {
+        self.prepare_history_read();
         let history = self.term.grid().history_size();
         let rows = self.geometry.rows;
         let cols = self.geometry.cols;
@@ -1416,7 +1759,7 @@ impl HeadlessScreen {
                     1
                 };
                 let range = [x as u16, (x + width).min(cols) as u16];
-                text.push(if c < ' ' && c != '\t' { ' ' } else { c });
+                text.push(text_char(c));
                 ranges.push(range);
                 if let Some(combining) = cell.zerowidth() {
                     for &ch in combining {
@@ -1455,6 +1798,7 @@ impl HeadlessScreen {
         first_row: i64,
         max_rows: i64,
     ) -> diri_proto::ReadScrollbackCellsResult {
+        self.prepare_history_read();
         let history = self.term.grid().history_size();
         let cols = self.geometry.cols;
         let total = history + self.geometry.rows;
@@ -1570,9 +1914,27 @@ impl HeadlessScreen {
         // Account for framing as well as text before allocating. Retained Find
         // uses complete mode; existing live/page exports keep their old limits.
         let mut used = 0;
+        // Decoration spans have a budget of their own (the same size), so
+        // they never crowd out a link. Past it a span is dropped and its
+        // cells keep the plain underline bit.
+        let mut style_used = 0;
         let source = &grid[line];
         for x in 0..self.geometry.cols {
             let cell = &source[Column(x)];
+            // Links, combining marks and underline colors all live in the
+            // cell's extra storage: a plain cell needs no further look.
+            let extra = cell.extra.is_some();
+            if !extra && !cell.flags.intersects(SPAN_FLAGS) {
+                continue;
+            }
+            if cell.flags.intersects(SPAN_FLAGS)
+                || (extra && cell.flags.intersects(Flags::ALL_UNDERLINES))
+            {
+                push_style_span(&mut result.styles, cell, x as u16, &mut style_used, budget);
+            }
+            if !extra {
+                continue;
+            }
             if let Some(link) = cell.hyperlink() {
                 let uri = link.uri();
                 if let Some(last) = result.links.last_mut()
@@ -1650,7 +2012,7 @@ impl HeadlessScreen {
             {
                 continue;
             }
-            text.push(cell.c);
+            text.push(text_char(cell.c));
             if let Some(combining) = cell.zerowidth() {
                 text.extend(combining.iter().copied());
             }
@@ -1662,7 +2024,10 @@ impl HeadlessScreen {
     /// of scrollback: text with soft-wrapped rows rejoined (a URL longer than
     /// the terminal is one logical line), and every OSC 8 hyperlink target,
     /// which is often the only place the URL of a `[title](url)` link exists.
-    pub fn link_source(&self, history_rows: usize) -> LinkSource {
+    pub fn link_source(&mut self, history_rows: usize) -> LinkSource {
+        if history_rows > 0 {
+            self.prepare_history_read();
+        }
         let grid = self.term.grid();
         let history = grid.history_size().min(history_rows);
         let cols = self.geometry.cols;
@@ -1696,7 +2061,7 @@ impl HeadlessScreen {
                 {
                     continue;
                 }
-                row_text.push(cell.c);
+                row_text.push(text_char(cell.c));
                 if let Some(combining) = cell.zerowidth() {
                     row_text.extend(combining.iter().copied());
                 }
@@ -2020,6 +2385,15 @@ impl HeadlessScreen {
 ///
 /// The existing Rust wire vocabulary uses `Default`/`DefaultInverted` for the
 /// two default colors, ANSI indices for 0–255, and stable protocol style bits.
+/// A cell's character as text for a reader. The parser marks the cell where
+/// a tab began with `\t` but leaves the cells it moved over blank, so the
+/// tab reads as the space it is on screen, as xterm and Ghostty copy it;
+/// keeping it would read as a tab followed by the spaces it stood for.
+/// Other control characters never reach a cell but read as a space too.
+fn text_char(c: char) -> char {
+    if c < ' ' { ' ' } else { c }
+}
+
 fn wire_cell(cell: &alacritty_terminal::term::cell::Cell) -> GridCell {
     let scalar = if cell
         .flags
@@ -2109,6 +2483,69 @@ fn wire_color(color: Color) -> TermColor {
     }
 }
 
+/// The decoration of `cell` beyond the style bits, if it needs a span.
+fn cell_decoration(cell: &Cell) -> Option<StyleSpan> {
+    let flags = cell.flags;
+    let underline = if flags.contains(Flags::UNDERCURL) {
+        UnderlineKind::Curly
+    } else if flags.contains(Flags::DOUBLE_UNDERLINE) {
+        UnderlineKind::Double
+    } else if flags.contains(Flags::DOTTED_UNDERLINE) {
+        UnderlineKind::Dotted
+    } else if flags.contains(Flags::DASHED_UNDERLINE) {
+        UnderlineKind::Dashed
+    } else if flags.contains(Flags::UNDERLINE) {
+        UnderlineKind::Single
+    } else {
+        UnderlineKind::None
+    };
+    // SGR 58 alone draws nothing; `Default` is the foreground anyway.
+    let underline_color = cell
+        .underline_color()
+        .map(|color| wire_color(color).packed())
+        .filter(|packed| *packed != TermColor::Default.packed() && !underline.is_none());
+    let overline = flags.contains(Flags::OVERLINE);
+    let plain = matches!(underline, UnderlineKind::None | UnderlineKind::Single)
+        && underline_color.is_none()
+        && !overline;
+    (!plain).then_some(StyleSpan {
+        start: 0,
+        end: 0,
+        underline,
+        underline_color,
+        overline,
+    })
+}
+
+/// Extends the last span or starts one for the cell at `x`.
+fn push_style_span(
+    spans: &mut Vec<StyleSpan>,
+    cell: &Cell,
+    x: u16,
+    used: &mut usize,
+    budget: usize,
+) {
+    let Some(mut span) = cell_decoration(cell) else {
+        return;
+    };
+    if let Some(last) = spans.last_mut()
+        && last.end == x
+        && last.same_decoration(&span)
+    {
+        last.end += 1;
+        return;
+    }
+    // A span serializes to at most ~90 bytes of JSON.
+    const SPAN_BYTES: usize = 96;
+    if *used + SPAN_BYTES > budget || spans.len() >= diri_proto::grid::MAX_STYLE_SPANS_PER_ROW {
+        return;
+    }
+    *used += SPAN_BYTES;
+    span.start = x;
+    span.end = x + 1;
+    spans.push(span);
+}
+
 /// Folded 64×64→128-bit multiply: one step of a fast non-cryptographic hash.
 #[inline]
 fn fold_mix(state: u64, word: u64) -> u64 {
@@ -2177,6 +2614,13 @@ impl RowHashState {
                 self.marks = fold_mix(self.marks, u64::from(*ch) | (column as u64) << 32);
             }
         }
+        // SGR 58: an undercurl that only changes color is a visible change.
+        if let Some(color) = cell.underline_color() {
+            self.marks = fold_mix(
+                self.marks,
+                u64::from(wire_color(color).packed()) | (column as u64) << 32 | 1 << 62,
+            );
+        }
     }
 }
 
@@ -2200,9 +2644,12 @@ fn raw_style_key(cell: &Cell) -> u128 {
 #[inline]
 fn style_word(flags: Flags, fg: Color, bg: Color) -> u64 {
     let colors = u64::from(wire_color(fg).packed()) | u64::from(wire_color(bg).packed()) << 32;
+    // The wire collapses underline kinds into one style bit and carries the
+    // kind and overline in a span: hash the raw flags that reach the screen.
+    let decoration = (flags & (Flags::ALL_UNDERLINES | Flags::OVERLINE)).bits();
     fold_mix(
         fold_mix(0x243f_6a88_85a3_08d3, colors),
-        u64::from(wire_style(flags).bits()),
+        u64::from(wire_style(flags).bits()) | u64::from(decoration) << 32,
     )
 }
 
@@ -2247,7 +2694,9 @@ fn wire_style(flags: Flags) -> TermStyle {
         style |= TermStyle::WIDE_SPACER;
     }
     style |= shell_mark_style(flags);
-    if flags.intersects(Flags::BOLD | Flags::DIM_BOLD) {
+    // `Flags::DIM_BOLD` is DIM | BOLD, so testing either bit against it
+    // marks every bold cell faint and every faint cell bold. One bit each.
+    if flags.contains(Flags::BOLD) {
         style |= TermStyle::BOLD;
     }
     if flags.intersects(Flags::ALL_UNDERLINES) {
@@ -2256,10 +2705,13 @@ fn wire_style(flags: Flags) -> TermStyle {
     if flags.contains(Flags::INVERSE) {
         style |= TermStyle::INVERSE;
     }
+    if flags.contains(Flags::BLINK) {
+        style |= TermStyle::BLINK;
+    }
     if flags.contains(Flags::HIDDEN) {
         style |= TermStyle::INVISIBLE;
     }
-    if flags.intersects(Flags::DIM | Flags::DIM_BOLD) {
+    if flags.contains(Flags::DIM) {
         style |= TermStyle::DIM;
     }
     if flags.contains(Flags::ITALIC) {
@@ -2272,7 +2724,7 @@ fn wire_style(flags: Flags) -> TermStyle {
 }
 
 /// The SGR sequence that reproduces a cell's attributes.
-fn sgr(cell: &GridCell) -> String {
+fn sgr(cell: &GridCell, decoration: Option<&StyleSpan>) -> String {
     let mut codes: Vec<String> = vec!["0".into()];
     if cell.style.contains(TermStyle::BOLD) {
         codes.push("1".into());
@@ -2283,8 +2735,13 @@ fn sgr(cell: &GridCell) -> String {
     if cell.style.contains(TermStyle::ITALIC) {
         codes.push("3".into());
     }
-    if cell.style.contains(TermStyle::UNDERLINE) {
-        codes.push("4".into());
+    match decoration.map(|span| span.underline) {
+        Some(UnderlineKind::Double) => codes.push("4:2".into()),
+        Some(UnderlineKind::Curly) => codes.push("4:3".into()),
+        Some(UnderlineKind::Dotted) => codes.push("4:4".into()),
+        Some(UnderlineKind::Dashed) => codes.push("4:5".into()),
+        _ if cell.style.contains(TermStyle::UNDERLINE) => codes.push("4".into()),
+        _ => {}
     }
     if cell.style.contains(TermStyle::BLINK) {
         codes.push("5".into());
@@ -2298,8 +2755,18 @@ fn sgr(cell: &GridCell) -> String {
     if cell.style.contains(TermStyle::CROSSED_OUT) {
         codes.push("9".into());
     }
+    if decoration.is_some_and(|span| span.overline) {
+        codes.push("53".into());
+    }
     append_color(cell.fg, true, &mut codes);
     append_color(cell.bg, false, &mut codes);
+    if let Some(color) = decoration.and_then(|span| span.underline_color) {
+        match TermColor::unpack(color) {
+            TermColor::Ansi(index) => codes.push(format!("58:5:{index}")),
+            TermColor::Rgb(red, green, blue) => codes.push(format!("58:2::{red}:{green}:{blue}")),
+            TermColor::Default | TermColor::DefaultInverted => {}
+        }
+    }
     format!("\x1b[{}m", codes.join(";"))
 }
 
@@ -2418,6 +2885,55 @@ mod tests {
                 ..Default::default()
             }
         );
+    }
+
+    #[test]
+    fn a_line_edit_loses_cells_only_on_the_cursor_row() {
+        let mut screen = super::HeadlessScreen::new(40, 6);
+        screen.feed(b"first line of output\r\nsecond line\r\n$ echo hello world");
+        for edit in [
+            &b"\x08 \x08"[..], // backspace erase
+            b"\x1b[5D\x1b[K",  // kill to end of line
+            b"\r\x1b[K$ true", // history entry rewritten shorter
+        ] {
+            screen.mark_row_baseline();
+            let before = screen.filled_cells();
+            screen.feed(edit);
+            assert!(screen.filled_cells() < before, "{edit:?} removes cells");
+            assert!(screen.lost_cells_only_on_cursor_row(), "{edit:?}");
+            screen.feed(b"\r$ echo hello world");
+        }
+    }
+
+    #[test]
+    fn a_repaint_between_erase_and_redraw_is_not_a_line_edit() {
+        let mut screen = super::HeadlessScreen::new(40, 6);
+        let page = b"\x1b[Hrow one\r\nrow two\r\nrow three\r\n$ prompt";
+        screen.feed(page);
+        for erase in [
+            // Clear, cursor home: the erased rows are below the cursor.
+            &b"\x1b[H\x1b[2J"[..],
+            // An Ink-style redraw cut short: the last row is still blank,
+            // but the program hid the cursor while drawing.
+            b"\x1b[?25l\x1b[H\x1b[2Jrow one\r\nrow two\r\nrow three\r\n",
+            // Erased above the cursor, which then moved on.
+            b"\x1b[1;1H\x1b[2K\x1b[4;1H",
+            // The cursor's row cleared to nothing (`less` before its next
+            // page, a progress line before its text): the rewrite is next.
+            b"\r\x1b[2K",
+        ] {
+            screen.feed(b"\x1b[?25h");
+            screen.feed(page);
+            screen.mark_row_baseline();
+            screen.feed(erase);
+            assert!(!screen.lost_cells_only_on_cursor_row(), "{erase:?}");
+        }
+        // A resize since the mark is not judged at all.
+        screen.feed(b"\x1b[?25h");
+        screen.feed(page);
+        screen.mark_row_baseline();
+        screen.resize(40, 5);
+        assert!(!screen.lost_cells_only_on_cursor_row());
     }
 
     use super::*;
@@ -3088,6 +3604,124 @@ mod tests {
         assert_eq!(screen.lines(), vec!["hello"]);
     }
 
+    /// Numbered lines `first..first + count`, each `width` columns wide.
+    #[cfg(feature = "compact-history")]
+    fn numbered_lines(first: usize, count: usize, width: usize) -> Vec<u8> {
+        let mut out = String::new();
+        for id in first..first + count {
+            let line = format!("L{id:06} {}", "abcdefghij".repeat(30));
+            out.push_str(&line[..width]);
+            out.push_str("\r\n");
+        }
+        out.into_bytes()
+    }
+
+    /// Line numbers still held anywhere in history or on the screen.
+    #[cfg(feature = "compact-history")]
+    fn retained_ids(screen: &mut HeadlessScreen) -> Vec<usize> {
+        screen
+            .link_source(usize::MAX)
+            .text
+            .lines()
+            .filter_map(|line| line.strip_prefix('L')?.get(..6)?.parse().ok())
+            .collect()
+    }
+
+    /// Splitting a pane, toggling the sidebar or dragging a window narrower
+    /// used to evict the oldest half of a full history: the re-wrapped rows
+    /// went past the row limit and the reflow cut them, so widening again
+    /// could not bring them back. A reference multiplexer keeps every line.
+    #[cfg(feature = "compact-history")]
+    #[test]
+    fn a_resize_at_capacity_keeps_every_retained_line() {
+        for (width, label) in [(70, "unwrapped"), (120, "wrapped")] {
+            let mut screen = HeadlessScreen::new(80, 24);
+            screen.feed(&numbered_lines(0, 30_000, width));
+            let full = retained_ids(&mut screen);
+            assert_eq!(screen.term.grid().history_size(), 10_000, "{label}");
+            let expected: Vec<usize> = (full[0]..30_000).collect();
+            assert_eq!(full, expected, "{label}: the starting point is contiguous");
+
+            for (cols, rows) in [(40, 24), (120, 24), (80, 12), (24, 30), (80, 24)] {
+                screen.resize(cols, rows);
+                assert_eq!(
+                    retained_ids(&mut screen),
+                    expected,
+                    "{label}: {cols}x{rows} lost history"
+                );
+            }
+            assert_eq!(screen.term.grid().history_size(), 10_000, "{label}");
+        }
+    }
+
+    /// The allowance a narrowing needed is held, not reused for growth: new
+    /// output recycles the oldest row at the re-wrapped count, and a clear or
+    /// widening returns the limit to its base.
+    #[cfg(feature = "compact-history")]
+    #[test]
+    fn a_raised_history_limit_follows_history_back_down() {
+        let mut screen = HeadlessScreen::new(80, 24);
+        screen.feed(&numbered_lines(0, 20_000, 120));
+        screen.resize(40, 24);
+        let narrowed = screen.term.grid().history_size();
+        assert!(narrowed > 10_000, "{narrowed} rows after narrowing");
+
+        // At the narrow width the same rows stay retained as output arrives.
+        screen.feed(&numbered_lines(20_000, 1_000, 120));
+        assert_eq!(screen.term.grid().history_size(), narrowed);
+        let ids = retained_ids(&mut screen);
+        assert_eq!(ids, (ids[0]..21_000).collect::<Vec<_>>());
+
+        // Clearing scrollback ends the allowance: the next burst stops at
+        // the base limit, as it would have without the resize.
+        screen.feed(b"\x1b[3J");
+        screen.feed(&numbered_lines(21_000, 20_000, 120));
+        assert_eq!(screen.term.grid().history_size(), 10_000);
+
+        // So does widening that merges rows back.
+        screen.resize(80, 24);
+        screen.resize(40, 24);
+        screen.resize(80, 24);
+        screen.feed(&numbered_lines(41_000, 20_000, 120));
+        assert_eq!(screen.term.grid().history_size(), 10_000);
+    }
+
+    /// A re-wrapped history can hold more rows than restore admits, so a
+    /// checkpoint carries the newest of them and still restores.
+    #[cfg(feature = "compact-history")]
+    #[test]
+    fn a_checkpoint_of_re_wrapped_history_stays_restorable() {
+        let mut screen = HeadlessScreen::new(80, 24);
+        screen.feed(&numbered_lines(0, 20_000, 120));
+        screen.resize(40, 24);
+        assert!(screen.term.grid().history_size() > HISTORY_EXPORT_ROWS);
+        let history = screen.history_snapshot();
+        let metadata = screen.history_metadata();
+        assert_eq!(history.len(), HISTORY_EXPORT_ROWS);
+        assert_eq!(metadata.len(), HISTORY_EXPORT_ROWS);
+        let (payload_rows, payload) = screen.history_payload();
+        assert_eq!(payload_rows, HISTORY_EXPORT_ROWS);
+        assert_eq!(
+            diri_proto::grid::GridRowCodec::decode_rows(&payload, payload_rows).expect("decode"),
+            history
+        );
+
+        let mut restored = HeadlessScreen::new(40, 24);
+        assert!(restored.restore(
+            &history,
+            &screen.full_snapshot(),
+            false,
+            false,
+            MouseModes::OFF
+        ));
+        restored.restore_history_metadata(&metadata);
+        let newest = screen.scrollback().lines;
+        assert_eq!(
+            restored.scrollback().lines,
+            newest[newest.len() - HISTORY_EXPORT_ROWS - 24..]
+        );
+    }
+
     #[test]
     fn resize_keeps_history_within_the_cell_budget() {
         for alternate in [false, true] {
@@ -3298,6 +3932,39 @@ mod tests {
         assert!(restored.term.grid().history_storage_bytes() <= HISTORY_STORAGE_BUDGET_BYTES);
     }
 
+    #[cfg(feature = "compact-history")]
+    #[test]
+    fn idle_compaction_gives_back_caches_and_changes_nothing_observable() {
+        // Two screens fed the same bytes; one compacts every time output
+        // pauses. History beyond the row limit keeps an eviction index, and a
+        // read of recent history leaves decoded blocks behind.
+        let mut idle = HeadlessScreen::new(120, 40);
+        let mut busy = HeadlessScreen::new(120, 40);
+        for burst in 0..3 {
+            let mut bytes = Vec::new();
+            for line in 0..4_500 {
+                bytes.extend_from_slice(
+                    format!("{burst}:{line:05} \x1b[1mbold\x1b[0m\r\n").as_bytes(),
+                );
+            }
+            // A synchronized repaint grows the parser's holding buffer.
+            bytes.extend_from_slice(b"\x1b[?2026h");
+            bytes.extend_from_slice(&[b'x'; 64 << 10]);
+            bytes.extend_from_slice(b"\x1b[?2026l\r\n");
+            idle.feed(&bytes);
+            busy.feed(&bytes);
+            let _ = idle.link_source(400);
+            let _ = busy.link_source(400);
+            let before = idle.term.grid().history_storage_bytes();
+            idle.compact_idle();
+            assert!(idle.term.grid().history_storage_bytes() <= before);
+            assert_eq!(idle.scrollback(), busy.scrollback());
+            assert_eq!(idle.full_snapshot(), busy.full_snapshot());
+        }
+        assert_eq!(idle.history_snapshot(), busy.history_snapshot());
+        assert_eq!(idle.parser.sync_bytes_count(), 0);
+    }
+
     #[test]
     fn a_boxed_prompt_survives_emulation_intact() {
         // What detection actually consumes, end to end.
@@ -3358,6 +4025,58 @@ mod tests {
     }
 
     #[test]
+    fn resumed_delta_applies_only_to_its_base_and_digests_track_rows() {
+        let key = [7_u8; diri_proto::remote_pty::GRID_RESUME_KEY_BYTES];
+        let mut holder = HeadlessScreen::new(8, 3);
+        holder.feed(b"one\r\ntwo");
+        let mut mirror = GridMirror::new();
+        assert_eq!(mirror.row_digests(&key), None, "nothing to describe yet");
+        mirror
+            .apply_snapshot(4, &holder.full_snapshot(), false, false, MouseModes::OFF)
+            .unwrap();
+        let before = mirror.row_digests(&key).unwrap();
+        // Holder-side digests of the same rows agree with the mirror's.
+        let snapshot = holder.full_snapshot();
+        for row in &snapshot.changed_rows {
+            assert_eq!(
+                diri_proto::remote_pty::grid_resume_row_digest(&key, 8, &row.cells, &row.metadata),
+                before[usize::from(row.y)]
+            );
+        }
+        // Another key gives unrelated digests.
+        assert_ne!(mirror.row_digests(&[8; 16]).unwrap(), before);
+
+        holder.feed(b" 2");
+        let mut delta = holder.full_snapshot();
+        delta.is_full_snapshot = false;
+        delta.changed_rows.retain(|row| row.y == 1);
+        for (base, sequence) in [(3, 9), (4, 4)] {
+            assert!(matches!(
+                mirror.clone().apply_resumed_delta(
+                    base,
+                    sequence,
+                    &delta,
+                    false,
+                    false,
+                    MouseModes::OFF
+                ),
+                Err(MirrorError::SequenceGap { .. })
+            ));
+        }
+        mirror
+            .apply_resumed_delta(4, 9, &delta, false, false, MouseModes::OFF)
+            .unwrap();
+        assert_eq!(mirror.sequence(), Some(9));
+        let after = mirror.row_digests(&key).unwrap();
+        assert_eq!((after[0], after[2]), (before[0], before[2]));
+        assert_ne!(after[1], before[1]);
+        assert_eq!(
+            mirror.full_update().unwrap().encode().unwrap(),
+            holder.full_snapshot().encode().unwrap()
+        );
+    }
+
+    #[test]
     fn parser_preserves_each_tracking_mode_and_encoding_independently() {
         let mut screen = HeadlessScreen::new(300, 24);
         assert_eq!(screen.mouse_modes(), MouseModes::OFF);
@@ -3384,11 +4103,122 @@ mod tests {
             "1006 is independent of tracking"
         );
     }
+
+    /// Wheel bytes per mode, as a reference xterm-compatible emulator sends
+    /// them (recorded from a program reading its raw input).
+    #[test]
+    fn wheel_reports_and_alternate_scroll_arrows_follow_the_program_modes() {
+        let wheel = |setup: &[u8], up: bool, lines: usize| {
+            let mut screen = HeadlessScreen::new(320, 90);
+            screen.feed(setup);
+            screen.mouse_wheel(up, lines, 3, 4)
+        };
+        // Main screen, no reporting: Diri scrolls its own history.
+        assert_eq!(wheel(b"", true, 1), b"");
+        assert_eq!(
+            wheel(b"\x1b[?1007h", true, 1),
+            b"",
+            "1007 applies only on the alternate screen"
+        );
+        // Alternate screen, no reporting: arrows, by default (1007 starts set).
+        assert_eq!(wheel(b"\x1b[?1049h", true, 1), b"\x1b[A");
+        assert_eq!(wheel(b"\x1b[?1049h", false, 3), b"\x1b[B\x1b[B\x1b[B");
+        assert_eq!(wheel(b"\x1b[?1049h\x1b[?1h", true, 2), b"\x1bOA\x1bOA");
+        assert_eq!(wheel(b"\x1b[?1049h\x1b[?1h", false, 1), b"\x1bOB");
+        assert_eq!(wheel(b"\x1b[?1047h", false, 1), b"\x1b[B");
+        assert_eq!(
+            wheel(b"\x1b[?1049h\x1b[?1007l", true, 1),
+            b"",
+            "a program can opt out"
+        );
+        // Reporting wins over alternate scroll, on either screen.
+        assert_eq!(
+            wheel(b"\x1b[?1049h\x1b[?1000h\x1b[?1006h", true, 1),
+            b"\x1b[<64;4;5M"
+        );
+        assert_eq!(
+            wheel(b"\x1b[?1000h\x1b[?1006h", false, 2),
+            b"\x1b[<65;4;5M\x1b[<65;4;5M"
+        );
+        assert_eq!(wheel(b"\x1b[?1000h", true, 1), b"\x1b[M`$%");
+        assert_eq!(wheel(b"\x1b[?1000h", false, 1), b"\x1b[Ma$%");
+        assert_eq!(wheel(b"\x1b[?1049h", true, 0), b"", "no lines, no bytes");
+        // Real start-up sequences: vim 9 (`--clean`), tmux with `mouse on`,
+        // and less/man (alternate screen and cursor-key mode, no mouse).
+        let mut vim = HeadlessScreen::new(80, 24);
+        vim.feed(b"\x1b[?1049h\x1b[?1h\x1b[?1006;1000h\x1b[?1002h\x1b[?1004h");
+        assert_eq!(
+            vim.mouse_modes(),
+            MouseModes::new(MouseTrackingMode::ButtonMotion, MouseEncoding::Sgr)
+        );
+        assert_eq!(vim.mouse_wheel(false, 1, 0, 0), b"\x1b[<65;1;1M");
+        let mut tmux = HeadlessScreen::new(80, 24);
+        tmux.feed(b"\x1b[?1049h\x1b[?1005l\x1b[?1006l\x1b[?1000h\x1b[?1002h\x1b[?1006h");
+        assert_eq!(
+            tmux.mouse_modes(),
+            MouseModes::new(MouseTrackingMode::ButtonMotion, MouseEncoding::Sgr)
+        );
+        assert_eq!(
+            wheel(b"\x1b[?1049h\x1b[?1h", false, 1),
+            b"\x1bOB",
+            "less and man"
+        );
+    }
 }
 
 #[cfg(test)]
 mod qol_tests {
     use super::*;
+
+    /// The weight and faint bits of `bold faint both`, one per word.
+    fn weights(cells: &[GridCell]) -> Vec<(bool, bool)> {
+        [0, 5, 11]
+            .iter()
+            .map(|&col| {
+                let style = cells[col].style;
+                (
+                    style.contains(TermStyle::BOLD),
+                    style.contains(TermStyle::DIM),
+                )
+            })
+            .collect()
+    }
+
+    const BOLD_FAINT_BOTH: &[u8] = b"\x1b[1mbold\x1b[0m \x1b[2mfaint\x1b[0m \x1b[1;2mboth\x1b[0m";
+    /// (bold, faint) for `bold`, `faint` and `both`.
+    const BOLD_FAINT_BOTH_STYLES: [(bool, bool); 3] = [(true, false), (false, true), (true, true)];
+
+    #[test]
+    fn bold_is_not_faint_and_faint_is_not_bold() {
+        let mut screen = HeadlessScreen::new(20, 2);
+        screen.feed(BOLD_FAINT_BOTH);
+        let full = screen.full_snapshot();
+        assert_eq!(weights(&full.changed_rows[0].cells), BOLD_FAINT_BOTH_STYLES);
+
+        // So does a diff against an earlier frame.
+        let mut live = HeadlessScreen::new(20, 2);
+        live.grid_update(true);
+        live.feed(BOLD_FAINT_BOTH);
+        let delta = live.grid_update(false);
+        assert_eq!(
+            weights(&delta.changed_rows[0].cells),
+            BOLD_FAINT_BOTH_STYLES
+        );
+
+        // A checkpoint restores the same weights.
+        let mut restored = HeadlessScreen::new(20, 2);
+        assert!(restored.restore(&[], &full, false, false, MouseModes::OFF));
+        assert_eq!(
+            weights(&restored.full_snapshot().changed_rows[0].cells),
+            BOLD_FAINT_BOTH_STYLES
+        );
+
+        // Scrolled into history, the cells keep them too.
+        screen.feed(b"\r\n\r\n");
+        let history = screen.scrollback_cells(0, 1);
+        let rows = GridRowCodec::decode_rows(&history.payload, history.row_count as usize).unwrap();
+        assert_eq!(weights(&rows[0]), BOLD_FAINT_BOTH_STYLES);
+    }
     #[test]
     fn hyperlink_only_changes_advance_sequence_and_survive_mirror_reseed() {
         let mut screen = HeadlessScreen::new(40, 4);
@@ -3730,5 +4560,165 @@ mod find_capture_tests {
                 );
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod style_tests {
+    use super::*;
+
+    fn screen(bytes: &[u8]) -> HeadlessScreen {
+        let mut screen = HeadlessScreen::new(20, 3);
+        screen.feed(bytes);
+        screen
+    }
+
+    fn row0(screen: &HeadlessScreen) -> ChangedRow {
+        screen.full_snapshot().changed_rows.remove(0)
+    }
+
+    #[test]
+    fn underline_kinds_colors_and_overline_reach_the_wire() {
+        let screen = screen(
+            b"a\x1b[4:3;58:2::255:0:0mbc\x1b[4:2;59md\x1b[4:4me\x1b[4:5mf\x1b[24;53mg\x1b[55;4mh\x1b[0m",
+        );
+        let row = row0(&screen);
+        let spans = &row.metadata.styles;
+        let kinds: Vec<_> = spans
+            .iter()
+            .map(|span| {
+                (
+                    span.start,
+                    span.end,
+                    span.underline,
+                    span.underline_color,
+                    span.overline,
+                )
+            })
+            .collect();
+        assert_eq!(
+            kinds,
+            vec![
+                (
+                    1,
+                    3,
+                    UnderlineKind::Curly,
+                    Some(TermColor::Rgb(255, 0, 0).packed()),
+                    false
+                ),
+                (3, 4, UnderlineKind::Double, None, false),
+                (4, 5, UnderlineKind::Dotted, None, false),
+                (5, 6, UnderlineKind::Dashed, None, false),
+                (6, 7, UnderlineKind::None, None, true),
+            ]
+        );
+        // Every underlined cell keeps the bit an older renderer draws.
+        for x in 1..6 {
+            assert!(row.cells[x].style.contains(TermStyle::UNDERLINE), "col {x}");
+        }
+        // A plain underline needs no span.
+        assert!(row.metadata.style_at(7).is_none());
+        assert!(row.cells[7].style.contains(TermStyle::UNDERLINE));
+    }
+
+    #[test]
+    fn indexed_underline_color_and_blink() {
+        let row = row0(&screen(b"\x1b[4;58;5;3;5mx\x1b[25my"));
+        assert_eq!(
+            row.metadata.styles[0].underline_color,
+            Some(TermColor::Ansi(3).packed())
+        );
+        assert!(row.cells[0].style.contains(TermStyle::BLINK));
+        assert!(!row.cells[1].style.contains(TermStyle::BLINK));
+    }
+
+    #[test]
+    fn decscusr_reaches_the_wire_and_advances_content_seq() {
+        let mut screen = screen(b"hello");
+        assert_eq!(screen.full_snapshot().cursor_style, CursorStyle::default());
+        let _ = screen.grid_update(true);
+        let before = screen.content_seq();
+        // neovim entering insert mode: only the cursor changes.
+        screen.feed(b"\x1b[6 q");
+        assert!(
+            screen.content_seq() > before,
+            "a cursor-only change was withheld"
+        );
+        let update = screen.grid_update(false);
+        assert_eq!(
+            update.cursor_style,
+            CursorStyle {
+                shape: CursorShape::Bar,
+                steady: true
+            }
+        );
+        assert!(update.changed_rows.is_empty());
+        for (code, shape, steady) in [
+            (b"\x1b[1 q", CursorShape::Block, false),
+            (b"\x1b[2 q", CursorShape::Block, true),
+            (b"\x1b[3 q", CursorShape::Underline, false),
+            (b"\x1b[4 q", CursorShape::Underline, true),
+            (b"\x1b[5 q", CursorShape::Bar, false),
+            (b"\x1b[0 q", CursorShape::Block, false),
+        ] {
+            screen.feed(code);
+            assert_eq!(screen.cursor_style(), CursorStyle { shape, steady });
+        }
+        // A DECRQM ?12 query must not turn Diri's blinking cursor steady.
+        screen.feed(b"\x1b[?12$p");
+        assert!(!screen.cursor_style().steady);
+        // A resize keeps the program's cursor and Diri's default.
+        screen.feed(b"\x1b[3 q");
+        screen.resize(40, 10);
+        assert_eq!(screen.cursor_style().shape, CursorShape::Underline);
+    }
+
+    #[test]
+    fn a_decoration_only_repaint_advances_content_seq() {
+        // Same glyphs, same colors, same style bits on the wire: only the
+        // underline kind, its color or overline changes.
+        for (first, second) in [
+            (&b"\x1b[H\x1b[4:1mword"[..], &b"\x1b[H\x1b[4:3mword"[..]),
+            (b"\x1b[H\x1b[4:3;58;5;1mword", b"\x1b[H\x1b[4:3;58;5;2mword"),
+            (b"\x1b[H\x1b[0mword", b"\x1b[H\x1b[53mword"),
+        ] {
+            let mut screen = screen(first);
+            let before = screen.content_seq();
+            screen.feed(second);
+            assert!(screen.content_seq() > before, "{second:?}");
+        }
+    }
+
+    #[test]
+    fn restore_reproduces_styles_and_cursor() {
+        let source = screen(b"a\x1b[4:3;58:2::1:2:3mbc\x1b[0;53;4:4;58;5;9md\x1b[0m\x1b[5 q");
+        let snapshot = source.full_snapshot();
+        let mut restored = HeadlessScreen::new(20, 3);
+        assert!(restored.restore(&[], &snapshot, false, false, MouseModes::default()));
+        let again = restored.full_snapshot();
+        assert_eq!(
+            again.changed_rows[0].metadata.styles,
+            snapshot.changed_rows[0].metadata.styles
+        );
+        assert_eq!(again.cursor_style, snapshot.cursor_style);
+    }
+
+    #[test]
+    fn mirror_keeps_the_cursor_style() {
+        let mut source = screen(b"\x1b[4 qx");
+        let mut mirror = GridMirror::new();
+        mirror
+            .apply_snapshot(
+                1,
+                &source.grid_update(true),
+                false,
+                false,
+                MouseModes::default(),
+            )
+            .unwrap();
+        assert_eq!(
+            mirror.full_update().unwrap().cursor_style.shape,
+            CursorShape::Underline
+        );
     }
 }

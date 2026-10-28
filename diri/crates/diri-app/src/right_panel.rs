@@ -17,7 +17,7 @@
 
 use diri_ui::{Fill, Metrics, Radius, SemanticColors};
 use gpui::{
-    AnyElement, App, AppContext, ClickEvent, InteractiveElement, IntoElement, MouseButton,
+    AnyElement, App, ClickEvent, InteractiveElement, IntoElement, MouseButton,
     ParentElement, Rgba, StatefulInteractiveElement, Styled, Window, div, px,
 };
 
@@ -75,14 +75,6 @@ pub(crate) fn toggle_label(open: bool) -> &'static str {
     }
 }
 
-/// The tooltip line: the action, then its shortcut when one is bound.
-pub(crate) fn toggle_tooltip(open: bool) -> String {
-    let label = toggle_label(open);
-    match crate::commands::command(CommandId::ToggleInspector).shortcut_label() {
-        Some(shortcut) => format!("{label}  {shortcut}"),
-        None => label.to_owned(),
-    }
-}
 
 /// The right sidebar toggle. It is drawn by whichever title bar ends at the
 /// window's trailing edge -- the session pane's while the panel is closed, the
@@ -99,7 +91,6 @@ pub(crate) fn toggle_button(
     held_hint: f32,
     on_click: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static,
 ) -> AnyElement {
-    let tooltip = toggle_tooltip(open);
     let button = div()
         .id(selector)
         .debug_selector(move || selector.into())
@@ -119,10 +110,7 @@ pub(crate) fn toggle_button(
             on_click(event, window, cx);
             cx.stop_propagation();
         })
-        .warm_tooltip(move |_, cx| {
-            cx.new(|_| crate::palette_chrome::PaletteTooltip(tooltip.clone(), colors))
-                .into()
-        })
+        .shortcut_tooltip(toggle_label(open), Some(CommandId::ToggleInspector), colors)
         .into_any_element();
     crate::held_hints::below(
         button,
@@ -275,6 +263,5 @@ mod tests {
     fn the_toggle_names_what_it_will_do() {
         assert_eq!(toggle_label(true), "Hide right sidebar");
         assert_eq!(toggle_label(false), "Show right sidebar");
-        assert!(toggle_tooltip(false).starts_with("Show right sidebar"));
     }
 }

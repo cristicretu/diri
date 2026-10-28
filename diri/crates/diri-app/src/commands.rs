@@ -70,6 +70,9 @@ actions!(
         MovePaneRight,
         MovePaneUp,
         MovePaneDown,
+        MovePaneToNewTab,
+        MovePaneToNextTab,
+        MovePaneToPreviousTab,
         OpenWorktrees,
         NewNote,
         ShowTodos,
@@ -191,6 +194,9 @@ pub enum CommandId {
     MovePaneRight,
     MovePaneUp,
     MovePaneDown,
+    MovePaneToNewTab,
+    MovePaneToNextTab,
+    MovePaneToPreviousTab,
     OpenWorktrees,
     NewNote,
     ShowTodos,
@@ -721,6 +727,36 @@ pub const COMMANDS: &[CommandSpec] = &[
         "command.move_pane_down.palette_title",
         "rectangle.split.2x1",
         "workspace move pane down dock"
+    ),
+    spec!(
+        MovePaneToNewTab,
+        "move-pane-to-new-tab",
+        None,
+        None,
+        Some(APP_CONTEXT),
+        "command.move_pane_to_new_tab.palette_title",
+        "rectangle.split.2x1",
+        "workspace move pane new tab break detach"
+    ),
+    spec!(
+        MovePaneToNextTab,
+        "move-pane-to-next-tab",
+        None,
+        None,
+        Some(APP_CONTEXT),
+        "command.move_pane_to_next_tab.palette_title",
+        "rectangle.split.2x1",
+        "workspace move pane next tab join"
+    ),
+    spec!(
+        MovePaneToPreviousTab,
+        "move-pane-to-previous-tab",
+        None,
+        None,
+        Some(APP_CONTEXT),
+        "command.move_pane_to_previous_tab.palette_title",
+        "rectangle.split.2x1",
+        "workspace move pane previous tab join"
     ),
     spec!(
         NewNote,
@@ -1452,6 +1488,9 @@ impl CommandSpec {
             CommandId::MovePaneRight => KeyBinding::new(key, MovePaneRight, context),
             CommandId::MovePaneUp => KeyBinding::new(key, MovePaneUp, context),
             CommandId::MovePaneDown => KeyBinding::new(key, MovePaneDown, context),
+            CommandId::MovePaneToNewTab => KeyBinding::new(key, MovePaneToNewTab, context),
+            CommandId::MovePaneToNextTab => KeyBinding::new(key, MovePaneToNextTab, context),
+            CommandId::MovePaneToPreviousTab => KeyBinding::new(key, MovePaneToPreviousTab, context),
 
             CommandId::OpenWorktrees => KeyBinding::new(key, OpenWorktrees, context),
             CommandId::NewNote => KeyBinding::new(key, NewNote, context),
@@ -1623,6 +1662,25 @@ fn platform_shortcut_label(label: &str) -> String {
 }
 
 /// How a native menu prints a keymap source such as `"cmd-alt-1"`: `⌥⌘1`.
+/// A chrome control's tooltip line: its name, then the shortcut `id` is
+/// bound to right now, or the name alone when it has none.
+pub(crate) fn with_shortcut(label: &str, id: CommandId) -> String {
+    joined_with_shortcut(label, command(id).shortcut_label())
+}
+
+/// [`with_shortcut`] against an explicit keymap.
+#[cfg(test)]
+pub(crate) fn with_shortcut_for(label: &str, id: CommandId, overrides: &ShortcutOverrides) -> String {
+    joined_with_shortcut(label, command(id).shortcut_label_for(overrides))
+}
+
+fn joined_with_shortcut(label: &str, shortcut: Option<String>) -> String {
+    match shortcut {
+        Some(shortcut) => format!("{label}  {shortcut}"),
+        None => label.to_owned(),
+    }
+}
+
 pub(crate) fn keystroke_label(source: &str) -> String {
     Keystroke::parse(source)
         .map_or_else(|_| source.to_owned(), |k| shortcut_label_for_keystroke(&k))
@@ -1933,6 +1991,21 @@ impl CommandId {
             Self::MovePaneDown => ShortcutMetadata {
                 title: t("command.move_pane_down.title"),
                 description: t("command.move_pane_down.description"),
+                category: Workspace,
+            },
+            Self::MovePaneToNewTab => ShortcutMetadata {
+                title: t("command.move_pane_to_new_tab.title"),
+                description: t("command.move_pane_to_new_tab.description"),
+                category: Workspace,
+            },
+            Self::MovePaneToNextTab => ShortcutMetadata {
+                title: t("command.move_pane_to_next_tab.title"),
+                description: t("command.move_pane_to_next_tab.description"),
+                category: Workspace,
+            },
+            Self::MovePaneToPreviousTab => ShortcutMetadata {
+                title: t("command.move_pane_to_previous_tab.title"),
+                description: t("command.move_pane_to_previous_tab.description"),
                 category: Workspace,
             },
             Self::ToggleTabPeek => ShortcutMetadata {
@@ -2262,6 +2335,9 @@ impl CommandId {
             Self::MovePaneRight => Box::new(MovePaneRight),
             Self::MovePaneUp => Box::new(MovePaneUp),
             Self::MovePaneDown => Box::new(MovePaneDown),
+            Self::MovePaneToNewTab => Box::new(MovePaneToNewTab),
+            Self::MovePaneToNextTab => Box::new(MovePaneToNextTab),
+            Self::MovePaneToPreviousTab => Box::new(MovePaneToPreviousTab),
 
             Self::OpenWorktrees => Box::new(OpenWorktrees),
             Self::NewNote => Box::new(NewNote),
@@ -2509,6 +2585,34 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn tooltips_follow_the_keymap() {
+        let mut overrides = ShortcutOverrides::new();
+        let default = with_shortcut_for("Hide sidebar", CommandId::ToggleSidebar, &overrides);
+        let bound = command(CommandId::ToggleSidebar)
+            .shortcut_label_for(&overrides)
+            .unwrap();
+        assert_eq!(default, format!("Hide sidebar  {bound}"));
+
+        overrides.insert(
+            command(CommandId::ToggleSidebar).stable_id.to_owned(),
+            Some("cmd-alt-b".to_owned()),
+        );
+        let rebound = with_shortcut_for("Hide sidebar", CommandId::ToggleSidebar, &overrides);
+        #[cfg(target_os = "macos")]
+        assert_eq!(rebound, "Hide sidebar  ⌥⌘B");
+        assert_ne!(rebound, default);
+
+        overrides.insert(
+            command(CommandId::ToggleSidebar).stable_id.to_owned(),
+            None,
+        );
+        assert_eq!(
+            with_shortcut_for("Hide sidebar", CommandId::ToggleSidebar, &overrides),
+            "Hide sidebar"
+        );
     }
 
     #[test]

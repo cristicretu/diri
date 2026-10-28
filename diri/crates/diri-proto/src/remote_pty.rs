@@ -19,8 +19,9 @@ use crate::terminal::MouseModes;
 
 pub const PROTOCOL_MAJOR: u16 = 1;
 pub const PROTOCOL_MINOR: u16 = 19;
-/// Minors 17 and 18 are `grid-resume-v1` and `terminal-styles-v1`, which
-/// land separately; each capability is gated by its own name.
+pub const GRID_RESUME_PROTOCOL_MINOR: u16 = 17;
+/// Minor 17 belongs to `grid-resume-v1`; styles are negotiated by name.
+pub const TERMINAL_STYLES_PROTOCOL_MINOR: u16 = 18;
 pub const QUERY_REPLIES_PROTOCOL_MINOR: u16 = 19;
 pub const INLINE_IMAGES_PROTOCOL_MINOR: u16 = 16;
 pub const TERMINAL_RESET_PROTOCOL_MINOR: u16 = 15;
@@ -120,6 +121,14 @@ pub enum RemoteCapability {
     /// their support probes and serves stored pixels by `ImageRequest`.
     #[serde(rename = "inline-images-v1")]
     InlineImages,
+    /// A reattaching controller can name the grid it already holds; the
+    /// Holder answers with only the rows that differ instead of a snapshot.
+    #[serde(rename = "grid-resume-v1")]
+    GridResume,
+    /// Cursor shape and blink in grid flag bits 3-5, and underline kind,
+    /// underline color and overline spans in row annotations.
+    #[serde(rename = "terminal-styles-v1")]
+    TerminalStyles,
     /// The Holder answers its program's terminal queries from its own
     /// emulator, `OSC 7501` support queries included, in stream order. The
     /// Engine then answers none of them.
@@ -169,6 +178,8 @@ impl RemoteCapability {
             Self::StopSession => "stop-session-v1",
             Self::TerminalReset => "terminal-reset-v1",
             Self::InlineImages => "inline-images-v1",
+            Self::GridResume => "grid-resume-v1",
+            Self::TerminalStyles => "terminal-styles-v1",
             Self::QueryReplies => "query-replies-v1",
             Self::FullSnapshot => "full-snapshot",
             Self::IncrementalGrid => "incremental-grid",
@@ -238,6 +249,8 @@ pub const ANNOTATED_HOLDER_CAPABILITIES: &[RemoteCapability] = &[
     RemoteCapability::StopSession,
     RemoteCapability::TerminalReset,
     RemoteCapability::InlineImages,
+    RemoteCapability::GridResume,
+    RemoteCapability::TerminalStyles,
     RemoteCapability::QueryReplies,
 ];
 pub const ANNOTATED_HELPER_CAPABILITIES: &[RemoteCapability] = &[
@@ -262,6 +275,8 @@ pub const ANNOTATED_HELPER_CAPABILITIES: &[RemoteCapability] = &[
     RemoteCapability::StopSession,
     RemoteCapability::TerminalReset,
     RemoteCapability::InlineImages,
+    RemoteCapability::GridResume,
+    RemoteCapability::TerminalStyles,
 ];
 
 /// Authentication bearer shared only by the local Engine and one Holder.
@@ -321,6 +336,10 @@ pub struct Hello {
     pub required_capabilities: Vec<RemoteCapability>,
     pub last_acknowledged_output_offset: Option<u64>,
     pub last_acknowledged_grid_sequence: Option<u64>,
+    /// `grid-resume-v1` (protocol minor 17): the grid this controller already
+    /// holds. Older Holders ignore the field and send a Full Snapshot.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub grid_resume: Option<GridResume>,
 }
 
 impl Hello {
@@ -331,6 +350,9 @@ impl Hello {
             validate_identifier("expected incarnation", incarnation)?;
         }
         validate_identifier("client nonce", &self.client_nonce)?;
+        if let Some(resume) = &self.grid_resume {
+            resume.validate()?;
+        }
         SessionToken::new(self.session_token.expose_secret().to_string()).map(|_| ())
     }
 }
@@ -364,6 +386,10 @@ pub struct HelloAck {
     /// PTY foreground process group. Absent from protocol 1.4 HelloAck.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub foreground_pid: Option<i32>,
+    /// The answer to `Hello.grid_resume`; absent when none was asked or the
+    /// Holder predates `grid-resume-v1`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub grid_resume: Option<GridResumeOutcome>,
 }
 
 impl HelloAck {
@@ -383,8 +409,190 @@ impl HelloAck {
                     .into(),
             });
         }
+        if self.grid_resume.is_some()
+            && (self.protocol.minor < GRID_RESUME_PROTOCOL_MINOR
+                || !self.capabilities.contains(&RemoteCapability::GridResume))
+        {
+            return Err(RemoteCodecError::InvalidControlPayload {
+                kind: KIND_HELLO_ACK,
+                detail: "grid resume answer without grid-resume-v1".into(),
+            });
+        }
         Ok(())
     }
+}
+
+/// Bytes of the random per-attach key every resume row digest is keyed with.
+pub const GRID_RESUME_KEY_BYTES: usize = 16;
+/// Visible rows a resume request may describe: 16 hex characters each keeps
+/// the request far inside one control frame. Taller grids reseed instead.
+pub const MAX_GRID_RESUME_ROWS: u16 = 1024;
+
+/// What a reattaching controller already shows: the sequence and geometry of
+/// its grid, the lease and reset generation it last held, and one keyed
+/// digest per visible row (see [`grid_resume_row_digest`]). It carries no
+/// cell content, so the request stays small and reveals nothing new.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GridResume {
+    pub controller_epoch: u64,
+    pub base_sequence: u64,
+    pub reset_generation: u64,
+    pub cols: u16,
+    pub rows: u16,
+    /// `GRID_RESUME_KEY_BYTES` random bytes as lowercase hex.
+    pub digest_key: String,
+    /// One 16-character lowercase hex digest per visible row, top to bottom.
+    pub row_digests: String,
+}
+
+impl GridResume {
+    #[must_use]
+    pub fn new(
+        controller_epoch: u64,
+        base_sequence: u64,
+        reset_generation: u64,
+        cols: u16,
+        rows: u16,
+        key: &[u8; GRID_RESUME_KEY_BYTES],
+        digests: &[u64],
+    ) -> Self {
+        let mut digest_key = String::with_capacity(GRID_RESUME_KEY_BYTES * 2);
+        for byte in key {
+            digest_key.push_str(&format!("{byte:02x}"));
+        }
+        let mut row_digests = String::with_capacity(digests.len() * 16);
+        for digest in digests {
+            row_digests.push_str(&format!("{digest:016x}"));
+        }
+        Self {
+            controller_epoch,
+            base_sequence,
+            reset_generation,
+            cols,
+            rows,
+            digest_key,
+            row_digests,
+        }
+    }
+
+    pub fn validate(&self) -> Result<(), RemoteCodecError> {
+        let invalid = |detail: &str| RemoteCodecError::InvalidControlPayload {
+            kind: KIND_HELLO,
+            detail: detail.into(),
+        };
+        validate_terminal_dimensions(self.cols, self.rows)?;
+        if self.rows > MAX_GRID_RESUME_ROWS {
+            return Err(invalid("grid resume describes too many rows"));
+        }
+        if self.key().is_none() {
+            return Err(invalid("grid resume key is malformed"));
+        }
+        if self.row_digests.len() != usize::from(self.rows) * 16 || !is_lower_hex(&self.row_digests)
+        {
+            return Err(invalid("grid resume digests do not match its rows"));
+        }
+        Ok(())
+    }
+
+    #[must_use]
+    pub fn key(&self) -> Option<[u8; GRID_RESUME_KEY_BYTES]> {
+        if self.digest_key.len() != GRID_RESUME_KEY_BYTES * 2 || !is_lower_hex(&self.digest_key) {
+            return None;
+        }
+        let mut key = [0_u8; GRID_RESUME_KEY_BYTES];
+        for (index, byte) in key.iter_mut().enumerate() {
+            *byte = u8::from_str_radix(&self.digest_key[index * 2..index * 2 + 2], 16).ok()?;
+        }
+        Some(key)
+    }
+
+    /// The row digests, or `None` if they do not match the declared rows.
+    #[must_use]
+    pub fn digests(&self) -> Option<Vec<u64>> {
+        if self.row_digests.len() != usize::from(self.rows) * 16 || !is_lower_hex(&self.row_digests)
+        {
+            return None;
+        }
+        (0..usize::from(self.rows))
+            .map(|row| u64::from_str_radix(&self.row_digests[row * 16..row * 16 + 16], 16).ok())
+            .collect()
+    }
+}
+
+fn is_lower_hex(value: &str) -> bool {
+    value
+        .bytes()
+        .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+}
+
+/// The Holder's answer to a [`GridResume`].
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(tag = "outcome", rename_all = "kebab-case")]
+pub enum GridResumeOutcome {
+    /// The next grid publication is a `GridDelta` against `base_sequence`
+    /// carrying every row that differs; no Full Snapshot follows.
+    Accepted {
+        #[serde(rename = "baseSequence")]
+        base_sequence: u64,
+    },
+    /// The attach proceeds exactly as without a request: a Full Snapshot.
+    Declined { reason: GridResumeDecline },
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum GridResumeDecline {
+    /// Another controller attached after the one this request names.
+    StaleControllerEpoch,
+    /// The terminal was reset since the controller's grid was published.
+    ResetGenerationChanged,
+    /// The visible grid no longer has the controller's dimensions.
+    GeometryChanged,
+    /// A reason introduced by a newer Holder.
+    #[serde(other)]
+    Unknown,
+}
+
+/// Keyed digest of one visible row as a controller holds it: the row padded
+/// or truncated to `cols` exactly as [`GridUpdate::apply`] stores it, plus its
+/// annotations. Both ends compute it over the same wire representation, so
+/// equal digests mean the Holder need not send the row. The key is random per
+/// attach, so a program cannot aim output at a colliding row.
+#[must_use]
+pub fn grid_resume_row_digest(
+    key: &[u8; GRID_RESUME_KEY_BYTES],
+    cols: u16,
+    cells: &[crate::grid::GridCell],
+    metadata: &crate::grid::RowMetadata,
+) -> u64 {
+    use sha2::Digest as _;
+    let width = usize::from(cols);
+    let mut row = Vec::with_capacity(width * 16 + 2);
+    let stored: Vec<crate::grid::GridCell> = cells
+        .iter()
+        .copied()
+        .chain(std::iter::repeat(crate::grid::GridCell::BLANK))
+        .take(width)
+        .collect();
+    // Widths are validated before any digest is taken; an over-wide row
+    // simply never matches.
+    if crate::grid::GridRowCodec::append_row(&stored, &mut row).is_err() {
+        return 0;
+    }
+    let mut hasher = sha2::Sha256::new();
+    hasher.update(b"diri-grid-resume-v1\0");
+    hasher.update(key);
+    hasher.update(cols.to_be_bytes());
+    hasher.update(&row);
+    if metadata.is_empty() {
+        hasher.update([0]);
+    } else {
+        hasher.update([1]);
+        hasher.update(serde_json::to_vec(metadata).unwrap_or_default());
+    }
+    let digest = hasher.finalize();
+    u64::from_be_bytes(digest[..8].try_into().expect("eight bytes"))
 }
 
 /// Input state staged before the grid publication with the exact same sequence.
@@ -1695,6 +1903,106 @@ mod tests {
     use super::*;
     use crate::grid::{ChangedRow, GridCell};
 
+    #[test]
+    fn grid_resume_is_validated_and_answered_only_with_its_capability() {
+        let key = [0xab_u8; GRID_RESUME_KEY_BYTES];
+        let resume = GridResume::new(3, 41, 0, 80, 2, &key, &[1, u64::MAX]);
+        assert_eq!(resume.key(), Some(key));
+        assert_eq!(resume.digests(), Some(vec![1, u64::MAX]));
+        let mut request = hello();
+        request.grid_resume = Some(resume.clone());
+        let encoded = RemoteCodec::encode(&RemoteMessage::Hello(request.clone())).unwrap();
+        assert_eq!(
+            RemoteCodec::new().feed(&encoded).unwrap(),
+            vec![RemoteMessage::Hello(request.clone())]
+        );
+        // Malformed requests never reach a Holder's comparison.
+        for broken in [
+            GridResume {
+                row_digests: "00".into(),
+                ..resume.clone()
+            },
+            GridResume {
+                digest_key: "XY".repeat(GRID_RESUME_KEY_BYTES),
+                ..resume.clone()
+            },
+            GridResume {
+                rows: MAX_GRID_RESUME_ROWS + 1,
+                row_digests: "0".repeat(16 * usize::from(MAX_GRID_RESUME_ROWS + 1)),
+                ..resume.clone()
+            },
+        ] {
+            request.grid_resume = Some(broken);
+            assert!(request.validate().is_err());
+        }
+        // Without the field the wire form is exactly the pre-17 Hello.
+        let plain = serde_json::to_value(hello()).unwrap();
+        assert!(plain.get("gridResume").is_none());
+
+        let mut ack = HelloAck {
+            protocol: ProtocolVersion::CURRENT,
+            holder_build_id: "holder".into(),
+            session_incarnation: "incarnation".into(),
+            capabilities: vec![RemoteCapability::GridResume],
+            controller_epoch: 4,
+            process_state: RemoteProcessState::Running { pid: 9 },
+            child_identity: None,
+            output_offset: 0,
+            snapshot_sequence: 41,
+            foreground_pid: None,
+            grid_resume: Some(GridResumeOutcome::Accepted { base_sequence: 41 }),
+        };
+        assert!(ack.validate().is_ok());
+        let json = serde_json::to_value(&ack).unwrap();
+        assert_eq!(
+            json["gridResume"],
+            serde_json::json!({"outcome": "accepted", "baseSequence": 41})
+        );
+        ack.capabilities.clear();
+        assert!(ack.validate().is_err());
+        ack.capabilities.push(RemoteCapability::GridResume);
+        ack.protocol.minor = GRID_RESUME_PROTOCOL_MINOR - 1;
+        assert!(ack.validate().is_err());
+        // A reason from a newer Holder still decodes as a decline.
+        let declined: GridResumeOutcome =
+            serde_json::from_str(r#"{"outcome":"declined","reason":"something-new"}"#).unwrap();
+        assert_eq!(
+            declined,
+            GridResumeOutcome::Declined {
+                reason: GridResumeDecline::Unknown
+            }
+        );
+    }
+
+    #[test]
+    fn grid_resume_digest_covers_cells_padding_and_annotations() {
+        let key = [1_u8; GRID_RESUME_KEY_BYTES];
+        let cells = vec![GridCell::new(
+            u32::from('a'),
+            crate::grid::TermColor::Default,
+            crate::grid::TermColor::DefaultInverted,
+            crate::grid::TermStyle::empty(),
+        )];
+        let plain = crate::grid::RowMetadata::default();
+        let digest = grid_resume_row_digest(&key, 4, &cells, &plain);
+        // A short row is compared as stored: padded with blanks to the width.
+        let mut padded = cells.clone();
+        padded.resize(4, GridCell::BLANK);
+        assert_eq!(grid_resume_row_digest(&key, 4, &padded, &plain), digest);
+        assert_ne!(grid_resume_row_digest(&key, 5, &cells, &plain), digest);
+        let linked = crate::grid::RowMetadata {
+            links: vec![crate::grid::LinkSpan {
+                start: 0,
+                end: 1,
+                uri: "https://example.com".into(),
+            }],
+            graphemes: Vec::new(),
+            styles: Vec::new(),
+        };
+        assert_ne!(grid_resume_row_digest(&key, 4, &cells, &linked), digest);
+        assert_ne!(grid_resume_row_digest(&[2; 16], 4, &cells, &plain), digest);
+    }
+
     fn hello() -> Hello {
         Hello {
             protocol: ProtocolVersion::CURRENT,
@@ -1707,6 +2015,7 @@ mod tests {
             required_capabilities: vec![RemoteCapability::FullSnapshot],
             last_acknowledged_output_offset: Some(6),
             last_acknowledged_grid_sequence: Some(7),
+            grid_resume: None,
         }
     }
 
@@ -1802,6 +2111,7 @@ mod tests {
                 cursor_visible: true,
                 is_full_snapshot: true,
                 changed_rows: vec![ChangedRow::new(0, vec![GridCell::BLANK; 2])],
+                cursor_style: Default::default(),
             },
         }
     }
@@ -2250,6 +2560,7 @@ mod tests {
             assert!(KIND_TERMINAL_RESET_STATE == 49);
             assert!(KIND_IMAGE_REQUEST > KIND_TERMINAL_RESET_STATE);
             assert!(INLINE_IMAGES_PROTOCOL_MINOR == 16);
+            assert!(INLINE_IMAGES_PROTOCOL_MINOR < PROTOCOL_MINOR);
         }
         assert_eq!(
             serde_json::to_string(&RemoteCapability::InlineImages).unwrap(),
@@ -2268,6 +2579,8 @@ mod tests {
         // answers a query, so an older peer never sees anything new.
         const {
             assert!(QUERY_REPLIES_PROTOCOL_MINOR == 19);
+            assert!(QUERY_REPLIES_PROTOCOL_MINOR == PROTOCOL_MINOR);
+            assert!(QUERY_REPLIES_PROTOCOL_MINOR > TERMINAL_STYLES_PROTOCOL_MINOR);
             assert!(QUERY_REPLIES_PROTOCOL_MINOR > INLINE_IMAGES_PROTOCOL_MINOR);
         }
         assert_eq!(
@@ -2482,5 +2795,24 @@ mod usage_tests {
             }],
         };
         assert!(request.validate().is_ok());
+    }
+
+    #[test]
+    fn terminal_styles_is_an_optional_minor_18_capability() {
+        const {
+            assert!(TERMINAL_STYLES_PROTOCOL_MINOR == 18);
+            assert!(TERMINAL_STYLES_PROTOCOL_MINOR < PROTOCOL_MINOR);
+            assert!(TERMINAL_STYLES_PROTOCOL_MINOR > INLINE_IMAGES_PROTOCOL_MINOR);
+        }
+        assert_eq!(
+            serde_json::to_string(&RemoteCapability::TerminalStyles).unwrap(),
+            "\"terminal-styles-v1\""
+        );
+        assert_eq!(
+            RemoteCapability::TerminalStyles.wire_name(),
+            "terminal-styles-v1"
+        );
+        assert!(!PHASE_ONE_HOLDER_CAPABILITIES.contains(&RemoteCapability::TerminalStyles));
+        assert!(ANNOTATED_HOLDER_CAPABILITIES.contains(&RemoteCapability::TerminalStyles));
     }
 }

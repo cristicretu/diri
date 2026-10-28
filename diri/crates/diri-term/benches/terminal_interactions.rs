@@ -83,6 +83,7 @@ fn full_frame(cols: u16, rows: u16, offset: usize, wide: bool) -> GridUpdate {
                 ChangedRow::new(row, cells)
             })
             .collect(),
+        cursor_style: Default::default(),
     }
 }
 

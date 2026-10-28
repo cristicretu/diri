@@ -497,6 +497,91 @@ fn session_record_host_field_is_wire_compatible() {
     typed_round_trip(&record);
 }
 
+/// The tab policy for one-off commands, case by case, as a reference terminal
+/// multiplexer measures it with its 250 ms quick-exit threshold. A slower
+/// failure is `false` here: the existing "stays listed, announced" handling
+/// applies to it, never a close.
+#[test]
+fn command_tabs_stay_only_after_a_quick_failure_or_keep_open() {
+    use diri_proto::{CommandRun, ExitInfo, ExitReason};
+    let sessions: SessionListResult = fixture_ok(FIXTURES[1]);
+    let mut record = sessions.sessions[0].clone();
+    assert!(
+        record.command_run.is_none(),
+        "older records have no command run"
+    );
+    let exited = |code| {
+        SessionStatus::Exited(ExitInfo {
+            reason: ExitReason::Exited,
+            code: Some(code),
+            signal: None,
+            system_restart: false,
+            interrupted: false,
+        })
+    };
+    let killed = SessionStatus::Exited(ExitInfo {
+        reason: ExitReason::Signaled,
+        code: None,
+        signal: Some(9),
+        system_restart: false,
+        interrupted: true,
+    });
+    let run = |keep_open, ran_ms| {
+        Some(CommandRun {
+            keep_open,
+            ran_ms: Some(ran_ms),
+        })
+    };
+    for (command_run, status, keeps, case) in [
+        (run(false, 3), exited(3), true, "exit 3 at once"),
+        (run(false, 3), exited(127), true, "missing program"),
+        (run(false, 20), killed.clone(), true, "kill -9 at once"),
+        (run(false, 3), exited(0), false, "exit 0 at once"),
+        (run(false, 600), exited(3), false, "sleep .6; exit 3"),
+        (run(true, 3), exited(0), true, "--keep-open, exit 0"),
+        (
+            run(true, 9_000),
+            exited(3),
+            true,
+            "--keep-open, slow failure",
+        ),
+        (None, exited(3), false, "a login shell or an Agent"),
+        (
+            Some(CommandRun {
+                keep_open: false,
+                ran_ms: None,
+            }),
+            exited(3),
+            false,
+            "adopted run of unknown length",
+        ),
+        (run(true, 3), SessionStatus::Working, false, "still running"),
+        (
+            run(true, 3),
+            SessionStatus::Exited(ExitInfo::restart(false)),
+            false,
+            "ended by a restart",
+        ),
+    ] {
+        record.command_run = command_run;
+        record.status = status;
+        assert_eq!(record.command_keeps_tab(), keeps, "{case}");
+    }
+
+    record.command_run = run(true, 12);
+    let encoded = serde_json::to_value(&record).unwrap();
+    assert_eq!(
+        encoded["commandRun"],
+        json!({"keepOpen": true, "ranMs": 12})
+    );
+    typed_round_trip(&record);
+    record.command_run = Some(CommandRun::default());
+    assert_eq!(
+        serde_json::to_value(&record).unwrap()["commandRun"],
+        json!({})
+    );
+}
+
 #[test]
 fn plain_terminal_liveness_does_not_report_agent_activity() {
     let sessions: SessionListResult = fixture_ok(FIXTURES[1]);

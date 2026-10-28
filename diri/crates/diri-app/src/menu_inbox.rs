@@ -127,7 +127,7 @@ mod tests {
         kind: AgentKind,
         status: SessionStatus,
     ) -> Arc<SessionRecord> {
-        Arc::new(SessionRecord {
+        Arc::new(SessionRecord { command_run: None,
             attention_state: None,
             id: SessionId::new(id),
             kind,

@@ -96,6 +96,7 @@ pub(crate) fn kill(selector: &SessionSelector) -> io::Result<SessionInspection> 
         ],
         last_acknowledged_output_offset: Some(expected.output_offset),
         last_acknowledged_grid_sequence: None,
+        grid_resume: None,
     });
     match write_message(&stream, &hello, deadline) {
         Ok(()) => {}
@@ -462,6 +463,7 @@ mod tests {
             output_offset: 0,
             snapshot_sequence: 1,
             foreground_pid: None,
+            grid_resume: None,
         }
     }
     #[test]
