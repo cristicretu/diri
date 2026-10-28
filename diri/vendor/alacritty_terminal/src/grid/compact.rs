@@ -57,6 +57,8 @@ pub struct RowCodec<T> {
     /// to them in history.
     reflow_line: fn(Vec<Row<T>>, usize) -> Vec<Row<T>>,
     clone_row: fn(&Row<T>) -> Row<T>,
+    /// Reset a row to default cells: equal to `Row::new` of its width.
+    clear_row: fn(&mut Row<T>),
     #[cfg(test)]
     rows_equal: RowsEqual<T>,
 }
@@ -214,6 +216,20 @@ const HAS_EXTRA: u32 = 1 << 31;
 struct Lines<T> {
     packed: VecDeque<PackedLine>,
     extras: VecDeque<LineExtra<T>>,
+    /// Heap bytes the extras own, kept current so the history bound, which
+    /// measures storage after every eviction, does not walk every line.
+    extra_heap: usize,
+}
+
+impl<T> LineExtra<T> {
+    fn heap_bytes(&self) -> usize {
+        match self {
+            LineExtra::Greedy { wide, .. } => wide
+                .as_ref()
+                .map_or(0, |runs| std::mem::size_of_val(&**runs)),
+            LineExtra::Eager(rows) => rows.capacity() * std::mem::size_of::<Row<T>>(),
+        }
+    }
 }
 
 impl<T> Lines<T> {
@@ -221,6 +237,7 @@ impl<T> Lines<T> {
         Self {
             packed: VecDeque::new(),
             extras: VecDeque::new(),
+            extra_heap: 0,
         }
     }
 
@@ -242,6 +259,7 @@ impl<T> Lines<T> {
         let (packed, extra) = Self::pack(line);
         self.packed.push_front(packed);
         if let Some(extra) = extra {
+            self.extra_heap += extra.heap_bytes();
             self.extras.push_front(extra);
         }
     }
@@ -249,7 +267,10 @@ impl<T> Lines<T> {
     fn push_back(&mut self, line: DeferredLine<T>) {
         let (packed, extra) = Self::pack(line);
         self.packed.push_back(packed);
-        self.extras.extend(extra);
+        if let Some(extra) = extra {
+            self.extra_heap += extra.heap_bytes();
+            self.extras.push_back(extra);
+        }
     }
 
     fn unpack(packed: PackedLine, extra: impl FnOnce() -> LineExtra<T>) -> DeferredLine<T> {
@@ -263,14 +284,18 @@ impl<T> Lines<T> {
     fn pop_front(&mut self) -> Option<DeferredLine<T>> {
         let packed = self.packed.pop_front()?;
         Some(Self::unpack(packed, || {
-            self.extras.pop_front().expect("line extra")
+            let extra = self.extras.pop_front().expect("line extra");
+            self.extra_heap -= extra.heap_bytes();
+            extra
         }))
     }
 
     fn pop_back(&mut self) -> Option<DeferredLine<T>> {
         let packed = self.packed.pop_back()?;
         Some(Self::unpack(packed, || {
-            self.extras.pop_back().expect("line extra")
+            let extra = self.extras.pop_back().expect("line extra");
+            self.extra_heap -= extra.heap_bytes();
+            extra
         }))
     }
 
@@ -299,18 +324,18 @@ impl<T> Lines<T> {
     }
 
     fn heap_bytes(&self) -> usize {
+        debug_assert_eq!(
+            self.extra_heap,
+            self.extras.iter().map(LineExtra::heap_bytes).sum::<usize>()
+        );
         self.packed.capacity() * std::mem::size_of::<PackedLine>()
             + self.extras.capacity() * std::mem::size_of::<LineExtra<T>>()
-            + self
-                .extras
-                .iter()
-                .map(|extra| match extra {
-                    LineExtra::Greedy { wide, .. } => wide
-                        .as_ref()
-                        .map_or(0, |runs| std::mem::size_of_val(&**runs)),
-                    LineExtra::Eager(rows) => rows.capacity() * std::mem::size_of::<Row<T>>(),
-                })
-                .sum::<usize>()
+            + self.extra_heap
+    }
+
+    /// Recompute `extra_heap` after extras were changed in place.
+    fn recount_heap(&mut self) {
+        self.extra_heap = self.extras.iter().map(LineExtra::heap_bytes).sum();
     }
 }
 
@@ -493,6 +518,34 @@ impl<T> Deferred<T> {
     /// Every row at `columns`, newest first.
     fn build_rows(&self, codec: RowCodec<T>) -> Vec<Row<T>> {
         let mut out = Vec::with_capacity(self.rows);
+        self.for_each_row_chunk(codec, usize::MAX, |rows| out.append(rows));
+        out
+    }
+
+    /// [`Self::build_rows`] handed to `sink` in chunks of exactly `chunk`
+    /// rows (the last one shorter), newest first, so a caller that encodes
+    /// each chunk never holds every reflowed row at once. `sink` takes the
+    /// rows it keeps out of the buffer.
+    fn for_each_row_chunk(
+        &self,
+        codec: RowCodec<T>,
+        chunk: usize,
+        mut sink: impl FnMut(&mut Vec<Row<T>>),
+    ) {
+        let mut out = Vec::with_capacity(self.rows.min(chunk));
+        let mut flush = |out: &mut Vec<Row<T>>, all: bool| {
+            while out.len() >= chunk || (all && !out.is_empty()) {
+                if out.len() > chunk {
+                    let rest = out.split_off(chunk);
+                    sink(out);
+                    out.clear();
+                    out.extend(rest);
+                } else {
+                    sink(out);
+                    out.clear();
+                }
+            }
+        };
         let mut sources = self.sources.iter();
         let mut decoded = Vec::new().into_iter();
         let mut chunks = Vec::new();
@@ -510,6 +563,7 @@ impl<T> Deferred<T> {
             let skip = match extra {
                 Some(LineExtra::Eager(rows)) => {
                     out.extend(rows.iter().rev().map(codec.clone_row));
+                    flush(&mut out, false);
                     continue;
                 }
                 Some(LineExtra::Greedy { skip, .. }) => *skip as usize,
@@ -518,8 +572,9 @@ impl<T> Deferred<T> {
             rows.reverse();
             (codec.line_rows)(rows, skip, cells as usize, self.columns, &mut chunks);
             out.extend(chunks.drain(..).rev());
+            flush(&mut out, false);
         }
-        out
+        flush(&mut out, true);
     }
 
     /// Remove the newest `count` source rows, newest first.
@@ -913,7 +968,18 @@ impl<T> CompactRows<T> {
         T: Default,
     {
         self.needs_maintenance |= count != 0;
-        self.oldest.extend((0..count).map(|_| Row::new(columns)));
+        // Growing history allocates a row per new line; reuse the cells of
+        // the block sealed last instead (see `seal_recent`).
+        for _ in 0..count {
+            let row = match self.spare.pop() {
+                Some(mut row) if row.len() == columns => {
+                    (self.codec.clear_row)(&mut row);
+                    row
+                }
+                _ => Row::new(columns),
+            };
+            self.oldest.push_back(row);
+        }
         self.len += count;
     }
 
@@ -1026,6 +1092,19 @@ impl<T> CompactRows<T> {
         }
     }
 
+    /// Give back what streaming output leaves behind once it stops: decode
+    /// caches, the oldest block's eviction index and spare row allocations,
+    /// and deque capacity beyond what the rows need. Stored history is
+    /// untouched; each cache is rebuilt on its next use.
+    pub fn release_idle(&mut self) {
+        self.release_read_cache();
+        self.evict_cache = None;
+        self.spare = Vec::new();
+        self.recent.shrink_to_fit();
+        self.oldest.shrink_to_fit();
+        self.blocks.shrink_to_fit();
+    }
+
     #[cfg(test)]
     fn payload_bytes(&self) -> usize {
         self.payload_bytes
@@ -1128,6 +1207,11 @@ impl<T> CompactRows<T> {
         self.release_read_cache();
         if self.payload_bytes.is_none() {
             self.payload_bytes = Some(self.stored_payload_bytes());
+        }
+        // Release a block index emptied by deferral or eviction before
+        // measuring, so its spare capacity does not evict history.
+        if self.blocks.capacity() > self.blocks.len().saturating_mul(2).saturating_add(64) {
+            self.blocks.shrink_to_fit();
         }
         let mut raw_left = true;
         while self.len > self.visible && self.history_storage_bytes() > budget {
@@ -1310,12 +1394,10 @@ impl<T> CompactRows<T> {
 
     /// The hard-line case of `prepare_reflow`: cold history needs no reflow.
     fn keep_hard_lines(&mut self, columns: usize) -> bool {
+        // Only the oldest block may be partial (bounded history drops its
+        // rows one at a time); splitting keeps that true.
         if !self.oldest.is_empty()
             || self.blocks.is_empty()
-            || self
-                .blocks
-                .back()
-                .is_some_and(|last| last.count != self.block_rows)
             || self
                 .blocks
                 .iter()
@@ -1334,7 +1416,7 @@ impl<T> CompactRows<T> {
                     blocks.push_back(Block {
                         bytes: block.bytes.clone(),
                         start: block.start + offset as u32,
-                        count: next_rows,
+                        count: next_rows.min(block.count - offset),
                         columns,
                         resize_floor: block.resize_floor,
                         decoded: OnceLock::new(),
@@ -1446,9 +1528,24 @@ impl<T> CompactRows<T> {
                 *rows = (codec.reflow_line)(std::mem::take(rows), columns);
             }
         }
+        deferred.lines.recount_heap();
+        deferred.sources.reserve_exact(self.blocks.len());
         for block in self.blocks.drain(..).rev() {
             deferred.sources.push_front(block);
         }
+        // The line index counts against the history budget; doubling growth
+        // could leave up to half of it unused.
+        // `older` is empty without oldest rows.
+        deferred
+            .lines
+            .packed
+            .reserve_exact(newer.len() + older.len());
+        let extras = newer
+            .iter()
+            .chain(&older)
+            .filter(|line| line.extra.is_some())
+            .count();
+        deferred.lines.extras.reserve_exact(extras);
         for line in newer {
             deferred.lines.push_front(line);
         }
@@ -1478,6 +1575,19 @@ impl<T> CompactRows<T> {
         true
     }
 
+    /// Reflow deferred history into blocks now, one block at a time, so a
+    /// read of every history row (a checkpoint, a capture) decodes a block
+    /// at a time instead of first reflowing all of it into one copy.
+    pub fn prepare_history_read(&mut self) {
+        if self
+            .deferred
+            .as_ref()
+            .is_some_and(|d| d.read.get().is_none())
+        {
+            self.materialize_deferred();
+        }
+    }
+
     /// Reflow deferred history into blocks after every newer block.
     fn materialize_deferred(&mut self) {
         let Some(deferred) = self.deferred.take() else {
@@ -1486,18 +1596,26 @@ impl<T> CompactRows<T> {
         let codec = self.codec;
         let columns = deferred.columns;
         let mut deferred = *deferred;
-        let rows = deferred
-            .read
-            .take()
-            .unwrap_or_else(|| deferred.build_rows(codec));
         debug_assert!(
             self.blocks
                 .iter()
                 .all(|block| block.count == self.block_rows)
         );
         debug_assert_eq!(self.block_rows, block_rows::<T>(columns));
-        for chunk in rows.chunks(self.block_rows) {
-            self.blocks.push_back(Block::new(chunk, codec));
+        match deferred.read.take() {
+            Some(rows) => {
+                for chunk in rows.chunks(self.block_rows) {
+                    self.blocks.push_back(Block::new(chunk, codec));
+                }
+            }
+            // Nothing read it yet: encode one block at a time rather than
+            // reflowing every row first (tens of MB for full history).
+            None => {
+                let blocks = &mut self.blocks;
+                deferred.for_each_row_chunk(codec, self.block_rows, |rows| {
+                    blocks.push_back(Block::new(rows, codec));
+                });
+            }
         }
         self.payload_bytes = None;
         self.evict_cache = None;
@@ -1884,6 +2002,7 @@ pub fn cell_codec() -> RowCodec<Cell> {
         line_rows: cell_line_rows,
         reflow_line: cell_reflow_line,
         clone_row: Row::clone,
+        clear_row: |row| row.reset(&Cell::default()),
         #[cfg(test)]
         rows_equal: |a, b| a == b,
     }
@@ -3916,6 +4035,12 @@ mod tests {
                         }
                         1 => compact.bound_primary_history_storage(usize::MAX / 2),
                         2 => same_as_dense(&mut compact, &dense, &label),
+                        // A full in-order read (a checkpoint): deferred
+                        // history is stored a block at a time first.
+                        3 => {
+                            compact.grid_mut().prepare_history_read();
+                            same_as_dense(&mut compact, &dense, &label);
+                        }
                         _ => {}
                     }
                 }

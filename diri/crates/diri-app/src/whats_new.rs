@@ -406,7 +406,7 @@ impl WhatsNewSheet {
     }
 }
 
-fn sheet_button(
+pub(crate) fn sheet_button(
     id: &'static str,
     label: SharedString,
     shortcut: Option<String>,

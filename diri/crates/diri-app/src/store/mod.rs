@@ -2,6 +2,7 @@
 
 mod computer;
 mod herdr;
+mod terminal_setup;
 mod prefs;
 mod projection;
 mod residency;
@@ -40,7 +41,7 @@ use crate::switcher::{
 };
 
 pub use prefs::{
-    DictationShortcut, FileEditor, InspectorTab, InterfaceStyle, NewAgentStart, PaneDensity, Prefs,
+    AttentionRoute, AttentionRoutes, CursorBlinkPref, CursorShapePref, DictationShortcut, DockBadge, FileEditor, InspectorTab, InterfaceStyle, NewAgentStart, OptionAsMeta, PaneDensity, Prefs,
     SavedWindow, SidebarGrouping, SidebarOrdering, TabOrientation, TalkAnswer, UiLanguage,
     WindowMaterial, WindowMode, WindowPlacement,
 };
@@ -56,6 +57,21 @@ pub use workspace_spawn::{
 pub use workspaces::{WorkspaceCatalog, WorkspaceCatalogStatus};
 
 pub const AUXILIARY_TERMINAL_TITLE: &str = "Terminal";
+
+/// The per-state route a feed entry follows; `None` for an agent's own
+/// notification, which only the global switches govern.
+fn attention_route(
+    kind: &crate::notification_feed::NotificationKind,
+    routes: &AttentionRoutes,
+) -> Option<AttentionRoute> {
+    use crate::notification_feed::NotificationKind;
+    match kind {
+        NotificationKind::NeedsInput => Some(routes.blocked),
+        NotificationKind::Failed => Some(routes.error),
+        NotificationKind::Done => Some(routes.done),
+        NotificationKind::Custom => None,
+    }
+}
 
 fn agent_target_key(host: Option<&str>) -> String {
     host.unwrap_or("local").to_owned()
@@ -193,6 +209,8 @@ pub enum StoreEffect {
     },
     /// Open every planned herdr pane as a Diri session, in herdr's order.
     ImportHerdr(Vec<herdr::ImportStep>),
+    /// Read other terminals' configs off the main thread.
+    ScanTerminalSetup,
     /// Resume every session a restart ended, a few at a time.
     ResumeAll(Vec<SessionId>),
     /// Poll computer use setup while Settings or a permission guide shows it.
@@ -514,6 +532,7 @@ pub struct SessionStore {
     agent_install: Option<AgentKind>,
     computer: computer::ComputerSetupState,
     herdr: herdr::HerdrState,
+    terminal_setup: terminal_setup::TerminalSetupState,
     /// Attention states serving out their settle window, newest arming wins.
     /// Drained by the settle task in `StoreHandle`, which is what turns one of
     /// these into a chime and a banner — see `drain_settled_attention`.
@@ -619,6 +638,7 @@ impl SessionStore {
                 agent_install: None,
                 computer: computer::ComputerSetupState::default(),
                 herdr: herdr::HerdrState::default(),
+                terminal_setup: terminal_setup::TerminalSetupState::default(),
                 notification_feed,
                 attention_wake: Arc::new(Notify::new()),
                 terminal_clipboard: broadcast::channel(4).0,
@@ -729,13 +749,71 @@ impl SessionStore {
 
     /// Recheck at delivery time: a queued transition may already be read,
     /// resolved, or muted by the time the main thread receives it.
+    ///
+    /// Session news posts a system notification only while Diri is in the
+    /// background: in front, the session's row already shows it, and the
+    /// sound (see [`Self::should_play_sound`]) is the cue.
     pub fn should_deliver_notification(
         &self,
         request: &crate::notifications::NotificationRequest,
     ) -> bool {
-        if !self.prefs.status_notifications {
-            return false;
+        self.prefs.status_notifications
+            && !(request.session_event && self.app_is_active)
+            && self.route(request).is_none_or(|route| route.notify)
+            && self.still_news(request)
+    }
+
+    /// Whether a session's status sound may still play: the same read,
+    /// focus and mute checks as its notification, but in front of Diri too,
+    /// and under its own per-state switch.
+    pub fn should_play_sound(&self, request: &crate::notifications::NotificationRequest) -> bool {
+        self.prefs.status_sounds
+            && self.route(request).is_none_or(|route| route.sound)
+            && self.still_news(request)
+    }
+
+    /// Whether a session's news bounces the Dock icon once: only while Diri
+    /// is in the background, under its state's bounce switch (by default
+    /// only a session waiting on you), with the same mute and read checks.
+    pub fn should_bounce_dock(&self, request: &crate::notifications::NotificationRequest) -> bool {
+        !self.app_is_active
+            && self.route(request).is_some_and(|route| route.bounce)
+            && self.still_news(request)
+    }
+
+    /// The Dock menu's "Mark All as Seen": every session that finished or
+    /// failed unseen reads as seen, as if each had been opened. A session
+    /// still waiting on you keeps its mark: seeing a question does not
+    /// answer it.
+    pub fn mark_all_seen(&mut self) {
+        let unseen: Vec<SessionId> = self
+            .sessions
+            .values()
+            .filter(|session| {
+                !session.is_archived()
+                    && session.attention() != AttentionLevel::NeedsInput
+                    && (session.attention() == AttentionLevel::DoneUnseen
+                        || self.notification_feed.session_unread(&session.id)
+                        || self.unread_holds.contains(&session.id))
+            })
+            .map(|session| session.id.clone())
+            .collect();
+        for id in unseen {
+            self.mark_session_read(id);
         }
+    }
+
+    /// The per-state route of a session event's feed entry; `None` for
+    /// anything else (an agent's own notification, a one-shot fact).
+    fn route(&self, request: &crate::notifications::NotificationRequest) -> Option<AttentionRoute> {
+        if !request.session_event {
+            return None;
+        }
+        let kind = &self.notification_feed.entry(&request.identifier)?.kind;
+        attention_route(kind, &self.prefs.attention_routes)
+    }
+
+    fn still_news(&self, request: &crate::notifications::NotificationRequest) -> bool {
         if let Some(session) = &request.thread_identifier {
             let id = SessionId::new(session.clone());
             if self.prefs.muted_notification_sessions.contains(&id.0)
@@ -744,10 +822,25 @@ impl SessionStore {
                 return false;
             }
         }
-        if !request.session_event {
-            return true;
+        !request.session_event || self.notification_feed.deliverable(&request.identifier)
+    }
+
+    /// The number on the Dock icon. By default, sessions that are blocked,
+    /// failed or finished and not looked at yet (each counted once, muted
+    /// sessions not at all); [`DockBadge::Notifications`] keeps the former
+    /// count of unread inbox entries.
+    pub fn dock_badge_count(&self) -> usize {
+        match self.prefs.dock_badge {
+            DockBadge::Notifications => self.notification_feed.unread_count(),
+            DockBadge::Sessions => self.notification_feed.unseen_sessions(|entry| {
+                !self
+                    .prefs
+                    .muted_notification_sessions
+                    .contains(&entry.session_id.0)
+                    && attention_route(&entry.kind, &self.prefs.attention_routes)
+                        .is_some_and(|route| route.badge)
+            }),
         }
-        self.notification_feed.deliverable(&request.identifier)
     }
 
     pub fn toggle_notification_alerts(&mut self) {
@@ -1887,6 +1980,29 @@ impl SessionStore {
         self.reconcile_navigation();
     }
 
+    /// An Agent changed the window through Diri's tools: name it. Only
+    /// requests stamped with an actor reach here, and the app never stamps
+    /// its own, so the person's input is never announced back to them. An
+    /// actor this window does not know (archived, or not yet listed) stays
+    /// silent rather than showing an id; a note actor is the person.
+    fn agent_acted(&mut self, event: diri_proto::agent_action::AgentActionEvent) {
+        let Some(actor) = self
+            .sessions
+            .get(&event.session_id)
+            // A note acts only when the person starts work from it.
+            .filter(|session| !session.is_archived() && !session.is_note())
+        else {
+            return;
+        };
+        let notice = crate::agent_notice::notice(actor, event.action);
+        self.emit(StoreEffect::StatusTransition(StatusTransition {
+            dismiss: Vec::new(),
+            sound: None,
+            notification: None,
+            in_app_banner: Some(notice),
+        }));
+    }
+
     /// Applies a daemon event and reports whether any UI-visible store state
     /// changed. The daemon can repeat snapshots and also carries events for
     /// direct consumers such as terminal attachments; neither should rebuild
@@ -1919,6 +2035,15 @@ impl SessionStore {
                     serde_json::from_value::<diri_proto::SessionOpenApiRequestParams>(event.params)
                 {
                     self.accept_api_request(params);
+                }
+                return StoreEventChange::None;
+            }
+            EventName::AGENT_ACTION => {
+                if let Ok(event) = serde_json::from_value::<
+                    diri_proto::agent_action::AgentActionEvent,
+                >(event.params)
+                {
+                    self.agent_acted(event);
                 }
                 return StoreEventChange::None;
             }
@@ -2186,16 +2311,18 @@ impl SessionStore {
     }
 
     pub fn drain_settled_attention(&mut self, now: Instant) -> Vec<StatusTransition> {
-        let transitions = self
-            .notification_feed
-            .drain_due(now, self.prefs.status_sounds);
+        let transitions = self.notification_feed.drain_due(now, true);
         transitions
             .into_iter()
-            .filter(|effect| {
-                effect
-                    .notification
-                    .as_ref()
-                    .is_some_and(|request| self.should_deliver_notification(request))
+            .filter_map(|mut effect| {
+                // Each channel is decided on its own: a muted Done can still
+                // badge, a frontmost window still hears the chime.
+                let request = effect.notification.as_ref()?;
+                if !self.should_play_sound(request) {
+                    effect.sound = None;
+                }
+                let post = self.should_deliver_notification(request);
+                (post || effect.sound.is_some()).then_some(effect)
             })
             .map(|mut effect| {
                 if let Some(request) = effect.notification.as_mut() {
@@ -2966,13 +3093,53 @@ impl SessionStore {
     }
 
     /// The session a pane belongs to in the sidebar: a pane shell's parent,
-    /// otherwise the session itself.
+    /// otherwise the session itself. A pane shell moved into a tab its
+    /// parent is not in belongs to that tab's first session with a row, so
+    /// the tab stays one row and focusing the shell keeps that row selected.
     pub fn pane_owner(&self, session: &SessionId) -> SessionId {
-        self.sessions
+        use diri_proto::workspace::LayoutNode;
+        fn leaves<'a>(node: &'a LayoutNode, out: &mut Vec<&'a SessionId>) {
+            match node {
+                LayoutNode::Pane { session_id, .. } => out.push(session_id),
+                LayoutNode::Split { first, second, .. } => {
+                    leaves(first, out);
+                    leaves(second, out);
+                }
+            }
+        }
+        let Some(parent) = self
+            .sessions
             .get(session)
             .filter(|record| is_auxiliary_terminal(record))
             .and_then(|record| record.parent.clone())
-            .unwrap_or_else(|| session.clone())
+        else {
+            return session.clone();
+        };
+        let Some(snapshot) = self.workspaces.snapshot() else {
+            return parent;
+        };
+        let mut panes = Vec::new();
+        for tab in snapshot.workspaces.iter().flat_map(|w| &w.tabs) {
+            if !matches!(tab.layout, LayoutNode::Split { .. }) {
+                continue;
+            }
+            panes.clear();
+            leaves(&tab.layout, &mut panes);
+            if !panes.contains(&session) {
+                continue;
+            }
+            if panes.contains(&&parent) {
+                return parent;
+            }
+            if let Some(head) = panes.iter().find(|id| {
+                self.sessions
+                    .get(**id)
+                    .is_some_and(|record| !is_auxiliary_terminal(record))
+            }) {
+                return (*head).clone();
+            }
+        }
+        parent
     }
 
     /// The tab that shows `owner`, as its sidebar row sums it up: how many
@@ -3002,7 +3169,7 @@ impl SessionStore {
                     .iter()
                     .filter_map(|id| self.sessions.get(*id))
                     .filter(|session| {
-                        session.parent.as_ref() == Some(owner) && is_auxiliary_terminal(session)
+                        is_auxiliary_terminal(session) && self.pane_owner(&session.id) == *owner
                     })
                     .cloned()
                     .collect();
@@ -3923,6 +4090,11 @@ impl StoreRuntime {
                                     state_store.write().expect("session store lock poisoned");
                                 store.hydrate(list);
                                 store.request_herdr_scan();
+                                // Only a first run shows the welcome that
+                                // offers it; Settings asks on its own.
+                                if store.sessions().is_empty() {
+                                    store.request_terminal_setup_scan();
+                                }
                                 store.snapshot()
                             };
                             state_snapshots.send_replace(snapshot);
@@ -4437,6 +4609,10 @@ async fn run_effects(
                 });
                 Ok(())
             }
+            StoreEffect::ScanTerminalSetup => {
+                tokio::spawn(terminal_setup::scan(Arc::clone(&store), change_tx.clone()));
+                Ok(())
+            }
             StoreEffect::ScanHerdr { tracked, imported } => {
                 tokio::spawn(herdr::scan(
                     tracked,
@@ -4667,6 +4843,8 @@ fn action_context(effect: &StoreEffect) -> Option<ActionContext> {
         StoreEffect::WatchComputer | StoreEffect::ComputerSetup(_) => return None,
         // Import outcomes, failures included, arrive as one summary banner.
         StoreEffect::ScanHerdr { .. } | StoreEffect::ImportHerdr(_) => return None,
+        // Applying happens in the store; the scan only reads.
+        StoreEffect::ScanTerminalSetup => return None,
         // So does a "Resume all" batch.
         StoreEffect::ResumeAll(_) => return None,
     };

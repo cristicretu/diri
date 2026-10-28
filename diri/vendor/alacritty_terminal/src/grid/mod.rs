@@ -153,14 +153,49 @@ impl Grid<crate::term::cell::Cell> {
         self.raw.enable_compact(compact::cell_codec());
     }
 
+    /// Call before reading every history row in order: deferred reflow is
+    /// then stored a block at a time instead of built whole by the first read.
+    pub fn prepare_history_read(&mut self) {
+        self.raw.prepare_history_read();
+    }
+
     /// Reclaim decoded history only after callers have released their borrows.
     pub fn release_history_read_cache(&mut self) {
         self.raw.release_read_cache();
     }
 
-    pub fn bound_history_storage(&mut self, budget: usize) {
+    /// Release history caches and spare allocations once output is idle.
+    pub fn release_idle_history(&mut self) {
+        self.raw.release_idle();
+    }
+
+    /// Discard the oldest history beyond `budget` stored bytes.
+    ///
+    /// The row limit follows the byte bound, with `ceiling` as its maximum.
+    /// Once the budget evicts, the limit drops to the rows retained, so each
+    /// new line recycles the oldest row in place (the bounded-history path)
+    /// instead of allocating a row that a later bound discards with its whole
+    /// block. When stored history falls 1/16 below the budget (output that
+    /// compresses better than what it replaced), the limit returns to
+    /// `ceiling` and history grows again.
+    pub fn bound_history_storage(&mut self, budget: usize, ceiling: usize) {
+        let before = self.history_size();
         self.raw.bound_history_bytes(budget);
+        let after = self.history_size();
+        if after < before {
+            self.max_scroll_limit = after.min(ceiling);
+        } else if self.max_scroll_limit < ceiling
+            && self.raw.history_storage_bytes() <= budget - budget / 16
+        {
+            self.max_scroll_limit = ceiling;
+        }
         self.display_offset = self.display_offset.min(self.history_size());
+    }
+
+    /// Return the row limit to `ceiling`, e.g. before a reflow, which must
+    /// not drop rows by count that the byte budget would keep.
+    pub fn restore_history_limit(&mut self, ceiling: usize) {
+        self.max_scroll_limit = self.max_scroll_limit.max(ceiling);
     }
 
     pub fn history_storage_bytes(&self) -> usize {

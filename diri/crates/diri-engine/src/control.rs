@@ -102,6 +102,7 @@ const TERMINAL_ONLY_METHODS: &[&str] = &[
     Method::SESSION_READ_SCREEN,
     Method::SESSION_TERMINAL_TITLE,
     Method::SESSION_RESET_TERMINAL,
+    Method::SESSION_CLEAR_SCROLLBACK,
     Method::SESSION_CAPTURE_FIND,
     Method::SESSION_READ_SCROLLBACK,
     Method::SESSION_READ_SCROLLBACK_CELLS,
@@ -804,7 +805,7 @@ impl ControlServer {
             std::fs::remove_file(&self.socket_path)?;
         }
         if let Some(parent) = self.socket_path.parent() {
-            std::fs::create_dir_all(parent)?;
+            diri_platform::private::create_dir_all(parent)?;
         }
         let listener = UnixListener::bind(&self.socket_path)?;
         #[cfg(unix)]
@@ -1160,6 +1161,28 @@ impl ControlServer {
     }
 
     fn dispatch(&self, method: &str, params: Option<JsonValue>) -> Result<JsonValue, ControlError> {
+        // An Agent's window change is announced only once it committed, so a
+        // rejected or conflicting request never shows a notice.
+        let announcement = diri_proto::agent_action::announcement(method, params.as_ref());
+        let result = self.dispatch_recorded(method, params);
+        if result.is_ok()
+            && let Some(announcement) = announcement
+        {
+            let actor = announcement.session_id.0.clone();
+            self.events.publish_encoded(
+                diri_proto::EventName::AGENT_ACTION,
+                &announcement,
+                Some(&actor),
+            );
+        }
+        result
+    }
+
+    fn dispatch_recorded(
+        &self,
+        method: &str,
+        params: Option<JsonValue>,
+    ) -> Result<JsonValue, ControlError> {
         if !diri_telemetry::is_enabled() {
             return self.dispatch_method(method, params);
         }
@@ -1286,6 +1309,7 @@ impl ControlServer {
             Method::SESSION_READ_SCREEN => self.session_read_screen(params),
             Method::SESSION_TERMINAL_TITLE => self.session_terminal_title(params),
             Method::SESSION_RESET_TERMINAL => self.session_reset_terminal(params),
+            Method::SESSION_CLEAR_SCROLLBACK => self.session_clear_scrollback(params),
             Method::SESSION_CAPTURE_FIND => self.session_capture_find(params),
             Method::SESSION_READ_SCROLLBACK => self.session_read_scrollback(params),
             Method::SESSION_READ_SCROLLBACK_CELLS => self.session_read_scrollback_cells(params),
@@ -3283,6 +3307,33 @@ impl ControlServer {
         Ok(json!({ "sessionID": p.session_id.0 }))
     }
 
+    fn session_clear_scrollback(
+        &self,
+        params: Option<JsonValue>,
+    ) -> Result<JsonValue, ControlError> {
+        let p: diri_proto::SessionIdParams = decode(params)?;
+        let registry = self.registry.lock().map_err(poisoned)?;
+        let Some(session) = registry.get(&p.session_id.0) else {
+            return if registry.record(&p.session_id.0).is_some() {
+                Err(ControlError::new(
+                    "terminal_clear_unavailable",
+                    "the session has no live terminal to clear",
+                ))
+            } else {
+                Err(ControlError::not_found(p.session_id.0.clone()))
+            };
+        };
+        let cleared = session.clear_scrollback().map_err(|error| {
+            let code = match error.kind() {
+                std::io::ErrorKind::Unsupported => "terminal_clear_unsupported",
+                std::io::ErrorKind::NotConnected => "terminal_clear_unavailable",
+                _ => "terminal_clear_failed",
+            };
+            ControlError::new(code, error.to_string())
+        })?;
+        Ok(json!({ "sessionID": p.session_id.0, "cleared": cleared }))
+    }
+
     fn session_capture_find(&self, params: Option<JsonValue>) -> Result<JsonValue, ControlError> {
         let p: diri_proto::SessionIdParams = decode(params)?;
         let reader = {
@@ -3482,6 +3533,10 @@ impl ControlServer {
         registry
             .remove(&p.session_id.0, &self.logs_dir)
             .map_err(io_control_error)?;
+        if let Some(holder) = &self.holder {
+            let _ =
+                crate::session_files::remove_holder_record(&holder.holders_dir, &p.session_id.0);
+        }
         if let Some(store) = &self.remote_bindings {
             let _ = store.remove(&p.session_id.0);
         }
@@ -8098,7 +8153,10 @@ mod tests {
         };
         let line = serde_json::to_vec(&request).expect("encode");
         let (writer, peer) = UnixStream::pair().expect("socketpair");
-        peer.set_read_timeout(Some(Duration::from_secs(10)))
+        // A bound on a hung test, not a latency budget: a background RPC
+        // that runs git (worktree cleanup) has outlasted 10 s on a loaded
+        // Windows runner.
+        peer.set_read_timeout(Some(Duration::from_secs(60)))
             .unwrap();
         if let Some(response) = server.handle_line(&line, &Arc::new(Mutex::new(writer)), &mut None)
         {

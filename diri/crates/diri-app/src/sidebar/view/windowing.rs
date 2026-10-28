@@ -225,6 +225,54 @@ mod tests {
         (sidebar, cx)
     }
 
+    /// Cost of the Activity filter on a 1000-session fleet: the projection
+    /// it adds to a render while on, the toggle's dot every render, and a
+    /// full sidebar render either way. Prints; run with
+    /// `cargo test -p diri-app --release activity_filter_cost -- --ignored --nocapture`.
+    #[gpui::test]
+    #[ignore]
+    fn activity_filter_cost(cx: &mut TestAppContext) {
+        let (sidebar, cx) = fleet(cx, 1000, 20, None, SidebarGrouping::Project);
+        const RUNS: u32 = 200;
+        let time = |cx: &mut VisualTestContext, activity: bool| {
+            sidebar.update(cx, |sidebar, _| sidebar.activity_filter = activity);
+            let started = std::time::Instant::now();
+            let mut listed = 0;
+            for _ in 0..RUNS {
+                listed = sidebar.update(cx, |sidebar, _| {
+                    let mut store = sidebar.store.write().unwrap();
+                    sidebar.visible_projection(&mut store).ordered_sessions.len()
+                });
+            }
+            (started.elapsed() / RUNS, listed)
+        };
+        let (off, all) = time(cx, false);
+        let (on, listed) = time(cx, true);
+        let started = std::time::Instant::now();
+        for _ in 0..RUNS {
+            sidebar.update(cx, |sidebar, _| {
+                let store = sidebar.store.read().unwrap();
+                std::hint::black_box(sidebar.activity_pending(&store));
+            });
+        }
+        let dot = started.elapsed() / RUNS;
+        let render = |cx: &mut VisualTestContext, activity: bool| {
+            sidebar.update(cx, |sidebar, _| sidebar.activity_filter = activity);
+            redraw(&sidebar, cx);
+            let started = std::time::Instant::now();
+            for _ in 0..20 {
+                redraw(&sidebar, cx);
+            }
+            started.elapsed() / 20
+        };
+        let render_off = render(cx, false);
+        let render_on = render(cx, true);
+        eprintln!(
+            "activity_filter_cost: projection off {off:?} ({all} rows), on {on:?} ({listed} rows); \
+             dot {dot:?}; sidebar render off {render_off:?}, on {render_on:?}"
+        );
+    }
+
     fn redraw(sidebar: &Entity<Sidebar>, cx: &mut VisualTestContext) {
         sidebar.update(cx, |_, cx| cx.notify());
         cx.run_until_parked();

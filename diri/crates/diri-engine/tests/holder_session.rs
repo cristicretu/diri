@@ -735,6 +735,81 @@ fn local_reset_survives_engine_replacement() {
     restored.terminate(id, Duration::from_millis(500)).unwrap();
 }
 
+/// Clear Screen and Scrollback keeps the prompt line, drops the rest, and
+/// survives Engine replacement the way a reset does.
+#[test]
+fn local_clear_keeps_the_prompt_and_survives_engine_replacement() {
+    let root = holders_dir("clear");
+    let logs = root.join("logs");
+    std::fs::create_dir_all(&logs).unwrap();
+    let state = root.join("state.json");
+    let holder = holder_config(&root);
+    let id = "clear-run";
+
+    let mut registry = Registry::new(engine(), &state);
+    registry
+        .spawn(
+            shell_spec(
+                id,
+                "printf 'old one\\nold two\\n$ '; IFS= read -r value; printf 'after:%s\\n' \"$value\"; IFS= read -r done",
+                &logs,
+                Some(holder.clone()),
+            ),
+            record(id),
+        )
+        .expect("spawn held");
+    let mut published = HashMap::new();
+    let screen = |registry: &Registry| registry.get(id).unwrap().screen_lines().join("\n");
+    wait_until("output before the clear", Duration::from_secs(10), || {
+        registry.changed_since(&mut published);
+        screen(&registry).contains("old two")
+    });
+    assert!(
+        registry
+            .get(id)
+            .unwrap()
+            .clear_scrollback()
+            .expect("queued")
+    );
+    wait_until("the clear to apply", Duration::from_secs(5), || {
+        !screen(&registry).contains("old")
+    });
+    assert_eq!(screen(&registry).trim(), "$");
+    assert_eq!(
+        registry
+            .get(id)
+            .unwrap()
+            .read_scrollback()
+            .visible_start_row,
+        0,
+        "history is cleared too"
+    );
+    let pid = registry.get(id).unwrap().child_pid();
+
+    registry.persist_for_shutdown().unwrap();
+    drop(registry);
+    let mut restored = Registry::new(engine(), &state);
+    restored.load().unwrap();
+    assert_eq!(restored.restore(&holder, &logs), vec![id.to_string()]);
+    assert_eq!(restored.get(id).unwrap().child_pid(), pid);
+    std::thread::sleep(Duration::from_millis(300));
+    assert!(
+        !screen(&restored).contains("old"),
+        "cleared output came back through replay: {:?}",
+        screen(&restored)
+    );
+    restored.get(id).unwrap().write_input(b"x\n").unwrap();
+    wait_until("output after adoption", Duration::from_secs(10), || {
+        screen(&restored).contains("after:x")
+    });
+    assert!(
+        screen(&restored).starts_with("$ x"),
+        "{:?}",
+        screen(&restored)
+    );
+    restored.terminate(id, Duration::from_millis(500)).unwrap();
+}
+
 #[test]
 fn a_resumed_session_never_shows_the_previous_childs_output() {
     let root = holders_dir("resume");
@@ -805,4 +880,228 @@ fn a_resumed_session_never_shows_the_previous_childs_output() {
     resumed
         .terminate(Duration::from_secs(2))
         .expect("terminate");
+}
+
+/// Context switches and syscalls of `pid` so far (macOS task counters).
+#[cfg(target_os = "macos")]
+fn task_activity(pid: i32) -> (i64, i64) {
+    // SAFETY: a zeroed out-struct of the size the call is told.
+    unsafe {
+        let mut task: libc::proc_taskinfo = std::mem::zeroed();
+        let size = std::mem::size_of::<libc::proc_taskinfo>() as i32;
+        let read = libc::proc_pidinfo(pid, libc::PROC_PIDTASKINFO, 0, (&raw mut task).cast(), size);
+        assert_eq!(read, size, "task info for {pid}");
+        (
+            i64::from(task.pti_csw),
+            i64::from(task.pti_syscalls_unix) + i64::from(task.pti_syscalls_mach),
+        )
+    }
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn an_idle_held_shell_wakes_neither_its_holder_nor_its_pump_and_answers_at_once() {
+    // A shell sitting at its prompt used to cost the Engine a pump pass a
+    // second and the Holder a stat connection every two seconds, forever.
+    // Now the pump parks on the output subscription and nothing ticks.
+    let root = holders_dir("idle-park");
+    let logs = root.join("logs");
+    let spec = shell_spec(
+        "s_idle_park",
+        "echo ready; exec cat",
+        &logs,
+        Some(holder_config(&root)),
+    );
+    let session = Session::spawn(spec, engine()).expect("spawn held shell");
+    wait_until("first output", Duration::from_secs(20), || {
+        session
+            .screen_lines()
+            .iter()
+            .any(|line| line.trim_end() == "ready")
+    });
+    let manager = std::fs::read_to_string(
+        diri_engine::holder::paths::HolderManagerPaths::new(&root.join("holders")).pid_file(),
+    )
+    .expect("manager pid")
+    .trim()
+    .parse::<i32>()
+    .expect("manager pid");
+
+    // The settle after output (foreground samples, checkpoint) is allowed
+    // its few passes, and the Holder's lanes their idle period after the
+    // last of them before they park; after that, silence.
+    std::thread::sleep(Duration::from_secs(6));
+    let before = task_activity(manager);
+    std::thread::sleep(Duration::from_secs(6));
+    let after = task_activity(manager);
+    assert_eq!(
+        after.1 - before.1,
+        0,
+        "the Holder manager made syscalls for an idle session ({} context switches)",
+        after.0 - before.0
+    );
+
+    // Typing wakes everything at once.
+    let typed = Instant::now();
+    session.write_input(b"woke\n").expect("type");
+    // The terminal's echo, then `cat` writing the line back.
+    wait_until("echo and output", Duration::from_secs(5), || {
+        session
+            .screen_lines()
+            .iter()
+            .filter(|line| line.trim_end() == "woke")
+            .count()
+            == 2
+    });
+    assert!(
+        typed.elapsed() < Duration::from_secs(2),
+        "the first output after idle took {:?}",
+        typed.elapsed()
+    );
+
+    // And a parked pump still stops promptly when its session is dropped.
+    std::thread::sleep(Duration::from_secs(3));
+    let dropped = Instant::now();
+    let mut session = session;
+    session
+        .terminate(Duration::from_secs(2))
+        .expect("terminate");
+    drop(session);
+    assert!(dropped.elapsed() < Duration::from_secs(4));
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[cfg(target_os = "macos")]
+fn task_threads(pid: i32) -> i32 {
+    // SAFETY: a zeroed out-struct of the size the call is told.
+    unsafe {
+        let mut task: libc::proc_taskinfo = std::mem::zeroed();
+        let size = std::mem::size_of::<libc::proc_taskinfo>() as i32;
+        let read = libc::proc_pidinfo(pid, libc::PROC_PIDTASKINFO, 0, (&raw mut task).cast(), size);
+        assert_eq!(read, size, "task info for {pid}");
+        task.pti_threadnum
+    }
+}
+
+/// Threads of this process whose names start with `prefix`.
+#[cfg(target_os = "macos")]
+fn threads_named(prefix: &str) -> usize {
+    const PROC_PIDLISTTHREADS: libc::c_int = 6;
+    let pid = std::process::id() as i32;
+    let mut handles = vec![0u64; 4096];
+    // SAFETY: a writable buffer of the size passed.
+    let bytes = unsafe {
+        libc::proc_pidinfo(
+            pid,
+            PROC_PIDLISTTHREADS,
+            0,
+            handles.as_mut_ptr().cast(),
+            (handles.len() * 8) as i32,
+        )
+    };
+    handles.truncate(bytes.max(0) as usize / 8);
+    handles
+        .iter()
+        .filter(|&&handle| {
+            // SAFETY: a zeroed out-struct of the size the call is told.
+            let mut info: libc::proc_threadinfo = unsafe { std::mem::zeroed() };
+            let size = std::mem::size_of::<libc::proc_threadinfo>() as i32;
+            let read = unsafe {
+                libc::proc_pidinfo(
+                    pid,
+                    libc::PROC_PIDTHREADINFO,
+                    handle,
+                    (&raw mut info).cast(),
+                    size,
+                )
+            };
+            if read != size {
+                return false;
+            }
+            // SAFETY: a NUL-terminated name inside the struct.
+            let name = unsafe { std::ffi::CStr::from_ptr(info.pth_name.as_ptr()) };
+            name.to_bytes().starts_with(prefix.as_bytes())
+        })
+        .count()
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn idle_held_sessions_cost_no_threads() {
+    // A hosted session used to keep seven threads in the Holder manager for
+    // its whole life (control socket, PTY reader, log writer, exit watch,
+    // input lane, and a writer and hangup watcher per subscriber), busy or
+    // not, and one Engine pump thread. Idle lanes and pumps now park on one
+    // shared reactor thread per process.
+    const SESSIONS: usize = 6;
+    let root = holders_dir("idle-threads");
+    let logs = root.join("logs");
+    let sessions: Vec<Session> = (0..SESSIONS)
+        .map(|index| {
+            let spec = shell_spec(
+                &format!("s_idle_threads_{index}"),
+                "echo ready; exec cat",
+                &logs,
+                Some(holder_config(&root)),
+            );
+            Session::spawn(spec, engine()).expect("spawn held shell")
+        })
+        .collect();
+    for session in &sessions {
+        wait_until("first output", Duration::from_secs(20), || {
+            session
+                .screen_lines()
+                .iter()
+                .any(|line| line.trim_end() == "ready")
+        });
+    }
+    let manager = std::fs::read_to_string(
+        diri_engine::holder::paths::HolderManagerPaths::new(&root.join("holders")).pid_file(),
+    )
+    .expect("manager pid")
+    .trim()
+    .parse::<i32>()
+    .expect("manager pid");
+
+    // Its own accept loop, idle watchdog, Engine watch and the reactor: a
+    // constant, whatever the number of sessions.
+    let idle_threads = 5;
+    let pumps = "diri-session-s_idle_threads_";
+    wait_until("idle lanes park", Duration::from_secs(15), || {
+        task_threads(manager) <= idle_threads && threads_named(pumps) == 0
+    });
+
+    // Every session still answers at once, and goes back to costing nothing.
+    for (index, session) in sessions.iter().enumerate() {
+        let line = format!("woke{index}");
+        let typed = Instant::now();
+        session
+            .write_input(format!("{line}\n").as_bytes())
+            .expect("type");
+        wait_until("echo and output", Duration::from_secs(5), || {
+            session
+                .screen_lines()
+                .iter()
+                .filter(|row| row.trim_end() == line)
+                .count()
+                == 2
+        });
+        assert!(
+            typed.elapsed() < Duration::from_secs(2),
+            "the first output after idle took {:?}",
+            typed.elapsed()
+        );
+    }
+    // The Holder's lanes park again. (The Engine pumps of sessions just
+    // typed into tick for their hot window first, as they always have.)
+    wait_until("lanes park again", Duration::from_secs(15), || {
+        task_threads(manager) <= idle_threads
+    });
+
+    for mut session in sessions {
+        session
+            .terminate(Duration::from_secs(2))
+            .expect("terminate");
+    }
+    let _ = std::fs::remove_dir_all(&root);
 }

@@ -651,6 +651,85 @@ fn holder_agent_has_a_real_editable_resizable_terminal() {
 }
 
 #[test]
+fn holder_lays_out_emoji_clusters_as_claude_code_measures_them() {
+    // The Holder runs the shared parser: `❤️`, a ZWJ family and a flag each
+    // take the two columns Bun's stringWidth gives them, as one wide cell
+    // carrying the rest of the cluster, in the snapshot a reconnect gets.
+    let temporary = tempfile::tempdir().expect("temp");
+    let state_dir = temporary.path().join("state");
+    let request = LaunchRequest {
+        session_id: test_session_id("holder-grapheme-widths"),
+        session_token: token(),
+        argv: vec![
+            "/bin/sh".into(),
+            "-c".into(),
+            "printf '|\\342\\235\\244\\357\\270\\217|\\360\\237\\221\\250\\342\\200\\215\\360\\237\\221\\251\\342\\200\\215\\360\\237\\221\\247|\\360\\237\\207\\267\\360\\237\\207\\264|end>'; while :; do sleep 1; done".into(),
+        ],
+        cwd: "/".into(),
+        environment: vec![diri_proto::remote_pty::EnvironmentVariable {
+            name: "PATH".into(),
+            value: "/usr/bin:/bin".into(),
+        }],
+        cols: 40,
+        rows: 4,
+        persistence: PersistenceCapability::NonPersistent,
+    };
+    let launch: LaunchResult = run_json("launch", &state_dir, Some(&request));
+    {
+        let mut first = Attach::open(&state_dir, hello(&launch, Some(0), "grapheme-first"));
+        first.receive_until(Duration::from_secs(3), |message| {
+            message_contains(message, "end>")
+        });
+    }
+    let mut second = Attach::open(&state_dir, hello(&launch, None, "grapheme-second"));
+    let received = second.receive_until(Duration::from_secs(3), |message| {
+        matches!(message, RemoteMessage::FullSnapshot(_))
+    });
+    let Some(RemoteMessage::FullSnapshot(snapshot)) = received.last() else {
+        panic!("reconnect snapshot");
+    };
+    let row = snapshot
+        .grid
+        .changed_rows
+        .iter()
+        .find(|row| row.y == 0)
+        .expect("first row");
+    let bars: Vec<usize> = row
+        .cells
+        .iter()
+        .enumerate()
+        .filter(|(_, cell)| cell.scalar == u32::from('|'))
+        .map(|(column, _)| column)
+        .collect();
+    assert_eq!(bars, [0, 3, 6, 9]);
+    for spacer in [2, 5, 8] {
+        assert!(
+            row.cells[spacer]
+                .style
+                .contains(diri_proto::grid::TermStyle::WIDE_SPACER)
+        );
+    }
+    assert_eq!(
+        row.metadata.graphemes,
+        vec![
+            (1, "\u{FE0F}".to_string()),
+            (4, "\u{200D}👩\u{200D}👧".to_string()),
+            (7, "🇴".to_string()),
+        ]
+    );
+
+    let _: SessionInspection = run_json(
+        "kill",
+        &state_dir,
+        Some(&SessionSelector {
+            session_id: launch.session_id,
+            session_token: token(),
+            expected_incarnation: Some(launch.session_incarnation),
+        }),
+    );
+}
+
+#[test]
 fn list_kill_and_gc_complete_the_session_lifecycle() {
     let temporary = tempfile::tempdir().expect("temp");
     let state_dir = temporary.path().join("state");
@@ -2118,8 +2197,17 @@ fn continuous_output_stays_capped_at_one_publication_per_interval() {
 /// The leading edge never publishes a repaint caught between its erase and
 /// its redraw: output that removed content keeps the whole coalescing
 /// interval for the redraw to arrive, as before.
+///
+/// The redraw follows the erase by 3 ms, but a shared CI runner can stall
+/// this writer (or the Holder) past the 8 ms interval, and then publishing
+/// the erase alone is correct. So every attempt checks the invariant that
+/// holds regardless of scheduling (an erase published alone was held for the
+/// whole interval), and the repaint must be folded whole in at least one
+/// attempt, which it never is without the hold.
 #[test]
 fn an_erase_waits_for_its_redraw_instead_of_the_leading_edge() {
+    const INTERVAL: Duration = Duration::from_millis(8);
+    const ATTEMPTS: usize = 10;
     let temporary = tempfile::tempdir_in("/tmp").expect("temp");
     let state_dir = temporary.path().join("state");
     let (mut attach, tty, selector) = quiet_tty_holder(&state_dir, "erase-hold");
@@ -2127,25 +2215,48 @@ fn an_erase_waits_for_its_redraw_instead_of_the_leading_edge() {
         .write(true)
         .open(&tty)
         .expect("open tty");
-    terminal.write_all(b"before\r\n").expect("tty write");
-    attach.receive_until(Duration::from_secs(2), |message| {
-        !matches!(message, RemoteMessage::Terminal(_)) && message_contains(message, "before")
-    });
-    std::thread::sleep(Duration::from_millis(50));
-    // Clear, then redraw 3 ms later: past the quiet window, inside the
-    // interval.
-    terminal.write_all(b"\x1b[2J\x1b[H").expect("tty write");
-    std::thread::sleep(Duration::from_millis(3));
-    terminal.write_all(b"redrawn\r\n").expect("tty write");
-    let first = attach.receive_until(Duration::from_secs(2), |message| {
-        matches!(
-            message,
-            RemoteMessage::GridDelta(_) | RemoteMessage::FullSnapshot(_)
-        )
-    });
+    let mut outcomes = Vec::new();
+    for attempt in 0..ATTEMPTS {
+        let before = format!("before {attempt}");
+        let redrawn = format!("redrawn {attempt}");
+        write!(terminal, "{before}\r\n").expect("tty write");
+        attach.receive_until(Duration::from_secs(2), |message| {
+            !matches!(message, RemoteMessage::Terminal(_)) && message_contains(message, &before)
+        });
+        std::thread::sleep(Duration::from_millis(50));
+        while attach.messages.try_recv().is_ok() {}
+        // Clear, then redraw 3 ms later: past the quiet window, inside the
+        // interval. Spin rather than sleep, so timer slack cannot stretch
+        // the gap.
+        let erased_at = Instant::now();
+        terminal.write_all(b"\x1b[2J\x1b[H").expect("tty write");
+        while erased_at.elapsed() < Duration::from_millis(3) {
+            std::hint::spin_loop();
+        }
+        write!(terminal, "{redrawn}\r\n").expect("tty write");
+        let gap = erased_at.elapsed();
+        let first = attach.receive_until(Duration::from_secs(2), |message| {
+            matches!(
+                message,
+                RemoteMessage::GridDelta(_) | RemoteMessage::FullSnapshot(_)
+            )
+        });
+        let received = erased_at.elapsed();
+        let whole = message_contains(first.last().expect("a publication"), &redrawn);
+        assert!(
+            whole || received >= INTERVAL,
+            "the erased half of a repaint was published on its own {received:?} after the \
+             erase, inside the {INTERVAL:?} interval (redraw written after {gap:?})"
+        );
+        outcomes.push((gap, received, whole));
+        if whole {
+            break;
+        }
+    }
     let _: SessionInspection = run_json("kill", &state_dir, Some(&selector));
     assert!(
-        message_contains(first.last().expect("a publication"), "redrawn"),
-        "the erased half of a repaint was published on its own"
+        outcomes.iter().any(|(_, _, whole)| *whole),
+        "the erased half of a repaint was published on its own in every attempt \
+         (redraw gap, publication received): {outcomes:?}"
     );
 }
