@@ -15,6 +15,7 @@
 
 #[cfg(feature = "core-v2")]
 pub mod core_v2;
+mod emulator;
 mod inline_images;
 mod notifications;
 mod program_status;
@@ -34,7 +35,7 @@ use alacritty_terminal::grid::Dimensions;
 use alacritty_terminal::index::{Column, Line};
 use alacritty_terminal::term::cell::{Cell, Flags};
 use alacritty_terminal::term::color::Colors;
-use alacritty_terminal::term::{CONTENT_CHANGED, Config, Term, TermMode};
+use alacritty_terminal::term::{CONTENT_CHANGED, Config, TermMode};
 use alacritty_terminal::vte::ansi::{Color, NamedColor, Processor, Rgb};
 use diri_proto::grid::{
     ChangedRow, CursorShape, CursorStyle, GridCell, GridRowCodec, GridUpdate, LinkSpan,
@@ -45,6 +46,11 @@ use diri_proto::terminal::{
     encode_mouse_wheel,
 };
 use diri_proto::{TerminalAppearance, TerminalPalette};
+
+use emulator::{CellView, CellWrite, Emu, Emulator, LinkView, RowView};
+
+/// The emulator's cell type.
+type EmuCell = <Emu as Emulator>::Cell;
 
 /// Diri's own cursor: a block that blinks (the renderer's eased, finite
 /// blink). A program's DECSCUSR replaces it and `CSI 0 SP q` restores it. Mode
@@ -391,7 +397,7 @@ fn history_line_limit(cols: usize) -> usize {
     }
     #[cfg(not(feature = "compact-history"))]
     {
-        let bytes_per_line = cols.max(1).saturating_mul(std::mem::size_of::<Cell>());
+        let bytes_per_line = cols.max(1).saturating_mul(std::mem::size_of::<EmuCell>());
         HISTORY_STORAGE_BUDGET_BYTES / bytes_per_line
     }
 }
@@ -483,7 +489,7 @@ pub struct HeadlessScreen {
     // changes this observation or enables parser support. Exact parking must
     // preserve it independently of Term flags.
     keyboard_enhancements_known: bool,
-    term: Term<Collector>,
+    term: Emu,
     parser: Processor,
     events: Arc<Mutex<Inbox>>,
     /// Drained events, kept to reuse the allocation.
@@ -600,13 +606,7 @@ impl HeadlessScreen {
             default_cursor_style: DEFAULT_CURSOR,
             ..Config::default()
         };
-        let term = Term::new(config, &geometry, Collector(Arc::clone(&events)));
-        #[cfg(feature = "compact-history")]
-        let term = {
-            let mut term = term;
-            term.grid_mut().enable_compact_history();
-            term
-        };
+        let term = Emu::create(config, &geometry, Collector(Arc::clone(&events)));
         let mut screen = Self {
             keyboard_enhancements_known: true,
             term,
@@ -679,7 +679,7 @@ impl HeadlessScreen {
     /// [`HeadlessScreen::keeping_spare_rows_until_idle`]).
     pub fn release_idle_memory(&mut self) {
         #[cfg(feature = "compact-history")]
-        self.term.release_primary_history_spare_rows();
+        self.term.release_history_spare_rows();
     }
 
     /// Answer `OSC 7501` support queries among this terminal's replies, in
@@ -704,9 +704,9 @@ impl HeadlessScreen {
         self.host_replies = true;
         let config = Config {
             terminal_version: Some(terminal_version.into()),
-            ..self.term.config().clone()
+            ..self.term.options().clone()
         };
-        self.term.set_options(config);
+        self.term.replace_options(config);
         // `set_options` re-announces the title; nothing changed.
         self.drain_events();
         self
@@ -722,7 +722,7 @@ impl HeadlessScreen {
         if self.host_replies
             && before != after
             && let Some(appearance) = after
-            && self.term.mode().contains(TermMode::COLOR_SCHEME_UPDATES)
+            && self.term.modes().contains(TermMode::COLOR_SCHEME_UPDATES)
         {
             self.unsolicited
                 .extend_from_slice(color_scheme_report(appearance).as_bytes());
@@ -771,7 +771,7 @@ impl HeadlessScreen {
         if self.host_replies {
             let version = self
                 .term
-                .config()
+                .options()
                 .terminal_version
                 .clone()
                 .unwrap_or_default();
@@ -798,13 +798,15 @@ impl HeadlessScreen {
         if self.is_alt_screen() {
             return false;
         }
-        let cursor = self.term.grid().cursor.point.line.0.max(0) as usize;
+        let cursor = self.term.cursor_point().line.0.max(0) as usize;
         let cols = self.geometry.cols;
         let mut top = cursor;
         while top > 0
             && cols > 0
-            && self.term.grid()[Line(top as i32 - 1)][Column(cols - 1)]
-                .flags
+            && self
+                .term
+                .cell(Line(top as i32 - 1), Column(cols - 1))
+                .cell_flags()
                 .contains(Flags::WRAPLINE)
         {
             top -= 1;
@@ -945,7 +947,7 @@ impl HeadlessScreen {
     /// changes; every buffer regrows on demand.
     pub fn compact_idle(&mut self) {
         #[cfg(feature = "compact-history")]
-        self.term.release_idle_history();
+        self.term.release_idle_history_memory();
         self.parser.release_idle_buffers();
         self.replies.shrink_to_fit();
         self.progress_carry.shrink_to_fit();
@@ -997,19 +999,18 @@ impl HeadlessScreen {
     fn settle(&mut self) {
         #[cfg(feature = "compact-history")]
         {
+            self.term.keep_history_spare_rows(self.keep_spare_rows);
             self.term
-                .keep_primary_history_spare_rows(self.keep_spare_rows);
-            self.term
-                .bound_primary_history_storage(HISTORY_STORAGE_BUDGET_BYTES);
+                .bound_history_storage(HISTORY_STORAGE_BUDGET_BYTES);
             // A limit a resize raised follows history back down (widening,
             // a clear, budget eviction), so it never lets a later burst grow
             // past the rows the re-wrap needed.
-            let limit = self.term.config().scrolling_history;
+            let limit = self.term.options().scrolling_history;
             let base = history_line_limit(self.geometry.cols);
             if limit > base {
-                let history = self.term.primary_history_size();
+                let history = self.term.primary_history_rows();
                 if history < limit {
-                    self.term.set_scrolling_history(history.max(base));
+                    self.term.set_history_limit(history.max(base));
                 }
             }
         }
@@ -1018,22 +1019,18 @@ impl HeadlessScreen {
         self.current_damage_rows.resize(rows, false);
         self.current_damage_rows.fill(false);
         self.pending_damage_rows.resize(rows, false);
-        let full = match self.term.damage() {
-            alacritty_terminal::term::TermDamage::Full => {
-                self.current_damage_rows.fill(true);
-                self.pending_damage_rows.fill(true);
-                true
+        let current = &mut self.current_damage_rows;
+        let pending = &mut self.pending_damage_rows;
+        let full = self.term.collect_damage(|line| {
+            if line < rows {
+                current[line] = true;
+                pending[line] = true;
             }
-            alacritty_terminal::term::TermDamage::Partial(lines) => {
-                for damage in lines {
-                    if damage.line < rows {
-                        self.current_damage_rows[damage.line] = true;
-                        self.pending_damage_rows[damage.line] = true;
-                    }
-                }
-                false
-            }
-        };
+        });
+        if full {
+            self.current_damage_rows.fill(true);
+            self.pending_damage_rows.fill(true);
+        }
         // The title is compared where it is assigned, so settling costs no
         // clone of it per chunk of output.
         let mut content_changed = std::mem::take(&mut self.title_changed);
@@ -1043,7 +1040,7 @@ impl HeadlessScreen {
             content_changed = true;
         }
         // Only a host screen publishes program colors (`palette_overrides`).
-        let colors_generation = self.term.colors_generation();
+        let colors_generation = self.term.program_colors_generation();
         if colors_generation != self.colors_generation {
             self.colors_generation = colors_generation;
             content_changed |= self.host_replies;
@@ -1055,7 +1052,7 @@ impl HeadlessScreen {
             // Scrolling damages the whole screen but only moves most rows:
             // a moved row keeps the fingerprint it had at the last settle.
             // Rows that any write touched since then are hashed again.
-            let sources = self.term.damage_content_sources();
+            let sources = self.term.moved_line_sources();
             #[cfg(test)]
             let sources = sources.filter(|_| self.reuse_moved_fingerprints);
             let moved = if full && self.fingerprints_track_cells {
@@ -1100,7 +1097,7 @@ impl HeadlessScreen {
                 }
             }
         }
-        self.term.reset_damage();
+        self.term.clear_damage();
         // Full damage fingerprinted every row that was not only moved.
         self.fingerprints_track_cells |= full;
         if content_changed {
@@ -1178,15 +1175,15 @@ impl HeadlessScreen {
             // under the history budget throughout.
             let base = history_line_limit(geometry.cols);
             let allowance = base.saturating_mul(RESIZE_ROW_ALLOWANCE);
-            self.term.set_scrolling_history(allowance);
+            self.term.set_history_limit(allowance);
             self.geometry = geometry;
-            self.term.resize(self.geometry);
-            let kept = self.term.primary_history_size().clamp(base, allowance);
-            self.term.set_scrolling_history(kept);
+            self.term.resize_screen(self.geometry);
+            let kept = self.term.primary_history_rows().clamp(base, allowance);
+            self.term.set_history_limit(kept);
         }
         #[cfg(not(feature = "compact-history"))]
         self.resize_dense(geometry);
-        if self.host_replies && self.term.mode().contains(TermMode::IN_BAND_RESIZE) {
+        if self.host_replies && self.term.modes().contains(TermMode::IN_BAND_RESIZE) {
             // DECSET 2048: the program reads its new size from the stream
             // rather than asking after SIGWINCH.
             let report = self.in_band_size_report();
@@ -1205,19 +1202,19 @@ impl HeadlessScreen {
         // and trimming beforehand would discard history that still fits.
         // Only the history limit changes; keyboard negotiation and the
         // reported identity are construction options and must survive.
-        let with_history = |term: &Term<Collector>| Config {
+        let with_history = |term: &Emu| Config {
             scrolling_history: new_limit,
-            ..term.config().clone()
+            ..term.options().clone()
         };
         if new_limit > old_limit {
-            self.term.set_options(with_history(&self.term));
+            self.term.replace_options(with_history(&self.term));
         }
         self.geometry = geometry;
-        self.term.resize(self.geometry);
+        self.term.resize_screen(self.geometry);
         if new_limit < old_limit {
             // set_options updates the primary history even while the alternate
             // screen is active, and preserves the limit across terminal reset.
-            self.term.set_options(with_history(&self.term));
+            self.term.replace_options(with_history(&self.term));
         }
     }
 
@@ -1237,7 +1234,7 @@ impl HeadlessScreen {
     pub fn history_storage_bytes(&self) -> usize {
         #[cfg(feature = "compact-history")]
         {
-            self.term.grid().history_storage_bytes()
+            self.term.history_storage_bytes()
         }
         #[cfg(not(feature = "compact-history"))]
         0
@@ -1254,26 +1251,20 @@ impl HeadlessScreen {
     /// True while the child is on the alternate screen (a full-screen program
     /// like an editor or pager).
     pub fn is_alt_screen(&self) -> bool {
-        self.term
-            .mode()
-            .contains(alacritty_terminal::term::TermMode::ALT_SCREEN)
+        self.term.modes().contains(TermMode::ALT_SCREEN)
     }
 
     /// Whether the child has bracketed-paste mode on — submitted prompts are
     /// then framed as a paste so embedded newlines don't submit early.
     pub fn bracketed_paste(&self) -> bool {
-        self.term
-            .mode()
-            .contains(alacritty_terminal::term::TermMode::BRACKETED_PASTE)
+        self.term.modes().contains(TermMode::BRACKETED_PASTE)
     }
 
     /// The current grid geometry.
     /// Whether the child asked for focus in/out reports (DEC 1004): left on
     /// under a shell, every window switch types `^[[I` / `^[[O` at its prompt.
     pub fn focus_reporting(&self) -> bool {
-        self.term
-            .mode()
-            .contains(alacritty_terminal::term::TermMode::FOCUS_IN_OUT)
+        self.term.modes().contains(TermMode::FOCUS_IN_OUT)
     }
 
     pub fn size(&self) -> (usize, usize) {
@@ -1282,7 +1273,7 @@ impl HeadlessScreen {
 
     /// Rows above the visible grid.
     pub fn history_rows(&self) -> usize {
-        self.term.grid().history_size()
+        self.term.history_rows()
     }
 
     pub fn invalidate_keyboard_enhancements(&mut self) {
@@ -1290,7 +1281,7 @@ impl HeadlessScreen {
     }
 
     pub fn keyboard_enhancements_enabled(&self) -> bool {
-        self.term.keyboard_enhancements_enabled()
+        self.term.kitty_keyboard_enabled()
     }
 
     /// Unknown enhanced state may never masquerade as legacy-only input.
@@ -1302,11 +1293,11 @@ impl HeadlessScreen {
 
     /// Keyboard modes from the same parser that owns the visible terminal.
     pub fn keyboard_state(&self) -> diri_proto::terminal_input::KeyboardState {
-        let mode = self.term.mode();
+        let mode = self.term.modes();
         diri_proto::terminal_input::KeyboardState {
             enhancements: self.keyboard_enhancements_known.then(|| {
                 diri_proto::terminal_input::enhanced::KeyboardEnhancements::try_from(
-                    alacritty_terminal::vte::ansi::KeyboardModes::from(*mode).bits(),
+                    alacritty_terminal::vte::ansi::KeyboardModes::from(mode).bits(),
                 )
                 .expect("parser keyboard flags are bounded")
             }),
@@ -1319,15 +1310,15 @@ impl HeadlessScreen {
     /// must remain absent rather than becoming a fabricated known zero.
     pub fn keyboard_snapshot(&self) -> Option<KeyboardSnapshot> {
         self.keyboard_enhancements_known
-            .then(|| self.term.keyboard_snapshot())
+            .then(|| self.term.keyboard_stacks())
     }
 
     pub fn can_restore_keyboard_snapshot(&self, snapshot: &KeyboardSnapshot) -> bool {
-        self.term.can_restore_keyboard_snapshot(snapshot)
+        self.term.can_restore_keyboard_stacks(snapshot)
     }
 
     pub fn restore_keyboard_snapshot(&mut self, snapshot: &KeyboardSnapshot) -> bool {
-        if !self.term.restore_keyboard_snapshot(snapshot) {
+        if !self.term.restore_keyboard_stacks(snapshot) {
             return false;
         }
         self.keyboard_enhancements_known = true;
@@ -1340,8 +1331,8 @@ impl HeadlessScreen {
     /// zero; restoring it leaves them known rather than unknown. Returns
     /// false, changing nothing, if this screen holds any flags.
     pub fn mark_keyboard_never_negotiated(&mut self) -> bool {
-        let snapshot = self.term.keyboard_snapshot();
-        if snapshot != Self::new(1, 1).term.keyboard_snapshot() {
+        let snapshot = self.term.keyboard_stacks();
+        if snapshot != Self::new(1, 1).term.keyboard_stacks() {
             return false;
         }
         self.keyboard_enhancements_known = true;
@@ -1366,7 +1357,7 @@ impl HeadlessScreen {
 
     /// The independent tracking and encoding modes requested by the child.
     pub fn mouse_modes(&self) -> MouseModes {
-        let mode = self.term.mode();
+        let mode = self.term.modes();
         let tracking = if mode.contains(TermMode::MOUSE_MOTION) {
             MouseTrackingMode::AnyMotion
         } else if mode.contains(TermMode::MOUSE_DRAG) {
@@ -1398,7 +1389,7 @@ impl HeadlessScreen {
 
     fn wire_cursor_style(&self) -> CursorStyle {
         use alacritty_terminal::vte::ansi::CursorShape as Shape;
-        let style = self.term.cursor_style();
+        let style = self.term.program_cursor_style();
         CursorStyle {
             shape: match style.shape {
                 Shape::Underline => CursorShape::Underline,
@@ -1411,11 +1402,11 @@ impl HeadlessScreen {
 
     /// Cursor (col, row, visible) without touching cell data.
     pub fn cursor(&self) -> (u16, u16, bool) {
-        let point = self.term.grid().cursor.point;
+        let point = self.term.cursor_point();
         (
             point.column.0 as u16,
             point.line.0.max(0) as u16,
-            self.term.mode().contains(TermMode::SHOW_CURSOR),
+            self.term.modes().contains(TermMode::SHOW_CURSOR),
         )
     }
 
@@ -1436,7 +1427,6 @@ impl HeadlessScreen {
         }
 
         let overrides = palette_overrides(self.host_replies, &self.term);
-        let grid = self.term.grid();
         let candidate_count = if force_full {
             rows
         } else {
@@ -1458,13 +1448,13 @@ impl HeadlessScreen {
             // are the only sources of row metadata. Noting them in the one
             // pass over the cells spares a plain row a second pass.
             let mut annotated = false;
-            let source = &grid[line];
+            let source = self.term.row(line).cells();
             // Two loops rather than a branch per cell: this is the
             // publication hot path, and the common case has no overrides.
             if let Some(colors) = overrides {
                 for (x, previous) in row.iter_mut().enumerate() {
-                    let source = &source[Column(x)];
-                    annotated |= source.extra.is_some() | source.flags.intersects(SPAN_FLAGS);
+                    let source = &source[x];
+                    annotated |= source.has_extra() | source.cell_flags().intersects(SPAN_FLAGS);
                     let mut cell = wire_cell(source);
                     apply_palette(&mut cell, colors);
                     row_changed |= *previous != cell;
@@ -1472,8 +1462,8 @@ impl HeadlessScreen {
                 }
             } else {
                 for (x, previous) in row.iter_mut().enumerate() {
-                    let source = &source[Column(x)];
-                    annotated |= source.extra.is_some() | source.flags.intersects(SPAN_FLAGS);
+                    let source = &source[x];
+                    annotated |= source.has_extra() | source.cell_flags().intersects(SPAN_FLAGS);
                     let cell = wire_cell(source);
                     row_changed |= *previous != cell;
                     *previous = cell;
@@ -1499,13 +1489,13 @@ impl HeadlessScreen {
         }
         self.pending_damage_rows.fill(false);
 
-        let cursor = grid.cursor.point;
+        let cursor = self.term.cursor_point();
         GridUpdate {
             cols: cols as u16,
             rows: rows as u16,
             cursor_col: cursor.column.0 as u16,
             cursor_row: cursor.line.0.max(0) as u16,
-            cursor_visible: self.term.mode().contains(TermMode::SHOW_CURSOR),
+            cursor_visible: self.term.modes().contains(TermMode::SHOW_CURSOR),
             is_full_snapshot: force_full,
             changed_rows: changed,
             cursor_style: self.wire_cursor_style(),
@@ -1518,17 +1508,16 @@ impl HeadlessScreen {
     pub fn full_snapshot(&self) -> GridUpdate {
         let cols = self.geometry.cols;
         let rows = self.geometry.rows;
-        let grid = self.term.grid();
         let overrides = palette_overrides(self.host_replies, &self.term);
         let mut all = Vec::with_capacity(rows);
         for y in 0..rows {
             let line = Line(y as i32);
             let mut row = Vec::with_capacity(cols);
-            let source = &grid[line];
+            let source = self.term.row(line).cells();
             let mut annotated = false;
             for x in 0..cols {
-                let source = &source[Column(x)];
-                annotated |= source.extra.is_some() | source.flags.intersects(SPAN_FLAGS);
+                let source = &source[x];
+                annotated |= source.has_extra() | source.cell_flags().intersects(SPAN_FLAGS);
                 row.push(wire_cell(source));
             }
             if let Some(colors) = overrides {
@@ -1540,13 +1529,13 @@ impl HeadlessScreen {
             }
             all.push(changed);
         }
-        let cursor = grid.cursor.point;
+        let cursor = self.term.cursor_point();
         GridUpdate {
             cols: cols as u16,
             rows: rows as u16,
             cursor_col: cursor.column.0 as u16,
             cursor_row: cursor.line.0.max(0) as u16,
-            cursor_visible: self.term.mode().contains(TermMode::SHOW_CURSOR),
+            cursor_visible: self.term.modes().contains(TermMode::SHOW_CURSOR),
             is_full_snapshot: true,
             changed_rows: all,
             cursor_style: self.wire_cursor_style(),
@@ -1567,15 +1556,15 @@ impl HeadlessScreen {
     /// more.
     pub fn history_snapshot(&mut self) -> Vec<Vec<GridCell>> {
         self.prepare_history_read();
-        let exported = self.term.grid().history_size().min(HISTORY_EXPORT_ROWS);
+        let exported = self.term.history_rows().min(HISTORY_EXPORT_ROWS);
         let cols = self.geometry.cols;
         let mut rows = Vec::with_capacity(exported);
         for index in 0..exported {
             let line = Line(index as i32 - exported as i32);
             let mut row = Vec::with_capacity(cols);
-            let source = &self.term.grid()[line];
-            for x in 0..cols {
-                row.push(wire_cell(&source[Column(x)]));
+            let source = self.term.row(line).cells();
+            for cell in &source[..cols] {
+                row.push(wire_cell(cell));
             }
             rows.push(row);
             self.finish_history_read_batch(index + 1, index + 1 == exported);
@@ -1590,15 +1579,15 @@ impl HeadlessScreen {
     /// row.
     pub fn history_payload(&mut self) -> (usize, Vec<u8>) {
         self.prepare_history_read();
-        let history = self.term.grid().history_size().min(HISTORY_EXPORT_ROWS);
+        let history = self.term.history_rows().min(HISTORY_EXPORT_ROWS);
         let cols = self.geometry.cols;
         let mut payload = Vec::new();
         let mut row = Vec::with_capacity(cols);
         for index in 0..history {
             let line = Line(index as i32 - history as i32);
             row.clear();
-            let source = &self.term.grid()[line];
-            row.extend((0..cols).map(|x| wire_cell(&source[Column(x)])));
+            let source = self.term.row(line).cells();
+            row.extend((0..cols).map(|x| wire_cell(&source[x])));
             // A row is at most the terminal width, far below the codec's
             // u16 cell limit, so encoding cannot fail.
             let _ = diri_proto::grid::GridRowCodec::append_row(&row, &mut payload);
@@ -1610,7 +1599,7 @@ impl HeadlessScreen {
     /// Annotations of the rows [`Self::history_snapshot`] exports.
     pub fn history_metadata(&mut self) -> Vec<RowMetadata> {
         self.prepare_history_read();
-        let count = self.term.grid().history_size().min(HISTORY_EXPORT_ROWS);
+        let count = self.term.history_rows().min(HISTORY_EXPORT_ROWS);
         let mut rows = Vec::with_capacity(count);
         for index in 0..count {
             rows.push(self.row_metadata(Line(index as i32 - count as i32)));
@@ -1624,21 +1613,16 @@ impl HeadlessScreen {
     /// the new width, tens of MB) by the first read.
     fn prepare_history_read(&mut self) {
         #[cfg(feature = "compact-history")]
-        self.term.grid_mut().prepare_history_read();
+        self.term.prepare_history_read();
     }
 
     fn finish_history_read_batch(&mut self, completed: usize, finished: bool) {
         #[cfg(feature = "compact-history")]
         {
-            let row_bytes = self
-                .geometry
-                .cols
-                .saturating_mul(std::mem::size_of::<Cell>())
-                .saturating_add(std::mem::size_of::<alacritty_terminal::grid::Row<Cell>>())
-                .max(1);
+            let row_bytes = Emu::decoded_row_bytes(self.geometry.cols).max(1);
             let batch = (128 * 1024 / row_bytes).clamp(1, 64);
             if finished || completed.is_multiple_of(batch) {
-                self.term.grid_mut().release_history_read_cache();
+                self.term.release_history_read_cache();
             }
         }
         #[cfg(not(feature = "compact-history"))]
@@ -1646,46 +1630,46 @@ impl HeadlessScreen {
     }
 
     pub fn restore_history_metadata(&mut self, rows: &[RowMetadata]) {
-        let count = self.term.grid().history_size();
+        let count = self.term.history_rows();
         if rows.len() != count {
             return;
         }
         for (index, metadata) in rows.iter().enumerate() {
             let line = Line(index as i32 - count as i32);
             for link in &metadata.links {
-                let link_value = alacritty_terminal::term::cell::Hyperlink::new(
-                    None::<String>,
-                    link.uri.clone(),
-                );
+                let link_value = EmuCell::new_link(link.uri.clone());
                 for x in link.start..link.end {
-                    self.term.grid_mut()[line][Column(usize::from(x))]
-                        .set_hyperlink(Some(link_value.clone()));
+                    self.term
+                        .cell_mut(line, Column(usize::from(x)))
+                        .attach_link(link_value.clone());
                 }
             }
             for (x, text) in &metadata.graphemes {
                 let column = Column(usize::from(*x));
                 for ch in text.chars() {
-                    self.term.grid_mut()[line][column].push_zerowidth(ch);
+                    self.term.cell_mut(line, column).append_zerowidth(ch);
                 }
-                let spacer_follows = column.0 + 1 < self.term.columns()
-                    && self.term.grid()[line][column + 1]
-                        .flags
+                let spacer_follows = column.0 + 1 < self.term.cols()
+                    && self
+                        .term
+                        .cell(line, column + 1)
+                        .cell_flags()
                         .contains(Flags::WIDE_CHAR_SPACER);
-                restore_wide_base(&mut self.term.grid_mut()[line][column], spacer_follows);
+                restore_wide_base(self.term.cell_mut(line, column), spacer_follows);
             }
             // The cells came back with the plain underline bit; the spans
             // say which underline, in which color, and the overline.
             for span in &metadata.styles {
                 let end = usize::from(span.end).min(self.geometry.cols);
                 for x in usize::from(span.start)..end {
-                    restore_decoration(&mut self.term.grid_mut()[line][Column(x)], span);
+                    restore_decoration(self.term.cell_mut(line, Column(x)), span);
                 }
             }
             self.finish_history_read_batch(index + 1, index + 1 == count);
         }
         #[cfg(feature = "compact-history")]
         self.term
-            .bound_primary_history_storage(HISTORY_STORAGE_BUDGET_BYTES);
+            .bound_history_storage(HISTORY_STORAGE_BUDGET_BYTES);
     }
 
     pub fn restore(
@@ -1715,16 +1699,15 @@ impl HeadlessScreen {
         // the persisted cells. The visible grid is painted below; CSI 2 J
         // clears only that viewport and deliberately leaves history intact.
         if !history.is_empty() {
-            let grid = self.term.grid_mut();
-            grid.scroll_up(&(Line(0)..Line(rows as i32)), history.len());
-            let restored_history = grid.history_size();
+            self.term.push_screen_into_history(history.len());
+            let restored_history = self.term.history_rows();
             if restored_history != history.len() {
                 return false;
             }
             for (index, row) in history.iter().enumerate() {
                 let line = Line(index as i32 - restored_history as i32);
                 for (x, cell) in row.iter().enumerate() {
-                    grid[line][Column(x)] = emulator_cell(*cell);
+                    self.term.write_cell(line, Column(x), *cell);
                 }
             }
         }
@@ -1804,7 +1787,7 @@ impl HeadlessScreen {
         self.feed(&bytes);
         for row in &update.changed_rows {
             for (x, cell) in row.cells.iter().enumerate() {
-                let target = &mut self.term.grid_mut()[Line(i32::from(row.y))][Column(x)];
+                let target = self.term.cell_mut(Line(i32::from(row.y)), Column(x));
                 restore_semantic_flags(target, *cell);
                 if let Some(link) = row
                     .metadata
@@ -1812,10 +1795,7 @@ impl HeadlessScreen {
                     .iter()
                     .find(|link| usize::from(link.start) <= x && x < usize::from(link.end))
                 {
-                    target.set_hyperlink(Some(alacritty_terminal::term::cell::Hyperlink::new(
-                        None::<String>,
-                        link.uri.clone(),
-                    )));
+                    target.attach_link(EmuCell::new_link(link.uri.clone()));
                 }
                 if let Some((_, text)) = row
                     .metadata
@@ -1824,7 +1804,7 @@ impl HeadlessScreen {
                     .find(|(col, _)| usize::from(*col) == x)
                 {
                     for ch in text.chars() {
-                        target.push_zerowidth(ch);
+                        target.append_zerowidth(ch);
                     }
                 }
                 let spacer_follows = row
@@ -1861,7 +1841,7 @@ impl HeadlessScreen {
         }
         let modes = self.mouse_modes();
         if !modes.is_reporting() {
-            let mode = self.term.mode();
+            let mode = self.term.modes();
             if !mode.contains(TermMode::ALT_SCREEN) || !mode.contains(TermMode::ALTERNATE_SCROLL) {
                 return Vec::new();
             }
@@ -1901,7 +1881,7 @@ impl HeadlessScreen {
     /// `first_row`: the whole text is built under the screen lock.
     pub fn scrollback(&mut self) -> diri_proto::ReadScrollbackResult {
         self.prepare_history_read();
-        let history = self.term.grid().history_size();
+        let history = self.term.history_rows();
         let first = history - history.min(HISTORY_EXPORT_ROWS);
         let rows = self.geometry.rows;
         let cols = self.geometry.cols;
@@ -1913,17 +1893,14 @@ impl HeadlessScreen {
             let line = Line(index as i32 - history as i32);
             let mut text = String::with_capacity(cols);
             ranges.clear();
-            let source = &self.term.grid()[line];
-            for x in 0..cols {
-                let cell = &source[Column(x)];
-                if cell
-                    .flags
-                    .intersects(Flags::WIDE_CHAR_SPACER | Flags::LEADING_WIDE_CHAR_SPACER)
-                {
+            let source = self.term.row(line).cells();
+            for (x, cell) in source[..cols].iter().enumerate() {
+                let flags = cell.cell_flags();
+                if flags.intersects(Flags::WIDE_CHAR_SPACER | Flags::LEADING_WIDE_CHAR_SPACER) {
                     continue;
                 }
-                let c = cell.c;
-                let width = if cell.flags.contains(Flags::WIDE_CHAR) {
+                let c = cell.ch();
+                let width = if flags.contains(Flags::WIDE_CHAR) {
                     2
                 } else {
                     1
@@ -1931,7 +1908,7 @@ impl HeadlessScreen {
                 let range = [x as u16, (x + width).min(cols) as u16];
                 text.push(text_char(c));
                 ranges.push(range);
-                if let Some(combining) = cell.zerowidth() {
+                if let Some(combining) = cell.combining() {
                     for &ch in combining {
                         text.push(ch);
                         ranges.push(range);
@@ -1969,7 +1946,7 @@ impl HeadlessScreen {
         max_rows: i64,
     ) -> diri_proto::ReadScrollbackCellsResult {
         self.prepare_history_read();
-        let history = self.term.grid().history_size();
+        let history = self.term.history_rows();
         let cols = self.geometry.cols;
         let total = history + self.geometry.rows;
 
@@ -1981,9 +1958,9 @@ impl HeadlessScreen {
         for index in start..end {
             let line = Line(index as i32 - history as i32);
             let mut row = Vec::with_capacity(cols);
-            let source = &self.term.grid()[line];
-            for x in 0..cols {
-                let mut cell = wire_cell(&source[Column(x)]);
+            let source = self.term.row(line).cells();
+            for cell in &source[..cols] {
+                let mut cell = wire_cell(cell);
                 if let Some(colors) = &overrides {
                     apply_palette(&mut cell, colors);
                 }
@@ -2014,8 +1991,7 @@ impl HeadlessScreen {
         &self,
     ) -> Result<diri_proto::ReadScrollbackCellsResult, &'static str> {
         let (cols, visible) = self.size();
-        let grid = self.term.grid();
-        let history = grid.history_size();
+        let history = self.term.history_rows();
         let total = history + visible;
         let limit = (diri_proto::FIND_CAPTURE_MAX_CELLS / cols.max(1))
             .min(diri_proto::FIND_CAPTURE_MAX_ROWS)
@@ -2035,11 +2011,8 @@ impl HeadlessScreen {
                 break;
             };
             remaining -= bytes;
-            rows.push(
-                (0..cols)
-                    .map(|x| wire_cell(&grid[line][Column(x)]))
-                    .collect(),
-            );
+            let source = self.term.row(line).cells();
+            rows.push((0..cols).map(|x| wire_cell(&source[x])).collect());
             metadata.push(annotations);
         }
         if rows.len() < visible {
@@ -2079,86 +2052,13 @@ impl HeadlessScreen {
         budget: usize,
         complete: bool,
     ) -> Option<(RowMetadata, usize)> {
-        let mut result = RowMetadata::default();
-        let grid = self.term.grid();
-        // Account for framing as well as text before allocating. Retained Find
-        // uses complete mode; existing live/page exports keep their old limits.
-        let mut used = 0;
-        // Decoration spans have a budget of their own (the same size), so
-        // they never crowd out a link. Past it a span is dropped and its
-        // cells keep the plain underline bit.
-        let mut style_used = 0;
-        let overrides = palette_overrides(self.host_replies, &self.term);
-        let source = &grid[line];
-        for x in 0..self.geometry.cols {
-            let cell = &source[Column(x)];
-            // Links, combining marks and underline colors all live in the
-            // cell's extra storage: a plain cell needs no further look.
-            let extra = cell.extra.is_some();
-            if !extra && !cell.flags.intersects(SPAN_FLAGS) {
-                continue;
-            }
-            if cell.flags.intersects(SPAN_FLAGS)
-                || (extra && cell.flags.intersects(Flags::ALL_UNDERLINES))
-            {
-                push_style_span(
-                    &mut result.styles,
-                    (cell, overrides),
-                    x as u16,
-                    &mut style_used,
-                    budget,
-                );
-            }
-            if !extra {
-                continue;
-            }
-            if let Some(link) = cell.hyperlink() {
-                let uri = link.uri();
-                if let Some(last) = result.links.last_mut()
-                    && last.end == x as u16
-                    && last.uri == uri
-                {
-                    last.end += 1;
-                } else if !uri.is_empty()
-                    && uri.len() <= diri_proto::grid::MAX_LINK_URI_BYTES
-                    && !uri.chars().any(char::is_control)
-                {
-                    let needed = uri.len() + 48;
-                    if used + needed <= budget {
-                        used += needed;
-                        result.links.push(LinkSpan {
-                            start: x as u16,
-                            end: x as u16 + 1,
-                            uri: uri.to_owned(),
-                        });
-                    } else if complete {
-                        return None;
-                    }
-                }
-            }
-            if let Some(chars) = cell.zerowidth() {
-                let text_len = chars
-                    .iter()
-                    .filter(|ch| !ch.is_control())
-                    .map(|ch| ch.len_utf8())
-                    .sum::<usize>();
-                if text_len == 0 {
-                    continue;
-                }
-                if text_len <= 64 && used + text_len + 16 <= budget {
-                    used += text_len + 16;
-                    let text = chars
-                        .iter()
-                        .copied()
-                        .filter(|ch| !ch.is_control())
-                        .collect();
-                    result.graphemes.push((x as u16, text));
-                } else if complete {
-                    return None;
-                }
-            }
-        }
-        Some((result, used))
+        row_metadata_budgeted(
+            self.term.row(line),
+            self.geometry.cols,
+            palette_overrides(self.host_replies, &self.term),
+            budget,
+            complete,
+        )
     }
 
     /// The visible grid as plain text, trailing blank lines removed.
@@ -2178,23 +2078,7 @@ impl HeadlessScreen {
         if row >= self.geometry.rows {
             return String::new();
         }
-        let source = &self.term.grid()[Line(row as i32)];
-        let mut text = String::with_capacity(self.geometry.cols);
-        for column in 0..self.geometry.cols {
-            let cell = &source[Column(column)];
-            // These occupy terminal columns but are not textual spaces.
-            if cell
-                .flags
-                .intersects(Flags::WIDE_CHAR_SPACER | Flags::LEADING_WIDE_CHAR_SPACER)
-            {
-                continue;
-            }
-            text.push(text_char(cell.c));
-            if let Some(combining) = cell.zerowidth() {
-                text.extend(combining.iter().copied());
-            }
-        }
-        text.trim_end().to_string()
+        row_text(self.term.row(Line(row as i32)), self.geometry.cols)
     }
 
     /// What a link scanner needs from the screen and the newest `history_rows`
@@ -2205,8 +2089,7 @@ impl HeadlessScreen {
         if history_rows > 0 {
             self.prepare_history_read();
         }
-        let grid = self.term.grid();
-        let history = grid.history_size().min(history_rows);
+        let history = self.term.history_rows().min(history_rows);
         let cols = self.geometry.cols;
         let mut source = LinkSource {
             text: String::with_capacity((history + self.geometry.rows) * (cols + 1)),
@@ -2215,16 +2098,15 @@ impl HeadlessScreen {
         };
         let mut row_text = String::with_capacity(cols);
         for index in -(history as i32)..self.geometry.rows as i32 {
-            let row = &grid[Line(index)];
+            let row = self.term.row(Line(index)).cells();
             row_text.clear();
             let mut wrapped = false;
-            for column in 0..cols {
-                let cell = &row[Column(column)];
+            for (column, cell) in row[..cols].iter().enumerate() {
                 if column + 1 == cols {
-                    wrapped = cell.flags.contains(Flags::WRAPLINE);
+                    wrapped = cell.cell_flags().contains(Flags::WRAPLINE);
                 }
-                if let Some(link) = cell.hyperlink() {
-                    let uri = link.uri();
+                if let Some(link) = cell.link() {
+                    let uri = link.target();
                     if source.hyperlinks.last().is_none_or(|(_, last)| last != uri)
                         && uri.len() <= diri_proto::grid::MAX_LINK_URI_BYTES
                     {
@@ -2233,13 +2115,13 @@ impl HeadlessScreen {
                     }
                 }
                 if cell
-                    .flags
+                    .cell_flags()
                     .intersects(Flags::WIDE_CHAR_SPACER | Flags::LEADING_WIDE_CHAR_SPACER)
                 {
                     continue;
                 }
-                row_text.push(text_char(cell.c));
-                if let Some(combining) = cell.zerowidth() {
+                row_text.push(text_char(cell.ch()));
+                if let Some(combining) = cell.combining() {
                     row_text.extend(combining.iter().copied());
                 }
             }
@@ -2373,7 +2255,7 @@ impl HeadlessScreen {
     /// else the App's palette. Unknown until the App has sent a palette,
     /// except the fixed 16–255 cube and ramp.
     fn color_value(&self, index: usize) -> Option<Rgb> {
-        if let Some(color) = self.term.colors()[index] {
+        if let Some(color) = self.term.program_colors()[index] {
             return Some(color);
         }
         let rgb = |[r, g, b]: [u8; 3]| Rgb { r, g, b };
@@ -2411,43 +2293,7 @@ impl HeadlessScreen {
         #[cfg(test)]
         self.fingerprinted_rows
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        let grid = self.term.grid();
-        let source = &grid[Line(row as i32)];
-        let width = self.geometry.cols.min(source.len());
-        // Default cells after the content add only their count, so a short
-        // line in a wide row hashes its text, not the blank rest of the row.
-        let content = source.content_len(Cell::is_default).min(width);
-        let cells = &source[..][..content];
-        let mut state = RowHashState::default();
-        let mut lanes = [
-            0xcbf2_9ce4_8422_2325u64,
-            0x8422_2325_cbf2_9ce4,
-            0x243f_6a88_85a3_08d3,
-            0x1319_8a2e_0370_7344,
-        ];
-        let (chunks, remainder) = cells.as_chunks::<4>();
-        let mut column = 0;
-        for chunk in chunks {
-            let words = [
-                state.word(column, &chunk[0]),
-                state.word(column + 1, &chunk[1]),
-                state.word(column + 2, &chunk[2]),
-                state.word(column + 3, &chunk[3]),
-            ];
-            lanes[0] = fold_mix(lanes[0], words[0]);
-            lanes[1] = fold_mix(lanes[1], words[1]);
-            lanes[2] = fold_mix(lanes[2], words[2]);
-            lanes[3] = fold_mix(lanes[3], words[3]);
-            column += 4;
-        }
-        for (offset, cell) in remainder.iter().enumerate() {
-            lanes[offset] = fold_mix(lanes[offset], state.word(column + offset, cell));
-        }
-        let mut digest = fold_mix(state.marks, (width as u64) << 32 | content as u64);
-        for lane in lanes {
-            digest = fold_mix(digest, lane);
-        }
-        (digest, state.filled)
+        fingerprint_cells(self.term.row(Line(row as i32)), self.geometry.cols)
     }
 
     fn rebuild_content_cache(&mut self) {
@@ -2581,23 +2427,171 @@ fn text_char(c: char) -> char {
     if c < ' ' { ' ' } else { c }
 }
 
-fn wire_cell(cell: &alacritty_terminal::term::cell::Cell) -> GridCell {
-    let scalar = if cell
-        .flags
-        .intersects(Flags::WIDE_CHAR_SPACER | Flags::LEADING_WIDE_CHAR_SPACER)
-    {
+fn wire_cell<C: CellView>(cell: &C) -> GridCell {
+    let flags = cell.cell_flags();
+    let c = cell.ch();
+    let scalar = if flags.intersects(Flags::WIDE_CHAR_SPACER | Flags::LEADING_WIDE_CHAR_SPACER) {
         0
-    } else if cell.c == '\0' {
+    } else if c == '\0' {
         32
     } else {
-        cell.c as u32
+        c as u32
     };
     GridCell::new(
         scalar,
-        wire_color(cell.fg),
-        wire_color(cell.bg),
-        wire_style(cell.flags),
+        wire_color(cell.fg_color()),
+        wire_color(cell.bg_color()),
+        wire_style(flags),
     )
+}
+
+/// One row as plain text, trailing blanks removed.
+fn row_text<R: RowView>(row: &R, cols: usize) -> String {
+    let source = row.cells();
+    let mut text = String::with_capacity(cols);
+    for cell in &source[..cols] {
+        // These occupy terminal columns but are not textual spaces.
+        if cell
+            .cell_flags()
+            .intersects(Flags::WIDE_CHAR_SPACER | Flags::LEADING_WIDE_CHAR_SPACER)
+        {
+            continue;
+        }
+        text.push(text_char(cell.ch()));
+        if let Some(combining) = cell.combining() {
+            text.extend(combining.iter().copied());
+        }
+    }
+    text.trim_end().to_string()
+}
+
+/// The annotations of one row of `cols` cells within `budget`; see
+/// [`HeadlessScreen::row_metadata_budgeted`]. `None` in `complete` mode when
+/// an annotation does not fit.
+fn row_metadata_budgeted<R: RowView>(
+    source: &R,
+    cols: usize,
+    overrides: Option<&Colors>,
+    budget: usize,
+    complete: bool,
+) -> Option<(RowMetadata, usize)> {
+    let mut result = RowMetadata::default();
+    // Account for framing as well as text before allocating. Retained Find
+    // uses complete mode; existing live/page exports keep their old limits.
+    let mut used = 0;
+    // Decoration spans have a budget of their own (the same size), so
+    // they never crowd out a link. Past it a span is dropped and its
+    // cells keep the plain underline bit.
+    let mut style_used = 0;
+    let source = source.cells();
+    for (x, cell) in source[..cols].iter().enumerate() {
+        // Links, combining marks and underline colors all live in the
+        // cell's extra storage: a plain cell needs no further look.
+        let extra = cell.has_extra();
+        let flags = cell.cell_flags();
+        if !extra && !flags.intersects(SPAN_FLAGS) {
+            continue;
+        }
+        if flags.intersects(SPAN_FLAGS) || (extra && flags.intersects(Flags::ALL_UNDERLINES)) {
+            push_style_span(
+                &mut result.styles,
+                (cell, overrides),
+                x as u16,
+                &mut style_used,
+                budget,
+            );
+        }
+        if !extra {
+            continue;
+        }
+        if let Some(link) = cell.link() {
+            let uri = link.target();
+            if let Some(last) = result.links.last_mut()
+                && last.end == x as u16
+                && last.uri == uri
+            {
+                last.end += 1;
+            } else if !uri.is_empty()
+                && uri.len() <= diri_proto::grid::MAX_LINK_URI_BYTES
+                && !uri.chars().any(char::is_control)
+            {
+                let needed = uri.len() + 48;
+                if used + needed <= budget {
+                    used += needed;
+                    result.links.push(LinkSpan {
+                        start: x as u16,
+                        end: x as u16 + 1,
+                        uri: uri.to_owned(),
+                    });
+                } else if complete {
+                    return None;
+                }
+            }
+        }
+        if let Some(chars) = cell.combining() {
+            let text_len = chars
+                .iter()
+                .filter(|ch| !ch.is_control())
+                .map(|ch| ch.len_utf8())
+                .sum::<usize>();
+            if text_len == 0 {
+                continue;
+            }
+            if text_len <= 64 && used + text_len + 16 <= budget {
+                used += text_len + 16;
+                let text = chars
+                    .iter()
+                    .copied()
+                    .filter(|ch| !ch.is_control())
+                    .collect();
+                result.graphemes.push((x as u16, text));
+            } else if complete {
+                return None;
+            }
+        }
+    }
+    Some((result, used))
+}
+
+/// A row's text fingerprint and filled cells; see
+/// [`HeadlessScreen::fingerprint_row`].
+fn fingerprint_cells<R: RowView>(source: &R, cols: usize) -> (u64, usize) {
+    let all = source.cells();
+    let width = cols.min(all.len());
+    // Default cells after the content add only their count, so a short
+    // line in a wide row hashes its text, not the blank rest of the row.
+    let content = source.content_width().min(width);
+    let cells = &all[..content];
+    let mut state = RowHashState::default();
+    let mut lanes = [
+        0xcbf2_9ce4_8422_2325u64,
+        0x8422_2325_cbf2_9ce4,
+        0x243f_6a88_85a3_08d3,
+        0x1319_8a2e_0370_7344,
+    ];
+    let (chunks, remainder) = cells.as_chunks::<4>();
+    let mut column = 0;
+    for chunk in chunks {
+        let words = [
+            state.word(column, &chunk[0]),
+            state.word(column + 1, &chunk[1]),
+            state.word(column + 2, &chunk[2]),
+            state.word(column + 3, &chunk[3]),
+        ];
+        lanes[0] = fold_mix(lanes[0], words[0]);
+        lanes[1] = fold_mix(lanes[1], words[1]);
+        lanes[2] = fold_mix(lanes[2], words[2]);
+        lanes[3] = fold_mix(lanes[3], words[3]);
+        column += 4;
+    }
+    for (offset, cell) in remainder.iter().enumerate() {
+        lanes[offset] = fold_mix(lanes[offset], state.word(column + offset, cell));
+    }
+    let mut digest = fold_mix(state.marks, (width as u64) << 32 | content as u64);
+    for lane in lanes {
+        digest = fold_mix(digest, lane);
+    }
+    (digest, state.filled)
 }
 
 /// The last color index cells are painted with: 0–255, then the default
@@ -2608,8 +2602,8 @@ const PAINTED_COLORS: usize = NamedColor::Background as usize + 1;
 /// foreground and background with OSC 10/11, so grids show them as the RGB
 /// the program chose. `None`, the usual case, costs one scan of 258 entries
 /// per publication and nothing per cell.
-fn palette_overrides(host_replies: bool, term: &Term<Collector>) -> Option<&Colors> {
-    let colors = term.colors();
+fn palette_overrides<E: Emulator>(host_replies: bool, term: &E) -> Option<&Colors> {
+    let colors = term.program_colors();
     (host_replies && (0..PAINTED_COLORS).any(|index| colors[index].is_some())).then_some(colors)
 }
 
@@ -2684,8 +2678,8 @@ fn wire_color(color: Color) -> TermColor {
 /// The decoration of `cell` beyond the style bits, if it needs a span. An
 /// indexed underline color a program redefined (`overrides`) is sent as the
 /// RGB it chose, like the cell's own colors.
-fn cell_decoration(cell: &Cell, overrides: Option<&Colors>) -> Option<StyleSpan> {
-    let flags = cell.flags;
+fn cell_decoration<C: CellView>(cell: &C, overrides: Option<&Colors>) -> Option<StyleSpan> {
+    let flags = cell.cell_flags();
     let underline = if flags.contains(Flags::UNDERCURL) {
         UnderlineKind::Curly
     } else if flags.contains(Flags::DOUBLE_UNDERLINE) {
@@ -2701,7 +2695,7 @@ fn cell_decoration(cell: &Cell, overrides: Option<&Colors>) -> Option<StyleSpan>
     };
     // SGR 58 alone draws nothing; `Default` is the foreground anyway.
     let underline_color = cell
-        .underline_color()
+        .underline()
         .map(|color| match (wire_color(color), overrides) {
             (TermColor::Ansi(index), Some(colors)) => colors[usize::from(index)]
                 .map_or(TermColor::Ansi(index), |rgb| {
@@ -2725,9 +2719,9 @@ fn cell_decoration(cell: &Cell, overrides: Option<&Colors>) -> Option<StyleSpan>
 }
 
 /// Extends the last span or starts one for the cell at `x`.
-fn push_style_span(
+fn push_style_span<C: CellView>(
     spans: &mut Vec<StyleSpan>,
-    (cell, overrides): (&Cell, Option<&Colors>),
+    (cell, overrides): (&C, Option<&Colors>),
     x: u16,
     used: &mut usize,
     budget: usize,
@@ -2761,11 +2755,11 @@ fn fold_mix(state: u64, word: u64) -> u64 {
 }
 
 /// Per-row fingerprint state outside the four multiply lanes.
-struct RowHashState {
+struct RowHashState<L> {
     filled: usize,
     /// Links and zero-width marks are rare; they fold into their own lane.
     marks: u64,
-    previous_link: Option<alacritty_terminal::term::cell::Hyperlink>,
+    previous_link: Option<L>,
     /// The wire style is derived only for a raw style not seen in the last
     /// two: consecutive cells rarely change it, and a run of wide characters
     /// alternates between the character's style and its spacer's.
@@ -2775,7 +2769,7 @@ struct RowHashState {
     other_style_hash: u64,
 }
 
-impl Default for RowHashState {
+impl<L> Default for RowHashState<L> {
     fn default() -> Self {
         Self {
             filled: 0,
@@ -2789,10 +2783,10 @@ impl Default for RowHashState {
     }
 }
 
-impl RowHashState {
+impl<L: LinkView> RowHashState<L> {
     #[inline(always)]
-    fn word(&mut self, column: usize, cell: &Cell) -> u64 {
-        if cell.extra.is_some() {
+    fn word<C: CellView<Link = L>>(&mut self, column: usize, cell: &C) -> u64 {
+        if cell.has_extra() {
             self.marks(column, cell);
         } else if self.previous_link.is_some() {
             self.marks = fold_mix(self.marks, column as u64 | 1 << 63);
@@ -2804,19 +2798,21 @@ impl RowHashState {
             std::mem::swap(&mut self.style_hash, &mut self.other_style_hash);
             if raw != self.raw_style {
                 self.raw_style = raw;
-                self.style_hash = style_word(cell.flags, cell.fg, cell.bg);
+                self.style_hash = style_word(cell.cell_flags(), cell.fg_color(), cell.bg_color());
             }
         }
-        let character = cell.c;
+        let character = cell.ch();
         self.filled += usize::from(character != ' ' && character != '\0');
         u64::from(character) ^ self.style_hash
     }
 
     #[inline(never)]
-    fn marks(&mut self, column: usize, cell: &Cell) {
-        let link = cell.hyperlink();
+    fn marks<C: CellView<Link = L>>(&mut self, column: usize, cell: &C) {
+        let link = cell.link();
         if link != self.previous_link {
-            let uri = link.as_ref().map_or(&b""[..], |link| link.uri().as_bytes());
+            let uri = link
+                .as_ref()
+                .map_or(&b""[..], |link| link.target().as_bytes());
             for chunk in uri.chunks(8) {
                 let mut bytes = [0u8; 8];
                 bytes[..chunk.len()].copy_from_slice(chunk);
@@ -2825,13 +2821,13 @@ impl RowHashState {
             self.marks = fold_mix(self.marks, column as u64 | 1 << 63);
             self.previous_link = link;
         }
-        if let Some(chars) = cell.zerowidth() {
+        if let Some(chars) = cell.combining() {
             for ch in chars {
                 self.marks = fold_mix(self.marks, u64::from(*ch) | (column as u64) << 32);
             }
         }
         // SGR 58: an undercurl that only changes color is a visible change.
-        if let Some(color) = cell.underline_color() {
+        if let Some(color) = cell.underline() {
             self.marks = fold_mix(
                 self.marks,
                 u64::from(wire_color(color).packed()) | (column as u64) << 32 | 1 << 62,
@@ -2842,7 +2838,7 @@ impl RowHashState {
 
 /// Exact raw style identity (both colors and all flags), cheap to compare.
 #[inline]
-fn raw_style_key(cell: &Cell) -> u128 {
+fn raw_style_key<C: CellView>(cell: &C) -> u128 {
     #[inline]
     fn color(value: Color) -> u128 {
         match value {
@@ -2853,7 +2849,9 @@ fn raw_style_key(cell: &Cell) -> u128 {
             Color::Indexed(index) => 2 << 24 | u128::from(index),
         }
     }
-    color(cell.fg) | color(cell.bg) << 32 | u128::from(cell.flags.bits()) << 64
+    color(cell.fg_color())
+        | color(cell.bg_color()) << 32
+        | u128::from(cell.cell_flags().bits()) << 64
 }
 
 /// Hash of a cell's wire style bits and both wire colors.
@@ -3044,17 +3042,17 @@ fn find(haystack: &[u8], needle: &[u8]) -> Option<usize> {
     memchr::memmem::find(haystack, needle)
 }
 
-fn restore_semantic_flags(target: &mut Cell, source: GridCell) {
+fn restore_semantic_flags<C: CellWrite>(target: &mut C, source: GridCell) {
     if source.style.contains(TermStyle::SOFT_WRAP) {
-        target.flags.insert(Flags::WRAPLINE);
+        target.insert_flags(Flags::WRAPLINE);
     }
     for (style, flag) in SHELL_MARK_BITS {
         if source.style.contains(style) {
-            target.flags.insert(flag);
+            target.insert_flags(flag);
         }
     }
     if source.style.contains(TermStyle::WIDE_SPACER) {
-        target.flags.insert(Flags::WIDE_CHAR_SPACER);
+        target.insert_flags(Flags::WIDE_CHAR_SPACER);
     }
 }
 
@@ -3063,27 +3061,27 @@ fn restore_semantic_flags(target: &mut Cell, source: GridCell) {
 /// cluster widened by what follows its first codepoint (`❤` + VS16, a flag)
 /// was replayed by that codepoint alone. A spacer after a one-column cluster
 /// is the leading spacer of a wide character wrapped to the next row.
-fn restore_wide_base(target: &mut Cell, spacer_follows: bool) {
+fn restore_wide_base<C: CellWrite>(target: &mut C, spacer_follows: bool) {
     if !spacer_follows
-        || target.flags.intersects(
+        || target.cell_flags().intersects(
             Flags::WIDE_CHAR | Flags::WIDE_CHAR_SPACER | Flags::LEADING_WIDE_CHAR_SPACER,
         )
     {
         return;
     }
-    let Some(zerowidth) = target.zerowidth().filter(|chars| !chars.is_empty()) else {
+    let Some(zerowidth) = target.combining().filter(|chars| !chars.is_empty()) else {
         return;
     };
-    let cluster: String = std::iter::once(target.c)
+    let cluster: String = std::iter::once(target.ch())
         .chain(zerowidth.iter().copied())
         .collect();
     if alacritty_terminal::term::grapheme_width(&cluster) == 2 {
-        target.flags.insert(Flags::WIDE_CHAR);
+        target.insert_flags(Flags::WIDE_CHAR);
     }
 }
 
 /// Puts a row's decoration span back on one restored cell.
-fn restore_decoration(cell: &mut Cell, span: &StyleSpan) {
+fn restore_decoration<C: CellWrite>(cell: &mut C, span: &StyleSpan) {
     let underline = match span.underline {
         UnderlineKind::None => Flags::empty(),
         UnderlineKind::Single => Flags::UNDERLINE,
@@ -3092,10 +3090,14 @@ fn restore_decoration(cell: &mut Cell, span: &StyleSpan) {
         UnderlineKind::Dotted => Flags::DOTTED_UNDERLINE,
         UnderlineKind::Dashed => Flags::DASHED_UNDERLINE,
     };
-    cell.flags.remove(Flags::ALL_UNDERLINES);
-    cell.flags.insert(underline);
-    cell.flags.set(Flags::OVERLINE, span.overline);
-    cell.set_underline_color(
+    cell.remove_flags(Flags::ALL_UNDERLINES);
+    cell.insert_flags(underline);
+    if span.overline {
+        cell.insert_flags(Flags::OVERLINE);
+    } else {
+        cell.remove_flags(Flags::OVERLINE);
+    }
+    cell.put_underline_color(
         span.underline_color
             .map(|packed| emulator_color(TermColor::unpack(packed))),
     );

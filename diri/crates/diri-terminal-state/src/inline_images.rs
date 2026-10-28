@@ -30,13 +30,12 @@
 use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
 
-use alacritty_terminal::grid::Dimensions;
-use alacritty_terminal::index::{Column, Line};
-use alacritty_terminal::term::cell::{Cell, Hyperlink};
+use alacritty_terminal::index::{Column, Line, Point};
 use alacritty_terminal::vte::ansi::Handler;
 use diri_proto::inline_image::{ImageAnchor, InlineImageFormat, MAX_IMAGE_BYTES};
 
 use crate::HeadlessScreen;
+use crate::emulator::{CellView, Emulator, LinkView, RowView};
 
 /// Hard budget for one terminal's stored images. Placing a new image evicts
 /// the oldest until it fits; evicted placements stay as blank cells.
@@ -483,7 +482,7 @@ impl HeadlessScreen {
                 Some(found.1)
             }
             b'c' => {
-                let point = self.term.grid().cursor.point;
+                let point = self.term.cursor_point();
                 let Some(internal) = self.anchor_at(point.line, point.column) else {
                     return;
                 };
@@ -652,7 +651,7 @@ impl HeadlessScreen {
         let cell = images.cell_pixels;
         let columns = self.geometry.cols;
         let screen_lines = self.geometry.rows;
-        let cursor = self.term.grid().cursor.point;
+        let cursor = self.term.cursor_point();
         let col0 = cursor.column.0.min(columns - 1);
         let available = (columns - col0) as u32;
         let (cols, rows) = cell_box(
@@ -662,15 +661,15 @@ impl HeadlessScreen {
             available,
             fit_height.then_some(screen_lines as u32),
         );
-        let saved_template = self.term.grid().cursor.template.clone();
-        let saved_wrap = self.term.grid().cursor.input_needs_wrap;
+        let saved_template = self.term.pen();
+        let saved_wrap = self.term.cursor_pending_wrap();
         let written = usize::from(cols).min(columns - col0);
         let mut line = cursor.line;
         for row in 0..rows {
             if row > 0 {
                 if move_cursor {
                     Handler::linefeed(&mut self.term);
-                    line = self.term.grid().cursor.point.line;
+                    line = self.term.cursor_point().line;
                 } else {
                     line = Line(line.0 + 1);
                     if line.0 >= screen_lines as i32 {
@@ -685,33 +684,26 @@ impl HeadlessScreen {
                 cols,
                 rows,
             };
-            let mut template = Cell::default();
-            template.set_hyperlink(Some(Hyperlink::new(None::<&str>, anchor.to_uri())));
-            let grid = self.term.grid_mut();
-            grid.cursor.template = template;
-            grid.cursor.point.line = line;
-            grid.cursor.point.column = Column(col0);
-            grid.cursor.input_needs_wrap = false;
+            self.term.set_link_pen(Some(anchor.to_uri()));
+            self.term
+                .place_cursor(Point::new(line, Column(col0)), false);
             for _ in 0..written {
                 Handler::input(&mut self.term, ' ');
             }
         }
-        let grid = self.term.grid_mut();
-        grid.cursor.template = saved_template;
+        self.term.restore_pen(saved_template);
         if !move_cursor {
-            grid.cursor.point = cursor;
-            grid.cursor.input_needs_wrap = saved_wrap;
+            self.term.place_cursor(cursor, saved_wrap);
         }
     }
 
     /// The image whose anchor covers a visible cell.
     fn anchor_at(&self, line: Line, column: Column) -> Option<u32> {
-        let grid = self.term.grid();
-        if line.0 < 0 || line.0 >= grid.screen_lines() as i32 || column.0 >= grid.columns() {
+        if line.0 < 0 || line.0 >= self.term.screen_rows() as i32 || column.0 >= self.term.cols() {
             return None;
         }
-        let link = grid[line][column].hyperlink()?;
-        let anchor = ImageAnchor::parse(link.uri())?;
+        let link = self.term.cell(line, column).link()?;
+        let anchor = ImageAnchor::parse(link.target())?;
         self.images.as_ref()?.store.internal(&anchor.key)
     }
 
@@ -719,17 +711,16 @@ impl HeadlessScreen {
         let Some(images) = self.images.as_ref() else {
             return Vec::new();
         };
-        let grid = self.term.grid();
         let mut positions = Vec::new();
-        for line in 0..grid.screen_lines() {
+        for line in 0..self.term.screen_rows() {
             let line = Line(line as i32);
-            let row = &grid[line];
-            for column in 0..grid.columns() {
-                let column = Column(column);
-                let Some(link) = row[column].hyperlink() else {
+            let row = self.term.row(line).cells();
+            for (column, cell) in row[..self.term.cols()].iter().enumerate() {
+                let Some(link) = cell.link() else {
                     continue;
                 };
-                if let Some(anchor) = ImageAnchor::parse(link.uri())
+                let column = Column(column);
+                if let Some(anchor) = ImageAnchor::parse(link.target())
                     && images.store.internal(&anchor.key).is_some_and(matches)
                 {
                     positions.push((line, column));
@@ -745,22 +736,16 @@ impl HeadlessScreen {
         if positions.is_empty() {
             return;
         }
-        let grid = self.term.grid();
-        let saved_point = grid.cursor.point;
-        let saved_wrap = grid.cursor.input_needs_wrap;
-        let saved_template = grid.cursor.template.clone();
-        self.term.grid_mut().cursor.template = Cell::default();
+        let saved_point = self.term.cursor_point();
+        let saved_wrap = self.term.cursor_pending_wrap();
+        let saved_template = self.term.pen();
+        self.term.set_link_pen(None);
         for &(line, column) in positions {
-            let grid = self.term.grid_mut();
-            grid.cursor.point.line = line;
-            grid.cursor.point.column = column;
-            grid.cursor.input_needs_wrap = false;
+            self.term.place_cursor(Point::new(line, column), false);
             Handler::input(&mut self.term, ' ');
         }
-        let grid = self.term.grid_mut();
-        grid.cursor.template = saved_template;
-        grid.cursor.point = saved_point;
-        grid.cursor.input_needs_wrap = saved_wrap;
+        self.term.restore_pen(saved_template);
+        self.term.place_cursor(saved_point, saved_wrap);
     }
 }
 
