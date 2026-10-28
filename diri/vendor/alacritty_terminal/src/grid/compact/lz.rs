@@ -79,9 +79,16 @@ fn match_length(input: &[u8], earlier: usize, later: usize) -> usize {
     len
 }
 
+#[cfg(test)]
 pub(super) fn compress(input: &[u8]) -> Vec<u8> {
     let mut out = Vec::with_capacity(input.len() / 2 + 16);
-    put_varint(&mut out, input.len());
+    compress_into(input, &mut out);
+    out
+}
+
+/// Appends the compressed form of `input` to `out`.
+pub(super) fn compress_into(input: &[u8], out: &mut Vec<u8>) {
+    put_varint(out, input.len());
     let mut table = [u32::MAX; 1 << HASH_BITS];
     let mut anchor = 0;
     let mut position = 0;
@@ -97,13 +104,13 @@ pub(super) fn compress(input: &[u8]) -> Vec<u8> {
             || read_u32(input, candidate) != value
         {
             misses += 1;
-            position += 1 + (misses >> 6);
+            position += 1 + (misses >> 4);
             continue;
         }
         misses = 0;
         let len = MIN_MATCH + match_length(input, candidate + MIN_MATCH, position + MIN_MATCH);
         emit(
-            &mut out,
+            out,
             &input[anchor..position],
             Some((position - candidate, len)),
         );
@@ -116,8 +123,7 @@ pub(super) fn compress(input: &[u8]) -> Vec<u8> {
         position += len;
         anchor = position;
     }
-    emit(&mut out, &input[anchor..], None);
-    out
+    emit(out, &input[anchor..], None);
 }
 
 struct Cursor<'a> {

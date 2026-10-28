@@ -4693,7 +4693,7 @@ mod ascii_run_tests {
             let line = Line(line);
             assert_eq!(a[line], b[line], "line {line} after step {step}");
             assert_eq!(
-                a[line].occ, b[line].occ,
+                a[line].occ(), b[line].occ(),
                 "occupancy of {line} after step {step}"
             );
         }

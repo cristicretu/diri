@@ -33,25 +33,25 @@ fn scroll_up() {
     grid.scroll_up::<usize>(&(Line(0)..Line(10)), 2);
 
     assert_eq!(grid[Line(0)][Column(0)], 2);
-    assert_eq!(grid[Line(0)].occ, 1);
+    assert_eq!(grid[Line(0)].occ(), 1);
     assert_eq!(grid[Line(1)][Column(0)], 3);
-    assert_eq!(grid[Line(1)].occ, 1);
+    assert_eq!(grid[Line(1)].occ(), 1);
     assert_eq!(grid[Line(2)][Column(0)], 4);
-    assert_eq!(grid[Line(2)].occ, 1);
+    assert_eq!(grid[Line(2)].occ(), 1);
     assert_eq!(grid[Line(3)][Column(0)], 5);
-    assert_eq!(grid[Line(3)].occ, 1);
+    assert_eq!(grid[Line(3)].occ(), 1);
     assert_eq!(grid[Line(4)][Column(0)], 6);
-    assert_eq!(grid[Line(4)].occ, 1);
+    assert_eq!(grid[Line(4)].occ(), 1);
     assert_eq!(grid[Line(5)][Column(0)], 7);
-    assert_eq!(grid[Line(5)].occ, 1);
+    assert_eq!(grid[Line(5)].occ(), 1);
     assert_eq!(grid[Line(6)][Column(0)], 8);
-    assert_eq!(grid[Line(6)].occ, 1);
+    assert_eq!(grid[Line(6)].occ(), 1);
     assert_eq!(grid[Line(7)][Column(0)], 9);
-    assert_eq!(grid[Line(7)].occ, 1);
+    assert_eq!(grid[Line(7)].occ(), 1);
     assert_eq!(grid[Line(8)][Column(0)], 0); // was 0.
-    assert_eq!(grid[Line(8)].occ, 0);
+    assert_eq!(grid[Line(8)].occ(), 0);
     assert_eq!(grid[Line(9)][Column(0)], 0); // was 1.
-    assert_eq!(grid[Line(9)].occ, 0);
+    assert_eq!(grid[Line(9)].occ(), 0);
 }
 
 // Scroll down moves lines downward.
@@ -65,25 +65,25 @@ fn scroll_down() {
     grid.scroll_down::<usize>(&(Line(0)..Line(10)), 2);
 
     assert_eq!(grid[Line(0)][Column(0)], 0); // was 8.
-    assert_eq!(grid[Line(0)].occ, 0);
+    assert_eq!(grid[Line(0)].occ(), 0);
     assert_eq!(grid[Line(1)][Column(0)], 0); // was 9.
-    assert_eq!(grid[Line(1)].occ, 0);
+    assert_eq!(grid[Line(1)].occ(), 0);
     assert_eq!(grid[Line(2)][Column(0)], 0);
-    assert_eq!(grid[Line(2)].occ, 1);
+    assert_eq!(grid[Line(2)].occ(), 1);
     assert_eq!(grid[Line(3)][Column(0)], 1);
-    assert_eq!(grid[Line(3)].occ, 1);
+    assert_eq!(grid[Line(3)].occ(), 1);
     assert_eq!(grid[Line(4)][Column(0)], 2);
-    assert_eq!(grid[Line(4)].occ, 1);
+    assert_eq!(grid[Line(4)].occ(), 1);
     assert_eq!(grid[Line(5)][Column(0)], 3);
-    assert_eq!(grid[Line(5)].occ, 1);
+    assert_eq!(grid[Line(5)].occ(), 1);
     assert_eq!(grid[Line(6)][Column(0)], 4);
-    assert_eq!(grid[Line(6)].occ, 1);
+    assert_eq!(grid[Line(6)].occ(), 1);
     assert_eq!(grid[Line(7)][Column(0)], 5);
-    assert_eq!(grid[Line(7)].occ, 1);
+    assert_eq!(grid[Line(7)].occ(), 1);
     assert_eq!(grid[Line(8)][Column(0)], 6);
-    assert_eq!(grid[Line(8)].occ, 1);
+    assert_eq!(grid[Line(8)].occ(), 1);
     assert_eq!(grid[Line(9)][Column(0)], 7);
-    assert_eq!(grid[Line(9)].occ, 1);
+    assert_eq!(grid[Line(9)].occ(), 1);
 }
 
 #[test]
@@ -97,25 +97,25 @@ fn scroll_down_with_history() {
     grid.scroll_down::<usize>(&(Line(0)..Line(10)), 2);
 
     assert_eq!(grid[Line(0)][Column(0)], 0); // was 8.
-    assert_eq!(grid[Line(0)].occ, 0);
+    assert_eq!(grid[Line(0)].occ(), 0);
     assert_eq!(grid[Line(1)][Column(0)], 0); // was 9.
-    assert_eq!(grid[Line(1)].occ, 0);
+    assert_eq!(grid[Line(1)].occ(), 0);
     assert_eq!(grid[Line(2)][Column(0)], 0);
-    assert_eq!(grid[Line(2)].occ, 1);
+    assert_eq!(grid[Line(2)].occ(), 1);
     assert_eq!(grid[Line(3)][Column(0)], 1);
-    assert_eq!(grid[Line(3)].occ, 1);
+    assert_eq!(grid[Line(3)].occ(), 1);
     assert_eq!(grid[Line(4)][Column(0)], 2);
-    assert_eq!(grid[Line(4)].occ, 1);
+    assert_eq!(grid[Line(4)].occ(), 1);
     assert_eq!(grid[Line(5)][Column(0)], 3);
-    assert_eq!(grid[Line(5)].occ, 1);
+    assert_eq!(grid[Line(5)].occ(), 1);
     assert_eq!(grid[Line(6)][Column(0)], 4);
-    assert_eq!(grid[Line(6)].occ, 1);
+    assert_eq!(grid[Line(6)].occ(), 1);
     assert_eq!(grid[Line(7)][Column(0)], 5);
-    assert_eq!(grid[Line(7)].occ, 1);
+    assert_eq!(grid[Line(7)].occ(), 1);
     assert_eq!(grid[Line(8)][Column(0)], 6);
-    assert_eq!(grid[Line(8)].occ, 1);
+    assert_eq!(grid[Line(8)].occ(), 1);
     assert_eq!(grid[Line(9)][Column(0)], 7);
-    assert_eq!(grid[Line(9)].occ, 1);
+    assert_eq!(grid[Line(9)].occ(), 1);
 }
 
 // Test that GridIterator works.

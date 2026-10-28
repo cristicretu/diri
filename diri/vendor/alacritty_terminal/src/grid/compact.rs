@@ -13,6 +13,8 @@ use super::{GridCell, Row};
 use crate::term::cell::ResetDiscriminant;
 
 mod lz;
+mod seal;
+use seal::SealSlot;
 use crate::term::cell::{Cell, CellExtra, Flags, Hyperlink};
 use crate::vte::ansi::{Color, NamedColor, Rgb};
 
@@ -57,6 +59,9 @@ pub struct RowCodec<T> {
     /// to them in history.
     reflow_line: fn(Vec<Row<T>>, usize) -> Vec<Row<T>>,
     clone_row: fn(&Row<T>) -> Row<T>,
+    /// Encode a sealed block on the helper thread (see `seal`); `Err` gives
+    /// the rows back to be encoded inline. `None` always encodes inline.
+    seal: Option<SealRows<T>>,
     /// Reset a row to default cells: equal to `Row::new` of its width.
     clear_row: fn(&mut Row<T>),
     #[cfg(test)]
@@ -64,6 +69,7 @@ pub struct RowCodec<T> {
 }
 
 type EncodeRows<T> = fn(&[Row<T>]) -> Encoded;
+type SealRows<T> = fn(Vec<Row<T>>, EncodeRows<T>) -> Result<Arc<SealSlot<T>>, Vec<Row<T>>>;
 type LineRows<T> = fn(Vec<Row<T>>, usize, usize, usize, &mut Vec<Row<T>>);
 type ShapeRow<T> = fn(&Row<T>, &mut Vec<(u32, u32)>) -> Option<RowShape>;
 #[cfg(test)]
@@ -660,6 +666,7 @@ impl<T> Deferred<T> {
 }
 
 /// An encoded block and the facts storage needs without decoding it.
+#[derive(Clone)]
 struct Encoded {
     bytes: Arc<[u8]>,
     /// The narrowest width every row can reflow to without discarding
@@ -677,7 +684,8 @@ type ResetRow<T> = fn(&EvictIndex<T>, usize, &T, usize) -> Option<Row<T>>;
 #[derive(Clone, Debug)]
 pub struct EvictIndex<T> {
     raw: Vec<u8>,
-    rows: Vec<usize>,
+    /// Each row's metadata and text offsets in `raw`.
+    rows: Vec<(usize, usize)>,
     styles: Vec<T>,
 }
 
@@ -713,7 +721,10 @@ struct Block<T> {
 
 impl<T> Block<T> {
     fn new(rows: &[Row<T>], codec: RowCodec<T>) -> Self {
-        let encoded = (codec.encode)(rows);
+        Self::from_encoded((codec.encode)(rows), rows)
+    }
+
+    fn from_encoded(encoded: Encoded, rows: &[Row<T>]) -> Self {
         Self {
             bytes: encoded.bytes,
             start: 0,
@@ -790,6 +801,10 @@ impl<T> Block<T> {
 #[derive(Clone, Debug)]
 pub struct CompactRows<T> {
     recent: VecDeque<Row<T>>,
+    /// Full blocks being encoded on the helper thread, newest first: older
+    /// than `recent`, newer than `blocks`. Collected into `blocks` as they
+    /// finish and all of them before history is measured or restructured.
+    sealing: VecDeque<Sealing<T>>,
     blocks: VecDeque<Block<T>>,
     oldest: VecDeque<Row<T>>,
     codec: RowCodec<T>,
@@ -829,6 +844,27 @@ impl Clone for ReadCacheFlag {
     }
 }
 
+/// The most blocks one storage has on the helper thread. Sealing another
+/// waits for the oldest, so a helper that falls behind slows the parser
+/// down rather than holding more rows.
+const MAX_SEALING: usize = 8;
+
+/// A block on the helper thread (see `seal`).
+struct Sealing<T>(Arc<SealSlot<T>>);
+
+impl<T: Clone> Clone for Sealing<T> {
+    fn clone(&self) -> Self {
+        let (encoded, rows) = self.0.wait();
+        Self(SealSlot::finished(encoded.clone(), rows.to_vec()))
+    }
+}
+
+impl<T> std::fmt::Debug for Sealing<T> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(if self.0.is_done() { "Sealing(done)" } else { "Sealing" })
+    }
+}
+
 /// A block's share of the payload term of `history_storage_bytes`.
 fn payload_bytes<T>(block: &Block<T>) -> usize {
     block.bytes.len() + 2 * std::mem::size_of::<usize>()
@@ -850,6 +886,7 @@ impl<T> CompactRows<T> {
         let mut storage = Self {
             len: rows.len(),
             recent: rows.into(),
+            sealing: VecDeque::new(),
             blocks: VecDeque::new(),
             oldest: VecDeque::new(),
             codec,
@@ -867,6 +904,7 @@ impl<T> CompactRows<T> {
             eager_reflow: false,
         };
         storage.seal_recent();
+        storage.finish_sealing();
         storage.recent.shrink_to_fit();
         storage
     }
@@ -899,6 +937,12 @@ impl<T> CompactRows<T> {
     fn cold_row(&self, mut index: usize) -> &Row<T> {
         assert!(index < self.len);
         index -= self.recent.len();
+        let sealing_rows = self.sealing.len() * self.block_rows;
+        if index < sealing_rows {
+            let (_, rows) = self.sealing[index / self.block_rows].0.wait();
+            return &rows[index % self.block_rows];
+        }
+        index -= sealing_rows;
         let cold_rows = self.cold_rows();
         if index < cold_rows {
             let block = &self.blocks[index / self.block_rows];
@@ -920,7 +964,9 @@ impl<T> CompactRows<T> {
 
     /// Rows before `oldest`, from the newest.
     fn rows_before_oldest(&self) -> usize {
-        self.recent.len() + self.cold_rows() + self.deferred.as_ref().map_or(0, |d| d.rows)
+        self.recent.len()
+            + self.sealing.len() * self.block_rows
+            + self.cold_rows() + self.deferred.as_ref().map_or(0, |d| d.rows)
     }
 
     #[inline(always)]
@@ -936,6 +982,9 @@ impl<T> CompactRows<T> {
     #[inline(never)]
     fn cold_row_mut(&mut self, mut index: usize) -> &mut Row<T> {
         assert!(index < self.len);
+        if index >= self.recent.len() {
+            self.finish_sealing();
+        }
         if index >= self.visible {
             self.needs_maintenance = true;
         }
@@ -1019,6 +1068,7 @@ impl<T> CompactRows<T> {
     }
 
     pub fn truncate(&mut self, len: usize) {
+        self.finish_sealing();
         assert!(len <= self.len);
         self.needs_maintenance |= self.len != len;
         while self.len > len {
@@ -1044,6 +1094,7 @@ impl<T> CompactRows<T> {
     }
 
     pub fn set_visible(&mut self, visible: usize) {
+        self.finish_sealing();
         assert!(visible <= self.len);
         self.needs_maintenance |= self.visible != visible;
         self.visible = visible;
@@ -1097,6 +1148,7 @@ impl<T> CompactRows<T> {
     /// and deque capacity beyond what the rows need. Stored history is
     /// untouched; each cache is rebuilt on its next use.
     pub fn release_idle(&mut self) {
+        self.finish_sealing();
         self.release_read_cache();
         self.evict_cache = None;
         self.spare = Vec::new();
@@ -1170,7 +1222,7 @@ impl<T> CompactRows<T> {
         let evict_cache = self.evict_cache.as_ref().map_or(0, |cache| {
             std::mem::size_of::<EvictCache<T>>()
                 + cache.index.raw.capacity()
-                + cache.index.rows.capacity() * std::mem::size_of::<usize>()
+                + cache.index.rows.capacity() * std::mem::size_of::<(usize, usize)>()
                 + cache.index.styles.capacity() * std::mem::size_of::<T>()
         });
         let deferred = self.deferred.as_ref().map_or(0, |deferred| {
@@ -1180,7 +1232,15 @@ impl<T> CompactRows<T> {
                 + deferred.lines.heap_bytes()
                 + deferred.eager_cells * std::mem::size_of::<T>()
         });
+        // Blocks on the helper thread count as soon as they are encoded.
+        let sealing = self.sealing.capacity() * std::mem::size_of::<Sealing<T>>()
+            + self
+                .sealing
+                .iter()
+                .map(|sealing| sealing.0.wait().0.bytes.len() + 2 * std::mem::size_of::<usize>())
+                .sum::<usize>();
         payload
+            + sealing
             + evict_cache
             + deferred
             + self.blocks.capacity() * std::mem::size_of::<Block<T>>()
@@ -1198,6 +1258,7 @@ impl<T> CompactRows<T> {
     /// Discard only the oldest history when the retained representation is full.
     #[inline]
     pub fn bound_history_bytes(&mut self, budget: usize) {
+        self.finish_sealing();
         if self.spare.capacity() != 0 {
             self.spare = Vec::new();
         }
@@ -1213,16 +1274,7 @@ impl<T> CompactRows<T> {
         if self.blocks.capacity() > self.blocks.len().saturating_mul(2).saturating_add(64) {
             self.blocks.shrink_to_fit();
         }
-        let mut raw_left = true;
         while self.len > self.visible && self.history_storage_bytes() > budget {
-            // Compress before discarding: history keeps every row it kept
-            // when blocks were compressed as they were sealed.
-            if raw_left {
-                raw_left = self.compress_oldest_raw();
-                if raw_left {
-                    continue;
-                }
-            }
             if self.oldest.is_empty() && self.deferred.is_none() && self.blocks.len() > 1 {
                 self.len -= self.pop_block_back().expect("oldest block").count;
                 self.evict_cache = None;
@@ -1239,48 +1291,8 @@ impl<T> CompactRows<T> {
         self.last_budget = budget;
     }
 
-    /// LZ-compress the oldest payload still stored raw, with every range
-    /// that shares it. `false` when every payload is compressed.
-    fn compress_oldest_raw(&mut self) -> bool {
-        if let Some(deferred) = &mut self.deferred {
-            if let Some(at) = deferred
-                .sources
-                .iter()
-                .rposition(|block| payload_is_raw(&block.bytes))
-            {
-                let old = deferred.sources[at].bytes.clone();
-                let packed = compress_payload(&old);
-                for block in deferred.sources.iter_mut() {
-                    if Arc::ptr_eq(&block.bytes, &old) {
-                        block.bytes = packed.clone();
-                    }
-                }
-                deferred.recount();
-                return true;
-            }
-        }
-        let Some(at) = self
-            .blocks
-            .iter()
-            .rposition(|block| payload_is_raw(&block.bytes))
-        else {
-            return false;
-        };
-        let old = self.blocks[at].bytes.clone();
-        let packed = compress_payload(&old);
-        // Ranges of one payload are adjacent.
-        for block in self.blocks.range_mut(at.saturating_sub(MAX_BLOCK_ROWS)..=at) {
-            if Arc::ptr_eq(&block.bytes, &old) {
-                block.bytes = packed.clone();
-            }
-        }
-        if let Some(payload) = &mut self.payload_bytes {
-            *payload -= old.len() - packed.len();
-        }
-        true
-    }
-
     pub fn into_rows(mut self) -> Vec<Row<T>> {
+        self.finish_sealing();
         self.materialize_deferred();
         let mut rows = Vec::with_capacity(self.len);
         rows.extend(self.recent);
@@ -1292,6 +1304,7 @@ impl<T> CompactRows<T> {
     }
 
     pub fn drain_rows(&mut self) -> Vec<Row<T>> {
+        self.finish_sealing();
         if self.reflowing_recent {
             let rows: Vec<_> = self.recent.drain(..).collect();
             self.len -= rows.len();
@@ -1311,6 +1324,7 @@ impl<T> CompactRows<T> {
     }
 
     pub fn replace_rows(&mut self, rows: Vec<Row<T>>, visible: usize, columns: usize) {
+        self.finish_sealing();
         self.needs_maintenance = true;
         if self.reflowing_recent {
             self.reflowing_recent = false;
@@ -1342,6 +1356,7 @@ impl<T> CompactRows<T> {
     /// follow a hard line break and are already at the new width, so the
     /// caller's reflow of the rest matches reflowing every row.
     pub fn prepare_reflow(&mut self, columns: usize, reflow: bool, display_offset: usize) -> usize {
+        self.finish_sealing();
         self.release_read_cache();
         if self.deferred.is_none() && self.keep_hard_lines(columns) {
             return self.recent.len();
@@ -1369,6 +1384,7 @@ impl<T> CompactRows<T> {
     /// Remove at least `count` of the newest rows kept back from a reflow
     /// (fewer only when none remain), newest first, at the new width.
     pub fn take_reflowed_newest(&mut self, count: usize) -> Vec<Row<T>> {
+        self.finish_sealing();
         debug_assert!(self.reflowing_recent);
         let mut rows = Vec::with_capacity(count);
         while rows.len() < count {
@@ -1579,6 +1595,7 @@ impl<T> CompactRows<T> {
     /// read of every history row (a checkpoint, a capture) decodes a block
     /// at a time instead of first reflowing all of it into one copy.
     pub fn prepare_history_read(&mut self) {
+        self.finish_sealing();
         if self
             .deferred
             .as_ref()
@@ -1590,6 +1607,7 @@ impl<T> CompactRows<T> {
 
     /// Reflow deferred history into blocks after every newer block.
     fn materialize_deferred(&mut self) {
+        self.finish_sealing();
         let Some(deferred) = self.deferred.take() else {
             return;
         };
@@ -1714,6 +1732,7 @@ impl<T> CompactRows<T> {
     }
 
     fn pop_oldest(&mut self) -> Option<Row<T>> {
+        self.finish_sealing_if_oldest();
         if let Some(row) = self.oldest.pop_back() {
             return Some(row);
         }
@@ -1731,6 +1750,7 @@ impl<T> CompactRows<T> {
 
     /// Discard the oldest row without decoding any other row.
     fn drop_oldest(&mut self) {
+        self.finish_sealing_if_oldest();
         if self.oldest.pop_back().is_some() {
             return;
         }
@@ -1760,6 +1780,7 @@ impl<T> CompactRows<T> {
         T: ResetDiscriminant<D> + GridCell + Default,
         D: PartialEq,
     {
+        self.finish_sealing_if_oldest();
         if self.oldest.is_empty() {
             if let Some(deferred) = &self.deferred {
                 if !deferred.lines.back_is_eager() {
@@ -1849,6 +1870,8 @@ impl<T> CompactRows<T> {
         if !self.recent.is_empty() {
             return;
         }
+        // The newest history rows may be on the helper thread.
+        self.finish_sealing();
         if let Some(block) = self.blocks.pop_front() {
             self.payload_bytes = None;
             self.recent.extend(block.into_rows(self.codec));
@@ -1865,25 +1888,97 @@ impl<T> CompactRows<T> {
 
     fn seal_recent(&mut self) {
         while self.recent.len() >= self.visible + self.block_rows {
-            let mut rows: Vec<_> = self
+            let rows: Vec<_> = self
                 .recent
                 .drain(self.recent.len() - self.block_rows..)
                 .collect();
-            let block = Block::new(&rows, self.codec);
-            // Only full history recycles rows, and it does so one block at a
-            // time; keep one block of allocations for that. A row whose
-            // reset would keep cells that are not template cells is marked
-            // fully occupied, so `Row::reset` overwrites every cell. Others
-            // keep their occupancy and reset only the cells they wrote.
-            if self.spare.is_empty() {
-                for (index, row) in rows.iter_mut().enumerate() {
-                    if block.blank_on_reset >> index & 1 == 0 {
-                        row.occ = row.len();
+            let rows = match self.codec.seal {
+                Some(seal) => {
+                    // Collect what finished; wait for the oldest when the
+                    // helper is this far behind.
+                    self.collect_sealed(false);
+                    if self.sealing.len() >= MAX_SEALING {
+                        self.collect_oldest_sealed();
                     }
+                    match seal(rows, self.codec.encode) {
+                        Ok(slot) => {
+                            self.sealing.push_front(Sealing(slot));
+                            continue;
+                        },
+                        Err(rows) => rows,
+                    }
+                },
+                None => rows,
+            };
+            // Blocks enter `blocks` in order: older ones first.
+            self.finish_sealing();
+            let encoded = (self.codec.encode)(&rows);
+            self.push_sealed(encoded, rows);
+        }
+    }
+
+    /// Store a sealed block and keep its row allocations for recycling.
+    fn push_sealed(&mut self, encoded: Encoded, mut rows: Vec<Row<T>>) {
+        let block = Block::from_encoded(encoded, &rows);
+        // Only full history recycles rows, and it does so one block at a
+        // time; keep one block of allocations for that. A row whose reset
+        // would keep cells that are not template cells is marked fully
+        // occupied, so `Row::reset` overwrites every cell. Others keep their
+        // occupancy and reset only the cells they wrote.
+        // Blocks come back from the helper thread later than they are
+        // sealed, several at a time, so as many blocks of allocations as
+        // can be on the helper are kept.
+        if self.spare.len() < MAX_SEALING * self.block_rows {
+            for (index, row) in rows.iter_mut().enumerate() {
+                if block.blank_on_reset >> index & 1 == 0 {
+                    row.set_occ(row.len());
                 }
+            }
+            if self.spare.is_empty() {
+                self.spare = rows;
+            } else {
+                // Recycling pops from the end: the older rows go first.
+                rows.append(&mut self.spare);
                 self.spare = rows;
             }
-            self.push_block_front(block);
+        }
+        self.push_block_front(block);
+    }
+
+    /// Move finished blocks from the helper into `blocks`, oldest first,
+    /// stopping at the first unfinished one unless `wait`.
+    fn collect_sealed(&mut self, wait: bool) {
+        while let Some(oldest) = self.sealing.back() {
+            if !wait && !oldest.0.is_done() {
+                return;
+            }
+            self.collect_oldest_sealed();
+        }
+    }
+
+    fn collect_oldest_sealed(&mut self) {
+        let Sealing(slot) = self.sealing.pop_back().expect("sealing block");
+        let (encoded, rows) = SealSlot::take(slot);
+        self.push_sealed(encoded, rows);
+    }
+
+    /// Wait for every block on the helper thread.
+    #[inline]
+    fn finish_sealing(&mut self) {
+        if !self.sealing.is_empty() {
+            self.collect_sealed(true);
+        }
+    }
+
+    /// Wait for the helper when the oldest history rows are on it.
+    #[inline]
+    fn finish_sealing_if_oldest(&mut self) {
+        if !self.sealing.is_empty()
+            && self.oldest.is_empty()
+            && self.deferred.is_none()
+            && self.blocks.is_empty()
+        {
+            self.finish_sealing();
         }
     }
 }
@@ -2002,6 +2097,7 @@ pub fn cell_codec() -> RowCodec<Cell> {
         line_rows: cell_line_rows,
         reflow_line: cell_reflow_line,
         clone_row: Row::clone,
+        seal: Some(seal::seal::<Cell>),
         clear_row: |row| row.reset(&Cell::default()),
         #[cfg(test)]
         rows_equal: |a, b| a == b,
@@ -2079,7 +2175,7 @@ fn cell_shape(row: &Row<Cell>, wide: &mut Vec<(u32, u32)>) -> Option<RowShape> {
                 .all(|cell| is_default(cell, default_key)),
         // A row reset by a coloured template keeps coloured blanks above its
         // occupancy; `Row::reset` treats them unlike greedy rows' padding.
-        plain: plain && row.occ >= stored,
+        plain: plain && row.occ() >= stored,
         starts_wide: cells
             .first()
             .is_some_and(|cell| cell.flags.contains(Flags::WIDE_CHAR)),
@@ -2393,27 +2489,22 @@ fn encode_cells(rows: &[Row<Cell>]) -> Encoded {
     // Rows of default cells are common; their styles are found without the
     // table's lookup.
     let mut last_style: Option<(Color, Color, Flags, u32)> = None;
-    let mut body = SCRATCH.with(|scratch| scratch.take());
-    body.clear();
-    body.reserve(rows.iter().map(|row| row.len() + 16).sum());
+    let (mut meta, mut text) = SCRATCH.with(|scratch| scratch.take());
+    meta.clear();
+    text.clear();
+    meta.reserve(rows.len() * 8);
+    text.reserve(rows.iter().map(Row::len).sum());
     let mut runs: Vec<(u32, u32)> = Vec::new();
     let mut floor = Some(1);
     for (index, row) in rows.iter().enumerate() {
         let cells = &row[..];
         let stored = stored_cells(&cells[..row.content_bound()]);
-        if cells.len() == width && width != 0 && row.occ >= stored {
+        if cells.len() == width && width != 0 && row.occ() >= stored {
             blank_on_reset |= 1 << index;
         }
         floor = floor.map(|floor: usize| floor.max(stored));
         runs.clear();
-        put_varint(&mut body, row.occ);
-        put_varint(&mut body, cells.len());
-        put_varint(&mut body, stored);
-        // The text length is written in front of the text once known. One
-        // byte holds rows of up to 127 bytes; longer ones shift the text.
-        let length_at = body.len();
-        body.push(0);
-        let text_start = body.len();
+        let text_start = text.len();
         let mut start = 0;
         while start < stored {
             let cell = &cells[start];
@@ -2428,7 +2519,7 @@ fn encode_cells(rows: &[Row<Cell>]) -> Encoded {
                 let mut text_from = start;
                 if is_default_style(cell) {
                     // Default-styled ASCII, eight cells at a time.
-                    push_char(&mut body, cell.c);
+                    push_char(&mut text, cell.c);
                     text_from = end;
                     while end + 8 <= stored {
                         let chunk: &[Cell; 8] = cells[end..end + 8].try_into().expect("8 cells");
@@ -2443,7 +2534,7 @@ fn encode_cells(rows: &[Row<Cell>]) -> Encoded {
                         if !styled || any >= 0x80 {
                             break;
                         }
-                        body.extend_from_slice(&bytes);
+                        text.extend_from_slice(&bytes);
                         end += 8;
                         text_from = end;
                     }
@@ -2459,7 +2550,7 @@ fn encode_cells(rows: &[Row<Cell>]) -> Encoded {
                     }
                     end += 1;
                 }
-                push_text(&mut body, &cells[text_from..end]);
+                push_text(&mut text, &cells[text_from..end]);
                 match last_style {
                     Some((f, b, l, id)) if f == fg && b == bg && l == flags => id,
                     _ => {
@@ -2469,7 +2560,7 @@ fn encode_cells(rows: &[Row<Cell>]) -> Encoded {
                     },
                 }
             } else {
-                push_char(&mut body, cell.c);
+                push_char(&mut text, cell.c);
                 table.id(cell)
             };
             let count = (end - start) as u32;
@@ -2479,18 +2570,14 @@ fn encode_cells(rows: &[Row<Cell>]) -> Encoded {
             }
             start = end;
         }
-        let text_len = body.len() - text_start;
-        if text_len < 0x80 {
-            body[length_at] = text_len as u8;
-        } else {
-            let mut prefix = Vec::with_capacity(10);
-            put_varint(&mut prefix, text_len);
-            body.splice(length_at..text_start, prefix);
-        }
-        put_varint(&mut body, runs.len());
+        put_varint(&mut meta, row.occ());
+        put_varint(&mut meta, cells.len());
+        put_varint(&mut meta, stored);
+        put_varint(&mut meta, text.len() - text_start);
+        put_varint(&mut meta, runs.len());
         for &(id, count) in &runs {
-            put_varint(&mut body, id as usize);
-            put_varint(&mut body, count as usize);
+            put_varint(&mut meta, id as usize);
+            put_varint(&mut meta, count as usize);
         }
     }
     let mut styles = Vec::with_capacity(8 + table.styles.len() * 8);
@@ -2498,28 +2585,28 @@ fn encode_cells(rows: &[Row<Cell>]) -> Encoded {
     for style in &table.styles {
         put_style(&mut styles, style);
     }
-    // The header goes in front of the body, then one allocation holds it.
-    let mut header = Vec::with_capacity(styles.len() + 11);
-    header.push(PAYLOAD_RAW);
-    put_varint(&mut header, styles.len());
-    header.extend_from_slice(&styles);
-    let body_len = body.len();
-    body.extend_from_slice(&header);
-    body.rotate_right(header.len());
-    let bytes = Arc::<[u8]>::from(&body[..header.len() + body_len]);
-    if body.capacity() <= SCRATCH_BYTES {
-        SCRATCH.with(|scratch| scratch.set(body));
+    // Layout: styles, row metadata, then all text. Keeping text apart lets
+    // the compressor skip through text that does not repeat quickly.
+    let mut raw = Vec::with_capacity(styles.len() + meta.len() + text.len() + 20);
+    put_varint(&mut raw, styles.len());
+    raw.extend_from_slice(&styles);
+    put_varint(&mut raw, meta.len());
+    raw.extend_from_slice(&meta);
+    raw.extend_from_slice(&text);
+    if meta.capacity() <= SCRATCH_BYTES && text.capacity() <= SCRATCH_BYTES {
+        SCRATCH.with(|scratch| scratch.set((meta, text)));
     }
     Encoded {
-        bytes,
+        bytes: pack_payload(&raw),
         resize_floor: floor,
         blank_on_reset,
     }
 }
 
 thread_local! {
-    /// The body of the block being encoded, reused while it stays small.
-    static SCRATCH: std::cell::Cell<Vec<u8>> = const { std::cell::Cell::new(Vec::new()) };
+    /// Row metadata and text of the block being encoded, reused while small.
+    static SCRATCH: std::cell::Cell<(Vec<u8>, Vec<u8>)> =
+        const { std::cell::Cell::new((Vec::new(), Vec::new())) };
 }
 
 /// The most scratch capacity an encoding thread keeps between blocks.
@@ -2717,33 +2804,22 @@ const NAMED_COLORS: [NamedColor; 29] = [
     NamedColor::DimForeground,
 ];
 
-/// First byte of a payload: the encoded rows follow as they are.
-const PAYLOAD_RAW: u8 = 0;
-/// First byte of a payload: the encoded rows follow LZ-compressed.
-const PAYLOAD_LZ: u8 = 1;
 /// First byte of a payload: the encoded rows follow as they are, because
 /// compressing them did not make them smaller.
-const PAYLOAD_STORED: u8 = 2;
+const PAYLOAD_STORED: u8 = 0;
+/// First byte of a payload: the encoded rows follow LZ-compressed.
+const PAYLOAD_LZ: u8 = 1;
 
-/// Whether a payload is still uncompressed (see [`compress_payload`]).
-#[inline]
-fn payload_is_raw(bytes: &[u8]) -> bool {
-    bytes.first() == Some(&PAYLOAD_RAW)
-}
-
-/// The LZ-compressed form of a raw payload. Blocks are sealed raw, so
-/// scrolling output pays only for the row encoding; history is compressed
-/// only when its stored bytes would otherwise exceed the budget.
-fn compress_payload(bytes: &[u8]) -> Arc<[u8]> {
-    debug_assert!(payload_is_raw(bytes));
-    let packed = lz::compress(&bytes[1..]);
-    let mut out = Vec::with_capacity(packed.len().min(bytes.len() - 1) + 1);
-    if packed.len() < bytes.len() - 1 {
-        out.push(PAYLOAD_LZ);
-        out.extend_from_slice(&packed);
-    } else {
+/// A block payload: the encoded rows, compressed when that makes them
+/// smaller.
+fn pack_payload(raw: &[u8]) -> Arc<[u8]> {
+    let mut out = Vec::with_capacity(raw.len() / 2 + 32);
+    out.push(PAYLOAD_LZ);
+    lz::compress_into(raw, &mut out);
+    if out.len() > raw.len() {
+        out.clear();
         out.push(PAYLOAD_STORED);
-        out.extend_from_slice(&bytes[1..]);
+        out.extend_from_slice(raw);
     }
     out.into()
 }
@@ -2751,10 +2827,16 @@ fn compress_payload(bytes: &[u8]) -> Arc<[u8]> {
 /// The encoded rows of a payload.
 fn payload_rows(bytes: &[u8]) -> std::borrow::Cow<'_, [u8]> {
     match bytes.split_first() {
-        Some((&(PAYLOAD_RAW | PAYLOAD_STORED), raw)) => std::borrow::Cow::Borrowed(raw),
+        Some((&PAYLOAD_STORED, raw)) => std::borrow::Cow::Borrowed(raw),
         Some((&PAYLOAD_LZ, packed)) => std::borrow::Cow::Owned(lz::decompress(packed)),
         _ => panic!("internally encoded payload"),
     }
+}
+
+/// The text of a payload's rows starts after its row metadata.
+fn read_meta_len(reader: &mut Reader<'_>) -> usize {
+    let len = reader.varint();
+    reader.position + len
 }
 
 fn read_styles(reader: &mut Reader<'_>) -> Vec<Cell> {
@@ -2769,14 +2851,15 @@ fn index_cells(bytes: &[u8]) -> EvictIndex<Cell> {
         position: 0,
     };
     let styles = read_styles(&mut reader);
+    let mut text = read_meta_len(&mut reader);
+    let meta_end = text;
     let mut rows = Vec::new();
-    while reader.position < raw.len() {
-        rows.push(reader.position);
+    while reader.position < meta_end {
+        rows.push((reader.position, text));
         let _occ = reader.varint();
         let _len = reader.varint();
         let _stored = reader.varint();
-        let text_len = reader.varint();
-        reader.position += text_len;
+        text += reader.varint();
         for _ in 0..2 * reader.varint() {
             reader.varint();
         }
@@ -2793,9 +2876,10 @@ fn reset_cell_row(
     template: &Cell,
     columns: usize,
 ) -> Option<Row<Cell>> {
+    let (meta, text_at) = index.rows[row];
     let mut reader = Reader {
         bytes: &index.raw,
-        position: index.rows[row],
+        position: meta,
     };
     let occ = reader.varint();
     let len = reader.varint();
@@ -2804,7 +2888,7 @@ fn reset_cell_row(
         return None;
     }
     let text_len = reader.varint();
-    let text = reader.slice(text_len);
+    let text = &index.raw[text_at..text_at + text_len];
     let run_count = reader.varint();
     let runs_start = reader.position;
     let mut last_style = None;
@@ -2857,14 +2941,17 @@ fn decode_cells(bytes: &[u8]) -> Vec<Row<Cell>> {
         position: 0,
     };
     let styles = read_styles(&mut reader);
+    let mut text_at = read_meta_len(&mut reader);
+    let meta_end = text_at;
     let mut rows = Vec::new();
-    while reader.position < raw.len() {
+    while reader.position < meta_end {
         let occ = reader.varint();
         let len = reader.varint();
         let stored = reader.varint();
         assert!(occ <= len && stored <= len);
         let text_len = reader.varint();
-        let text = reader.slice(text_len);
+        let text = &raw[text_at..text_at + text_len];
+        text_at += text_len;
         let mut cells = Vec::with_capacity(len);
         if text.len() == stored {
             // ASCII: one byte per cell.
@@ -2961,17 +3048,47 @@ mod tests {
             seed ^= seed << 17;
             seed
         };
-        let rows: Vec<Row<Cell>> = (0..64)
-            .map(|_| {
+        let rows: Vec<Row<Cell>> = match std::env::var_os("DIRI_ENCODE_TEXT") {
+            // Lines of a captured file, wrapped at 120 columns.
+            Some(path) => {
+                let text = std::fs::read(path).expect("text");
+                let mut rows = Vec::new();
                 let mut row = Row::<Cell>::new(120);
-                let len = (next() % 100) as usize;
-                for column in 0..len {
-                    row[Column(column)].c = char::from(b'!' + (next() % 90) as u8);
+                let mut column = 0;
+                for &byte in &text {
+                    if byte == b'\n' || column == 120 {
+                        rows.push(std::mem::replace(&mut row, Row::new(120)));
+                        column = 0;
+                        if byte == b'\n' {
+                            continue;
+                        }
+                    }
+                    if byte == b'\t' {
+                        column = (column / 8 + 1) * 8;
+                        column = column.min(119);
+                        continue;
+                    }
+                    row[Column(column)].c = char::from(byte);
+                    column += 1;
+                    if rows.len() == 64 {
+                        break;
+                    }
                 }
-                row.occ = len;
-                row
-            })
-            .collect();
+                rows.truncate(64);
+                rows
+            },
+            None => (0..64)
+                .map(|_| {
+                    let mut row = Row::<Cell>::new(120);
+                    let len = (next() % 100) as usize;
+                    for column in 0..len {
+                        row[Column(column)].c = char::from(b'!' + (next() % 90) as u8);
+                    }
+                    row.set_occ(len);
+                    row
+                })
+                .collect(),
+        };
         let mut best = f64::MAX;
         for _ in 0..30 {
             let started = std::time::Instant::now();
@@ -2992,6 +3109,18 @@ mod tests {
             best = best.min(started.elapsed().as_nanos() as f64 / 64_000.0);
         }
         println!("stored_cells: {best:.1} ns/row");
+        let bytes = encode_cells(&rows).bytes;
+        println!("payload: {} bytes for 64 rows", bytes.len());
+        let raw = payload_rows(&bytes).into_owned();
+        let mut best = f64::MAX;
+        for _ in 0..30 {
+            let started = std::time::Instant::now();
+            for _ in 0..1000 {
+                std::hint::black_box(pack_payload(std::hint::black_box(&raw)));
+            }
+            best = best.min(started.elapsed().as_nanos() as f64 / 64_000.0);
+        }
+        println!("pack: {best:.1} ns/row of {} raw bytes", raw.len());
     }
 
     fn parser_rows() -> Vec<Row<Cell>> {
@@ -3025,7 +3154,7 @@ mod tests {
             // Row equality intentionally omits occupancy; compare it explicitly
             // because reset/reflow behavior depends on that private metadata.
             assert_eq!(actual.row(index), row, "row {index}");
-            assert_eq!(actual.row(index).occ, row.occ, "occupancy {index}");
+            assert_eq!(actual.row(index).occ(), row.occ(), "occupancy {index}");
         }
     }
 
@@ -3058,7 +3187,7 @@ mod tests {
         assert_eq!(decoded.len(), rows.len());
         for (index, (actual, expected)) in decoded.iter().zip(rows).enumerate() {
             assert_eq!(actual, expected, "row {index}");
-            assert_eq!(actual.occ, expected.occ, "occupancy {index}");
+            assert_eq!(actual.occ(), expected.occ(), "occupancy {index}");
             assert_eq!(actual.len(), expected.len(), "width {index}");
         }
     }
@@ -3124,11 +3253,11 @@ mod tests {
                     }
                 }
                 // Occupancy is independent metadata, including beyond content.
-                row.occ = if row_index % 4 == 0 {
+                row.set_occ(if row_index % 4 == 0 {
                     width
                 } else {
                     next() as usize % (width + 1)
-                };
+                });
                 // Lowering the occupancy leaves cells past it.
                 row.blank_tail = false;
                 rows.push(row);
@@ -3190,7 +3319,7 @@ mod tests {
                     }
                 }
                 // Includes occupancy below, at and above the stored content.
-                row.occ = next() as usize % (width + 1);
+                row.set_occ(next() as usize % (width + 1));
                 row.blank_tail = false;
                 rows.push(row);
             }
@@ -3204,7 +3333,7 @@ mod tests {
                 // A spare row, as `seal_recent` prepares it for recycling.
                 let mut spare = row.clone();
                 if !blank_on_reset {
-                    spare.occ = spare.len();
+                    spare.set_occ(spare.len());
                 }
                 for background in backgrounds {
                     let template = Cell {
@@ -3216,13 +3345,13 @@ mod tests {
                     let actual =
                         reset_cell_row(&index, position, &template, width).expect("matching width");
                     assert_eq!(actual, expected, "row {position} template {background:?}");
-                    assert_eq!(actual.occ, expected.occ);
+                    assert_eq!(actual.occ(), expected.occ());
                     assert_eq!(actual.len(), expected.len());
                     // Rows marked blank recycle as template cells without
                     // the payload, and every spare row resets to them.
                     let blank = Row::from_vec(vec![Cell::default(); width], 0);
                     let mut blank = blank;
-                    blank.occ = width;
+                    blank.set_occ(width);
                     blank.reset(&template);
                     if blank_on_reset {
                         assert_eq!(expected, blank, "blank row {position} {background:?}");
@@ -3230,7 +3359,7 @@ mod tests {
                     let mut recycled = spare.clone();
                     recycled.reset(&template);
                     assert_eq!(recycled, blank, "spare row {position} {background:?}");
-                    assert_eq!(recycled.occ, 0);
+                    assert_eq!(recycled.occ(), 0);
                 }
             }
             assert!(
@@ -3259,6 +3388,9 @@ mod tests {
         let mut codec = cell_codec();
         codec.decode = decode;
         codec.index = index;
+        // Inline sealing: rows sealed on the helper thread come back when it
+        // finishes, so how many are reused depends on its timing.
+        codec.seal = None;
         let rows = (0..24 + 512).map(|_| Row::new(80)).collect();
         let mut storage = CompactRows::new(rows, 24, 80, codec);
         let template = Cell::default();
@@ -3276,13 +3408,18 @@ mod tests {
             }
             // Pointers of the rows the next seal will take.
             if storage.recent.len() + 1 == storage.visible + storage.block_rows {
-                sealed = storage
-                    .recent
-                    .iter()
-                    .rev()
-                    .take(storage.block_rows)
-                    .map(|row| row[..].as_ptr())
-                    .collect();
+                sealed.extend(
+                    storage
+                        .recent
+                        .iter()
+                        .rev()
+                        .take(storage.block_rows)
+                        .map(|row| row[..].as_ptr()),
+                );
+                let keep = storage.block_rows;
+                if sealed.len() > keep {
+                    sealed.drain(..sealed.len() - keep);
+                }
             }
         }
         assert_eq!(
@@ -3382,8 +3519,8 @@ mod tests {
                 for line in -(e.history_size() as i32)..e.screen_lines() as i32 {
                     assert_eq!(a[Line(line)], e[Line(line)], "line {line} at {step}");
                     assert_eq!(
-                        a[Line(line)].occ,
-                        e[Line(line)].occ,
+                        a[Line(line)].occ(),
+                        e[Line(line)].occ(),
                         "occupancy {line} at {step}"
                     );
                 }

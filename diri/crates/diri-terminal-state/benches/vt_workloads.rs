@@ -3,8 +3,12 @@
 //! ASCII, Unicode, unique multi-codepoint cells, CSI with few characters,
 //! Kitty images and long OSCs, parsed into a 120x80 terminal configured as
 //! the local Engine configures it (notifications, inline images, host
-//! replies, kitty keyboard). Every byte is parsed: the probe checks that the
-//! screen ends where a one-shot parse of the same bytes ends.
+//! replies, kitty keyboard). Every byte is parsed, and the bench proves it:
+//! each timed run counts the bytes it fed, and its final state (grid,
+//! cursor, every retained history row with its cells and metadata, links,
+//! title, modes, stored images, replies and notifications) must equal a
+//! parse of the same bytes fed one at a time, or the bench panics without a
+//! number. Nothing a run starts is left working when its clock stops.
 //!
 //! The data is the kitten's own when `DIRI_VT_BENCH_DIR` names a directory
 //! holding `ascii.bin`, `unicode.bin`, `unique_unicode.bin`, `csi.bin`,
@@ -165,18 +169,146 @@ fn screen() -> HeadlessScreen {
         .with_host_replies("bench")
 }
 
+/// What a run leaves behind: the screen and everything it handed out.
+struct Fed {
+    screen: HeadlessScreen,
+    /// Bytes handed to the parser.
+    bytes: usize,
+    replies: Vec<u8>,
+    notifications: Vec<String>,
+    clipboard: Vec<String>,
+}
+
+impl Fed {
+    fn new() -> Self {
+        Self {
+            screen: screen(),
+            bytes: 0,
+            replies: Vec::new(),
+            notifications: Vec::new(),
+            clipboard: Vec::new(),
+        }
+    }
+
+    /// One read, handled the way the Engine pump handles it.
+    #[inline]
+    fn feed(&mut self, chunk: &[u8]) {
+        self.bytes += chunk.len();
+        self.screen.feed(black_box(chunk));
+        self.replies.extend(self.screen.take_replies());
+        for notification in self.screen.take_notifications() {
+            self.notifications.push(format!("{notification:?}"));
+        }
+        self.clipboard.extend(self.screen.take_clipboard());
+    }
+
+    /// Every observable piece of state, for comparing two runs: the grid,
+    /// cursor, all retained history with its cells and metadata, links,
+    /// title, modes, progress, stored images, replies and notifications.
+    fn state(mut self) -> String {
+        let screen = &mut self.screen;
+        let scrollback = screen.scrollback();
+        let cells = screen.scrollback_cells(0, i64::MAX);
+        let links = screen.link_source(usize::MAX);
+        format!(
+            "{:?}\n{:?}\n{}\n{:?}\n{:?}\n{}\n{:?}\n{:?}\n{:?} {} {} {:?} {:?}\n{:?}\n{:?}\n{:?}\n{}\n{:?}\n{:?}\n{:?}\n{:?}",
+            scrollback.lines,
+            scrollback.text_cells,
+            scrollback.visible_start_row,
+            cells.payload,
+            without_store_nonce(format!("{:?}", cells.metadata)),
+            without_store_nonce(format!("{:?}", screen.full_snapshot())),
+            links.text,
+            links
+                .hyperlinks
+                .into_iter()
+                .map(|(at, uri)| (at, without_store_nonce(uri)))
+                .collect::<Vec<_>>(),
+            screen.title(),
+            screen.is_alt_screen(),
+            screen.bracketed_paste(),
+            screen.mouse_modes(),
+            screen.cursor_style(),
+            screen.cursor(),
+            screen.keyboard_state(),
+            screen.progress(),
+            screen.inline_image_bytes(),
+            format!("{:?}", screen.program_status()),
+            self.replies,
+            self.notifications,
+            self.clipboard,
+        )
+    }
+}
+
+/// Image anchors name a per-screen store; only the rest must match.
+fn without_store_nonce(text: String) -> String {
+    const ANCHOR: &str = "diri-image:";
+    let mut out = String::with_capacity(text.len());
+    let mut rest = text.as_str();
+    while let Some(at) = rest.find(ANCHOR) {
+        out.push_str(&rest[..at + ANCHOR.len()]);
+        rest = &rest[at + ANCHOR.len()..];
+        let nonce = rest.find('.').unwrap_or(0);
+        out.push('#');
+        rest = &rest[nonce..];
+    }
+    out.push_str(rest);
+    out
+}
+
 /// One run: feed `reps` copies of `data` in `read`-sized pieces, handling
-/// replies and notifications the way the Engine pump does.
-fn run(data: &[u8], reps: usize, read: usize) -> (Duration, HeadlessScreen) {
-    let mut screen = screen();
+/// replies and notifications the way the Engine pump does. The clock stops
+/// after the last read returns; nothing the run started is still working
+/// then (history blocks being encoded are collected by each read).
+fn run(data: &[u8], reps: usize, read: usize) -> (Duration, Fed) {
+    let mut fed = Fed::new();
     let started = Instant::now();
     for _ in 0..reps {
         for chunk in data.chunks(read) {
-            screen.feed(black_box(chunk));
-            black_box(screen.take_replies());
+            fed.feed(chunk);
         }
     }
-    (started.elapsed(), screen)
+    let elapsed = started.elapsed();
+    assert_eq!(fed.bytes, data.len() * reps, "every payload byte fed");
+    (elapsed, fed)
+}
+
+/// The reference: the same bytes parsed one at a time, which never takes
+/// the parser's multi-byte fast paths.
+fn reference(data: &[u8], reps: usize) -> String {
+    let mut fed = Fed::new();
+    for _ in 0..reps {
+        for byte in data.chunks(1) {
+            fed.feed(byte);
+        }
+    }
+    assert_eq!(fed.bytes, data.len() * reps);
+    fed.state()
+}
+
+/// Panics, naming the first difference, unless a run ended in the
+/// reference's state.
+fn check(name: &str, expected: &str, fed: Fed) {
+    let actual = fed.state();
+    if actual == expected {
+        return;
+    }
+    let at = expected
+        .bytes()
+        .zip(actual.bytes())
+        .position(|(a, b)| a != b)
+        .unwrap_or(expected.len().min(actual.len()));
+    let window = |s: &str| {
+        let start = s.floor_char_boundary(at.saturating_sub(80));
+        let end = s.ceil_char_boundary((at + 80).min(s.len()));
+        s[start..end].to_owned()
+    };
+    panic!(
+        "{name}: final state differs from a byte-at-a-time parse at {at}\n  reference: {}\n  run:       {}",
+        window(expected),
+        window(&actual)
+    );
 }
 
 fn main() {
@@ -215,19 +347,13 @@ fn main() {
             None => (generate(name), "generated"),
         };
         let reps = MIN_BYTES_PER_RUN.div_ceil(data.len());
-        // Every byte parsed: reads of any size end on the same screen.
-        let (_, chunked) = run(&data, 1, read);
-        let mut whole = screen();
-        whole.feed(&data);
-        assert_eq!(
-            chunked.lines(),
-            whole.lines(),
-            "{name}: chunking changed the screen"
-        );
+        // Every run must end where parsing the same bytes one at a time ends.
+        let expected = reference(&data, reps);
         let _ = run(&data, 1, read); // warm-up
         let mut rates: Vec<f64> = (0..RUNS)
             .map(|_| {
-                let (elapsed, _) = run(&data, reps, read);
+                let (elapsed, fed) = run(&data, reps, read);
+                check(name, &expected, fed);
                 (data.len() * reps) as f64 / elapsed.as_secs_f64() / 1e6
             })
             .collect();
