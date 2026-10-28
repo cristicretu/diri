@@ -181,6 +181,17 @@ impl HeadlessScreen {
             .map_or(0, |images| images.stored_bytes())
     }
 
+    /// Every image stored since the last call, oldest first, with its Kitty
+    /// id. Benchmark verification only (feature `bench-verify`): a stored
+    /// image can be deleted before the run ends, so the final store alone
+    /// cannot show that its pixels were decoded right.
+    #[cfg(feature = "bench-verify")]
+    pub fn take_stored_image_log(&mut self) -> Vec<(Option<u32>, StoredImage)> {
+        self.images
+            .as_mut()
+            .map_or_else(Vec::new, |images| std::mem::take(&mut images.store.log))
+    }
+
     /// The device-pixel size of one cell as the client draws it. Images given
     /// no size in cells are sized from it, and pixel-size queries report it.
     pub fn set_cell_pixels(&mut self, width: u16, height: u16) {
@@ -240,9 +251,29 @@ impl HeadlessScreen {
                     }
                     Collected::Aborted(consumed) => {
                         // An ESC that does not end the string starts a new
-                        // sequence: hand it back to the parser.
+                        // sequence, and a CAN or SUB cancels it: either way
+                        // the byte goes back to the parser.
                         images.collecting = None;
                         position += consumed;
+                    }
+                    Collected::CompleteBefore(consumed) => {
+                        // A CAN or SUB ends an OSC as the parser ends one:
+                        // dispatch it, then the parser executes the byte.
+                        position += consumed;
+                        let collecting = images.collecting.take().expect("collecting");
+                        self.dispatch(collecting, position <= historical);
+                    }
+                    Collected::AbortedHeldEsc => {
+                        // The ESC held back at the end of the previous read
+                        // starts a new sequence. It goes back in front of
+                        // this read exactly as if the read had not split
+                        // there, so it may open another image sequence.
+                        images.collecting = None;
+                        images.held.push(0x1b);
+                        let rest = &input[position..];
+                        let historical = historical.saturating_sub(position);
+                        self.advance_with_images(rest, historical, false);
+                        return;
                     }
                     Collected::Partial => position = input.len(),
                 }
@@ -838,6 +869,9 @@ struct ImageStore {
     /// Kitty image number (`I`) → the id assigned to it.
     kitty_numbers: HashMap<u32, u32>,
     next_kitty_id: u32,
+    /// Every image stored, in order (benchmark verification only).
+    #[cfg(feature = "bench-verify")]
+    log: Vec<(Option<u32>, StoredImage)>,
 }
 
 impl ImageStore {
@@ -862,6 +896,8 @@ impl ImageStore {
             // Ids the terminal assigns for image numbers stay clear of the
             // small ids programs pick themselves.
             next_kitty_id: 0x7f00_0000,
+            #[cfg(feature = "bench-verify")]
+            log: Vec::new(),
         }
     }
 
@@ -908,6 +944,8 @@ impl ImageStore {
             };
             self.remove(oldest);
         }
+        #[cfg(feature = "bench-verify")]
+        self.log.push((kitty_id, image.clone()));
         let internal = self.next_id;
         self.next_id = self.next_id.wrapping_add(1).max(1);
         self.bytes += size;
@@ -1195,29 +1233,50 @@ fn next_sequence(input: &[u8]) -> Next {
 enum Collected {
     /// The terminator ended at this many bytes in.
     Complete(usize),
-    /// A stray ESC begins at this many bytes in; it is not consumed.
+    /// An OSC ended by the CAN or SUB at this many bytes in; the byte is not
+    /// consumed.
+    CompleteBefore(usize),
+    /// A stray ESC, or a CAN or SUB cancelling an APC, begins at this many
+    /// bytes in; it is not consumed.
     Aborted(usize),
+    /// The ESC held back from the previous read does not end the string; it
+    /// begins a new sequence before this input.
+    AbortedHeldEsc,
     Partial,
 }
 
-/// Appends body bytes up to a terminator (BEL or ST).
+/// The first byte that can end a string: BEL, ESC, CAN or SUB.
+fn string_end(input: &[u8]) -> Option<usize> {
+    let first = memchr::memchr3(0x07, 0x1b, 0x18, input);
+    let before = first.unwrap_or(input.len());
+    memchr::memchr(0x1a, &input[..before]).or(first)
+}
+
+/// Appends body bytes up to a terminator (BEL or ST). CAN and SUB end the
+/// string the way the parser ends one in a string state: an APC is
+/// cancelled, an OSC is dispatched, and the byte itself is executed.
 fn collect(collecting: &mut Collecting, input: &[u8]) -> Collected {
     if collecting.pending_esc {
         collecting.pending_esc = false;
         if input.first() == Some(&b'\\') {
             return Collected::Complete(1);
         }
-        // The ESC we held back starts something else; it is lost to the
-        // parser, but so it is in a real terminal's string state.
-        return Collected::Aborted(0);
+        return Collected::AbortedHeldEsc;
     }
-    let Some(at) = memchr::memchr2(0x07, 0x1b, input) else {
+    let Some(at) = string_end(input) else {
         push_body(collecting, input);
         return Collected::Partial;
     };
     push_body(collecting, &input[..at]);
-    if input[at] == 0x07 {
-        return Collected::Complete(at + 1);
+    match input[at] {
+        0x07 => return Collected::Complete(at + 1),
+        0x18 | 0x1a => {
+            return match collecting.kind {
+                SequenceKind::Kitty => Collected::Aborted(at),
+                SequenceKind::Iterm => Collected::CompleteBefore(at),
+            };
+        }
+        _ => {}
     }
     match input.get(at + 1) {
         Some(b'\\') => Collected::Complete(at + 2),
