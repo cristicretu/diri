@@ -46,7 +46,9 @@ pub struct RowMeta {
 #[derive(Default)]
 pub struct StyleTable {
     table: Vec<Style>,
-    /// Boxed: packed pages drop it, and a page's size counts in the budget.
+    /// Boxed: packed pages drop it, and a page's size counts in the budget
+    /// (a bare `HashMap` adds 40 bytes to every packed page).
+    #[allow(clippy::box_collection)]
     index: Option<Box<HashMap<Style, u16>>>,
 }
 
