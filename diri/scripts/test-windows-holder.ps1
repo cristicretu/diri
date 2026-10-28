@@ -20,7 +20,15 @@ try {
   # Windows PowerShell's first launch on a fresh runner is cold. Pay for it
   # once here, and log what it cost, rather than inside a test's deadline.
   `$warm = [Diagnostics.Stopwatch]::StartNew()
-  & powershell.exe -NoLogo -NoProfile -NonInteractive -Command 'exit 0' | Out-Null
+  # WMI hands this wrapper no PATHEXT, so start it by full path through .NET.
+  `$warmup = [Diagnostics.Process]::new()
+  `$warmup.StartInfo.FileName = Join-Path `$env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe'
+  `$warmup.StartInfo.Arguments = '-NoLogo -NoProfile -NonInteractive -Command exit'
+  `$warmup.StartInfo.UseShellExecute = `$false
+  `$warmup.StartInfo.CreateNoWindow = `$true
+  `$null = `$warmup.Start()
+  if (!`$warmup.WaitForExit(120000)) { `$warmup.Kill(`$true) }
+  `$warmup.Dispose()
   "Windows PowerShell warm-up: `$([int]`$warm.Elapsed.TotalMilliseconds) ms" | Out-File -Append -FilePath $(Quote $log)
   # Start-Process -Wait creates its own restrictive tracking Job. Use the
   # plain .NET process API so this wrapper does not recreate the CI constraint.
