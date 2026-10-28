@@ -56,6 +56,8 @@ mod fanout;
 #[cfg(unix)]
 mod log_feed;
 #[cfg(unix)]
+mod pty_read;
+#[cfg(unix)]
 pub(crate) mod reactor;
 
 pub use client::{HolderClient, HolderManagerClient, HolderOutputStream};
