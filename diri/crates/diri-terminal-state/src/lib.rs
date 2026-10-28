@@ -680,6 +680,19 @@ impl HeadlessScreen {
         self.term.release_primary_history_spare_rows();
     }
 
+    /// Answer `OSC 7501` support queries among this terminal's replies, in
+    /// stream order with the emulator's own, and interpret no other product
+    /// OSC. For a remote Holder (`query-replies-v1`), which answers its
+    /// program's queries itself and does not interpret product alerts. A
+    /// screen [`Self::with_notifications`] already answers them.
+    #[must_use]
+    pub fn answering_program_status_queries(mut self) -> Self {
+        if self.notifications.is_none() {
+            self.notifications = Some(notifications::NotificationParser::queries_only());
+        }
+        self
+    }
+
     /// Opt in only where this screen is the terminal the program talks to
     /// and its replies reach the program: a local Engine session. The screen
     /// then reports `terminal_version` to XTVERSION, answers color queries
@@ -743,8 +756,8 @@ impl HeadlessScreen {
             self.geometry.rows,
             self.keyboard_enhancements_enabled(),
         );
-        if self.notifications.is_some() {
-            reset = reset.with_notifications();
+        if let Some(parser) = &self.notifications {
+            reset.notifications = Some(parser.reset_copy());
         }
         if let Some(images) = &self.images {
             let cell_pixels = images.cell_pixels;
@@ -4125,6 +4138,44 @@ mod tests {
         assert_eq!(screen.term.grid().history_size(), HISTORY_ROW_CEILING);
     }
 
+    /// Narrowing a full history defers its re-wrap; new lines then evict
+    /// deferred rows. A line must cost what it did before the resize, not
+    /// a walk of every deferred line (4–7 ms per line at 150,000 rows in the
+    /// debug builds tests and development apps run).
+    #[cfg(feature = "compact-history")]
+    #[test]
+    fn lines_after_narrowing_a_full_history_cost_what_they_did_before() {
+        fn per_line(screen: &mut HeadlessScreen, next: &mut usize) -> std::time::Duration {
+            let mut batches: Vec<_> = (0..5)
+                .map(|_| {
+                    let lines = numbered_lines(*next, 200, 70);
+                    *next += 200;
+                    let start = std::time::Instant::now();
+                    for line in lines.split_inclusive(|&byte| byte == b'\n') {
+                        screen.feed(line);
+                    }
+                    start.elapsed() / 200
+                })
+                .collect();
+            batches.sort();
+            batches[2]
+        }
+        let mut screen = HeadlessScreen::new(80, 24);
+        let mut next = HISTORY_ROW_CEILING + 24;
+        screen.feed(&numbered_lines(0, next, 70));
+        assert_eq!(screen.term.grid().history_size(), HISTORY_ROW_CEILING);
+        let before = per_line(&mut screen, &mut next);
+        screen.resize(40, 24);
+        let narrowed = screen.term.grid().history_size();
+        assert!(narrowed > HISTORY_ROW_CEILING, "{narrowed} rows");
+        let after = per_line(&mut screen, &mut next);
+        assert_eq!(screen.term.grid().history_size(), narrowed);
+        assert!(
+            after <= before * 2 + std::time::Duration::from_micros(20),
+            "{after:?} per line after narrowing, {before:?} before"
+        );
+    }
+
     /// A re-wrapped history can hold more rows than restore admits, so a
     /// checkpoint carries the newest of them and still restores.
     #[cfg(feature = "compact-history")]
@@ -4382,6 +4433,57 @@ mod tests {
     #[cfg(feature = "compact-history")]
     fn line_number(text: &str) -> Option<usize> {
         text.rsplit_once("line ")?.1.get(..7)?.parse().ok()
+    }
+
+    /// Narrowing a deep history of wide-character lines re-wraps it rather
+    /// than evicting it. Its deferred line index used to count at capacity,
+    /// which evicting never gave back, so 150,000 rows became 73,777 here
+    /// (about 150 at 100,001 rows of 40-column CJK prose).
+    #[cfg(feature = "compact-history")]
+    #[test]
+    fn narrowing_deep_wide_character_history_keeps_it() {
+        const WIDE: &[char] = &['漢', '字', '行', '日', '本', '語', '中', '文', '書', '道'];
+        let line = |n: usize| {
+            // 36 wide characters after the number: two rows at 80 columns.
+            let text: String = (0..36)
+                .map(|i| WIDE[(n / 10 + i * 7 + n) % WIDE.len()])
+                .collect();
+            format!("line {n:07}{text}\r\n")
+        };
+        let mut screen = HeadlessScreen::new(80, 24);
+        let lines = 100_024;
+        let log: String = (0..lines).map(line).collect();
+        for chunk in log.as_bytes().chunks(64 * 1024) {
+            screen.feed(chunk);
+        }
+        let before = screen.history_rows();
+        assert!(before > 50_000, "{before} rows before narrowing");
+        screen.resize(40, 24);
+        let after = screen.history_rows();
+        assert!(
+            after >= before,
+            "{before} rows became {after} after narrowing"
+        );
+        assert!(screen.history_storage_bytes() <= HISTORY_STORAGE_BUDGET_BYTES);
+        // More output keeps it: lines evict in proportion.
+        let more: String = (lines..lines + 2_000).map(line).collect();
+        screen.feed(more.as_bytes());
+        assert!(
+            screen.history_rows() + 4_000 >= after,
+            "{} rows",
+            screen.history_rows()
+        );
+        // The newest history line is one of those just above the screen.
+        let rows = screen.history_rows() as i64;
+        let newest = history_text(&mut screen, rows - 4, 4)
+            .iter()
+            .filter_map(|text| text.strip_prefix("line ")?.get(..7)?.parse::<usize>().ok())
+            .max();
+        let newest = newest.expect("numbered history rows");
+        assert!(
+            (lines + 2_000 - 24..lines + 2_000).contains(&newest),
+            "newest history line {newest}"
+        );
     }
 
     #[cfg(feature = "compact-history")]

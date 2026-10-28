@@ -32,3 +32,9 @@ blank and random-truecolor output at 80 and 200 columns, one child process per
 scenario, and reports retained rows, stored bytes per row, RSS growth and the
 cost of each history walker. `DIRI_HISTORY_LINES` sets the history depth of
 `terminal_interactions` (default 10,000).
+
+`narrow_history` fills 10,000/50,000/150,000 rows at 80 columns, then reports
+the cost of one line fed on its own before and after narrowing to 40 columns,
+the narrow itself, stored bytes and RSS. Add `--profile dev` for debug builds;
+`NARROW_GATE=2` fails when a line after the narrow costs more than twice one
+before it.
