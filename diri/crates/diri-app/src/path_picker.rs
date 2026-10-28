@@ -83,6 +83,10 @@ pub struct PathIndex {
     /// `node_modules`: the empty-query listing is a directory listing.
     listing: Vec<PathEntry>,
     pub truncated: bool,
+    /// A remote session's index is built one directory level at a time from
+    /// its Helper (`session.list_dir`): the directories already listed, the
+    /// root being `""`. `None` for a local index, which is scanned whole.
+    remote_listed: Option<BTreeSet<String>>,
 }
 
 impl PathIndex {
@@ -102,9 +106,62 @@ impl PathIndex {
             entries,
             listing,
             truncated: false,
+            remote_listed: None,
         };
         index.sort_listing();
         index
+    }
+
+    /// A remote session's root level, as its Helper listed it relative to the
+    /// remote child's live working directory.
+    pub fn from_remote(listing: &diri_proto::remote_pty::ListDirResult) -> Self {
+        let entries: Vec<PathEntry> = remote_entries("", &listing.entries).collect();
+        let mut index = Self {
+            root: PathBuf::from(&listing.cwd),
+            listing: entries.clone(),
+            entries,
+            truncated: listing.truncated,
+            remote_listed: Some(BTreeSet::from([String::new()])),
+        };
+        index.sort_listing();
+        index
+    }
+
+    /// Add one more remote level under `directory` (relative to the root).
+    /// Listing a level twice, or past the index cap, adds nothing.
+    pub fn merge_remote(
+        &mut self,
+        directory: &str,
+        listing: &diri_proto::remote_pty::ListDirResult,
+    ) {
+        let Some(listed) = self.remote_listed.as_mut() else {
+            return;
+        };
+        if !listed.insert(directory.to_owned()) {
+            return;
+        }
+        let room = INDEX_CAP.saturating_sub(self.entries.len());
+        let before = self.entries.len();
+        self.entries
+            .extend(remote_entries(directory, &listing.entries).take(room));
+        self.truncated |=
+            listing.truncated || self.entries.len() - before < listing.entries.len();
+    }
+
+    /// The directory a remote query is typing into (`src/ma` → `src`) when
+    /// that directory is known and not listed yet, so the picker can fetch
+    /// it. Local indexes are complete and never ask.
+    pub fn unlisted_directory(&self, query: &str) -> Option<String> {
+        let listed = self.remote_listed.as_ref()?;
+        let (directory, _) = query.rsplit_once('/')?;
+        let directory = directory.trim_end_matches('/');
+        if directory.is_empty() || listed.contains(directory) {
+            return None;
+        }
+        self.entries
+            .iter()
+            .any(|entry| entry.is_dir && entry.relative == directory)
+            .then(|| directory.to_owned())
     }
 
     fn sort_listing(&mut self) {
@@ -135,6 +192,27 @@ pub fn scan(root: &Path) -> PathIndex {
     index.truncated = truncated;
     index.sort_listing();
     index
+}
+
+fn remote_entries<'a>(
+    directory: &'a str,
+    entries: &'a [diri_proto::remote_pty::ListDirEntry],
+) -> impl Iterator<Item = PathEntry> + 'a {
+    entries
+        .iter()
+        // A name the shell would split on `/` cannot be one entry.
+        .filter(|entry| !entry.name.is_empty() && !entry.name.contains('/'))
+        .map(move |entry| {
+            let relative = if directory.is_empty() {
+                entry.name.clone()
+            } else {
+                format!("{directory}/{}", entry.name)
+            };
+            PathEntry::new(
+                relative,
+                entry.kind == diri_proto::remote_pty::ListDirEntryKind::Directory,
+            )
+        })
 }
 
 fn list_children(root: &Path) -> Vec<PathEntry> {
@@ -363,6 +441,16 @@ pub fn elide_middle(
     (out, ranges)
 }
 
+fn empty_listing() -> diri_proto::remote_pty::ListDirResult {
+    diri_proto::remote_pty::ListDirResult {
+        cwd: String::new(),
+        path: String::new(),
+        entries: Vec::new(),
+        truncated: false,
+        failure: None,
+    }
+}
+
 /// The picker's lifecycle. The index is scanned off the UI thread after the
 /// session's live working directory is known, so an open picker starts in
 /// `Loading` and renders its query field immediately.
@@ -383,6 +471,8 @@ pub struct PathPicker {
     pub index: PickerIndex,
     pub rows: Vec<PickerRow>,
     pub selected: usize,
+    /// The remote level being fetched, so one keystroke asks only once.
+    pending_directory: Option<String>,
 }
 
 impl PathPicker {
@@ -393,7 +483,44 @@ impl PathPicker {
             index: PickerIndex::Loading,
             rows: Vec::new(),
             selected: 0,
+            pending_directory: None,
         }
+    }
+
+    /// The remote directory the current query needs and nobody has asked
+    /// for yet. Marks it pending; the caller lists it and hands the answer
+    /// to [`Self::adopt_directory`].
+    pub fn take_wanted_directory(&mut self) -> Option<String> {
+        let PickerIndex::Ready(index) = &self.index else {
+            return None;
+        };
+        let wanted = index.unlisted_directory(self.query.text())?;
+        if self.pending_directory.as_deref() == Some(wanted.as_str()) {
+            return None;
+        }
+        self.pending_directory = Some(wanted.clone());
+        Some(wanted)
+    }
+
+    /// Merge one fetched remote level and re-rank, keeping the query. A
+    /// refused level is simply not merged; the query still ranks what is known.
+    pub fn adopt_directory(
+        &mut self,
+        directory: &str,
+        listing: Option<&diri_proto::remote_pty::ListDirResult>,
+    ) {
+        if self.pending_directory.as_deref() == Some(directory) {
+            self.pending_directory = None;
+        }
+        let PickerIndex::Ready(index) = &mut self.index else {
+            return;
+        };
+        match listing {
+            Some(listing) if listing.failure.is_none() => index.merge_remote(directory, listing),
+            // Remember the refusal so the same keystrokes do not ask again.
+            _ => index.merge_remote(directory, &empty_listing()),
+        }
+        self.refresh();
     }
 
     pub fn adopt_index(&mut self, index: PathIndex) {
@@ -648,5 +775,76 @@ mod tests {
         assert!(!paths.iter().any(|path| path.starts_with("node_modules/")));
         assert!(paths.contains(&"loop"));
         assert!(!paths.iter().any(|path| path.starts_with("loop/")));
+    }
+
+    fn remote_level(names: &[(&str, bool)]) -> diri_proto::remote_pty::ListDirResult {
+        use diri_proto::remote_pty::{ListDirEntry, ListDirEntryKind};
+        diri_proto::remote_pty::ListDirResult {
+            cwd: "/srv/app".into(),
+            path: "/srv/app".into(),
+            entries: names
+                .iter()
+                .map(|(name, is_dir)| ListDirEntry {
+                    name: (*name).into(),
+                    kind: if *is_dir {
+                        ListDirEntryKind::Directory
+                    } else {
+                        ListDirEntryKind::File
+                    },
+                    symlink: false,
+                })
+                .collect(),
+            truncated: false,
+            failure: None,
+        }
+    }
+
+    #[test]
+    fn a_remote_index_lists_its_root_then_fetches_levels_as_the_query_enters_them() {
+        let mut picker = PathPicker::new(1);
+        picker.adopt_index(PathIndex::from_remote(&remote_level(&[
+            ("src", true),
+            (".git", true),
+            ("README.md", false),
+        ])));
+        assert_eq!(picker.root(), Some(Path::new("/srv/app")));
+        assert_eq!(relatives(&picker.rows), ["README.md", "src"]);
+        assert_eq!(picker.take_wanted_directory(), None, "the root is listed");
+
+        // Tab into `src`: the query names an unlisted level, asked for once.
+        picker.selected = 1;
+        assert!(picker.descend());
+        assert_eq!(picker.take_wanted_directory().as_deref(), Some("src"));
+        assert_eq!(picker.take_wanted_directory(), None, "already pending");
+        picker.adopt_directory("src", Some(&remote_level(&[("main.rs", false), ("ui", true)])));
+        assert_eq!(relatives(&picker.rows)[..2], ["src/ui", "src/main.rs"]);
+        assert_eq!(picker.take_wanted_directory(), None, "src is listed now");
+
+        picker.query.insert("ui/");
+        picker.refresh();
+        assert_eq!(picker.take_wanted_directory().as_deref(), Some("src/ui"));
+        // A refused level is remembered and never retried by the same query.
+        picker.adopt_directory("src/ui", None);
+        assert_eq!(picker.take_wanted_directory(), None);
+
+        // A name that is not a known directory is never asked for.
+        picker.query.clear();
+        picker.query.insert("README.md/x");
+        picker.refresh();
+        assert_eq!(picker.take_wanted_directory(), None);
+        assert_eq!(insertion_text(&PickerRow {
+            relative: "src/main.rs".into(),
+            is_dir: false,
+            highlights: Vec::new(),
+        }), "src/main.rs ");
+    }
+
+    #[test]
+    fn local_indexes_never_ask_for_remote_levels() {
+        let mut picker = PathPicker::new(1);
+        picker.adopt_index(index());
+        picker.query.insert("apps/");
+        picker.refresh();
+        assert_eq!(picker.take_wanted_directory(), None);
     }
 }

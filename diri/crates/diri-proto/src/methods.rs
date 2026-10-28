@@ -38,6 +38,11 @@ impl Method {
     pub const SESSION_REMOVE: &'static str = "session.remove";
     pub const SESSION_RENAME: &'static str = "session.rename";
     pub const SESSION_PROCESS_INFO: &'static str = "session.process_info";
+    /// One directory level resolved against a session child's live working
+    /// directory on its own host ([`SessionListDirParams`] →
+    /// [`SessionListDirResult`]). Remote sessions need a `list-dir-v1`
+    /// Helper; older Helpers and local sessions answer `list_dir_unsupported`.
+    pub const SESSION_LIST_DIR: &'static str = "session.list_dir";
     pub const SESSION_RECONNECT: &'static str = "session.reconnect";
     pub const SESSION_RESUME: &'static str = "session.resume";
     pub const SESSION_FORK: &'static str = "session.fork";
@@ -614,6 +619,46 @@ pub struct SessionIdParams {
 
 /// Swift spelling retained for protocol-oriented callers.
 pub use SessionIdParams as SessionIDParams;
+
+/// What to list for `session.list_dir`: like a shell argument, empty is the
+/// child's working directory, `~/…` the account home, relative paths are
+/// joined to the working directory.
+#[derive(Clone, Debug, Default, Deserialize, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ListDirQuery {
+    #[serde(default)]
+    pub path: String,
+    #[serde(default)]
+    pub include_files: bool,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub prefix: String,
+    #[serde(default = "default_list_dir_query_limit")]
+    pub limit: u32,
+}
+
+fn default_list_dir_query_limit() -> u32 {
+    crate::remote_pty::MAX_LIST_DIR_ENTRIES as u32
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SessionListDirParams {
+    #[serde(rename = "sessionID")]
+    pub session_id: SessionId,
+    #[serde(flatten)]
+    pub query: ListDirQuery,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SessionListDirResult {
+    #[serde(rename = "sessionID")]
+    pub session_id: SessionId,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub host: Option<String>,
+    #[serde(flatten)]
+    pub listing: crate::remote_pty::ListDirResult,
+}
 
 pub type SessionKillParams = SessionIdParams;
 pub type SessionRemoveParams = SessionIdParams;

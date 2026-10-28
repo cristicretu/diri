@@ -1834,3 +1834,251 @@ fn grid_update_text(update: &diri_proto::grid::GridUpdate) -> String {
         .collect::<Vec<_>>()
         .join("\n")
 }
+
+/// Insert Path on a remote session: `session.list_dir` reaches the session's
+/// own Helper build (`list-dir-v1`), which lists relative to the remote
+/// child's live cwd (the shell `cd`ed after launch). Filesystem refusals are
+/// answers, a Helper from before minor 21 is refused without opening an SSH
+/// channel, and neither path touches the attach or the Holder.
+#[test]
+fn insert_path_lists_a_remote_childs_live_cwd_and_old_helpers_stay_local_only() {
+    use diri_engine::control::ControlServer;
+    use diri_engine::registry::Registry;
+    use diri_proto::remote_pty::{LIST_DIR_PROTOCOL_MINOR, ListDirEntryKind, ListDirFailure};
+    use diri_proto::{ControlMessage, Method};
+    use serde_json::json;
+    use std::io::{BufRead, BufReader};
+    use std::os::unix::net::UnixStream;
+    use std::sync::Mutex;
+
+    let temporary = tempfile::tempdir().expect("temp");
+    let remote_home = temporary.path().join("remote-home");
+    let remote_state = temporary.path().join("remote-state");
+    let work = temporary.path().join("work");
+    fs::create_dir_all(work.join("src")).unwrap();
+    fs::create_dir_all(work.join("docs")).unwrap();
+    fs::create_dir_all(&remote_home).unwrap();
+    fs::write(work.join("README.md"), b"").unwrap();
+    fs::write(work.join("src").join("main.rs"), b"").unwrap();
+    fs::write(work.join("src").join("render.rs"), b"").unwrap();
+    std::os::unix::fs::symlink(&remote_home, work.join("home-link")).unwrap();
+    let locked = work.join("locked");
+    fs::create_dir(&locked).unwrap();
+    fs::set_permissions(&locked, fs::Permissions::from_mode(0o000)).unwrap();
+    let argv_log = temporary.path().join("ssh-argv");
+    let fake_ssh =
+        write_fake_ssh_with_argv_log(temporary.path(), &remote_home, &remote_state, &argv_log);
+    let manager = Arc::new(
+        RemoteManager::new(
+            ProcessExecutor::new(fake_ssh),
+            ArtifactCatalog::from_native_helper(Path::new(helper())).unwrap(),
+            temporary.path().join("ssh-control"),
+        )
+        .unwrap(),
+    );
+    let host = HostEntry {
+        transport: Default::default(),
+        id: "insert-path".into(),
+        name: None,
+        ssh: "fixture-host".into(),
+        default_cwd: Some("/".into()),
+        node: None,
+    };
+    let installed = manager.ensure_helper(&host).unwrap();
+    let registry = Arc::new(Mutex::new(Registry::new(
+        Arc::new(ManifestEngine::new(Vec::new())),
+        temporary.path().join("state.json"),
+    )));
+    // Launched in `/`; the shell moves into the work tree afterwards, so a
+    // listing of the launch cwd would be visibly wrong.
+    let script = format!(
+        "cd '{}' && printf 'ready>' && IFS= read -r line",
+        work.display()
+    );
+    let mut ids = Vec::new();
+    for (label, minor) in [
+        ("current", LIST_DIR_PROTOCOL_MINOR),
+        ("old", LIST_DIR_PROTOCOL_MINOR - 1),
+    ] {
+        let id = unique_stop_session_id(&format!("insert-path-{label}"));
+        let request = LaunchRequest {
+            session_id: id.clone(),
+            session_token: token_for_retry(),
+            argv: vec!["/bin/sh".into(), "-c".into(), script.clone()],
+            cwd: "/".into(),
+            environment: vec![EnvironmentVariable {
+                name: "PATH".into(),
+                value: "/usr/bin:/bin".into(),
+            }],
+            cols: 80,
+            rows: 24,
+            persistence: PersistenceCapability::NativeDetach,
+        };
+        let mut helper = installed.clone();
+        helper.protocol.minor = minor;
+        let record = serde_json::from_value(json!({
+            "id":id, "kind":{"shell":{}}, "cwd":"/", "projectID":"p",
+            "title":label, "titleSource":0, "status":{"starting":{}},
+            "resumability":"notResumable", "createdAt":0, "updatedAt":0, "pinned":false,
+            "host":host.id,
+        }))
+        .unwrap();
+        registry
+            .lock()
+            .unwrap()
+            .spawn(
+                SessionSpec {
+                    id: id.clone(),
+                    pty: PtySpec::new(request.argv.clone(), "/").size(80, 24),
+                    manifest_id: "shell".into(),
+                    authority: Authority::ProcessOnly,
+                    logs_dir: temporary.path().join(format!("logs-{label}")),
+                    holder: None,
+                    defer_launch: false,
+                    remote: Some(RemoteSessionSpec {
+                        manager: Arc::clone(&manager),
+                        helper,
+                        launch: request,
+                        host_id: host.id.clone(),
+                        binding_store: RemoteBindingStore::new(
+                            temporary.path().join(format!("bindings-{label}")),
+                        )
+                        .unwrap(),
+                    }),
+                },
+                record,
+            )
+            .unwrap();
+        wait_for_grid(registry.lock().unwrap().get(&id).unwrap(), "ready>");
+        ids.push(id);
+    }
+
+    let socket = temporary.path().join("daemon.sock");
+    let server = Arc::new(ControlServer::new(Arc::clone(&registry), &socket));
+    let listener = server.bind().unwrap();
+    let worker = std::thread::spawn(move || {
+        let (stream, _) = listener.accept().unwrap();
+        server.serve(stream).unwrap();
+    });
+    let stream = UnixStream::connect(&socket).unwrap();
+    stream
+        .set_read_timeout(Some(Duration::from_secs(10)))
+        .unwrap();
+    let mut reader = BufReader::new(stream.try_clone().unwrap());
+    let mut writer = stream;
+    let mut next_id = 0;
+    // Owns both stream halves: dropping it closes the control connection.
+    let mut call = move |params: serde_json::Value| {
+        next_id += 1;
+        let mut bytes = serde_json::to_vec(&ControlMessage::Request {
+            id: next_id,
+            method: Method::SESSION_LIST_DIR.into(),
+            params: Some(params),
+        })
+        .unwrap();
+        bytes.push(b'\n');
+        writer.write_all(&bytes).unwrap();
+        let mut line = String::new();
+        reader.read_line(&mut line).unwrap();
+        let ControlMessage::Response { id, result } = serde_json::from_str(&line).unwrap() else {
+            panic!("unexpected control message: {line}")
+        };
+        assert_eq!(id, next_id);
+        result
+            .map(|value| serde_json::from_value::<diri_proto::SessionListDirResult>(value).unwrap())
+    };
+    let current = ids[0].as_str();
+    let canonical_work = fs::canonicalize(&work).unwrap();
+
+    let root = call(json!({"sessionID": current, "includeFiles": true})).unwrap();
+    assert_eq!(Path::new(&root.listing.cwd), canonical_work);
+    assert_eq!(root.host.as_deref(), Some("insert-path"));
+    assert!(root.listing.failure.is_none() && !root.listing.truncated);
+    let names: Vec<_> = root
+        .listing
+        .entries
+        .iter()
+        .map(|e| e.name.as_str())
+        .collect();
+    assert_eq!(names, ["README.md", "docs", "home-link", "locked", "src"]);
+    let link = &root.listing.entries[2];
+    assert!(link.symlink && link.kind == ListDirEntryKind::Directory);
+    assert_eq!(root.listing.entries[0].kind, ListDirEntryKind::File);
+
+    let dirs_only = call(json!({"sessionID": current})).unwrap();
+    assert!(
+        dirs_only
+            .listing
+            .entries
+            .iter()
+            .all(|entry| entry.kind == ListDirEntryKind::Directory)
+    );
+
+    let src = call(json!({
+        "sessionID": current, "path": "src", "includeFiles": true, "prefix": "REN"
+    }))
+    .unwrap();
+    assert_eq!(src.listing.entries.len(), 1);
+    assert_eq!(src.listing.entries[0].name, "render.rs");
+
+    // SAFETY: geteuid has no preconditions.
+    if unsafe { libc::geteuid() } != 0 {
+        let denied = call(json!({"sessionID": current, "path": "locked"})).unwrap();
+        assert_eq!(
+            denied.listing.failure,
+            Some(ListDirFailure::PermissionDenied)
+        );
+        assert!(denied.listing.entries.is_empty());
+    }
+    let missing = call(json!({"sessionID": current, "path": "nope"})).unwrap();
+    assert_eq!(missing.listing.failure, Some(ListDirFailure::NotFound));
+    let bad = call(json!({"sessionID": current, "limit": 5000})).unwrap_err();
+    assert_eq!(bad.code, "invalid_params");
+
+    // Latency through the fake SSH (local process spawn; real WAN adds RTT).
+    let mut samples = Vec::new();
+    for _ in 0..20 {
+        let started = Instant::now();
+        call(json!({"sessionID": current, "includeFiles": true})).unwrap();
+        samples.push(started.elapsed());
+    }
+    samples.sort();
+    eprintln!(
+        "list-dir via fake ssh: p50 {:?} p90 {:?}",
+        samples[samples.len() / 2],
+        samples[samples.len() * 9 / 10]
+    );
+
+    let before_old = fs::read_to_string(&argv_log).unwrap();
+    let old = call(json!({"sessionID": ids[1].as_str()})).unwrap_err();
+    assert_eq!(old.code, "list_dir_unsupported");
+    assert_eq!(
+        fs::read_to_string(&argv_log).unwrap(),
+        before_old,
+        "an old Helper must be refused before any SSH channel opens"
+    );
+    assert!(before_old.contains("list-dir"));
+
+    // The terminal is untouched by the listings: input still reaches the
+    // shell on the same attach.
+    let session_ready = |id: &str| {
+        registry
+            .lock()
+            .unwrap()
+            .get(id)
+            .unwrap()
+            .write_input(b"done\n")
+            .unwrap()
+    };
+    for id in &ids {
+        session_ready(id);
+    }
+    for id in &ids {
+        wait_until("remote exit", Duration::from_secs(5), || {
+            registry.lock().unwrap().get(id).unwrap().view().exited
+        });
+    }
+    fs::set_permissions(&locked, fs::Permissions::from_mode(0o700)).unwrap();
+    drop(call);
+    worker.join().unwrap();
+}

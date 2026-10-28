@@ -278,6 +278,7 @@ diri-remote list
 diri-remote kill
 diri-remote environment
 diri-remote directories
+diri-remote list-dir
 diri-remote usage
 diri-remote persistence
 diri-remote gc
@@ -2128,6 +2129,57 @@ so a decoration-only repaint is never withheld by the attach pump. Mode 12
 starts from the blinking default, so a DECRQM `?12` query reports the blink
 and never turns the cursor steady. Checkpoint restore replays spans and the
 cursor style. No Holder task, timer or queue is added.
+
+## Session directory listing (protocol minor 21)
+
+Protocol minor 21 adds the optional Helper capability `list-dir-v1` and the
+one-shot `diri-remote list-dir` command, which Insert Path (⌘E) uses for
+remote sessions. Minors 19 and 20 belong to `query-replies-v1` and
+`kitty-keyboard-v1`; this minor lands after them.
+
+- **Where it runs.** Like process facts, a short-lived Helper process started
+  over the existing SSH ControlMaster answers it; the Holder, its PTY loop
+  and the attach channel are not involved, and no frame kind is added. An idle
+  session pays nothing: no thread, timer, socket or cache.
+- **Identity.** The request carries the authenticated `SessionSelector` with a
+  pinned incarnation. The Helper checks the token, incarnation and owner lock,
+  then reads the session child's working directory (`/proc/<pid>/cwd`,
+  `proc_pidinfo`) between two native birth observations, and rechecks the
+  binding afterwards, so a recycled PID is never listed. Sessions without a
+  captured child identity answer `process_facts_unsupported`.
+- **Resolution.** `path` is read like a shell argument: empty is the child's
+  live cwd, `~` and `~/…` the account `HOME`, absolute paths stand alone, and
+  anything else is joined to the cwd. `.` is dropped; `..` is left for the
+  kernel, as it would be for the program. Paths are NUL-free and at most
+  4096 bytes.
+- **Bounds.** One level, never recursive. At most 2,000 entries (`limit`,
+  1..=2000), the lexicographically earliest kept in O(limit) memory; at most
+  65,536 directory entries read; at most 1 MiB of JSON; a `timeoutMs`
+  (1..=2000) deadline checked every 256 entries. Any bound sets `truncated`.
+  An optional case-insensitive name `prefix` filters before the limit.
+  Directories only unless `includeFiles`.
+- **Symlinks.** Entry kinds come from the directory entry (no follow). A
+  symlink costs one `stat` to report its target's kind (`directory`, `file`,
+  `other` for missing targets) and is flagged `symlink`; it is never entered.
+- **Errors.** Filesystem refusals are answers, not RPC failures: the result
+  keeps `cwd` and the resolved `path` and sets `failure` to
+  `permission_denied`, `not_found`, `not_a_directory` or `unreadable`.
+  Diagnostics never include names, paths or the token.
+- **Compatibility.** The Engine sends `list-dir` only through the session's
+  own Helper build at minor 21 or above; older builds are refused before any
+  SSH channel opens and `session.list_dir` answers `list_dir_unsupported`,
+  which the app shows as the existing "Insert Path works in local sessions
+  only". This is an optional operation, so the minor gate never touches
+  close, restore or terminate. Unknown entry kinds and failure codes from a
+  newer Helper decode as `other` / `unreadable`.
+- **Engine and app.** `session.list_dir` follows `session.process_info`:
+  the session handle is captured under the Registry, released before remote
+  I/O, shares the four-request admission, and the same handle and host are
+  rechecked before answering (`stale_session`). The deadline is 3 s. The
+  picker lists the root level when it opens and fetches one more level when
+  the query enters a known directory (Tab, or typing `dir/`), once per
+  directory; fuzzy ranking runs over the levels fetched so far. Local
+  sessions keep the app's whole-tree scan.
 
 ## Read-only output log ownership
 
