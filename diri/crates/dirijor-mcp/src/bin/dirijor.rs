@@ -1,3 +1,5 @@
+#[path = "dirijor/completion.rs"]
+mod completion;
 #[path = "dirijor/notes.rs"]
 mod notes;
 #[path = "dirijor/organization.rs"]
@@ -90,6 +92,8 @@ fn run(arguments: &[String]) -> Result<(), CliError> {
         "ports" => ports(arguments.get(1..).unwrap_or_default()),
         "note" | "notes" => notes::run(arguments.get(1..).unwrap_or_default()),
         "doctor" => doctor(),
+        "completion" | "completions" => completion::run(arguments.get(1..).unwrap_or_default()),
+        "__complete" => completion::complete(arguments.get(1..).unwrap_or_default()),
         "forward" => Err(CliError::failure(
             "companion TCP forwarding is not part of the Rust Engine",
         )),
@@ -97,12 +101,11 @@ fn run(arguments: &[String]) -> Result<(), CliError> {
     }
 }
 
-fn print_help() {
-    println!(
-        "dirijor — Diri automation CLI\n\n\
+const HELP_USAGE: &str = "dirijor — Diri automation CLI\n\n\
          Usage:\n  dirijor status [--json]\n  dirijor activity [--limit N] [--json]\n  dirijor session <list|get|process|terminal-title|reset-terminal|read|send|key|wait|spawn|run|fork|reconnect|release|archive> ...\n  \
          dirijor worktree <list|create|remove> ...\n  dirijor artifacts <session> [--json]\n  \
          dirijor events <subscribe|wait> ...\n  dirijor ports [--json]\n  dirijor doctor\n  \
+         dirijor completion <fish|zsh|bash>\n  \
          dirijor hook <event>\n  dirijor notify <json>\n  dirijor notify --title TEXT --body TEXT\n  dirijor mcp-tools\n  \
          dirijor mcp-call --tool <name> < input.json\n\n\
          dirijor workspace list | create NAME | rename ID NAME | remove ID | move ID INDEX\n  \
@@ -116,10 +119,13 @@ fn print_help() {
          Reads the current local terminal OSC title, not the conversation name. Remote titles are unsupported.\n\n\
          dirijor session reset-terminal ID\n  \
          Resets the emulator (screen, history, modes, title) without touching the process.\n\n\
-         Deferred on Linux: companion forwarding (dirijor forward).\n\n\
-         {}\n\n\
-         Notes (Markdown files; new notes appear in the sidebar when Diri is running):\n  {}",
+         Deferred on Linux: companion forwarding (dirijor forward).";
+
+fn print_help() {
+    println!(
+        "{HELP_USAGE}\n\n{}\n\n{}\n\nNotes (Markdown files; new notes appear in the sidebar when Diri is running):\n  {}",
         script::HELP,
+        completion::HELP,
         notes::HELP
     );
 }
