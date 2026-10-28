@@ -3482,6 +3482,10 @@ impl ControlServer {
         registry
             .remove(&p.session_id.0, &self.logs_dir)
             .map_err(io_control_error)?;
+        if let Some(holder) = &self.holder {
+            let _ =
+                crate::session_files::remove_holder_record(&holder.holders_dir, &p.session_id.0);
+        }
         if let Some(store) = &self.remote_bindings {
             let _ = store.remove(&p.session_id.0);
         }
