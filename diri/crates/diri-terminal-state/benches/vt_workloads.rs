@@ -27,6 +27,9 @@
 //! Engine).
 //!
 //! `DIRI_VT_BENCH_ONLY=ascii,unicode` runs only the named workloads.
+//! `DIRI_VT_BENCH_REFERENCE=<dir>` keeps the byte-at-a-time reference states
+//! there, so interleaved runs of several builds compute each once and are
+//! all checked against it.
 //!
 //! `DIRI_VT_BENCH_READ` sets the read size (default 64 KiB; a macOS PTY hands
 //! over about 1 KiB per read). Reported: MB/s (10^6 bytes) of wall time for
@@ -287,6 +290,28 @@ fn reference(data: &[u8], reps: usize) -> String {
     fed.state()
 }
 
+/// [`reference`], kept in `DIRI_VT_BENCH_REFERENCE` (a directory) when set,
+/// so interleaved runs of several builds parse each payload one byte at a
+/// time once and are all held to that same state. Delete the directory when
+/// the expected terminal state changes.
+fn cached_reference(name: &str, data: &[u8], reps: usize) -> String {
+    let Some(dir) = std::env::var_os("DIRI_VT_BENCH_REFERENCE") else {
+        return reference(data, reps);
+    };
+    // FNV-1a of the payload names the file.
+    let hash = data.iter().fold(0xcbf2_9ce4_8422_2325u64, |hash, &byte| {
+        (hash ^ u64::from(byte)).wrapping_mul(0x100_0000_01b3)
+    });
+    let path = std::path::Path::new(&dir).join(format!("{name}-{reps}x-{hash:016x}.state"));
+    if let Ok(state) = std::fs::read_to_string(&path) {
+        return state;
+    }
+    let state = reference(data, reps);
+    std::fs::create_dir_all(&dir).expect("reference directory");
+    std::fs::write(&path, &state).expect("write reference");
+    state
+}
+
 /// Panics, naming the first difference, unless a run ended in the
 /// reference's state.
 fn check(name: &str, expected: &str, fed: Fed) {
@@ -351,7 +376,7 @@ fn main() {
         };
         let reps = MIN_BYTES_PER_RUN.div_ceil(data.len());
         // Every run must end where parsing the same bytes one at a time ends.
-        let expected = reference(&data, reps);
+        let expected = cached_reference(name, &data, reps);
         let _ = run(&data, 1, read); // warm-up
         let mut rates: Vec<f64> = (0..RUNS)
             .map(|_| {

@@ -97,12 +97,17 @@ impl<T> SealSlot<T> {
         Arc::new(Self { rows, encode, done })
     }
 
-    /// The payload, and the rows unless the helper is still holding them
-    /// (then it frees them when it is done).
-    pub(crate) fn take(slot: Arc<Self>) -> (Encoded, Option<Vec<Row<T>>>) {
+    /// The payload, and the rows, or the slot back while the helper still
+    /// holds it (it is encoding the same rows; see [`Self::reclaim`]).
+    pub(crate) fn take(slot: Arc<Self>) -> (Encoded, Result<Vec<Row<T>>, Arc<Self>>) {
         let encoded = slot.encoded().clone();
-        let rows = Arc::try_unwrap(slot).ok().map(|slot| slot.rows);
-        (encoded, rows)
+        (encoded, Self::reclaim(slot))
+    }
+
+    /// The rows, once the helper has let go of the slot. Rows are allocated
+    /// by the owner's thread and freed or reused there, never on a helper.
+    pub(crate) fn reclaim(slot: Arc<Self>) -> Result<Vec<Row<T>>, Arc<Self>> {
+        Arc::try_unwrap(slot).map(|slot| slot.rows)
     }
 
     pub(crate) fn encoder(&self) -> EncodeRows<T> {

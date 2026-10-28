@@ -831,6 +831,9 @@ pub struct CompactRows<T> {
     /// than `recent`, newer than `blocks`. Collected into `blocks` as they
     /// finish and all of them before history is measured or restructured.
     sealing: VecDeque<Sealing<T>>,
+    /// Collected blocks whose rows a helper still holds (it was encoding
+    /// them when they were collected); their rows return to `spare` here.
+    reclaim: Vec<Sealing<T>>,
     blocks: VecDeque<Block<T>>,
     oldest: VecDeque<Row<T>>,
     codec: RowCodec<T>,
@@ -925,6 +928,7 @@ impl<T> CompactRows<T> {
             len: rows.len(),
             recent: rows.into(),
             sealing: VecDeque::new(),
+            reclaim: Vec::new(),
             blocks: VecDeque::new(),
             oldest: VecDeque::new(),
             codec,
@@ -1312,6 +1316,7 @@ impl<T> CompactRows<T> {
     /// thread's encoding buffers with them.
     pub fn release_spare_rows(&mut self) {
         self.spare = Vec::new();
+        self.reclaim = Vec::new();
         release_encode_scratch();
     }
 
@@ -1319,8 +1324,9 @@ impl<T> CompactRows<T> {
     #[inline]
     pub fn bound_history_bytes(&mut self, budget: usize) {
         self.finish_sealing();
-        if !self.keep_spare && self.spare.capacity() != 0 {
+        if !self.keep_spare && self.spare.capacity() + self.reclaim.capacity() != 0 {
             self.spare = Vec::new();
+            self.reclaim = Vec::new();
             release_encode_scratch();
         }
         if !self.needs_maintenance && self.last_budget == budget {
@@ -1962,6 +1968,9 @@ impl<T> CompactRows<T> {
                     // Collect what finished. When the helper is this far
                     // behind, collect the oldest too, encoding it here if
                     // the helper has not started it.
+                    if !self.reclaim.is_empty() {
+                        self.reclaim_rows();
+                    }
                     self.collect_sealed(false);
                     if self.sealing.len() >= MAX_SEALING {
                         self.collect_oldest_sealed();
@@ -2041,7 +2050,27 @@ impl<T> CompactRows<T> {
         let Sealing(slot) = self.sealing.pop_back().expect("sealing block");
         let (count, columns) = (slot.rows().len(), slot.rows().first().map_or(0, Row::len));
         let (encoded, rows) = SealSlot::take(slot);
+        let rows = rows.map_err(|slot| self.reclaim.push(Sealing(slot))).ok();
         self.push_sealed(encoded, count, columns, rows);
+    }
+
+    /// Take back the rows of collected blocks the helper has let go of.
+    fn reclaim_rows(&mut self) {
+        for Sealing(slot) in std::mem::take(&mut self.reclaim) {
+            match SealSlot::reclaim(slot) {
+                Ok(mut rows) => {
+                    if self.spare.len() < MAX_SEALING * self.block_rows {
+                        for row in &mut rows {
+                            // Encoded elsewhere: reset every cell on reuse.
+                            row.occ = row.len();
+                        }
+                        rows.append(&mut self.spare);
+                        self.spare = rows;
+                    }
+                }
+                Err(slot) => self.reclaim.push(Sealing(slot)),
+            }
+        }
     }
 
     /// Wait for every block on the helper thread.

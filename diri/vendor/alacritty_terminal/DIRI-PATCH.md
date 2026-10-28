@@ -414,3 +414,33 @@ OSC 4/10/11 changes no cell, so without it the host's change detection saw no
 change and never republished the screen. `reset_state` (RIS, `ESC c`) also
 clears every color a program set, as xterm and libghostty do; upstream kept
 them across `reset`. No wire, checkpoint or protocol change.
+
+## History blocks encoded off the parser thread
+
+Every 32 to 64 rows that scroll into history are sealed into a block, which
+was encoded and LZ-compressed inline. On plain-text floods that was about
+half of the parser thread's time. `CompactRows::seal_recent` now queues the
+block's rows (read-only from then on) to a helper thread (`grid/compact/seal.rs`)
+and keeps parsing; finished blocks are collected in order at the next seal,
+and all of them before any operation that measures or restructures history
+(every `bound_history_bytes`, i.e. at the end of each parsed read, plus
+resize, truncation, edits of history rows and whole-history reads). The bytes
+stored, the history budget's measure and so the rows kept are exactly those of
+inline encoding.
+
+- **The parser never waits for a helper.** A block it needs before a helper
+  finished it is encoded on the parser thread from the same rows, and the
+  helper's copy is discarded, so a descheduled helper costs at most inline
+  encoding. Reading a queued block's rows needs no encoding at all.
+- **Bounded.** At most four blocks per terminal are queued (`MAX_SEALING`);
+  sealing a fifth collects the oldest first. Up to two helper threads serve
+  the process (`HELPERS`); they start with the first queued block and exit
+  after 500 ms without work, so an idle process has none.
+- **Rows stay on the owner's thread.** Rows are allocated, reused and freed
+  by the terminal's thread: a block collected while a helper still holds its
+  rows (a duplicate encoding in progress) waits in `reclaim` and its rows
+  return to `spare` later. Up to four blocks of spare rows are kept while
+  helpers are in use, released at the next history bound as before.
+- `RowCodec::seal` selects this; `None` keeps inline encoding (the two
+  allocation-reuse tests use it, since with helpers which rows come back when
+  depends on scheduling).
