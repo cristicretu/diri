@@ -240,7 +240,7 @@ pub(crate) fn confirm(
     .detach();
 }
 
-fn join_list(parts: &[String]) -> String {
+pub(crate) fn join_list(parts: &[String]) -> String {
     match parts {
         [] => String::new(),
         [only] => only.clone(),

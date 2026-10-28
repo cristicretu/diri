@@ -484,6 +484,8 @@ mod tests {
         }
     }
 
+    // Unix paths: `/home/u` is not absolute on Windows.
+    #[cfg(unix)]
     #[test]
     fn private_roots_collapse_nesting_and_never_include_home() {
         let home = Path::new("/home/u");

@@ -335,8 +335,6 @@ impl Registry {
                     // Progress is a live report; whatever reported it is gone
                     // or will report again.
                     record.terminal_progress = None;
-                    // Likewise the foreground job: the next fold reads it again.
-                    record.foreground_program = None;
                     repair_persisted_agent_title(&mut record);
                     // Resolve the owning project before repairing its
                     // location namespace. In particular, a linked worktree's
@@ -2608,14 +2606,6 @@ fn apply_cursor_conversation(
     changed
 }
 
-/// Titles a fork "Fork of …" after its source. That is Diri's placeholder,
-/// not a chosen name: automatic titles keep off it, but the forked Agent may
-/// name itself after its new task and the user's rename wins as always.
-pub(crate) fn name_fork(record: &mut SessionRecord, source_title: &str) {
-    record.title = format!("Fork of {source_title}");
-    record.title_source = TitleSource::Forked;
-}
-
 /// A name someone chose on purpose: the user's own, or one Diri or a parent
 /// Agent gave at spawn. Agents never replace these.
 fn is_explicit_title(source: TitleSource) -> bool {
@@ -2719,7 +2709,6 @@ fn fold_session_view(record: &mut SessionRecord, view: &SessionView) {
         TitleSource::AgentProvided
             | TitleSource::AgentNamed
             | TitleSource::DirijorAssigned
-            | TitleSource::Forked
             | TitleSource::UserRename
     ) {
         return;
@@ -2755,12 +2744,6 @@ fn fold_session_view(record: &mut SessionRecord, view: &SessionView) {
 /// A remote shell reports none of this and keeps its placeholder.
 fn fold_shell_view(record: &mut SessionRecord, view: &SessionView) {
     record.foreground_agent = view.foreground_agent.clone().map(AgentKind::new);
-    // A recognised Agent shows its own mark, so only a plain program is kept.
-    record.foreground_program = if record.foreground_agent.is_none() && !view.exited {
-        view.foreground_program.clone()
-    } else {
-        None
-    };
     if view.terminal_cwd.is_some() {
         record.terminal_cwd.clone_from(&view.terminal_cwd);
     }
@@ -2779,7 +2762,6 @@ fn fold_shell_view(record: &mut SessionRecord, view: &SessionView) {
         TitleSource::AgentProvided
             | TitleSource::AgentNamed
             | TitleSource::DirijorAssigned
-            | TitleSource::Forked
             | TitleSource::UserRename
     ) {
         return;
@@ -3173,7 +3155,6 @@ fn recovered_record(capsule: diri_proto::recovery::SessionRecoveryCapsule) -> Se
         pull_requests: None,
         listening_ports: None,
         foreground_agent: None,
-        foreground_program: None,
         terminal_cwd: None,
         agent_workspace: None,
         note_id: None,
@@ -3417,7 +3398,6 @@ mod tests {
             pull_requests: None,
             listening_ports: None,
             foreground_agent: None,
-            foreground_program: None,
             terminal_cwd: None,
             agent_workspace: None,
             note_id: None,
@@ -4806,10 +4786,8 @@ mod tests {
         assert_eq!(shell.cwd, "/work/diri", "the launch cwd owns the project");
         assert_eq!(shell.effective_kind(), &AgentKind::SHELL);
 
-        assert_eq!(shell.foreground_program, None, "a prompt runs nothing");
         fold_session_view(&mut shell, &view(Some("vim"), None, Some("notes.md - VIM")));
         assert_eq!(shell.title, "vim");
-        assert_eq!(shell.foreground_program.as_deref(), Some("vim"));
 
         // Claude started by hand: its icon, then its own task title.
         fold_session_view(
@@ -4819,10 +4797,6 @@ mod tests {
         assert_eq!(shell.effective_kind(), &AgentKind::CLAUDE_CODE);
         assert_eq!(shell.kind, AgentKind::SHELL);
         assert_eq!(shell.title, "claude");
-        assert_eq!(
-            shell.foreground_program, None,
-            "an Agent shows its own mark"
-        );
         fold_session_view(
             &mut shell,
             &view(
@@ -4844,7 +4818,6 @@ mod tests {
 
         fold_session_view(&mut shell, &view(None, None, None));
         assert_eq!(shell.foreground_agent, None);
-        assert_eq!(shell.foreground_program, None);
         assert_eq!(shell.title, "crates");
 
         shell.title = "Build server".into();
@@ -5806,70 +5779,6 @@ mod tests {
                 .name_by_agent("claude", "other-task", false)
                 .unwrap(),
             AgentNaming::Explicit("Release prep: v2".into())
-        );
-    }
-
-    #[test]
-    fn a_forked_agent_may_rename_its_fork_title_but_automatic_titles_may_not() {
-        let temp = tempfile::tempdir().expect("temp");
-        let mut registry = Registry::new(engine(), temp.path().join("state.json"));
-        let mut fork = record("fork");
-        fork.kind = AgentKind::CLAUDE_CODE;
-        name_fork(&mut fork, "fix-login-redirect");
-        assert_eq!(fork.title, "Fork of fix-login-redirect");
-        assert_eq!(fork.title_source, TitleSource::Forked);
-
-        // Automatic titles keep off it, as they do off Diri's own names.
-        let mut automatic = fork.clone();
-        assert!(!apply_native_title(
-            &mut automatic,
-            "Investigate login redirect"
-        ));
-        assert!(!apply_provider_title(
-            &mut automatic,
-            &crate::history::ProviderTitle {
-                title: "a later prompt".into(),
-                source: TitleSource::FirstPrompt,
-            }
-        ));
-        fold_session_view(&mut automatic, &titled_view("fork", "✳ Claude Code: other"));
-        assert_eq!(automatic.title, "Fork of fix-login-redirect");
-        assert_eq!(automatic.title_source, TitleSource::Forked);
-        let mut shell = fork.clone();
-        shell.kind = AgentKind::SHELL;
-        fold_session_view(&mut shell, &titled_view("fork", "vim notes.md"));
-        assert_eq!(shell.title_source, TitleSource::Forked);
-
-        // The forked Agent names itself after its new task.
-        registry.insert_record(fork);
-        assert_eq!(
-            registry
-                .name_by_agent("fork", "audit-redirect-tests", false)
-                .unwrap(),
-            AgentNaming::Named("audit-redirect-tests".into())
-        );
-        assert_eq!(
-            registry.record("fork").unwrap().title_source,
-            TitleSource::AgentNamed
-        );
-
-        // The user's name still wins over the Agent's.
-        registry.rename("fork", "Redirect follow-up").unwrap();
-        assert_eq!(
-            registry.name_by_agent("fork", "other-task", false).unwrap(),
-            AgentNaming::Explicit("Redirect follow-up".into())
-        );
-
-        // A fork the user renamed before the Agent named it stays the user's.
-        let mut renamed = record("renamed-fork");
-        name_fork(&mut renamed, "source");
-        registry.insert_record(renamed);
-        registry.rename("renamed-fork", "Mine").unwrap();
-        assert_eq!(
-            registry
-                .name_by_agent("renamed-fork", "agent-name", false)
-                .unwrap(),
-            AgentNaming::Explicit("Mine".into())
         );
     }
 
