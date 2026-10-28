@@ -231,7 +231,7 @@ pub struct PlatformPlayer;
 impl Player for PlatformPlayer {
     fn play(&self, wav: &[u8], volume: f32) -> io::Result<()> {
         use std::{
-            fs::{self, OpenOptions},
+            fs,
             io::Write,
             process::Command,
             sync::atomic::{AtomicU64, Ordering},
@@ -244,7 +244,7 @@ impl Player for PlatformPlayer {
             "diri-status-sound-{}-{sequence}.wav",
             std::process::id()
         ));
-        let mut file = OpenOptions::new()
+        let mut file = diri_platform::private::options()
             .write(true)
             .create_new(true)
             .open(&path)?;
@@ -276,7 +276,7 @@ impl Player for PlatformPlayer {
 impl Player for PlatformPlayer {
     fn play(&self, wav: &[u8], _volume: f32) -> io::Result<()> {
         use std::{
-            fs::{self, OpenOptions},
+            fs,
             io::Write,
             process::Command,
             sync::atomic::{AtomicU64, Ordering},
@@ -289,7 +289,7 @@ impl Player for PlatformPlayer {
             "diri-status-sound-{}-{sequence}.wav",
             std::process::id()
         ));
-        let mut file = OpenOptions::new()
+        let mut file = diri_platform::private::options()
             .write(true)
             .create_new(true)
             .open(&path)?;

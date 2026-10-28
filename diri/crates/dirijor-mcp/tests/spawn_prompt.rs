@@ -124,6 +124,7 @@ fn start_server(temp: &Path, fixture: &Path, parent_cwd: &Path) -> Arc<ControlSe
         pull_requests: None,
         listening_ports: None,
         foreground_agent: None,
+        foreground_program: None,
         terminal_cwd: None,
         agent_workspace: None,
         note_id: None,

@@ -123,6 +123,52 @@ pub fn command_output_at<'a>(
     None
 }
 
+/// What a search for the nearest prompt mark found.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum PromptSearch {
+    /// The absolute row of the nearest prompt that way.
+    Found(i64),
+    /// Every row that way was read and none starts a prompt.
+    Absent,
+    /// A row that way is not held here, so a fuller copy must answer.
+    Unknown,
+}
+
+/// Whether a row holds the start of a shell prompt.
+#[inline]
+#[must_use]
+pub fn starts_prompt(cells: &[GridCell]) -> bool {
+    cells
+        .iter()
+        .any(|cell| cell.style.contains(TermStyle::PROMPT_START))
+}
+
+/// The prompt nearest to `from`, strictly above it (`next == false`) or
+/// strictly below it, among rows `first..end`. Reads outward one row at a
+/// time and stops at the first prompt, so its cost is the distance to that
+/// prompt, not the length of the history. A row `row` cannot supply makes the
+/// answer [`PromptSearch::Unknown`] instead of a guess.
+pub fn nearest_prompt<'a>(
+    from: i64,
+    next: bool,
+    first: i64,
+    end: i64,
+    row: impl Fn(i64) -> Option<&'a [GridCell]>,
+) -> PromptSearch {
+    let step = if next { 1 } else { -1 };
+    let mut absolute = from.saturating_add(step);
+    while absolute >= first && absolute < end {
+        let Some(cells) = row(absolute) else {
+            return PromptSearch::Unknown;
+        };
+        if starts_prompt(cells) {
+            return PromptSearch::Found(absolute);
+        }
+        absolute += step;
+    }
+    PromptSearch::Absent
+}
+
 /// The rows of a command's output, cut to the output's first and last cells.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct OutputRows {
@@ -502,5 +548,30 @@ mod tests {
         // The same prompt after the command ended is the shell's own.
         let idle = ["{A}~> {C}true", "{0}{A}~> "];
         assert_eq!(prompt_at(&idle, 1, 3), PromptLine::Unknown);
+    }
+
+    #[test]
+    fn the_nearest_prompt_is_read_outward_and_never_guessed() {
+        let session = session();
+        let all = lookup(&session);
+        assert_eq!(nearest_prompt(5, false, 0, 6, &all), PromptSearch::Found(4));
+        assert_eq!(nearest_prompt(4, false, 0, 6, &all), PromptSearch::Found(3));
+        assert_eq!(nearest_prompt(3, false, 0, 6, &all), PromptSearch::Found(0));
+        assert_eq!(nearest_prompt(0, false, 0, 6, &all), PromptSearch::Absent);
+        assert_eq!(nearest_prompt(0, true, 0, 6, &all), PromptSearch::Found(3));
+        assert_eq!(nearest_prompt(4, true, 0, 6, &all), PromptSearch::Absent);
+        // A gap in the held rows stops the search before it guesses past it.
+        let held = |row: i64| (row != 2).then(|| session[row as usize].as_slice());
+        assert_eq!(nearest_prompt(3, false, 0, 6, held), PromptSearch::Unknown);
+        assert_eq!(nearest_prompt(1, true, 0, 6, held), PromptSearch::Unknown);
+        assert_eq!(nearest_prompt(4, false, 0, 6, held), PromptSearch::Found(3));
+        // Rows outside `first..end` are never asked for.
+        assert_eq!(
+            nearest_prompt(2, false, 1, 6, |row| {
+                assert!(row >= 1, "asked for row {row}");
+                Some(session[row as usize].as_slice())
+            }),
+            PromptSearch::Absent
+        );
     }
 }
