@@ -414,3 +414,14 @@ OSC 4/10/11 changes no cell, so without it the host's change detection saw no
 change and never republished the screen. `reset_state` (RIS, `ESC c`) also
 clears every color a program set, as xterm and libghostty do; upstream kept
 them across `reset`. No wire, checkpoint or protocol change.
+
+## Faster skipping through text that does not repeat
+
+The history LZ codec steps one byte further per 32 consecutive missed
+matches, instead of per 64, as LZ4's acceleration does. On floods of text
+that repeats little, compressing took a third of the parser thread; this
+makes ASCII floods about 10% faster (Unicode 5%). Payloads stay valid LZ
+streams, decoded unchanged, but find slightly fewer matches: the 4 MiB budget
+keeps 0.35% fewer rows of kitten ASCII, 0.9% of kitten Unicode and 0.4% of
+`git log -p` at 160 columns (outputs at the 150,000-row ceiling are
+unchanged).
