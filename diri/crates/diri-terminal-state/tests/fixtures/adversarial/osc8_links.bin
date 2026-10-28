@@ -1,0 +1,4 @@
+]8;id=1;https://example.com/alink one]8;; mid ]8;;https://ex.org/x?y=1;z\two
+wrap two
+wrap two
+wrap ]8;;\plain]8;id=2:foo=bar;file:///tmp/x\three]8;;\

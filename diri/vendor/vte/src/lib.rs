@@ -39,6 +39,8 @@ mod params;
 
 #[cfg(feature = "ansi")]
 pub mod ansi;
+#[cfg(feature = "observe")]
+pub mod observe;
 pub use params::{Params, ParamsIter};
 
 const MAX_INTERMEDIATES: usize = 2;
@@ -660,6 +662,8 @@ impl<const OSC_RAW_BUF_SIZE: usize> Parser<OSC_RAW_BUF_SIZE> {
         unsafe {
             let num_params = self.osc_num_params;
             let params = &slices[..num_params] as *const [MaybeUninit<&[u8]>] as *const [&[u8]];
+            #[cfg(feature = "observe")]
+            observe::record(&*params, byte == 0x07);
             performer.osc_dispatch(&*params, byte == 0x07);
         }
     }
@@ -787,7 +791,7 @@ impl<const OSC_RAW_BUF_SIZE: usize> Parser<OSC_RAW_BUF_SIZE> {
             // If the entire buffer is valid, use the first character and continue parsing.
             Ok(parsed) => {
                 let c = unsafe { parsed.chars().next().unwrap_unchecked() };
-                performer.print(c);
+                Self::partial_dispatch(performer, c);
 
                 self.partial_utf8_len = 0;
                 c.len_utf8() - old_bytes
@@ -803,7 +807,7 @@ impl<const OSC_RAW_BUF_SIZE: usize> Parser<OSC_RAW_BUF_SIZE> {
                         parsed.chars().next().unwrap_unchecked()
                     };
 
-                    performer.print(c);
+                    Self::partial_dispatch(performer, c);
 
                     self.partial_utf8_len = 0;
                     // Only the first character's bytes are consumed. The
@@ -825,6 +829,19 @@ impl<const OSC_RAW_BUF_SIZE: usize> Parser<OSC_RAW_BUF_SIZE> {
                     None => to_copy,
                 }
             },
+        }
+    }
+
+    /// DIRI PATCH: a character completed across reads is dispatched as the
+    /// whole-text path dispatches it: a C1 control encoded in UTF-8
+    /// (`C2 80` to `C2 9F`) executes instead of printing. Upstream printed
+    /// it, so `ESC [ b` (REP) after a split `C2 9C` repeated the C1 instead
+    /// of the character before it, only when a read ended between its bytes.
+    #[inline]
+    fn partial_dispatch<P: Perform>(performer: &mut P, c: char) {
+        match c {
+            '\u{80}'..='\u{9f}' => performer.execute(c as u8),
+            _ => performer.print(c),
         }
     }
 
@@ -1857,6 +1874,25 @@ mod tests {
                 ['e', '\u{301}', 'a', '\u{308}', 'b'].map(Sequence::Print),
                 "split at {split}"
             );
+        }
+    }
+
+    #[test]
+    fn split_utf8_c1_control_executes_as_whole() {
+        // `C2 9C` is the C1 control ST in UTF-8. Whole, it executes; split
+        // between its bytes it must too, not print.
+        const INPUT: &[u8] = b"a\xC2\x9Cb\xC2\x85c";
+
+        let mut whole = Dispatcher::default();
+        Parser::new().advance(&mut whole, INPUT);
+        assert!(whole.dispatched.contains(&Sequence::Execute(0x9C)), "{:?}", whole.dispatched);
+
+        for split in 1..INPUT.len() {
+            let mut dispatcher = Dispatcher::default();
+            let mut parser = Parser::new();
+            parser.advance(&mut dispatcher, &INPUT[..split]);
+            parser.advance(&mut dispatcher, &INPUT[split..]);
+            assert_eq!(dispatcher.dispatched, whole.dispatched, "split at {split}");
         }
     }
 

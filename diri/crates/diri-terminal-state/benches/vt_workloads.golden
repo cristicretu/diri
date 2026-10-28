@@ -1,0 +1,364 @@
+# Golden digests for benches/vt_workloads.rs. Do not edit by hand.
+#
+# Reference: diri 3fc4feb66 (origin/main) with #921 (c23006a27, "Keep the
+# same history whatever the reads") merged and only the passive
+# `bench-verify` observers added (no parser change), built in release and
+# fed one byte per read with the OSC checksum on:
+#
+#   cargo build --release -p diri-terminal-state --features bench-verify --bench vt_workloads
+#   DIRI_VT_BENCH_GOLDEN=$PWD/crates/diri-terminal-state/benches/vt_workloads.golden <bench binary> --bench
+#   DIRI_VT_BENCH_GOLDEN=... DIRI_VT_BENCH_DIR=<kitten captures> <bench binary> --bench
+#
+# Sections are "[workload payload-sha256]": the generated payloads, and the
+# kitten 0.48 `__benchmark__` captures (one repetition each) the published
+# numbers use. Regenerate only from a known-good reference commit, never
+# from the code being measured, and name that commit here.
+
+[ascii 5b1de281ecd8d0f0db1696ae1dbf745069c6ff3815c809f02e31791d50cb131d]
+bytes_fed = 67109280
+clipboard = 0 sha256=e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855
+cursor = (9, 79, true)
+grid_sha256 = 0bdd638dfe0da16daa647ea76e34c74502b6ba23ca84afd27820cb74733c1365
+history_rows_checked = 63537
+history_rows_reference = 63537
+images_held_bytes = 0
+images_stored = count=0
+keyboard = KeyboardState { enhancements: Some(KeyboardEnhancements(0)), application_cursor_keys: false, application_keypad: false }
+links = 0 sha256=42475689862da2c92a584e37de737353bca43690b4633004b93ed4e0e4ace183
+modes = alt=false paste=false focus=false mouse=MouseModes { tracking: Off, encoding: Legacy } cursor=CursorStyle { shape: Block, steady: false }
+notifications = 0 sha256=e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855
+osc_checksum = cbf29ce484222325
+osc_dispatches = 0 params=0 param_bytes=0 bel=0
+payload_bytes = 2097165
+payload_sha256 = 5b1de281ecd8d0f0db1696ae1dbf745069c6ff3815c809f02e31791d50cb131d
+program_status = None
+progress = None
+replies = 0B sha256=e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855
+reps = 32
+scrollback_cells_sha256 = 97eced81f8740707a7955c5a142daaa0dadfff8dd4a9aa2bef75e3784580f744
+scrollback_metadata_sha256 = ae5d8149f73fa80acfebb3b8e7355eb70e6125d44edbd44b9cb853a7d4b0dbd4
+scrollback_text_sha256 = f41b74c9c18597b11893115fb7d25addce8c3d68445445ee02b4593e4993d8d9
+size = 120x80
+synchronized = completed_any=false open=false
+title = None
+workload = ascii
+
+[csi b7bfea3a6d84589f965ab6e84e3fe634a9937e29a50259783fec367c5ce02523]
+bytes_fed = 67110144
+clipboard = 0 sha256=e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855
+cursor = (27, 4, true)
+grid_sha256 = a424af0b9579afa21ca77503ae21ecadbc013bd8e239080420f3302441a18ece
+history_rows_checked = 0
+history_rows_reference = 0
+images_held_bytes = 0
+images_stored = count=0
+keyboard = KeyboardState { enhancements: Some(KeyboardEnhancements(0)), application_cursor_keys: false, application_keypad: false }
+links = 0 sha256=71ba0fe3de4326bb8bf138280fac9457c49ee76acc52561e9c9b917609402f84
+modes = alt=false paste=false focus=false mouse=MouseModes { tracking: Off, encoding: Legacy } cursor=CursorStyle { shape: Block, steady: false }
+notifications = 0 sha256=e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855
+osc_checksum = cbf29ce484222325
+osc_dispatches = 0 params=0 param_bytes=0 bel=0
+payload_bytes = 1048596
+payload_sha256 = b7bfea3a6d84589f965ab6e84e3fe634a9937e29a50259783fec367c5ce02523
+program_status = None
+progress = None
+replies = 0B sha256=e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855
+reps = 64
+scrollback_cells_sha256 = 6146f62835a3e9f30659dac67202f34962f93ef609993276869a622f4741abd7
+scrollback_metadata_sha256 = e2be6ea5a21267d2598fc584493276133d98e6e7d62b41c8426b1c8e54744689
+scrollback_text_sha256 = 2d97f9d88bf70646aa4c00fcce46df4b8eeceabc2950e730d685ac07e8654067
+size = 120x80
+synchronized = completed_any=false open=false
+title = None
+workload = csi
+
+[images 94b5a737a3a84154fadd1df770e6f31de39287f1b782a1f74badba275ee1ffb0]
+bytes_fed = 67257024
+clipboard = 0 sha256=e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855
+cursor = (0, 0, true)
+grid_sha256 = 7c87369d111aeaafde4dac73bbfab0537dcfe2451a285c0190f41170c126641c
+history_rows_checked = 0
+history_rows_reference = 0
+images_held_bytes = 0
+images_stored = count=12 [id=12345 Rgba 1024x1024 4194304B sha256=bb9f8df61474d25e71fa00722318cd387396ca1736605e1248821cc0de3d3af8]x12
+keyboard = KeyboardState { enhancements: Some(KeyboardEnhancements(0)), application_cursor_keys: false, application_keypad: false }
+links = 0 sha256=10c2c987f6ed558f381a14fc2d24c0743b36e2de13d0087927026581465bad77
+modes = alt=false paste=false focus=false mouse=MouseModes { tracking: Off, encoding: Legacy } cursor=CursorStyle { shape: Block, steady: false }
+notifications = 0 sha256=e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855
+osc_checksum = cbf29ce484222325
+osc_dispatches = 0 params=0 param_bytes=0 bel=0
+payload_bytes = 5604752
+payload_sha256 = 94b5a737a3a84154fadd1df770e6f31de39287f1b782a1f74badba275ee1ffb0
+program_status = None
+progress = None
+replies = 0B sha256=e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855
+reps = 12
+scrollback_cells_sha256 = fcd7d53a4aaab8ad813dc658c276a3fdb06f1a62b3b6561aebeefc0de8a01a67
+scrollback_metadata_sha256 = 56991e1105ab51704a7254d1a4f304e0d8525a0f415fc84da0e03267cadb2ec4
+scrollback_text_sha256 = c87e2d3c5d189ab9602a09b5e7c164d18af864e8ba7317fcc1f2e682e6b5f01f
+size = 120x80
+synchronized = completed_any=false open=false
+title = None
+workload = images
+
+[long_escape_codes 41a060059065f8ef6981a979f74a3223d4a814a44fb5c4db1a69c70571c648e3]
+bytes_fed = 73995264
+clipboard = 0 sha256=e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855
+cursor = (0, 0, true)
+grid_sha256 = 7c87369d111aeaafde4dac73bbfab0537dcfe2451a285c0190f41170c126641c
+history_rows_checked = 0
+history_rows_reference = 0
+images_held_bytes = 0
+images_stored = count=0
+keyboard = KeyboardState { enhancements: Some(KeyboardEnhancements(0)), application_cursor_keys: false, application_keypad: false }
+links = 0 sha256=10c2c987f6ed558f381a14fc2d24c0743b36e2de13d0087927026581465bad77
+modes = alt=false paste=false focus=false mouse=MouseModes { tracking: Off, encoding: Legacy } cursor=CursorStyle { shape: Block, steady: false }
+notifications = 0 sha256=e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855
+osc_checksum = 29bc3cfae0fd1b25
+osc_dispatches = 9216 params=147456 param_bytes=7335936 bel=9216
+payload_bytes = 8221696
+payload_sha256 = 41a060059065f8ef6981a979f74a3223d4a814a44fb5c4db1a69c70571c648e3
+program_status = None
+progress = None
+replies = 0B sha256=e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855
+reps = 9
+scrollback_cells_sha256 = fcd7d53a4aaab8ad813dc658c276a3fdb06f1a62b3b6561aebeefc0de8a01a67
+scrollback_metadata_sha256 = 56991e1105ab51704a7254d1a4f304e0d8525a0f415fc84da0e03267cadb2ec4
+scrollback_text_sha256 = c87e2d3c5d189ab9602a09b5e7c164d18af864e8ba7317fcc1f2e682e6b5f01f
+size = 120x80
+synchronized = completed_any=false open=false
+title = None
+workload = long_escape_codes
+
+[unicode 33d19ab233c8bb6434f594a1afa41aec58f12bc44005b87e0c059b11ced0033b]
+bytes_fed = 68308992
+clipboard = 0 sha256=e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855
+cursor = (119, 79, true)
+grid_sha256 = e92d906246c828031f21a118c93fd783e7bdf357f1383f6ec35554e82d93b0b9
+history_rows_checked = 54608
+history_rows_reference = 54608
+images_held_bytes = 0
+images_stored = count=0
+keyboard = KeyboardState { enhancements: Some(KeyboardEnhancements(0)), application_cursor_keys: false, application_keypad: false }
+links = 0 sha256=7c5533c308170a081b6ed8049b7ee47b449dd2ed7911d31f66c669664966ebec
+modes = alt=false paste=false focus=false mouse=MouseModes { tracking: Off, encoding: Legacy } cursor=CursorStyle { shape: Block, steady: false }
+notifications = 0 sha256=e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855
+osc_checksum = cbf29ce484222325
+osc_dispatches = 0 params=0 param_bytes=0 bel=0
+payload_bytes = 1897472
+payload_sha256 = 33d19ab233c8bb6434f594a1afa41aec58f12bc44005b87e0c059b11ced0033b
+program_status = None
+progress = None
+replies = 0B sha256=e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855
+reps = 36
+scrollback_cells_sha256 = 47c95b57d98a9d0c5e31685a1770f9054cc45725f296963a5409af5f9e2ca9b3
+scrollback_metadata_sha256 = cb89a788cfd9974ca01d96202b2d751d7ee528bb13a057cb83e088942bdf44b5
+scrollback_text_sha256 = 47785b37a4c0760c70feb71e774bcec734b7cdab859c504493ed660051ce2b69
+size = 120x80
+synchronized = completed_any=false open=false
+title = None
+workload = unicode
+
+[unique_unicode e24ca5bf1ab1c7eca80a124b666a220bef9fd8bc6a30247f8288827b60d6f516]
+bytes_fed = 67895296
+clipboard = 0 sha256=e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855
+cursor = (88, 79, true)
+grid_sha256 = 307df109763476042ef3e47291b7da8719c43b91e11011ff4745a89bf1ed9309
+history_rows_checked = 4780
+history_rows_reference = 4780
+images_held_bytes = 0
+images_stored = count=0
+keyboard = KeyboardState { enhancements: Some(KeyboardEnhancements(0)), application_cursor_keys: false, application_keypad: false }
+links = 0 sha256=6b0117a5564bb202f4d1066291851ed99524ed66ef06b47bc22769d0e928e0b4
+modes = alt=false paste=false focus=false mouse=MouseModes { tracking: Off, encoding: Legacy } cursor=CursorStyle { shape: Block, steady: false }
+notifications = 0 sha256=e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855
+osc_checksum = cbf29ce484222325
+osc_dispatches = 0 params=0 param_bytes=0 bel=0
+payload_bytes = 1835008
+payload_sha256 = e24ca5bf1ab1c7eca80a124b666a220bef9fd8bc6a30247f8288827b60d6f516
+program_status = None
+progress = None
+replies = 0B sha256=e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855
+reps = 37
+scrollback_cells_sha256 = c86c7bc4a649cf503c56e25b4149c4d6e7919755a6f13814b002b997ab2a4773
+scrollback_metadata_sha256 = 4b5e74dde205edc129cb9f800aa9e06a6560a0c45789eb66da9c70fd1c62eab1
+scrollback_text_sha256 = 561ec2756777b76079334f5ce17e5ea9b6ac46f9a190918c1ad9595201f8ccbf
+size = 120x80
+synchronized = completed_any=false open=false
+title = None
+workload = unique_unicode
+
+[ascii af0751e04c0301ae668fb64fee70eb53a45637e32ec2d5999c6367df6d10d515]
+bytes_fed = 67109280
+clipboard = 0 sha256=e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855
+cursor = (98, 79, true)
+grid_sha256 = d211d26b236ecb833159905984aecdec2d379b7ab041d44075f079356eeff683
+history_rows_checked = 63793
+history_rows_reference = 63793
+images_held_bytes = 0
+images_stored = count=0
+keyboard = KeyboardState { enhancements: Some(KeyboardEnhancements(0)), application_cursor_keys: false, application_keypad: false }
+links = 0 sha256=b3d547a234b0cc3542a3da5b101df29dba35c600d8d534955039ef0b86600797
+modes = alt=false paste=false focus=false mouse=MouseModes { tracking: Off, encoding: Legacy } cursor=CursorStyle { shape: Block, steady: false }
+notifications = 0 sha256=e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855
+osc_checksum = cbf29ce484222325
+osc_dispatches = 0 params=0 param_bytes=0 bel=0
+payload_bytes = 2097165
+payload_sha256 = af0751e04c0301ae668fb64fee70eb53a45637e32ec2d5999c6367df6d10d515
+program_status = None
+progress = None
+replies = 0B sha256=e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855
+reps = 32
+scrollback_cells_sha256 = e2f8d5cdef655a4c038ba08dda982b433ebdbc490a9f117b1c2c4d3c68fcf48f
+scrollback_metadata_sha256 = cc5fe5589862a40ac15327afc729bc2ee1d33e31f6eac0036978578ef4606ed8
+scrollback_text_sha256 = 7fa9fdeeb9edbf75bea4090118429effb8e5dc11df047f6dbcfad658c2da1b83
+size = 120x80
+synchronized = completed_any=false open=false
+title = None
+workload = ascii
+
+[csi 672aee3bea41ac255857ca20c8581989920a1b4fb795d84b6ecce63e9981d9b2]
+bytes_fed = 67111552
+clipboard = 0 sha256=e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855
+cursor = (0, 0, true)
+grid_sha256 = d265b3814a37892ca9af3aff73aacbee6cf48d52ec74806bca4b0c8afb029d47
+history_rows_checked = 0
+history_rows_reference = 0
+images_held_bytes = 0
+images_stored = count=0
+keyboard = KeyboardState { enhancements: Some(KeyboardEnhancements(0)), application_cursor_keys: true, application_keypad: false }
+links = 0 sha256=037890379f0c73be2bd0d78ddff84fa22eb2b2ab19c7fc1719fa49cf87be1f11
+modes = alt=false paste=false focus=false mouse=MouseModes { tracking: Off, encoding: Legacy } cursor=CursorStyle { shape: Block, steady: false }
+notifications = 0 sha256=e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855
+osc_checksum = cbf29ce484222325
+osc_dispatches = 0 params=0 param_bytes=0 bel=0
+payload_bytes = 1048618
+payload_sha256 = 672aee3bea41ac255857ca20c8581989920a1b4fb795d84b6ecce63e9981d9b2
+program_status = None
+progress = None
+replies = 0B sha256=e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855
+reps = 64
+scrollback_cells_sha256 = 878d6db61185d0195d919702b8a260ac586fbb871bf69a80150f368200f510d0
+scrollback_metadata_sha256 = 9cebf8a09aa6dfbbe4d9d9239f491c5e59844439c6a3174ba68bae5c36468eb2
+scrollback_text_sha256 = 7896c53a8c6a4401d1ae5c72672c25d250fbcea7c0c4a90fac2ddc21720ca419
+size = 120x80
+synchronized = completed_any=false open=false
+title = None
+workload = csi
+
+[images be0ef4fe2e03278276921bc56eeb481f8f7ee15c8c1c80f66c0ca2cf1cba6935]
+bytes_fed = 67116252
+clipboard = 0 sha256=e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855
+cursor = (0, 0, true)
+grid_sha256 = 7c87369d111aeaafde4dac73bbfab0537dcfe2451a285c0190f41170c126641c
+history_rows_checked = 0
+history_rows_reference = 0
+images_held_bytes = 0
+images_stored = count=12 [id=12345 Rgba 1024x1024 4194304B sha256=bb9f8df61474d25e71fa00722318cd387396ca1736605e1248821cc0de3d3af8]x12
+keyboard = KeyboardState { enhancements: Some(KeyboardEnhancements(0)), application_cursor_keys: false, application_keypad: false }
+links = 0 sha256=10c2c987f6ed558f381a14fc2d24c0743b36e2de13d0087927026581465bad77
+modes = alt=false paste=false focus=false mouse=MouseModes { tracking: Off, encoding: Legacy } cursor=CursorStyle { shape: Block, steady: false }
+notifications = 0 sha256=e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855
+osc_checksum = cbf29ce484222325
+osc_dispatches = 0 params=0 param_bytes=0 bel=0
+payload_bytes = 5593021
+payload_sha256 = be0ef4fe2e03278276921bc56eeb481f8f7ee15c8c1c80f66c0ca2cf1cba6935
+program_status = None
+progress = None
+replies = 0B sha256=e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855
+reps = 12
+scrollback_cells_sha256 = fcd7d53a4aaab8ad813dc658c276a3fdb06f1a62b3b6561aebeefc0de8a01a67
+scrollback_metadata_sha256 = 56991e1105ab51704a7254d1a4f304e0d8525a0f415fc84da0e03267cadb2ec4
+scrollback_text_sha256 = c87e2d3c5d189ab9602a09b5e7c164d18af864e8ba7317fcc1f2e682e6b5f01f
+size = 120x80
+synchronized = completed_any=false open=false
+title = None
+workload = images
+
+[long_escape_codes e039f9f3fe7da463c619d6cac2462a6a2c98ca38ce9056b30f17217c23d1bed8]
+bytes_fed = 73995264
+clipboard = 0 sha256=e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855
+cursor = (0, 0, true)
+grid_sha256 = 7c87369d111aeaafde4dac73bbfab0537dcfe2451a285c0190f41170c126641c
+history_rows_checked = 0
+history_rows_reference = 0
+images_held_bytes = 0
+images_stored = count=0
+keyboard = KeyboardState { enhancements: Some(KeyboardEnhancements(0)), application_cursor_keys: false, application_keypad: false }
+links = 0 sha256=10c2c987f6ed558f381a14fc2d24c0743b36e2de13d0087927026581465bad77
+modes = alt=false paste=false focus=false mouse=MouseModes { tracking: Off, encoding: Legacy } cursor=CursorStyle { shape: Block, steady: false }
+notifications = 0 sha256=e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855
+osc_checksum = e8eb0858e9097725
+osc_dispatches = 9216 params=147456 param_bytes=12395520 bel=9216
+payload_bytes = 8221696
+payload_sha256 = e039f9f3fe7da463c619d6cac2462a6a2c98ca38ce9056b30f17217c23d1bed8
+program_status = None
+progress = None
+replies = 0B sha256=e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855
+reps = 9
+scrollback_cells_sha256 = fcd7d53a4aaab8ad813dc658c276a3fdb06f1a62b3b6561aebeefc0de8a01a67
+scrollback_metadata_sha256 = 56991e1105ab51704a7254d1a4f304e0d8525a0f415fc84da0e03267cadb2ec4
+scrollback_text_sha256 = c87e2d3c5d189ab9602a09b5e7c164d18af864e8ba7317fcc1f2e682e6b5f01f
+size = 120x80
+synchronized = completed_any=false open=false
+title = None
+workload = long_escape_codes
+
+[unicode d5c85baa3324d1f35a7ac69f020494d7ec82fd281ceaf72bafa17ae871679c4a]
+bytes_fed = 68308992
+clipboard = 0 sha256=e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855
+cursor = (119, 79, true)
+grid_sha256 = ca960410b38b77fd8ddf41457286c96eed6c84978fb0953a6c749de5bbbbbcc6
+history_rows_checked = 54608
+history_rows_reference = 54608
+images_held_bytes = 0
+images_stored = count=0
+keyboard = KeyboardState { enhancements: Some(KeyboardEnhancements(0)), application_cursor_keys: false, application_keypad: false }
+links = 0 sha256=6ba09a3a49fa41eab1d3938fe652b63857a85fab24ffbec4058bff9394b1717f
+modes = alt=false paste=false focus=false mouse=MouseModes { tracking: Off, encoding: Legacy } cursor=CursorStyle { shape: Block, steady: false }
+notifications = 0 sha256=e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855
+osc_checksum = cbf29ce484222325
+osc_dispatches = 0 params=0 param_bytes=0 bel=0
+payload_bytes = 1897472
+payload_sha256 = d5c85baa3324d1f35a7ac69f020494d7ec82fd281ceaf72bafa17ae871679c4a
+program_status = None
+progress = None
+replies = 0B sha256=e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855
+reps = 36
+scrollback_cells_sha256 = 47c95b57d98a9d0c5e31685a1770f9054cc45725f296963a5409af5f9e2ca9b3
+scrollback_metadata_sha256 = cb89a788cfd9974ca01d96202b2d751d7ee528bb13a057cb83e088942bdf44b5
+scrollback_text_sha256 = 856845797c33154e92f0cd1a4b29155c148d3d1b8e396c7b1b225fa73fd34bee
+size = 120x80
+synchronized = completed_any=false open=false
+title = None
+workload = unicode
+
+[unique_unicode e24ca5bf1ab1c7eca80a124b666a220bef9fd8bc6a30247f8288827b60d6f516]
+bytes_fed = 67895296
+clipboard = 0 sha256=e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855
+cursor = (88, 79, true)
+grid_sha256 = 307df109763476042ef3e47291b7da8719c43b91e11011ff4745a89bf1ed9309
+history_rows_checked = 4780
+history_rows_reference = 4780
+images_held_bytes = 0
+images_stored = count=0
+keyboard = KeyboardState { enhancements: Some(KeyboardEnhancements(0)), application_cursor_keys: false, application_keypad: false }
+links = 0 sha256=6b0117a5564bb202f4d1066291851ed99524ed66ef06b47bc22769d0e928e0b4
+modes = alt=false paste=false focus=false mouse=MouseModes { tracking: Off, encoding: Legacy } cursor=CursorStyle { shape: Block, steady: false }
+notifications = 0 sha256=e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855
+osc_checksum = cbf29ce484222325
+osc_dispatches = 0 params=0 param_bytes=0 bel=0
+payload_bytes = 1835008
+payload_sha256 = e24ca5bf1ab1c7eca80a124b666a220bef9fd8bc6a30247f8288827b60d6f516
+program_status = None
+progress = None
+replies = 0B sha256=e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855
+reps = 37
+scrollback_cells_sha256 = c86c7bc4a649cf503c56e25b4149c4d6e7919755a6f13814b002b997ab2a4773
+scrollback_metadata_sha256 = 4b5e74dde205edc129cb9f800aa9e06a6560a0c45789eb66da9c70fd1c62eab1
+scrollback_text_sha256 = 561ec2756777b76079334f5ce17e5ea9b6ac46f9a190918c1ad9595201f8ccbf
+size = 120x80
+synchronized = completed_any=false open=false
+title = None
+workload = unique_unicode
+
