@@ -772,7 +772,7 @@
       "name": "wait_for_agent"
     },
     {
-      "description": "Read what a session produced. last_message (best for results) returns the Agent's final answer from its transcript; transcript returns the last N turns; since returns only terminal lines added after cursor (pass back the returned cursor next time); screen/tail return the rendered screen. Transcript modes fall back to the screen tail when a session has no readable transcript (remote, shells, other agents).",
+      "description": "Read what a session produced. last_message (best for results) returns the Agent's final answer from its transcript; transcript returns the last N turns; since returns only terminal lines added after cursor (pass back the returned cursor next time); screen/tail return the rendered screen, with rows the terminal soft-wrapped rejoined into the line the program wrote so URLs, paths and JSON arrive whole (unwrap:false for one line per screen row). Transcript modes fall back to the screen tail when a session has no readable transcript (remote, shells, other agents).",
       "inputSchema": {
         "additionalProperties": false,
         "properties": {
@@ -803,6 +803,10 @@
             "maximum": 100,
             "minimum": 1,
             "type": "number"
+          },
+          "unwrap": {
+            "default": true,
+            "type": "boolean"
           }
         },
         "required": [

@@ -868,6 +868,26 @@ impl<'de> Deserialize<'de> for ClientRole {
     }
 }
 
+/// `session.read_screen` parameters. Every option is additive and defaults
+/// off, so a bare `{"sessionID"}` request reads exactly as before: one line
+/// per visible row, trailing blanks and trailing empty rows removed.
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ReadScreenParams {
+    #[serde(rename = "sessionID")]
+    pub session_id: SessionId,
+    /// Join rows the terminal soft-wrapped at its width back into the one
+    /// line the program wrote, so URLs, paths and JSON arrive whole.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub unwrap: bool,
+    /// Keep colours and text attributes as SGR escape sequences.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub ansi: bool,
+    /// Read the retained history above the screen too, oldest first.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub scrollback: bool,
+}
+
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
 pub struct ReadScreenResult {
     pub text: String,
