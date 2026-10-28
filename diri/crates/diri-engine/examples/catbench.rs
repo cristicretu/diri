@@ -248,8 +248,6 @@ fn run_once(payload: &Path, cols: u16, rows: u16) -> Run {
     while !seeded.load(Ordering::SeqCst) {
         std::thread::sleep(Duration::from_millis(5));
     }
-    std::thread::sleep(Duration::from_millis(100));
-
     // `CATBENCH_SETTLE_MS` waits longer, so the Engine has subscribed to the
     // Holder's live stream before `cat` starts.
     let settle = std::env::var("CATBENCH_SETTLE_MS")
@@ -326,7 +324,6 @@ fn main() {
         let run = run_once(&payload, cols, rows);
         println!(
             "drain {:.3} s ({:.1} MB/s)  final-grid {:.3} s ({:.1} MB/s)  engine-cpu {:.3} s  \
-             client-cpu {:.3} s  holder-cpu {:.2} s  frames {}  frame-MB {:.2}",
              client-cpu {:.3} s  holder-cpu {:.2} s  frames {}  frame-MB {:.2}  skipped-MB {:.2}",
             run.drained.as_secs_f64(),
             mb / run.drained.as_secs_f64(),

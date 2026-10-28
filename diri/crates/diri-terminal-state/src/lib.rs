@@ -625,6 +625,8 @@ impl HeadlessScreen {
     pub fn release_idle_memory(&mut self) {
         #[cfg(feature = "compact-history")]
         self.term.release_primary_history_spare_rows();
+    }
+
     /// Opt in only where this screen is the terminal the program talks to
     /// and its replies reach the program: a local Engine session. The screen
     /// then reports `terminal_version` to XTVERSION, answers color queries
@@ -1022,6 +1024,8 @@ impl HeadlessScreen {
         }
         #[cfg(not(feature = "compact-history"))]
         0
+    }
+
     /// `CSI 48 ; rows ; cols ; height ; width t`, pixels zero when unknown.
     fn in_band_size_report(&self) -> String {
         let (cell_width, cell_height) = self.cell_pixels().unwrap_or((0, 0));
