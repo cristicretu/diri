@@ -626,6 +626,7 @@ impl Render for ActionHarness {
             ToggleReadAloud,
             CheckForUpdates,
             ShowWhatsNew,
+            ImportTerminalSetup,
             TogglePerfOverlay,
             ToggleRenderCounters
         );
@@ -665,7 +666,7 @@ fn every_static_palette_action_dispatches_once_by_mouse_and_keyboard(cx: &mut Te
     };
     assert_eq!(
         actions.len(),
-        44,
+        45,
         "new static actions need a dispatch probe"
     );
     for action in actions {

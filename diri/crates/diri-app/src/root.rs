@@ -25,6 +25,8 @@ mod whats_new_clips;
 #[cfg(all(test, target_os = "macos"))]
 mod site_clips;
 #[cfg(test)]
+mod terminal_import_tests;
+#[cfg(test)]
 mod whats_new_tests;
 #[cfg(all(test, target_os = "macos"))]
 mod window_navigation_tests;
@@ -377,6 +379,7 @@ pub struct RootView {
     close_prompt: Option<Task<()>>,
     /// The What's New sheet, while open.
     whats_new: Option<Entity<crate::whats_new::WhatsNewSheet>>,
+    terminal_import: Option<Entity<crate::terminal_import::sheet::TerminalImportSheet>>,
     /// The main window's viewport, for content that sizes to it while a
     /// panel paints it elsewhere.
     main_viewport: gpui::Size<gpui::Pixels>,
@@ -919,6 +922,12 @@ impl RootView {
                     match event {
                         UtilitySurfacesEvent::ShowWhatsNew(page) => {
                             this.open_whats_new_at(*page, window, cx);
+                        }
+                        UtilitySurfacesEvent::ShowTerminalImport => {
+                            this.open_terminal_import(window, cx);
+                        }
+                        UtilitySurfacesEvent::UndoTerminalImport => {
+                            this.undo_terminal_import(cx);
                         }
                         UtilitySurfacesEvent::RefreshUsageLimits => {
                             let _ = this.services.usage_limits_refresh.try_send(());
@@ -1573,6 +1582,7 @@ impl RootView {
             notification_panel_open: false,
             close_prompt: None,
             whats_new: None,
+            terminal_import: None,
             main_viewport: gpui::Size::default(),
             notification_filter_unread: true,
             notification_selected: 0,
@@ -1885,6 +1895,10 @@ impl RootView {
             }
             ToastCommand::CopyDetails(detail) => {
                 cx.write_to_clipboard(gpui::ClipboardItem::new_string(detail));
+            }
+            ToastCommand::UndoTerminalImport => {
+                self.toast.dismiss();
+                self.undo_terminal_import(cx);
             }
         }
         cx.notify();
@@ -2829,6 +2843,7 @@ impl RootView {
             }
             CommandId::CheckForUpdates => self.services.updates.check(true),
             CommandId::ShowWhatsNew => self.open_whats_new_at(0, window, cx),
+            CommandId::ImportTerminalSetup => self.open_terminal_import(window, cx),
             CommandId::ToggleReadAloud => self.toggle_read_aloud(cx),
             CommandId::ToggleReadThisTab => {
                 self.set_read_aloud(crate::store::ReadAloudChoice::Toggle, cx)
@@ -3052,6 +3067,121 @@ impl RootView {
         self.whats_new = Some(sheet);
         self.sidebar.update(cx, |_, cx| cx.notify());
         cx.notify();
+    }
+
+    /// Opens "Bring your setup from …?" on the best plan the last scan made.
+    /// With nothing to bring over it says why instead of opening empty.
+    pub(crate) fn open_terminal_import(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        use crate::terminal_import::sheet::{TerminalImportEvent, TerminalImportSheet};
+        if self.terminal_import.is_some() {
+            return;
+        }
+        let runtime = Arc::clone(&self.services.store);
+        let (plans, scanned, found) = {
+            let mut store = runtime.store.write().expect("session store lock poisoned");
+            store.replan_terminal_setup();
+            let setup = store.terminal_setup();
+            let state = (setup.plans().to_vec(), setup.scanned(), setup.found());
+            if !setup.scanned() {
+                store.request_terminal_setup_scan();
+            }
+            state
+        };
+        if plans.is_empty() {
+            let message = match found {
+                _ if !scanned => t("terminal_import.settings.looking").to_owned(),
+                Some(source) => tf(
+                    "terminal_import.settings.matches",
+                    &[("terminal", &source.name())],
+                ),
+                None => tf(
+                    "terminal_import.settings.none_found",
+                    &[("machine", &crate::platform::local_machine_label_lowercase())],
+                ),
+            };
+            self.show_toast(Toast::info(message), cx);
+            return;
+        }
+        let sheet = cx.new(|cx| TerminalImportSheet::new(plans, runtime, cx));
+        cx.subscribe_in(
+            &sheet,
+            window,
+            |this, _, event: &TerminalImportEvent, window, cx| {
+                let apply = match event {
+                    TerminalImportEvent::Close => None,
+                    TerminalImportEvent::Apply(source) => Some(*source),
+                };
+                this.close_terminal_import(window, cx);
+                if let Some(source) = apply {
+                    this.apply_terminal_import(source, cx);
+                }
+            },
+        )
+        .detach();
+        sheet.read(cx).focus_handle(cx).focus(window, cx);
+        self.terminal_import = Some(sheet);
+        cx.notify();
+    }
+
+    fn close_terminal_import(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.terminal_import.take().is_some() {
+            self.focus_active_terminal(window, cx);
+            cx.notify();
+        }
+    }
+
+    fn apply_terminal_import(
+        &mut self,
+        source: crate::terminal_import::Source,
+        cx: &mut Context<Self>,
+    ) {
+        let result = self
+            .services
+            .store
+            .store
+            .write()
+            .expect("session store lock poisoned")
+            .apply_terminal_setup(source);
+        let toast = match result {
+            Ok(()) => Toast::success(tf(
+                "terminal_import.toast.applied",
+                &[("terminal", &source.name())],
+            ))
+            .action(
+                t("terminal_import.toast.undo"),
+                ToastCommand::UndoTerminalImport,
+            ),
+            Err(_) => Toast::error(tf(
+                "terminal_import.toast.failed",
+                &[("terminal", &source.name())],
+            )),
+        };
+        self.after_terminal_import_change(cx);
+        self.show_toast(toast, cx);
+    }
+
+    fn undo_terminal_import(&mut self, cx: &mut Context<Self>) {
+        let undone = self
+            .services
+            .store
+            .store
+            .write()
+            .expect("session store lock poisoned")
+            .undo_terminal_setup();
+        if undone {
+            self.after_terminal_import_change(cx);
+            self.show_toast(Toast::info(t("terminal_import.toast.undone")), cx);
+        }
+    }
+
+    /// Settings keeps its own copy of the preferences; an import from the
+    /// sheet must show there too.
+    fn after_terminal_import_change(&mut self, cx: &mut Context<Self>) {
+        self.services.store.publish_local_change();
+        if let Some(surfaces) = &self.utility_surfaces {
+            surfaces.update(cx, |surfaces, cx| surfaces.reload_preferences(cx));
+        }
+        cx.refresh_windows();
     }
 
     fn close_whats_new(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -5938,6 +6068,9 @@ impl Render for RootView {
             .on_action(cx.listener(|this, _: &CheckForUpdates, window, cx| {
                 this.run_command(CommandId::CheckForUpdates, window, cx);
             }))
+            .on_action(cx.listener(|this, _: &crate::commands::ImportTerminalSetup, window, cx| {
+                this.run_command(CommandId::ImportTerminalSetup, window, cx);
+            }))
             .on_action(cx.listener(|this, _: &ShowWhatsNew, window, cx| {
                 this.run_command(CommandId::ShowWhatsNew, window, cx);
             }))
@@ -6230,6 +6363,9 @@ impl Render for RootView {
         }
         // Above Settings too: Settings › What's New opens it.
         if let Some(sheet) = &self.whats_new {
+            root = root.child(div().absolute().inset_0().child(sheet.clone()));
+        }
+        if let Some(sheet) = &self.terminal_import {
             root = root.child(div().absolute().inset_0().child(sheet.clone()));
         }
         if let Some(picker) = self.quote_target_picker(colors, sidebar_width, cx) {
@@ -12269,6 +12405,10 @@ mod tests {
                     }
                 }
                 store.set_agent_catalog(catalog);
+                // `DIRI_VISUAL_TERMINAL_SETUP=ghostty` adds the import line.
+                if let Ok(fixture) = std::env::var("DIRI_VISUAL_TERMINAL_SETUP") {
+                    store.set_terminal_setup_scan(crate::terminal_import::fixture_scan(&fixture));
+                }
                 store
                     .update_preferences(|prefs| {
                         prefs.sidebar_visible = true;

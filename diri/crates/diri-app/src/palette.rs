@@ -369,6 +369,7 @@ fn append_management_actions(
                             | CommandId::ReadAllTabs
                             | CommandId::CheckForUpdates
                             | CommandId::ShowWhatsNew
+                            | CommandId::ImportTerminalSetup
                             | CommandId::TogglePerfOverlay
                             | CommandId::ToggleRenderCounters
                     )
@@ -708,6 +709,7 @@ pub fn actions_for_default_host(
         registered_action(CommandId::CompactDensity),
         registered_action(CommandId::CheckForUpdates),
         registered_action(CommandId::ShowWhatsNew),
+        registered_action(CommandId::ImportTerminalSetup),
         registered_action(CommandId::TogglePerfOverlay),
         registered_action(CommandId::ToggleRenderCounters),
     ]);
@@ -1359,6 +1361,7 @@ mod tests {
                 "compact-density",
                 "check-for-updates",
                 "whats-new",
+                "import-terminal-setup",
                 "toggle-perf-overlay",
                 "toggle-render-counters",
             ]

@@ -70,6 +70,10 @@ image = { workspace = true, features = ["ico", "png", "webp"] }
 libc = "0.2"
 nucleo-matcher.workspace = true
 notify.workspace = true
+# Read-only parsers for other terminals' configs (Settings › Import). Both
+# are already in the workspace (diri-term, diri-engine); no new crates.
+plist.workspace = true
+toml_edit = "0.25.13"
 rusqlite.workspace = true
 serde.workspace = true
 serde_json.workspace = true

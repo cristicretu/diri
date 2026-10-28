@@ -39,6 +39,8 @@ pub(crate) struct EmptyWorkbench {
     /// herdr sessions this Mac could bring over, as "5 sessions from herdr".
     pub herdr: Option<SharedString>,
     pub importing_herdr: bool,
+    /// Another terminal whose setup this Mac could bring over ("Ghostty").
+    pub terminal_setup: Option<&'static str>,
 }
 
 pub(crate) struct EmptyWorkbenchActions {
@@ -63,6 +65,9 @@ pub(crate) fn render(
         resting(&actions, colors)
     } else {
         welcome(&state, &actions, colors)
+            .when_some(terminal_setup_link(&state, colors), |column, link| {
+                column.child(div().pt(px(10.0)).child(link))
+            })
     };
     div()
         .id("empty-workbench")
@@ -300,6 +305,21 @@ fn missing(
                     |window, cx| window.dispatch_action(Box::new(ShowAgentSettings), cx),
                 )),
         )
+}
+
+/// Someone arriving from another terminal wants it to look and feel the
+/// same: one quiet line opens the import sheet, which shows every change.
+fn terminal_setup_link(state: &EmptyWorkbench, colors: SemanticColors) -> Option<AnyElement> {
+    let terminal = state.terminal_setup?;
+    Some(quiet_link(
+        "empty-import-terminal-setup",
+        tf("terminal_import.welcome.link", &[("terminal", &terminal)]),
+        Some("arrow.down"),
+        colors,
+        |window, cx| {
+            window.dispatch_action(Box::new(crate::commands::ImportTerminalSetup), cx);
+        },
+    ))
 }
 
 /// Someone arriving from herdr already has work in flight: one quiet line
