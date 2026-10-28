@@ -138,3 +138,11 @@ parser skipping its body. Without the feature the dispatch path is unchanged.
 Test: `diri-terminal-state`'s `tests/osc_observe.rs`
 (`cargo test -p diri-terminal-state --features bench-verify --test osc_observe`).
 
+## C1 control completed across reads
+
+Upstream bug, fixed here. A C1 control sent as UTF-8 (`C2 80` to `C2 9F`)
+executes when both bytes arrive in one read, but `advance_partial_utf8`
+printed it when a read ended between them. The printed C1 then became the
+character `REP` repeats, so `5 C2 9C ESC [ b` showed `55` in one read and
+`5` split. A character completed across reads now goes through the same
+C1 check as the whole-text path. Test: `split_utf8_c1_control_executes_as_whole`.
