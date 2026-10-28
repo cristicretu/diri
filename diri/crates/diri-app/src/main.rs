@@ -17,6 +17,8 @@ mod details_ui;
 mod dev_build;
 mod diagnostics;
 pub mod diff;
+#[cfg(any(target_os = "macos", test))]
+mod dock_menu;
 mod empty_workbench;
 mod external_drop;
 mod file_links;
@@ -267,6 +269,7 @@ fn main() {
     #[cfg(all(target_os = "macos", debug_assertions))]
     if std::env::var_os("DIRI_NATIVE_MENU_SMOKE").is_some() {
         macos::menu_bar::smoke_test();
+        macos::dock_menu::smoke_test();
         return;
     }
     #[cfg(all(target_os = "macos", debug_assertions))]

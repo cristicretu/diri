@@ -4087,8 +4087,8 @@ impl UtilitySurfaces {
 
     /// Where blocked, failed and finished sessions are announced: one row
     /// per state, one switch per channel. Working only ever marks its row,
-    /// so it has none. Notifications post only while Diri is in the
-    /// background.
+    /// so it has none. Notifications and Dock bounces happen only while Diri
+    /// is in the background.
     fn alert_settings(&self, cx: &mut Context<Self>) -> impl IntoElement {
         use crate::store::{AttentionRoute, AttentionRoutes, DockBadge};
         type Pick = fn(&mut AttentionRoutes) -> &mut AttentionRoute;
@@ -4140,14 +4140,16 @@ impl UtilitySurfaces {
                 )
                 .child(column(t("settings.general.alert_notify")))
                 .child(column(t("settings.general.alert_sound")))
-                .child(column(t("settings.general.alert_badge"))),
+                .child(column(t("settings.general.alert_badge")))
+                .child(column(t("settings.general.alert_bounce"))),
         );
         for (key, label, detail, route, pick) in states {
             type Channel = fn(&mut AttentionRoute) -> &mut bool;
-            let channels: [(&'static str, bool, Channel); 3] = [
+            let channels: [(&'static str, bool, Channel); 4] = [
                 ("notify", route.notify, |route| &mut route.notify),
                 ("sound", route.sound, |route| &mut route.sound),
                 ("badge", route.badge, |route| &mut route.badge),
+                ("bounce", route.bounce, |route| &mut route.bounce),
             ];
             let row = div()
                 .min_h(px(SETTINGS_ROW_HEIGHT))
@@ -8041,8 +8043,8 @@ fn toggle_row(
 /// One alert channel column in General > Alerts.
 const ALERT_COLUMN_WIDTH: f32 = 52.0;
 
-/// A channel's switch in the alerts grid: a small check box, so three fit
-/// on a row where three toggles would crowd it.
+/// A channel's switch in the alerts grid: a small check box, so four fit
+/// on a row where four toggles would crowd it.
 fn alert_check(
     id: SharedString,
     on: bool,

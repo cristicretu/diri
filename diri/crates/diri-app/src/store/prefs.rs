@@ -32,13 +32,15 @@ impl UiLanguage {
 
 /// Where one kind of session news is announced, besides the session's own
 /// row: a system notification (only while Diri is in the background), a
-/// sound, and the Dock badge.
+/// sound, the Dock badge, and one bounce of the Dock icon (also only in the
+/// background).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default, rename_all = "camelCase")]
 pub struct AttentionRoute {
     pub notify: bool,
     pub sound: bool,
     pub badge: bool,
+    pub bounce: bool,
 }
 
 impl Default for AttentionRoute {
@@ -47,13 +49,14 @@ impl Default for AttentionRoute {
             notify: true,
             sound: true,
             badge: true,
+            bounce: false,
         }
     }
 }
 
 /// Per-state routing. Working has no entry: it only ever marks the row.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(default, rename_all = "camelCase")]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", from = "RawAttentionRoutes")]
 pub struct AttentionRoutes {
     /// A permission prompt or question is waiting.
     pub blocked: AttentionRoute,
@@ -61,6 +64,63 @@ pub struct AttentionRoutes {
     pub error: AttentionRoute,
     /// A turn finished.
     pub done: AttentionRoute,
+}
+
+impl Default for AttentionRoutes {
+    /// Every channel on, except the Dock bounce, which only a session that
+    /// is waiting on you earns.
+    fn default() -> Self {
+        Self {
+            blocked: AttentionRoute {
+                bounce: true,
+                ..AttentionRoute::default()
+            },
+            error: AttentionRoute::default(),
+            done: AttentionRoute::default(),
+        }
+    }
+}
+
+/// [`AttentionRoutes`] as stored, so a channel missing from saved prefs takes
+/// its own state's default (a blocked route saved before the bounce channel
+/// existed still bounces).
+#[derive(Default, Deserialize)]
+#[serde(default, rename_all = "camelCase")]
+struct RawAttentionRoutes {
+    blocked: RawAttentionRoute,
+    error: RawAttentionRoute,
+    done: RawAttentionRoute,
+}
+
+#[derive(Default, Deserialize)]
+#[serde(default, rename_all = "camelCase")]
+struct RawAttentionRoute {
+    notify: Option<bool>,
+    sound: Option<bool>,
+    badge: Option<bool>,
+    bounce: Option<bool>,
+}
+
+impl RawAttentionRoute {
+    fn or(self, default: AttentionRoute) -> AttentionRoute {
+        AttentionRoute {
+            notify: self.notify.unwrap_or(default.notify),
+            sound: self.sound.unwrap_or(default.sound),
+            badge: self.badge.unwrap_or(default.badge),
+            bounce: self.bounce.unwrap_or(default.bounce),
+        }
+    }
+}
+
+impl From<RawAttentionRoutes> for AttentionRoutes {
+    fn from(raw: RawAttentionRoutes) -> Self {
+        let defaults = Self::default();
+        Self {
+            blocked: raw.blocked.or(defaults.blocked),
+            error: raw.error.or(defaults.error),
+            done: raw.done.or(defaults.done),
+        }
+    }
 }
 
 /// What the Dock badge counts.
@@ -953,6 +1013,28 @@ impl Prefs {
 mod tests {
     use super::*;
     use crate::launch_recipe::{LaunchRecipe, RecipeProject};
+
+    #[test]
+    fn only_a_waiting_session_bounces_the_dock_by_default_and_saved_routes_keep_it() {
+        let fresh: Prefs = serde_json::from_str("{}").unwrap();
+        let routes = fresh.attention_routes;
+        assert!(routes.blocked.bounce);
+        assert!(!routes.error.bounce && !routes.done.bounce);
+        // Routes saved before the bounce channel existed: each state takes
+        // its own default for the missing channel and keeps what was saved.
+        let saved: Prefs = serde_json::from_str(
+            r#"{"attentionRoutes":{"blocked":{"notify":false},"done":{"sound":false}}}"#,
+        )
+        .unwrap();
+        let routes = saved.attention_routes;
+        assert!(!routes.blocked.notify && routes.blocked.bounce && routes.blocked.badge);
+        assert!(!routes.done.sound && !routes.done.bounce && routes.done.notify);
+        let mut changed = Prefs::default();
+        changed.attention_routes.blocked.bounce = false;
+        changed.attention_routes.done.bounce = true;
+        let read: Prefs = serde_json::from_str(&serde_json::to_string(&changed).unwrap()).unwrap();
+        assert_eq!(read.attention_routes, changed.attention_routes);
+    }
 
     #[test]
     fn files_from_before_interface_styles_keep_their_material() {
