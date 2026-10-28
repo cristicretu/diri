@@ -823,17 +823,6 @@ impl<const OSC_RAW_BUF_SIZE: usize> Parser<OSC_RAW_BUF_SIZE> {
         }
     }
 
-    /// DIRI PATCH: a character completed across reads. A C1 control is
-    /// executed, as it is when the whole character arrives in one read.
-    #[inline]
-    fn print_or_execute<P: Perform>(performer: &mut P, c: char) {
-        if ('\u{80}'..='\u{9f}').contains(&c) {
-            performer.execute(c as u8);
-        } else {
-            performer.print(c);
-        }
-    }
-
     /// Advance the parser while processing a partial utf8 codepoint.
     #[inline]
     fn advance_partial_utf8<P: Perform>(&mut self, performer: &mut P, bytes: &[u8]) -> usize {
@@ -848,7 +837,7 @@ impl<const OSC_RAW_BUF_SIZE: usize> Parser<OSC_RAW_BUF_SIZE> {
             // If the entire buffer is valid, use the first character and continue parsing.
             Ok(parsed) => {
                 let c = unsafe { parsed.chars().next().unwrap_unchecked() };
-                Self::print_or_execute(performer, c);
+                Self::partial_dispatch(performer, c);
 
                 self.partial_utf8_len = 0;
                 c.len_utf8() - old_bytes
@@ -864,7 +853,7 @@ impl<const OSC_RAW_BUF_SIZE: usize> Parser<OSC_RAW_BUF_SIZE> {
                         parsed.chars().next().unwrap_unchecked()
                     };
 
-                    Self::print_or_execute(performer, c);
+                    Self::partial_dispatch(performer, c);
 
                     self.partial_utf8_len = 0;
                     // Only the first character's bytes are consumed. The
@@ -886,6 +875,19 @@ impl<const OSC_RAW_BUF_SIZE: usize> Parser<OSC_RAW_BUF_SIZE> {
                     None => to_copy,
                 }
             },
+        }
+    }
+
+    /// DIRI PATCH: a character completed across reads is dispatched as the
+    /// whole-text path dispatches it: a C1 control encoded in UTF-8
+    /// (`C2 80` to `C2 9F`) executes instead of printing. Upstream printed
+    /// it, so `ESC [ b` (REP) after a split `C2 9C` repeated the C1 instead
+    /// of the character before it, only when a read ended between its bytes.
+    #[inline]
+    fn partial_dispatch<P: Perform>(performer: &mut P, c: char) {
+        match c {
+            '\u{80}'..='\u{9f}' => performer.execute(c as u8),
+            _ => performer.print(c),
         }
     }
 

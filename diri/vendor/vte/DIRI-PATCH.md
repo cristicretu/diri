@@ -152,7 +152,7 @@ Upstream bug, fixed here: a C1 control completed across reads (`C2` at the end
 of one read, `85` at the start of the next) was printed as a character, where
 a whole read executes it. REP then repeated it instead of the character before,
 so the screen depended on where the read split. `advance_partial_utf8` now
-executes a completed C1.
+executes a completed C1 (see "C1 control completed across reads" below).
 
 Tests: `non_ascii_runs_end_where_from_utf8_and_c1_end_them` (300,000 byte
 strings built from UTF-8 edge bytes, against `from_utf8`),
@@ -173,9 +173,14 @@ parser skipping its body. Without the feature the dispatch path is unchanged.
 Test: `diri-terminal-state`'s `tests/osc_observe.rs`
 (`cargo test -p diri-terminal-state --features bench-verify --test osc_observe`).
 
-The same split-C1 fix also came with #927 (`partial_dispatch`); this branch's
-`print_or_execute` above is that fix, and #927's test
-`split_utf8_c1_control_executes_as_whole` runs here too.
+## C1 control completed across reads
+
+Upstream bug, fixed here. A C1 control sent as UTF-8 (`C2 80` to `C2 9F`)
+executes when both bytes arrive in one read, but `advance_partial_utf8`
+printed it when a read ended between them. The printed C1 then became the
+character `REP` repeats, so `5 C2 9C ESC [ b` showed `55` in one read and
+`5` split. A character completed across reads now goes through the same
+C1 check as the whole-text path. Test: `split_utf8_c1_control_executes_as_whole`.
 
 ## Ground-state text and REP hooks (core v2 prototype)
 
@@ -198,3 +203,25 @@ Tests: `diri-terminal-state` `core_v2::tests` (feature `core-v2`) feed the
 prototype one-shot, byte by byte, at every split and in random reads and
 compare with the current core's byte-at-a-time state; `cargo test -p vte`
 covers the unchanged defaults.
+
+## Test-only OSC observation
+
+Feature `observe` (off by default; no product crate enables it) adds
+`vte::observe`: per-thread totals of `osc_dispatch` calls, their parameters
+and parameter bytes, and, when turned on with `observe::reset(true)`, an
+order-sensitive FNV-1a checksum of every parameter byte. `vt_workloads`
+compares these with a reference parse, because an OSC nothing reads (the
+long-escapes workload is OSC 6) leaves no terminal state that would expose a
+parser skipping its body. Without the feature the dispatch path is unchanged.
+
+Test: `diri-terminal-state`'s `tests/osc_observe.rs`
+(`cargo test -p diri-terminal-state --features bench-verify --test osc_observe`).
+
+## C1 control completed across reads
+
+Upstream bug, fixed here. A C1 control sent as UTF-8 (`C2 80` to `C2 9F`)
+executes when both bytes arrive in one read, but `advance_partial_utf8`
+printed it when a read ended between them. The printed C1 then became the
+character `REP` repeats, so `5 C2 9C ESC [ b` showed `55` in one read and
+`5` split. A character completed across reads now goes through the same
+C1 check as the whole-text path. Test: `split_utf8_c1_control_executes_as_whole`.
