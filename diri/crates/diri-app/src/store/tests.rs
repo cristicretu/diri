@@ -65,6 +65,7 @@ pub(super) fn session(value: &str, project: &str, created: f64) -> SessionRecord
         pull_requests: None,
         listening_ports: None,
         foreground_agent: None,
+        foreground_program: None,
         terminal_cwd: None,
         agent_workspace: None,
         note_id: None,

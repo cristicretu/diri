@@ -325,6 +325,18 @@ fn validate_grid(grid: &GridUpdate) -> Result<(), MirrorError> {
     Ok(())
 }
 
+/// How [`HeadlessScreen::text_lines`] reads; all off reads like
+/// [`HeadlessScreen::lines`].
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct TextOptions {
+    /// Join soft-wrapped rows into the line the program wrote.
+    pub unwrap: bool,
+    /// Keep colours and attributes as SGR escape sequences.
+    pub ansi: bool,
+    /// Include retained history above the screen, oldest first.
+    pub scrollback: bool,
+}
+
 /// Screen text and hyperlink targets for the artifact scanner; see
 /// [`HeadlessScreen::link_source`].
 #[derive(Clone, Debug, Default)]
@@ -2007,6 +2019,132 @@ impl HeadlessScreen {
         text.trim_end().to_string()
     }
 
+    /// The screen, and with [`TextOptions::scrollback`] the retained history
+    /// above it, as text for a reader rather than a renderer: an agent or a
+    /// script reading another session's output. With every option off this
+    /// is exactly [`Self::lines`].
+    ///
+    /// [`TextOptions::unwrap`] rejoins rows the terminal soft-wrapped at its
+    /// width, so a URL, path, JSON value or stack frame longer than the pane
+    /// arrives as the one line the program wrote. A hard newline still ends
+    /// a line, and trailing blanks are trimmed only where a line really ends.
+    ///
+    /// [`TextOptions::ansi`] keeps colours and attributes as SGR sequences,
+    /// emitted only where the style changes and reset at each line's end so
+    /// any line can be printed on its own.
+    pub fn text_lines(&mut self, options: TextOptions) -> Vec<String> {
+        let rows = self.geometry.rows;
+        let history = if options.scrollback {
+            self.term.grid().history_size()
+        } else {
+            0
+        };
+        let total = history + rows;
+        let mut lines = Vec::with_capacity(total);
+        let mut logical = String::new();
+        for index in 0..total {
+            let line = Line(index as i32 - history as i32);
+            let continues = options.unwrap && index + 1 < total && self.row_wraps(line);
+            self.push_row_text(line, options.ansi, continues, &mut logical);
+            if !continues {
+                lines.push(std::mem::take(&mut logical));
+            }
+            if options.scrollback {
+                self.finish_history_read_batch(index + 1, index + 1 == total);
+            }
+        }
+        while lines.last().is_some_and(|line| line.trim().is_empty()) {
+            lines.pop();
+        }
+        lines
+    }
+
+    /// Whether the program's line runs on past the end of `line`.
+    fn row_wraps(&self, line: Line) -> bool {
+        let cols = self.geometry.cols;
+        cols > 0
+            && self.term.grid()[line][Column(cols - 1)]
+                .flags
+                .contains(Flags::WRAPLINE)
+    }
+
+    /// Appends one row's text to `out`; trailing blanks are kept only when
+    /// the line continues onto the next row.
+    fn push_row_text(&self, line: Line, ansi: bool, keep_trailing: bool, out: &mut String) {
+        let source = &self.term.grid()[line];
+        let cols = self.geometry.cols;
+        let spacer = Flags::WIDE_CHAR_SPACER | Flags::LEADING_WIDE_CHAR_SPACER;
+        if !ansi {
+            let start = out.len();
+            for column in 0..cols {
+                let cell = &source[Column(column)];
+                if cell.flags.intersects(spacer) {
+                    continue;
+                }
+                out.push(cell.c);
+                if let Some(combining) = cell.zerowidth() {
+                    out.extend(combining.iter().copied());
+                }
+            }
+            if !keep_trailing {
+                let kept = start + out[start..].trim_end().len();
+                out.truncate(kept);
+            }
+            return;
+        }
+        let end = if keep_trailing {
+            cols
+        } else {
+            (0..cols)
+                .rev()
+                .find(|&column| {
+                    let cell = &source[Column(column)];
+                    !cell.flags.intersects(spacer)
+                        && (!(cell.c.is_whitespace() || cell.c == '\0')
+                            || cell.zerowidth().is_some())
+                })
+                .map_or(0, |column| column + 1)
+        };
+        let visual = |cell: &GridCell| {
+            (
+                cell.fg,
+                cell.bg,
+                TermStyle::from_bits_retain(cell.style.bits() & 0xff),
+            )
+        };
+        let plain = visual(&GridCell::BLANK);
+        let mut current = plain;
+        for column in 0..end {
+            let cell = &source[Column(column)];
+            if cell.flags.intersects(spacer) {
+                continue;
+            }
+            let mut wire = wire_cell(cell);
+            // The wire folds BOLD and DIM together (`DIM_BOLD` holds both
+            // bits); a reader gets the attributes the program set.
+            let mut bits = wire.style.bits() & !(TermStyle::BOLD.bits() | TermStyle::DIM.bits());
+            if cell.flags.contains(Flags::BOLD) {
+                bits |= TermStyle::BOLD.bits();
+            }
+            if cell.flags.contains(Flags::DIM) {
+                bits |= TermStyle::DIM.bits();
+            }
+            wire.style = TermStyle::from_bits_retain(bits);
+            let style = visual(&wire);
+            if style != current {
+                out.push_str(&sgr(&wire, None));
+                current = style;
+            }
+            out.push(if cell.c == '\0' { ' ' } else { cell.c });
+            if let Some(combining) = cell.zerowidth() {
+                out.extend(combining.iter().copied());
+            }
+        }
+        if current != plain {
+            out.push_str("\x1b[0m");
+        }
+    }
+
     /// What a link scanner needs from the screen and the newest `history_rows`
     /// of scrollback: text with soft-wrapped rows rejoined (a URL longer than
     /// the terminal is one logical line), and every OSC 8 hyperlink target,
@@ -3309,6 +3447,69 @@ mod tests {
         let (at, uri) = &source.hyperlinks[0];
         assert_eq!(uri, "https://github.com/o/r/pull/9");
         assert!(source.text[*at..].starts_with("PR #9"));
+    }
+
+    #[test]
+    fn text_lines_with_no_options_reads_like_lines() {
+        let mut screen = HeadlessScreen::new(10, 4);
+        screen.feed(b"abcdefghijKLM  \r\n\x1b[31mred\x1b[0m \xe4\xb8\xad\r\n");
+        assert_eq!(screen.text_lines(TextOptions::default()), screen.lines());
+        assert_eq!(screen.lines(), ["abcdefghij", "KLM", "red \u{4e2d}"]);
+    }
+
+    #[test]
+    fn text_lines_unwrap_rejoins_soft_wraps_but_not_hard_newlines() {
+        let mut screen = HeadlessScreen::new(10, 6);
+        // 24 columns of path wrap twice; the space at a wrap boundary is
+        // part of the line, the blanks after a hard newline are not.
+        screen.feed(b"/a/b/c/d/e f/h/i/j/k/l/m\r\nshort   \r\n0123456789\r\nnext");
+        let unwrap = TextOptions {
+            unwrap: true,
+            ..TextOptions::default()
+        };
+        assert_eq!(
+            screen.text_lines(unwrap),
+            ["/a/b/c/d/e f/h/i/j/k/l/m", "short", "0123456789", "next"]
+        );
+    }
+
+    #[test]
+    fn text_lines_unwrap_reaches_into_history_and_across_the_screen_edge() {
+        let mut screen = HeadlessScreen::new(8, 3);
+        screen.feed(b"https://example.com/long/path\r\nx\r\ny\r\nz");
+        let visible = TextOptions {
+            unwrap: true,
+            ..TextOptions::default()
+        };
+        // Only the URL's tail is on screen.
+        assert_eq!(screen.text_lines(visible), ["x", "y", "z"]);
+        let all = TextOptions {
+            scrollback: true,
+            ..visible
+        };
+        assert_eq!(
+            screen.text_lines(all),
+            ["https://example.com/long/path", "x", "y", "z"]
+        );
+    }
+
+    #[test]
+    fn text_lines_ansi_keeps_style_changes_and_resets_each_line() {
+        let mut screen = HeadlessScreen::new(20, 3);
+        screen.feed(b"ok \x1b[1;31mFAIL\x1b[0m done\r\n\x1b[32mgreen\r\nplain");
+        let ansi = TextOptions {
+            ansi: true,
+            ..TextOptions::default()
+        };
+        assert_eq!(
+            screen.text_lines(ansi),
+            [
+                "ok \x1b[0;1;38;5;1;49mFAIL\x1b[0;39;49m done",
+                "\x1b[0;38;5;2;49mgreen\x1b[0m",
+                // SGR 32 is still in force: the program never reset it.
+                "\x1b[0;38;5;2;49mplain\x1b[0m",
+            ]
+        );
     }
 
     #[test]

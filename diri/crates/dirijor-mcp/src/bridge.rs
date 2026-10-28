@@ -1253,7 +1253,8 @@ fn compact(record: &SessionRecord) -> Value {
 
 /// Who chose a session's current name, so an Agent knows whether it may
 /// replace it: `user` and `diri` names are kept, an `agent` name may be
-/// refined, an `automatic` one (prompt, terminal, provider summary) replaced.
+/// refined, an `automatic` one (prompt, terminal, provider summary, or the
+/// "Fork of …" title a fork starts with) replaced.
 fn name_set_by(source: diri_proto::TitleSource) -> &'static str {
     use diri_proto::TitleSource;
     match source {
@@ -1264,6 +1265,7 @@ fn name_set_by(source: diri_proto::TitleSource) -> &'static str {
         | TitleSource::FirstPrompt
         | TitleSource::AgentProvided
         | TitleSource::TerminalTitle
+        | TitleSource::Forked
         | TitleSource::Unknown => "automatic",
     }
 }
@@ -1534,6 +1536,7 @@ mod tests {
             pull_requests: None,
             listening_ports: None,
             foreground_agent: None,
+            foreground_program: None,
             terminal_cwd: None,
             agent_workspace: None,
             note_id: None,
