@@ -313,6 +313,95 @@ fn cut(
     (row, metadata.cloned())
 }
 
+/// What the line under the cursor is, read from the OSC 133 marks on the
+/// screen. Decides whether typing a command there runs it in the shell.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PromptLine {
+    /// A shell prompt whose input start (`B`) is marked and has nothing
+    /// typed before the cursor.
+    Empty,
+    /// A marked prompt with text typed after its input start.
+    Typed,
+    /// A shell prompt (`A`, or the last command's `D`) with no input-start
+    /// mark, so typed text cannot be told from the prompt (fish).
+    Unknown,
+    /// A command line is running (`C` with no `D` since).
+    Busy,
+    /// No marks on screen before the cursor.
+    Unmarked,
+}
+
+/// Reads [`PromptLine`] backwards from the cursor through the screen rows.
+/// The cursor's own cell counts for its marks, not its text: an empty
+/// prompt parks the cursor on the cell its `B` was written to. A prompt
+/// drawn inside a running command line (fish's `read`: `C`, then `A` with
+/// no `D`) is that command asking for input, so it reads as busy.
+pub fn prompt_line<'a>(
+    cursor_row: usize,
+    cursor_col: usize,
+    row: impl Fn(usize) -> Option<&'a [GridCell]>,
+) -> PromptLine {
+    let mut typed = false;
+    // The prompt's verdict, once its `B` or `A` is found, and whether its
+    // `A` has been passed yet.
+    let mut verdict: Option<PromptLine> = None;
+    let mut passed_prompt_start = false;
+    for line in (0..=cursor_row).rev() {
+        let Some(cells) = row(line) else {
+            break;
+        };
+        let end = if line == cursor_row {
+            (cursor_col + 1).min(cells.len())
+        } else {
+            cells.len()
+        };
+        for (col, cell) in cells[..end].iter().enumerate().rev() {
+            let style = cell.style;
+            let ended = style.command_end().is_some();
+            let prompt = style.contains(TermStyle::PROMPT_START);
+            let output = style.contains(TermStyle::OUTPUT_START);
+            let Some(found) = verdict else {
+                let before_cursor = line < cursor_row || col < cursor_col;
+                if before_cursor && cell.scalar != 0 && cell.scalar != u32::from(' ') {
+                    typed = true;
+                }
+                if style.contains(TermStyle::INPUT_START) {
+                    verdict = Some(if typed {
+                        PromptLine::Typed
+                    } else {
+                        PromptLine::Empty
+                    });
+                } else if prompt || ended {
+                    verdict = Some(PromptLine::Unknown);
+                    passed_prompt_start = true;
+                } else if output {
+                    return PromptLine::Busy;
+                }
+                if verdict.is_some() && ended {
+                    return verdict.unwrap_or(PromptLine::Unmarked);
+                }
+                continue;
+            };
+            if !passed_prompt_start {
+                if prompt {
+                    passed_prompt_start = true;
+                    if ended {
+                        return found;
+                    }
+                }
+                continue;
+            }
+            if output && !ended && !prompt {
+                return PromptLine::Busy;
+            }
+            if output || ended || prompt {
+                return found;
+            }
+        }
+    }
+    verdict.unwrap_or(PromptLine::Unmarked)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -337,6 +426,7 @@ mod tests {
                         assert_eq!(chars.next(), Some('}'));
                         pending |= match mark {
                             'A' => TermStyle::PROMPT_START,
+                            'B' => TermStyle::INPUT_START,
                             'C' => TermStyle::OUTPUT_START,
                             '0' => TermStyle::COMMAND_SUCCEEDED,
                             '1' => TermStyle::COMMAND_FAILED,
@@ -457,6 +547,61 @@ mod tests {
         assert_eq!(output.rows.len(), 2, "the end's own row holds no output");
         assert_eq!(output.rows[0].0[0].scalar, u32::from('a'));
     }
+
+    fn prompt_at(lines: &[&str], row: usize, col: usize) -> PromptLine {
+        let rows = rows(lines);
+        prompt_line(row, col, |line| rows.get(line).map(Vec::as_slice))
+    }
+
+    #[test]
+    fn a_marked_empty_prompt_is_ready_for_a_command() {
+        // bash/zsh with shell integration: A, prompt text, B where input
+        // starts; the cursor sits on the B cell.
+        assert_eq!(prompt_at(&["{A}~/w $ {B}"], 0, 8), PromptLine::Empty);
+        // A finished command above does not matter; the new prompt does.
+        let screen = ["{A}$ {B}ls", "{C}a b", "{0}{A}$ {B}"];
+        assert_eq!(prompt_at(&screen, 2, 2), PromptLine::Empty);
+        // A two-line prompt: A on the line above, B on the cursor's line.
+        assert_eq!(
+            prompt_at(&["{A}~/w main", "> {B}"], 1, 2),
+            PromptLine::Empty
+        );
+    }
+
+    #[test]
+    fn typed_text_at_a_marked_prompt_is_not_overwritten() {
+        assert_eq!(prompt_at(&["{A}$ {B}git st"], 0, 8), PromptLine::Typed);
+        // Text after the cursor alone (an autosuggestion) is not typed.
+        assert_eq!(prompt_at(&["{A}$ {B}git status"], 0, 2), PromptLine::Empty);
+    }
+
+    #[test]
+    fn fish_prompts_without_an_input_mark_are_unknown() {
+        assert_eq!(prompt_at(&["{0}{A}~/w> "], 0, 5), PromptLine::Unknown);
+        assert_eq!(prompt_at(&["{A}~/w> echo"], 0, 9), PromptLine::Unknown);
+    }
+
+    #[test]
+    fn a_running_command_or_unmarked_screen_is_refused() {
+        let running = ["{A}$ {B}vim", "{C}~", "~"];
+        assert_eq!(prompt_at(&running, 2, 1), PromptLine::Busy);
+        // An agent started from the shell is a running command line.
+        assert_eq!(
+            prompt_at(&["{A}$ {B}claude", "{C}> "], 1, 2),
+            PromptLine::Busy
+        );
+        assert_eq!(
+            prompt_at(&["plain output", "$ "], 1, 2),
+            PromptLine::Unmarked
+        );
+        // fish's `read` inside a running command: `A` after `C`, no `D`.
+        let read = ["{A}~> {C}read x", "{A}read> "];
+        assert_eq!(prompt_at(&read, 1, 6), PromptLine::Busy);
+        // The same prompt after the command ended is the shell's own.
+        let idle = ["{A}~> {C}true", "{0}{A}~> "];
+        assert_eq!(prompt_at(&idle, 1, 3), PromptLine::Unknown);
+    }
+
     #[test]
     fn the_newest_output_read_backward_matches_a_full_forward_read() {
         let histories: Vec<Vec<Vec<GridCell>>> = vec![
