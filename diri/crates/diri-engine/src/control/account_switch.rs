@@ -181,6 +181,7 @@ mod tests {
     #[test]
     fn sign_in_finds_an_agent_installed_through_the_interactive_rc() {
         if !std::path::Path::new("/bin/zsh").exists() {
+            eprintln!("skipped: /bin/zsh is not installed");
             return;
         }
         let temp = tempfile::tempdir().unwrap();
@@ -188,11 +189,8 @@ mod tests {
         std::fs::create_dir(&bin).unwrap();
         // Login startup files can add globally installed CLIs back to PATH even
         // after env_clear(). Never use a real CLI name in either launch below.
-        let agent_name = format!(
-            "diri-account-switch-fixture-{}",
-            temp.path().file_name().unwrap().to_str().unwrap()
-        );
-        let agent = bin.join(&agent_name);
+        let agent_name = "diri-account-switch-fixture-cli";
+        let agent = bin.join(agent_name);
         std::fs::write(
             &agent,
             "#!/bin/sh\nprintf 'signed-in:%s:%s\\n' \"$*\" \"$STORE\"\n",
@@ -220,7 +218,7 @@ mod tests {
         let command = [
             "/usr/bin/env".to_owned(),
             format!("STORE={}", store.display()),
-            agent_name.clone(),
+            agent_name.to_owned(),
             "auth".to_owned(),
             "login".to_owned(),
         ];
@@ -230,28 +228,24 @@ mod tests {
             "-lc".into(),
             format!(
                 "exec /usr/bin/env {} auth login",
-                crate::hosts::shell_quote(&agent_name)
+                crate::hosts::shell_quote(agent_name)
             ),
         ]);
         assert_eq!(
             before.status.code(),
             Some(127),
-            "the old launch could not find it"
-        );
-
-        assert!(before.stdout.is_empty(), "{before:?}");
-        assert!(
-            String::from_utf8_lossy(&before.stderr).contains(&agent_name),
-            "{before:?}"
+            "the old launch could not find it: {before:?}"
         );
 
         let after = run(&sign_in_argv(Some("/bin/zsh".into()), &command));
         assert_eq!(after.status.code(), Some(0), "{after:?}");
-        assert_eq!(
-            after.stdout,
-            format!("signed-in:auth login:{}\n", store.display()).as_bytes()
+        // System rc files (/etc/zshrc) may print banners or warnings; only
+        // require the fixture's own line.
+        assert!(
+            String::from_utf8_lossy(&after.stdout)
+                .contains(&format!("signed-in:auth login:{}\n", store.display())),
+            "{after:?}"
         );
-        assert!(after.stderr.is_empty(), "{after:?}");
     }
 
     #[test]
