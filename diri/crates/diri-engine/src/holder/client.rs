@@ -9,7 +9,7 @@ use diri_platform::ipc::UnixStream;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use base64::Engine as _;
 
@@ -242,6 +242,16 @@ impl HolderClient {
 /// Read buffer for one output subscription.
 const OUTPUT_READ_BUFFER: usize = 256 << 10;
 
+/// A run of at least this many bytes is output streaming in, not an echo or
+/// a prompt; see [`HolderOutputStream::next_run_into`].
+const STREAMING_RUN_MIN: usize = 4 << 10;
+/// The run a streaming wait aims for: past it, per-pass costs no longer show.
+const STREAMING_RUN_TARGET: usize = 128 << 10;
+/// The longest a streaming run waits for its next frame.
+const STREAMING_RUN_GAP: Duration = Duration::from_micros(200);
+/// The longest a streaming run waits in all.
+const STREAMING_RUN_WAIT: Duration = Duration::from_millis(2);
+
 /// The longest subscription response accepted; a real one is under a hundred
 /// bytes.
 const RESPONSE_LINE_LIMIT: u64 = 64 << 10;
@@ -257,6 +267,9 @@ pub struct HolderOutputStream {
     /// The timeout currently set on the socket. Setting it is a syscall, and
     /// the coalescing loop would otherwise pay one per frame.
     timeout: Option<Duration>,
+    /// When the last run was handed back: a run that begins soon after it is
+    /// part of streaming output.
+    last_run: Option<Instant>,
 }
 
 impl HolderOutputStream {
@@ -299,6 +312,7 @@ impl HolderOutputStream {
             start_offset,
             resumed: resume_from.is_some() && response.resumed == Some(true),
             timeout: None,
+            last_run: None,
         }))
     }
 
@@ -349,8 +363,32 @@ impl HolderOutputStream {
         let Some(offset) = self.read_frame_into(timeout, run)? else {
             return Ok(None);
         };
+        // While output streams, frames keep arriving a PTY read apart. Each
+        // pass the caller makes costs it a settle and a fingerprint of every
+        // visible row, so a few kilobytes per pass made a flood cost a
+        // quarter more to parse than the same bytes in large runs. A run that
+        // is already streaming-sized, or that began within
+        // [`STREAMING_RUN_WAIT`] of the last one, waits briefly for the frames
+        // still on their way (never longer than [`STREAMING_RUN_GAP`] between
+        // two of them, or [`STREAMING_RUN_WAIT`] in all), so it grows toward
+        // [`STREAMING_RUN_TARGET`]. A lone echo or prompt never waits.
+        let following = self
+            .last_run
+            .is_some_and(|at| at.elapsed() < STREAMING_RUN_WAIT);
+        let mut waited: Option<Instant> = None;
         while run.len() < budget {
-            match self.read_frame_into(Duration::ZERO, run) {
+            let streaming =
+                (following || run.len() >= STREAMING_RUN_MIN) && run.len() < STREAMING_RUN_TARGET;
+            let wait = match waited {
+                _ if !streaming => Duration::ZERO,
+                None => {
+                    waited = Some(Instant::now());
+                    STREAMING_RUN_GAP
+                }
+                Some(started) if started.elapsed() < STREAMING_RUN_WAIT => STREAMING_RUN_GAP,
+                Some(_) => Duration::ZERO,
+            };
+            match self.read_frame_into(wait, run) {
                 Ok(Some(_)) => {}
                 Ok(None) => break,
                 // A frame that fails mid-run leaves the stream unusable, but
@@ -359,6 +397,7 @@ impl HolderOutputStream {
                 Err(_) => break,
             }
         }
+        self.last_run = Some(Instant::now());
         Ok(Some(offset))
     }
 
@@ -661,6 +700,83 @@ mod deadline_tests {
             .next_run_into(Duration::from_secs(1), 1 << 20, &mut run)
             .unwrap();
         assert_eq!((at, &run[..]), (Some(40), &b"hello"[..]));
+    }
+
+    /// Opens an output stream to a fake Holder that sends `frames` (kilobyte
+    /// frames from offset 0), each after `gap`, and keeps the socket open.
+    fn stream_of_frames(
+        path: &Path,
+        frames: usize,
+        gap: Duration,
+    ) -> (HolderOutputStream, std::thread::JoinHandle<UnixStream>) {
+        let listener = UnixListener::bind(path).unwrap();
+        let worker = std::thread::spawn(move || {
+            let (mut socket, _) = listener.accept().unwrap();
+            let mut line = String::new();
+            BufReader::new(&mut socket).read_line(&mut line).unwrap();
+            let mut reply = serde_json::to_vec(&HolderResponse::output_stream(
+                HOLDER_OUTPUT_STREAM_VERSION,
+                0,
+            ))
+            .unwrap();
+            reply.push(b'\n');
+            socket.write_all(&reply).unwrap();
+            for frame in 0..frames {
+                std::thread::sleep(gap);
+                let mut bytes = Vec::new();
+                bytes.extend_from_slice(&(frame as u64 * 1024).to_be_bytes());
+                bytes.extend_from_slice(&1024_u32.to_be_bytes());
+                bytes.extend_from_slice(&[b'a' + (frame % 26) as u8; 1024]);
+                socket.write_all(&bytes).unwrap();
+            }
+            socket
+        });
+        let stream = HolderClient::at(path)
+            .open_output_stream()
+            .unwrap()
+            .expect("stream supported");
+        (stream, worker)
+    }
+
+    #[test]
+    fn streaming_frames_a_read_apart_join_one_run() {
+        let temp = tempfile::tempdir_in("/tmp").unwrap();
+        let path = temp.path().join("output.sock");
+        // A flood: kilobyte frames 20 µs apart, as a PTY hands them over.
+        let (mut stream, worker) = stream_of_frames(&path, 64, Duration::from_micros(20));
+        let mut run = Vec::new();
+        let mut runs = 0;
+        let mut received = 0;
+        while received < 64 << 10 {
+            let at = stream
+                .next_run_into(Duration::from_secs(5), 1 << 20, &mut run)
+                .unwrap()
+                .expect("a run");
+            assert_eq!(at, received as u64, "contiguous");
+            received += run.len();
+            runs += 1;
+        }
+        let _socket = worker.join().unwrap();
+        assert_eq!(received, 64 << 10);
+        // Without the streaming wait each frame arrived alone: 64 runs.
+        assert!(runs <= 8, "{runs} runs");
+    }
+
+    #[test]
+    fn a_short_frame_is_returned_without_waiting() {
+        let temp = tempfile::tempdir_in("/tmp").unwrap();
+        let path = temp.path().join("output.sock");
+        // One echo-sized frame, then nothing for a while.
+        let (mut stream, worker) = stream_of_frames(&path, 1, Duration::ZERO);
+        let mut run = Vec::new();
+        let started = Instant::now();
+        let at = stream
+            .next_run_into(Duration::from_secs(5), 1 << 20, &mut run)
+            .unwrap();
+        assert_eq!((at, run.len()), (Some(0), 1024));
+        // Below the streaming size: no wait for frames that are not coming.
+        assert!(started.elapsed() < Duration::from_millis(100));
+        let _socket = worker.join().unwrap();
     }
 
     #[test]

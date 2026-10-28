@@ -155,6 +155,20 @@ impl FrameQueue {
         }
     }
 
+    /// Takes the next frame, waiting up to `timeout` for one to arrive.
+    #[cfg(unix)]
+    pub(super) fn pop_within(&self, timeout: Duration) -> Option<Frame> {
+        let state = self.state.lock().expect("frame queue");
+        let (mut state, _) = self
+            .changed
+            .wait_timeout_while(state, timeout, |state| {
+                state.frames.is_empty() && !state.closed
+            })
+            .expect("frame queue");
+        let frame = Self::take_front(&mut state)?;
+        Some(self.released(state, frame))
+    }
+
     /// Takes a frame only if one is already waiting.
     #[cfg(any(unix, test))]
     pub(super) fn try_pop(&self) -> Option<Frame> {
