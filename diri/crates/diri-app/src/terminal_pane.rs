@@ -7911,6 +7911,20 @@ mod tests {
                         ).as_bytes());
                         grid = screen.full_snapshot();
                     }
+                    if scene == "weights" {
+                        // SGR 1 and SGR 2 apart and together, then the way
+                        // an agent mixes them, in default text and colour.
+                        let mut screen = diri_engine::HeadlessScreen::new(60, 10);
+                        screen.feed(concat!(
+                            "normal \x1b[1mbold\x1b[0m \x1b[2mfaint\x1b[0m \x1b[1;2mboth\x1b[0m\r\n",
+                            "\x1b[32mnormal \x1b[1mbold\x1b[0m\x1b[32m \x1b[2mfaint\x1b[0m\x1b[32m \x1b[1;2mboth\x1b[0m\r\n",
+                            "\r\n",
+                            "\x1b[32m●\x1b[0m \x1b[1mUpdate\x1b[0m(crates/diri-term/src/metrics.rs)\r\n",
+                            "  ⎿  \x1b[2mUpdated with 3 additions and 1 removal\x1b[0m\r\n",
+                            "\x1b[1mTotal cost:\x1b[0m $0.42  \x1b[2m(ctrl+o to expand)\x1b[0m",
+                        ).as_bytes());
+                        grid = screen.full_snapshot();
+                    }
                     if scene.starts_with("commands") {
                         // A shell with OSC 133 marks: two commands that
                         // passed, one that failed, and one still running.

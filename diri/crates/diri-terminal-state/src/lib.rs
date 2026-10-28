@@ -2502,7 +2502,9 @@ fn wire_style(flags: Flags) -> TermStyle {
         style |= TermStyle::WIDE_SPACER;
     }
     style |= shell_mark_style(flags);
-    if flags.intersects(Flags::BOLD | Flags::DIM_BOLD) {
+    // `Flags::DIM_BOLD` is DIM | BOLD, so testing either bit against it
+    // marks every bold cell faint and every faint cell bold. One bit each.
+    if flags.contains(Flags::BOLD) {
         style |= TermStyle::BOLD;
     }
     if flags.intersects(Flags::ALL_UNDERLINES) {
@@ -2517,7 +2519,7 @@ fn wire_style(flags: Flags) -> TermStyle {
     if flags.contains(Flags::HIDDEN) {
         style |= TermStyle::INVISIBLE;
     }
-    if flags.intersects(Flags::DIM | Flags::DIM_BOLD) {
+    if flags.contains(Flags::DIM) {
         style |= TermStyle::DIM;
     }
     if flags.contains(Flags::ITALIC) {
@@ -3714,6 +3716,56 @@ mod tests {
 #[cfg(test)]
 mod qol_tests {
     use super::*;
+
+    /// The weight and faint bits of `bold faint both`, one per word.
+    fn weights(cells: &[GridCell]) -> Vec<(bool, bool)> {
+        [0, 5, 11]
+            .iter()
+            .map(|&col| {
+                let style = cells[col].style;
+                (
+                    style.contains(TermStyle::BOLD),
+                    style.contains(TermStyle::DIM),
+                )
+            })
+            .collect()
+    }
+
+    const BOLD_FAINT_BOTH: &[u8] = b"\x1b[1mbold\x1b[0m \x1b[2mfaint\x1b[0m \x1b[1;2mboth\x1b[0m";
+    /// (bold, faint) for `bold`, `faint` and `both`.
+    const BOLD_FAINT_BOTH_STYLES: [(bool, bool); 3] = [(true, false), (false, true), (true, true)];
+
+    #[test]
+    fn bold_is_not_faint_and_faint_is_not_bold() {
+        let mut screen = HeadlessScreen::new(20, 2);
+        screen.feed(BOLD_FAINT_BOTH);
+        let full = screen.full_snapshot();
+        assert_eq!(weights(&full.changed_rows[0].cells), BOLD_FAINT_BOTH_STYLES);
+
+        // So does a diff against an earlier frame.
+        let mut live = HeadlessScreen::new(20, 2);
+        live.grid_update(true);
+        live.feed(BOLD_FAINT_BOTH);
+        let delta = live.grid_update(false);
+        assert_eq!(
+            weights(&delta.changed_rows[0].cells),
+            BOLD_FAINT_BOTH_STYLES
+        );
+
+        // A checkpoint restores the same weights.
+        let mut restored = HeadlessScreen::new(20, 2);
+        assert!(restored.restore(&[], &full, false, false, MouseModes::OFF));
+        assert_eq!(
+            weights(&restored.full_snapshot().changed_rows[0].cells),
+            BOLD_FAINT_BOTH_STYLES
+        );
+
+        // Scrolled into history, the cells keep them too.
+        screen.feed(b"\r\n\r\n");
+        let history = screen.scrollback_cells(0, 1);
+        let rows = GridRowCodec::decode_rows(&history.payload, history.row_count as usize).unwrap();
+        assert_eq!(weights(&rows[0]), BOLD_FAINT_BOTH_STYLES);
+    }
     #[test]
     fn hyperlink_only_changes_advance_sequence_and_survive_mirror_reseed() {
         let mut screen = HeadlessScreen::new(40, 4);
