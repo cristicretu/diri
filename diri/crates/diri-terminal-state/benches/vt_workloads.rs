@@ -4,7 +4,8 @@
 //! Kitty images and long OSCs, parsed into a 120x80 terminal configured as
 //! the local Engine configures it (notifications, inline images, host
 //! replies, kitty keyboard). Every byte is parsed: the probe checks that the
-//! screen ends where a one-shot parse of the same bytes ends.
+//! screen ends where a one-shot parse and a byte-at-a-time parse of the same
+//! bytes end.
 //!
 //! The data is the kitten's own when `DIRI_VT_BENCH_DIR` names a directory
 //! holding `ascii.bin`, `unicode.bin`, `unique_unicode.bin`, `csi.bin`,
@@ -209,7 +210,8 @@ fn main() {
             None => (generate(name), "generated"),
         };
         let reps = MIN_BYTES_PER_RUN.div_ceil(data.len());
-        // Every byte parsed: reads of any size end on the same screen.
+        // Every byte parsed: reads of any size, down to one byte at a time,
+        // end on the same screen.
         let (_, chunked) = run(&data, 1, read);
         let mut whole = screen();
         whole.feed(&data);
@@ -217,6 +219,12 @@ fn main() {
             chunked.lines(),
             whole.lines(),
             "{name}: chunking changed the screen"
+        );
+        let (_, bytewise) = run(&data, 1, 1);
+        assert_eq!(
+            chunked.lines(),
+            bytewise.lines(),
+            "{name}: reads of {read} bytes and of one byte ended on different screens"
         );
         let _ = run(&data, 1, read); // warm-up
         let mut rates: Vec<f64> = (0..RUNS)

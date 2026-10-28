@@ -4386,6 +4386,57 @@ mod tests {
         text.rsplit_once("line ")?.1.get(..7)?.parse().ok()
     }
 
+    /// Narrowing a deep history of wide-character lines re-wraps it rather
+    /// than evicting it. Its deferred line index used to count at capacity,
+    /// which evicting never gave back, so 150,000 rows became 73,777 here
+    /// (about 150 at 100,001 rows of 40-column CJK prose).
+    #[cfg(feature = "compact-history")]
+    #[test]
+    fn narrowing_deep_wide_character_history_keeps_it() {
+        const WIDE: &[char] = &['漢', '字', '行', '日', '本', '語', '中', '文', '書', '道'];
+        let line = |n: usize| {
+            // 36 wide characters after the number: two rows at 80 columns.
+            let text: String = (0..36)
+                .map(|i| WIDE[(n / 10 + i * 7 + n) % WIDE.len()])
+                .collect();
+            format!("line {n:07}{text}\r\n")
+        };
+        let mut screen = HeadlessScreen::new(80, 24);
+        let lines = 100_024;
+        let log: String = (0..lines).map(line).collect();
+        for chunk in log.as_bytes().chunks(64 * 1024) {
+            screen.feed(chunk);
+        }
+        let before = screen.history_rows();
+        assert!(before > 50_000, "{before} rows before narrowing");
+        screen.resize(40, 24);
+        let after = screen.history_rows();
+        assert!(
+            after >= before,
+            "{before} rows became {after} after narrowing"
+        );
+        assert!(screen.history_storage_bytes() <= HISTORY_STORAGE_BUDGET_BYTES);
+        // More output keeps it: lines evict in proportion.
+        let more: String = (lines..lines + 2_000).map(line).collect();
+        screen.feed(more.as_bytes());
+        assert!(
+            screen.history_rows() + 4_000 >= after,
+            "{} rows",
+            screen.history_rows()
+        );
+        // The newest history line is one of those just above the screen.
+        let rows = screen.history_rows() as i64;
+        let newest = history_text(&mut screen, rows - 4, 4)
+            .iter()
+            .filter_map(|text| text.strip_prefix("line ")?.get(..7)?.parse::<usize>().ok())
+            .max();
+        let newest = newest.expect("numbered history rows");
+        assert!(
+            (lines + 2_000 - 24..lines + 2_000).contains(&newest),
+            "newest history line {newest}"
+        );
+    }
+
     #[cfg(feature = "compact-history")]
     #[test]
     fn history_depth_is_bounded_by_stored_bytes_not_rows() {

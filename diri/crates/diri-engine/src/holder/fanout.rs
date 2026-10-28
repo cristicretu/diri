@@ -47,6 +47,9 @@ struct State {
     /// next push starts one; a close while it is set leaves the subscriber's
     /// teardown to whoever closed.
     writer_parked: bool,
+    /// The writer is in [`FrameQueue::linger`]: it wakes at its own
+    /// deadline, so a push need not wake it until a batch has built.
+    lingering: bool,
 }
 
 /// What became of a frame offered to a subscriber.
@@ -72,6 +75,13 @@ pub(super) enum Popped {
     Idle,
 }
 
+/// Bytes that wake a lingering reader before its deadline. While output
+/// streams, a pump read is a kilobyte a few microseconds apart, and waking
+/// the reader for each one cost a condvar signal and a context switch per
+/// kilobyte: more than the PTY read itself. A lingering reader wakes at its
+/// deadline anyway (100 µs) and finds them all joined in one frame.
+const LINGER_WAKE_BYTES: usize = 64 << 10;
+
 pub(super) struct FrameQueue {
     state: Mutex<State>,
     /// Signals both directions: room appeared, or a frame did.
@@ -93,6 +103,7 @@ impl FrameQueue {
                 closed: false,
                 progress: 0,
                 writer_parked: true,
+                lingering: false,
             }),
             changed: Condvar::new(),
             capacity: capacity.max(1),
@@ -164,10 +175,16 @@ impl FrameQueue {
             _ => state.frames.push_back((offset, bytes.to_vec())),
         }
         let unserved = std::mem::take(&mut state.writer_parked);
-        drop(state);
         // A reader parks only on an empty queue, so a push onto a non-empty
-        // one has nobody to wake.
-        if was_empty {
+        // one has nobody to wake, and a lingering one is woken only once a
+        // batch has built.
+        let wake = if state.lingering {
+            state.queued >= LINGER_WAKE_BYTES && state.queued - bytes.len() < LINGER_WAKE_BYTES
+        } else {
+            was_empty
+        };
+        drop(state);
+        if wake {
             self.changed.notify_all();
         }
         if unserved {
@@ -232,6 +249,32 @@ impl FrameQueue {
             #[cfg(not(test))]
             let _ = timeout;
         }
+    }
+
+    /// Takes what arrives within `timeout`, joined into one frame where it
+    /// is contiguous. Pushes do not cut the wait short until
+    /// [`LINGER_WAKE_BYTES`] are waiting, so a stream of small frames costs
+    /// one wakeup per `timeout` rather than one per frame; only the queue
+    /// closing or filling ends it sooner.
+    #[cfg(unix)]
+    pub(super) fn linger(&self, timeout: Duration) -> Option<Frame> {
+        let mut state = self.state.lock().expect("frame queue");
+        if state.frames.is_empty() && !state.closed {
+            state.lingering = true;
+            state = self
+                .changed
+                .wait_timeout_while(state, timeout, |state| {
+                    !state.closed && state.queued < LINGER_WAKE_BYTES
+                })
+                .expect("frame queue")
+                .0;
+            state.lingering = false;
+            #[cfg(test)]
+            self.wakeups
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        }
+        let frame = Self::take_front(&mut state)?;
+        Some(self.released(state, frame))
     }
 
     /// Ends the writer's turn if nothing is waiting: returns true, and the
@@ -410,6 +453,74 @@ mod tests {
         assert!(push(&queue, 7, Duration::from_millis(10)));
         queue.close();
         assert_eq!(reader.join().expect("reader"), (Some(7), None));
+    }
+
+    /// A writer lingering for the next frame of a stream is not woken by
+    /// each kilobyte the pump pushes: it collects them all, joined, at its
+    /// deadline, and pays one wakeup instead of one per read.
+    #[cfg(unix)]
+    #[test]
+    fn a_lingering_reader_collects_a_stream_of_small_frames_at_its_deadline() {
+        let queue = FrameQueue::new(1 << 20);
+        let lingering = {
+            let queue = Arc::clone(&queue);
+            std::thread::spawn(move || {
+                let started = Instant::now();
+                (queue.linger(Duration::from_millis(300)), started.elapsed())
+            })
+        };
+        while !queue.state.lock().expect("frame queue").lingering {
+            std::thread::yield_now();
+        }
+        for offset in 0..32 {
+            assert!(queue.push(offset * 1024, &[b'x'; 1024], Duration::from_secs(1)));
+        }
+        let (frame, waited) = lingering.join().expect("reader");
+        let (offset, bytes) = frame.expect("a frame");
+        assert_eq!(offset, 0);
+        assert_eq!(bytes.len(), 32 * 1024, "every kilobyte, in one frame");
+        assert!(
+            waited >= Duration::from_millis(250),
+            "woken early: {waited:?}"
+        );
+    }
+
+    /// A batch big enough to be worth writing, a close, or nothing at all:
+    /// a lingering reader is woken at once for the first two.
+    #[cfg(unix)]
+    #[test]
+    fn a_lingering_reader_wakes_early_for_a_full_batch_or_a_close() {
+        let queue = FrameQueue::new(1 << 20);
+        let reader = {
+            let queue = Arc::clone(&queue);
+            std::thread::spawn(move || {
+                let started = Instant::now();
+                let frame = queue.linger(Duration::from_secs(10));
+                (frame.map(|frame| frame.1.len()), started.elapsed())
+            })
+        };
+        while !queue.state.lock().expect("frame queue").lingering {
+            std::thread::yield_now();
+        }
+        assert!(queue.push(0, &vec![b'x'; LINGER_WAKE_BYTES], Duration::from_secs(1)));
+        let (bytes, waited) = reader.join().expect("reader");
+        assert_eq!(bytes, Some(LINGER_WAKE_BYTES));
+        assert!(waited < Duration::from_secs(5), "waited {waited:?}");
+
+        let reader = {
+            let queue = Arc::clone(&queue);
+            std::thread::spawn(move || {
+                let started = Instant::now();
+                (queue.linger(Duration::from_secs(10)), started.elapsed())
+            })
+        };
+        while !queue.state.lock().expect("frame queue").lingering {
+            std::thread::yield_now();
+        }
+        queue.close();
+        let (frame, waited) = reader.join().expect("reader");
+        assert!(frame.is_none());
+        assert!(waited < Duration::from_secs(5), "waited {waited:?}");
     }
 
     #[test]
