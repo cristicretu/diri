@@ -1,5 +1,6 @@
 pub mod brand_raster;
 pub mod browser;
+pub mod dock_menu;
 pub(crate) mod floating_panel;
 pub(crate) mod global_shortcut;
 pub(crate) mod shortcut_capture;

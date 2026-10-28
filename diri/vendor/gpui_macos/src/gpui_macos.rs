@@ -32,6 +32,7 @@ mod open_type;
 mod text_system;
 
 mod platform;
+pub use platform::set_dock_menu_provider;
 mod window;
 mod window_appearance;
 

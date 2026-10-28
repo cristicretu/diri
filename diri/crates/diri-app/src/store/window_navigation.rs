@@ -193,6 +193,29 @@ impl WindowStore {
             })
         })
     }
+    /// The live window already showing `session`, so jumping to it raises
+    /// that window and leaves the others where they are; otherwise the
+    /// focused one, as [`Self::focused`].
+    #[cfg(any(target_os = "macos", test))]
+    pub fn showing(canonical: &Arc<RwLock<SessionStore>>, session: &SessionId) -> Option<Self> {
+        WINDOWS
+            .with(|windows| {
+                windows.borrow().iter().rev().find_map(|entry| {
+                    let store = entry.canonical.upgrade()?;
+                    let navigation = entry.navigation.upgrade()?;
+                    let shown = {
+                        let navigation = navigation.borrow();
+                        navigation.live && navigation.selected_session_id.as_ref() == Some(session)
+                    };
+                    (Arc::ptr_eq(&store, canonical) && shown).then(|| Self {
+                        canonical: store,
+                        navigation,
+                        owner: entry.owner,
+                    })
+                })
+            })
+            .or_else(|| Self::focused(canonical))
+    }
     pub fn enqueue(&self, action: WindowAction) -> bool {
         let mut navigation = self.navigation.borrow_mut();
         if !navigation.live || navigation.actions.len() >= 16 {
@@ -1674,5 +1697,20 @@ mod tests {
             WindowStore::focused(&first.canonical).unwrap().owner(),
             first.owner()
         );
+    }
+    #[test]
+    fn a_jump_raises_the_window_already_showing_the_session() {
+        let (first, second, ids) = windows();
+        first.write().unwrap().select(ids[0].clone());
+        second.write().unwrap().select(ids[1].clone());
+        second.write().unwrap().set_active(true);
+        let showing = |id: &SessionId| WindowStore::showing(&first.canonical, id).unwrap().owner();
+        // The background window keeps its session; the jump goes there.
+        assert_eq!(showing(&ids[0]), first.owner());
+        assert_eq!(showing(&ids[1]), second.owner());
+        // Shown nowhere: the focused window opens it.
+        assert_eq!(showing(&ids[2]), second.owner());
+        first.close_context();
+        assert_eq!(showing(&ids[0]), second.owner());
     }
 }

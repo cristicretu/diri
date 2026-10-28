@@ -4493,3 +4493,220 @@ fn dock_badge_counts_unseen_sessions_once_until_each_is_viewed() {
     store.toggle_notification_mute(id("failed"));
     assert_eq!(store.dock_badge_count(), 0);
 }
+
+/// A session that has waited on `summary` since `since_ms`.
+fn dock_asking(value: &str, summary: &str, since_ms: f64) -> SessionRecord {
+    let mut record = dock_titled(session(value, "p", 1.0));
+    record.updated_at = DateMillis(since_ms);
+    record.status = SessionStatus::NeedsInput(diri_proto::NeedsInputKind::Permission);
+    record.needs_input = Some(diri_proto::NeedsInputDetail {
+        kind: diri_proto::NeedsInputKind::Permission,
+        source: diri_proto::NeedsInputSource::ProgramStatus,
+        tool_name: None,
+        summary: summary.into(),
+        prompt_excerpt: None,
+        options: None,
+        risk_hint: diri_proto::RiskHint::Neutral,
+        occurred_at: DateMillis(since_ms),
+        secret: false,
+    });
+    add_attention_fixture(&mut record);
+    record
+}
+
+/// A session whose unseen `kind` event happened at `at_ms`.
+fn dock_news(value: &str, kind: diri_proto::attention::AttentionKind, at_ms: f64) -> SessionRecord {
+    let mut record = dock_titled(session_with_event(value, kind, 1));
+    if let Some(state) = &mut record.attention_state {
+        for event in &mut state.events {
+            event.occurred_at = DateMillis(at_ms);
+        }
+    }
+    record
+}
+
+fn dock_titled(mut record: SessionRecord) -> SessionRecord {
+    record.title_source = TitleSource::UserRename;
+    record
+}
+
+const DOCK_MINUTE: f64 = 60_000.0;
+const DOCK_NOW: u64 = 10 * 60_000;
+
+#[test]
+fn the_dock_menu_lists_who_needs_you_first_then_whos_working() {
+    use diri_proto::attention::AttentionKind;
+    let mut busy = dock_titled(session("busy", "p", 1.0));
+    busy.status = SessionStatus::Working;
+    busy.terminal_progress = Some(diri_proto::TerminalProgress {
+        state: diri_proto::TerminalProgressState::Normal,
+        percent: 40,
+    });
+    let mut building = dock_titled(session("cargo build", "p", 1.0));
+    building.kind = AgentKind::SHELL;
+    building.status = SessionStatus::Working;
+    let (mut store, _effects) = hydrated(
+        vec![
+            dock_titled(session("idle", "p", 1.0)),
+            busy,
+            building,
+            dock_news("finished earlier", AttentionKind::Completion, 1.0),
+            dock_asking("asks", "Allow `deploy` to staging?", 7.0 * DOCK_MINUTE),
+            dock_news("failed", AttentionKind::Failure, 1.0),
+            dock_news("finished", AttentionKind::Completion, 5.0 * DOCK_MINUTE),
+            dock_asking("asks again", "Waiting for approval", 9.9 * DOCK_MINUTE),
+        ],
+        vec![project("p", "P")],
+        Prefs::default(),
+    );
+    let menu = crate::dock_menu::build(&mut store, DOCK_NOW);
+    // Waiting (newest first), failed, finished (newest first); then agents
+    // at work. Idle sessions and a shell running a build are left out.
+    assert_eq!(
+        menu.render_text(),
+        "[Needs You]\n\
+         asks again — Waiting for approval · now\n\
+         asks — Allow deploy to staging? · 3m\n\
+         failed — Failed · 9m\n\
+         finished — Finished · 5m\n\
+         finished earlier — Finished · 9m\n\
+         [Working]\n\
+         busy — Working · 40%\n\
+         —\n\
+         Mark All as Seen"
+    );
+    assert_eq!(menu.attention[0].session_id, id("asks again"));
+    assert_eq!(menu.attention[0].agent_id, AgentKind::CLAUDE_CODE_ID);
+}
+
+#[test]
+fn mark_all_seen_clears_finished_and_failed_but_keeps_what_still_waits() {
+    use diri_proto::attention::AttentionKind;
+    let (mut store, mut effects) = hydrated(
+        vec![
+            dock_asking("asks", "Allow deploy?", 7.0 * DOCK_MINUTE),
+            dock_news("failed", AttentionKind::Failure, 1.0),
+            dock_news("finished", AttentionKind::Completion, 1.0),
+        ],
+        vec![project("p", "P")],
+        Prefs::default(),
+    );
+    drain(&mut effects);
+    assert_eq!(store.dock_badge_count(), 2);
+    store.mark_all_seen();
+    let seen: Vec<_> = drain(&mut effects)
+        .into_iter()
+        .filter_map(|effect| match effect {
+            StoreEffect::MarkSeen(id) => Some(id.0),
+            _ => None,
+        })
+        .collect();
+    assert!(seen.contains(&"failed".to_owned()) && seen.contains(&"finished".to_owned()));
+    assert!(!seen.contains(&"asks".to_owned()), "seeing a question does not answer it");
+    assert_eq!(store.dock_badge_count(), 0);
+    let menu = crate::dock_menu::build(&mut store, DOCK_NOW);
+    assert_eq!(menu.render_text(), "[Needs You]\nasks — Allow deploy? · 3m");
+    assert!(!menu.can_mark_seen);
+}
+
+#[test]
+fn a_long_dock_menu_folds_the_rest_into_one_item() {
+    use diri_proto::attention::AttentionKind;
+    let mut sessions: Vec<_> = (0..15)
+        .map(|n| dock_news(&format!("done {n:02}"), AttentionKind::Completion, n as f64))
+        .collect();
+    sessions.extend((0..10).map(|n| {
+        let mut busy = dock_titled(session(&format!("busy {n}"), "p", 1.0));
+        busy.status = SessionStatus::Working;
+        busy
+    }));
+    let (mut store, _effects) = hydrated(sessions, vec![project("p", "P")], Prefs::default());
+    let menu = crate::dock_menu::build(&mut store, DOCK_NOW);
+    assert_eq!(menu.attention.len(), crate::dock_menu::MAX_ATTENTION_ROWS);
+    assert_eq!(menu.working.len(), crate::dock_menu::MAX_WORKING_ROWS);
+    assert_eq!(menu.more, 3 + 2);
+    assert!(menu.render_text().contains("5 more in Diri…"));
+    // The newest finished turns are the ones kept.
+    assert_eq!(menu.attention[0].session_id, id("done 14"));
+}
+
+#[test]
+fn only_a_new_blocker_in_the_background_bounces_the_dock_by_default() {
+    use diri_proto::attention::AttentionKind;
+    let (mut store, mut effects) = hydrated(
+        vec![session("visible", "p", 2.0)],
+        vec![project("p", "P")],
+        Prefs::default(),
+    );
+    store.select(id("visible"));
+    store.set_active(false);
+    drain(&mut effects);
+    store.upsert_session(session_with_event("done", AttentionKind::Completion, 1));
+    store.upsert_session(session_with_event("failed", AttentionKind::Failure, 1));
+    store.upsert_session(session_with_event("asks", AttentionKind::Request, 1));
+    let due = store.next_attention_deadline().unwrap() + Duration::from_secs(1);
+    let transitions = store.drain_settled_attention(due);
+    let request = |name: &str| {
+        transitions
+            .iter()
+            .find_map(|transition| {
+                transition
+                    .notification
+                    .as_ref()
+                    .filter(|request| request.thread_identifier.as_deref() == Some(name))
+            })
+            .unwrap_or_else(|| panic!("{name} announced"))
+            .clone()
+    };
+    let (asks, done, failed) = (request("asks"), request("done"), request("failed"));
+    assert!(store.should_bounce_dock(&asks));
+    assert!(!store.should_bounce_dock(&done));
+    assert!(!store.should_bounce_dock(&failed));
+    // Its own switch, per state.
+    store
+        .update_preferences(|prefs| {
+            prefs.attention_routes.blocked.bounce = false;
+            prefs.attention_routes.done.bounce = true;
+        })
+        .unwrap();
+    assert!(!store.should_bounce_dock(&asks));
+    assert!(store.should_bounce_dock(&done));
+    // Never while Diri is in front, nor for a muted session.
+    store.set_active(true);
+    assert!(!store.should_bounce_dock(&done));
+    store.set_active(false);
+    store.toggle_notification_mute(id("done"));
+    assert!(!store.should_bounce_dock(&done));
+}
+
+/// What opening the Dock menu costs at fleet scale: building its model from
+/// 1000 sessions (a fifth waiting, a fifth finished, a fifth working).
+/// `cargo test -p diri-app --release dock_menu_build_cost -- --ignored --nocapture`
+#[test]
+#[ignore = "measurement"]
+fn dock_menu_build_cost() {
+    use diri_proto::attention::AttentionKind;
+    let sessions: Vec<_> = (0..1000)
+        .map(|n| match n % 5 {
+            0 => dock_asking(&format!("s{n}"), "Allow deploy?", n as f64),
+            1 => dock_news(&format!("s{n}"), AttentionKind::Completion, n as f64),
+            2 => {
+                let mut busy = dock_titled(session(&format!("s{n}"), "p", 1.0));
+                busy.status = SessionStatus::Working;
+                busy
+            }
+            _ => dock_titled(session(&format!("s{n}"), "p", 1.0)),
+        })
+        .collect();
+    let (mut store, _effects) = hydrated(sessions, vec![project("p", "P")], Prefs::default());
+    let _ = crate::dock_menu::build(&mut store, DOCK_NOW);
+    let runs = 200;
+    let started = Instant::now();
+    for _ in 0..runs {
+        std::hint::black_box(crate::dock_menu::build(&mut store, DOCK_NOW));
+    }
+    eprintln!(
+        "dock menu model, 1000 sessions: {:?} per open",
+        started.elapsed() / runs
+    );
+}

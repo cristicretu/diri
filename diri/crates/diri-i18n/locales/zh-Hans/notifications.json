@@ -1,4 +1,8 @@
 {
+  "dock.mark_all_seen": "全部标记为已查看",
+  "dock.more": "Diri 中还有 {n} 个…",
+  "dock.section_needs_you": "需要你",
+  "dock.section_working": "工作中",
   "menubar.close_session": "关闭 {title}",
   "menubar.default_agent": "默认智能体",
   "menubar.new_agent": "新建智能体…",

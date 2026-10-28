@@ -1,4 +1,8 @@
 {
+  "dock.mark_all_seen": "Mark All as Seen",
+  "dock.more": "{n} more in Diri…",
+  "dock.section_needs_you": "Needs You",
+  "dock.section_working": "Working",
   "menubar.close_session": "Close {title}",
   "menubar.default_agent": "Default Agent",
   "menubar.new_agent": "New Agent…",

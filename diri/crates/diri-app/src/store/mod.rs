@@ -767,6 +767,37 @@ impl SessionStore {
             && self.still_news(request)
     }
 
+    /// Whether a session's news bounces the Dock icon once: only while Diri
+    /// is in the background, under its state's bounce switch (by default
+    /// only a session waiting on you), with the same mute and read checks.
+    pub fn should_bounce_dock(&self, request: &crate::notifications::NotificationRequest) -> bool {
+        !self.app_is_active
+            && self.route(request).is_some_and(|route| route.bounce)
+            && self.still_news(request)
+    }
+
+    /// The Dock menu's "Mark All as Seen": every session that finished or
+    /// failed unseen reads as seen, as if each had been opened. A session
+    /// still waiting on you keeps its mark: seeing a question does not
+    /// answer it.
+    pub fn mark_all_seen(&mut self) {
+        let unseen: Vec<SessionId> = self
+            .sessions
+            .values()
+            .filter(|session| {
+                !session.is_archived()
+                    && session.attention() != AttentionLevel::NeedsInput
+                    && (session.attention() == AttentionLevel::DoneUnseen
+                        || self.notification_feed.session_unread(&session.id)
+                        || self.unread_holds.contains(&session.id))
+            })
+            .map(|session| session.id.clone())
+            .collect();
+        for id in unseen {
+            self.mark_session_read(id);
+        }
+    }
+
     /// The per-state route of a session event's feed entry; `None` for
     /// anything else (an agent's own notification, a one-shot fact).
     fn route(&self, request: &crate::notifications::NotificationRequest) -> Option<AttentionRoute> {
