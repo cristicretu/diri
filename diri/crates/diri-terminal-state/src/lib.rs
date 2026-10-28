@@ -40,7 +40,7 @@ use diri_proto::grid::{
 };
 use diri_proto::terminal::{
     MouseEncoding, MouseModes, MouseTrackingMode, TerminalMouseEvent, TerminalMouseModifiers,
-    encode_mouse_event,
+    encode_mouse_wheel,
 };
 use diri_proto::{TerminalAppearance, TerminalPalette};
 
@@ -1064,6 +1064,11 @@ impl HeadlessScreen {
         (self.geometry.cols, self.geometry.rows)
     }
 
+    /// Rows above the visible grid.
+    pub fn history_rows(&self) -> usize {
+        self.term.grid().history_size()
+    }
+
     pub fn invalidate_keyboard_enhancements(&mut self) {
         self.keyboard_enhancements_known = false;
     }
@@ -1343,6 +1348,7 @@ impl HeadlessScreen {
     ///
     /// At most the newest [`HISTORY_EXPORT_ROWS`]: restore admits no more.
     pub fn history_snapshot(&mut self) -> Vec<Vec<GridCell>> {
+        self.prepare_history_read();
         let history = self.term.grid().history_size().min(HISTORY_EXPORT_ROWS);
         let cols = self.geometry.cols;
         let mut rows = Vec::with_capacity(history);
@@ -1359,8 +1365,33 @@ impl HeadlessScreen {
         rows
     }
 
+    /// [`Self::history_snapshot`] already encoded with
+    /// [`diri_proto::grid::GridRowCodec::append_row`], oldest row first, and
+    /// its row count. One row is decoded at a time, so the transient is one
+    /// row of cells plus the compact payload instead of a cell copy of every
+    /// row.
+    pub fn history_payload(&mut self) -> (usize, Vec<u8>) {
+        self.prepare_history_read();
+        let history = self.term.grid().history_size().min(HISTORY_EXPORT_ROWS);
+        let cols = self.geometry.cols;
+        let mut payload = Vec::new();
+        let mut row = Vec::with_capacity(cols);
+        for index in 0..history {
+            let line = Line(index as i32 - history as i32);
+            row.clear();
+            let source = &self.term.grid()[line];
+            row.extend((0..cols).map(|x| wire_cell(&source[Column(x)])));
+            // A row is at most the terminal width, far below the codec's
+            // u16 cell limit, so encoding cannot fail.
+            let _ = diri_proto::grid::GridRowCodec::append_row(&row, &mut payload);
+            self.finish_history_read_batch(index + 1, index + 1 == history);
+        }
+        (history, payload)
+    }
+
     /// Annotations of the rows [`Self::history_snapshot`] exports.
     pub fn history_metadata(&mut self) -> Vec<RowMetadata> {
+        self.prepare_history_read();
         let count = self.term.grid().history_size().min(HISTORY_EXPORT_ROWS);
         let mut rows = Vec::with_capacity(count);
         for index in 0..count {
@@ -1368,6 +1399,14 @@ impl HeadlessScreen {
             self.finish_history_read_batch(index + 1, index + 1 == count);
         }
         rows
+    }
+
+    /// Before reading history rows: a reflow the compact store deferred is
+    /// stored a block at a time now, rather than rebuilt whole (every row at
+    /// the new width, tens of MB) by the first read.
+    fn prepare_history_read(&mut self) {
+        #[cfg(feature = "compact-history")]
+        self.term.grid_mut().prepare_history_read();
     }
 
     fn finish_history_read_batch(&mut self, completed: usize, finished: bool) {
@@ -1569,34 +1608,49 @@ impl HeadlessScreen {
         true
     }
 
-    /// Encodes a wheel event for the child, when it asked for mouse
-    /// reporting. Returns the bytes to write to the PTY — empty means the
-    /// child doesn't care and the client should scroll its own scrollback.
+    /// Encodes a wheel event for the child. Returns the bytes to write to the
+    /// PTY — empty means the child doesn't care and the client should scroll
+    /// its own scrollback.
+    ///
+    /// A program reporting the mouse gets one wheel report per line. A
+    /// program on the alternate screen that does not read the mouse gets
+    /// arrow keys instead while alternate scroll (DECSET 1007, on by default)
+    /// is set, as xterm does: pagers such as `less` and `man`, and editors,
+    /// have no scrollback for the terminal to move. The arrows follow the
+    /// cursor-key mode (`CSI A` or `SS3 A`).
     pub fn mouse_wheel(&self, up: bool, lines: usize, col: usize, row: usize) -> Vec<u8> {
-        if !self.mouse_reporting() || lines == 0 {
+        if lines == 0 {
             return Vec::new();
+        }
+        let modes = self.mouse_modes();
+        if !modes.is_reporting() {
+            let mode = self.term.mode();
+            if !mode.contains(TermMode::ALT_SCREEN) || !mode.contains(TermMode::ALTERNATE_SCROLL) {
+                return Vec::new();
+            }
+            let arrow: &[u8] = match (mode.contains(TermMode::APP_CURSOR), up) {
+                (true, true) => b"\x1bOA",
+                (true, false) => b"\x1bOB",
+                (false, true) => b"\x1b[A",
+                (false, false) => b"\x1b[B",
+            };
+            return arrow.repeat(lines);
         }
         let x = col.min(self.geometry.cols.saturating_sub(1));
         let y = row.min(self.geometry.rows.saturating_sub(1));
-        let mut out = Vec::new();
-        for _ in 0..lines {
-            let event = if up {
-                TerminalMouseEvent::WheelUp
-            } else {
-                TerminalMouseEvent::WheelDown
-            };
-            let Some(report) = encode_mouse_event(
-                self.mouse_modes(),
-                event,
-                TerminalMouseModifiers::default(),
-                x as u16,
-                y as u16,
-            ) else {
-                break;
-            };
-            out.extend_from_slice(&report);
-        }
-        out
+        let event = if up {
+            TerminalMouseEvent::WheelUp
+        } else {
+            TerminalMouseEvent::WheelDown
+        };
+        encode_mouse_wheel(
+            modes,
+            event,
+            TerminalMouseModifiers::default(),
+            x as u16,
+            y as u16,
+            lines,
+        )
     }
 
     /// Scrollback plus the visible screen as plain text, for search.
@@ -1606,6 +1660,7 @@ impl HeadlessScreen {
     /// deep scrollback across heavy output may refetch; the visible region and
     /// recent history are exact.
     pub fn scrollback(&mut self) -> diri_proto::ReadScrollbackResult {
+        self.prepare_history_read();
         let history = self.term.grid().history_size();
         let rows = self.geometry.rows;
         let cols = self.geometry.cols;
@@ -1633,7 +1688,7 @@ impl HeadlessScreen {
                     1
                 };
                 let range = [x as u16, (x + width).min(cols) as u16];
-                text.push(if c < ' ' && c != '\t' { ' ' } else { c });
+                text.push(text_char(c));
                 ranges.push(range);
                 if let Some(combining) = cell.zerowidth() {
                     for &ch in combining {
@@ -1672,6 +1727,7 @@ impl HeadlessScreen {
         first_row: i64,
         max_rows: i64,
     ) -> diri_proto::ReadScrollbackCellsResult {
+        self.prepare_history_read();
         let history = self.term.grid().history_size();
         let cols = self.geometry.cols;
         let total = history + self.geometry.rows;
@@ -1885,7 +1941,7 @@ impl HeadlessScreen {
             {
                 continue;
             }
-            text.push(cell.c);
+            text.push(text_char(cell.c));
             if let Some(combining) = cell.zerowidth() {
                 text.extend(combining.iter().copied());
             }
@@ -1897,7 +1953,10 @@ impl HeadlessScreen {
     /// of scrollback: text with soft-wrapped rows rejoined (a URL longer than
     /// the terminal is one logical line), and every OSC 8 hyperlink target,
     /// which is often the only place the URL of a `[title](url)` link exists.
-    pub fn link_source(&self, history_rows: usize) -> LinkSource {
+    pub fn link_source(&mut self, history_rows: usize) -> LinkSource {
+        if history_rows > 0 {
+            self.prepare_history_read();
+        }
         let grid = self.term.grid();
         let history = grid.history_size().min(history_rows);
         let cols = self.geometry.cols;
@@ -1931,7 +1990,7 @@ impl HeadlessScreen {
                 {
                     continue;
                 }
-                row_text.push(cell.c);
+                row_text.push(text_char(cell.c));
                 if let Some(combining) = cell.zerowidth() {
                     row_text.extend(combining.iter().copied());
                 }
@@ -2255,6 +2314,15 @@ impl HeadlessScreen {
 ///
 /// The existing Rust wire vocabulary uses `Default`/`DefaultInverted` for the
 /// two default colors, ANSI indices for 0–255, and stable protocol style bits.
+/// A cell's character as text for a reader. The parser marks the cell where
+/// a tab began with `\t` but leaves the cells it moved over blank, so the
+/// tab reads as the space it is on screen, as xterm and Ghostty copy it;
+/// keeping it would read as a tab followed by the spaces it stood for.
+/// Other control characters never reach a cell but read as a space too.
+fn text_char(c: char) -> char {
+    if c < ' ' { ' ' } else { c }
+}
+
 fn wire_cell(cell: &alacritty_terminal::term::cell::Cell) -> GridCell {
     let scalar = if cell
         .flags
@@ -2555,7 +2623,9 @@ fn wire_style(flags: Flags) -> TermStyle {
         style |= TermStyle::WIDE_SPACER;
     }
     style |= shell_mark_style(flags);
-    if flags.intersects(Flags::BOLD | Flags::DIM_BOLD) {
+    // `Flags::DIM_BOLD` is DIM | BOLD, so testing either bit against it
+    // marks every bold cell faint and every faint cell bold. One bit each.
+    if flags.contains(Flags::BOLD) {
         style |= TermStyle::BOLD;
     }
     if flags.intersects(Flags::ALL_UNDERLINES) {
@@ -2570,7 +2640,7 @@ fn wire_style(flags: Flags) -> TermStyle {
     if flags.contains(Flags::HIDDEN) {
         style |= TermStyle::INVISIBLE;
     }
-    if flags.intersects(Flags::DIM | Flags::DIM_BOLD) {
+    if flags.contains(Flags::DIM) {
         style |= TermStyle::DIM;
     }
     if flags.contains(Flags::ITALIC) {
@@ -3428,7 +3498,7 @@ mod tests {
 
     /// Line numbers still held anywhere in history or on the screen.
     #[cfg(feature = "compact-history")]
-    fn retained_ids(screen: &HeadlessScreen) -> Vec<usize> {
+    fn retained_ids(screen: &mut HeadlessScreen) -> Vec<usize> {
         screen
             .link_source(usize::MAX)
             .text
@@ -3447,7 +3517,7 @@ mod tests {
         for (width, label) in [(70, "unwrapped"), (120, "wrapped")] {
             let mut screen = HeadlessScreen::new(80, 24);
             screen.feed(&numbered_lines(0, 30_000, width));
-            let full = retained_ids(&screen);
+            let full = retained_ids(&mut screen);
             assert_eq!(screen.term.grid().history_size(), 10_000, "{label}");
             let expected: Vec<usize> = (full[0]..30_000).collect();
             assert_eq!(full, expected, "{label}: the starting point is contiguous");
@@ -3455,7 +3525,7 @@ mod tests {
             for (cols, rows) in [(40, 24), (120, 24), (80, 12), (24, 30), (80, 24)] {
                 screen.resize(cols, rows);
                 assert_eq!(
-                    retained_ids(&screen),
+                    retained_ids(&mut screen),
                     expected,
                     "{label}: {cols}x{rows} lost history"
                 );
@@ -3479,7 +3549,7 @@ mod tests {
         // At the narrow width the same rows stay retained as output arrives.
         screen.feed(&numbered_lines(20_000, 1_000, 120));
         assert_eq!(screen.term.grid().history_size(), narrowed);
-        let ids = retained_ids(&screen);
+        let ids = retained_ids(&mut screen);
         assert_eq!(ids, (ids[0]..21_000).collect::<Vec<_>>());
 
         // Clearing scrollback ends the allowance: the next burst stops at
@@ -3509,6 +3579,12 @@ mod tests {
         let metadata = screen.history_metadata();
         assert_eq!(history.len(), HISTORY_EXPORT_ROWS);
         assert_eq!(metadata.len(), HISTORY_EXPORT_ROWS);
+        let (payload_rows, payload) = screen.history_payload();
+        assert_eq!(payload_rows, HISTORY_EXPORT_ROWS);
+        assert_eq!(
+            diri_proto::grid::GridRowCodec::decode_rows(&payload, payload_rows).expect("decode"),
+            history
+        );
 
         let mut restored = HeadlessScreen::new(40, 24);
         assert!(restored.restore(
@@ -3874,11 +3950,122 @@ mod tests {
             "1006 is independent of tracking"
         );
     }
+
+    /// Wheel bytes per mode, as a reference xterm-compatible emulator sends
+    /// them (recorded from a program reading its raw input).
+    #[test]
+    fn wheel_reports_and_alternate_scroll_arrows_follow_the_program_modes() {
+        let wheel = |setup: &[u8], up: bool, lines: usize| {
+            let mut screen = HeadlessScreen::new(320, 90);
+            screen.feed(setup);
+            screen.mouse_wheel(up, lines, 3, 4)
+        };
+        // Main screen, no reporting: Diri scrolls its own history.
+        assert_eq!(wheel(b"", true, 1), b"");
+        assert_eq!(
+            wheel(b"\x1b[?1007h", true, 1),
+            b"",
+            "1007 applies only on the alternate screen"
+        );
+        // Alternate screen, no reporting: arrows, by default (1007 starts set).
+        assert_eq!(wheel(b"\x1b[?1049h", true, 1), b"\x1b[A");
+        assert_eq!(wheel(b"\x1b[?1049h", false, 3), b"\x1b[B\x1b[B\x1b[B");
+        assert_eq!(wheel(b"\x1b[?1049h\x1b[?1h", true, 2), b"\x1bOA\x1bOA");
+        assert_eq!(wheel(b"\x1b[?1049h\x1b[?1h", false, 1), b"\x1bOB");
+        assert_eq!(wheel(b"\x1b[?1047h", false, 1), b"\x1b[B");
+        assert_eq!(
+            wheel(b"\x1b[?1049h\x1b[?1007l", true, 1),
+            b"",
+            "a program can opt out"
+        );
+        // Reporting wins over alternate scroll, on either screen.
+        assert_eq!(
+            wheel(b"\x1b[?1049h\x1b[?1000h\x1b[?1006h", true, 1),
+            b"\x1b[<64;4;5M"
+        );
+        assert_eq!(
+            wheel(b"\x1b[?1000h\x1b[?1006h", false, 2),
+            b"\x1b[<65;4;5M\x1b[<65;4;5M"
+        );
+        assert_eq!(wheel(b"\x1b[?1000h", true, 1), b"\x1b[M`$%");
+        assert_eq!(wheel(b"\x1b[?1000h", false, 1), b"\x1b[Ma$%");
+        assert_eq!(wheel(b"\x1b[?1049h", true, 0), b"", "no lines, no bytes");
+        // Real start-up sequences: vim 9 (`--clean`), tmux with `mouse on`,
+        // and less/man (alternate screen and cursor-key mode, no mouse).
+        let mut vim = HeadlessScreen::new(80, 24);
+        vim.feed(b"\x1b[?1049h\x1b[?1h\x1b[?1006;1000h\x1b[?1002h\x1b[?1004h");
+        assert_eq!(
+            vim.mouse_modes(),
+            MouseModes::new(MouseTrackingMode::ButtonMotion, MouseEncoding::Sgr)
+        );
+        assert_eq!(vim.mouse_wheel(false, 1, 0, 0), b"\x1b[<65;1;1M");
+        let mut tmux = HeadlessScreen::new(80, 24);
+        tmux.feed(b"\x1b[?1049h\x1b[?1005l\x1b[?1006l\x1b[?1000h\x1b[?1002h\x1b[?1006h");
+        assert_eq!(
+            tmux.mouse_modes(),
+            MouseModes::new(MouseTrackingMode::ButtonMotion, MouseEncoding::Sgr)
+        );
+        assert_eq!(
+            wheel(b"\x1b[?1049h\x1b[?1h", false, 1),
+            b"\x1bOB",
+            "less and man"
+        );
+    }
 }
 
 #[cfg(test)]
 mod qol_tests {
     use super::*;
+
+    /// The weight and faint bits of `bold faint both`, one per word.
+    fn weights(cells: &[GridCell]) -> Vec<(bool, bool)> {
+        [0, 5, 11]
+            .iter()
+            .map(|&col| {
+                let style = cells[col].style;
+                (
+                    style.contains(TermStyle::BOLD),
+                    style.contains(TermStyle::DIM),
+                )
+            })
+            .collect()
+    }
+
+    const BOLD_FAINT_BOTH: &[u8] = b"\x1b[1mbold\x1b[0m \x1b[2mfaint\x1b[0m \x1b[1;2mboth\x1b[0m";
+    /// (bold, faint) for `bold`, `faint` and `both`.
+    const BOLD_FAINT_BOTH_STYLES: [(bool, bool); 3] = [(true, false), (false, true), (true, true)];
+
+    #[test]
+    fn bold_is_not_faint_and_faint_is_not_bold() {
+        let mut screen = HeadlessScreen::new(20, 2);
+        screen.feed(BOLD_FAINT_BOTH);
+        let full = screen.full_snapshot();
+        assert_eq!(weights(&full.changed_rows[0].cells), BOLD_FAINT_BOTH_STYLES);
+
+        // So does a diff against an earlier frame.
+        let mut live = HeadlessScreen::new(20, 2);
+        live.grid_update(true);
+        live.feed(BOLD_FAINT_BOTH);
+        let delta = live.grid_update(false);
+        assert_eq!(
+            weights(&delta.changed_rows[0].cells),
+            BOLD_FAINT_BOTH_STYLES
+        );
+
+        // A checkpoint restores the same weights.
+        let mut restored = HeadlessScreen::new(20, 2);
+        assert!(restored.restore(&[], &full, false, false, MouseModes::OFF));
+        assert_eq!(
+            weights(&restored.full_snapshot().changed_rows[0].cells),
+            BOLD_FAINT_BOTH_STYLES
+        );
+
+        // Scrolled into history, the cells keep them too.
+        screen.feed(b"\r\n\r\n");
+        let history = screen.scrollback_cells(0, 1);
+        let rows = GridRowCodec::decode_rows(&history.payload, history.row_count as usize).unwrap();
+        assert_eq!(weights(&rows[0]), BOLD_FAINT_BOTH_STYLES);
+    }
     #[test]
     fn hyperlink_only_changes_advance_sequence_and_survive_mirror_reseed() {
         let mut screen = HeadlessScreen::new(40, 4);

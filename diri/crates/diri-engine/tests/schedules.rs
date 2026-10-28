@@ -218,12 +218,14 @@ fn an_occurrence_missed_while_not_running_fires_once_late() {
         "schedule.create",
         spec(
             &marker,
-            json!({ "kind": "cron", "expr": "0 9 * * *" }),
+            json!({ "kind": "cron", "expr": "0 9 29 2 *" }),
             12 * 3_600_000,
         ),
     );
     let id = created["id"].as_str().unwrap().to_owned();
     // Due ten minutes ago, before this Engine started: the 9:00-but-it's-9:10 case.
+    // A leap-day expression keeps the schedule's own next occurrence years
+    // away: a daily 9:00 made this run on time whenever CI ran at 9:00-9:10.
     backdate(temp.path(), &id, now_ms() - 10.0 * 60_000.0);
     server.spawn_scheduler();
 
@@ -262,11 +264,12 @@ fn an_occurrence_past_its_window_is_recorded_missed_and_not_run() {
         "schedule.create",
         spec(
             &marker,
-            json!({ "kind": "cron", "expr": "0 9 * * *" }),
+            json!({ "kind": "cron", "expr": "0 9 29 2 *" }),
             60_000,
         ),
     );
     let id = created["id"].as_str().unwrap().to_owned();
+    // Leap day, as above: no real occurrence can fall inside the backdate.
     backdate(temp.path(), &id, now_ms() - 10.0 * 60_000.0);
     server.spawn_scheduler();
 

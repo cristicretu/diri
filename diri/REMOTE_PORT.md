@@ -101,7 +101,9 @@ requests fail explicitly when that state is unavailable. Desktop arrows and
 Home/End retain their historical normal-cursor CSI encoding for these legacy
 sessions instead of disabling navigation after an upgrade. This compatibility
 choice does not claim or persist known modes; observed application-cursor modes
-always override it. Keypad input still requires observed modes. Controller and
+always override it. Keypad keys type their characters in every legacy mode
+(DECKPAM is observed but, as on a Num Lock keypad, changes no bytes), so they
+need no observed modes; kitty-flag programs get keypad key codes. Controller and
 enhanced-keyboard admission checks remain enforced by the Engine.
 
 Local app/client `Modes` frames retain their existing first byte and gain an
@@ -691,7 +693,13 @@ wire mode byte retains its historical any-mouse bit and uses previously unused
 bits for those details. A live protocol 1.3 Holder exposes only the historical
 bit, so the Engine preserves those details as unknown: it does not synthesize
 button or motion reports, while wheel intent remains encoded by that Holder's
-authoritative parser. Scrollback is bounded to 4 MiB and served on demand
+authoritative parser. A `Scroll` frame for a program on the alternate screen
+that does not read the mouse becomes Up/Down arrow keys (alternate scroll,
+DECSET 1007, cursor-key mode honoured) in Helper builds that include it; an
+older live Holder keeps ignoring that wheel. No frame or capability changes.
+A controller encodes wheel reports for a program whose mouse details it
+knows, with modifiers and the sideways axis, and sends them as mouse input
+like its clicks. Scrollback is bounded to 4 MiB and served on demand
 through `Scroll`. Raw output is bounded to 32 MiB.
 
 On-demand history reads use the Engine's bounded background-request pool. The
@@ -918,6 +926,24 @@ completed rejection is remembered for the attached session lifetime, and the
 Engine keeps following its durable log without probing on every wakeup.
 Transport failures and interrupted supported streams remain retryable. This
 changes no local or remote wire format and never replaces a live Holder.
+
+The local output stream additively accepts `resumeFrom`, the first offset the
+Engine has not parsed. A Holder that understands it answers `resumed: true` and
+serves the bytes between that offset (or its log's oldest kept byte, if later)
+and its live offset from its own log before the live frames. The Engine owns
+the session's terminal state; it is not a display client. So while it keeps
+taking bytes, backlog or queue, the Holder waits for queue room before reading
+more from the PTY: a program that prints faster than the Engine parses is paced
+to the Engine, as a terminal emulator's own reads pace it, and can no longer
+lap the 32 MiB session log and have output silently skipped. The Holder gives
+up on a subscriber only after 500 ms in which it took nothing (a hung Engine);
+the program then runs free and the Engine resumes from its offset when it
+returns. Display clients are unaffected: they attach to the Engine, whose
+bounded per-client queues still drop stale diffs and reseed with a Full
+Snapshot. An older live Holder ignores `resumeFrom` and omits `resumed`; the
+Engine keeps its previous behaviour for that Holder (follow the log, subscribe
+at the live offset once drained). The remote Helper protocol is unchanged: the
+remote Holder feeds its parser on the loop that reads its PTY.
 
 The local Holder's `OutputLog` writer retains no raw-output ring: no Holder
 operation reads it. Durable file output, offsets, rotation and exit markers

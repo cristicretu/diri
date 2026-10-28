@@ -219,7 +219,7 @@ fn load_or_create_key(path: &Path) -> io::Result<[u8; KEY_BYTES]> {
 /// Writes `contents` atomically to an owner-only (`0600`) file.
 fn write_private(path: &Path, contents: &[u8]) -> io::Result<()> {
     if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)?;
+        diri_platform::private::create_dir_all(parent)?;
     }
     let mut nonce = [0_u8; 8];
     getrandom::fill(&mut nonce).map_err(io::Error::other)?;

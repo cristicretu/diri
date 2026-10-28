@@ -80,6 +80,18 @@ fn replay_budget() -> usize {
         })
 }
 
+/// The session log size a Holder is launched with. `DIRIJOR_HOLDER_LOG_BYTES`
+/// overrides it, no lower than a megabyte; tests use it to reach the log's
+/// bound without printing tens of megabytes.
+fn holder_log_capacity() -> i64 {
+    std::env::var("DIRIJOR_HOLDER_LOG_BYTES")
+        .ok()
+        .and_then(|value| value.parse::<i64>().ok())
+        .map_or(crate::holder::protocol::DEFAULT_DISK_CAPACITY, |value| {
+            value.max(1 << 20)
+        })
+}
+
 /// Quiet time after the last output before a screen checkpoint is written,
 /// the Swift daemon's `checkpointSettleDelay`. Bursts coalesce into one
 /// write; an idle screen is checkpointed within about a second.
@@ -312,6 +324,17 @@ const EVAL_INTERVAL: Duration = Duration::from_millis(16);
 /// taking. Beyond this the file is followed instead, which costs latency for a
 /// moment rather than churning subscriptions that cannot be read yet.
 const LIVE_HANDOVER_GAP: u64 = 256 << 10;
+
+/// Bytes held-session pumps in this process skipped because the log had
+/// already rotated past them. Every one is output the screen never saw, so
+/// anything but zero is a bug; benches and tests read it to prove that.
+static HELD_OUTPUT_SKIPPED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// See [`HELD_OUTPUT_SKIPPED`].
+#[doc(hidden)]
+pub fn held_output_skipped_bytes() -> u64 {
+    HELD_OUTPUT_SKIPPED.load(Ordering::Relaxed)
+}
 
 /// What a session looks like from the outside.
 #[derive(Clone, Debug)]
@@ -2106,7 +2129,7 @@ impl Session {
             environment: spec.pty.env.iter().cloned().collect(),
             cols: spec.pty.cols.max(2),
             rows: spec.pty.rows.max(2),
-            disk_capacity: crate::holder::protocol::DEFAULT_DISK_CAPACITY,
+            disk_capacity: holder_log_capacity(),
         };
         HolderLauncher::launch(&holder.executable, &paths, &launch).map_err(holder_io_error)?;
 
@@ -2185,7 +2208,7 @@ impl Session {
                         environment: pty.env.iter().cloned().collect(),
                         cols: pty.cols,
                         rows: pty.rows,
-                        disk_capacity: crate::holder::protocol::DEFAULT_DISK_CAPACITY,
+                        disk_capacity: holder_log_capacity(),
                     };
                     let exec_started = Instant::now();
                     *shared.exec_at.lock().expect("exec at") = Some(exec_started);
@@ -4268,7 +4291,7 @@ fn scan_artifacts_if_due(
     }
     *last_scan_at = Some(std::time::Instant::now());
     let (seq, source) = {
-        let screen = shared.screen.lock().expect("screen");
+        let mut screen = shared.screen.lock().expect("screen");
         let seq = screen.content_seq();
         if seq == *last_scan_seq {
             return;
@@ -5973,7 +5996,15 @@ fn pump_held(
             ),
             None => {
                 let floor = exit_marker_floor.min(tail);
-                let start = log.preferred_replay_start(replay_budget).max(floor);
+                // A child this Engine just launched has printed only what it
+                // printed while the pump was starting, and all of it belongs
+                // on its screen. The replay budget bounds the work of adopting
+                // a session with a long past, which a fresh one does not have.
+                let start = if fresh {
+                    floor
+                } else {
+                    log.preferred_replay_start(replay_budget).max(floor)
+                };
                 // Replaying from this child's first byte sees every keyboard
                 // mode it set, just as replaying a whole log from zero does.
                 let whole_child = start == 0 || start == floor;
@@ -6066,8 +6097,14 @@ fn pump_held(
     // followed up to this point before a frame can be consumed.
     let mut live_from: u64 = 0;
     // Set once the log has been read to its end, which is the only safe moment
-    // to subscribe.
+    // to subscribe to a Holder that cannot resume.
     let mut drained = false;
+    // Whether to subscribe without waiting for a drained log. A Holder that
+    // resumes from our offset sends what we have not read yet itself, and
+    // holds its PTY at our pace while we read it, so subscribing at once is
+    // what keeps a flood from outrunning this pump. Cleared for a Holder that
+    // cannot resume, and after a failed attempt, until the log next drains.
+    let mut subscribe_eagerly = true;
 
     while !shared.stop.load(Ordering::SeqCst) && exit_status.is_none() {
         if shared.reset_requested.swap(false, Ordering::SeqCst) {
@@ -6094,15 +6131,28 @@ fn pump_held(
             shared.grid_wake.notify();
         }
         scan_artifacts_if_due(&shared, &mut last_scan_at, &mut last_scan_seq);
-        // Subscribe only from a standing start, with the log drained.
+        // Subscribe from where this pump stands. A Holder that resumes sends
+        // the bytes we have not read itself, so this works at any distance
+        // behind it, and it is what bounds that distance: while we are
+        // subscribed the Holder reads its PTY no faster than we take output,
+        // so a flood cannot outrun us past what its log keeps.
         //
-        // A subscription taken while still catching up is worse than none: the
-        // holder begins filling a queue this loop is not yet reading, and once
-        // that queue is full the pump waits on it for every chunk. Waiting for
-        // a drained log keeps the handover to a few frames.
-        if output_stream_supported && live.is_none() && drained {
-            match client.open_output_stream() {
+        // An older Holder only streams from its live offset. Subscribing to
+        // one while still catching up is worse than none: it begins filling a
+        // queue this loop is not yet reading, and once that queue is full it
+        // waits on it for every chunk. For those, wait for a drained log,
+        // which keeps the handover to a few frames.
+        if output_stream_supported && live.is_none() && (drained || subscribe_eagerly) {
+            match client.open_output_stream_from(offset) {
+                // Starts at `offset`, or later only if the log has already
+                // rotated past it, which the log read below records.
+                Ok(Some(stream)) if stream.resumed() => {
+                    live_from = stream.start_offset();
+                    live = Some(stream);
+                    subscribe_eagerly = true;
+                }
                 Ok(Some(stream)) => {
+                    subscribe_eagerly = false;
                     // A drained log does not mean the holder is where the log
                     // ends: writes are queued, so it can be megabytes further on.
                     // Subscribing across that distance is the worst case — the
@@ -6117,7 +6167,7 @@ fn pump_held(
                     }
                 }
                 Ok(None) => output_stream_supported = false,
-                Err(_) => {}
+                Err(_) => subscribe_eagerly = false,
             }
             drained = false;
         }
@@ -6335,7 +6385,13 @@ fn pump_held(
 
         trace_hop!(OutputReceived);
         // A rotation can move the readable floor past us; resynchronize.
-        if start > offset && !marker_buffer.is_empty() {
+        if start > offset {
+            HELD_OUTPUT_SKIPPED.fetch_add(start - offset, Ordering::Relaxed);
+            diri_telemetry::warn_event!(
+                "session.held_output_skipped",
+                session = diri_telemetry::id(&shared.id),
+                bytes = start - offset,
+            );
             marker_buffer.clear();
         }
         offset = start + chunk.len() as u64;
@@ -6951,12 +7007,13 @@ fn persist_checkpoint(
     marker_buffer: &[u8],
     last_key: &mut Option<CheckpointKey>,
 ) {
-    let (key, checkpoint) = capture_checkpoint(shared, offset, marker_buffer);
+    let (key, checkpoint, history) = capture_checkpoint_with(shared, offset, marker_buffer, true);
     if last_key.as_ref() == Some(&key) {
         return;
     }
+    let (rows, payload) = history.unwrap_or_default();
     // A failed write must not stop the session; the checkpoint is a cache.
-    if checkpoint.write_atomically(path).is_ok() {
+    if checkpoint.write_with_history(path, rows, &payload).is_ok() {
         *last_key = Some(key);
     }
 }
@@ -6967,8 +7024,25 @@ fn capture_checkpoint(
     offset: u64,
     marker_buffer: &[u8],
 ) -> (CheckpointKey, crate::checkpoint::ScreenCheckpoint) {
+    let (key, checkpoint, _) = capture_checkpoint_with(shared, offset, marker_buffer, false);
+    (key, checkpoint)
+}
+
+/// With `encode_history`, history is returned encoded (row count, payload)
+/// and the checkpoint's `history` is empty: rows are encoded as they are
+/// read, so a full-history checkpoint never holds a cell copy of every row.
+fn capture_checkpoint_with(
+    shared: &Shared,
+    offset: u64,
+    marker_buffer: &[u8],
+    encode_history: bool,
+) -> (
+    CheckpointKey,
+    crate::checkpoint::ScreenCheckpoint,
+    Option<(usize, Vec<u8>)>,
+) {
     let (
-        history,
+        (history, encoded),
         history_metadata,
         grid,
         alt_screen,
@@ -6979,8 +7053,13 @@ fn capture_checkpoint(
         keyboard_snapshot,
     ) = {
         let mut screen = shared.screen.lock().expect("screen");
+        let (history, encoded) = if encode_history {
+            (Vec::new(), Some(screen.history_payload()))
+        } else {
+            (screen.history_snapshot(), None)
+        };
         (
-            screen.history_snapshot(),
+            (history, encoded),
             screen.history_metadata(),
             screen.full_snapshot(),
             screen.is_alt_screen(),
@@ -7021,7 +7100,7 @@ fn capture_checkpoint(
         bracketed_paste,
         mouse,
     };
-    (key, checkpoint)
+    (key, checkpoint, encoded)
 }
 
 /// Wakes the held pump the moment the holder appends to the log, instead of
@@ -8439,7 +8518,10 @@ if mkdir first 2>/dev/null; then
   cat reset.bin snapshot.bin
   while [ ! -f disconnect ]; do sleep 0.01; done
 else
-  cat <&0 > second-stdin.bin &
+  # dash (Linux /bin/sh) points an async list's stdin at /dev/null even
+  # with an explicit `<&0`, so hand the bridge's stdin over on fd 3.
+  exec 3<&0
+  cat <&3 > second-stdin.bin &
   while [ ! -f reconnect ]; do sleep 0.01; done
   cat hello.bin modes.bin reset.bin snapshot.bin
   while [ ! -f finish ]; do sleep 0.01; done
@@ -8576,12 +8658,17 @@ fi
             // The reconnect offered grid-resume-v1 for the grid it held. This
             // Holder answered without it (as one predating the capability
             // does), and the snapshot that followed seeded the session.
-            let Some(RemoteMessage::Hello(second)) = RemoteCodec::new()
-                .feed(&std::fs::read(temp.path().join("second-stdin.bin")).unwrap())
-                .unwrap()
-                .into_iter()
-                .next()
-            else {
+            // The fixture's background `cat` copies stdin to the file on its
+            // own schedule, so wait for the whole Hello frame to land.
+            let reconnect_hello = || {
+                RemoteCodec::new()
+                    .feed(&std::fs::read(temp.path().join("second-stdin.bin")).ok()?)
+                    .ok()?
+                    .into_iter()
+                    .next()
+            };
+            wait_for("reconnect Hello recorded", || reconnect_hello().is_some());
+            let Some(RemoteMessage::Hello(second)) = reconnect_hello() else {
                 panic!("reconnect Hello");
             };
             let offered = second.grid_resume.expect("resume offered");

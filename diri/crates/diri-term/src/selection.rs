@@ -47,6 +47,8 @@ pub struct TerminalSelection {
     granularity: Granularity,
     initial: Option<SelectionRange>,
     rectangle: bool,
+    /// The cell [`Self::begin`] was given, for keyboard selection by cells.
+    anchor_cell: Option<SelectionPoint>,
 }
 
 impl TerminalSelection {
@@ -68,6 +70,27 @@ impl TerminalSelection {
         self.clear();
         self.anchor = Some(point);
         self.head = Some(point);
+        self.anchor_cell = Some(point);
+    }
+
+    /// Selects from the cell given to [`Self::begin`] through `cell`, both
+    /// included, in either direction: keyboard copy mode moves a cursor over
+    /// cells rather than a pointer over boundaries.
+    pub fn drag_cells_to(&mut self, cell: SelectionPoint) {
+        let Some(anchor) = self.anchor_cell else {
+            return;
+        };
+        let after = |point: SelectionPoint| SelectionPoint {
+            row: point.row,
+            col: point.col + 1,
+        };
+        if cell >= anchor {
+            self.anchor = Some(anchor);
+            self.head = Some(after(cell));
+        } else {
+            self.anchor = Some(after(anchor));
+            self.head = Some(cell);
+        }
     }
 
     pub fn drag_to(&mut self, point: SelectionPoint) {
@@ -88,18 +111,38 @@ impl TerminalSelection {
         row: usize,
         col: usize,
     ) {
+        self.drag_in_view_to_edge(viewport, buffer, row, col, col);
+    }
+
+    /// [`Self::drag_in_view`] for a pointer: a character drag ends at `edge`,
+    /// the cell boundary nearest the pointer (0 to `cols` inclusive), so a
+    /// cell joins the selection once the pointer passes its middle and the
+    /// last column can be reached. Word and line drags extend by the cell
+    /// under the pointer, `col`.
+    pub fn drag_in_view_to_edge(
+        &mut self,
+        viewport: &ScrollbackViewport,
+        buffer: &GridBuffer,
+        row: usize,
+        col: usize,
+        edge: usize,
+    ) {
         let point = SelectionPoint {
             row: viewport.absolute_row(row),
             col,
         };
+        let edge_point = SelectionPoint {
+            row: point.row,
+            col: edge,
+        };
         let Some(initial) = self.initial else {
-            self.drag_to(point);
+            self.drag_to(edge_point);
             return;
         };
         let mut target = Self::default();
         match self.granularity {
             Granularity::Cell => {
-                self.drag_to(point);
+                self.drag_to(edge_point);
                 return;
             }
             Granularity::Word => target.select_word(viewport, buffer, row, col),
@@ -119,9 +162,10 @@ impl TerminalSelection {
 
     fn columns(&self, range: SelectionRange, row: i64, cols: usize) -> (usize, usize) {
         if self.rectangle {
+            // Both ends are cell boundaries, like a character selection's.
             let a = self.anchor.unwrap().col;
             let b = self.head.unwrap().col;
-            (a.min(b).min(cols), a.max(b).saturating_add(1).min(cols))
+            (a.min(b).min(cols), a.max(b).min(cols))
         } else {
             columns_for_row(range, row, cols)
         }
@@ -147,7 +191,10 @@ impl TerminalSelection {
     }
 
     /// Expands a double-click to a run of word, whitespace, or punctuation
-    /// cells. The resulting endpoint is exclusive.
+    /// cells. The run follows soft wraps, so a URL or path longer than the
+    /// pane is one word, and a double-width glyph's spacer belongs to its
+    /// glyph rather than breaking the word. The resulting endpoint is
+    /// exclusive.
     pub fn select_word(
         &mut self,
         viewport: &ScrollbackViewport,
@@ -156,51 +203,38 @@ impl TerminalSelection {
         col: usize,
     ) {
         self.clear();
-        let row = viewport.window_row(buffer, window_row);
-        if row.is_empty() {
-            self.clear();
+        let cols = usize::from(buffer.cols);
+        if cols == 0 {
             return;
         }
-        let col = col.min(row.len() - 1);
-        if let Some((start, end)) = url_span_at(&row, col) {
-            let absolute_row = viewport.absolute_row(window_row);
-            self.anchor = Some(SelectionPoint {
-                row: absolute_row,
-                col: start,
-            });
-            self.head = Some(SelectionPoint {
-                row: absolute_row,
-                col: end,
-            });
-            self.granularity = Granularity::Word;
-            self.initial = self.range();
+        let line = LogicalLine::around(viewport, buffer, viewport.absolute_row(window_row));
+        let Some(at) = line.index(viewport.absolute_row(window_row), col.min(cols - 1)) else {
             return;
-        }
-        let class = word_class(row[col]);
-        let mut start = col;
-        while start > 0 && word_class(row[start - 1]) == class {
-            start -= 1;
-        }
-        let mut end = col + 1;
-        while end < row.len() && word_class(row[end]) == class {
-            end += 1;
-        }
-        let absolute_row = viewport.absolute_row(window_row);
-        self.anchor = Some(SelectionPoint {
-            row: absolute_row,
-            col: start,
+        };
+        let cells = &line.cells;
+        let (start, end) = url_span_at(cells, at).unwrap_or_else(|| {
+            let classes = word_classes(cells);
+            let class = classes[at];
+            let mut start = at;
+            while start > 0 && classes[start - 1] == class {
+                start -= 1;
+            }
+            let mut end = at + 1;
+            while end < cells.len() && classes[end] == class {
+                end += 1;
+            }
+            (start, end)
         });
-        self.head = Some(SelectionPoint {
-            row: absolute_row,
-            col: end,
-        });
+        self.anchor = Some(line.start_point(start));
+        self.head = Some(line.end_point(end));
         self.granularity = Granularity::Word;
         self.initial = self.range();
     }
 
-    /// Expands a triple-click to the complete visual row. Terminal padding is
-    /// retained in the range so dragging can continue naturally, while copy
-    /// still trims the padding through [`Self::selected_text`].
+    /// Expands a triple-click to the whole line the program wrote: every row
+    /// joined to this one by soft wraps. Terminal padding is retained in the
+    /// range so dragging can continue naturally, while copy still trims the
+    /// padding through [`Self::selected_text`].
     pub fn select_line(
         &mut self,
         viewport: &ScrollbackViewport,
@@ -208,20 +242,15 @@ impl TerminalSelection {
         window_row: usize,
     ) {
         self.clear();
-        let row = viewport.window_row(buffer, window_row);
-        if row.is_empty() {
-            self.clear();
+        if buffer.cols == 0 {
             return;
         }
-        let absolute_row = viewport.absolute_row(window_row);
-        self.anchor = Some(SelectionPoint {
-            row: absolute_row,
-            col: 0,
-        });
-        self.head = Some(SelectionPoint {
-            row: absolute_row,
-            col: row.len(),
-        });
+        let line = LogicalLine::around(viewport, buffer, viewport.absolute_row(window_row));
+        if line.cells.is_empty() {
+            return;
+        }
+        self.anchor = Some(line.start_point(0));
+        self.head = Some(line.end_point(line.cells.len()));
         self.granularity = Granularity::Line;
         self.initial = self.range();
     }
@@ -318,7 +347,10 @@ impl TerminalSelection {
                     line.push_str(extra);
                 }
             }
+            // A soft wrap joins this row to the next only when the selection
+            // carries on there; the selection's own last row is trimmed.
             let wraps = !self.rectangle
+                && absolute_row < range.end.row
                 && end_col == cols
                 && row
                     .last()
@@ -350,6 +382,101 @@ fn columns_for_row(range: SelectionRange, row: i64, cols: usize) -> (usize, usiz
     (start.min(cols), end.min(cols))
 }
 
+/// Rows a double or triple click may follow through soft wraps in each
+/// direction. Ample for any URL or command; bounds a minified file's line.
+const MAX_WRAPPED_ROWS: i64 = 1_000;
+
+/// The rows one program line occupies after the terminal soft-wrapped it,
+/// as one run of cells. Rows the view has not fetched end the walk.
+struct LogicalLine {
+    cells: Vec<GridCell>,
+    first_row: i64,
+    cols: usize,
+}
+
+impl LogicalLine {
+    fn around(viewport: &ScrollbackViewport, buffer: &GridBuffer, absolute_row: i64) -> Self {
+        let cols = usize::from(buffer.cols);
+        let wraps = |row: &[GridCell]| {
+            row.len() >= cols && row[cols - 1].style.contains(TermStyle::SOFT_WRAP)
+        };
+        let mut first_row = absolute_row;
+        while absolute_row - first_row < MAX_WRAPPED_ROWS
+            && viewport
+                .stored_row(buffer, first_row - 1)
+                .is_some_and(wraps)
+        {
+            first_row -= 1;
+        }
+        let mut cells = Vec::with_capacity(cols);
+        let mut row = first_row;
+        loop {
+            let cells_of_row = viewport.row_at_absolute(buffer, row);
+            let continues = wraps(&cells_of_row)
+                && row - absolute_row < MAX_WRAPPED_ROWS
+                && viewport.stored_row(buffer, row + 1).is_some();
+            cells.extend(cells_of_row);
+            if !continues {
+                break;
+            }
+            row += 1;
+        }
+        Self {
+            cells,
+            first_row,
+            cols,
+        }
+    }
+
+    fn index(&self, row: i64, col: usize) -> Option<usize> {
+        let offset = usize::try_from(row - self.first_row).ok()?;
+        let index = offset * self.cols + col;
+        (index < self.cells.len()).then_some(index)
+    }
+
+    fn point(&self, index: usize) -> SelectionPoint {
+        SelectionPoint {
+            row: self.first_row + (index / self.cols) as i64,
+            col: index % self.cols,
+        }
+    }
+
+    fn start_point(&self, index: usize) -> SelectionPoint {
+        self.point(index)
+    }
+
+    /// An exclusive end stays on the row of the last selected cell, so a word
+    /// ending at a wrap does not reach onto the next row.
+    fn end_point(&self, index: usize) -> SelectionPoint {
+        if index == 0 {
+            return self.point(0);
+        }
+        let last = self.point(index - 1);
+        SelectionPoint {
+            row: last.row,
+            col: last.col + 1,
+        }
+    }
+}
+
+fn is_spacer(cell: GridCell) -> bool {
+    cell.style.contains(TermStyle::WIDE_SPACER)
+}
+
+/// Each cell's class, a double-width glyph's spacer taking its glyph's.
+fn word_classes(cells: &[GridCell]) -> Vec<WordClass> {
+    let mut classes = Vec::with_capacity(cells.len());
+    for (index, cell) in cells.iter().enumerate() {
+        let class = if index > 0 && is_spacer(*cell) {
+            classes[index - 1]
+        } else {
+            word_class(*cell)
+        };
+        classes.push(class);
+    }
+    classes
+}
+
 fn word_class(cell: GridCell) -> WordClass {
     let ch = cell_char(cell);
     if ch.is_alphanumeric() || is_terminal_word_punctuation(ch) {
@@ -376,12 +503,13 @@ fn is_terminal_word_punctuation(ch: char) -> bool {
 /// terminal output. `&` and `#` are shell boundaries everywhere else, but are
 /// meaningful query/fragment separators inside these recognized references.
 fn url_span_at(row: &[GridCell], col: usize) -> Option<(usize, usize)> {
+    let blank = |cell: GridCell| !is_spacer(cell) && cell_char(cell).is_whitespace();
     let mut run_start = col;
-    while run_start > 0 && !cell_char(row[run_start - 1]).is_whitespace() {
+    while run_start > 0 && !blank(row[run_start - 1]) {
         run_start -= 1;
     }
     let mut run_end = col + 1;
-    while run_end < row.len() && !cell_char(row[run_end]).is_whitespace() {
+    while run_end < row.len() && !blank(row[run_end]) {
         run_end += 1;
     }
 
@@ -402,7 +530,12 @@ fn url_span_at(row: &[GridCell], col: usize) -> Option<(usize, usize)> {
         return None;
     }
 
-    let candidate: String = row[start..end].iter().copied().map(cell_char).collect();
+    let candidate: String = row[start..end]
+        .iter()
+        .copied()
+        .filter(|cell| !is_spacer(*cell))
+        .map(cell_char)
+        .collect();
     let recognized = candidate.starts_with("http://")
         || candidate.starts_with("https://")
         || candidate.starts_with("file://")
@@ -412,12 +545,16 @@ fn url_span_at(row: &[GridCell], col: usize) -> Option<(usize, usize)> {
     recognized.then_some((start, end))
 }
 
+/// The text a cell stands for. The parser marks the cell where a tab began
+/// with `\t`, but the tab moved the cursor over blank cells that copy as
+/// spaces, as in xterm and Ghostty; keeping the `\t` as well would paste a
+/// tab followed by the spaces it already stood for.
 pub(crate) fn cell_char(cell: GridCell) -> char {
     if cell.scalar == 0 {
         return ' ';
     }
     char::from_u32(cell.scalar)
-        .filter(|ch| *ch != '\n' && *ch != '\r')
+        .filter(|ch| !matches!(ch, '\n' | '\r' | '\t'))
         .unwrap_or(' ')
 }
 
@@ -625,7 +762,8 @@ mod qol_tests {
         let grid = buffer(&["a 11 x", "b 22 y", "c 33 z"], 8);
         let view = ScrollbackViewport::default();
         let mut selection = TerminalSelection::default();
-        selection.begin_rectangle(SelectionPoint { row: 2, col: 3 });
+        // Corners are cell boundaries: columns 2 and 3 lie between 2 and 4.
+        selection.begin_rectangle(SelectionPoint { row: 2, col: 4 });
         selection.drag_to(SelectionPoint { row: 0, col: 2 });
         assert_eq!(selection.selected_text(&view, &grid), "11\n22\n33");
     }

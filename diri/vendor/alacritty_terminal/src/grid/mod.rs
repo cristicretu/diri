@@ -146,6 +146,12 @@ impl Grid<crate::term::cell::Cell> {
         self.raw.enable_compact(compact::cell_codec());
     }
 
+    /// Call before reading every history row in order: deferred reflow is
+    /// then stored a block at a time instead of built whole by the first read.
+    pub fn prepare_history_read(&mut self) {
+        self.raw.prepare_history_read();
+    }
+
     /// Reclaim decoded history only after callers have released their borrows.
     pub fn release_history_read_cache(&mut self) {
         self.raw.release_read_cache();
