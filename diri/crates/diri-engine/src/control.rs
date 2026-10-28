@@ -8098,7 +8098,10 @@ mod tests {
         };
         let line = serde_json::to_vec(&request).expect("encode");
         let (writer, peer) = UnixStream::pair().expect("socketpair");
-        peer.set_read_timeout(Some(Duration::from_secs(10)))
+        // A bound on a hung test, not a latency budget: a background RPC
+        // that runs git (worktree cleanup) has outlasted 10 s on a loaded
+        // Windows runner.
+        peer.set_read_timeout(Some(Duration::from_secs(60)))
             .unwrap();
         if let Some(response) = server.handle_line(&line, &Arc::new(Mutex::new(writer)), &mut None)
         {
