@@ -983,6 +983,80 @@ impl TerminalPane {
         .detach();
     }
 
+    /// Clear Screen and Scrollback. The view returns to the live edge first so
+    /// no fetched history is left on screen; the Engine's next grid is the
+    /// cleared one. Feedback only when nothing changed or it failed.
+    pub(super) fn clear_scrollback(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(id) = self.selected_id() else {
+            return;
+        };
+        if !self.residents.contains_key(&id) {
+            return;
+        }
+        self.return_to_live(&id, cx);
+        let client = Arc::clone(self.runtime.client());
+        let request_id = id.clone();
+        let task = self
+            .tokio
+            .spawn(async move { client.clear_scrollback(&request_id).await });
+        cx.spawn_in(window, async move |this, cx| {
+            let result = task.await;
+            let _ = crate::floating::update_in_owner(&this, cx, |this, window, cx| {
+                if this.selected_id().as_ref() != Some(&id) {
+                    return;
+                }
+                let message = match result {
+                    Ok(Ok(true)) => return,
+                    Ok(Ok(false)) => t("terminal.clear.alt_screen"),
+                    Ok(Err(diri_client::ClientError::Control(error)))
+                        if error.code == "terminal_clear_unsupported" =>
+                    {
+                        t("terminal.clear.remote_unsupported")
+                    }
+                    _ => t("terminal.clear.failed"),
+                };
+                this.show_terminal_feedback(message, window, cx);
+            });
+        })
+        .detach();
+    }
+
+    /// Reset Terminal: blanks the emulator and restores default modes for a
+    /// garbled screen, local or remote; the child keeps running.
+    pub(super) fn reset_terminal(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(id) = self.selected_id() else {
+            return;
+        };
+        if !self.residents.contains_key(&id) {
+            return;
+        }
+        self.return_to_live(&id, cx);
+        let client = Arc::clone(self.runtime.client());
+        let request_id = id.clone();
+        let task = self
+            .tokio
+            .spawn(async move { client.reset_terminal(&request_id).await });
+        cx.spawn_in(window, async move |this, cx| {
+            let result = task.await;
+            let _ = crate::floating::update_in_owner(&this, cx, |this, window, cx| {
+                if this.selected_id().as_ref() != Some(&id) {
+                    return;
+                }
+                let message = match result {
+                    Ok(Ok(())) => return,
+                    Ok(Err(diri_client::ClientError::Control(error)))
+                        if error.code == "terminal_reset_unsupported" =>
+                    {
+                        t("terminal.reset.unsupported")
+                    }
+                    _ => t("terminal.reset.failed"),
+                };
+                this.show_terminal_feedback(message, window, cx);
+            });
+        })
+        .detach();
+    }
+
     /// Uses the same Engine RPC for local and remote history. A changing
     /// sequence aborts instead of exporting mismatched pages or jumping wrong.
     pub(super) fn read_terminal_history(

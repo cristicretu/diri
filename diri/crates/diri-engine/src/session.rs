@@ -430,6 +430,9 @@ struct Shared {
     /// A local emulator reset the held pump owes on its next pass. The pump
     /// applies it between chunks and persists the boundary checkpoint.
     reset_requested: AtomicBool,
+    /// A Clear Screen and Scrollback the held pump owes on its next pass,
+    /// applied and checkpointed at a chunk boundary like a reset.
+    clear_requested: AtomicBool,
     /// Advances on every applied local reset so attached clients receive a
     /// full grid instead of a diff against pre-reset cells.
     reset_generation: AtomicU64,
@@ -3422,6 +3425,42 @@ impl Session {
         }
     }
 
+    /// Clear Screen and Scrollback: drops history and every row above the
+    /// cursor's line, keeping that line (a shell prompt and what was typed
+    /// at it) at the top. The child is not told. Returns `Ok(false)` when
+    /// the alternate screen is showing, which a full-screen program owns and
+    /// is left alone. Held local sessions only, queued for the pump like a
+    /// reset so the checkpoint at that offset makes it survive an Engine
+    /// restart. A remote Holder owns its grid and has no clear operation yet.
+    pub fn clear_scrollback(&self) -> std::io::Result<bool> {
+        if self.shared.exited.load(Ordering::SeqCst) {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::NotConnected,
+                "session has exited",
+            ));
+        }
+        match &self.transport {
+            Transport::Held(_) => {
+                if self.pump.is_none() {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::NotConnected,
+                        "session has no terminal owner to apply a clear",
+                    ));
+                }
+                if self.shared.screen.lock().expect("screen").is_alt_screen() {
+                    return Ok(false);
+                }
+                self.shared.clear_requested.store(true, Ordering::SeqCst);
+                self.shared.note_hot();
+                Ok(true)
+            }
+            Transport::Remote(_) | Transport::Direct(_) => Err(std::io::Error::new(
+                std::io::ErrorKind::Unsupported,
+                "this session's terminal cannot be cleared from the Engine",
+            )),
+        }
+    }
+
     /// How many local resets this Session has applied; tests and callers
     /// observing the boundary use it, clients see it through a full grid.
     pub fn reset_generation(&self) -> u64 {
@@ -3706,6 +3745,7 @@ fn new_shared(
     Arc::new(Shared {
         holder_identity: std::sync::OnceLock::new(),
         reset_requested: AtomicBool::new(false),
+        clear_requested: AtomicBool::new(false),
         reset_generation: AtomicU64::new(0),
         completed: Mutex::new(None),
         keyboard_known: AtomicBool::new(true),
@@ -6265,6 +6305,25 @@ fn pump_held(
             );
             checkpoint_dirty_at = None;
             shared.grid_wake.notify();
+        }
+        if shared.clear_requested.swap(false, Ordering::SeqCst) {
+            // Same boundary as a reset: every consumed byte is fed, so the
+            // checkpoint below keeps a restart from replaying the history
+            // that was just cleared. A program that entered the alternate
+            // screen since the request is left alone.
+            let cleared = shared.screen.lock().expect("screen").clear_scrollback();
+            if cleared {
+                shared.bump_state_version();
+                persist_checkpoint(
+                    &shared,
+                    &checkpoint_path,
+                    offset,
+                    &marker_buffer,
+                    &mut last_checkpoint_key,
+                );
+                checkpoint_dirty_at = None;
+                shared.grid_wake.notify();
+            }
         }
         scan_artifacts_if_due(&shared, &mut last_scan_at, &mut last_scan_seq);
         // Subscribe from where this pump stands. A Holder that resumes sends
