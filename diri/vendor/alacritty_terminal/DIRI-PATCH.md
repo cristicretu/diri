@@ -303,6 +303,28 @@ stored rows when only the oldest block is partial, and the deferred line index
 reserves exact capacity and tracks its extras' heap incrementally (the history
 bound measures storage after every eviction).
 
+## History kept is independent of read boundaries
+
+The history budget used to measure allocation capacities, the rows not yet
+sealed into a block as they stood when the bound ran, and the oldest block's
+decode index; and `Grid::bound_history_storage` lowered the row limit to the
+rows kept after an eviction until storage fell 1/16 below the budget. All of
+these depend on when the bound runs, which is once per read, so how much
+history a terminal kept depended on how its output was split into reads (a
+64 KiB-read parse and a byte-at-a-time parse of the same 64 MB differed by
+hundreds of rows). Capacities also never shrank as narrowed deferred lines were
+evicted, so narrowing deep wide-character history evicted most of it.
+
+`CompactRows::history_storage_bytes` now counts live bytes as a function of the
+history alone: index lengths instead of capacities, the unsealed rows as the
+full block they grow into between seals (once history exists), and not the
+decode index (a cache that exists only while full history recycles rows). The
+bound shrinks the block and deferred-line indexes when their capacity exceeds
+twice their length plus 64, so uncounted slack stays bounded. The row limit
+stays at the ceiling. The kept rows are then the newest that fit, whenever the
+bound runs. Tests: `bounded_history_does_not_depend_on_read_boundaries`, and
+`narrowing_deep_wide_character_history_keeps_it` in `diri-terminal-state`.
+
 ## Cheaper history encoding
 
 History encoding was half of the session thread while output streamed. Four
