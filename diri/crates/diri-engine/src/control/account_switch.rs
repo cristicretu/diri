@@ -186,7 +186,13 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let bin = temp.path().join("nvm-bin");
         std::fs::create_dir(&bin).unwrap();
-        let agent = bin.join("claude");
+        // Login startup files can add globally installed CLIs back to PATH even
+        // after env_clear(). Never use a real CLI name in either launch below.
+        let agent_name = format!(
+            "diri-account-switch-fixture-{}",
+            temp.path().file_name().unwrap().to_str().unwrap()
+        );
+        let agent = bin.join(&agent_name);
         std::fs::write(
             &agent,
             "#!/bin/sh\nprintf 'signed-in:%s:%s\\n' \"$*\" \"$STORE\"\n",
@@ -214,7 +220,7 @@ mod tests {
         let command = [
             "/usr/bin/env".to_owned(),
             format!("STORE={}", store.display()),
-            "claude".to_owned(),
+            agent_name.clone(),
             "auth".to_owned(),
             "login".to_owned(),
         ];
@@ -222,7 +228,10 @@ mod tests {
         let before = run(&[
             "/bin/zsh".into(),
             "-lc".into(),
-            "exec /usr/bin/env claude auth login".into(),
+            format!(
+                "exec /usr/bin/env {} auth login",
+                crate::hosts::shell_quote(&agent_name)
+            ),
         ]);
         assert_eq!(
             before.status.code(),
@@ -230,13 +239,19 @@ mod tests {
             "the old launch could not find it"
         );
 
-        let after = run(&sign_in_argv(Some("/bin/zsh".into()), &command));
-        let stdout = String::from_utf8_lossy(&after.stdout);
-        assert!(after.status.success(), "{after:?}");
+        assert!(before.stdout.is_empty(), "{before:?}");
         assert!(
-            stdout.contains(&format!("signed-in:auth login:{}", store.display())),
-            "{stdout:?}"
+            String::from_utf8_lossy(&before.stderr).contains(&agent_name),
+            "{before:?}"
         );
+
+        let after = run(&sign_in_argv(Some("/bin/zsh".into()), &command));
+        assert_eq!(after.status.code(), Some(0), "{after:?}");
+        assert_eq!(
+            after.stdout,
+            format!("signed-in:auth login:{}\n", store.display()).as_bytes()
+        );
+        assert!(after.stderr.is_empty(), "{after:?}");
     }
 
     #[test]
