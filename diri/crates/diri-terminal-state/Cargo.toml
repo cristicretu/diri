@@ -14,6 +14,9 @@ compact-history = ["alacritty_terminal/compact-history"]
 # and checksums each OSC body it dispatches and the image store logs each
 # image it stores, so `vt_workloads` can compare every run with a reference.
 bench-verify = ["alacritty_terminal/observe"]
+# Prototype of the page-based terminal core (docs/core-v2.md). Off by
+# default and not used by the Engine or the Remote Helper.
+core-v2 = []
 
 [dependencies]
 alacritty_terminal.workspace = true
@@ -28,7 +31,8 @@ diri-pty.workspace = true
 diri-platform.workspace = true
 serde.workspace = true
 serde_json.workspace = true
-# SHA-256 of payloads, images and state in the benchmark's golden check.
+# SHA-256 of payloads, images and state in the benchmark's golden check and
+# the core v2 bench's golden digests.
 sha2.workspace = true
 
 [[bench]]
@@ -63,3 +67,7 @@ harness = false
 [[bench]]
 name = "narrow_history"
 harness = false
+
+[[example]]
+name = "core_v2_bench"
+required-features = ["core-v2"]

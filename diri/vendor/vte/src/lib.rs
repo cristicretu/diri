@@ -681,6 +681,14 @@ impl<const OSC_RAW_BUF_SIZE: usize> Parser<OSC_RAW_BUF_SIZE> {
     /// sequences as validating the whole text.
     #[inline]
     fn advance_ground<P: Perform>(&mut self, performer: &mut P, bytes: &[u8]) -> usize {
+        // DIRI PATCH: a performer that parses ground-state text itself takes
+        // the leading bytes it understands; the rest is parsed below.
+        let taken = performer.ground_bytes(bytes);
+        if taken != 0 {
+            debug_assert!(taken <= bytes.len());
+            return taken;
+        }
+
         // Find the next escape character.
         let num_bytes = bytes.len();
         let plain_chars = memchr::memchr(0x1B, bytes).unwrap_or(num_bytes);
@@ -1055,6 +1063,17 @@ pub trait Perform {
     }
 
     /// Execute a C0 or C1 control function.
+    /// DIRI PATCH: ground-state bytes, offered before the parser scans
+    /// them. A performer may consume a prefix holding only printable text
+    /// and C0 controls it performs exactly as `print`/`print_ascii`/
+    /// `print_text` and `execute` would, and returns its length. It must
+    /// stop before an escape, a C1 control, DEL, or invalid or incomplete
+    /// UTF-8. The default consumes nothing.
+    #[inline]
+    fn ground_bytes(&mut self, _bytes: &[u8]) -> usize {
+        0
+    }
+
     fn execute(&mut self, _byte: u8) {}
 
     /// Invoked when a final character arrives in first part of device control
