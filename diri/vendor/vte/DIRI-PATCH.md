@@ -88,6 +88,11 @@ the ASCII byte was never parsed: the letter vanished, and only when that read
 boundary fell there. It now consumes only the first character's bytes.
 Test: `partial_utf8_then_ascii_then_partial_utf8`.
 
+## Mode 1016
+
+`NamedPrivateMode::SgrPixelMouse` names DECSET 1016 (SGR mouse reports in
+pixels); `alacritty_terminal` sets, resets and reports it.
+
 ## Mode 2027
 
 `NamedPrivateMode::GraphemeClustering` names DECSET 2027 so `Term` can set,
@@ -124,6 +129,28 @@ soups of printable runs, controls, DEL, C1 in both encodings, valid,
 truncated and invalid UTF-8 and escapes of every kind, fed whole and in
 pieces of 1 to 40 bytes. `printable_runs_end_at_the_first_byte_outside_space_to_tilde`
 checks the word test for every byte value at every offset.
+
+## Ground-state text and REP hooks (core v2 prototype)
+
+Two additive hooks for the core v2 prototype (`docs/core-v2.md`), with
+defaults that keep every existing performer and handler unchanged:
+
+- `Perform::ground_bytes(&[u8]) -> usize`, called at the start of each
+  ground-state slice before the parser scans it. The ANSI performer forwards
+  it as `Handler::input_bytes(&[u8]) -> (usize, Option<char>)` and records the
+  returned last printed character for REP. A handler may consume a prefix of
+  printable text and the C0 controls HT, BS, CR, LF, VT and FF, with exactly
+  the effect of the calls the parser would make, and must stop before ESC,
+  other C0, DEL, C1, or invalid or incomplete UTF-8. The defaults consume
+  nothing, so the parser handles every byte as before.
+- `Handler::input_repeat(char, usize)` for REP (`CSI b`), whose default calls
+  `input` `count` times, as the parser did.
+
+No new dependency; the Remote Helper Build ID changes with the source.
+Tests: `diri-terminal-state` `core_v2::tests` (feature `core-v2`) feed the
+prototype one-shot, byte by byte, at every split and in random reads and
+compare with the current core's byte-at-a-time state; `cargo test -p vte`
+covers the unchanged defaults.
 
 ## Test-only OSC observation
 

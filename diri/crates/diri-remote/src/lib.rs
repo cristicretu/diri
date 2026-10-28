@@ -891,6 +891,7 @@ mod tests {
             cols: 80,
             rows: 24,
             persistence: PersistenceCapability::NonPersistent,
+            keyboard_enhancements: false,
         };
         let paths = roots.session(&request.session_id).unwrap();
         paths.ensure().unwrap();

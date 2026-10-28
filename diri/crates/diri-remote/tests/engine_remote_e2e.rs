@@ -84,6 +84,7 @@ fn remote_scrollback_does_not_block_input_or_screen_reads() {
         cols: 80,
         rows: 24,
         persistence: PersistenceCapability::NativeDetach,
+        keyboard_enhancements: false,
     };
     let registry = Arc::new(Mutex::new(Registry::new(
         Arc::new(ManifestEngine::new(Vec::new())),
@@ -569,6 +570,7 @@ fn engine_bootstraps_detaches_and_adopts_the_same_remote_process() {
         cols: 80,
         rows: 24,
         persistence: PersistenceCapability::NativeDetach,
+        keyboard_enhancements: false,
     };
     let bindings = RemoteBindingStore::new(temporary.path().join("bindings")).expect("bindings");
     let engine = Arc::new(ManifestEngine::new(Vec::new()));
@@ -766,6 +768,7 @@ fn engine_resets_a_remote_terminal_without_replacing_the_process() {
         cols: 80,
         rows: 24,
         persistence: PersistenceCapability::NativeDetach,
+        keyboard_enhancements: false,
     };
     let bindings = RemoteBindingStore::new(temporary.path().join("bindings")).expect("bindings");
     let engine = Arc::new(ManifestEngine::new(Vec::new()));
@@ -940,6 +943,7 @@ fn launch_response_disconnect_recovers_the_existing_holder_idempotently() {
         cols: 80,
         rows: 24,
         persistence: PersistenceCapability::NonPersistent,
+        keyboard_enhancements: false,
     };
     let launched = manager
         .launch(&installed, &request)
@@ -1110,6 +1114,7 @@ fn attach_ssh_disconnect_reconnects_without_replaying_unavailable_input() {
         cols: 80,
         rows: 24,
         persistence: PersistenceCapability::NonPersistent,
+        keyboard_enhancements: false,
     };
     let bindings = RemoteBindingStore::new(temporary.path().join("bindings")).expect("bindings");
     let mut session = Session::spawn(
@@ -1223,6 +1228,7 @@ fn engine_terminate_uses_stop_result_after_controller_revocation() {
         cols: 80,
         rows: 24,
         persistence: PersistenceCapability::NonPersistent,
+        keyboard_enhancements: false,
     };
     let mut session = Session::spawn(
         SessionSpec {
@@ -1315,6 +1321,7 @@ fn engine_reads_remote_inline_images_from_a_capable_holder() {
         cols: 80,
         rows: 24,
         persistence: PersistenceCapability::NativeDetach,
+        keyboard_enhancements: false,
     };
     let bindings = RemoteBindingStore::new(temporary.path().join("bindings")).expect("bindings");
     let session = Session::spawn(
@@ -1619,6 +1626,7 @@ fn remote_output_leading_edge_to_engine_attach() {
         cols: 80,
         rows: 24,
         persistence: PersistenceCapability::NativeDetach,
+        keyboard_enhancements: false,
     };
     let registry = Arc::new(Mutex::new(Registry::new(
         Arc::new(ManifestEngine::new(Vec::new())),
@@ -1886,6 +1894,7 @@ fn spawn_remote_program(
         cols: 100,
         rows: 30,
         persistence: PersistenceCapability::NativeDetach,
+        keyboard_enhancements: false,
     };
     let bindings = RemoteBindingStore::new(temporary.join("bindings")).expect("bindings");
     Session::spawn(
@@ -1982,6 +1991,78 @@ fn remote_program_queries_are_answered_once_in_stream_order() {
     let _ = session.terminate(Duration::from_millis(100));
 }
 
+/// A remote program negotiates kitty keyboard flags exactly as a local one:
+/// its Holder answers `CSI ? u` from its own emulator, ahead of DA1, and once
+/// the program pushes flags the Engine encodes keys with them (Shift+Enter
+/// becomes `CSI 13;2u`), from the flags the Holder published.
+#[test]
+fn a_remote_program_negotiates_kitty_keyboard_flags() {
+    use diri_proto::terminal_input::{KeyAction, KeyEvent, Modifiers, NamedKey, encode_action};
+
+    let query_replies: &[u8] = b"\x1b[?0u\x1b[?62;22c";
+    let shift_enter: &[u8] = b"\x1b[13;2u";
+    let hex = |bytes: &[u8]| -> String { bytes.iter().map(|byte| format!("{byte:02x}")).collect() };
+    let temporary = tempfile::tempdir().expect("temp");
+    let script = format!(
+        "printf 'ready>'; IFS= read -r go; clear; stty raw -echo min 0 time 20; \
+         printf '\\033[?u\\033[c'; dd bs=1 count={} 2>/dev/null | od -An -tx1 | tr -d ' \\n'; \
+         printf '\\033[>1u|pushed>'; dd bs=1 count={} 2>/dev/null | od -An -tx1 | tr -d ' \\n'; \
+         printf '|done'; stty min 1 time 0; IFS= read -r line",
+        query_replies.len(),
+        shift_enter.len()
+    );
+    let session = spawn_remote_program(
+        temporary.path(),
+        "kitty-keyboard",
+        vec!["/bin/sh".into(), "-c".into(), script],
+        None,
+    );
+    wait_for_grid(&session, "ready>");
+    assert_eq!(
+        session
+            .keyboard_state()
+            .and_then(|state| state.enhancements)
+            .map(|flags| flags.bits()),
+        Some(0),
+        "a known zero before the program asks"
+    );
+    session.write_input(b"go\n").expect("input");
+    wait_for_grid(&session, "pushed>");
+    wait_until("the pushed flags", Duration::from_secs(10), || {
+        session
+            .keyboard_state()
+            .and_then(|state| state.enhancements)
+            .is_some_and(|flags| flags.bits() == 1)
+    });
+    let shift = Modifiers {
+        shift: true,
+        ..Modifiers::default()
+    };
+    let bytes = encode_action(
+        &KeyEvent::named(NamedKey::Enter),
+        shift,
+        session.keyboard_state(),
+        KeyAction::Press,
+    )
+    .expect("encode");
+    assert_eq!(bytes, shift_enter);
+    session.write_input(&bytes).expect("input");
+    let mut screen = String::new();
+    wait_until("the key", Duration::from_secs(20), || {
+        screen = session.screen_lines().concat();
+        screen.retain(|character| !character.is_whitespace());
+        screen.contains("|done")
+    });
+    assert_eq!(
+        screen,
+        format!("{}|pushed>{}|done", hex(query_replies), hex(shift_enter)),
+        "what the remote program read (hex)"
+    );
+    session.write_input(b"\r").expect("input");
+    let mut session = session;
+    let _ = session.terminate(Duration::from_millis(100));
+}
+
 /// Round trip of each terminal query a remote program makes, measured inside
 /// the remote PTY: the time from writing the query to reading its whole
 /// answer, or `timeout` after 1 s. Then the order in which an `OSC 7501`
@@ -2065,6 +2146,7 @@ my @queries = (
     ["CSI-?996n", "\e[?996n", qr/\e\[\?997;\dn$/],
     ["XTVERSION", "\e[>0q", qr/\eP>\|[^\e]*\e\\$/],
     ["OSC-7501", "\e]7501;?\e\\", qr/\e\]7501;\?\e\\$/],
+    ["kitty-?u", "\e[?u", qr/\e\[\?\d+u$/],
 );
 for my $query (@queries) {
     my ($name, $bytes, $pattern) = @$query;
@@ -2154,3 +2236,299 @@ while ($open{out} || @queue) {
 waitpid($pid, 0);
 exit($? >> 8);
 "#;
+
+/// A destructive repaint (an erase, then its redraw a few milliseconds later
+/// in a separate write) never reaches a local Engine attach as an erased
+/// frame, whether it answers a keystroke or nobody typed for it.
+#[test]
+fn a_remote_repaint_is_published_with_its_redraw() {
+    let flashes = remote_repaint_flashes(Duration::ZERO, 5, &[(true, 5), (false, 5)]);
+    assert_eq!(
+        flashes,
+        [0, 0],
+        "erased frames per (keystroke, background) repaint"
+    );
+}
+
+/// Whether a remote destructive repaint (an erase, then its redraw a few
+/// milliseconds later in a separate write) ever reaches a local Engine
+/// attach as an erased frame, over a fake `ssh` that holds every chunk for
+/// `DIRI_REPAINT_DELAY_MS` (default 25) in each direction.
+///
+/// Two triggers: a keystroke sent through the Engine (the program repaints
+/// in answer to it, so the Holder's interactive budget applies), and output
+/// nobody typed for, written to the child's TTY. For each gap between the
+/// erase and the redraw, it prints how many repaints showed a frame with
+/// fewer rows than the screen held before and after.
+///
+/// ```sh
+/// cargo test --release -p diri-remote --test engine_remote_e2e \
+///     measure_remote_destructive_repaint -- --ignored --nocapture
+/// ```
+#[test]
+#[ignore = "measurement: run with --release -- --ignored --nocapture"]
+fn measure_remote_destructive_repaint() {
+    let delay = Duration::from_millis(
+        std::env::var("DIRI_REPAINT_DELAY_MS")
+            .ok()
+            .and_then(|value| value.parse().ok())
+            .unwrap_or(25),
+    );
+    let trials: usize = std::env::var("DIRI_REPAINT_TRIALS")
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(30);
+    let cases: Vec<(bool, u64)> = [true, false]
+        .into_iter()
+        .flat_map(|typed| [0, 2, 5, 10, 14, 20].map(|gap| (typed, gap)))
+        .collect();
+    eprintln!("one-way ssh delay {delay:?}, {trials} repaints per gap");
+    let flashes = remote_repaint_flashes(delay, trials, &cases);
+    for ((typed, gap), flashed) in cases.iter().zip(flashes) {
+        let trigger = if *typed { "keystroke " } else { "background" };
+        eprintln!("REPAINT {trigger} gap {gap:>2} ms: {flashed}/{trials} showed an erased frame");
+    }
+}
+
+/// Runs `trials` repaints per `(typed, gap ms)` case in a remote session
+/// behind a fake `ssh` with `delay` each way and counts, per case, the
+/// repaints whose erase reached an Engine attach before its redraw.
+fn remote_repaint_flashes(delay: Duration, trials: usize, cases: &[(bool, u64)]) -> Vec<usize> {
+    use diri_engine::control::ControlServer;
+    use diri_engine::registry::Registry;
+    use diri_proto::frames::{FrameCodec, FrameType};
+    use serde_json::json;
+    use std::io::Read;
+    use std::os::unix::net::UnixStream;
+    use std::sync::Mutex;
+
+    const ROWS: usize = 20;
+    let temporary = tempfile::tempdir_in("/tmp").expect("temp");
+    let home = temporary.path().join("home");
+    fs::create_dir(&home).unwrap();
+    let script = temporary.path().join("repaint.pl");
+    let tty_file = temporary.path().join("tty");
+    // Each input line is "<letter> <gap ms>": erase the screen, wait the
+    // gap, redraw every row with the letter.
+    fs::write(
+        &script,
+        format!(
+            r#"use strict; use Time::HiRes qw(sleep); $| = 1;
+system("stty -echo -icanon min 1; tty > '{tty}'");
+print "ready\r\n";
+while (my $line = <STDIN>) {{
+    my ($letter, $gap) = split ' ', $line;
+    syswrite(STDOUT, "\e[H\e[2J");
+    sleep($gap / 1000) if $gap > 0;
+    syswrite(STDOUT, "\e[H" . join("\r\n", map {{ $letter x 60 }} 1 .. {ROWS}));
+}}
+"#,
+            tty = tty_file.display()
+        ),
+    )
+    .unwrap();
+    let manager = Arc::new(
+        RemoteManager::new(
+            ProcessExecutor::new(write_delayed_fake_ssh(
+                temporary.path(),
+                &home,
+                &temporary.path().join("remote-state"),
+                delay,
+            )),
+            ArtifactCatalog::from_native_helper(Path::new(helper())).unwrap(),
+            temporary.path().join("control"),
+        )
+        .unwrap(),
+    );
+    let host = HostEntry {
+        transport: Default::default(),
+        id: "repaint".into(),
+        name: None,
+        ssh: "fixture".into(),
+        default_cwd: None,
+        node: None,
+    };
+    let installed = manager.ensure_helper(&host).unwrap();
+    let token = token_for_retry();
+    let id = unique_stop_session_id("repaint");
+    let request = LaunchRequest {
+        session_id: id.clone(),
+        session_token: token.clone(),
+        argv: vec!["/usr/bin/perl".into(), script.display().to_string()],
+        cwd: "/".into(),
+        environment: vec![],
+        cols: 80,
+        rows: 24,
+        persistence: PersistenceCapability::NativeDetach,
+        keyboard_enhancements: false,
+    };
+    let registry = Arc::new(Mutex::new(Registry::new(
+        Arc::new(ManifestEngine::new(Vec::new())),
+        temporary.path().join("state.json"),
+    )));
+    let record = serde_json::from_value(json!({
+        "id":id, "kind":{"shell":{}}, "cwd":"/", "projectID":"p",
+        "title":"repaint", "titleSource":0, "status":{"starting":{}},
+        "resumability":"notResumable", "createdAt":0, "updatedAt":0, "pinned":false,
+        "host":host.id,
+    }))
+    .unwrap();
+    registry
+        .lock()
+        .unwrap()
+        .spawn(
+            SessionSpec {
+                id: id.clone(),
+                pty: PtySpec::new(request.argv.clone(), "/").size(80, 24),
+                manifest_id: "shell".into(),
+                authority: Authority::ProcessOnly,
+                logs_dir: temporary.path().join("logs"),
+                holder: None,
+                defer_launch: false,
+                remote: Some(RemoteSessionSpec {
+                    manager: Arc::clone(&manager),
+                    helper: installed.clone(),
+                    launch: request,
+                    host_id: host.id.clone(),
+                    binding_store: RemoteBindingStore::new(temporary.path().join("bindings"))
+                        .unwrap(),
+                }),
+            },
+            record,
+        )
+        .unwrap();
+    wait_for_grid(registry.lock().unwrap().get(&id).unwrap(), "ready");
+    struct Cleanup {
+        manager: Arc<RemoteManager>,
+        helper: diri_engine::remote::manager::InstalledHelper,
+        selector: SessionSelector,
+    }
+    impl Drop for Cleanup {
+        fn drop(&mut self) {
+            let _ = self.manager.kill(&self.helper, &self.selector);
+        }
+    }
+    let _cleanup = Cleanup {
+        manager: Arc::clone(&manager),
+        helper: installed,
+        selector: SessionSelector {
+            session_id: id.clone(),
+            session_token: token,
+            expected_incarnation: None,
+        },
+    };
+
+    let server = Arc::new(ControlServer::new(
+        Arc::clone(&registry),
+        temporary.path().join("daemon.sock"),
+    ));
+    let (mut attach, attach_server) = UnixStream::pair().unwrap();
+    let attach_worker = {
+        let server = Arc::clone(&server);
+        std::thread::spawn(move || {
+            let _ = server.serve(attach_server);
+        })
+    };
+    attach
+        .write_all(format!("{{\"attach\":\"{id}\"}}\n").as_bytes())
+        .unwrap();
+    // Folds every Grid frame the attach receives into a mirror of the first
+    // ROWS rows and reports each frame's count of filled rows and its letter.
+    let (sender, frames) = std::sync::mpsc::channel::<(usize, char)>();
+    {
+        let mut attach = attach.try_clone().unwrap();
+        std::thread::spawn(move || {
+            let mut codec = FrameCodec::new();
+            let mut bytes = vec![0; 1 << 16];
+            let mut mirror = vec![String::new(); ROWS];
+            while let Ok(count) = attach.read(&mut bytes) {
+                if count == 0 {
+                    return;
+                }
+                let Ok(decoded) = codec.feed(&bytes[..count]) else {
+                    return;
+                };
+                for frame in decoded {
+                    if frame.frame_type != FrameType::Grid {
+                        continue;
+                    }
+                    let Ok(Some(update)) = frame.grid_payload() else {
+                        continue;
+                    };
+                    if update.is_full_snapshot {
+                        mirror.iter_mut().for_each(String::clear);
+                    }
+                    for row in &update.changed_rows {
+                        if let Some(slot) = mirror.get_mut(usize::from(row.y)) {
+                            *slot = row
+                                .cells
+                                .iter()
+                                .map(|cell| char::from_u32(cell.scalar).unwrap_or(' '))
+                                .collect::<String>()
+                                .trim()
+                                .to_string();
+                        }
+                    }
+                    let filled = mirror.iter().filter(|row| row.len() >= 60).count();
+                    let letter = mirror[ROWS - 1].chars().next().unwrap_or(' ');
+                    if sender.send((filled, letter)).is_err() {
+                        return;
+                    }
+                }
+            }
+        });
+    }
+    let session_input = |bytes: &[u8]| {
+        registry
+            .lock()
+            .unwrap()
+            .get(&id)
+            .unwrap()
+            .write_input(bytes)
+            .unwrap();
+    };
+    // Waits for the redraw with `letter`, returning whether any frame before
+    // it showed fewer than every row.
+    let repaint = |letter: char| -> bool {
+        let mut erased = false;
+        loop {
+            let (filled, shown) = frames
+                .recv_timeout(Duration::from_secs(10))
+                .unwrap_or_else(|_| panic!("timed out waiting for the {letter} redraw"));
+            if filled == ROWS && shown == letter {
+                return erased;
+            }
+            erased |= filled < ROWS;
+        }
+    };
+    session_input(b"a 0\n");
+    repaint('a');
+    std::thread::sleep(Duration::from_millis(200));
+    while frames.try_recv().is_ok() {}
+    let tty = fs::read_to_string(&tty_file).unwrap().trim().to_string();
+    let mut terminal = fs::OpenOptions::new().write(true).open(&tty).unwrap();
+    let mut flashes = Vec::with_capacity(cases.len());
+    for &(typed, gap) in cases {
+        let mut flashed = 0;
+        for trial in 0..trials {
+            let letter = char::from(b'b' + (trial % 24) as u8);
+            if typed {
+                session_input(format!("{letter} {gap}\n").as_bytes());
+            } else {
+                terminal.write_all(b"\x1b[H\x1b[2J").unwrap();
+                std::thread::sleep(Duration::from_millis(gap));
+                let rows = vec![letter.to_string().repeat(60); ROWS].join("\r\n");
+                write!(terminal, "\x1b[H{rows}").unwrap();
+            }
+            if repaint(letter) {
+                flashed += 1;
+            }
+            std::thread::sleep(Duration::from_millis(60));
+            while frames.try_recv().is_ok() {}
+        }
+        flashes.push(flashed);
+    }
+    let _ = attach.shutdown(std::net::Shutdown::Both);
+    drop(attach_worker);
+    flashes
+}

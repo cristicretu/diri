@@ -12,6 +12,7 @@ mod rename_input;
 mod rows;
 mod strip_tabs;
 mod tabs;
+pub(crate) use tabs::DraggedTab;
 mod titles;
 mod windowing;
 mod workspaces;

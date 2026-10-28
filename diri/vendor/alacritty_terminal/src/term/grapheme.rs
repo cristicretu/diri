@@ -24,24 +24,24 @@ const EMOJI_BIT: u8 = 0x80;
 
 /// A codepoint's packed classification.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) struct Info(u8);
+pub struct Info(u8);
 
 impl Info {
     #[inline]
-    pub(crate) fn of(c: char) -> Self {
+    pub fn of(c: char) -> Self {
         let cp = c as usize;
         let block = STAGE1[cp >> 8] as usize;
         Self(STAGE2[(block << 8) | (cp & 0xFF)])
     }
 
     #[inline]
-    pub(crate) fn class(self) -> Class {
+    pub fn class(self) -> Class {
         Class::from_bits(self.0 & CLASS_MASK)
     }
 
     /// Terminal columns of the codepoint alone; East Asian ambiguous is narrow.
     #[inline]
-    pub(crate) fn width(self) -> usize {
+    pub fn width(self) -> usize {
         match (self.0 >> WIDTH_SHIFT) & WIDTH_MASK {
             WIDTH_AMBIGUOUS => 1,
             width => width as usize,
@@ -56,7 +56,7 @@ impl Info {
 
 /// Grapheme break class, including the Indic conjunct break classes (UAX #29).
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum Class {
+pub enum Class {
     Other,
     Prepend,
     RegionalIndicator,
@@ -124,7 +124,7 @@ impl Class {
     /// Everything else (letters, digits, CJK, …) always starts a new one,
     /// except after a Prepend, which this terminal never joins.
     #[inline]
-    pub(crate) fn may_continue(self) -> bool {
+    pub fn may_continue(self) -> bool {
         !matches!(self, Self::Other | Self::Prepend | Self::Lv | Self::Lvt)
     }
 }
@@ -132,25 +132,25 @@ impl Class {
 /// Whether `c` may change the cluster before it: the variation selectors,
 /// the keycap mark and ZWJ, or a class that can continue a cluster.
 #[inline]
-pub(crate) fn may_join(c: char, info: Info) -> bool {
+pub fn may_join(c: char, info: Info) -> bool {
     is_presentation_mark(c) || info.class().may_continue()
 }
 
 /// Whether `c` in a cluster can bring an emoji width rule into play.
 #[inline]
-pub(crate) fn sets_presentation(c: char) -> bool {
+pub fn sets_presentation(c: char) -> bool {
     is_presentation_mark(c) || is_regional_indicator(c) || is_skin_tone(c)
 }
 
 /// Codepoints that change a cluster's width by their presence alone.
 #[inline]
-pub(crate) fn is_presentation_mark(c: char) -> bool {
+pub fn is_presentation_mark(c: char) -> bool {
     matches!(c, '\u{FE0E}' | '\u{FE0F}' | '\u{20E3}' | '\u{200D}')
 }
 
 /// State carried between [`breaks`] calls within one run of codepoints.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
-pub(crate) enum BreakState {
+pub enum BreakState {
     #[default]
     Default,
     RegionalIndicator,
@@ -162,7 +162,7 @@ pub(crate) enum BreakState {
 /// Whether a grapheme cluster boundary falls between consecutive codepoints
 /// of classes `a` and `b` (UAX #29 including GB9c, as Bun implements it).
 #[inline]
-pub(crate) fn breaks(a: Class, b: Class, state: &mut BreakState) -> bool {
+pub fn breaks(a: Class, b: Class, state: &mut BreakState) -> bool {
     use BreakState as S;
     use Class as G;
 
@@ -272,7 +272,7 @@ pub(crate) fn breaks(a: Class, b: Class, state: &mut BreakState) -> bool {
 
 /// One grapheme cluster's width facts, accumulated codepoint by codepoint.
 #[derive(Clone, Copy, Debug)]
-pub(crate) struct Cluster {
+pub struct Cluster {
     first: char,
     base_width: u8,
     sum: u16,
@@ -288,7 +288,7 @@ pub(crate) struct Cluster {
 
 impl Cluster {
     #[inline]
-    pub(crate) fn new(c: char, info: Info) -> Self {
+    pub fn new(c: char, info: Info) -> Self {
         let width = info.width() as u8;
         Self {
             first: c,
@@ -306,7 +306,7 @@ impl Cluster {
     }
 
     #[inline]
-    pub(crate) fn add(&mut self, c: char, info: Info) {
+    pub fn add(&mut self, c: char, info: Info) {
         self.count = self.count.saturating_add(1);
         self.keycap |= c == '\u{20E3}';
         self.regional |= is_regional_indicator(c);
@@ -320,7 +320,7 @@ impl Cluster {
     /// Whether an emoji or presentation rule decides the width, rather than
     /// the widths of the codepoints themselves.
     #[inline]
-    pub(crate) fn presentation(&self) -> bool {
+    pub fn presentation(&self) -> bool {
         self.regional
             || self.keycap
             || (self.emoji_base && (self.skin_tone || self.zwj))
@@ -331,7 +331,7 @@ impl Cluster {
     /// Columns of the cluster: Bun's `stringWidth` rule by default, the
     /// mode 2027 rule when `clustering` is set.
     #[inline]
-    pub(crate) fn width(&self, clustering: bool) -> usize {
+    pub fn width(&self, clustering: bool) -> usize {
         if self.regional && self.count >= 2 {
             return 2;
         }
@@ -374,7 +374,7 @@ fn is_skin_tone(c: char) -> bool {
 }
 
 /// The width of `text` as Bun's `stringWidth` (or mode 2027) measures it.
-pub(crate) fn str_width(text: &str, clustering: bool) -> usize {
+pub fn str_width(text: &str, clustering: bool) -> usize {
     let mut total = 0;
     let mut current: Option<(Cluster, Class)> = None;
     let mut state = BreakState::Default;

@@ -117,6 +117,11 @@ impl ScreenCheckpoint {
                     u8::try_from(dict.get("mouseEncoding")?.as_unsigned_integer()?).ok()?,
                 )?,
             )
+            .with_pixel_reports(
+                dict.get("mousePixelReports")
+                    .and_then(plist::Value::as_boolean)
+                    .unwrap_or(false),
+            )
         };
         let keyboard = match dict.get("keyboardState") {
             None => None,
@@ -262,10 +267,19 @@ impl ScreenCheckpoint {
             "mouseTrackingMode".into(),
             plist::Value::Integer(u64::from(self.mouse.tracking as u8).into()),
         );
+        // SGR-Pixels (DECSET 1016) is stored as SGR plus its own key, so an
+        // Engine that predates it still loads the checkpoint, as SGR.
+        let encoding = match self.mouse.encoding {
+            MouseEncoding::SgrPixels => MouseEncoding::Sgr,
+            other => other,
+        };
         dict.insert(
             "mouseEncoding".into(),
-            plist::Value::Integer(u64::from(self.mouse.encoding as u8).into()),
+            plist::Value::Integer(u64::from(encoding as u8).into()),
         );
+        if self.mouse.pixel_reports() {
+            dict.insert("mousePixelReports".into(), plist::Value::Boolean(true));
+        }
 
         // Terminal content: owner-only from creation, never via the umask.
         let mut bytes = Vec::new();
@@ -439,6 +453,27 @@ mod tests {
         assert!(loaded.alt_screen);
         assert!(!loaded.bracketed_paste);
         assert_eq!(loaded.mouse, sample().mouse);
+    }
+
+    #[test]
+    fn sgr_pixel_mouse_survives_a_checkpoint_and_older_engines_read_sgr() {
+        let dir = tempfile::tempdir().expect("temp");
+        let path = dir.path().join("s_x.screen.plist");
+        let mut checkpoint = sample();
+        checkpoint.mouse = MouseModes::new(MouseTrackingMode::AnyMotion, MouseEncoding::SgrPixels);
+        checkpoint.write_atomically(&path).expect("write");
+        assert_eq!(
+            ScreenCheckpoint::load(&path).expect("load").mouse,
+            checkpoint.mouse
+        );
+        // The stored encoding is one an Engine that predates 1016 knows.
+        let dict = plist::Value::from_file(&path).expect("plist");
+        let dict = dict.as_dictionary().expect("dict");
+        assert_eq!(
+            dict.get("mouseEncoding")
+                .and_then(plist::Value::as_unsigned_integer),
+            Some(MouseEncoding::Sgr as u64)
+        );
     }
 
     #[cfg(unix)]
