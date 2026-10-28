@@ -108,14 +108,10 @@ const CHECKPOINT_MAX_STALENESS: Duration = Duration::from_secs(5);
 
 /// How long a deferred spawn waits for the first client size before
 /// launching at the estimated size anyway — an MCP-spawned agent may never
-/// get a view. The Swift daemon's 400ms fallback window.
+/// get a view. The Swift daemon's 400ms fallback window. Only a spawn with
+/// no known size waits here: a caller-named size, or the size a client last
+/// gave any session, launches at once.
 const LAUNCH_FALLBACK: Duration = Duration::from_millis(400);
-
-/// While unlaunched, each client resize pushes the exec back this far, so
-/// the agent starts at the SETTLED viewport rather than a transient
-/// first-layout size — otherwise its one-shot banner bakes at the wrong
-/// width. The Swift daemon's `scheduleDebouncedLaunch` delay.
-const LAUNCH_DEBOUNCE: Duration = Duration::from_millis(120);
 
 /// Outlasts the Holder's 10 s wait for a launchd job to call back
 /// (`diri_pty::detached`), after which it starts the Agent directly.
@@ -169,6 +165,20 @@ const OUTPUT_SETTLE: Duration = Duration::from_millis(16);
 /// One 120 Hz display interval, so continuous streaming cannot be held longer
 /// than the renderer's own frame cadence.
 const OUTPUT_BATCH_CEILING: Duration = Duration::from_millis(8);
+
+/// How long a held pump waits for more output before it publishes a batch
+/// that opened at least [`OUTPUT_BATCH_CEILING`] after the last publication.
+///
+/// The Holder's output stream cannot say a burst is over: a run read off it
+/// ends when the socket is momentarily empty, and the next PTY read may be
+/// microseconds behind. Waiting out the whole batch ceiling for the empty poll
+/// that proves it put ~9 ms between every lone piece of output (a background
+/// program's line, a spinner tick, a remote echo) and the screen. A short
+/// quiet window still folds in the rest of a write that spans several PTY
+/// reads, or several writes issued back to back, and anything that lost
+/// content waits for its redraw as before ([`RepaintHold`]). Continuous
+/// output stays capped at one publication per [`OUTPUT_BATCH_CEILING`].
+const OUTPUT_QUIET: Duration = Duration::from_millis(1);
 
 /// How long after a keystroke the output that follows it counts as its
 /// answer. A shell's echo lands well under a millisecond after the write and a
@@ -353,6 +363,8 @@ pub struct SessionView {
     pub terminal_progress: Option<diri_proto::TerminalProgress>,
     pub tail_offset: u64,
     pub exited: bool,
+    /// How long the child ran, once this Engine saw a child it exec'd exit.
+    pub ran: Option<Duration>,
 }
 
 /// Small input-side composer mirror used only until the first real prompt is
@@ -484,6 +496,12 @@ struct Shared {
     /// When this Engine launched the child; `None` for an adopted one, whose
     /// start this process never saw.
     launched_at: Option<Instant>,
+    /// When the child was exec'd: `launched_at`, or later for a launch that
+    /// waited for the client's size. `None` for an adopted child.
+    exec_at: Mutex<Option<Instant>>,
+    /// How long the child ran, from `exec_at` to the moment its exit was
+    /// applied. Set once; a command session's tab policy reads it.
+    ran: Mutex<Option<Duration>>,
     /// Set before an explicit stop, so its exit is not read as a crash.
     terminate_requested: AtomicBool,
     /// A remote stop is in flight. Its Helper `kill` takes the controller
@@ -510,6 +528,9 @@ struct Shared {
     /// What the program says it is doing with `OSC 7501`. See
     /// [`observe_program_status`].
     program_status: Mutex<ProgramStatusTrack>,
+    /// The shell has no job and is asking for a line itself, as of the last
+    /// local foreground sample. See [`shell_prompts_in_command`].
+    builtin_prompt: AtomicBool,
     /// Agents a shell recognises in its foreground, by the program name a
     /// user types to start them. Empty for every session but a shell.
     known_agents: Vec<KnownAgent>,
@@ -637,6 +658,8 @@ struct ProgressTrack {
 struct ProgramStatusTrack {
     generation_seen: u64,
     published: Option<diri_terminal_state::ProgramRecord>,
+    /// Why nothing reports any more, while `published` is `None`.
+    removal: Option<diri_terminal_state::ProgramRemoval>,
     unreduced: bool,
 }
 
@@ -1563,10 +1586,10 @@ fn accept_remote_stop_result(
     }
 }
 
-/// Deferred-launch state: the agent is not exec'd until the attaching client
-/// reports its real terminal size, so a TUI's one-shot banner renders at the
-/// exact width (no post-spawn reflow). Ported from the Swift daemon's
-/// `scheduleDebouncedLaunch`.
+/// Deferred-launch state: the agent is not exec'd until its size is known
+/// (named by the caller, or reported by the attaching client), so a TUI's
+/// one-shot banner renders at the exact width (no post-spawn reflow). Ported
+/// from the Swift daemon's `scheduleDebouncedLaunch`, without its debounce.
 struct DeferredLaunch {
     state: Mutex<DeferredState>,
     cond: std::sync::Condvar,
@@ -1604,15 +1627,21 @@ impl DeferredLaunch {
         }
     }
 
-    /// Records a client size while unlaunched, pushing the exec back so the
-    /// viewport can settle. False once launched: resize the PTY instead.
+    /// Records a client size while unlaunched and launches at it now. A
+    /// size that arrives while the exec is in flight is handed back by
+    /// [`Self::finish_launch`] and applied as an ordinary resize, which the
+    /// child sees long before an agent paints its first frame (Claude Code
+    /// boots for ~300 ms). The Swift daemon debounced 120 ms per proposal
+    /// because AppKit's first layout was transient; the GPUI pane measures
+    /// its laid-out viewport, so that wait only delayed every tab.
+    /// False once launched: resize the PTY instead.
     fn propose_size(&self, cols: u16, rows: u16) -> bool {
         let mut state = self.state.lock().expect("deferred");
         if state.launched {
             return false;
         }
         state.pending = Some((cols, rows));
-        state.deadline = Instant::now() + LAUNCH_DEBOUNCE;
+        state.deadline = Instant::now();
         self.cond.notify_all();
         true
     }
@@ -1739,8 +1768,9 @@ pub struct SessionSpec {
     /// Present for a remote Holder-backed session. It is mutually exclusive
     /// with the local `holder` transport.
     pub remote: Option<RemoteSessionSpec>,
-    /// Defer the exec until the first client size settles (holder spawns
-    /// only), so the agent's banner renders at the real viewport width.
+    /// Defer the exec until a size is known (holder spawns only): the first
+    /// client size or [`Session::launch_at`], so the agent's banner renders
+    /// at the real viewport width.
     pub defer_launch: bool,
 }
 
@@ -2114,11 +2144,12 @@ impl Session {
         Self::attach(spec, client, floor, engine, true, stat.as_ref())
     }
 
-    /// Spawns through a holder, but not yet: the exec waits for the first
-    /// client size to settle ([`LAUNCH_DEBOUNCE`] after each proposal, at
-    /// most [`LAUNCH_FALLBACK`] total without one), so the agent's one-shot
-    /// banner renders at the real viewport width. Until then input queues
-    /// and the session presents an empty screen at the estimated size.
+    /// Spawns through a holder, but not yet: the exec waits for a client
+    /// size (the first proposal, or [`Session::launch_at`] when the size is
+    /// already known; at most [`LAUNCH_FALLBACK`] without one), so the
+    /// agent's one-shot banner renders at the real viewport width. Until
+    /// then input queues and the session presents an empty screen at the
+    /// estimated size.
     fn spawn_held_deferred(
         spec: SessionSpec,
         holder: &HolderConfig,
@@ -2180,6 +2211,7 @@ impl Session {
                         disk_capacity: holder_log_capacity(),
                     };
                     let exec_started = Instant::now();
+                    *shared.exec_at.lock().expect("exec at") = Some(exec_started);
                     if let Err(error) = HolderLauncher::launch(&holder.executable, &paths, &launch)
                     {
                         mark_launch_failed(&shared, "holder_launch", &error);
@@ -2241,6 +2273,12 @@ impl Session {
                         // A size proposed while the exec was in flight: apply
                         // as an ordinary resize now that the PTY exists.
                         let (cols, rows) = (cols.max(2), rows.max(2));
+                        diri_telemetry::debug_event!(
+                            "session.exec_resized",
+                            session = diri_telemetry::id(&id),
+                            cols = cols,
+                            rows = rows,
+                        );
                         let _ = client.resize_with_pixels(
                             cols,
                             rows,
@@ -2461,6 +2499,7 @@ impl Session {
             title_source,
             tail_offset: self.shared.log.lock().expect("log").tail_offset(),
             exited: self.shared.exited.load(Ordering::SeqCst),
+            ran: *self.shared.ran.lock().expect("ran"),
         }
     }
 
@@ -3178,6 +3217,13 @@ impl Session {
             bytes,
             b"\r" | b"\n" | b"\r\n" | b"\x03" | b"\x1b" | b"y" | b"n"
         );
+        if self.manifest_id == "shell" && bytes.iter().any(|byte| matches!(byte, b'\r' | b'\n')) {
+            self.shared
+                .screen
+                .lock()
+                .expect("screen")
+                .shell_line_submitted();
+        }
         self.feed_signal(if submits {
             StatusSignal::UserSubmission
         } else {
@@ -3334,6 +3380,17 @@ impl Session {
             }
             _ => None,
         }
+    }
+
+    /// Launches a deferred spawn now at `cols`×`rows`, a size its caller
+    /// already knows (the pane it opens in, or the size a client last gave
+    /// any session), instead of waiting for its pane to report one. A pane
+    /// that then reports a different size resizes the child like any other
+    /// resize. False when the session was not waiting to launch.
+    pub fn launch_at(&self, cols: u16, rows: u16) -> bool {
+        self.deferred
+            .as_ref()
+            .is_some_and(|deferred| deferred.propose_size(cols.max(2), rows.max(2)))
     }
 
     pub fn resize(&self, cols: u16, rows: u16) -> std::io::Result<()> {
@@ -3556,6 +3613,7 @@ fn new_shared(
         .map(|manifest| manifest.version.clone());
     let reducer = StatusReducer::new(spec.authority, SystemTime::now())
         .with_manifest(spec.manifest_id.clone(), manifest_version)
+        .with_program_reporters(engine.program_reporters())
         .with_attention_storage(
             &spec.logs_dir.join(format!("{}.attention.sqlite", spec.id)),
             fresh,
@@ -3575,6 +3633,7 @@ fn new_shared(
                 .find(|event| event.kind == diri_proto::attention::AttentionKind::Completion)
         })
         .map(|event| event.occurred_at);
+    let launched_at = fresh.then(Instant::now);
     Arc::new(Shared {
         holder_identity: std::sync::OnceLock::new(),
         reset_requested: AtomicBool::new(false),
@@ -3648,7 +3707,9 @@ fn new_shared(
         awaiting_redraw: AtomicBool::new(false),
         grid_wake: GridWake::for_agent(&spec.manifest_id),
         agent: spec.manifest_id.clone(),
-        launched_at: fresh.then(Instant::now),
+        launched_at,
+        exec_at: Mutex::new(launched_at),
+        ran: Mutex::new(None),
         terminate_requested: AtomicBool::new(false),
         remote_stopping: AtomicBool::new(false),
         exit_recorded: AtomicBool::new(false),
@@ -3664,6 +3725,7 @@ fn new_shared(
         foreground: Mutex::new(ForegroundProgram::default()),
         progress: Mutex::new(ProgressTrack::default()),
         program_status: Mutex::new(ProgramStatusTrack::default()),
+        builtin_prompt: AtomicBool::new(false),
         known_agents: if spec.manifest_id == "shell" {
             known_agents(engine)
         } else {
@@ -3825,6 +3887,18 @@ mod paste_text_sanitize_tests {
 fn apply(shared: &Shared, outcome: &ReducerOutcome) {
     let mut changed = outcome.attention_changed;
     if let Some(status) = &outcome.status_change {
+        // Before the status: a view that reads the exit also reads how long
+        // the child ran, so a command's tab policy never sees one alone.
+        if matches!(status, SessionStatus::Exited(_)) {
+            let mut ran = shared.ran.lock().expect("ran");
+            if ran.is_none() {
+                *ran = shared
+                    .exec_at
+                    .lock()
+                    .expect("exec at")
+                    .map(|exec| exec.elapsed());
+            }
+        }
         {
             let mut current = shared.status.lock().expect("status");
             if *current != *status {
@@ -3897,6 +3971,14 @@ fn apply_foreground_sample(
     let Some(running) = crate::status::foreground_job_running(child_pid, foreground_pgid) else {
         return;
     };
+    // No job, yet the shell is asking for a line on behalf of the command it
+    // runs: fish's `read` builtin. To the status it is a job waiting on its
+    // line, which the line probe then reports. Only the shell's own marks
+    // say so, and only a local shell's foreground is known to be the shell.
+    let builtin_prompt = !running && host == SampleHost::Local && shell_prompts_in_command(shared);
+    shared
+        .builtin_prompt
+        .store(builtin_prompt, Ordering::SeqCst);
     progress_follows_job(shared, foreground_pgid.filter(|_| running));
     let agent: Option<Lend<'_>> = match host {
         #[cfg(unix)]
@@ -3917,8 +3999,15 @@ fn apply_foreground_sample(
                 reducer.lend_to_agent(&agent.manifest_id, Some(&agent.manifest_version), now)
             }
             Some(Lend::Activity(id)) => reducer.lend_to_activity(id, now),
-            None if reducer.foreground_agent().is_some() => reducer.return_from_agent(running, now),
-            None => reducer.reduce(StatusSignal::ForegroundJob { running }, now),
+            None if reducer.foreground_agent().is_some() => {
+                reducer.return_from_agent(running || builtin_prompt, now)
+            }
+            None => reducer.reduce(
+                StatusSignal::ForegroundJob {
+                    running: running || builtin_prompt,
+                },
+                now,
+            ),
         };
         let read_as = reducer.foreground_agent().map(str::to_owned);
         shared.foreground.lock().expect("foreground").read_as = read_as;
@@ -4100,9 +4189,20 @@ fn probe_direct_line_wait(_shared: &Shared, _pty: &Mutex<Pty>) {
     // Unknown on ConPTY; do not fabricate a negative observation.
 }
 
+/// Whether the shell drew a prompt inside the command line it runs, per its
+/// `OSC 133` marks. See [`diri_terminal_state::ShellPhase::PromptInCommand`].
+fn shell_prompts_in_command(shared: &Shared) -> bool {
+    shared.screen.lock().expect("screen").shell_phase()
+        == diri_terminal_state::ShellPhase::PromptInCommand
+}
+
 /// Folds a line-wait sample into the shell's status, with the question as
 /// the screen shows it. Nothing is read from the screen while echo is off.
+///
+/// The shell's own prompt inside a command (fish's `read`) is a line wait
+/// too; the PTY owner, which looks for a job, never reports it.
 fn apply_line_wait(shared: &Shared, awaiting: bool) {
+    let awaiting = awaiting || shared.builtin_prompt.load(Ordering::SeqCst);
     let prompt = awaiting.then(|| {
         let secret = shared.secret_input.load(Ordering::SeqCst);
         let line = (!secret).then(|| {
@@ -5665,6 +5765,7 @@ fn observe_program_status(shared: &Shared, screen: &HeadlessScreen) {
         return;
     }
     let progress = track.progress();
+    track.removal = screen.program_status_removal();
     track.published = next;
     track.unreduced = true;
     let progress_changed = track.progress() != progress;
@@ -5678,23 +5779,33 @@ fn observe_program_status(shared: &Shared, screen: &HeadlessScreen) {
 /// the reducer already locked, ahead of the screen observation from the same
 /// output, so a program that just reported work silences the screen rules.
 fn reduce_program_status(shared: &Shared, reducer: &mut StatusReducer, now: SystemTime) {
-    let report = {
+    let signal = {
         let mut track = shared.program_status.lock().expect("program status");
         if !std::mem::take(&mut track.unreduced) {
             return;
         }
-        track.published.clone()
+        match (&track.published, track.removal) {
+            (None, Some(reason)) => StatusSignal::ProgramStatusRemoved(reason),
+            (report, _) => StatusSignal::ProgramStatus(report.clone()),
+        }
     };
-    let outcome = reducer.reduce(StatusSignal::ProgramStatus(report), now);
+    if let StatusSignal::ProgramStatusRemoved(reason) = &signal {
+        diri_telemetry::debug_event!(
+            "session.program_status_removed",
+            session = diri_telemetry::id(&shared.id),
+            reason = reason.as_str(),
+        );
+    }
+    let outcome = reducer.reduce(signal, now);
     apply(shared, &outcome);
 }
 
 /// The program a session's `OSC 7501` records described has ended: the
 /// wrapped agent returned to its shell, or a shell's job left the foreground.
-fn end_program_status(shared: &Shared) {
+fn end_program_status(shared: &Shared, reason: diri_terminal_state::ProgramRemoval) {
     {
         let mut screen = shared.screen.lock().expect("screen");
-        if !screen.end_program_status() {
+        if !screen.end_program_status(reason) {
             return;
         }
         observe_program_status(shared, &screen);
@@ -5718,7 +5829,7 @@ fn progress_follows_job(shared: &Shared, job: Option<i32>) {
         shared.bump_state_version();
     }
     if ended {
-        end_program_status(shared);
+        end_program_status(shared, diri_terminal_state::ProgramRemoval::Foreground);
     }
 }
 
@@ -5794,6 +5905,23 @@ fn evaluate_if_screen_changed(
 /// honoring only markers at or beyond `exit_marker_floor` (bytes below it
 /// belong to prior incarnations of the session id). A holder that dies
 /// *without* a marker is caught by a periodic liveness probe.
+/// How long a held pump's output stream may wait for more of a pending,
+/// non-destructive batch, given how long ago the batch opened and the last
+/// publication went out.
+///
+/// The batch never outlives [`OUTPUT_BATCH_CEILING`]. Within it, once a
+/// publication is due by the cadence, only [`OUTPUT_QUIET`] of silence is
+/// asked for before the batch is published; until then the wait runs to
+/// the moment the cadence allows the next one, so continuous output is still
+/// published at most once per ceiling.
+fn held_batch_wait(batch_age: Duration, since_published: Option<Duration>) -> Duration {
+    let ceiling = OUTPUT_BATCH_CEILING.saturating_sub(batch_age);
+    let cadence = since_published.map_or(Duration::ZERO, |since| {
+        OUTPUT_BATCH_CEILING.saturating_sub(since)
+    });
+    ceiling.min(cadence.max(OUTPUT_QUIET))
+}
+
 fn pump_held(
     shared: Arc<Shared>,
     engine: Arc<ManifestEngine>,
@@ -5921,6 +6049,9 @@ fn pump_held(
     let mut interactive_qos = false;
     // Set while a repaint is being assembled across more than one log read.
     let mut publish_pending: Option<Instant> = None;
+    // When output was last published, which paces the leading edge; see
+    // [`OUTPUT_QUIET`].
+    let mut last_published: Option<Instant> = None;
     // Filled cells when the pending batch opened, so an echo is judged
     // against the last published screen rather than the previous read.
     let mut batch_filled: Option<usize> = None;
@@ -6063,7 +6194,9 @@ fn pump_held(
                     (Some(RepaintHold::Redrawing(until)), _) => until
                         .saturating_duration_since(Instant::now())
                         .min(OUTPUT_BATCH_CEILING),
-                    (None, Some(started)) => OUTPUT_BATCH_CEILING.saturating_sub(started.elapsed()),
+                    (None, Some(started)) => {
+                        held_batch_wait(started.elapsed(), last_published.map(|at| at.elapsed()))
+                    }
                     (None, None) => shared.quiet_tick(),
                 };
                 match stream.next_run_into(timeout, LOG_READ_BUDGET, &mut live_run) {
@@ -6123,6 +6256,7 @@ fn pump_held(
             blank_since = None;
             shared.awaiting_redraw.store(false, Ordering::SeqCst);
             if publish_pending.take().is_some() {
+                last_published = Some(Instant::now());
                 shared.grid_wake.notify();
             }
         }
@@ -6425,6 +6559,7 @@ fn pump_held(
                 batch_filled = None;
                 repaint = None;
                 blank_since = None;
+                last_published = Some(Instant::now());
                 shared.awaiting_redraw.store(false, Ordering::SeqCst);
                 shared.grid_wake.notify();
             }
@@ -6696,7 +6831,7 @@ fn split_shell_status(status: i32) -> (Option<i32>, Option<i32>) {
 /// that change with the rest of this output.
 fn note_agent_exit(shared: &Shared, status: i32, screen: &mut HeadlessScreen) {
     *shared.agent_exit.lock().expect("agent exit") = Some(status);
-    if screen.end_program_status() {
+    if screen.end_program_status(diri_terminal_state::ProgramRemoval::ChildExited) {
         observe_program_status(shared, screen);
     }
     if status == 0
@@ -7168,6 +7303,45 @@ mod quiet_tick_tests {
         // Input or an attach makes it interactive again at once.
         shared.note_hot();
         assert_eq!(shared.quiet_tick(), TICK_INTERVAL);
+    }
+}
+
+#[cfg(test)]
+mod held_batch_wait_tests {
+    use super::*;
+
+    const MS: Duration = Duration::from_millis(1);
+
+    #[test]
+    fn output_after_quiet_waits_only_the_quiet_window() {
+        // Nothing published yet, or long enough ago: the batch publishes once
+        // the stream has been silent for OUTPUT_QUIET (was the whole ceiling).
+        assert_eq!(held_batch_wait(Duration::ZERO, None), OUTPUT_QUIET);
+        assert_eq!(
+            held_batch_wait(Duration::ZERO, Some(500 * MS)),
+            OUTPUT_QUIET
+        );
+        assert_eq!(
+            held_batch_wait(Duration::ZERO, Some(OUTPUT_BATCH_CEILING)),
+            OUTPUT_QUIET
+        );
+    }
+
+    #[test]
+    fn continuous_output_stays_paced_by_the_ceiling() {
+        // A batch that opened 1 ms after the last publication waits until the
+        // cadence allows the next one, never sooner.
+        assert_eq!(held_batch_wait(Duration::ZERO, Some(MS)), 7 * MS);
+        assert_eq!(held_batch_wait(3 * MS, Some(4 * MS)), 4 * MS);
+        // And never past its own ceiling.
+        assert_eq!(held_batch_wait(7 * MS, Some(7 * MS)), MS);
+        assert_eq!(held_batch_wait(OUTPUT_BATCH_CEILING, None), Duration::ZERO);
+        assert_eq!(held_batch_wait(20 * MS, Some(MS)), Duration::ZERO);
+    }
+
+    #[test]
+    fn the_quiet_window_is_shorter_than_a_display_frame() {
+        assert!(OUTPUT_QUIET * 4 <= OUTPUT_BATCH_CEILING);
     }
 }
 
@@ -8129,6 +8303,36 @@ mod preview_tests {
         );
         assert!(!session.accepts_keyboard_input(false));
         assert!(session.accepts_keyboard_input(true));
+    }
+
+    #[test]
+    fn a_client_size_ends_the_launch_wait_at_once() {
+        // The Swift-era debounce held the exec 120 ms after every proposal.
+        // A size now launches at once: the waiting launcher wakes with it.
+        let deferred = Arc::new(DeferredLaunch::new());
+        let waiter = {
+            let deferred = Arc::clone(&deferred);
+            std::thread::spawn(move || {
+                let size = deferred.wait_for_launch_size((80, 24));
+                (size, Instant::now())
+            })
+        };
+        std::thread::sleep(Duration::from_millis(20));
+        let proposed = Instant::now();
+        assert!(deferred.propose_size(132, 41));
+        let (size, woke) = waiter.join().unwrap();
+        assert_eq!(size, Some((132, 41)));
+        assert!(
+            woke.duration_since(proposed) < Duration::from_millis(100),
+            "the launch waited {:?} after the size arrived",
+            woke.duration_since(proposed)
+        );
+        // A size arriving while the exec is in flight is handed back to be
+        // applied as an ordinary resize.
+        assert!(deferred.propose_size(90, 28));
+        let handoff = deferred.finish_launch((132, 41)).unwrap();
+        assert_eq!(handoff.late_size, Some((90, 28)));
+        assert!(!deferred.propose_size(100, 30), "launched: resize instead");
     }
 
     #[test]

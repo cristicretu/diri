@@ -32,6 +32,7 @@
   "settings.appearance.shell_integration_detail": "在新终端中标记 zsh 和 bash 的提示符与命令结果。更改后打开的终端生效。",
   "settings.appearance.terminal_font": "终端字体",
   "settings.appearance.theme": "主题",
+  "settings.appearance.theme_drop_hint": "或将 Ghostty 主题或 .itermcolors 文件拖到这里",
   "settings.appearance.theme_error_format": "不是 iTerm2、Ghostty 或 diri 主题",
   "settings.appearance.theme_error_missing": "缺少必需的颜色",
   "settings.appearance.theme_error_newer": "由更新版本的 diri 创建",

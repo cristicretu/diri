@@ -33,6 +33,15 @@ const STARTUP_TIMEOUT: Duration = Duration::from_secs(5);
 /// One 120 Hz display interval. Remote links still coalesce sustained output,
 /// but never force a ProMotion client down to 60 fps.
 const DIFF_COALESCE: Duration = Duration::from_millis(8);
+/// How long the PTY must stay quiet before a pending diff is published on
+/// its leading edge, once [`DIFF_COALESCE`] has passed since the last one.
+///
+/// A PTY read cannot say a burst is over, so waiting out the whole interval
+/// put ~8 ms between every lone piece of output nobody typed for (a
+/// background program's line, a spinner tick) and the controller. A short
+/// quiet window still folds in a write that spans several reads, or several
+/// writes issued back to back. See [`grid_due`].
+const OUTPUT_QUIET: Duration = Duration::from_millis(1);
 const INTERACTIVE_GRID_BUDGET: u8 = 2;
 const MAX_OUTBOUND_BYTES: usize = 20 << 20;
 const MAX_PENDING_INPUT_BYTES: usize = 1 << 20;
@@ -428,6 +437,14 @@ struct Holder {
     pending_connection: Option<Connection>,
     pending_input: PendingBytes,
     dirty_since: Option<Instant>,
+    /// The latest PTY read, which the leading edge waits to go quiet.
+    last_output: Option<Instant>,
+    /// When the last grid diff went out, which paces the leading edge.
+    last_grid_publication: Option<Instant>,
+    /// Filled cells when the last batch ended. A batch that leaves fewer is
+    /// a repaint caught between its erase and its redraw, and keeps the
+    /// whole interval for the redraw to arrive instead of the leading edge.
+    published_filled: usize,
     /// Raw output waiting to be framed, and the offset it starts at.
     pending_output: Vec<u8>,
     pending_output_offset: u64,
@@ -528,6 +545,9 @@ impl Holder {
             pending_connection: None,
             pending_input: PendingBytes::default(),
             dirty_since: None,
+            last_output: None,
+            last_grid_publication: None,
+            published_filled: 0,
             pending_output: Vec::with_capacity(OUTPUT_FRAME_BYTES),
             pending_output_offset: 0,
             interactive_grid_budget: 0,
@@ -674,9 +694,10 @@ impl Holder {
             {
                 self.read_pending_connection()?;
             }
-            if self.dirty_since.is_some_and(|since| {
-                self.interactive_grid_budget > 0 || since.elapsed() >= DIFF_COALESCE
-            }) {
+            if self
+                .grid_due()
+                .is_some_and(|due| self.interactive_grid_budget > 0 || Instant::now() >= due)
+            {
                 // Held output goes out with the diff it belongs to.
                 self.flush_output()?;
                 self.emit_grid_delta()?;
@@ -790,8 +811,10 @@ impl Holder {
         self.state.output_offset = self.log.tail_offset();
         self.screen.feed(bytes);
         self.answer_image_queries();
+        let now = Instant::now();
+        self.last_output = Some(now);
         if self.dirty_since.is_none() {
-            self.dirty_since = Some(Instant::now());
+            self.dirty_since = Some(now);
         }
         if self
             .connection
@@ -1425,9 +1448,7 @@ impl Holder {
     }
 
     fn poll_timeout_ms(&self) -> libc::c_int {
-        let grid = self
-            .dirty_since
-            .map(|since| poll_timeout(since + DIFF_COALESCE));
+        let grid = self.grid_due().map(poll_timeout);
         let probe = self.foreground_probe_deadline.map(poll_timeout);
         let stop = self
             .stop
@@ -1480,9 +1501,27 @@ impl Holder {
         Ok(())
     }
 
+    /// When the pending grid diff is due, if one is pending.
+    fn grid_due(&self) -> Option<Instant> {
+        self.dirty_since.map(|since| {
+            if self.screen.filled_cells() < self.published_filled {
+                // Content was removed and may be about to be redrawn: give
+                // the redraw the whole interval, as before the leading edge.
+                return since + DIFF_COALESCE;
+            }
+            grid_due(
+                since,
+                self.last_output.unwrap_or(since),
+                self.last_grid_publication,
+            )
+        })
+    }
+
     fn emit_grid_delta(&mut self) -> io::Result<()> {
         self.interactive_grid_budget = self.interactive_grid_budget.saturating_sub(1);
         self.dirty_since = None;
+        self.last_grid_publication = Some(Instant::now());
+        self.published_filled = self.screen.filled_cells();
         if self
             .connection
             .as_ref()
@@ -2039,6 +2078,26 @@ fn allowed_signal(signal: i32) -> bool {
     )
 }
 
+/// When a pending grid diff is due: once the PTY has been quiet for
+/// [`OUTPUT_QUIET`], provided the last diff is at least [`DIFF_COALESCE`]
+/// old, and never later than [`DIFF_COALESCE`] after the batch opened.
+///
+/// Output after a pause is published on its leading edge; output that never
+/// pauses for the quiet window is still published at most once per
+/// interval, so a stream cannot exceed one diff per [`DIFF_COALESCE`].
+fn grid_due(
+    dirty_since: Instant,
+    last_output: Instant,
+    last_published: Option<Instant>,
+) -> Instant {
+    let ceiling = dirty_since + DIFF_COALESCE;
+    let cadence = last_published.map_or(dirty_since, |at| at + DIFF_COALESCE);
+    ceiling.min(cadence.max(last_output + OUTPUT_QUIET))
+}
+
+/// Milliseconds until `deadline`, rounded up: poll(2) takes whole
+/// milliseconds, and rounding down would spin poll(0) through the last
+/// fraction of every wait (all of a sub-millisecond quiet window).
 fn poll_timeout(deadline: Instant) -> libc::c_int {
     let now = Instant::now();
     if deadline <= now {
@@ -2046,7 +2105,8 @@ fn poll_timeout(deadline: Instant) -> libc::c_int {
     }
     deadline
         .duration_since(now)
-        .as_millis()
+        .as_micros()
+        .div_ceil(1_000)
         .min(libc::c_int::MAX as u128) as libc::c_int
 }
 
@@ -2180,6 +2240,68 @@ mod tests {
     }
 
     use super::*;
+
+    const MS: Duration = Duration::from_millis(1);
+
+    #[test]
+    fn output_after_quiet_is_due_after_the_quiet_window_only() {
+        let start = Instant::now();
+        // Nothing published yet, or long enough ago: due once the PTY has
+        // been silent for OUTPUT_QUIET (was the whole interval).
+        assert_eq!(grid_due(start, start, None), start + OUTPUT_QUIET);
+        assert_eq!(
+            grid_due(start + 500 * MS, start + 500 * MS, Some(start)),
+            start + 500 * MS + OUTPUT_QUIET
+        );
+        assert_eq!(
+            grid_due(start + DIFF_COALESCE, start + DIFF_COALESCE, Some(start)),
+            start + DIFF_COALESCE + OUTPUT_QUIET
+        );
+        // More output inside the window moves it along.
+        assert_eq!(
+            grid_due(start, start + 600 * Duration::from_micros(1), None),
+            start + 1_600 * Duration::from_micros(1)
+        );
+    }
+
+    #[test]
+    fn continuous_output_stays_paced_by_the_interval() {
+        let start = Instant::now();
+        // A batch that opened 1 ms after the last diff waits for the cadence,
+        // even once the PTY goes quiet.
+        assert_eq!(
+            grid_due(start + MS, start + MS, Some(start)),
+            start + DIFF_COALESCE
+        );
+        // Output that never pauses is due at the batch's ceiling, never later.
+        assert_eq!(
+            grid_due(start + MS, start + 30 * MS, Some(start)),
+            start + MS + DIFF_COALESCE
+        );
+        assert_eq!(
+            grid_due(start, start + 30 * MS, None),
+            start + DIFF_COALESCE
+        );
+        // Whatever the inputs, consecutive diffs are at least one interval
+        // apart unless the batch itself reached its ceiling, which can only
+        // open after the previous diff.
+        for opened in 0..20 {
+            for quiet in 0..40 {
+                let opened = start + opened * MS / 2;
+                let due = grid_due(opened, opened + quiet * MS / 4, Some(start));
+                assert!(due >= start + DIFF_COALESCE || due == opened + DIFF_COALESCE);
+                assert!(due <= opened + DIFF_COALESCE);
+            }
+        }
+    }
+
+    #[test]
+    fn poll_timeouts_round_up_instead_of_spinning() {
+        let deadline = Instant::now() + 300 * Duration::from_micros(1);
+        assert_eq!(poll_timeout(deadline), 1);
+        assert_eq!(poll_timeout(Instant::now() - MS), 0);
+        assert!(OUTPUT_QUIET * 4 <= DIFF_COALESCE);
+    }
 
     #[test]
     fn only_a_valid_resize_followed_by_a_resize_is_superseded() {
@@ -2411,6 +2533,9 @@ mod tests {
             pending_connection: None,
             pending_input: PendingBytes::default(),
             dirty_since: None,
+            last_output: None,
+            last_grid_publication: None,
+            published_filled: 0,
             pending_output: Vec::new(),
             pending_output_offset: 0,
             interactive_grid_budget: 0,

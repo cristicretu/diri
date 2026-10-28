@@ -52,6 +52,7 @@ impl Bridge {
         parent: Option<&str>,
     ) -> Result<NoteSpawn, String> {
         let params = SessionSpawnParams {
+            keep_open: None,
             appearance: None,
             account_profile_id: None,
             kind: AgentKind::NOTE,

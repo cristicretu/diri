@@ -517,6 +517,18 @@ The local Engine sends a structured launch request containing:
 The PTY child executes `argv` directly. Agent launches are never assembled by
 concatenating shell text.
 
+A program that cannot be executed is reported the way a shell reports it
+(October 2026, shared `diri-pty` exec path for the local Holder, its launchd
+helper, and the remote Helper): the child writes `diri: <argv[0]>: command not
+found` (or the `execve` error) to the PTY and exits 127, or 126 when the file
+exists but cannot be run. The search uses the launch's own `PATH`. The launch
+itself succeeds, so the output log, exit marker and exit facts carry the
+failure like any other exit. This is not a protocol change: before, the child
+aborted (SIGABRT) because the descriptors it closes include the Rust runtime's
+exec-error pipe. The Engine-side tab policy for one-off commands
+(`SessionRecord.commandRun`, `keepOpen`) is local-only and never crosses the
+Helper protocol.
+
 Local credentials, local Unix sockets, authentication responses, and local
 process environment are not copied wholesale. Sensitive or irrelevant local
 variables, including local-only `DIRI_` and `SSH_` state, are removed. The
@@ -693,7 +705,16 @@ no protocol or binary update.
 The PTY reader must never block on a client. The Holder uses bounded queues. It
 coalesces background output for no more than 8 ms, while up to two grid
 publications after interactive input bypass that wait (one trailing publication
-may already be in flight before the actual response). If a destructive repaint
+may already be in flight before the actual response). Output that follows a
+pause is published on its leading edge: once the last diff is at least 8 ms
+old, a pending diff goes out after 1 ms of PTY quiet instead of waiting out the
+interval, so a background program's lone line leaves the Holder about 1.4 ms
+after it is written rather than 8 ms. Output that never pauses for 1 ms is
+still published at most once per 8 ms, and a batch that leaves fewer filled
+cells than the last publication (an erase whose redraw may follow) keeps the
+whole 8 ms interval. This is a Holder-only timing rule with no protocol change
+or capability; Holders launched by older Helper builds keep the 8 ms trailing
+wait until their session is relaunched with a new Helper. If a destructive repaint
 temporarily removes screen content, the Holder instead gives its redraw bytes up
 to 16 ms to arrive, returning immediately when they do. That longer ceiling is
 isolated from typed echo and additive scrolling. When no client is attached, it

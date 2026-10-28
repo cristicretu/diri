@@ -906,9 +906,10 @@ impl AttachHub {
             // milliseconds over long history, and every session's input
             // and publication needs that lock.
             let reflow = {
-                let Ok(guard) = registry.lock() else {
+                let Ok(mut guard) = registry.lock() else {
                     return false;
                 };
+                guard.note_client_size(cols.max(2), rows.max(2));
                 let Some(session) = guard.get(session_id) else {
                     return true;
                 };
@@ -1618,6 +1619,7 @@ mod tests {
             interrupted: false,
         };
         let record = diri_proto::SessionRecord {
+            command_run: None,
             attention_state: None,
             id: diri_proto::SessionId("finished".into()),
             kind: diri_proto::AgentKind::SHELL,

@@ -135,6 +135,11 @@ pub struct Registry {
     /// Session installed under that id closes it and the client reattaches
     /// to the live run instead of typing into the dead one.
     completed_views: HashMap<String, Vec<(u64, diri_platform::ipc::UnixStream)>>,
+    /// The grid size a client last gave any session. A new session whose
+    /// caller named no size is launched at this one rather than waiting for
+    /// its own pane to report: a window's panes share its geometry, and a
+    /// size that turns out wrong reaches the child as an ordinary resize.
+    last_client_size: Option<(u16, u16)>,
 }
 
 /// Immutable input for a Cursor provider-store scan. The events watcher builds
@@ -246,7 +251,20 @@ impl Registry {
             completed_views: HashMap::new(),
             cursor_title_refresh_at: None,
             native_title_refresh_at: None,
+            last_client_size: None,
         }
+    }
+
+    /// Records a grid size a client asked a session's PTY to take.
+    pub fn note_client_size(&mut self, cols: u16, rows: u16) {
+        if cols >= 2 && rows >= 2 {
+            self.last_client_size = Some((cols, rows));
+        }
+    }
+
+    /// The grid size a client last asked any session to take, if one has.
+    pub fn last_client_size(&self) -> Option<(u16, u16)> {
+        self.last_client_size
     }
 
     /// Loads a persisted state file.
@@ -2074,6 +2092,44 @@ impl Registry {
         Ok(())
     }
 
+    /// The session's own Agent naming it. A name the user or Diri gave is
+    /// never replaced, unless `for_user` says the user asked the Agent for
+    /// this one, which then lands as an explicit name later Agent names
+    /// leave alone. Returns what the session is called afterwards and
+    /// whether that changed.
+    pub fn name_by_agent(
+        &mut self,
+        id: &str,
+        name: &str,
+        for_user: bool,
+    ) -> std::io::Result<AgentNaming> {
+        let record = self.records.get_mut(id).ok_or_else(|| not_found(id))?;
+        let normalized = if for_user {
+            diri_proto::session_naming::normalize_user_name(name)
+        } else {
+            diri_proto::session_naming::normalize_agent_name(name)
+        };
+        let title = match normalized {
+            Ok(title) => title,
+            Err(invalid) => return Ok(AgentNaming::Invalid(invalid)),
+        };
+        if !for_user && is_explicit_title(record.title_source) {
+            return Ok(AgentNaming::Explicit(record.title.clone()));
+        }
+        let source = if for_user {
+            TitleSource::DirijorAssigned
+        } else {
+            TitleSource::AgentNamed
+        };
+        if record.title == title && record.title_source == source {
+            return Ok(AgentNaming::Unchanged(title));
+        }
+        record.title.clone_from(&title);
+        record.title_source = source;
+        record.updated_at = DateMillis::from(std::time::SystemTime::now());
+        Ok(AgentNaming::Named(title))
+    }
+
     /// Moves an ended resumable record to another checkout of the same
     /// project and persists the change as one logical operation. Validation of
     /// repository membership and target ownership lives in the control method.
@@ -2550,6 +2606,25 @@ fn apply_cursor_conversation(
     changed
 }
 
+/// A name someone chose on purpose: the user's own, or one Diri or a parent
+/// Agent gave at spawn. Agents never replace these.
+fn is_explicit_title(source: TitleSource) -> bool {
+    matches!(
+        source,
+        TitleSource::UserRename | TitleSource::DirijorAssigned
+    )
+}
+
+/// What [`Registry::name_by_agent`] did.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum AgentNaming {
+    Named(String),
+    Unchanged(String),
+    /// Kept the user's or Diri's name, carried here.
+    Explicit(String),
+    Invalid(diri_proto::session_naming::InvalidName),
+}
+
 fn accepts_native_title(source: TitleSource) -> bool {
     matches!(
         source,
@@ -2615,6 +2690,12 @@ fn fold_session_view(record: &mut SessionRecord, view: &SessionView) {
     record.remote_connection = view.remote_connection;
     record.terminal_progress = view.terminal_progress;
     fold_session_status(record, view);
+    if let Some(run) = record.command_run.as_mut()
+        && run.ran_ms.is_none()
+        && let Some(ran) = view.ran
+    {
+        run.ran_ms = Some(u64::try_from(ran.as_millis()).unwrap_or(u64::MAX));
+    }
     // cursor-agent (and similar) stamp a brand/status OSC title as soon as
     // they are idle. That must not freeze the record as AgentProvided, or
     // the first real prompt can never name the session.
@@ -2625,7 +2706,10 @@ fn fold_session_view(record: &mut SessionRecord, view: &SessionView) {
     }
     if matches!(
         record.title_source,
-        TitleSource::AgentProvided | TitleSource::DirijorAssigned | TitleSource::UserRename
+        TitleSource::AgentProvided
+            | TitleSource::AgentNamed
+            | TitleSource::DirijorAssigned
+            | TitleSource::UserRename
     ) {
         return;
     }
@@ -2675,7 +2759,10 @@ fn fold_shell_view(record: &mut SessionRecord, view: &SessionView) {
     }
     if matches!(
         record.title_source,
-        TitleSource::AgentProvided | TitleSource::DirijorAssigned | TitleSource::UserRename
+        TitleSource::AgentProvided
+            | TitleSource::AgentNamed
+            | TitleSource::DirijorAssigned
+            | TitleSource::UserRename
     ) {
         return;
     }
@@ -3033,6 +3120,7 @@ fn recovered_record(capsule: diri_proto::recovery::SessionRecoveryCapsule) -> Se
     let now = DateMillis::from(std::time::SystemTime::now());
     let project_id = session_project_id(&capsule.cwd, None);
     SessionRecord {
+        command_run: None,
         attention_state: None,
         id: capsule.session_id,
         kind: AgentKind::new(capsule.manifest_id),
@@ -3275,6 +3363,7 @@ mod tests {
 
     fn record(id: &str) -> SessionRecord {
         SessionRecord {
+            command_run: None,
             attention_state: None,
             id: SessionId(id.into()),
             kind: AgentKind::SHELL,
@@ -4666,6 +4755,7 @@ mod tests {
     #[test]
     fn a_shell_is_named_after_its_foreground_program_or_directory() {
         let view = |program: Option<&str>, agent: Option<&str>, title: Option<&str>| SessionView {
+            ran: None,
             remote_connection: None,
             foreground_program: program.map(str::to_owned),
             foreground_agent: agent.map(str::to_owned),
@@ -4752,6 +4842,7 @@ mod tests {
             process_name: "node".to_owned(),
         };
         let view = |program: Option<&str>, ports: Vec<diri_proto::PortInfo>| SessionView {
+            ran: None,
             remote_connection: None,
             foreground_program: program.map(str::to_owned),
             foreground_agent: None,
@@ -4842,6 +4933,7 @@ mod tests {
     #[test]
     fn pty_titles_are_filtered_fallbacks_and_never_override_user_renames() {
         let view = SessionView {
+            ran: None,
             remote_connection: None,
             foreground_program: None,
             foreground_agent: None,
@@ -5007,6 +5099,7 @@ mod tests {
         // A newly attached Session has no captured prompt. Its first input can
         // be a follow-up to the conversation whose title was already saved.
         let view = SessionView {
+            ran: None,
             remote_connection: None,
             foreground_program: None,
             foreground_agent: None,
@@ -5128,6 +5221,7 @@ mod tests {
             session.title = "Fix chat naming".into();
             session.title_source = TitleSource::FirstPrompt;
             let view = SessionView {
+                ran: None,
                 remote_connection: None,
                 foreground_program: None,
                 foreground_agent: None,
@@ -5157,6 +5251,7 @@ mod tests {
         session.kind = AgentKind::CODEX;
         session.cwd = "/work/anara".into();
         let mut view = SessionView {
+            ran: None,
             remote_connection: None,
             foreground_program: None,
             foreground_agent: None,
@@ -5580,6 +5675,129 @@ mod tests {
         assert_eq!(session.title, "Diri sidebar rename");
     }
 
+    /// A live view whose terminal reports `title` as its OSC title.
+    fn titled_view(id: &str, title: &str) -> SessionView {
+        SessionView {
+            remote_connection: None,
+            foreground_program: None,
+            foreground_agent: None,
+            terminal_cwd: None,
+            foreground_ports: Vec::new(),
+            terminal_progress: None,
+            attention_state: None,
+            terminal_title: Some(title.to_owned()),
+            id: id.to_owned(),
+            status: SessionStatus::Working,
+            status_evidence: None,
+            needs_input: None,
+            last_turn_completed_at: None,
+            title: Some(title.to_owned()),
+            title_source: Some(TitleSource::AgentProvided),
+            tail_offset: 0,
+            exited: false,
+            ran: None,
+        }
+    }
+
+    #[test]
+    fn an_agent_names_its_session_over_automatic_titles_but_never_over_explicit_ones() {
+        let temp = tempfile::tempdir().expect("temp");
+        let mut registry = Registry::new(engine(), temp.path().join("state.json"));
+        let mut session = record("claude");
+        session.kind = AgentKind::CLAUDE_CODE;
+        session.title = "can you look at the login redirect".into();
+        session.title_source = TitleSource::FirstPrompt;
+        registry.insert_record(session);
+
+        // The first prompt is replaced, in the one shape every Agent name has.
+        assert_eq!(
+            registry
+                .name_by_agent("claude", "Fix Login redirect", false)
+                .unwrap(),
+            AgentNaming::Named("fix-login-redirect".into())
+        );
+        let named = registry.record("claude").unwrap().clone();
+        assert_eq!(named.title_source, TitleSource::AgentNamed);
+        assert_eq!(
+            registry
+                .name_by_agent("claude", "fix-login-redirect", false)
+                .unwrap(),
+            AgentNaming::Unchanged("fix-login-redirect".into())
+        );
+        assert!(matches!(
+            registry.name_by_agent("claude", "claude", false).unwrap(),
+            AgentNaming::Invalid(_)
+        ));
+
+        // Automatic titles never replace the Agent's own name.
+        let mut record = named.clone();
+        assert!(!apply_native_title(
+            &mut record,
+            "Investigate login redirect bug"
+        ));
+        assert!(!apply_provider_title(
+            &mut record,
+            &crate::history::ProviderTitle {
+                title: "a later prompt".into(),
+                source: TitleSource::FirstPrompt,
+            }
+        ));
+        fold_session_view(&mut record, &titled_view("claude", "✳ Claude Code: other"));
+        assert_eq!(record.title, "fix-login-redirect");
+        assert_eq!(record.title_source, TitleSource::AgentNamed);
+
+        // A new task, a new name.
+        assert_eq!(
+            registry
+                .name_by_agent("claude", "audit-session-names", false)
+                .unwrap(),
+            AgentNaming::Named("audit-session-names".into())
+        );
+
+        // The user's name wins and stays.
+        registry.rename("claude", "My login work").unwrap();
+        assert_eq!(
+            registry
+                .name_by_agent("claude", "something-else", false)
+                .unwrap(),
+            AgentNaming::Explicit("My login work".into())
+        );
+        assert_eq!(registry.record("claude").unwrap().title, "My login work");
+
+        // Unless the user asks the Agent for a name: kept as written, and
+        // explicit from then on.
+        assert_eq!(
+            registry
+                .name_by_agent("claude", "  Release prep: v2 ", true)
+                .unwrap(),
+            AgentNaming::Named("Release prep: v2".into())
+        );
+        let explicit = registry.record("claude").unwrap();
+        assert_eq!(explicit.title_source, TitleSource::DirijorAssigned);
+        assert_eq!(
+            registry
+                .name_by_agent("claude", "other-task", false)
+                .unwrap(),
+            AgentNaming::Explicit("Release prep: v2".into())
+        );
+    }
+
+    #[test]
+    fn a_parent_given_name_is_explicit_to_the_child_agent() {
+        let temp = tempfile::tempdir().expect("temp");
+        let mut registry = Registry::new(engine(), temp.path().join("state.json"));
+        let mut child = record("child");
+        child.title = "Review the parser".into();
+        child.title_source = TitleSource::DirijorAssigned;
+        registry.insert_record(child);
+        assert_eq!(
+            registry
+                .name_by_agent("child", "parser-review", false)
+                .unwrap(),
+            AgentNaming::Explicit("Review the parser".into())
+        );
+    }
+
     #[test]
     fn a_cursor_status_title_does_not_block_the_first_prompt_hook() {
         let temp = tempfile::tempdir().expect("temp");
@@ -5698,6 +5916,7 @@ mod tests {
         session.kind = AgentKind::CLAUDE_CODE;
         session.status = SessionStatus::Working;
         let view = SessionView {
+            ran: None,
             remote_connection: None,
             foreground_program: None,
             foreground_agent: None,
@@ -5794,6 +6013,7 @@ mod tests {
         after.load().expect("load");
         let mut adopted = after.record("shell").expect("record");
         let unsampled = SessionView {
+            ran: None,
             remote_connection: None,
             foreground_program: None,
             foreground_ports: Vec::new(),

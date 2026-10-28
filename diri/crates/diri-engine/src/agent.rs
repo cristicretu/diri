@@ -215,6 +215,23 @@ pub struct AgentDescriptor {
     pub approve: Option<ApproveSpec>,
     #[serde(default)]
     pub setup: Option<SetupSpec>,
+    /// How the agent uses `OSC 7501` program status, when it reports it.
+    #[serde(default)]
+    pub program_status: Option<ProgramStatusSpec>,
+}
+
+/// What an Agent's own `OSC 7501` reports mean.
+#[derive(Clone, Debug, Default, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProgramStatusSpec {
+    /// The `app` value its reports carry (`claude-code`, `codex`).
+    #[serde(default)]
+    pub app: Option<String>,
+    /// It reports `idle`, never `done`, when a turn finishes, so `idle`
+    /// after work is the turn's result. Otherwise `idle` mid-turn is a
+    /// cancelled or denied turn, as the specification has it.
+    #[serde(default)]
+    pub idle_ends_turn: bool,
 }
 
 impl AgentDescriptor {

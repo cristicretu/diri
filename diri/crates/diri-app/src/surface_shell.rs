@@ -43,7 +43,7 @@ use diri_ui::{
 };
 use gpui::{
     Animation, AnimationExt, AnyElement, App, Bounds, ClickEvent, Context, CursorStyle,
-    DragMoveEvent, FocusHandle, Focusable, FontWeight, IntoElement, KeyDownEvent, MouseButton,
+    DragMoveEvent, ExternalPaths, FocusHandle, Focusable, FontWeight, IntoElement, KeyDownEvent, MouseButton,
     MouseDownEvent, PathPromptOptions, Pixels, Render, Rgba, ScrollHandle, ScrollStrategy,
     SharedString, Task, TextRun, UniformListScrollHandle, Window, canvas, deferred, div,
     ease_out_quint, font, point, prelude::*, px, rgba, uniform_list,
@@ -2434,6 +2434,22 @@ impl UtilitySurfaces {
             let Ok(Ok(Some(paths))) = paths.await else {
                 return;
             };
+            let _ = this.update(cx, |this, cx| this.import_theme_paths(paths, cx));
+        })
+        .detach();
+    }
+
+    /// Imports theme files picked or dropped onto the Appearance page. Each
+    /// is validated by its format (UTF-8 text for Ghostty and Diri files, a
+    /// plist for `.itermcolors`); the last good one becomes the theme and the
+    /// first failure is reported by file name.
+    fn import_theme_paths(&mut self, paths: Vec<PathBuf>, cx: &mut Context<Self>) {
+        self.settings_menu = None;
+        let paths: Vec<PathBuf> = paths.into_iter().filter(|path| path.is_file()).collect();
+        if paths.is_empty() {
+            return;
+        }
+        cx.spawn(async move |this, cx| {
             let dir = crate::imported_themes::default_dir();
             let results = cx
                 .background_spawn(async move {
@@ -2524,6 +2540,9 @@ impl UtilitySurfaces {
             ),
             ThemeFileStatus::Failed(message) => (message.clone(), Ink::DANGER),
         });
+        // Until something happens, say the row also takes a dropped file.
+        let status =
+            status.or_else(|| Some((t("settings.appearance.theme_drop_hint").into(), colors.tertiary)));
         div()
             .min_w(px(0.0))
             .flex()
@@ -4775,6 +4794,23 @@ impl UtilitySurfaces {
                 .flex_col()
                 .gap(px(SETTINGS_SECTION_GAP))
                 .children(self.computer_settings(cx))
+                .child(setting_section(
+                    t("settings.agents.session_names"),
+                    toggle_row(
+                        t("settings.agents.name_sessions"),
+                        t("settings.agents.name_sessions_detail"),
+                        self.prefs.agents_name_sessions,
+                        "toggle-agents-name-sessions",
+                        colors,
+                        cx,
+                        |this, cx| {
+                            let enabled = !this.prefs.agents_name_sessions;
+                            this.update_prefs(move |prefs| prefs.agents_name_sessions = enabled);
+                            cx.notify();
+                        },
+                    ),
+                    colors,
+                ))
                 // With no remote hosts the only target is this machine.
                 .when(!hosts.is_empty(), |page| {
                     page.child(setting_section(
@@ -6150,6 +6186,16 @@ impl UtilitySurfaces {
                         )),
                     colors,
                 ))
+                // A theme file dropped anywhere on the page imports, like
+                // choosing it with Import…
+                .id("appearance-theme-drop")
+                .drag_over::<ExternalPaths>(move |page, _, _, _| {
+                    page.rounded(px(Radius::CARD))
+                        .bg(colors.primary.alpha(0.04))
+                })
+                .on_drop(cx.listener(|this, paths: &ExternalPaths, _, cx| {
+                    this.import_theme_paths(paths.paths().to_vec(), cx);
+                }))
                 .child(setting_section(
                     t("settings.appearance.window"),
                     div()
@@ -12212,6 +12258,65 @@ mod tests {
             });
             assert!(cx.debug_bounds("APPEARANCE_WORKSPACE_PREVIEW").is_some());
         }
+    }
+
+    #[gpui::test]
+    fn theme_files_dropped_on_the_appearance_page_import(cx: &mut TestAppContext) {
+        use gpui::FileDropEvent;
+        let themes = tempfile::tempdir().unwrap();
+        crate::imported_themes::set_test_dir(Some(themes.path().to_path_buf()));
+        let files = tempfile::tempdir().unwrap();
+        let ghostty = files.path().join("Dropped Night");
+        let mut text = String::from("background = #101418\nforeground = #d8dee9\n");
+        for index in 0..16 {
+            text.push_str(&format!("palette = {index}=#{:02x}{:02x}{:02x}\n", 40 + index * 10, 80, 120));
+        }
+        std::fs::write(&ghostty, text).unwrap();
+        let binary = files.path().join("not-a-theme.itermcolors");
+        std::fs::write(&binary, [0xff, 0xfe, 0x00, 0x01]).unwrap();
+
+        let (harness, cx) = cx.add_window_view(|window, cx| {
+            SettingsWorkbenchHarness::open_at(SettingsTab::Appearance, window, cx)
+        });
+        cx.run_until_parked();
+        let surfaces = harness.read_with(cx, |harness, _| harness.surfaces.clone());
+        let hint = cx.debug_bounds("theme-file-status").expect("drop hint");
+        let drop = |cx: &mut gpui::VisualTestContext, path: &std::path::Path| {
+            cx.simulate_event(FileDropEvent::Entered {
+                position: hint.center(),
+                paths: ExternalPaths(smallvec::smallvec![path.to_path_buf()]),
+            });
+            cx.simulate_event(FileDropEvent::Submit {
+                position: hint.center(),
+            });
+            cx.run_until_parked();
+        };
+
+        drop(cx, &ghostty);
+        surfaces.read_with(cx, |surfaces, _| {
+            assert_eq!(surfaces.theme_file_status, Some(ThemeFileStatus::Imported(1)));
+            assert!(
+                surfaces.prefs.terminal_theme.starts_with(diri_term::themes::IMPORTED_PREFIX),
+                "{}",
+                surfaces.prefs.terminal_theme
+            );
+        });
+        assert!(themes.path().read_dir().unwrap().count() == 1);
+
+        // A file that is not text, or not a plist, is refused by name and
+        // leaves the theme alone.
+        drop(cx, &binary);
+        surfaces.read_with(cx, |surfaces, _| {
+            match &surfaces.theme_file_status {
+                Some(ThemeFileStatus::Failed(message)) => {
+                    assert!(message.contains("not-a-theme.itermcolors"), "{message}")
+                }
+                other => panic!("{other:?}"),
+            }
+            assert!(surfaces.prefs.terminal_theme.starts_with(diri_term::themes::IMPORTED_PREFIX));
+        });
+        assert!(themes.path().read_dir().unwrap().count() == 1);
+        crate::imported_themes::set_test_dir(None);
     }
 
     #[gpui::test]

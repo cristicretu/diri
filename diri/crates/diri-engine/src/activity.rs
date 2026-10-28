@@ -197,6 +197,7 @@ mod tests {
 
     fn record(id: &str, status: SessionStatus) -> SessionRecord {
         SessionRecord {
+            command_run: None,
             attention_state: None,
             id: SessionId::new(id),
             kind: AgentKind::CODEX,

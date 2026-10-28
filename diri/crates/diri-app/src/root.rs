@@ -4519,7 +4519,7 @@ impl RootView {
             let strip_height = self.sidebar.read(cx).tab_strip_height();
             let strip = self.sidebar.update(cx, |sidebar, cx| {
                 sidebar.strip_held_hint = held_hint;
-                sidebar.title_opacity = crate::window_chrome::title_row_opacity(window);
+                sidebar.sync_chrome_look(sidebar_colors, window);
                 sidebar.strip_caption_inset = crate::window_chrome::caption_inset(
                     0.0,
                     f32::from(viewport_size.width) - (origin_x + card_width),

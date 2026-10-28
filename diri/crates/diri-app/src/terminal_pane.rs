@@ -2006,11 +2006,7 @@ impl TerminalPane {
                     self.schedule_find(id.clone(), self.find_rescan_delay(&id), window, cx);
                 }
                 if terminal_damage_should_repaint(self.selected_id().as_ref(), &id, changed) {
-                    let echo = self
-                        .residents
-                        .get(&id)
-                        .is_some_and(|resident| resident.attachment.take_echo());
-                    self.request_terminal_repaint(echo, window, cx);
+                    self.request_terminal_repaint(true, window, cx);
                     diri_client::latency_trace::mark(diri_client::latency_trace::Hop::PaneNotified);
                 }
             }
@@ -2710,7 +2706,7 @@ impl TerminalPane {
 
     fn request_terminal_repaint(
         &mut self,
-        echo: bool,
+        output: bool,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
@@ -2719,12 +2715,14 @@ impl TerminalPane {
         // display deadline (and capped ProMotion at 60 fps), so terminal
         // damage has exactly one pacing authority: the display itself.
         cx.notify();
-        // Except for the one frame a keystroke's echo buys: in an idle window
-        // it is drawn as soon as this update returns instead of at the next
-        // refresh, which the echo would otherwise wait up to a whole interval
-        // for. The platform refuses while a recent frame may still be queued,
-        // so streams and animations stay on the display link.
-        if echo {
+        // Except for the first frame of new output in an idle window, whether
+        // a keystroke's echo or a line a background program printed: it is
+        // drawn as soon as this update returns instead of at the next refresh,
+        // which it would otherwise wait up to a whole interval for. The
+        // platform refuses while a recent frame may still be on its way to
+        // the screen, so streams and animations stay on the display link and
+        // no frame is drawn that the link would not have drawn anyway.
+        if output {
             window.request_immediate_frame();
         }
     }
@@ -4449,6 +4447,14 @@ impl TerminalPane {
             let previous = resident.last_size;
             let first_measure = previous == (0, 0);
             resident.last_size = size;
+            // Only the main pane's real viewport, never the full-window launch
+            // guess or a split's share of it, sizes the window's next tab.
+            if matches!(self.session_source, SessionSource::FollowSelection)
+                && self.viewport.is_some()
+                && let Some(window_store) = &self.window_store
+            {
+                window_store.note_terminal_grid(size);
+            }
             let now = Instant::now();
             let since_sent = self.last_resize_sent.map(|at| now.duration_since(at));
             let delay = match plan_resize(first_measure, since_sent, self.resize_flush_armed) {
@@ -5620,24 +5626,26 @@ impl TerminalPane {
         if crate::alerts::enabled(cx) {
             self.sync_paste_prompt(window, cx);
         }
-        let (theme, colors, sidebar_colors, typeface) = {
+        let (theme, colors, sidebar_colors, typeface, chrome_look) = {
             let store = self
                 .runtime
                 .store
                 .read()
                 .expect("session store lock poisoned");
+            let colors = crate::app_theme::colors_in(&store);
             (
                 crate::app_theme::terminal_theme_in(&store),
-                crate::app_theme::colors_in(&store),
+                colors,
                 crate::app_theme::sidebar_colors_in(&store),
                 TerminalType::from_prefs(store.preferences()),
+                crate::chrome_focus::look_in(&store, colors.appearance, window),
             )
         };
         self.sync_status_glyphs(colors, window, cx);
         self.update_selected_geometry(window, cx);
         self.main_viewport = window.viewport_size();
         self.held_hint = crate::held_hints::opacity(window, cx);
-        self.title_opacity = crate::window_chrome::title_row_opacity(window);
+        self.title_opacity = crate::window_chrome::title_row_opacity(window, chrome_look);
 
         let selected = self.selected_session();
 
@@ -6373,6 +6381,20 @@ fn exit_description(session: &SessionRecord) -> String {
     let SessionStatus::Exited(info) = &session.status else {
         return t("terminal.exit.session_ended").to_owned();
     };
+    if session.command_run.is_some() {
+        // A command's own status, as a shell would show it: a kill is not
+        // an Agent being interrupted, and the signal is the reason.
+        match (info.reason, info.code, info.signal) {
+            (ExitReason::Exited, Some(0), _) => return t("terminal.exit.command_exited").to_owned(),
+            (ExitReason::Exited, Some(code), _) => {
+                return tf("terminal.exit.command_exited_code", &[("code", &code)]);
+            }
+            (ExitReason::Signaled, _, Some(signal)) => {
+                return tf("terminal.exit.command_killed", &[("signal", &signal)]);
+            }
+            _ => {}
+        }
+    }
     if info.interrupted {
         // Killed from outside (a force-quit, memory pressure), not finished:
         // the session comes back on its own, so don't blame the Agent.
@@ -8395,11 +8417,13 @@ mod tests {
             .unwrap();
     }
 
-    /// A keystroke's echo is drawn without waiting for the display's next
-    /// refresh; ordinary output, and output after the echo, keep the display
-    /// link as their only pacer.
+    /// The first frame of new output is drawn without waiting for the
+    /// display's next refresh, whether or not anyone typed for it; the
+    /// platform decides whether a recent frame makes that unsafe, which keeps
+    /// streams on the display link. An update that changed nothing, or one for
+    /// a session that is not on screen, asks for nothing.
     #[gpui::test]
-    fn only_a_keystroke_echo_asks_for_an_immediate_frame(cx: &mut TestAppContext) {
+    fn visible_output_asks_for_an_immediate_frame(cx: &mut TestAppContext) {
         let runtime = Arc::new(StoreRuntime::inert());
         let tokio = Arc::new(
             tokio::runtime::Builder::new_current_thread()
@@ -8429,36 +8453,36 @@ mod tests {
         let requests = |cx: &mut gpui::VisualTestContext| {
             cx.update(|window, _| window.immediate_frame_requests())
         };
-        let damage = |changed: bool, cx: &mut gpui::VisualTestContext| {
+        let damage = |id: &SessionId, changed: bool, cx: &mut gpui::VisualTestContext| {
             sender
                 .send(PaneEvent::ControllerDamage(id.clone(), generation, changed))
                 .expect("the pane listens for output");
             cx.run_until_parked();
         };
 
-        damage(true, cx);
-        assert_eq!(
-            requests(cx),
-            0,
-            "output nobody typed for waits for the display"
-        );
-
-        pane.read_with(cx, |pane, _| {
-            pane.residents[&id].attachment.note_echo_due_for_test()
-        });
-        damage(false, cx);
+        damage(&id, false, cx);
         assert_eq!(
             requests(cx),
             0,
             "an update that changed nothing draws nothing"
         );
-        damage(true, cx);
-        assert_eq!(requests(cx), 1, "the echo is drawn at once");
-        damage(true, cx);
+        damage(&id, true, cx);
         assert_eq!(
             requests(cx),
             1,
-            "what follows the echo is paced by the display"
+            "output nobody typed for is drawn at once, like an echo"
+        );
+        damage(&id, true, cx);
+        assert_eq!(
+            requests(cx),
+            2,
+            "every change asks; the platform paces a stream"
+        );
+        damage(&SessionId("offscreen".into()), true, cx);
+        assert_eq!(
+            requests(cx),
+            2,
+            "a session that is not on screen draws nothing"
         );
     }
 
@@ -11143,6 +11167,34 @@ mod tests {
             "Ended when your computer restarted"
         };
         assert_eq!(exit_description(&session), expected);
+    }
+
+    /// A kept command tab says how the command ended in its own terms: its
+    /// code, or the signal that killed it, never "Agent was interrupted".
+    #[test]
+    fn a_command_exit_names_its_code_or_signal() {
+        let mut session = fixture_session();
+        session.command_run = Some(diri_proto::CommandRun::default());
+        let exit = |reason, code, signal, interrupted| {
+            SessionStatus::Exited(ExitInfo {
+                reason,
+                code,
+                signal,
+                system_restart: false,
+                interrupted,
+            })
+        };
+        session.status = exit(ExitReason::Exited, Some(127), None, false);
+        assert_eq!(exit_description(&session), "Command exited (code 127)");
+        session.status = exit(ExitReason::Signaled, None, Some(9), true);
+        assert_eq!(
+            exit_description(&session),
+            "Command was killed (signal 9)"
+        );
+        session.status = exit(ExitReason::Exited, Some(0), None, false);
+        assert_eq!(exit_description(&session), "Command exited");
+        session.command_run = None;
+        assert_eq!(exit_description(&session), "Agent exited");
     }
 
     #[test]

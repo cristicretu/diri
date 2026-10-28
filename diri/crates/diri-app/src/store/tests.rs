@@ -30,7 +30,7 @@ fn pid(value: &str) -> ProjectId {
 }
 
 pub(super) fn session(value: &str, project: &str, created: f64) -> SessionRecord {
-    SessionRecord {
+    SessionRecord { command_run: None,
         attention_state: None,
         id: id(value),
         kind: AgentKind::CLAUDE_CODE,
