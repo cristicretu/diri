@@ -13,10 +13,8 @@ use super::{GridCell, Row};
 use crate::term::cell::ResetDiscriminant;
 
 mod lz;
-mod seal;
 use crate::term::cell::{Cell, CellExtra, Flags, Hyperlink};
 use crate::vte::ansi::{Color, NamedColor, Rgb};
-use seal::SealSlot;
 
 const MAX_BLOCK_ROWS: usize = 64;
 /// The most decoded cells deferred history keeps for lines that are
@@ -59,9 +57,6 @@ pub struct RowCodec<T> {
     /// to them in history.
     reflow_line: fn(Vec<Row<T>>, usize) -> Vec<Row<T>>,
     clone_row: fn(&Row<T>) -> Row<T>,
-    /// Encode a sealed block on the helper thread (see `seal`); `Err` gives
-    /// the rows back to be encoded inline. `None` always encodes inline.
-    seal: Option<SealRows<T>>,
     /// Reset a row to default cells: equal to `Row::new` of its width.
     clear_row: fn(&mut Row<T>),
     #[cfg(test)]
@@ -69,7 +64,6 @@ pub struct RowCodec<T> {
 }
 
 type EncodeRows<T> = fn(&[Row<T>]) -> Encoded;
-type SealRows<T> = fn(Vec<Row<T>>, EncodeRows<T>) -> Result<Arc<SealSlot<T>>, Vec<Row<T>>>;
 type LineRows<T> = fn(Vec<Row<T>>, usize, usize, usize, &mut Vec<Row<T>>);
 type ShapeRow<T> = fn(&Row<T>, &mut Vec<(u32, u32)>) -> Option<RowShape>;
 #[cfg(test)]
@@ -689,7 +683,6 @@ impl<T> Deferred<T> {
 }
 
 /// An encoded block and the facts storage needs without decoding it.
-#[derive(Clone)]
 struct Encoded {
     bytes: Arc<[u8]>,
     /// The narrowest width every row can reflow to without discarding
@@ -743,19 +736,12 @@ struct Block<T> {
 
 impl<T> Block<T> {
     fn new(rows: &[Row<T>], codec: RowCodec<T>) -> Self {
-        Self::from_encoded(
-            (codec.encode)(rows),
-            rows.len(),
-            rows.first().map_or(0, Row::len),
-        )
-    }
-
-    fn from_encoded(encoded: Encoded, count: usize, columns: usize) -> Self {
+        let encoded = (codec.encode)(rows);
         Self {
             bytes: encoded.bytes,
             start: 0,
-            count,
-            columns,
+            count: rows.len(),
+            columns: rows.first().map_or(0, Row::len),
             resize_floor: encoded.resize_floor,
             decoded: OnceLock::new(),
             dirty: false,
@@ -827,13 +813,6 @@ impl<T> Block<T> {
 #[derive(Clone, Debug)]
 pub struct CompactRows<T> {
     recent: VecDeque<Row<T>>,
-    /// Full blocks being encoded on the helper thread, newest first: older
-    /// than `recent`, newer than `blocks`. Collected into `blocks` as they
-    /// finish and all of them before history is measured or restructured.
-    sealing: VecDeque<Sealing<T>>,
-    /// Collected blocks whose rows a helper still holds (it was encoding
-    /// them when they were collected); their rows return to `spare` here.
-    reclaim: Vec<Sealing<T>>,
     blocks: VecDeque<Block<T>>,
     oldest: VecDeque<Row<T>>,
     codec: RowCodec<T>,
@@ -878,34 +857,6 @@ impl Clone for ReadCacheFlag {
     }
 }
 
-/// The most blocks one storage has on the helper thread. Sealing another
-/// collects the oldest first (see `seal`), so a helper that falls behind
-/// costs inline encoding rather than holding more rows.
-const MAX_SEALING: usize = 4;
-
-/// A block on the helper thread (see `seal`).
-struct Sealing<T>(Arc<SealSlot<T>>);
-
-impl<T: Clone> Clone for Sealing<T> {
-    fn clone(&self) -> Self {
-        Self(SealSlot::finished(
-            self.0.encoded().clone(),
-            self.0.rows().to_vec(),
-            self.0.encoder(),
-        ))
-    }
-}
-
-impl<T> std::fmt::Debug for Sealing<T> {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(if self.0.is_done() {
-            "Sealing(done)"
-        } else {
-            "Sealing"
-        })
-    }
-}
-
 /// A block's share of the payload term of `history_storage_bytes`.
 fn payload_bytes<T>(block: &Block<T>) -> usize {
     block.bytes.len() + 2 * std::mem::size_of::<usize>()
@@ -927,8 +878,6 @@ impl<T> CompactRows<T> {
         let mut storage = Self {
             len: rows.len(),
             recent: rows.into(),
-            sealing: VecDeque::new(),
-            reclaim: Vec::new(),
             blocks: VecDeque::new(),
             oldest: VecDeque::new(),
             codec,
@@ -947,7 +896,6 @@ impl<T> CompactRows<T> {
             eager_reflow: false,
         };
         storage.seal_recent();
-        storage.finish_sealing();
         storage.recent.shrink_to_fit();
         storage
     }
@@ -980,11 +928,6 @@ impl<T> CompactRows<T> {
     fn cold_row(&self, mut index: usize) -> &Row<T> {
         assert!(index < self.len);
         index -= self.recent.len();
-        let sealing_rows = self.sealing.len() * self.block_rows;
-        if index < sealing_rows {
-            return &self.sealing[index / self.block_rows].0.rows()[index % self.block_rows];
-        }
-        index -= sealing_rows;
         let cold_rows = self.cold_rows();
         if index < cold_rows {
             let block = &self.blocks[index / self.block_rows];
@@ -1006,10 +949,7 @@ impl<T> CompactRows<T> {
 
     /// Rows before `oldest`, from the newest.
     fn rows_before_oldest(&self) -> usize {
-        self.recent.len()
-            + self.sealing.len() * self.block_rows
-            + self.cold_rows()
-            + self.deferred.as_ref().map_or(0, |d| d.rows)
+        self.recent.len() + self.cold_rows() + self.deferred.as_ref().map_or(0, |d| d.rows)
     }
 
     #[inline(always)]
@@ -1025,9 +965,6 @@ impl<T> CompactRows<T> {
     #[inline(never)]
     fn cold_row_mut(&mut self, mut index: usize) -> &mut Row<T> {
         assert!(index < self.len);
-        if index >= self.recent.len() {
-            self.finish_sealing();
-        }
         if index >= self.visible {
             self.needs_maintenance = true;
         }
@@ -1111,7 +1048,6 @@ impl<T> CompactRows<T> {
     }
 
     pub fn truncate(&mut self, len: usize) {
-        self.finish_sealing();
         assert!(len <= self.len);
         self.needs_maintenance |= self.len != len;
         while self.len > len {
@@ -1137,7 +1073,6 @@ impl<T> CompactRows<T> {
     }
 
     pub fn set_visible(&mut self, visible: usize) {
-        self.finish_sealing();
         assert!(visible <= self.len);
         self.needs_maintenance |= self.visible != visible;
         self.visible = visible;
@@ -1191,7 +1126,6 @@ impl<T> CompactRows<T> {
     /// and deque capacity beyond what the rows need. Stored history is
     /// untouched; each cache is rebuilt on its next use.
     pub fn release_idle(&mut self) {
-        self.finish_sealing();
         self.release_read_cache();
         self.evict_cache = None;
         self.release_spare_rows();
@@ -1288,15 +1222,7 @@ impl<T> CompactRows<T> {
             self.recent.iter().skip(self.visible).map(row_bytes).sum()
         };
         let row_structs = self.recent.len().max(self.visible + self.block_rows) + self.oldest.len();
-        // Blocks on the helper thread count as soon as they are encoded (a
-        // bound collects them all first).
-        let sealing = self
-            .sealing
-            .iter()
-            .map(|sealing| sealing.0.encoded().bytes.len() + 2 * std::mem::size_of::<usize>())
-            .sum::<usize>();
         payload
-            + sealing
             + deferred
             + self.blocks.len() * std::mem::size_of::<Block<T>>()
             + row_structs * std::mem::size_of::<Row<T>>()
@@ -1316,17 +1242,14 @@ impl<T> CompactRows<T> {
     /// thread's encoding buffers with them.
     pub fn release_spare_rows(&mut self) {
         self.spare = Vec::new();
-        self.reclaim = Vec::new();
         release_encode_scratch();
     }
 
     /// Discard only the oldest history when the retained representation is full.
     #[inline]
     pub fn bound_history_bytes(&mut self, budget: usize) {
-        self.finish_sealing();
-        if !self.keep_spare && self.spare.capacity() + self.reclaim.capacity() != 0 {
+        if !self.keep_spare && self.spare.capacity() != 0 {
             self.spare = Vec::new();
-            self.reclaim = Vec::new();
             release_encode_scratch();
         }
         if !self.needs_maintenance && self.last_budget == budget {
@@ -1363,7 +1286,6 @@ impl<T> CompactRows<T> {
     }
 
     pub fn into_rows(mut self) -> Vec<Row<T>> {
-        self.finish_sealing();
         self.materialize_deferred();
         let mut rows = Vec::with_capacity(self.len);
         rows.extend(self.recent);
@@ -1375,7 +1297,6 @@ impl<T> CompactRows<T> {
     }
 
     pub fn drain_rows(&mut self) -> Vec<Row<T>> {
-        self.finish_sealing();
         if self.reflowing_recent {
             let rows: Vec<_> = self.recent.drain(..).collect();
             self.len -= rows.len();
@@ -1395,7 +1316,6 @@ impl<T> CompactRows<T> {
     }
 
     pub fn replace_rows(&mut self, rows: Vec<Row<T>>, visible: usize, columns: usize) {
-        self.finish_sealing();
         self.needs_maintenance = true;
         if self.reflowing_recent {
             self.reflowing_recent = false;
@@ -1427,7 +1347,6 @@ impl<T> CompactRows<T> {
     /// follow a hard line break and are already at the new width, so the
     /// caller's reflow of the rest matches reflowing every row.
     pub fn prepare_reflow(&mut self, columns: usize, reflow: bool, display_offset: usize) -> usize {
-        self.finish_sealing();
         self.release_read_cache();
         if self.deferred.is_none() && self.keep_hard_lines(columns) {
             return self.recent.len();
@@ -1455,7 +1374,6 @@ impl<T> CompactRows<T> {
     /// Remove at least `count` of the newest rows kept back from a reflow
     /// (fewer only when none remain), newest first, at the new width.
     pub fn take_reflowed_newest(&mut self, count: usize) -> Vec<Row<T>> {
-        self.finish_sealing();
         debug_assert!(self.reflowing_recent);
         let mut rows = Vec::with_capacity(count);
         while rows.len() < count {
@@ -1666,7 +1584,6 @@ impl<T> CompactRows<T> {
     /// read of every history row (a checkpoint, a capture) decodes a block
     /// at a time instead of first reflowing all of it into one copy.
     pub fn prepare_history_read(&mut self) {
-        self.finish_sealing();
         if self
             .deferred
             .as_ref()
@@ -1678,7 +1595,6 @@ impl<T> CompactRows<T> {
 
     /// Reflow deferred history into blocks after every newer block.
     fn materialize_deferred(&mut self) {
-        self.finish_sealing();
         let Some(deferred) = self.deferred.take() else {
             return;
         };
@@ -1803,7 +1719,6 @@ impl<T> CompactRows<T> {
     }
 
     fn pop_oldest(&mut self) -> Option<Row<T>> {
-        self.finish_sealing_if_oldest();
         if let Some(row) = self.oldest.pop_back() {
             return Some(row);
         }
@@ -1821,7 +1736,6 @@ impl<T> CompactRows<T> {
 
     /// Discard the oldest row without decoding any other row.
     fn drop_oldest(&mut self) {
-        self.finish_sealing_if_oldest();
         if self.oldest.pop_back().is_some() {
             return;
         }
@@ -1851,7 +1765,6 @@ impl<T> CompactRows<T> {
         T: ResetDiscriminant<D> + GridCell + Default,
         D: PartialEq,
     {
-        self.finish_sealing_if_oldest();
         if self.oldest.is_empty() {
             if let Some(deferred) = &self.deferred {
                 if !deferred.lines.back_is_eager() {
@@ -1941,8 +1854,6 @@ impl<T> CompactRows<T> {
         if !self.recent.is_empty() {
             return;
         }
-        // The newest history rows may be on the helper thread.
-        self.finish_sealing();
         if let Some(block) = self.blocks.pop_front() {
             self.payload_bytes = None;
             self.recent.extend(block.into_rows(self.codec));
@@ -1959,137 +1870,25 @@ impl<T> CompactRows<T> {
 
     fn seal_recent(&mut self) {
         while self.recent.len() >= self.visible + self.block_rows {
-            let rows: Vec<_> = self
+            let mut rows: Vec<_> = self
                 .recent
                 .drain(self.recent.len() - self.block_rows..)
                 .collect();
-            let rows = match self.codec.seal {
-                Some(seal) => {
-                    // Collect what finished. When the helper is this far
-                    // behind, collect the oldest too, encoding it here if
-                    // the helper has not started it.
-                    if !self.reclaim.is_empty() {
-                        self.reclaim_rows();
-                    }
-                    self.collect_sealed(false);
-                    if self.sealing.len() >= MAX_SEALING {
-                        self.collect_oldest_sealed();
-                    }
-                    match seal(rows, self.codec.encode) {
-                        Ok(slot) => {
-                            self.sealing.push_front(Sealing(slot));
-                            continue;
-                        }
-                        Err(rows) => rows,
-                    }
-                }
-                None => rows,
-            };
-            // Blocks enter `blocks` in order: older ones first.
-            self.finish_sealing();
-            let encoded = (self.codec.encode)(&rows);
-            let (count, columns) = (rows.len(), rows.first().map_or(0, Row::len));
-            self.push_sealed(encoded, count, columns, Some(rows));
-        }
-    }
-
-    /// Store a sealed block of `count` rows of `columns` cells, and keep its
-    /// row allocations for recycling when given them.
-    fn push_sealed(
-        &mut self,
-        encoded: Encoded,
-        count: usize,
-        columns: usize,
-        rows: Option<Vec<Row<T>>>,
-    ) {
-        let block = Block::from_encoded(encoded, count, columns);
-        let Some(mut rows) = rows else {
-            self.push_block_front(block);
-            return;
-        };
-        // Only full history recycles rows, and it does so one block at a
-        // time. A row whose reset would keep cells that are not template
-        // cells is marked fully occupied, so `Row::reset` overwrites every
-        // cell. Others keep their occupancy and reset only the cells they
-        // wrote. Blocks come back from the helper thread later than they are
-        // sealed, several at a time, so as many blocks of allocations as can
-        // be on the helper are kept.
-        let keep = match self.codec.seal {
-            Some(_) => MAX_SEALING * self.block_rows,
-            None => 1,
-        };
-        if self.spare.len() < keep {
-            for (index, row) in rows.iter_mut().enumerate() {
-                if block.blank_on_reset >> index & 1 == 0 {
-                    row.occ = row.len();
-                }
-            }
+            let block = Block::new(&rows, self.codec);
+            // Only full history recycles rows, and it does so one block at a
+            // time; keep one block of allocations for that. A row whose
+            // reset would keep cells that are not template cells is marked
+            // fully occupied, so `Row::reset` overwrites every cell. Others
+            // keep their occupancy and reset only the cells they wrote.
             if self.spare.is_empty() {
-                self.spare = rows;
-            } else {
-                // Recycling pops from the end: the older rows go first.
-                rows.append(&mut self.spare);
-                self.spare = rows;
-            }
-        }
-        self.push_block_front(block);
-    }
-
-    /// Move finished blocks from the helper into `blocks`, oldest first,
-    /// stopping at the first unfinished one unless `wait`.
-    fn collect_sealed(&mut self, wait: bool) {
-        while let Some(oldest) = self.sealing.back() {
-            if !wait && !oldest.0.is_done() {
-                return;
-            }
-            self.collect_oldest_sealed();
-        }
-    }
-
-    fn collect_oldest_sealed(&mut self) {
-        let Sealing(slot) = self.sealing.pop_back().expect("sealing block");
-        let (count, columns) = (slot.rows().len(), slot.rows().first().map_or(0, Row::len));
-        let (encoded, rows) = SealSlot::take(slot);
-        let rows = rows.map_err(|slot| self.reclaim.push(Sealing(slot))).ok();
-        self.push_sealed(encoded, count, columns, rows);
-    }
-
-    /// Take back the rows of collected blocks the helper has let go of.
-    fn reclaim_rows(&mut self) {
-        for Sealing(slot) in std::mem::take(&mut self.reclaim) {
-            match SealSlot::reclaim(slot) {
-                Ok(mut rows) => {
-                    if self.spare.len() < MAX_SEALING * self.block_rows {
-                        for row in &mut rows {
-                            // Encoded elsewhere: reset every cell on reuse.
-                            row.occ = row.len();
-                        }
-                        rows.append(&mut self.spare);
-                        self.spare = rows;
+                for (index, row) in rows.iter_mut().enumerate() {
+                    if block.blank_on_reset >> index & 1 == 0 {
+                        row.occ = row.len();
                     }
                 }
-                Err(slot) => self.reclaim.push(Sealing(slot)),
+                self.spare = rows;
             }
-        }
-    }
-
-    /// Wait for every block on the helper thread.
-    #[inline]
-    fn finish_sealing(&mut self) {
-        if !self.sealing.is_empty() {
-            self.collect_sealed(true);
-        }
-    }
-
-    /// Wait for the helper when the oldest history rows are on it.
-    #[inline]
-    fn finish_sealing_if_oldest(&mut self) {
-        if !self.sealing.is_empty()
-            && self.oldest.is_empty()
-            && self.deferred.is_none()
-            && self.blocks.is_empty()
-        {
-            self.finish_sealing();
+            self.push_block_front(block);
         }
     }
 }
@@ -2208,7 +2007,6 @@ pub fn cell_codec() -> RowCodec<Cell> {
         line_rows: cell_line_rows,
         reflow_line: cell_reflow_line,
         clone_row: Row::clone,
-        seal: Some(seal::seal::<Cell>),
         clear_row: |row| row.reset(&Cell::default()),
         #[cfg(test)]
         rows_equal: |a, b| a == b,
@@ -3566,11 +3364,7 @@ mod tests {
         // An owner that bounds history after every read keeps reusing the
         // rows of the block it sealed last, then lets them go when idle.
         let rows = (0..24 + 512).map(|_| Row::new(80)).collect();
-        // Inline sealing: rows sealed on the helper thread come back when it
-        // finishes, so which ones are reused depends on its timing.
-        let mut codec = cell_codec();
-        codec.seal = None;
-        let mut storage = CompactRows::new(rows, 24, 80, codec);
+        let mut storage = CompactRows::new(rows, 24, 80, cell_codec());
         storage.keep_spare_rows(true);
         let template = Cell::default();
         let mut sealed = Vec::new();
@@ -3625,8 +3419,6 @@ mod tests {
         let mut codec = cell_codec();
         codec.decode = decode;
         codec.index = index;
-        // Inline sealing, as in `spare_rows_survive_history_bounds_until_released`.
-        codec.seal = None;
         let rows = (0..24 + 512).map(|_| Row::new(80)).collect();
         let mut storage = CompactRows::new(rows, 24, 80, codec);
         let template = Cell::default();
