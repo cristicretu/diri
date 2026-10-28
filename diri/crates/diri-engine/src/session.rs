@@ -8439,7 +8439,10 @@ if mkdir first 2>/dev/null; then
   cat reset.bin snapshot.bin
   while [ ! -f disconnect ]; do sleep 0.01; done
 else
-  cat <&0 > second-stdin.bin &
+  # dash (Linux /bin/sh) points an async list's stdin at /dev/null even
+  # with an explicit `<&0`, so hand the bridge's stdin over on fd 3.
+  exec 3<&0
+  cat <&3 > second-stdin.bin &
   while [ ! -f reconnect ]; do sleep 0.01; done
   cat hello.bin modes.bin reset.bin snapshot.bin
   while [ ! -f finish ]; do sleep 0.01; done
@@ -8576,12 +8579,17 @@ fi
             // The reconnect offered grid-resume-v1 for the grid it held. This
             // Holder answered without it (as one predating the capability
             // does), and the snapshot that followed seeded the session.
-            let Some(RemoteMessage::Hello(second)) = RemoteCodec::new()
-                .feed(&std::fs::read(temp.path().join("second-stdin.bin")).unwrap())
-                .unwrap()
-                .into_iter()
-                .next()
-            else {
+            // The fixture's background `cat` copies stdin to the file on its
+            // own schedule, so wait for the whole Hello frame to land.
+            let reconnect_hello = || {
+                RemoteCodec::new()
+                    .feed(&std::fs::read(temp.path().join("second-stdin.bin")).ok()?)
+                    .ok()?
+                    .into_iter()
+                    .next()
+            };
+            wait_for("reconnect Hello recorded", || reconnect_hello().is_some());
+            let Some(RemoteMessage::Hello(second)) = reconnect_hello() else {
                 panic!("reconnect Hello");
             };
             let offered = second.grid_resume.expect("resume offered");
