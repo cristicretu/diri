@@ -153,6 +153,10 @@ pub(super) struct AttachmentControl {
     echo: Arc<crate::telemetry::EchoProbe>,
     #[cfg(test)]
     pub(super) input_observer: Option<(SessionId, InputObserver)>,
+    /// Test-only: every mouse report and engine-encoded scroll this view
+    /// submits, scrolls written as `scroll <direction> <lines> <col> <row>`.
+    #[cfg(test)]
+    pub(super) mouse_observer: Option<std::sync::mpsc::Sender<Vec<u8>>>,
 }
 
 impl AttachmentControl {
@@ -331,6 +335,10 @@ impl AttachmentControl {
 
     pub(super) fn mouse(&self, bytes: Vec<u8>) {
         if !bytes.is_empty() {
+            #[cfg(test)]
+            if let Some(observer) = &self.mouse_observer {
+                let _ = observer.send(bytes.clone());
+            }
             self.claim_if_vacant();
             self.report("mouse", self.submit(AttachmentCommand::Mouse(bytes)));
         }
@@ -366,6 +374,10 @@ impl AttachmentControl {
     }
 
     pub(super) fn scroll(&self, direction: u8, lines: u16, col: u16, row: u16) {
+        #[cfg(test)]
+        if let Some(observer) = &self.mouse_observer {
+            let _ = observer.send(format!("scroll {direction} {lines} {col} {row}").into_bytes());
+        }
         self.claim_if_vacant();
         self.report(
             "scroll",
@@ -513,6 +525,8 @@ impl ControllerLease {
             echo: core.echo.clone(),
             #[cfg(test)]
             input_observer: None,
+            #[cfg(test)]
+            mouse_observer: None,
         };
         let _ = events.send(PaneEvent::AttachmentState(
             id.clone(),
@@ -1213,6 +1227,8 @@ mod tests {
             id: SessionId("a-note".into()),
             echo: Arc::default(),
             input_observer: None,
+            #[cfg(test)]
+            mouse_observer: None,
         }
     }
 
@@ -1365,6 +1381,8 @@ mod tests {
             id: SessionId("benchmark".into()),
             echo: Arc::default(),
             input_observer: None,
+            #[cfg(test)]
+            mouse_observer: None,
         };
         let mut samples = Vec::new();
         for _ in 0..1000 {

@@ -805,7 +805,7 @@ impl ControlServer {
             std::fs::remove_file(&self.socket_path)?;
         }
         if let Some(parent) = self.socket_path.parent() {
-            std::fs::create_dir_all(parent)?;
+            diri_platform::private::create_dir_all(parent)?;
         }
         let listener = UnixListener::bind(&self.socket_path)?;
         #[cfg(unix)]
@@ -1161,6 +1161,28 @@ impl ControlServer {
     }
 
     fn dispatch(&self, method: &str, params: Option<JsonValue>) -> Result<JsonValue, ControlError> {
+        // An Agent's window change is announced only once it committed, so a
+        // rejected or conflicting request never shows a notice.
+        let announcement = diri_proto::agent_action::announcement(method, params.as_ref());
+        let result = self.dispatch_recorded(method, params);
+        if result.is_ok()
+            && let Some(announcement) = announcement
+        {
+            let actor = announcement.session_id.0.clone();
+            self.events.publish_encoded(
+                diri_proto::EventName::AGENT_ACTION,
+                &announcement,
+                Some(&actor),
+            );
+        }
+        result
+    }
+
+    fn dispatch_recorded(
+        &self,
+        method: &str,
+        params: Option<JsonValue>,
+    ) -> Result<JsonValue, ControlError> {
         if !diri_telemetry::is_enabled() {
             return self.dispatch_method(method, params);
         }
@@ -3064,24 +3086,29 @@ impl ControlServer {
     }
 
     fn session_read_screen(&self, params: Option<JsonValue>) -> Result<JsonValue, ControlError> {
-        let p: diri_proto::SessionIdParams = decode(params)?;
+        let p: diri_proto::ReadScreenParams = decode(params)?;
+        let options = diri_terminal_state::TextOptions {
+            unwrap: p.unwrap,
+            ansi: p.ansi,
+            scrollback: p.scrollback,
+        };
         {
             let registry = self.registry.lock().map_err(poisoned)?;
             if let Some(session) = registry.get(&p.session_id.0) {
                 let (cols, rows) = session.screen_size();
                 return encode(&diri_proto::ReadScreenResult {
-                    text: session.screen_lines().join("\n"),
+                    text: session.screen_text(options).join("\n"),
                     cols: cols as i64,
                     rows: rows as i64,
                 });
             }
         }
-        let screen = self
+        let mut screen = self
             .completed_terminal_screen(&p.session_id.0)?
             .ok_or_else(|| self.no_retained_terminal(&p.session_id.0))?;
         let (cols, rows) = screen.size();
         encode(&diri_proto::ReadScreenResult {
-            text: screen.lines().join("\n"),
+            text: screen.text_lines(options).join("\n"),
             cols: cols as i64,
             rows: rows as i64,
         })
@@ -3511,6 +3538,10 @@ impl ControlServer {
         registry
             .remove(&p.session_id.0, &self.logs_dir)
             .map_err(io_control_error)?;
+        if let Some(holder) = &self.holder {
+            let _ =
+                crate::session_files::remove_holder_record(&holder.holders_dir, &p.session_id.0);
+        }
         if let Some(store) = &self.remote_bindings {
             let _ = store.remove(&p.session_id.0);
         }
@@ -4165,8 +4196,7 @@ impl ControlServer {
         record.parent = Some(p.parent.clone().unwrap_or_else(|| source.id.clone()));
         record.host = source.host.clone();
         record.remote_persistence = remote_persistence;
-        record.title = format!("Fork of {}", source.title);
-        record.title_source = diri_proto::TitleSource::DirijorAssigned;
+        crate::registry::name_fork(&mut record, &source.title);
 
         if spec.remote.is_some() {
             self.spawn_session_unlocked(spec, Some(record))?;
@@ -5694,6 +5724,7 @@ pub(crate) fn new_record(id: &str, kind: &str, cwd: &str) -> diri_proto::Session
         pull_requests: None,
         listening_ports: None,
         foreground_agent: None,
+        foreground_program: None,
         terminal_cwd: None,
         agent_workspace: None,
         note_id: None,
@@ -8049,6 +8080,7 @@ mod tests {
             pull_requests: None,
             listening_ports: None,
             foreground_agent: None,
+            foreground_program: None,
             terminal_cwd: None,
             agent_workspace: None,
             note_id: None,
@@ -8127,7 +8159,10 @@ mod tests {
         };
         let line = serde_json::to_vec(&request).expect("encode");
         let (writer, peer) = UnixStream::pair().expect("socketpair");
-        peer.set_read_timeout(Some(Duration::from_secs(10)))
+        // A bound on a hung test, not a latency budget: a background RPC
+        // that runs git (worktree cleanup) has outlasted 10 s on a loaded
+        // Windows runner.
+        peer.set_read_timeout(Some(Duration::from_secs(60)))
             .unwrap();
         if let Some(response) = server.handle_line(&line, &Arc::new(Mutex::new(writer)), &mut None)
         {
@@ -8664,6 +8699,7 @@ mod tests {
         let key = crate::completed_terminal::CompletedRunKey::bind(&record, child, 10).unwrap();
         let mut screen = diri_terminal_state::HeadlessScreen::new(40, 4);
         screen.feed(b"line one\r\nline two\r\nline three\r\nline four\r\nline five");
+        screen.feed(b"\r\nhttps://example.com/a/very/long/path/that/wraps.json");
         let checkpoint = crate::checkpoint::ScreenCheckpoint {
             keyboard_snapshot: screen.keyboard_snapshot(),
             keyboard: Some(screen.keyboard_state()),
@@ -8709,6 +8745,26 @@ mod tests {
         assert!(
             result["text"].as_str().unwrap().contains("line five"),
             "{result}"
+        );
+        // The wrap survives the retained checkpoint: an unwrapped read hands
+        // the URL over whole, and scrollback reaches the rows above.
+        assert!(
+            !result["text"]
+                .as_str()
+                .unwrap()
+                .contains("https://example.com/a/very/long/path/that/wraps.json"),
+            "{result}"
+        );
+        let unwrapped = ok_of(call(
+            &server,
+            "session.read_screen",
+            Some(json!({ "sessionID": "finished", "unwrap": true, "scrollback": true })),
+        ));
+        assert_eq!(
+            unwrapped["text"],
+            "line one\nline two\nline three\nline four\nline five\n\
+             https://example.com/a/very/long/path/that/wraps.json",
+            "{unwrapped}"
         );
         let scrollback = ok_of(call(
             &server,

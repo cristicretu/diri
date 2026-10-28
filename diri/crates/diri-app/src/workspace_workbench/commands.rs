@@ -16,6 +16,8 @@ pub(crate) enum PaneCommand {
     Resize(LayoutAxis, bool),
     Swap(DockEdge),
     Move(DockEdge),
+    /// The focused pane leaves for a tab of its own.
+    Break,
 }
 impl PaneCommand {
     pub(crate) fn from_id(id: CommandId) -> Option<Self> {
@@ -43,6 +45,7 @@ impl PaneCommand {
             CommandId::MovePaneRight => Self::Move(DockEdge::Right),
             CommandId::MovePaneUp => Self::Move(DockEdge::Top),
             CommandId::MovePaneDown => Self::Move(DockEdge::Bottom),
+            CommandId::MovePaneToNewTab => Self::Break,
             _ => return None,
         })
     }
@@ -236,6 +239,13 @@ impl WorkspaceWorkbench {
             );
             return true;
         }
+        // Moves glide to their new places, like a drop.
+        if matches!(
+            command,
+            PaneCommand::Swap(_) | PaneCommand::Move(_) | PaneCommand::Break
+        ) {
+            crate::pane_drag::arm(focused.clone(), cx);
+        }
         let mutation = match command {
             PaneCommand::Zoom => {
                 // Zoom needs company: one pane already fills the tab.
@@ -278,6 +288,29 @@ impl WorkspaceWorkbench {
                     second: target,
                 }
             }
+            PaneCommand::Break => {
+                let Some(source) = self.focused_drag_source() else {
+                    return true;
+                };
+                let Some(mutation) = self
+                    .runtime
+                    .store
+                    .read()
+                    .expect("store")
+                    .workspace_catalog()
+                    .snapshot()
+                    .and_then(|snapshot| {
+                        crate::pane_drag::drop_mutation(
+                            &source,
+                            &crate::pane_drag::DropTarget::NewTab,
+                            snapshot,
+                        )
+                    })
+                else {
+                    return true;
+                };
+                mutation
+            }
             PaneCommand::Move(edge) => {
                 let Some(target) = nearest(&geometry, edge) else {
                     return true;
@@ -299,6 +332,21 @@ impl WorkspaceWorkbench {
             .edit_workspace(mutation);
         cx.notify();
         true
+    }
+
+    /// The focused pane as a drag would carry it, for the commands that
+    /// move it to another tab. None in a one-pane tab.
+    pub(crate) fn focused_drag_source(&self) -> Option<crate::pane_drag::DraggedPane> {
+        if !self.enabled {
+            return None;
+        }
+        let tab = self.tab.as_ref()?;
+        let focused = self.focused_id()?;
+        let identity = PaneIdentity {
+            pane: focused.clone(),
+            session: pane_session(&tab.layout, focused)?,
+        };
+        self.drag_source(tab, &identity, diri_ui::SemanticColors::dark())
     }
 
     fn focus_pane(&mut self, pane: PaneId, window: &mut Window, cx: &mut Context<Self>) {

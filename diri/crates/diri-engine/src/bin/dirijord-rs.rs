@@ -119,7 +119,7 @@ fn main() {
     // the live daemon's socket and orphaning its PTYs. The fd leaks on
     // purpose — it must stay open until process exit.
     let lock_path = runtime_dir.join("daemon.lock");
-    let lock = std::fs::OpenOptions::new()
+    let lock = diri_platform::private::options()
         .create(true)
         .read(true)
         .write(true)
@@ -332,6 +332,7 @@ fn main() {
     {
         let registry = Arc::clone(&registry);
         let logs_dir = logs_dir.clone();
+        let home = home.clone();
         let holders_dir = app_support.join("holders");
         let bindings_dir = state_dir.join(diri_engine::layout_migration::REMOTE_BINDINGS_DIR_NAME);
         let _ = std::thread::Builder::new()
@@ -357,6 +358,17 @@ fn main() {
                         report.elapsed,
                     ),
                     None => eprintln!("dirijord-rs: orphan sweep skipped (no loaded records)"),
+                }
+                // State older builds wrote through the umask becomes owner-only.
+                let started = std::time::Instant::now();
+                let tightened = diri_engine::session_files::tighten_private_roots(&home);
+                if tightened.changed > 0 {
+                    eprintln!(
+                        "dirijord-rs: made {} of {} state entries owner-only in {:?}",
+                        tightened.changed,
+                        tightened.visited,
+                        started.elapsed(),
+                    );
                 }
             });
     }
@@ -694,7 +706,7 @@ fn ensure_private_dir(path: &Path) -> std::io::Result<()> {
 #[cfg(unix)]
 fn install_cli_helpers(exe_dir: &Path, app_support: &Path) -> PathBuf {
     let bin_dir = app_support.join("bin");
-    let _ = std::fs::create_dir_all(&bin_dir);
+    let _ = diri_platform::private::create_dir_all(&bin_dir);
     for name in ["dirijor", "dirijor-mcp"] {
         let dest = bin_dir.join(name);
         let Some(source) = cli_helper_sources(exe_dir, name)
@@ -782,7 +794,7 @@ fn install_cli_resource_bundle(exe_dir: &Path, bin_dir: &Path) {
 
 #[cfg(unix)]
 fn copy_dir(source: &Path, dest: &Path) -> std::io::Result<()> {
-    std::fs::create_dir_all(dest)?;
+    diri_platform::private::create_dir_all(dest)?;
     for entry in std::fs::read_dir(source)? {
         let entry = entry?;
         let file_type = entry.file_type()?;
@@ -790,7 +802,9 @@ fn copy_dir(source: &Path, dest: &Path) -> std::io::Result<()> {
         if file_type.is_dir() {
             copy_dir(&entry.path(), &target)?;
         } else if file_type.is_file() {
-            std::fs::copy(entry.path(), target)?;
+            // Bundle resources are data: write them owner-only rather than
+            // inheriting the source's (world-readable) mode via fs::copy.
+            diri_platform::private::write(&target, std::fs::read(entry.path())?)?;
         } else {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidData,
@@ -840,7 +854,9 @@ fn set_executable(path: &Path) {
     use std::os::unix::fs::PermissionsExt;
     if let Ok(meta) = std::fs::metadata(path) {
         let mut perms = meta.permissions();
-        perms.set_mode(perms.mode() | 0o755);
+        // Owner-only, like everything else under App Support: the helpers
+        // are only ever run by this user's Agents and hooks.
+        perms.set_mode((perms.mode() | 0o700) & !0o077);
         let _ = std::fs::set_permissions(path, perms);
     }
 }
@@ -1092,6 +1108,36 @@ mod tests {
         running.read_to_string(&mut old).expect("old inode");
         assert_eq!(old, "old");
         assert_eq!(std::fs::read_to_string(&dest).expect("new path"), "new");
+    }
+
+    #[test]
+    fn installed_helpers_and_their_resources_are_owner_only() {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = |path: &Path| std::fs::metadata(path).unwrap().permissions().mode() & 0o777;
+        let temporary = tempfile::tempdir().expect("temp");
+        let source = temporary.path().join("source");
+        std::fs::write(&source, b"#!").expect("source");
+        std::fs::set_permissions(&source, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let dest = temporary.path().join("dirijor");
+        install_cli_helper(&source, &dest).expect("install");
+        assert_eq!(mode(&dest), 0o700);
+
+        let manifests = temporary
+            .path()
+            .join("dirijor_DirijorCore.bundle/manifests");
+        std::fs::create_dir_all(&manifests).expect("source bundle");
+        std::fs::write(manifests.join("codex.json"), b"codex").expect("manifest");
+        std::fs::set_permissions(
+            manifests.join("codex.json"),
+            std::fs::Permissions::from_mode(0o644),
+        )
+        .unwrap();
+        let bin = temporary.path().join("bin");
+        install_cli_resource_bundle(temporary.path(), &bin);
+        let installed = bin.join("dirijor_DirijorCore.bundle");
+        assert_eq!(mode(&installed), 0o700);
+        assert_eq!(mode(&installed.join("manifests")), 0o700);
+        assert_eq!(mode(&installed.join("manifests/codex.json")), 0o600);
     }
 
     #[test]

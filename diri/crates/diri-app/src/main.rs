@@ -1,4 +1,5 @@
 mod agent_catalog;
+mod agent_notice;
 mod agent_setup;
 mod alerts;
 mod api_client;
@@ -60,6 +61,7 @@ mod overview_zoom;
 pub mod palette;
 mod palette_chrome;
 mod palette_workspace;
+mod pane_drag;
 mod pane_fade;
 mod path_picker;
 mod peek_settle;

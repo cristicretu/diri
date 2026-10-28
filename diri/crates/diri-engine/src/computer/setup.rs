@@ -5,9 +5,19 @@
 //! The driver runs in Cua's embedded mode, spawned directly by the Engine,
 //! which the Diri app spawned. macOS attributes Accessibility and Screen
 //! Recording along that launch chain, so the grants (and the row in System
-//! Settings) are Diri's own. Agent sessions are not in that chain: their
-//! Holders run as their own responsible processes, so granting Diri does not
-//! hand the Agents' shells these permissions.
+//! Settings) are Diri's own.
+//!
+//! Agent sessions share them. A local Agent's shell is started by a launchd
+//! job whose program is the Diri app executable (`diri --exec-agent`), and
+//! `tccd` attributes by that responsible path: its log charges `claude`,
+//! `/bin/sh`, `python3` and the rest of an Agent's tree to `com.dirijor.diri`.
+//! So granting Diri Accessibility or Screen Recording grants every local
+//! Agent the same, and anything an Agent runs can use them. (Only when
+//! detached launch is unavailable does an Agent run under the Holder
+//! manager's own job, whose `diri-holder` program is a separate identity.)
+//! `responsibility_get_pid_responsible_for_pid` returns the process itself
+//! for an Agent and does not show this; read `tccd`'s log, or preflight from
+//! inside the Agent's chain, to see what TCC decides.
 //!
 //! The release is pinned: its archive must match a SHA-256 baked in here and
 //! the binary must carry the pinned Developer ID signature before it is used.
@@ -476,7 +486,7 @@ fn sha256_file(path: &Path) -> std::io::Result<String> {
 }
 
 fn create_private_dir(dir: &Path) -> std::io::Result<()> {
-    std::fs::create_dir_all(dir)?;
+    diri_platform::private::create_dir_all(dir)?;
     set_mode(dir, 0o700)
 }
 

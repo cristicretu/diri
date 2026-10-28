@@ -332,6 +332,7 @@ fn record(id: &str) -> diri_proto::SessionRecord {
         pull_requests: None,
         listening_ports: None,
         foreground_agent: None,
+        foreground_program: None,
         terminal_cwd: None,
         agent_workspace: None,
         note_id: None,
@@ -880,4 +881,92 @@ fn a_resumed_session_never_shows_the_previous_childs_output() {
     resumed
         .terminate(Duration::from_secs(2))
         .expect("terminate");
+}
+
+/// Context switches and syscalls of `pid` so far (macOS task counters).
+#[cfg(target_os = "macos")]
+fn task_activity(pid: i32) -> (i64, i64) {
+    // SAFETY: a zeroed out-struct of the size the call is told.
+    unsafe {
+        let mut task: libc::proc_taskinfo = std::mem::zeroed();
+        let size = std::mem::size_of::<libc::proc_taskinfo>() as i32;
+        let read = libc::proc_pidinfo(pid, libc::PROC_PIDTASKINFO, 0, (&raw mut task).cast(), size);
+        assert_eq!(read, size, "task info for {pid}");
+        (
+            i64::from(task.pti_csw),
+            i64::from(task.pti_syscalls_unix) + i64::from(task.pti_syscalls_mach),
+        )
+    }
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn an_idle_held_shell_wakes_neither_its_holder_nor_its_pump_and_answers_at_once() {
+    // A shell sitting at its prompt used to cost the Engine a pump pass a
+    // second and the Holder a stat connection every two seconds, forever.
+    // Now the pump parks on the output subscription and nothing ticks.
+    let root = holders_dir("idle-park");
+    let logs = root.join("logs");
+    let spec = shell_spec(
+        "s_idle_park",
+        "echo ready; exec cat",
+        &logs,
+        Some(holder_config(&root)),
+    );
+    let session = Session::spawn(spec, engine()).expect("spawn held shell");
+    wait_until("first output", Duration::from_secs(20), || {
+        session
+            .screen_lines()
+            .iter()
+            .any(|line| line.trim_end() == "ready")
+    });
+    let manager = std::fs::read_to_string(
+        diri_engine::holder::paths::HolderManagerPaths::new(&root.join("holders")).pid_file(),
+    )
+    .expect("manager pid")
+    .trim()
+    .parse::<i32>()
+    .expect("manager pid");
+
+    // The settle after output (foreground samples, checkpoint) is allowed
+    // its few passes; after it, silence.
+    std::thread::sleep(Duration::from_secs(4));
+    let before = task_activity(manager);
+    std::thread::sleep(Duration::from_secs(6));
+    let after = task_activity(manager);
+    assert_eq!(
+        after.1 - before.1,
+        0,
+        "the Holder manager made syscalls for an idle session ({} context switches)",
+        after.0 - before.0
+    );
+
+    // Typing wakes everything at once.
+    let typed = Instant::now();
+    session.write_input(b"woke\n").expect("type");
+    // The terminal's echo, then `cat` writing the line back.
+    wait_until("echo and output", Duration::from_secs(5), || {
+        session
+            .screen_lines()
+            .iter()
+            .filter(|line| line.trim_end() == "woke")
+            .count()
+            == 2
+    });
+    assert!(
+        typed.elapsed() < Duration::from_secs(2),
+        "the first output after idle took {:?}",
+        typed.elapsed()
+    );
+
+    // And a parked pump still stops promptly when its session is dropped.
+    std::thread::sleep(Duration::from_secs(3));
+    let dropped = Instant::now();
+    let mut session = session;
+    session
+        .terminate(Duration::from_secs(2))
+        .expect("terminate");
+    drop(session);
+    assert!(dropped.elapsed() < Duration::from_secs(4));
+    let _ = std::fs::remove_dir_all(&root);
 }
