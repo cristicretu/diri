@@ -4916,7 +4916,8 @@ impl TerminalPane {
             .line_height_scale(typeface.line_height)
             .focus_handle(self.focus.clone())
             .reduce_motion(cx.reduce_motion())
-            .hovered_reference(self.qol.hit.clone());
+            .hovered_reference(self.qol.hit.clone())
+            .padding_extend(grid_surface_padding());
         let element = if self.qol.copy_mode.is_some()
             || self.qol.paste.is_some()
             || self.qol.menu.is_some()
@@ -4947,9 +4948,10 @@ impl TerminalPane {
             .relative()
             .flex_1()
             .overflow_hidden()
-            .pt(px(2.0))
-            .pb(px(10.0))
-            .px(px(12.0))
+            .pt(grid_surface_padding().top)
+            .pb(grid_surface_padding().bottom)
+            .pl(grid_surface_padding().left)
+            .pr(grid_surface_padding().right)
             .cursor(if self.qol.hit.is_some() {
                 gpui::CursorStyle::PointingHand
             } else {
@@ -5026,8 +5028,9 @@ impl TerminalPane {
                         ),
                     },
                 )
-                // Shell command marks sit in the grid's left padding.
-                .bleed_left(px(diri_term::element::COMMAND_MARK_GUTTER))
+                // Shell command marks sit in the grid's left padding, and a
+                // full-screen program's backgrounds extend into all of it.
+                .bleed(grid_surface_padding())
                 .size_full(),
             );
 
@@ -6023,6 +6026,18 @@ fn secondary_button(
 
 pub(crate) fn resume_all_label(count: usize) -> String {
     tf("terminal.resume_all", &[("count", &count)])
+}
+
+/// The padding around a pane's grid. The left side also holds the shell
+/// command marks, so it is at least [`diri_term::element::COMMAND_MARK_GUTTER`].
+fn grid_surface_padding() -> gpui::Edges<gpui::Pixels> {
+    const _: () = assert!(12.0 >= diri_term::element::COMMAND_MARK_GUTTER);
+    gpui::Edges {
+        top: px(2.0),
+        right: px(12.0),
+        bottom: px(10.0),
+        left: px(12.0),
+    }
 }
 
 fn centered_message(icon: &str, message: &str, colors: SemanticColors) -> gpui::Div {
