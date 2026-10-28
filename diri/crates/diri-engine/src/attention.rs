@@ -63,7 +63,7 @@ impl From<&StatusSignal> for Evidence {
                 StatusSignal::CodexTurnComplete
                     | StatusSignal::CursorTranscriptIdle { .. }
                     | StatusSignal::ClaudeHook {
-                        hook: ClaudeHook::Stop,
+                        hook: ClaudeHook::Stop | ClaudeHook::StopAsking { .. },
                         pending_work: None | Some(false),
                         ..
                     }

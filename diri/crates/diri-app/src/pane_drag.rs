@@ -639,19 +639,22 @@ pub(crate) fn now() -> Instant {
 #[cfg(test)]
 pub(crate) mod test_clock {
     use std::cell::Cell;
-    use std::time::{Duration, Instant};
+    use std::time::Instant;
     thread_local! {
         static NOW: Cell<Option<Instant>> = const { Cell::new(None) };
     }
     pub(crate) fn get() -> Option<Instant> {
         NOW.with(Cell::get)
     }
+    #[cfg(target_os = "macos")]
     pub(crate) fn start() {
         NOW.with(|now| now.set(Some(Instant::now())));
     }
-    pub(crate) fn advance(by: Duration) {
+    #[cfg(target_os = "macos")]
+    pub(crate) fn advance(by: std::time::Duration) {
         NOW.with(|now| now.set(now.get().map(|at| at + by)));
     }
+    #[cfg(target_os = "macos")]
     pub(crate) fn stop() {
         NOW.with(|now| now.set(None));
     }

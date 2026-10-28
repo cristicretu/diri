@@ -35,8 +35,6 @@ pub(in crate::sidebar) struct StripTabProps {
     pub(super) id: SessionId,
     pub(super) title: String,
     pub(super) kind: ProtoAgentKind,
-    /// A terminal's program glyph; see `session_presentation::program_glyph`.
-    pub(super) glyph: Option<diri_ui::IconName>,
     pub(super) active: bool,
     /// ⌘1–⌘8, then ⌘9 for the last tab.
     pub(super) rank: Option<usize>,
@@ -133,9 +131,10 @@ impl Sidebar {
         };
         StripTabProps {
             id: id.clone(),
-            title: display_title(session),
+            // A tab waiting on a named question shows the question.
+            title: crate::session_presentation::blocker_line(session)
+                .unwrap_or_else(|| display_title(session)),
             kind: session.effective_kind().clone(),
-            glyph: crate::session_presentation::program_glyph(session),
             active,
             rank,
             state,

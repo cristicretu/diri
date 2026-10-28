@@ -362,6 +362,7 @@ fn append_management_actions(
                             | CommandId::OpenSettings
                             | CommandId::ToggleHistory
                             | CommandId::ToggleNotifications
+                            | CommandId::ToggleActivity
                             | CommandId::ToggleReadAloud
                             | CommandId::ToggleReadThisTab
                             | CommandId::ReadOnlyThisTab
@@ -369,6 +370,7 @@ fn append_management_actions(
                             | CommandId::ReadAllTabs
                             | CommandId::CheckForUpdates
                             | CommandId::ShowWhatsNew
+                            | CommandId::ImportTerminalSetup
                             | CommandId::TogglePerfOverlay
                             | CommandId::ToggleRenderCounters
                             | CommandId::ClearScrollback
@@ -678,6 +680,7 @@ pub fn actions_for_default_host(
         registered_action(CommandId::OpenSettings),
         registered_action(CommandId::ToggleHistory),
         registered_action(CommandId::ToggleNotifications),
+        registered_action(CommandId::ToggleActivity),
         registered_action(CommandId::ToggleReadAloud),
     ]);
     // Per-tab reading needs a tab to act on.
@@ -718,6 +721,7 @@ pub fn actions_for_default_host(
         registered_action(CommandId::CompactDensity),
         registered_action(CommandId::CheckForUpdates),
         registered_action(CommandId::ShowWhatsNew),
+        registered_action(CommandId::ImportTerminalSetup),
         registered_action(CommandId::TogglePerfOverlay),
         registered_action(CommandId::ToggleRenderCounters),
     ]);
@@ -1362,6 +1366,7 @@ mod tests {
                 "settings",
                 "history",
                 "toggle-notifications",
+                "toggle-activity",
                 "toggle-read-aloud",
                 "color-theme",
                 "interface-style",
@@ -1369,6 +1374,7 @@ mod tests {
                 "compact-density",
                 "check-for-updates",
                 "whats-new",
+                "import-terminal-setup",
                 "toggle-perf-overlay",
                 "toggle-render-counters",
             ]
@@ -1524,7 +1530,6 @@ mod tests {
             pull_requests: None,
             listening_ports: None,
             foreground_agent: None,
-            foreground_program: None,
             terminal_cwd: None,
             agent_workspace: None,
             note_id: None,
