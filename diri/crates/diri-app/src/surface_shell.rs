@@ -6926,6 +6926,23 @@ impl UtilitySurfaces {
                                 ))
                         }),
                     colors,
+                ))
+                .child(setting_section(
+                    t("settings.terminal.panes"),
+                    div().flex().flex_col().child(toggle_row(
+                        t("settings.terminal.auto_balance_panes"),
+                        t("settings.terminal.auto_balance_panes_detail"),
+                        self.prefs.auto_balance_panes,
+                        "auto_balance_panes",
+                        colors,
+                        cx,
+                        |this, cx| {
+                            let enabled = !this.prefs.auto_balance_panes;
+                            this.update_prefs(move |prefs| prefs.auto_balance_panes = enabled);
+                            cx.notify();
+                        },
+                    )),
+                    colors,
                 )),
             colors,
         )

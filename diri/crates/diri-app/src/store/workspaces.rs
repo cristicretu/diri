@@ -42,6 +42,9 @@ pub struct WorkspaceCatalog {
     replay: Option<WorkspaceMutation>,
     /// The in-flight edit is that replay; a second conflict drops it.
     replaying: bool,
+    /// Tabs whose pane count changed since the last snapshot, to even out
+    /// once edits are possible again. Only filled with `auto_balance_panes`.
+    balance: Vec<diri_proto::workspace::TabId>,
 }
 
 impl Default for WorkspaceCatalog {
@@ -65,8 +68,33 @@ impl Default for WorkspaceCatalog {
             creating: false,
             replay: None,
             replaying: false,
+            balance: Vec::new(),
         }
     }
+}
+
+/// Tabs in `next` that gained or lost a pane since `previous` and are left
+/// with more than one: the ones an automatic even-out applies to. A tab
+/// that is new, or down to one pane, has nothing to even out.
+fn tabs_with_new_pane_count(
+    previous: &WorkspaceSnapshot,
+    next: &WorkspaceSnapshot,
+) -> Vec<diri_proto::workspace::TabId> {
+    let counts: HashMap<_, _> = previous
+        .workspaces
+        .iter()
+        .flat_map(|workspace| &workspace.tabs)
+        .map(|tab| (&tab.id, tab.layout.pane_count()))
+        .collect();
+    next.workspaces
+        .iter()
+        .flat_map(|workspace| &workspace.tabs)
+        .filter(|tab| {
+            let count = tab.layout.pane_count();
+            count > 1 && counts.get(&tab.id).is_some_and(|before| *before != count)
+        })
+        .map(|tab| tab.id.clone())
+        .collect()
 }
 
 /// The Engine decides an edit from its saved layout (named by the revision)
@@ -182,6 +210,7 @@ impl SessionStore {
         catalog.created_workspace = None;
         catalog.announced_revision = 0;
         catalog.in_flight = None;
+        catalog.balance.clear();
         // Another Engine may decide differently.
         catalog.rejected = None;
         catalog.status = if connected {
@@ -285,6 +314,7 @@ impl SessionStore {
         mutation: bool,
         result: Result<WorkspaceSnapshot, ClientError>,
     ) {
+        let auto_balance = self.prefs.auto_balance_panes;
         let catalog = &mut self.workspaces;
         if generation != catalog.generation || !catalog.connected {
             return;
@@ -321,6 +351,18 @@ impl SessionStore {
                         .as_ref()
                         .is_none_or(|current| snapshot.revision >= current.revision);
                 if accepts {
+                    // Only a change seen within this connection: hydration
+                    // after a reconnect is not a pane being added.
+                    if auto_balance
+                        && catalog.hydrated
+                        && let Some(previous) = catalog.snapshot.as_deref()
+                    {
+                        for tab in tabs_with_new_pane_count(previous, &snapshot) {
+                            if !catalog.balance.contains(&tab) {
+                                catalog.balance.push(tab);
+                            }
+                        }
+                    }
                     catalog.snapshot = Some(Arc::new(snapshot));
                     catalog.hydrated = true;
                 }
@@ -375,6 +417,32 @@ impl SessionStore {
                 self.edit_workspace(replay);
             } else {
                 self.workspaces.replay = None;
+            }
+        } else {
+            self.balance_next_tab();
+        }
+    }
+
+    /// Even out one tab queued by `auto_balance_panes`, if the catalog can
+    /// take an edit. Its answer lands here again and sends the next, so a
+    /// queue drains one edit at a time. A tab already even, or gone, is
+    /// skipped without a round trip.
+    fn balance_next_tab(&mut self) {
+        if !self.prefs.auto_balance_panes {
+            self.workspaces.balance.clear();
+            return;
+        }
+        while self.workspaces.can_edit() && !self.workspaces.balance.is_empty() {
+            let tab_id = self.workspaces.balance.remove(0);
+            let uneven = self.workspaces.snapshot.as_ref().is_some_and(|snapshot| {
+                snapshot
+                    .workspaces
+                    .iter()
+                    .flat_map(|workspace| &workspace.tabs)
+                    .any(|tab| tab.id == tab_id && !tab.layout.is_balanced())
+            });
+            if uneven && self.edit_workspace(WorkspaceMutation::EqualizeTab { tab_id }) {
+                return;
             }
         }
     }
@@ -865,5 +933,218 @@ mod tests {
         tokio::task::spawn_blocking(move || worker.join().unwrap())
             .await
             .unwrap();
+    }
+
+    mod auto_balance {
+        use super::*;
+        use diri_proto::workspace::{
+            LayoutAxis, LayoutNode, PaneId, SplitId, TabId, WorkspaceId, WorkspaceRecord,
+            WorkspaceTab,
+        };
+
+        fn pane(id: &str) -> LayoutNode {
+            LayoutNode::Pane {
+                id: PaneId::new(id),
+                session_id: SessionId::new(id),
+            }
+        }
+        fn split(axis: LayoutAxis, fraction: f32, a: LayoutNode, b: LayoutNode) -> LayoutNode {
+            LayoutNode::Split {
+                id: SplitId::new(format!("{fraction}")),
+                axis,
+                fraction,
+                first: Box::new(a),
+                second: Box::new(b),
+            }
+        }
+        fn layout(revision: u64, tabs: Vec<(&str, LayoutNode)>) -> WorkspaceSnapshot {
+            WorkspaceSnapshot {
+                revision,
+                workspaces: vec![WorkspaceRecord {
+                    project_id: None,
+                    id: WorkspaceId::new("w"),
+                    name: "w".into(),
+                    selected_tab: None,
+                    tabs: tabs
+                        .into_iter()
+                        .map(|(id, layout)| WorkspaceTab {
+                            id: TabId::new(id),
+                            title: None,
+                            focused_pane: PaneId::new("a"),
+                            zoomed_pane: None,
+                            layout,
+                        })
+                        .collect(),
+                }],
+                ..Default::default()
+            }
+        }
+        /// a | (b / c) at a 0.7 divider: one pane added below `b`.
+        fn three() -> LayoutNode {
+            split(
+                LayoutAxis::Horizontal,
+                0.7,
+                pane("a"),
+                split(LayoutAxis::Vertical, 0.5, pane("b"), pane("c")),
+            )
+        }
+        fn ready(enabled: bool) -> (SessionStore, mpsc::UnboundedReceiver<StoreEffect>, u64) {
+            let (mut store, mut effects, generation) = connected();
+            store.prefs.auto_balance_panes = enabled;
+            store.finish_workspace_request(
+                generation,
+                false,
+                Ok(layout(
+                    1,
+                    vec![
+                        (
+                            "split",
+                            split(LayoutAxis::Horizontal, 0.7, pane("a"), pane("b")),
+                        ),
+                        ("other", pane("z")),
+                    ],
+                )),
+            );
+            while effects.try_recv().is_ok() {}
+            (store, effects, generation)
+        }
+        fn equalized(effects: &mut mpsc::UnboundedReceiver<StoreEffect>) -> Vec<TabId> {
+            std::iter::from_fn(|| effects.try_recv().ok())
+                .filter_map(|effect| match effect {
+                    StoreEffect::MutateWorkspace { params, .. } => match params.mutation {
+                        WorkspaceMutation::EqualizeTab { tab_id } => Some(tab_id),
+                        other => panic!("unexpected edit {other:?}"),
+                    },
+                    _ => None,
+                })
+                .collect()
+        }
+
+        #[test]
+        fn a_pane_added_by_a_spawn_evens_out_its_tab_once() {
+            let (mut store, mut effects, generation) = ready(true);
+            // The Engine docked a split shell: the refresh shows three panes.
+            store.finish_workspace_request(
+                generation,
+                false,
+                Ok(layout(2, vec![("split", three()), ("other", pane("z"))])),
+            );
+            assert_eq!(equalized(&mut effects), vec![TabId::new("split")]);
+            // The Engine's even layout comes back: nothing more to do.
+            let even = split(
+                LayoutAxis::Horizontal,
+                0.5,
+                pane("a"),
+                split(LayoutAxis::Vertical, 0.5, pane("b"), pane("c")),
+            );
+            assert!(even.is_balanced());
+            store.finish_workspace_request(
+                generation,
+                true,
+                Ok(layout(3, vec![("split", even), ("other", pane("z"))])),
+            );
+            assert!(equalized(&mut effects).is_empty());
+        }
+
+        #[test]
+        fn a_closed_pane_evens_out_what_is_left_and_a_lone_pane_is_left_alone() {
+            let (mut store, mut effects, generation) = ready(true);
+            store.finish_workspace_request(
+                generation,
+                false,
+                Ok(layout(2, vec![("split", three()), ("other", pane("z"))])),
+            );
+            assert_eq!(equalized(&mut effects), vec![TabId::new("split")]);
+            // The Engine answers the even-out.
+            store.finish_workspace_request(
+                generation,
+                true,
+                Ok(layout(
+                    3,
+                    vec![
+                        (
+                            "split",
+                            split(
+                                LayoutAxis::Horizontal,
+                                0.5,
+                                pane("a"),
+                                split(LayoutAxis::Vertical, 0.5, pane("b"), pane("c")),
+                            ),
+                        ),
+                        ("other", pane("z")),
+                    ],
+                )),
+            );
+            store.finish_workspace_request(
+                generation,
+                false,
+                Ok(layout(
+                    4,
+                    vec![
+                        (
+                            "split",
+                            split(
+                                LayoutAxis::Horizontal,
+                                0.5,
+                                pane("a"),
+                                split(LayoutAxis::Vertical, 0.8, pane("b"), pane("c")),
+                            ),
+                        ),
+                        ("other", pane("z")),
+                    ],
+                )),
+            );
+            // Same count, hand-sized divider: a resize is not an add.
+            assert!(equalized(&mut effects).is_empty());
+            store.finish_workspace_request(
+                generation,
+                false,
+                Ok(layout(
+                    5,
+                    vec![
+                        (
+                            "split",
+                            split(LayoutAxis::Horizontal, 0.5, pane("a"), pane("b")),
+                        ),
+                        ("other", pane("z")),
+                    ],
+                )),
+            );
+            // Already even after the close: no round trip.
+            assert!(equalized(&mut effects).is_empty());
+            store.finish_workspace_request(
+                generation,
+                false,
+                Ok(layout(
+                    6,
+                    vec![("split", pane("a")), ("other", pane("z")), ("new", pane("b"))],
+                )),
+            );
+            // Down to one pane, and a brand-new tab: nothing to even out.
+            assert!(equalized(&mut effects).is_empty());
+        }
+
+        #[test]
+        fn off_by_default_and_never_on_a_reconnect() {
+            assert!(!Prefs::default().auto_balance_panes);
+            let (mut store, mut effects, generation) = ready(false);
+            store.finish_workspace_request(
+                generation,
+                false,
+                Ok(layout(2, vec![("split", three()), ("other", pane("z"))])),
+            );
+            assert!(equalized(&mut effects).is_empty());
+
+            let (mut store, mut effects, _) = ready(true);
+            store.workspace_connection_changed(false);
+            store.workspace_connection_changed(true);
+            let generation = store.workspaces.generation;
+            store.finish_workspace_request(
+                generation,
+                false,
+                Ok(layout(9, vec![("split", three()), ("other", pane("z"))])),
+            );
+            assert!(equalized(&mut effects).is_empty());
+        }
     }
 }

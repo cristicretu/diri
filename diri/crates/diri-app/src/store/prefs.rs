@@ -852,6 +852,9 @@ pub struct Prefs {
     pub horizontal_tabs_visible: bool,
     /// Initial workspace for new windows; each open window keeps its own selection.
     pub active_workspace: Option<diri_proto::workspace::WorkspaceId>,
+    /// Even out a tab's panes whenever one is added to it or leaves it,
+    /// like ⌃⌘= after every split and close. Off keeps hand-sized dividers.
+    pub auto_balance_panes: bool,
     pub sidebar_ordering: SidebarOrdering,
     /// The projectless recency view has one shared archive disclosure rather
     /// than one disclosure per hidden project header.
@@ -985,6 +988,7 @@ impl Default for Prefs {
             window_placement: None,
             additional_windows: Vec::new(),
             sidebar_visible: false,
+            auto_balance_panes: false,
             sidebar_width: 248.0,
             sidebar_grouping: SidebarGrouping::Project,
             sidebar_lineage_highlights: true,

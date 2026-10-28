@@ -7,7 +7,9 @@
 //! path as one paste. Remote sessions are refused up front: their files are
 //! not on this Mac.
 use super::*;
-use crate::path_picker::{self, PathPicker, PickerIndex};
+use crate::path_picker::{self, PathPicker, PickerIndex, PickerMode, RecentDirectory};
+use crate::path_recents;
+use diri_term::command_marks::PromptLine;
 use diri_ui::GlassMenuRow;
 use gpui::{AvailableSpace, Bounds, Pixels, Point, Size, canvas, point, size};
 use std::cell::Cell;
@@ -32,6 +34,11 @@ pub(super) struct PathPickerState {
     above: Rc<Cell<bool>>,
 }
 
+/// What Go to Directory types before its `cd` when it cannot see whether
+/// the line holds typed text: end of line, then kill the line. The text
+/// goes to the shell's kill ring, so Control-Y brings it back.
+const CLEAR_LINE: &str = "\x05\x15";
+
 impl TerminalPane {
     pub(super) fn open_path_picker(
         &mut self,
@@ -39,6 +46,19 @@ impl TerminalPane {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        self.open_picker(PickerMode::InsertPath, window, cx);
+    }
+
+    pub(super) fn open_go_to_directory(
+        &mut self,
+        _: &crate::commands::GoToDirectory,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.open_picker(PickerMode::GoToDirectory, window, cx);
+    }
+
+    fn open_picker(&mut self, mode: PickerMode, window: &mut Window, cx: &mut Context<Self>) {
         let Some(id) = self.selected_id() else {
             return;
         };
@@ -55,10 +75,18 @@ impl TerminalPane {
             cx.stop_propagation();
             return;
         }
+        if mode == PickerMode::GoToDirectory
+            && let Some(resident) = self.residents.get(&id)
+            && let Some(refusal) = prompt_refusal(resident.element.prompt_line(), &session)
+        {
+            self.show_terminal_feedback(t(refusal), window, cx);
+            cx.stop_propagation();
+            return;
+        }
         if self
             .path_picker
             .as_ref()
-            .is_some_and(|state| state.session == id)
+            .is_some_and(|state| state.session == id && state.picker.mode == mode)
         {
             // ⌘E again closes, like a toggle.
             self.close_path_picker();
@@ -79,12 +107,13 @@ impl TerminalPane {
         let generation = self.path_picker_generation;
         self.path_picker = Some(PathPickerState {
             session: id.clone(),
-            picker: PathPicker::new(generation),
+            picker: PathPicker::new(generation, mode),
             above: Rc::default(),
         });
 
         let client = Arc::clone(self.runtime.client());
         let fallback = PathBuf::from(&session.cwd);
+        let recents_file = path_recents::default_path();
         let job = self.tokio.spawn(async move {
             let live = tokio::time::timeout(CWD_TIMEOUT, client.process_info(&id))
                 .await
@@ -99,7 +128,17 @@ impl TerminalPane {
             let root = live.filter(|path| path.is_dir()).unwrap_or(fallback);
             tokio::task::spawn_blocking(move || {
                 if root.is_dir() {
-                    Ok(path_picker::scan(&root))
+                    let home = diri_platform::home_dir()
+                        .map(|p| p.into_os_string())
+                        .map(PathBuf::from)
+                        .unwrap_or_default();
+                    let recents = recents_file
+                        .map(|file| path_recents::load(&file, path_recents::LOCAL_HOST))
+                        .unwrap_or_default()
+                        .into_iter()
+                        .map(|path| RecentDirectory::new(path, &home))
+                        .collect::<Vec<_>>();
+                    Ok((path_picker::scan(&root), recents))
                 } else {
                     Err(tf(
                         "terminal.path.not_folder",
@@ -122,7 +161,7 @@ impl TerminalPane {
                     return;
                 }
                 match result {
-                    Ok(index) => state.picker.adopt_index(index),
+                    Ok((index, recents)) => state.picker.adopt(index, recents),
                     Err(message) => state.picker.fail(message),
                 }
                 cx.notify();
@@ -139,6 +178,28 @@ impl TerminalPane {
     pub(super) fn path_picker_adopt_for_test(&mut self, index: path_picker::PathIndex) {
         if let Some(state) = self.path_picker.as_mut() {
             state.picker.adopt_index(index);
+        }
+    }
+
+    /// The screenshot fixture's Go to Directory, with recents, opened
+    /// without a prompt check: its screen carries no marks.
+    #[cfg(all(test, target_os = "macos"))]
+    pub(super) fn go_to_directory_adopt_for_test(
+        &mut self,
+        index: path_picker::PathIndex,
+        recents: &[&str],
+    ) {
+        let home = diri_platform::home_dir()
+            .map(|p| p.into_os_string())
+            .map(PathBuf::from)
+            .unwrap_or_default();
+        if let Some(state) = self.path_picker.as_mut() {
+            state.picker.mode = PickerMode::GoToDirectory;
+            let recents = recents
+                .iter()
+                .map(|path| RecentDirectory::new(home.join(path), &home))
+                .collect();
+            state.picker.adopt(index, recents);
         }
     }
 
@@ -200,7 +261,13 @@ impl TerminalPane {
             "escape" => {
                 self.close_path_picker();
             }
-            "enter" => self.insert_picked_path(window, cx),
+            "enter" => self.choose_picked_path(window, cx),
+            "backspace" if modifiers.platform && picker.query.is_empty() => {
+                // ⌘⌫ forgets a recent; elsewhere it edits the query.
+                if let Some(path) = picker.forget_selected_recent() {
+                    forget_recent(path);
+                }
+            }
             "up" => picker.move_selection(away),
             "down" => picker.move_selection(-away),
             "p" if modifiers.control => picker.move_selection(-1),
@@ -242,19 +309,99 @@ impl TerminalPane {
         true
     }
 
-    fn insert_picked_path(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+    fn choose_picked_path(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let Some(state) = self.path_picker.as_ref() else {
             return;
         };
         let Some(row) = state.picker.selected_row() else {
             return;
         };
-        let text = path_picker::insertion_text(row);
+        let Some(root) = state.picker.root() else {
+            return;
+        };
+        let directory = row.directory(root);
         let session = state.session.clone();
-        self.close_path_picker();
-        self.paste_into_session(&session, &text);
+        match state.picker.mode {
+            PickerMode::InsertPath => {
+                let text = path_picker::insertion_text(row);
+                self.close_path_picker();
+                self.paste_into_session(&session, &text);
+                remember_recent(directory);
+            }
+            PickerMode::GoToDirectory => {
+                let Some(command) = path_picker::cd_command(&directory) else {
+                    self.show_terminal_feedback(t("terminal.goto.unquotable"), window, cx);
+                    cx.notify();
+                    return;
+                };
+                self.close_path_picker();
+                self.change_directory(&session, directory, command, window, cx);
+            }
+        }
         window.focus(&self.focus, cx);
         cx.notify();
+    }
+
+    /// Types `command` into the session if its shell is at a prompt, read
+    /// from the screen's OSC 133 marks. A shell with no marks on screen is
+    /// asked through its process group instead: at its prompt, nothing else
+    /// holds the terminal.
+    fn change_directory(
+        &mut self,
+        session: &SessionId,
+        directory: PathBuf,
+        command: String,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(record) = self.session_record(session) else {
+            return;
+        };
+        let Some(resident) = self.residents.get(session) else {
+            return;
+        };
+        let line = resident.element.prompt_line();
+        if let Some(refusal) = prompt_refusal(line, &record) {
+            self.show_terminal_feedback(t(refusal), window, cx);
+            return;
+        }
+        match line {
+            PromptLine::Empty => {
+                resident.send_user_input(command.into_bytes());
+                remember_recent(directory);
+            }
+            PromptLine::Unknown => {
+                resident.send_user_input(format!("{CLEAR_LINE}{command}").into_bytes());
+                remember_recent(directory);
+            }
+            _ => {
+                // Unmarked shell: ask whether it holds the terminal.
+                let client = Arc::clone(self.runtime.client());
+                let id = session.clone();
+                let facts = self.tokio.spawn(async move {
+                    tokio::time::timeout(CWD_TIMEOUT, client.process_info(&id))
+                        .await
+                        .ok()
+                        .and_then(Result::ok)
+                        .map(|info| shell_holds_terminal(&info.process))
+                });
+                let session = session.clone();
+                cx.spawn_in(window, async move |this, cx| {
+                    let at_prompt = facts.await.ok().flatten().unwrap_or(false);
+                    let _ = crate::floating::update_in_owner(&this, cx, |this, window, cx| {
+                        if !at_prompt {
+                            this.show_terminal_feedback(t("terminal.goto.busy"), window, cx);
+                            return;
+                        }
+                        if let Some(resident) = this.residents.get(&session) {
+                            resident.send_user_input(format!("{CLEAR_LINE}{command}").into_bytes());
+                            remember_recent(directory);
+                        }
+                    });
+                })
+                .detach();
+            }
+        }
     }
 
     pub(super) fn render_path_picker(
@@ -299,7 +446,14 @@ impl TerminalPane {
                 .bg(colors.primary.alpha(0.06))
                 .text_size(px(Typo::ROW.size))
                 .text_color(colors.primary)
-                .child(sf_symbol("magnifyingglass", 12.0, colors.tertiary))
+                .child(sf_symbol(
+                    match picker.mode {
+                        PickerMode::InsertPath => "magnifyingglass",
+                        PickerMode::GoToDirectory => "arrow.turn.down.right",
+                    },
+                    12.0,
+                    colors.tertiary,
+                ))
                 .child(div().flex_1().min_w(px(0.0)).overflow_hidden().child(
                     if picker.query.is_empty() {
                         div()
@@ -361,6 +515,49 @@ impl TerminalPane {
     }
 }
 
+/// Why Go to Directory will not type into this session, if it will not.
+/// An unmarked screen is only refused up front for a session that is not a
+/// plain shell; a shell is then asked through its process group.
+fn prompt_refusal(line: PromptLine, session: &SessionRecord) -> Option<&'static str> {
+    match line {
+        PromptLine::Empty | PromptLine::Unknown => None,
+        PromptLine::Typed => Some("terminal.goto.clear_line"),
+        PromptLine::Busy => Some("terminal.goto.busy"),
+        PromptLine::Unmarked if session.effective_kind() == &diri_proto::AgentKind::SHELL => None,
+        PromptLine::Unmarked => Some("terminal.goto.no_shell"),
+    }
+}
+
+/// A shell is at its prompt when its own process group holds the terminal.
+fn shell_holds_terminal(facts: &diri_proto::process_facts::ProcessFacts) -> bool {
+    use diri_proto::process_facts::ProcessValue;
+    match (&facts.process_group, &facts.foreground_process_group) {
+        (
+            ProcessValue::Available { value: group },
+            ProcessValue::Available {
+                value: Some(foreground),
+            },
+        ) => group == foreground,
+        _ => false,
+    }
+}
+
+fn remember_recent(directory: PathBuf) {
+    if let Some(file) = path_recents::default_path() {
+        std::thread::spawn(move || {
+            let _ = path_recents::record(&file, path_recents::LOCAL_HOST, &directory);
+        });
+    }
+}
+
+fn forget_recent(directory: PathBuf) {
+    if let Some(file) = path_recents::default_path() {
+        std::thread::spawn(move || {
+            let _ = path_recents::remove(&file, path_recents::LOCAL_HOST, &directory);
+        });
+    }
+}
+
 fn status_line(text: &str, colors: SemanticColors) -> AnyElement {
     div()
         .px(px(14.0))
@@ -399,7 +596,13 @@ fn picker_row(
         .text_size(px(Typo::ROW.size))
         .text_color(colors.primary)
         .child(sf_symbol(
-            if row.is_dir { "folder" } else { "doc" },
+            if row.recent.is_some() {
+                "clock.fill"
+            } else if row.is_dir {
+                "folder"
+            } else {
+                "doc"
+            },
             12.0,
             if row.is_dir {
                 colors.secondary
@@ -419,7 +622,7 @@ fn picker_row(
             if let Some(state) = this.path_picker.as_mut() {
                 state.picker.selected = index;
             }
-            this.insert_picked_path(window, cx);
+            this.choose_picked_path(window, cx);
         }))
         .into_any_element()
 }
