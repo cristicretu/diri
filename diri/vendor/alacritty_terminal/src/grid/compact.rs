@@ -339,6 +339,13 @@ impl<T> Lines<T> {
             + self.extra_heap
     }
 
+    /// `heap_bytes` with the line indexes at their lengths.
+    fn live_bytes(&self) -> usize {
+        self.packed.len() * std::mem::size_of::<PackedLine>()
+            + self.extras.len() * std::mem::size_of::<LineExtra<T>>()
+            + self.extra_heap
+    }
+
     /// Recompute `extra_heap` after extras were changed in place.
     fn recount_heap(&mut self) {
         self.extra_heap = self.extras.iter().map(LineExtra::heap_bytes).sum();
@@ -430,6 +437,22 @@ impl<T> Deferred<T> {
             previous = ptr;
         }
         (rows, payload, eager)
+    }
+
+    /// Give back index capacity that evicted lines left behind, which the
+    /// history budget does not count.
+    fn shrink_evicted(&mut self) {
+        debug_assert!(self.lines.heap_bytes() >= self.lines.live_bytes());
+        let slack = |len: usize| len.saturating_mul(2).saturating_add(64);
+        if self.lines.packed.capacity() > slack(self.lines.packed.len()) {
+            self.lines.packed.shrink_to_fit();
+        }
+        if self.lines.extras.capacity() > slack(self.lines.extras.len()) {
+            self.lines.extras.shrink_to_fit();
+        }
+        if self.sources.capacity() > slack(self.sources.len()) {
+            self.sources.shrink_to_fit();
+        }
     }
 
     fn recount(&mut self) {
@@ -684,8 +707,7 @@ type ResetRow<T> = fn(&EvictIndex<T>, usize, &T, usize) -> Option<Row<T>>;
 #[derive(Clone, Debug)]
 pub struct EvictIndex<T> {
     raw: Vec<u8>,
-    /// Each row's metadata and text offsets in `raw`.
-    rows: Vec<(usize, usize)>,
+    rows: Vec<usize>,
     styles: Vec<T>,
 }
 
@@ -818,8 +840,13 @@ pub struct CompactRows<T> {
     evict_cache: Option<Box<EvictCache<T>>>,
     /// Row allocations of the newest sealed block, reused for recycled rows
     /// until the next history bound. Never counted: they are released at
-    /// every `bound_history_bytes`, before stored bytes are measured.
+    /// every `bound_history_bytes`, before stored bytes are measured, or,
+    /// with `keep_spare`, by `release_spare_rows` once output goes quiet.
     spare: Vec<Row<T>>,
+    /// Whether spare rows outlive a history bound. An owner that bounds
+    /// history after every small read would otherwise drop them before most
+    /// are reused, and allocate a row for nearly every line.
+    keep_spare: bool,
     /// The payload term of `history_storage_bytes`, kept current by block
     /// pushes and pops at the ends that streaming output uses, and
     /// recomputed after any other change to `blocks`.
@@ -897,6 +924,7 @@ impl<T> CompactRows<T> {
             last_budget: 0,
             evict_cache: None,
             spare: Vec::new(),
+            keep_spare: false,
             payload_bytes: Some(0),
             read_cache: ReadCacheFlag::default(),
             deferred: None,
@@ -1151,7 +1179,7 @@ impl<T> CompactRows<T> {
         self.finish_sealing();
         self.release_read_cache();
         self.evict_cache = None;
-        self.spare = Vec::new();
+        self.release_spare_rows();
         self.recent.shrink_to_fit();
         self.oldest.shrink_to_fit();
         self.blocks.shrink_to_fit();
@@ -1219,48 +1247,70 @@ impl<T> CompactRows<T> {
             }
             None => self.stored_payload_bytes(),
         };
-        let evict_cache = self.evict_cache.as_ref().map_or(0, |cache| {
-            std::mem::size_of::<EvictCache<T>>()
-                + cache.index.raw.capacity()
-                + cache.index.rows.capacity() * std::mem::size_of::<(usize, usize)>()
-                + cache.index.styles.capacity() * std::mem::size_of::<T>()
-        });
+        // Live bytes, as a function of the history alone, so the rows kept
+        // never depend on when the bound runs (after every read, whatever its
+        // size): indexes count their lengths, not their capacities (bounds
+        // shrink those, see `bound_history_bytes`), and rows not yet sealed
+        // into a block count as the full block they grow into between seals.
+        // The oldest block's decode index, a cache that exists while full
+        // history recycles rows, is not counted.
         let deferred = self.deferred.as_ref().map_or(0, |deferred| {
             std::mem::size_of::<Deferred<T>>()
                 + deferred.payload
-                + deferred.sources.capacity() * std::mem::size_of::<Block<T>>()
-                + deferred.lines.heap_bytes()
+                + deferred.sources.len() * std::mem::size_of::<Block<T>>()
+                + deferred.lines.live_bytes()
                 + deferred.eager_cells * std::mem::size_of::<T>()
         });
-        // Blocks on the helper thread count as soon as they are encoded.
-        let sealing = self.sealing.capacity() * std::mem::size_of::<Sealing<T>>()
-            + self
-                .sealing
-                .iter()
-                .map(|sealing| sealing.0.wait().0.bytes.len() + 2 * std::mem::size_of::<usize>())
-                .sum::<usize>();
+        let unsealed = self.recent.len().saturating_sub(self.visible);
+        let unsealed_bytes = if self.blocks.is_empty() && self.deferred.is_none() {
+            // No history to evict yet: count only what exists.
+            self.recent.iter().skip(self.visible).map(row_bytes).sum()
+        } else if unsealed < self.block_rows {
+            self.recent
+                .front()
+                .map_or(0, |row| self.block_rows * row_bytes(row))
+        } else {
+            self.recent.iter().skip(self.visible).map(row_bytes).sum()
+        };
+        let row_structs = self.recent.len().max(self.visible + self.block_rows) + self.oldest.len();
+        // Blocks on the helper thread count as soon as they are encoded (a
+        // bound collects them all first).
+        let sealing = self
+            .sealing
+            .iter()
+            .map(|sealing| sealing.0.wait().0.bytes.len() + 2 * std::mem::size_of::<usize>())
+            .sum::<usize>();
         payload
             + sealing
-            + evict_cache
             + deferred
-            + self.blocks.capacity() * std::mem::size_of::<Block<T>>()
-            + self.recent.capacity() * std::mem::size_of::<Row<T>>()
-            + self.oldest.capacity() * std::mem::size_of::<Row<T>>()
-            + self
-                .recent
-                .iter()
-                .skip(self.visible)
-                .map(row_bytes)
-                .sum::<usize>()
+            + self.blocks.len() * std::mem::size_of::<Block<T>>()
+            + row_structs * std::mem::size_of::<Row<T>>()
+            + unsealed_bytes
             + self.oldest.iter().map(row_bytes).sum::<usize>()
+    }
+
+    /// Keep spare rows across history bounds until `release_spare_rows`.
+    pub fn keep_spare_rows(&mut self, keep: bool) {
+        self.keep_spare = keep;
+        if !keep {
+            self.release_spare_rows();
+        }
+    }
+
+    /// Drop the row allocations kept for recycling (see `spare`), and this
+    /// thread's encoding buffers with them.
+    pub fn release_spare_rows(&mut self) {
+        self.spare = Vec::new();
+        release_encode_scratch();
     }
 
     /// Discard only the oldest history when the retained representation is full.
     #[inline]
     pub fn bound_history_bytes(&mut self, budget: usize) {
         self.finish_sealing();
-        if self.spare.capacity() != 0 {
+        if !self.keep_spare && self.spare.capacity() != 0 {
             self.spare = Vec::new();
+            release_encode_scratch();
         }
         if !self.needs_maintenance && self.last_budget == budget {
             return;
@@ -1283,9 +1333,13 @@ impl<T> CompactRows<T> {
                 self.len -= 1;
             }
         }
-        // Do not retain a large block-index allocation after erasing history.
+        // Do not retain large index allocations after erasing history: the
+        // budget counts their lengths.
         if self.blocks.capacity() > self.blocks.len().saturating_mul(2).saturating_add(64) {
             self.blocks.shrink_to_fit();
+        }
+        if let Some(deferred) = &mut self.deferred {
+            deferred.shrink_evicted();
         }
         self.needs_maintenance = false;
         self.last_budget = budget;
@@ -1921,17 +1975,20 @@ impl<T> CompactRows<T> {
     fn push_sealed(&mut self, encoded: Encoded, mut rows: Vec<Row<T>>) {
         let block = Block::from_encoded(encoded, &rows);
         // Only full history recycles rows, and it does so one block at a
-        // time; keep one block of allocations for that. A row whose reset
-        // would keep cells that are not template cells is marked fully
-        // occupied, so `Row::reset` overwrites every cell. Others keep their
-        // occupancy and reset only the cells they wrote.
-        // Blocks come back from the helper thread later than they are
-        // sealed, several at a time, so as many blocks of allocations as
-        // can be on the helper are kept.
-        if self.spare.len() < MAX_SEALING * self.block_rows {
+        // time. A row whose reset would keep cells that are not template
+        // cells is marked fully occupied, so `Row::reset` overwrites every
+        // cell. Others keep their occupancy and reset only the cells they
+        // wrote. Blocks come back from the helper thread later than they are
+        // sealed, several at a time, so as many blocks of allocations as can
+        // be on the helper are kept.
+        let keep = match self.codec.seal {
+            Some(_) => MAX_SEALING * self.block_rows,
+            None => 1,
+        };
+        if self.spare.len() < keep {
             for (index, row) in rows.iter_mut().enumerate() {
                 if block.blank_on_reset >> index & 1 == 0 {
-                    row.set_occ(row.len());
+                    row.occ = row.len();
                 }
             }
             if self.spare.is_empty() {
@@ -2113,13 +2170,12 @@ fn cell_shape(row: &Row<Cell>, wide: &mut Vec<(u32, u32)>) -> Option<RowShape> {
     let wraps = cells
         .last()
         .is_some_and(|cell| cell.flags.contains(Flags::WRAPLINE));
-    let default_key = plain_style_key(&Cell::default());
     let mut content = 0;
     let mut stored = 0;
     let mut padded = false;
     let mut plain = true;
     for (index, cell) in cells.iter().enumerate() {
-        if is_default(cell, default_key) {
+        if cell.is_default() {
             continue;
         }
         stored = index + 1;
@@ -2169,13 +2225,10 @@ fn cell_shape(row: &Row<Cell>, wide: &mut Vec<(u32, u32)>) -> Option<RowShape> {
         wraps,
         padded,
         content,
-        default_tail: wraps
-            || cells[content..]
-                .iter()
-                .all(|cell| is_default(cell, default_key)),
+        default_tail: wraps || cells[content..].iter().all(Cell::is_default),
         // A row reset by a coloured template keeps coloured blanks above its
         // occupancy; `Row::reset` treats them unlike greedy rows' padding.
-        plain: plain && row.occ() >= stored,
+        plain: plain && row.occ >= stored,
         starts_wide: cells
             .first()
             .is_some_and(|cell| cell.flags.contains(Flags::WIDE_CHAR)),
@@ -2280,13 +2333,16 @@ fn resize_cell_row(row: &mut Row<Cell>, columns: usize) {
 
 // Block layout. Integers are LEB128 varints unless stated otherwise.
 //
-//   styles_len, style_count, style*   (a style is a cell without its character;
-//                                      `styles_len` covers count and styles)
-//   row*: occupancy, columns, stored, text_len, UTF-8 text of the `stored`
-//         characters, run_count, (style_id, cells)*
+//   body_len (u32, little-endian), row*, style_count, style*
+//                                     (a style is a cell without its character)
+//   row: occupancy, columns, stored, text_len, UTF-8 text, (code, cells)*
 //
 // `stored` excludes the row's suffix of cells equal to `Cell::default()`;
 // decoding restores that suffix, so rows keep their exact length and cells.
+// The runs cover exactly the `stored` cells. A run's code is its style id
+// shifted left once; the low bit marks a paired run, which alternates wide
+// characters of that style with the spacers that follow them, so each pair
+// takes one character of text and the spacers no style of their own.
 
 /// Minimal FxHash-style hasher. Keys are process-local and never adversarial
 /// in a way that matters here: collisions only cost a comparison.
@@ -2350,17 +2406,13 @@ fn plain_style_key(cell: &Cell) -> u128 {
         | u128::from(cell.flags.bits()) << 64
 }
 
-#[derive(Clone, Eq, PartialEq)]
-struct Style(Cell);
-
-impl Hash for Style {
-    fn hash<H: Hasher>(&self, state: &mut H) {
-        plain_style_key(&self.0).hash(state);
-        if let Some(extra) = &self.0.extra {
-            extra.zerowidth.hash(state);
-            extra.underline_color.map(color_key).hash(state);
-            extra.hyperlink.hash(state);
-        }
+/// Hashes everything but the character: the style a run shares.
+fn hash_style<H: Hasher>(cell: &Cell, state: &mut H) {
+    plain_style_key(cell).hash(state);
+    if let Some(extra) = &cell.extra {
+        extra.zerowidth.hash(state);
+        extra.underline_color.map(color_key).hash(state);
+        extra.hyperlink.hash(state);
     }
 }
 
@@ -2371,6 +2423,57 @@ fn put_varint(out: &mut Vec<u8>, mut value: usize) {
         value >>= 7;
     }
     out.push(value as u8);
+}
+
+#[inline]
+fn push_scalar(text: &mut Vec<u8>, c: char) {
+    if c.is_ascii() {
+        text.push(c as u8);
+    } else {
+        text.extend_from_slice(c.encode_utf8(&mut [0; 4]).as_bytes());
+    }
+}
+
+/// Appends the text of the leading cells that are ASCII and have the plain
+/// style `key`, and returns how many there were.
+///
+/// Most of a history row is such a run. Writing into reserved capacity
+/// keeps the length out of memory between characters.
+#[inline]
+fn extend_ascii_run(cells: &[Cell], key: u128, text: &mut Vec<u8>) -> usize {
+    text.reserve(cells.len());
+    let mut count = 0;
+    for (cell, slot) in cells.iter().zip(text.spare_capacity_mut()) {
+        let c = u32::from(cell.c);
+        if c >= 0x80 || cell.extra.is_some() || plain_style_key(cell) != key {
+            break;
+        }
+        slot.write(c as u8);
+        count += 1;
+    }
+    // SAFETY: the first `count` spare bytes were just written.
+    unsafe { text.set_len(text.len() + count) };
+    count
+}
+
+/// The flags of the spacer a paired run stores implicitly after each wide
+/// character of `style`.
+#[inline]
+fn wide_spacer_flags(style: Flags) -> Flags {
+    style
+        .difference(Flags::WIDE_CHAR)
+        .union(Flags::WIDE_CHAR_SPACER)
+}
+
+/// Whether `spacer` is exactly the cell a paired run rebuilds after `wide`.
+#[inline]
+fn is_wide_spacer_of(spacer: &Cell, wide: &Cell) -> bool {
+    wide.flags.contains(Flags::WIDE_CHAR)
+        && spacer.extra.is_none()
+        && spacer.c == ' '
+        && spacer.flags == wide_spacer_flags(wide.flags)
+        && spacer.fg == wide.fg
+        && spacer.bg == wide.bg
 }
 
 fn put_bytes(out: &mut Vec<u8>, bytes: &[u8]) {
@@ -2420,18 +2523,40 @@ fn put_style(out: &mut Vec<u8>, style: &Cell) {
     }
 }
 
-/// Style table for one block. Most blocks use a handful of styles, so plain
-/// styles are found by a short linear scan; a larger table switches to a map.
-#[derive(Default)]
+/// Style table for one block. Each run's style is found in a small
+/// direct-mapped cache first, so a block that cycles through many styles (a
+/// colored log) still finds it in one probe; a miss searches the table.
 struct StyleTable {
     styles: Vec<Cell>,
+    /// `(key, id + 1)` of recent plain styles; an id of zero is empty.
+    recent: [(u128, u32); StyleTable::SLOTS],
+    /// Plain style keys by id order, searched on a cache miss while short.
     plain: Vec<(u128, u32)>,
     plain_map: HashMap<u128, u32, FxBuild>,
-    extra: HashMap<Style, u32, FxBuild>,
+    /// Styles with extra storage by hash; equal hashes are told apart by
+    /// comparing with the stored style.
+    extra: Vec<(u64, u32)>,
+    /// The last extra style seen, by its shared storage: cells written with
+    /// one template (a hyperlink, an underline color) share it.
+    last_extra: Option<(*const CellExtra, u32)>,
+}
+
+impl Default for StyleTable {
+    fn default() -> Self {
+        Self {
+            styles: Vec::new(),
+            recent: [(0, 0); Self::SLOTS],
+            plain: Vec::new(),
+            plain_map: HashMap::default(),
+            extra: Vec::new(),
+            last_extra: None,
+        }
+    }
 }
 
 impl StyleTable {
-    const LINEAR_PLAIN: usize = 16;
+    const SLOTS: usize = 32;
+    const LINEAR_PLAIN: usize = 32;
 
     fn push(&mut self, cell: &Cell) -> u32 {
         let mut style = cell.clone();
@@ -2440,44 +2565,92 @@ impl StyleTable {
         (self.styles.len() - 1) as u32
     }
 
+    #[inline]
+    fn slot(key: u128) -> usize {
+        let folded = (key as u64) ^ ((key >> 64) as u64).rotate_left(29);
+        (folded.wrapping_mul(0x9e37_79b9_7f4a_7c15) >> (64 - Self::SLOTS.trailing_zeros())) as usize
+    }
+
+    #[inline]
     fn id(&mut self, cell: &Cell) -> u32 {
         if cell.extra.is_some() {
-            let mut style = Style(cell.clone());
-            style.0.c = ' ';
-            if let Some(&id) = self.extra.get(&style) {
-                return id;
-            }
-            let id = self.push(cell);
-            self.extra.insert(style, id);
-            return id;
+            return self.extra_id(cell);
         }
         let key = plain_style_key(cell);
-        if self.plain.len() < Self::LINEAR_PLAIN {
-            if let Some(&(_, id)) = self.plain.iter().find(|entry| entry.0 == key) {
+        let slot = Self::slot(key);
+        let (cached, id) = self.recent[slot];
+        if cached == key && id != 0 {
+            return id - 1;
+        }
+        self.plain_id(cell, key, slot)
+    }
+
+    #[cold]
+    fn plain_id(&mut self, cell: &Cell, key: u128, slot: usize) -> u32 {
+        let found = if self.plain.len() < Self::LINEAR_PLAIN {
+            self.plain
+                .iter()
+                .find(|entry| entry.0 == key)
+                .map(|entry| entry.1)
+        } else {
+            self.plain_map.get(&key).copied()
+        };
+        let id = found.unwrap_or_else(|| {
+            let id = self.push(cell);
+            if self.plain.len() < Self::LINEAR_PLAIN {
+                self.plain.push((key, id));
+                if self.plain.len() == Self::LINEAR_PLAIN {
+                    self.plain_map.extend(self.plain.iter().copied());
+                }
+            } else {
+                self.plain_map.insert(key, id);
+            }
+            id
+        });
+        self.recent[slot] = (key, id + 1);
+        id
+    }
+
+    fn extra_id(&mut self, cell: &Cell) -> u32 {
+        let extra = cell.extra.as_ref().expect("a style with extra storage");
+        let shared = Arc::as_ptr(extra);
+        if let Some((last, id)) = self.last_extra {
+            if last == shared && plain_style_key(&self.styles[id as usize]) == plain_style_key(cell)
+            {
                 return id;
             }
-            let id = self.push(cell);
-            self.plain.push((key, id));
-            if self.plain.len() == Self::LINEAR_PLAIN {
-                self.plain_map.extend(self.plain.iter().copied());
+        }
+        let mut hasher = FxHasher::default();
+        hash_style(cell, &mut hasher);
+        let hash = hasher.finish();
+        let styles = &self.styles;
+        let found = self.extra.iter().find(|&&(entry, id)| {
+            entry == hash && {
+                let style = &styles[id as usize];
+                plain_style_key(style) == plain_style_key(cell) && style.extra == cell.extra
             }
-            return id;
-        }
-        if let Some(&id) = self.plain_map.get(&key) {
-            return id;
-        }
-        let id = self.push(cell);
-        self.plain_map.insert(key, id);
+        });
+        let id = match found {
+            Some(&(_, id)) => id,
+            None => {
+                let id = self.push(cell);
+                self.extra.push((hash, id));
+                id
+            }
+        };
+        self.last_extra = Some((shared, id));
         id
     }
 }
 
-/// Equal to `Cell::default()`, without the branchy derived color comparisons.
-#[inline]
-fn is_default(cell: &Cell, default_key: u128) -> bool {
-    cell.c == ' ' && cell.extra.is_none() && plain_style_key(cell) == default_key
+/// One run being extended: its encoded style (`id << 1 | paired`) and cells.
+struct PendingRun {
+    code: u32,
+    count: usize,
 }
 
+/// Encodes up to 64 rows into one compressed payload (see the block layout
+/// above).
 fn encode_cells(rows: &[Row<Cell>]) -> Encoded {
     assert!(
         rows.len() <= u64::BITS as usize,
@@ -2486,196 +2659,120 @@ fn encode_cells(rows: &[Row<Cell>]) -> Encoded {
     let width = rows.first().map_or(0, Row::len);
     let mut blank_on_reset = 0;
     let mut table = StyleTable::default();
-    // Rows of default cells are common; their styles are found without the
-    // table's lookup.
-    let mut last_style: Option<(Color, Color, Flags, u32)> = None;
-    let (mut meta, mut text) = SCRATCH.with(|scratch| scratch.take());
-    meta.clear();
-    text.clear();
-    meta.reserve(rows.len() * 8);
-    text.reserve(rows.iter().map(Row::len).sum());
-    let mut runs: Vec<(u32, u32)> = Vec::new();
+    // The working buffers keep their capacity from one block to the next.
+    let (mut raw, mut text, mut runs, mut packed) = ENCODE_SCRATCH.take();
+    raw.clear();
+    raw.reserve(rows.iter().map(|row| row.len() + 8).sum::<usize>() + 64);
+    raw.extend_from_slice(&[0; 4]);
     let mut floor = Some(1);
     for (index, row) in rows.iter().enumerate() {
         let cells = &row[..];
-        let stored = stored_cells(&cells[..row.content_bound()]);
-        if cells.len() == width && width != 0 && row.occ() >= stored {
+        let stored = row.content_len(Cell::is_default);
+        if cells.len() == width && width != 0 && row.occ >= stored {
             blank_on_reset |= 1 << index;
         }
         floor = floor.map(|floor: usize| floor.max(stored));
+        put_varint(&mut raw, row.occ);
+        put_varint(&mut raw, cells.len());
+        put_varint(&mut raw, stored);
+        text.clear();
         runs.clear();
-        let text_start = text.len();
+        let mut pending: Option<PendingRun> = None;
         let mut start = 0;
         while start < stored {
             let cell = &cells[start];
             // A soft wrap anywhere prevents cold reflow. Cells in one run
-            // share flags, so checking each run's first cell suffices.
+            // share flags (a paired run's spacers differ only in the wide
+            // flags), so checking each run's first cell suffices.
             if cell.flags.contains(Flags::WRAPLINE) {
                 floor = None;
             }
+            let id = table.id(cell);
+            push_scalar(&mut text, cell.c);
             let mut end = start + 1;
-            let id = if cell.extra.is_none() {
-                let (fg, bg, flags) = (cell.fg, cell.bg, cell.flags);
-                let mut text_from = start;
-                if is_default_style(cell) {
-                    // Default-styled ASCII, eight cells at a time.
-                    push_char(&mut text, cell.c);
-                    text_from = end;
-                    while end + 8 <= stored {
-                        let chunk: &[Cell; 8] = cells[end..end + 8].try_into().expect("8 cells");
-                        let mut bytes = [0u8; 8];
-                        let mut any = 0;
-                        let mut styled = true;
-                        for (byte, cell) in bytes.iter_mut().zip(chunk) {
-                            styled &= is_default_style(cell);
-                            any |= cell.c as u32;
-                            *byte = cell.c as u8;
-                        }
-                        if !styled || any >= 0x80 {
+            let mut paired = false;
+            if cell.extra.is_none() {
+                let key = plain_style_key(cell);
+                if end < stored && is_wide_spacer_of(&cells[end], cell) {
+                    // Wide characters alternate with their spacers, which
+                    // would make every cell its own run.
+                    paired = true;
+                    end += 1;
+                    while end + 1 < stored {
+                        let (wide, spacer) = (&cells[end], &cells[end + 1]);
+                        if wide.extra.is_some()
+                            || plain_style_key(wide) != key
+                            || !is_wide_spacer_of(spacer, wide)
+                        {
                             break;
                         }
-                        text.extend_from_slice(&bytes);
-                        end += 8;
-                        text_from = end;
+                        push_scalar(&mut text, wide.c);
+                        end += 2;
+                    }
+                } else {
+                    loop {
+                        end += extend_ascii_run(&cells[end..stored], key, &mut text);
+                        // A character of the same style that is not ASCII.
+                        match cells[end..stored].first() {
+                            Some(next) if next.extra.is_none() && plain_style_key(next) == key => {
+                                push_scalar(&mut text, next.c);
+                                end += 1;
+                            }
+                            _ => break,
+                        }
                     }
                 }
-                while end < stored {
-                    let next = &cells[end];
-                    if !(next.extra.is_none()
-                        & (next.flags == flags)
-                        & (next.fg == fg)
-                        & (next.bg == bg))
-                    {
-                        break;
+            }
+            let code = id << 1 | u32::from(paired);
+            let count = end - start;
+            match &mut pending {
+                Some(run) if run.code == code => run.count += count,
+                _ => {
+                    if let Some(run) = pending.replace(PendingRun { code, count }) {
+                        put_varint(&mut runs, run.code as usize);
+                        put_varint(&mut runs, run.count);
                     }
-                    end += 1;
                 }
-                push_text(&mut text, &cells[text_from..end]);
-                match last_style {
-                    Some((f, b, l, id)) if f == fg && b == bg && l == flags => id,
-                    _ => {
-                        let id = table.id(cell);
-                        last_style = Some((fg, bg, flags, id));
-                        id
-                    },
-                }
-            } else {
-                push_char(&mut text, cell.c);
-                table.id(cell)
-            };
-            let count = (end - start) as u32;
-            match runs.last_mut() {
-                Some(run) if run.0 == id => run.1 += count,
-                _ => runs.push((id, count)),
             }
             start = end;
         }
-        put_varint(&mut meta, row.occ());
-        put_varint(&mut meta, cells.len());
-        put_varint(&mut meta, stored);
-        put_varint(&mut meta, text.len() - text_start);
-        put_varint(&mut meta, runs.len());
-        for &(id, count) in &runs {
-            put_varint(&mut meta, id as usize);
-            put_varint(&mut meta, count as usize);
+        if let Some(run) = pending {
+            put_varint(&mut runs, run.code as usize);
+            put_varint(&mut runs, run.count);
         }
+        put_bytes(&mut raw, &text);
+        raw.extend_from_slice(&runs);
     }
-    let mut styles = Vec::with_capacity(8 + table.styles.len() * 8);
-    put_varint(&mut styles, table.styles.len());
+    let body = (raw.len() - 4) as u32;
+    raw[..4].copy_from_slice(&body.to_le_bytes());
+    put_varint(&mut raw, table.styles.len());
     for style in &table.styles {
-        put_style(&mut styles, style);
+        put_style(&mut raw, style);
     }
-    // Layout: styles, row metadata, then all text. Keeping text apart lets
-    // the compressor skip through text that does not repeat quickly.
-    let mut raw = Vec::with_capacity(styles.len() + meta.len() + text.len() + 20);
-    put_varint(&mut raw, styles.len());
-    raw.extend_from_slice(&styles);
-    put_varint(&mut raw, meta.len());
-    raw.extend_from_slice(&meta);
-    raw.extend_from_slice(&text);
-    if meta.capacity() <= SCRATCH_BYTES && text.capacity() <= SCRATCH_BYTES {
-        SCRATCH.with(|scratch| scratch.set((meta, text)));
-    }
+    // One allocation of the exact size, shared by the block from here on.
+    lz::compress_into(&raw, &mut packed);
+    let bytes = Arc::from(&packed[..]);
+    ENCODE_SCRATCH.set((raw, text, runs, packed));
     Encoded {
-        bytes: pack_payload(&raw),
+        bytes,
         resize_floor: floor,
         blank_on_reset,
     }
 }
 
+/// Frees [`ENCODE_SCRATCH`]: whatever keeps spare rows only while output
+/// streams keeps these the same way, so an idle terminal holds neither.
+fn release_encode_scratch() {
+    drop(ENCODE_SCRATCH.take());
+}
+
 thread_local! {
-    /// Row metadata and text of the block being encoded, reused while small.
-    static SCRATCH: std::cell::Cell<(Vec<u8>, Vec<u8>)> =
-        const { std::cell::Cell::new((Vec::new(), Vec::new())) };
-}
-
-/// The most scratch capacity an encoding thread keeps between blocks.
-const SCRATCH_BYTES: usize = 64 * 1024;
-
-/// Equal to `Cell::default()`, without branches, so whole chunks of a row's
-/// blank tail are checked at once.
-#[inline(always)]
-fn is_default_cell(cell: &Cell) -> bool {
-    (cell.c == ' ')
-        & cell.extra.is_none()
-        & matches!(cell.fg, Color::Named(NamedColor::Foreground))
-        & matches!(cell.bg, Color::Named(NamedColor::Background))
-        & cell.flags.is_empty()
-}
-
-/// The default cell's style, whatever its character.
-#[inline(always)]
-fn is_default_style(cell: &Cell) -> bool {
-    cell.extra.is_none()
-        & matches!(cell.fg, Color::Named(NamedColor::Foreground))
-        & matches!(cell.bg, Color::Named(NamedColor::Background))
-        & cell.flags.is_empty()
-}
-
-/// Cells through the last that is not `Cell::default()`.
-#[inline]
-fn stored_cells(cells: &[Cell]) -> usize {
-    const CHUNK: usize = 8;
-    let mut end = cells.len();
-    while end >= CHUNK {
-        let chunk = &cells[end - CHUNK..end];
-        if !chunk.iter().fold(true, |all, cell| all & is_default_cell(cell)) {
-            break;
-        }
-        end -= CHUNK;
-    }
-    cells[..end]
-        .iter()
-        .rposition(|cell| !is_default_cell(cell))
-        .map_or(0, |i| i + 1)
-}
-
-/// Appends the cells' characters as UTF-8.
-#[inline]
-fn push_text(out: &mut Vec<u8>, cells: &[Cell]) {
-    let start = out.len();
-    let mut any = 0;
-    out.extend(cells.iter().map(|cell| {
-        any |= cell.c as u32;
-        cell.c as u8
-    }));
-    if any >= 0x80 {
-        out.truncate(start);
-        for cell in cells {
-            push_char(out, cell.c);
-        }
-    }
-}
-
-/// Appends one cell's character as UTF-8.
-#[inline(always)]
-fn push_char(out: &mut Vec<u8>, c: char) {
-    if c.is_ascii() {
-        out.push(c as u8);
-    } else {
-        let mut buffer = [0; 4];
-        out.extend_from_slice(c.encode_utf8(&mut buffer).as_bytes());
-    }
+    /// [`encode_cells`]'s payload, row text, row run and compressed payload
+    /// buffers, kept from one block to the next while output streams (about
+    /// 20 KiB at 160 columns).
+    #[allow(clippy::type_complexity)]
+    static ENCODE_SCRATCH: std::cell::Cell<(Vec<u8>, Vec<u8>, Vec<u8>, Vec<u8>)> =
+        const { std::cell::Cell::new((Vec::new(), Vec::new(), Vec::new(), Vec::new())) };
 }
 
 struct Reader<'a> {
@@ -2804,65 +2901,79 @@ const NAMED_COLORS: [NamedColor; 29] = [
     NamedColor::DimForeground,
 ];
 
-/// First byte of a payload: the encoded rows follow as they are, because
-/// compressing them did not make them smaller.
-const PAYLOAD_STORED: u8 = 0;
-/// First byte of a payload: the encoded rows follow LZ-compressed.
-const PAYLOAD_LZ: u8 = 1;
+/// The style table of an uncompressed payload and the end of its body; rows
+/// start at byte 4 (see [`encode_cells`]).
+fn read_styles(raw: &[u8]) -> (Vec<Cell>, usize) {
+    let body_end = 4 + u32::from_le_bytes(raw[..4].try_into().expect("payload header")) as usize;
+    let mut reader = Reader {
+        bytes: raw,
+        position: body_end,
+    };
+    let styles = (0..reader.varint()).map(|_| reader.style()).collect();
+    (styles, body_end)
+}
 
-/// A block payload: the encoded rows, compressed when that makes them
-/// smaller.
-fn pack_payload(raw: &[u8]) -> Arc<[u8]> {
-    let mut out = Vec::with_capacity(raw.len() / 2 + 32);
-    out.push(PAYLOAD_LZ);
-    lz::compress_into(raw, &mut out);
-    if out.len() > raw.len() {
-        out.clear();
-        out.push(PAYLOAD_STORED);
-        out.extend_from_slice(raw);
+/// One encoded row, with its runs and text still encoded.
+struct EncodedRow<'a> {
+    occ: usize,
+    len: usize,
+    stored: usize,
+    /// Whether any run is paired (see [`encode_cells`]).
+    paired: bool,
+    runs: Reader<'a>,
+    text: &'a [u8],
+}
+
+impl<'a> EncodedRow<'a> {
+    fn read(reader: &mut Reader<'a>) -> Self {
+        let occ = reader.varint();
+        let len = reader.varint();
+        let stored = reader.varint();
+        assert!(occ <= len && stored <= len, "internally encoded row");
+        let text_len = reader.varint();
+        let text = reader.slice(text_len);
+        let runs_start = reader.position;
+        let (mut covered, mut paired) = (0, false);
+        while covered < stored {
+            paired |= reader.varint() & 1 == 1;
+            covered += reader.varint();
+        }
+        let runs = Reader {
+            bytes: &reader.bytes[..reader.position],
+            position: runs_start,
+        };
+        Self {
+            occ,
+            len,
+            stored,
+            paired,
+            runs,
+            text,
+        }
     }
-    out.into()
-}
 
-/// The encoded rows of a payload.
-fn payload_rows(bytes: &[u8]) -> std::borrow::Cow<'_, [u8]> {
-    match bytes.split_first() {
-        Some((&PAYLOAD_STORED, raw)) => std::borrow::Cow::Borrowed(raw),
-        Some((&PAYLOAD_LZ, packed)) => std::borrow::Cow::Owned(lz::decompress(packed)),
-        _ => panic!("internally encoded payload"),
+    /// The next run: its style index, whether it is paired, and its cells.
+    #[inline]
+    fn next_run(&mut self) -> Option<(usize, bool, usize)> {
+        if self.runs.position == self.runs.bytes.len() {
+            return None;
+        }
+        let code = self.runs.varint();
+        Some((code >> 1, code & 1 == 1, self.runs.varint()))
     }
-}
-
-/// The text of a payload's rows starts after its row metadata.
-fn read_meta_len(reader: &mut Reader<'_>) -> usize {
-    let len = reader.varint();
-    reader.position + len
-}
-
-fn read_styles(reader: &mut Reader<'_>) -> Vec<Cell> {
-    let _styles_len = reader.varint();
-    (0..reader.varint()).map(|_| reader.style()).collect()
 }
 
 fn index_cells(bytes: &[u8]) -> EvictIndex<Cell> {
-    let raw = payload_rows(bytes).into_owned();
+    let raw = lz::decompress(bytes);
+    let (styles, body_end) = read_styles(&raw);
     let mut reader = Reader {
-        bytes: &raw,
-        position: 0,
+        bytes: &raw[..body_end],
+        position: 4,
     };
-    let styles = read_styles(&mut reader);
-    let mut text = read_meta_len(&mut reader);
-    let meta_end = text;
     let mut rows = Vec::new();
-    while reader.position < meta_end {
-        rows.push((reader.position, text));
-        let _occ = reader.varint();
-        let _len = reader.varint();
-        let _stored = reader.varint();
-        text += reader.varint();
-        for _ in 0..2 * reader.varint() {
-            reader.varint();
-        }
+    while reader.position < body_end {
+        rows.push(reader.position);
+        EncodedRow::read(&mut reader);
     }
     EvictIndex { raw, rows, styles }
 }
@@ -2876,25 +2987,18 @@ fn reset_cell_row(
     template: &Cell,
     columns: usize,
 ) -> Option<Row<Cell>> {
-    let (meta, text_at) = index.rows[row];
     let mut reader = Reader {
         bytes: &index.raw,
-        position: meta,
+        position: index.rows[row],
     };
-    let occ = reader.varint();
-    let len = reader.varint();
-    let stored = reader.varint();
+    let mut encoded = EncodedRow::read(&mut reader);
+    let (occ, len, stored) = (encoded.occ, encoded.len, encoded.stored);
     if len != columns || len == 0 {
         return None;
     }
-    let text_len = reader.varint();
-    let text = &index.raw[text_at..text_at + text_len];
-    let run_count = reader.varint();
-    let runs_start = reader.position;
     let mut last_style = None;
-    for _ in 0..run_count {
-        last_style = Some(reader.varint());
-        reader.varint();
+    while let Some((style, _, _)) = encoded.next_run() {
+        last_style = Some(style);
     }
     let default = Cell::default();
     let last_bg = match last_style {
@@ -2909,17 +3013,30 @@ fn reset_cell_row(
     cells.extend(std::iter::repeat_n(blank, reset));
     if reset < stored {
         // Decode the stored cells the reset keeps.
-        let mut reader = Reader {
+        let mut encoded = EncodedRow::read(&mut Reader {
             bytes: &index.raw,
-            position: runs_start,
-        };
-        let mut characters = std::str::from_utf8(text)
+            position: index.rows[row],
+        });
+        let mut characters = std::str::from_utf8(encoded.text)
             .expect("internally encoded text")
             .chars();
         let mut column = 0;
-        for _ in 0..run_count {
-            let style = &index.styles[reader.varint()];
-            for _ in 0..reader.varint() {
+        while let Some((style, paired, count)) = encoded.next_run() {
+            let style = &index.styles[style];
+            if paired {
+                for _ in 0..count / 2 {
+                    let c = characters.next().expect("one scalar per wide pair");
+                    if column >= reset {
+                        cells.push(Cell { c, ..style.clone() });
+                    }
+                    if column + 1 >= reset {
+                        cells.push(wide_spacer(style));
+                    }
+                    column += 2;
+                }
+                continue;
+            }
+            for _ in 0..count {
                 let c = characters.next().expect("one scalar per encoded cell");
                 if column >= reset {
                     let mut cell = style.clone();
@@ -2935,30 +3052,22 @@ fn reset_cell_row(
 }
 
 fn decode_cells(bytes: &[u8]) -> Vec<Row<Cell>> {
-    let raw = payload_rows(bytes);
+    let raw = lz::decompress(bytes);
+    let (styles, body_end) = read_styles(&raw);
     let mut reader = Reader {
-        bytes: &raw,
-        position: 0,
+        bytes: &raw[..body_end],
+        position: 4,
     };
-    let styles = read_styles(&mut reader);
-    let mut text_at = read_meta_len(&mut reader);
-    let meta_end = text_at;
     let mut rows = Vec::new();
-    while reader.position < meta_end {
-        let occ = reader.varint();
-        let len = reader.varint();
-        let stored = reader.varint();
-        assert!(occ <= len && stored <= len);
-        let text_len = reader.varint();
-        let text = &raw[text_at..text_at + text_len];
-        text_at += text_len;
+    while reader.position < body_end {
+        let mut encoded = EncodedRow::read(&mut reader);
+        let (occ, len, stored, text) = (encoded.occ, encoded.len, encoded.stored, encoded.text);
         let mut cells = Vec::with_capacity(len);
-        if text.len() == stored {
+        if !encoded.paired && text.len() == stored {
             // ASCII: one byte per cell.
             let mut offset = 0;
-            for _ in 0..reader.varint() {
-                let style = &styles[reader.varint()];
-                let count = reader.varint();
+            while let Some((style, _, count)) = encoded.next_run() {
+                let style = &styles[style];
                 let bytes = &text[offset..offset + count];
                 offset += count;
                 if style.extra.is_none() {
@@ -2983,24 +3092,48 @@ fn decode_cells(bytes: &[u8]) -> Vec<Row<Cell>> {
             let mut text = std::str::from_utf8(text)
                 .expect("internally encoded text")
                 .chars();
-            for _ in 0..reader.varint() {
-                let style = &styles[reader.varint()];
-                let count = reader.varint();
-                push_run(&mut cells, style, count, &mut text);
+            while let Some((style, paired, count)) = encoded.next_run() {
+                let style = &styles[style];
+                if paired {
+                    push_pairs(&mut cells, style, count, &mut text);
+                } else {
+                    push_run(&mut cells, style, count, &mut text);
+                }
             }
             assert!(text.next().is_none());
         }
         assert_eq!(cells.len(), stored, "internally encoded runs");
         // Cloning one default is measurably cheaper than `resize_with`.
         cells.extend(std::iter::repeat_n(Cell::default(), len - stored));
-        // Cells past `stored` are default cells.
-        rows.push(if occ >= stored {
-            Row::from_vec_blank_tail(cells, occ)
-        } else {
-            Row::from_vec(cells, occ)
-        });
+        rows.push(Row::from_vec(cells, occ));
     }
     rows
+}
+
+/// The spacer a paired run rebuilds after each wide character of `style`.
+fn wide_spacer(style: &Cell) -> Cell {
+    Cell {
+        c: ' ',
+        fg: style.fg,
+        bg: style.bg,
+        flags: wide_spacer_flags(style.flags),
+        extra: None,
+    }
+}
+
+/// A paired run: `count / 2` wide characters, each followed by its spacer.
+fn push_pairs(cells: &mut Vec<Cell>, style: &Cell, count: usize, text: impl Iterator<Item = char>) {
+    assert!(
+        count % 2 == 0 && style.extra.is_none(),
+        "internally encoded pairs"
+    );
+    let before = cells.len();
+    let spacer = wide_spacer(style);
+    for c in text.take(count / 2) {
+        cells.push(Cell { c, ..style.clone() });
+        cells.push(spacer.clone());
+    }
+    assert_eq!(cells.len() - before, count, "one scalar per wide pair");
 }
 
 fn push_run(cells: &mut Vec<Cell>, style: &Cell, count: usize, text: impl Iterator<Item = char>) {
@@ -3037,92 +3170,6 @@ mod tests {
         }
     }
 
-    /// `cargo test --release --features compact-history encode_speed -- --ignored --nocapture`
-    #[test]
-    #[ignore]
-    fn encode_speed() {
-        let mut seed = 7u64;
-        let mut next = move || {
-            seed ^= seed << 13;
-            seed ^= seed >> 7;
-            seed ^= seed << 17;
-            seed
-        };
-        let rows: Vec<Row<Cell>> = match std::env::var_os("DIRI_ENCODE_TEXT") {
-            // Lines of a captured file, wrapped at 120 columns.
-            Some(path) => {
-                let text = std::fs::read(path).expect("text");
-                let mut rows = Vec::new();
-                let mut row = Row::<Cell>::new(120);
-                let mut column = 0;
-                for &byte in &text {
-                    if byte == b'\n' || column == 120 {
-                        rows.push(std::mem::replace(&mut row, Row::new(120)));
-                        column = 0;
-                        if byte == b'\n' {
-                            continue;
-                        }
-                    }
-                    if byte == b'\t' {
-                        column = (column / 8 + 1) * 8;
-                        column = column.min(119);
-                        continue;
-                    }
-                    row[Column(column)].c = char::from(byte);
-                    column += 1;
-                    if rows.len() == 64 {
-                        break;
-                    }
-                }
-                rows.truncate(64);
-                rows
-            },
-            None => (0..64)
-                .map(|_| {
-                    let mut row = Row::<Cell>::new(120);
-                    let len = (next() % 100) as usize;
-                    for column in 0..len {
-                        row[Column(column)].c = char::from(b'!' + (next() % 90) as u8);
-                    }
-                    row.set_occ(len);
-                    row
-                })
-                .collect(),
-        };
-        let mut best = f64::MAX;
-        for _ in 0..30 {
-            let started = std::time::Instant::now();
-            for _ in 0..1000 {
-                std::hint::black_box(encode_cells(std::hint::black_box(&rows)));
-            }
-            best = best.min(started.elapsed().as_nanos() as f64 / 64_000.0);
-        }
-        println!("encode: {best:.1} ns/row");
-        let mut best = f64::MAX;
-        for _ in 0..30 {
-            let started = std::time::Instant::now();
-            for _ in 0..1000 {
-                for row in std::hint::black_box(&rows) {
-                    std::hint::black_box(stored_cells(&row[..]));
-                }
-            }
-            best = best.min(started.elapsed().as_nanos() as f64 / 64_000.0);
-        }
-        println!("stored_cells: {best:.1} ns/row");
-        let bytes = encode_cells(&rows).bytes;
-        println!("payload: {} bytes for 64 rows", bytes.len());
-        let raw = payload_rows(&bytes).into_owned();
-        let mut best = f64::MAX;
-        for _ in 0..30 {
-            let started = std::time::Instant::now();
-            for _ in 0..1000 {
-                std::hint::black_box(pack_payload(std::hint::black_box(&raw)));
-            }
-            best = best.min(started.elapsed().as_nanos() as f64 / 64_000.0);
-        }
-        println!("pack: {best:.1} ns/row of {} raw bytes", raw.len());
-    }
-
     fn parser_rows() -> Vec<Row<Cell>> {
         let mut term = Term::new(
             Config {
@@ -3148,13 +3195,26 @@ mod tests {
             .collect()
     }
 
+    /// Sets the occupancy of a row built cell by cell, making the cells at
+    /// and after it equal to the last cell as `Row` guarantees: an
+    /// occupancy below the content leaves a uniform tail, as a reset with a
+    /// coloured template does.
+    fn obey_occupancy(row: &mut Row<Cell>, occ: usize) {
+        let len = row.len();
+        let last = row[Column(len - 1)].clone();
+        for column in occ..len {
+            row[Column(column)] = last.clone();
+        }
+        row.occ = occ;
+    }
+
     fn assert_rows(actual: &CompactRows<Cell>, expected: &[Row<Cell>]) {
         assert_eq!(actual.len(), expected.len());
         for (index, row) in expected.iter().enumerate() {
             // Row equality intentionally omits occupancy; compare it explicitly
             // because reset/reflow behavior depends on that private metadata.
             assert_eq!(actual.row(index), row, "row {index}");
-            assert_eq!(actual.row(index).occ(), row.occ(), "occupancy {index}");
+            assert_eq!(actual.row(index).occ, row.occ, "occupancy {index}");
         }
     }
 
@@ -3187,7 +3247,7 @@ mod tests {
         assert_eq!(decoded.len(), rows.len());
         for (index, (actual, expected)) in decoded.iter().zip(rows).enumerate() {
             assert_eq!(actual, expected, "row {index}");
-            assert_eq!(actual.occ(), expected.occ(), "occupancy {index}");
+            assert_eq!(actual.occ, expected.occ, "occupancy {index}");
             assert_eq!(actual.len(), expected.len(), "width {index}");
         }
     }
@@ -3252,14 +3312,13 @@ mod tests {
                         _ => {}
                     }
                 }
-                // Occupancy is independent metadata, including beyond content.
-                row.set_occ(if row_index % 4 == 0 {
+                // Occupancy below, at and beyond the content.
+                let occ = if row_index % 4 == 0 {
                     width
                 } else {
                     next() as usize % (width + 1)
-                });
-                // Lowering the occupancy leaves cells past it.
-                row.blank_tail = false;
+                };
+                obey_occupancy(&mut row, occ);
                 rows.push(row);
             }
             assert_codec_round_trip(&rows);
@@ -3319,8 +3378,7 @@ mod tests {
                     }
                 }
                 // Includes occupancy below, at and above the stored content.
-                row.set_occ(next() as usize % (width + 1));
-                row.blank_tail = false;
+                obey_occupancy(&mut row, next() as usize % (width + 1));
                 rows.push(row);
             }
             let encoded = encode_cells(&rows);
@@ -3333,7 +3391,7 @@ mod tests {
                 // A spare row, as `seal_recent` prepares it for recycling.
                 let mut spare = row.clone();
                 if !blank_on_reset {
-                    spare.set_occ(spare.len());
+                    spare.occ = spare.len();
                 }
                 for background in backgrounds {
                     let template = Cell {
@@ -3345,13 +3403,13 @@ mod tests {
                     let actual =
                         reset_cell_row(&index, position, &template, width).expect("matching width");
                     assert_eq!(actual, expected, "row {position} template {background:?}");
-                    assert_eq!(actual.occ(), expected.occ());
+                    assert_eq!(actual.occ, expected.occ);
                     assert_eq!(actual.len(), expected.len());
                     // Rows marked blank recycle as template cells without
                     // the payload, and every spare row resets to them.
                     let blank = Row::from_vec(vec![Cell::default(); width], 0);
                     let mut blank = blank;
-                    blank.set_occ(width);
+                    blank.occ = width;
                     blank.reset(&template);
                     if blank_on_reset {
                         assert_eq!(expected, blank, "blank row {position} {background:?}");
@@ -3359,7 +3417,7 @@ mod tests {
                     let mut recycled = spare.clone();
                     recycled.reset(&template);
                     assert_eq!(recycled, blank, "spare row {position} {background:?}");
-                    assert_eq!(recycled.occ(), 0);
+                    assert_eq!(recycled.occ, 0);
                 }
             }
             assert!(
@@ -3373,6 +3431,131 @@ mod tests {
     /// Output streaming through full history recycles rows from their
     /// recipe bits and reuses sealed row allocations: no block is
     /// decompressed and the recycled rows are the sealed rows' storage.
+    #[test]
+    fn wide_character_pairs_round_trip_with_their_spacers() {
+        let wide = |c: char, bg: Color| Cell {
+            c,
+            bg,
+            flags: Flags::WIDE_CHAR,
+            ..Cell::default()
+        };
+        let spacer = |bg: Color, flags: Flags| Cell {
+            bg,
+            flags: Flags::WIDE_CHAR_SPACER | flags,
+            ..Cell::default()
+        };
+        let red = Color::Named(NamedColor::Red);
+        let default_bg = Color::Named(NamedColor::Background);
+        let row = |cells: Vec<Cell>| {
+            let len = cells.len();
+            let mut row = Row::from_vec(cells, len);
+            row.grow(12);
+            row
+        };
+        let mut joined = wide('界', default_bg);
+        joined.push_zerowidth('\u{301}');
+        let mut text_spacer = spacer(default_bg, Flags::empty());
+        text_spacer.c = 'x';
+        let rows = vec![
+            // Pairs of one style, then pairs of another, then ASCII.
+            row(vec![
+                wide('日', default_bg),
+                spacer(default_bg, Flags::empty()),
+                wide('本', default_bg),
+                spacer(default_bg, Flags::empty()),
+                wide('語', red),
+                spacer(red, Flags::empty()),
+                Cell {
+                    c: 'a',
+                    ..Cell::default()
+                },
+            ]),
+            // A spacer whose style differs from its character's.
+            row(vec![wide('日', red), spacer(default_bg, Flags::empty())]),
+            // A spacer with flags of its own, one with a character, a lone
+            // spacer, and a wide character with marks.
+            row(vec![
+                wide('日', default_bg),
+                spacer(default_bg, Flags::BOLD),
+                wide('本', default_bg),
+                text_spacer,
+                spacer(default_bg, Flags::empty()),
+                joined,
+                spacer(default_bg, Flags::empty()),
+            ]),
+            // A wide character in the last column, without its spacer.
+            row(vec![Cell::default(); 11]
+                .into_iter()
+                .chain([wide('日', red)])
+                .collect()),
+        ];
+        assert_codec_round_trip(&rows);
+        let encoded = encode_cells(&rows);
+        let index = index_cells(&encoded.bytes);
+        // Recycling reads the pairs back the same way.
+        for (position, row) in rows.iter().enumerate() {
+            for background in [default_bg, red] {
+                let template = Cell {
+                    bg: background,
+                    ..Cell::default()
+                };
+                let mut expected = row.clone();
+                expected.reset(&template);
+                let actual = reset_cell_row(&index, position, &template, 12).expect("width");
+                assert_eq!(actual, expected, "row {position} {background:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn spare_rows_survive_history_bounds_until_released() {
+        // An owner that bounds history after every read keeps reusing the
+        // rows of the block it sealed last, then lets them go when idle.
+        let rows = (0..24 + 512).map(|_| Row::new(80)).collect();
+        // Inline sealing: rows sealed on the helper thread come back when it
+        // finishes, so which ones are reused depends on its timing.
+        let mut codec = cell_codec();
+        codec.seal = None;
+        let mut storage = CompactRows::new(rows, 24, 80, codec);
+        storage.keep_spare_rows(true);
+        let template = Cell::default();
+        let mut sealed = Vec::new();
+        let mut reused = 0;
+        for line in 0..5000 {
+            storage.rotate_reset(1, &template);
+            let recycled = storage.row(0)[..].as_ptr();
+            reused += usize::from(sealed.contains(&recycled));
+            for (column, c) in format!("line {line}").chars().enumerate() {
+                storage.row_mut(0)[Column(column)].c = c;
+            }
+            if storage.recent.len() + 1 == storage.visible + storage.block_rows {
+                sealed = storage
+                    .recent
+                    .iter()
+                    .rev()
+                    .take(storage.block_rows)
+                    .map(|row| row[..].as_ptr())
+                    .collect();
+            }
+            // A read of a few lines, then the settle that bounds history.
+            if line % 3 == 0 {
+                storage.bound_history_bytes(4 << 20);
+            }
+        }
+        assert!(
+            reused > 4000,
+            "{reused} of 5000 recycled rows reused sealed storage"
+        );
+        assert!(!storage.spare.is_empty());
+        storage.release_spare_rows();
+        assert_eq!(storage.spare.capacity(), 0);
+        // Without the option every bound drops them, as before.
+        storage.keep_spare_rows(false);
+        storage.rotate_reset(storage.block_rows + 1, &template);
+        storage.bound_history_bytes(4 << 20);
+        assert_eq!(storage.spare.capacity(), 0);
+    }
+
     #[test]
     fn streaming_full_history_recycles_without_decoding() {
         use std::sync::atomic::{AtomicUsize, Ordering};
@@ -3388,8 +3571,7 @@ mod tests {
         let mut codec = cell_codec();
         codec.decode = decode;
         codec.index = index;
-        // Inline sealing: rows sealed on the helper thread come back when it
-        // finishes, so how many are reused depends on its timing.
+        // Inline sealing, as in `spare_rows_survive_history_bounds_until_released`.
         codec.seal = None;
         let rows = (0..24 + 512).map(|_| Row::new(80)).collect();
         let mut storage = CompactRows::new(rows, 24, 80, codec);
@@ -3408,18 +3590,13 @@ mod tests {
             }
             // Pointers of the rows the next seal will take.
             if storage.recent.len() + 1 == storage.visible + storage.block_rows {
-                sealed.extend(
-                    storage
-                        .recent
-                        .iter()
-                        .rev()
-                        .take(storage.block_rows)
-                        .map(|row| row[..].as_ptr()),
-                );
-                let keep = storage.block_rows;
-                if sealed.len() > keep {
-                    sealed.drain(..sealed.len() - keep);
-                }
+                sealed = storage
+                    .recent
+                    .iter()
+                    .rev()
+                    .take(storage.block_rows)
+                    .map(|row| row[..].as_ptr())
+                    .collect();
             }
         }
         assert_eq!(
@@ -3519,8 +3696,8 @@ mod tests {
                 for line in -(e.history_size() as i32)..e.screen_lines() as i32 {
                     assert_eq!(a[Line(line)], e[Line(line)], "line {line} at {step}");
                     assert_eq!(
-                        a[Line(line)].occ(),
-                        e[Line(line)].occ(),
+                        a[Line(line)].occ,
+                        e[Line(line)].occ,
                         "occupancy {line} at {step}"
                     );
                 }
@@ -3959,6 +4136,62 @@ mod tests {
 
     /// Everything a reader can observe: history length, cursors and every
     /// row, compared with dense storage.
+    /// Retained history is a function of the output alone: bounding it after
+    /// every byte or after every 64 KiB read keeps the same rows. Terminals
+    /// bound history once per read, and read sizes vary from run to run.
+    #[test]
+    fn bounded_history_does_not_depend_on_read_boundaries() {
+        let mut seed = 0x9e37_79b9_7f4a_7c15u64;
+        let mut next = move || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed
+        };
+        // Lines of varied length and compressibility, some coloured, some
+        // wrapping, so blocks differ in size.
+        let mut text = Vec::new();
+        let mut line = 0;
+        while text.len() < 3 << 20 {
+            let len = (next() % 150) as usize;
+            if next() % 4 == 0 {
+                text.extend_from_slice(format!("\x1b[3{}m", next() % 8).as_bytes());
+            }
+            for _ in 0..len {
+                let byte = if next() % 3 == 0 {
+                    b'a' + (line % 26) as u8
+                } else {
+                    b' ' + (next() % 95) as u8
+                };
+                text.push(byte);
+            }
+            text.extend_from_slice(b"\x1b[0m\r\n");
+            line += 1;
+        }
+        let budget = 192 * 1024;
+        let config = Config {
+            scrolling_history: 150_000,
+            ..Config::default()
+        };
+        let parse = |read: usize| {
+            let mut term = Term::new(config.clone(), &Size, VoidListener);
+            term.grid_mut().enable_compact_history();
+            let mut parser: Processor = Processor::new();
+            for chunk in text.chunks(read) {
+                parser.advance(&mut term, chunk);
+                term.bound_primary_history_storage(budget);
+            }
+            term
+        };
+        let mut whole = parse(64 << 10);
+        let bytes = parse(1);
+        assert!(bytes.grid().history_size() > 1000);
+        same_as_dense(&mut whole, &bytes, "64 KiB reads vs single bytes");
+        // Nor on reads that happen to align with neither.
+        let mut odd = parse(4093);
+        same_as_dense(&mut odd, &bytes, "4093-byte reads vs single bytes");
+    }
+
     fn same_as_dense(actual: &mut Term<VoidListener>, expected: &Term<VoidListener>, step: &str) {
         let (a, e) = (actual.grid(), expected.grid());
         assert_eq!(a.history_size(), e.history_size(), "history after {step}");

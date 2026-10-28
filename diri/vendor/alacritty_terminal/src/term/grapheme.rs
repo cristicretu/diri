@@ -105,14 +105,17 @@ impl Class {
             .unwrap_or(Self::Other)
     }
 
+    #[inline]
     fn extend(self) -> bool {
         matches!(self, Self::Zwnj | Self::IndicExtend | Self::IndicLinker)
     }
 
+    #[inline]
     fn indic_extend(self) -> bool {
         matches!(self, Self::IndicExtend | Self::Zwj)
     }
 
+    #[inline]
     fn pictographic(self) -> bool {
         matches!(self, Self::ExtendedPictographic | Self::EmojiModifierBase)
     }
@@ -158,6 +161,7 @@ pub(crate) enum BreakState {
 
 /// Whether a grapheme cluster boundary falls between consecutive codepoints
 /// of classes `a` and `b` (UAX #29 including GB9c, as Bun implements it).
+#[inline]
 pub(crate) fn breaks(a: Class, b: Class, state: &mut BreakState) -> bool {
     use BreakState as S;
     use Class as G;
@@ -283,6 +287,7 @@ pub(crate) struct Cluster {
 }
 
 impl Cluster {
+    #[inline]
     pub(crate) fn new(c: char, info: Info) -> Self {
         let width = info.width() as u8;
         Self {
@@ -300,6 +305,7 @@ impl Cluster {
         }
     }
 
+    #[inline]
     pub(crate) fn add(&mut self, c: char, info: Info) {
         self.count = self.count.saturating_add(1);
         self.keycap |= c == '\u{20E3}';
@@ -313,6 +319,7 @@ impl Cluster {
 
     /// Whether an emoji or presentation rule decides the width, rather than
     /// the widths of the codepoints themselves.
+    #[inline]
     pub(crate) fn presentation(&self) -> bool {
         self.regional
             || self.keycap
@@ -323,6 +330,7 @@ impl Cluster {
 
     /// Columns of the cluster: Bun's `stringWidth` rule by default, the
     /// mode 2027 rule when `clustering` is set.
+    #[inline]
     pub(crate) fn width(&self, clustering: bool) -> usize {
         if self.regional && self.count >= 2 {
             return 2;
@@ -355,10 +363,12 @@ impl Cluster {
     }
 }
 
+#[inline]
 fn is_regional_indicator(c: char) -> bool {
     ('\u{1F1E6}'..='\u{1F1FF}').contains(&c)
 }
 
+#[inline]
 fn is_skin_tone(c: char) -> bool {
     ('\u{1F3FB}'..='\u{1F3FF}').contains(&c)
 }
