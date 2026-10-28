@@ -1,4 +1,5 @@
 {
+  "menu.clear_scrollback": "清除屏幕和回滚记录",
   "menu.close_session": "关闭会话",
   "menu.close_window": "关闭窗口",
   "menu.copy": "拷贝",
@@ -12,6 +13,7 @@
   "menu.quit_diri": "退出 diri",
   "menu.reopen_closed_session": "重新打开已关闭的会话",
   "menu.report_problem": "报告问题…",
+  "menu.reset_terminal": "重置终端",
   "menu.services": "服务",
   "menu.whats_new": "新功能",
   "menu.window": "窗口",

@@ -674,6 +674,45 @@ impl HeadlessScreen {
         *self = reset;
     }
 
+    /// Clear Screen and Scrollback, the ⌘K of other terminals: history goes,
+    /// and the line the cursor is on (from where the program started it, if
+    /// it wrapped) moves to the top with everything above it dropped, so a
+    /// shell's prompt and whatever was typed at it stay. Modes, title and
+    /// the child are untouched.
+    ///
+    /// In the alternate screen this does nothing and returns false: a
+    /// full-screen program owns that screen and would not repaint it.
+    ///
+    /// Like [`Self::reset`] the owner must order it with output and durable
+    /// replay; the content revision always advances.
+    pub fn clear_scrollback(&mut self) -> bool {
+        use alacritty_terminal::vte::ansi::{ClearMode, Handler};
+        if self.is_alt_screen() {
+            return false;
+        }
+        let cursor = self.term.grid().cursor.point.line.0.max(0) as usize;
+        let cols = self.geometry.cols;
+        let mut top = cursor;
+        while top > 0
+            && cols > 0
+            && self.term.grid()[Line(top as i32 - 1)][Column(cols - 1)]
+                .flags
+                .contains(Flags::WRAPLINE)
+        {
+            top -= 1;
+        }
+        if top > 0 {
+            self.term.scroll_up(top);
+            self.term.move_up(top);
+        }
+        // Clearing history damages the whole screen, so the next
+        // publication is full.
+        self.term.clear_screen(ClearMode::Saved);
+        self.settle();
+        self.content_seq = self.content_seq.saturating_add(1);
+        true
+    }
+
     pub fn reset_notification_sequence(&mut self) {
         if let Some(parser) = &mut self.notifications {
             parser.reset_sequence();
@@ -3050,6 +3089,54 @@ mod tests {
             !screen.flush_expired_sync(),
             "releasing it once clears the deadline"
         );
+    }
+
+    #[test]
+    fn clear_scrollback_keeps_the_cursor_line_and_drops_everything_above() {
+        let mut screen = HeadlessScreen::new(10, 4);
+        for n in 0..8 {
+            screen.feed(format!("out {n}\r\n").as_bytes());
+        }
+        // A prompt whose typed command wrapped onto a second row.
+        screen.feed(b"$ echo abcdefgh");
+        let seq = screen.content_seq();
+        assert!(screen.scrollback().first_row == 0 && screen.scrollback().visible_start_row > 0);
+        assert!(screen.clear_scrollback());
+        assert_eq!(screen.lines(), ["$ echo abc", "defgh"]);
+        assert_eq!(screen.cursor(), (5, 1, true));
+        let after = screen.scrollback();
+        assert_eq!(after.visible_start_row, 0, "history is gone");
+        assert!(screen.content_seq() > seq);
+        // Typing continues where it was.
+        screen.feed(b"!\r\nnext");
+        assert_eq!(screen.lines(), ["$ echo abc", "defgh!", "next"]);
+    }
+
+    #[test]
+    fn clear_scrollback_at_the_top_still_drops_history() {
+        let mut screen = HeadlessScreen::new(10, 3);
+        screen.feed(b"a\r\nb\r\nc\r\nd\r\n\x1b[H\x1b[2J$ ");
+        assert!(screen.scrollback().visible_start_row > 0);
+        let seq = screen.content_seq();
+        assert!(screen.clear_scrollback());
+        assert_eq!(screen.scrollback().visible_start_row, 0);
+        assert_eq!(screen.lines(), ["$"]);
+        assert!(
+            screen.content_seq() > seq,
+            "a history-only change still publishes"
+        );
+    }
+
+    #[test]
+    fn clear_scrollback_leaves_the_alternate_screen_alone() {
+        let mut screen = HeadlessScreen::new(10, 3);
+        screen.feed(b"a\r\nb\r\nc\r\nd\r\n\x1b[?1049h\x1b[HTUI");
+        let seq = screen.content_seq();
+        assert!(!screen.clear_scrollback());
+        assert_eq!(screen.lines(), ["TUI"]);
+        assert_eq!(screen.content_seq(), seq);
+        screen.feed(b"\x1b[?1049l");
+        assert!(screen.scrollback().visible_start_row > 0, "history kept");
     }
 
     #[test]

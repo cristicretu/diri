@@ -145,6 +145,8 @@ actions!(
         PreviousPrompt,
         NextPrompt,
         CopyLastCommandOutput,
+        ClearScrollback,
+        ResetTerminal,
     ]
 );
 
@@ -250,6 +252,8 @@ pub enum CommandId {
     PreviousPrompt,
     NextPrompt,
     CopyLastCommandOutput,
+    ClearScrollback,
+    ResetTerminal,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1247,6 +1251,27 @@ pub const COMMANDS: &[CommandSpec] = &[
         "doc.on.doc",
         "terminal shell command output copy last osc 133"
     ),
+    // ⌘K is the palette here, so Clear takes the shifted chord.
+    spec!(
+        ClearScrollback,
+        "terminal-clear-scrollback",
+        Some("cmd-shift-k"),
+        Some("⇧⌘K"),
+        Some(TERMINAL_CONTEXT),
+        "command.clear_scrollback.palette_title",
+        "trash",
+        "terminal clear screen scrollback history wipe clean cls"
+    ),
+    spec!(
+        ResetTerminal,
+        "terminal-reset",
+        None,
+        None,
+        Some(TERMINAL_CONTEXT),
+        "command.reset_terminal.palette_title",
+        "arrow.counterclockwise",
+        "terminal reset garbled broken modes emulator stty sane"
+    ),
 ];
 
 pub fn command(id: CommandId) -> &'static CommandSpec {
@@ -1532,6 +1557,8 @@ impl CommandSpec {
             CommandId::CopyLastCommandOutput => {
                 KeyBinding::new(key, CopyLastCommandOutput, context)
             }
+            CommandId::ClearScrollback => KeyBinding::new(key, ClearScrollback, context),
+            CommandId::ResetTerminal => KeyBinding::new(key, ResetTerminal, context),
         }
     }
 }
@@ -2157,6 +2184,16 @@ impl CommandId {
                 description: t("command.copy_last_command_output.description"),
                 category: ShortcutCategory::Terminal,
             },
+            Self::ClearScrollback => ShortcutMetadata {
+                title: t("command.clear_scrollback.title"),
+                description: t("command.clear_scrollback.description"),
+                category: ShortcutCategory::Terminal,
+            },
+            Self::ResetTerminal => ShortcutMetadata {
+                title: t("command.reset_terminal.title"),
+                description: t("command.reset_terminal.description"),
+                category: ShortcutCategory::Terminal,
+            },
             Self::CopySelection => ShortcutMetadata {
                 title: t("command.copy_selection.title"),
                 description: t("command.copy_selection.description"),
@@ -2341,6 +2378,8 @@ impl CommandId {
             Self::PreviousPrompt => Box::new(PreviousPrompt),
             Self::NextPrompt => Box::new(NextPrompt),
             Self::CopyLastCommandOutput => Box::new(CopyLastCommandOutput),
+            Self::ClearScrollback => Box::new(ClearScrollback),
+            Self::ResetTerminal => Box::new(ResetTerminal),
         }
     }
 }
@@ -2614,6 +2653,19 @@ mod tests {
             command(CommandId::SelectNextSession).keystroke,
             Some("cmd-}")
         );
+    }
+
+    #[test]
+    fn clear_and_reset_are_terminal_commands_in_the_palette() {
+        let clear = command(CommandId::ClearScrollback);
+        // ⌘K stays the palette; Clear takes the shifted chord, terminal only.
+        assert_eq!(command(CommandId::ToggleCommandPalette).keystroke, Some("cmd-k"));
+        assert_eq!(clear.keystroke, Some("cmd-shift-k"));
+        assert_eq!(clear.context, Some(TERMINAL_CONTEXT));
+        let reset = command(CommandId::ResetTerminal);
+        assert_eq!(reset.keystroke, None, "reset is palette and menu only");
+        assert_eq!(reset.context, Some(TERMINAL_CONTEXT));
+        assert!(clear.palette.is_some() && reset.palette.is_some());
     }
 
     #[test]

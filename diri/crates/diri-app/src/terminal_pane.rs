@@ -5805,6 +5805,18 @@ impl TerminalPane {
                 },
             ))
             .on_action(
+                cx.listener(|this, _: &crate::commands::ClearScrollback, window, cx| {
+                    this.clear_scrollback(window, cx);
+                    cx.stop_propagation();
+                }),
+            )
+            .on_action(
+                cx.listener(|this, _: &crate::commands::ResetTerminal, window, cx| {
+                    this.reset_terminal(window, cx);
+                    cx.stop_propagation();
+                }),
+            )
+            .on_action(
                 cx.listener(|this, _: &crate::commands::NextPrompt, window, cx| {
                     this.read_terminal_history(Some(true), window, cx);
                     cx.stop_propagation();

@@ -50,6 +50,10 @@ impl Method {
     /// Resets the emulator (screens, history, modes, title) without touching
     /// the PTY or process. Acceptance means queued to the terminal owner.
     pub const SESSION_RESET_TERMINAL: &'static str = "session.reset_terminal";
+    /// Clear Screen and Scrollback for a local session (`SessionIdParams`).
+    /// Replies `{"sessionID", "cleared"}`; `cleared` is false while the
+    /// alternate screen shows. Remote sessions: `terminal_clear_unsupported`.
+    pub const SESSION_CLEAR_SCROLLBACK: &'static str = "session.clear_scrollback";
     /// Sets the palette local terminals answer color queries from
     /// ([`TerminalPalette`]). Engine-wide; the result is empty.
     pub const TERMINAL_SET_PALETTE: &'static str = "terminal.set_palette";

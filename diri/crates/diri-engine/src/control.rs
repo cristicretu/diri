@@ -102,6 +102,7 @@ const TERMINAL_ONLY_METHODS: &[&str] = &[
     Method::SESSION_READ_SCREEN,
     Method::SESSION_TERMINAL_TITLE,
     Method::SESSION_RESET_TERMINAL,
+    Method::SESSION_CLEAR_SCROLLBACK,
     Method::SESSION_CAPTURE_FIND,
     Method::SESSION_READ_SCROLLBACK,
     Method::SESSION_READ_SCROLLBACK_CELLS,
@@ -1286,6 +1287,7 @@ impl ControlServer {
             Method::SESSION_READ_SCREEN => self.session_read_screen(params),
             Method::SESSION_TERMINAL_TITLE => self.session_terminal_title(params),
             Method::SESSION_RESET_TERMINAL => self.session_reset_terminal(params),
+            Method::SESSION_CLEAR_SCROLLBACK => self.session_clear_scrollback(params),
             Method::SESSION_CAPTURE_FIND => self.session_capture_find(params),
             Method::SESSION_READ_SCROLLBACK => self.session_read_scrollback(params),
             Method::SESSION_READ_SCROLLBACK_CELLS => self.session_read_scrollback_cells(params),
@@ -3281,6 +3283,33 @@ impl ControlServer {
             ControlError::new(code, error.to_string())
         })?;
         Ok(json!({ "sessionID": p.session_id.0 }))
+    }
+
+    fn session_clear_scrollback(
+        &self,
+        params: Option<JsonValue>,
+    ) -> Result<JsonValue, ControlError> {
+        let p: diri_proto::SessionIdParams = decode(params)?;
+        let registry = self.registry.lock().map_err(poisoned)?;
+        let Some(session) = registry.get(&p.session_id.0) else {
+            return if registry.record(&p.session_id.0).is_some() {
+                Err(ControlError::new(
+                    "terminal_clear_unavailable",
+                    "the session has no live terminal to clear",
+                ))
+            } else {
+                Err(ControlError::not_found(p.session_id.0.clone()))
+            };
+        };
+        let cleared = session.clear_scrollback().map_err(|error| {
+            let code = match error.kind() {
+                std::io::ErrorKind::Unsupported => "terminal_clear_unsupported",
+                std::io::ErrorKind::NotConnected => "terminal_clear_unavailable",
+                _ => "terminal_clear_failed",
+            };
+            ControlError::new(code, error.to_string())
+        })?;
+        Ok(json!({ "sessionID": p.session_id.0, "cleared": cleared }))
     }
 
     fn session_capture_find(&self, params: Option<JsonValue>) -> Result<JsonValue, ControlError> {

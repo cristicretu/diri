@@ -203,6 +203,9 @@ pub(crate) fn refresh_app_menus(cx: &mut App) {
         Menu::new(t("menu.edit")).items([
             MenuItem::os_action(t("menu.copy"), CopySelection, OsAction::Copy),
             MenuItem::os_action(t("menu.paste"), Paste, OsAction::Paste),
+            MenuItem::separator(),
+            MenuItem::action(t("menu.clear_scrollback"), commands::ClearScrollback),
+            MenuItem::action(t("menu.reset_terminal"), commands::ResetTerminal),
         ]),
         Menu::new(t("menu.window")).items([
             MenuItem::action(t("menu.close_session"), CloseSession),
@@ -226,6 +229,9 @@ pub(crate) fn refresh_app_menus(cx: &mut App) {
         Menu::new(t("menu.edit")).items([
             MenuItem::os_action(t("menu.copy"), CopySelection, OsAction::Copy),
             MenuItem::os_action(t("menu.paste"), Paste, OsAction::Paste),
+            MenuItem::separator(),
+            MenuItem::action(t("menu.clear_scrollback"), commands::ClearScrollback),
+            MenuItem::action(t("menu.reset_terminal"), commands::ResetTerminal),
         ]),
         Menu::new(t("menu.window")).items([
             MenuItem::action(t("menu.close_session"), CloseSession),
