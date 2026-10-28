@@ -45,6 +45,53 @@ pub struct AccountLimits {
     pub signing_in: bool,
 }
 
+/// A conservative footer summary of the currently selected local logins.
+#[derive(Debug, PartialEq)]
+pub(crate) struct FooterQuota<'a> {
+    pub remaining_percent: f64,
+    pub provider: &'a str,
+    pub account: &'a str,
+    pub window: &'a str,
+}
+
+/// Unknown data on any current login makes the aggregate unknown. In
+/// particular, an elapsed reset is not evidence of a fresh, empty window.
+/// This only reads the last menu-triggered snapshot; it never fetches tokens.
+pub(crate) fn footer_quota(limits: &[AccountLimits], now: i64) -> Option<FooterQuota<'_>> {
+    let mut tightest: Option<FooterQuota<'_>> = None;
+    for account in limits.iter().filter(|account| account.live) {
+        if account.signing_in
+            || account.error.is_some()
+            || account.checked_at <= 0
+            || now.saturating_sub(account.checked_at) > 360
+            || account.windows.is_empty()
+        {
+            return None;
+        }
+        for window in &account.windows {
+            if window.resets_at.is_some_and(|reset| reset <= now)
+                || !window.used_percent.is_finite()
+                || window.used_percent < 0.0
+            {
+                return None;
+            }
+            let remaining_percent = (100.0 - window.used_percent).max(0.0);
+            if tightest
+                .as_ref()
+                .is_none_or(|quota| remaining_percent < quota.remaining_percent)
+            {
+                tightest = Some(FooterQuota {
+                    remaining_percent,
+                    provider: account.provider,
+                    account: &account.account,
+                    window: &window.label,
+                });
+            }
+        }
+    }
+    tightest
+}
+
 /// How many percentage points more room another account needs before it is
 /// pointed out: a slightly emptier one is not worth a switch.
 pub(crate) const ROOM_MARGIN: f64 = 20.0;
@@ -972,6 +1019,64 @@ mod tests {
             error: None,
             signing_in: false,
         }
+    }
+
+    #[test]
+    fn footer_quota_uses_the_tightest_window_of_current_logins_only() {
+        let now = 1_000;
+        let mut claude = limits(Some("work"), "Claude", true, 30.0);
+        claude.checked_at = now;
+        claude.windows.push(LimitWindow {
+            label: "Weekly".into(),
+            used_percent: 85.0,
+            resets_at: Some(3_000),
+        });
+        let mut codex = limits(None, "Codex", true, 60.0);
+        codex.checked_at = now;
+        let saved = limits(Some("idle"), "Claude", false, 100.0);
+        let all = [claude, codex, saved];
+        let quota = footer_quota(&all, now).unwrap();
+        assert_eq!(quota.remaining_percent, 15.0);
+        assert_eq!(quota.provider, "Claude");
+        assert_eq!(quota.account, "work");
+        assert_eq!(quota.window, "Weekly");
+        assert_eq!(footer_quota(&[], now), None);
+        assert_eq!(footer_quota(&all[2..], now), None);
+    }
+
+    #[test]
+    fn footer_quota_is_unknown_if_any_current_login_has_unknown_data() {
+        let now = 1_000;
+        let mut good = limits(None, "Claude", true, 20.0);
+        good.checked_at = now;
+        let mut other = limits(None, "Codex", true, 90.0);
+        other.checked_at = now - 360;
+        assert_eq!(
+            footer_quota(&[good.clone(), other.clone()], now)
+                .unwrap()
+                .remaining_percent,
+            10.0
+        );
+        let original = other.clone();
+        for case in 0..7 {
+            other = original.clone();
+            match case {
+                0 => other.checked_at -= 1,
+                1 => other.error = Some("Unavailable"),
+                2 => other.windows.clear(),
+                3 => other.windows[0].resets_at = Some(now),
+                4 => other.signing_in = true,
+                5 => other.windows[0].used_percent = f64::NAN,
+                _ => other.windows[0].used_percent = -1.0,
+            }
+            assert_eq!(
+                footer_quota(&[good.clone(), other], now),
+                None,
+                "case {case}"
+            );
+        }
+        good.windows[0].used_percent = 105.0;
+        assert_eq!(footer_quota(&[good], now).unwrap().remaining_percent, 0.0);
     }
 
     #[test]

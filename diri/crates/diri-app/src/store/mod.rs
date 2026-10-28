@@ -42,7 +42,7 @@ use crate::switcher::{
 
 pub use prefs::{
     AttentionRoute, AttentionRoutes, CursorBlinkPref, CursorShapePref, DictationShortcut, DockBadge, FileEditor, InspectorTab, InterfaceStyle, NewAgentStart, OptionAsMeta, PaneDensity, Prefs,
-    SavedWindow, SidebarGrouping, SidebarOrdering, TabOrientation, TalkAnswer, UiLanguage,
+    SavedWindow, SidebarGrouping, SidebarOrdering, SidebarUsageIndicator, TabOrientation, TalkAnswer, UiLanguage,
     WindowMaterial, WindowMode, WindowPlacement,
 };
 pub use projection::{SidebarProject, SidebarProjection, SidebarRow};
