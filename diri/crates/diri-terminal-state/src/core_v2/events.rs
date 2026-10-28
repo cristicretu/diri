@@ -346,9 +346,8 @@ impl Core {
                 NamedPrivateMode::SyncUpdate => ModeState::Reset,
                 NamedPrivateMode::GraphemeClustering => on(TermMode::GRAPHEME_CLUSTERING),
                 NamedPrivateMode::ColumnMode => ModeState::NotSupported,
-                NamedPrivateMode::LeftRightMargins | NamedPrivateMode::SgrPixelMouse => {
-                    ModeState::PermanentlyReset
-                }
+                NamedPrivateMode::LeftRightMargins => ModeState::PermanentlyReset,
+                NamedPrivateMode::SgrPixelMouse => on(TermMode::SGR_PIXEL_MOUSE),
                 NamedPrivateMode::ColorSchemeUpdates => on(TermMode::COLOR_SCHEME_UPDATES),
                 NamedPrivateMode::InBandResize => on(TermMode::IN_BAND_RESIZE),
             },

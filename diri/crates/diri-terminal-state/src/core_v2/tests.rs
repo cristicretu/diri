@@ -369,6 +369,9 @@ fn random_sequences_match_the_current_core() {
         "\x1b[?1000h",
         "\x1b[?1006h",
         "\x1b[3g",
+        "\x1b[?1016h",
+        "\x1b[?1005h",
+        "\x1b[?1016l",
         "🇷🇴",
         "\u{1F3FB}",
         "\x1b[1;1H\x1b[2J",
@@ -522,7 +525,7 @@ fn events_titles_colors_replies_keyboard_and_cursor_style() {
                   \x1b]52;c;aGVsbG8=\x07\x1b]52;p;?\x07\x1b]52;x;Zg==\x07\
                   \x1b[c\x1b[>c\x1b[5n\x1b[3;4H\x1b[6n\x1b[?6n\x1b[?996n\x1b[14t\x1b[16t\x1b[18t\x1b[19t\x1b[>q\
                   \x1bP+q544E;436F;626164\x1b\\\x1b[1;31;48;5;20;58:2::1:2:3m\x1bP$qm\x1b\\\x1b[2;5r\x1bP$qr\x1b\\\
-                  \x1b[5 q\x1bP$q q\x1b\\\x1b[?12l\x1b[?12$p\x1b[?1049$p\x1b[4$p\x1b[99$p\x1b[?7$p\x1b[?69$p\
+                  \x1b[5 q\x1bP$q q\x1b\\\x1b[?12l\x1b[?12$p\x1b[?1016h\x1b[?1016$p\x1b[?1006h\x1b[?1016$p\x1b[?1049$p\x1b[4$p\x1b[99$p\x1b[?7$p\x1b[?69$p\
                   \x1b[>1u\x1b[>5u\x1b[?u\x1b[=3;2u\x1b[?u\x1b[<u\x1b[?u\x1b[?1049h\x1b[>2u\x1b[?u\x1b[?1049l\x1b[?u\
                   \x07\x1b[?1000h\x1b[?1000l\x1b[?2048h\x1b[?12h\x1b[!p\x1b]0;again\x07\x1b]4;2;rgb:01/02/03\x07\x1bc";
     let config = Config {
