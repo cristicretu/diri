@@ -146,6 +146,7 @@ actions!(
         EnterCopyMode,
         FindSelection,
         InsertPath,
+        GoToDirectory,
         ExportScrollback,
         PreviousPrompt,
         NextPrompt,
@@ -258,6 +259,7 @@ pub enum CommandId {
     EnterCopyMode,
     FindSelection,
     InsertPath,
+    GoToDirectory,
     ExportScrollback,
     PreviousPrompt,
     NextPrompt,
@@ -1272,6 +1274,16 @@ pub const COMMANDS: &[CommandSpec] = &[
         "insert path file picker fuzzy terminal"
     ),
     spec!(
+        GoToDirectory,
+        "terminal-go-to-directory",
+        Some("cmd-alt-e"),
+        Some("⌥⌘E"),
+        Some(TERMINAL_CONTEXT),
+        "command.go_to_directory.palette_title",
+        "folder",
+        "go to directory cd change folder recent jump shell"
+    ),
+    spec!(
         ExportScrollback,
         "terminal-export",
         Some("cmd-shift-e"),
@@ -1616,6 +1628,7 @@ impl CommandSpec {
             CommandId::EnterCopyMode => KeyBinding::new(key, EnterCopyMode, context),
             CommandId::FindSelection => KeyBinding::new(key, FindSelection, context),
             CommandId::InsertPath => KeyBinding::new(key, InsertPath, context),
+            CommandId::GoToDirectory => KeyBinding::new(key, GoToDirectory, context),
             CommandId::ExportScrollback => KeyBinding::new(key, ExportScrollback, context),
             CommandId::PreviousPrompt => KeyBinding::new(key, PreviousPrompt, context),
             CommandId::NextPrompt => KeyBinding::new(key, NextPrompt, context),
@@ -1833,6 +1846,118 @@ pub fn shortcut_conflict(
                     })
                 })
     })
+}
+
+/// The keymap a person sees is two layers: the shipped defaults in
+/// [`COMMANDS`], then the shortcuts they recorded ([`ShortcutOverrides`],
+/// persisted in preferences). An entry is `Some(key)` to rebind, `None` to
+/// unbind; no entry means the default. These edits are the only way either
+/// recorder (the palette's and Settings') changes that top layer, so both
+/// resolve a clash the same way.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ShortcutResolution {
+    /// Take the key; the command holding it keeps whatever else it has.
+    Replace,
+    /// Take the key and give the holder this command's previous shortcut.
+    Swap,
+}
+
+/// A recorded key another command already performs.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ShortcutClash {
+    pub binding: String,
+    pub holder: CommandId,
+    /// The global show-Diri hotkey is registered with the system by its
+    /// physical key, so only its own Settings row may move it.
+    pub can_replace: bool,
+    /// Only when this command had a shortcut to hand over.
+    pub can_swap: bool,
+}
+
+fn same_keystroke(a: &str, b: &str) -> bool {
+    match (Keystroke::parse(a), Keystroke::parse(b)) {
+        (Ok(a), Ok(b)) => a.modifiers == b.modifiers && a.key == b.key,
+        _ => false,
+    }
+}
+
+/// Binds `binding` to `id` in the user layer. Without a `resolution` a clash
+/// is returned for the caller to show; with one it is resolved.
+pub fn assign_shortcut(
+    overrides: &ShortcutOverrides,
+    id: CommandId,
+    binding: &str,
+    resolution: Option<ShortcutResolution>,
+) -> Result<ShortcutOverrides, ShortcutClash> {
+    let previous = command(id).effective_keystrokes(overrides);
+    let mut next = overrides.clone();
+    if let Some(holder) = shortcut_conflict(id, binding, overrides) {
+        let clash = ShortcutClash {
+            binding: binding.to_owned(),
+            holder: holder.id,
+            can_replace: holder.id != CommandId::ShowApp,
+            can_swap: holder.id != CommandId::ShowApp
+                && id != CommandId::ShowApp
+                && !previous.is_empty(),
+        };
+        let handed_over = match resolution {
+            Some(ShortcutResolution::Replace) if clash.can_replace => holder
+                .effective_keystrokes(overrides)
+                .into_iter()
+                .find(|key| !same_keystroke(key, binding)),
+            Some(ShortcutResolution::Swap) if clash.can_swap => previous.first().cloned(),
+            _ => return Err(clash),
+        };
+        next.insert(holder.stable_id.to_owned(), handed_over);
+    }
+    next.insert(command(id).stable_id.to_owned(), Some(binding.to_owned()));
+    Ok(without_default_entries(next))
+}
+
+/// Unbinds `id`: it keeps its row everywhere but performs on no key.
+pub fn unassign_shortcut(overrides: &ShortcutOverrides, id: CommandId) -> ShortcutOverrides {
+    let mut next = overrides.clone();
+    next.insert(command(id).stable_id.to_owned(), None);
+    without_default_entries(next)
+}
+
+/// Drops `id`'s recorded shortcut so the default shows through again. A
+/// default another command has since taken stays with that command, so a
+/// reset never makes one key perform two actions.
+pub fn reset_shortcut(overrides: &ShortcutOverrides, id: CommandId) -> ShortcutOverrides {
+    let spec = command(id);
+    let mut next = overrides.clone();
+    next.remove(spec.stable_id);
+    let defaults = spec.effective_keystrokes(&next);
+    let free: Vec<String> = defaults
+        .iter()
+        .filter(|key| shortcut_conflict(id, key, &next).is_none())
+        .cloned()
+        .collect();
+    if free.len() != defaults.len() {
+        next.insert(spec.stable_id.to_owned(), free.into_iter().next());
+    }
+    without_default_entries(next)
+}
+
+/// An entry that restates what the defaults already do is not a change.
+/// Dropping it keeps "Reset all (n)" honest and lets a swap made twice read
+/// as unmodified again.
+fn without_default_entries(mut overrides: ShortcutOverrides) -> ShortcutOverrides {
+    let ids: Vec<String> = overrides.keys().cloned().collect();
+    for id in ids {
+        if !COMMANDS.iter().any(|spec| spec.stable_id == id) {
+            continue;
+        }
+        let mut without = overrides.clone();
+        without.remove(&id);
+        if COMMANDS.iter().all(|spec| {
+            spec.effective_keystrokes(&without) == spec.effective_keystrokes(&overrides)
+        }) {
+            overrides = without;
+        }
+    }
+    overrides
 }
 
 impl CommandId {
@@ -2249,6 +2374,11 @@ impl CommandId {
                 description: t("command.insert_path.description"),
                 category: ShortcutCategory::Terminal,
             },
+            Self::GoToDirectory => ShortcutMetadata {
+                title: t("command.go_to_directory.title"),
+                description: t("command.go_to_directory.description"),
+                category: ShortcutCategory::Terminal,
+            },
             Self::ExportScrollback => ShortcutMetadata {
                 title: t("command.export_scrollback.title"),
                 description: t("command.export_scrollback.description"),
@@ -2469,6 +2599,7 @@ impl CommandId {
             Self::EnterCopyMode => Box::new(EnterCopyMode),
             Self::FindSelection => Box::new(FindSelection),
             Self::InsertPath => Box::new(InsertPath),
+            Self::GoToDirectory => Box::new(GoToDirectory),
             Self::ExportScrollback => Box::new(ExportScrollback),
             Self::PreviousPrompt => Box::new(PreviousPrompt),
             Self::NextPrompt => Box::new(NextPrompt),
@@ -2576,6 +2707,169 @@ mod tests {
                 .effective_keystrokes(&overrides)
                 .is_empty()
         );
+    }
+
+    #[test]
+    fn recorded_shortcuts_layer_over_defaults_and_reset_back_to_them() {
+        let defaults = ShortcutOverrides::new();
+        let sidebar = command(CommandId::ToggleSidebar);
+        assert_eq!(sidebar.effective_keystrokes(&defaults), vec![test_chords("cmd-b")]);
+
+        let rebound = assign_shortcut(
+            &defaults,
+            CommandId::ToggleSidebar,
+            &test_chords("cmd-alt-y"),
+            None,
+        )
+        .unwrap();
+        assert_eq!(rebound.len(), 1);
+        assert_eq!(sidebar.effective_keystrokes(&rebound), vec![test_chords("cmd-alt-y")]);
+        assert!(sidebar.is_overridden(&rebound));
+
+        let unbound = unassign_shortcut(&rebound, CommandId::ToggleSidebar);
+        assert!(sidebar.effective_keystrokes(&unbound).is_empty());
+        assert_eq!(sidebar.shortcut_label_for(&unbound), None);
+
+        let reset = reset_shortcut(&unbound, CommandId::ToggleSidebar);
+        assert!(reset.is_empty(), "a reset leaves no user entry behind");
+        assert_eq!(sidebar.effective_keystrokes(&reset), vec![test_chords("cmd-b")]);
+
+        // Recording the default itself is not a change either.
+        assert!(
+            assign_shortcut(&rebound, CommandId::ToggleSidebar, &test_chords("cmd-b"), None)
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn a_clash_names_the_holder_and_saves_nothing_until_resolved() {
+        let defaults = ShortcutOverrides::new();
+        let clash = assign_shortcut(
+            &defaults,
+            CommandId::ToggleSidebar,
+            &test_chords("cmd-n"),
+            None,
+        )
+        .unwrap_err();
+        assert_eq!(clash.holder, CommandId::OpenLauncher);
+        assert_eq!(clash.binding, test_chords("cmd-n"));
+        assert!(clash.can_replace && clash.can_swap);
+
+        // An unbound command has nothing to hand over, so it cannot swap.
+        let unbound = unassign_shortcut(&defaults, CommandId::ToggleSidebar);
+        let clash = assign_shortcut(
+            &unbound,
+            CommandId::ToggleSidebar,
+            &test_chords("cmd-n"),
+            Some(ShortcutResolution::Swap),
+        )
+        .unwrap_err();
+        assert!(clash.can_replace && !clash.can_swap);
+    }
+
+    #[test]
+    fn replace_takes_the_key_and_leaves_the_holder_unbound() {
+        let replaced = assign_shortcut(
+            &ShortcutOverrides::new(),
+            CommandId::ToggleSidebar,
+            &test_chords("cmd-n"),
+            Some(ShortcutResolution::Replace),
+        )
+        .unwrap();
+        assert_eq!(
+            command(CommandId::ToggleSidebar).effective_keystrokes(&replaced),
+            vec![test_chords("cmd-n")]
+        );
+        assert!(
+            command(CommandId::OpenLauncher)
+                .effective_keystrokes(&replaced)
+                .is_empty()
+        );
+        assert!(shortcut_conflict(CommandId::ToggleSidebar, &test_chords("cmd-n"), &replaced).is_none());
+    }
+
+    #[test]
+    fn replace_leaves_the_holder_its_other_keys() {
+        let replaced = assign_shortcut(
+            &ShortcutOverrides::new(),
+            CommandId::ToggleSidebar,
+            &platform_keystroke(CommandId::ZoomIn, "cmd-+").unwrap(),
+            Some(ShortcutResolution::Replace),
+        )
+        .unwrap();
+        let zoom = command(CommandId::ZoomIn).effective_keystrokes(&replaced);
+        assert_eq!(zoom.len(), 1);
+        assert!(same_keystroke(&zoom[0], &platform_keystroke(CommandId::ZoomIn, "cmd-=").unwrap()));
+    }
+
+    #[test]
+    fn swap_trades_keys_and_swapping_back_restores_the_defaults() {
+        let swapped = assign_shortcut(
+            &ShortcutOverrides::new(),
+            CommandId::ToggleSidebar,
+            &test_chords("cmd-n"),
+            Some(ShortcutResolution::Swap),
+        )
+        .unwrap();
+        assert_eq!(
+            command(CommandId::ToggleSidebar).effective_keystrokes(&swapped),
+            vec![test_chords("cmd-n")]
+        );
+        assert_eq!(
+            command(CommandId::OpenLauncher).effective_keystrokes(&swapped),
+            vec![test_chords("cmd-b")]
+        );
+        let back = assign_shortcut(
+            &swapped,
+            CommandId::ToggleSidebar,
+            &test_chords("cmd-b"),
+            Some(ShortcutResolution::Swap),
+        )
+        .unwrap();
+        assert!(back.is_empty(), "{back:?}");
+    }
+
+    #[test]
+    fn a_reset_never_takes_a_default_back_from_its_new_owner() {
+        // Sidebar's ⌘B went to New Session; resetting Sidebar must not make
+        // ⌘B perform both.
+        let taken = assign_shortcut(
+            &ShortcutOverrides::new(),
+            CommandId::OpenLauncher,
+            &test_chords("cmd-b"),
+            Some(ShortcutResolution::Replace),
+        )
+        .unwrap();
+        let reset = reset_shortcut(&taken, CommandId::ToggleSidebar);
+        assert!(
+            command(CommandId::ToggleSidebar)
+                .effective_keystrokes(&reset)
+                .is_empty()
+        );
+        assert_eq!(
+            command(CommandId::OpenLauncher).effective_keystrokes(&reset),
+            vec![test_chords("cmd-b")]
+        );
+        // Once the owner gives it up, the reset gets it back.
+        let released = reset_shortcut(&reset, CommandId::OpenLauncher);
+        let reset = reset_shortcut(&released, CommandId::ToggleSidebar);
+        assert!(reset.is_empty(), "{reset:?}");
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn the_global_hotkey_is_never_taken_from_outside_its_settings_row() {
+        let overrides = ShortcutOverrides::from([("show-app".into(), Some("cmd-alt-space".into()))]);
+        let clash = assign_shortcut(
+            &overrides,
+            CommandId::ToggleSidebar,
+            "cmd-alt-space",
+            Some(ShortcutResolution::Replace),
+        )
+        .unwrap_err();
+        assert_eq!(clash.holder, CommandId::ShowApp);
+        assert!(!clash.can_replace && !clash.can_swap);
     }
 
     #[test]

@@ -3075,9 +3075,10 @@ impl Session {
         if bytes.is_empty() {
             return Ok(());
         }
-        // Raw: a wheel is not a keystroke, and must not look like user typing
-        // to the status reducer.
-        self.write_raw(&bytes)
+        // A wheel is not a keystroke and must not look like user typing to
+        // the status reducer, but the program's redraw in answer to it is
+        // interactive output: publish it at once like a click's.
+        self.write_mouse(&bytes)
     }
 
     pub fn read_scrollback(&self) -> diri_proto::ReadScrollbackResult {
@@ -3822,6 +3823,8 @@ fn new_shared(
         prompt_input: Mutex::new(PromptInputState::default()),
         log: Mutex::new(log),
         screen: Mutex::new({
+            // The pump feeds every Holder frame (about a kilobyte while output
+            // streams) and releases streaming memory once it settles.
             let (cols, rows) = (spec.pty.cols as usize, spec.pty.rows as usize);
             // Only a local session's own emulator feeds the client grid; a
             // remote session's grid, image anchors and pixels come from its
@@ -3835,11 +3838,14 @@ fn new_shared(
                 let mut screen = HeadlessScreen::new_with_keyboard_enhancements(cols, rows)
                     .with_notifications()
                     .with_inline_images()
-                    .with_host_replies(TERMINAL_VERSION);
+                    .with_host_replies(TERMINAL_VERSION)
+                    .keeping_spare_rows_until_idle();
                 screen.set_palette(terminal_palette());
                 screen
             } else {
-                HeadlessScreen::new(cols, rows).with_notifications()
+                HeadlessScreen::new(cols, rows)
+                    .with_notifications()
+                    .keeping_spare_rows_until_idle()
             }
         }),
         cell_pixels: spec
@@ -6797,6 +6803,7 @@ fn held_turn(state: Box<HeldPump>, mut resumed: bool, may_park: bool) -> HeldTur
                 replaying = false;
                 // The replay tail is drained: checkpoint immediately, as the
                 // Swift daemon does right after `replayExistingLog`.
+                shared.screen.lock().expect("screen").release_idle_memory();
                 if checkpoint_dirty_at.take().is_some() {
                     persist_checkpoint(
                         &shared,
@@ -6810,6 +6817,9 @@ fn held_turn(state: Box<HeldPump>, mut resumed: bool, may_park: bool) -> HeldTur
                 last.elapsed() >= CHECKPOINT_SETTLE || first.elapsed() >= CHECKPOINT_MAX_STALENESS
             }) {
                 checkpoint_dirty_at = None;
+                // Output has been quiet for a second (or keeps streaming past
+                // the staleness bound, when the rows are reused at once).
+                shared.screen.lock().expect("screen").release_idle_memory();
                 persist_checkpoint(
                     &shared,
                     &checkpoint_path,

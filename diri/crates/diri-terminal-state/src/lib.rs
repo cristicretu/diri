@@ -552,6 +552,10 @@ pub struct HeadlessScreen {
     /// Whether the title moved since the last settle, tracked where it is
     /// assigned so no per-chunk clone is needed to notice.
     title_changed: bool,
+    /// Keep the rows history recycles for new lines from one read to the
+    /// next, until [`HeadlessScreen::release_idle_memory`]; see
+    /// [`HeadlessScreen::keeping_spare_rows_until_idle`].
+    keep_spare_rows: bool,
     /// The DECSCUSR cursor at the last settle. A program that only changes
     /// its cursor (neovim entering insert mode) must still advance
     /// `content_seq`, or the attach pump withholds the frame.
@@ -637,6 +641,7 @@ impl HeadlessScreen {
             palette: None,
             unsolicited: Vec::new(),
             title_changed: false,
+            keep_spare_rows: false,
             cursor_style: CursorStyle::default(),
             colors_generation: 0,
             last_cells: Vec::new(),
@@ -652,6 +657,27 @@ impl HeadlessScreen {
     pub fn with_notifications(mut self) -> Self {
         self.notifications = Some(Default::default());
         self
+    }
+
+    /// Keeps the rows that history recycles for new lines from one feed to
+    /// the next, for an owner that feeds every small read and calls
+    /// [`HeadlessScreen::release_idle_memory`] once output goes quiet.
+    ///
+    /// History seals rows into compressed blocks and reuses their cells for
+    /// the next lines. By default those spare rows are dropped after every
+    /// feed, so an idle terminal holds none; output arriving a kilobyte at a
+    /// time then allocates and clears a fresh row for most lines. Kept, they
+    /// cost at most one block of rows (128 KiB of cells) while output streams.
+    pub fn keeping_spare_rows_until_idle(mut self) -> Self {
+        self.keep_spare_rows = true;
+        self
+    }
+
+    /// Releases memory only streaming output needs (the spare rows kept by
+    /// [`HeadlessScreen::keeping_spare_rows_until_idle`]).
+    pub fn release_idle_memory(&mut self) {
+        #[cfg(feature = "compact-history")]
+        self.term.release_primary_history_spare_rows();
     }
 
     /// Opt in only where this screen is the terminal the program talks to
@@ -726,6 +752,7 @@ impl HeadlessScreen {
             reset.set_cell_pixels(cell_pixels.0, cell_pixels.1);
         }
         reset.image_replies_only = self.image_replies_only;
+        reset.keep_spare_rows = self.keep_spare_rows;
         if self.host_replies {
             let version = self
                 .term
@@ -869,12 +896,20 @@ impl HeadlessScreen {
     /// Parses all terminal bytes while excluding a replay prefix from product
     /// notifications. A partial historical OSC cannot leak into live output.
     pub fn feed_with_history(&mut self, bytes: &[u8], historical_bytes: usize) {
-        self.scan_progress(bytes);
+        // Colors and cursor moves are nearly every escape in bulk output. When
+        // they are the only ones, no side scanner below can find anything, so
+        // they are skipped instead of each looking at every escape.
+        let csi_only = only_csi_escapes(bytes);
+        if !(csi_only && self.progress_carry.is_empty()) {
+            self.scan_progress(bytes);
+        }
         if let Some(parser) = &mut self.notifications {
             if historical_bytes != 0 {
                 parser.reset_sequence();
             }
-            parser.feed(&bytes[historical_bytes.min(bytes.len())..]);
+            if !(csi_only && parser.is_idle()) {
+                parser.feed(&bytes[historical_bytes.min(bytes.len())..]);
+            }
             // An `OSC 7501` support query is answered ahead of the emulator's
             // replies for the same chunk. Programs detect support by sending
             // the query and then a device-attributes request, and read an
@@ -885,7 +920,7 @@ impl HeadlessScreen {
                 self.replies.append(&mut parser.replies);
             }
         }
-        self.advance_with_images(bytes, historical_bytes);
+        self.advance_with_images(bytes, historical_bytes, csi_only);
         self.settle();
     }
 
@@ -947,6 +982,8 @@ impl HeadlessScreen {
     fn settle(&mut self) {
         #[cfg(feature = "compact-history")]
         {
+            self.term
+                .keep_primary_history_spare_rows(self.keep_spare_rows);
             self.term
                 .bound_primary_history_storage(HISTORY_STORAGE_BUDGET_BYTES);
             // A limit a resize raised follows history back down (widening,
@@ -2361,8 +2398,11 @@ impl HeadlessScreen {
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let grid = self.term.grid();
         let source = &grid[Line(row as i32)];
-        let cells = &source[..];
-        let cells = &cells[..self.geometry.cols.min(cells.len())];
+        let width = self.geometry.cols.min(source.len());
+        // Default cells after the content add only their count, so a short
+        // line in a wide row hashes its text, not the blank rest of the row.
+        let content = source.content_len(Cell::is_default).min(width);
+        let cells = &source[..][..content];
         let mut state = RowHashState::default();
         let mut lanes = [
             0xcbf2_9ce4_8422_2325u64,
@@ -2388,7 +2428,7 @@ impl HeadlessScreen {
         for (offset, cell) in remainder.iter().enumerate() {
             lanes[offset] = fold_mix(lanes[offset], state.word(column + offset, cell));
         }
-        let mut digest = fold_mix(state.marks, cells.len() as u64);
+        let mut digest = fold_mix(state.marks, (width as u64) << 32 | content as u64);
         for lane in lanes {
             digest = fold_mix(digest, lane);
         }
@@ -2711,10 +2751,13 @@ struct RowHashState {
     /// Links and zero-width marks are rare; they fold into their own lane.
     marks: u64,
     previous_link: Option<alacritty_terminal::term::cell::Hyperlink>,
-    /// The wire style is derived only when the raw style changes, which
-    /// consecutive cells rarely do.
+    /// The wire style is derived only for a raw style not seen in the last
+    /// two: consecutive cells rarely change it, and a run of wide characters
+    /// alternates between the character's style and its spacer's.
     raw_style: u128,
     style_hash: u64,
+    other_raw_style: u128,
+    other_style_hash: u64,
 }
 
 impl Default for RowHashState {
@@ -2725,6 +2768,8 @@ impl Default for RowHashState {
             previous_link: None,
             raw_style: u128::MAX,
             style_hash: 0,
+            other_raw_style: u128::MAX,
+            other_style_hash: 0,
         }
     }
 }
@@ -2740,8 +2785,12 @@ impl RowHashState {
         }
         let raw = raw_style_key(cell);
         if raw != self.raw_style {
-            self.raw_style = raw;
-            self.style_hash = style_word(cell.flags, cell.fg, cell.bg);
+            std::mem::swap(&mut self.raw_style, &mut self.other_raw_style);
+            std::mem::swap(&mut self.style_hash, &mut self.other_style_hash);
+            if raw != self.raw_style {
+                self.raw_style = raw;
+                self.style_hash = style_word(cell.flags, cell.fg, cell.bg);
+            }
         }
         let character = cell.c;
         self.filled += usize::from(character != ' ' && character != '\0');
@@ -2942,6 +2991,37 @@ fn append_color(color: TermColor, foreground: bool, codes: &mut Vec<String>) {
     }
 }
 
+/// Whether every ESC in `bytes` introduces a CSI (`ESC [`), and the last
+/// byte is not an ESC whose next byte is still to come.
+///
+/// Eight bytes are tested at a time, each against its successor: a byte is
+/// an ESC not followed by `[` exactly where the masks below disagree.
+fn only_csi_escapes(bytes: &[u8]) -> bool {
+    const ONES: u64 = 0x0101_0101_0101_0101;
+    const LOW: u64 = 0x7f7f_7f7f_7f7f_7f7f;
+    // The high bit of each byte of `word` that equals `byte`.
+    let equal = |word: u64, byte: u8| {
+        let t = word ^ (ONES * u64::from(byte));
+        !(((t & LOW).wrapping_add(LOW)) | t | LOW)
+    };
+    let mut at = 0;
+    while at + 9 <= bytes.len() {
+        let word = u64::from_le_bytes(bytes[at..at + 8].try_into().expect("eight bytes"));
+        let next = u64::from_le_bytes(bytes[at + 1..at + 9].try_into().expect("eight bytes"));
+        if equal(word, 0x1b) & !equal(next, b'[') != 0 {
+            return false;
+        }
+        at += 8;
+    }
+    while at < bytes.len() {
+        if bytes[at] == 0x1b && bytes.get(at + 1) != Some(&b'[') {
+            return false;
+        }
+        at += 1;
+    }
+    true
+}
+
 fn find(haystack: &[u8], needle: &[u8]) -> Option<usize> {
     if needle.is_empty() {
         return None;
@@ -3057,6 +3137,83 @@ fn emulator_color(color: TermColor) -> Color {
 #[cfg(test)]
 mod tests {
     #[test]
+    fn only_csi_escapes_matches_a_bytewise_check() {
+        let mut seed = 0x9e37_79b9_7f4a_7c15u64;
+        for _ in 0..20_000 {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            let length = (seed % 40) as usize;
+            let bytes: Vec<u8> = (0..length)
+                .map(|index| b"\x1b\x1b[[]_a\x9b"[(seed >> (index % 56)) as usize % 8])
+                .collect();
+            let expected = bytes
+                .iter()
+                .enumerate()
+                .all(|(index, &byte)| byte != 0x1b || bytes.get(index + 1) == Some(&b'['));
+            assert_eq!(super::only_csi_escapes(&bytes), expected, "{bytes:?}");
+        }
+    }
+
+    /// Chunks of colored output skip the progress, notification and image
+    /// scanners. Wherever the chunk boundaries fall, what they find must not
+    /// change.
+    #[test]
+    fn side_scanners_find_the_same_reports_however_output_is_split() {
+        let pieces: &[&[u8]] = &[
+            b"\x1b[31mred\x1b[0m ",
+            b"plain ",
+            b"\r\n",
+            b"\x1b]9;4;1;40\x07",
+            b"\x1b]9;4;2;70\x1b\\",
+            b"\x1b]9;done\x07",
+            b"\x1b]777;notify;title;body\x07",
+            b"\x1b]133;A\x07",
+            b"\x1b]133;D;0\x07",
+            b"\x1b_Ga=T,f=24,s=1,v=1;AAAA\x1b\\",
+            b"\x1b[38;2;1;2;3mx",
+            b"\x1b",
+        ];
+        let mut seed = 0x2545_f491_4f6c_dd1du64;
+        let mut next = move || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed
+        };
+        let observe = |screen: &mut super::HeadlessScreen| {
+            (
+                screen.progress(),
+                screen.progress_reports(),
+                format!("{:?}", screen.take_notifications()),
+                screen.shell_phase(),
+                screen.take_replies(),
+                screen.lines(),
+            )
+        };
+        for _ in 0..200 {
+            let stream: Vec<u8> = (0..60)
+                .flat_map(|_| pieces[next() as usize % pieces.len()].iter().copied())
+                .collect();
+            let screen = || {
+                super::HeadlessScreen::new(30, 6)
+                    .with_notifications()
+                    .with_inline_images()
+            };
+            let mut whole = screen();
+            whole.feed(&stream);
+            let mut split = screen();
+            let mut at = 0;
+            while at < stream.len() {
+                let end = (at + 1 + next() as usize % 24).min(stream.len());
+                split.feed(&stream[at..end]);
+                at = end;
+            }
+            assert_eq!(observe(&mut split), observe(&mut whole), "{stream:?}");
+        }
+    }
+
+    #[test]
     fn keyboard_mode_only_changes_leave_cells_unchanged_and_reset_independently() {
         let mut screen = super::HeadlessScreen::new(20, 3);
         screen.feed(b"unchanged");
@@ -3155,6 +3312,27 @@ mod tests {
         fn take_fingerprinted_rows(&self) -> usize {
             self.fingerprinted_rows
                 .swap(0, std::sync::atomic::Ordering::Relaxed)
+        }
+    }
+
+    #[test]
+    fn fingerprints_see_cells_after_the_text() {
+        // Fingerprints hash a row's text and stop at its last non-default
+        // cell; whatever changes after the text must still change them.
+        let mut screen = HeadlessScreen::new(40, 3);
+        screen.feed(b"short");
+        let mut seq = screen.content_seq();
+        for change in [
+            &b"\x1b[1;30H\x1b[41m \x1b[0m"[..],
+            b"\x1b[1;30H ",
+            b"\x1b[1;40Hz",
+            b"\x1b[1;40H\x1b[K",
+            b"\x1b[1;20H\x1b]8;;https://example.invalid\x07 \x1b]8;;\x07",
+        ] {
+            screen.feed(change);
+            assert_ne!(screen.content_seq(), seq, "{change:?}");
+            seq = screen.content_seq();
+            screen.assert_fingerprints_current(0);
         }
     }
 
