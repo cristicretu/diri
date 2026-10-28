@@ -5,6 +5,7 @@ mod directories;
 mod environment;
 mod executables;
 mod holder;
+mod list_dir;
 mod output_log;
 mod paths;
 mod persistence;
@@ -50,6 +51,7 @@ kill                   Stop an authenticated Holder and its process tree\n  \
 gc                     Remove dead, unreferenced session state\n  \
 environment            Capture the remote login/cwd environment\n  \
 directories            List one bounded directory level\n  \
+list-dir               List one level relative to a session's working directory\n  \
 usage                  Report bounded transcript token summaries\n  \
 executables            Resolve a bounded Agent executable batch\n  \
 persistence            Run a persistence capability probe step\n  \
@@ -87,6 +89,7 @@ enum Invocation {
     Gc,
     Environment,
     Directories,
+    ListDir,
     Executables,
     Usage,
     Persistence,
@@ -167,6 +170,11 @@ pub fn execute<W: Write + Send>(
         >(stdin, 8 * 1024)
         .and_then(|request| directories::list(&request))
         .and_then(|result| write_json(stdout, &result)),
+        Invocation::ListDir => {
+            holder::read_limited_json::<_, diri_proto::remote_pty::ListDirRequest>(stdin, 16 * 1024)
+                .and_then(|request| list_dir_request(&request))
+                .and_then(|result| write_json(stdout, &result))
+        }
         Invocation::Executables => holder::read_limited_json::<
             _,
             diri_proto::remote_pty::ExecutableDiscoveryRequest,
@@ -263,6 +271,7 @@ fn parse(arguments: impl IntoIterator<Item = String>) -> Result<Invocation, Stri
         "gc" => no_more(arguments, Invocation::Gc),
         "environment" => no_more(arguments, Invocation::Environment),
         "directories" => no_more(arguments, Invocation::Directories),
+        "list-dir" => no_more(arguments, Invocation::ListDir),
         "executables" => no_more(arguments, Invocation::Executables),
         "usage" => no_more(arguments, Invocation::Usage),
         "persistence" => no_more(arguments, Invocation::Persistence),
@@ -481,6 +490,84 @@ fn inspect_at_with_facts(
     .and_then(|inspection| {
         check_facts_deadline(facts)?;
         Ok(inspection)
+    })
+    .map_err(|error| {
+        if error
+            .get_ref()
+            .is_some_and(|inner| inner.is::<RemoteManagementFailure>())
+            || error.kind() == io::ErrorKind::PermissionDenied
+        {
+            error
+        } else {
+            RemoteManagementFailure::ProcessIdentityUnavailable.into_io_error()
+        }
+    })
+}
+
+/// `list-dir-v1`: authenticate the session, read its child's live working
+/// directory bracketed by the child's verified birth, then list one level.
+fn list_dir_request(
+    request: &diri_proto::remote_pty::ListDirRequest,
+) -> io::Result<diri_proto::remote_pty::ListDirResult> {
+    request
+        .validate()
+        .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error))?;
+    if request.selector.expected_incarnation.is_none() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "list-dir requires a pinned incarnation",
+        ));
+    }
+    let deadline =
+        std::time::Instant::now() + std::time::Duration::from_millis(u64::from(request.timeout_ms));
+    let roots = paths::StatePaths::resolve()?;
+    let cwd = verified_working_directory(&roots, &request.selector)?;
+    let home = std::env::var_os("HOME")
+        .filter(|home| !home.is_empty())
+        .map(std::path::PathBuf::from);
+    Ok(list_dir::list_in(&cwd, home.as_deref(), request, deadline))
+}
+
+/// The authenticated, live session child's working directory, read between
+/// two native birth observations so a recycled PID is never listed.
+fn verified_working_directory(
+    roots: &paths::StatePaths,
+    selector: &SessionSelector,
+) -> io::Result<String> {
+    let paths = roots.session(&selector.session_id)?;
+    let authenticated = || -> io::Result<()> {
+        if state::authenticate(&paths, &selector.session_token)? {
+            Ok(())
+        } else {
+            Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "session authentication failed",
+            ))
+        }
+    };
+    authenticated()?;
+    let state = state::read_state(&paths.state)?;
+    validate_incarnation(selector, &state)?;
+    let Some(identity) = state.child_identity else {
+        return Err(RemoteManagementFailure::ProcessFactsUnsupported.into_io_error());
+    };
+    if !matches!(state.process_state, RemoteProcessState::Running { pid } if pid == identity.pid())
+    {
+        return Err(RemoteManagementFailure::ProcessIdentityUnavailable.into_io_error());
+    }
+    if !state::holder_lock_held(&paths.lock)? {
+        return Err(RemoteManagementFailure::HolderUnavailable.into_io_error());
+    }
+    diri_pty::process_identity::inspect_verified(&identity, || {
+        let cwd = diri_pty::process_facts::working_directory(identity.pid())?;
+        authenticated()?;
+        let current = state::read_state(&paths.state)?;
+        validate_incarnation(selector, &current)?;
+        validate_process_binding(&state, &current)?;
+        if !state::holder_lock_held(&paths.lock)? {
+            return Err(RemoteManagementFailure::HolderUnavailable.into_io_error());
+        }
+        Ok(cwd)
     })
     .map_err(|error| {
         if error
@@ -891,6 +978,7 @@ mod tests {
             cols: 80,
             rows: 24,
             persistence: PersistenceCapability::NonPersistent,
+            keyboard_enhancements: false,
         };
         let paths = roots.session(&request.session_id).unwrap();
         paths.ensure().unwrap();
