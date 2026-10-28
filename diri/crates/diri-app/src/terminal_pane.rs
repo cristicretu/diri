@@ -2453,24 +2453,29 @@ impl TerminalPane {
                 self.paste_into_session(&id, &text);
             }
             Some(TerminalDropAction::Upload(files)) => {
-                let Some((target, ssh)) = destination else {
-                    return;
-                };
-                let pane_tx = self.pane_tx.clone();
-                self.tokio.spawn(async move {
-                    let result = tokio::task::spawn_blocking(move || {
-                        files
-                            .iter()
-                            .map(|file| upload_dropped_file(file, &ssh))
-                            .collect::<Result<Vec<_>, _>>()
-                    })
-                    .await
-                    .unwrap_or_else(|error| Err(format!("upload task failed: {error}")));
-                    let _ = pane_tx.send(PaneEvent::DroppedFilesUploaded(target, result));
-                });
+                if let Some(destination) = destination {
+                    self.upload_files(destination, files);
+                }
             }
         }
         cx.notify();
+    }
+
+    /// Copies local files to a remote session's host; the remote paths are
+    /// pasted when the upload finishes (`PaneEvent::DroppedFilesUploaded`).
+    fn upload_files(&self, (target, ssh): (UploadTarget, String), files: Vec<std::path::PathBuf>) {
+        let pane_tx = self.pane_tx.clone();
+        self.tokio.spawn(async move {
+            let result = tokio::task::spawn_blocking(move || {
+                files
+                    .iter()
+                    .map(|file| upload_dropped_file(file, &ssh))
+                    .collect::<Result<Vec<_>, _>>()
+            })
+            .await
+            .unwrap_or_else(|error| Err(format!("upload task failed: {error}")));
+            let _ = pane_tx.send(PaneEvent::DroppedFilesUploaded(target, result));
+        });
     }
 
     /// One tick as dragged files arrive over this pane, if releasing them
@@ -3889,7 +3894,41 @@ impl TerminalPane {
             return;
         }
 
-        let Some(text) = item.text() else {
+        // Files copied in Finder paste the way they drop: escaped paths a
+        // shell or an agent can use, uploaded first for a remote session.
+        // Finder's plain-text flavour is only the file's name. In Find the
+        // paths are just text for the query.
+        let copied_files = clipboard_paths(&item).filter(|_| {
+            self.residents
+                .get(&id)
+                .is_some_and(|resident| resident.find.is_none())
+        });
+        let text = if let Some(paths) = copied_files {
+            let destination = self.upload_destination(&id);
+            let plan = plan_terminal_drop(paths, destination.is_some());
+            if let Some(message) = plan.feedback() {
+                cx.emit(TerminalPaneEvent::ExternalDropFeedback { message });
+            }
+            match plan.action {
+                None => {
+                    record("files_refused", "files", 0, false);
+                    cx.stop_propagation();
+                    return;
+                }
+                Some(TerminalDropAction::Upload(files)) => {
+                    record("files_upload", "files", 0, false);
+                    if let Some(destination) = destination {
+                        self.upload_files(destination, files);
+                    }
+                    cx.stop_propagation();
+                    cx.notify();
+                    return;
+                }
+                Some(TerminalDropAction::Paste(text)) => text,
+            }
+        } else if let Some(text) = item.text() {
+            text
+        } else {
             record("no_text", "other", 0, false);
             return;
         };
@@ -6362,6 +6401,14 @@ fn estimated_grid_size(
         metrics.cols_for_width(width).max(2),
         metrics.rows_for_height(height).max(2),
     )
+}
+
+/// The files a Finder copy put on the pasteboard, if any.
+fn clipboard_paths(item: &ClipboardItem) -> Option<&[std::path::PathBuf]> {
+    item.entries().iter().find_map(|entry| match entry {
+        ClipboardEntry::ExternalPaths(paths) if !paths.paths().is_empty() => Some(paths.paths()),
+        _ => None,
+    })
 }
 
 fn clipboard_image(item: &ClipboardItem) -> Option<(&[u8], &'static str)> {
@@ -9153,6 +9200,77 @@ mod tests {
         // The channel is live: a real keystroke still arrives.
         cx.simulate_keystrokes("a");
         assert_eq!(input.try_recv().unwrap(), (id.clone(), b"a".to_vec()));
+    }
+
+    #[gpui::test]
+    fn pasting_files_copied_in_finder_types_their_escaped_paths(cx: &mut TestAppContext) {
+        let runtime = Arc::new(StoreRuntime::inert());
+        let tokio = Arc::new(
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap(),
+        );
+        let session = fixture_session();
+        let id = session.id.clone();
+        {
+            let mut store = runtime.store.write().unwrap();
+            store.upsert_session(session);
+            store.select(id.clone());
+        }
+        let folder = tempfile::tempdir().unwrap();
+        let shot = folder.path().join("Screen Shot (1).png");
+        let notes = folder.path().join("notes.md");
+        std::fs::write(&shot, b"png").unwrap();
+        std::fs::write(&notes, b"# notes").unwrap();
+        let (pane, cx) =
+            cx.add_window_view(move |window, cx| TerminalPane::new(runtime, tokio, window, cx));
+        pane.update_in(cx, |pane, window, cx| {
+            pane.reconcile_store_change(window, cx);
+            let (tx, mut input) = mpsc::unbounded_channel();
+            let resident = pane.residents.get_mut(&id).unwrap();
+            resident.attachment.claim();
+            resident.attachment.input_observer = Some((id.clone(), tx));
+
+            // What AppKit hands over for a Finder ⌘C of two files: the file
+            // URLs, and as plain text only their names.
+            cx.write_to_clipboard(ClipboardItem {
+                entries: vec![
+                    ClipboardEntry::ExternalPaths(ExternalPaths(smallvec::smallvec![
+                        shot.clone(),
+                        notes.clone(),
+                    ])),
+                    ClipboardEntry::String(gpui::ClipboardString::new(
+                        "Screen Shot (1).png\rnotes.md".to_owned(),
+                    )),
+                ],
+            });
+            pane.paste(&Paste, window, cx);
+            let expected = terminal_drop_text([
+                shot.to_str().unwrap(),
+                notes.to_str().unwrap(),
+            ]);
+            assert!(expected.contains("Screen\\ Shot\\ \\(1\\).png "), "{expected}");
+            assert_eq!(
+                input.try_recv().unwrap(),
+                (id.clone(), expected.into_bytes()),
+                "pasted like a drop, not as the file names"
+            );
+
+            // A copied file that no longer exists pastes nothing.
+            cx.write_to_clipboard(ClipboardItem {
+                entries: vec![ClipboardEntry::ExternalPaths(ExternalPaths(
+                    smallvec::smallvec![folder.path().join("gone.png")],
+                ))],
+            });
+            pane.paste(&Paste, window, cx);
+            assert!(input.try_recv().is_err(), "a missing file was pasted");
+
+            // Ordinary text is untouched.
+            cx.write_to_clipboard(ClipboardItem::new_string("echo hi".to_owned()));
+            pane.paste(&Paste, window, cx);
+            assert_eq!(input.try_recv().unwrap(), (id.clone(), b"echo hi".to_vec()));
+        });
     }
 
     #[gpui::test]
