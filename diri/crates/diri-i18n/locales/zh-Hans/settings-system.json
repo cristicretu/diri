@@ -192,6 +192,8 @@
   "settings.terminal.app_links_detail": "这些链接无需询问即可打开。点按一项可恢复询问。",
   "settings.terminal.app_links_detail_none": "Diri 会在打开 ssh、mailto、编辑器及其他 App 链接前询问。",
   "settings.terminal.app_links_remove": "{scheme} ✕",
+  "settings.terminal.auto_balance_panes": "拆分或关闭后均分窗格",
+  "settings.terminal.auto_balance_panes_detail": "每当标签页中新增或关闭一个窗格时，让所有窗格大小相同。关闭时保留你调整的大小。",
   "settings.terminal.file_links_detail": "点击文件路径时用来打开的编辑器。",
   "settings.terminal.keyboard": "键盘",
   "settings.terminal.mouse": "鼠标与选择",
@@ -202,5 +204,6 @@
   "settings.terminal.option_left": "左 Option",
   "settings.terminal.option_off": "关闭",
   "settings.terminal.option_right": "右 Option",
+  "settings.terminal.panes": "拆分窗格",
   "settings.terminal.shell": "Shell"
 }
