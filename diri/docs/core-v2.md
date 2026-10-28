@@ -1,0 +1,254 @@
+# Terminal core v2
+
+Status: design and prototype. The prototype is `diri-terminal-state/src/core_v2`
+behind the off-by-default `core-v2` feature. Neither the Engine nor the Remote
+Helper uses it.
+
+## Why
+
+Today every byte a program prints goes through the vendored `vte` parser into
+the vendored `alacritty_terminal` grid: 24-byte `Cell`s in a `Storage` ring of
+`Row`s. Scrollback goes to the compact history, which LZ-encodes every row as
+it leaves the screen. Measured headless at 120×80 in 64 KiB reads, a reference
+terminal reaches about 620 MB/s on ASCII, 930 MB/s on Unicode and 200 MB/s on
+CSI. In the Engine's configuration (compact history), Diri's current core
+reaches 130 / 125 / 102 MB/s. With history off it reaches 400 / 230 / 106 MB/s.
+
+Three costs dominate:
+
+1. **Cell size.** A 24-byte cell (`char`, two 4-byte colors, 4-byte flags and an
+   `Option<Arc<CellExtra>>`) means every printed character writes 24 bytes and
+   every scrolled row resets 120 × 24 bytes. An 8-byte cell measured 1.6× on
+   ASCII and 1.35× on Unicode in isolation, on the same parser and grid.
+2. **Text decoding.** The parser validates UTF-8 (`str::from_utf8`), splits runs,
+   and hands over `&str`. The grid then decodes each character again and looks
+   up its width in a two-stage table, plus the cluster test. On Unicode text
+   this is about half of what remains once cells are small.
+3. **History encoding.** Each row is encoded once when it scrolls off, so the
+   Engine is capped near 230 MB/s whatever the parser does.
+
+Core v2 replaces the grid and the ground-state text path. The escape-sequence
+state machine stays `vte`. Its escape bodies are already indexed once per read
+(#922). The wire protocol, the renderer and every client stay as they are.
+
+## Prototype results
+
+The prototype covers printable text (ASCII and UTF-8, grapheme clusters,
+wrap), C0 controls, SGR, REP, cursor moves, `EL`, and linefeed into page
+history. Its history is bounded like the Engine's: at most 150,000 rows and
+4 MiB of live bytes, with cold pages packed (see "Compression").
+
+**How it was measured:**
+
+- Machine: Apple M4 Max with 14 cores. Load average was 25–42 from other agents, and it moved enough between runs that only same-run comparisons are meaningful.
+- Payloads: the kitten `__benchmark__` captures (`ascii.bin`, `unicode.bin`, `csi.bin`), repeated to at least 64 MiB, the same repetitions as `vt_workloads`.
+- Reads: 64 KiB.
+- Screen: 120×80.
+- Rounds: 7. Each round runs v2, then the Engine's `HeadlessScreen` (compact history bounded at 4 MiB, the real Engine configuration).
+- Figures: medians, with min..max in brackets. Base is `3fc4feb66`.
+
+**Every timed v2 run passes two checks**, or it reports no number:
+
+1. **The golden digests** of `vt_workloads.golden` (branch `test/vt-bench-golden`).
+   - These are digests of a known-good byte-at-a-time parse at `3fc4feb66`: bytes fed, the full snapshot, the newest 62,401 / 53,361 / 0 history rows as scrollback text, cells and metadata, links, and the cursor.
+   - They are computed on the v2 state, packed pages included, through `HeadlessScreen::from_core_v2` with the same encoders the bench uses.
+2. **A cell-for-cell comparison** with a byte-at-a-time parse by the current core keeping as many history rows.
+   - It covers the screen and all retained history: character, cluster codepoints, width flags, wrap, style flags, foreground, background, underline color, cursor and pending wrap.
+   - It also asserts that every payload byte was fed.
+
+Both checks, and the packed-history differential tests, were mutation-tested: one flipped write fails them.
+
+```sh
+cargo run --release -p diri-terminal-state --features core-v2 --example core_v2_bench -- <kitten dir>
+CORE_V2_GOLDEN=<vt_workloads.golden> cargo run ...       # as measured: 150,000 rows, 4 MiB
+CORE_V2_BUDGET=none CORE_V2_HISTORY=0 cargo run ...      # history off
+CORE_V2_RSS=v2|engine CORE_V2_ONLY=ascii cargo run ...   # peak RSS, one core per process
+```
+
+All figures are MB/s.
+
+**History at budget.** A sustained flood keeps 4 MiB of live history from the second repetition on.
+
+| Workload | v2 | Engine today | Reference terminal | v2 rows kept | Engine rows kept |
+|---|---:|---:|---:|---:|---:|
+| ASCII | **590** (562..604) | 125 (118..127) | 630 (622..636) | 62,705 | 63,647 |
+| Unicode | **436** (430..453) | 118 (117..123) | 948 (920..959) | 53,424 | 54,207 |
+| CSI | **274** (271..280) | 101 (98..104) | 210 (207..211) | 0 | 0 |
+
+**History off.**
+
+| Workload | v2 | Engine today |
+|---|---:|---:|
+| ASCII | 777 (757..784) | 125 (123..126) |
+| Unicode | 775 (754..778) | 122 (113..123) |
+| CSI | 270 (229..279) | 97 (95..100) |
+
+**Peak RSS of one 64 MiB flood**, each core alone in a fresh process whose start-up RSS is 4.1–4.3 MB:
+
+| Workload | v2 | Engine today |
+|---|---:|---:|
+| ASCII | 11.3 MB | 10.9 MB |
+| Unicode | 9.3 MB | 10.8 MB |
+
+**Reading the tables honestly:**
+
+- **v2 is slower than the reference with history on: 0.94× on ASCII and 0.46× on Unicode.** It is ahead only on CSI (1.30×).
+- **Where the history cost goes.** History costs v2 about a quarter on ASCII and close to half on Unicode, against history off. The cost is mostly keeping each row's packed tokens as it is written (the "text log" below), and the general path for rows with clusters.
+- **v2 keeps slightly fewer rows** than the Engine in the same 4 MiB: 1.5% fewer on ASCII and 1.4% fewer on Unicode. The golden check covers the newest 62,401 and 53,361 rows, which both keep.
+- **Peak RSS is about the same as today.** ASCII is 0.4 MB higher and Unicode 1.5 MB lower. In both cores, the rest beyond the 4 MiB history is allocator slack and the screen.
+- **The reference ran differently.**
+  - It ran as its own benchmark binary, `+terminal-stream`, on the same 64 MiB files in 64 KiB reads, at commit `6ba1441`.
+  - Each figure is the median of 7 runs. Process start-up was measured with an empty file (10 ms) and subtracted.
+  - Its scrollback is its benchmark default of 10 KB, about one page: it keeps no history at budget and compresses nothing.
+  - It runs a complete terminal, while v2 handles only the sequences above. On these three payloads that is everything they contain: the prototype counts any sequence it does not implement, and the checks would fail.
+- **Part of the CSI gain is not v2-specific.** It comes from the new `Handler::input_repeat` hook (REP as row segments), which the current core could adopt too.
+- **Images and long escapes were not measured.** They are bound by escape bodies (#922). v2 does not change them.
+
+## Design
+
+### Cell: 8 bytes
+
+```
+bits  0..21  codepoint (0 = never written; reads as a space)
+bits 21..26  WIDE, SPACER, LEADING_SPACER, GRAPHEME, HYPERLINK
+bits 26..31  shell marks (OSC 133 A, B, C, D-ok, D-failed)
+bits 32..48  style id in the owning page's style table (0 = default)
+bits 48..64  cluster index in the page's arena (with GRAPHEME)
+```
+
+- **What a cell holds.** Everything that was in `Cell::extra` (cluster codepoints, hyperlink, underline color) moves out of the cell. Underline color goes into the style. Clusters and links become page tables, flagged by one bit each.
+- **Row facts move to the row.** Soft wrap (`WRAPLINE`) becomes a row flag.
+- **Writing stays in place.** A write is a single `u64` store. Shell marks are kept by `old & MARKS`, exactly as `Flags::SHELL_MARKS` is today.
+
+### Style and grapheme tables, per page
+
+- **Styles.**
+  - A `Style` is `{fg, bg, underline color, style flags}`. Each page interns styles in its own table, so a cell carries a 16-bit id.
+  - The pen caches `(page serial, id)`. SGR only invalidates the cache, and the next write re-interns.
+  - Per-page tables mean eviction frees styles with the page, with no reference counts.
+  - Styles are interned only when a cell or a row fill is written, so a page never holds more styles than cells plus rows, well under `u16::MAX`. An SGR flood that writes nothing interns nothing.
+- **Clusters.**
+  - The extra codepoints of a cluster live in a per-page arena: a `Vec<char>` and `(start, len)` spans. The cell's top 16 bits index its span while the GRAPHEME bit is set.
+  - Adding a codepoint appends in place when the span is last in the arena, and otherwise moves the span to the end.
+  - Overwriting a cell clears the bit and leaves a dead span. The arena is compacted (rebuilt from the cells that still name a span) when it reaches 65,535 spans or 1 Mi codepoints, and it is dropped when the page is packed.
+  - A zero-width mark after a cell that is not a lone regional indicator, keycap or emoji modifier goes straight onto that cell, skipping the cluster replay that `continue_cluster` would decline anyway.
+- **Hyperlinks** (OSC 8, and inline-image anchors, which are hyperlinks) use the same shape: a per-page span table keyed by cell, flagged by HYPERLINK.
+
+### Pages: screen and history in one structure
+
+- **Shape.** A page is a fixed block of rows: a power of two near 64 KiB of cells, at least 16 rows. At 120 columns that is 64 rows, or 61 KiB.
+  - `cells: [Cell; rows × cols]`
+  - `meta: [RowMeta; rows]`, where `RowMeta` is `{occ, fill, lead: u16, wrapped, dirty, simple}`
+  - the style table, the grapheme table and the link table
+- **The screen is the newest rows.** The page list is a `VecDeque<Page>`, and the screen is its newest `lines` rows.
+- **Scrolling is nearly free.** A linefeed at the bottom of a full-screen scroll region appends one row by writing its `RowMeta`. No cell is touched. The oldest screen row becomes history by definition.
+  - Scrolling into history costs nothing.
+  - Viewing history is reading the same pages, with no decode while they are dense.
+- **Eviction and recycling.** Whole pages past the row limit, or (oldest first) while history exceeds its byte budget, are dropped. A packed page's cell buffer is reused for the next tail page, so steady-state output allocates only the packed bytes.
+- **Partial scroll regions.** `DECSTBM`, `IL`/`DL` and `RI` inside a region move rows within the screen.
+  - This copies cells between row slots and remaps style, grapheme and link ids when the slots are in different pages.
+  - It costs about the same as today's `Storage::swap`, and is the only path that needs remapping.
+
+### Row reuse without per-cell resets
+
+- **Lazy clear.** Each row has an occupancy `occ`. Cells at or past `occ` read as blanks of the row's erase `fill` style, and whatever bytes they hold are never read.
+- **Writes.**
+  - Appending a row sets `occ = 0` and `fill = pen background`.
+  - A write past `occ` first blanks the gap, then writes. Writes into fresh cells skip the wide-character checks entirely.
+- **Erase.** `EL`/`ED` to the end of a row with the row's own fill only lowers `occ`. A whole-row erase also sets `fill`.
+- **Result.** The 120-cell reset per scrolled row disappears. It was about a quarter of the ASCII profile left in the 8-byte-cell experiment.
+- **Generation counters were not needed.** `occ` is the generation: one `u16` per row.
+
+### The text path
+
+- **One new hook in the vendored parser.**
+  - `Perform::ground_bytes` and `Handler::input_bytes` offer each ground-state slice to the terminal before the parser scans it.
+  - The terminal consumes a prefix of printable text and the C0 controls HT, BS, CR, LF, VT and FF, with exactly the effect of the calls the parser would make. It returns the last printed character, so REP stays correct.
+  - It stops before ESC, other C0 controls, DEL, C1, or invalid or incomplete UTF-8. The parser handles those exactly as before, including UTF-8 split across reads.
+  - The default consumes nothing, so the current core is unaffected.
+- **Printable ASCII runs.** The end of a run is found 16 bytes at a time with NEON (with a scalar fallback elsewhere). Each run is written as row segments of `byte | style | old marks`.
+- **Validate, decode and measure in one pass.**
+  - Characters are decoded from the lead byte with continuation, overlong, surrogate and range checks.
+  - The class (two bits per BMP codepoint: general path, one column, or two columns, never joining) comes from one 16 KiB table indexed by the codepoint.
+  - That table is built once per process from the same grapheme table #840 uses, and a unit test checks the two agree for every BMP codepoint.
+  - This replaces `from_utf8` followed by the second decode, the two-stage lookup, and the join test.
+- **CJK, kana and Hangul with NEON.** Runs of three-byte characters are classified 16 at a time:
+  - `vld3q_u8` splits lead and continuation bytes.
+  - Two `vqtbl4q_u8` lookups read a 1024-bit map of 64-codepoint blocks that are entirely two-column and non-joining.
+  - The leading accepted lanes are written as wide-plus-spacer pairs.
+  - Overlong forms and surrogates fall in blocks the map rejects, so the vector path also validates.
+- **The general path.** Clusters, zero-width marks, emoji, 4-byte characters, wrap-pending, insert mode and overwritten wide characters go through a port of `Term::input` / `continue_cluster` / `widen_cluster` / `narrow_cluster`. It uses the shared grapheme module, so Bun-compatible widths and mode 2027 are unchanged.
+- **REP.** `Handler::input_repeat` writes printable ASCII repeats as row segments.
+
+### Compression
+
+- **When a page is packed.** A page whose rows are all older than the newest history row is packed at once. Writes at the top of the screen can still touch that one row, so it stays dense. Packing is deterministic: it happens when the row count crosses a page boundary, never on a timer or at a read boundary.
+- **Budget.** History is bounded by live bytes, following #921's semantics:
+  - the packed bytes, row metadata and style table of each packed page;
+  - plus every dense page that holds a history row, counted at its full size.
+
+  While that total exceeds the budget, the oldest packed page is dropped. The kept history is a function of the output alone, and the differential tests check it is identical for every read split.
+- **Packed format**, per row from `lead` to `occ`, as tokens:
+  - A row written only by the text paths in its fill style is a text row: a header with `lead`, then one byte per ASCII cell, blank runs, a leading-spacer byte, and a character per glyph. Two-column characters imply their spacer, and U+4E00 onwards takes two bytes instead of three.
+  - Any other row uses general tokens: a style change, a blank run, a cluster prefix carrying its codepoints, the same character tokens, and an eight-byte literal for anything else (marks, odd spacers). So packing is lossless.
+- **The text log: packing without reading cells back.**
+  - While a row is written left to right by the text paths, the writers also append its tokens to a per-page log: the bytes they just wrote, a CJK code, or a blank run for a gap.
+  - Any other write invalidates the row's log, and that row is packed from its cells instead.
+  - When every written row of a page is logged, in order and contiguously, the log is the packed page and packing copies nothing.
+  - Debug builds decode every logged row and compare it with the cells.
+  - This cut packing from about 0.07 s to 0.01 s per 64 MiB of ASCII. The remaining cost is appending to the log as text is written.
+- **Unpacking.** A packed page is unpacked into a one-page cache on demand, for `Scroll`, find capture or a checkpoint export. The cache is not counted in the budget, and readers release it after a batch.
+
+### Footprint
+
+- Per terminal at 120×80: the screen spans two or three pages (122–184 KiB) against 230 KiB of 24-byte cells today.
+- History is bounded at 4 MiB of live bytes, packed. Measured peak RSS for a 64 MiB flood is 11.3 MB (ASCII) and 9.3 MB (Unicode), against 10.9 and 10.8 MB for today's Engine, with process start-up at about 4.2 MB.
+- The class tables are 16 KiB per process, not per session.
+- The prototype adds no idle work: no timers, no background threads.
+
+## Migrating the consumers
+
+Only `diri-terminal-state` (`HeadlessScreen`, `GridMirror` helpers, `inline_images`) touches `alacritty_terminal` types. Everything downstream reads the wire types in `diri_proto::grid` (`GridCell`, `GridUpdate`, `ChangedRow`, `RowMetadata`, `GridRowCodec`) and `remote_pty` (`FullSnapshot`, `GridDelta`, `GridResume`, `ScrollbackResponse`). The migration therefore converts at that boundary, and the wire stays byte-identical.
+
+| Consumer | Today | With v2 |
+|---|---|---|
+| **Snapshots and diffs** (`grid_update`, `full_snapshot`) | Walk damaged rows; `wire_cell` maps `c/fg/bg/flags`; annotated rows produce `RowMetadata` | Walk rows with `dirty` set (row bit instead of `TermDamage`); `wire_cell` reads the cell plus the page's style; metadata from the page's grapheme and link tables. Fingerprints and the `last_cells` baseline are unchanged. Gate: snapshots/diffs equal on every existing test and the vt workloads. |
+| **Scrollback** (`scrollback`, `scrollback_cells`, `find_capture_cells`) | `grid[Line(-n)]` with compact read caches | The same rows from pages; a cold page is unpacked once per batch. `GridRowCodec` output is identical. |
+| **Renderer** (`diri-term`) | Wire `GridCell` only | Unchanged. |
+| **Selection, find** | Client-side on wire cells (`diri-term/selection.rs`, `find/*`) | Unchanged. The vendored `selection.rs`, `search.rs` and `vi_mode.rs` are unused by Diri and are not ported. |
+| **Reflow** (`grid/resize.rs` + compact deferred reflow) | Row re-wrap with compact hooks | Rewrap page by page into new pages: logical lines are rows joined by `wrapped`. Clusters, links and styles are re-interned. Deferred reflow of cold pages keeps resize O(screen). |
+| **Inline images** | Covered cells are blanks whose OSC 8 URI is an `ImageAnchor` | Same anchors in the page link table, so images scroll, erase and evict exactly like text. |
+| **Hyperlinks** | `CellExtra.hyperlink` (an `Arc`) | Page link table plus the HYPERLINK bit; `MAX_LINK_URI_BYTES` and metadata budgets unchanged. |
+| **Grapheme widths (#840)** | `grapheme::Info`, `Cluster`, `continue_cluster` | Same module (now public in the vendored crate); the fused class table is generated from it, and the general path is a port of the same functions. Differential tests cover clusters, VS15/VS16, ZWJ, flags, keycaps and Indic. |
+| **Remote Helper** | `HeadlessScreen` inside `diri-remote` | Same crate and feature switch. The protocol and capabilities are unchanged. The Helper Build ID changes with the binary, as for any parser change; live Holders keep their binary. |
+| **Checkpoints** (`history_snapshot`, `history_metadata`, `restore`) | Read and write `Cell`s | Export reads pages. Import writes through the general cell setter. The format is unchanged. |
+| **Deterministic budget (#921)** | History bound once per read on live bytes | Retention is counted in whole rows and pages, and sealing is driven by page sequence. The kept history is therefore identical for any read split. Gate: the #914/#921 differential runs (one-shot, byte-by-byte, every split, random reads) include history. |
+
+## Migration plan
+
+Each PR lands on its own, behind the single `core-v2` cargo feature of `diri-terminal-state`, which the Engine and the Remote Helper leave off until the last PR. The current core stays until parity is proven, and is removed in a separate PR afterwards.
+
+1. **This PR (design + prototype).**
+   - What lands: the vendored `vte` hooks (`ground_bytes`/`input_bytes`, `input_repeat`; defaults keep today's behavior), the public grapheme module, the `core_v2` prototype, its differential tests, the `HeadlessScreen::from_core_v2` bridge, the bench with the golden check (v2 and, switch off, the Engine on all six workloads), and CI running the switch both ways (arm64 NEON and x86_64 scalar).
+2. **Complete grid semantics.**
+   - Implement every `Handler` method with the current semantics: scroll regions, `IL`/`DL`/`ICH`/`DCH`/`ECH`, `ED` variants (including Diri's "bare `ED 2` scrolls into history"), save/restore, charsets, origin mode, insert mode, alternate screen, tabs, resets, OSC 8 links and OSC 133 marks.
+   - The `unsupported` counter must reach zero on the whole terminal-state test corpus. Each sequence family gets a differential test against the current core.
+3. **Link table and the Unicode gap.** The grapheme arena has landed in the prototype. Add the link table, and close the Unicode gap: history-on Unicode is 0.46× the reference.
+4. **Boundary adapter.**
+   - Implement `HeadlessScreen` over v2 (`core-v2` feature).
+   - Run the whole `diri-terminal-state` test suite and benches on both cores in CI.
+   - Snapshot/diff/scrollback wire output must be byte-identical on the vt workloads and the parity bench.
+5. **Reflow.** Page rewrap plus deferred cold reflow. Run the resize tests, and the #921 narrowing test on both cores.
+6. **Cold-page packing and the budget.** Prototyped here: it measures 4.7× and 3.7× the Engine (ASCII and Unicode) at budget, and is deterministic under the split tests.
+   - Remaining: close the 1.5% gap in rows kept against today's Engine.
+   - Then wire packing through the `HeadlessScreen` adapter, and pass the regenerated full-history golden (#921).
+7. **Inline images and checkpoints** on v2, with the existing image and checkpoint tests.
+8. **Switch.** Enable `core-v2` for the Engine and the Remote Helper after a soak on the nightly channel. Holder→Engine vtbench before/after; `PERF.md` gates unchanged or better.
+9. **Remove** the old grid, compact history and the unused vendored selection/search/vi-mode code.
+
+## Risks
+
+- **Reflow** is the largest semantic surface: clusters and leading spacers at row ends, and wrapped wide characters. It gets its own differential suite in step 5 before anything ships.
+- **Per-page style ids** make cross-page row moves remap ids. They are rare: scroll regions only.
+- **NEON is aarch64-only.** x86_64 Linux Helpers use the scalar fused path until an SSE4.1/AVX2 version lands with the same tests. The scalar path already removes the double decode.
+- **The text log adds writer state per hot page** (a token arena of a few KiB). A row rewritten in place forever cannot grow it without bound: past 1 KiB per row, the page drops its logs and packs from cells.

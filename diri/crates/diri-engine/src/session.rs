@@ -1929,7 +1929,12 @@ impl Session {
                 "a session cannot use local and remote Holders together",
             ));
         }
-        let remote = spec.remote.take().expect("checked");
+        let mut remote = spec.remote.take().expect("checked");
+        // This Engine and its App encode keys with negotiated kitty flags
+        // (`enhanced-keyboard-v1`), so a Holder that can is asked to let its
+        // program negotiate them. Older Helpers are never sent the field.
+        remote.launch.keyboard_enhancements =
+            remote.helper.protocol.minor >= diri_proto::remote_pty::KITTY_KEYBOARD_PROTOCOL_MINOR;
         remote.launch.validate().map_err(std::io::Error::other)?;
         if remote.launch.session_id != spec.id {
             return Err(std::io::Error::new(
