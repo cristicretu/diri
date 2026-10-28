@@ -3,8 +3,19 @@
 //! ASCII, Unicode, unique multi-codepoint cells, CSI with few characters,
 //! Kitty images and long OSCs, parsed into a 120x80 terminal configured as
 //! the local Engine configures it (notifications, inline images, host
-//! replies, kitty keyboard). Every byte is parsed: the probe checks that the
-//! screen ends where a one-shot parse of the same bytes ends.
+//! replies, kitty keyboard, compact history; `--no-default-features` gives
+//! dense history). History is the Engine's: a 4 MiB budget.
+//!
+//! Every byte is parsed, and the numbers are only printed when the state
+//! proves it. Before timing, one payload fed in reads of the bench's size
+//! must leave exactly the state of a reference parse that takes it a byte at
+//! a time through the emulator's per-character input (no printable runs):
+//! visible grid and cursor, every history row's text, cells and metadata,
+//! hyperlinks, title, modes, keyboard state, replies and stored images. After
+//! every timed run, its final state must equal the same per-character
+//! reference fed the same bytes, and the bytes fed must equal the bytes of
+//! the payload times its repetitions. Nothing is deferred past the timer:
+//! `feed` returns with the bytes parsed and the screen settled.
 //!
 //! The data is the kitten's own when `DIRI_VT_BENCH_DIR` names a directory
 //! holding `ascii.bin`, `unicode.bin`, `unique_unicode.bin`, `csi.bin`,
@@ -22,9 +33,13 @@
 //! for `diri-engine`'s `vtbench` (the same workloads through Holder and
 //! Engine).
 //!
+//! `DIRI_VT_BENCH_ONLY=ascii,unicode` runs only the named workloads.
+//!
 //! `DIRI_VT_BENCH_READ` sets the read size (default 64 KiB; a macOS PTY hands
 //! over about 1 KiB per read). Reported: MB/s (10^6 bytes) of wall time for
-//! `feed` alone, median of 7 runs of at least 64 MB each.
+//! `feed` and reply collection, median of 7 runs of at least 64 MB each with
+//! the range, and the median per CPU second of this single-threaded process
+//! (less sensitive to a loaded machine than wall time).
 
 use std::hint::black_box;
 use std::time::{Duration, Instant};
@@ -163,18 +178,138 @@ fn screen() -> HeadlessScreen {
         .with_host_replies("bench")
 }
 
-/// One run: feed `reps` copies of `data` in `read`-sized pieces, handling
-/// replies and notifications the way the Engine pump does.
-fn run(data: &[u8], reps: usize, read: usize) -> (Duration, HeadlessScreen) {
-    let mut screen = screen();
-    let started = Instant::now();
-    for _ in 0..reps {
-        for chunk in data.chunks(read) {
-            screen.feed(black_box(chunk));
-            black_box(screen.take_replies());
+/// Wall and CPU time of one run.
+struct Timing {
+    wall: Duration,
+    cpu: Duration,
+}
+
+/// User plus system CPU time of this (single-threaded) process.
+fn cpu_time() -> Duration {
+    // SAFETY: getrusage only writes the zeroed struct it is given.
+    let usage = unsafe {
+        let mut usage = std::mem::zeroed::<libc::rusage>();
+        assert_eq!(libc::getrusage(libc::RUSAGE_SELF, &mut usage), 0);
+        usage
+    };
+    let time = |t: libc::timeval| Duration::new(t.tv_sec as u64, t.tv_usec as u32 * 1_000);
+    time(usage.ru_utime) + time(usage.ru_stime)
+}
+
+/// A screen fed the way the Engine pump feeds it, keeping its replies.
+struct Fed {
+    screen: HeadlessScreen,
+    replies: Vec<u8>,
+    bytes: usize,
+}
+
+impl Fed {
+    fn new(screen: HeadlessScreen) -> Self {
+        Self {
+            screen,
+            replies: Vec::new(),
+            bytes: 0,
         }
     }
-    (started.elapsed(), screen)
+
+    #[inline]
+    fn feed(&mut self, chunk: &[u8]) {
+        self.screen.feed(black_box(chunk));
+        self.replies.extend(self.screen.take_replies());
+        self.bytes += chunk.len();
+    }
+
+    fn feed_all(&mut self, data: &[u8], reps: usize, read: usize) {
+        for _ in 0..reps {
+            for chunk in data.chunks(read) {
+                self.feed(chunk);
+            }
+        }
+    }
+
+    /// Everything observable about the final state, as text to compare.
+    fn state(&mut self) -> String {
+        let screen = &mut self.screen;
+        let scrollback = screen.scrollback();
+        let cells = screen.scrollback_cells(0, i64::MAX);
+        let links = screen.link_source(usize::MAX);
+        without_store_nonce(format!(
+            "lines {:?}\ntext cells {:?}\nvisible start {}\ncells {:?}\nmetadata {:?}\n\
+             snapshot {:?}\nlinks {:?} {:?}\ntitle {:?}\nmodes alt={} paste={} focus={} \
+             mouse={:?} cursor style={:?}\ncursor {:?}\nkeyboard {:?}\nprogress {:?}\n\
+             images {}\nreplies {:?}",
+            scrollback.lines,
+            scrollback.text_cells,
+            scrollback.visible_start_row,
+            cells.payload,
+            cells.metadata,
+            screen.full_snapshot(),
+            links.text,
+            links.hyperlinks,
+            screen.title(),
+            screen.is_alt_screen(),
+            screen.bracketed_paste(),
+            screen.focus_reporting(),
+            screen.mouse_modes(),
+            screen.cursor_style(),
+            screen.cursor(),
+            screen.keyboard_state(),
+            screen.progress(),
+            screen.inline_image_bytes(),
+            self.replies,
+        ))
+    }
+}
+
+/// Image anchors name a per-screen store; only the rest must match.
+fn without_store_nonce(text: String) -> String {
+    const ANCHOR: &str = "diri-image:";
+    let mut out = String::with_capacity(text.len());
+    let mut rest = text.as_str();
+    while let Some(at) = rest.find(ANCHOR) {
+        out.push_str(&rest[..at + ANCHOR.len()]);
+        rest = &rest[at + ANCHOR.len()..];
+        let nonce = rest.find('.').unwrap_or(0);
+        out.push('#');
+        rest = &rest[nonce..];
+    }
+    out.push_str(rest);
+    out
+}
+
+/// Panics, naming the first difference, unless `actual` equals `expected`.
+fn assert_same_state(name: &str, how: &str, expected: &str, actual: &str) {
+    if expected == actual {
+        return;
+    }
+    let at = expected
+        .bytes()
+        .zip(actual.bytes())
+        .position(|(e, a)| e != a)
+        .unwrap_or(expected.len().min(actual.len()));
+    let window = |s: &str| {
+        let start = s.floor_char_boundary(at.saturating_sub(80));
+        let end = s.ceil_char_boundary((at + 80).min(s.len()));
+        s[start..end].to_owned()
+    };
+    panic!(
+        "{name}: {how} differs from the per-character reference at byte {at}:\n  reference: {}\n  {how}: {}",
+        window(expected),
+        window(actual)
+    );
+}
+
+/// One timed run: feed `reps` copies of `data` in `read`-sized pieces.
+fn run(data: &[u8], reps: usize, read: usize) -> (Timing, Fed) {
+    let mut fed = Fed::new(screen());
+    let cpu = cpu_time();
+    let started = Instant::now();
+    fed.feed_all(data, reps, read);
+    let timing = Timing {
+        wall: started.elapsed(),
+        cpu: cpu_time() - cpu,
+    };
+    (timing, fed)
 }
 
 fn main() {
@@ -184,7 +319,7 @@ fn main() {
         .unwrap_or(64 << 10);
     let dir = std::env::var_os("DIRI_VT_BENCH_DIR");
     println!(
-        "workload            MB/s  (median of {RUNS}; min..max)   source  read={read}  {COLS}x{ROWS}"
+        "workload            MB/s  (median of {RUNS}; min..max)   cpu MB/s   source  read={read}  {COLS}x{ROWS}"
     );
     if let Some(out) = std::env::var_os("DIRI_VT_BENCH_WRITE") {
         let out = std::path::Path::new(&out);
@@ -199,7 +334,14 @@ fn main() {
         }
         return;
     }
+    let only = std::env::var("DIRI_VT_BENCH_ONLY").ok();
     for name in WORKLOADS {
+        if only
+            .as_deref()
+            .is_some_and(|only| !only.split(',').any(|wanted| wanted == name))
+        {
+            continue;
+        }
         let (data, source) = match &dir {
             Some(dir) => (
                 std::fs::read(std::path::Path::new(dir).join(format!("{name}.bin")))
@@ -209,28 +351,43 @@ fn main() {
             None => (generate(name), "generated"),
         };
         let reps = MIN_BYTES_PER_RUN.div_ceil(data.len());
-        // Every byte parsed: reads of any size end on the same screen.
-        let (_, chunked) = run(&data, 1, read);
-        let mut whole = screen();
-        whole.feed(&data);
-        assert_eq!(
-            chunked.lines(),
-            whole.lines(),
-            "{name}: chunking changed the screen"
+        // Every byte parsed, and runs equal per-character input: one payload
+        // in reads of the bench's size against a byte at a time.
+        let mut bytewise = Fed::new(screen().with_per_character_input());
+        bytewise.feed_all(&data, 1, 1);
+        let mut chunked = Fed::new(screen());
+        chunked.feed_all(&data, 1, read);
+        assert_same_state(
+            name,
+            "one payload in reads",
+            &bytewise.state(),
+            &chunked.state(),
         );
+        // The reference every timed run must end on.
+        let mut reference = Fed::new(screen().with_per_character_input());
+        reference.feed_all(&data, reps, read);
+        let reference = reference.state();
         let _ = run(&data, 1, read); // warm-up
-        let mut rates: Vec<f64> = (0..RUNS)
+        let mut timings: Vec<Timing> = (0..RUNS)
             .map(|_| {
-                let (elapsed, _) = run(&data, reps, read);
-                (data.len() * reps) as f64 / elapsed.as_secs_f64() / 1e6
+                let (timing, mut fed) = run(&data, reps, read);
+                assert_eq!(fed.bytes, data.len() * reps, "{name}: bytes fed");
+                assert_same_state(name, "timed run", &reference, &fed.state());
+                timing
             })
             .collect();
-        rates.sort_by(f64::total_cmp);
+        let rate = |time: Duration| (data.len() * reps) as f64 / time.as_secs_f64() / 1e6;
+        timings.sort_by_key(|timing| timing.wall);
+        let wall = [
+            rate(timings[RUNS / 2].wall),
+            rate(timings[RUNS - 1].wall),
+            rate(timings[0].wall),
+        ];
+        timings.sort_by_key(|timing| timing.cpu);
+        let cpu = rate(timings[RUNS / 2].cpu);
         println!(
-            "{name:<18} {:8.1}  ({:.1}..{:.1})   {source}",
-            rates[RUNS / 2],
-            rates[0],
-            rates[RUNS - 1]
+            "{name:<18} {:8.1}  ({:.1}..{:.1})   cpu {cpu:7.1}   {source}",
+            wall[0], wall[1], wall[2]
         );
     }
 }

@@ -326,6 +326,13 @@ impl<T: Timeout> Processor<T> {
         Self::default()
     }
 
+    /// DIRI PATCH: prints ground-state text one character at a time
+    /// instead of as runs; see [`crate::Parser::set_per_character_print`].
+    #[doc(hidden)]
+    pub fn set_per_character_print(&mut self, per_character: bool) {
+        self.parser.set_per_character_print(per_character);
+    }
+
     /// Synchronized update timeout.
     pub fn sync_timeout(&self) -> &T {
         &self.state.sync_state.timeout

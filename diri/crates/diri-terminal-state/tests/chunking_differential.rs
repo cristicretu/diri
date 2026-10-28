@@ -307,8 +307,17 @@ struct Feeder {
 
 impl Feeder {
     fn new() -> Self {
+        Self::with(screen())
+    }
+
+    /// Per-character input instead of runs: the unoptimized reference.
+    fn per_character() -> Self {
+        Self::with(screen().with_per_character_input())
+    }
+
+    fn with(screen: HeadlessScreen) -> Self {
         Self {
-            screen: screen(),
+            screen,
             replies: Vec::new(),
             notifications: Vec::new(),
             clipboard: Vec::new(),
@@ -459,6 +468,136 @@ fn assert_same(expected: &Observed, actual: &Observed, how: &str) {
         context(&e),
         context(&a)
     );
+}
+
+fn observe_per_character<'a>(chunks: impl IntoIterator<Item = &'a [u8]>) -> Observed {
+    let mut feeder = Feeder::per_character();
+    for chunk in chunks {
+        feeder.feed(chunk);
+    }
+    feeder.observe()
+}
+
+/// Text that stresses writing runs of cells: ASCII and wide characters
+/// reaching the right margin at every column, combining and spacing marks,
+/// emoji with modifiers, ZWJ sequences and variation selectors, overwrites of
+/// wide characters and their spacers, insert mode, autowrap off, the line
+/// drawing charset, shell marks, links and colors, C1 controls and invalid
+/// UTF-8.
+fn text_stream(seed: u64, pieces: usize) -> Vec<u8> {
+    const TEXT: &[&str] = &[
+        "abc",
+        "The quick brown fox",
+        "~!@#",
+        " ",
+        "漢字",
+        "界",
+        "ｈｉ",
+        "é",
+        "e\u{301}",
+        "a\u{301}\u{302}\u{303}",
+        "\u{9b2}\u{9cb}",
+        "\u{e01}\u{e33}",
+        "👍🏽",
+        "👩\u{200d}💻",
+        "❤\u{fe0f}",
+        "\u{1f1fa}\u{1f1f8}",
+        "ß→€",
+        "\u{a0}",
+        "\u{ad}",
+        "\u{200b}",
+        "한국어",
+        "ｶﾀｶﾅ",
+        "\u{301}",
+        "\u{200d}",
+        "\u{fe0f}",
+        "❤",
+        "\u{1f3fd}",
+        "1\u{fe0f}\u{20e3}",
+        "\u{1100}\u{1161}\u{11a8}",
+        "\u{915}\u{94d}\u{937}",
+        "\u{1f1f7}",
+        "\x1b[?2027h",
+        "\x1b[?2027l",
+    ];
+    const CONTROLS: &[&[u8]] = &[
+        b"\r\n",
+        b"\r",
+        b"\n",
+        b"\t",
+        b"\x08",
+        b"\x08\x08",
+        b"\x1b[4h",
+        b"\x1b[4l",
+        b"\x1b[?7l",
+        b"\x1b[?7h",
+        b"\x1b(0",
+        b"\x1b(B",
+        b"\x1b[31;1m",
+        b"\x1b[0m",
+        b"\x1b[3@",
+        b"\x1b[2P",
+        b"\x1b[3X",
+        b"\x1b[2K",
+        b"\x1b[H",
+        b"\x1b]8;;https://example.invalid\x07",
+        b"\x1b]8;;\x07",
+        b"\x1b]133;A\x07",
+        b"\x1b]133;B\x07",
+        b"\x1b]133;C\x07",
+        b"\x1b[2b",
+        b"\xc2\x85",
+        b"\xc2\x9b2C",
+        b"\xff",
+        b"\xe6\x97",
+        b"\x7f",
+        b"\x1b[1;1H\x1b[3;8r",
+        b"\x1b[r",
+    ];
+    let mut rng = Rng(seed);
+    let mut out = Vec::new();
+    for _ in 0..pieces {
+        match rng.below(6) {
+            0 => out.extend_from_slice(CONTROLS[rng.below(CONTROLS.len())]),
+            // Land the next text anywhere, including the last two columns.
+            1 => out.extend_from_slice(
+                format!(
+                    "\x1b[{};{}H",
+                    1 + rng.below(ROWS),
+                    COLS - rng.below(COLS.min(6))
+                )
+                .as_bytes(),
+            ),
+            _ => {
+                for _ in 0..1 + rng.below(12) {
+                    out.extend_from_slice(TEXT[rng.below(TEXT.len())].as_bytes());
+                }
+            }
+        }
+    }
+    out
+}
+
+#[test]
+fn runs_parse_the_same_as_per_character_input() {
+    for seed in 1..=16u64 {
+        let mut rng = Rng(seed.wrapping_mul(0x2545_f491_4f6c_dd1d) | 1);
+        for stream in [text_stream(seed, 3_000), dense_stream(seed)] {
+            let reference = observe_per_character(stream.chunks(1));
+            assert_same(&reference, &observe_chunks([&stream[..]]), "runs, one shot");
+            assert_same(
+                &reference,
+                &observe_per_character([&stream[..]]),
+                "per character, one shot",
+            );
+            let chunks = random_chunks(&stream, &mut rng, 4096);
+            assert_same(
+                &reference,
+                &observe_chunks(chunks),
+                &format!("runs, seed {seed}"),
+            );
+        }
+    }
 }
 
 #[test]

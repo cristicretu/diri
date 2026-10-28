@@ -680,6 +680,16 @@ impl HeadlessScreen {
         self.term.release_primary_history_spare_rows();
     }
 
+    /// Parses printable text one character at a time, through the
+    /// emulator's per-character input, instead of as runs. The resulting
+    /// state is identical; benches and tests use it as the reference the
+    /// run paths are checked against.
+    #[doc(hidden)]
+    pub fn with_per_character_input(mut self) -> Self {
+        self.parser.set_per_character_print(true);
+        self
+    }
+
     /// Opt in only where this screen is the terminal the program talks to
     /// and its replies reach the program: a local Engine session. The screen
     /// then reports `terminal_version` to XTVERSION, answers color queries

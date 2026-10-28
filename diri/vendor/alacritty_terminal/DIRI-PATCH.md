@@ -405,6 +405,30 @@ old way (`reference_wide_writes`), across wrapping, insert mode, charsets,
 hyperlinks, prompt marks, mode 2027, scroll regions and the alternate screen;
 `ascii_runs_match_per_character_input` covers the one-pass writer.
 
+### Characters beyond ASCII a row segment at a time
+
+`input_text` now writes every character that starts a grapheme cluster of its
+own and takes one or two columns (by the same `grapheme::Info` lookup `input`
+makes) straight into the cursor row, narrow ones included, with the row
+looked up once per segment instead of once per character. A segment ends at
+anything `input` must decide: a character that may join the cluster before it
+(marks, ZWJ, variation selectors, keycaps, emoji modifiers, regional
+indicators, Indic and Hangul continuations), a zero-width character, a wide
+character at the right margin, a cell that belongs to an earlier wide
+character, a pending wrap or insert mode. That character goes through `input`
+(`input_measured`, which reuses the lookup already made), so #840's widths and
+cluster rules are unchanged. Cells, spacers, prompt marks, template colors,
+flags and hyperlinks, occupancy, cursor and wrap state are those of `input`;
+damage is left to cursor damage, as `input` leaves it.
+
+Tests: `non_ascii_runs_match_per_character_input` above, and
+`diri-terminal-state`'s `runs_parse_the_same_as_per_character_input`, which
+compares the Engine screen's whole observable state after streams that put
+every kind of character at every column near the margin (with insert mode,
+autowrap off, the line-drawing charset, overwritten wide characters, mode
+2027, C1 controls and invalid UTF-8) against per-character input a byte at a
+time.
+
 ## Program colors: a generation, and RIS resets them
 
 `Term` keeps `colors_generation`, advanced whenever `set_color` or
