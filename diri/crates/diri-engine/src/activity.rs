@@ -128,7 +128,7 @@ fn trim(entries: &mut Vec<ActivityEntry>) {
 
 fn append_line(path: &Path, entry: &ActivityEntry) -> io::Result<()> {
     if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)?;
+        diri_platform::private::create_dir_all(parent)?;
     }
     let mut options = OpenOptions::new();
     options.create(true).append(true);
@@ -232,6 +232,7 @@ mod tests {
             pull_requests: None,
             listening_ports: None,
             foreground_agent: None,
+            foreground_program: None,
             terminal_cwd: None,
             agent_workspace: None,
             note_id: None,

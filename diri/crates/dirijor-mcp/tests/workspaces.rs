@@ -118,6 +118,7 @@ fn record(id: &str, project: &str, host: Option<&str>) -> diri_proto::SessionRec
         pull_requests: None,
         listening_ports: None,
         foreground_agent: None,
+        foreground_program: None,
         terminal_cwd: None,
         agent_workspace: None,
         note_id: None,

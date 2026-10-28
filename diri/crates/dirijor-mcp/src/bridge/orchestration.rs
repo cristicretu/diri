@@ -277,6 +277,9 @@ impl Bridge {
     pub(super) fn read_output(&self, arguments: &Value) -> Result<Value, String> {
         let id = required_string(arguments, "session_id")?;
         let mode = optional_string(arguments, "mode").unwrap_or_else(|| "screen".into());
+        // Soft wraps split URLs, paths and JSON at the pane width; a reader
+        // wants the lines the program wrote.
+        let unwrap = optional_bool(arguments, "unwrap").unwrap_or(true);
         match mode.as_str() {
             "last_message" | "transcript" => {
                 let turns = if mode == "last_message" {
@@ -291,7 +294,7 @@ impl Bridge {
                     DEFAULT_TIMEOUT,
                 )?;
                 if !transcript.available {
-                    let mut fallback = self.read_screen(&id, Some(50))?;
+                    let mut fallback = self.read_screen(&id, Some(50), unwrap)?;
                     if fallback.get("mode").is_none() {
                         fallback["mode"] = json!("tail");
                     }
@@ -314,16 +317,20 @@ impl Bridge {
                 let lines = optional_number(arguments, "lines")
                     .unwrap_or(50.0)
                     .clamp(1.0, 500.0) as usize;
-                self.read_screen(&id, Some(lines))
+                self.read_screen(&id, Some(lines), unwrap)
             }
-            _ => self.read_screen(&id, None),
+            _ => self.read_screen(&id, None, unwrap),
         }
     }
 
-    fn read_screen(&self, id: &str, tail: Option<usize>) -> Result<Value, String> {
+    fn read_screen(&self, id: &str, tail: Option<usize>, unwrap: bool) -> Result<Value, String> {
         let raw = match self.request_failure(
             Method::SESSION_READ_SCREEN,
-            json!({"sessionID": id}),
+            if unwrap {
+                json!({"sessionID": id, "unwrap": true})
+            } else {
+                json!({"sessionID": id})
+            },
             DEFAULT_TIMEOUT,
         ) {
             Ok(raw) => raw,

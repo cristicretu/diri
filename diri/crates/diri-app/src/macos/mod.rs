@@ -9,6 +9,7 @@ pub(crate) mod login_item;
 pub mod menu_bar;
 pub mod notifier;
 pub mod permission_guide;
+pub(crate) mod terminal_accessibility;
 pub(crate) mod terminal_keys;
 
 use objc2_foundation::NSBundle;
@@ -189,6 +190,30 @@ pub(crate) fn perform_haptic(pattern: crate::haptics::Pattern) {
     };
     NSHapticFeedbackManager::defaultPerformer()
         .performFeedbackPattern_performanceTime(pattern, NSHapticFeedbackPerformanceTime::Now);
+}
+
+/// Exposes `element` through the window's accessibility text area; see
+/// [`terminal_accessibility`]. A frame that changes nothing costs a pointer
+/// comparison.
+pub(crate) fn sync_terminal_accessibility(
+    window: &gpui::Window,
+    element: &diri_term::element::TerminalElement,
+    focused: bool,
+    label: &str,
+) {
+    use raw_window_handle::{HasWindowHandle, RawWindowHandle};
+    if objc2::MainThreadMarker::new().is_none() {
+        return;
+    }
+    let Ok(handle) = HasWindowHandle::window_handle(window) else {
+        return;
+    };
+    let RawWindowHandle::AppKit(handle) = handle.as_raw() else {
+        return;
+    };
+    // SAFETY: GPUI's window owns this view for as long as `window` is borrowed.
+    let host = unsafe { &*handle.ns_view.as_ptr().cast::<objc2_app_kit::NSView>() };
+    terminal_accessibility::sync(host, &element.accessibility(), focused, label);
 }
 
 #[cfg(test)]

@@ -8,14 +8,17 @@
 //!
 //! Writes `styles.png` (the screen as this build draws it), `styles-legacy.png`
 //! (the same screen as a client without `terminal-styles-v1` receives it),
-//! `cursor-{block,underline,bar}.png`, and `editor-insert.png` when the
+//! `cursor-{block,underline,bar}.png`, `cursor-pref-*.png` (the user's
+//! cursor preference over and under a program's), and `editor-insert.png` when the
 //! real-editor check left its screen in the same directory.
 #![cfg(target_os = "macos")]
 
 use std::path::PathBuf;
 use std::sync::Arc;
 
+use diri_proto::grid::CursorShape;
 use diri_proto::grid::GridUpdate;
+use diri_term::cursor_motion::{BlinkRate, CursorPreferences};
 use diri_term::{buffer::GridBuffer, element::TerminalElement};
 use diri_terminal_state::HeadlessScreen;
 use gpui::{AppContext as _, Context, IntoElement, ParentElement, Render, Styled, Window, div, px};
@@ -58,15 +61,16 @@ fn styles_screen(cursor: &[u8]) -> GridUpdate {
 }
 
 fn capture(update: GridUpdate, name: &str) {
-    capture_sized(update, name);
+    capture_sized(update, name, CursorPreferences::default());
 }
 
-fn capture_sized(update: GridUpdate, name: &str) {
+fn capture_sized(update: GridUpdate, name: &str, cursor: CursorPreferences) {
     let (cols, rows) = (update.cols, update.rows);
     let window_size = gpui::size(px(f32::from(cols) * 9.1), px(f32::from(rows) * 18.3));
     let element = TerminalElement::with_buffer(GridBuffer::new(cols, rows))
         .focused(true)
-        .font(gpui::font("Menlo"));
+        .font(gpui::font("Menlo"))
+        .cursor_preferences(cursor);
     element.apply_damage(update);
     let platform = gpui_platform::current_platform(true);
     let mut cx = gpui::HeadlessAppContext::with_platform(
@@ -108,11 +112,30 @@ fn render_style_goldens() {
     ] {
         capture(styles_screen(sequence), name);
     }
+    // The user's cursor preference: a bar where no program asked for one,
+    // and an underline kept over a program's bar when programs may not
+    // change it.
+    let bar = CursorPreferences {
+        shape: CursorShape::Bar,
+        blink: BlinkRate::Off,
+        follow_program: true,
+    };
+    capture_sized(styles_screen(b""), "cursor-pref-bar.png", bar);
+    let underline_only = CursorPreferences {
+        shape: CursorShape::Underline,
+        blink: BlinkRate::Normal,
+        follow_program: false,
+    };
+    capture_sized(
+        styles_screen(b"\x1b[6 q"),
+        "cursor-pref-ignores-program.png",
+        underline_only,
+    );
     // The real-editor check (`diri-terminal-state --test real_editor`) leaves
     // its insert-mode screen here; render it at its own size.
     let editor = output("editor-insert.grid");
     if let Ok(bytes) = std::fs::read(&editor) {
         let update = GridUpdate::decode(&bytes).expect("editor grid");
-        capture_sized(update, "editor-insert.png");
+        capture_sized(update, "editor-insert.png", CursorPreferences::default());
     }
 }

@@ -103,7 +103,7 @@ impl Writer {
                 let _ = file.flush();
             }
             if urgent {
-                let _ = File::create(self.dir.join(URGENT_MARKER));
+                let _ = diri_platform::private::create(&self.dir.join(URGENT_MARKER));
             }
             for ack in acks {
                 let _ = ack.send(());
