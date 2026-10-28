@@ -67,8 +67,12 @@ const OUTPUT_QUEUE_BYTES: usize = 1 << 20;
 /// progress. A subscriber that is gone releases the pump at once.
 const OUTPUT_SEND_PATIENCE: Duration = Duration::from_millis(500);
 
-/// Buffer for one subscriber's socket writes.
-const OUTPUT_WRITE_BUFFER: usize = 256 << 10;
+/// Bytes of frames a subscriber's writer gathers before it sends them,
+/// whether or not more are on their way.
+const OUTPUT_WRITE_BATCH: usize = 256 << 10;
+
+/// Frames a writer gathers into one `writev`, well under any `IOV_MAX`.
+const OUTPUT_WRITE_FRAMES: usize = 64;
 
 /// Sessions whose pump reads in blocking mode from its first read.
 #[cfg(test)]
@@ -1350,12 +1354,7 @@ fn write_log_backlog(
         if start != from || bytes.is_empty() {
             return false;
         }
-        let length = bytes.len() as u32;
-        if stream.write_all(&from.to_be_bytes()).is_err()
-            || stream.write_all(&length.to_be_bytes()).is_err()
-            || stream.write_all(&bytes).is_err()
-            || stream.flush().is_err()
-        {
+        if write_frames(stream, &[(from, &bytes[..])]).is_err() {
             return false;
         }
         frames.note_progress();
@@ -1386,19 +1385,29 @@ fn write_output(
 ) {
     use super::fanout::Popped;
     let idle = reactor::lane_idle();
-    let mut stream = std::io::BufWriter::with_capacity(OUTPUT_WRITE_BUFFER, &link.stream);
+    let mut stream = &link.stream;
+    // Frames taken but not yet sent. They are sent together, header and
+    // bytes in one `writev`, once nothing else is waiting or a write's worth
+    // has built: a burst leaves in few writes, and the bytes go to the
+    // socket from the frames themselves rather than through a copy into a
+    // write buffer.
+    let mut batch: Vec<super::fanout::Frame> = Vec::new();
+    let mut batched = 0usize;
     let mut queued: Option<super::fanout::Frame> = None;
     let mut last_write: Option<Instant> = None;
     let replayed = backlog.is_empty() || write_log_backlog(&mut stream, holder, frames, backlog);
     if replayed {
         loop {
-            let (offset, frame) = match queued.take() {
+            let frame = match queued.take() {
                 Some(frame) => frame,
                 None => match idle {
                     Some(idle) => match frames.pop_within(idle) {
                         Popped::Frame(frame) => frame,
                         Popped::Closed => break,
                         Popped::Idle => {
+                            // Nothing is batched here: a batch is always
+                            // sent before the writer waits, so ending idle
+                            // strands nothing.
                             if frames.park_writer() {
                                 return;
                             }
@@ -1411,24 +1420,24 @@ fn write_output(
                     },
                 },
             };
-            let length = frame.len() as u32;
-            if stream.write_all(&offset.to_be_bytes()).is_err()
-                || stream.write_all(&length.to_be_bytes()).is_err()
-                || stream.write_all(&frame).is_err()
+            batched += frame.1.len();
+            batch.push(frame);
+            if (batched >= OUTPUT_WRITE_BATCH || batch.len() >= OUTPUT_WRITE_FRAMES)
+                && !send_batch(&mut stream, frames, &mut batch, &mut batched)
             {
-                frames.close();
                 break;
             }
-            // Flushed only once nothing else is waiting, so a burst coalesces into
-            // few writes while a lone chunk still leaves immediately. The frame
-            // taken here is carried to the next turn, never dropped.
+            // Sent only once nothing else is waiting, so a burst coalesces
+            // into few writes while a lone chunk still leaves immediately.
+            // The frame taken here is carried to the next turn, never
+            // dropped.
             //
-            // While output streams, though, the next frame is a PTY read away,
-            // and flushing each kilobyte cost a write system call per read: a
-            // third of the Holder's time in a flood. A frame written within
-            // [`STREAMING_FLUSH_GAP`] of the one before waits that long for its
-            // successor before flushing alone. Typing and prompts, whose frames
-            // are further apart, still leave at once.
+            // While output streams, though, the next frame is a PTY read
+            // away, and sending each kilobyte cost a write system call per
+            // read: a third of the Holder's time in a flood. A frame taken
+            // within [`STREAMING_FLUSH_GAP`] of the one before waits that long
+            // for its successor before it is sent alone. Typing and prompts,
+            // whose frames are further apart, still leave at once.
             let streaming =
                 last_write.is_some_and(|at: Instant| at.elapsed() < STREAMING_FLUSH_GAP);
             let next = frames.try_pop().or_else(|| {
@@ -1441,16 +1450,16 @@ fn write_output(
             match next {
                 Some(next) => queued = Some(next),
                 None => {
-                    if stream.flush().is_err() {
-                        frames.close();
+                    if !send_batch(&mut stream, frames, &mut batch, &mut batched) {
                         break;
                     }
                 }
             }
         }
     }
-    let _ = stream.flush();
-    drop(stream);
+    // Whatever was taken is still sent: the subscriber may be closing, but a
+    // frame it was handed is part of its stream.
+    let _ = send_batch(&mut stream, frames, &mut batch, &mut batched);
     frames.close();
     // A running writer owns the release.
     link.finish();
@@ -1462,6 +1471,66 @@ fn write_output(
             .subscribers
             .retain(|subscriber| !Arc::ptr_eq(&subscriber.frames, frames));
     }
+}
+
+/// Sends `batch` in one gathered write and hands the frames' buffers back to
+/// the queue for reuse. Returns false, with the queue closed, when the
+/// subscriber's socket failed.
+fn send_batch(
+    stream: &mut impl Write,
+    frames: &super::fanout::FrameQueue,
+    batch: &mut Vec<super::fanout::Frame>,
+    batched: &mut usize,
+) -> bool {
+    if batch.is_empty() {
+        return true;
+    }
+    let parts: Vec<(u64, &[u8])> = batch
+        .iter()
+        .map(|(offset, bytes)| (*offset, &bytes[..]))
+        .collect();
+    let sent = write_frames(stream, &parts).is_ok();
+    drop(parts);
+    *batched = 0;
+    for (_, bytes) in batch.drain(..) {
+        frames.recycle(bytes);
+    }
+    if !sent {
+        frames.close();
+    }
+    sent
+}
+
+/// Writes output frames, each its 8-byte offset, 4-byte length and bytes,
+/// with as few `writev` calls as the socket takes them in.
+fn write_frames(stream: &mut impl Write, parts: &[(u64, &[u8])]) -> std::io::Result<()> {
+    let headers: Vec<[u8; 12]> = parts
+        .iter()
+        .map(|(offset, bytes)| {
+            let mut header = [0u8; 12];
+            header[..8].copy_from_slice(&offset.to_be_bytes());
+            header[8..].copy_from_slice(&(bytes.len() as u32).to_be_bytes());
+            header
+        })
+        .collect();
+    let mut slices: Vec<std::io::IoSlice<'_>> = headers
+        .iter()
+        .zip(parts)
+        .flat_map(|(header, (_, bytes))| {
+            [std::io::IoSlice::new(header), std::io::IoSlice::new(bytes)]
+        })
+        .filter(|slice| !slice.is_empty())
+        .collect();
+    let mut remaining = &mut slices[..];
+    while !remaining.is_empty() {
+        match stream.write_vectored(remaining) {
+            Ok(0) => return Err(std::io::ErrorKind::WriteZero.into()),
+            Ok(written) => std::io::IoSlice::advance_slices(&mut remaining, written),
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(error) => return Err(error),
+        }
+    }
+    Ok(())
 }
 
 /// Arranges for the child's exit to start the exit path: on the reactor when
@@ -2183,6 +2252,49 @@ mod tests {
     use super::*;
 
     #[cfg(target_os = "macos")]
+    /// Frames leave as offset, length and bytes, whatever share of a
+    /// gathered write the socket takes at a time.
+    #[test]
+    fn gathered_frames_survive_short_writes() {
+        struct Trickle(Vec<u8>);
+        impl Write for Trickle {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                let taken = bytes.len().min(5);
+                self.0.extend_from_slice(&bytes[..taken]);
+                Ok(taken)
+            }
+            fn write_vectored(
+                &mut self,
+                slices: &[std::io::IoSlice<'_>],
+            ) -> std::io::Result<usize> {
+                let mut budget = 7;
+                let mut taken = 0;
+                for slice in slices {
+                    let part = slice.len().min(budget);
+                    self.0.extend_from_slice(&slice[..part]);
+                    taken += part;
+                    budget -= part;
+                    if budget == 0 {
+                        break;
+                    }
+                }
+                Ok(taken)
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        let mut out = Trickle(Vec::new());
+        write_frames(&mut out, &[(7, b"hello"), (12, b""), (12, b"world!")]).expect("write");
+        let mut expected = Vec::new();
+        for (offset, bytes) in [(7u64, &b"hello"[..]), (12, b""), (12, b"world!")] {
+            expected.extend_from_slice(&offset.to_be_bytes());
+            expected.extend_from_slice(&(bytes.len() as u32).to_be_bytes());
+            expected.extend_from_slice(bytes);
+        }
+        assert_eq!(out.0, expected);
+    }
+
     #[test]
     fn a_timed_out_launchd_handoff_starts_agents_directly_until_the_retry() {
         let at = std::time::Instant::now();

@@ -615,30 +615,19 @@ impl HolderExitMarker {
 }
 
 fn find(haystack: &[u8], needle: &[u8]) -> Option<usize> {
-    // Anchored on one byte rather than comparing the whole needle at every
-    // offset: every byte of every session's output passes through here, and a
-    // nineteen-byte window comparison per position was costing more than
-    // parsing the bytes did. The anchor is the needle's second byte. Its first
-    // is ESC, which colored output repeats every few bytes, so anchoring there
-    // stopped for a comparison at every color change; the `]` of an OSC is
-    // rare by comparison.
-    let [_, anchor, ..] = *needle else {
-        return haystack
-            .iter()
-            .position(|byte| Some(byte) == needle.first());
-    };
-    // `memchr` rather than `Iterator::position`: the scan visits every byte
-    // a session prints, and a byte-at-a-time loop was a measurable share of
-    // the Engine pump while a `cat` of a large log streamed.
-    let mut offset = 1;
-    while let Some(hit) = memchr::memchr(anchor, haystack.get(offset..)?) {
-        let start = offset + hit - 1;
-        if haystack[start..].starts_with(needle) {
-            return Some(start);
-        }
-        offset += hit + 1;
+    // Every byte of every session's output passes through here. `memmem`
+    // tests a pair of the needle's bytes at a time with SIMD, so text that
+    // repeats one of them (ESC in colored output, `]` in plain text) costs no
+    // stop per occurrence: anchoring a `memchr` on `]` scanned ASCII output
+    // at 4-5 GB/s, a few percent of the Engine pump in a flood, and this
+    // scans it at over 40.
+    static MARKER: std::sync::LazyLock<memchr::memmem::Finder<'static>> =
+        std::sync::LazyLock::new(|| memchr::memmem::Finder::new(HolderExitMarker::PREFIX));
+    if needle == HolderExitMarker::PREFIX {
+        MARKER.find(haystack)
+    } else {
+        memchr::memmem::find(haystack, needle)
     }
-    None
 }
 
 fn longest_suffix_of_prefix(data: &[u8]) -> usize {

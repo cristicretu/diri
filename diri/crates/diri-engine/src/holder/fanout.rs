@@ -50,7 +50,16 @@ struct State {
     /// The writer is in [`FrameQueue::linger`]: it wakes at its own
     /// deadline, so a push need not wake it until a batch has built.
     lingering: bool,
+    /// Buffers of frames the writer has sent, handed back (see
+    /// [`FrameQueue::recycle`]) so a streaming session's next frame starts
+    /// with the room it will grow into instead of reallocating its way up
+    /// from one PTY read. At most [`SPARE_FRAMES`], and emptied whenever the
+    /// writer parks, so a quiet session keeps none.
+    spare: Vec<Vec<u8>>,
 }
+
+/// How many sent frames' buffers a queue keeps for reuse.
+const SPARE_FRAMES: usize = 2;
 
 /// What became of a frame offered to a subscriber.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -104,6 +113,7 @@ impl FrameQueue {
                 progress: 0,
                 writer_parked: true,
                 lingering: false,
+                spare: Vec::new(),
             }),
             changed: Condvar::new(),
             capacity: capacity.max(1),
@@ -172,7 +182,16 @@ impl FrameQueue {
             {
                 frame.extend_from_slice(bytes);
             }
-            _ => state.frames.push_back((offset, bytes.to_vec())),
+            _ => {
+                let frame = match state.spare.pop() {
+                    Some(mut frame) => {
+                        frame.extend_from_slice(bytes);
+                        frame
+                    }
+                    None => bytes.to_vec(),
+                };
+                state.frames.push_back((offset, frame));
+            }
         }
         let unserved = std::mem::take(&mut state.writer_parked);
         // A reader parks only on an empty queue, so a push onto a non-empty
@@ -284,9 +303,26 @@ impl FrameQueue {
         let mut state = self.state.lock().expect("frame queue");
         if state.frames.is_empty() && !state.closed {
             state.writer_parked = true;
+            state.spare = Vec::new();
             true
         } else {
             false
+        }
+    }
+
+    /// Hands back the buffer of a frame the writer has sent, for the next
+    /// frame to reuse. Kept only while a writer serves the queue and only up
+    /// to [`SPARE_FRAMES`] (and never one larger than a joined frame grows);
+    /// any other is freed.
+    #[cfg(unix)]
+    pub(super) fn recycle(&self, mut frame: Vec<u8>) {
+        if frame.capacity() > JOINED_FRAME_BYTES {
+            return;
+        }
+        frame.clear();
+        let mut state = self.state.lock().expect("frame queue");
+        if !state.closed && !state.writer_parked && state.spare.len() < SPARE_FRAMES {
+            state.spare.push(frame);
         }
     }
 
@@ -335,6 +371,7 @@ impl FrameQueue {
     pub(super) fn close(&self) -> bool {
         let mut state = self.state.lock().expect("frame queue");
         state.closed = true;
+        state.spare = Vec::new();
         let unserved = std::mem::take(&mut state.writer_parked);
         drop(state);
         self.changed.notify_all();
@@ -384,6 +421,28 @@ mod tests {
             started.elapsed() < Duration::from_millis(500),
             "push should give up at its deadline, not hang"
         );
+    }
+
+    /// A sent frame's buffer starts the next frame, with its room kept, and
+    /// a writer that parks leaves none behind.
+    #[test]
+    fn a_sent_frames_buffer_is_reused_until_the_writer_parks() {
+        let queue = FrameQueue::new(1 << 20);
+        assert_eq!(queue.offer(0, b"abc", Duration::ZERO), Pushed::WakeWriter);
+        let (_, mut sent) = queue.try_pop().expect("frame");
+        sent.reserve(64 << 10);
+        let room = sent.capacity();
+        queue.recycle(sent);
+        assert_eq!(queue.offer(3, b"de", Duration::ZERO), Pushed::Queued);
+        let (offset, frame) = queue.try_pop().expect("frame");
+        assert_eq!((offset, &frame[..]), (3, &b"de"[..]));
+        assert_eq!(frame.capacity(), room, "the sent frame's buffer was reused");
+        queue.recycle(frame);
+        assert!(queue.park_writer());
+        assert!(queue.state.lock().unwrap().spare.is_empty());
+        // Parked, nothing is kept.
+        queue.recycle(Vec::with_capacity(4096));
+        assert!(queue.state.lock().unwrap().spare.is_empty());
     }
 
     #[test]

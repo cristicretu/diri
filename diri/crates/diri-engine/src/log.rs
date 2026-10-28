@@ -360,13 +360,12 @@ impl OutputLog {
             }
         }
 
-        // Positions wholly inside the chunk.
-        let mut index = 0;
-        while index + 1 < data.len() {
-            if data[index] != 0x1B {
-                index += 1;
-                continue;
-            }
+        // Positions wholly inside the chunk. Escapes are found with `memchr`
+        // rather than by testing every byte: the Holder's log writer scans
+        // everything a session prints, and the byte loop was the largest
+        // user-space cost on that thread in a flood.
+        let last = data.len().saturating_sub(1);
+        for index in memchr::memchr_iter(0x1B, &data[..last]) {
             let found = data[index + 1] == 0x63
                 || (index + 3 < data.len()
                     && data[index + 1] == 0x5B
@@ -375,7 +374,6 @@ impl OutputLog {
             if found {
                 self.record_sync_point(chunk_start + index as u64);
             }
-            index += 1;
         }
 
         // Carry the trailing bytes of the virtual haystack forward.

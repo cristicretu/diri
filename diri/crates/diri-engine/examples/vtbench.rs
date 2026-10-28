@@ -31,6 +31,8 @@
 //!
 //! `DIRI_VT_BENCH_RUNS` sets the run count (default 5) and
 //! `DIRI_VT_BENCH_ONLY=ascii,csi` limits the workloads.
+//! `DIRI_VT_BENCH_MIN_MB` sets the least bytes per run (default 64), so a
+//! profiler can attach to one long run.
 //! `DIRI_VT_BENCH_PROFILE=1` skips the reference parse and the state check
 //! so a profiler sees only the timed path; it prints no numbers.
 //!
@@ -387,7 +389,11 @@ fn main() {
         }
         let data = std::fs::read(source.join(format!("{name}.bin")))
             .unwrap_or_else(|error| panic!("{name}.bin: {error}"));
-        let reps = MIN_BYTES.div_ceil(data.len());
+        let min_bytes = std::env::var("DIRI_VT_BENCH_MIN_MB")
+            .ok()
+            .and_then(|mb| mb.parse::<usize>().ok())
+            .map_or(MIN_BYTES, |mb| mb << 20);
+        let reps = min_bytes.div_ceil(data.len());
         let mut stream = data.repeat(reps);
         let payload = root.join(format!("{name}.bin"));
         std::fs::write(&payload, &stream).expect("payload");
