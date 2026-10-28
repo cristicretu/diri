@@ -160,7 +160,16 @@ impl HolderClient {
     /// the holder predates the output stream, and tailing the log is the only
     /// route.
     pub fn open_output_stream(&self) -> HolderResult<Option<HolderOutputStream>> {
-        HolderOutputStream::open(&self.socket_path)
+        HolderOutputStream::open(&self.socket_path, None)
+    }
+
+    /// Subscribes to PTY output starting at `offset`, which the caller has
+    /// not consumed yet. A Holder that supports it sends what precedes its
+    /// live stream from its own log first, and paces the PTY by this
+    /// subscriber the whole time; see [`HolderOutputStream::resumed`]. An
+    /// older Holder answers as [`Self::open_output_stream`] does.
+    pub fn open_output_stream_from(&self, offset: u64) -> HolderResult<Option<HolderOutputStream>> {
+        HolderOutputStream::open(&self.socket_path, Some(offset))
     }
 
     pub fn is_alive(&self) -> bool {
@@ -243,13 +252,15 @@ pub struct HolderOutputStream {
     /// chunk sizes the syscalls cost more than the parsing they feed.
     stream: std::io::BufReader<diri_platform::ipc::UnixStream>,
     start_offset: u64,
+    /// Whether the Holder honoured the requested resume offset.
+    resumed: bool,
     /// The timeout currently set on the socket. Setting it is a syscall, and
     /// the coalescing loop would otherwise pay one per frame.
     timeout: Option<Duration>,
 }
 
 impl HolderOutputStream {
-    fn open(path: &Path) -> HolderResult<Option<Self>> {
+    fn open(path: &Path, resume_from: Option<u64>) -> HolderResult<Option<Self>> {
         use std::io::BufRead;
         let mut stream = socket::connect(path)?;
         socket::set_buffer(
@@ -259,6 +270,7 @@ impl HolderOutputStream {
         );
         let mut request = HolderRequest::op(HolderOperation::OutputStream);
         request.stream_version = Some(HOLDER_OUTPUT_STREAM_VERSION);
+        request.resume_from = resume_from;
         socket::write_json_line(&mut stream, &request)?;
         // The response is read through the same buffer the frames will be.
         // The holder may send its first frame straight behind the response,
@@ -285,6 +297,7 @@ impl HolderOutputStream {
         Ok(Some(Self {
             stream,
             start_offset,
+            resumed: resume_from.is_some() && response.resumed == Some(true),
             timeout: None,
         }))
     }
@@ -299,6 +312,14 @@ impl HolderOutputStream {
             .map_err(|error| HolderError::io("set output stream timeout", error))?;
         self.timeout = timeout;
         Ok(())
+    }
+
+    /// Whether the Holder honoured the resume offset: the stream then starts
+    /// there, or at the oldest byte the log still keeps if that is later, and
+    /// the Holder will not drop it for being behind while it keeps reading.
+    #[must_use]
+    pub fn resumed(&self) -> bool {
+        self.resumed
     }
 
     /// Offset of the first byte this stream will deliver.
@@ -525,7 +546,7 @@ impl HolderManagerClient {
     /// the holder predates the output stream, and tailing the log is the only
     /// route.
     pub fn open_output_stream(&self) -> HolderResult<Option<HolderOutputStream>> {
-        HolderOutputStream::open(&self.socket_path)
+        HolderOutputStream::open(&self.socket_path, None)
     }
 
     pub fn is_alive(&self) -> bool {

@@ -907,6 +907,24 @@ Engine keeps following its durable log without probing on every wakeup.
 Transport failures and interrupted supported streams remain retryable. This
 changes no local or remote wire format and never replaces a live Holder.
 
+The local output stream additively accepts `resumeFrom`, the first offset the
+Engine has not parsed. A Holder that understands it answers `resumed: true` and
+serves the bytes between that offset (or its log's oldest kept byte, if later)
+and its live offset from its own log before the live frames. The Engine owns
+the session's terminal state; it is not a display client. So while it keeps
+taking bytes, backlog or queue, the Holder waits for queue room before reading
+more from the PTY: a program that prints faster than the Engine parses is paced
+to the Engine, as a terminal emulator's own reads pace it, and can no longer
+lap the 32 MiB session log and have output silently skipped. The Holder gives
+up on a subscriber only after 500 ms in which it took nothing (a hung Engine);
+the program then runs free and the Engine resumes from its offset when it
+returns. Display clients are unaffected: they attach to the Engine, whose
+bounded per-client queues still drop stale diffs and reseed with a Full
+Snapshot. An older live Holder ignores `resumeFrom` and omits `resumed`; the
+Engine keeps its previous behaviour for that Holder (follow the log, subscribe
+at the live offset once drained). The remote Helper protocol is unchanged: the
+remote Holder feeds its parser on the loop that reads its PTY.
+
 The local Holder's `OutputLog` writer retains no raw-output ring: no Holder
 operation reads it. Durable file output, offsets, rotation and exit markers
 remain unchanged; the separate bounded live-output queue still serves attached
@@ -1845,7 +1863,12 @@ account record, not environment variables. No command arguments are collected.
 `enhanced-keyboard-v1` is an optional, explicit controller capability. It does
 not enable parser negotiation: shipping `HeadlessScreen::new` remains disabled.
 Only an explicitly configured capable input owner may use the opt-in parser
-constructor. Five validated flag bits come from the shared parser; there is no
+constructor. The local Engine is such an owner for local sessions: it builds
+their screens with `new_with_keyboard_enhancements`, and the desktop App
+attaches with `enhancedKeyboard` and encodes the negotiated flags. The remote
+Holder and the Engine's mirror of a remote session keep the disabled parser,
+so remote sessions still never answer `CSI ? u`; enabling it there is a
+separate Holder change. Five validated flag bits come from the shared parser; there is no
 second escape parser. Direct set, query, push/pop and screen swaps share the
 same bounded stack state.
 
@@ -1952,6 +1975,16 @@ attributes (`?62;22c`, which kitten's probe waits on), and it sets the PTY's
 queries. Every other reply stays unanswered, as before, and the Holder keeps
 no queue of unanswered replies. A Holder from before minor 16 neither intercepts
 nor answers, so its programs see no support and keep working unchanged.
+
+Local sessions answer more than this: XTVERSION, XTGETTCAP, DECRQSS, the kitty
+keyboard query, OSC 4/10/11/12 color queries from the App's palette
+(`terminal.configure`), `CSI ? 996 n` and DECSET 2031/2048 reports. That is
+opt-in on the shared screen (`with_host_replies`) and the Holder does not opt
+in, so a remote program still gets none of these replies and no OSC 4 color
+rewrite on the wire. Answering them remotely needs its own revision of this
+section. The shared emulator's state fixes (DECSTR, erase-in-line at a pending
+wrap, RIS clearing the title, modes 47 and 1047) reach Holders as ordinary
+emulator behavior with no protocol change.
 
 Pixels are read on demand. `ImageRequest` (kind 50, JSON) names an anchor
 key and a byte offset. `ImageResponse` (kind 51) carries a length-prefixed JSON
@@ -2078,6 +2111,53 @@ status ticker. Upstream `Hello` grew from 526 to 1,452 bytes. Holder
 wall time (about 20 to 60 ms) is dominated by process spawn either way. The
 harness is `diri-remote/tests/reconnect_resume.rs` (ignored measurement
 tests).
+
+## Terminal styles (protocol minor 18)
+
+Protocol minor 18 adds optional `terminal-styles-v1`: the grid now carries
+the cursor shape and blink a program asks for (DECSCUSR, mode 12) and the
+underline kind (`4:2` double, `4:3` curly, `4:4` dotted, `4:5` dashed),
+underline color (SGR 58/59) and overline (SGR 53) that the shared parser
+already kept. The RLE rows, the u16 cell style and the annotation extension
+are unchanged:
+
+- The cursor rides grid flag bits 3-4 (block, underline, bar) and bit 5
+  (steady). All zero is a blinking block, the cursor Diri always drew, so
+  every older encoder already means the default.
+- Decorations are a sorted, non-overlapping `styles` span list in the
+  existing row annotations (`start`, `end`, `underline`, packed
+  `underlineColor`, `overline`). A span exists only where a cell needs one:
+  a plain underline stays the `UNDERLINE` style bit alone, and every
+  underlined cell keeps that bit, so a renderer without spans draws a single
+  underline. Spans have their own per-response budget the size of the link
+  budget; past it a span is dropped and its cells keep the bit. A row holds
+  at most 512 spans. Invalid, overlapping or empty spans fail decoding.
+- SGR 5/6 now reach the existing `BLINK` style bit. The vendored VTE parses
+  SGR 53/55, and the vendored alacritty_terminal gains `BLINK` and
+  `OVERLINE` cell flags (the cell stays 24 bytes; the compact history stores
+  flags as a varint).
+
+Older peers keep working. Negotiation is by capability name, not by minor
+order (minor 17 is `grid-resume-v1`): the Engine lists `terminal-styles-v1`
+in `Hello.requiredCapabilities` only for a Helper at minor 18 or above,
+because an older Holder rejects a capability it does not know. A Holder
+rejects the request below minor 18, and otherwise strips spans and cursor
+bits from snapshots, deltas and scrollback for every controller that did not
+ask, naming the capability in `HelloAck` only to one that did. Annotation
+JSON rejects unknown fields, so this keeps older Engines reading. A new Engine attaching to an older live Holder
+receives neither and shows the default cursor and single underlines, never
+fabricated styles. Locally, `AttachRequest.terminalStyles` and the
+`session.read_scrollback_cells` `styles` parameter opt in the same way; the
+Engine sends a client that omits them the exact pre-styles bytes, encoding a
+second time only for a publication that carries styles while such a sink is
+attached. Previews always receive the legacy form.
+
+A cursor-only change (neovim entering insert mode) advances `content_seq`,
+and the row fingerprint hashes underline kind, overline and underline color,
+so a decoration-only repaint is never withheld by the attach pump. Mode 12
+starts from the blinking default, so a DECRQM `?12` query reports the blink
+and never turns the cursor steady. Checkpoint restore replays spans and the
+cursor style. No Holder task, timer or queue is added.
 
 ## Read-only output log ownership
 

@@ -1,4 +1,6 @@
-use diri_proto::grid::{ChangedRow, GridCell, GridRowCodec, GridUpdate, TermColor, TermStyle};
+use diri_proto::grid::{
+    ChangedRow, GridCell, GridRowCodec, GridUpdate, StyleSpan, TermColor, TermStyle, UnderlineKind,
+};
 use diri_proto::methods::ReadScrollbackCellsResult;
 use diri_term::scrollback::{WheelDelta, WheelEvent};
 use diri_term::{buffer::GridBuffer, element::TerminalElement, theme::TermTheme};
@@ -242,6 +244,7 @@ fn terminal_theme_fade_redraw(cx: &mut BenchAppContext) {
         cursor_visible: true,
         is_full_snapshot: true,
         changed_rows,
+        cursor_style: Default::default(),
     });
 
     let mut window = cx.add_empty_window();
@@ -269,9 +272,60 @@ fn terminal_theme_fade_redraw(cx: &mut BenchAppContext) {
     }
 }
 
+/// An editor full of LSP diagnostics: every row carries a colored undercurl
+/// and a dotted hint, as decoration spans.
+#[gpui::bench(fps = 120)]
+fn terminal_diagnostics_scroll(cx: &mut BenchAppContext) {
+    scroll_frames(cx, |offset, full| diagnostic_frame(offset, full, true));
+}
+
+/// The same rows as `terminal_diagnostics_scroll` on the legacy wire: one
+/// plain underline bit and no spans, which is what every underline cost
+/// before decoration spans.
+#[gpui::bench(fps = 120)]
+fn terminal_diagnostics_legacy_scroll(cx: &mut BenchAppContext) {
+    scroll_frames(cx, |offset, full| diagnostic_frame(offset, full, false));
+}
+
+fn diagnostic_frame(offset: usize, is_full_snapshot: bool, spans: bool) -> GridUpdate {
+    let mut frame = build_frame(offset, is_full_snapshot, styled_row);
+    for row in &mut frame.changed_rows {
+        for cell in &mut row.cells[4..24] {
+            cell.style |= TermStyle::UNDERLINE;
+        }
+        if spans {
+            row.metadata.styles = vec![
+                StyleSpan {
+                    start: 4,
+                    end: 14,
+                    underline: UnderlineKind::Curly,
+                    underline_color: Some(TermColor::Rgb(224, 108, 117).packed()),
+                    overline: false,
+                },
+                StyleSpan {
+                    start: 14,
+                    end: 24,
+                    underline: UnderlineKind::Dotted,
+                    underline_color: Some(TermColor::Ansi(3).packed()),
+                    overline: false,
+                },
+            ];
+        }
+    }
+    frame
+}
+
 fn scroll(cx: &mut BenchAppContext, row: fn(usize) -> Vec<GridCell>) {
     let initial = build_frame(0, true, row);
     let frames = [build_frame(1, false, row), build_frame(0, false, row)];
+    scroll_updates(cx, initial, frames);
+}
+
+fn scroll_frames(cx: &mut BenchAppContext, frame: fn(usize, bool) -> GridUpdate) {
+    scroll_updates(cx, frame(0, true), [frame(1, false), frame(0, false)]);
+}
+
+fn scroll_updates(cx: &mut BenchAppContext, initial: GridUpdate, frames: [GridUpdate; 2]) {
     let terminal = TerminalElement::with_buffer(GridBuffer::new(COLS, ROWS)).focused(true);
     terminal.apply_damage(initial);
 
@@ -432,6 +486,7 @@ fn build_frame(
         cursor_visible: true,
         is_full_snapshot,
         changed_rows,
+        cursor_style: Default::default(),
     }
 }
 
@@ -440,6 +495,8 @@ gpui::bench_group!(
     terminal_build_log_scroll,
     terminal_styled_tui_scroll,
     terminal_framed_tui_scroll,
+    terminal_diagnostics_scroll,
+    terminal_diagnostics_legacy_scroll,
     terminal_reading_view_redraw,
     terminal_trackpad_fling,
     terminal_theme_fade_redraw

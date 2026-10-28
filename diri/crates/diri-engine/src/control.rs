@@ -125,7 +125,19 @@ fn terminal_settings(config_dir: &Path) -> diri_proto::TerminalConfigureParams {
         .and_then(|bytes| serde_json::from_slice(&bytes).ok())
         .unwrap_or(diri_proto::TerminalConfigureParams {
             shell_integration: true,
+            palette: None,
         })
+}
+
+/// Restores the palette the App last sent, so local terminals answer color
+/// queries before it reconnects. Absent leaves the Engine's current palette.
+fn load_terminal_palette(config_dir: &Path, registry: &Mutex<Registry>) {
+    if let Some(palette) = terminal_settings(config_dir).palette {
+        crate::session::set_terminal_palette(Some(palette));
+        if let Ok(registry) = registry.lock() {
+            registry.apply_terminal_palette(Some(palette));
+        }
+    }
 }
 
 /// A terminal's shell: the user's own, as a login shell.
@@ -277,6 +289,7 @@ impl ControlServer {
         let config_dir = socket_path
             .parent()
             .map_or_else(|| PathBuf::from("."), Path::to_path_buf);
+        load_terminal_palette(&config_dir, &registry);
         let remote_bindings = remote_binding_store(&config_dir);
         let (agent_catalog, accounts) = agent_config_stores(&config_dir);
         let events = crate::events::EventBus::new();
@@ -361,6 +374,13 @@ impl ControlServer {
                 &bytes,
             )
             .map_err(io_control_error)?;
+        }
+        if crate::session::terminal_palette() != p.palette {
+            crate::session::set_terminal_palette(p.palette);
+            self.registry
+                .lock()
+                .map_err(poisoned)?
+                .apply_terminal_palette(p.palette);
         }
         Ok(json!({}))
     }
@@ -543,6 +563,7 @@ impl ControlServer {
     /// and the app writes `hosts.json` to the XDG config directory.
     pub fn with_config_dir(mut self, dir: impl Into<PathBuf>) -> Self {
         self.config_dir = dir.into();
+        load_terminal_palette(&self.config_dir, &self.registry);
         let (agent_catalog, accounts) = agent_config_stores(&self.config_dir);
         self.agent_catalog = Arc::new(Mutex::new(agent_catalog));
         self.accounts = Mutex::new(accounts);
@@ -884,10 +905,13 @@ impl ControlServer {
                     // Bytes the line reader buffered past the attach line are
                     // already binary frames; hand them over.
                     let buffered = reader.buffer().to_vec();
-                    self.attach.serve_with_keyboard(
+                    self.attach.serve_with_capabilities(
                         &self.registry,
                         &attach.attach.0,
-                        attach.enhanced_keyboard,
+                        crate::attach::AttachCapabilities {
+                            enhanced_keyboard: attach.enhanced_keyboard,
+                            terminal_styles: attach.terminal_styles,
+                        },
                         reader.into_inner(),
                         buffered,
                         writer,
@@ -2987,7 +3011,12 @@ impl ControlServer {
         // The reflow runs after the Registry lock is released; see
         // `Session::resize_pty`.
         if let Some(reflow) = reflow {
-            reflow.apply();
+            let reports = reflow.apply();
+            if !reports.is_empty()
+                && let Some(session) = self.registry.lock().map_err(poisoned)?.get(&p.session_id.0)
+            {
+                session.write_reports(&reports);
+            }
         }
         Ok(json!({}))
     }
@@ -3281,13 +3310,23 @@ impl ControlServer {
         // A remote history page takes a network round trip (up to the request
         // timeout). Attach input and grid publication also need the Registry;
         // neither may wait for this reply.
+        // An older client rejects decoration spans it does not know.
+        let styled = |mut result: diri_proto::ReadScrollbackCellsResult| {
+            if !p.styles {
+                result
+                    .metadata
+                    .iter_mut()
+                    .for_each(|metadata| metadata.styles.clear());
+            }
+            result
+        };
         if let Some(reader) = reader {
-            return encode(&reader.read(p.first_row, p.max_rows));
+            return encode(&styled(reader.read(p.first_row, p.max_rows)));
         }
         let (mut screen, _) = self
             .completed_terminal(&p.session_id.0)?
             .ok_or_else(|| self.no_retained_terminal(&p.session_id.0))?;
-        encode(&screen.scrollback_cells(p.first_row, p.max_rows))
+        encode(&styled(screen.scrollback_cells(p.first_row, p.max_rows)))
     }
 
     fn spawn_session_unlocked(
@@ -9019,6 +9058,7 @@ mod tests {
                     diri_proto::grid::ChangedRow::new(0, row.clone()),
                     diri_proto::grid::ChangedRow::new(1, row),
                 ],
+                cursor_style: Default::default(),
             },
             marker_buffer: Vec::new(),
             alt_screen: false,

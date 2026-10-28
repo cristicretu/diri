@@ -207,6 +207,17 @@ pub struct HolderRequest {
     /// On `stat`: also report `awaitingLine`. Older holders ignore it.
     #[serde(rename = "lineProbe", default, skip_serializing_if = "Option::is_none")]
     pub line_probe: Option<bool>,
+    /// On `outputStream`: the first offset the subscriber still needs. A
+    /// Holder that honours it delivers from there (or from the oldest byte
+    /// its log still keeps), reading what precedes the live stream from its
+    /// own log, and answers `resumed`. Older Holders ignore it and start at
+    /// the live offset.
+    #[serde(
+        rename = "resumeFrom",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub resume_from: Option<u64>,
 }
 
 impl HolderRequest {
@@ -219,6 +230,7 @@ impl HolderRequest {
             rows: None,
             sig: None,
             line_probe: None,
+            resume_from: None,
         }
     }
 }
@@ -246,6 +258,10 @@ pub struct HolderResponse {
         skip_serializing_if = "Option::is_none"
     )]
     pub start_offset: Option<u64>,
+    /// Set when the Holder honoured `resumeFrom`: `startOffset` is then the
+    /// requested offset, or the oldest byte its log keeps when that is later.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resumed: Option<bool>,
 }
 
 impl HolderResponse {
@@ -260,6 +276,14 @@ impl HolderResponse {
         }
     }
 
+    /// Accepts an output-stream upgrade that honours `resumeFrom`.
+    pub fn resumed_output_stream(version: u16, start_offset: u64) -> Self {
+        Self {
+            resumed: Some(true),
+            ..Self::output_stream(version, start_offset)
+        }
+    }
+
     pub fn success() -> Self {
         Self {
             ok: true,
@@ -268,6 +292,7 @@ impl HolderResponse {
             stat: None,
             tree: None,
             start_offset: None,
+            resumed: None,
         }
     }
 
@@ -293,6 +318,7 @@ impl HolderResponse {
             stat: None,
             tree: None,
             start_offset: None,
+            resumed: None,
         }
     }
 

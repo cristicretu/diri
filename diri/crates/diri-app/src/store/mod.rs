@@ -1738,6 +1738,10 @@ impl SessionStore {
     pub fn terminal_settings(&self) -> TerminalConfigureParams {
         TerminalConfigureParams {
             shell_integration: self.prefs.terminal_shell_integration,
+            palette: Some(crate::app_theme::engine_palette(
+                &self.prefs.terminal_theme,
+                self.prefs.interface_style(),
+            )),
         }
     }
 

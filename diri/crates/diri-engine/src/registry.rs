@@ -1129,6 +1129,14 @@ impl Registry {
         self.sessions.get(id)
     }
 
+    /// Local terminals answer color queries from `palette` from now on; see
+    /// [`Session::apply_terminal_palette`].
+    pub fn apply_terminal_palette(&self, palette: Option<diri_proto::TerminalPalette>) {
+        for session in self.sessions.values() {
+            session.apply_terminal_palette(palette);
+        }
+    }
+
     /// Whether `id` is a note Session: a record with no process or terminal.
     pub fn is_note(&self, id: &str) -> bool {
         self.records.get(id).is_some_and(SessionRecord::is_note)

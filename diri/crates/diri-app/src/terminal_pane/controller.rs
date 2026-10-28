@@ -750,7 +750,15 @@ fn spawn_transport(
         let mut backoff = REATTACH_DELAY;
         loop {
             trace.connecting();
-            let connect = SessionAttachment::connect(&socket, id.clone());
+            // This client encodes kitty keyboard flags (`encode_action`), so
+            // it can stay the controller of a program that enables them.
+            let connect = SessionAttachment::connect_with_options(
+                &socket,
+                id.clone(),
+                diri_client::attachment::AttachmentOptions {
+                    enhanced_keyboard: true,
+                },
+            );
             let connected = tokio::select! {
                 _ = &mut shutdown => return,
                 result = tokio::time::timeout(Duration::from_secs(2), connect) => result,
@@ -1008,6 +1016,7 @@ mod tests {
             cursor_row: 0,
             cursor_visible: true,
             is_full_snapshot: sequence == 1,
+            cursor_style: Default::default(),
             changed_rows: vec![ChangedRow::new(
                 0,
                 vec![

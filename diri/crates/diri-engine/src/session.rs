@@ -80,6 +80,18 @@ fn replay_budget() -> usize {
         })
 }
 
+/// The session log size a Holder is launched with. `DIRIJOR_HOLDER_LOG_BYTES`
+/// overrides it, no lower than a megabyte; tests use it to reach the log's
+/// bound without printing tens of megabytes.
+fn holder_log_capacity() -> i64 {
+    std::env::var("DIRIJOR_HOLDER_LOG_BYTES")
+        .ok()
+        .and_then(|value| value.parse::<i64>().ok())
+        .map_or(crate::holder::protocol::DEFAULT_DISK_CAPACITY, |value| {
+            value.max(1 << 20)
+        })
+}
+
 /// Quiet time after the last output before a screen checkpoint is written,
 /// the Swift daemon's `checkpointSettleDelay`. Bursts coalesce into one
 /// write; an idle screen is checkpointed within about a second.
@@ -302,6 +314,17 @@ const EVAL_INTERVAL: Duration = Duration::from_millis(16);
 /// taking. Beyond this the file is followed instead, which costs latency for a
 /// moment rather than churning subscriptions that cannot be read yet.
 const LIVE_HANDOVER_GAP: u64 = 256 << 10;
+
+/// Bytes held-session pumps in this process skipped because the log had
+/// already rotated past them. Every one is output the screen never saw, so
+/// anything but zero is a bug; benches and tests read it to prove that.
+static HELD_OUTPUT_SKIPPED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// See [`HELD_OUTPUT_SKIPPED`].
+#[doc(hidden)]
+pub fn held_output_skipped_bytes() -> u64 {
+    HELD_OUTPUT_SKIPPED.load(Ordering::Relaxed)
+}
 
 /// What a session looks like from the outside.
 #[derive(Clone, Debug)]
@@ -1026,8 +1049,32 @@ pub(crate) struct MirrorResize {
     shared: Arc<Shared>,
 }
 
+/// What XTVERSION reports for a local terminal.
+const TERMINAL_VERSION: &str = concat!("diri ", env!("DIRI_APP_VERSION"));
+
+/// The palette the App paints local terminals with, from the last
+/// `terminal.configure`. One per Engine: every local terminal shares the
+/// App's theme.
+static TERMINAL_PALETTE: std::sync::RwLock<Option<diri_proto::TerminalPalette>> =
+    std::sync::RwLock::new(None);
+
+pub(crate) fn terminal_palette() -> Option<diri_proto::TerminalPalette> {
+    *TERMINAL_PALETTE
+        .read()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+pub(crate) fn set_terminal_palette(palette: Option<diri_proto::TerminalPalette>) {
+    *TERMINAL_PALETTE
+        .write()
+        .unwrap_or_else(|poisoned| poisoned.into_inner()) = palette;
+}
+
 impl MirrorResize {
-    pub(crate) fn apply(self) {
+    /// Reflows the emulator and returns the in-band size report a program
+    /// asked for with DECSET 2048, which the caller writes to the PTY.
+    #[must_use]
+    pub(crate) fn apply(self) -> Vec<u8> {
         let mut screen = self.shared.screen.lock().expect("screen");
         let Some((cols, rows)) = self
             .shared
@@ -1036,15 +1083,17 @@ impl MirrorResize {
             .expect("requested size")
             .take()
         else {
-            return;
+            return Vec::new();
         };
         screen.resize(cols as usize, rows as usize);
+        let reports = screen.take_unsolicited();
         drop(screen);
         // A TUI answers the resize by clearing and redrawing. If the clear is
         // already parsed, the held pump publishes once the redraw lands.
         if !self.shared.awaiting_redraw.load(Ordering::SeqCst) {
             self.shared.grid_wake.notify();
         }
+        reports
     }
 }
 
@@ -2050,7 +2099,7 @@ impl Session {
             environment: spec.pty.env.iter().cloned().collect(),
             cols: spec.pty.cols.max(2),
             rows: spec.pty.rows.max(2),
-            disk_capacity: crate::holder::protocol::DEFAULT_DISK_CAPACITY,
+            disk_capacity: holder_log_capacity(),
         };
         HolderLauncher::launch(&holder.executable, &paths, &launch).map_err(holder_io_error)?;
 
@@ -2128,7 +2177,7 @@ impl Session {
                         environment: pty.env.iter().cloned().collect(),
                         cols: pty.cols,
                         rows: pty.rows,
-                        disk_capacity: crate::holder::protocol::DEFAULT_DISK_CAPACITY,
+                        disk_capacity: holder_log_capacity(),
                     };
                     let exec_started = Instant::now();
                     if let Err(error) = HolderLauncher::launch(&holder.executable, &paths, &launch)
@@ -3289,9 +3338,34 @@ impl Session {
 
     pub fn resize(&self, cols: u16, rows: u16) -> std::io::Result<()> {
         if let Some(reflow) = self.resize_pty(cols, rows)? {
-            reflow.apply();
+            self.write_reports(&reflow.apply());
         }
         Ok(())
+    }
+
+    /// Writes reports a program asked to receive (DECSET 2031 and 2048) when
+    /// something outside its output changed. They are not typed input: no
+    /// keyboard admission, no echo or prompt tracking. A failed write is
+    /// dropped like any reply to a program that has gone.
+    pub(crate) fn write_reports(&self, reports: &[u8]) {
+        if !reports.is_empty() && !matches!(self.transport, Transport::Remote(_)) {
+            let _ = self.write_raw(reports);
+        }
+    }
+
+    /// Answers color queries from `palette` from now on, and tells a program
+    /// that asked for color-scheme reports when light/dark changed. Remote
+    /// sessions are untouched: their Holder answers its own queries.
+    pub(crate) fn apply_terminal_palette(&self, palette: Option<diri_proto::TerminalPalette>) {
+        if matches!(self.transport, Transport::Remote(_)) {
+            return;
+        }
+        let reports = {
+            let mut screen = self.shared.screen.lock().expect("screen");
+            screen.set_palette(palette);
+            screen.take_unsolicited()
+        };
+        self.write_reports(&reports);
     }
 
     /// Resizes the PTY now and returns the emulator reflow still owed, for
@@ -3529,17 +3603,27 @@ fn new_shared(
         screen: Mutex::new({
             // The pump feeds every Holder frame (about a kilobyte while output
             // streams) and releases streaming memory once it settles.
-            let screen = HeadlessScreen::new(spec.pty.cols as usize, spec.pty.rows as usize)
-                .with_notifications()
-                .keeping_spare_rows_until_idle();
+            let (cols, rows) = (spec.pty.cols as usize, spec.pty.rows as usize);
             // Only a local session's own emulator feeds the client grid; a
             // remote session's grid, image anchors and pixels come from its
             // Holder (`inline-images-v1`), so storing images here too would
-            // cost memory for pixels nobody reads.
+            // cost memory for pixels nobody reads. A remote mirror's replies
+            // never reach the program, so it answers nothing new either.
             if spec.remote.is_none() {
-                screen.with_inline_images()
-            } else {
+                // The local Engine is the input owner and the App encodes the
+                // negotiated flags, so programs may enable kitty keyboard
+                // reporting here.
+                let mut screen = HeadlessScreen::new_with_keyboard_enhancements(cols, rows)
+                    .with_notifications()
+                    .with_inline_images()
+                    .with_host_replies(TERMINAL_VERSION)
+                    .keeping_spare_rows_until_idle();
+                screen.set_palette(terminal_palette());
                 screen
+            } else {
+                HeadlessScreen::new(cols, rows)
+                    .with_notifications()
+                    .keeping_spare_rows_until_idle()
             }
         }),
         cell_pixels: spec
@@ -5766,6 +5850,11 @@ fn pump_held(
                         .store(checkpoint.keyboard.is_some(), Ordering::SeqCst);
                     if let Some(keyboard) = checkpoint.keyboard {
                         screen.restore_keyboard_state(keyboard);
+                        // Written before keyboard snapshots, by an Engine
+                        // whose parser never negotiated kitty flags: zero.
+                        if checkpoint.keyboard_snapshot.is_none() {
+                            screen.mark_keyboard_never_negotiated();
+                        }
                     }
                     if let Some(snapshot) = &checkpoint.keyboard_snapshot {
                         let restored_keyboard = screen.restore_keyboard_snapshot(snapshot);
@@ -5784,7 +5873,15 @@ fn pump_held(
             ),
             None => {
                 let floor = exit_marker_floor.min(tail);
-                let start = log.preferred_replay_start(replay_budget).max(floor);
+                // A child this Engine just launched has printed only what it
+                // printed while the pump was starting, and all of it belongs
+                // on its screen. The replay budget bounds the work of adopting
+                // a session with a long past, which a fresh one does not have.
+                let start = if fresh {
+                    floor
+                } else {
+                    log.preferred_replay_start(replay_budget).max(floor)
+                };
                 // Replaying from this child's first byte sees every keyboard
                 // mode it set, just as replaying a whole log from zero does.
                 let whole_child = start == 0 || start == floor;
@@ -5874,8 +5971,14 @@ fn pump_held(
     // followed up to this point before a frame can be consumed.
     let mut live_from: u64 = 0;
     // Set once the log has been read to its end, which is the only safe moment
-    // to subscribe.
+    // to subscribe to a Holder that cannot resume.
     let mut drained = false;
+    // Whether to subscribe without waiting for a drained log. A Holder that
+    // resumes from our offset sends what we have not read yet itself, and
+    // holds its PTY at our pace while we read it, so subscribing at once is
+    // what keeps a flood from outrunning this pump. Cleared for a Holder that
+    // cannot resume, and after a failed attempt, until the log next drains.
+    let mut subscribe_eagerly = true;
 
     while !shared.stop.load(Ordering::SeqCst) && exit_status.is_none() {
         if shared.reset_requested.swap(false, Ordering::SeqCst) {
@@ -5902,15 +6005,28 @@ fn pump_held(
             shared.grid_wake.notify();
         }
         scan_artifacts_if_due(&shared, &mut last_scan_at, &mut last_scan_seq);
-        // Subscribe only from a standing start, with the log drained.
+        // Subscribe from where this pump stands. A Holder that resumes sends
+        // the bytes we have not read itself, so this works at any distance
+        // behind it, and it is what bounds that distance: while we are
+        // subscribed the Holder reads its PTY no faster than we take output,
+        // so a flood cannot outrun us past what its log keeps.
         //
-        // A subscription taken while still catching up is worse than none: the
-        // holder begins filling a queue this loop is not yet reading, and once
-        // that queue is full the pump waits on it for every chunk. Waiting for
-        // a drained log keeps the handover to a few frames.
-        if output_stream_supported && live.is_none() && drained {
-            match client.open_output_stream() {
+        // An older Holder only streams from its live offset. Subscribing to
+        // one while still catching up is worse than none: it begins filling a
+        // queue this loop is not yet reading, and once that queue is full it
+        // waits on it for every chunk. For those, wait for a drained log,
+        // which keeps the handover to a few frames.
+        if output_stream_supported && live.is_none() && (drained || subscribe_eagerly) {
+            match client.open_output_stream_from(offset) {
+                // Starts at `offset`, or later only if the log has already
+                // rotated past it, which the log read below records.
+                Ok(Some(stream)) if stream.resumed() => {
+                    live_from = stream.start_offset();
+                    live = Some(stream);
+                    subscribe_eagerly = true;
+                }
                 Ok(Some(stream)) => {
+                    subscribe_eagerly = false;
                     // A drained log does not mean the holder is where the log
                     // ends: writes are queued, so it can be megabytes further on.
                     // Subscribing across that distance is the worst case — the
@@ -5925,7 +6041,7 @@ fn pump_held(
                     }
                 }
                 Ok(None) => output_stream_supported = false,
-                Err(_) => {}
+                Err(_) => subscribe_eagerly = false,
             }
             drained = false;
         }
@@ -6144,7 +6260,13 @@ fn pump_held(
 
         trace_hop!(OutputReceived);
         // A rotation can move the readable floor past us; resynchronize.
-        if start > offset && !marker_buffer.is_empty() {
+        if start > offset {
+            HELD_OUTPUT_SKIPPED.fetch_add(start - offset, Ordering::Relaxed);
+            diri_telemetry::warn_event!(
+                "session.held_output_skipped",
+                session = diri_telemetry::id(&shared.id),
+                bytes = start - offset,
+            );
             marker_buffer.clear();
         }
         offset = start + chunk.len() as u64;
@@ -7173,14 +7295,69 @@ mod resize_tests {
         let second = session.resize_pty(120, 40).unwrap().expect("owed");
         // The older reflow wins the lock race but must not leave the
         // emulator at a size the PTY no longer has.
-        first.apply();
+        let _ = first.apply();
         assert_eq!(session.screen_size(), (120, 40));
         // The newer one finds nothing left to do.
         session.shared.screen.lock().unwrap().resize(90, 20);
-        second.apply();
+        let _ = second.apply();
         assert_eq!(session.screen_size(), (90, 20), "a spent reflow is a no-op");
         session.resize(132, 42).unwrap();
         assert_eq!(session.screen_size(), (132, 42));
+        let _ = session.terminate(Duration::from_secs(2));
+    }
+
+    /// End to end through a real PTY: a local program's queries are answered
+    /// by the Engine pump, in order, from the palette the App sent, and the
+    /// kitty keyboard query is answered because local sessions negotiate it.
+    #[cfg(unix)]
+    #[test]
+    fn a_local_program_gets_its_query_replies_in_order() {
+        let temp = tempfile::tempdir().unwrap();
+        let out = temp.path().join("replies");
+        let done = temp.path().join("done");
+        let script = format!(
+            "sleep 0.5; stty raw -echo min 0 time 15; \
+             printf '\\033]11;?\\033\\\\\\033[>0q\\033[?u\\033[?996n\\033[c'; \
+             cat > '{}'; : > '{}'; exec sleep 30",
+            out.display(),
+            done.display()
+        );
+        let (engine, _) = ManifestEngine::load_dir(&crate::detect::bundled_manifest_dir()).unwrap();
+        let spec = SessionSpec {
+            id: "queries".into(),
+            pty: PtySpec::new(vec!["/bin/sh".into(), "-c".into(), script], "/tmp")
+                .env("PATH", "/usr/bin:/bin")
+                .size(80, 24),
+            manifest_id: "shell".into(),
+            authority: Authority::ProcessOnly,
+            logs_dir: temp.path().to_path_buf(),
+            holder: None,
+            remote: None,
+            defer_launch: false,
+        };
+        let mut session = Session::spawn(spec, Arc::new(engine)).expect("spawn");
+        session.apply_terminal_palette(Some(diri_proto::TerminalPalette {
+            appearance: diri_proto::TerminalAppearance::Light,
+            foreground: [0x20, 0x20, 0x20],
+            background: [0xfa, 0xfb, 0xfc],
+            cursor: [0x20, 0x20, 0x20],
+            ansi: [[0; 3]; 16],
+        }));
+        let deadline = Instant::now() + Duration::from_secs(20);
+        while !done.exists() {
+            assert!(
+                Instant::now() < deadline,
+                "the program never finished reading"
+            );
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        let replies = String::from_utf8(std::fs::read(&out).unwrap()).unwrap();
+        assert_eq!(
+            replies,
+            format!(
+                "\x1b]11;rgb:fafa/fbfb/fcfc\x1b\\\x1bP>|{TERMINAL_VERSION}\x1b\\\x1b[?0u\x1b[?997;2n\x1b[?62;22c"
+            )
+        );
         let _ = session.terminate(Duration::from_secs(2));
     }
 }
@@ -7878,6 +8055,9 @@ mod preview_tests {
             manifest_id: spec.manifest_id.clone(),
             deferred: Some(Arc::new(DeferredLaunch::new())),
         };
+        // Local sessions now negotiate kitty flags; the legacy half of this
+        // contract is a parser that cannot (a remote session's mirror).
+        *session.shared.screen.lock().unwrap() = HeadlessScreen::new(80, 24);
         session.shared.keyboard_known.store(false, Ordering::SeqCst);
         assert_eq!(session.keyboard_state(), None);
         assert!(session.allows_keyboard_controller(false));

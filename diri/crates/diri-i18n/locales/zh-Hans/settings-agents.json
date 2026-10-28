@@ -170,6 +170,7 @@
   "settings.schedules.when_weekly": "{days} {time}",
   "settings.schedules.yesterday_at": "昨天 {time}",
   "settings.skills.back": "返回技能",
+  "settings.skills.copied": "已拷贝",
   "settings.skills.copy": "拷贝说明",
   "settings.skills.count_one": "{count} 个技能",
   "settings.skills.count_other": "{count} 个技能",

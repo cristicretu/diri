@@ -469,6 +469,16 @@ impl ScrollbackViewport {
             .map_or(&[], |metadata| metadata.graphemes.as_slice())
     }
 
+    /// The row's decoration spans (undercurl, colored underline, overline).
+    pub fn row_styles<'a>(
+        &'a self,
+        buffer: &'a GridBuffer,
+        row: i64,
+    ) -> &'a [diri_proto::grid::StyleSpan] {
+        self.row_metadata_ref(buffer, row)
+            .map_or(&[], |metadata| metadata.styles.as_slice())
+    }
+
     fn row_metadata_ref<'a>(&'a self, buffer: &'a GridBuffer, row: i64) -> Option<&'a RowMetadata> {
         if let Some(source) = &self.find_source {
             return source.metadata(row);

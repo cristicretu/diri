@@ -170,6 +170,7 @@
   "settings.schedules.when_weekly": "{days} at {time}",
   "settings.schedules.yesterday_at": "yesterday at {time}",
   "settings.skills.back": "Back to skills",
+  "settings.skills.copied": "Copied",
   "settings.skills.copy": "Copy instructions",
   "settings.skills.count_one": "{count} skill",
   "settings.skills.count_other": "{count} skills",

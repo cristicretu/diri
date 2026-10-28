@@ -944,6 +944,8 @@ impl DaemonClient {
                 session_id: session_id.clone(),
                 first_row,
                 max_rows,
+                // The desktop renderer draws decoration spans.
+                styles: true,
             },
         )
         .await
