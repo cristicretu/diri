@@ -459,3 +459,11 @@ O(1) amortized. Release builds compile none of it; no behavior, wire,
 checkpoint or protocol change. Test:
 `lines_after_narrowing_a_full_history_cost_what_they_did_before`
 (`diri-terminal-state`); probe: `--bench narrow_history`.
+
+## Reply helpers for core v2
+
+`term::xtgettcap_reply`, `term::da2_version`, `term::osc52_store_text` and
+`term::osc52_load_reply` (all `#[doc(hidden)]`) expose the existing XTGETTCAP
+answer table, the DA2 version and the OSC 52 base64 handling, so the core v2
+prototype in `diri-terminal-state` answers exactly as `Term` does instead of
+keeping a second copy. `Term`'s own code paths are unchanged.
