@@ -13,6 +13,8 @@
 //! emulator does not model, so it is scanned out of the byte stream directly —
 //! see [`scan_progress`].
 
+#[cfg(feature = "core-v2")]
+pub mod core_v2;
 mod inline_images;
 mod notifications;
 mod program_status;

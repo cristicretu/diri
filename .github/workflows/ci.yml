@@ -76,6 +76,10 @@ jobs:
       # every pull request.
       - name: Test
         run: cargo test --workspace
+      # The terminal core v2 switch (docs/core-v2.md), on: its differential
+      # and packing tests against the current core. Off is the line above.
+      - name: Test terminal core v2 switch on
+        run: cargo test --locked -p diri-terminal-state --features core-v2 --lib core_v2
       - name: Test native keypad dispatch boundary
         run: cargo test --locked -p diri-app -p gpui_macos --lib --bins native_key::tests
 
@@ -205,3 +209,6 @@ jobs:
         run: cargo test --locked -p diri-pty -- --nocapture
       - name: Test Rust engine natively
         run: cargo test --locked -p diri-engine -- --nocapture
+      # x86_64 takes the scalar paths the NEON code falls back to.
+      - name: Test terminal core v2 switch on (scalar paths)
+        run: cargo test --locked -p diri-terminal-state --features core-v2 --lib core_v2
