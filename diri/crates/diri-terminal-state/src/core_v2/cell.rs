@@ -139,41 +139,27 @@ impl Style {
 pub fn fill_bytes(cells: &mut [Cell], src: &[u8], high: u64) {
     debug_assert_eq!(cells.len(), src.len());
     let n = src.len().min(cells.len());
-    #[cfg(target_arch = "aarch64")]
-    {
-        // Sixteen cells per step, the last step overlapping the one before
-        // (the overlap is written twice with the same values); eight at a
-        // time below sixteen.
-        if n >= 16 {
-            let mut k = 0;
-            while k + 16 <= n {
-                // SAFETY: `k + 16 <= n`.
-                unsafe { neon::fill16(cells.as_mut_ptr().add(k), src.as_ptr().add(k), high) };
-                k += 16;
-            }
-            if k < n {
-                // SAFETY: `n >= 16`.
-                unsafe {
-                    neon::fill16(
-                        cells.as_mut_ptr().add(n - 16),
-                        src.as_ptr().add(n - 16),
-                        high,
-                    )
-                };
-            }
-            return;
-        }
-        if n >= 8 {
-            // SAFETY: `8 <= n`, so both windows are in bounds.
-            unsafe {
-                neon::fill8(cells.as_mut_ptr(), src.as_ptr(), high);
-                neon::fill8(cells.as_mut_ptr().add(n - 8), src.as_ptr().add(n - 8), high);
-            }
-            return;
-        }
-    }
-    for (cell, &byte) in cells[..n].iter_mut().zip(&src[..n]) {
+    // Whole sixteens with the vectorised loop; a remainder after at least
+    // sixteen as one overlapping NEON window (the overlap is written twice
+    // with the same values) instead of a scalar tail.
+    let body = if cfg!(target_arch = "aarch64") && n > 16 {
+        n & !15
+    } else {
+        n
+    };
+    for (cell, &byte) in cells[..body].iter_mut().zip(&src[..body]) {
         cell.0 = byte as u64 | high;
+    }
+    #[cfg(target_arch = "aarch64")]
+    if body < n {
+        // SAFETY: `n > 16`, so the window `n - 16..n` is in bounds.
+        unsafe {
+            neon::fill16(
+                cells.as_mut_ptr().add(n - 16),
+                src.as_ptr().add(n - 16),
+                high,
+            )
+        };
     }
 }
 
@@ -181,19 +167,6 @@ pub fn fill_bytes(cells: &mut [Cell], src: &[u8], high: u64) {
 mod neon {
     use super::Cell;
     use std::arch::aarch64::*;
-
-    /// Table indices that spread two source bytes into two u64 lanes (an
-    /// index past the table reads as zero).
-    const SPREAD: [[u8; 16]; 8] = {
-        let mut t = [[0xFFu8; 16]; 8];
-        let mut j = 0;
-        while j < 8 {
-            t[j][0] = 2 * j as u8;
-            t[j][8] = 2 * j as u8 + 1;
-            j += 1;
-        }
-        t
-    };
 
     /// Sixteen cells from sixteen bytes.
     ///
@@ -207,27 +180,25 @@ mod neon {
             let v = vld1q_u8(src);
             let fill = vdupq_n_u64(high);
             let dst = dst as *mut u64;
-            for (j, spread) in SPREAD.iter().enumerate() {
-                let lanes = vreinterpretq_u64_u8(vqtbl1q_u8(v, vld1q_u8(spread.as_ptr())));
-                vst1q_u64(dst.add(2 * j), vorrq_u64(lanes, fill));
-            }
-        }
-    }
-
-    /// Eight cells from eight bytes.
-    ///
-    /// # Safety
-    /// `dst` has room for eight cells and `src` holds eight bytes.
-    #[inline(always)]
-    pub unsafe fn fill8(dst: *mut Cell, src: *const u8, high: u64) {
-        // SAFETY: as `fill16`, over eight bytes.
-        unsafe {
-            let v = vcombine_u8(vld1_u8(src), vdup_n_u8(0));
-            let fill = vdupq_n_u64(high);
-            let dst = dst as *mut u64;
-            for (j, spread) in SPREAD[..4].iter().enumerate() {
-                let lanes = vreinterpretq_u64_u8(vqtbl1q_u8(v, vld1q_u8(spread.as_ptr())));
-                vst1q_u64(dst.add(2 * j), vorrq_u64(lanes, fill));
+            // Widen u8 -> u16 -> u32 -> u64 by zipping with zero.
+            let z8 = vdupq_n_u8(0);
+            let (h0, h1) = (
+                vreinterpretq_u16_u8(vzip1q_u8(v, z8)),
+                vreinterpretq_u16_u8(vzip2q_u8(v, z8)),
+            );
+            let z16 = vdupq_n_u16(0);
+            let words = [
+                vreinterpretq_u32_u16(vzip1q_u16(h0, z16)),
+                vreinterpretq_u32_u16(vzip2q_u16(h0, z16)),
+                vreinterpretq_u32_u16(vzip1q_u16(h1, z16)),
+                vreinterpretq_u32_u16(vzip2q_u16(h1, z16)),
+            ];
+            let z32 = vdupq_n_u32(0);
+            for (j, w) in words.into_iter().enumerate() {
+                let lo = vorrq_u64(vreinterpretq_u64_u32(vzip1q_u32(w, z32)), fill);
+                let hi = vorrq_u64(vreinterpretq_u64_u32(vzip2q_u32(w, z32)), fill);
+                vst1q_u64(dst.add(4 * j), lo);
+                vst1q_u64(dst.add(4 * j + 2), hi);
             }
         }
     }
