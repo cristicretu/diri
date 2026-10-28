@@ -2,18 +2,8 @@
 //!
 //! ASCII, Unicode, unique multi-codepoint cells, CSI with few characters,
 //! Kitty images and long OSCs, parsed into a 120x80 terminal configured as
-//! the local Engine configures it (compact history with its default
-//! scrollback, notifications, inline images, host replies, kitty keyboard),
-//! with replies, notifications and clipboard writes taken after every read.
-//!
-//! Every byte is parsed, and each number is checked before it is printed:
-//! every timed run must hand the parser exactly the payload's bytes and end
-//! in the same state as a reference parse of the same bytes fed one at a
-//! time: visible grid, every scrollback row's cells and metadata, cursor,
-//! modes, title, hyperlinks, replies, notifications and stored images (ids,
-//! sizes and a hash of their bytes). Kitten's image payload deletes its image
-//! at the end, so it is also compared once with the deletes removed. A run
-//! that differs panics instead of reporting.
+//! the local Engine configures it (compact history at its default depth,
+//! notifications, inline images, host replies, kitty keyboard).
 //!
 //! The data is the kitten's own when `DIRI_VT_BENCH_DIR` names a directory
 //! holding `ascii.bin`, `unicode.bin`, `unique_unicode.bin`, `csi.bin`,
@@ -23,29 +13,65 @@
 //! fixed seed.
 //!
 //! ```sh
-//! cargo bench -p diri-terminal-state --bench vt_workloads
-//! DIRI_VT_BENCH_READ=1024 cargo bench -p diri-terminal-state --bench vt_workloads
+//! cargo bench -p diri-terminal-state --features bench-verify --bench vt_workloads
+//! DIRI_VT_BENCH_READ=1024 cargo bench -p diri-terminal-state --features bench-verify --bench vt_workloads
 //! ```
+//!
+//! # Every run is checked against a golden reference
+//!
+//! A number is printed only if every timed run ends exactly where a
+//! reference parse of the same bytes ended. The reference is not the code
+//! under test: `vt_workloads.golden` holds digests computed once, at the
+//! commit named in its header, by feeding each payload one byte at a time
+//! (see `DIRI_VT_BENCH_GOLDEN` below). A bug that behaves the same at every
+//! read size, which comparing the code with itself cannot see, changes a
+//! digest and stops the bench. Each digest covers:
+//!
+//! - bytes fed (must equal payload length x repetitions);
+//! - the visible grid with styles, every scrollback row with its cells and
+//!   metadata, the cursor and its style, modes, keyboard state, title,
+//!   hyperlinks, progress and program status;
+//! - replies, notifications and clipboard writes, in order;
+//! - every image stored during the run (it may be deleted before the end):
+//!   exact count, Kitty id, format, size and SHA-256 of the pixels;
+//! - every OSC the parser dispatched: count, parameters, parameter bytes and
+//!   BEL terminators, so a parser that skips the bodies of an OSC nothing
+//!   reads (the long-escapes workload is OSC 6) is caught.
+//!
+//! Timed runs keep the OSC counts but not the per-byte OSC checksum, which
+//! would add a pass over every body to the timer. One untimed run per
+//! workload at the same read size turns the checksum on and must match the
+//! golden checksum too. The image log keeps each stored image alive until
+//! the run ends; it is hashed after the clock stops.
+//!
+//! The checks need the test-only `bench-verify` feature (the parser's OSC
+//! totals and the image store's log); the bench does not build without it.
+//!
+//! `DIRI_VT_BENCH_GOLDEN=<file>` recomputes the digests (one byte per read,
+//! checksum on) for the payloads in use, merges them into that file and
+//! exits. Run it only at a known-good reference commit and record that
+//! commit in the file's header. Captured payloads are matched by SHA-256, so
+//! a different capture has no golden digest and is refused.
 //!
 //! `DIRI_VT_BENCH_WRITE=<dir>` writes the payloads it uses there and exits,
 //! for `diri-engine`'s `vtbench` (the same workloads through Holder and
 //! Engine).
 //!
-//! `DIRI_VT_BENCH_ONLY=csi,images` runs only the named workloads, and
-//! `DIRI_VT_BENCH_MB=1024` makes each run at least that many MiB (for
-//! profiling).
+//! `DIRI_VT_BENCH_ONLY=images,csi` measures only the named workloads.
 //!
 //! `DIRI_VT_BENCH_READ` sets the read size (default 64 KiB; a macOS PTY hands
 //! over about 1 KiB per read). Reported: MB/s (10^6 bytes) of wall time for
-//! the reads alone (the checks are untimed), median of 7 runs of at least 64
-//! MiB each.
+//! `feed` and the pump's `take_*` calls, median of 7 runs of at least 64 MB
+//! each.
 
+use std::collections::BTreeMap;
+use std::fmt::Write as _;
 use std::hint::black_box;
+use std::path::Path;
 use std::time::{Duration, Instant};
 
-#[path = "../tests/support/observed.rs"]
-mod observed;
-use observed::{Feeder, assert_same};
+use diri_terminal_state::{HeadlessScreen, osc_observe};
+use sha2::{Digest as _, Sha256};
 
 const COLS: usize = 120;
 const ROWS: usize = 80;
@@ -172,65 +198,334 @@ fn generate(name: &str) -> Vec<u8> {
     }
 }
 
-/// One run: feed `reps` copies of `data` in `read`-sized pieces, taking
-/// replies, notifications and clipboard writes after each read as the Engine
-/// pump does. Returns the time spent and the bytes handed to the parser.
-fn run(data: &[u8], reps: usize, read: usize) -> (Duration, usize, Feeder) {
-    let mut feeder = Feeder::new(COLS, ROWS);
-    let mut fed = 0;
+fn screen() -> HeadlessScreen {
+    HeadlessScreen::new_with_keyboard_enhancements(COLS, ROWS)
+        .with_notifications()
+        .with_inline_images()
+        .with_host_replies("bench")
+}
+
+/// What a run leaves behind, beyond the screen itself.
+struct Run {
+    screen: HeadlessScreen,
+    bytes_fed: usize,
+    replies: Vec<u8>,
+    notifications: Vec<String>,
+    clipboard: Vec<String>,
+}
+
+/// One run: feed `reps` copies of `data` in `read`-sized pieces, handling
+/// replies, notifications and clipboard writes the way the Engine pump
+/// does. `checksum` turns on the per-byte OSC checksum (never for a timed
+/// run).
+fn run(data: &[u8], reps: usize, read: usize, checksum: bool) -> (Duration, Run) {
+    let mut out = Run {
+        screen: screen(),
+        bytes_fed: 0,
+        replies: Vec::new(),
+        notifications: Vec::new(),
+        clipboard: Vec::new(),
+    };
+    osc_observe::reset(checksum);
     let started = Instant::now();
     for _ in 0..reps {
         for chunk in data.chunks(read) {
-            feeder.feed(black_box(chunk));
-            fed += chunk.len();
+            out.screen.feed(black_box(chunk));
+            out.bytes_fed += chunk.len();
+            out.replies.extend(out.screen.take_replies());
+            let notifications = out.screen.take_notifications();
+            if !notifications.is_empty() {
+                out.notifications
+                    .extend(notifications.iter().map(|n| format!("{n:?}")));
+            }
+            out.clipboard.extend(out.screen.take_clipboard());
         }
     }
-    (started.elapsed(), fed, feeder)
+    (started.elapsed(), out)
 }
 
-/// The reference: the same bytes fed one at a time, so every escape, string
-/// body and character crosses a read boundary and goes through the parsers'
-/// per-byte paths.
-fn reference(data: &[u8], reps: usize) -> Feeder {
-    let mut feeder = Feeder::new(COLS, ROWS);
-    for _ in 0..reps {
-        for byte in data.chunks(1) {
-            feeder.feed(byte);
+fn sha256(bytes: &[u8]) -> String {
+    let mut hex = String::with_capacity(64);
+    for byte in Sha256::digest(bytes) {
+        let _ = write!(hex, "{byte:02x}");
+    }
+    hex
+}
+
+/// Image anchors name a per-screen store nonce; only the rest must match.
+fn without_store_nonce(text: String) -> String {
+    const ANCHOR: &str = "diri-image:";
+    let mut out = String::with_capacity(text.len());
+    let mut rest = text.as_str();
+    while let Some(at) = rest.find(ANCHOR) {
+        out.push_str(&rest[..at + ANCHOR.len()]);
+        rest = &rest[at + ANCHOR.len()..];
+        let nonce = rest.find('.').unwrap_or(0);
+        out.push('#');
+        rest = &rest[nonce..];
+    }
+    out.push_str(rest);
+    out
+}
+
+/// History rows compared: all the reference kept. Retention depends only
+/// on the output, not on where reads end, so every row must match.
+fn history_checked(kept: usize) -> usize {
+    kept
+}
+
+/// Digest key of the per-byte OSC checksum, which timed runs leave off.
+const OSC_CHECKSUM: &str = "osc_checksum";
+/// Digest key recorded for the reader, not compared.
+const REFERENCE_ONLY: &str = "history_rows_reference";
+
+/// Everything observable at the end of a run, hashed where large. Keys are
+/// stable; values are compared as text.
+///
+/// History is compared over its newest `checked_rows` rows (all of it; see
+/// [`history_checked`]). `None` is the reference, which records what it kept.
+fn digest(
+    name: &str,
+    data: &[u8],
+    reps: usize,
+    mut run: Run,
+    checked_rows: Option<usize>,
+) -> BTreeMap<String, String> {
+    let mut d = BTreeMap::new();
+    let mut put = |key: &str, value: String| {
+        d.insert(key.to_owned(), value);
+    };
+    put("workload", name.to_owned());
+    put("size", format!("{COLS}x{ROWS}"));
+    put("payload_sha256", sha256(data));
+    put("payload_bytes", data.len().to_string());
+    put("reps", reps.to_string());
+    put("bytes_fed", run.bytes_fed.to_string());
+
+    let osc = osc_observe::totals();
+    put(
+        "osc_dispatches",
+        format!(
+            "{} params={} param_bytes={} bel={}",
+            osc.dispatches, osc.params, osc.param_bytes, osc.bell_terminated
+        ),
+    );
+    put(OSC_CHECKSUM, format!("{:016x}", osc.checksum));
+
+    // Images: every one stored, in order, with runs of identical entries
+    // collapsed so the file stays readable.
+    let log = run.screen.take_stored_image_log();
+    let mut images = format!("count={}", log.len());
+    let mut previous: Option<(String, usize)> = None;
+    let flush = |images: &mut String, entry: Option<(String, usize)>| {
+        if let Some((text, times)) = entry {
+            let _ = write!(images, " [{text}]x{times}");
+        }
+    };
+    for (kitty_id, image) in &log {
+        let text = format!(
+            "id={} {:?}{} {}x{} {}B sha256={}",
+            kitty_id.map_or_else(|| "-".to_owned(), |id| id.to_string()),
+            image.format,
+            if image.compressed { " z" } else { "" },
+            image.width,
+            image.height,
+            image.data.len(),
+            sha256(&image.data)
+        );
+        match &mut previous {
+            Some((last, times)) if *last == text => *times += 1,
+            _ => flush(&mut images, previous.replace((text, 1))),
         }
     }
-    feeder
-}
+    flush(&mut images, previous);
+    put("images_stored", images);
+    put(
+        "images_held_bytes",
+        run.screen.inline_image_bytes().to_string(),
+    );
 
-/// Requires `actual` to end where `expected` did, every retained history
-/// row included.
-fn assert_same_state(expected: &mut Feeder, actual: &mut Feeder, how: &str) {
-    assert_same(&expected.snapshot(), &actual.snapshot(), how);
-}
+    put(
+        "replies",
+        format!("{}B sha256={}", run.replies.len(), sha256(&run.replies)),
+    );
+    put(
+        "notifications",
+        format!(
+            "{} sha256={}",
+            run.notifications.len(),
+            sha256(run.notifications.join("\n").as_bytes())
+        ),
+    );
+    put(
+        "clipboard",
+        format!(
+            "{} sha256={}",
+            run.clipboard.len(),
+            sha256(run.clipboard.join("\n").as_bytes())
+        ),
+    );
 
-/// `data` without Kitty delete commands (`a=d`), so the images it transmits
-/// stay stored and the comparison covers their decoded bytes. `None` when
-/// there is none to remove.
-fn without_image_deletes(data: &[u8]) -> Option<Vec<u8>> {
-    let mut out = Vec::with_capacity(data.len());
-    let mut at = 0;
-    let mut removed = false;
-    while let Some(start) = memchr::memmem::find(&data[at..], b"\x1b_G").map(|start| at + start) {
-        let end = memchr::memmem::find(&data[start..], b"\x1b\\")
-            .map_or(data.len(), |end| start + end + 2);
-        let control_end = memchr::memchr(b';', &data[start..end]).map_or(end, |semi| start + semi);
-        out.extend_from_slice(&data[at..start]);
-        if data[start + 3..control_end]
-            .split(|&byte| byte == b',')
-            .any(|key| key == b"a=d")
-        {
-            removed = true;
+    let screen = &mut run.screen;
+    put(
+        "grid_sha256",
+        sha256(without_store_nonce(format!("{:?}", screen.full_snapshot())).as_bytes()),
+    );
+    let kept = screen.history_rows();
+    let checked = checked_rows.unwrap_or_else(|| history_checked(kept));
+    if checked_rows.is_none() {
+        put("history_rows_reference", kept.to_string());
+    }
+    put(
+        "history_rows_checked",
+        if kept >= checked {
+            checked.to_string()
         } else {
-            out.extend_from_slice(&data[start..end]);
+            format!("{checked} but only {kept} kept")
+        },
+    );
+    // The newest `checked` history rows and the screen, as text with cell
+    // mappings re-indexed from the first row compared.
+    let scrollback = screen.scrollback();
+    let skip = scrollback.lines.len().saturating_sub(checked + ROWS);
+    let mut text = scrollback.lines[skip..].join("\n");
+    let text_cells: Vec<_> = scrollback
+        .text_cells
+        .range(skip..)
+        .map(|(row, cells)| (row - skip, cells))
+        .collect();
+    let _ = write!(text, "\n{text_cells:?}\n{}", scrollback.is_alt_screen);
+    put("scrollback_text_sha256", sha256(text.as_bytes()));
+    let cells = screen.scrollback_cells(
+        (kept.saturating_sub(checked)) as i64,
+        (checked + ROWS) as i64,
+    );
+    put("scrollback_cells_sha256", sha256(&cells.payload));
+    put(
+        "scrollback_metadata_sha256",
+        sha256(without_store_nonce(format!("{:?}", cells.metadata)).as_bytes()),
+    );
+    let links = screen.link_source(checked);
+    let link_list: Vec<String> = links
+        .hyperlinks
+        .into_iter()
+        .map(|(at, uri)| format!("{at} {}", without_store_nonce(uri)))
+        .collect();
+    put(
+        "links",
+        format!(
+            "{} sha256={}",
+            link_list.len(),
+            sha256(format!("{}\n{}", links.text, link_list.join("\n")).as_bytes())
+        ),
+    );
+    put("title", format!("{:?}", screen.title()));
+    put("cursor", format!("{:?}", screen.cursor()));
+    put(
+        "modes",
+        format!(
+            "alt={} paste={} focus={} mouse={:?} cursor={:?}",
+            screen.is_alt_screen(),
+            screen.bracketed_paste(),
+            screen.focus_reporting(),
+            screen.mouse_modes(),
+            screen.cursor_style(),
+        ),
+    );
+    put("keyboard", format!("{:?}", screen.keyboard_state()));
+    put("progress", format!("{:?}", screen.progress()));
+    put("program_status", format!("{:?}", screen.program_status()));
+    put(
+        "synchronized",
+        format!(
+            "completed_any={} open={}",
+            screen.synchronized_updates_completed() > 0,
+            screen.in_synchronized_update()
+        ),
+    );
+    d
+}
+
+/// Sections of a golden file, keyed by `name payload_sha256`.
+type Golden = BTreeMap<String, BTreeMap<String, String>>;
+
+const GOLDEN_FILE: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/benches/vt_workloads.golden");
+
+fn golden_key(digest: &BTreeMap<String, String>) -> String {
+    format!("{} {}", digest["workload"], digest["payload_sha256"])
+}
+
+fn read_golden(path: &Path) -> (String, Golden) {
+    let text = std::fs::read_to_string(path).unwrap_or_default();
+    let mut header = String::new();
+    let mut golden = Golden::new();
+    let mut section: Option<String> = None;
+    for line in text.lines() {
+        if let Some(key) = line.strip_prefix('[').and_then(|l| l.strip_suffix(']')) {
+            section = Some(key.to_owned());
+            golden.entry(key.to_owned()).or_default();
+        } else if let (Some(key), Some((field, value))) = (&section, line.split_once(" = ")) {
+            golden
+                .get_mut(key)
+                .expect("section")
+                .insert(field.to_owned(), value.to_owned());
+        } else if section.is_none() {
+            header.push_str(line);
+            header.push('\n');
         }
-        at = end;
     }
-    out.extend_from_slice(&data[at..]);
-    removed.then_some(out)
+    (header, golden)
+}
+
+fn write_golden(path: &Path, header: &str, golden: &Golden) {
+    let mut text = header.to_owned();
+    for (key, fields) in golden {
+        let _ = writeln!(text, "[{key}]");
+        for (field, value) in fields {
+            let _ = writeln!(text, "{field} = {value}");
+        }
+        text.push('\n');
+    }
+    std::fs::write(path, text).expect("write golden file");
+}
+
+/// The fields of `got` that differ from `want`, skipping `skip`.
+fn differences(
+    want: &BTreeMap<String, String>,
+    got: &BTreeMap<String, String>,
+    skip: &[&str],
+) -> Vec<String> {
+    want.keys()
+        .chain(got.keys().filter(|key| !want.contains_key(*key)))
+        .filter(|key| !skip.contains(&key.as_str()))
+        .filter(|key| want.get(*key) != got.get(*key))
+        .map(|key| {
+            format!(
+                "  {key}:\n    golden: {}\n    run:    {}",
+                want.get(key).map_or("(missing)", String::as_str),
+                got.get(key).map_or("(missing)", String::as_str)
+            )
+        })
+        .collect()
+}
+
+fn refuse(name: &str, what: &str, diffs: &[String]) -> ! {
+    eprintln!(
+        "{name}: {what} does not match the golden reference; no number is reported.\n{}",
+        diffs.join("\n")
+    );
+    std::process::exit(1);
+}
+
+fn load(name: &str, dir: Option<&std::ffi::OsString>) -> (Vec<u8>, &'static str) {
+    match dir {
+        Some(dir) => (
+            std::fs::read(Path::new(dir).join(format!("{name}.bin")))
+                .unwrap_or_else(|error| panic!("{name}.bin: {error}")),
+            "kitten",
+        ),
+        None => (generate(name), "generated"),
+    }
 }
 
 fn main() {
@@ -239,72 +534,74 @@ fn main() {
         .and_then(|value| value.parse().ok())
         .unwrap_or(64 << 10);
     let dir = std::env::var_os("DIRI_VT_BENCH_DIR");
-    let only = std::env::var("DIRI_VT_BENCH_ONLY").ok();
-    let min_bytes = std::env::var("DIRI_VT_BENCH_MB")
-        .ok()
-        .and_then(|value| value.parse::<usize>().ok())
-        .map_or(MIN_BYTES_PER_RUN, |mb| mb << 20);
     if let Some(out) = std::env::var_os("DIRI_VT_BENCH_WRITE") {
-        let out = std::path::Path::new(&out);
+        let out = Path::new(&out);
         std::fs::create_dir_all(out).expect("output directory");
         for name in WORKLOADS {
-            let data = match &dir {
-                Some(dir) => std::fs::read(std::path::Path::new(dir).join(format!("{name}.bin")))
-                    .expect("captured payload"),
-                None => generate(name),
-            };
+            let (data, _) = load(name, dir.as_ref());
             std::fs::write(out.join(format!("{name}.bin")), data).expect("write payload");
         }
         return;
     }
+    if let Some(path) = std::env::var_os("DIRI_VT_BENCH_GOLDEN") {
+        // The reference: one byte per read, checksum on.
+        let path = Path::new(&path);
+        let (header, mut golden) = read_golden(path);
+        for name in WORKLOADS {
+            let (data, source) = load(name, dir.as_ref());
+            let reps = MIN_BYTES_PER_RUN.div_ceil(data.len());
+            let started = Instant::now();
+            let (_, reference) = run(&data, reps, 1, true);
+            let digest = digest(name, &data, reps, reference, None);
+            println!(
+                "{name:<18} {source}: reference digest in {:.1} s",
+                started.elapsed().as_secs_f64()
+            );
+            golden.insert(golden_key(&digest), digest);
+        }
+        write_golden(path, &header, &golden);
+        return;
+    }
+    let only = std::env::var("DIRI_VT_BENCH_ONLY").ok();
+    let selected = |name: &str| {
+        only.as_deref()
+            .is_none_or(|only| only.split(',').any(|item| item.trim() == name))
+    };
+    let (_, golden) = read_golden(Path::new(GOLDEN_FILE));
     println!(
-        "workload            MB/s  (median of {RUNS}; min..max)   source  read={read}  {COLS}x{ROWS}"
+        "workload            MB/s  (median of {RUNS}; min..max)   source  read={read}  {COLS}x{ROWS}  checked: golden"
     );
-    for name in WORKLOADS {
-        if only
-            .as_deref()
-            .is_some_and(|only| !only.split(',').any(|wanted| wanted == name))
-        {
-            continue;
-        }
-        let (data, source) = match &dir {
-            Some(dir) => (
-                std::fs::read(std::path::Path::new(dir).join(format!("{name}.bin")))
-                    .unwrap_or_else(|error| panic!("{name}.bin: {error}")),
-                "kitten",
-            ),
-            None => (generate(name), "generated"),
+    for name in WORKLOADS.into_iter().filter(|name| selected(name)) {
+        let (data, source) = load(name, dir.as_ref());
+        let reps = MIN_BYTES_PER_RUN.div_ceil(data.len());
+        let key = format!("{name} {}", sha256(&data));
+        let Some(want) = golden.get(&key) else {
+            eprintln!(
+                "{name}: no golden digest for this {source} payload ({key}); no number is \
+                 reported. Generate one with DIRI_VT_BENCH_GOLDEN at a known-good commit."
+            );
+            std::process::exit(1);
         };
-        let reps = min_bytes.div_ceil(data.len());
-        // The images a payload deletes again are compared too.
-        if let Some(kept) = without_image_deletes(&data) {
-            let (_, _, mut chunked) = run(&kept, 1, read);
-            let mut expected = reference(&kept, 1);
-            assert!(
-                !expected.screen.inline_image_store_summary().is_empty(),
-                "{name}: images kept"
-            );
-            assert_same_state(
-                &mut expected,
-                &mut chunked,
-                &format!("{name} without deletes"),
-            );
+        let checked_rows = want
+            .get("history_rows_checked")
+            .and_then(|rows| rows.parse().ok())
+            .expect("golden history_rows_checked");
+        let check = |run| digest(name, &data, reps, run, Some(checked_rows));
+        // Untimed: the full check, OSC checksum included, at this read size.
+        let (_, checked) = run(&data, reps, read, true);
+        let diffs = differences(want, &check(checked), &[REFERENCE_ONLY]);
+        if !diffs.is_empty() {
+            refuse(name, "the checked run", &diffs);
         }
-        let mut expected = reference(&data, reps);
-        let _ = run(&data, 1, read); // warm-up
-        let mut rates: Vec<f64> = (0..RUNS)
-            .map(|_| {
-                let (elapsed, fed, mut feeder) = run(&data, reps, read);
-                // A run that dropped or changed anything reports nothing.
-                assert_eq!(fed, data.len() * reps, "{name}: bytes fed");
-                assert_same_state(
-                    &mut expected,
-                    &mut feeder,
-                    &format!("{name} in {read}-byte reads"),
-                );
-                (data.len() * reps) as f64 / elapsed.as_secs_f64() / 1e6
-            })
-            .collect();
+        let mut rates = Vec::with_capacity(RUNS);
+        for index in 0..RUNS {
+            let (elapsed, timed) = run(&data, reps, read, false);
+            let diffs = differences(want, &check(timed), &[REFERENCE_ONLY, OSC_CHECKSUM]);
+            if !diffs.is_empty() {
+                refuse(name, &format!("timed run {}", index + 1), &diffs);
+            }
+            rates.push((data.len() * reps) as f64 / elapsed.as_secs_f64() / 1e6);
+        }
         rates.sort_by(f64::total_cmp);
         println!(
             "{name:<18} {:8.1}  ({:.1}..{:.1})   {source}",

@@ -422,3 +422,9 @@ hyperlink, zero-width characters) into each cell. A cell that already shares
 the template's `Arc` (a repeated character, a redrawn row) now keeps it
 instead of an atomic increment and decrement per cell. The cell ends the
 same. No wire, checkpoint or protocol change.
+
+## Test-only `observe` feature
+
+`observe = ["vte/observe"]` only forwards the vendored VTE's test-only OSC
+totals (see its DIRI-PATCH.md) so `diri-terminal-state`'s `bench-verify`
+feature can reach them. No source change.

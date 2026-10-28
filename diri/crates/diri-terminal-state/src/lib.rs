@@ -16,6 +16,10 @@
 mod inline_images;
 mod notifications;
 mod program_status;
+/// Per-thread totals of the OSCs the parser dispatched (benchmark
+/// verification only).
+#[cfg(feature = "bench-verify")]
+pub use alacritty_terminal::vte::observe as osc_observe;
 pub use inline_images::{
     DEFAULT_CELL_PIXELS, STORE_BUDGET_BYTES as INLINE_IMAGE_BUDGET_BYTES, StoredImage,
 };

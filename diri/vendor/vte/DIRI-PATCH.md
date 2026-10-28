@@ -193,3 +193,27 @@ as before.
 Tests: `indexed_parsing_dispatches_what_scanning_does` (2,000 random soups of
 every escape kind, string bodies, controls, C1 and UTF-8, in small and whole
 reads, with and without the index); the OSC oracle tests also run indexed.
+
+## Test-only OSC observation
+
+Feature `observe` (off by default; no product crate enables it) adds
+`vte::observe`: per-thread totals of `osc_dispatch` calls, their parameters
+and parameter bytes, and, when turned on with `observe::reset(true)`, an
+order-sensitive FNV-1a checksum of every parameter byte. `vt_workloads`
+compares these with a reference parse, because an OSC nothing reads (the
+long-escapes workload is OSC 6) leaves no terminal state that would expose a
+parser skipping its body. Both dispatch paths record: `osc_dispatch` and
+the in-place `osc_finish_in_place`. Without the feature the dispatch paths
+are unchanged.
+
+Test: `diri-terminal-state`'s `tests/osc_observe.rs`
+(`cargo test -p diri-terminal-state --features bench-verify --test osc_observe`).
+
+## C1 control completed across reads
+
+Upstream bug, fixed here. A C1 control sent as UTF-8 (`C2 80` to `C2 9F`)
+executes when both bytes arrive in one read, but `advance_partial_utf8`
+printed it when a read ended between them. The printed C1 then became the
+character `REP` repeats, so `5 C2 9C ESC [ b` showed `55` in one read and
+`5` split. A character completed across reads now goes through the same
+C1 check as the whole-text path. Test: `split_utf8_c1_control_executes_as_whole`.
