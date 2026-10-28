@@ -261,3 +261,13 @@ absolutely after multi-column clusters, so it is unaffected. Lookup is a binary
 search over 152 ranges, only for width-1 non-ASCII characters. No wire,
 checkpoint or protocol change; the parser source is part of the Remote Helper
 Build ID. Test: `spacing_vowel_signs_share_their_base_cell_like_claude_code`.
+
+## Program colors: a generation, and RIS resets them
+
+`Term` keeps `colors_generation`, advanced whenever `set_color` or
+`reset_color` changes a color cells are painted with (0–255 and the dynamic
+foreground and background; not the cursor). A program that recolors with
+OSC 4/10/11 changes no cell, so without it the host's change detection saw no
+change and never republished the screen. `reset_state` (RIS, `ESC c`) also
+clears every color a program set, as xterm and libghostty do; upstream kept
+them across `reset`. No wire, checkpoint or protocol change.
