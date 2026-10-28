@@ -10,6 +10,7 @@ use alacritty_terminal::vte::ansi::{Color, NamedColor};
 /// | 0..21  | codepoint; 0 is a blank that was never written           |
 /// | 21..26 | WIDE, SPACER, LEADING_SPACER, GRAPHEME, HYPERLINK        |
 /// | 26..31 | shell marks (OSC 133 A/B/C/D-ok/D-failed)                |
+/// | 31     | soft-wrap mark moved off the last column                 |
 /// | 32..48 | style id in the owning page's style table (0 = default) |
 /// | 48..64 | cluster index in the page's arena, with GRAPHEME         |
 ///
@@ -27,6 +28,9 @@ pub const GRAPHEME: u64 = 1 << 24;
 pub const HYPERLINK: u64 = 1 << 25;
 pub const MARKS_SHIFT: u32 = 26;
 pub const MARKS: u64 = 0x1F << MARKS_SHIFT;
+/// A soft-wrap mark that left the last column (DCH moved the cell); the
+/// last column's mark is `RowMeta::wrapped`.
+pub const WRAP: u64 = 1 << 31;
 pub const STYLE_SHIFT: u32 = 32;
 pub const STYLE: u64 = 0xFFFF << STYLE_SHIFT;
 /// Index of the cell's cluster in the page's cluster arena (with GRAPHEME).

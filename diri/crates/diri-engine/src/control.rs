@@ -127,7 +127,25 @@ fn terminal_settings(config_dir: &Path) -> diri_proto::TerminalConfigureParams {
         .unwrap_or(diri_proto::TerminalConfigureParams {
             shell_integration: true,
             palette: None,
+            shell_command: None,
         })
+}
+
+/// A new local terminal's argv: the command chosen in Settings when it is a
+/// usable argv, otherwise the user's login shell. Executed directly, never
+/// through a shell, so its words reach the program exactly as typed.
+fn local_terminal_argv(config_dir: &Path) -> Vec<String> {
+    terminal_settings(config_dir)
+        .shell_command
+        .filter(|argv| {
+            !argv.is_empty()
+                && !argv[0].is_empty()
+                && argv.len() <= diri_proto::remote_pty::MAX_ARGUMENTS
+                && argv.iter().all(|argument| !argument.contains('\0'))
+                && argv.iter().map(String::len).sum::<usize>()
+                    <= diri_proto::remote_pty::MAX_LAUNCH_BYTES
+        })
+        .unwrap_or_else(login_shell_argv)
 }
 
 /// Restores the palette the App last sent, so local terminals answer color
@@ -1533,7 +1551,9 @@ impl ControlServer {
         let argv = if argv.is_empty() {
             match p.kind.command() {
                 Some(command) if !command.is_empty() => local_shell_argv(Some(command)),
-                _ if kind == diri_proto::AgentKind::SHELL_ID => local_shell_argv(None),
+                _ if kind == diri_proto::AgentKind::SHELL_ID => {
+                    local_terminal_argv(&self.config_dir)
+                }
                 _ => Vec::new(),
             }
         } else {
@@ -4402,7 +4422,7 @@ impl ControlServer {
             .and_then(|manifest| manifest.agent.as_ref())
             .ok_or_else(|| ControlError::not_found(format!("no manifest for agent {kind:?}")))?;
         let launch_path = directory.unwrap_or_else(|| Path::new(&record.cwd));
-        let mut pty = crate::pty::PtySpec::new(login_shell_argv(), launch_path);
+        let mut pty = crate::pty::PtySpec::new(local_terminal_argv(&self.config_dir), launch_path);
         // As a new terminal's: a shell restarted after a reboot or a crash
         // must still know its session, or nothing run in it can reach Diri.
         pty.env = self.local_terminal_environment(&record.id.0, descriptor, inherited);
@@ -7955,6 +7975,46 @@ mod tests {
         let registry = Registry::new(engine(), temp.path().join("state.json"));
         let bare = ControlServer::new(Arc::new(Mutex::new(registry)), temp.path().join("socket"));
         assert!(bare.terminal_shell_integration().is_none());
+    }
+
+    #[test]
+    fn terminal_shell_command_replaces_the_login_shell_only_when_usable() {
+        let temp = tempfile::tempdir().unwrap();
+        let start = || {
+            let registry = Registry::new(engine(), temp.path().join("state.json"));
+            ControlServer::new(Arc::new(Mutex::new(registry)), temp.path().join("socket"))
+        };
+        let server = start();
+        assert_eq!(local_terminal_argv(&server.config_dir), login_shell_argv());
+        let configure = |command: JsonValue| {
+            server
+                .dispatch(
+                    Method::TERMINAL_CONFIGURE,
+                    Some(json!({ "shellIntegration": true, "shellCommand": command })),
+                )
+                .unwrap();
+        };
+        configure(json!(["nix", "develop", "--command", "zsh -l"]));
+        assert_eq!(
+            local_terminal_argv(&server.config_dir),
+            ["nix", "develop", "--command", "zsh -l"],
+            "words reach the program as given, with no shell between"
+        );
+        // Terminals the next Engine starts before the app connects.
+        assert_eq!(
+            local_terminal_argv(&start().config_dir),
+            ["nix", "develop", "--command", "zsh -l"]
+        );
+        for unusable in [json!([]), json!(["", "-l"]), json!(["zsh", "a\u{0}b"])] {
+            configure(unusable.clone());
+            assert_eq!(
+                local_terminal_argv(&server.config_dir),
+                login_shell_argv(),
+                "{unusable}"
+            );
+        }
+        configure(JsonValue::Null);
+        assert_eq!(local_terminal_argv(&server.config_dir), login_shell_argv());
     }
 
     #[test]

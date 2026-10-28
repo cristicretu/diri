@@ -807,6 +807,10 @@ pub struct Prefs {
     /// Where a clicked `file:line` reference in terminal output opens.
     #[serde(default)]
     pub terminal_file_editor: FileEditor,
+    /// What a new local terminal runs instead of the login shell, as typed
+    /// in Settings (`zsh -l`, `nix develop`). Empty is the login shell.
+    #[serde(default)]
+    pub terminal_shell_command: String,
     /// Which Option keys are Meta in a terminal.
     #[serde(default)]
     pub terminal_option_as_meta: OptionAsMeta,
@@ -982,6 +986,7 @@ impl Default for Prefs {
             terminal_cursor_follows_programs: true,
             terminal_shell_integration: true,
             terminal_file_editor: FileEditor::Automatic,
+            terminal_shell_command: String::new(),
             terminal_option_as_meta: OptionAsMeta::Automatic,
             terminal_follows_last_directory: true,
             terminal_paste_protection: false,
@@ -1140,6 +1145,15 @@ impl Prefs {
             Some(style) if style.material() == self.window_material => style,
             _ => InterfaceStyle::from_material(self.window_material),
         }
+    }
+
+    /// The new-terminal command as argv: words split the way a shell reads
+    /// them, nothing expanded. `None` (the login shell) when empty or
+    /// unbalanced; Settings refuses to save an unbalanced one.
+    pub fn terminal_shell_argv(&self) -> Option<Vec<String>> {
+        let mut argv = crate::agent_catalog::split_launch_args(&self.terminal_shell_command)?;
+        argv.retain(|word| !word.is_empty());
+        (!argv.is_empty()).then_some(argv)
     }
 
     pub fn set_interface_style(&mut self, style: InterfaceStyle) {
@@ -1442,6 +1456,21 @@ mod tests {
         restored.follow_system_theme = false;
         assert!(!restored.apply_system_theme(false));
         assert_eq!(restored.terminal_theme, "dirijor-dark");
+    }
+
+    #[test]
+    fn terminal_shell_command_is_split_into_argv_without_expansion() {
+        let mut prefs: Prefs = serde_json::from_str("{}").unwrap();
+        assert_eq!(prefs.terminal_shell_argv(), None, "login shell by default");
+        prefs.terminal_shell_command = r#"nix develop --command zsh -c 'echo $HOME; ls ~'"#.into();
+        assert_eq!(
+            prefs.terminal_shell_argv().unwrap(),
+            ["nix", "develop", "--command", "zsh", "-c", "echo $HOME; ls ~"]
+        );
+        prefs.terminal_shell_command = "   ".into();
+        assert_eq!(prefs.terminal_shell_argv(), None);
+        prefs.terminal_shell_command = "zsh 'unterminated".into();
+        assert_eq!(prefs.terminal_shell_argv(), None);
     }
 
     #[test]
