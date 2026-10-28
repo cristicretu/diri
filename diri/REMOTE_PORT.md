@@ -942,10 +942,13 @@ the session's terminal state; it is not a display client. So while it keeps
 taking bytes, backlog or queue, the Holder waits for queue room before reading
 more from the PTY: a program that prints faster than the Engine parses is paced
 to the Engine, as a terminal emulator's own reads pace it, and can no longer
-lap the 32 MiB session log and have output silently skipped. The Holder gives
-up on a subscriber only after 500 ms in which it took nothing (a hung Engine);
-the program then runs free and the Engine resumes from its offset when it
-returns. Display clients are unaffected: they attach to the Engine, whose
+lap the 32 MiB session log and have output silently skipped. A slow Engine
+is never given up on: while its stream stays connected the Holder leaves the
+PTY unread and the kernel pauses the program, however long a parse pass takes
+on a loaded machine. The program runs free only once the Engine hangs up (its
+socket closes) or the session is dying (kill-tree, SIGKILL, or the child has
+exited) and the Engine has then taken nothing for 500 ms, so a killed leader
+can still drain and exit; the Engine resumes from its offset when it returns. Display clients are unaffected: they attach to the Engine, whose
 bounded per-client queues still drop stale diffs and reseed with a Full
 Snapshot. An older live Holder ignores `resumeFrom` and omits `resumed`; the
 Engine keeps its previous behaviour for that Holder (follow the log, subscribe

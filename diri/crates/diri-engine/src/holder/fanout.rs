@@ -44,6 +44,17 @@ struct State {
     progress: u64,
 }
 
+/// What became of bytes offered to a subscriber.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum Offer {
+    Queued,
+    /// The subscriber is gone; nothing was queued.
+    Closed,
+    /// The queue stayed full while the subscriber took nothing for the whole
+    /// patience; nothing was queued.
+    Stalled,
+}
+
 pub(super) struct FrameQueue {
     state: Mutex<State>,
     /// Signals both directions: room appeared, or a frame did.
@@ -82,7 +93,15 @@ impl FrameQueue {
     /// Returns false if the subscriber is gone or has taken nothing for
     /// `patience` — in both cases the caller drops it, and it resumes from the
     /// log, which has every byte.
+    #[cfg(any(windows, test))]
     pub(super) fn push(&self, offset: u64, bytes: &[u8], patience: Duration) -> bool {
+        self.offer(offset, bytes, patience) == Offer::Queued
+    }
+
+    /// [`Self::push`], telling apart a subscriber that is gone from one that
+    /// has merely taken nothing for `patience`. A stalled offer queues
+    /// nothing, so the caller can offer the same bytes again.
+    pub(super) fn offer(&self, offset: u64, bytes: &[u8], patience: Duration) -> Offer {
         let mut state = self.state.lock().expect("frame queue");
         if !state.closed && state.queued >= self.capacity {
             let mut deadline = Instant::now() + patience;
@@ -95,7 +114,7 @@ impl FrameQueue {
                     remaining = patience;
                 }
                 if remaining.is_zero() {
-                    return false;
+                    return Offer::Stalled;
                 }
                 let (guard, _) = self
                     .changed
@@ -105,7 +124,7 @@ impl FrameQueue {
             }
         }
         if state.closed {
-            return false;
+            return Offer::Closed;
         }
         let was_empty = state.frames.is_empty();
         state.queued += bytes.len();
@@ -127,7 +146,7 @@ impl FrameQueue {
         if was_empty {
             self.changed.notify_all();
         }
-        true
+        Offer::Queued
     }
 
     /// Takes the next frame, waiting for as long as it takes one to arrive.
@@ -232,6 +251,25 @@ mod tests {
             started.elapsed() < Duration::from_millis(500),
             "push should give up at its deadline, not hang"
         );
+    }
+
+    #[test]
+    fn a_stalled_offer_queues_nothing_and_can_be_offered_again() {
+        let queue = FrameQueue::new(1);
+        assert_eq!(queue.offer(0, b"a", Duration::ZERO), Offer::Queued);
+        assert_eq!(
+            queue.offer(1, b"b", Duration::from_millis(10)),
+            Offer::Stalled
+        );
+        assert_eq!(queue.try_pop(), Some((0, b"a".to_vec())));
+        assert!(
+            queue.try_pop().is_none(),
+            "the stalled bytes were not queued"
+        );
+        assert_eq!(queue.offer(1, b"b", Duration::ZERO), Offer::Queued);
+        assert_eq!(queue.try_pop(), Some((1, b"b".to_vec())));
+        queue.close();
+        assert_eq!(queue.offer(2, b"c", Duration::ZERO), Offer::Closed);
     }
 
     #[test]
