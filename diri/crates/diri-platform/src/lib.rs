@@ -4,6 +4,7 @@ pub mod ipc;
 pub mod launch;
 pub mod pipe;
 pub mod poll;
+pub mod private;
 pub mod security;
 pub mod signals;
 
