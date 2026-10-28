@@ -26,6 +26,10 @@ use crate::smooth_scroll::ScrollPosition;
 
 const MAX_SCROLLBACK_CACHE_BYTES: usize = 4 * 1024 * 1024;
 
+/// Scrollback requests allowed out at once. A flick into deep history keeps
+/// one window arriving while the next is already on its way.
+pub const MAX_FETCHES_IN_FLIGHT: usize = 2;
+
 pub type FetchFuture<'a> = Pin<
     Box<dyn Future<Output = Result<ReadScrollbackCellsResult, ScrollbackFetchError>> + Send + 'a>,
 >;
@@ -176,8 +180,13 @@ pub struct ScrollbackViewport {
     /// in place; an absolute scroll anchor alone cannot preserve their text.
     held_live: Option<GridBuffer>,
     held_live_start: Option<i64>,
-    in_flight: Option<Range<i64>>,
+    /// Requests sent and not yet answered, oldest first.
+    in_flight: [Option<Range<i64>>; MAX_FETCHES_IN_FLIGHT],
     queued: Option<Range<i64>>,
+    /// Rows to fetch past the window in the direction a precise gesture is
+    /// moving, signed like `view_offset` (positive toward history). Zero
+    /// means one screen either way.
+    lead: i64,
 }
 
 impl ScrollbackViewport {
@@ -201,7 +210,7 @@ impl ScrollbackViewport {
         self.history_rows = Some(self.live_start_row.max(0));
         self.find_source = Some(source);
         self.queued = None;
-        self.in_flight = None;
+        self.in_flight = Default::default();
         self.scroll_to_absolute(absolute_row, crate::find::HISTORY_ANCHOR, visible_rows);
         self.sync_anchor();
     }
@@ -268,6 +277,30 @@ impl ScrollbackViewport {
     #[must_use]
     pub fn painted_rows(&self, visible_rows: usize) -> usize {
         visible_rows + usize::from(self.sub_row > 0.0)
+    }
+
+    /// History rows the window would paint right now without their cells:
+    /// rows above the live grid that no fetch has delivered yet, which a
+    /// frame draws blank. Zero on the live grid and under find.
+    #[must_use]
+    pub fn unfetched_rows(&self, visible_rows: usize) -> usize {
+        if self.find_source.is_some() || self.view_offset <= 0 {
+            return 0;
+        }
+        let held_start = self.held_live.as_ref().map(|held| {
+            (
+                self.held_live_start.unwrap_or(self.live_start_row),
+                held.rows,
+            )
+        });
+        (0..self.painted_rows(visible_rows))
+            .filter(|&window_row| {
+                let row = self.absolute_row(window_row);
+                let held = held_start
+                    .is_some_and(|(start, rows)| row >= start && row < start + i64::from(rows));
+                row < self.live_start_row && !held && !self.cache.contains_key(&row)
+            })
+            .count()
     }
 
     #[must_use]
@@ -401,6 +434,26 @@ impl ScrollbackViewport {
         let changed = self.set_scroll_position(step.position, visible_rows);
         self.leaving_live = step.pending;
         changed
+    }
+
+    /// Whether travel of this sign (positive toward history) would move the
+    /// view from where it is.
+    #[must_use]
+    pub fn can_scroll(&self, travel: f32) -> bool {
+        if travel > 0.0 {
+            self.scroll_position().as_rows() < self.max_offset(0) as f64
+        } else if travel < 0.0 {
+            !self.scroll_position().is_live()
+        } else {
+            false
+        }
+    }
+
+    /// Widens the fetch window by `lead` rows in the direction of travel
+    /// (see `lead`) and queues whatever that reveals as missing.
+    pub fn lead_fetch(&mut self, lead: i64, visible_rows: usize) {
+        self.lead = lead;
+        self.queue_missing_window(visible_rows);
     }
 
     /// Re-pins the anchor to whatever content the window now shows. Returning
@@ -591,6 +644,7 @@ impl ScrollbackViewport {
         self.annotations.clear();
         self.cache_seq = None;
         self.queued = None;
+        self.lead = 0;
         // Live grid updates carry no history geometry. After following live,
         // the next reply must establish a fresh origin for the captured screen.
         self.geometry_known = false;
@@ -598,16 +652,22 @@ impl ScrollbackViewport {
 
     /// Returns the next coalesced request and marks it in flight. Until it is
     /// completed, further viewport movement is merged into one queued range.
+    ///
+    /// Up to [`MAX_FETCHES_IN_FLIGHT`] requests can be out at once, so a host
+    /// calls this until it returns `None`.
     pub fn begin_fetch(&mut self, visible_rows: usize) -> Option<ScrollbackRequest> {
         self.queue_missing_window(visible_rows);
-        if self.in_flight.is_some() {
+        // Until a reply has placed history, a second request would only
+        // guess at the same rows again.
+        if !self.geometry_known && self.in_flight.iter().any(Option::is_some) {
             return None;
         }
+        let slot = self.in_flight.iter().position(Option::is_none)?;
         let range = self.queued.take()?;
         if range.start >= range.end {
             return None;
         }
-        self.in_flight = Some(range.clone());
+        self.in_flight[slot] = Some(range.clone());
         Some(ScrollbackRequest {
             first_row: range.start,
             max_rows: range.end - range.start,
@@ -621,7 +681,7 @@ impl ScrollbackViewport {
         result: ReadScrollbackCellsResult,
         visible_rows: usize,
     ) -> Result<(), ScrollbackApplyError> {
-        self.in_flight = None;
+        self.finish_in_flight(result.first_row);
         if self.find_source.is_some() {
             return Ok(());
         }
@@ -662,10 +722,44 @@ impl ScrollbackViewport {
         Ok(())
     }
 
+    /// Fails the oldest request in flight; its rows are queued again.
     pub fn fail_fetch(&mut self) {
-        if let Some(range) = self.in_flight.take() {
+        if let Some(range) = self.take_in_flight(0) {
             merge_range(&mut self.queued, range);
         }
+    }
+
+    /// Retires the request a reply starting at `first_row` answers: the one
+    /// whose range holds it (the daemon clamps a request's start into the
+    /// rows it retains), else the oldest.
+    fn finish_in_flight(&mut self, first_row: i64) {
+        let slot = self
+            .in_flight
+            .iter()
+            .position(|range| {
+                range
+                    .as_ref()
+                    .is_some_and(|range| range.contains(&first_row))
+            })
+            .unwrap_or(0);
+        self.take_in_flight(slot);
+    }
+
+    fn take_in_flight(&mut self, slot: usize) -> Option<Range<i64>> {
+        let range = self.in_flight.get_mut(slot)?.take();
+        // Keep the slots oldest first.
+        self.in_flight[slot..].rotate_left(1);
+        range
+    }
+
+    /// Whether `row` is fetched or already requested.
+    fn has_or_awaits(&self, row: i64) -> bool {
+        self.cache.contains_key(&row)
+            || self
+                .in_flight
+                .iter()
+                .flatten()
+                .any(|range| range.contains(&row))
     }
 
     pub fn apply_rows(
@@ -777,13 +871,65 @@ impl ScrollbackViewport {
         let visible_rows = i64::try_from(visible_rows).unwrap_or(i64::MAX);
         let top = self.live_start_row.saturating_sub(self.view_offset);
         let needed_end = self.live_start_row.min(top.saturating_add(painted_rows));
-        if top >= needed_end || (top..needed_end).all(|row| self.cache.contains_key(&row)) {
+        if !self.geometry_known {
+            // The first request of a reading view learns where history is;
+            // until it answers, rows have no absolute address to lead from.
+            if top >= needed_end || (top..needed_end).all(|row| self.cache.contains_key(&row)) {
+                return;
+            }
+            let request =
+                top.saturating_sub(visible_rows).max(0)..needed_end.saturating_add(visible_rows);
+            if self
+                .in_flight
+                .iter()
+                .flatten()
+                .any(|range| *range == request)
+                || self.queued.as_ref() == Some(&request)
+            {
+                return;
+            }
+            merge_range(&mut self.queued, request);
             return;
         }
-
-        let request =
-            top.saturating_sub(visible_rows).max(0)..needed_end.saturating_add(visible_rows);
-        if self.in_flight.as_ref() == Some(&request) || self.queued.as_ref() == Some(&request) {
+        // One screen either way at rest; a moving gesture fetches `lead`
+        // rows ahead in its direction instead, and starts doing so while the
+        // first missing row is still half a lead away.
+        let lead = if self.lead == 0 {
+            visible_rows
+        } else {
+            self.lead.unsigned_abs().min(i64::MAX as u64) as i64
+        };
+        let (behind, ahead) = if self.lead < 0 {
+            (visible_rows, lead)
+        } else {
+            (lead, visible_rows)
+        };
+        let history = 0..self.live_start_row.max(0);
+        let clip = |range: Range<i64>| range.start.max(history.start)..range.end.min(history.end);
+        // `behind` extends toward older rows (above the window), `ahead`
+        // toward the live edge. At rest only a gap in the window itself
+        // asks, as it always did.
+        let trigger = if self.lead == 0 {
+            clip(top..needed_end)
+        } else {
+            clip(top.saturating_sub(behind / 2)..needed_end.saturating_add(ahead / 2))
+        };
+        if trigger.clone().all(|row| self.has_or_awaits(row)) {
+            return;
+        }
+        let wanted = clip(top.saturating_sub(behind)..needed_end.saturating_add(ahead));
+        // Ask only for the span still missing; rows already held or on
+        // their way are not fetched twice.
+        let Some(first) = wanted.clone().find(|&row| !self.has_or_awaits(row)) else {
+            return;
+        };
+        let last = wanted
+            .clone()
+            .rev()
+            .find(|&row| !self.has_or_awaits(row))
+            .unwrap_or(first);
+        let request = first..last.saturating_add(1);
+        if self.queued.as_ref() == Some(&request) {
             return;
         }
         merge_range(&mut self.queued, request);
@@ -857,6 +1003,9 @@ pub enum WheelRoute {
 #[derive(Clone, Copy, Debug, Default)]
 pub struct ScrollRouter {
     accumulated_points: f32,
+    /// Sign of the last precise delta. The accumulator itself can be owed
+    /// travel of the opposite sign, so it cannot tell a reversal.
+    direction: f32,
 }
 
 impl ScrollRouter {
@@ -870,6 +1019,7 @@ impl ScrollRouter {
     /// is not later delivered to a program that turns mouse reporting on.
     pub fn reset(&mut self) {
         self.accumulated_points = 0.0;
+        self.direction = 0.0;
     }
 
     pub fn route(&mut self, modes: TerminalModes, event: WheelEvent) -> Option<WheelRoute> {
@@ -894,14 +1044,18 @@ impl ScrollRouter {
         if delta == 0.0 {
             return None;
         }
-        if self.accumulated_points != 0.0
-            && delta.is_sign_positive() != self.accumulated_points.is_sign_positive()
-        {
+        let direction = delta.signum();
+        if self.direction != direction {
             self.accumulated_points = 0.0;
+            self.direction = direction;
         }
         self.accumulated_points += delta;
         let per_line = line_height.max(8.0);
-        let steps = (self.accumulated_points / per_line).trunc() as i32;
+        // Rounded, not truncated: a line is sent once half of it has been
+        // travelled and the rest is owed from the next. The count over a
+        // gesture is the same, each report goes out half a line sooner, and
+        // a slow gesture's first one no longer waits for a whole line.
+        let steps = (self.accumulated_points / per_line).round() as i32;
         if steps == 0 {
             return None;
         }
@@ -1024,6 +1178,36 @@ mod tests {
             Poll::Ready(output) => output,
             Poll::Pending => panic!("fake fetcher unexpectedly yielded"),
         }
+    }
+
+    #[test]
+    fn a_program_gets_a_wheel_line_at_half_a_line_of_travel() {
+        // A slow trackpad ramp into a mouse-reporting program: the first
+        // report used to wait for a whole line of travel (five events here),
+        // which was most of the delay before its transcript moved.
+        let modes = TerminalModes {
+            alt_screen: true,
+            mouse: MouseModes::OFF,
+        };
+        let mut router = ScrollRouter::default();
+        let event = |delta| WheelEvent {
+            delta: WheelDelta::PrecisePoints(delta),
+            col: 0,
+            row: 0,
+            visible_rows: 40,
+            line_height: 15.0,
+        };
+        let lines = |route: Option<WheelRoute>| match route {
+            Some(WheelRoute::Daemon { lines, .. }) => i32::from(lines),
+            _ => 0,
+        };
+        let sent: Vec<i32> = [2.5, 2.5, 3.0, 3.0, 3.0, 3.0, 3.0, 3.0, 3.0, 3.0]
+            .into_iter()
+            .map(|delta| lines(router.route(modes, event(delta))))
+            .collect();
+        assert_eq!(sent, [0, 0, 1, 0, 0, 0, 0, 1, 0, 0]);
+        // 30 points of travel is two lines, no more.
+        assert_eq!(sent.iter().sum::<i32>(), 2);
     }
 
     #[test]
@@ -1266,16 +1450,20 @@ mod tests {
     }
 
     #[test]
-    fn fetches_are_cached_and_coalesced_while_one_is_in_flight() {
+    fn fetches_are_cached_and_coalesced_while_two_are_in_flight() {
         let mut viewport = ScrollbackViewport::default();
         viewport.apply_rows(vec![], 0, 100, 100, 1, 10);
         viewport.set_view_offset(10, 10);
         let first = viewport.begin_fetch(10).unwrap();
-        assert_eq!(first.range(), 80..110);
+        assert_eq!(first.range(), 80..100, "live rows are never requested");
         assert!(viewport.begin_fetch(10).is_none());
 
+        // A second window goes out at once, without the rows already coming.
         viewport.set_view_offset(30, 10);
-        assert!(viewport.begin_fetch(10).is_none());
+        let second = viewport.begin_fetch(10).unwrap();
+        assert_eq!(second.range(), 60..80);
+        viewport.set_view_offset(50, 10);
+        assert!(viewport.begin_fetch(10).is_none(), "two at most");
         let response_rows: Vec<_> = (80..100).map(|_| row("cached", 8)).collect();
         viewport
             .complete_fetch(
@@ -1294,8 +1482,40 @@ mod tests {
             .unwrap();
 
         let coalesced = viewport.begin_fetch(10).unwrap();
-        assert_eq!(coalesced.range(), 60..90);
+        assert_eq!(coalesced.range(), 40..60);
         assert_eq!(viewport.cached_row_count(), 20);
+    }
+
+    #[test]
+    fn a_flick_fetches_ahead_before_the_window_runs_out() {
+        // The window's own rows are all fetched, so a fetch-on-miss viewport
+        // waits until the flick paints rows it does not have. A lead fetches
+        // the rows the flick is heading for while it still shows real ones.
+        let mut viewport = ScrollbackViewport::default();
+        viewport.apply_rows(
+            (0..30).map(|_| row("held", 4)).collect(),
+            970,
+            1_000,
+            1_010,
+            1,
+            10,
+        );
+        viewport.set_view_offset(20, 10);
+        assert!(viewport.begin_fetch(10).is_none(), "the window is complete");
+        assert_eq!(viewport.unfetched_rows(10), 0);
+
+        viewport.lead_fetch(40, 10);
+        let ahead = viewport.begin_fetch(10).expect("fetches ahead");
+        assert_eq!(ahead.range(), 940..970, "older rows, up to the lead");
+
+        // Scrolling back toward live leads the other way: the rows below
+        // are live or held, so there is nothing to ask for.
+        viewport.lead_fetch(-40, 10);
+        assert!(viewport.begin_fetch(10).is_none());
+
+        // What the frame would paint blank if it jumped past the cache.
+        viewport.set_view_offset(35, 10);
+        assert_eq!(viewport.unfetched_rows(10), 5);
     }
 
     #[test]
@@ -1319,7 +1539,7 @@ mod tests {
 
         assert_eq!(viewport.cached_row(2), Some(row("two", 5).as_slice()));
         assert!(viewport.begin_fetch(2).is_none());
-        assert_eq!(*fetcher.calls.lock().unwrap(), vec![0..6]);
+        assert_eq!(*fetcher.calls.lock().unwrap(), vec![0..4]);
     }
 
     #[test]

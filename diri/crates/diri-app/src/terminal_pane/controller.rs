@@ -274,6 +274,9 @@ impl AttachmentControl {
         }
         let writer = state.writer.as_ref().ok_or(InputRejection::Disconnected)?;
         let typed = matches!(command, AttachmentCommand::Input(_));
+        // A wheel report is answered by the program redrawing; that answer
+        // gets the same one immediate frame a keystroke's echo does.
+        let answered = typed || matches!(command, AttachmentCommand::Scroll { .. });
         let result = match command {
             AttachmentCommand::Input(bytes) => writer.send_input(bytes),
             AttachmentCommand::Mouse(bytes) => writer.send_mouse(bytes),
@@ -285,10 +288,12 @@ impl AttachmentControl {
                 row,
             } => writer.scroll(direction, lines, col, row),
         };
-        if typed && result.is_ok() {
+        if answered && result.is_ok() {
             let now = Instant::now();
             state.echo_due = Some(now);
-            state.input_at_risk.sent(now);
+            if typed {
+                state.input_at_risk.sent(now);
+            }
         }
         result.map_err(|error| match error {
             AttachmentClosed::Backpressure => InputRejection::Overloaded,
@@ -1615,6 +1620,12 @@ mod tests {
         control.claim();
         control.mouse(b"\x1b[<0;1;1M".to_vec());
         assert!(!control.take_echo(), "a click is not typing");
+        control.scroll(0, 1, 0, 0);
+        assert!(
+            control.take_echo(),
+            "a wheel report's redraw is drawn at once"
+        );
+        assert!(!control.take_echo());
         control.input(b"x".to_vec());
         assert!(
             control.take_echo(),

@@ -15,6 +15,7 @@ pub mod keys;
 pub mod messages;
 pub mod metrics;
 pub mod scroll_glide;
+pub mod scroll_pacer;
 pub mod scrollback;
 pub mod selection;
 mod selection_shape;

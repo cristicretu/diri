@@ -721,9 +721,19 @@ use Time::HiRes qw(usleep);
 my ($mode, $gap) = @ARGV;
 system("stty raw -echo");
 $| = 1;
+# The wheel mode is a fullscreen transcript: alternate screen, SGR mouse
+# reporting, one plain redraw per wheel report.
+syswrite STDOUT, "\e[?1049h\e[?1000h\e[?1006h" if $mode eq "wheel";
 syswrite STDOUT, "\e[2J\e[H> \e[2mTry \"refactor the parser\"\e[0m\r\n" . ("x" x 80);
 my $typed = "";
+my $wheels = 0;
 while (sysread(STDIN, my $key, 1)) {
+    if ($mode eq "wheel") {
+        next unless $key eq "M";
+        $wheels++;
+        syswrite STDOUT, "\e[H\e[2Kscrolled $wheels\r\n\e[2K" . ("y" x 40);
+        next;
+    }
     $typed .= $key;
     my $n = length $typed;
     if ($mode eq "sync") {
@@ -809,10 +819,16 @@ fn fake_tui_redraw_latencies(mode: &str, gap_us: u64, keys: usize) -> Vec<Durati
         typed.push(char::from(key));
         let done = match mode {
             "sync" => format!("> {typed}"),
+            "wheel" => format!("scrolled {}", index + 1),
             _ => format!("status {}", typed.len()),
         };
+        let frame = if mode == "wheel" {
+            Frame::scroll(0, 1, 10, 10)
+        } else {
+            Frame::input(vec![key])
+        };
         let sent = Instant::now();
-        data.write_all(&FrameCodec::encode(&Frame::input(vec![key])).unwrap())
+        data.write_all(&FrameCodec::encode(&frame).unwrap())
             .expect("send key");
         frames.until("the finished redraw", |frame| {
             frame.frame_type == FrameType::Grid
@@ -859,6 +875,21 @@ fn a_synchronized_redraw_that_removes_cells_answers_a_keystroke_at_once() {
     assert!(
         median <= Duration::from_millis(5),
         "a synchronized echo that removed cells took {median:?} (median); it must not wait out the 8 ms batch"
+    );
+}
+
+/// A wheel report is answered by the program redrawing its transcript, and
+/// that redraw is the scroll the user is waiting to see. It used to reach the
+/// PTY as background output, so the answer sat out the 8 ms batch (median
+/// ~10 ms) while a click's was published at once.
+#[test]
+fn a_wheel_reports_redraw_is_published_at_once() {
+    let mut latencies = fake_tui_redraw_latencies("wheel", 0, 21);
+    let median = percentile(&mut latencies, 0.5);
+    eprintln!("wheel redraw: median {}us", median.as_micros());
+    assert!(
+        median <= Duration::from_millis(5),
+        "a wheel report's redraw took {median:?} (median); it must not wait out the 8 ms batch"
     );
 }
 
